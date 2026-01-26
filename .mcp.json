@@ -3,6 +3,10 @@
     "supabase": {
       "type": "http",
       "url": "https://mcp.supabase.com/mcp?project_ref=xzcdodccpjmveubfitvo"
+    },
+    "pcp": {
+      "type": "sse",
+      "url": "http://localhost:3001/sse"
     }
   }
 }

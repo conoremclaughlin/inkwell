@@ -8,6 +8,9 @@
 
 import { spawn, ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
+import { writeFileSync, unlinkSync, existsSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { logger } from '../../utils/logger';
 import type {
   AgentBackend,
@@ -58,10 +61,12 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
   private messageCount = 0;
   private startTime: Date | null = null;
   private lastError: string | null = null;
-  private outputBuffer = '';
 
   // Track pending message for response routing
   private pendingMessage: AgentMessage | null = null;
+
+  // Temp file for system prompt
+  private systemPromptFile: string | null = null;
 
   constructor(config: Partial<ClaudeCodeConfig> = {}) {
     super();
@@ -69,65 +74,42 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
   }
 
   async initialize(): Promise<void> {
-    if (this.process) {
-      logger.warn('Claude Code backend already initialized');
-      return;
-    }
-
     logger.info('Initializing Claude Code backend...');
 
-    const args = this.buildArgs();
-    logger.info(`Spawning Claude Code: claude ${args.join(' ')}`);
-
-    this.process = spawn('claude', args, {
-      cwd: this.config.workingDirectory,
-      env: { ...process.env },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-
+    // Claude Code with stream-json requires -p mode, so we can't keep a single
+    // persistent process. Instead, we initialize by marking as ready and will
+    // spawn per-message with --resume to maintain session continuity.
     this.startTime = new Date();
-    this.setupProcessHandlers();
+    this.ready = true;
 
-    // Wait for the process to be ready
-    await this.waitForReady();
+    // If we have a system prompt, write it to temp file now
+    if (this.config.systemPrompt && !this.systemPromptFile) {
+      this.systemPromptFile = join(tmpdir(), `pcp-system-prompt-${Date.now()}.md`);
+      writeFileSync(this.systemPromptFile, this.config.systemPrompt, 'utf-8');
+      logger.debug(`System prompt written to: ${this.systemPromptFile}`);
+    }
+
+    logger.info('Claude Code backend ready (session-based mode)');
+    this.emit('ready');
   }
 
   async shutdown(): Promise<void> {
-    if (!this.process) {
-      return;
-    }
-
     logger.info('Shutting down Claude Code backend...');
 
-    return new Promise((resolve) => {
-      if (!this.process) {
-        resolve();
-        return;
-      }
+    // Kill any running process
+    if (this.process) {
+      this.process.kill('SIGTERM');
+      this.process = null;
+    }
 
-      const timeout = setTimeout(() => {
-        logger.warn('Force killing Claude Code process');
-        this.process?.kill('SIGKILL');
-        resolve();
-      }, 5000);
+    this.ready = false;
+    this.cleanupTempFiles();
 
-      this.process.on('close', () => {
-        clearTimeout(timeout);
-        resolve();
-      });
-
-      // Send exit command
-      this.process.stdin?.write('/exit\n');
-
-      // Give it a moment, then SIGTERM
-      setTimeout(() => {
-        this.process?.kill('SIGTERM');
-      }, 1000);
-    });
+    this.emit('exit', 0);
   }
 
   async sendMessage(message: AgentMessage): Promise<void> {
-    if (!this.process || !this.ready) {
+    if (!this.ready) {
       throw new Error('Claude Code backend not ready');
     }
 
@@ -139,20 +121,128 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
 
     logger.info(`Sending message to Claude Code [${message.channel}]: ${message.content.substring(0, 100)}...`);
 
-    // Write to stdin
-    this.process.stdin?.write(formattedInput + '\n');
+    // Spawn a Claude Code process for this message
+    // Use --resume to continue the session if we have a session ID
+    return this.executeMessage(formattedInput);
+  }
 
-    // Response will come via MCP send_response tool, not stdout parsing
-    // The tool handler will route it back to the appropriate channel
+  /**
+   * Execute a message using Claude Code in -p mode
+   * Returns the response content from stdout
+   */
+  private executeMessage(input: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const args = this.buildArgs();
+
+      // Add -p flag for print mode (required for stream-json)
+      args.unshift('-p');
+
+      logger.debug(`Spawning Claude Code: claude ${args.join(' ').substring(0, 200)}...`);
+
+      const proc = spawn('claude', args, {
+        cwd: this.config.workingDirectory,
+        env: { ...process.env },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      this.process = proc;
+      let responseContent = '';
+      let outputBuffer = '';
+
+      proc.stdout?.on('data', (data: Buffer) => {
+        const chunk = data.toString();
+        outputBuffer += chunk;
+
+        // Process complete JSON lines
+        const lines = outputBuffer.split('\n');
+        outputBuffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+
+          try {
+            const parsed = JSON.parse(line) as ClaudeStreamMessage;
+
+            // Capture session ID
+            if (parsed.type === 'system' && parsed.session_id) {
+              this.sessionId = parsed.session_id;
+              logger.info('Claude Code backend ready', { sessionId: this.sessionId });
+            }
+
+            // Capture response text
+            if (parsed.type === 'assistant' && parsed.message?.content) {
+              for (const block of parsed.message.content) {
+                if (block.type === 'text' && block.text) {
+                  responseContent += block.text;
+                  this.emit('text', block.text);
+                }
+              }
+            }
+
+            // Handle result
+            if (parsed.type === 'result') {
+              this.emit('result', {
+                success: !parsed.is_error,
+                content: parsed.result || responseContent,
+                sessionId: parsed.session_id || this.sessionId,
+                cost: parsed.total_cost_usd,
+                usage: parsed.usage,
+              });
+
+              // If we have a pending message, emit the response for routing
+              if (this.pendingMessage && (parsed.result || responseContent)) {
+                const finalContent = parsed.result || responseContent;
+                this.emit('response', {
+                  channel: this.pendingMessage.channel,
+                  conversationId: this.pendingMessage.conversationId,
+                  content: finalContent,
+                });
+              }
+            }
+          } catch {
+            // Not JSON, ignore
+          }
+        }
+      });
+
+      proc.stderr?.on('data', (data: Buffer) => {
+        logger.debug('Claude Code stderr:', data.toString());
+      });
+
+      // Set timeout
+      const timeout = setTimeout(() => {
+        proc.kill('SIGTERM');
+        reject(new Error(`Claude Code timed out after ${this.config.timeout}ms`));
+      }, this.config.timeout || 300000);
+
+      proc.on('close', (code) => {
+        clearTimeout(timeout);
+        this.process = null;
+
+        if (code !== 0) {
+          logger.warn(`Claude Code exited with code ${code}`);
+        }
+        resolve();
+      });
+
+      proc.on('error', (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+
+      // Send the input and close stdin
+      proc.stdin?.write(input);
+      proc.stdin?.end();
+    });
   }
 
   isReady(): boolean {
-    return this.ready && this.process !== null;
+    return this.ready; // In session-based mode, we're ready if initialized
   }
 
   getHealth(): BackendHealth {
     return {
-      healthy: this.ready && this.process !== null,
+      healthy: this.ready, // In session-based mode, we don't need a persistent process
       lastCheck: new Date(),
       sessionId: this.sessionId || undefined,
       uptime: this.startTime ? Date.now() - this.startTime.getTime() : undefined,
@@ -206,7 +296,11 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     }
 
     if (this.config.systemPrompt) {
-      args.push('--append-system-prompt', this.config.systemPrompt);
+      // Write system prompt to a temp file to avoid shell escaping issues
+      this.systemPromptFile = join(tmpdir(), `pcp-system-prompt-${Date.now()}.md`);
+      writeFileSync(this.systemPromptFile, this.config.systemPrompt, 'utf-8');
+      args.push('--system-prompt', this.systemPromptFile);
+      logger.debug(`System prompt written to: ${this.systemPromptFile}`);
     }
 
     if (this.sessionId) {
@@ -216,98 +310,23 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     return args;
   }
 
-  private setupProcessHandlers(): void {
-    if (!this.process) return;
-
-    this.process.stdout?.on('data', (data: Buffer) => {
-      this.handleStdout(data.toString());
-    });
-
-    this.process.stderr?.on('data', (data: Buffer) => {
-      const text = data.toString();
-      logger.debug('Claude Code stderr:', text);
-      // Stderr often contains progress info, not just errors
-    });
-
-    this.process.on('close', (code) => {
-      logger.info(`Claude Code process exited with code ${code}`);
-      this.ready = false;
-      this.process = null;
-      this.emit('exit', code);
-    });
-
-    this.process.on('error', (error) => {
-      logger.error('Claude Code process error:', error);
-      this.lastError = error.message;
-      this.emit('error', error);
-    });
-  }
-
-  private handleStdout(chunk: string): void {
-    this.outputBuffer += chunk;
-
-    // Process complete JSON lines
-    const lines = this.outputBuffer.split('\n');
-    this.outputBuffer = lines.pop() || ''; // Keep incomplete line in buffer
-
-    for (const line of lines) {
-      if (!line.trim()) continue;
-
+  /**
+   * Clean up temp files
+   */
+  private cleanupTempFiles(): void {
+    if (this.systemPromptFile && existsSync(this.systemPromptFile)) {
       try {
-        const parsed = JSON.parse(line) as ClaudeStreamMessage;
-        this.handleStreamMessage(parsed);
-      } catch {
-        // Not JSON, emit as raw output
-        this.emit('output', line);
+        unlinkSync(this.systemPromptFile);
+        logger.debug(`Cleaned up system prompt file: ${this.systemPromptFile}`);
+      } catch (error) {
+        logger.warn(`Failed to clean up system prompt file: ${error}`);
       }
-    }
-  }
-
-  private handleStreamMessage(msg: ClaudeStreamMessage): void {
-    switch (msg.type) {
-      case 'system':
-        if (msg.session_id) {
-          this.sessionId = msg.session_id;
-        }
-        if (msg.subtype === 'init') {
-          this.ready = true;
-          this.emit('ready');
-          logger.info('Claude Code backend ready', { sessionId: this.sessionId });
-        }
-        break;
-
-      case 'assistant':
-        // Emit text chunks for streaming
-        if (msg.message?.content) {
-          for (const block of msg.message.content) {
-            if (block.type === 'text' && block.text) {
-              this.emit('text', block.text);
-            }
-          }
-        }
-        break;
-
-      case 'result':
-        this.emit('result', {
-          success: !msg.is_error,
-          content: msg.result || '',
-          sessionId: msg.session_id || '',
-          cost: msg.total_cost_usd,
-          usage: msg.usage,
-        });
-        break;
-
-      case 'error':
-        this.lastError = msg.result || 'Unknown error';
-        this.emit('error', new Error(this.lastError));
-        logger.error('Claude Code error:', msg);
-        break;
+      this.systemPromptFile = null;
     }
   }
 
   private formatInput(message: AgentMessage): string {
     // Include channel context so Claude knows where the message came from
-    // and can respond appropriately via send_response tool
     const parts: string[] = [];
 
     // Channel indicator
@@ -327,40 +346,9 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     parts.push('');
     parts.push(message.content);
 
-    // Instructions for response (remind Claude to use send_response)
-    parts.push('');
-    parts.push('(Remember: Use the send_response MCP tool to reply to this message)');
-
     return parts.join('\n');
   }
 
-  private waitForReady(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error('Claude Code backend initialization timeout'));
-      }, 30000);
-
-      const checkReady = () => {
-        if (this.ready) {
-          clearTimeout(timeout);
-          resolve();
-        }
-      };
-
-      this.once('ready', () => {
-        clearTimeout(timeout);
-        resolve();
-      });
-
-      this.once('error', (error) => {
-        clearTimeout(timeout);
-        reject(error);
-      });
-
-      // Check immediately in case already ready
-      checkReady();
-    });
-  }
 }
 
 /**

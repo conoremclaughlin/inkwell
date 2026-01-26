@@ -1,5 +1,16 @@
 import winston from 'winston';
+import { mkdirSync, existsSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
 import { env } from '../config/env';
+
+// PCP log directory in user's home
+const PCP_LOG_DIR = join(homedir(), '.pcp', 'logs');
+
+// Ensure log directory exists
+if (!existsSync(PCP_LOG_DIR)) {
+  mkdirSync(PCP_LOG_DIR, { recursive: true });
+}
 
 // Define log format
 const logFormat = winston.format.combine(
@@ -31,23 +42,23 @@ export const logger = winston.createLogger({
     }),
     // Write all logs with level 'error' and below to error.log
     new winston.transports.File({
-      filename: 'logs/error.log',
+      filename: join(PCP_LOG_DIR, 'error.log'),
       level: 'error',
       maxsize: 5242880, // 5MB
       maxFiles: 5,
     }),
     // Write all logs to combined.log
     new winston.transports.File({
-      filename: 'logs/combined.log',
+      filename: join(PCP_LOG_DIR, 'combined.log'),
       maxsize: 5242880, // 5MB
       maxFiles: 5,
     }),
   ],
   exceptionHandlers: [
-    new winston.transports.File({ filename: 'logs/exceptions.log' }),
+    new winston.transports.File({ filename: join(PCP_LOG_DIR, 'exceptions.log') }),
   ],
   rejectionHandlers: [
-    new winston.transports.File({ filename: 'logs/rejections.log' }),
+    new winston.transports.File({ filename: join(PCP_LOG_DIR, 'rejections.log') }),
   ],
 });
 

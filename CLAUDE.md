@@ -6,25 +6,27 @@ This file provides context and guidelines for AI agents (particularly Claude) wo
 
 Personal Context Protocol (PCP) is a system that captures and manages personal context (links, notes, tasks, reminders) across AI interfaces. It uses MCP (Model Context Protocol) to expose tools that AI agents can use to store and retrieve user context.
 
+## Coding Style
+
+Use extreme camelCase for variable and function names. Use PascalCase for class names and types. Use SCREAMING_SNAKE_CASE for constants. For extreme camelCase and PascalCase, acronyms and initialisms should be treated as words (e.g., `userId`, `HttpClient`, `apiResponse`).
+
 ## Project Structure
 
 ```
 personal-context-protocol/
 ├── packages/
-│   ├── api/                    # Main API server
-│   │   ├── src/
-│   │   │   ├── channels/       # Messaging platform integrations
-│   │   │   ├── config/         # Configuration and environment
-│   │   │   ├── data/           # Data layer (repositories, models)
-│   │   │   │   ├── models/     # Type definitions
-│   │   │   │   ├── repositories/ # Database operations
-│   │   │   │   └── supabase/   # Supabase client and types
-│   │   │   ├── mcp/            # MCP server and tools
-│   │   │   │   └── tools/      # Tool handlers (links, notes, etc.)
-│   │   │   ├── services/       # Business logic services
-│   │   │   └── utils/          # Shared utilities
-│   │   └── package.json
-│   └── clawdbot/               # Git submodule - messaging gateway
+│   └── api/                    # Main API server
+│       ├── src/
+│       │   ├── config/         # Configuration and environment
+│       │   ├── data/           # Data layer (repositories, models)
+│       │   │   ├── models/     # Type definitions
+│       │   │   ├── repositories/ # Database operations
+│       │   │   └── supabase/   # Supabase client and types
+│       │   ├── mcp/            # MCP server and tools
+│       │   │   └── tools/      # Tool handlers (links, notes, etc.)
+│       │   ├── services/       # Business logic services
+│       │   └── utils/          # Shared utilities
+│       └── package.json
 ├── supabase/
 │   └── migrations/             # Database migrations
 ├── ARCHITECTURE.md             # System architecture documentation
@@ -37,7 +39,6 @@ personal-context-protocol/
 - **MCP SDK**: `@modelcontextprotocol/sdk`
 - **Database**: Supabase (PostgreSQL + pgvector)
 - **Validation**: Zod schemas
-- **Messaging**: Clawdbot (submodule for Telegram, WhatsApp, Discord, etc.)
 
 ## Development Commands
 
@@ -56,21 +57,6 @@ yarn type-check
 
 # Test database connection
 yarn test:connection
-```
-
-## Clawdbot Integration
-
-Clawdbot is included as a **git submodule** at `packages/clawdbot`. Key points:
-
-- **DO NOT modify** clawdbot directly - it's an external dependency
-- Use the `ChannelAdapter` and `ClawdbotBridge` classes to integrate
-- Clawdbot's message context (`MsgContext`) is converted to our `InboundMessage` format
-- See `packages/api/src/channels/clawdbot-bridge.ts` for the integration layer
-
-### Updating Clawdbot
-
-```bash
-git submodule update --remote packages/clawdbot
 ```
 
 ## Database Migrations
@@ -155,13 +141,6 @@ npx @modelcontextprotocol/inspector packages/api/dist/index.js
 2. Define Zod schema for inputs
 3. Register in `packages/api/src/mcp/tools/index.ts`
 4. Add repository methods if needed
-
-### Adding a New Platform
-
-1. Platform handling is via clawdbot (don't modify)
-2. Ensure `ChannelAdapter` handles the platform
-3. Add platform to `ChannelPlatform` type if needed
-4. Update user resolver for platform ID mapping
 
 ### Debugging
 

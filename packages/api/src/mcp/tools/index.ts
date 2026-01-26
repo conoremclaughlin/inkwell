@@ -28,6 +28,15 @@ import {
   handleGetTaskStats,
 } from './task-handlers';
 
+import {
+  handleSendResponse,
+  handleGetPendingMessages,
+  handleMarkRead,
+} from './response-handlers';
+
+// Re-export for external use
+export { setResponseCallback, addPendingMessage } from './response-handlers';
+
 // Shared schema for flexible user identification
 // Users can be identified by: userId, email, phone, or platform+platformId
 const userIdentifierFields = {
@@ -500,6 +509,95 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleGetTaskStats(args, dataComposer);
       } catch (error) {
         logger.error('Error in get_task_stats:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // RESPONSE ROUTING TOOLS
+  // =====================================================
+
+  // Register send_response tool
+  server.registerTool(
+    'send_response',
+    {
+      description: `Send a response to a specific channel. Use this tool to reply to messages from Telegram, terminal, or other channels.
+
+This is the primary way to send responses back to users. Always use this tool instead of just outputting text.`,
+      inputSchema: {
+        channel: z.enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api'])
+          .describe('Channel to send the response to'),
+        conversationId: z.string()
+          .describe('Conversation ID to route the response to'),
+        content: z.string()
+          .describe('The response content to send'),
+        format: z.enum(['text', 'markdown', 'code', 'json']).optional()
+          .describe('Format of the response content'),
+        replyToMessageId: z.string().optional()
+          .describe('Message ID to reply to (for threading)'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleSendResponse(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in send_response:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register get_pending_messages tool
+  server.registerTool(
+    'get_pending_messages',
+    {
+      description: `Get pending messages from other channels. Use this to check if there are new messages from Telegram or other platforms that need your attention.`,
+      inputSchema: {
+        channel: z.enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'all']).optional()
+          .default('all')
+          .describe('Filter by channel (default: all)'),
+        limit: z.number().min(1).max(50).optional()
+          .default(10)
+          .describe('Maximum messages to return'),
+        since: z.string().datetime().optional()
+          .describe('Only messages after this timestamp'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleGetPendingMessages(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_pending_messages:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register mark_messages_read tool
+  server.registerTool(
+    'mark_messages_read',
+    {
+      description: `Mark messages as read. Use this after you've processed pending messages.`,
+      inputSchema: {
+        messageIds: z.array(z.string())
+          .describe('Message IDs to mark as read'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleMarkRead(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in mark_messages_read:', error);
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
           isError: true,

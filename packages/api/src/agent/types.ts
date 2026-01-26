@@ -5,6 +5,8 @@
  * and the message/response types they work with.
  */
 
+import { EventEmitter } from 'events';
+
 export type ChannelType = 'telegram' | 'terminal' | 'discord' | 'whatsapp' | 'http' | 'api';
 export type BackendType = 'claude-code' | 'direct-api';
 export type ResponseFormat = 'text' | 'markdown' | 'code' | 'json';
@@ -83,8 +85,9 @@ export interface BackendConfig {
 
 /**
  * The core interface all agent backends must implement
+ * Extends EventEmitter for event-based communication
  */
-export interface AgentBackend {
+export interface AgentBackend extends EventEmitter {
   readonly type: BackendType;
 
   /**

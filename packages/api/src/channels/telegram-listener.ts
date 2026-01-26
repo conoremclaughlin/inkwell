@@ -252,7 +252,7 @@ export class TelegramListener extends EventEmitter {
         username: msg.from?.username,
         name: msg.from ? `${msg.from.first_name}${msg.from.last_name ? ' ' + msg.from.last_name : ''}` : undefined,
       },
-      conversationId: `telegram:${msg.chat.id}`,
+      conversationId: String(msg.chat.id),
       conversationLabel: msg.chat.title || msg.chat.username || msg.chat.first_name,
       groupSubject: msg.chat.title,
     };
@@ -307,6 +307,45 @@ export class TelegramListener extends EventEmitter {
    */
   get running(): boolean {
     return this.isRunning;
+  }
+
+  /**
+   * Send a message to a Telegram chat
+   * conversationId format: "telegram:<chatId>" or just "<chatId>"
+   */
+  async sendMessage(
+    conversationId: string,
+    content: string,
+    options?: {
+      replyToMessageId?: string;
+      parseMode?: 'Markdown' | 'MarkdownV2' | 'HTML';
+    }
+  ): Promise<void> {
+    // Extract chat ID from conversation ID
+    const chatId = conversationId.startsWith('telegram:')
+      ? conversationId.replace('telegram:', '')
+      : conversationId;
+
+    const params: Record<string, unknown> = {
+      chat_id: chatId,
+      text: content,
+    };
+
+    if (options?.replyToMessageId) {
+      params.reply_to_message_id = parseInt(options.replyToMessageId, 10);
+    }
+
+    if (options?.parseMode) {
+      params.parse_mode = options.parseMode;
+    }
+
+    try {
+      await this.apiCall('sendMessage', params);
+      logger.info(`Sent message to Telegram chat ${chatId}`);
+    } catch (error) {
+      logger.error(`Failed to send message to Telegram chat ${chatId}:`, error);
+      throw error;
+    }
   }
 }
 

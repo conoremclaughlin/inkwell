@@ -1,5 +1,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import express from 'express';
+import cors from 'cors';
+import type { Server } from 'http';
 import { MCP_SERVER_NAME, MCP_SERVER_VERSION } from '../config/constants';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
@@ -9,6 +13,8 @@ import { registerAllTools } from './tools';
 export class MCPServer {
   private server: McpServer;
   private dataComposer: DataComposer;
+  private httpServer: Server | null = null;
+  private sseTransport: SSEServerTransport | null = null;
 
   constructor(dataComposer: DataComposer) {
     this.dataComposer = dataComposer;
@@ -67,13 +73,59 @@ export class MCPServer {
   }
 
   /**
-   * Start with HTTP transport (for cloud deployment)
+   * Start with HTTP/SSE transport
    */
   private async startHttp(): Promise<void> {
-    // HTTP transport will be implemented when deploying to cloud
-    // For now, we'll use stdio for local development
-    logger.warn('HTTP transport not yet implemented, falling back to stdio');
-    await this.startStdio();
+    const port = env.MCP_HTTP_PORT;
+    const app = express();
+
+    // Enable CORS for Claude Code and other MCP clients
+    app.use(cors());
+
+    // SSE endpoint for MCP communication
+    app.get('/sse', async (_req, res) => {
+      logger.info('SSE connection request received');
+
+      this.sseTransport = new SSEServerTransport('/message', res);
+
+      // Connect the transport to the MCP server
+      // Note: connect() calls start() automatically on the transport
+      await this.server.connect(this.sseTransport);
+
+      logger.info('SSE transport connected', { sessionId: this.sseTransport.sessionId });
+    });
+
+    // Message endpoint for client-to-server messages
+    // Note: Don't use express.json() here - handlePostMessage reads the raw body itself
+    app.post('/message', async (req, res) => {
+      if (!this.sseTransport) {
+        res.status(503).json({ error: 'SSE transport not connected' });
+        return;
+      }
+
+      try {
+        await this.sseTransport.handlePostMessage(req, res);
+      } catch (error) {
+        logger.error('Error handling message:', error);
+        res.status(500).json({ error: 'Internal server error' });
+      }
+    });
+
+    // Health check endpoint
+    app.get('/health', (_req, res) => {
+      res.json({
+        status: 'ok',
+        name: MCP_SERVER_NAME,
+        version: MCP_SERVER_VERSION,
+        connected: this.sseTransport !== null,
+      });
+    });
+
+    this.httpServer = app.listen(port, () => {
+      logger.info(`MCP Server started with HTTP/SSE transport on port ${port}`);
+      logger.info(`SSE endpoint: http://localhost:${port}/sse`);
+      logger.info(`Message endpoint: http://localhost:${port}/message`);
+    });
   }
 
   /**
@@ -88,8 +140,39 @@ export class MCPServer {
    */
   async shutdown(): Promise<void> {
     logger.info('Shutting down MCP server...');
-    await this.server.close();
+
+    // Close the MCP server first (this closes the SSE transport)
+    try {
+      await this.server.close();
+      this.sseTransport = null;
+    } catch (error) {
+      logger.warn('Error closing MCP server:', error);
+    }
+
+    if (this.httpServer) {
+      // Force close all connections (Node 18.2+)
+      this.httpServer.closeAllConnections();
+
+      await new Promise<void>((resolve) => {
+        this.httpServer!.close(() => resolve());
+      });
+      this.httpServer = null;
+    }
+
     logger.info('MCP server shut down');
+  }
+
+  /**
+   * Get the HTTP port if running in HTTP mode
+   */
+  getPort(): number | null {
+    if (this.httpServer) {
+      const addr = this.httpServer.address();
+      if (addr && typeof addr === 'object') {
+        return addr.port;
+      }
+    }
+    return null;
   }
 }
 

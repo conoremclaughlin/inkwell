@@ -237,7 +237,7 @@ export class DirectApiBackend extends EventEmitter implements AgentBackend {
     }
 
     // If no tool was called, send the text response directly
-    if (!response.content.some(b => b.type === 'tool_use') && textContent && this.responseHandler) {
+    if (!response.content.some((b: Anthropic.ContentBlock) => b.type === 'tool_use') && textContent && this.responseHandler) {
       await this.responseHandler({
         channel: originalMessage.channel,
         conversationId: originalMessage.conversationId,
