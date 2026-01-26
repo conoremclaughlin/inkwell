@@ -34,6 +34,22 @@ import {
   handleMarkRead,
 } from './response-handlers';
 
+import {
+  handleRemember,
+  handleRecall,
+  handleForget,
+  handleUpdateMemory,
+  handleStartSession,
+  handleLogSession,
+  handleEndSession,
+  handleGetSession,
+  handleListSessions,
+  handleGetMemoryHistory,
+  handleGetUserHistory,
+  handleRestoreMemory,
+  handleBootstrap,
+} from './memory-handlers';
+
 // Re-export for external use
 export { setResponseCallback, addPendingMessage } from './response-handlers';
 
@@ -598,6 +614,378 @@ This is the primary way to send responses back to users. Always use this tool in
         return await handleMarkRead(args, dataComposer);
       } catch (error) {
         logger.error('Error in mark_messages_read:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // MEMORY TOOLS
+  // =====================================================
+
+  // Register remember tool
+  server.registerTool(
+    'remember',
+    {
+      description: `Save something to long-term memory. Memories persist across sessions and can be recalled later.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+        content: z.string().describe('The content to remember'),
+        source: z.enum(['conversation', 'observation', 'user_stated', 'inferred', 'session']).optional()
+          .describe('Source of the memory (default: observation)'),
+        salience: z.enum(['low', 'medium', 'high', 'critical']).optional()
+          .describe('Importance level (default: medium)'),
+        topics: z.array(z.string()).optional().describe('Topics for categorization'),
+        metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
+        expiresAt: z.string().datetime().optional().describe('Optional expiration date (ISO 8601)'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleRemember(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in remember:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register recall tool
+  server.registerTool(
+    'recall',
+    {
+      description: `Search and retrieve memories. Currently uses text search; semantic search coming soon.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+        query: z.string().optional().describe('Search query (text search for now)'),
+        source: z.enum(['conversation', 'observation', 'user_stated', 'inferred', 'session']).optional()
+          .describe('Filter by source'),
+        salience: z.enum(['low', 'medium', 'high', 'critical']).optional()
+          .describe('Filter by salience'),
+        topics: z.array(z.string()).optional().describe('Filter by topics (any match)'),
+        limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
+        includeExpired: z.boolean().optional().describe('Include expired memories'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleRecall(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in recall:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register forget tool
+  server.registerTool(
+    'forget',
+    {
+      description: `Delete a memory permanently.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+        memoryId: z.string().uuid().describe('ID of the memory to forget'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleForget(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in forget:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register update_memory tool
+  server.registerTool(
+    'update_memory',
+    {
+      description: `Update a memory's salience, topics, or metadata.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+        memoryId: z.string().uuid().describe('ID of the memory to update'),
+        salience: z.enum(['low', 'medium', 'high', 'critical']).optional().describe('New salience level'),
+        topics: z.array(z.string()).optional().describe('New topics'),
+        metadata: z.record(z.unknown()).optional().describe('Metadata to merge'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleUpdateMemory(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in update_memory:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // SESSION TOOLS (for tracking AI sessions)
+  // =====================================================
+
+  // Register start_session tool
+  server.registerTool(
+    'start_session',
+    {
+      description: `Start a new AI session. Sessions track work done across a conversation and can be logged to.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+        agentId: z.string().optional().describe('Agent identifier (e.g., "claude-code", "telegram-myra")'),
+        metadata: z.record(z.unknown()).optional().describe('Session metadata'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleStartSession(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in start_session:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register log_session tool
+  server.registerTool(
+    'log_session',
+    {
+      description: `Add an entry to the current session log. Use this to record important events, decisions, or progress.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+        sessionId: z.string().uuid().optional().describe('Session ID (uses active session if not provided)'),
+        content: z.string().describe('Log entry content'),
+        salience: z.enum(['low', 'medium', 'high', 'critical']).optional().describe('Importance (default: medium)'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleLogSession(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in log_session:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register end_session tool
+  server.registerTool(
+    'end_session',
+    {
+      description: `End a session with an optional summary. The summary is automatically saved as a high-salience memory.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+        sessionId: z.string().uuid().optional().describe('Session ID (uses active session if not provided)'),
+        summary: z.string().optional().describe('End-of-session summary (saved as memory)'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleEndSession(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in end_session:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register get_session tool
+  server.registerTool(
+    'get_session',
+    {
+      description: `Get details about a session, optionally including its logs.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+        sessionId: z.string().uuid().optional().describe('Session ID (returns active session if not provided)'),
+        includeLogs: z.boolean().optional().describe('Include session logs (default: false)'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleGetSession(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_session:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register list_sessions tool
+  server.registerTool(
+    'list_sessions',
+    {
+      description: `List past sessions, optionally filtered by agent.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+        agentId: z.string().optional().describe('Filter by agent'),
+        limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleListSessions(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_sessions:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // MEMORY HISTORY TOOLS (versioning & backup)
+  // =====================================================
+
+  // Register get_memory_history tool
+  server.registerTool(
+    'get_memory_history',
+    {
+      description: `Get version history for a specific memory. Shows all previous versions before updates/deletes.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+        memoryId: z.string().uuid().describe('ID of the memory to get history for'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleGetMemoryHistory(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_memory_history:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register get_user_history tool
+  server.registerTool(
+    'get_user_history',
+    {
+      description: `Get recent memory changes (updates and deletes) for a user. Useful for reviewing what changed.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+        limit: z.number().min(1).max(100).optional().describe('Max results (default: 50)'),
+        changeType: z.enum(['update', 'delete']).optional().describe('Filter by change type'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleGetUserHistory(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_user_history:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register restore_memory tool
+  server.registerTool(
+    'restore_memory',
+    {
+      description: `Restore a memory from a previous version in history. Can restore updated or deleted memories.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+        historyId: z.string().uuid().describe('ID of the history entry to restore from'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleRestoreMemory(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in restore_memory:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // BOOTSTRAP TOOL (session startup)
+  // =====================================================
+
+  // Register bootstrap tool
+  server.registerTool(
+    'bootstrap',
+    {
+      description: `Load identity and context for a new session. Call this at the start of every new conversation.
+
+Returns:
+- Identity Core: user profile, assistant role, relationship context
+- Active Context: current projects, focus, project-specific context
+- Active Session: current session if any
+- Recent Memories: high-salience memories from recent sessions
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+        includeRecentMemories: z.boolean().optional().describe('Include recent high-salience memories (default: true)'),
+        memoryLimit: z.number().min(1).max(20).optional().describe('Max recent memories to include (default: 5)'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleBootstrap(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in bootstrap:', error);
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
           isError: true,

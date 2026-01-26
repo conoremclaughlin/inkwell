@@ -2,6 +2,43 @@
 
 This file provides context and guidelines for AI agents (particularly Claude) working on this codebase.
 
+## Session Initialization (IMPORTANT)
+
+**At the start of every new session**, load user config and call bootstrap:
+
+1. Read user identity from `~/.pcp/config.json`:
+```json
+{"userId": "...", "email": "..."}
+```
+
+2. Call bootstrap with the userId:
+```
+bootstrap(userId: "<from config>")
+```
+
+This returns:
+- **Identity Core**: Who you are (assistant), who you're working with (user), your relationship
+- **Active Context**: Current projects, focus, project-specific context
+- **Recent Memories**: High-salience memories from recent sessions
+- **Active Session**: Current session if any
+
+3. Start or resume a session:
+```
+start_session(userId: "<from config>", agentId: "claude-code")
+```
+
+Throughout the session, log important events:
+```
+log_session(userId: "...", content: "Completed feature X", salience: "high")
+```
+
+At session end, save a summary:
+```
+end_session(userId: "...", summary: "Built memory layer with versioning...")
+```
+
+**Note**: Never commit PII (emails, user IDs) to the repository. Always read from `~/.pcp/config.json`.
+
 ## Project Overview
 
 Personal Context Protocol (PCP) is a system that captures and manages personal context (links, notes, tasks, reminders) across AI interfaces. It uses MCP (Model Context Protocol) to expose tools that AI agents can use to store and retrieve user context.
@@ -76,14 +113,43 @@ Current migrations:
 
 The MCP server exposes these tools:
 
-### Link Management
+### Bootstrap & Session (use these!)
+- `bootstrap` - **Call first!** Loads identity, context, and recent memories
+- `start_session` - Start tracking a session
+- `log_session` - Log important events/decisions
+- `end_session` - End session with summary (auto-saved as memory)
+- `get_session` - Get session details and logs
+- `list_sessions` - List past sessions
+
+### Memory (long-term storage)
+- `remember` - Save to long-term memory with salience/topics
+- `recall` - Search memories (text search, semantic coming)
+- `forget` - Delete a memory
+- `update_memory` - Update salience/topics
+
+### Memory History (versioning)
+- `get_memory_history` - View all versions of a memory
+- `get_user_history` - See recent changes (updates/deletes)
+- `restore_memory` - Rollback to a previous version
+
+### Context
+- `save_context` - Save context summaries (user, assistant, relationship, project)
+- `get_context` - Retrieve context
+
+### Projects
+- `save_project` - Create/update a project
+- `list_projects` - List all projects
+- `get_project` - Get project details
+
+### Links
 - `save_link` - Save a URL with metadata
 - `search_links` - Search saved links
 - `tag_link` - Add/remove tags
 
-User identification supports multiple methods:
+### User Identification
+All tools support multiple identification methods:
 - `userId` - Direct UUID
-- `email` - Account email
+- `email` - Account email (e.g., conoremclaughlin@gmail.com)
 - `platform` + `platformId` - Platform-specific ID (telegram:123456)
 - `phone` - E.164 phone number
 
