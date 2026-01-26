@@ -12,6 +12,39 @@ export type BackendType = 'claude-code' | 'direct-api';
 export type ResponseFormat = 'text' | 'markdown' | 'code' | 'json';
 
 /**
+ * Bootstrap context injected into messages for context continuity
+ */
+export interface InjectedContext {
+  user?: {
+    id: string;
+    summary?: string;
+    metadata?: Record<string, unknown>;
+  };
+  assistant?: {
+    summary?: string;
+    metadata?: Record<string, unknown>;
+  };
+  relationship?: {
+    summary?: string;
+  };
+  activeProjects?: Array<{
+    id: string;
+    name: string;
+    description?: string;
+    status: string;
+  }>;
+  currentFocus?: {
+    projectId?: string;
+    summary?: string;
+  };
+  recentMemories?: Array<{
+    content: string;
+    source: string;
+    topics: string[];
+  }>;
+}
+
+/**
  * Message coming INTO the agent from a channel
  */
 export interface AgentMessage {
@@ -34,6 +67,9 @@ export interface AgentMessage {
     sessionId?: string;
     replyToMessageId?: string;
   };
+
+  // Auto-injected context from bootstrap (set by SessionHost)
+  injectedContext?: InjectedContext;
 }
 
 /**

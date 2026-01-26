@@ -104,6 +104,18 @@ export const bootstrapSchema = userIdentifierBaseSchema.extend({
 });
 
 // =====================================================
+// COMPACTION SCHEMAS
+// =====================================================
+
+export const compactSessionSchema = userIdentifierBaseSchema.extend({
+  sessionId: z.string().uuid().optional().describe('Session ID to compact (uses active session if not provided)'),
+  groupByTopics: z.boolean().optional().describe('Group logs by inferred topics (default: true)'),
+  minSalience: z.enum(['low', 'medium', 'high', 'critical']).optional()
+    .describe('Minimum salience to include in compaction (default: medium)'),
+  preserveLogs: z.boolean().optional().describe('Keep original logs after compaction (default: false)'),
+});
+
+// =====================================================
 // HANDLERS
 // =====================================================
 
@@ -794,6 +806,190 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
               topics: m.topics,
               createdAt: m.createdAt.toISOString(),
             })),
+          },
+          null,
+          2
+        ),
+      },
+    ],
+  };
+}
+
+// =====================================================
+// COMPACTION HANDLER
+// =====================================================
+
+/**
+ * Compact session logs into memories.
+ *
+ * This implements the compaction strategy from the PCP spec:
+ * 1. Group logs by salience
+ * 2. Create summarized memories from high-value logs
+ * 3. Optionally clear the original logs
+ *
+ * The result is fewer, higher-quality memories that capture
+ * the key decisions and events from the session.
+ */
+export async function handleCompactSession(args: unknown, dataComposer: DataComposer) {
+  const params = compactSessionSchema.parse(args);
+  const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
+
+  const minSalience = params.minSalience || 'medium';
+  const preserveLogs = params.preserveLogs ?? false;
+
+  // Get session ID
+  let sessionId = params.sessionId;
+  let session;
+
+  if (sessionId) {
+    session = await dataComposer.repositories.memory.getSession(sessionId);
+  } else {
+    session = await dataComposer.repositories.memory.getActiveSession(user.id);
+    sessionId = session?.id;
+  }
+
+  if (!session || !sessionId) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({ success: false, error: 'No session found to compact' }, null, 2),
+        },
+      ],
+    };
+  }
+
+  // Get logs at or above minimum salience
+  const logs = await dataComposer.repositories.memory.getSessionLogsBySalience(sessionId, minSalience);
+
+  if (logs.length === 0) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({
+            success: true,
+            message: 'No logs to compact at specified salience level',
+            user: { id: user.id, resolvedBy },
+            sessionId,
+            logsProcessed: 0,
+            memoriesCreated: 0,
+          }, null, 2),
+        },
+      ],
+    };
+  }
+
+  // Group logs by salience for processing
+  const bySalience: Record<string, typeof logs> = {
+    critical: [],
+    high: [],
+    medium: [],
+    low: [],
+  };
+
+  for (const log of logs) {
+    bySalience[log.salience].push(log);
+  }
+
+  const memoriesCreated: Array<{ id: string; salience: string; content: string }> = [];
+
+  // Track log IDs per memory for soft-delete linking
+  let logsCompacted = 0;
+
+  // Process critical logs - each becomes its own memory
+  for (const log of bySalience.critical) {
+    const memory = await dataComposer.repositories.memory.remember({
+      userId: user.id,
+      content: log.content,
+      source: 'session',
+      salience: 'critical',
+      topics: ['session-compaction'],
+      metadata: { sessionId, originalLogId: log.id, compactedAt: new Date().toISOString() },
+    });
+    memoriesCreated.push({ id: memory.id, salience: 'critical', content: log.content.substring(0, 100) });
+
+    // Soft-delete: mark log as compacted with link to memory
+    if (!preserveLogs) {
+      await dataComposer.repositories.memory.markSpecificLogsCompacted([log.id], memory.id);
+      logsCompacted++;
+    }
+  }
+
+  // Process high salience logs - each becomes its own memory
+  for (const log of bySalience.high) {
+    const memory = await dataComposer.repositories.memory.remember({
+      userId: user.id,
+      content: log.content,
+      source: 'session',
+      salience: 'high',
+      topics: ['session-compaction'],
+      metadata: { sessionId, originalLogId: log.id, compactedAt: new Date().toISOString() },
+    });
+    memoriesCreated.push({ id: memory.id, salience: 'high', content: log.content.substring(0, 100) });
+
+    // Soft-delete: mark log as compacted with link to memory
+    if (!preserveLogs) {
+      await dataComposer.repositories.memory.markSpecificLogsCompacted([log.id], memory.id);
+      logsCompacted++;
+    }
+  }
+
+  // Process medium logs - combine into a single summary memory if multiple
+  if (bySalience.medium.length > 0) {
+    const combinedContent = bySalience.medium.length === 1
+      ? bySalience.medium[0].content
+      : `Session notes (${bySalience.medium.length} entries):\n` +
+        bySalience.medium.map((l, i) => `${i + 1}. ${l.content}`).join('\n');
+
+    const memory = await dataComposer.repositories.memory.remember({
+      userId: user.id,
+      content: combinedContent,
+      source: 'session',
+      salience: 'medium',
+      topics: ['session-compaction', 'session-notes'],
+      metadata: {
+        sessionId,
+        logCount: bySalience.medium.length,
+        compactedAt: new Date().toISOString(),
+      },
+    });
+    memoriesCreated.push({ id: memory.id, salience: 'medium', content: combinedContent.substring(0, 100) });
+
+    // Soft-delete: mark all medium logs as compacted with link to combined memory
+    if (!preserveLogs) {
+      const mediumLogIds = bySalience.medium.map(l => l.id);
+      logsCompacted += await dataComposer.repositories.memory.markSpecificLogsCompacted(mediumLogIds, memory.id);
+    }
+  }
+
+  // Mark any remaining low-salience logs as compacted (discarded, no memory link)
+  if (!preserveLogs && bySalience.low.length > 0) {
+    const lowLogIds = bySalience.low.map(l => l.id);
+    logsCompacted += await dataComposer.repositories.memory.markSpecificLogsCompacted(lowLogIds);
+  }
+
+  logger.info(`Session compacted`, {
+    sessionId,
+    logsProcessed: logs.length,
+    memoriesCreated: memoriesCreated.length,
+    logsCompacted,
+  });
+
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify(
+          {
+            success: true,
+            message: 'Session compacted successfully',
+            user: { id: user.id, resolvedBy },
+            sessionId,
+            logsProcessed: logs.length,
+            memoriesCreated: memoriesCreated.length,
+            logsCompacted: preserveLogs ? 0 : logsCompacted,
+            memories: memoriesCreated,
           },
           null,
           2

@@ -48,6 +48,7 @@ import {
   handleGetUserHistory,
   handleRestoreMemory,
   handleBootstrap,
+  handleCompactSession,
 } from './memory-handlers';
 
 // Re-export for external use
@@ -986,6 +987,44 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleBootstrap(args, dataComposer);
       } catch (error) {
         logger.error('Error in bootstrap:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // COMPACTION TOOL
+  // =====================================================
+
+  // Register compact_session tool
+  server.registerTool(
+    'compact_session',
+    {
+      description: `Compact session logs into long-term memories. This implements the tier 3→tier 2 compaction strategy:
+
+- Critical/High logs → Individual memories (preserved as-is)
+- Medium logs → Combined into session notes
+- Low logs → Discarded (unless preserveLogs=true)
+
+Use this to convert session activity into durable memories before ending a session.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+        sessionId: z.string().uuid().optional().describe('Session ID to compact (uses active session if not provided)'),
+        minSalience: z.enum(['low', 'medium', 'high', 'critical']).optional()
+          .describe('Minimum salience to include (default: medium)'),
+        preserveLogs: z.boolean().optional().describe('Keep original logs visible after compaction (default: false). Note: Logs are always soft-deleted for audit trail.'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleCompactSession(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in compact_session:', error);
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
           isError: true,

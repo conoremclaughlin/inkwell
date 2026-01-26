@@ -3317,6 +3317,7 @@ __metadata:
     "@types/node": "npm:^20.10.6"
     "@typescript-eslint/eslint-plugin": "npm:^6.17.0"
     "@typescript-eslint/parser": "npm:^6.17.0"
+    "@vitest/coverage-v8": "npm:^4.0.18"
     bcrypt: "npm:^5.1.1"
     compression: "npm:^1.7.4"
     cors: "npm:^2.8.5"
@@ -3331,6 +3332,7 @@ __metadata:
     ts-jest: "npm:^29.1.1"
     tsx: "npm:^4.7.0"
     typescript: "npm:^5.3.3"
+    vitest: "npm:^4.0.18"
     winston: "npm:^3.11.0"
     zod: "npm:^3.25.0"
   languageName: unknown

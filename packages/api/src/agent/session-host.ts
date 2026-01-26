@@ -11,7 +11,7 @@
 import { EventEmitter } from 'events';
 import { logger } from '../utils/logger';
 import type { DataComposer } from '../data/composer';
-import type { AgentMessage, AgentResponse, ChannelType, ResponseHandler } from './types';
+import type { AgentMessage, AgentResponse, ChannelType, ResponseHandler, InjectedContext } from './types';
 import { BackendManager, createBackendManager, BackendManagerConfig } from './backend-manager';
 import { setResponseCallback, addPendingMessage } from '../mcp/tools/response-handlers';
 
@@ -29,6 +29,15 @@ export interface SessionHostConfig {
   dataComposer: DataComposer;
   /** Channel senders for routing responses */
   channels?: Partial<Record<ChannelType, ChannelSender>>;
+  /** Context cache TTL in milliseconds (default: 5 minutes) */
+  contextCacheTtl?: number;
+  /** Disable auto-injection of context (default: false) */
+  disableContextInjection?: boolean;
+}
+
+interface CachedContext {
+  context: InjectedContext;
+  timestamp: Date;
 }
 
 export class SessionHost extends EventEmitter {
@@ -37,9 +46,16 @@ export class SessionHost extends EventEmitter {
   private dataComposer: DataComposer;
   private messageCounter = 0;
 
+  // Context injection
+  private contextCache: Map<string, CachedContext> = new Map();
+  private contextCacheTtl: number;
+  private disableContextInjection: boolean;
+
   constructor(config: SessionHostConfig) {
     super();
     this.dataComposer = config.dataComposer;
+    this.contextCacheTtl = config.contextCacheTtl ?? 5 * 60 * 1000; // 5 minutes default
+    this.disableContextInjection = config.disableContextInjection ?? false;
 
     // Create backend manager
     this.backendManager = createBackendManager(config.backend);
@@ -101,6 +117,129 @@ export class SessionHost extends EventEmitter {
   }
 
   /**
+   * Get injected context for a user (with caching)
+   */
+  private async getInjectedContext(
+    userId?: string,
+    platform?: string,
+    platformId?: string
+  ): Promise<InjectedContext | undefined> {
+    // Need at least one identifier
+    if (!userId && !platformId) {
+      return undefined;
+    }
+
+    // Cache key based on available identifiers
+    const cacheKey = userId || `${platform}:${platformId}`;
+
+    // Check cache
+    const cached = this.contextCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp.getTime() < this.contextCacheTtl) {
+      logger.debug(`Context cache hit for ${cacheKey}`);
+      return cached.context;
+    }
+
+    try {
+      // Resolve user
+      let resolvedUserId = userId;
+      if (!resolvedUserId && platform && platformId) {
+        const user = await this.dataComposer.repositories.users.findByPlatformId(
+          platform as 'telegram' | 'whatsapp' | 'discord',
+          platformId
+        );
+        resolvedUserId = user?.id;
+      }
+
+      if (!resolvedUserId) {
+        logger.debug(`Could not resolve user for context injection: ${cacheKey}`);
+        return undefined;
+      }
+
+      // Fetch context components in parallel
+      const [contexts, projects, focus, recentMemories] = await Promise.all([
+        this.dataComposer.repositories.context.findAllByUser(resolvedUserId),
+        this.dataComposer.repositories.projects.findAllByUser(resolvedUserId, 'active'),
+        this.dataComposer.repositories.sessionFocus.findLatestByUser(resolvedUserId),
+        this.dataComposer.repositories.memory.recall(resolvedUserId, undefined, {
+          salience: 'high',
+          limit: 5,
+        }),
+      ]);
+
+      // Build injected context
+      const userContext = contexts.find((c) => c.context_type === 'user' && !c.context_key);
+      const assistantContext = contexts.find((c) => c.context_type === 'assistant' && !c.context_key);
+      const relationshipContext = contexts.find((c) => c.context_type === 'relationship' && !c.context_key);
+
+      const injectedContext: InjectedContext = {
+        user: userContext
+          ? {
+              id: resolvedUserId,
+              summary: userContext.summary,
+              metadata: userContext.metadata as Record<string, unknown>,
+            }
+          : { id: resolvedUserId },
+        assistant: assistantContext
+          ? {
+              summary: assistantContext.summary,
+              metadata: assistantContext.metadata as Record<string, unknown>,
+            }
+          : undefined,
+        relationship: relationshipContext
+          ? { summary: relationshipContext.summary }
+          : undefined,
+        activeProjects: projects.map((p) => ({
+          id: p.id,
+          name: p.name,
+          description: p.description || undefined,
+          status: p.status,
+        })),
+        currentFocus: focus
+          ? {
+              projectId: focus.project_id || undefined,
+              summary: focus.focus_summary || undefined,
+            }
+          : undefined,
+        recentMemories: recentMemories.map((m) => ({
+          content: m.content,
+          source: m.source,
+          topics: m.topics,
+        })),
+      };
+
+      // Cache it
+      this.contextCache.set(cacheKey, {
+        context: injectedContext,
+        timestamp: new Date(),
+      });
+
+      logger.info(`Context injected for user ${resolvedUserId}`, {
+        hasUser: !!userContext,
+        hasAssistant: !!assistantContext,
+        projectCount: projects.length,
+        memoryCount: recentMemories.length,
+      });
+
+      return injectedContext;
+    } catch (error) {
+      logger.error('Failed to get injected context:', error);
+      return undefined;
+    }
+  }
+
+  /**
+   * Clear context cache for a user (useful after context updates)
+   */
+  clearContextCache(userId?: string, platform?: string, platformId?: string): void {
+    if (userId) {
+      this.contextCache.delete(userId);
+    }
+    if (platform && platformId) {
+      this.contextCache.delete(`${platform}:${platformId}`);
+    }
+  }
+
+  /**
    * Handle an incoming message from any channel
    */
   async handleMessage(
@@ -154,6 +293,15 @@ export class SessionHost extends EventEmitter {
 
     // Persist the incoming message
     await this.persistMessage(message, 'user');
+
+    // Auto-inject context if enabled and we can identify the user
+    if (!this.disableContextInjection) {
+      const userId = options?.userId;
+      const platformId = sender.id;
+      const platform = this.mapChannelToPlatform(channel);
+
+      message.injectedContext = await this.getInjectedContext(userId, platform, platformId);
+    }
 
     // Send to the agent backend
     try {

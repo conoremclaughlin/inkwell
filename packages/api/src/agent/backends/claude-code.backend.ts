@@ -18,6 +18,7 @@ import type {
   BackendHealth,
   BackendConfig,
   BackendType,
+  InjectedContext,
 } from '../types';
 
 interface ClaudeStreamMessage {
@@ -329,6 +330,12 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     // Include channel context so Claude knows where the message came from
     const parts: string[] = [];
 
+    // Inject user context if available (for continuity across sessions)
+    if (message.injectedContext) {
+      parts.push(this.formatInjectedContext(message.injectedContext));
+      parts.push('');
+    }
+
     // Channel indicator
     parts.push(`[Channel: ${message.channel}]`);
 
@@ -347,6 +354,62 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     parts.push(message.content);
 
     return parts.join('\n');
+  }
+
+  /**
+   * Format injected context into a readable block for Claude
+   */
+  private formatInjectedContext(context: InjectedContext): string {
+    const sections: string[] = [];
+    sections.push('<user-context>');
+
+    // User info
+    if (context.user) {
+      sections.push('## User');
+      if (context.user.summary) {
+        sections.push(context.user.summary);
+      }
+      sections.push(`User ID: ${context.user.id}`);
+    }
+
+    // Relationship
+    if (context.relationship?.summary) {
+      sections.push('');
+      sections.push('## Our Relationship');
+      sections.push(context.relationship.summary);
+    }
+
+    // Active projects
+    if (context.activeProjects && context.activeProjects.length > 0) {
+      sections.push('');
+      sections.push('## Active Projects');
+      for (const project of context.activeProjects) {
+        sections.push(`- **${project.name}** (${project.status})`);
+        if (project.description) {
+          sections.push(`  ${project.description}`);
+        }
+      }
+    }
+
+    // Current focus
+    if (context.currentFocus?.summary) {
+      sections.push('');
+      sections.push('## Current Focus');
+      sections.push(context.currentFocus.summary);
+    }
+
+    // Recent memories
+    if (context.recentMemories && context.recentMemories.length > 0) {
+      sections.push('');
+      sections.push('## Recent Context');
+      for (const memory of context.recentMemories) {
+        const topics = memory.topics.length > 0 ? ` [${memory.topics.join(', ')}]` : '';
+        sections.push(`- ${memory.content.substring(0, 200)}${memory.content.length > 200 ? '...' : ''}${topics}`);
+      }
+    }
+
+    sections.push('</user-context>');
+    return sections.join('\n');
   }
 
 }

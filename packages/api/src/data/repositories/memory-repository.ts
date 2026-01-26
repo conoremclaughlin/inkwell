@@ -321,18 +321,107 @@ export class MemoryRepository {
   }
 
   /**
-   * Get all logs for a session
+   * Get all logs for a session (excludes compacted logs by default)
    */
-  async getSessionLogs(sessionId: string): Promise<SessionLog[]> {
-    const { data, error } = await this.supabase
+  async getSessionLogs(sessionId: string, includeCompacted = false): Promise<SessionLog[]> {
+    let query = this.supabase
       .from('session_logs')
       .select('*')
       .eq('session_id', sessionId)
       .order('created_at', { ascending: true });
 
+    if (!includeCompacted) {
+      query = query.is('compacted_at', null);
+    }
+
+    const { data, error } = await query;
+
     if (error) {
       logger.error('Failed to get session logs:', error);
       throw new Error(`Failed to get session logs: ${error.message}`);
+    }
+
+    return (data || []).map(this.rowToSessionLog);
+  }
+
+  /**
+   * Soft-delete session logs by marking them as compacted
+   */
+  async markLogsCompacted(
+    sessionId: string,
+    memoryId?: string
+  ): Promise<number> {
+    const { data, error } = await this.supabase
+      .from('session_logs')
+      .update({
+        compacted_at: new Date().toISOString(),
+        compacted_into_memory_id: memoryId,
+      })
+      .eq('session_id', sessionId)
+      .is('compacted_at', null)
+      .select('id');
+
+    if (error) {
+      logger.error('Failed to mark logs as compacted:', error);
+      throw new Error(`Failed to mark logs as compacted: ${error.message}`);
+    }
+
+    return data?.length || 0;
+  }
+
+  /**
+   * Mark specific logs as compacted (for granular compaction)
+   * Pass memoryId to link to the memory created from the log(s), or undefined if discarded
+   */
+  async markSpecificLogsCompacted(
+    logIds: string[],
+    memoryId?: string
+  ): Promise<number> {
+    const { data, error } = await this.supabase
+      .from('session_logs')
+      .update({
+        compacted_at: new Date().toISOString(),
+        compacted_into_memory_id: memoryId || null,
+      })
+      .in('id', logIds)
+      .select('id');
+
+    if (error) {
+      logger.error('Failed to mark specific logs as compacted:', error);
+      throw new Error(`Failed to mark specific logs as compacted: ${error.message}`);
+    }
+
+    return data?.length || 0;
+  }
+
+  /**
+   * Get session logs filtered by salience (excludes compacted logs by default)
+   */
+  async getSessionLogsBySalience(
+    sessionId: string,
+    minSalience: 'low' | 'medium' | 'high' | 'critical',
+    includeCompacted = false
+  ): Promise<SessionLog[]> {
+    const salienceOrder = ['low', 'medium', 'high', 'critical'];
+    const minIndex = salienceOrder.indexOf(minSalience);
+    const validSaliences = salienceOrder.slice(minIndex);
+
+    let query = this.supabase
+      .from('session_logs')
+      .select('*')
+      .eq('session_id', sessionId)
+      .in('salience', validSaliences)
+      .order('created_at', { ascending: true });
+
+    if (!includeCompacted) {
+      query = query.is('compacted_at', null);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      logger.error('Failed to get session logs by salience:', error);
+      throw new Error(`Failed to get session logs by salience: ${error.message}`);
     }
 
     return (data || []).map(this.rowToSessionLog);
