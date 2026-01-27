@@ -46,6 +46,9 @@ const envSchema = z.object({
   MCP_HTTP_PORT: z.string().transform(Number).default('3001'),
   MCP_AUTH_TOKEN: optionalString,
 
+  // Myra (persistent messaging process)
+  MYRA_HTTP_PORT: z.string().transform(Number).default('3003'),
+
   // Authentication
   JWT_SECRET: z.string().min(32),
   JWT_EXPIRES_IN: z.string().default('7d'),

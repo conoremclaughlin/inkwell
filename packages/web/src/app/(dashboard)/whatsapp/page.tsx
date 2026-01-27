@@ -39,23 +39,42 @@ export default function WhatsAppPage() {
       eventSourceRef.current.close();
     }
 
-    const eventSource = new EventSource('/api/admin/whatsapp/qr');
+    // Connect directly to Myra's HTTP server for SSE
+    // Next.js rewrites don't properly handle SSE streaming
+    const myraUrl = process.env.NEXT_PUBLIC_MYRA_URL || 'http://localhost:3003';
+    const eventSource = new EventSource(`${myraUrl}/api/admin/whatsapp/qr`);
     eventSourceRef.current = eventSource;
 
+    eventSource.onopen = () => {
+      console.log('[WhatsApp SSE] Connection opened');
+    };
+
     eventSource.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      if (data.type === 'qr') {
-        setQrCode(data.qr);
-      } else if (data.type === 'connected') {
-        setStatus({ connected: true, phoneNumber: data.phoneNumber });
-        setQrCode(null);
-      } else if (data.type === 'disconnected') {
-        setStatus({ connected: false });
+      console.log('[WhatsApp SSE] Raw event.data:', event.data.substring(0, 100) + '...');
+      try {
+        const data = JSON.parse(event.data);
+        console.log('[WhatsApp SSE] Parsed type:', data.type, data.type === 'qr' ? '(SVG length: ' + data.qr?.length + ')' : '');
+        if (data.type === 'qr') {
+          console.log('[WhatsApp SSE] Setting QR code, length:', data.qr?.length);
+          setQrCode(data.qr);
+          setError(null);
+        } else if (data.type === 'connected') {
+          setStatus({ connected: true, phoneNumber: data.phoneNumber });
+          setQrCode(null);
+          setError(null);
+        } else if (data.type === 'disconnected') {
+          setStatus({ connected: false });
+        } else if (data.type === 'error') {
+          setError(data.message);
+        }
+      } catch (err) {
+        console.error('Failed to parse SSE data:', err);
       }
     };
 
-    eventSource.onerror = () => {
-      setError('Lost connection to QR stream');
+    eventSource.onerror = (err) => {
+      console.error('SSE connection error:', err);
+      setError('Lost connection to QR stream. Is Myra running?');
       eventSource.close();
     };
   };
@@ -71,6 +90,16 @@ export default function WhatsAppPage() {
     };
   }, []);
 
+  // Debug: log whenever qrCode state changes
+  useEffect(() => {
+    console.log('[WhatsApp State] qrCode changed, length:', qrCode?.length, 'truthy:', !!qrCode);
+  }, [qrCode]);
+
+  // Debug: log whenever status state changes
+  useEffect(() => {
+    console.log('[WhatsApp State] status changed:', status);
+  }, [status]);
+
   const handleLogout = async () => {
     if (!confirm('Are you sure you want to disconnect WhatsApp?')) return;
 
@@ -85,6 +114,9 @@ export default function WhatsAppPage() {
       setError(err instanceof Error ? err.message : 'Logout failed');
     }
   };
+
+  // Debug logging
+  console.log('[WhatsApp Render] status:', status, 'qrCode length:', qrCode?.length, 'isLoading:', isLoading);
 
   return (
     <div>
@@ -106,6 +138,13 @@ export default function WhatsAppPage() {
           {error}
         </div>
       )}
+
+      {/* Debug panel - remove after fixing */}
+      <div className="mt-4 rounded-md bg-yellow-50 p-4 text-yellow-800 text-sm font-mono">
+        <div>Debug: status={JSON.stringify(status)}</div>
+        <div>qrCode={qrCode ? `[SVG, ${qrCode.length} chars]` : 'null'}</div>
+        <div>isLoading={String(isLoading)}</div>
+      </div>
 
       <div className="mt-8 grid gap-6 md:grid-cols-2">
         {/* Connection Status */}
@@ -177,7 +216,7 @@ export default function WhatsAppPage() {
             ) : qrCode ? (
               <div className="flex flex-col items-center">
                 <div
-                  className="bg-white p-4 rounded-lg"
+                  className="bg-white p-4 rounded-lg w-64 h-64 [&>svg]:w-full [&>svg]:h-full"
                   dangerouslySetInnerHTML={{ __html: qrCode }}
                 />
                 <p className="mt-4 text-sm text-gray-500">

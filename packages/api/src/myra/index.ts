@@ -9,11 +9,15 @@
  * - MCP Server (via HTTP) for tools and data access
  * - Claude Code backend for AI processing
  *
+ * Also runs a small HTTP server for WhatsApp admin endpoints (QR streaming).
+ *
  * Run: pm2 start myra
  *      yarn myra
  */
 
 import path from 'path';
+import http from 'http';
+import QRCode from 'qrcode';
 import { getDataComposer, DataComposer } from '../data/composer';
 import { createTelegramListener, TelegramListener } from '../channels/telegram-listener';
 import { createWhatsAppListener, WhatsAppListener } from '../channels/whatsapp-listener';
@@ -48,7 +52,11 @@ let sessionHost: SessionHost | null = null;
 let telegramListener: TelegramListener | null = null;
 let whatsappListener: WhatsAppListener | null = null;
 let dataComposer: DataComposer | null = null;
+let httpServer: http.Server | null = null;
 let isShuttingDown = false;
+
+// Cache the most recent QR code for new SSE clients
+let cachedQrCode: string | null = null;
 
 // Typing indicator management
 const activeTypingIntervals: Map<string, NodeJS.Timeout> = new Map();
@@ -172,6 +180,126 @@ WhatsApp has limited formatting. Use plain text for best compatibility.
   }
 
   return parts.join('\n');
+}
+
+/**
+ * Start HTTP server for WhatsApp admin endpoints
+ * This allows the web dashboard to stream QR codes from Myra
+ */
+async function startHttpServer(): Promise<void> {
+  const port = env.MYRA_HTTP_PORT;
+
+  httpServer = http.createServer((req, res) => {
+    // CORS headers for cross-origin requests from web dashboard
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(200);
+      res.end();
+      return;
+    }
+
+    const url = new URL(req.url || '/', `http://localhost:${port}`);
+
+    // Health check
+    if (url.pathname === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', service: 'myra' }));
+      return;
+    }
+
+    // WhatsApp status
+    if (url.pathname === '/api/admin/whatsapp/status') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        connected: whatsappListener?.connected ?? false,
+        running: whatsappListener?.running ?? false,
+        enabled: !!whatsappListener,
+      }));
+      return;
+    }
+
+    // WhatsApp QR SSE stream
+    if (url.pathname === '/api/admin/whatsapp/qr') {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      });
+
+      // Send initial status
+      if (whatsappListener?.connected) {
+        res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`);
+      } else {
+        res.write(`data: ${JSON.stringify({ type: 'disconnected' })}\n\n`);
+        // Send cached QR code if available (for clients that connect after QR was generated)
+        if (cachedQrCode) {
+          res.write(`data: ${JSON.stringify({ type: 'qr', qr: cachedQrCode })}\n\n`);
+        }
+      }
+
+      if (!whatsappListener) {
+        res.write(`data: ${JSON.stringify({ type: 'error', message: 'WhatsApp not enabled' })}\n\n`);
+        return;
+      }
+
+      // Event handlers
+      const qrHandler = async (qrData: string) => {
+        try {
+          // Convert QR data to SVG
+          const qrSvg = await QRCode.toString(qrData, { type: 'svg', margin: 2, width: 256 });
+          cachedQrCode = qrSvg;
+          res.write(`data: ${JSON.stringify({ type: 'qr', qr: qrSvg })}\n\n`);
+        } catch (err) {
+          logger.error('Failed to generate QR SVG:', err);
+        }
+      };
+
+      const connectedHandler = (info: { jid: string; e164: string | null }) => {
+        cachedQrCode = null; // Clear cached QR when connected
+        res.write(`data: ${JSON.stringify({ type: 'connected', phoneNumber: info.e164 || info.jid })}\n\n`);
+      };
+
+      const disconnectedHandler = () => {
+        res.write(`data: ${JSON.stringify({ type: 'disconnected' })}\n\n`);
+      };
+
+      // Attach listeners
+      whatsappListener.on('qr', qrHandler);
+      whatsappListener.on('connected', connectedHandler);
+      whatsappListener.on('disconnected', disconnectedHandler);
+      whatsappListener.on('loggedOut', disconnectedHandler);
+
+      // Clean up on close
+      req.on('close', () => {
+        whatsappListener?.off('qr', qrHandler);
+        whatsappListener?.off('connected', connectedHandler);
+        whatsappListener?.off('disconnected', disconnectedHandler);
+        whatsappListener?.off('loggedOut', disconnectedHandler);
+      });
+
+      return;
+    }
+
+    // 404 for everything else
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found' }));
+  });
+
+  return new Promise((resolve, reject) => {
+    httpServer!.listen(port, () => {
+      logger.info(`Myra HTTP server listening on port ${port}`);
+      logger.info(`  WhatsApp QR stream: http://localhost:${port}/api/admin/whatsapp/qr`);
+      resolve();
+    });
+
+    httpServer!.on('error', (err) => {
+      logger.error('Failed to start Myra HTTP server:', err);
+      reject(err);
+    });
+  });
 }
 
 /**
@@ -418,11 +546,18 @@ async function startMyra(config: MyraConfig = {}): Promise<void> {
     });
 
     whatsappListener.on('connected', (info: { jid: string; e164: string | null }) => {
+      cachedQrCode = null; // Clear QR on connect
       logger.info(`WhatsApp connected: ${info.e164 || info.jid}`);
     });
 
-    whatsappListener.on('qr', () => {
-      logger.info('WhatsApp QR code displayed - please scan with your phone');
+    whatsappListener.on('qr', async (qrData: string) => {
+      try {
+        // Convert QR data to SVG for web dashboard
+        cachedQrCode = await QRCode.toString(qrData, { type: 'svg', margin: 2, width: 256 });
+        logger.info('WhatsApp QR code displayed - please scan with your phone');
+      } catch (err) {
+        logger.error('Failed to generate QR SVG:', err);
+      }
     });
 
     whatsappListener.on('loggedOut', () => {
@@ -439,7 +574,10 @@ async function startMyra(config: MyraConfig = {}): Promise<void> {
     logger.info('WhatsApp disabled (set ENABLE_WHATSAPP=true to enable)');
   }
 
-  // 8. Print status
+  // 8. Start HTTP server for WhatsApp admin endpoints (QR streaming)
+  await startHttpServer();
+
+  // 9. Print status
   logger.info('');
   logger.info('='.repeat(60));
   logger.info('  MYRA IS RUNNING');
@@ -474,6 +612,12 @@ async function shutdown(): Promise<void> {
     clearInterval(interval);
   }
   activeTypingIntervals.clear();
+
+  // Stop HTTP server
+  if (httpServer) {
+    logger.info('Stopping HTTP server...');
+    httpServer.close();
+  }
 
   // Stop listeners
   if (telegramListener) {
