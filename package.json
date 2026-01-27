@@ -18,7 +18,9 @@
     "restart:myra": "pm2 restart myra",
     "logs": "pm2 logs",
     "logs:myra": "pm2 logs myra",
+    "logs:mcp": "pm2 logs mcp",
     "status": "pm2 status",
+    "pm2": "pm2",
     "build": "yarn workspaces run build",
     "build:web": "yarn workspace @personal-context/web build",
     "test": "yarn workspaces run test",
@@ -42,5 +44,8 @@
     "ai-assistant"
   ],
   "author": "",
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "pm2": "^6.0.14"
+  }
 }
