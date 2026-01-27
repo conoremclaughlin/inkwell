@@ -1003,16 +1003,19 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Load identity and context for a new session. Call this at the start of every new conversation.
 
 Returns:
-- Identity Core: user profile, assistant role, relationship context
+- Identity Files: VALUES.md, USER.md, and agent-specific IDENTITY.md from ~/.pcp
+- Identity Core: user profile, assistant role, relationship context from DB
 - Active Context: current projects, focus, project-specific context
 - Active Session: current session if any
-- Recent Memories: high-salience memories from recent sessions
+- Recent Memories: high-salience memories (filtered by agent if provided)
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
         includeRecentMemories: z.boolean().optional().describe('Include recent high-salience memories (default: true)'),
         memoryLimit: z.number().min(1).max(20).optional().describe('Max recent memories to include (default: 5)'),
+        agentId: z.string().optional().describe('Agent identity (e.g., "wren", "benson", "myra"). Loads identity files and filters memories.'),
+        identityBasePath: z.string().optional().describe('Base path for identity files (default: ~/.pcp)'),
       },
     },
     async (args) => {

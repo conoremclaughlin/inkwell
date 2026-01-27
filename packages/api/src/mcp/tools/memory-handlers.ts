@@ -5,10 +5,22 @@
  */
 
 import { z } from 'zod';
+import * as fs from 'fs/promises';
+import * as path from 'path';
+import * as os from 'os';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
 import type { MemorySource, Salience } from '../../data/models/memory';
+
+// Helper to safely read a file, returning null if it doesn't exist
+async function safeReadFile(filePath: string): Promise<string | null> {
+  try {
+    return await fs.readFile(filePath, 'utf-8');
+  } catch {
+    return null;
+  }
+}
 
 // Enums for validation
 const memorySourceSchema = z.enum(['conversation', 'observation', 'user_stated', 'inferred', 'session']);
@@ -104,6 +116,8 @@ export const restoreMemorySchema = userIdentifierBaseSchema.extend({
 export const bootstrapSchema = userIdentifierBaseSchema.extend({
   includeRecentMemories: z.boolean().optional().describe('Include recent high-salience memories (default: true)'),
   memoryLimit: z.number().min(1).max(20).optional().describe('Max recent memories to include (default: 5)'),
+  agentId: z.string().optional().describe('Agent identity (e.g., "wren", "benson", "myra"). Filters memories and loads identity files.'),
+  identityBasePath: z.string().optional().describe('Base path for identity files (default: ~/.pcp)'),
 });
 
 // =====================================================
@@ -706,7 +720,8 @@ export async function handleRestoreMemory(args: unknown, dataComposer: DataCompo
  * This is the recommended way to start a new session.
  *
  * Returns:
- * - Identity Core: user, assistant, relationship context
+ * - Identity Files: VALUES.md, USER.md, and agent-specific IDENTITY.md
+ * - Identity Core: user, assistant, relationship context from DB
  * - Active Context: current projects, focus, recent high-salience memories
  * - Active Session: current session info if any
  */
@@ -716,6 +731,31 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 
   const includeMemories = params.includeRecentMemories !== false;
   const memoryLimit = params.memoryLimit || 5;
+  const agentId = params.agentId;
+  const basePath = params.identityBasePath || path.join(os.homedir(), '.pcp');
+
+  // Load identity files if agentId is provided
+  let identityFiles: {
+    values: string | null;
+    user: string | null;
+    self: string | null;
+    agentId: string | null;
+  } | null = null;
+
+  if (agentId) {
+    const [valuesContent, userContent, selfContent] = await Promise.all([
+      safeReadFile(path.join(basePath, 'shared', 'VALUES.md')),
+      safeReadFile(path.join(basePath, 'shared', 'USER.md')),
+      safeReadFile(path.join(basePath, agentId, 'IDENTITY.md')),
+    ]);
+
+    identityFiles = {
+      agentId,
+      values: valuesContent,
+      user: userContent,
+      self: selfContent,
+    };
+  }
 
   // Fetch all context in parallel
   const [contexts, projects, focus, activeSession, recentMemories] = await Promise.all([
@@ -725,13 +765,15 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     dataComposer.repositories.projects.findAllByUser(user.id, 'active'),
     // Current focus
     dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
-    // Active session
-    dataComposer.repositories.memory.getActiveSession(user.id),
-    // Recent high-salience memories
+    // Active session (filter by agentId if provided)
+    dataComposer.repositories.memory.getActiveSession(user.id, agentId),
+    // Recent high-salience memories (filter by agentId if provided, include shared)
     includeMemories
       ? dataComposer.repositories.memory.recall(user.id, undefined, {
           salience: 'high',
           limit: memoryLimit,
+          agentId: agentId,
+          includeShared: true,
         })
       : Promise.resolve([]),
   ]);
@@ -746,10 +788,12 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   const projectContexts = contexts.filter((c) => c.context_type === 'project');
 
   logger.info(`Bootstrap loaded for user ${user.id}`, {
+    agentId: agentId || 'none',
     contextCount: contexts.length,
     projectCount: projects.length,
     memoryCount: recentMemories.length,
     hasActiveSession: !!activeSession,
+    hasIdentityFiles: !!identityFiles,
   });
 
   return {
@@ -761,7 +805,10 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
             success: true,
             user: { id: user.id, resolvedBy },
 
-            // Tier 1: Identity Core
+            // Identity files from filesystem
+            identityFiles: identityFiles,
+
+            // Tier 1: Identity Core from DB
             identityCore: {
               user: identityCore.user
                 ? { summary: identityCore.user.summary, metadata: identityCore.user.metadata }
@@ -806,12 +853,14 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
                 }
               : null,
 
-            // Recent high-salience memories
+            // Recent high-salience memories (filtered by agent if provided)
             recentMemories: recentMemories.map((m) => ({
               id: m.id,
               content: m.content,
               source: m.source,
+              salience: m.salience,
               topics: m.topics,
+              agentId: m.agentId,
               createdAt: m.createdAt.toISOString(),
             })),
           },

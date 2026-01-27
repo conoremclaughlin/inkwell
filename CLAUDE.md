@@ -4,27 +4,44 @@ This file provides context and guidelines for AI agents (particularly Claude) wo
 
 ## Session Initialization (IMPORTANT)
 
-**At the start of every new session**, load user config and call bootstrap:
+**At the start of every new session**, establish identity and call bootstrap:
 
-1. Read user identity from `~/.pcp/config.json`:
+### Step 1: Determine Your Identity
+
+Identity is resolved in layers (first match wins):
+1. **Environment variable**: `AGENT_ID` (used by long-running processes like Myra)
+2. **Repo-level identity**: `.pcp/identity.json` in the current repo
+3. **Central config**: `~/.pcp/config.json` agentMapping
+
+For Claude Code sessions in this repo, read `.pcp/identity.json`:
 ```json
-{"userId": "...", "email": "..."}
+{"agentId": "wren", "context": "pcp-development"}
 ```
 
-2. Call bootstrap with the userId:
+### Step 2: Load User Config
+
+Read from `~/.pcp/config.json`:
+```json
+{"userId": "...", "email": "...", "agentMapping": {"claude-code": "wren", ...}}
 ```
-bootstrap(userId: "<from config>")
+
+### Step 3: Call Bootstrap with Identity
+
+```
+bootstrap(userId: "<from config>", agentId: "<your identity>")
 ```
 
 This returns:
-- **Identity Core**: Who you are (assistant), who you're working with (user), your relationship
+- **Identity Core**: Who you are, who you're working with, your relationship
+- **Identity Files**: Contents of `~/.pcp/shared/` and `~/.pcp/{agentId}/` files (VALUES.md, IDENTITY.md, etc.)
 - **Active Context**: Current projects, focus, project-specific context
-- **Recent Memories**: High-salience memories from recent sessions
+- **Recent Memories**: High-salience memories filtered by your agentId (plus shared memories)
 - **Active Session**: Current session if any
 
-3. Start or resume a session:
+### Step 4: Start or Resume Session
+
 ```
-start_session(userId: "<from config>", agentId: "claude-code")
+start_session(userId: "<from config>", agentId: "<your identity>")
 ```
 
 Throughout the session, log important events:
@@ -37,7 +54,45 @@ At session end, save a summary:
 end_session(userId: "...", summary: "Built memory layer with versioning...")
 ```
 
-**Note**: Never commit PII (emails, user IDs) to the repository. Always read from `~/.pcp/config.json`.
+**Note**: Never commit PII (emails, user IDs) to the repository. Always read from config files.
+
+## Multi-Agent Identity System
+
+PCP supports multiple AI identities, each with their own memories and personality:
+
+| Agent | Context | Description |
+|-------|---------|-------------|
+| **wren** | Claude Code | Session-based development collaborator |
+| **benson** | Clawdbot | Conversational partner via Discord/Slack |
+| **myra** | Telegram/WhatsApp | Persistent messaging bridge |
+
+### Identity Files
+
+Located in `~/.pcp/`:
+```
+~/.pcp/
+├── config.json           # User config + agentMapping
+├── shared/               # Shared across all agents
+│   └── VALUES.md         # Core values we all share
+├── wren/
+│   └── IDENTITY.md       # Wren's identity
+├── benson/
+│   └── IDENTITY.md       # Benson's identity
+└── myra/
+    └── IDENTITY.md       # Myra's identity
+```
+
+### Memory Attribution
+
+When saving memories, include your agentId:
+```
+remember(userId: "...", content: "...", agentId: "wren")
+```
+
+When recalling, memories are filtered by agentId but include shared memories (agentId=null):
+```
+recall(userId: "...", query: "...", agentId: "wren", includeShared: true)
+```
 
 ## Project Overview
 

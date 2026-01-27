@@ -1,0 +1,5 @@
+{
+  "agentId": "wren",
+  "context": "pcp-development",
+  "description": "Primary development context for PCP. Wren is the Claude Code collaborator."
+}
