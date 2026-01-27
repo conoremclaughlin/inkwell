@@ -254,6 +254,8 @@ export class SessionHost extends EventEmitter {
       replyToMessageId?: string;
       metadata?: Record<string, unknown>;
       media?: Array<{ type: 'image' | 'video' | 'audio' | 'document'; url?: string; path?: string }>;
+      chatType?: 'direct' | 'group' | 'channel';
+      mentions?: { users: string[]; botMentioned: boolean };
     }
   ): Promise<void> {
     this.messageCounter++;
@@ -267,6 +269,8 @@ export class SessionHost extends EventEmitter {
       content,
       timestamp: new Date(),
       media: options?.media,
+      chatType: options?.chatType,
+      mentions: options?.mentions,
       context: {
         userId: options?.userId,
         projectId: options?.projectId,

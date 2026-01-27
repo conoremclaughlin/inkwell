@@ -48,6 +48,14 @@ interface TelegramFile {
   file_path?: string;
 }
 
+interface TelegramMessageEntity {
+  type: 'mention' | 'hashtag' | 'cashtag' | 'bot_command' | 'url' | 'email' | 'phone_number' | 'bold' | 'italic' | 'underline' | 'strikethrough' | 'code' | 'pre' | 'text_link' | 'text_mention';
+  offset: number;
+  length: number;
+  url?: string;
+  user?: TelegramUser;
+}
+
 interface TelegramMessage {
   message_id: number;
   from?: TelegramUser;
@@ -56,6 +64,8 @@ interface TelegramMessage {
   text?: string;
   caption?: string;
   photo?: TelegramPhotoSize[];
+  entities?: TelegramMessageEntity[];
+  caption_entities?: TelegramMessageEntity[];
   reply_to_message?: TelegramMessage;
   forward_from?: TelegramUser;
   forward_date?: number;
@@ -214,7 +224,8 @@ export class TelegramListener extends EventEmitter {
     const params: Record<string, unknown> = {
       offset: this.lastUpdateId + 1,
       timeout: Math.floor(this.config.timeout / 1000), // Telegram expects seconds
-      allowed_updates: ['message', 'edited_message'],
+      // Include all relevant update types for groups
+      allowed_updates: ['message', 'edited_message', 'my_chat_member', 'chat_member'],
     };
 
     return this.apiCall<TelegramUpdate[]>('getUpdates', params);
@@ -334,6 +345,34 @@ export class TelegramListener extends EventEmitter {
         });
       }
     }
+
+    // Extract mentions from entities
+    const entities = msg.entities || msg.caption_entities || [];
+    const mentionedUsers: string[] = [];
+    let botMentioned = false;
+
+    for (const entity of entities) {
+      if (entity.type === 'mention') {
+        // Extract the @username from the text
+        const mentionText = textContent.substring(entity.offset, entity.offset + entity.length);
+        mentionedUsers.push(mentionText);
+        // Check if it's our bot
+        if (mentionText.toLowerCase() === '@myra_help_bot') {
+          botMentioned = true;
+        }
+      }
+    }
+
+    // Also check for name mentions (case-insensitive)
+    const lowerText = textContent.toLowerCase();
+    if (lowerText.includes('myra')) {
+      botMentioned = true;
+    }
+
+    message.mentions = {
+      users: mentionedUsers,
+      botMentioned,
+    };
 
     // Add reply context if present
     if (msg.reply_to_message) {

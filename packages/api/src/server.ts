@@ -223,8 +223,20 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     telegramListener.onMessage(async (message) => {
       const senderId = message.sender.id || 'unknown';
       const conversationId = message.conversationId || senderId;
+      const isGroupChat = message.chatType === 'group';
+      const botMentioned = message.mentions?.botMentioned ?? false;
 
-      logger.info(`Received message from @${message.sender.username || senderId}`);
+      logger.info(`Received message from @${message.sender.username || senderId}`, {
+        chatType: message.chatType,
+        botMentioned,
+        mentions: message.mentions?.users,
+      });
+
+      // In group chats, only respond if bot is mentioned
+      if (isGroupChat && !botMentioned) {
+        logger.debug('Skipping group message - bot not mentioned');
+        return;
+      }
 
       // Start persistent typing indicator (refreshes every 4s until response is sent)
       startTypingIndicator(conversationId);
@@ -252,6 +264,8 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
             userId: user?.id,
             replyToMessageId: message.replyTo?.id,
             media: message.media,
+            chatType: message.chatType,
+            mentions: message.mentions,
           }
         );
       } catch (error) {
@@ -313,13 +327,24 @@ You're receiving messages from various channels (Telegram, terminal, etc.).
 
 ## Response Instructions
 
-Simply respond to messages conversationally. Your response will be automatically
-routed back to the channel the message came from. Be concise and helpful.
+Your response will be automatically routed back to the channel the message came from.
+Be concise and helpful.
 
 The message metadata shows:
 - [Channel: X] - Which platform the message came from
-- [Conversation: X] - The conversation/chat ID
+- [Conversation: X] - The conversation/chat ID (negative IDs = group chats)
 - [From: X] - The sender's name
+
+### Group Chat Behavior (IMPORTANT)
+
+In **group chats** (conversation ID is negative, or chatType is "group"/"supergroup"):
+- **ONLY respond if you are directly mentioned** (@myra_help_bot) or called by name ("Myra")
+- If the message doesn't mention you, stay silent - do NOT respond
+- When you do respond in groups, keep it brief and relevant
+
+In **private/direct chats**: respond to all messages normally.
+
+This prevents you from interrupting group conversations where you weren't addressed.
 
 ### Telegram Formatting
 When responding to Telegram, use plain text. Telegram has limited markdown support:

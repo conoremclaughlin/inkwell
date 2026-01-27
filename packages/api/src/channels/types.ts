@@ -59,6 +59,12 @@ export interface InboundMessage {
   // Media attachments
   media?: MediaAttachment[];
 
+  // Mentions (for group chat @mention detection)
+  mentions?: {
+    users: string[];      // @usernames mentioned
+    botMentioned: boolean; // Was the bot specifically @mentioned?
+  };
+
   // Location data
   location?: {
     latitude: number;

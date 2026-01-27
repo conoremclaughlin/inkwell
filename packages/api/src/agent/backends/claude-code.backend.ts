@@ -339,6 +339,11 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     // Channel indicator
     parts.push(`[Channel: ${message.channel}]`);
 
+    // Chat type (important for group behavior)
+    if (message.chatType) {
+      parts.push(`[Chat Type: ${message.chatType}]`);
+    }
+
     // Conversation context
     if (message.conversationId) {
       parts.push(`[Conversation: ${message.conversationId}]`);
@@ -347,6 +352,14 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     // Sender info
     if (message.sender.name) {
       parts.push(`[From: ${message.sender.name}]`);
+    }
+
+    // Mention info (for group chats)
+    if (message.mentions) {
+      parts.push(`[Bot Mentioned: ${message.mentions.botMentioned ? 'yes' : 'no'}]`);
+      if (message.mentions.users.length > 0) {
+        parts.push(`[Mentions: ${message.mentions.users.join(', ')}]`);
+      }
     }
 
     // Media attachments

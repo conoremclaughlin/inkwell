@@ -75,6 +75,15 @@ export interface AgentMessage {
     replyToMessageId?: string;
   };
 
+  // Chat type for group detection
+  chatType?: 'direct' | 'group' | 'channel';
+
+  // Mention info for group chat behavior
+  mentions?: {
+    users: string[];       // @usernames mentioned
+    botMentioned: boolean; // Was the bot @mentioned or called by name?
+  };
+
   // Auto-injected context from bootstrap (set by SessionHost)
   injectedContext?: InjectedContext;
 }
