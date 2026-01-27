@@ -15,12 +15,12 @@
 import path from 'path';
 import { getDataComposer } from './data/composer';
 import { createTelegramListener, TelegramListener } from './channels/telegram-listener';
+import { createWhatsAppListener, WhatsAppListener } from './channels/whatsapp-listener';
 import { createSessionHost, SessionHost } from './agent';
-import { createMCPServer, MCPServer } from './mcp/server';
+import { createMCPServer, MCPServer, setWhatsAppListener } from './mcp/server';
 import { setTelegramListener } from './mcp/tools';
 import { logger } from './utils/logger';
 import { env } from './config/env';
-// @ts-expect-error - no types available
 import telegramifyMarkdown from 'telegramify-markdown';
 
 // Server configuration
@@ -37,6 +37,10 @@ interface ServerConfig {
   telegramPollingInterval?: number;
   /** Allowed Telegram chat IDs (empty = allow all) */
   allowedTelegramChats?: string[];
+  /** WhatsApp account ID (default: 'default') */
+  whatsappAccountId?: string;
+  /** Whether to enable WhatsApp (requires credentials) */
+  enableWhatsApp?: boolean;
   /** System prompt to append */
   systemPrompt?: string;
 }
@@ -44,6 +48,7 @@ interface ServerConfig {
 // Global state
 let sessionHost: SessionHost | null = null;
 let telegramListener: TelegramListener | null = null;
+let whatsappListener: WhatsAppListener | null = null;
 let mcpServer: MCPServer | null = null;
 let isShuttingDown = false;
 
@@ -51,19 +56,24 @@ let isShuttingDown = false;
 const activeTypingIntervals: Map<string, NodeJS.Timeout> = new Map();
 const TYPING_INTERVAL_MS = 4000; // Telegram typing expires after ~5s
 
-function startTypingIndicator(conversationId: string): void {
+function startTypingIndicator(conversationId: string, channel: 'telegram' | 'whatsapp' = 'telegram'): void {
   // Clear any existing interval for this conversation
   stopTypingIndicator(conversationId);
 
   // Send immediately
-  if (telegramListener) {
+  if (channel === 'telegram' && telegramListener) {
     telegramListener.sendTypingIndicator(conversationId);
+  } else if (channel === 'whatsapp' && whatsappListener) {
+    whatsappListener.sendTypingIndicator(conversationId);
   }
 
   // Then send every 4 seconds
   const interval = setInterval(() => {
-    if (telegramListener) {
+    if (channel === 'telegram' && telegramListener) {
       telegramListener.sendTypingIndicator(conversationId);
+      logger.debug(`Refreshed typing indicator for ${conversationId}`);
+    } else if (channel === 'whatsapp' && whatsappListener) {
+      whatsappListener.sendTypingIndicator(conversationId);
       logger.debug(`Refreshed typing indicator for ${conversationId}`);
     }
   }, TYPING_INTERVAL_MS);
@@ -152,37 +162,40 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       },
       enableFailover: true,
     },
-    channels: telegramListener ? {
-      telegram: {
-        sendMessage: async (conversationId, content, options) => {
-          // Auto-detect markdown syntax and convert for Telegram
-          // This handles cases where the AI uses markdown but doesn't set format='markdown'
-          const hasMarkdown = /\*\*.+?\*\*|\*.+?\*|`.+?`|^#{1,6}\s/m.test(content);
+    channels: {
+      ...(telegramListener ? {
+        telegram: {
+          sendMessage: async (conversationId, content, options) => {
+            // Auto-detect markdown syntax and convert for Telegram
+            // This handles cases where the AI uses markdown but doesn't set format='markdown'
+            const hasMarkdown = /\*\*.+?\*\*|\*.+?\*|`.+?`|^#{1,6}\s/m.test(content);
 
-          let parseMode: 'Markdown' | 'MarkdownV2' | 'HTML' | undefined;
-          let processedContent = content;
+            let parseMode: 'Markdown' | 'MarkdownV2' | 'HTML' | undefined;
+            let processedContent = content;
 
-          if (options?.format === 'markdown' || hasMarkdown) {
-            // Use telegramify-markdown to convert to Telegram MarkdownV2 format
-            // The library handles escaping and conversion properly
-            try {
-              processedContent = telegramifyMarkdown(content, 'escape');
-              parseMode = 'MarkdownV2';
-            } catch (err) {
-              // If conversion fails, send as plain text
-              logger.warn('Markdown conversion failed, sending as plain text:', err);
-              processedContent = content;
-              parseMode = undefined;
+            if (options?.format === 'markdown' || hasMarkdown) {
+              // Use telegramify-markdown to convert to Telegram MarkdownV2 format
+              // The library handles escaping and conversion properly
+              try {
+                processedContent = telegramifyMarkdown(content, 'escape');
+                parseMode = 'MarkdownV2';
+              } catch (err) {
+                // If conversion fails, send as plain text
+                logger.warn('Markdown conversion failed, sending as plain text:', err);
+                processedContent = content;
+                parseMode = undefined;
+              }
             }
-          }
 
-          await telegramListener!.sendMessage(conversationId, processedContent, {
-            replyToMessageId: options?.replyToMessageId,
-            parseMode,
-          });
+            await telegramListener!.sendMessage(conversationId, processedContent, {
+              replyToMessageId: options?.replyToMessageId,
+              parseMode,
+            });
+          },
         },
-      },
-    } : {},
+      } : {}),
+      // WhatsApp channel will be added after listener is created
+    },
   });
 
   // Forward session host events to console
@@ -201,7 +214,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   sessionHost.on('response:sent', (response: { channel: string; conversationId: string }) => {
     logger.info(`Response sent to ${response.channel}:${response.conversationId}`);
     // Stop typing indicator when response is sent
-    if (response.channel === 'telegram') {
+    if (response.channel === 'telegram' || response.channel === 'whatsapp') {
       stopTypingIndicator(response.conversationId);
     }
   });
@@ -300,7 +313,114 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     logger.warn('TELEGRAM_BOT_TOKEN not set - Telegram listener disabled');
   }
 
-  // 7. Print status
+  // 7. Create and start WhatsApp listener if enabled
+  const enableWhatsApp = config.enableWhatsApp ?? (process.env.ENABLE_WHATSAPP === 'true');
+  if (enableWhatsApp) {
+    logger.info('Creating WhatsApp listener...');
+    whatsappListener = createWhatsAppListener({
+      accountId: config.whatsappAccountId || 'default',
+      printQr: true,
+      onQr: (_qr) => {
+        logger.info('WhatsApp QR code ready for scanning');
+      },
+    });
+
+    // Register with admin routes for dashboard access
+    setWhatsAppListener(whatsappListener);
+    logger.info('WhatsApp listener registered with admin routes');
+
+    // Add WhatsApp channel to session host
+    if (sessionHost) {
+      sessionHost.registerChannel('whatsapp', {
+        sendMessage: async (conversationId: string, content: string) => {
+          await whatsappListener!.sendMessage(conversationId, content);
+        },
+      });
+    }
+
+    // Handle WhatsApp messages
+    whatsappListener.onMessage(async (message) => {
+      const senderId = message.sender.id || 'unknown';
+      const conversationId = message.conversationId || senderId;
+      const isGroupChat = message.chatType === 'group';
+      const botMentioned = message.mentions?.botMentioned ?? false;
+
+      logger.info(`Received WhatsApp message from ${message.sender.name || senderId}`, {
+        chatType: message.chatType,
+        botMentioned,
+      });
+
+      // In group chats, only respond if bot is mentioned
+      if (isGroupChat && !botMentioned) {
+        logger.debug('Skipping WhatsApp group message - bot not mentioned');
+        return;
+      }
+
+      // Start typing indicator
+      startTypingIndicator(conversationId, 'whatsapp');
+
+      try {
+        // Get or resolve user (WhatsApp uses phone numbers)
+        const user = await resolveOrCreateWhatsAppUser(dataComposer, {
+          sender: {
+            id: senderId,
+            name: message.sender.name,
+          },
+        });
+
+        // Send to session host
+        await sessionHost!.handleMessage(
+          'whatsapp',
+          conversationId,
+          {
+            id: senderId,
+            name: message.sender.name,
+          },
+          message.body,
+          {
+            userId: user?.id,
+            chatType: message.chatType,
+            mentions: message.mentions,
+          }
+        );
+      } catch (error) {
+        logger.error('Error handling WhatsApp message:', error);
+        stopTypingIndicator(conversationId);
+
+        try {
+          await whatsappListener!.sendMessage(
+            conversationId,
+            'Sorry, I encountered an error processing your message. Please try again.'
+          );
+        } catch (sendError) {
+          logger.error('Failed to send WhatsApp error message:', sendError);
+        }
+      }
+    });
+
+    whatsappListener.on('connected', (info: { jid: string; e164: string | null }) => {
+      logger.info(`WhatsApp connected: ${info.e164 || info.jid}`);
+    });
+
+    whatsappListener.on('qr', () => {
+      logger.info('WhatsApp QR code displayed - please scan with your phone');
+    });
+
+    whatsappListener.on('loggedOut', () => {
+      logger.warn('WhatsApp logged out - please re-scan QR code');
+    });
+
+    whatsappListener.on('error', (error: Error) => {
+      logger.error('WhatsApp listener error:', error);
+    });
+
+    await whatsappListener.start();
+    logger.info('WhatsApp listener started');
+  } else {
+    logger.info('WhatsApp listener disabled (set ENABLE_WHATSAPP=true to enable)');
+  }
+
+  // 8. Print status
   printStatus();
 
   // Ready
@@ -309,7 +429,14 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   logger.info('PCP Server is running');
   logger.info('='.repeat(60));
   logger.info('');
-  logger.info('Send a message via Telegram to start a conversation.');
+  const enabledChannels: string[] = [];
+  if (telegramListener) enabledChannels.push('Telegram');
+  if (whatsappListener) enabledChannels.push('WhatsApp');
+  if (enabledChannels.length > 0) {
+    logger.info(`Send a message via ${enabledChannels.join(' or ')} to start a conversation.`);
+  } else {
+    logger.info('No messaging channels enabled.');
+  }
   logger.info('Press Ctrl+C to stop.');
   logger.info('');
 }
@@ -323,7 +450,7 @@ function buildSystemPrompt(additionalPrompt?: string): string {
   parts.push(`## Personal Context Protocol (PCP)
 
 You are Myra, a helpful AI assistant connected to the Personal Context Protocol.
-You're receiving messages from various channels (Telegram, terminal, etc.).
+You're receiving messages from various channels (Telegram, WhatsApp, terminal, etc.).
 
 ## Response Instructions
 
@@ -331,9 +458,11 @@ Your response will be automatically routed back to the channel the message came 
 Be concise and helpful.
 
 The message metadata shows:
-- [Channel: X] - Which platform the message came from
-- [Conversation: X] - The conversation/chat ID (negative IDs = group chats)
-- [From: X] - The sender's name
+- [Channel: X] - Which platform the message came from (telegram, whatsapp, etc.)
+- [Conversation: X] - The conversation/chat ID
+  - Telegram: negative IDs = group chats
+  - WhatsApp: ends with @g.us = group chats, @s.whatsapp.net = DMs
+- [From: X] - The sender's name or phone number
 
 ### Group Chat Behavior (IMPORTANT)
 
@@ -469,6 +598,37 @@ function printStatus(): void {
 }
 
 /**
+ * Resolve or create a user from a WhatsApp message
+ */
+async function resolveOrCreateWhatsAppUser(
+  dataComposer: Awaited<ReturnType<typeof getDataComposer>>,
+  message: { sender: { id: string; name?: string } }
+) {
+  try {
+    // WhatsApp IDs are phone numbers in E.164 format
+    const phoneNumber = message.sender.id;
+
+    // Try to find by phone number
+    let user = await dataComposer.repositories.users.findByPhoneNumber(phoneNumber);
+
+    if (!user) {
+      // Create new user with phone number
+      user = await dataComposer.repositories.users.create({
+        phone_number: phoneNumber,
+        first_name: message.sender.name?.split(' ')[0],
+        last_name: message.sender.name?.split(' ').slice(1).join(' ') || undefined,
+      });
+      logger.info(`Created new WhatsApp user: ${user.id}`);
+    }
+
+    return user;
+  } catch (error) {
+    logger.error('Failed to resolve WhatsApp user:', error);
+    return null;
+  }
+}
+
+/**
  * Graceful shutdown
  */
 async function shutdown(): Promise<void> {
@@ -481,6 +641,12 @@ async function shutdown(): Promise<void> {
   if (telegramListener) {
     await telegramListener.stop();
     logger.info('Telegram listener stopped');
+  }
+
+  // Stop WhatsApp listener
+  if (whatsappListener) {
+    await whatsappListener.stop();
+    logger.info('WhatsApp listener stopped');
   }
 
   // Shutdown session host

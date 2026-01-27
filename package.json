@@ -7,12 +7,24 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "yarn workspace @personal-context/api dev",
+    "dev": "pm2 start ecosystem.config.cjs",
+    "dev:mcp": "yarn workspace @personal-context/api dev:mcp",
+    "dev:myra": "yarn workspace @personal-context/api myra",
+    "dev:web": "yarn workspace @personal-context/web dev",
+    "dev:all": "pm2 start ecosystem.config.cjs",
+    "stop": "pm2 stop all",
+    "restart": "pm2 restart all",
+    "restart:mcp": "pm2 restart mcp",
+    "restart:myra": "pm2 restart myra",
+    "logs": "pm2 logs",
+    "logs:myra": "pm2 logs myra",
+    "status": "pm2 status",
     "build": "yarn workspaces run build",
+    "build:web": "yarn workspace @personal-context/web build",
     "test": "yarn workspaces run test",
     "lint": "yarn workspaces run lint",
     "type-check": "yarn workspaces run type-check",
-    "clean": "yarn workspaces run clean && rm -rf node_modules"
+    "clean": "yarn workspaces run clean && rm -rf node_modules && pm2 delete all"
   },
   "engines": {
     "node": ">=18.0.0",

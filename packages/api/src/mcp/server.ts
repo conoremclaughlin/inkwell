@@ -10,6 +10,9 @@ import { logger } from '../utils/logger';
 import type { DataComposer } from '../data/composer';
 import { registerAllTools, setMiniAppsRegistry } from './tools';
 import { loadMiniApps, registerMiniAppTools, getMiniAppsInfo } from '../mini-apps';
+import adminRouter, { setWhatsAppListener } from '../routes/admin';
+
+export { setWhatsAppListener };
 
 export class MCPServer {
   private server: McpServer;
@@ -135,6 +138,11 @@ export class MCPServer {
         miniApps: this.miniAppsInfo,
       });
     });
+
+    // Admin API routes (for web dashboard)
+    app.use(express.json());
+    app.use('/api/admin', adminRouter);
+    logger.info('Admin API routes registered at /api/admin');
 
     // Refresh tools endpoint - notifies connected clients that tools have changed
     app.post('/refresh-tools', async (_req, res) => {
