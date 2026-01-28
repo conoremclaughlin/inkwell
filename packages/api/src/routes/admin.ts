@@ -449,4 +449,69 @@ router.post('/whatsapp/logout', async (_req: Request, res: Response) => {
   }
 });
 
+// =============================================================================
+// Heartbeat / Scheduled Tasks
+// =============================================================================
+
+/**
+ * POST /api/admin/heartbeat
+ * Process heartbeat - check for due reminders and execute them
+ * Called by pg_cron in production or node-cron locally
+ */
+router.post('/heartbeat', async (_req: Request, res: Response) => {
+  try {
+    // Import dynamically to avoid circular dependencies
+    const { processHeartbeat } = await import('../services/heartbeat.js');
+    const stats = await processHeartbeat();
+
+    res.json({
+      success: true,
+      ...stats,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('Heartbeat processing failed:', error);
+    res.status(500).json({ error: 'Heartbeat processing failed' });
+  }
+});
+
+/**
+ * GET /api/admin/reminders
+ * List all reminders (admin view)
+ */
+router.get('/reminders', async (_req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+
+    const { data, error } = await supabase
+      .from('scheduled_reminders')
+      .select('*, users(email, first_name)')
+      .order('next_run_at', { ascending: true })
+      .limit(100);
+
+    if (error) {
+      res.status(500).json({ error: 'Failed to list reminders' });
+      return;
+    }
+
+    res.json({
+      reminders: (data || []).map((r) => ({
+        id: r.id,
+        userId: r.user_id,
+        title: r.title,
+        description: r.description,
+        cronExpression: r.cron_expression,
+        nextRunAt: r.next_run_at,
+        lastRunAt: r.last_run_at,
+        deliveryChannel: r.delivery_channel,
+        status: r.status,
+        runCount: r.run_count,
+      })),
+    });
+  } catch (error) {
+    logger.error('Failed to list reminders:', error);
+    res.status(500).json({ error: 'Failed to list reminders' });
+  }
+});
+
 export default router;

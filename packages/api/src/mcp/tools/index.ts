@@ -79,6 +79,41 @@ import {
   getActivitySummarySchema,
 } from './permissions';
 
+import {
+  handleSaveIdentity,
+  handleGetIdentity,
+  handleListIdentities,
+  handleGetIdentityHistory,
+  handleRestoreIdentity,
+  saveIdentitySchema,
+  getIdentitySchema,
+  listIdentitiesSchema,
+  getIdentityHistorySchema,
+  restoreIdentitySchema,
+} from './identity-handlers';
+
+import {
+  handleCreateReminder,
+  handleListReminders,
+  handleUpdateReminder,
+  handleCancelReminder,
+  handleGetReminderHistory,
+  handleSetQuietHours,
+  createReminderSchema,
+  listRemindersSchema,
+  updateReminderSchema,
+  cancelReminderSchema,
+  getReminderHistorySchema,
+  setQuietHoursSchema,
+} from './reminder-handlers';
+
+import {
+  handleSetTimezone,
+  handleGetTimezone,
+  setTimezoneSchema,
+  getTimezoneSchema,
+} from './user-settings-handlers';
+
 // Re-export for external use
 export { setResponseCallback, addPendingMessage } from './response-handlers';
 export { setTelegramListener, registerChannelListener } from './chat-context-handlers';
@@ -1339,6 +1374,318 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleGetActivitySummary(args, dataComposer);
       } catch (error) {
         logger.error('Error in get_activity_summary:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // IDENTITY TOOLS
+  // =====================================================
+
+  server.registerTool(
+    'save_identity',
+    {
+      description: `Save or update an AI being's identity. Identities are versioned - updates automatically archive the previous version.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: saveIdentitySchema,
+    },
+    async (args) => {
+      try {
+        return await handleSaveIdentity(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in save_identity:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_identity',
+    {
+      description: `Get an AI being's identity by agent ID. Returns structured identity data including name, role, values, relationships, and capabilities.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getIdentitySchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetIdentity(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_identity:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'list_identities',
+    {
+      description: `List all AI being identities for a user.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: listIdentitiesSchema,
+    },
+    async (args) => {
+      try {
+        return await handleListIdentities(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_identities:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_identity_history',
+    {
+      description: `Get the version history of an AI being's identity. Use this to see how identity has evolved over time.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getIdentityHistorySchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetIdentityHistory(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_identity_history:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'restore_identity',
+    {
+      description: `Restore an AI being's identity to a previous version. This creates a new version with the restored content.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: restoreIdentitySchema,
+    },
+    async (args) => {
+      try {
+        return await handleRestoreIdentity(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in restore_identity:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // REMINDER TOOLS
+  // =====================================================
+
+  server.registerTool(
+    'create_reminder',
+    {
+      description: `Create a scheduled reminder. Can be one-time or recurring.
+
+Examples:
+- "Remind me to call mom tomorrow at 9am" → runAt: "2024-01-28T09:00:00Z"
+- "Remind me daily at 9am to take vitamins" → cronExpression: "0 9 * * *"
+- "Remind me every weekday at 9am" → cronExpression: "0 9 * * 1-5"
+
+Common cron patterns:
+- "0 9 * * *" - Daily at 9am
+- "0 9 * * 1-5" - Weekdays at 9am
+- "0 0 * * 0" - Weekly on Sunday midnight
+- "*/30 * * * *" - Every 30 minutes
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: createReminderSchema,
+    },
+    async (args) => {
+      try {
+        return await handleCreateReminder(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in create_reminder:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'list_reminders',
+    {
+      description: `List a user's scheduled reminders. By default shows only active reminders.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: listRemindersSchema,
+    },
+    async (args) => {
+      try {
+        return await handleListReminders(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_reminders:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'update_reminder',
+    {
+      description: `Update an existing reminder. Can change title, description, schedule, or pause/resume.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: updateReminderSchema,
+    },
+    async (args) => {
+      try {
+        return await handleUpdateReminder(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in update_reminder:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'cancel_reminder',
+    {
+      description: `Cancel a scheduled reminder. The reminder will be marked as completed and won't fire again.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: cancelReminderSchema,
+    },
+    async (args) => {
+      try {
+        return await handleCancelReminder(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in cancel_reminder:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_reminder_history',
+    {
+      description: `Get the delivery history for a reminder. Shows when it was triggered and whether delivery succeeded.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getReminderHistorySchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetReminderHistory(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_reminder_history:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'set_quiet_hours',
+    {
+      description: `Set quiet hours during which reminders won't be delivered. They'll be skipped and rescheduled.
+
+Example: "Don't send reminders between 11pm and 8am"
+→ quietStart: "23:00", quietEnd: "08:00"
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: setQuietHoursSchema,
+    },
+    async (args) => {
+      try {
+        return await handleSetQuietHours(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in set_quiet_hours:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ============================================
+  // User Settings Tools
+  // ============================================
+
+  server.registerTool(
+    'set_timezone',
+    {
+      description: `Set the user's timezone for accurate time handling in reminders and scheduling.
+
+Use IANA timezone identifiers like:
+- America/Los_Angeles (Pacific)
+- America/New_York (Eastern)
+- America/Chicago (Central)
+- Europe/London
+- Asia/Tokyo
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: setTimezoneSchema,
+    },
+    async (args) => {
+      try {
+        const result = await handleSetTimezone(args, dataComposer);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify(result) }],
+        };
+      } catch (error) {
+        logger.error('Error in set_timezone:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_timezone',
+    {
+      description: `Get the user's current timezone setting and local time.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getTimezoneSchema,
+    },
+    async (args) => {
+      try {
+        const result = await handleGetTimezone(args, dataComposer);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify(result) }],
+        };
+      } catch (error) {
+        logger.error('Error in get_timezone:', error);
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
           isError: true,

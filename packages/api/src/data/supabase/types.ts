@@ -11,11 +11,130 @@ export type Json =
 
 export type Database = {
   // Allows to automatically instantiate createClient with right options
+  // instead of createClient<Database, { PostgrestVersion: 'XX' }>(URL, KEY)
   __InternalSupabase: {
     PostgrestVersion: "13.0.5"
   }
   public: {
     Tables: {
+      agent_identities: {
+        Row: {
+          agent_id: string
+          capabilities: Json | null
+          created_at: string | null
+          description: string | null
+          id: string
+          metadata: Json | null
+          name: string
+          relationships: Json | null
+          role: string
+          updated_at: string | null
+          user_id: string
+          values: Json | null
+          version: number | null
+        }
+        Insert: {
+          agent_id: string
+          capabilities?: Json | null
+          created_at?: string | null
+          description?: string | null
+          id?: string
+          metadata?: Json | null
+          name: string
+          relationships?: Json | null
+          role: string
+          updated_at?: string | null
+          user_id: string
+          values?: Json | null
+          version?: number | null
+        }
+        Update: {
+          agent_id?: string
+          capabilities?: Json | null
+          created_at?: string | null
+          description?: string | null
+          id?: string
+          metadata?: Json | null
+          name?: string
+          relationships?: Json | null
+          role?: string
+          updated_at?: string | null
+          user_id?: string
+          values?: Json | null
+          version?: number | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "agent_identities_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      agent_identity_history: {
+        Row: {
+          agent_id: string
+          archived_at: string | null
+          capabilities: Json | null
+          change_type: string
+          created_at: string
+          description: string | null
+          id: string
+          identity_id: string
+          metadata: Json | null
+          name: string
+          relationships: Json | null
+          role: string
+          user_id: string
+          values: Json | null
+          version: number
+        }
+        Insert: {
+          agent_id: string
+          archived_at?: string | null
+          capabilities?: Json | null
+          change_type?: string
+          created_at: string
+          description?: string | null
+          id?: string
+          identity_id: string
+          metadata?: Json | null
+          name: string
+          relationships?: Json | null
+          role: string
+          user_id: string
+          values?: Json | null
+          version: number
+        }
+        Update: {
+          agent_id?: string
+          archived_at?: string | null
+          capabilities?: Json | null
+          change_type?: string
+          created_at?: string
+          description?: string | null
+          id?: string
+          identity_id?: string
+          metadata?: Json | null
+          name?: string
+          relationships?: Json | null
+          role?: string
+          user_id?: string
+          values?: Json | null
+          version?: number
+        }
+        Relationships: [
+          {
+            foreignKeyName: "agent_identity_history_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       agent_sessions: {
         Row: {
           backend: string
@@ -371,6 +490,41 @@ export type Database = {
             foreignKeyName: "group_challenge_codes_created_by_fkey"
             columns: ["created_by"]
             isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      heartbeat_state: {
+        Row: {
+          last_checks: Json | null
+          quiet_end: string | null
+          quiet_start: string | null
+          timezone: string | null
+          updated_at: string | null
+          user_id: string
+        }
+        Insert: {
+          last_checks?: Json | null
+          quiet_end?: string | null
+          quiet_start?: string | null
+          timezone?: string | null
+          updated_at?: string | null
+          user_id: string
+        }
+        Update: {
+          last_checks?: Json | null
+          quiet_end?: string | null
+          quiet_start?: string | null
+          timezone?: string | null
+          updated_at?: string | null
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "heartbeat_state_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: true
             referencedRelation: "users"
             referencedColumns: ["id"]
           },
@@ -842,6 +996,50 @@ export type Database = {
           },
         ]
       }
+      reminder_history: {
+        Row: {
+          delivered_at: string | null
+          error_message: string | null
+          id: string
+          reminder_id: string
+          response_at: string | null
+          response_content: string | null
+          response_received: boolean | null
+          status: string
+          triggered_at: string | null
+        }
+        Insert: {
+          delivered_at?: string | null
+          error_message?: string | null
+          id?: string
+          reminder_id: string
+          response_at?: string | null
+          response_content?: string | null
+          response_received?: boolean | null
+          status: string
+          triggered_at?: string | null
+        }
+        Update: {
+          delivered_at?: string | null
+          error_message?: string | null
+          id?: string
+          reminder_id?: string
+          response_at?: string | null
+          response_content?: string | null
+          response_received?: boolean | null
+          status?: string
+          triggered_at?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "reminder_history_reminder_id_fkey"
+            columns: ["reminder_id"]
+            isOneToOne: false
+            referencedRelation: "scheduled_reminders"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       reminders: {
         Row: {
           channel: string
@@ -885,6 +1083,68 @@ export type Database = {
         Relationships: [
           {
             foreignKeyName: "reminders_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      scheduled_reminders: {
+        Row: {
+          created_at: string | null
+          cron_expression: string | null
+          delivery_channel: string
+          delivery_target: string | null
+          description: string | null
+          id: string
+          last_run_at: string | null
+          max_runs: number | null
+          metadata: Json | null
+          next_run_at: string
+          run_count: number | null
+          status: string
+          title: string
+          updated_at: string | null
+          user_id: string
+        }
+        Insert: {
+          created_at?: string | null
+          cron_expression?: string | null
+          delivery_channel?: string
+          delivery_target?: string | null
+          description?: string | null
+          id?: string
+          last_run_at?: string | null
+          max_runs?: number | null
+          metadata?: Json | null
+          next_run_at: string
+          run_count?: number | null
+          status?: string
+          title: string
+          updated_at?: string | null
+          user_id: string
+        }
+        Update: {
+          created_at?: string | null
+          cron_expression?: string | null
+          delivery_channel?: string
+          delivery_target?: string | null
+          description?: string | null
+          id?: string
+          last_run_at?: string | null
+          max_runs?: number | null
+          metadata?: Json | null
+          next_run_at?: string
+          run_count?: number | null
+          status?: string
+          title?: string
+          updated_at?: string | null
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "scheduled_reminders_user_id_fkey"
             columns: ["user_id"]
             isOneToOne: false
             referencedRelation: "users"
@@ -1229,6 +1489,13 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      calculate_next_run: {
+        Args: {
+          cron_expr: string
+          from_time?: string
+        }
+        Returns: string
+      }
       match_links: {
         Args: {
           match_count?: number
@@ -1385,6 +1652,23 @@ export type Enums<
   ? DatabaseWithoutInternals[DefaultSchemaEnumNameOrOptions["schema"]]["Enums"][EnumName]
   : DefaultSchemaEnumNameOrOptions extends keyof DefaultSchema["Enums"]
     ? DefaultSchema["Enums"][DefaultSchemaEnumNameOrOptions]
+    : never
+
+export type CompositeTypes<
+  PublicCompositeTypeNameOrOptions extends
+    | keyof DefaultSchema["CompositeTypes"]
+    | { schema: keyof DatabaseWithoutInternals },
+  CompositeTypeName extends PublicCompositeTypeNameOrOptions extends {
+    schema: keyof DatabaseWithoutInternals
+  }
+    ? keyof DatabaseWithoutInternals[PublicCompositeTypeNameOrOptions["schema"]]["CompositeTypes"]
+    : never = never,
+> = PublicCompositeTypeNameOrOptions extends {
+  schema: keyof DatabaseWithoutInternals
+}
+  ? DatabaseWithoutInternals[PublicCompositeTypeNameOrOptions["schema"]]["CompositeTypes"][CompositeTypeName]
+  : PublicCompositeTypeNameOrOptions extends keyof DefaultSchema["CompositeTypes"]
+    ? DefaultSchema["CompositeTypes"][PublicCompositeTypeNameOrOptions]
     : never
 
 export const Constants = {

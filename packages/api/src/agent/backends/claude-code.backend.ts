@@ -330,9 +330,20 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     // Include channel context so Claude knows where the message came from
     const parts: string[] = [];
 
-    // Inject user context if available (for continuity across sessions)
+    // Inject context based on session state
+    // - New session (no sessionId): Full context (identity, user, projects, memories)
+    // - Resuming session: Minimal context (just time + brief identity reminder)
     if (message.injectedContext) {
-      parts.push(this.formatInjectedContext(message.injectedContext));
+      const isResuming = !!this.sessionId;
+      logger.debug(`Context injection: ${isResuming ? 'MINIMAL (resuming)' : 'FULL (new session)'}`, {
+        sessionId: this.sessionId,
+        hasIdentity: !!message.injectedContext.agentIdentity,
+      });
+      if (isResuming) {
+        parts.push(this.formatMinimalContext(message.injectedContext));
+      } else {
+        parts.push(this.formatInjectedContext(message.injectedContext));
+      }
       parts.push('');
     }
 
@@ -392,6 +403,32 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     const sections: string[] = [];
     sections.push('<user-context>');
 
+    // Agent identity - who am I?
+    if (context.agentIdentity) {
+      sections.push('## My Identity');
+      sections.push(`I am **${context.agentIdentity.name}** (${context.agentIdentity.agentId})`);
+      sections.push(`Role: ${context.agentIdentity.role}`);
+      if (context.agentIdentity.description) {
+        sections.push(context.agentIdentity.description);
+      }
+      if (context.agentIdentity.values && context.agentIdentity.values.length > 0) {
+        sections.push(`Values: ${context.agentIdentity.values.join(', ')}`);
+      }
+      if (context.agentIdentity.capabilities && context.agentIdentity.capabilities.length > 0) {
+        sections.push(`Capabilities: ${context.agentIdentity.capabilities.join(', ')}`);
+      }
+      sections.push('');
+    }
+
+    // Temporal context (current time)
+    if (context.temporal) {
+      sections.push('## Current Time');
+      sections.push(`**${context.temporal.localTime}**`);
+      sections.push(`Timezone: ${context.temporal.userTimezone}`);
+      sections.push(`UTC: ${context.temporal.currentTimeUtc}`);
+      sections.push('');
+    }
+
     // User info
     if (context.user) {
       sections.push('## User');
@@ -439,6 +476,29 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
 
     sections.push('</user-context>');
     return sections.join('\n');
+  }
+
+  /**
+   * Format minimal context for resuming sessions
+   * Only includes time (which changes) and a brief identity reminder
+   * Full context is already in the conversation history from the first message
+   */
+  private formatMinimalContext(context: InjectedContext): string {
+    const parts: string[] = [];
+    parts.push('<context-update>');
+
+    // Brief identity reminder (one line)
+    if (context.agentIdentity) {
+      parts.push(`[I am ${context.agentIdentity.name}]`);
+    }
+
+    // Current time (always include - it changes!)
+    if (context.temporal) {
+      parts.push(`[Time: ${context.temporal.localTime}]`);
+    }
+
+    parts.push('</context-update>');
+    return parts.join('\n');
   }
 
 }

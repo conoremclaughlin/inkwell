@@ -3324,6 +3324,7 @@ __metadata:
     "@types/jest": "npm:^29.5.11"
     "@types/jsonwebtoken": "npm:^9.0.5"
     "@types/node": "npm:^20.10.6"
+    "@types/node-cron": "npm:^3.0.11"
     "@types/qrcode": "npm:^1.5.6"
     "@typescript-eslint/eslint-plugin": "npm:^6.17.0"
     "@typescript-eslint/parser": "npm:^6.17.0"
@@ -3340,6 +3341,7 @@ __metadata:
     jest: "npm:^29.7.0"
     jsonwebtoken: "npm:^9.0.2"
     link-preview-js: "npm:^3.2.0"
+    node-cron: "npm:^4.2.1"
     qrcode: "npm:^1.5.4"
     qrcode-terminal: "npm:^0.12.0"
     telegraf: "npm:^4.15.0"
@@ -5085,6 +5087,13 @@ __metadata:
   version: 2.1.0
   resolution: "@types/ms@npm:2.1.0"
   checksum: 532d2ebb91937ccc4a89389715e5b47d4c66e708d15942fe6cc25add6dc37b2be058230a327dd50f43f89b8b6d5d52b74685a9e8f70516edfc9bdd6be910eff4
+  languageName: node
+  linkType: hard
+
+"@types/node-cron@npm:^3.0.11":
+  version: 3.0.11
+  resolution: "@types/node-cron@npm:3.0.11"
+  checksum: a73f69bcca52a5f3b1671cfb00a8e4a1d150d0aef36a611564a2f94e66b6981bade577e267ceeeca6fcee241768902d55eb8cf3a81f9ef4ed767a23112fdb16d
   languageName: node
   linkType: hard
 
@@ -11413,6 +11422,13 @@ __metadata:
   version: 1.8.0
   resolution: "node-api-headers@npm:1.8.0"
   checksum: c154a19e803e30a57b6c6334016f89f993acd4b310125cafe62fda990925433374ac5bf0a9c9ac7f53d426f1b0bc03043d60ffb74ef23e1b10a6d68373792a79
+  languageName: node
+  linkType: hard
+
+"node-cron@npm:^4.2.1":
+  version: 4.2.1
+  resolution: "node-cron@npm:4.2.1"
+  checksum: 7550b105e4aab772597383e24c4b31b6d5dc9604c96bcefb1a4b8a94a432b8835e3010a0dfc1d34492edfb64a2e55f334cf3ad0a76901b72de11ef506cbfd31a
   languageName: node
   linkType: hard
 

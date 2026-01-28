@@ -33,10 +33,15 @@ export interface SessionHostConfig {
   contextCacheTtl?: number;
   /** Disable auto-injection of context (default: false) */
   disableContextInjection?: boolean;
+  /** Agent ID for identity injection (e.g., "myra", "wren") */
+  agentId?: string;
 }
 
 interface CachedContext {
-  context: InjectedContext;
+  /** Context without temporal (temporal is always computed fresh) */
+  context: Omit<InjectedContext, 'temporal'>;
+  /** User's timezone for building fresh temporal context */
+  userTimezone: string | null;
   timestamp: Date;
 }
 
@@ -50,12 +55,14 @@ export class SessionHost extends EventEmitter {
   private contextCache: Map<string, CachedContext> = new Map();
   private contextCacheTtl: number;
   private disableContextInjection: boolean;
+  private agentId: string | undefined;
 
   constructor(config: SessionHostConfig) {
     super();
     this.dataComposer = config.dataComposer;
     this.contextCacheTtl = config.contextCacheTtl ?? 30 * 60 * 1000; // 30 minutes default
     this.disableContextInjection = config.disableContextInjection ?? false;
+    this.agentId = config.agentId;
 
     // Create backend manager
     this.backendManager = createBackendManager(config.backend);
@@ -136,7 +143,11 @@ export class SessionHost extends EventEmitter {
     const cached = this.contextCache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp.getTime() < this.contextCacheTtl) {
       logger.debug(`Context cache hit for ${cacheKey}`);
-      return cached.context;
+      // Return cached context with FRESH temporal (time changes!)
+      return {
+        ...cached.context,
+        temporal: this.buildTemporalContext(cached.userTimezone),
+      };
     }
 
     try {
@@ -155,8 +166,20 @@ export class SessionHost extends EventEmitter {
         return undefined;
       }
 
-      // Fetch context components in parallel
-      const [contexts, projects, focus, recentMemories] = await Promise.all([
+      // Fetch context components in parallel (including user for timezone and agent identity)
+      const supabase = this.dataComposer.getClient();
+      const agentIdentityPromise = this.agentId
+        ? supabase
+            .from('agent_identities')
+            .select('agent_id, name, role, description, values, capabilities')
+            .eq('user_id', resolvedUserId)
+            .eq('agent_id', this.agentId)
+            .single()
+            .then(({ data }) => data)
+        : Promise.resolve(null);
+
+      const [userRecord, contexts, projects, focus, recentMemories, agentIdentity] = await Promise.all([
+        this.dataComposer.repositories.users.findById(resolvedUserId),
         this.dataComposer.repositories.context.findAllByUser(resolvedUserId),
         this.dataComposer.repositories.projects.findAllByUser(resolvedUserId, 'active'),
         this.dataComposer.repositories.sessionFocus.findLatestByUser(resolvedUserId),
@@ -164,6 +187,7 @@ export class SessionHost extends EventEmitter {
           salience: 'high',
           limit: 5,
         }),
+        agentIdentityPromise,
       ]);
 
       // Build injected context
@@ -205,17 +229,33 @@ export class SessionHost extends EventEmitter {
           source: m.source,
           topics: m.topics,
         })),
+        agentIdentity: agentIdentity
+          ? {
+              agentId: agentIdentity.agent_id,
+              name: agentIdentity.name,
+              role: agentIdentity.role,
+              description: agentIdentity.description || undefined,
+              values: agentIdentity.values || undefined,
+              capabilities: agentIdentity.capabilities || undefined,
+            }
+          : undefined,
+        // Temporal is added fresh (not from cache)
+        temporal: this.buildTemporalContext(userRecord?.timezone),
       };
 
-      // Cache it
+      // Cache everything EXCEPT temporal (time changes between messages!)
+      const { temporal: _temporal, ...contextWithoutTemporal } = injectedContext;
       this.contextCache.set(cacheKey, {
-        context: injectedContext,
+        context: contextWithoutTemporal,
+        userTimezone: userRecord?.timezone || null,
         timestamp: new Date(),
       });
 
       logger.info(`Context injected for user ${resolvedUserId}`, {
         hasUser: !!userContext,
         hasAssistant: !!assistantContext,
+        hasAgentIdentity: !!agentIdentity,
+        agentId: this.agentId,
         projectCount: projects.length,
         memoryCount: recentMemories.length,
       });
@@ -392,6 +432,32 @@ export class SessionHost extends EventEmitter {
       default:
         return channel;
     }
+  }
+
+  /**
+   * Build temporal context with current time in user's timezone
+   */
+  private buildTemporalContext(userTimezone?: string | null): InjectedContext['temporal'] {
+    const now = new Date();
+    const timezone = userTimezone || 'UTC';
+
+    // Format local time in a human-readable way
+    const localTime = now.toLocaleString('en-US', {
+      timeZone: timezone,
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      timeZoneName: 'short',
+    });
+
+    return {
+      currentTimeUtc: now.toISOString(),
+      userTimezone: timezone,
+      localTime,
+    };
   }
 
   /**

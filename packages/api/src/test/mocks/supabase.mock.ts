@@ -21,7 +21,7 @@ export function createMockSupabaseClient() {
   const queryBuilder: Record<string, unknown> = {};
 
   const chainableMethods = [
-    'select', 'insert', 'update', 'delete',
+    'select', 'insert', 'update', 'delete', 'upsert',
     'eq', 'neq', 'in', 'is', 'or', 'and',
     'gt', 'gte', 'lt', 'lte',
     'ilike', 'like', 'overlaps', 'contains',

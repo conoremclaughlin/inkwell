@@ -98,14 +98,15 @@ async function resolveOrCreateTelegramUser(
   message: { sender: { id: string; username?: string; name?: string } }
 ): Promise<{ id: string } | null> {
   try {
-    const user = await composer.users.findByPlatformId('telegram', message.sender.id);
+    const user = await composer.repositories.users.findByPlatformId('telegram', message.sender.id);
     if (user) return user;
 
-    // Create new user
-    const newUser = await composer.users.create({
+    // Create new user - use snake_case field names matching database schema
+    const displayName = message.sender.name || message.sender.username || `Telegram User ${message.sender.id}`;
+    const newUser = await composer.repositories.users.create({
       email: `telegram_${message.sender.id}@placeholder.local`,
-      name: message.sender.name || message.sender.username || `Telegram User ${message.sender.id}`,
-      telegramId: message.sender.id,
+      first_name: displayName,
+      telegram_id: parseInt(message.sender.id, 10) || null,
     });
     return newUser;
   } catch (error) {
@@ -122,14 +123,15 @@ async function resolveOrCreateWhatsAppUser(
   message: { sender: { id: string; name?: string } }
 ): Promise<{ id: string } | null> {
   try {
-    const user = await composer.users.findByPlatformId('whatsapp', message.sender.id);
+    const user = await composer.repositories.users.findByPlatformId('whatsapp', message.sender.id);
     if (user) return user;
 
-    // Create new user
-    const newUser = await composer.users.create({
+    // Create new user - use snake_case field names matching database schema
+    const displayName = message.sender.name || `WhatsApp User ${message.sender.id}`;
+    const newUser = await composer.repositories.users.create({
       email: `whatsapp_${message.sender.id}@placeholder.local`,
-      name: message.sender.name || `WhatsApp User ${message.sender.id}`,
-      whatsappId: message.sender.id,
+      first_name: displayName,
+      whatsapp_id: message.sender.id,
     });
     return newUser;
   } catch (error) {
@@ -283,6 +285,51 @@ async function startHttpServer(): Promise<void> {
       return;
     }
 
+    // Heartbeat endpoint - trigger reminder processing
+    if (url.pathname === '/api/admin/heartbeat' && req.method === 'POST') {
+      (async () => {
+        try {
+          const { processHeartbeat, registerDeliveryChannel } = await import('../services/heartbeat.js');
+
+          // Ensure delivery channels are registered before processing
+          const channels: string[] = [];
+          if (telegramListener) {
+            registerDeliveryChannel('telegram', {
+              sendMessage: async (target: string, message: string) => {
+                await telegramListener!.sendMessage(target, message);
+              },
+            });
+            channels.push('telegram');
+          }
+          if (whatsappListener) {
+            registerDeliveryChannel('whatsapp', {
+              sendMessage: async (target: string, message: string) => {
+                await whatsappListener!.sendMessage(target, message);
+              },
+            });
+            channels.push('whatsapp');
+          }
+          logger.info('Heartbeat triggered', { availableChannels: channels });
+
+          const stats = await processHeartbeat();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: true,
+            ...stats,
+            timestamp: new Date().toISOString(),
+          }));
+        } catch (error) {
+          logger.error('Heartbeat processing failed:', error);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: false,
+            error: error instanceof Error ? error.message : 'Heartbeat failed',
+          }));
+        }
+      })();
+      return;
+    }
+
     // 404 for everything else
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not found' }));
@@ -352,6 +399,7 @@ async function startMyra(config: MyraConfig = {}): Promise<void> {
   logger.info(`Creating Session Host with ${backend} backend...`);
   sessionHost = createSessionHost({
     dataComposer,
+    agentId: 'myra',  // Identity for context injection
     backend: {
       primaryBackend: backend,
       backends: {
@@ -422,9 +470,10 @@ async function startMyra(config: MyraConfig = {}): Promise<void> {
   // 6. Wire up Telegram message handling
   if (telegramListener) {
     telegramListener.onMessage(async (message) => {
-      const senderId = message.sender.id || 'unknown';
+      const senderId = message.sender.id ?? 'unknown';
       const conversationId = message.conversationId || senderId;
-      const isGroupChat = message.chatType === 'group' || message.chatType === 'supergroup';
+      // chatType is 'direct' | 'group' | 'channel' - treat 'group' and 'channel' as group contexts
+      const isGroupChat = message.chatType === 'group' || message.chatType === 'channel';
       const botMentioned = message.mentions?.botMentioned ?? false;
 
       logger.info(`[Telegram] Message from @${message.sender.username || senderId}`, {
@@ -441,7 +490,15 @@ async function startMyra(config: MyraConfig = {}): Promise<void> {
       startTypingIndicator(conversationId, 'telegram');
 
       try {
-        const user = await resolveOrCreateTelegramUser(dataComposer!, message);
+        // Ensure sender.id is defined for user resolution
+        const senderForUser = {
+          sender: {
+            id: senderId,
+            username: message.sender.username,
+            name: message.sender.name,
+          }
+        };
+        const user = await resolveOrCreateTelegramUser(dataComposer!, senderForUser);
 
         await sessionHost!.handleMessage(
           'telegram',
@@ -449,7 +506,6 @@ async function startMyra(config: MyraConfig = {}): Promise<void> {
           {
             id: senderId,
             name: message.sender.name || message.sender.username,
-            username: message.sender.username,
           },
           message.body,
           {
@@ -515,7 +571,14 @@ async function startMyra(config: MyraConfig = {}): Promise<void> {
       startTypingIndicator(conversationId, 'whatsapp');
 
       try {
-        const user = await resolveOrCreateWhatsAppUser(dataComposer!, { sender: message.sender });
+        // Ensure sender.id is defined for user resolution
+        const senderForUser = {
+          sender: {
+            id: senderId,
+            name: message.sender.name,
+          }
+        };
+        const user = await resolveOrCreateWhatsAppUser(dataComposer!, senderForUser);
 
         await sessionHost!.handleMessage(
           'whatsapp',
@@ -577,7 +640,40 @@ async function startMyra(config: MyraConfig = {}): Promise<void> {
   // 8. Start HTTP server for WhatsApp admin endpoints (QR streaming)
   await startHttpServer();
 
-  // 9. Print status
+  // 9. Initialize heartbeat service for local development
+  const { initHeartbeatService, registerDeliveryChannel } = await import('../services/heartbeat.js');
+
+  // Register delivery channels
+  if (telegramListener) {
+    registerDeliveryChannel('telegram', {
+      sendMessage: async (target: string, message: string) => {
+        await telegramListener!.sendMessage(target, message);
+      },
+    });
+  }
+
+  if (whatsappListener) {
+    registerDeliveryChannel('whatsapp', {
+      sendMessage: async (target: string, message: string) => {
+        await whatsappListener!.sendMessage(target, message);
+      },
+    });
+  }
+
+  // Start local cron scheduler (disabled in production - uses pg_cron instead)
+  const enableLocalCron = process.env.NODE_ENV !== 'production' && process.env.ENABLE_LOCAL_HEARTBEAT !== 'false';
+  initHeartbeatService({
+    interval: process.env.HEARTBEAT_INTERVAL || '*/5 * * * *', // Every 5 minutes
+    enableLocalCron,
+  });
+
+  if (enableLocalCron) {
+    logger.info('Heartbeat service started (local cron mode)');
+  } else {
+    logger.info('Heartbeat service initialized (cloud mode - uses pg_cron)');
+  }
+
+  // 10. Print status
   logger.info('');
   logger.info('='.repeat(60));
   logger.info('  MYRA IS RUNNING');
@@ -590,6 +686,9 @@ async function startMyra(config: MyraConfig = {}): Promise<void> {
     logger.info('Send a message to start a conversation!');
   } else {
     logger.warn('No messaging channels enabled.');
+  }
+  if (enableLocalCron) {
+    logger.info('Heartbeat: local cron (every 5 min)');
   }
   logger.info('');
   logger.info('To restart Myra: pm2 restart myra');
@@ -612,6 +711,15 @@ async function shutdown(): Promise<void> {
     clearInterval(interval);
   }
   activeTypingIntervals.clear();
+
+  // Stop heartbeat service
+  try {
+    const { stopHeartbeatService } = await import('../services/heartbeat.js');
+    stopHeartbeatService();
+    logger.info('Heartbeat service stopped');
+  } catch {
+    // May not be initialized
+  }
 
   // Stop HTTP server
   if (httpServer) {

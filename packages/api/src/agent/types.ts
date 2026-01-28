@@ -42,6 +42,24 @@ export interface InjectedContext {
     source: string;
     topics: string[];
   }>;
+  /** Temporal context - current time and user's timezone (NOT cached - computed fresh) */
+  temporal?: {
+    /** Current time in UTC (ISO8601) */
+    currentTimeUtc: string;
+    /** User's IANA timezone identifier (e.g., 'America/Los_Angeles') */
+    userTimezone: string;
+    /** Current time formatted in user's local timezone */
+    localTime: string;
+  };
+  /** Agent's own identity - who am I in this conversation? */
+  agentIdentity?: {
+    agentId: string;
+    name: string;
+    role: string;
+    description?: string;
+    values?: string[];
+    capabilities?: string[];
+  };
 }
 
 /**
