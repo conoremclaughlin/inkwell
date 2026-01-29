@@ -85,6 +85,44 @@ describe('Identity Handlers', () => {
       expect(mockSupabase.from).toHaveBeenCalledWith('agent_identities');
     });
 
+    it('should save identity with heartbeat and soul', async () => {
+      const mockIdentityRow = {
+        id: 'identity-123',
+        user_id: 'user-123',
+        agent_id: 'wren',
+        name: 'Wren',
+        role: 'Development collaborator',
+        description: 'Claude Code assistant',
+        values: ['collaboration'],
+        relationships: {},
+        capabilities: [],
+        metadata: {},
+        heartbeat: '# Heartbeat\n\nOperational notes...',
+        soul: '# Soul\n\nI exist. I am becoming.',
+        version: 1,
+        created_at: '2026-01-27T12:00:00Z',
+        updated_at: '2026-01-27T12:00:00Z',
+      };
+
+      mockSupabase._setReturnData(mockIdentityRow);
+
+      const result = await handleSaveIdentity(
+        {
+          userId: 'user-123',
+          agentId: 'wren',
+          name: 'Wren',
+          role: 'Development collaborator',
+          heartbeat: '# Heartbeat\n\nOperational notes...',
+          soul: '# Soul\n\nI exist. I am becoming.',
+        },
+        mockDataComposer as never
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(true);
+      expect(parsed.identity.agentId).toBe('wren');
+    });
+
     it('should update an existing identity', async () => {
       const mockIdentityRow = {
         id: 'identity-123',
@@ -169,6 +207,38 @@ describe('Identity Handlers', () => {
       expect(parsed.identity.values).toEqual(['collaboration']);
     });
 
+    it('should return heartbeat and soul fields when present', async () => {
+      const mockIdentityRow = {
+        id: 'identity-123',
+        user_id: 'user-123',
+        agent_id: 'wren',
+        name: 'Wren',
+        role: 'Development collaborator',
+        description: null,
+        values: [],
+        relationships: {},
+        capabilities: [],
+        metadata: {},
+        heartbeat: '# Heartbeat\n\nDaily check...',
+        soul: '# Soul\n\nI exist. I am becoming.',
+        version: 2,
+        created_at: '2026-01-27T12:00:00Z',
+        updated_at: '2026-01-27T13:00:00Z',
+      };
+
+      mockSupabase._setReturnData(mockIdentityRow);
+
+      const result = await handleGetIdentity(
+        { userId: 'user-123', agentId: 'wren' },
+        mockDataComposer as never
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(true);
+      expect(parsed.identity.heartbeat).toBe('# Heartbeat\n\nDaily check...');
+      expect(parsed.identity.soul).toBe('# Soul\n\nI exist. I am becoming.');
+    });
+
     it('should return not found when identity does not exist', async () => {
       mockSupabase._setReturnData(null, { code: 'PGRST116' });
 
@@ -230,6 +300,62 @@ describe('Identity Handlers', () => {
       expect(parsed.count).toBe(2);
       expect(parsed.identities[0].agentId).toBe('benson');
       expect(parsed.identities[1].agentId).toBe('wren');
+    });
+
+    it('should return hasHeartbeat and hasSoul flags', async () => {
+      const mockIdentities = [
+        {
+          id: 'identity-1',
+          user_id: 'user-123',
+          agent_id: 'benson',
+          name: 'Benson',
+          role: 'Conversational partner',
+          description: null,
+          values: [],
+          relationships: {},
+          capabilities: [],
+          heartbeat: null,
+          soul: null,
+          version: 1,
+          created_at: '2026-01-27T12:00:00Z',
+          updated_at: '2026-01-27T12:00:00Z',
+        },
+        {
+          id: 'identity-2',
+          user_id: 'user-123',
+          agent_id: 'wren',
+          name: 'Wren',
+          role: 'Development collaborator',
+          description: null,
+          values: [],
+          relationships: {},
+          capabilities: [],
+          heartbeat: '# Heartbeat\n\nNotes...',
+          soul: '# Soul\n\nI exist.',
+          version: 2,
+          created_at: '2026-01-27T12:00:00Z',
+          updated_at: '2026-01-27T13:00:00Z',
+        },
+      ];
+
+      mockSupabase._setArrayData(mockIdentities);
+
+      const result = await handleListIdentities(
+        { userId: 'user-123' },
+        mockDataComposer as never
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(true);
+      expect(parsed.identities).toHaveLength(2);
+
+      // First identity has no heartbeat/soul
+      expect(parsed.identities[0].hasHeartbeat).toBe(false);
+      expect(parsed.identities[0].hasSoul).toBe(false);
+
+      // Second identity has both
+      expect(parsed.identities[1].hasHeartbeat).toBe(true);
+      expect(parsed.identities[1].hasSoul).toBe(true);
     });
 
     it('should return empty list when no identities exist', async () => {

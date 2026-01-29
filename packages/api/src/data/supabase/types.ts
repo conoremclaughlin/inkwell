@@ -87,12 +87,14 @@ export type Database = {
           change_type: string
           created_at: string
           description: string | null
+          heartbeat: string | null
           id: string
           identity_id: string
           metadata: Json | null
           name: string
           relationships: Json | null
           role: string
+          soul: string | null
           user_id: string
           values: Json | null
           version: number
@@ -104,12 +106,14 @@ export type Database = {
           change_type?: string
           created_at: string
           description?: string | null
+          heartbeat?: string | null
           id?: string
           identity_id: string
           metadata?: Json | null
           name: string
           relationships?: Json | null
           role: string
+          soul?: string | null
           user_id: string
           values?: Json | null
           version: number
@@ -121,12 +125,14 @@ export type Database = {
           change_type?: string
           created_at?: string
           description?: string | null
+          heartbeat?: string | null
           id?: string
           identity_id?: string
           metadata?: Json | null
           name?: string
           relationships?: Json | null
           role?: string
+          soul?: string | null
           user_id?: string
           values?: Json | null
           version?: number
@@ -135,6 +141,88 @@ export type Database = {
           {
             foreignKeyName: "agent_identity_history_user_id_fkey"
             columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      agent_inbox: {
+        Row: {
+          acknowledged_at: string | null
+          content: string
+          created_at: string | null
+          expires_at: string | null
+          id: string
+          message_type: string
+          metadata: Json | null
+          priority: string
+          read_at: string | null
+          recipient_agent_id: string
+          recipient_user_id: string
+          related_artifact_uri: string | null
+          related_session_id: string | null
+          sender_agent_id: string | null
+          sender_user_id: string | null
+          status: string
+          subject: string | null
+        }
+        Insert: {
+          acknowledged_at?: string | null
+          content: string
+          created_at?: string | null
+          expires_at?: string | null
+          id?: string
+          message_type?: string
+          metadata?: Json | null
+          priority?: string
+          read_at?: string | null
+          recipient_agent_id: string
+          recipient_user_id: string
+          related_artifact_uri?: string | null
+          related_session_id?: string | null
+          sender_agent_id?: string | null
+          sender_user_id?: string | null
+          status?: string
+          subject?: string | null
+        }
+        Update: {
+          acknowledged_at?: string | null
+          content?: string
+          created_at?: string | null
+          expires_at?: string | null
+          id?: string
+          message_type?: string
+          metadata?: Json | null
+          priority?: string
+          read_at?: string | null
+          recipient_agent_id?: string
+          recipient_user_id?: string
+          related_artifact_uri?: string | null
+          related_session_id?: string | null
+          sender_agent_id?: string | null
+          sender_user_id?: string | null
+          status?: string
+          subject?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "agent_inbox_recipient_user_id_fkey"
+            columns: ["recipient_user_id"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "agent_inbox_related_session_id_fkey"
+            columns: ["related_session_id"]
+            isOneToOne: false
+            referencedRelation: "agent_sessions"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "agent_inbox_sender_user_id_fkey"
+            columns: ["sender_user_id"]
             isOneToOne: false
             referencedRelation: "users"
             referencedColumns: ["id"]
@@ -202,6 +290,122 @@ export type Database = {
         Relationships: [
           {
             foreignKeyName: "agent_sessions_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      artifact_history: {
+        Row: {
+          artifact_id: string
+          change_summary: string | null
+          change_type: string | null
+          changed_by_agent_id: string | null
+          changed_by_user_id: string | null
+          content: string
+          created_at: string | null
+          id: string
+          title: string
+          version: number
+        }
+        Insert: {
+          artifact_id: string
+          change_summary?: string | null
+          change_type?: string | null
+          changed_by_agent_id?: string | null
+          changed_by_user_id?: string | null
+          content: string
+          created_at?: string | null
+          id?: string
+          title: string
+          version: number
+        }
+        Update: {
+          artifact_id?: string
+          change_summary?: string | null
+          change_type?: string | null
+          changed_by_agent_id?: string | null
+          changed_by_user_id?: string | null
+          content?: string
+          created_at?: string | null
+          id?: string
+          title?: string
+          version?: number
+        }
+        Relationships: [
+          {
+            foreignKeyName: "artifact_history_artifact_id_fkey"
+            columns: ["artifact_id"]
+            isOneToOne: false
+            referencedRelation: "artifacts"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "artifact_history_changed_by_user_id_fkey"
+            columns: ["changed_by_user_id"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      artifacts: {
+        Row: {
+          artifact_type: string
+          collaborators: string[] | null
+          content: string
+          content_type: string | null
+          created_at: string | null
+          created_by_agent_id: string | null
+          id: string
+          metadata: Json | null
+          tags: string[] | null
+          title: string
+          updated_at: string | null
+          uri: string
+          user_id: string
+          version: number | null
+          visibility: string | null
+        }
+        Insert: {
+          artifact_type?: string
+          collaborators?: string[] | null
+          content: string
+          content_type?: string | null
+          created_at?: string | null
+          created_by_agent_id?: string | null
+          id?: string
+          metadata?: Json | null
+          tags?: string[] | null
+          title: string
+          updated_at?: string | null
+          uri: string
+          user_id: string
+          version?: number | null
+          visibility?: string | null
+        }
+        Update: {
+          artifact_type?: string
+          collaborators?: string[] | null
+          content?: string
+          content_type?: string | null
+          created_at?: string | null
+          created_by_agent_id?: string | null
+          id?: string
+          metadata?: Json | null
+          tags?: string[] | null
+          title?: string
+          updated_at?: string | null
+          uri?: string
+          user_id?: string
+          version?: number | null
+          visibility?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "artifacts_user_id_fkey"
             columns: ["user_id"]
             isOneToOne: false
             referencedRelation: "users"

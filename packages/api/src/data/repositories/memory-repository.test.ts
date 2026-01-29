@@ -90,6 +90,37 @@ describe('MemoryRepository', () => {
       expect(result.expiresAt).toEqual(new Date('2026-02-26T12:00:00Z'));
     });
 
+    it('should support reflection source type for agent reflections', async () => {
+      const mockMemoryRow = {
+        id: 'mem-123',
+        user_id: 'user-456',
+        content: 'Reflection on recent experiences: I notice patterns in how I approach problems.',
+        source: 'reflection',
+        salience: 'high',
+        topics: ['self-awareness', 'growth'],
+        embedding: null,
+        metadata: { agentId: 'wren', reflectionType: 'periodic' },
+        version: 1,
+        created_at: '2026-01-26T12:00:00Z',
+        expires_at: null,
+      };
+
+      mockSupabase._setReturnData(mockMemoryRow);
+
+      const result = await repo.remember({
+        userId: 'user-456',
+        content: 'Reflection on recent experiences: I notice patterns in how I approach problems.',
+        source: 'reflection',
+        salience: 'high',
+        topics: ['self-awareness', 'growth'],
+        metadata: { agentId: 'wren', reflectionType: 'periodic' },
+      });
+
+      expect(result.source).toBe('reflection');
+      expect(result.topics).toContain('self-awareness');
+      expect(result.metadata).toHaveProperty('agentId', 'wren');
+    });
+
     it('should throw on database error', async () => {
       mockSupabase._setReturnData(null, { message: 'Database error' });
 

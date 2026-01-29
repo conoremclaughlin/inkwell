@@ -3,7 +3,6 @@
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import {
-  MessageSquare,
   Users,
   UsersRound,
   Key,
@@ -12,6 +11,7 @@ import {
   Bot,
   Bell,
   Link2,
+  FileText,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { createClient } from '@/lib/supabase/client';
@@ -19,13 +19,13 @@ import { useRouter } from 'next/navigation';
 
 const navigation = [
   { name: 'Dashboard', href: '/', icon: Home },
-  { name: 'WhatsApp', href: '/whatsapp', icon: MessageSquare },
   { name: 'Trusted Users', href: '/trusted-users', icon: Users },
   { name: 'Groups', href: '/groups', icon: UsersRound },
   { name: 'Challenge Codes', href: '/challenge-codes', icon: Key },
   { name: 'Individuals', href: '/individuals', icon: Bot },
+  { name: 'Artifacts', href: '/artifacts', icon: FileText },
   { name: 'Reminders', href: '/reminders', icon: Bell },
-  { name: 'Connected Accounts', href: '/connected-accounts', icon: Link2 },
+  { name: 'Connections', href: '/connected-accounts', icon: Link2 },
 ];
 
 export function Sidebar() {

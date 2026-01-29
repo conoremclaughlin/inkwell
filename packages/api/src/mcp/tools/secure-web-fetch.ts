@@ -162,7 +162,7 @@ export function validateWebPageExtraction(
     sanitizeOutput: true,
   });
 
-  return reader.validateExtraction(extraction as Record<string, unknown>, 'web_fetch') as {
+  return reader.validateExtraction(extraction as unknown as Record<string, unknown>, 'web_fetch') as unknown as {
     valid: boolean;
     sanitized: WebPageExtraction;
     violations: string[];

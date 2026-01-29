@@ -218,7 +218,7 @@ export function validateSearchExtraction(
     sanitizeOutput: true,
   });
 
-  return reader.validateExtraction(extraction as Record<string, unknown>, 'web_search') as {
+  return reader.validateExtraction(extraction as unknown as Record<string, unknown>, 'web_search') as unknown as {
     valid: boolean;
     sanitized: SearchResultExtraction;
     violations: string[];
@@ -247,9 +247,12 @@ export interface SearchBackendAdapter {
 export class BraveSearchAdapter implements SearchBackendAdapter {
   readonly name = 'brave';
 
-  constructor(private apiKey?: string) {}
+  // API key stored for future implementation
+  constructor(_apiKey?: string) {
+    // _apiKey will be used once actual API implementation is added
+  }
 
-  async search(query: string, options?: { maxResults?: number }): Promise<RawSearchResponse> {
+  async search(query: string, _options?: { maxResults?: number }): Promise<RawSearchResponse> {
     // TODO: Implement Brave Search API call
     // This is a placeholder - actual implementation would:
     // 1. Call https://api.search.brave.com/res/v1/web/search

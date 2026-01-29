@@ -11,6 +11,7 @@ import type { DataComposer } from '../../data/composer';
 import { resolveUser, userIdentifierFields } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
 import { simplifyDebts, calculatePersonSummary, type Debt } from './debt-utils';
+import type { Json } from '../../data/supabase/types';
 
 const saveRecordSchema = {
   ...userIdentifierFields,
@@ -116,13 +117,13 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
             user_id: resolved.user.id,
             app_name: appName,
             type,
-            data,
+            data: data as Json,
             amount,
             recorded_at: recordedAt,
             text,
             tags,
             related_record_id: relatedRecordId,
-            metadata: metadata || {},
+            metadata: (metadata || {}) as Json,
           })
           .select()
           .single();
@@ -385,7 +386,7 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
             .from('mini_app_records')
             .update({
               amount: newBalance,
-              data: { key, transactions },
+              data: { key, transactions } as Json,
               updated_at: new Date().toISOString(),
             })
             .eq('id', existing.id)

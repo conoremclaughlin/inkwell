@@ -121,6 +121,23 @@ import {
   updateSessionStatusSchema,
 } from './session-orchestration-handlers';
 
+import {
+  handleCreateArtifact,
+  handleGetArtifact,
+  handleUpdateArtifact,
+  handleListArtifacts,
+  handleGetArtifactHistory,
+  artifactToolDefinitions,
+} from './artifact-handlers';
+
+import {
+  handleSendToInbox,
+  handleGetInbox,
+  handleUpdateInboxMessage,
+  handleGetAgentStatus,
+  inboxToolDefinitions,
+} from './inbox-handlers';
+
 // Re-export for external use
 export { setResponseCallback, addPendingMessage } from './response-handlers';
 export { setTelegramListener, registerChannelListener } from './chat-context-handlers';
@@ -1750,6 +1767,213 @@ Call this before going idle so other agents can find and resume your session:
         return await handleUpdateSessionStatus(args, dataComposer);
       } catch (error) {
         logger.error('Error in update_session_status:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // ARTIFACT TOOLS (shared documents, specs, designs)
+  // =====================================================
+
+  server.registerTool(
+    'create_artifact',
+    {
+      description: `Create a shared artifact (spec, design, document). Artifacts are collaborative resources with versioning, distinct from personal memories.
+
+Use for specs, designs, decisions, and shared documents that multiple beings may work on.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: artifactToolDefinitions[0].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleCreateArtifact(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in create_artifact:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_artifact',
+    {
+      description: `Get an artifact by URI or ID. Returns the full content and metadata.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: artifactToolDefinitions[1].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleGetArtifact(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_artifact:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'update_artifact',
+    {
+      description: `Update an artifact. Automatically versions the content and tracks who made changes.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: artifactToolDefinitions[2].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleUpdateArtifact(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in update_artifact:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'list_artifacts',
+    {
+      description: `List artifacts with optional filters for type, tags, visibility, and search.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: artifactToolDefinitions[3].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleListArtifacts(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_artifacts:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_artifact_history',
+    {
+      description: `Get version history for an artifact. Shows all previous versions and who made changes.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: artifactToolDefinitions[4].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleGetArtifactHistory(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_artifact_history:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ============== Agent Inbox Tools ==============
+
+  server.registerTool(
+    'send_to_inbox',
+    {
+      description: `Send a message to another agent's inbox. Use for cross-agent communication, task handoff, or session resume requests.
+
+Message types:
+- message: General communication
+- task_request: Request another agent to do work
+- session_resume: Request agent to resume a specific session
+- notification: FYI, no response needed
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: inboxToolDefinitions[0].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleSendToInbox(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in send_to_inbox:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_inbox',
+    {
+      description: `Get messages from an agent's inbox. Returns unread messages by default, ordered by priority and recency.
+
+Use to check for messages from other agents or task requests.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: inboxToolDefinitions[1].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleGetInbox(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_inbox:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'update_inbox_message',
+    {
+      description: `Update inbox message status. Mark as read, acknowledged, or completed.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: inboxToolDefinitions[2].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleUpdateInboxMessage(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in update_inbox_message:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_agent_status',
+    {
+      description: `Get status of an agent: whether active/inactive, unread message count, and last session info.
+
+Use to check if another agent is available before sending messages.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: inboxToolDefinitions[3].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleGetAgentStatus(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_agent_status:', error);
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
           isError: true,

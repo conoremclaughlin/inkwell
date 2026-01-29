@@ -557,6 +557,10 @@ router.get('/individuals', async (_req: Request, res: Response) => {
         relationships: identity.relationships,
         capabilities: identity.capabilities,
         metadata: identity.metadata,
+        heartbeat: identity.heartbeat,
+        soul: identity.soul,
+        hasSoul: !!identity.soul,
+        hasHeartbeat: !!identity.heartbeat,
         version: identity.version,
         createdAt: identity.created_at,
         updatedAt: identity.updated_at,
@@ -614,6 +618,10 @@ router.get('/individuals/:agentId/history', async (req: Request, res: Response) 
         values: h.values,
         relationships: h.relationships,
         capabilities: h.capabilities,
+        heartbeat: h.heartbeat,
+        soul: h.soul,
+        hasSoul: !!h.soul,
+        hasHeartbeat: !!h.heartbeat,
         changeType: h.change_type,
         archivedAt: h.archived_at,
       })),
@@ -1018,6 +1026,192 @@ router.get('/oauth/:provider/callback', async (req: Request, res: Response) => {
     sendHtmlResponse(false, error instanceof Error ? error.message : 'Failed to connect account');
   }
 });
+
+// =============================================================================
+// Artifacts
+// =============================================================================
+
+/**
+ * GET /api/admin/artifacts
+ * List all artifacts
+ */
+router.get('/artifacts', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const authReq = req as Request & { user: { email: string } };
+
+    // Get the PCP user ID from the authenticated user's email
+    const { data: pcpUser } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', authReq.user.email)
+      .single();
+
+    if (!pcpUser) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from('artifacts')
+      .select('id, uri, title, artifact_type, visibility, version, tags, created_at, updated_at')
+      .eq('user_id', pcpUser.id)
+      .order('updated_at', { ascending: false });
+
+    if (error) {
+      logger.error('Failed to list artifacts:', error);
+      res.status(500).json({ error: 'Failed to list artifacts' });
+      return;
+    }
+
+    res.json({
+      artifacts: (data || []).map((a) => ({
+        id: a.id,
+        uri: a.uri,
+        title: a.title,
+        artifactType: a.artifact_type,
+        visibility: a.visibility,
+        version: a.version,
+        tags: a.tags,
+        createdAt: a.created_at,
+        updatedAt: a.updated_at,
+      })),
+    });
+  } catch (error) {
+    logger.error('Failed to list artifacts:', error);
+    res.status(500).json({ error: 'Failed to list artifacts' });
+  }
+});
+
+/**
+ * GET /api/admin/artifacts/:id
+ * Get a single artifact with full content
+ */
+router.get('/artifacts/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const authReq = req as Request & { user: { email: string } };
+
+    // Get the PCP user ID
+    const { data: pcpUser } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', authReq.user.email)
+      .single();
+
+    if (!pcpUser) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+
+    const { data: artifact, error } = await supabase
+      .from('artifacts')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', pcpUser.id)
+      .single();
+
+    if (error || !artifact) {
+      res.status(404).json({ error: 'Artifact not found' });
+      return;
+    }
+
+    res.json({
+      artifact: {
+        id: artifact.id,
+        uri: artifact.uri,
+        title: artifact.title,
+        content: artifact.content,
+        contentType: artifact.content_type,
+        artifactType: artifact.artifact_type,
+        createdByAgentId: artifact.created_by_agent_id,
+        collaborators: artifact.collaborators,
+        visibility: artifact.visibility,
+        version: artifact.version,
+        tags: artifact.tags,
+        metadata: artifact.metadata,
+        createdAt: artifact.created_at,
+        updatedAt: artifact.updated_at,
+      },
+    });
+  } catch (error) {
+    logger.error('Failed to get artifact:', error);
+    res.status(500).json({ error: 'Failed to get artifact' });
+  }
+});
+
+/**
+ * GET /api/admin/artifacts/:id/history
+ * Get version history for an artifact
+ */
+router.get('/artifacts/:id/history', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const authReq = req as Request & { user: { email: string } };
+
+    // Get the PCP user ID
+    const { data: pcpUser } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', authReq.user.email)
+      .single();
+
+    if (!pcpUser) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+
+    // Verify artifact ownership
+    const { data: artifact } = await supabase
+      .from('artifacts')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', pcpUser.id)
+      .single();
+
+    if (!artifact) {
+      res.status(404).json({ error: 'Artifact not found' });
+      return;
+    }
+
+    // Get history
+    const { data: history, error } = await supabase
+      .from('artifact_history')
+      .select('*')
+      .eq('artifact_id', id)
+      .order('version', { ascending: false });
+
+    if (error) {
+      logger.error('Failed to get artifact history:', error);
+      res.status(500).json({ error: 'Failed to get history' });
+      return;
+    }
+
+    res.json({
+      artifactId: id,
+      history: (history || []).map((h) => ({
+        id: h.id,
+        version: h.version,
+        title: h.title,
+        content: h.content,
+        changedByAgentId: h.changed_by_agent_id,
+        changedByUserId: h.changed_by_user_id,
+        changeType: h.change_type,
+        changeSummary: h.change_summary,
+        createdAt: h.created_at,
+      })),
+    });
+  } catch (error) {
+    logger.error('Failed to get artifact history:', error);
+    res.status(500).json({ error: 'Failed to get history' });
+  }
+});
+
+// =============================================================================
+// Connected Accounts (OAuth)
+// =============================================================================
 
 /**
  * DELETE /api/admin/connected-accounts/:id

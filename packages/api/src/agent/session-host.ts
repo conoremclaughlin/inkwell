@@ -235,8 +235,8 @@ export class SessionHost extends EventEmitter {
               name: agentIdentity.name,
               role: agentIdentity.role,
               description: agentIdentity.description || undefined,
-              values: agentIdentity.values || undefined,
-              capabilities: agentIdentity.capabilities || undefined,
+              values: (agentIdentity.values as string[] | null) || undefined,
+              capabilities: (agentIdentity.capabilities as string[] | null) || undefined,
             }
           : undefined,
         // Temporal is added fresh (not from cache)
