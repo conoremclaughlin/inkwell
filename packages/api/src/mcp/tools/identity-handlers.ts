@@ -9,7 +9,7 @@ import { writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { DataComposer } from '../../data/composer';
-import type { Json } from '../../data/supabase/types';
+import type { Json, TablesInsert } from '../../data/supabase/types';
 import { logger } from '../../utils/logger';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
 
@@ -26,6 +26,8 @@ export const saveIdentitySchema = userIdentifierBaseSchema.extend({
   relationships: z.record(z.string()).optional().describe('Map of agentId to relationship description'),
   capabilities: z.array(z.string()).optional().describe('What this agent can do'),
   metadata: z.record(z.unknown()).optional().describe('Additional flexible data'),
+  heartbeat: z.string().optional().describe('HEARTBEAT.md content - operational wake-up checklist'),
+  soul: z.string().optional().describe('SOUL.md content - core essence and philosophical grounding'),
   syncToFile: z.boolean().optional().describe('Also write to ~/.pcp/individuals/{agentId}/IDENTITY.md'),
 });
 
@@ -144,27 +146,29 @@ export async function handleSaveIdentity(
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();
 
-  const { agentId, name, role, description, values, relationships, capabilities, metadata, syncToFile } = params;
+  const { agentId, name, role, description, values, relationships, capabilities, metadata, heartbeat, soul, syncToFile } = params;
+
+  // Build update object, only including fields that were provided
+  const upsertData: TablesInsert<'agent_identities'> = {
+    user_id: user.id,
+    agent_id: agentId,
+    name,
+    role,
+    description: description || null,
+    values: (values || []) as unknown as Json,
+    relationships: (relationships || {}) as unknown as Json,
+    capabilities: (capabilities || []) as unknown as Json,
+    metadata: (metadata || {}) as unknown as Json,
+    heartbeat: heartbeat || null,
+    soul: soul || null,
+  };
 
   // Use upsert to handle both create and update
   const { data, error } = await supabase
     .from('agent_identities')
-    .upsert(
-      {
-        user_id: user.id,
-        agent_id: agentId,
-        name,
-        role,
-        description: description || null,
-        values: (values || []) as unknown as Json,
-        relationships: (relationships || {}) as unknown as Json,
-        capabilities: (capabilities || []) as unknown as Json,
-        metadata: (metadata || {}) as unknown as Json,
-      },
-      {
-        onConflict: 'user_id,agent_id',
-      }
-    )
+    .upsert(upsertData, {
+      onConflict: 'user_id,agent_id',
+    })
     .select()
     .single();
 
@@ -280,6 +284,8 @@ export async function handleGetIdentity(
               relationships: data.relationships,
               capabilities: data.capabilities,
               metadata: data.metadata,
+              heartbeat: data.heartbeat,
+              soul: data.soul,
               version: data.version,
               createdAt: data.created_at,
               updatedAt: data.updated_at,
@@ -329,6 +335,8 @@ export async function handleListIdentities(
               values: row.values,
               relationships: row.relationships,
               capabilities: row.capabilities,
+              hasHeartbeat: !!row.heartbeat,
+              hasSoul: !!row.soul,
               version: row.version,
               createdAt: row.created_at,
               updatedAt: row.updated_at,
