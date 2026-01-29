@@ -7,7 +7,7 @@
 
 import { EventEmitter } from 'events';
 
-export type ChannelType = 'telegram' | 'terminal' | 'discord' | 'whatsapp' | 'http' | 'api';
+export type ChannelType = 'telegram' | 'terminal' | 'discord' | 'whatsapp' | 'http' | 'api' | 'agent';
 export type BackendType = 'claude-code' | 'direct-api';
 export type ResponseFormat = 'text' | 'markdown' | 'code' | 'json';
 

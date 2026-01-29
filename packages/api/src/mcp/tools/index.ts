@@ -138,6 +138,13 @@ import {
   inboxToolDefinitions,
 } from './inbox-handlers';
 
+import {
+  handleTriggerAgent,
+  handleListRegisteredAgents,
+  triggerAgentSchema,
+  listRegisteredAgentsSchema,
+} from './agent-triggers';
+
 // Re-export for external use
 export { setResponseCallback, addPendingMessage } from './response-handlers';
 export { setTelegramListener, registerChannelListener } from './chat-context-handlers';
@@ -635,7 +642,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 
 This is the primary way to send responses back to users. Always use this tool instead of just outputting text.`,
       inputSchema: {
-        channel: z.enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api'])
+        channel: z.enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'agent'])
           .describe('Channel to send the response to'),
         conversationId: z.string()
           .describe('Conversation ID to route the response to'),
@@ -1974,6 +1981,54 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleGetAgentStatus(args, dataComposer);
       } catch (error) {
         logger.error('Error in get_agent_status:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // AGENT TRIGGER TOOLS (real-time agent-to-agent wakeup)
+  // =====================================================
+
+  server.registerTool(
+    'trigger_agent',
+    {
+      description: `Trigger another agent to wake up immediately. Use this after sending to an agent's inbox to avoid waiting for their polling interval.
+
+Pattern:
+1. send_to_inbox(toAgentId: "myra", content: "Task completed", ...)
+2. trigger_agent(toAgentId: "myra", fromAgentId: "wren", triggerType: "task_complete")
+
+This is the "doorbell" - the inbox is the "mailbox". Use both together for reliable async communication.`,
+      inputSchema: triggerAgentSchema,
+    },
+    async (args) => {
+      try {
+        return await handleTriggerAgent(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in trigger_agent:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'list_registered_agents',
+    {
+      description: `List agents that have registered trigger handlers. These agents can receive instant triggers via trigger_agent.`,
+      inputSchema: listRegisteredAgentsSchema,
+    },
+    async () => {
+      try {
+        return await handleListRegisteredAgents({}, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_registered_agents:', error);
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
           isError: true,

@@ -21,6 +21,7 @@ import QRCode from 'qrcode';
 import { getDataComposer, DataComposer } from '../data/composer';
 import { createTelegramListener, TelegramListener } from '../channels/telegram-listener';
 import { createWhatsAppListener, WhatsAppListener } from '../channels/whatsapp-listener';
+import { getAgentGateway, type AgentTriggerPayload } from '../channels/agent-gateway';
 import { createSessionHost, SessionHost } from '../agent';
 import { setTelegramListener } from '../mcp/tools';
 import { logger } from '../utils/logger';
@@ -88,6 +89,115 @@ function stopTypingIndicator(conversationId: string): void {
     clearInterval(interval);
     activeTypingIntervals.delete(conversationId);
   }
+}
+
+/**
+ * Check Myra's inbox for messages from other agents and process them
+ */
+async function checkAndProcessInbox(): Promise<void> {
+  if (!dataComposer || !sessionHost) {
+    logger.warn('[Inbox] Cannot check inbox - not initialized');
+    return;
+  }
+
+  try {
+    const supabase = dataComposer.getClient();
+
+    // Fetch unread messages for Myra
+    const { data: messages, error } = await supabase
+      .from('agent_inbox')
+      .select('*')
+      .eq('recipient_agent_id', 'myra')
+      .eq('status', 'unread')
+      .order('priority', { ascending: false })
+      .order('created_at', { ascending: false })
+      .limit(10);
+
+    if (error) {
+      logger.error('[Inbox] Failed to fetch inbox:', error);
+      return;
+    }
+
+    if (!messages || messages.length === 0) {
+      logger.debug('[Inbox] No unread messages');
+      return;
+    }
+
+    logger.info(`[Inbox] Found ${messages.length} unread message(s)`);
+
+    for (const msg of messages) {
+      logger.info(`[Inbox] Processing message from ${msg.sender_agent_id || 'unknown'}:`, {
+        subject: msg.subject,
+        type: msg.message_type,
+        priority: msg.priority,
+      });
+
+      // Mark as read immediately to avoid reprocessing
+      await supabase
+        .from('agent_inbox')
+        .update({ status: 'read', read_at: new Date().toISOString() })
+        .eq('id', msg.id);
+
+      // Build a prompt for the session host to process
+      const inboxPrompt = `
+[AGENT INBOX MESSAGE]
+From: ${msg.sender_agent_id || 'unknown agent'}
+Subject: ${msg.subject || 'No subject'}
+Priority: ${msg.priority}
+Type: ${msg.message_type}
+
+${msg.content}
+
+---
+IMPORTANT: This message came through your agent inbox, NOT from a user on Telegram/WhatsApp.
+Your normal response here will NOT reach anyone on messaging platforms.
+
+If you need to send a message to a user on Telegram:
+1. Check user.contacts in your bootstrap for their telegramId
+2. Call the send_response MCP tool with:
+   - channel: "telegram"
+   - conversationId: the user's telegramId (e.g., "726555973" for Conor)
+   - content: your message
+
+Do NOT just respond - you MUST explicitly call send_response to reach external channels.
+`;
+
+      // Send to session host for processing (using a virtual "agent" channel)
+      await sessionHost.handleMessage(
+        'agent',
+        `inbox:${msg.id}`,
+        { id: msg.sender_agent_id || 'system', name: msg.sender_agent_id || 'system' },
+        inboxPrompt,
+        {
+          chatType: 'direct',
+        }
+      );
+
+      // Mark as acknowledged after processing
+      await supabase
+        .from('agent_inbox')
+        .update({ status: 'acknowledged' })
+        .eq('id', msg.id);
+
+      logger.info(`[Inbox] Message ${msg.id} processed`);
+    }
+  } catch (error) {
+    logger.error('[Inbox] Error checking inbox:', error);
+  }
+}
+
+/**
+ * Handle agent trigger - called when another agent wants to wake us up
+ */
+async function handleAgentTrigger(payload: AgentTriggerPayload): Promise<void> {
+  logger.info(`[Trigger] Received trigger from ${payload.fromAgentId}`, {
+    type: payload.triggerType,
+    priority: payload.priority,
+    summary: payload.summary,
+  });
+
+  // Check inbox for the message that triggered us
+  await checkAndProcessInbox();
 }
 
 /**
@@ -285,6 +395,60 @@ async function startHttpServer(): Promise<void> {
       return;
     }
 
+    // Send message endpoint - allows MCP server to route messages through Myra
+    if (url.pathname === '/api/admin/send' && req.method === 'POST') {
+      let body = '';
+      req.on('data', chunk => { body += chunk.toString(); });
+      req.on('end', async () => {
+        try {
+          const { channel, conversationId, content } = JSON.parse(body);
+          logger.info(`External send request: ${channel}:${conversationId}`);
+
+          if (channel === 'telegram' && telegramListener) {
+            await telegramListener.sendMessage(conversationId, content);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: true, channel, conversationId }));
+          } else if (channel === 'whatsapp' && whatsappListener) {
+            await whatsappListener.sendMessage(conversationId, content);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: true, channel, conversationId }));
+          } else {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: `Channel ${channel} not available` }));
+          }
+        } catch (error) {
+          logger.error('Send message failed:', error);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Send failed' }));
+        }
+      });
+      return;
+    }
+
+    // Inbox check endpoint - manually trigger inbox processing
+    if (url.pathname === '/api/admin/inbox/check' && req.method === 'POST') {
+      (async () => {
+        try {
+          logger.info('Manual inbox check triggered via HTTP');
+          await checkAndProcessInbox();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: true,
+            message: 'Inbox check completed',
+            timestamp: new Date().toISOString(),
+          }));
+        } catch (error) {
+          logger.error('Inbox check failed:', error);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: false,
+            error: error instanceof Error ? error.message : 'Inbox check failed',
+          }));
+        }
+      })();
+      return;
+    }
+
     // Heartbeat endpoint - trigger reminder processing
     if (url.pathname === '/api/admin/heartbeat' && req.method === 'POST') {
       (async () => {
@@ -466,6 +630,20 @@ async function startMyra(config: MyraConfig = {}): Promise<void> {
   logger.info('Initializing Session Host (starting Claude Code)...');
   await sessionHost.initialize();
   logger.info('Session Host ready');
+
+  // 5b. Register agent trigger handler for instant wake-up
+  const agentGateway = getAgentGateway();
+  agentGateway.registerHandler('myra', handleAgentTrigger);
+  logger.info('Agent trigger handler registered for myra');
+
+  // 5c. Register 'agent' channel for inbox message responses
+  // Responses to inbox messages get logged but don't go anywhere specific
+  sessionHost.registerChannel('agent', {
+    sendMessage: async (conversationId, content) => {
+      logger.info(`[Agent Response] ${conversationId}: ${content.substring(0, 100)}...`);
+      // For now, just log. Could send back to sender's inbox if needed.
+    },
+  });
 
   // 6. Wire up Telegram message handling
   if (telegramListener) {
@@ -665,6 +843,10 @@ async function startMyra(config: MyraConfig = {}): Promise<void> {
   initHeartbeatService({
     interval: process.env.HEARTBEAT_INTERVAL || '*/5 * * * *', // Every 5 minutes
     enableLocalCron,
+    // Add inbox checking to heartbeat
+    onHeartbeat: async () => {
+      await checkAndProcessInbox();
+    },
   });
 
   if (enableLocalCron) {

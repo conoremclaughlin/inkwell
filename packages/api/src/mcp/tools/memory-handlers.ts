@@ -736,17 +736,24 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 
   // Load identity files if agentId is provided
   let identityFiles: {
+    agentId: string;
     values: string | null;
     user: string | null;
     self: string | null;
-    agentId: string | null;
+    heartbeat: string | null;
+    soul: string | null;
   } | null = null;
 
   if (agentId) {
-    const [valuesContent, userContent, selfContent] = await Promise.all([
+    // Load identity files from local filesystem
+    // Path: ~/.pcp/individuals/{agentId}/IDENTITY.md for agent-specific
+    // Path: ~/.pcp/shared/VALUES.md and USER.md for shared files
+    const [valuesContent, userContent, selfContent, heartbeatContent, soulContent] = await Promise.all([
       safeReadFile(path.join(basePath, 'shared', 'VALUES.md')),
       safeReadFile(path.join(basePath, 'shared', 'USER.md')),
-      safeReadFile(path.join(basePath, agentId, 'IDENTITY.md')),
+      safeReadFile(path.join(basePath, 'individuals', agentId, 'IDENTITY.md')),
+      safeReadFile(path.join(basePath, 'individuals', agentId, 'HEARTBEAT.md')),
+      safeReadFile(path.join(basePath, 'individuals', agentId, 'SOUL.md')),
     ]);
 
     identityFiles = {
@@ -754,6 +761,8 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
       values: valuesContent,
       user: userContent,
       self: selfContent,
+      heartbeat: heartbeatContent,
+      soul: soulContent,
     };
   }
 
@@ -823,6 +832,24 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     reflectionStatus = { lastReflectedAt, daysSince, suggestion };
   }
 
+  // Merge identity: prioritize Supabase over local files
+  // dbIdentity has: name, role, description, heartbeat, soul
+  // identityFiles has: values, user, self, heartbeat, soul
+  const mergedIdentity = identityFiles ? {
+    ...identityFiles,
+    // Override local files with Supabase content if available
+    self: (dbIdentity?.description as string | null) || identityFiles.self,
+    heartbeat: (dbIdentity?.heartbeat as string | null) || identityFiles.heartbeat,
+    soul: (dbIdentity?.soul as string | null) || identityFiles.soul,
+  } : null;
+
+  // Build agent info from dbIdentity
+  const agentInfo = dbIdentity ? {
+    name: dbIdentity.name as string,
+    role: dbIdentity.role as string,
+    capabilities: dbIdentity.capabilities as Record<string, unknown> | null,
+  } : null;
+
   logger.info(`Bootstrap loaded for user ${user.id}`, {
     agentId: agentId || 'none',
     contextCount: contexts.length,
@@ -831,6 +858,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     hasActiveSession: !!activeSession,
     hasIdentityFiles: !!identityFiles,
     hasDbIdentity: !!dbIdentity,
+    identitySource: dbIdentity?.description ? 'supabase' : (identityFiles?.self ? 'local' : 'none'),
   });
 
   return {
@@ -840,10 +868,23 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
         text: JSON.stringify(
           {
             success: true,
-            user: { id: user.id, resolvedBy },
+            user: {
+              id: user.id,
+              resolvedBy,
+              // Platform contact info for sending messages
+              contacts: {
+                email: user.email || null,
+                telegramId: user.telegram_id ? String(user.telegram_id) : null,
+                whatsappId: user.whatsapp_id || null,
+                phoneNumber: user.phone_number || null,
+              },
+            },
 
-            // Identity files from filesystem
-            identityFiles: identityFiles,
+            // Agent info from Supabase (name, role, capabilities)
+            agentInfo: agentInfo,
+
+            // Identity files (merged: Supabase priority, local fallback)
+            identityFiles: mergedIdentity,
 
             // Tier 1: Identity Core from DB
             identityCore: {

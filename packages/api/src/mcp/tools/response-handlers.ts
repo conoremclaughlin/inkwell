@@ -36,7 +36,7 @@ export function getResponseCallback(): ResponseCallback | null {
 // ============================================================================
 
 export const sendResponseSchema = z.object({
-  channel: z.enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api'])
+  channel: z.enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'agent'])
     .describe('Channel to send the response to'),
   conversationId: z.string()
     .describe('Conversation ID to route the response to'),
@@ -62,6 +62,9 @@ function mcpResponse(data: object, isError = false): McpResponse {
   };
 }
 
+// Myra's HTTP endpoint for message routing (fallback when no local callback)
+const MYRA_SEND_ENDPOINT = process.env.MYRA_SEND_URL || 'http://localhost:3003/api/admin/send';
+
 export async function handleSendResponse(
   args: z.infer<typeof sendResponseSchema>,
   _dataComposer: DataComposer
@@ -71,14 +74,6 @@ export async function handleSendResponse(
       conversationId: args.conversationId,
       contentLength: args.content.length,
     });
-
-    if (!globalResponseCallback) {
-      logger.error('No response callback registered');
-      return mcpResponse({
-        success: false,
-        error: 'Response routing not configured. No callback registered.',
-      }, true);
-    }
 
     // Build the response object
     const response: AgentResponse = {
@@ -90,12 +85,38 @@ export async function handleSendResponse(
       metadata: args.metadata,
     };
 
-    // Route the response via the callback
-    await globalResponseCallback(response);
+    // Try local callback first (when running in same process as session host)
+    if (globalResponseCallback) {
+      await globalResponseCallback(response);
+      logger.info(`Response sent to ${args.channel}:${args.conversationId} via local callback`);
+    } else {
+      // Fallback: route through Myra's HTTP endpoint for external channels
+      if (args.channel === 'telegram' || args.channel === 'whatsapp') {
+        logger.info(`Routing ${args.channel} message through Myra's HTTP endpoint`);
+        const httpResponse = await fetch(MYRA_SEND_ENDPOINT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            channel: args.channel,
+            conversationId: args.conversationId,
+            content: args.content,
+          }),
+        });
 
-    // Optionally persist the message
-    // This could be expanded to save to the messages table
-    logger.info(`Response sent to ${args.channel}:${args.conversationId}`);
+        if (!httpResponse.ok) {
+          const errorData = await httpResponse.json().catch(() => ({})) as { error?: string };
+          throw new Error(`Myra send failed: ${errorData.error || httpResponse.statusText}`);
+        }
+
+        logger.info(`Response sent to ${args.channel}:${args.conversationId} via Myra HTTP`);
+      } else {
+        logger.warn(`No routing available for channel: ${args.channel}`);
+        return mcpResponse({
+          success: false,
+          error: `No routing configured for channel: ${args.channel}`,
+        }, true);
+      }
+    }
 
     return mcpResponse({
       success: true,

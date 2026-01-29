@@ -16,6 +16,7 @@ import path from 'path';
 import { getDataComposer } from './data/composer';
 import { createTelegramListener, TelegramListener } from './channels/telegram-listener';
 import { createWhatsAppListener, WhatsAppListener } from './channels/whatsapp-listener';
+import { getAgentGateway, type TriggerCallback } from './channels/agent-gateway';
 import { createSessionHost, SessionHost } from './agent';
 import { createMCPServer, MCPServer, setWhatsAppListener } from './mcp/server';
 import { setTelegramListener } from './mcp/tools';
@@ -43,6 +44,10 @@ interface ServerConfig {
   enableWhatsApp?: boolean;
   /** System prompt to append */
   systemPrompt?: string;
+  /** Agent ID for this server instance (for trigger handling) */
+  agentId?: string;
+  /** Trigger handler callback (called when another agent triggers this one) */
+  onAgentTrigger?: TriggerCallback;
 }
 
 // Global state
@@ -231,7 +236,14 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   await sessionHost.initialize();
   logger.info('Session Host ready');
 
-  // 6. Start Telegram listener and wire up message handling
+  // 6. Register agent trigger handler (if configured)
+  if (config.agentId && config.onAgentTrigger) {
+    const agentGateway = getAgentGateway();
+    agentGateway.registerHandler(config.agentId, config.onAgentTrigger);
+    logger.info(`Agent trigger handler registered for: ${config.agentId}`);
+  }
+
+  // 7. Start Telegram listener and wire up message handling
   if (telegramListener) {
     telegramListener.onMessage(async (message) => {
       const senderId = message.sender.id || 'unknown';

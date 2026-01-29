@@ -50,3 +50,11 @@ export {
   createClawdbotBridge,
   convertClawdbotContext,
 } from './clawdbot-bridge';
+
+// Agent Gateway (agent-to-agent triggers)
+export type { AgentTriggerPayload, AgentTriggerResponse, TriggerCallback } from './agent-gateway';
+export {
+  AgentGateway,
+  getAgentGateway,
+  createAgentGatewayRoutes,
+} from './agent-gateway';

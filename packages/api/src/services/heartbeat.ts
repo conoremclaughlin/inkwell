@@ -37,6 +37,8 @@ interface HeartbeatConfig {
   enableLocalCron?: boolean;
   /** Delivery channels */
   channels?: Record<string, DeliveryChannel>;
+  /** Callback to run on each heartbeat (for inbox checking, etc.) */
+  onHeartbeat?: () => Promise<void>;
 }
 
 // Singleton state
@@ -47,15 +49,20 @@ let deliveryChannels: Record<string, DeliveryChannel> = {};
 /**
  * Initialize the heartbeat service
  */
+// Store the onHeartbeat callback
+let heartbeatCallback: (() => Promise<void>) | null = null;
+
 export function initHeartbeatService(config: HeartbeatConfig = {}): void {
   const {
     interval = '*/5 * * * *', // Every 5 minutes
     enableLocalCron = process.env.NODE_ENV !== 'production',
     channels = {},
+    onHeartbeat,
   } = config;
 
-  // Store delivery channels
+  // Store delivery channels and callback
   deliveryChannels = channels;
+  heartbeatCallback = onHeartbeat || null;
 
   // Initialize typed Supabase client
   supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
@@ -66,6 +73,10 @@ export function initHeartbeatService(config: HeartbeatConfig = {}): void {
     cronTask = cron.schedule(interval, async () => {
       try {
         await processHeartbeat();
+        // Call the onHeartbeat callback if provided
+        if (heartbeatCallback) {
+          await heartbeatCallback();
+        }
       } catch (error) {
         logger.error('Heartbeat cron error:', error);
       }

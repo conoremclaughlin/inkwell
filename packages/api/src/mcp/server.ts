@@ -11,8 +11,9 @@ import type { DataComposer } from '../data/composer';
 import { registerAllTools, setMiniAppsRegistry } from './tools';
 import { loadMiniApps, registerMiniAppTools, getMiniAppsInfo } from '../mini-apps';
 import adminRouter, { setWhatsAppListener } from '../routes/admin';
+import agentTriggerRouter, { getAgentGateway } from '../routes/agent-trigger';
 
-export { setWhatsAppListener };
+export { setWhatsAppListener, getAgentGateway };
 
 export class MCPServer {
   private server: McpServer;
@@ -143,6 +144,10 @@ export class MCPServer {
     app.use(express.json());
     app.use('/api/admin', adminRouter);
     logger.info('Admin API routes registered at /api/admin');
+
+    // Agent trigger routes (for agent-to-agent communication)
+    app.use('/api/agent', agentTriggerRouter);
+    logger.info('Agent trigger routes registered at /api/agent');
 
     // Refresh tools endpoint - notifies connected clients that tools have changed
     app.post('/refresh-tools', async (_req, res) => {
