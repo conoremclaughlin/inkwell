@@ -14,6 +14,7 @@ import { getAuthorizationService } from '../services/authorization';
 import { getOAuthService } from '../services/oauth';
 import { logger } from '../utils/logger';
 import { env } from '../config/env';
+import { runWithRequestContext } from '../utils/request-context';
 import crypto from 'crypto';
 
 // WhatsApp listener reference (set via setWhatsAppListener)
@@ -92,9 +93,19 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       return;
     }
 
-    // Attach user to request
-    (req as Request & { user: typeof user }).user = user;
-    next();
+    // Attach user and PCP user ID to request
+    const authReq = req as Request & { user: typeof user; pcpUserId: string };
+    authReq.user = user;
+    authReq.pcpUserId = pcpUser.id;
+
+    // Wrap the rest of the request in context
+    runWithRequestContext(
+      {
+        userId: pcpUser.id,
+        email: user.email || undefined,
+      },
+      () => next()
+    );
   } catch (error) {
     logger.error('Admin auth error:', error);
     res.status(500).json({ error: 'Authentication error' });

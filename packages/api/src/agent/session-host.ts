@@ -14,6 +14,7 @@ import type { DataComposer } from '../data/composer';
 import type { AgentMessage, AgentResponse, ChannelType, ResponseHandler, InjectedContext } from './types';
 import { BackendManager, createBackendManager, BackendManagerConfig } from './backend-manager';
 import { setResponseCallback, addPendingMessage } from '../mcp/tools/response-handlers';
+import { getAgentGateway, type AgentTriggerPayload } from '../channels/agent-gateway';
 
 export interface ChannelSender {
   sendMessage(conversationId: string, content: string, options?: {
@@ -35,6 +36,8 @@ export interface SessionHostConfig {
   disableContextInjection?: boolean;
   /** Agent ID for identity injection (e.g., "myra", "wren") */
   agentId?: string;
+  /** Agent IDs to register trigger handlers for (enables wake-up via trigger_agent) */
+  registeredAgents?: string[];
 }
 
 interface CachedContext {
@@ -57,12 +60,16 @@ export class SessionHost extends EventEmitter {
   private disableContextInjection: boolean;
   private agentId: string | undefined;
 
+  // Trigger handlers
+  private registeredAgents: string[] = [];
+
   constructor(config: SessionHostConfig) {
     super();
     this.dataComposer = config.dataComposer;
     this.contextCacheTtl = config.contextCacheTtl ?? 30 * 60 * 1000; // 30 minutes default
     this.disableContextInjection = config.disableContextInjection ?? false;
     this.agentId = config.agentId;
+    this.registeredAgents = config.registeredAgents || [];
 
     // Create backend manager
     this.backendManager = createBackendManager(config.backend);
@@ -92,6 +99,9 @@ export class SessionHost extends EventEmitter {
     // Initialize backend manager
     await this.backendManager.initialize();
 
+    // Register trigger handlers for configured agents
+    this.registerTriggerHandlers();
+
     // Set response handler on backend manager too
     this.backendManager.setResponseHandler(this.handleResponse.bind(this));
 
@@ -109,10 +119,99 @@ export class SessionHost extends EventEmitter {
   async shutdown(): Promise<void> {
     logger.info('Shutting down Session Host...');
 
+    // Unregister trigger handlers
+    const gateway = getAgentGateway();
+    for (const agentId of this.registeredAgents) {
+      gateway.unregisterHandler(agentId);
+    }
+
     await this.backendManager.shutdown();
 
     logger.info('Session Host shutdown complete');
     this.emit('shutdown');
+  }
+
+  /**
+   * Register trigger handlers for configured agents.
+   * Enables agents to be "woken up" via the trigger_agent tool.
+   */
+  private registerTriggerHandlers(): void {
+    if (this.registeredAgents.length === 0) {
+      return;
+    }
+
+    const gateway = getAgentGateway();
+
+    for (const agentId of this.registeredAgents) {
+      gateway.registerHandler(agentId, this.handleAgentTrigger.bind(this, agentId));
+      logger.info(`Trigger handler registered for agent: ${agentId}`);
+    }
+
+    logger.info(`Registered trigger handlers for agents: ${this.registeredAgents.join(', ')}`);
+  }
+
+  /**
+   * Handle a trigger for a specific agent.
+   * Fetches inbox message (if provided) and sends to the agent for processing.
+   */
+  private async handleAgentTrigger(agentId: string, payload: AgentTriggerPayload): Promise<void> {
+    logger.info(`Handling trigger for agent: ${agentId}`, {
+      from: payload.fromAgentId,
+      type: payload.triggerType,
+      inboxMessageId: payload.inboxMessageId,
+    });
+
+    // Build the trigger message content
+    let content = `[TRIGGER from ${payload.fromAgentId}]\nType: ${payload.triggerType}`;
+
+    if (payload.summary) {
+      content += `\nSummary: ${payload.summary}`;
+    }
+
+    // If inbox message ID provided, fetch it
+    if (payload.inboxMessageId) {
+      try {
+        const supabase = this.dataComposer.getClient();
+        const { data: inboxMessage } = await supabase
+          .from('agent_inbox')
+          .select('*')
+          .eq('id', payload.inboxMessageId)
+          .single();
+
+        if (inboxMessage) {
+          content += `\n\n[INBOX MESSAGE]\nFrom: ${inboxMessage.sender_agent_id || 'user'}`;
+          content += `\nSubject: ${inboxMessage.subject}`;
+          content += `\nPriority: ${inboxMessage.priority}`;
+          content += `\nContent:\n${inboxMessage.content}`;
+
+          // Mark as read
+          await supabase
+            .from('agent_inbox')
+            .update({ status: 'read', read_at: new Date().toISOString() })
+            .eq('id', payload.inboxMessageId);
+        }
+      } catch (error) {
+        logger.error('Failed to fetch inbox message:', error);
+      }
+    }
+
+    // Send to the agent as an "agent" channel message
+    // This goes through the normal message handling flow
+    await this.handleMessage(
+      'agent' as ChannelType,
+      `trigger-${agentId}`,
+      { id: payload.fromAgentId, name: payload.fromAgentId },
+      content,
+      {
+        metadata: {
+          triggerType: payload.triggerType,
+          inboxMessageId: payload.inboxMessageId,
+          ...payload.metadata,
+        },
+      }
+    );
+
+    this.emit('agent:triggered', { agentId, payload });
   }
 
   /**

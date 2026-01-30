@@ -46,7 +46,13 @@ interface MyraConfig {
   enableWhatsApp?: boolean;
   /** System prompt to append */
   systemPrompt?: string;
+  /** Whether to enable message listeners (Telegram/WhatsApp) */
+  enableListeners?: boolean;
 }
+
+// TEMPORARY: Disable listeners when MCP Server owns the ChannelGateway
+// Set ENABLE_MYRA_LISTENERS=true to use Myra's own listeners (legacy mode)
+const ENABLE_LISTENERS = process.env.ENABLE_MYRA_LISTENERS === 'true';
 
 // Global state
 let sessionHost: SessionHost | null = null;
@@ -544,14 +550,18 @@ async function startMyra(config: MyraConfig = {}): Promise<void> {
   dataComposer = await getDataComposer();
   logger.info('Data layer ready');
 
-  // 2. Create Telegram listener
-  if (env.TELEGRAM_BOT_TOKEN) {
+  // 2. Create Telegram listener (only if listeners are enabled)
+  const enableListeners = config.enableListeners ?? ENABLE_LISTENERS;
+  if (enableListeners && env.TELEGRAM_BOT_TOKEN) {
     logger.info('Creating Telegram listener...');
     telegramListener = createTelegramListener({
       pollingInterval: config.telegramPollingInterval || 1000,
     });
     setTelegramListener(telegramListener);
     logger.info('Telegram listener created');
+  } else if (!enableListeners) {
+    logger.info('Telegram listener DISABLED (MCP Server owns ChannelGateway)');
+    logger.info('Set ENABLE_MYRA_LISTENERS=true to enable legacy mode');
   } else {
     logger.warn('TELEGRAM_BOT_TOKEN not set - Telegram disabled');
   }
@@ -645,8 +655,8 @@ async function startMyra(config: MyraConfig = {}): Promise<void> {
     },
   });
 
-  // 6. Wire up Telegram message handling
-  if (telegramListener) {
+  // 6. Wire up Telegram message handling (only if listeners are enabled)
+  if (enableListeners && telegramListener) {
     telegramListener.onMessage(async (message) => {
       const senderId = message.sender.id ?? 'unknown';
       const conversationId = message.conversationId || senderId;
@@ -710,9 +720,9 @@ async function startMyra(config: MyraConfig = {}): Promise<void> {
     logger.info('Telegram listener started');
   }
 
-  // 7. Create and start WhatsApp listener if enabled
+  // 7. Create and start WhatsApp listener if enabled (and listeners are enabled)
   const enableWhatsApp = config.enableWhatsApp ?? (process.env.ENABLE_WHATSAPP === 'true');
-  if (enableWhatsApp) {
+  if (enableListeners && enableWhatsApp) {
     logger.info('Creating WhatsApp listener...');
     whatsappListener = createWhatsAppListener({
       accountId: config.whatsappAccountId || 'default',

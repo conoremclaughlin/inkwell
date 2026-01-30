@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { DataComposer } from '../data/composer';
 import type { User } from '../data/models/user.model';
 import { logger } from '../utils/logger';
+import { getUserFromContext } from '../utils/request-context';
 
 /**
  * Base schema for user identification fields.
@@ -62,6 +63,10 @@ export interface ResolvedUser {
 /**
  * Resolves a user from various identifiers.
  * Tries identifiers in priority order: userId > email > platform > phone
+ *
+ * If no explicit identifiers are provided, falls back to:
+ * - Request context (from web dashboard JWT auth)
+ * - Session context (from bootstrap() call)
  */
 export async function resolveUser(
   identifier: UserIdentifier,
@@ -69,43 +74,71 @@ export async function resolveUser(
 ): Promise<ResolvedUser | null> {
   const usersRepo = dataComposer.repositories.users;
 
+  // Merge with context if no explicit identifiers provided
+  const hasExplicitIdentifier = !!(
+    identifier.userId ||
+    identifier.email ||
+    identifier.phone ||
+    (identifier.platform && identifier.platformId)
+  );
+
+  let effectiveIdentifier = identifier;
+
+  if (!hasExplicitIdentifier) {
+    // Try to get user from request/session context
+    const contextUser = getUserFromContext();
+    if (contextUser) {
+      logger.debug('Using user identifier from context', {
+        hasUserId: !!contextUser.userId,
+        hasEmail: !!contextUser.email,
+      });
+      effectiveIdentifier = {
+        ...identifier,
+        userId: identifier.userId || contextUser.userId,
+        email: identifier.email || contextUser.email,
+        platform: identifier.platform || (contextUser.platform as typeof identifier.platform),
+        platformId: identifier.platformId || contextUser.platformId,
+      };
+    }
+  }
+
   // 1. Try userId first (most specific)
-  if (identifier.userId) {
-    const user = await usersRepo.findById(identifier.userId);
+  if (effectiveIdentifier.userId) {
+    const user = await usersRepo.findById(effectiveIdentifier.userId);
     if (user) {
-      logger.debug(`User resolved by userId: ${identifier.userId}`);
+      logger.debug(`User resolved by userId: ${effectiveIdentifier.userId}`);
       return { user, resolvedBy: 'userId' };
     }
   }
 
   // 2. Try email
-  if (identifier.email) {
-    const user = await usersRepo.findByEmail(identifier.email);
+  if (effectiveIdentifier.email) {
+    const user = await usersRepo.findByEmail(effectiveIdentifier.email);
     if (user) {
-      logger.debug(`User resolved by email: ${identifier.email}`);
+      logger.debug(`User resolved by email: ${effectiveIdentifier.email}`);
       return { user, resolvedBy: 'email' };
     }
   }
 
   // 3. Try platform + platformId
-  if (identifier.platform && identifier.platformId) {
-    const user = await usersRepo.findByPlatformId(identifier.platform, identifier.platformId);
+  if (effectiveIdentifier.platform && effectiveIdentifier.platformId) {
+    const user = await usersRepo.findByPlatformId(effectiveIdentifier.platform, effectiveIdentifier.platformId);
     if (user) {
-      logger.debug(`User resolved by ${identifier.platform}: ${identifier.platformId}`);
+      logger.debug(`User resolved by ${effectiveIdentifier.platform}: ${effectiveIdentifier.platformId}`);
       return { user, resolvedBy: 'platform' };
     }
   }
 
   // 4. Try phone number
-  if (identifier.phone) {
-    const user = await usersRepo.findByPhoneNumber(identifier.phone);
+  if (effectiveIdentifier.phone) {
+    const user = await usersRepo.findByPhoneNumber(effectiveIdentifier.phone);
     if (user) {
-      logger.debug(`User resolved by phone: ${identifier.phone}`);
+      logger.debug(`User resolved by phone: ${effectiveIdentifier.phone}`);
       return { user, resolvedBy: 'phone' };
     }
   }
 
-  logger.warn('User not found with provided identifiers', { identifier });
+  logger.warn('User not found with provided identifiers', { identifier: effectiveIdentifier });
   return null;
 }
 

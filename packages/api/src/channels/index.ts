@@ -58,3 +58,11 @@ export {
   getAgentGateway,
   createAgentGatewayRoutes,
 } from './agent-gateway';
+
+// Channel Gateway (Telegram/WhatsApp listeners)
+export type { ChannelGatewayConfig, IncomingMessageHandler } from './gateway';
+export {
+  ChannelGateway,
+  getChannelGateway,
+  createChannelGateway,
+} from './gateway';

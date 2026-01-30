@@ -3,10 +3,16 @@
  * PCP Server - Personal Context Protocol
  *
  * Main entry point that orchestrates:
+ * - MCP Server with integrated ChannelGateway (Telegram/WhatsApp)
  * - Session Host with persistent Claude Code backend
- * - Telegram listener for incoming messages
- * - Response routing via MCP send_response tool
+ * - Response routing via MCP send_response tool (direct, no HTTP round-trip)
  * - Session persistence to Supabase
+ *
+ * Architecture:
+ * - MCP Server owns the ChannelGateway (central channel management)
+ * - ChannelGateway handles all Telegram/WhatsApp listeners
+ * - Session Host processes messages and manages AI backend
+ * - send_response tool routes directly through ChannelGateway
  *
  * Run: npx tsx src/server.ts
  *      yarn server
@@ -14,15 +20,11 @@
 
 import path from 'path';
 import { getDataComposer } from './data/composer';
-import { createTelegramListener, TelegramListener } from './channels/telegram-listener';
-import { createWhatsAppListener, WhatsAppListener } from './channels/whatsapp-listener';
 import { getAgentGateway, type TriggerCallback } from './channels/agent-gateway';
 import { createSessionHost, SessionHost } from './agent';
-import { createMCPServer, MCPServer, setWhatsAppListener } from './mcp/server';
-import { setTelegramListener } from './mcp/tools';
+import { createMCPServer, MCPServer, type IncomingMessageHandler } from './mcp/server';
 import { logger } from './utils/logger';
 import { env } from './config/env';
-import telegramifyMarkdown from 'telegramify-markdown';
 
 // Server configuration
 interface ServerConfig {
@@ -52,49 +54,8 @@ interface ServerConfig {
 
 // Global state
 let sessionHost: SessionHost | null = null;
-let telegramListener: TelegramListener | null = null;
-let whatsappListener: WhatsAppListener | null = null;
 let mcpServer: MCPServer | null = null;
 let isShuttingDown = false;
-
-// Typing indicator management - keeps indicator alive during processing
-const activeTypingIntervals: Map<string, NodeJS.Timeout> = new Map();
-const TYPING_INTERVAL_MS = 4000; // Telegram typing expires after ~5s
-
-function startTypingIndicator(conversationId: string, channel: 'telegram' | 'whatsapp' = 'telegram'): void {
-  // Clear any existing interval for this conversation
-  stopTypingIndicator(conversationId);
-
-  // Send immediately
-  if (channel === 'telegram' && telegramListener) {
-    telegramListener.sendTypingIndicator(conversationId);
-  } else if (channel === 'whatsapp' && whatsappListener) {
-    whatsappListener.sendTypingIndicator(conversationId);
-  }
-
-  // Then send every 4 seconds
-  const interval = setInterval(() => {
-    if (channel === 'telegram' && telegramListener) {
-      telegramListener.sendTypingIndicator(conversationId);
-      logger.debug(`Refreshed typing indicator for ${conversationId}`);
-    } else if (channel === 'whatsapp' && whatsappListener) {
-      whatsappListener.sendTypingIndicator(conversationId);
-      logger.debug(`Refreshed typing indicator for ${conversationId}`);
-    }
-  }, TYPING_INTERVAL_MS);
-
-  activeTypingIntervals.set(conversationId, interval);
-  logger.debug(`Started typing indicator interval for ${conversationId}`);
-}
-
-function stopTypingIndicator(conversationId: string): void {
-  const interval = activeTypingIntervals.get(conversationId);
-  if (interval) {
-    clearInterval(interval);
-    activeTypingIntervals.delete(conversationId);
-    logger.debug(`Stopped typing indicator interval for ${conversationId}`);
-  }
-}
 
 /**
  * Start the PCP server
@@ -121,33 +82,10 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   const dataComposer = await getDataComposer();
   logger.info('Data layer ready');
 
-  // 2. Start MCP server in HTTP mode (for Claude Code to connect)
-  logger.info('Starting MCP server...');
-  mcpServer = await createMCPServer(dataComposer);
-  // Force HTTP mode for the PCP server
-  const originalTransport = env.MCP_TRANSPORT;
-  (env as { MCP_TRANSPORT: string }).MCP_TRANSPORT = 'http';
-  await mcpServer.start();
-  (env as { MCP_TRANSPORT: string }).MCP_TRANSPORT = originalTransport;
-  logger.info(`MCP server ready on port ${env.MCP_HTTP_PORT}`);
-
-  // 3. Create Telegram listener (but don't start yet)
-  if (env.TELEGRAM_BOT_TOKEN) {
-    logger.info('Creating Telegram listener...');
-    telegramListener = createTelegramListener({
-      pollingInterval: config.telegramPollingInterval || 1000,
-      allowedChatIds: config.allowedTelegramChats,
-    });
-
-    // Register with MCP tools for chat context fetching
-    setTelegramListener(telegramListener);
-    logger.info('Telegram listener registered with MCP tools');
-  }
-
-  // 3. Build system prompt with PCP context
+  // 2. Build system prompt with PCP context
   const systemPrompt = buildSystemPrompt(config.systemPrompt);
 
-  // 4. Create Session Host with the appropriate backend
+  // 3. Create Session Host with the appropriate backend (but don't initialize yet)
   logger.info(`Creating Session Host with ${backend} backend...`);
   sessionHost = createSessionHost({
     dataComposer,
@@ -167,40 +105,11 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       },
       enableFailover: true,
     },
-    channels: {
-      ...(telegramListener ? {
-        telegram: {
-          sendMessage: async (conversationId, content, options) => {
-            // Auto-detect markdown syntax and convert for Telegram
-            // This handles cases where the AI uses markdown but doesn't set format='markdown'
-            const hasMarkdown = /\*\*.+?\*\*|\*.+?\*|`.+?`|^#{1,6}\s/m.test(content);
-
-            let parseMode: 'Markdown' | 'MarkdownV2' | 'HTML' | undefined;
-            let processedContent = content;
-
-            if (options?.format === 'markdown' || hasMarkdown) {
-              // Use telegramify-markdown to convert to Telegram MarkdownV2 format
-              // The library handles escaping and conversion properly
-              try {
-                processedContent = telegramifyMarkdown(content, 'escape');
-                parseMode = 'MarkdownV2';
-              } catch (err) {
-                // If conversion fails, send as plain text
-                logger.warn('Markdown conversion failed, sending as plain text:', err);
-                processedContent = content;
-                parseMode = undefined;
-              }
-            }
-
-            await telegramListener!.sendMessage(conversationId, processedContent, {
-              replyToMessageId: options?.replyToMessageId,
-              parseMode,
-            });
-          },
-        },
-      } : {}),
-      // WhatsApp channel will be added after listener is created
-    },
+    // Note: Channels are registered via ChannelGateway's response callback
+    // No need to manually register channel senders here
+    channels: {},
+    // Register trigger handlers for known agents (enables wake-up via trigger_agent)
+    registeredAgents: ['myra'],
   });
 
   // Forward session host events to console
@@ -218,10 +127,6 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
   sessionHost.on('response:sent', (response: { channel: string; conversationId: string }) => {
     logger.info(`Response sent to ${response.channel}:${response.conversationId}`);
-    // Stop typing indicator when response is sent
-    if (response.channel === 'telegram' || response.channel === 'whatsapp') {
-      stopTypingIndicator(response.conversationId);
-    }
   });
 
   sessionHost.on('response:unrouted', (response: { channel: string; content: string }) => {
@@ -231,205 +136,118 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     }
   });
 
-  // 5. Initialize the session host (starts the backend)
+  // 4. Create the incoming message handler
+  // This connects the ChannelGateway to the SessionHost
+  const messageHandler: IncomingMessageHandler = async (
+    channel,
+    conversationId,
+    sender,
+    content,
+    metadata
+  ) => {
+    // Resolve or create user based on channel
+    let userId: string | undefined = metadata?.userId;
+
+    if (!userId) {
+      try {
+        if (channel === 'telegram') {
+          const user = await resolveOrCreateUser(dataComposer, {
+            sender: { id: sender.id, name: sender.name },
+          });
+          userId = user?.id;
+        } else if (channel === 'whatsapp') {
+          const user = await resolveOrCreateWhatsAppUser(dataComposer, {
+            sender: { id: sender.id, name: sender.name },
+          });
+          userId = user?.id;
+        }
+      } catch (error) {
+        logger.error(`Failed to resolve user for ${channel}:${sender.id}`, error);
+      }
+    }
+
+    // Forward to session host
+    await sessionHost!.handleMessage(
+      channel,
+      conversationId,
+      sender,
+      content,
+      {
+        userId,
+        replyToMessageId: metadata?.replyToMessageId,
+        media: metadata?.media,
+        chatType: metadata?.chatType,
+        mentions: metadata?.mentions,
+      }
+    );
+  };
+
+  // 5. Start MCP server with ChannelGateway
+  // The gateway now owns Telegram/WhatsApp listeners and routes responses directly
+  logger.info('Starting MCP server with ChannelGateway...');
+  mcpServer = await createMCPServer(dataComposer, {
+    channelGateway: {
+      enableTelegram: !!env.TELEGRAM_BOT_TOKEN,
+      telegramPollingInterval: config.telegramPollingInterval || 1000,
+      allowedTelegramChats: config.allowedTelegramChats,
+      enableWhatsApp: config.enableWhatsApp ?? (process.env.ENABLE_WHATSAPP === 'true'),
+      whatsappAccountId: config.whatsappAccountId || 'default',
+      printWhatsAppQr: true,
+    },
+    messageHandler,
+  });
+
+  // Force HTTP mode for the PCP server
+  const originalTransport = env.MCP_TRANSPORT;
+  (env as { MCP_TRANSPORT: string }).MCP_TRANSPORT = 'http';
+  await mcpServer.start();
+  (env as { MCP_TRANSPORT: string }).MCP_TRANSPORT = originalTransport;
+  logger.info(`MCP server ready on port ${env.MCP_HTTP_PORT}`);
+
+  // 5b. Register ChannelGateway's send methods with SessionHost
+  // This allows send_response tool calls to route through the gateway
+  const gateway = mcpServer.getChannelGateway();
+  if (gateway) {
+    // Create channel sender adapters that wrap gateway.sendResponse
+    if (gateway.getStatus().telegram.enabled) {
+      sessionHost.registerChannel('telegram', {
+        sendMessage: async (conversationId, content, options) => {
+          await gateway.sendResponse({
+            channel: 'telegram',
+            conversationId,
+            content,
+            format: options?.format as 'text' | 'markdown' | 'code' | 'json' | undefined,
+            replyToMessageId: options?.replyToMessageId,
+          });
+        },
+      });
+    }
+    if (gateway.getStatus().whatsapp.enabled) {
+      sessionHost.registerChannel('whatsapp', {
+        sendMessage: async (conversationId, content, options) => {
+          await gateway.sendResponse({
+            channel: 'whatsapp',
+            conversationId,
+            content,
+            format: options?.format as 'text' | 'markdown' | 'code' | 'json' | undefined,
+            replyToMessageId: options?.replyToMessageId,
+          });
+        },
+      });
+    }
+    logger.info('ChannelGateway senders registered with SessionHost');
+  }
+
+  // 6. Initialize the session host (starts the backend)
   logger.info('Initializing Session Host (starting Claude Code)...');
   await sessionHost.initialize();
   logger.info('Session Host ready');
 
-  // 6. Register agent trigger handler (if configured)
+  // 7. Register agent trigger handler (if configured)
   if (config.agentId && config.onAgentTrigger) {
     const agentGateway = getAgentGateway();
     agentGateway.registerHandler(config.agentId, config.onAgentTrigger);
     logger.info(`Agent trigger handler registered for: ${config.agentId}`);
-  }
-
-  // 7. Start Telegram listener and wire up message handling
-  if (telegramListener) {
-    telegramListener.onMessage(async (message) => {
-      const senderId = message.sender.id || 'unknown';
-      const conversationId = message.conversationId || senderId;
-      const isGroupChat = message.chatType === 'group';
-      const botMentioned = message.mentions?.botMentioned ?? false;
-
-      logger.info(`Received message from @${message.sender.username || senderId}`, {
-        chatType: message.chatType,
-        botMentioned,
-        mentions: message.mentions?.users,
-      });
-
-      // In group chats, only respond if bot is mentioned
-      if (isGroupChat && !botMentioned) {
-        logger.debug('Skipping group message - bot not mentioned');
-        return;
-      }
-
-      // Start persistent typing indicator (refreshes every 4s until response is sent)
-      startTypingIndicator(conversationId);
-
-      try {
-        // Get or resolve user
-        const user = await resolveOrCreateUser(dataComposer, {
-          sender: {
-            id: senderId,
-            username: message.sender.username,
-            name: message.sender.name,
-          },
-        });
-
-        // Send to session host
-        await sessionHost!.handleMessage(
-          'telegram',
-          conversationId,
-          {
-            id: senderId,
-            name: message.sender.name || message.sender.username,
-          },
-          message.body,
-          {
-            userId: user?.id,
-            replyToMessageId: message.replyTo?.id,
-            media: message.media,
-            chatType: message.chatType,
-            mentions: message.mentions,
-          }
-        );
-      } catch (error) {
-        logger.error('Error handling Telegram message:', error);
-
-        // Stop typing indicator on error
-        stopTypingIndicator(conversationId);
-
-        // Send error response back to Telegram
-        try {
-          await telegramListener!.sendMessage(
-            conversationId,
-            'Sorry, I encountered an error processing your message. Please try again.'
-          );
-        } catch (sendError) {
-          logger.error('Failed to send error message:', sendError);
-        }
-      }
-    });
-
-    telegramListener.on('connected', (bot: { username: string }) => {
-      logger.info(`Telegram bot connected: @${bot.username}`);
-    });
-
-    telegramListener.on('error', (error: Error) => {
-      logger.error('Telegram listener error:', error);
-    });
-
-    await telegramListener.start();
-    logger.info('Telegram listener started');
-  } else {
-    logger.warn('TELEGRAM_BOT_TOKEN not set - Telegram listener disabled');
-  }
-
-  // 7. Create and start WhatsApp listener if enabled
-  const enableWhatsApp = config.enableWhatsApp ?? (process.env.ENABLE_WHATSAPP === 'true');
-  if (enableWhatsApp) {
-    logger.info('Creating WhatsApp listener...');
-    whatsappListener = createWhatsAppListener({
-      accountId: config.whatsappAccountId || 'default',
-      printQr: true,
-      onQr: (_qr) => {
-        logger.info('WhatsApp QR code ready for scanning');
-      },
-    });
-
-    // Register with admin routes for dashboard access
-    setWhatsAppListener(whatsappListener);
-    logger.info('WhatsApp listener registered with admin routes');
-
-    // Add WhatsApp channel to session host
-    if (sessionHost) {
-      sessionHost.registerChannel('whatsapp', {
-        sendMessage: async (conversationId: string, content: string) => {
-          await whatsappListener!.sendMessage(conversationId, content);
-        },
-      });
-    }
-
-    // Handle WhatsApp messages
-    whatsappListener.onMessage(async (message) => {
-      const senderId = message.sender.id || 'unknown';
-      const conversationId = message.conversationId || senderId;
-      const isGroupChat = message.chatType === 'group';
-      const botMentioned = message.mentions?.botMentioned ?? false;
-
-      logger.info(`Received WhatsApp message from ${message.sender.name || senderId}`, {
-        chatType: message.chatType,
-        botMentioned,
-      });
-
-      // In group chats, only respond if bot is mentioned
-      if (isGroupChat && !botMentioned) {
-        logger.debug('Skipping WhatsApp group message - bot not mentioned');
-        return;
-      }
-
-      // Start typing indicator
-      startTypingIndicator(conversationId, 'whatsapp');
-
-      try {
-        // Get or resolve user (WhatsApp uses phone numbers)
-        const user = await resolveOrCreateWhatsAppUser(dataComposer, {
-          sender: {
-            id: senderId,
-            name: message.sender.name,
-          },
-        });
-
-        // Send to session host
-        await sessionHost!.handleMessage(
-          'whatsapp',
-          conversationId,
-          {
-            id: senderId,
-            name: message.sender.name,
-          },
-          message.body,
-          {
-            userId: user?.id,
-            chatType: message.chatType,
-            mentions: message.mentions,
-          }
-        );
-      } catch (error) {
-        logger.error('Error handling WhatsApp message:', error);
-        stopTypingIndicator(conversationId);
-
-        try {
-          await whatsappListener!.sendMessage(
-            conversationId,
-            'Sorry, I encountered an error processing your message. Please try again.'
-          );
-        } catch (sendError) {
-          logger.error('Failed to send WhatsApp error message:', sendError);
-        }
-      }
-    });
-
-    whatsappListener.on('connected', (info: { jid: string; e164: string | null }) => {
-      logger.info(`WhatsApp connected: ${info.e164 || info.jid}`);
-    });
-
-    whatsappListener.on('qr', () => {
-      logger.info('WhatsApp QR code displayed - please scan with your phone');
-    });
-
-    whatsappListener.on('loggedOut', () => {
-      logger.warn('WhatsApp logged out - please re-scan QR code');
-    });
-
-    whatsappListener.on('error', (error: Error) => {
-      logger.error('WhatsApp listener error:', error);
-    });
-
-    await whatsappListener.start();
-    logger.info('WhatsApp listener started');
-  } else {
-    logger.info('WhatsApp listener disabled (set ENABLE_WHATSAPP=true to enable)');
   }
 
   // 8. Print status
@@ -441,9 +259,12 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   logger.info('PCP Server is running');
   logger.info('='.repeat(60));
   logger.info('');
+
+  const status = gateway?.getStatus();
   const enabledChannels: string[] = [];
-  if (telegramListener) enabledChannels.push('Telegram');
-  if (whatsappListener) enabledChannels.push('WhatsApp');
+  if (status?.telegram.enabled) enabledChannels.push('Telegram');
+  if (status?.whatsapp.enabled) enabledChannels.push('WhatsApp');
+
   if (enabledChannels.length > 0) {
     logger.info(`Send a message via ${enabledChannels.join(' or ')} to start a conversation.`);
   } else {
@@ -555,7 +376,7 @@ You also have access to Supabase MCP tools for direct database operations.
 }
 
 /**
- * Resolve or create a user from an incoming message
+ * Resolve or create a user from an incoming Telegram message
  */
 async function resolveOrCreateUser(
   dataComposer: Awaited<ReturnType<typeof getDataComposer>>,
@@ -581,32 +402,6 @@ async function resolveOrCreateUser(
     logger.error('Failed to resolve user:', error);
     return null;
   }
-}
-
-/**
- * Print server status
- */
-function printStatus(): void {
-  if (!sessionHost) return;
-
-  const health = sessionHost.getHealth();
-  const sessionId = sessionHost.getSessionId();
-
-  logger.info('');
-  logger.info('='.repeat(60));
-  logger.info('Session Status');
-  logger.info('='.repeat(60));
-  logger.info(`  Backend: ${Object.keys(health.backend).find(k => health.backend[k as keyof typeof health.backend]?.healthy) || 'none'}`);
-  logger.info(`  Session ID: ${sessionId || 'none'}`);
-  logger.info(`  Channels: ${health.channels.join(', ') || 'none'}`);
-
-  if (sessionId) {
-    logger.info('');
-    logger.info('To attach to this session from another terminal:');
-    logger.info(`  claude --resume ${sessionId}`);
-  }
-
-  logger.info('='.repeat(60));
 }
 
 /**
@@ -641,6 +436,32 @@ async function resolveOrCreateWhatsAppUser(
 }
 
 /**
+ * Print server status
+ */
+function printStatus(): void {
+  if (!sessionHost) return;
+
+  const health = sessionHost.getHealth();
+  const sessionId = sessionHost.getSessionId();
+
+  logger.info('');
+  logger.info('='.repeat(60));
+  logger.info('Session Status');
+  logger.info('='.repeat(60));
+  logger.info(`  Backend: ${Object.keys(health.backend).find(k => health.backend[k as keyof typeof health.backend]?.healthy) || 'none'}`);
+  logger.info(`  Session ID: ${sessionId || 'none'}`);
+  logger.info(`  Channels: ${health.channels.join(', ') || 'via ChannelGateway'}`);
+
+  if (sessionId) {
+    logger.info('');
+    logger.info('To attach to this session from another terminal:');
+    logger.info(`  claude --resume ${sessionId}`);
+  }
+
+  logger.info('='.repeat(60));
+}
+
+/**
  * Graceful shutdown
  */
 async function shutdown(): Promise<void> {
@@ -649,25 +470,13 @@ async function shutdown(): Promise<void> {
 
   logger.info('\nShutting down PCP Server...');
 
-  // Stop Telegram listener
-  if (telegramListener) {
-    await telegramListener.stop();
-    logger.info('Telegram listener stopped');
-  }
-
-  // Stop WhatsApp listener
-  if (whatsappListener) {
-    await whatsappListener.stop();
-    logger.info('WhatsApp listener stopped');
-  }
-
   // Shutdown session host
   if (sessionHost) {
     await sessionHost.shutdown();
     logger.info('Session host stopped');
   }
 
-  // Shutdown MCP server
+  // Shutdown MCP server (includes ChannelGateway shutdown)
   if (mcpServer) {
     await mcpServer.shutdown();
     logger.info('MCP server stopped');

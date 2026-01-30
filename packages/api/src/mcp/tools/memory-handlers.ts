@@ -11,6 +11,7 @@ import * as os from 'os';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
+import { setSessionContext } from '../../utils/request-context';
 import type { MemorySource, Salience } from '../../data/models/memory';
 
 // Helper to safely read a file, returning null if it doesn't exist
@@ -728,6 +729,13 @@ export async function handleRestoreMemory(args: unknown, dataComposer: DataCompo
 export async function handleBootstrap(args: unknown, dataComposer: DataComposer) {
   const params = bootstrapSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
+
+  // Set session context so subsequent MCP tool calls can use this user
+  setSessionContext({
+    userId: user.id,
+    email: user.email || undefined,
+    agentId: params.agentId,
+  });
 
   const includeMemories = params.includeRecentMemories !== false;
   const memoryLimit = params.memoryLimit || 5;

@@ -8,12 +8,20 @@ import { MCP_SERVER_NAME, MCP_SERVER_VERSION } from '../config/constants';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import type { DataComposer } from '../data/composer';
-import { registerAllTools, setMiniAppsRegistry } from './tools';
+import { registerAllTools, setMiniAppsRegistry, setTelegramListener } from './tools';
 import { loadMiniApps, registerMiniAppTools, getMiniAppsInfo } from '../mini-apps';
 import adminRouter, { setWhatsAppListener } from '../routes/admin';
 import agentTriggerRouter, { getAgentGateway } from '../routes/agent-trigger';
+import { ChannelGateway, createChannelGateway, type ChannelGatewayConfig, type IncomingMessageHandler } from '../channels/gateway';
 
 export { setWhatsAppListener, getAgentGateway };
+
+export interface MCPServerConfig {
+  /** Channel gateway configuration */
+  channelGateway?: ChannelGatewayConfig;
+  /** Handler for incoming messages from channels */
+  messageHandler?: IncomingMessageHandler;
+}
 
 export class MCPServer {
   private server: McpServer;
@@ -22,9 +30,12 @@ export class MCPServer {
   private sseTransport: SSEServerTransport | null = null;
   private miniAppsInfo: Array<{ name: string; version: string; description: string; triggers: string[]; functions: string[] }> = [];
   private toolsVersion = 0; // Incremented when tools change
+  private channelGateway: ChannelGateway | null = null;
+  private config: MCPServerConfig;
 
-  constructor(dataComposer: DataComposer) {
+  constructor(dataComposer: DataComposer, config: MCPServerConfig = {}) {
     this.dataComposer = dataComposer;
+    this.config = config;
 
     // Create MCP server instance using the high-level McpServer API
     this.server = new McpServer({
@@ -140,6 +151,27 @@ export class MCPServer {
       });
     });
 
+    // Register endpoint for MCP OAuth Dynamic Client Registration
+    // Claude Code expects OAuth 2.0 DCR response format
+    app.post('/register', express.json(), (req, res) => {
+      logger.info('MCP /register called', { body: req.body });
+
+      // Generate a client ID (or use one from the request)
+      const clientId = req.body.client_id || `pcp-client-${Date.now()}`;
+
+      // Return OAuth 2.0 Dynamic Client Registration response
+      res.json({
+        client_id: clientId,
+        client_secret: 'pcp-local-secret', // For local development
+        redirect_uris: req.body.redirect_uris || ['http://localhost:3001/callback'],
+        token_endpoint_auth_method: 'client_secret_post',
+        grant_types: ['authorization_code', 'refresh_token'],
+        response_types: ['code'],
+        client_name: req.body.client_name || 'Claude Code MCP Client',
+        scope: 'mcp:tools',
+      });
+    });
+
     // Admin API routes (for web dashboard)
     app.use(express.json());
     app.use('/api/admin', adminRouter);
@@ -172,6 +204,62 @@ export class MCPServer {
       logger.info(`SSE endpoint: http://localhost:${port}/sse`);
       logger.info(`Message endpoint: http://localhost:${port}/message`);
     });
+
+    // Initialize and start the channel gateway only if a message handler is configured
+    // This allows running MCP Server standalone (for tools only) without starting listeners
+    if (this.config.messageHandler) {
+      await this.startChannelGateway();
+    } else {
+      logger.info('ChannelGateway not started (no messageHandler configured)');
+    }
+  }
+
+  /**
+   * Initialize and start the channel gateway
+   * This is the central point for all messaging channels
+   */
+  private async startChannelGateway(): Promise<void> {
+    logger.info('Initializing ChannelGateway...');
+
+    this.channelGateway = createChannelGateway(this.config.channelGateway || {});
+
+    // Register message handler if provided
+    if (this.config.messageHandler) {
+      this.channelGateway.setMessageHandler(this.config.messageHandler);
+    }
+
+    // Register listeners with admin routes and MCP tools
+    // This is done before start() so the listeners are available immediately after creation
+    this.channelGateway.on('telegram:connected', () => {
+      const listener = this.channelGateway?.getTelegramListener();
+      if (listener) {
+        setTelegramListener(listener);
+        logger.info('Telegram listener registered with MCP tools');
+      }
+    });
+
+    this.channelGateway.on('whatsapp:connected', () => {
+      const listener = this.channelGateway?.getWhatsAppListener();
+      if (listener) {
+        setWhatsAppListener(listener);
+        logger.info('WhatsApp listener registered with admin routes');
+      }
+    });
+
+    await this.channelGateway.start();
+
+    // Register listeners immediately after start (even before connected events)
+    const telegramListener = this.channelGateway.getTelegramListener();
+    if (telegramListener) {
+      setTelegramListener(telegramListener);
+    }
+
+    const whatsAppListener = this.channelGateway.getWhatsAppListener();
+    if (whatsAppListener) {
+      setWhatsAppListener(whatsAppListener);
+    }
+
+    logger.info('ChannelGateway started', this.channelGateway.getStatus());
   }
 
   /**
@@ -187,7 +275,13 @@ export class MCPServer {
   async shutdown(): Promise<void> {
     logger.info('Shutting down MCP server...');
 
-    // Close the MCP server first (this closes the SSE transport)
+    // Stop channel gateway first (stops Telegram/WhatsApp listeners)
+    if (this.channelGateway) {
+      await this.channelGateway.stop();
+      this.channelGateway = null;
+    }
+
+    // Close the MCP server (this closes the SSE transport)
     try {
       await this.server.close();
       this.sseTransport = null;
@@ -206,6 +300,13 @@ export class MCPServer {
     }
 
     logger.info('MCP server shut down');
+  }
+
+  /**
+   * Get the channel gateway instance
+   */
+  getChannelGateway(): ChannelGateway | null {
+    return this.channelGateway;
   }
 
   /**
@@ -258,6 +359,8 @@ export class MCPServer {
   }
 }
 
-export async function createMCPServer(dataComposer: DataComposer): Promise<MCPServer> {
-  return new MCPServer(dataComposer);
+export async function createMCPServer(dataComposer: DataComposer, config?: MCPServerConfig): Promise<MCPServer> {
+  return new MCPServer(dataComposer, config);
 }
+
+export { ChannelGateway, type ChannelGatewayConfig, type IncomingMessageHandler };
