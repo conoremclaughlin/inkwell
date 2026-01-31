@@ -18,6 +18,13 @@ import {
   BookOpen,
   Wrench,
   Filter,
+  Download,
+  Github,
+  FolderPlus,
+  ExternalLink,
+  Copy,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 import { useApiQuery, apiPost } from '@/lib/api';
 import { useQueryClient } from '@tanstack/react-query';
@@ -121,11 +128,47 @@ function CapabilityBadge({ name, enabled }: { name: string; enabled?: boolean })
   );
 }
 
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    await navigator.clipboard.writeText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <button
+      onClick={handleCopy}
+      className="p-1 rounded hover:bg-gray-700 transition-colors"
+      title="Copy to clipboard"
+    >
+      {copied ? (
+        <CheckCircle className="h-4 w-4 text-green-400" />
+      ) : (
+        <Copy className="h-4 w-4 text-gray-400" />
+      )}
+    </button>
+  );
+}
+
+function CodeBlock({ children }: { children: string }) {
+  return (
+    <div className="relative bg-gray-900 rounded-lg p-3 font-mono text-sm text-gray-100 overflow-x-auto">
+      <div className="absolute top-2 right-2">
+        <CopyButton text={children} />
+      </div>
+      <pre className="pr-8">{children}</pre>
+    </div>
+  );
+}
+
 export default function SkillsPage() {
   const queryClient = useQueryClient();
   const [searchQuery, setSearchQuery] = useState('');
   const [typeFilter, setTypeFilter] = useState<SkillType | 'all'>('all');
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [showAddSkills, setShowAddSkills] = useState(false);
 
   const { data, isLoading, error, refetch } = useApiQuery<SkillsListResponse>(
     ['skills', typeFilter, searchQuery],
@@ -286,10 +329,20 @@ export default function SkillsPage() {
         <Card className="mt-6">
           <CardContent className="p-8 text-center">
             <Puzzle className="h-12 w-12 mx-auto text-gray-300 mb-3" />
-            <p className="text-gray-500">No skills found.</p>
-            <p className="text-sm text-gray-400 mt-1">
-              Skills are loaded from ~/.pcp/skills/ and the built-in directory.
+            <p className="text-gray-500 font-medium">No skills found</p>
+            <p className="text-sm text-gray-400 mt-1 mb-4">
+              Get started by adding skills to <code className="bg-gray-100 px-1 rounded">~/.pcp/skills/</code>
             </p>
+            <div className="flex justify-center gap-3">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setShowAddSkills(true)}
+              >
+                <FolderPlus className="mr-2 h-4 w-4" />
+                Learn How
+              </Button>
+            </div>
           </CardContent>
         </Card>
       ) : (
@@ -408,6 +461,155 @@ export default function SkillsPage() {
           ))}
         </div>
       )}
+
+      {/* How to Add Skills */}
+      <Card className="mt-6">
+        <CardHeader
+          className="cursor-pointer"
+          onClick={() => setShowAddSkills(!showAddSkills)}
+        >
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <FolderPlus className="h-5 w-5 text-gray-400" />
+              <CardTitle className="text-lg">How to Add Skills</CardTitle>
+            </div>
+            {showAddSkills ? (
+              <ChevronUp className="h-5 w-5 text-gray-400" />
+            ) : (
+              <ChevronDown className="h-5 w-5 text-gray-400" />
+            )}
+          </div>
+          <CardDescription>
+            Learn how to install skills from registries or create your own
+          </CardDescription>
+        </CardHeader>
+        {showAddSkills && (
+          <CardContent className="space-y-6">
+            {/* Skill Locations */}
+            <div>
+              <h4 className="font-medium text-gray-900 mb-2">Skill Locations</h4>
+              <p className="text-sm text-gray-600 mb-3">
+                Skills are automatically loaded from these directories:
+              </p>
+              <div className="space-y-2">
+                <div className="flex items-start gap-3 p-3 bg-gray-50 rounded-lg">
+                  <Folder className="h-5 w-5 text-blue-500 shrink-0 mt-0.5" />
+                  <div>
+                    <code className="text-sm font-mono text-gray-800">~/.pcp/skills/</code>
+                    <p className="text-xs text-gray-500 mt-1">Your custom and downloaded skills</p>
+                  </div>
+                </div>
+                <div className="flex items-start gap-3 p-3 bg-gray-50 rounded-lg">
+                  <Folder className="h-5 w-5 text-purple-500 shrink-0 mt-0.5" />
+                  <div>
+                    <code className="text-sm font-mono text-gray-800">Built-in skills</code>
+                    <p className="text-xs text-gray-500 mt-1">Ships with PCP, updated via releases</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Installation Methods */}
+            <div>
+              <h4 className="font-medium text-gray-900 mb-2">Installation Methods</h4>
+              <div className="grid md:grid-cols-2 gap-4">
+                {/* From GitHub */}
+                <div className="border rounded-lg p-4">
+                  <div className="flex items-center gap-2 mb-3">
+                    <Github className="h-5 w-5" />
+                    <span className="font-medium">From GitHub</span>
+                  </div>
+                  <p className="text-sm text-gray-600 mb-3">
+                    Clone a skill repository directly:
+                  </p>
+                  <CodeBlock>{`cd ~/.pcp/skills
+git clone https://github.com/user/skill-name`}</CodeBlock>
+                </div>
+
+                {/* Single File */}
+                <div className="border rounded-lg p-4">
+                  <div className="flex items-center gap-2 mb-3">
+                    <Download className="h-5 w-5" />
+                    <span className="font-medium">Single File</span>
+                  </div>
+                  <p className="text-sm text-gray-600 mb-3">
+                    Download a SKILL.md file directly:
+                  </p>
+                  <CodeBlock>{`curl -o ~/.pcp/skills/my-skill.md \\
+  https://example.com/SKILL.md`}</CodeBlock>
+                </div>
+              </div>
+            </div>
+
+            {/* Create Your Own */}
+            <div>
+              <h4 className="font-medium text-gray-900 mb-2">Create Your Own</h4>
+              <p className="text-sm text-gray-600 mb-3">
+                Skills are markdown files with YAML frontmatter. Here's a minimal example:
+              </p>
+              <CodeBlock>{`# ~/.pcp/skills/my-skill.md
+---
+name: my-skill
+version: "1.0.0"
+displayName: My Custom Skill
+description: What this skill does
+type: guide
+category: custom
+triggers:
+  keywords:
+    - my skill
+    - activate
+---
+
+# My Custom Skill
+
+Instructions for the AI assistant...`}</CodeBlock>
+            </div>
+
+            {/* Skill Types */}
+            <div>
+              <h4 className="font-medium text-gray-900 mb-2">Skill Types</h4>
+              <div className="grid md:grid-cols-3 gap-3">
+                <div className="flex items-start gap-2 p-3 bg-purple-50 rounded-lg">
+                  <Code className="h-5 w-5 text-purple-600 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-medium text-purple-900">Mini App</span>
+                    <p className="text-xs text-purple-700 mt-1">
+                      Code-based skills with functions (bill splitting, calculations)
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-start gap-2 p-3 bg-blue-50 rounded-lg">
+                  <Terminal className="h-5 w-5 text-blue-600 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-medium text-blue-900">CLI Tool</span>
+                    <p className="text-xs text-blue-700 mt-1">
+                      Wrappers for command-line tools (gh, aws, docker)
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-start gap-2 p-3 bg-green-50 rounded-lg">
+                  <BookOpen className="h-5 w-5 text-green-600 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-medium text-green-900">Guide</span>
+                    <p className="text-xs text-green-700 mt-1">
+                      Behavioral instructions (group chat etiquette, meeting notes)
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* After Adding */}
+            <div className="flex items-center gap-2 p-3 bg-blue-50 rounded-lg">
+              <RefreshCw className="h-5 w-5 text-blue-600 shrink-0" />
+              <p className="text-sm text-blue-800">
+                After adding skills, click <strong>Refresh</strong> above to reload the skill list.
+              </p>
+            </div>
+          </CardContent>
+        )}
+      </Card>
     </div>
   );
 }
