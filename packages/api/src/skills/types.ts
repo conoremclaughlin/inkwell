@@ -252,3 +252,177 @@ export interface SkillsListResponse {
   categories: string[];
   totalCount: number;
 }
+
+// ============================================================================
+// Cloud/Database Types
+// ============================================================================
+
+/**
+ * Skill record from the database (skills table)
+ */
+export interface DbSkill {
+  id: string;
+  name: string;
+  displayName: string;
+  description: string;
+  type: SkillType;
+  category: string | null;
+  tags: string[];
+  emoji: string | null;
+  currentVersion: string;
+  manifest: SkillManifest;
+  content: string;
+  author: string | null;
+  authorUserId: string | null;
+  repositoryUrl: string | null;
+  homepageUrl: string | null;
+  isOfficial: boolean;
+  isPublic: boolean;
+  isVerified: boolean;
+  installCount: number;
+  createdAt: string;
+  updatedAt: string;
+  publishedAt: string | null;
+}
+
+/**
+ * Skill version record from the database (skill_versions table)
+ */
+export interface DbSkillVersion {
+  id: string;
+  skillId: string;
+  version: string;
+  manifest: SkillManifest;
+  content: string;
+  changelog: string | null;
+  publishedBy: string | null;
+  publishedAt: string;
+}
+
+/**
+ * Skill installation record from the database (skill_installations table)
+ */
+export interface DbSkillInstallation {
+  id: string;
+  userId: string;
+  skillId: string;
+  versionPinned: string | null;
+  enabled: boolean;
+  config: Record<string, unknown>;
+  installedAt: string;
+  lastUsedAt: string | null;
+  usageCount: number;
+}
+
+/**
+ * Joined view of user's installed skills with resolved content
+ */
+export interface UserInstalledSkill {
+  installationId: string;
+  userId: string;
+  enabled: boolean;
+  userConfig: Record<string, unknown>;
+  versionPinned: string | null;
+  installedAt: string;
+  lastUsedAt: string | null;
+  usageCount: number;
+  skillId: string;
+  name: string;
+  displayName: string;
+  description: string;
+  type: SkillType;
+  category: string | null;
+  tags: string[];
+  emoji: string | null;
+  currentVersion: string;
+  manifest: SkillManifest;
+  content: string;
+  isOfficial: boolean;
+  isVerified: boolean;
+  author: string | null;
+  repositoryUrl: string | null;
+  resolvedContent: string;
+  resolvedManifest: SkillManifest;
+  resolvedVersion: string;
+}
+
+// ============================================================================
+// Cloud API Types
+// ============================================================================
+
+/**
+ * Options for listing skills from the registry
+ */
+export interface ListRegistrySkillsOptions {
+  type?: SkillType;
+  category?: string;
+  search?: string;
+  isOfficial?: boolean;
+  limit?: number;
+  offset?: number;
+}
+
+/**
+ * Options for installing a skill
+ */
+export interface InstallSkillOptions {
+  skillId: string;
+  userId: string;
+  versionPinned?: string;
+  config?: Record<string, unknown>;
+}
+
+/**
+ * Options for publishing a skill to the registry
+ */
+export interface PublishSkillOptions {
+  name: string;
+  displayName: string;
+  description: string;
+  type: SkillType;
+  category?: string;
+  tags?: string[];
+  emoji?: string;
+  version: string;
+  manifest: Partial<SkillManifest>;
+  content: string;
+  authorUserId?: string;
+  repositoryUrl?: string;
+  isPublic?: boolean;
+}
+
+/**
+ * Registry skill summary for browsing
+ */
+export interface RegistrySkillSummary {
+  id: string;
+  name: string;
+  displayName: string;
+  description: string;
+  type: SkillType;
+  category: string | null;
+  tags: string[];
+  emoji: string | null;
+  currentVersion: string;
+  author: string | null;
+  isOfficial: boolean;
+  isVerified: boolean;
+  installCount: number;
+  /** Whether the current user has this installed */
+  isInstalled?: boolean;
+}
+
+/**
+ * Full registry skill detail
+ */
+export interface RegistrySkillDetail extends RegistrySkillSummary {
+  manifest: SkillManifest;
+  content: string;
+  repositoryUrl: string | null;
+  homepageUrl: string | null;
+  versions: Array<{
+    version: string;
+    publishedAt: string;
+    changelog: string | null;
+  }>;
+}

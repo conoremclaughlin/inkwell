@@ -232,12 +232,104 @@ Supported install kinds:
 - `cargo` - Rust packages
 - `manual` - Manual installation with instructions
 
-## Skill Registries (Future)
+## Cloud Skills Registry
 
-We're planning official skill registries:
+PCP supports cloud-based skill storage and distribution:
 
-- **PCP Hub**: Curated, verified skills
-- **Community**: User-submitted skills
-- **Organization**: Private team skills
+### Architecture
 
-Stay tuned for updates!
+```
+┌─────────────────────┐         ┌──────────────────────┐
+│      skills         │         │  skill_installations │
+│   (Registry/Hub)    │◄────────│   (User References)  │
+├─────────────────────┤    FK   ├──────────────────────┤
+│ All available       │         │ Which skills each    │
+│ skills (official +  │         │ user has "installed" │
+│ community)          │         │ (references, not     │
+│                     │         │  copies)             │
+└─────────────────────┘         └──────────────────────┘
+          │
+          ▼
+┌─────────────────────┐
+│   skill_versions    │
+│  (Version History)  │
+├─────────────────────┤
+│ Enables rollback    │
+│ and version pinning │
+└─────────────────────┘
+```
+
+### Key Tables
+
+- **`skills`** - Central registry of all available skills
+- **`skill_versions`** - Version history for each skill
+- **`skill_installations`** - User's installed skill references
+
+### Loading Order
+
+1. **Local skills** (`~/.pcp/skills/`) - Always loaded first
+2. **Cloud installations** - User's installed skills from registry
+3. **Deduplication** - Local skills take precedence over cloud
+
+### User Installation Flow
+
+```typescript
+// Browse the registry
+const { skills } = await cloudService.browseRegistry({ category: 'finance' });
+
+// Install a skill (creates reference, not copy)
+await cloudService.installSkill({
+  skillId: 'uuid-of-bill-split',
+  userId: 'user-uuid',
+});
+
+// On bootstrap, get all user's skills
+const allSkills = await cloudService.loadUserSkills(userId);
+// Returns merged local + cloud skills
+```
+
+### Version Pinning
+
+Users can pin to specific versions:
+
+```typescript
+// Pin to version 1.2.3
+await cloudService.pinSkillVersion(installationId, userId, '1.2.3');
+
+// Follow latest (default)
+await cloudService.pinSkillVersion(installationId, userId, null);
+```
+
+### Publishing Skills
+
+```typescript
+await cloudService.publishSkill({
+  name: 'my-skill',
+  displayName: 'My Skill',
+  description: 'What it does',
+  type: 'guide',
+  version: '1.0.0',
+  content: '# My Skill\n\nInstructions...',
+  manifest: { triggers: { keywords: ['my skill'] } },
+  authorUserId: 'uuid',
+  isPublic: true,
+});
+```
+
+### Migration
+
+Apply the skills registry migration:
+
+```bash
+# Via Supabase CLI
+supabase db push
+
+# Or via MCP tool
+mcp__supabase__apply_migration
+```
+
+## Future: Skill Registries
+
+- **PCP Hub**: Curated, verified official skills
+- **Community**: User-submitted public skills
+- **Organization**: Private team skill collections

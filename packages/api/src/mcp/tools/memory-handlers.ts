@@ -13,6 +13,7 @@ import { logger } from '../../utils/logger';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
 import { setSessionContext } from '../../utils/request-context';
 import type { MemorySource, Salience } from '../../data/models/memory';
+import { getCloudSkillsService } from '../../skills/cloud-service';
 
 // Helper to safely read a file, returning null if it doesn't exist
 async function safeReadFile(filePath: string): Promise<string | null> {
@@ -774,8 +775,10 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     };
   }
 
-  // Fetch all context in parallel (including timezone)
-  const [contexts, projects, focus, activeSession, recentMemories, dbIdentity, userTimezone] = await Promise.all([
+  // Fetch all context in parallel (including timezone and skills)
+  const cloudSkillsService = getCloudSkillsService(dataComposer.getClient());
+
+  const [contexts, projects, focus, activeSession, recentMemories, dbIdentity, userTimezone, userSkills] = await Promise.all([
     // Identity Core: all context summaries
     dataComposer.repositories.context.findAllByUser(user.id),
     // Active projects
@@ -810,6 +813,11 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
       .eq('id', user.id)
       .single()
       .then(({ data }) => data?.timezone || 'UTC'),
+    // User's installed skills (local + cloud merged)
+    cloudSkillsService.loadUserSkills(user.id).catch((err) => {
+      logger.warn('Failed to load user skills:', err);
+      return [];
+    }),
   ]);
 
   // Organize contexts by type
@@ -870,6 +878,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     contextCount: contexts.length,
     projectCount: projects.length,
     memoryCount: recentMemories.length,
+    skillCount: userSkills.length,
     hasActiveSession: !!activeSession,
     hasIdentityFiles: !!identityFiles,
     hasDbIdentity: !!dbIdentity,
@@ -978,6 +987,18 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 
             // Reflection status - prompt for periodic self-reflection
             reflectionStatus,
+
+            // User's installed skills (local + cloud merged)
+            // Use these to understand what capabilities are available
+            skills: userSkills.map((skill) => ({
+              name: skill.manifest.name,
+              displayName: skill.manifest.displayName || skill.manifest.name,
+              type: skill.manifest.type,
+              description: skill.manifest.description,
+              triggers: skill.manifest.triggers?.keywords || [],
+              eligible: skill.eligibility.eligible,
+              eligibilityMessage: skill.eligibility.message,
+            })),
           },
           null,
           2
