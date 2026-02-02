@@ -62,6 +62,19 @@ import {
   handleGetSkill,
 } from './skill-handlers';
 
+import {
+  handlePublishSkill,
+  handleUpdateSkill,
+  handleForkSkill,
+  handleDeprecateSkill,
+  handleDeleteSkill,
+  publishSkillSchema,
+  updateSkillSchema,
+  forkSkillSchema,
+  deprecateSkillSchema,
+  deleteSkillSchema,
+} from './skill-management-handlers';
+
 import { registerMiniAppRecordTools } from './mini-app-records';
 
 import {
@@ -1205,6 +1218,128 @@ The skill document contains:
         return await handleGetSkill(args as Parameters<typeof handleGetSkill>[0], dataComposer);
       } catch (error) {
         logger.error('Error in get_skill:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // SKILL MANAGEMENT TOOLS (publish, update, fork, deprecate)
+  // =====================================================
+
+  server.registerTool(
+    'publish_skill',
+    {
+      description: `Publish a new skill to the registry. Skills are versioned and can be installed by users.
+
+Types:
+- mini-app: Code-based skills with functions (e.g., bill-split)
+- cli: External CLI tool wrappers
+- guide: Markdown guides for specific situations
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: publishSkillSchema,
+    },
+    async (args) => {
+      try {
+        return await handlePublishSkill(args as Record<string, unknown>, dataComposer);
+      } catch (error) {
+        logger.error('Error in publish_skill:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'update_skill',
+    {
+      description: `Update an existing skill with a new version. Requires version bump.
+
+Only the skill author can update their skills. Official skills require admin permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: updateSkillSchema,
+    },
+    async (args) => {
+      try {
+        return await handleUpdateSkill(args as Record<string, unknown>, dataComposer);
+      } catch (error) {
+        logger.error('Error in update_skill:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'fork_skill',
+    {
+      description: `Fork an existing public skill to create your own copy. The fork becomes owned by you and can diverge independently.
+
+Use this to customize existing skills or start from a working template.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: forkSkillSchema,
+    },
+    async (args) => {
+      try {
+        return await handleForkSkill(args as Record<string, unknown>, dataComposer);
+      } catch (error) {
+        logger.error('Error in fork_skill:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'deprecate_skill',
+    {
+      description: `Mark a skill as deprecated. Deprecated skills remain visible but show a warning. Use for skills being replaced or no longer maintained.
+
+Include a message with migration guidance when possible.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: deprecateSkillSchema,
+    },
+    async (args) => {
+      try {
+        return await handleDeprecateSkill(args as Record<string, unknown>, dataComposer);
+      } catch (error) {
+        logger.error('Error in deprecate_skill:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'delete_skill',
+    {
+      description: `Soft-delete a skill. The skill will be marked as deleted and hidden from the registry.
+
+Only the skill author can delete their skills. Official skills require admin permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: deleteSkillSchema,
+    },
+    async (args) => {
+      try {
+        return await handleDeleteSkill(args as Record<string, unknown>, dataComposer);
+      } catch (error) {
+        logger.error('Error in delete_skill:', error);
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
           isError: true,

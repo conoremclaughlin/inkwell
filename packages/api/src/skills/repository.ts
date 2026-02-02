@@ -18,6 +18,10 @@ import type {
   RegistrySkillSummary,
   RegistrySkillDetail,
   SkillManifest,
+  ForkSkillOptions,
+  DeprecateSkillOptions,
+  UpdateSkillContentOptions,
+  DbSkillWithManagement,
 } from './types';
 
 // Helper to convert snake_case DB rows to camelCase
@@ -472,5 +476,231 @@ export class SkillsRepository {
     }
 
     return toCamelCase<DbSkillVersion>(data);
+  }
+
+  // ===========================================================================
+  // Skill Management Operations
+  // ===========================================================================
+
+  /**
+   * Check skill ownership for authorization
+   */
+  private async checkSkillOwnership(
+    skillId: string,
+    userId: string
+  ): Promise<{ authorized: boolean; skill: DbSkillWithManagement | null; reason?: string }> {
+    const { data: skill, error } = await this.supabase
+      .from('skills')
+      .select('*')
+      .eq('id', skillId)
+      .single();
+
+    if (error || !skill) {
+      return { authorized: false, skill: null, reason: 'Skill not found' };
+    }
+
+    const dbSkill = toCamelCase<DbSkillWithManagement>(skill);
+
+    // Official skills can only be modified by the original author (admin check done at API level)
+    if (dbSkill.isOfficial && dbSkill.authorUserId !== userId) {
+      return { authorized: false, skill: dbSkill, reason: 'Official skills can only be modified by administrators' };
+    }
+
+    // Regular skill - check author
+    if (dbSkill.authorUserId && dbSkill.authorUserId !== userId) {
+      return { authorized: false, skill: dbSkill, reason: 'You can only modify your own skills' };
+    }
+
+    // Skill has no author (legacy) - allow modification
+    if (!dbSkill.authorUserId) {
+      return { authorized: true, skill: dbSkill };
+    }
+
+    return { authorized: true, skill: dbSkill };
+  }
+
+  /**
+   * Fork an existing skill to create a user's own copy
+   */
+  async forkSkill(options: ForkSkillOptions): Promise<DbSkillWithManagement> {
+    const { sourceSkillId, newName, newDisplayName, forkerUserId, customizations } = options;
+
+    // Get source skill (must be public)
+    const { data: source, error: sourceError } = await this.supabase
+      .from('skills')
+      .select('*')
+      .eq('id', sourceSkillId)
+      .eq('is_public', true)
+      .single();
+
+    if (sourceError || !source) {
+      throw new Error('Source skill not found or not public');
+    }
+
+    // Check name availability
+    const { data: existing } = await this.supabase
+      .from('skills')
+      .select('id')
+      .eq('name', newName)
+      .single();
+
+    if (existing) {
+      throw new Error(`Skill name "${newName}" is already taken`);
+    }
+
+    // Create forked skill
+    const { data, error } = await this.supabase
+      .from('skills')
+      .insert({
+        name: newName,
+        display_name: newDisplayName || `${source.display_name} (Fork)`,
+        description: customizations?.description || source.description,
+        type: source.type,
+        category: customizations?.category || source.category,
+        tags: customizations?.tags || source.tags,
+        emoji: source.emoji,
+        current_version: '1.0.0',
+        manifest: source.manifest,
+        content: source.content,
+        author_user_id: forkerUserId,
+        forked_from_id: sourceSkillId,
+        is_official: false,
+        is_public: true,
+        is_verified: false,
+        status: 'active',
+        repository_url: null,
+        homepage_url: null,
+        last_published_by: forkerUserId,
+        published_at: new Date().toISOString(),
+      })
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Failed to fork skill:', error);
+      throw error;
+    }
+
+    logger.info(`Skill forked: ${source.name} -> ${newName} by user ${forkerUserId}`);
+    return toCamelCase<DbSkillWithManagement>(data);
+  }
+
+  /**
+   * Deprecate a skill
+   */
+  async deprecateSkill(options: DeprecateSkillOptions): Promise<DbSkillWithManagement> {
+    const { skillId, userId, message } = options;
+
+    // Verify ownership
+    const auth = await this.checkSkillOwnership(skillId, userId);
+    if (!auth.authorized) {
+      throw new Error(auth.reason || 'Unauthorized');
+    }
+
+    const { data, error } = await this.supabase
+      .from('skills')
+      .update({
+        status: 'deprecated',
+        deprecated_at: new Date().toISOString(),
+        deprecated_by: userId,
+        deprecation_message: message || null,
+      })
+      .eq('id', skillId)
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Failed to deprecate skill:', error);
+      throw error;
+    }
+
+    logger.info(`Skill deprecated: ${auth.skill?.name} by user ${userId}`);
+    return toCamelCase<DbSkillWithManagement>(data);
+  }
+
+  /**
+   * Soft-delete a skill
+   */
+  async deleteSkill(skillId: string, userId: string): Promise<void> {
+    const auth = await this.checkSkillOwnership(skillId, userId);
+    if (!auth.authorized) {
+      throw new Error(auth.reason || 'Unauthorized');
+    }
+
+    const { error } = await this.supabase
+      .from('skills')
+      .update({ status: 'deleted' })
+      .eq('id', skillId);
+
+    if (error) {
+      logger.error('Failed to delete skill:', error);
+      throw error;
+    }
+
+    logger.info(`Skill deleted: ${auth.skill?.name} by user ${userId}`);
+  }
+
+  /**
+   * Update skill with version bump (tracks publisher)
+   */
+  async updateSkillWithVersion(
+    skillId: string,
+    authorUserId: string,
+    updates: UpdateSkillContentOptions
+  ): Promise<DbSkillWithManagement> {
+    // Verify ownership
+    const auth = await this.checkSkillOwnership(skillId, authorUserId);
+    if (!auth.authorized) {
+      throw new Error(auth.reason || 'Unauthorized');
+    }
+
+    const updateData: Record<string, unknown> = {
+      last_published_by: authorUserId,
+    };
+
+    if (updates.displayName) updateData.display_name = updates.displayName;
+    if (updates.description) updateData.description = updates.description;
+    if (updates.category !== undefined) updateData.category = updates.category;
+    if (updates.tags) updateData.tags = updates.tags;
+    if (updates.emoji !== undefined) updateData.emoji = updates.emoji;
+    if (updates.version) updateData.current_version = updates.version;
+    if (updates.content) updateData.content = updates.content;
+    if (updates.manifest) {
+      // Merge with existing manifest
+      const existingManifest = auth.skill!.manifest || {};
+      updateData.manifest = { ...existingManifest, ...updates.manifest, version: updates.version };
+    }
+
+    const { data, error } = await this.supabase
+      .from('skills')
+      .update(updateData)
+      .eq('id', skillId)
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Failed to update skill:', error);
+      throw error;
+    }
+
+    logger.info(`Skill updated: ${auth.skill?.name} to version ${updates.version} by user ${authorUserId}`);
+    return toCamelCase<DbSkillWithManagement>(data);
+  }
+
+  /**
+   * Get skill by ID (internal, includes management fields)
+   */
+  async getSkillById(skillId: string): Promise<DbSkillWithManagement | null> {
+    const { data, error } = await this.supabase
+      .from('skills')
+      .select('*')
+      .eq('id', skillId)
+      .single();
+
+    if (error || !data) {
+      return null;
+    }
+
+    return toCamelCase<DbSkillWithManagement>(data);
   }
 }

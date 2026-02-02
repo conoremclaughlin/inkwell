@@ -1537,4 +1537,177 @@ router.get('/skills/installed', async (req: Request, res: Response) => {
   }
 });
 
+// =============================================================================
+// Skills Management (Create/Update/Delete/Fork)
+// =============================================================================
+
+/**
+ * POST /api/admin/skills/publish
+ * Publish a new skill to the registry
+ */
+router.post('/skills/publish', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as Request & { pcpUserId: string };
+    const { name, displayName, description, type, category, tags, emoji, version, manifest, content, repositoryUrl, isPublic } = req.body;
+
+    if (!name || !displayName || !description || !type || !version || !content) {
+      res.status(400).json({ error: 'Missing required fields: name, displayName, description, type, version, content' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const { SkillsRepository } = await import('../skills/repository.js');
+    const repository = new SkillsRepository(supabase);
+
+    const skill = await repository.publishSkill({
+      name,
+      displayName,
+      description,
+      type,
+      category,
+      tags,
+      emoji,
+      version,
+      manifest: manifest || {},
+      content,
+      authorUserId: authReq.pcpUserId,
+      repositoryUrl,
+      isPublic: isPublic !== false,
+    });
+
+    res.json({ success: true, skill });
+  } catch (error) {
+    logger.error('Failed to publish skill:', error);
+    const message = error instanceof Error ? error.message : 'Failed to publish skill';
+    res.status(500).json({ error: message });
+  }
+});
+
+/**
+ * PATCH /api/admin/skills/manage/:skillId
+ * Update an existing skill (creates new version)
+ */
+router.patch('/skills/manage/:skillId', async (req: Request, res: Response) => {
+  try {
+    const { skillId } = req.params;
+    const authReq = req as Request & { pcpUserId: string };
+    const { displayName, description, category, tags, emoji, version, manifest, content, changelog } = req.body;
+
+    if (!version) {
+      res.status(400).json({ error: 'Version is required for updates' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const { SkillsRepository } = await import('../skills/repository.js');
+    const repository = new SkillsRepository(supabase);
+
+    const skill = await repository.updateSkillWithVersion(skillId, authReq.pcpUserId, {
+      displayName,
+      description,
+      category,
+      tags,
+      emoji,
+      version,
+      manifest,
+      content,
+      changelog,
+    });
+
+    res.json({ success: true, skill });
+  } catch (error) {
+    logger.error('Failed to update skill:', error);
+    const message = error instanceof Error ? error.message : 'Failed to update skill';
+    const status = message.includes('Unauthorized') || message.includes('only modify') ? 403 : 500;
+    res.status(status).json({ error: message });
+  }
+});
+
+/**
+ * DELETE /api/admin/skills/manage/:skillId
+ * Soft-delete a skill
+ */
+router.delete('/skills/manage/:skillId', async (req: Request, res: Response) => {
+  try {
+    const { skillId } = req.params;
+    const authReq = req as Request & { pcpUserId: string };
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const { SkillsRepository } = await import('../skills/repository.js');
+    const repository = new SkillsRepository(supabase);
+
+    await repository.deleteSkill(skillId, authReq.pcpUserId);
+
+    res.json({ success: true });
+  } catch (error) {
+    logger.error('Failed to delete skill:', error);
+    const message = error instanceof Error ? error.message : 'Failed to delete skill';
+    const status = message.includes('Unauthorized') || message.includes('only modify') ? 403 : 500;
+    res.status(status).json({ error: message });
+  }
+});
+
+/**
+ * POST /api/admin/skills/manage/:skillId/deprecate
+ * Deprecate a skill
+ */
+router.post('/skills/manage/:skillId/deprecate', async (req: Request, res: Response) => {
+  try {
+    const { skillId } = req.params;
+    const authReq = req as Request & { pcpUserId: string };
+    const { message } = req.body;
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const { SkillsRepository } = await import('../skills/repository.js');
+    const repository = new SkillsRepository(supabase);
+
+    const skill = await repository.deprecateSkill({
+      skillId,
+      userId: authReq.pcpUserId,
+      message,
+    });
+
+    res.json({ success: true, skill });
+  } catch (error) {
+    logger.error('Failed to deprecate skill:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Failed to deprecate skill';
+    res.status(500).json({ error: errorMessage });
+  }
+});
+
+/**
+ * POST /api/admin/skills/manage/:skillId/fork
+ * Fork an existing skill
+ */
+router.post('/skills/manage/:skillId/fork', async (req: Request, res: Response) => {
+  try {
+    const { skillId } = req.params;
+    const authReq = req as Request & { pcpUserId: string };
+    const { name, displayName, description, category, tags } = req.body;
+
+    if (!name) {
+      res.status(400).json({ error: 'Name is required for fork' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const { SkillsRepository } = await import('../skills/repository.js');
+    const repository = new SkillsRepository(supabase);
+
+    const skill = await repository.forkSkill({
+      sourceSkillId: skillId,
+      newName: name,
+      newDisplayName: displayName,
+      forkerUserId: authReq.pcpUserId,
+      customizations: { description, category, tags },
+    });
+
+    res.json({ success: true, skill });
+  } catch (error) {
+    logger.error('Failed to fork skill:', error);
+    const message = error instanceof Error ? error.message : 'Failed to fork skill';
+    res.status(500).json({ error: message });
+  }
+});
+
 export default router;

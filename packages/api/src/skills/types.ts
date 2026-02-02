@@ -426,3 +426,63 @@ export interface RegistrySkillDetail extends RegistrySkillSummary {
     changelog: string | null;
   }>;
 }
+
+// ============================================================================
+// Skill Management Types
+// ============================================================================
+
+/**
+ * Registry status for skills (different from display SkillStatus)
+ */
+export type SkillRegistryStatus = 'active' | 'deprecated' | 'deleted';
+
+/**
+ * Options for forking a skill
+ */
+export interface ForkSkillOptions {
+  sourceSkillId: string;
+  newName: string;
+  newDisplayName?: string;
+  forkerUserId: string;
+  customizations?: {
+    description?: string;
+    category?: string;
+    tags?: string[];
+  };
+}
+
+/**
+ * Options for deprecating a skill
+ */
+export interface DeprecateSkillOptions {
+  skillId: string;
+  userId: string;
+  message?: string;
+}
+
+/**
+ * Options for updating skill content with version bump
+ */
+export interface UpdateSkillContentOptions {
+  displayName?: string;
+  description?: string;
+  category?: string | null;
+  tags?: string[];
+  emoji?: string | null;
+  version: string; // Required for version bump
+  content?: string;
+  manifest?: Partial<SkillManifest>;
+  changelog?: string;
+}
+
+/**
+ * Extended DbSkill with management fields
+ */
+export interface DbSkillWithManagement extends DbSkill {
+  forkedFromId: string | null;
+  status: SkillRegistryStatus;
+  deprecatedAt: string | null;
+  deprecatedBy: string | null;
+  deprecationMessage: string | null;
+  lastPublishedBy: string | null;
+}
