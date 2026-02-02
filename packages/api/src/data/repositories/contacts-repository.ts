@@ -410,8 +410,8 @@ export class ContactsRepository {
       whatsappId: row.whatsapp_id,
       notes: row.notes,
       tags: row.tags || [],
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
+      createdAt: row.created_at || new Date().toISOString(),
+      updatedAt: row.updated_at || new Date().toISOString(),
     };
   }
 }

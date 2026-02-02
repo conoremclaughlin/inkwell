@@ -10,6 +10,7 @@ import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
+import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
 
 // ============== Schemas ==============
 
@@ -32,6 +33,10 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
   relatedArtifactUri: z.string().optional().describe('Related artifact URI'),
   metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
   expiresAt: z.string().datetime().optional().describe('When this message expires'),
+  // Trigger options - automatically trigger the recipient after sending
+  trigger: z.boolean().optional().default(false).describe('If true, automatically trigger the recipient agent after sending (avoids separate trigger_agent call)'),
+  triggerType: z.enum(['task_complete', 'approval_needed', 'message', 'error', 'custom']).optional().describe('Type of trigger (only used if trigger=true)'),
+  triggerSummary: z.string().optional().describe('Brief summary for the trigger (only used if trigger=true)'),
 });
 
 const getInboxSchema = userIdentifierBaseSchema.extend({
@@ -74,6 +79,9 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     relatedArtifactUri,
     metadata = {},
     expiresAt,
+    trigger = false,
+    triggerType,
+    triggerSummary,
   } = parsed;
 
   const { data: message, error } = await supabase
@@ -106,7 +114,45 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     from: senderAgentId || 'user',
     type: messageType,
     priority,
+    trigger,
   });
+
+  // Optionally trigger the recipient agent
+  let triggerResult: { triggered: boolean; triggerId?: string; processed?: boolean; error?: string } = {
+    triggered: false,
+  };
+
+  if (trigger && senderAgentId) {
+    const gateway = getAgentGateway();
+    const payload: AgentTriggerPayload = {
+      fromAgentId: senderAgentId,
+      toAgentId: recipientAgentId,
+      inboxMessageId: message.id,
+      triggerType: triggerType || 'message',
+      summary: triggerSummary || subject || `New ${messageType} from ${senderAgentId}`,
+      priority,
+    };
+
+    const result = await gateway.processTrigger(payload);
+    triggerResult = {
+      triggered: true,
+      triggerId: result.triggerId,
+      processed: result.processed,
+      error: result.error,
+    };
+
+    logger.info('Inbox message triggered recipient', {
+      messageId: message.id,
+      triggerId: result.triggerId,
+      processed: result.processed,
+    });
+  } else if (trigger && !senderAgentId) {
+    logger.warn('Trigger requested but no senderAgentId provided', { messageId: message.id });
+    triggerResult = {
+      triggered: false,
+      error: 'Cannot trigger without senderAgentId',
+    };
+  }
 
   return {
     content: [
@@ -114,12 +160,13 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         type: 'text' as const,
         text: JSON.stringify({
           success: true,
-          message: `Message sent to ${recipientAgentId}`,
+          message: `Message sent to ${recipientAgentId}${triggerResult.triggered ? ' and triggered' : ''}`,
           messageId: message.id,
           recipientAgentId,
           messageType,
           priority,
           createdAt: message.created_at,
+          trigger: triggerResult,
         }),
       },
     ],

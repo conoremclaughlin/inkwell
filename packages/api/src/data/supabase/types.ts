@@ -603,6 +603,71 @@ export type Database = {
           },
         ]
       }
+      contacts: {
+        Row: {
+          aliases: string[] | null
+          created_at: string | null
+          discord_id: string | null
+          display_name: string | null
+          email: string | null
+          id: string
+          imessage_id: string | null
+          name: string
+          notes: string | null
+          phone: string | null
+          tags: string[] | null
+          telegram_id: string | null
+          telegram_username: string | null
+          updated_at: string | null
+          user_id: string
+          whatsapp_id: string | null
+        }
+        Insert: {
+          aliases?: string[] | null
+          created_at?: string | null
+          discord_id?: string | null
+          display_name?: string | null
+          email?: string | null
+          id?: string
+          imessage_id?: string | null
+          name: string
+          notes?: string | null
+          phone?: string | null
+          tags?: string[] | null
+          telegram_id?: string | null
+          telegram_username?: string | null
+          updated_at?: string | null
+          user_id: string
+          whatsapp_id?: string | null
+        }
+        Update: {
+          aliases?: string[] | null
+          created_at?: string | null
+          discord_id?: string | null
+          display_name?: string | null
+          email?: string | null
+          id?: string
+          imessage_id?: string | null
+          name?: string
+          notes?: string | null
+          phone?: string | null
+          tags?: string[] | null
+          telegram_id?: string | null
+          telegram_username?: string | null
+          updated_at?: string | null
+          user_id?: string
+          whatsapp_id?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "contacts_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       context_history: {
         Row: {
           archived_at: string | null
@@ -1025,6 +1090,7 @@ export type Database = {
         Row: {
           amount: number | null
           app_name: string
+          contact_id: string | null
           created_at: string
           data: Json
           id: string
@@ -1042,6 +1108,7 @@ export type Database = {
         Insert: {
           amount?: number | null
           app_name: string
+          contact_id?: string | null
           created_at?: string
           data?: Json
           id?: string
@@ -1059,6 +1126,7 @@ export type Database = {
         Update: {
           amount?: number | null
           app_name?: string
+          contact_id?: string | null
           created_at?: string
           data?: Json
           id?: string
@@ -1074,6 +1142,13 @@ export type Database = {
           user_id?: string
         }
         Relationships: [
+          {
+            foreignKeyName: "mini_app_records_contact_id_fkey"
+            columns: ["contact_id"]
+            isOneToOne: false
+            referencedRelation: "contacts"
+            referencedColumns: ["id"]
+          },
           {
             foreignKeyName: "mini_app_records_related_record_id_fkey"
             columns: ["related_record_id"]
@@ -1597,6 +1672,248 @@ export type Database = {
           },
         ]
       }
+      skill_installations: {
+        Row: {
+          config: Json | null
+          enabled: boolean | null
+          id: string
+          installed_at: string | null
+          last_used_at: string | null
+          skill_id: string
+          usage_count: number | null
+          user_id: string
+          version_pinned: string | null
+        }
+        Insert: {
+          config?: Json | null
+          enabled?: boolean | null
+          id?: string
+          installed_at?: string | null
+          last_used_at?: string | null
+          skill_id: string
+          usage_count?: number | null
+          user_id: string
+          version_pinned?: string | null
+        }
+        Update: {
+          config?: Json | null
+          enabled?: boolean | null
+          id?: string
+          installed_at?: string | null
+          last_used_at?: string | null
+          skill_id?: string
+          usage_count?: number | null
+          user_id?: string
+          version_pinned?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "skill_installations_skill_id_fkey"
+            columns: ["skill_id"]
+            isOneToOne: false
+            referencedRelation: "skills"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "skill_installations_skill_id_fkey"
+            columns: ["skill_id"]
+            isOneToOne: false
+            referencedRelation: "user_installed_skills"
+            referencedColumns: ["skill_id"]
+          },
+          {
+            foreignKeyName: "skill_installations_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      skill_versions: {
+        Row: {
+          changelog: string | null
+          content: string
+          id: string
+          manifest: Json
+          published_at: string | null
+          published_by: string | null
+          skill_id: string
+          version: string
+        }
+        Insert: {
+          changelog?: string | null
+          content?: string
+          id?: string
+          manifest?: Json
+          published_at?: string | null
+          published_by?: string | null
+          skill_id: string
+          version: string
+        }
+        Update: {
+          changelog?: string | null
+          content?: string
+          id?: string
+          manifest?: Json
+          published_at?: string | null
+          published_by?: string | null
+          skill_id?: string
+          version?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "skill_versions_published_by_fkey"
+            columns: ["published_by"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "skill_versions_skill_id_fkey"
+            columns: ["skill_id"]
+            isOneToOne: false
+            referencedRelation: "skills"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "skill_versions_skill_id_fkey"
+            columns: ["skill_id"]
+            isOneToOne: false
+            referencedRelation: "user_installed_skills"
+            referencedColumns: ["skill_id"]
+          },
+        ]
+      }
+      skills: {
+        Row: {
+          author: string | null
+          author_user_id: string | null
+          category: string | null
+          content: string
+          created_at: string | null
+          current_version: string
+          deprecated_at: string | null
+          deprecated_by: string | null
+          deprecation_message: string | null
+          description: string
+          display_name: string
+          emoji: string | null
+          forked_from_id: string | null
+          homepage_url: string | null
+          id: string
+          install_count: number | null
+          is_official: boolean | null
+          is_public: boolean | null
+          is_verified: boolean | null
+          last_published_by: string | null
+          manifest: Json
+          name: string
+          published_at: string | null
+          repository_url: string | null
+          status: string | null
+          tags: string[] | null
+          type: string
+          updated_at: string | null
+        }
+        Insert: {
+          author?: string | null
+          author_user_id?: string | null
+          category?: string | null
+          content?: string
+          created_at?: string | null
+          current_version?: string
+          deprecated_at?: string | null
+          deprecated_by?: string | null
+          deprecation_message?: string | null
+          description: string
+          display_name: string
+          emoji?: string | null
+          forked_from_id?: string | null
+          homepage_url?: string | null
+          id?: string
+          install_count?: number | null
+          is_official?: boolean | null
+          is_public?: boolean | null
+          is_verified?: boolean | null
+          last_published_by?: string | null
+          manifest?: Json
+          name: string
+          published_at?: string | null
+          repository_url?: string | null
+          status?: string | null
+          tags?: string[] | null
+          type: string
+          updated_at?: string | null
+        }
+        Update: {
+          author?: string | null
+          author_user_id?: string | null
+          category?: string | null
+          content?: string
+          created_at?: string | null
+          current_version?: string
+          deprecated_at?: string | null
+          deprecated_by?: string | null
+          deprecation_message?: string | null
+          description?: string
+          display_name?: string
+          emoji?: string | null
+          forked_from_id?: string | null
+          homepage_url?: string | null
+          id?: string
+          install_count?: number | null
+          is_official?: boolean | null
+          is_public?: boolean | null
+          is_verified?: boolean | null
+          last_published_by?: string | null
+          manifest?: Json
+          name?: string
+          published_at?: string | null
+          repository_url?: string | null
+          status?: string | null
+          tags?: string[] | null
+          type?: string
+          updated_at?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "skills_author_user_id_fkey"
+            columns: ["author_user_id"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "skills_deprecated_by_fkey"
+            columns: ["deprecated_by"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "skills_forked_from_id_fkey"
+            columns: ["forked_from_id"]
+            isOneToOne: false
+            referencedRelation: "skills"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "skills_forked_from_id_fkey"
+            columns: ["forked_from_id"]
+            isOneToOne: false
+            referencedRelation: "user_installed_skills"
+            referencedColumns: ["skill_id"]
+          },
+          {
+            foreignKeyName: "skills_last_published_by_fkey"
+            columns: ["last_published_by"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       tasks: {
         Row: {
           completed_at: string | null
@@ -1803,7 +2120,45 @@ export type Database = {
       }
     }
     Views: {
-      [_ in never]: never
+      user_installed_skills: {
+        Row: {
+          author: string | null
+          category: string | null
+          content: string | null
+          current_version: string | null
+          description: string | null
+          display_name: string | null
+          emoji: string | null
+          enabled: boolean | null
+          installation_id: string | null
+          installed_at: string | null
+          is_official: boolean | null
+          is_verified: boolean | null
+          last_used_at: string | null
+          manifest: Json | null
+          name: string | null
+          repository_url: string | null
+          resolved_content: string | null
+          resolved_manifest: Json | null
+          resolved_version: string | null
+          skill_id: string | null
+          tags: string[] | null
+          type: string | null
+          usage_count: number | null
+          user_config: Json | null
+          user_id: string | null
+          version_pinned: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "skill_installations_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
     }
     Functions: {
       match_links: {
