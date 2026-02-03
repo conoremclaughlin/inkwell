@@ -28,6 +28,9 @@ import { logger } from '../utils/logger';
 import { env } from '../config/env';
 import telegramifyMarkdown from 'telegramify-markdown';
 
+// Activity stream - conversation to user mapping for outbound message logging
+const conversationUserMap = new Map<string, string>(); // conversationId -> userId
+
 // Configuration
 interface MyraConfig {
   /** Backend type: 'claude-code' (default) or 'direct-api' */
@@ -612,6 +615,24 @@ async function startMyra(config: MyraConfig = {}): Promise<void> {
               replyToMessageId: options?.replyToMessageId,
               parseMode,
             });
+
+            // Log outgoing message to activity stream
+            const userId = conversationUserMap.get(conversationId);
+            if (userId && dataComposer) {
+              try {
+                await dataComposer.repositories.activityStream.logMessage({
+                  userId,
+                  agentId: 'myra',
+                  direction: 'out',
+                  content,
+                  platform: 'telegram',
+                  platformChatId: conversationId,
+                  isDm: true, // Will be corrected by context
+                });
+              } catch (activityError) {
+                logger.warn('Failed to log outgoing message to activity stream:', activityError);
+              }
+            }
           },
         },
       } : {}),
@@ -687,6 +708,29 @@ async function startMyra(config: MyraConfig = {}): Promise<void> {
           }
         };
         const user = await resolveOrCreateTelegramUser(dataComposer!, senderForUser);
+
+        // Log incoming message to activity stream
+        if (user?.id) {
+          conversationUserMap.set(conversationId, user.id);
+          try {
+            await dataComposer!.repositories.activityStream.logMessage({
+              userId: user.id,
+              agentId: 'myra',
+              direction: 'in',
+              content: message.body,
+              platform: 'telegram',
+              platformMessageId: message.messageId,
+              platformChatId: conversationId,
+              isDm: !isGroupChat,
+              payload: {
+                senderName: message.sender.name || message.sender.username,
+                senderId: senderId,
+              },
+            });
+          } catch (activityError) {
+            logger.warn('Failed to log incoming message to activity stream:', activityError);
+          }
+        }
 
         await sessionHost!.handleMessage(
           'telegram',

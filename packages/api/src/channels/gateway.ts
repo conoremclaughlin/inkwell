@@ -17,9 +17,13 @@ import { createTelegramListener, TelegramListener } from './telegram-listener';
 import { createWhatsAppListener, WhatsAppListener } from './whatsapp-listener';
 import { setResponseCallback, type ResponseCallback } from '../mcp/tools/response-handlers';
 import type { AgentResponse } from '../agent/types';
+import type { DataComposer } from '../data/composer';
 import { logger } from '../utils/logger';
 import { env } from '../config/env';
 import telegramifyMarkdown from 'telegramify-markdown';
+
+// Activity stream - conversation to user mapping for outbound message logging
+const conversationUserMap = new Map<string, string>(); // conversationId -> userId
 
 export interface ChannelGatewayConfig {
   /** Whether to enable Telegram listener */
@@ -38,6 +42,8 @@ export interface ChannelGatewayConfig {
   onWhatsAppQr?: (qr: string) => void;
   /** Message buffer delay in ms (default: 2000). Set to 0 to disable buffering. */
   messageBufferDelayMs?: number;
+  /** Data composer for activity stream logging */
+  dataComposer?: DataComposer;
 }
 
 export type IncomingMessageHandler = (
@@ -86,6 +92,7 @@ export class ChannelGateway extends EventEmitter {
   private whatsappListener: WhatsAppListener | null = null;
   private config: ChannelGatewayConfig;
   private messageHandler: IncomingMessageHandler | null = null;
+  private dataComposer: DataComposer | null = null;
   private started = false;
 
   // Message buffering
@@ -108,6 +115,7 @@ export class ChannelGateway extends EventEmitter {
       ...config,
     };
     this.bufferDelayMs = this.config.messageBufferDelayMs ?? DEFAULT_BUFFER_DELAY_MS;
+    this.dataComposer = config.dataComposer ?? null;
   }
 
   /**
@@ -364,6 +372,32 @@ export class ChannelGateway extends EventEmitter {
       return;
     }
 
+    // Log incoming message to activity stream
+    const userId = metadata?.userId;
+    if (userId) {
+      conversationUserMap.set(conversationId, userId);
+    }
+    if (this.dataComposer && userId) {
+      try {
+        const isGroupChat = metadata?.chatType === 'group' || metadata?.chatType === 'channel';
+        await this.dataComposer.repositories.activityStream.logMessage({
+          userId,
+          agentId: 'myra',
+          direction: 'in',
+          content,
+          platform: channel,
+          platformChatId: conversationId,
+          isDm: !isGroupChat,
+          payload: {
+            senderName: sender.name,
+            senderId: sender.id,
+          },
+        });
+      } catch (activityError) {
+        logger.warn('Failed to log incoming message to activity stream:', activityError);
+      }
+    }
+
     try {
       await this.messageHandler(channel, conversationId, sender, content, metadata);
     } catch (error) {
@@ -424,6 +458,25 @@ export class ChannelGateway extends EventEmitter {
           throw new Error('WhatsApp listener not available');
         }
         await this.whatsappListener.sendMessage(conversationId, content);
+        // Log outgoing WhatsApp message to activity stream
+        {
+          const userId = conversationUserMap.get(conversationId);
+          if (this.dataComposer && userId) {
+            try {
+              await this.dataComposer.repositories.activityStream.logMessage({
+                userId,
+                agentId: 'myra',
+                direction: 'out',
+                content,
+                platform: 'whatsapp',
+                platformChatId: conversationId,
+                isDm: true,
+              });
+            } catch (activityError) {
+              logger.warn('Failed to log outgoing WhatsApp message to activity stream:', activityError);
+            }
+          }
+        }
         break;
 
       default:
@@ -518,6 +571,24 @@ export class ChannelGateway extends EventEmitter {
       replyToMessageId: options?.replyToMessageId,
       parseMode,
     });
+
+    // Log outgoing message to activity stream
+    const userId = conversationUserMap.get(conversationId);
+    if (this.dataComposer && userId) {
+      try {
+        await this.dataComposer.repositories.activityStream.logMessage({
+          userId,
+          agentId: 'myra',
+          direction: 'out',
+          content,
+          platform: 'telegram',
+          platformChatId: conversationId,
+          isDm: true, // Will be corrected by context
+        });
+      } catch (activityError) {
+        logger.warn('Failed to log outgoing message to activity stream:', activityError);
+      }
+    }
   }
 
   /**

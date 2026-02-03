@@ -60,6 +60,13 @@ export interface InjectedContext {
     values?: string[];
     capabilities?: string[];
   };
+  /** Recent conversation history from the activity stream */
+  conversationHistory?: Array<{
+    direction: 'in' | 'out';
+    content: string;
+    timestamp: string;
+    platform?: string;
+  }>;
 }
 
 /**

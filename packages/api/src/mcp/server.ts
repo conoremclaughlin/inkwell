@@ -489,7 +489,10 @@ export class MCPServer {
   private async startChannelGateway(): Promise<void> {
     logger.info('Initializing ChannelGateway...');
 
-    this.channelGateway = createChannelGateway(this.config.channelGateway || {});
+    this.channelGateway = createChannelGateway({
+      ...this.config.channelGateway,
+      dataComposer: this.dataComposer,
+    });
 
     // Register message handler if provided
     if (this.config.messageHandler) {

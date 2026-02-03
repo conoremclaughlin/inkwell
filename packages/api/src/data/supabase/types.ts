@@ -17,6 +17,107 @@ export type Database = {
   }
   public: {
     Tables: {
+      activity_stream: {
+        Row: {
+          agent_id: string
+          artifact_id: string | null
+          child_session_id: string | null
+          completed_at: string | null
+          contact_id: string | null
+          content: string
+          correlation_id: string | null
+          created_at: string
+          duration_ms: number | null
+          id: string
+          is_dm: boolean | null
+          parent_id: string | null
+          payload: Json
+          platform: string | null
+          platform_chat_id: string | null
+          platform_message_id: string | null
+          session_id: string | null
+          status: string | null
+          subtype: string | null
+          type: Database["public"]["Enums"]["activity_type"]
+          user_id: string
+        }
+        Insert: {
+          agent_id: string
+          artifact_id?: string | null
+          child_session_id?: string | null
+          completed_at?: string | null
+          contact_id?: string | null
+          content: string
+          correlation_id?: string | null
+          created_at?: string
+          duration_ms?: number | null
+          id?: string
+          is_dm?: boolean | null
+          parent_id?: string | null
+          payload?: Json
+          platform?: string | null
+          platform_chat_id?: string | null
+          platform_message_id?: string | null
+          session_id?: string | null
+          status?: string | null
+          subtype?: string | null
+          type: Database["public"]["Enums"]["activity_type"]
+          user_id: string
+        }
+        Update: {
+          agent_id?: string
+          artifact_id?: string | null
+          child_session_id?: string | null
+          completed_at?: string | null
+          contact_id?: string | null
+          content?: string
+          correlation_id?: string | null
+          created_at?: string
+          duration_ms?: number | null
+          id?: string
+          is_dm?: boolean | null
+          parent_id?: string | null
+          payload?: Json
+          platform?: string | null
+          platform_chat_id?: string | null
+          platform_message_id?: string | null
+          session_id?: string | null
+          status?: string | null
+          subtype?: string | null
+          type?: Database["public"]["Enums"]["activity_type"]
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "activity_stream_contact_id_fkey"
+            columns: ["contact_id"]
+            isOneToOne: false
+            referencedRelation: "contacts"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "activity_stream_parent_id_fkey"
+            columns: ["parent_id"]
+            isOneToOne: false
+            referencedRelation: "activity_stream"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "activity_stream_session_id_fkey"
+            columns: ["session_id"]
+            isOneToOne: false
+            referencedRelation: "sessions"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "activity_stream_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       agent_identities: {
         Row: {
           agent_id: string
@@ -2012,6 +2113,88 @@ export type Database = {
           },
         ]
       }
+      user_identity: {
+        Row: {
+          created_at: string | null
+          id: string
+          shared_values_md: string | null
+          updated_at: string | null
+          user_id: string
+          user_profile_md: string | null
+          version: number | null
+        }
+        Insert: {
+          created_at?: string | null
+          id?: string
+          shared_values_md?: string | null
+          updated_at?: string | null
+          user_id: string
+          user_profile_md?: string | null
+          version?: number | null
+        }
+        Update: {
+          created_at?: string | null
+          id?: string
+          shared_values_md?: string | null
+          updated_at?: string | null
+          user_id?: string
+          user_profile_md?: string | null
+          version?: number | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "user_identity_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: true
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      user_identity_history: {
+        Row: {
+          archived_at: string | null
+          change_type: string
+          created_at: string
+          id: string
+          identity_id: string
+          shared_values_md: string | null
+          user_id: string
+          user_profile_md: string | null
+          version: number
+        }
+        Insert: {
+          archived_at?: string | null
+          change_type?: string
+          created_at: string
+          id?: string
+          identity_id: string
+          shared_values_md?: string | null
+          user_id: string
+          user_profile_md?: string | null
+          version: number
+        }
+        Update: {
+          archived_at?: string | null
+          change_type?: string
+          created_at?: string
+          id?: string
+          identity_id?: string
+          shared_values_md?: string | null
+          user_id?: string
+          user_profile_md?: string | null
+          version?: number
+        }
+        Relationships: [
+          {
+            foreignKeyName: "user_identity_history_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       user_permissions: {
         Row: {
           enabled: boolean
@@ -2212,6 +2395,16 @@ export type Database = {
       trigger_heartbeat: { Args: never; Returns: undefined }
     }
     Enums: {
+      activity_type:
+        | "message_in"
+        | "message_out"
+        | "tool_call"
+        | "tool_result"
+        | "agent_spawn"
+        | "agent_complete"
+        | "state_change"
+        | "thinking"
+        | "error"
       trust_level: "owner" | "admin" | "member"
     }
     CompositeTypes: {
@@ -2340,6 +2533,17 @@ export type CompositeTypes<
 export const Constants = {
   public: {
     Enums: {
+      activity_type: [
+        "message_in",
+        "message_out",
+        "tool_call",
+        "tool_result",
+        "agent_spawn",
+        "agent_complete",
+        "state_change",
+        "thinking",
+        "error",
+      ],
       trust_level: ["owner", "admin", "member"],
     },
   },

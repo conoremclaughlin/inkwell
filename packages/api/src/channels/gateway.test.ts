@@ -348,3 +348,206 @@ describe('Gateway Status', () => {
     expect(status.whatsapp.enabled).toBe(true);
   });
 });
+
+describe('Activity Stream Integration', () => {
+  let gateway: ChannelGateway;
+  let mockLogMessage: Mock;
+  let mockDataComposer: any;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mockLogMessage = vi.fn().mockResolvedValue({ id: 'activity-123' });
+    mockDataComposer = {
+      repositories: {
+        activityStream: {
+          logMessage: mockLogMessage,
+        },
+      },
+    };
+    gateway = new ChannelGateway({
+      enableTelegram: false,
+      enableWhatsApp: false,
+      messageBufferDelayMs: 0, // Disable buffering for simpler tests
+      dataComposer: mockDataComposer,
+    });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+  });
+
+  describe('Incoming Messages', () => {
+    it('should log incoming message to activity stream when userId is provided', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined);
+      gateway.setMessageHandler(handler);
+
+      const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
+
+      await forwardToHandler(
+        'telegram',
+        'chat123',
+        { id: 'sender456', name: 'Test User' },
+        'Hello from user',
+        { userId: 'user-uuid-123', chatType: 'direct' }
+      );
+
+      expect(mockLogMessage).toHaveBeenCalledTimes(1);
+      expect(mockLogMessage).toHaveBeenCalledWith({
+        userId: 'user-uuid-123',
+        agentId: 'myra',
+        direction: 'in',
+        content: 'Hello from user',
+        platform: 'telegram',
+        platformChatId: 'chat123',
+        isDm: true,
+        payload: {
+          senderName: 'Test User',
+          senderId: 'sender456',
+        },
+      });
+    });
+
+    it('should set isDm to false for group chats', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined);
+      gateway.setMessageHandler(handler);
+
+      const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
+
+      await forwardToHandler(
+        'telegram',
+        'group123',
+        { id: 'sender456' },
+        'Hello group',
+        { userId: 'user-uuid-123', chatType: 'group' }
+      );
+
+      expect(mockLogMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          isDm: false,
+        })
+      );
+    });
+
+    it('should not log incoming message when userId is not provided', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined);
+      gateway.setMessageHandler(handler);
+
+      const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
+
+      await forwardToHandler(
+        'telegram',
+        'chat123',
+        { id: 'sender456' },
+        'Hello',
+        {} // No userId
+      );
+
+      expect(mockLogMessage).not.toHaveBeenCalled();
+    });
+
+    it('should still forward message even if activity logging fails', async () => {
+      mockLogMessage.mockRejectedValueOnce(new Error('DB error'));
+      const handler = vi.fn().mockResolvedValue(undefined);
+      gateway.setMessageHandler(handler);
+
+      const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
+
+      await forwardToHandler(
+        'telegram',
+        'chat123',
+        { id: 'sender456' },
+        'Hello',
+        { userId: 'user-uuid-123' }
+      );
+
+      // Handler should still be called despite logging error
+      expect(handler).toHaveBeenCalledTimes(1);
+    });
+
+    it('should store userId in conversationUserMap for later outbound logging', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined);
+      gateway.setMessageHandler(handler);
+
+      const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
+
+      await forwardToHandler(
+        'telegram',
+        'chat123',
+        { id: 'sender456' },
+        'Hello',
+        { userId: 'user-uuid-123' }
+      );
+
+      // Access the module-level conversationUserMap via the gateway's context
+      // We can verify this by checking outbound logging works
+      const sendTelegramMessage = (gateway as any).sendTelegramMessage.bind(gateway);
+
+      // Mock telegram listener for outbound
+      (gateway as any).telegramListener = {
+        sendMessage: vi.fn().mockResolvedValue(undefined),
+      };
+
+      await sendTelegramMessage('chat123', 'Reply message');
+
+      // Should have logged outbound message using stored userId
+      expect(mockLogMessage).toHaveBeenCalledTimes(2);
+      expect(mockLogMessage).toHaveBeenLastCalledWith({
+        userId: 'user-uuid-123',
+        agentId: 'myra',
+        direction: 'out',
+        content: 'Reply message',
+        platform: 'telegram',
+        platformChatId: 'chat123',
+        isDm: true,
+      });
+    });
+  });
+
+  describe('Outgoing Messages', () => {
+    it('should log outgoing Telegram message when userId is in conversationUserMap', async () => {
+      // First, simulate an incoming message to populate conversationUserMap
+      const handler = vi.fn().mockResolvedValue(undefined);
+      gateway.setMessageHandler(handler);
+
+      const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
+      await forwardToHandler(
+        'telegram',
+        'chat123',
+        { id: 'sender456' },
+        'Incoming',
+        { userId: 'user-uuid-123' }
+      );
+
+      // Now send outgoing message
+      (gateway as any).telegramListener = {
+        sendMessage: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const sendTelegramMessage = (gateway as any).sendTelegramMessage.bind(gateway);
+      await sendTelegramMessage('chat123', 'Outgoing reply');
+
+      expect(mockLogMessage).toHaveBeenCalledTimes(2);
+      expect(mockLogMessage).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          userId: 'user-uuid-123',
+          direction: 'out',
+          content: 'Outgoing reply',
+          platform: 'telegram',
+        })
+      );
+    });
+
+    it('should not log outgoing message when userId is not in conversationUserMap', async () => {
+      (gateway as any).telegramListener = {
+        sendMessage: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const sendTelegramMessage = (gateway as any).sendTelegramMessage.bind(gateway);
+      await sendTelegramMessage('unknown-chat', 'Message');
+
+      // No incoming message was processed for this chat, so no userId in map
+      expect(mockLogMessage).not.toHaveBeenCalled();
+    });
+  });
+});

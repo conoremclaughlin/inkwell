@@ -535,6 +535,103 @@ router.get('/reminders', async (_req: Request, res: Response) => {
 });
 
 // =============================================================================
+// User Identity (USER.md, VALUES.md)
+// =============================================================================
+
+/**
+ * GET /api/admin/user-identity
+ * Get user identity (USER.md, VALUES.md)
+ */
+router.get('/user-identity', async (_req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+
+    const { data, error } = await supabase
+      .from('user_identity')
+      .select('*')
+      .limit(1)
+      .single();
+
+    if (error && error.code !== 'PGRST116') {
+      logger.error('Failed to get user identity:', error);
+      res.status(500).json({ error: 'Failed to get user identity' });
+      return;
+    }
+
+    if (!data) {
+      res.json({ userIdentity: null });
+      return;
+    }
+
+    res.json({
+      userIdentity: {
+        id: data.id,
+        userId: data.user_id,
+        userProfileMd: data.user_profile_md,
+        sharedValuesMd: data.shared_values_md,
+        version: data.version,
+        createdAt: data.created_at,
+        updatedAt: data.updated_at,
+      },
+    });
+  } catch (error) {
+    logger.error('Failed to get user identity:', error);
+    res.status(500).json({ error: 'Failed to get user identity' });
+  }
+});
+
+/**
+ * GET /api/admin/user-identity/history
+ * Get version history for user identity
+ */
+router.get('/user-identity/history', async (_req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+
+    // First get the user identity ID
+    const { data: identity } = await supabase
+      .from('user_identity')
+      .select('id')
+      .limit(1)
+      .single();
+
+    if (!identity) {
+      res.json({ history: [] });
+      return;
+    }
+
+    // Get history entries
+    const { data, error } = await supabase
+      .from('user_identity_history')
+      .select('*')
+      .eq('identity_id', identity.id)
+      .order('archived_at', { ascending: false })
+      .limit(20);
+
+    if (error) {
+      logger.error('Failed to get user identity history:', error);
+      res.status(500).json({ error: 'Failed to get history' });
+      return;
+    }
+
+    res.json({
+      history: (data || []).map((h) => ({
+        id: h.id,
+        version: h.version,
+        userProfileMd: h.user_profile_md,
+        sharedValuesMd: h.shared_values_md,
+        changeType: h.change_type,
+        createdAt: h.created_at,
+        archivedAt: h.archived_at,
+      })),
+    });
+  } catch (error) {
+    logger.error('Failed to get user identity history:', error);
+    res.status(500).json({ error: 'Failed to get user identity history' });
+  }
+});
+
+// =============================================================================
 // Individuals (AI Beings)
 // =============================================================================
 

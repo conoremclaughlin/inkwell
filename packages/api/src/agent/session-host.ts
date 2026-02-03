@@ -228,7 +228,8 @@ export class SessionHost extends EventEmitter {
   private async getInjectedContext(
     userId?: string,
     platform?: string,
-    platformId?: string
+    platformId?: string,
+    platformChatId?: string
   ): Promise<InjectedContext | undefined> {
     // Need at least one identifier
     if (!userId && !platformId) {
@@ -238,14 +239,20 @@ export class SessionHost extends EventEmitter {
     // Cache key based on available identifiers
     const cacheKey = userId || `${platform}:${platformId}`;
 
-    // Check cache
+    // Check cache for stable context (user, projects, memories, etc.)
     const cached = this.contextCache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp.getTime() < this.contextCacheTtl) {
       logger.debug(`Context cache hit for ${cacheKey}`);
-      // Return cached context with FRESH temporal (time changes!)
+      // Return cached context with FRESH temporal and conversation history
+      const conversationHistory = await this.fetchConversationHistory(
+        cached.context.user?.id,
+        platform,
+        platformChatId
+      );
       return {
         ...cached.context,
         temporal: this.buildTemporalContext(cached.userTimezone),
+        conversationHistory,
       };
     }
 
@@ -340,12 +347,14 @@ export class SessionHost extends EventEmitter {
           : undefined,
         // Temporal is added fresh (not from cache)
         temporal: this.buildTemporalContext(userRecord?.timezone),
+        // Conversation history is also fetched fresh (changes with each message)
+        conversationHistory: await this.fetchConversationHistory(resolvedUserId, platform, platformChatId),
       };
 
-      // Cache everything EXCEPT temporal (time changes between messages!)
-      const { temporal: _temporal, ...contextWithoutTemporal } = injectedContext;
+      // Cache everything EXCEPT temporal and conversationHistory (these change between messages!)
+      const { temporal: _temporal, conversationHistory: _history, ...contextWithoutDynamic } = injectedContext;
       this.contextCache.set(cacheKey, {
-        context: contextWithoutTemporal,
+        context: contextWithoutDynamic,
         userTimezone: userRecord?.timezone || null,
         timestamp: new Date(),
       });
@@ -357,6 +366,7 @@ export class SessionHost extends EventEmitter {
         agentId: this.agentId,
         projectCount: projects.length,
         memoryCount: recentMemories.length,
+        conversationHistoryCount: injectedContext.conversationHistory?.length || 0,
       });
 
       return injectedContext;
@@ -445,7 +455,7 @@ export class SessionHost extends EventEmitter {
       const platformId = sender.id;
       const platform = this.mapChannelToPlatform(channel);
 
-      message.injectedContext = await this.getInjectedContext(userId, platform, platformId);
+      message.injectedContext = await this.getInjectedContext(userId, platform, platformId, conversationId);
     }
 
     // Send to the agent backend
@@ -557,6 +567,45 @@ export class SessionHost extends EventEmitter {
       userTimezone: timezone,
       localTime,
     };
+  }
+
+  /**
+   * Fetch recent conversation history from the activity stream
+   * This provides continuity across session restarts
+   */
+  private async fetchConversationHistory(
+    userId?: string,
+    platform?: string,
+    platformChatId?: string
+  ): Promise<InjectedContext['conversationHistory']> {
+    if (!userId) {
+      return undefined;
+    }
+
+    try {
+      const history = await this.dataComposer.repositories.activityStream.getConversationHistory(
+        userId,
+        {
+          platform,
+          platformChatId,
+          limit: 20, // Last 20 messages for context
+        }
+      );
+
+      if (history.length === 0) {
+        return undefined;
+      }
+
+      return history.map((activity) => ({
+        direction: activity.type === 'message_in' ? 'in' as const : 'out' as const,
+        content: activity.content,
+        timestamp: activity.createdAt.toISOString(),
+        platform: activity.platform || undefined,
+      }));
+    } catch (error) {
+      logger.warn('Failed to fetch conversation history:', error);
+      return undefined;
+    }
   }
 
   /**

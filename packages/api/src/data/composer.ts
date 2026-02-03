@@ -13,6 +13,7 @@ import { SessionFocusRepository } from './repositories/session-focus.repository'
 import { AgentSessionsRepository } from './repositories/agent-sessions.repository';
 import { ProjectTasksRepository } from './repositories/project-tasks.repository';
 import { MemoryRepository } from './repositories/memory-repository';
+import { ActivityStreamRepository } from './repositories/activity-stream.repository';
 import { logger } from '../utils/logger';
 
 export class DataComposer {
@@ -31,6 +32,7 @@ export class DataComposer {
     agentSessions: AgentSessionsRepository;
     projectTasks: ProjectTasksRepository;
     memory: MemoryRepository;
+    activityStream: ActivityStreamRepository;
   };
 
   private constructor(supabaseClient: SupabaseClient<Database>) {
@@ -50,6 +52,7 @@ export class DataComposer {
       agentSessions: new AgentSessionsRepository(supabaseClient),
       projectTasks: new ProjectTasksRepository(supabaseClient),
       memory: new MemoryRepository(supabaseClient),
+      activityStream: new ActivityStreamRepository(supabaseClient),
     };
 
     logger.info('Data composer initialized with all repositories');

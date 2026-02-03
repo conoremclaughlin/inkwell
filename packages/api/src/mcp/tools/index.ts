@@ -106,6 +106,17 @@ import {
 } from './identity-handlers';
 
 import {
+  handleSaveUserIdentity,
+  handleGetUserIdentity,
+  handleGetUserIdentityHistory,
+  handleRestoreUserIdentity,
+  saveUserIdentitySchema,
+  getUserIdentitySchema,
+  getUserIdentityHistorySchema,
+  restoreUserIdentitySchema,
+} from './user-identity-handlers';
+
+import {
   handleCreateReminder,
   handleListReminders,
   handleUpdateReminder,
@@ -181,6 +192,19 @@ import {
   draftEmailSchema,
   listLabelsSchema,
 } from '../../stories/gmail/handlers';
+
+import {
+  handleLogActivity,
+  handleLogMessage,
+  handleGetActivity,
+  handleGetConversationHistory,
+  handleGetSessionContext,
+  logActivitySchema,
+  logMessageSchema,
+  getActivitySchema,
+  getConversationHistorySchema,
+  getSessionContextSchema,
+} from './activity-stream-handlers';
 
 // Re-export for external use
 export { setResponseCallback, addPendingMessage } from './response-handlers';
@@ -1682,6 +1706,97 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   );
 
   // =====================================================
+  // USER IDENTITY TOOLS (USER.md, VALUES.md)
+  // =====================================================
+
+  server.registerTool(
+    'save_user_identity',
+    {
+      description: `Save or update user-level identity files (USER.md, VALUES.md). These are shared across all agents for a user.
+
+- userProfileMd: USER.md content - who the human is
+- sharedValuesMd: VALUES.md content - shared values across all SBs
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: saveUserIdentitySchema,
+    },
+    async (args) => {
+      try {
+        return await handleSaveUserIdentity(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in save_user_identity:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_user_identity',
+    {
+      description: `Get user-level identity files (USER.md, VALUES.md).
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getUserIdentitySchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetUserIdentity(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_user_identity:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_user_identity_history',
+    {
+      description: `Get version history for user identity files (USER.md, VALUES.md).
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getUserIdentityHistorySchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetUserIdentityHistory(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_user_identity_history:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'restore_user_identity',
+    {
+      description: `Restore user identity files (USER.md, VALUES.md) to a previous version.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: restoreUserIdentitySchema,
+    },
+    async (args) => {
+      try {
+        return await handleRestoreUserIdentity(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in restore_user_identity:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
   // REMINDER TOOLS
   // =====================================================
 
@@ -2426,6 +2541,149 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleListLabels(args, dataComposer);
       } catch (error) {
         logger.error('Error in list_email_labels:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // ACTIVITY STREAM TOOLS
+  // =====================================================
+
+  server.registerTool(
+    'log_activity',
+    {
+      description: `Log any activity to the unified activity stream. Use this to record tool calls, state changes, agent spawns, errors, and other significant events.
+
+Activity types:
+- message_in: Incoming message from a human
+- message_out: Outgoing message from an SB
+- tool_call: Tool/function invocation (status can be pending/running/completed/failed)
+- tool_result: Result of a tool call
+- agent_spawn: Spawning a sub-agent
+- agent_complete: Sub-agent completed
+- state_change: Notable state changes
+- thinking: Thinking/reasoning (optional)
+- error: Error events
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: logActivitySchema,
+    },
+    async (args) => {
+      try {
+        return await handleLogActivity(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in log_activity:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'log_message',
+    {
+      description: `Convenience tool to log a message to the activity stream. Use this for all incoming and outgoing messages in conversations.
+
+For incoming messages (direction: "in"), this records what the human said.
+For outgoing messages (direction: "out"), this records what the SB responded.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: logMessageSchema,
+    },
+    async (args) => {
+      try {
+        return await handleLogMessage(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in log_message:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_activity',
+    {
+      description: `Query the activity stream with various filters. Returns activities in reverse chronological order (newest first).
+
+Useful for:
+- Reviewing what happened in a session
+- Finding specific tool calls or events
+- Debugging issues
+- Analyzing patterns
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getActivitySchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetActivity(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_activity:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_conversation_history',
+    {
+      description: `Get message history with a contact or in a specific chat. Returns messages only (message_in and message_out) in chronological order.
+
+Use this to:
+- Load conversation context before responding
+- Review past conversations with someone
+- Continue a conversation across sessions
+
+Conversations can be filtered by contact, platform, or platform chat ID.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getConversationHistorySchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetConversationHistory(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_conversation_history:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_session_context',
+    {
+      description: `Get recent activity for session resumption. Returns a mix of messages and significant events in chronological order.
+
+Use this when:
+- Resuming a session to get context
+- Starting a conversation to load recent history
+- Continuing work after a break
+
+This is optimized for context loading - returns relevant recent activity.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getSessionContextSchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetSessionContext(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_session_context:', error);
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
           isError: true,

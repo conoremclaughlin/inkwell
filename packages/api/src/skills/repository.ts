@@ -322,7 +322,9 @@ export class SkillsRepository {
   // ===========================================================================
 
   /**
-   * Publish a new skill to the registry
+   * Publish a new skill to the registry.
+   *
+   * Also creates an initial version record in code for portability.
    */
   async publishSkill(options: PublishSkillOptions): Promise<DbSkill> {
     const {
@@ -371,6 +373,7 @@ export class SkillsRepository {
           repository_url: repositoryUrl || null,
           is_public: isPublic,
           published_at: new Date().toISOString(),
+          last_published_by: authorUserId || null,
         },
         { onConflict: 'name' }
       )
@@ -380,6 +383,25 @@ export class SkillsRepository {
     if (error) {
       logger.error('Failed to publish skill:', error);
       throw error;
+    }
+
+    // Create initial version record in code (not relying on DB trigger)
+    const { error: versionError } = await this.supabase
+      .from('skill_versions')
+      .upsert({
+        skill_id: data.id,
+        version,
+        manifest: fullManifest,
+        content,
+        changelog: 'Initial release',
+        published_by: authorUserId || null,
+        published_at: new Date().toISOString(),
+      }, { onConflict: 'skill_id,version' });
+
+    if (versionError) {
+      logger.warn('Failed to create initial version record:', versionError);
+    } else {
+      logger.info(`Initial version ${version} created for skill ${name}`);
     }
 
     return toCamelCase<DbSkill>(data);
@@ -581,6 +603,23 @@ export class SkillsRepository {
       throw error;
     }
 
+    // Create initial version record for forked skill
+    const { error: versionError } = await this.supabase
+      .from('skill_versions')
+      .upsert({
+        skill_id: data.id,
+        version: '1.0.0',
+        manifest: source.manifest,
+        content: source.content,
+        changelog: `Forked from ${source.name}`,
+        published_by: forkerUserId,
+        published_at: new Date().toISOString(),
+      }, { onConflict: 'skill_id,version' });
+
+    if (versionError) {
+      logger.warn('Failed to create version record for fork:', versionError);
+    }
+
     logger.info(`Skill forked: ${source.name} -> ${newName} by user ${forkerUserId}`);
     return toCamelCase<DbSkillWithManagement>(data);
   }
@@ -641,7 +680,10 @@ export class SkillsRepository {
   }
 
   /**
-   * Update skill with version bump (tracks publisher)
+   * Update skill with version bump and explicit version record creation.
+   *
+   * Note: This handles version creation in code rather than via DB trigger
+   * for better portability across database systems.
    */
   async updateSkillWithVersion(
     skillId: string,
@@ -654,8 +696,10 @@ export class SkillsRepository {
       throw new Error(auth.reason || 'Unauthorized');
     }
 
+    const existingSkill = auth.skill!;
     const updateData: Record<string, unknown> = {
       last_published_by: authorUserId,
+      updated_at: new Date().toISOString(),
     };
 
     if (updates.displayName) updateData.display_name = updates.displayName;
@@ -665,11 +709,13 @@ export class SkillsRepository {
     if (updates.emoji !== undefined) updateData.emoji = updates.emoji;
     if (updates.version) updateData.current_version = updates.version;
     if (updates.content) updateData.content = updates.content;
-    if (updates.manifest) {
-      // Merge with existing manifest
-      const existingManifest = auth.skill!.manifest || {};
-      updateData.manifest = { ...existingManifest, ...updates.manifest, version: updates.version };
-    }
+
+    // Build merged manifest
+    const existingManifest = existingSkill.manifest || {};
+    const newManifest = updates.manifest
+      ? { ...existingManifest, ...updates.manifest, version: updates.version }
+      : { ...existingManifest, version: updates.version };
+    updateData.manifest = newManifest;
 
     const { data, error } = await this.supabase
       .from('skills')
@@ -683,7 +729,32 @@ export class SkillsRepository {
       throw error;
     }
 
-    logger.info(`Skill updated: ${auth.skill?.name} to version ${updates.version} by user ${authorUserId}`);
+    // Create version record in code (not relying on DB trigger for portability)
+    const contentChanged = updates.content && updates.content !== existingSkill.content;
+    const manifestChanged = JSON.stringify(newManifest) !== JSON.stringify(existingManifest);
+
+    if (contentChanged || manifestChanged) {
+      const { error: versionError } = await this.supabase
+        .from('skill_versions')
+        .upsert({
+          skill_id: skillId,
+          version: updates.version,
+          manifest: newManifest,
+          content: updates.content || existingSkill.content,
+          changelog: updates.changelog || null,
+          published_by: authorUserId,
+          published_at: new Date().toISOString(),
+        }, { onConflict: 'skill_id,version' });
+
+      if (versionError) {
+        // Log but don't fail - skill update succeeded
+        logger.warn('Failed to create version record:', versionError);
+      } else {
+        logger.info(`Version ${updates.version} created for skill ${existingSkill.name}`);
+      }
+    }
+
+    logger.info(`Skill updated: ${existingSkill.name} to version ${updates.version} by user ${authorUserId}`);
     return toCamelCase<DbSkillWithManagement>(data);
   }
 
