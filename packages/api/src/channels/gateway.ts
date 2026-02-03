@@ -379,11 +379,27 @@ export class ChannelGateway extends EventEmitter {
       return;
     }
 
-    // Log incoming message to activity stream
-    const userId = metadata?.userId;
+    // Resolve userId for activity stream logging
+    // metadata.userId may be pre-set, otherwise resolve from platform + sender ID
+    let userId = metadata?.userId;
+    if (!userId && this.dataComposer && sender.id) {
+      try {
+        const user = await this.dataComposer.repositories.users.findByPlatformId(
+          channel as 'telegram' | 'whatsapp' | 'discord',
+          sender.id
+        );
+        if (user) {
+          userId = user.id;
+        }
+      } catch (err) {
+        logger.debug('Could not resolve userId from platform ID for activity logging:', err);
+      }
+    }
     if (userId) {
       conversationUserMap.set(conversationId, userId);
     }
+
+    // Log incoming message to activity stream
     if (this.dataComposer && userId) {
       try {
         const isGroupChat = metadata?.chatType === 'group' || metadata?.chatType === 'channel';
@@ -405,8 +421,13 @@ export class ChannelGateway extends EventEmitter {
       }
     }
 
+    // Pass resolved userId to message handler so session-host can persist messages
+    const enrichedMetadata = userId && !metadata?.userId
+      ? { ...metadata, userId }
+      : metadata;
+
     try {
-      await this.messageHandler(channel, conversationId, sender, content, metadata);
+      await this.messageHandler(channel, conversationId, sender, content, enrichedMetadata);
     } catch (error) {
       logger.error(`Error forwarding message to handler:`, error);
       this.stopTypingIndicator(conversationId);

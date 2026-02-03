@@ -420,13 +420,19 @@ describe('Activity Stream Integration', () => {
   let mockLogMessage: Mock;
   let mockDataComposer: any;
 
+  let mockFindByPlatformId: Mock;
+
   beforeEach(() => {
     vi.useFakeTimers();
     mockLogMessage = vi.fn().mockResolvedValue({ id: 'activity-123' });
+    mockFindByPlatformId = vi.fn().mockResolvedValue(null);
     mockDataComposer = {
       repositories: {
         activityStream: {
           logMessage: mockLogMessage,
+        },
+        users: {
+          findByPlatformId: mockFindByPlatformId,
         },
       },
     };
@@ -495,7 +501,11 @@ describe('Activity Stream Integration', () => {
       );
     });
 
-    it('should not log incoming message when userId is not provided', async () => {
+    it('should resolve userId from platform + sender ID when not in metadata (Telegram flow)', async () => {
+      // This is the core regression test: Telegram never passes userId in metadata.
+      // The gateway must resolve it from platform + sender ID.
+      mockFindByPlatformId.mockResolvedValueOnce({ id: 'resolved-user-uuid' });
+
       const handler = vi.fn().mockResolvedValue(undefined);
       gateway.setMessageHandler(handler);
 
@@ -504,11 +514,54 @@ describe('Activity Stream Integration', () => {
       await forwardToHandler(
         'telegram',
         'chat123',
-        { id: 'sender456' },
-        'Hello',
-        {} // No userId
+        { id: 'telegram-sender-789' },
+        'Hello from Telegram',
+        { chatType: 'direct' } // No userId — just like real Telegram messages
       );
 
+      // Should have resolved user from platform ID
+      expect(mockFindByPlatformId).toHaveBeenCalledWith('telegram', 'telegram-sender-789');
+
+      // Should log to activity stream with resolved userId
+      expect(mockLogMessage).toHaveBeenCalledTimes(1);
+      expect(mockLogMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: 'resolved-user-uuid',
+          direction: 'in',
+          content: 'Hello from Telegram',
+          platform: 'telegram',
+          platformChatId: 'chat123',
+        })
+      );
+
+      // Should pass resolved userId to handler in enriched metadata
+      expect(handler).toHaveBeenCalledWith(
+        'telegram',
+        'chat123',
+        { id: 'telegram-sender-789' },
+        'Hello from Telegram',
+        expect.objectContaining({ userId: 'resolved-user-uuid' })
+      );
+    });
+
+    it('should not log when userId cannot be resolved from platform ID', async () => {
+      // User not found in database — can't log to activity stream
+      mockFindByPlatformId.mockResolvedValueOnce(null);
+
+      const handler = vi.fn().mockResolvedValue(undefined);
+      gateway.setMessageHandler(handler);
+
+      const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
+
+      await forwardToHandler(
+        'telegram',
+        'chat123',
+        { id: 'unknown-sender' },
+        'Hello',
+        {} // No userId, and user not in DB
+      );
+
+      expect(mockFindByPlatformId).toHaveBeenCalledWith('telegram', 'unknown-sender');
       expect(mockLogMessage).not.toHaveBeenCalled();
     });
 
@@ -571,8 +624,12 @@ describe('Activity Stream Integration', () => {
   });
 
   describe('Outgoing Messages', () => {
-    it('should log outgoing Telegram message when userId is in conversationUserMap', async () => {
-      // First, simulate an incoming message to populate conversationUserMap
+    it('should log outgoing Telegram message using userId resolved from incoming', async () => {
+      // Simulate the real Telegram round-trip:
+      // 1. Incoming message with no userId → gateway resolves from platform ID
+      // 2. Outgoing response → gateway uses cached userId from conversationUserMap
+      mockFindByPlatformId.mockResolvedValueOnce({ id: 'resolved-user-uuid' });
+
       const handler = vi.fn().mockResolvedValue(undefined);
       gateway.setMessageHandler(handler);
 
@@ -582,7 +639,7 @@ describe('Activity Stream Integration', () => {
         'chat123',
         { id: 'sender456' },
         'Incoming',
-        { userId: 'user-uuid-123' }
+        { chatType: 'direct' } // No userId — resolved from platform ID
       );
 
       // Now send outgoing message
@@ -596,7 +653,7 @@ describe('Activity Stream Integration', () => {
       expect(mockLogMessage).toHaveBeenCalledTimes(2);
       expect(mockLogMessage).toHaveBeenLastCalledWith(
         expect.objectContaining({
-          userId: 'user-uuid-123',
+          userId: 'resolved-user-uuid',
           direction: 'out',
           content: 'Outgoing reply',
           platform: 'telegram',

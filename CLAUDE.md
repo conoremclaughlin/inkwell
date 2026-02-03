@@ -317,6 +317,10 @@ npx @modelcontextprotocol/inspector packages/api/dist/index.js
 - Use `logger.info()`, `logger.error()`, `logger.debug()`
 - MCP Inspector shows tool calls and responses
 
+## Specs & Artifacts
+
+When we refer to "specs" in this project, we mean **PCP artifacts** — versioned documents stored in Supabase and managed via the `create_artifact` / `update_artifact` / `get_artifact` MCP tools. They are NOT local markdown files. To view or update a spec, use the artifact tools with the artifact's UUID or URI (e.g., `pcp://specs/agent-orchestrator`).
+
 ## Architecture Notes
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for detailed architecture documentation including:
