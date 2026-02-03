@@ -261,11 +261,31 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
       proc.on('close', (code) => {
         clearTimeout(timeout);
         this.process = null;
-        this.pendingMessage = null;
 
         if (code !== 0) {
           logger.warn(`Claude Code exited with code ${code}`);
         }
+
+        // Fallback: if we accumulated response text but never got a `result` event,
+        // emit the response now so it reaches the channel (e.g., Telegram).
+        // This handles cases where Claude Code exits before streaming the result JSON.
+        const isInternalMessage = this.pendingMessage?.metadata?.isInternal === true;
+        if (!responseEmitted && !this.config.disableAutoResponse && !isInternalMessage && this.pendingMessage && responseContent.trim()) {
+          responseEmitted = true;
+          logger.warn('Claude Code exited without result event — emitting fallback auto-response', {
+            channel: this.pendingMessage.channel,
+            conversationId: this.pendingMessage.conversationId,
+            contentLength: responseContent.length,
+            exitCode: code,
+          });
+          this.emit('response', {
+            channel: this.pendingMessage.channel,
+            conversationId: this.pendingMessage.conversationId,
+            content: responseContent,
+          });
+        }
+
+        this.pendingMessage = null;
         resolve();
       });
 

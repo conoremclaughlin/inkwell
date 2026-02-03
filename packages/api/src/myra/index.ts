@@ -611,10 +611,22 @@ async function startMyra(config: MyraConfig = {}): Promise<void> {
               }
             }
 
-            await telegramListener!.sendMessage(conversationId, processedContent, {
-              replyToMessageId: options?.replyToMessageId,
-              parseMode,
-            });
+            try {
+              await telegramListener!.sendMessage(conversationId, processedContent, {
+                replyToMessageId: options?.replyToMessageId,
+                parseMode,
+              });
+            } catch (sendError) {
+              // If MarkdownV2 formatting failed, retry as plain text
+              if (parseMode === 'MarkdownV2') {
+                logger.warn('MarkdownV2 send failed, retrying as plain text:', sendError);
+                await telegramListener!.sendMessage(conversationId, content, {
+                  replyToMessageId: options?.replyToMessageId,
+                });
+              } else {
+                throw sendError;
+              }
+            }
 
             // Log outgoing message to activity stream
             const userId = conversationUserMap.get(conversationId);
