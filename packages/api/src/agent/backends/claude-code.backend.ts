@@ -33,6 +33,8 @@ interface ClaudeStreamMessage {
   usage?: {
     input_tokens: number;
     output_tokens: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
   };
   is_error?: boolean;
 }
@@ -192,15 +194,21 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
 
             // Handle result
             if (parsed.type === 'result') {
-              // Accumulate token usage for context window tracking
+              // Accumulate token usage for context window tracking.
+              // Claude Code uses prompt caching, so the full context window is:
+              //   input_tokens (non-cached) + cache_read + cache_creation
               if (parsed.usage) {
-                this.totalInputTokens += parsed.usage.input_tokens;
-                this.totalOutputTokens += parsed.usage.output_tokens;
+                const messageInputTokens = parsed.usage.input_tokens
+                  + (parsed.usage.cache_read_input_tokens ?? 0)
+                  + (parsed.usage.cache_creation_input_tokens ?? 0);
+                const messageOutputTokens = parsed.usage.output_tokens;
+                this.totalInputTokens += messageInputTokens;
+                this.totalOutputTokens += messageOutputTokens;
                 this.emit('session:usage', {
                   inputTokens: this.totalInputTokens,
                   outputTokens: this.totalOutputTokens,
-                  messageInputTokens: parsed.usage.input_tokens,
-                  messageOutputTokens: parsed.usage.output_tokens,
+                  messageInputTokens,
+                  messageOutputTokens,
                 });
               }
 

@@ -16,6 +16,7 @@
     "server:dev": "tsx watch src/server.ts",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:coverage": "vitest run --coverage",
     "test:connection": "tsx src/test-connection.ts",
     "test:channels": "tsx src/test-channels.ts",
