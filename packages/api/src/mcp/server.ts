@@ -196,15 +196,58 @@ export class MCPServer {
       }
     });
 
-    // Health check endpoint
-    app.get('/health', (_req, res) => {
-      res.json({
+    // Health check endpoint for external monitoring (UptimeRobot, Healthchecks.io, etc.)
+    app.get('/health', async (_req, res) => {
+      const startTime = Date.now();
+      const checks: Record<string, { status: 'ok' | 'error'; latencyMs?: number; error?: string; details?: unknown }> = {};
+
+      // Check database connectivity
+      try {
+        const dbStart = Date.now();
+        const { error } = await this.dataComposer.getClient().from('users').select('id').limit(1);
+        checks.database = error
+          ? { status: 'error', error: error.message }
+          : { status: 'ok', latencyMs: Date.now() - dbStart };
+      } catch (err) {
+        checks.database = { status: 'error', error: err instanceof Error ? err.message : 'Unknown error' };
+      }
+
+      // Check channel gateway status
+      if (this.channelGateway) {
+        const gatewayStatus = this.channelGateway.getStatus();
+        checks.telegram = {
+          status: gatewayStatus.telegram.enabled && gatewayStatus.telegram.connected ? 'ok' : 'error',
+          ...(gatewayStatus.telegram.enabled && !gatewayStatus.telegram.connected && { error: 'Not connected' }),
+          ...(!gatewayStatus.telegram.enabled && { error: 'Disabled' }),
+        };
+        checks.whatsapp = {
+          status: gatewayStatus.whatsapp.enabled && gatewayStatus.whatsapp.connected ? 'ok' : 'error',
+          ...(gatewayStatus.whatsapp.enabled && !gatewayStatus.whatsapp.connected && { error: 'Not connected' }),
+          ...(!gatewayStatus.whatsapp.enabled && { error: 'Disabled' }),
+        };
+      }
+
+      // MCP server status
+      checks.mcp = {
         status: 'ok',
-        name: MCP_SERVER_NAME,
+        details: {
+          sseConnected: this.sseTransport !== null,
+          toolsVersion: this.toolsVersion,
+          miniApps: this.miniAppsInfo.map((m) => m.name),
+        },
+      };
+
+      // Overall status - database is critical, channels are not
+      const dbOk = checks.database?.status === 'ok';
+      const overallStatus = dbOk ? 'healthy' : 'unhealthy';
+
+      res.status(dbOk ? 200 : 503).json({
+        status: overallStatus,
         version: MCP_SERVER_VERSION,
-        connected: this.sseTransport !== null,
-        toolsVersion: this.toolsVersion,
-        miniApps: this.miniAppsInfo,
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        latencyMs: Date.now() - startTime,
+        checks,
       });
     });
 
