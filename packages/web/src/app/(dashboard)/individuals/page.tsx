@@ -5,10 +5,24 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { History, Brain, Sparkles, FileText } from 'lucide-react';
+import { History, Brain, Sparkles, FileText, User, Heart, Zap } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useApiQuery } from '@/lib/api';
+
+interface UserIdentity {
+  id: string;
+  userId: string;
+  userProfileMd?: string;
+  sharedValuesMd?: string;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface UserIdentityResponse {
+  userIdentity: UserIdentity | null;
+}
 
 interface Identity {
   id: string;
@@ -89,6 +103,89 @@ function generateIdentityMarkdown(identity: Identity): string {
   return lines.join('\n');
 }
 
+function UserIdentityCard({ userIdentity }: { userIdentity: UserIdentity }) {
+  const hasUserProfile = !!userIdentity.userProfileMd;
+  const hasValues = !!userIdentity.sharedValuesMd;
+
+  if (!hasUserProfile && !hasValues) {
+    return (
+      <Card className="mb-6 border-dashed">
+        <CardContent className="py-8">
+          <p className="text-center text-gray-500">
+            No user identity files yet. Use the <code>save_user_identity</code> MCP tool to create USER.md and VALUES.md.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card className="mb-6 border-blue-200 bg-blue-50/30">
+      <CardHeader>
+        <div className="flex items-center justify-between">
+          <div>
+            <CardTitle className="flex items-center gap-2">
+              <User className="h-5 w-5" />
+              User Identity
+              <Badge variant="outline" className="font-mono text-xs">
+                Shared
+              </Badge>
+            </CardTitle>
+            <CardDescription className="mt-1">
+              USER.md and VALUES.md - inherited by all SBs
+            </CardDescription>
+          </div>
+          <div className="flex items-center gap-2">
+            <Badge variant="secondary">v{userIdentity.version}</Badge>
+            <Button variant="outline" size="sm" asChild>
+              <Link href="/individuals/user-identity/versions">
+                <History className="mr-1 h-4 w-4" />
+                Versions
+              </Link>
+            </Button>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent>
+        <Tabs defaultValue={hasUserProfile ? 'user' : 'values'} className="w-full">
+          <TabsList className="mb-4">
+            {hasUserProfile && (
+              <TabsTrigger value="user" className="flex items-center gap-1">
+                <User className="h-4 w-4" />
+                USER.md
+              </TabsTrigger>
+            )}
+            {hasValues && (
+              <TabsTrigger value="values" className="flex items-center gap-1">
+                <Heart className="h-4 w-4" />
+                VALUES.md
+              </TabsTrigger>
+            )}
+          </TabsList>
+          {hasUserProfile && (
+            <TabsContent value="user">
+              <div className="prose prose-sm max-w-none dark:prose-invert prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-li:my-0">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                  {userIdentity.userProfileMd || ''}
+                </ReactMarkdown>
+              </div>
+            </TabsContent>
+          )}
+          {hasValues && (
+            <TabsContent value="values">
+              <div className="prose prose-sm max-w-none dark:prose-invert prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-li:my-0">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                  {userIdentity.sharedValuesMd || ''}
+                </ReactMarkdown>
+              </div>
+            </TabsContent>
+          )}
+        </Tabs>
+      </CardContent>
+    </Card>
+  );
+}
+
 function IdentityCard({ identity }: { identity: Identity }) {
   const identityMarkdown = generateIdentityMarkdown(identity);
 
@@ -106,6 +203,12 @@ function IdentityCard({ identity }: { identity: Identity }) {
                 <Badge variant="secondary" className="text-xs">
                   <Sparkles className="mr-1 h-3 w-3" />
                   Soul
+                </Badge>
+              )}
+              {identity.hasHeartbeat && (
+                <Badge variant="secondary" className="text-xs">
+                  <Zap className="mr-1 h-3 w-3" />
+                  Heartbeat
                 </Badge>
               )}
             </CardTitle>
@@ -129,28 +232,45 @@ function IdentityCard({ identity }: { identity: Identity }) {
         </div>
       </CardHeader>
       <CardContent>
-        {identity.hasSoul ? (
+        {(identity.hasSoul || identity.hasHeartbeat) ? (
           <Tabs defaultValue="identity" className="w-full">
             <TabsList className="mb-4">
               <TabsTrigger value="identity" className="flex items-center gap-1">
                 <FileText className="h-4 w-4" />
                 Identity
               </TabsTrigger>
-              <TabsTrigger value="soul" className="flex items-center gap-1">
-                <Sparkles className="h-4 w-4" />
-                Soul
-              </TabsTrigger>
+              {identity.hasSoul && (
+                <TabsTrigger value="soul" className="flex items-center gap-1">
+                  <Sparkles className="h-4 w-4" />
+                  Soul
+                </TabsTrigger>
+              )}
+              {identity.hasHeartbeat && (
+                <TabsTrigger value="heartbeat" className="flex items-center gap-1">
+                  <Zap className="h-4 w-4" />
+                  Heartbeat
+                </TabsTrigger>
+              )}
             </TabsList>
             <TabsContent value="identity">
               <div className="prose prose-sm max-w-none dark:prose-invert prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-li:my-0">
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>{identityMarkdown}</ReactMarkdown>
               </div>
             </TabsContent>
-            <TabsContent value="soul">
-              <div className="prose prose-sm max-w-none dark:prose-invert prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-li:my-0">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{identity.soul || '*No soul content yet.*'}</ReactMarkdown>
-              </div>
-            </TabsContent>
+            {identity.hasSoul && (
+              <TabsContent value="soul">
+                <div className="prose prose-sm max-w-none dark:prose-invert prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-li:my-0">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{identity.soul || '*No soul content yet.*'}</ReactMarkdown>
+                </div>
+              </TabsContent>
+            )}
+            {identity.hasHeartbeat && (
+              <TabsContent value="heartbeat">
+                <div className="prose prose-sm max-w-none dark:prose-invert prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-li:my-0">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{identity.heartbeat || '*No heartbeat content yet.*'}</ReactMarkdown>
+                </div>
+              </TabsContent>
+            )}
           </Tabs>
         ) : (
           <div className="prose prose-sm max-w-none dark:prose-invert prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-li:my-0">
@@ -163,12 +283,19 @@ function IdentityCard({ identity }: { identity: Identity }) {
 }
 
 export default function IndividualsPage() {
+  // Fetch user identity (USER.md, VALUES.md)
+  const { data: userIdentityData, isLoading: userIdentityLoading } = useApiQuery<UserIdentityResponse>(
+    ['user-identity'],
+    '/api/admin/user-identity'
+  );
+
   // Fetch individuals
   const { data, isLoading, error } = useApiQuery<IndividualsResponse>(
     ['individuals'],
     '/api/admin/individuals'
   );
 
+  const userIdentity = userIdentityData?.userIdentity;
   const individuals = data?.individuals ?? [];
 
   return (
@@ -177,7 +304,7 @@ export default function IndividualsPage() {
         <div>
           <h1 className="text-3xl font-bold text-gray-900">Individuals</h1>
           <p className="mt-2 text-gray-600">
-            AI beings with identity files - Wren, Myra, Benson, and others.
+            Identity files for you (USER.md, VALUES.md) and your AI beings (Wren, Myra, Benson).
           </p>
         </div>
       </div>
@@ -189,25 +316,57 @@ export default function IndividualsPage() {
       )}
 
       <div className="mt-6">
-        {isLoading ? (
-          <Card>
-            <CardContent className="py-8">
-              <p className="text-center text-gray-500">Loading individuals...</p>
-            </CardContent>
-          </Card>
-        ) : individuals.length === 0 ? (
-          <Card>
-            <CardContent className="py-8">
-              <p className="text-center text-gray-500">
-                No individuals found. Use the <code>save_identity</code> MCP tool to create one.
-              </p>
-            </CardContent>
-          </Card>
-        ) : (
-          individuals.map((individual) => (
-            <IdentityCard key={individual.id} identity={individual} />
-          ))
-        )}
+        {/* User Identity Section */}
+        <div className="mb-8">
+          <h2 className="text-lg font-semibold text-gray-700 mb-4 flex items-center gap-2">
+            <User className="h-5 w-5" />
+            Your Identity (Shared)
+          </h2>
+          {userIdentityLoading ? (
+            <Card className="border-blue-200 bg-blue-50/30">
+              <CardContent className="py-8">
+                <p className="text-center text-gray-500">Loading user identity...</p>
+              </CardContent>
+            </Card>
+          ) : userIdentity ? (
+            <UserIdentityCard userIdentity={userIdentity} />
+          ) : (
+            <Card className="mb-6 border-dashed border-blue-200">
+              <CardContent className="py-8">
+                <p className="text-center text-gray-500">
+                  No user identity files yet. Use the <code>save_user_identity</code> MCP tool to create USER.md and VALUES.md.
+                </p>
+              </CardContent>
+            </Card>
+          )}
+        </div>
+
+        {/* AI Beings Section */}
+        <div>
+          <h2 className="text-lg font-semibold text-gray-700 mb-4 flex items-center gap-2">
+            <Sparkles className="h-5 w-5" />
+            AI Beings
+          </h2>
+          {isLoading ? (
+            <Card>
+              <CardContent className="py-8">
+                <p className="text-center text-gray-500">Loading individuals...</p>
+              </CardContent>
+            </Card>
+          ) : individuals.length === 0 ? (
+            <Card>
+              <CardContent className="py-8">
+                <p className="text-center text-gray-500">
+                  No individuals found. Use the <code>save_identity</code> MCP tool to create one.
+                </p>
+              </CardContent>
+            </Card>
+          ) : (
+            individuals.map((individual) => (
+              <IdentityCard key={individual.id} identity={individual} />
+            ))
+          )}
+        </div>
       </div>
     </div>
   );

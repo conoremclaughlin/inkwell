@@ -1,13 +1,12 @@
 'use client';
 
 import React from 'react';
-import { useParams } from 'next/navigation';
 import dynamic from 'next/dynamic';
 import Link from 'next/link';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { ArrowLeft, Loader2, Sparkles, FileText, Zap } from 'lucide-react';
+import { ArrowLeft, Loader2, User, Heart, FileText } from 'lucide-react';
 import { useApiQuery } from '@/lib/api';
 import clsx from 'clsx';
 
@@ -17,143 +16,76 @@ const MarkdownVersionDiff = dynamic(
   { ssr: false, loading: () => <p className="text-gray-500 p-4">Loading diff viewer...</p> }
 );
 
-interface Identity {
+interface UserIdentity {
   id: string;
-  agentId: string;
-  name: string;
-  role: string;
-  description?: string;
-  values?: string[];
-  relationships?: Record<string, string>;
-  capabilities?: string[];
-  heartbeat?: string;
-  soul?: string;
-  hasSoul: boolean;
-  hasHeartbeat: boolean;
+  userId: string;
+  userProfileMd?: string;
+  sharedValuesMd?: string;
   version: number;
+  createdAt: string;
   updatedAt: string;
 }
 
 interface HistoryEntry {
   id: string;
   version: number;
-  name: string;
-  role: string;
-  description?: string;
-  values?: string[];
-  relationships?: Record<string, string>;
-  capabilities?: string[];
-  heartbeat?: string;
-  soul?: string;
-  hasSoul: boolean;
-  hasHeartbeat: boolean;
+  userProfileMd?: string;
+  sharedValuesMd?: string;
   changeType: string;
+  createdAt: string;
   archivedAt: string;
 }
 
-interface IndividualsResponse {
-  individuals: Identity[];
+interface UserIdentityResponse {
+  userIdentity: UserIdentity | null;
 }
 
 interface HistoryResponse {
   history: HistoryEntry[];
 }
 
-/**
- * Generate IDENTITY.md content from identity data
- */
-function generateIdentityMarkdown(version: HistoryEntry): string {
-  const lines: string[] = [];
+type VersionEntry = {
+  id: string;
+  version: number;
+  userProfileMd?: string;
+  sharedValuesMd?: string;
+  changeType: string;
+  archivedAt: string;
+};
 
-  lines.push(`# ${version.name}`);
-  lines.push('');
-  lines.push(`**Role:** ${version.role}`);
-  lines.push('');
-
-  if (version.description) {
-    lines.push('## Nature');
-    lines.push('');
-    lines.push(version.description);
-    lines.push('');
-  }
-
-  if (version.values && version.values.length > 0) {
-    lines.push('## Values');
-    lines.push('');
-    for (const value of version.values) {
-      lines.push(`- ${value}`);
-    }
-    lines.push('');
-  }
-
-  if (version.capabilities && version.capabilities.length > 0) {
-    lines.push('## Capabilities');
-    lines.push('');
-    for (const cap of version.capabilities) {
-      lines.push(`- ${cap}`);
-    }
-    lines.push('');
-  }
-
-  if (version.relationships && Object.keys(version.relationships).length > 0) {
-    lines.push('## Relationships');
-    lines.push('');
-    for (const [agent, desc] of Object.entries(version.relationships)) {
-      lines.push(`- **${agent}:** ${desc}`);
-    }
-    lines.push('');
-  }
-
-  return lines.join('\n');
-}
-
-export default function VersionExplorerPage() {
-  const params = useParams();
-  const agentId = params.agentId as string;
-
+export default function UserIdentityVersionsPage() {
   const [selectedVersionIndex, setSelectedVersionIndex] = React.useState(0);
 
-  // Fetch identity
+  // Fetch user identity
   const {
-    data: individualsData,
-    isLoading: individualsLoading,
-    error: individualsError,
-  } = useApiQuery<IndividualsResponse>(['individuals'], '/api/admin/individuals');
+    data: userIdentityData,
+    isLoading: userIdentityLoading,
+    error: userIdentityError,
+  } = useApiQuery<UserIdentityResponse>(['user-identity'], '/api/admin/user-identity');
 
   // Fetch history
   const {
     data: historyData,
     isLoading: historyLoading,
     error: historyError,
-  } = useApiQuery<HistoryResponse>(
-    ['individuals', agentId, 'history'],
-    `/api/admin/individuals/${agentId}/history`
-  );
+  } = useApiQuery<HistoryResponse>(['user-identity', 'history'], '/api/admin/user-identity/history');
 
-  const identity = individualsData?.individuals.find((i) => i.agentId === agentId) ?? null;
+  const userIdentity = userIdentityData?.userIdentity ?? null;
   const history = historyData?.history ?? [];
 
-  const isLoading = individualsLoading || historyLoading;
-  const error = individualsError || historyError;
+  const isLoading = userIdentityLoading || historyLoading;
+  const error = userIdentityError || historyError;
 
   // Build all versions array: current + history (newest to oldest)
-  const allVersions: HistoryEntry[] = identity
+  const allVersions: VersionEntry[] = userIdentity
     ? [
         {
-          id: identity.id,
-          version: identity.version,
-          name: identity.name,
-          role: identity.role,
-          description: identity.description,
-          values: identity.values,
-          relationships: identity.relationships,
-          capabilities: identity.capabilities,
-          heartbeat: identity.heartbeat,
-          soul: identity.soul,
-          hasSoul: identity.hasSoul,
-          hasHeartbeat: identity.hasHeartbeat,
+          id: userIdentity.id,
+          version: userIdentity.version,
+          userProfileMd: userIdentity.userProfileMd,
+          sharedValuesMd: userIdentity.sharedValuesMd,
           changeType: 'current',
-          archivedAt: identity.updatedAt,
+          archivedAt: userIdentity.updatedAt,
         },
         ...history,
       ]
@@ -162,17 +94,15 @@ export default function VersionExplorerPage() {
   const selectedVersion = allVersions[selectedVersionIndex];
   const comparisonVersion = allVersions[selectedVersionIndex + 1];
 
-  // Determine which files have content across any version
-  const hasIdentity = allVersions.some((v) => v.description || v.values?.length || v.capabilities?.length || v.relationships);
-  const hasSoul = allVersions.some((v) => v.soul);
-  const hasHeartbeat = allVersions.some((v) => v.heartbeat);
+  // Determine which files have content
+  const hasUserProfile = allVersions.some((v) => v.userProfileMd);
+  const hasValues = allVersions.some((v) => v.sharedValuesMd);
 
   // Check if specific files changed between versions
-  const currentIdentityMd = selectedVersion ? generateIdentityMarkdown(selectedVersion) : '';
-  const prevIdentityMd = comparisonVersion ? generateIdentityMarkdown(comparisonVersion) : '';
-  const identityChanged = currentIdentityMd !== prevIdentityMd;
-  const soulChanged = selectedVersion?.soul !== comparisonVersion?.soul;
-  const heartbeatChanged = selectedVersion?.heartbeat !== comparisonVersion?.heartbeat;
+  const userProfileChanged = selectedVersion && comparisonVersion &&
+    selectedVersion.userProfileMd !== comparisonVersion.userProfileMd;
+  const valuesChanged = selectedVersion && comparisonVersion &&
+    selectedVersion.sharedValuesMd !== comparisonVersion.sharedValuesMd;
 
   if (isLoading) {
     return (
@@ -194,10 +124,10 @@ export default function VersionExplorerPage() {
     );
   }
 
-  if (!identity) {
+  if (!userIdentity) {
     return (
       <div className="rounded-md bg-yellow-50 p-4 text-yellow-800">
-        Identity not found: {agentId}
+        No user identity found. Create one first with the <code>save_user_identity</code> MCP tool.
         <Link href="/individuals" className="ml-2 underline">
           Back to Individuals
         </Link>
@@ -218,7 +148,7 @@ export default function VersionExplorerPage() {
           </Button>
           <div>
             <h1 className="text-2xl font-bold text-gray-900">
-              {identity.name} Version History
+              User Identity Version History
             </h1>
             <p className="text-gray-600">
               {allVersions.length} version{allVersions.length !== 1 ? 's' : ''} available
@@ -244,26 +174,26 @@ export default function VersionExplorerPage() {
 
                   {/* Show all changed files like a git diff */}
                   <div className="space-y-6">
-                    {/* IDENTITY.md */}
-                    {hasIdentity && (
+                    {/* USER.md */}
+                    {hasUserProfile && (
                       <div className={clsx(
                         'rounded-lg border',
-                        identityChanged ? 'border-amber-200 bg-amber-50/30' : 'border-gray-200 bg-gray-50/30'
+                        userProfileChanged ? 'border-amber-200 bg-amber-50/30' : 'border-gray-200 bg-gray-50/30'
                       )}>
                         <div className="flex items-center gap-2 px-4 py-2 border-b bg-white/50 rounded-t-lg">
-                          <FileText className="h-4 w-4 text-gray-600" />
-                          <span className="font-mono text-sm font-medium">IDENTITY.md</span>
-                          {identityChanged ? (
+                          <User className="h-4 w-4 text-gray-600" />
+                          <span className="font-mono text-sm font-medium">USER.md</span>
+                          {userProfileChanged ? (
                             <Badge variant="outline" className="ml-auto text-xs bg-amber-100">Changed</Badge>
                           ) : (
                             <Badge variant="outline" className="ml-auto text-xs text-gray-400">Unchanged</Badge>
                           )}
                         </div>
                         <div className="p-4">
-                          {identityChanged ? (
+                          {userProfileChanged ? (
                             <MarkdownVersionDiff
-                              currentMarkdown={currentIdentityMd}
-                              previousMarkdown={prevIdentityMd}
+                              currentMarkdown={selectedVersion.userProfileMd || ''}
+                              previousMarkdown={comparisonVersion.userProfileMd || ''}
                             />
                           ) : (
                             <p className="text-sm text-gray-500 italic">No changes in this file</p>
@@ -272,54 +202,26 @@ export default function VersionExplorerPage() {
                       </div>
                     )}
 
-                    {/* SOUL.md */}
-                    {hasSoul && (
+                    {/* VALUES.md */}
+                    {hasValues && (
                       <div className={clsx(
                         'rounded-lg border',
-                        soulChanged ? 'border-amber-200 bg-amber-50/30' : 'border-gray-200 bg-gray-50/30'
+                        valuesChanged ? 'border-amber-200 bg-amber-50/30' : 'border-gray-200 bg-gray-50/30'
                       )}>
                         <div className="flex items-center gap-2 px-4 py-2 border-b bg-white/50 rounded-t-lg">
-                          <Sparkles className="h-4 w-4 text-amber-500" />
-                          <span className="font-mono text-sm font-medium">SOUL.md</span>
-                          {soulChanged ? (
+                          <Heart className="h-4 w-4 text-gray-600" />
+                          <span className="font-mono text-sm font-medium">VALUES.md</span>
+                          {valuesChanged ? (
                             <Badge variant="outline" className="ml-auto text-xs bg-amber-100">Changed</Badge>
                           ) : (
                             <Badge variant="outline" className="ml-auto text-xs text-gray-400">Unchanged</Badge>
                           )}
                         </div>
                         <div className="p-4">
-                          {soulChanged ? (
+                          {valuesChanged ? (
                             <MarkdownVersionDiff
-                              currentMarkdown={selectedVersion.soul || ''}
-                              previousMarkdown={comparisonVersion.soul || ''}
-                            />
-                          ) : (
-                            <p className="text-sm text-gray-500 italic">No changes in this file</p>
-                          )}
-                        </div>
-                      </div>
-                    )}
-
-                    {/* HEARTBEAT.md */}
-                    {hasHeartbeat && (
-                      <div className={clsx(
-                        'rounded-lg border',
-                        heartbeatChanged ? 'border-amber-200 bg-amber-50/30' : 'border-gray-200 bg-gray-50/30'
-                      )}>
-                        <div className="flex items-center gap-2 px-4 py-2 border-b bg-white/50 rounded-t-lg">
-                          <Zap className="h-4 w-4 text-blue-500" />
-                          <span className="font-mono text-sm font-medium">HEARTBEAT.md</span>
-                          {heartbeatChanged ? (
-                            <Badge variant="outline" className="ml-auto text-xs bg-amber-100">Changed</Badge>
-                          ) : (
-                            <Badge variant="outline" className="ml-auto text-xs text-gray-400">Unchanged</Badge>
-                          )}
-                        </div>
-                        <div className="p-4">
-                          {heartbeatChanged ? (
-                            <MarkdownVersionDiff
-                              currentMarkdown={selectedVersion.heartbeat || ''}
-                              previousMarkdown={comparisonVersion.heartbeat || ''}
+                              currentMarkdown={selectedVersion.sharedValuesMd || ''}
+                              previousMarkdown={comparisonVersion.sharedValuesMd || ''}
                             />
                           ) : (
                             <p className="text-sm text-gray-500 italic">No changes in this file</p>
@@ -332,7 +234,9 @@ export default function VersionExplorerPage() {
               ) : (
                 <div className="text-center text-gray-500 py-8">
                   <p className="font-medium">Original version</p>
-                  <p className="text-sm mt-1">This is the first version - no previous version to compare.</p>
+                  <p className="text-sm mt-1">
+                    This is the first version - no previous version to compare.
+                  </p>
                 </div>
               )}
             </CardContent>
@@ -356,25 +260,17 @@ export default function VersionExplorerPage() {
                       key={v.id}
                       className={clsx(
                         'relative cursor-pointer rounded-md py-4 pl-8 pr-4 transition-colors',
-                        isActive
-                          ? 'bg-blue-50 text-blue-900'
-                          : 'hover:bg-gray-50'
+                        isActive ? 'bg-blue-50 text-blue-900' : 'hover:bg-gray-50'
                       )}
                       onClick={() => setSelectedVersionIndex(i)}
                     >
                       {/* Timeline line */}
                       <span
-                        className={clsx(
-                          'absolute left-[11px] w-[2px]',
-                          {
-                            'top-1/2 bottom-0': isFirst,
-                            'top-0 bottom-1/2': isLast,
-                            'top-0 bottom-0': !isFirst && !isLast,
-                          },
-                          isActive
-                            ? 'bg-blue-500'
-                            : 'bg-gray-300'
-                        )}
+                        className={clsx('absolute left-[11px] w-[2px]', {
+                          'top-1/2 bottom-0': isFirst,
+                          'top-0 bottom-1/2': isLast,
+                          'top-0 bottom-0': !isFirst && !isLast,
+                        }, isActive ? 'bg-blue-500' : 'bg-gray-300')}
                       />
                       {/* Timeline dot */}
                       <span
@@ -394,16 +290,6 @@ export default function VersionExplorerPage() {
                               <Badge variant="secondary" className="ml-2 text-xs">
                                 Current
                               </Badge>
-                            )}
-                            {v.hasSoul && (
-                              <span title="Has Soul">
-                                <Sparkles className="ml-2 h-3 w-3 text-amber-500" />
-                              </span>
-                            )}
-                            {v.hasHeartbeat && (
-                              <span title="Has Heartbeat">
-                                <Zap className="ml-2 h-3 w-3 text-blue-500" />
-                              </span>
                             )}
                           </div>
                           <div className="text-sm text-gray-500">
