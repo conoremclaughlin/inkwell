@@ -215,7 +215,9 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
               // If we have a pending message AND auto-response is enabled, emit the response ONCE
               // Note: When MCP tools (like send_response) are available, disable this to avoid duplicates
               // Guard: Only emit response once per message to prevent duplicates from multiple 'result' events
-              if (!responseEmitted && !this.config.disableAutoResponse && this.pendingMessage && (parsed.result || responseContent)) {
+              // Internal messages (compaction, system) should never trigger auto-response
+              const isInternalMessage = this.pendingMessage?.metadata?.isInternal === true;
+              if (!responseEmitted && !this.config.disableAutoResponse && !isInternalMessage && this.pendingMessage && (parsed.result || responseContent)) {
                 responseEmitted = true;
                 const finalContent = parsed.result || responseContent;
                 logger.info(`Emitting auto-response for ${this.pendingMessage.channel}:${this.pendingMessage.conversationId}`);

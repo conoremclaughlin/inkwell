@@ -478,6 +478,33 @@ describe('Session Continuity', () => {
     await msg;
   });
 
+  it('should suppress auto-response for internal messages', async () => {
+    const { ClaudeCodeBackend } = await import('./claude-code.backend');
+    const backend = new ClaudeCodeBackend({ type: 'claude-code' });
+    await backend.initialize();
+
+    const responses: unknown[] = [];
+    backend.on('response', (r: unknown) => responses.push(r));
+
+    // Send an internal message (like compaction)
+    const msg = backend.sendMessage({
+      id: 'compaction-1', channel: 'agent', conversationId: 'compaction-myra',
+      sender: { id: 'system', name: 'System' }, content: 'Compact session',
+      timestamp: new Date(),
+      metadata: { isInternal: true, isCompaction: true },
+    });
+
+    mockProcess.stdout.emit('data', Buffer.from(
+      '{"type":"system","session_id":"s1"}\n' +
+      '{"type":"result","result":"Compaction complete","usage":{"input_tokens":500,"output_tokens":200}}\n'
+    ));
+    mockProcess.emit('close', 0);
+    await msg;
+
+    // Auto-response should NOT be emitted for internal messages
+    expect(responses.length).toBe(0);
+  });
+
   it('should NOT use --resume flag for new sessions', async () => {
     const { ClaudeCodeBackend } = await import('./claude-code.backend');
     const backend = new ClaudeCodeBackend({ type: 'claude-code' });

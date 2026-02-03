@@ -16,6 +16,21 @@ import { BackendManager, createBackendManager, BackendManagerConfig } from './ba
 import { setResponseCallback, addPendingMessage } from '../mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from '../channels/agent-gateway';
 
+const COMPACTION_PROMPT = `[SYSTEM: SESSION COMPACTION REQUEST]
+
+Your context window is approaching capacity. This session will be rotated soon.
+Please perform the following maintenance tasks:
+
+1. Call \`compact_session\` to convert your session logs into durable memories.
+2. Review your recent conversation history for any important context, decisions, insights, or user preferences that may NOT be captured in session logs. Create a SINGLE consolidated summary memory using \`remember\` with topics: ["session-summary"] and salience: "high". Do NOT create separate memories for each item — consolidate everything into one comprehensive summary so the next session can reload it efficiently.
+3. Use \`create_task\` to capture any pending work or commitments you haven't completed yet.
+
+IMPORTANT:
+- This is an internal system message. Do NOT call send_response.
+- Do NOT call end_session — the system handles rotation automatically.
+- Complete these tasks silently and efficiently.
+- NEVER save sensitive information as memories: API keys, passwords, credit card numbers, payment details, SSNs, or other secrets. Summarize around them.`;
+
 export interface ChannelSender {
   sendMessage(conversationId: string, content: string, options?: {
     replyToMessageId?: string;
@@ -40,6 +55,10 @@ export interface SessionHostConfig {
   registeredAgents?: string[];
   /** Max input tokens before rotating to a new session (default: 160000, ~80% of 200k) */
   maxContextTokens?: number;
+  /** Token threshold to trigger graceful compaction (default: 75% of maxContextTokens) */
+  compactionThreshold?: number;
+  /** Token threshold for hard rotation safety net (default: 85% of maxContextTokens) */
+  hardRotationThreshold?: number;
 }
 
 interface CachedContext {
@@ -67,6 +86,9 @@ export class SessionHost extends EventEmitter {
 
   // Context window management
   private maxContextTokens: number;
+  private compactionThreshold: number;
+  private hardRotationThreshold: number;
+  private compactionInProgress = false;
 
   constructor(config: SessionHostConfig) {
     super();
@@ -76,6 +98,8 @@ export class SessionHost extends EventEmitter {
     this.agentId = config.agentId;
     this.registeredAgents = config.registeredAgents || [];
     this.maxContextTokens = config.maxContextTokens ?? 160000; // ~80% of 200k for Opus
+    this.compactionThreshold = config.compactionThreshold ?? Math.floor(this.maxContextTokens * 0.75);
+    this.hardRotationThreshold = config.hardRotationThreshold ?? Math.floor(this.maxContextTokens * 0.85);
 
     // Create backend manager
     this.backendManager = createBackendManager(config.backend);
@@ -741,11 +765,52 @@ export class SessionHost extends EventEmitter {
   }
 
   /**
+   * Send a compaction message to the agent before rotating the session.
+   * The agent processes this within its current context window, calling MCP tools
+   * (compact_session, remember, create_task) to persist important context, then
+   * the session is rotated regardless of success or failure.
+   */
+  private async sendCompactionMessage(): Promise<void> {
+    this.compactionInProgress = true;
+    this.emit('session:compactionStarted', { agentId: this.agentId });
+
+    logger.info('Compaction threshold reached, sending compaction message to agent', {
+      agentId: this.agentId,
+    });
+
+    const compactionMessage: AgentMessage = {
+      id: `compaction-${Date.now()}`,
+      channel: 'agent' as ChannelType,
+      conversationId: `compaction-${this.agentId}`,
+      sender: { id: 'system', name: 'System' },
+      content: COMPACTION_PROMPT,
+      timestamp: new Date(),
+      metadata: { isInternal: true, isCompaction: true },
+    };
+
+    try {
+      // Send directly to backend — bypasses handleMessage() pipeline
+      // (no persistence, no pending queue, no context injection)
+      await this.backendManager.sendMessage(compactionMessage);
+
+      logger.info('Compaction complete, rotating session', { agentId: this.agentId });
+      this.emit('session:compactionComplete', { agentId: this.agentId });
+    } catch (error) {
+      logger.error('Compaction failed, rotating session anyway', { error, agentId: this.agentId });
+      this.emit('session:compactionFailed', { agentId: this.agentId, error });
+    }
+
+    // Always rotate after compaction attempt (success or failure)
+    await this.rotateSession();
+  }
+
+  /**
    * Rotate to a new Claude session when context window is approaching limits.
    * Marks the current session as completed in the DB, clears the backend session ID,
    * and clears the context cache so fresh context is injected on the next message.
    */
   private async rotateSession(): Promise<void> {
+    this.compactionInProgress = false;
     if (!this.agentId) return;
 
     try {
@@ -854,20 +919,32 @@ export class SessionHost extends EventEmitter {
       await this.persistClaudeSessionId(sessionId);
     });
 
-    // Monitor token usage for context window rotation
+    // Monitor token usage for context window rotation (two-phase: compaction then rotation)
     this.backendManager.on('session:usage', async (usage: {
       inputTokens: number;
       outputTokens: number;
       messageInputTokens: number;
       messageOutputTokens: number;
     }) => {
-      if (usage.inputTokens >= this.maxContextTokens) {
-        logger.warn('Context window limit approaching, rotating to new session', {
+      // Skip if compaction is already in progress — sendCompactionMessage owns the rotation lifecycle
+      if (this.compactionInProgress) return;
+
+      if (usage.inputTokens >= this.hardRotationThreshold) {
+        // Safety net: hard rotate if tokens exceed the higher threshold
+        logger.warn('Hard rotation threshold exceeded, rotating immediately', {
           inputTokens: usage.inputTokens,
-          maxContextTokens: this.maxContextTokens,
+          hardRotationThreshold: this.hardRotationThreshold,
           agentId: this.agentId,
         });
         await this.rotateSession();
+      } else if (usage.inputTokens >= this.compactionThreshold) {
+        // Graceful: ask the agent to save context before rotating
+        logger.info('Compaction threshold reached', {
+          inputTokens: usage.inputTokens,
+          compactionThreshold: this.compactionThreshold,
+          agentId: this.agentId,
+        });
+        await this.sendCompactionMessage();
       }
     });
   }
