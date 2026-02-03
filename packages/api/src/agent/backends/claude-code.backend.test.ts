@@ -528,6 +528,177 @@ describe('Session Continuity', () => {
   });
 });
 
+describe('Fallback Auto-Response on Close', () => {
+  let mockProcess: EventEmitter & {
+    stdout: EventEmitter;
+    stderr: EventEmitter;
+    stdin: { write: Mock; end: Mock };
+    kill: Mock;
+  };
+
+  beforeEach(() => {
+    mockProcess = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      stdin: { write: vi.fn(), end: vi.fn() },
+      kill: vi.fn(),
+    });
+    (spawn as Mock).mockReturnValue(mockProcess);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('should emit fallback response when process exits without result event', async () => {
+    const { ClaudeCodeBackend } = await import('./claude-code.backend');
+    const backend = new ClaudeCodeBackend({ type: 'claude-code' });
+    await backend.initialize();
+
+    const responses: Array<{ channel: string; conversationId: string; content: string }> = [];
+    backend.on('response', (r) => responses.push(r));
+
+    const msg = backend.sendMessage({
+      id: 'msg-1', channel: 'telegram', conversationId: 'chat-123',
+      sender: { id: 'u1', name: 'Conor' }, content: 'Hello',
+      timestamp: new Date(),
+    });
+
+    // Simulate assistant text events but NO result event (e.g., Claude Code crashes mid-stream)
+    mockProcess.stdout.emit('data', Buffer.from(
+      '{"type":"system","session_id":"s1"}\n' +
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"Here is my response"}]}}\n'
+    ));
+
+    // Process exits without ever emitting a result event
+    mockProcess.emit('close', 1);
+    await msg;
+
+    // Fallback should have emitted the accumulated assistant text
+    expect(responses.length).toBe(1);
+    expect(responses[0].channel).toBe('telegram');
+    expect(responses[0].conversationId).toBe('chat-123');
+    expect(responses[0].content).toBe('Here is my response');
+  });
+
+  it('should NOT emit fallback when result event was already received', async () => {
+    const { ClaudeCodeBackend } = await import('./claude-code.backend');
+    const backend = new ClaudeCodeBackend({ type: 'claude-code' });
+    await backend.initialize();
+
+    const responses: Array<{ content: string }> = [];
+    backend.on('response', (r) => responses.push(r));
+
+    const msg = backend.sendMessage({
+      id: 'msg-1', channel: 'telegram', conversationId: 'chat-123',
+      sender: { id: 'u1' }, content: 'Hello', timestamp: new Date(),
+    });
+
+    // Normal flow: assistant text + result event
+    mockProcess.stdout.emit('data', Buffer.from(
+      '{"type":"system","session_id":"s1"}\n' +
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"Response text"}]}}\n' +
+      '{"type":"result","result":"Response text","usage":{"input_tokens":100,"output_tokens":50}}\n'
+    ));
+    mockProcess.emit('close', 0);
+    await msg;
+
+    // Only ONE response — from the result event, not a duplicate from close
+    expect(responses.length).toBe(1);
+  });
+
+  it('should NOT emit fallback for internal messages', async () => {
+    const { ClaudeCodeBackend } = await import('./claude-code.backend');
+    const backend = new ClaudeCodeBackend({ type: 'claude-code' });
+    await backend.initialize();
+
+    const responses: unknown[] = [];
+    backend.on('response', (r) => responses.push(r));
+
+    const msg = backend.sendMessage({
+      id: 'compaction-1', channel: 'agent', conversationId: 'compaction-myra',
+      sender: { id: 'system' }, content: 'Compact session',
+      timestamp: new Date(),
+      metadata: { isInternal: true, isCompaction: true },
+    });
+
+    // Assistant text but no result, and it's an internal message
+    mockProcess.stdout.emit('data', Buffer.from(
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"Compaction done"}]}}\n'
+    ));
+    mockProcess.emit('close', 0);
+    await msg;
+
+    expect(responses.length).toBe(0);
+  });
+
+  it('should NOT emit fallback when disableAutoResponse is true', async () => {
+    const { ClaudeCodeBackend } = await import('./claude-code.backend');
+    const backend = new ClaudeCodeBackend({ type: 'claude-code', disableAutoResponse: true });
+    await backend.initialize();
+
+    const responses: unknown[] = [];
+    backend.on('response', (r) => responses.push(r));
+
+    const msg = backend.sendMessage({
+      id: 'msg-1', channel: 'telegram', conversationId: 'chat-123',
+      sender: { id: 'u1' }, content: 'Hello', timestamp: new Date(),
+    });
+
+    mockProcess.stdout.emit('data', Buffer.from(
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"Response text"}]}}\n'
+    ));
+    mockProcess.emit('close', 1);
+    await msg;
+
+    expect(responses.length).toBe(0);
+  });
+
+  it('should NOT emit fallback when responseContent is empty', async () => {
+    const { ClaudeCodeBackend } = await import('./claude-code.backend');
+    const backend = new ClaudeCodeBackend({ type: 'claude-code' });
+    await backend.initialize();
+
+    const responses: unknown[] = [];
+    backend.on('response', (r) => responses.push(r));
+
+    const msg = backend.sendMessage({
+      id: 'msg-1', channel: 'telegram', conversationId: 'chat-123',
+      sender: { id: 'u1' }, content: 'Hello', timestamp: new Date(),
+    });
+
+    // Process exits with no assistant text and no result
+    mockProcess.stdout.emit('data', Buffer.from(
+      '{"type":"system","session_id":"s1"}\n'
+    ));
+    mockProcess.emit('close', 1);
+    await msg;
+
+    expect(responses.length).toBe(0);
+  });
+
+  it('should clear pendingMessage after fallback emission', async () => {
+    const { ClaudeCodeBackend } = await import('./claude-code.backend');
+    const backend = new ClaudeCodeBackend({ type: 'claude-code' });
+    await backend.initialize();
+
+    const msg = backend.sendMessage({
+      id: 'msg-1', channel: 'telegram', conversationId: 'chat-123',
+      sender: { id: 'u1' }, content: 'Hello', timestamp: new Date(),
+    });
+
+    expect(backend.getPendingMessage()).not.toBeNull();
+
+    mockProcess.stdout.emit('data', Buffer.from(
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"Fallback text"}]}}\n'
+    ));
+    mockProcess.emit('close', 1);
+    await msg;
+
+    expect(backend.getPendingMessage()).toBeNull();
+  });
+});
+
 describe('Backend Configuration', () => {
   it('should have correct default timeout', () => {
     const DEFAULT_TIMEOUT = 300000; // 5 minutes
