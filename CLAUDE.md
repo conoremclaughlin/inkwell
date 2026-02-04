@@ -183,6 +183,13 @@ yarn type-check
 
 # Test database connection
 yarn test:connection
+
+# Process management (pm2)
+yarn pm2 list              # List running processes
+yarn pm2 restart myra      # Restart Myra
+yarn pm2 restart pcp       # Restart PCP server
+yarn pm2 logs myra         # View Myra logs
+yarn pm2 start ecosystem.config.cjs  # Start all processes
 ```
 
 ## Database Migrations
