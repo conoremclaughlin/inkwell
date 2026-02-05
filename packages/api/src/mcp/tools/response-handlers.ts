@@ -16,6 +16,10 @@ export type ResponseCallback = (response: AgentResponse) => Promise<void>;
 // Global response callback - set by the session host
 let globalResponseCallback: ResponseCallback | null = null;
 
+// Track which conversations have received explicit responses via send_response
+// Key: "channel:conversationId", Value: timestamp of last response
+const explicitResponseTracker: Map<string, number> = new Map();
+
 /**
  * Register the global response callback
  * Called by the session host to handle send_response tool calls
@@ -29,6 +33,38 @@ export function setResponseCallback(callback: ResponseCallback): void {
  */
 export function getResponseCallback(): ResponseCallback | null {
   return globalResponseCallback;
+}
+
+/**
+ * Check if a conversation has received an explicit send_response within the last N ms.
+ * Used by server.ts to decide whether to auto-forward.
+ */
+export function hasExplicitResponse(channel: string, conversationId: string, withinMs = 60000): boolean {
+  const key = `${channel}:${conversationId}`;
+  const timestamp = explicitResponseTracker.get(key);
+  if (!timestamp) return false;
+  return Date.now() - timestamp < withinMs;
+}
+
+/**
+ * Clear explicit response tracking for a conversation (call after message processing complete)
+ */
+export function clearExplicitResponse(channel: string, conversationId: string): void {
+  const key = `${channel}:${conversationId}`;
+  explicitResponseTracker.delete(key);
+}
+
+/**
+ * Mark a conversation as having received an explicit response
+ */
+function markExplicitResponse(channel: string, conversationId: string): void {
+  const key = `${channel}:${conversationId}`;
+  explicitResponseTracker.set(key, Date.now());
+  // Clean up old entries (> 5 minutes) to prevent memory leak
+  const cutoff = Date.now() - 300000;
+  for (const [k, v] of explicitResponseTracker.entries()) {
+    if (v < cutoff) explicitResponseTracker.delete(k);
+  }
 }
 
 // ============================================================================
@@ -84,6 +120,9 @@ export async function handleSendResponse(
       replyToMessageId: args.replyToMessageId,
       metadata: args.metadata,
     };
+
+    // Mark this conversation as having received an explicit response
+    markExplicitResponse(args.channel, args.conversationId);
 
     // Try local callback first (when running in same process as session host)
     if (globalResponseCallback) {

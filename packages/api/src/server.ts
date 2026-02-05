@@ -24,7 +24,7 @@ import { SessionService, type SessionServiceConfig } from './services/sessions';
 import type { SessionRequest, ChannelResponse, ChannelType } from './services/sessions';
 import { createMCPServer, MCPServer, type IncomingMessageHandler, type ChannelGateway } from './mcp/server';
 import { initHeartbeatService, processHeartbeat, type DueReminder } from './services/heartbeat';
-import { setResponseCallback } from './mcp/tools/response-handlers';
+import { setResponseCallback, hasExplicitResponse } from './mcp/tools/response-handlers';
 import { logger } from './utils/logger';
 import { env } from './config/env';
 
@@ -169,9 +169,10 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     // and auto-route the text response if no explicit send_response was called
     const isExternalChannel = channel === 'telegram' || channel === 'whatsapp';
     if (isExternalChannel && channelGateway) {
-      const hasExplicitResponse = result.responses && result.responses.length > 0;
+      // Check if send_response was called via MCP (tracked in response-handlers)
+      const hadExplicitResponse = hasExplicitResponse(channel, conversationId);
 
-      if (!hasExplicitResponse && result.finalTextResponse && result.success) {
+      if (!hadExplicitResponse && result.finalTextResponse && result.success) {
         // Auto-route Claude's text response back to the originating channel
         logger.info('Auto-routing text response (no explicit send_response called)', {
           channel,
@@ -185,6 +186,11 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         );
       } else {
         // Just release the conversation (and process any pending messages)
+        logger.debug('Explicit send_response detected, skipping auto-forward', {
+          channel,
+          conversationId,
+          hadExplicitResponse,
+        });
         await channelGateway.releaseConversation(
           channel as 'telegram' | 'whatsapp',
           conversationId
