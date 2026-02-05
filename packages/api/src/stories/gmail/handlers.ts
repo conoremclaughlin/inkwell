@@ -35,6 +35,110 @@ type ToolResult = {
 };
 
 // ============================================================================
+// Label Permissions (Whitelist)
+// ============================================================================
+
+/**
+ * Labels that are allowed to be added via modify_emails.
+ * This whitelist prevents destructive operations like moving to trash.
+ *
+ * To enable deletion later, add 'TRASH' to this list (with appropriate
+ * permission checks from user/agent config).
+ */
+export const ALLOWED_ADD_LABELS: Set<string> = new Set([
+  'STARRED',
+  'IMPORTANT',
+  'UNREAD',
+  // Note: INBOX is allowed for "un-archiving" emails
+  'INBOX',
+  // User-created labels are allowed (checked separately)
+]);
+
+/**
+ * Labels that are allowed to be removed via modify_emails.
+ */
+export const ALLOWED_REMOVE_LABELS: Set<string> = new Set([
+  'UNREAD',
+  'STARRED',
+  'IMPORTANT',
+  'INBOX', // Removing from INBOX = archiving
+  'SPAM', // Allow moving out of spam
+]);
+
+/**
+ * Labels that are NEVER allowed to be added (destructive operations).
+ * These are explicitly blocked regardless of any other settings.
+ */
+export const BLOCKED_ADD_LABELS: Set<string> = new Set([
+  'TRASH', // Deleting emails
+  'SPAM', // Marking as spam
+]);
+
+/**
+ * Check if a label operation is allowed.
+ * User-created labels (not system labels) are generally allowed.
+ *
+ * @param label The label ID
+ * @param operation 'add' or 'remove'
+ * @returns { allowed: boolean, reason?: string }
+ */
+export function isLabelOperationAllowed(
+  label: string,
+  operation: 'add' | 'remove'
+): { allowed: boolean; reason?: string } {
+  // Check blocked list first (for add operations)
+  if (operation === 'add' && BLOCKED_ADD_LABELS.has(label)) {
+    return {
+      allowed: false,
+      reason: `Adding '${label}' label is not permitted. This operation could result in data loss.`,
+    };
+  }
+
+  // Check allowlist
+  const allowlist = operation === 'add' ? ALLOWED_ADD_LABELS : ALLOWED_REMOVE_LABELS;
+
+  // System labels (all caps) must be in the allowlist
+  const isSystemLabel = label === label.toUpperCase() && !label.startsWith('Label_');
+  if (isSystemLabel && !allowlist.has(label)) {
+    return {
+      allowed: false,
+      reason: `${operation === 'add' ? 'Adding' : 'Removing'} system label '${label}' is not permitted.`,
+    };
+  }
+
+  // User-created labels are allowed
+  return { allowed: true };
+}
+
+/**
+ * Validate all label operations in a modify request.
+ *
+ * @returns null if all operations are valid, or an error message describing blocked operations
+ */
+export function validateLabelOperations(
+  addLabelIds?: string[],
+  removeLabelIds?: string[]
+): string | null {
+  const errors: string[] = [];
+
+  for (const label of addLabelIds || []) {
+    const result = isLabelOperationAllowed(label, 'add');
+    if (!result.allowed) {
+      errors.push(result.reason!);
+    }
+  }
+
+  for (const label of removeLabelIds || []) {
+    const result = isLabelOperationAllowed(label, 'remove');
+    if (!result.allowed) {
+      errors.push(result.reason!);
+    }
+  }
+
+  return errors.length > 0 ? errors.join(' ') : null;
+}
+
+// ============================================================================
 // Schemas
 // ============================================================================
 
@@ -597,6 +701,37 @@ export async function handleModifyEmails(
             {
               success: false,
               error: 'Must specify at least one of addLabelIds or removeLabelIds',
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  // Validate label operations against whitelist
+  const labelValidationError = validateLabelOperations(params.addLabelIds, params.removeLabelIds);
+  if (labelValidationError) {
+    logger.warn('Blocked email modification due to label restrictions', {
+      userId: user.id,
+      addLabelIds: params.addLabelIds,
+      removeLabelIds: params.removeLabelIds,
+      error: labelValidationError,
+    });
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            {
+              success: false,
+              error: labelValidationError,
+              hint: 'Only safe label operations are permitted. Allowed: mark read/unread, star/unstar, archive. Deletion (TRASH) is not permitted.',
+              allowedAddLabels: Array.from(ALLOWED_ADD_LABELS),
+              allowedRemoveLabels: Array.from(ALLOWED_REMOVE_LABELS),
             },
             null,
             2

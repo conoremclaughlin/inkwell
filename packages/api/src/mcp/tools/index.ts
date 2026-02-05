@@ -2572,8 +2572,10 @@ Common operations:
 - Star: addLabelIds: ['STARRED']
 - Unstar: removeLabelIds: ['STARRED']
 - Archive: removeLabelIds: ['INBOX']
-- Move to trash: addLabelIds: ['TRASH']
+- Un-archive: addLabelIds: ['INBOX']
 - Mark important: addLabelIds: ['IMPORTANT']
+
+NOTE: Deletion (TRASH) and spam marking are NOT permitted for safety. Only organizational operations are allowed.
 
 Supports batch operations on up to 100 emails at once.
 

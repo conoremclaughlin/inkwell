@@ -343,6 +343,8 @@ export class GmailService {
   /**
    * Modify email labels (mark as read/unread, star/unstar, archive, etc.)
    *
+   * Uses Gmail's batchModify API for efficiency (up to 1000 emails per request).
+   *
    * Common operations:
    * - Mark as read: removeLabelIds: ['UNREAD']
    * - Mark as unread: addLabelIds: ['UNREAD']
@@ -356,7 +358,7 @@ export class GmailService {
 
     const { messageIds, addLabelIds, removeLabelIds } = options;
 
-    logger.info('Modifying emails', {
+    logger.info('Modifying emails via batchModify', {
       userId,
       count: messageIds.length,
       addLabelIds,
@@ -366,13 +368,41 @@ export class GmailService {
     const modified: string[] = [];
     const failed: Array<{ messageId: string; error: string }> = [];
 
-    // Process in parallel with concurrency limit
-    const batchSize = 10;
+    // Gmail batchModify supports up to 1000 IDs per request
+    const batchSize = 1000;
+
     for (let i = 0; i < messageIds.length; i += batchSize) {
       const batch = messageIds.slice(i, i + batchSize);
+      const batchNum = Math.floor(i / batchSize) + 1;
+      const totalBatches = Math.ceil(messageIds.length / batchSize);
 
-      await Promise.all(
-        batch.map(async (messageId) => {
+      logger.info(`Processing batch ${batchNum}/${totalBatches} (${batch.length} emails)`, { userId });
+
+      try {
+        // Use batchModify for efficient bulk modification
+        await gmail.users.messages.batchModify({
+          userId: 'me',
+          requestBody: {
+            ids: batch,
+            addLabelIds: addLabelIds || [],
+            removeLabelIds: removeLabelIds || [],
+          },
+        });
+
+        // batchModify succeeds atomically for all IDs in the batch
+        modified.push(...batch);
+        logger.info(`Batch ${batchNum} completed successfully`, {
+          userId,
+          modifiedCount: batch.length,
+        });
+      } catch (error) {
+        // If batch fails, fall back to individual modifications to identify which failed
+        logger.warn(`Batch ${batchNum} failed, falling back to individual modifications`, {
+          userId,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        });
+
+        for (const messageId of batch) {
           try {
             await gmail.users.messages.modify({
               userId: 'me',
@@ -383,13 +413,13 @@ export class GmailService {
               },
             });
             modified.push(messageId);
-          } catch (error) {
-            const message = error instanceof Error ? error.message : 'Unknown error';
+          } catch (individualError) {
+            const message = individualError instanceof Error ? individualError.message : 'Unknown error';
             failed.push({ messageId, error: message });
             logger.warn('Failed to modify email', { userId, messageId, error: message });
           }
-        })
-      );
+        }
+      }
     }
 
     logger.info('Emails modified', {
