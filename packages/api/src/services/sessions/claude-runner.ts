@@ -303,7 +303,8 @@ export class ClaudeRunner implements IClaudeRunner {
 export function buildIdentityPrompt(
   agentId: string,
   agentName: string,
-  soul?: string
+  soul?: string,
+  timezone?: string
 ): string {
   let prompt = `## Identity Override (CRITICAL)
 
@@ -316,6 +317,24 @@ Do NOT run \`echo $AGENT_ID\` — you are running headlessly without shell acces
 
   if (soul) {
     prompt += `\n\n### Soul\n${soul}`;
+  }
+
+  // Add timezone handling guidance if timezone is provided
+  if (timezone) {
+    prompt += `
+
+## Timezone Handling (CRITICAL)
+
+**User's timezone: ${timezone}**
+
+ALWAYS convert UTC timestamps to the user's local timezone when displaying dates/times.
+
+When presenting times from emails, APIs, or databases:
+- Convert UTC to ${timezone} before displaying
+- Use friendly formats: "Wed, Feb 4 at 10:55 AM PST" (not raw UTC)
+- For relative times: "2 hours ago", "yesterday at 3pm"
+
+Example: "Wed, 4 Feb 2026 18:55:35 +0000" → "Wed, Feb 4 at 10:55 AM PST"`;
   }
 
   return prompt;

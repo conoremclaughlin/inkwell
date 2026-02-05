@@ -125,7 +125,8 @@ export class SessionService implements ISessionService {
         appendSystemPrompt: buildIdentityPrompt(
           agentId,
           injectedContext.agent.name,
-          injectedContext.agent.soul
+          injectedContext.agent.soul,
+          injectedContext.user.timezone
         ),
       };
 
@@ -304,6 +305,13 @@ This session will continue with a fresh context after compaction. Your identity,
       session.agentId
     );
 
+    // Fetch user timezone for identity prompt
+    const fullContext = await this.contextBuilder.buildContext(
+      session.userId,
+      session.agentId,
+      session
+    );
+
     const runnerConfig: ClaudeRunnerConfig = {
       workingDirectory: this.config.defaultWorkingDirectory,
       mcpConfigPath: this.config.mcpConfigPath,
@@ -311,7 +319,8 @@ This session will continue with a fresh context after compaction. Your identity,
       appendSystemPrompt: buildIdentityPrompt(
         session.agentId,
         context.agent.name,
-        context.agent.soul
+        context.agent.soul,
+        fullContext.user.timezone
       ),
     };
 
