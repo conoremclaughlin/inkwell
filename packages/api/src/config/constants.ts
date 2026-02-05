@@ -8,6 +8,28 @@ export const APP_DESCRIPTION =
 // MCP Server metadata
 export const MCP_SERVER_NAME = 'personal-context-protocol';
 export const MCP_SERVER_VERSION = '1.0.0';
+export const MCP_SERVER_DESCRIPTION = `Personal Context Protocol (PCP) - Persistent memory and context management for AI agents.
+
+## User Identification
+Most tools require identifying a user. You can use ANY ONE of these methods:
+- userId: Direct UUID (e.g., "69ffffd2-f6e4-4cb7-b08f-9d051a63a409")
+- email: Email address (e.g., "user@example.com")
+- phone: E.164 format (e.g., "+14155551234")
+- platform + platformId: Platform name (telegram/whatsapp/discord) with user ID
+
+## Core Capabilities
+- **Memory**: remember, recall, forget - Long-term memory with semantic search
+- **Sessions**: start_session, log_session, end_session - Track conversation sessions
+- **Bootstrap**: bootstrap - Initialize agent with user context, identity, and recent memories
+- **Gmail**: list_emails, get_email, send_email, modify_emails - Full Gmail integration
+- **Calendar**: list_calendars, list_calendar_events - Google Calendar access
+- **Reminders**: create_reminder, list_reminders - Scheduled notifications
+- **Tasks**: create_task, list_tasks, update_task - Project task management
+
+## Important
+- Call bootstrap() at session start to load identity and context
+- Use remember() to persist important information across sessions
+- Use send_response() to route messages back to users on external channels`;
 
 // API configuration
 export const API_PREFIX = '/api/v1';

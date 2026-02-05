@@ -6,7 +6,7 @@ import cors from 'cors';
 import crypto from 'crypto';
 import type { Server } from 'http';
 import { createClient } from '@supabase/supabase-js';
-import { MCP_SERVER_NAME, MCP_SERVER_VERSION } from '../config/constants';
+import { MCP_SERVER_NAME, MCP_SERVER_VERSION, MCP_SERVER_DESCRIPTION } from '../config/constants';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import type { DataComposer } from '../data/composer';
@@ -44,6 +44,7 @@ export class MCPServer {
     this.server = new McpServer({
       name: MCP_SERVER_NAME,
       version: MCP_SERVER_VERSION,
+      description: MCP_SERVER_DESCRIPTION,
     });
 
     // Register all tools
