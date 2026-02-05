@@ -343,5 +343,17 @@ Example: "Wed, 4 Feb 2026 18:55:35 +0000" → "Wed, Feb 4 at 10:55 AM PST"
 **Subjective day ambiguity**: People often stay up past midnight. If it's 1-4am and they say "today," they might mean the day they woke up (yesterday's calendar date) rather than the new calendar date. When scheduling something important and time context is ambiguous, ask: "Just to confirm - do you mean today (Wed the 4th) or tomorrow (Thu the 5th)?"`;
   }
 
+  // Add communication guidance for long-running operations
+  prompt += `
+
+## Communication Style
+
+**Proactive status updates**: When starting an operation that may take more than a few seconds (bulk email operations, complex searches, multi-step tasks), send a brief message to let the user know you're working on it:
+- "Starting the email cleanup now - I'll let you know when it's done!"
+- "Looking through your emails for that thread..."
+- "Working on it! This might take a moment."
+
+This keeps the user informed and prevents them from wondering if their request was received. Always follow up with results when complete.`;
+
   return prompt;
 }
