@@ -173,9 +173,13 @@ import {
   handleListCalendars,
   handleListCalendarEvents,
   handleGetCalendarEvent,
+  handleRespondToCalendarEvent,
+  handleUpdateCalendarEvent,
   listCalendarsSchema,
   listCalendarEventsSchema,
   getCalendarEventSchema,
+  respondToCalendarEventSchema,
+  updateCalendarEventSchema,
 } from '../../stories/google-calendar/handlers';
 
 import {
@@ -2394,6 +2398,75 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleGetCalendarEvent(args, dataComposer);
       } catch (error) {
         logger.error('Error in get_calendar_event:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'respond_to_calendar_event',
+    {
+      description: `Respond to a calendar event invitation (accept, decline, or tentative).
+
+Allows the user to RSVP to meeting invitations they have received. The user must be listed as an attendee on the event.
+
+Response options:
+- "accepted" - Accept the invitation
+- "declined" - Decline the invitation
+- "tentative" - Mark as tentative/maybe
+
+Note: This tool can only respond to invites. It cannot delete events or modify other attendees (blocked for safety).
+
+User must have connected their Google account with Calendar write permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: respondToCalendarEventSchema,
+    },
+    async (args) => {
+      try {
+        return await handleRespondToCalendarEvent(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in respond_to_calendar_event:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'update_calendar_event',
+    {
+      description: `Update a calendar event's details (title, description, location, times).
+
+Allows modifying safe fields on events the user has edit access to (typically as the organizer or with writer access to the calendar).
+
+Updateable fields:
+- "summary" - Event title
+- "description" - Event description/notes
+- "location" - Event location
+- "start" - Start time (use dateTime for timed events, date for all-day)
+- "end" - End time (use dateTime for timed events, date for all-day)
+
+Note: This tool cannot delete events, modify attendees, or change the organizer (blocked for safety).
+
+For timed events, use RFC3339 format: "2026-02-10T10:00:00-08:00"
+For all-day events, use date format: "2026-02-10"
+
+User must have connected their Google account with Calendar write permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: updateCalendarEventSchema,
+    },
+    async (args) => {
+      try {
+        return await handleUpdateCalendarEvent(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in update_calendar_event:', error);
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
           isError: true,

@@ -65,3 +65,55 @@ export interface GetEventOptions {
   calendarId?: string;
   eventId: string;
 }
+
+/**
+ * Valid response statuses for calendar events.
+ * Maps to Google Calendar API's responseStatus values.
+ */
+export type EventResponseStatus = 'accepted' | 'declined' | 'tentative';
+
+export interface RespondToEventOptions {
+  calendarId?: string;
+  eventId: string;
+  responseStatus: EventResponseStatus;
+}
+
+/**
+ * Fields that can be updated on a calendar event.
+ */
+export interface UpdateEventFields {
+  summary?: string;
+  description?: string;
+  location?: string;
+  start?: {
+    dateTime?: string;
+    date?: string;
+    timeZone?: string;
+  };
+  end?: {
+    dateTime?: string;
+    date?: string;
+    timeZone?: string;
+  };
+}
+
+export interface UpdateEventOptions {
+  calendarId?: string;
+  eventId: string;
+  fields: UpdateEventFields;
+}
+
+/**
+ * Calendar operations that can be validated against whitelist/blocklist.
+ */
+export type CalendarOperation =
+  | 'respond_to_event'
+  | 'create_event'
+  | 'update_event'
+  | 'delete_event'
+  | 'update_attendees';
+
+/**
+ * Fields that are allowed to be updated via update_calendar_event.
+ */
+export type UpdateableEventField = 'summary' | 'description' | 'location' | 'start' | 'end';
