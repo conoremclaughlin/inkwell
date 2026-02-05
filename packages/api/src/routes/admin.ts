@@ -1153,6 +1153,127 @@ router.get('/oauth/:provider/callback', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * GET /api/admin/oauth/:provider/required-scopes
+ * Get the required scopes for a provider to check if upgrade is needed
+ */
+router.get('/oauth/:provider/required-scopes', async (req: Request, res: Response) => {
+  try {
+    const { provider } = req.params;
+    const oauthService = getOAuthService();
+
+    if (!oauthService.isProviderConfigured(provider)) {
+      res.status(400).json({ error: `OAuth not configured for ${provider}` });
+      return;
+    }
+
+    const requiredScopes = oauthService.getRequiredScopes(provider);
+    res.json({ provider, requiredScopes });
+  } catch (error) {
+    logger.error('Failed to get required scopes:', error);
+    res.status(500).json({ error: 'Failed to get required scopes' });
+  }
+});
+
+/**
+ * POST /api/admin/oauth/:provider/upgrade-scopes
+ * Start OAuth flow to upgrade scopes for an existing connection
+ */
+router.post('/oauth/:provider/upgrade-scopes', async (req: Request, res: Response) => {
+  try {
+    const { provider } = req.params;
+    const { accountId } = req.body;
+    const oauthService = getOAuthService();
+
+    if (!oauthService.isProviderConfigured(provider)) {
+      res.status(400).json({ error: `OAuth not configured for ${provider}` });
+      return;
+    }
+
+    if (!accountId) {
+      res.status(400).json({ error: 'accountId is required' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const authReq = req as Request & { user: { email: string } };
+
+    // Get the PCP user
+    const { data: pcpUser } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', authReq.user.email)
+      .single();
+
+    if (!pcpUser) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+
+    // Get the connected account
+    const { data: account, error: accountError } = await supabase
+      .from('connected_accounts')
+      .select('*')
+      .eq('id', accountId)
+      .eq('user_id', pcpUser.id)
+      .single();
+
+    if (accountError || !account) {
+      res.status(404).json({ error: 'Connected account not found' });
+      return;
+    }
+
+    const currentScopes = (account.scopes as string[]) || [];
+    const missingScopes = oauthService.getMissingScopes(provider, currentScopes);
+
+    if (missingScopes.length === 0) {
+      res.json({
+        needsUpgrade: false,
+        message: 'All required scopes are already granted'
+      });
+      return;
+    }
+
+    // Generate state token
+    const state = crypto.randomUUID();
+    oauthStateStore.set(state, {
+      userId: pcpUser.id,
+      provider,
+      expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes
+    });
+
+    // Build redirect URI
+    const configuredUrl = env.OAUTH_REDIRECT_BASE_URL;
+    const defaultPath = `/api/admin/oauth/${provider}/callback`;
+    let redirectUri: string;
+    if (configuredUrl) {
+      const url = new URL(configuredUrl);
+      redirectUri = url.pathname !== '/' ? configuredUrl : `${configuredUrl}${defaultPath}`;
+    } else {
+      redirectUri = `http://localhost:${env.MCP_HTTP_PORT}${defaultPath}`;
+    }
+
+    // Get upgrade URL with login hint
+    const authUrl = oauthService.getUpgradeScopesUrl(
+      provider,
+      redirectUri,
+      state,
+      currentScopes,
+      account.email as string | undefined
+    );
+
+    res.json({
+      needsUpgrade: true,
+      authUrl,
+      missingScopes,
+      currentScopes,
+    });
+  } catch (error) {
+    logger.error('Failed to start scope upgrade:', error);
+    res.status(500).json({ error: 'Failed to start scope upgrade' });
+  }
+});
+
 // =============================================================================
 // Artifacts
 // =============================================================================

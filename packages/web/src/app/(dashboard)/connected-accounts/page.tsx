@@ -5,6 +5,14 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import {
   Link2,
   Link2Off,
   Mail,
@@ -18,7 +26,7 @@ import {
   User,
   Shield,
 } from 'lucide-react';
-import { useApiQuery, useApiDelete, apiGet } from '@/lib/api';
+import { useApiQuery, useApiDelete, apiGet, apiPost } from '@/lib/api';
 import { useQueryClient } from '@tanstack/react-query';
 import clsx from 'clsx';
 import { useState, useEffect, useCallback } from 'react';
@@ -46,6 +54,19 @@ interface Provider {
 interface ConnectedAccountsResponse {
   accounts: ConnectedAccount[];
   providers: Provider[];
+}
+
+interface RequiredScopesResponse {
+  provider: string;
+  requiredScopes: string[];
+}
+
+interface UpgradeScopesResponse {
+  needsUpgrade: boolean;
+  authUrl?: string;
+  missingScopes?: string[];
+  currentScopes?: string[];
+  message?: string;
 }
 
 const providerConfig: Record<string, { label: string; icon: React.ReactNode; color: string; description: string }> = {
@@ -161,10 +182,43 @@ function formatRelativeTime(date: string): string {
 export default function ConnectedAccountsPage() {
   const queryClient = useQueryClient();
   const [connectingProvider, setConnectingProvider] = useState<string | null>(null);
+  const [upgradeModalOpen, setUpgradeModalOpen] = useState(false);
+  const [upgradeAccount, setUpgradeAccount] = useState<ConnectedAccount | null>(null);
+  const [missingScopes, setMissingScopes] = useState<string[]>([]);
+  const [upgradingScopes, setUpgradingScopes] = useState(false);
+  const [requiredScopes, setRequiredScopes] = useState<Record<string, string[]>>({});
 
   const { data, isLoading, error, refetch } = useApiQuery<ConnectedAccountsResponse>(
     ['connected-accounts'],
     '/api/admin/connected-accounts'
+  );
+
+  // Fetch required scopes for each provider
+  useEffect(() => {
+    const fetchRequiredScopes = async () => {
+      try {
+        const googleScopes = await apiGet<RequiredScopesResponse>(
+          '/api/admin/oauth/google/required-scopes'
+        );
+        setRequiredScopes((prev) => ({
+          ...prev,
+          google: googleScopes.requiredScopes,
+        }));
+      } catch (err) {
+        console.error('Failed to fetch required scopes:', err);
+      }
+    };
+    fetchRequiredScopes();
+  }, []);
+
+  // Check if an account has missing scopes
+  const getMissingScopes = useCallback(
+    (account: ConnectedAccount): string[] => {
+      const required = requiredScopes[account.provider] || [];
+      const current = new Set(account.scopes);
+      return required.filter((scope) => !current.has(scope));
+    },
+    [requiredScopes]
   );
 
   const disconnectMutation = useApiDelete<{ success: boolean }>('/api/admin/connected-accounts');
@@ -229,6 +283,55 @@ export default function ConnectedAccountsPage() {
       queryClient.invalidateQueries({ queryKey: ['connected-accounts'] });
     } catch (err) {
       console.error('Disconnect error:', err);
+    }
+  };
+
+  const handleOpenUpgradeModal = (account: ConnectedAccount) => {
+    const missing = getMissingScopes(account);
+    setUpgradeAccount(account);
+    setMissingScopes(missing);
+    setUpgradeModalOpen(true);
+  };
+
+  const handleUpgradeScopes = async () => {
+    if (!upgradeAccount) return;
+
+    setUpgradingScopes(true);
+    try {
+      const response = await apiPost<UpgradeScopesResponse>(
+        `/api/admin/oauth/${upgradeAccount.provider}/upgrade-scopes`,
+        { accountId: upgradeAccount.id }
+      );
+
+      if (!response.needsUpgrade) {
+        // No upgrade needed - scopes are already up to date
+        setUpgradeModalOpen(false);
+        refetch();
+        return;
+      }
+
+      if (response.authUrl) {
+        // Open popup for OAuth upgrade
+        const width = 500;
+        const height = 600;
+        const left = window.screenX + (window.outerWidth - width) / 2;
+        const top = window.screenY + (window.outerHeight - height) / 2;
+
+        const popup = window.open(
+          response.authUrl,
+          'oauth-upgrade-popup',
+          `width=${width},height=${height},left=${left},top=${top}`
+        );
+
+        if (!popup) {
+          alert('Popup was blocked. Please allow popups for this site.');
+        }
+      }
+    } catch (err) {
+      console.error('Upgrade scopes error:', err);
+    } finally {
+      setUpgradingScopes(false);
+      setUpgradeModalOpen(false);
     }
   };
 
@@ -354,6 +457,16 @@ export default function ConnectedAccountsPage() {
                         </div>
                       </div>
                       <div className="flex items-center gap-2">
+                        {account.status === 'active' && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => handleOpenUpgradeModal(account)}
+                          >
+                            <Shield className="h-4 w-4" />
+                            {getMissingScopes(account).length > 0 ? 'Modify Permissions' : 'View Permissions'}
+                          </Button>
+                        )}
                         {account.status === 'expired' && (
                           <Button
                             variant="outline"
@@ -481,6 +594,133 @@ export default function ConnectedAccountsPage() {
           )}
         </CardContent>
       </Card>
+
+      {/* Modify Permissions Modal */}
+      <Dialog open={upgradeModalOpen} onOpenChange={setUpgradeModalOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Shield className="h-5 w-5 text-gray-600" />
+              Modify Permissions
+            </DialogTitle>
+            <DialogDescription>
+              Manage permissions for your{' '}
+              {upgradeAccount?.provider === 'google' ? 'Google' : upgradeAccount?.provider} account.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="py-4 space-y-5">
+            {/* Current Permissions Section */}
+            {upgradeAccount && upgradeAccount.scopes.length > 0 && (
+              <div>
+                <h4 className="text-sm font-medium text-gray-700 mb-2 flex items-center gap-2">
+                  <CheckCircle className="h-4 w-4 text-green-500" />
+                  Current Permissions
+                </h4>
+                <div className="bg-green-50 rounded-lg p-3 border border-green-100">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {(Object.entries(groupScopes(upgradeAccount.scopes)) as [PermissionGroup, string[]][])
+                      .filter(([, scopes]) => scopes.length > 0)
+                      .map(([group, scopes]) => {
+                        const groupConfig = permissionGroups[group];
+                        return (
+                          <div key={group}>
+                            <div className="flex items-center gap-2 text-gray-700 mb-1">
+                              {groupConfig.icon}
+                              <span className="text-xs font-medium">{groupConfig.label}</span>
+                            </div>
+                            <div className="space-y-1">
+                              {scopes.map((scope) => (
+                                <div key={scope} className="flex items-center gap-2 text-xs text-gray-600">
+                                  <CheckCircle className="h-3 w-3 text-green-500" />
+                                  {translateScope(scope)}
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      })}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Available to Add Section */}
+            {missingScopes.length > 0 && (
+              <div>
+                <h4 className="text-sm font-medium text-gray-700 mb-2 flex items-center gap-2">
+                  <Shield className="h-4 w-4 text-blue-500" />
+                  Available to Add
+                </h4>
+                <div className="bg-blue-50 rounded-lg p-3 border border-blue-100">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {(Object.entries(groupScopes(missingScopes)) as [PermissionGroup, string[]][])
+                      .filter(([, scopes]) => scopes.length > 0)
+                      .map(([group, scopes]) => {
+                        const groupConfig = permissionGroups[group];
+                        return (
+                          <div key={group}>
+                            <div className="flex items-center gap-2 text-gray-700 mb-1">
+                              {groupConfig.icon}
+                              <span className="text-xs font-medium">{groupConfig.label}</span>
+                            </div>
+                            <div className="space-y-1">
+                              {scopes.map((scope) => (
+                                <div key={scope} className="flex items-center gap-2 text-xs text-gray-600">
+                                  <div className="h-3 w-3 rounded border border-blue-400 bg-white" />
+                                  {translateScope(scope)}
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      })}
+                  </div>
+                </div>
+                <p className="text-xs text-gray-500 mt-2">
+                  Click &quot;Add Permissions&quot; to authorize these additional permissions via Google.
+                </p>
+              </div>
+            )}
+
+            {/* Note about removing permissions */}
+            <div className="bg-gray-50 rounded-lg p-3 border border-gray-200">
+              <p className="text-xs text-gray-500">
+                <strong className="text-gray-600">Note:</strong> To remove permissions, you must disconnect this account
+                and reconnect with only the permissions you need. Google does not support revoking individual scopes.
+              </p>
+            </div>
+          </div>
+
+          <DialogFooter className="gap-2 sm:gap-0">
+            <Button
+              variant="outline"
+              onClick={() => setUpgradeModalOpen(false)}
+              disabled={upgradingScopes}
+            >
+              Close
+            </Button>
+            {missingScopes.length > 0 && (
+              <Button
+                onClick={handleUpgradeScopes}
+                disabled={upgradingScopes}
+              >
+                {upgradingScopes ? (
+                  <>
+                    <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                    Authorizing...
+                  </>
+                ) : (
+                  <>
+                    <Shield className="mr-2 h-4 w-4" />
+                    Add Permissions
+                  </>
+                )}
+              </Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

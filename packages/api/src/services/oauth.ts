@@ -71,6 +71,28 @@ class OAuthService {
   }
 
   /**
+   * Get the required scopes for a provider.
+   * Used by the frontend to compare against user's current scopes.
+   */
+  getRequiredScopes(provider: string): string[] {
+    const config = OAUTH_PROVIDERS[provider];
+    if (!config) {
+      throw new Error(`Unknown OAuth provider: ${provider}`);
+    }
+    return [...config.scopes];
+  }
+
+  /**
+   * Check if the user's current scopes are missing any required scopes.
+   * Returns the list of missing scopes, or empty array if all scopes are present.
+   */
+  getMissingScopes(provider: string, currentScopes: string[]): string[] {
+    const requiredScopes = this.getRequiredScopes(provider);
+    const currentSet = new Set(currentScopes);
+    return requiredScopes.filter((scope) => !currentSet.has(scope));
+  }
+
+  /**
    * Generate OAuth authorization URL for a provider
    */
   getAuthorizationUrl(
@@ -98,6 +120,51 @@ class OAuthService {
       access_type: 'offline', // Request refresh token
       prompt: 'consent', // Always show consent screen to get refresh token
     });
+
+    return `${config.authUrl}?${params.toString()}`;
+  }
+
+  /**
+   * Get an OAuth URL for upgrading scopes (incremental authorization).
+   * Uses Google's include_granted_scopes to keep existing permissions.
+   */
+  getUpgradeScopesUrl(
+    provider: string,
+    redirectUri: string,
+    state: string,
+    existingScopes: string[],
+    loginHint?: string
+  ): string {
+    const config = OAUTH_PROVIDERS[provider];
+    if (!config) {
+      throw new Error(`Unknown OAuth provider: ${provider}`);
+    }
+
+    if (!config.clientId) {
+      throw new Error(`OAuth not configured for ${provider}: missing client ID`);
+    }
+
+    // Only request the missing scopes
+    const missingScopes = this.getMissingScopes(provider, existingScopes);
+    if (missingScopes.length === 0) {
+      throw new Error('No missing scopes to upgrade');
+    }
+
+    const params = new URLSearchParams({
+      client_id: config.clientId,
+      redirect_uri: redirectUri,
+      response_type: 'code',
+      scope: missingScopes.join(' '),
+      state,
+      access_type: 'offline',
+      prompt: 'consent',
+      include_granted_scopes: 'true', // Keep existing scopes
+    });
+
+    // Add login_hint to pre-select the account
+    if (loginHint) {
+      params.set('login_hint', loginHint);
+    }
 
     return `${config.authUrl}?${params.toString()}`;
   }
