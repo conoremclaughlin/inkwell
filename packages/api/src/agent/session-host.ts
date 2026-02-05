@@ -1,5 +1,12 @@
 /**
- * Session Host
+ * @deprecated Use SessionService from '../services/sessions/session-service.ts' instead.
+ *
+ * Session Host (DEPRECATED)
+ *
+ * This class is deprecated in favor of SessionService which provides:
+ * - Proper locking per agent+session to prevent concurrent Claude Code processes
+ * - Stateless, horizontally-scalable session management
+ * - Message queuing when sessions are busy
  *
  * The main orchestrator that connects:
  * - Input channels (Telegram, terminal, HTTP, etc.)

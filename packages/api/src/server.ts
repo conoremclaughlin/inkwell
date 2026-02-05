@@ -20,7 +20,7 @@
 
 import path from 'path';
 import { getDataComposer, DataComposer } from './data/composer';
-import { SessionService, type SessionServiceConfig } from './services/sessions';
+import { createSessionService, SessionService, type SessionServiceConfig } from './services/sessions';
 import type { SessionRequest, ChannelResponse, ChannelType } from './services/sessions';
 import { createMCPServer, MCPServer, type IncomingMessageHandler, type ChannelGateway } from './mcp/server';
 import { initHeartbeatService, processHeartbeat, type DueReminder } from './services/heartbeat';
@@ -108,7 +108,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     defaultModel: model,
     compactionThreshold: config.compactionThreshold || 150000,
   };
-  sessionService = new SessionService(dataComposer.getClient(), sessionServiceConfig);
+  sessionService = createSessionService(dataComposer.getClient(), sessionServiceConfig);
   logger.info('SessionService ready');
 
   // 3. Create the incoming message handler

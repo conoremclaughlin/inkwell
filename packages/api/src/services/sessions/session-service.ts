@@ -3,6 +3,9 @@
  *
  * Stateless service for managing agent sessions.
  * Resolves all context from the database per-request.
+ *
+ * Supports dependency injection for testing - pass dependencies directly
+ * or use createSessionService() factory for production.
  */
 
 import { randomUUID } from 'crypto';
@@ -16,7 +19,11 @@ import type {
   SessionResult,
   ISessionService,
   ClaudeRunnerConfig,
+  IClaudeRunner,
+  ISessionRepository,
+  IContextBuilder,
 } from './types.js';
+import type { Json } from '../../data/supabase/types.js';
 import { SessionRepository } from './session-repository.js';
 import { ContextBuilder } from './context-builder.js';
 import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
@@ -44,21 +51,70 @@ const DEFAULT_CONFIG: SessionServiceConfig = {
   compactionThreshold: 150000, // ~150k tokens
 };
 
+/**
+ * Activity stream interface for dependency injection.
+ * (ISessionRepository and IContextBuilder are defined in types.ts)
+ */
+export interface IActivityStream {
+  logMessage(params: {
+    userId: string;
+    agentId: string;
+    direction: 'in' | 'out';
+    content: string;
+    platform?: string;
+    platformChatId?: string;
+    isDm?: boolean;
+    payload?: Json;
+  }): Promise<{ id: string }>;
+}
+
+/**
+ * Pending message queued while a session is being processed.
+ */
+interface PendingMessage {
+  request: SessionRequest;
+  resolve: (result: SessionResult) => void;
+  reject: (error: Error) => void;
+}
+
 export class SessionService implements ISessionService {
-  private repository: SessionRepository;
-  private contextBuilder: ContextBuilder;
-  private claudeRunner: ClaudeRunner;
-  private activityStream: ActivityStreamRepository;
+  private repository: ISessionRepository;
+  private contextBuilder: IContextBuilder;
+  private claudeRunner: IClaudeRunner;
+  private activityStream: IActivityStream;
   private config: SessionServiceConfig;
 
+  /**
+   * Processing lock per agent session.
+   * Key: `${agentId}:${sessionId}` - prevents concurrent Claude Code processes on the same session.
+   * This is critical because multiple channels (telegram, heartbeat, agent triggers) can
+   * target the same Claude session, and concurrent `--resume` calls cause race conditions.
+   */
+  private processingLocks: Set<string> = new Set();
+
+  /**
+   * Queue for messages that arrive while a session is being processed.
+   * Key: `${agentId}:${sessionId}` - matches processing lock key.
+   */
+  private pendingQueues: Map<string, PendingMessage[]> = new Map();
+
+  /**
+   * Create a SessionService with dependency injection support.
+   *
+   * For production, use createSessionService() factory which wires up real dependencies.
+   * For testing, pass mock implementations directly.
+   */
   constructor(
-    supabase: SupabaseClient<Database>,
+    repository: ISessionRepository,
+    contextBuilder: IContextBuilder,
+    claudeRunner: IClaudeRunner,
+    activityStream: IActivityStream,
     config: Partial<SessionServiceConfig> = {}
   ) {
-    this.repository = new SessionRepository(supabase);
-    this.contextBuilder = new ContextBuilder(supabase);
-    this.claudeRunner = new ClaudeRunner();
-    this.activityStream = new ActivityStreamRepository(supabase);
+    this.repository = repository;
+    this.contextBuilder = contextBuilder;
+    this.claudeRunner = claudeRunner;
+    this.activityStream = activityStream;
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
 
@@ -100,82 +156,43 @@ export class SessionService implements ISessionService {
     }
 
     try {
-      // 1. Get or create session
+      // 1. Get or create session (needed to determine lock key)
       const session = await this.getOrCreateSession(userId, agentId, {
         type: metadata?.sessionType || 'primary',
         taskDescription: metadata?.taskDescription,
         parentSessionId: metadata?.parentSessionId,
       });
 
-      // 2. Build context for the agent
-      const injectedContext = await this.contextBuilder.buildContext(
-        userId,
-        agentId,
-        session
-      );
+      // 2. Build lock key - must be per agent + session to support sub-agents
+      const lockKey = `${agentId}:${session.id}`;
 
-      // 3. Format the incoming message with sender info
-      const formattedMessage = this.formatMessage(request);
+      // 3. Check if session is already being processed
+      if (this.processingLocks.has(lockKey)) {
+        logger.info('Session is processing, queuing message', {
+          lockKey,
+          channel: request.channel,
+          conversationId: request.conversationId,
+        });
 
-      // 4. Build Claude runner config
-      const runnerConfig: ClaudeRunnerConfig = {
-        workingDirectory: this.config.defaultWorkingDirectory,
-        mcpConfigPath: this.config.mcpConfigPath,
-        model: this.config.defaultModel,
-        appendSystemPrompt: buildIdentityPrompt(
-          agentId,
-          injectedContext.agent.name,
-          injectedContext.agent.soul,
-          injectedContext.user.timezone
-        ),
-      };
-
-      // 5. Run Claude Code
-      const result = await this.claudeRunner.run(formattedMessage, {
-        claudeSessionId: session.claudeSessionId || undefined,
-        injectedContext: session.claudeSessionId ? undefined : injectedContext,
-        config: runnerConfig,
-      });
-
-      // 6. Update session with new Claude session ID and usage
-      if (result.claudeSessionId !== session.claudeSessionId) {
-        await this.repository.update(session.id, {
-          claudeSessionId: result.claudeSessionId,
+        // Queue the message and return a promise that resolves when processed
+        return new Promise((resolve, reject) => {
+          const queue = this.pendingQueues.get(lockKey) || [];
+          queue.push({ request, resolve, reject });
+          this.pendingQueues.set(lockKey, queue);
         });
       }
 
-      if (result.usage) {
-        await this.repository.updateTokenUsage(session.id, {
-          contextTokens: result.usage.contextTokens,
-          inputTokens: result.usage.inputTokens,
-          outputTokens: result.usage.outputTokens,
-        });
+      // 4. Acquire lock and process
+      this.processingLocks.add(lockKey);
+      logger.debug('Acquired processing lock', { lockKey });
 
-        // 7. Check if compaction is needed
-        if (result.usage.contextTokens >= this.config.compactionThreshold) {
-          logger.info('Session approaching context limit, triggering compaction', {
-            sessionId: session.id,
-            contextTokens: result.usage.contextTokens,
-            threshold: this.config.compactionThreshold,
-          });
-          // Trigger compaction asynchronously
-          this.triggerCompaction(session.id).catch((error) => {
-            logger.error('Compaction failed', { sessionId: session.id, error });
-          });
-        }
+      try {
+        const result = await this.processMessage(request, session);
+        return result;
+      } finally {
+        // 5. Process queued messages or release lock
+        await this.processQueueOrReleaseLock(lockKey);
       }
-
-      return {
-        success: result.success,
-        sessionId: session.id,
-        claudeSessionId: result.claudeSessionId,
-        responses: result.responses,
-        usage: result.usage,
-        sessionStatus: session.status,
-        compactionTriggered: false,
-        finalTextResponse: result.finalTextResponse,
-        error: result.error,
-      };
     } catch (error) {
       logger.error('Error handling message', {
         userId,
@@ -195,6 +212,134 @@ export class SessionService implements ISessionService {
         errorCode: 'INTERNAL_ERROR',
       };
     }
+  }
+
+  /**
+   * Process queued messages or release the lock.
+   * If there are pending messages, process the next one (lock remains held).
+   * If queue is empty, release the lock.
+   */
+  private async processQueueOrReleaseLock(lockKey: string): Promise<void> {
+    const queue = this.pendingQueues.get(lockKey);
+
+    if (queue && queue.length > 0) {
+      // Pop next message and process it (keep lock held)
+      const pending = queue.shift()!;
+      logger.info('Processing queued message', {
+        lockKey,
+        queueRemaining: queue.length,
+        channel: pending.request.channel,
+      });
+
+      // Clean up empty queue
+      if (queue.length === 0) {
+        this.pendingQueues.delete(lockKey);
+      }
+
+      try {
+        // Get session again (may have changed)
+        const session = await this.getOrCreateSession(
+          pending.request.userId,
+          pending.request.agentId,
+          {
+            type: pending.request.metadata?.sessionType || 'primary',
+            taskDescription: pending.request.metadata?.taskDescription,
+            parentSessionId: pending.request.metadata?.parentSessionId,
+          }
+        );
+
+        const result = await this.processMessage(pending.request, session);
+        pending.resolve(result);
+      } catch (error) {
+        pending.reject(error instanceof Error ? error : new Error(String(error)));
+      } finally {
+        // Continue processing queue
+        await this.processQueueOrReleaseLock(lockKey);
+      }
+    } else {
+      // Queue empty, release lock
+      this.processingLocks.delete(lockKey);
+      this.pendingQueues.delete(lockKey);
+      logger.debug('Released processing lock', { lockKey });
+    }
+  }
+
+  /**
+   * Process a message with an already-acquired lock.
+   * This is the core message processing logic, separated from locking.
+   */
+  private async processMessage(request: SessionRequest, session: Session): Promise<SessionResult> {
+    const { userId, agentId } = request;
+
+    // 1. Build context for the agent
+    const injectedContext = await this.contextBuilder.buildContext(
+      userId,
+      agentId,
+      session
+    );
+
+    // 2. Format the incoming message with sender info
+    const formattedMessage = this.formatMessage(request);
+
+    // 3. Build Claude runner config
+    const runnerConfig: ClaudeRunnerConfig = {
+      workingDirectory: this.config.defaultWorkingDirectory,
+      mcpConfigPath: this.config.mcpConfigPath,
+      model: this.config.defaultModel,
+      appendSystemPrompt: buildIdentityPrompt(
+        agentId,
+        injectedContext.agent.name,
+        injectedContext.agent.soul,
+        injectedContext.user.timezone
+      ),
+    };
+
+    // 4. Run Claude Code
+    const result = await this.claudeRunner.run(formattedMessage, {
+      claudeSessionId: session.claudeSessionId || undefined,
+      injectedContext: session.claudeSessionId ? undefined : injectedContext,
+      config: runnerConfig,
+    });
+
+    // 5. Update session with new Claude session ID and usage
+    if (result.claudeSessionId !== session.claudeSessionId) {
+      await this.repository.update(session.id, {
+        claudeSessionId: result.claudeSessionId,
+      });
+    }
+
+    if (result.usage) {
+      await this.repository.updateTokenUsage(session.id, {
+        contextTokens: result.usage.contextTokens,
+        inputTokens: result.usage.inputTokens,
+        outputTokens: result.usage.outputTokens,
+      });
+
+      // 6. Check if compaction is needed
+      if (result.usage.contextTokens >= this.config.compactionThreshold) {
+        logger.info('Session approaching context limit, triggering compaction', {
+          sessionId: session.id,
+          contextTokens: result.usage.contextTokens,
+          threshold: this.config.compactionThreshold,
+        });
+        // Trigger compaction asynchronously
+        this.triggerCompaction(session.id).catch((error) => {
+          logger.error('Compaction failed', { sessionId: session.id, error });
+        });
+      }
+    }
+
+    return {
+      success: result.success,
+      sessionId: session.id,
+      claudeSessionId: result.claudeSessionId,
+      responses: result.responses,
+      usage: result.usage,
+      sessionStatus: session.status,
+      compactionTriggered: false,
+      finalTextResponse: result.finalTextResponse,
+      error: result.error,
+    };
   }
 
   async getOrCreateSession(
@@ -447,4 +592,21 @@ This session will continue with a fresh context after compaction. Your identity,
 
     return lines.join('\n');
   }
+}
+
+/**
+ * Factory function to create a SessionService with real dependencies.
+ * Use this in production code. For testing, construct SessionService directly with mocks.
+ */
+export function createSessionService(
+  supabase: SupabaseClient<Database>,
+  config: Partial<SessionServiceConfig> = {}
+): SessionService {
+  return new SessionService(
+    new SessionRepository(supabase),
+    new ContextBuilder(supabase),
+    new ClaudeRunner(),
+    new ActivityStreamRepository(supabase),
+    config
+  );
 }

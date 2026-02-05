@@ -5,7 +5,12 @@
  */
 
 // Main service
-export { SessionService, type SessionServiceConfig } from './session-service.js';
+export {
+  SessionService,
+  createSessionService,
+  type SessionServiceConfig,
+  type IActivityStream,
+} from './session-service.js';
 
 // Repository (for direct database access if needed)
 export { SessionRepository } from './session-repository.js';
