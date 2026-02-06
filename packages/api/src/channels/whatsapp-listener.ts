@@ -2,7 +2,7 @@
  * WhatsApp Listener Service
  *
  * Listens for incoming WhatsApp messages via Baileys (WhatsApp Web protocol)
- * and routes them to the SessionHost for processing.
+ * and routes them to the SessionService for processing.
  *
  * Uses the same authorization model as Telegram:
  * - DMs: Only from trusted users

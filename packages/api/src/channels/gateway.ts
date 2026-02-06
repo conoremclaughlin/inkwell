@@ -427,7 +427,7 @@ export class ChannelGateway extends EventEmitter {
       }
     }
 
-    // Pass resolved userId to message handler so session-host can persist messages
+    // Pass resolved userId to message handler so SessionService can persist messages
     const enrichedMetadata = userId && !metadata?.userId
       ? { ...metadata, userId }
       : metadata;

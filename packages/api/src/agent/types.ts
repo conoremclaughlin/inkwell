@@ -109,7 +109,7 @@ export interface AgentMessage {
     botMentioned: boolean; // Was the bot @mentioned or called by name?
   };
 
-  // Auto-injected context from bootstrap (set by SessionHost)
+  // Auto-injected context from bootstrap (set by SessionService)
   injectedContext?: InjectedContext;
 }
 
