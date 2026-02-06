@@ -1,7 +1,7 @@
 /**
- * PCP Workspaces
+ * PCP CLI
  *
- * Programmatic API for workspace management.
+ * Programmatic API for PCP CLI functionality.
  * For CLI usage, see cli.ts
  */
 
@@ -22,11 +22,18 @@ export interface WorkspaceInfo {
   identity?: WorkspaceIdentity;
 }
 
+export interface PcpConfig {
+  userId?: string;
+  email?: string;
+  agentMapping?: Record<string, string>;
+}
+
 export interface CreateWorkspaceOptions {
   name: string;
   agentId?: string;
   gitRoot?: string;
+  purpose?: string;
 }
 
-// Re-export for programmatic use
-// Future: Add functions for creating/managing workspaces programmatically
+// Re-export command modules for programmatic use
+export { runClaude, runClaudeInteractive } from './commands/claude.js';

@@ -1,12 +1,12 @@
 {
-  "name": "@personal-context/workspaces",
-  "version": "0.1.0",
-  "description": "Workspace orchestration for parallel development with synthetic and biological teams",
+  "name": "@personal-context/cli",
+  "version": "0.2.0",
+  "description": "PCP CLI - Personal Context Protocol command-line interface",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "pcp-ws": "dist/cli.js",
-    "ws": "dist/cli.js"
+    "pcp": "dist/cli.js",
+    "pcp-ws": "dist/cli.js"
   },
   "scripts": {
     "build": "tsc",
@@ -29,9 +29,10 @@
   },
   "keywords": [
     "pcp",
+    "personal-context-protocol",
+    "cli",
     "workspaces",
-    "worktree",
-    "parallel-development",
-    "multi-agent"
+    "multi-agent",
+    "claude"
   ]
 }

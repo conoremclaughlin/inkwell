@@ -1,29 +1,25 @@
-#!/usr/bin/env node
 /**
- * PCP Workspaces CLI
+ * Workspace Commands
  *
- * Orchestrate parallel development with synthetic and biological teams.
- * Creates isolated git worktrees with PCP identity for each workspace.
+ * Manage git worktrees for parallel development with PCP identity.
  *
- * Usage:
- *   ws create <name>     Create a new workspace
- *   ws list              List all workspaces
- *   ws remove <name>     Remove a workspace (keeps branch)
- *   ws clean <name>      Remove workspace and delete branch
- *   ws status            Show status of all workspaces
- *   ws path <name>       Output workspace path (for cd)
+ * Commands:
+ *   ws create <name>   Create a new workspace
+ *   ws list            List all workspaces
+ *   ws remove <name>   Remove a workspace (keeps branch)
+ *   ws clean <name>    Remove workspace and delete branch
+ *   ws status          Show status of all workspaces
+ *   ws path <name>     Output workspace path (for cd)
+ *   ws cd <name>       Print cd command (use with: eval $(pcp ws cd foo))
  */
 
-import { program } from 'commander';
+import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
-import { execSync, spawnSync } from 'child_process';
+import { execSync } from 'child_process';
 import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync } from 'fs';
 import { join, dirname, basename } from 'path';
 import { homedir } from 'os';
-
-const VERSION = '0.1.0';
-const WORKSPACE_PREFIX = 'pcp-ws';
 
 interface WorkspaceIdentity {
   agentId: string;
@@ -40,12 +36,12 @@ interface WorkspaceInfo {
   path: string;
   branch: string;
   identity?: WorkspaceIdentity;
-  status?: string;
 }
 
-/**
- * Find the git root directory
- */
+// ============================================================================
+// Helpers
+// ============================================================================
+
 function findGitRoot(): string {
   try {
     const result = execSync('git rev-parse --show-toplevel', { encoding: 'utf-8' });
@@ -56,23 +52,19 @@ function findGitRoot(): string {
   }
 }
 
-/**
- * Get the parent directory where workspaces will be created
- */
 function getWorkspaceParent(gitRoot: string): string {
   return dirname(gitRoot);
 }
 
-/**
- * Get the workspace directory path
- */
-function getWorkspacePath(gitRoot: string, name: string): string {
-  return join(getWorkspaceParent(gitRoot), `${WORKSPACE_PREFIX}-${name}`);
+function getWorkspacePrefix(gitRoot: string): string {
+  // Use the repo folder name as prefix (e.g., "personal-context-protocol" -> "personal-context-protocol--")
+  return `${basename(gitRoot)}--`;
 }
 
-/**
- * Execute git command and return output
- */
+function getWorkspacePath(gitRoot: string, name: string): string {
+  return join(getWorkspaceParent(gitRoot), `${getWorkspacePrefix(gitRoot)}${name}`);
+}
+
 function git(args: string, cwd?: string): string {
   try {
     return execSync(`git ${args}`, {
@@ -86,9 +78,6 @@ function git(args: string, cwd?: string): string {
   }
 }
 
-/**
- * Check if a branch exists
- */
 function branchExists(branch: string, cwd?: string): boolean {
   try {
     git(`show-ref --verify --quiet refs/heads/${branch}`, cwd);
@@ -98,22 +87,16 @@ function branchExists(branch: string, cwd?: string): boolean {
   }
 }
 
-/**
- * Get current user from git config or PCP config
- */
 function getCurrentUser(): string | undefined {
-  // Try PCP config first
   const pcpConfigPath = join(homedir(), '.pcp', 'config.json');
   if (existsSync(pcpConfigPath)) {
     try {
       const config = JSON.parse(readFileSync(pcpConfigPath, 'utf-8'));
       return config.email || config.userId;
     } catch {
-      // Fall through to git config
+      // Fall through
     }
   }
-
-  // Try git config
   try {
     return git('config user.email');
   } catch {
@@ -121,14 +104,10 @@ function getCurrentUser(): string | undefined {
   }
 }
 
-/**
- * List all workspaces
- */
 function listWorkspaces(gitRoot: string): WorkspaceInfo[] {
   const parentDir = getWorkspaceParent(gitRoot);
   const workspaces: WorkspaceInfo[] = [];
 
-  // Get all worktrees
   const worktreeOutput = git('worktree list --porcelain', gitRoot);
   const worktrees = new Map<string, string>();
 
@@ -141,12 +120,12 @@ function listWorkspaces(gitRoot: string): WorkspaceInfo[] {
     }
   }
 
-  // Find PCP workspaces
+  const prefix = getWorkspacePrefix(gitRoot);
   if (existsSync(parentDir)) {
     for (const entry of readdirSync(parentDir)) {
-      if (entry.startsWith(`${WORKSPACE_PREFIX}-`)) {
+      if (entry.startsWith(prefix)) {
         const wsPath = join(parentDir, entry);
-        const name = entry.replace(`${WORKSPACE_PREFIX}-`, '');
+        const name = entry.slice(prefix.length);
         const branch = worktrees.get(wsPath) || 'unknown';
 
         let identity: WorkspaceIdentity | undefined;
@@ -155,7 +134,7 @@ function listWorkspaces(gitRoot: string): WorkspaceInfo[] {
           try {
             identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
           } catch {
-            // Ignore parse errors
+            // Ignore
           }
         }
 
@@ -171,10 +150,7 @@ function listWorkspaces(gitRoot: string): WorkspaceInfo[] {
 // Commands
 // ============================================================================
 
-/**
- * Create a new workspace
- */
-async function createWorkspace(name: string, options: { agent?: string }): Promise<void> {
+async function createWorkspace(name: string, options: { agent?: string; purpose?: string }): Promise<void> {
   const spinner = ora(`Creating workspace: ${name}`).start();
 
   try {
@@ -182,29 +158,26 @@ async function createWorkspace(name: string, options: { agent?: string }): Promi
     const wsPath = getWorkspacePath(gitRoot, name);
     const branch = `workspace/${name}`;
 
-    // Check if workspace already exists
     if (existsSync(wsPath)) {
       spinner.fail(`Workspace already exists at ${wsPath}`);
       process.exit(1);
     }
 
-    // Create worktree with branch
-    spinner.text = `Creating git worktree...`;
+    spinner.text = 'Creating git worktree...';
     if (branchExists(branch, gitRoot)) {
       git(`worktree add "${wsPath}" "${branch}"`, gitRoot);
     } else {
       git(`worktree add -b "${branch}" "${wsPath}"`, gitRoot);
     }
 
-    // Create .pcp directory and identity
-    spinner.text = `Setting up PCP identity...`;
+    spinner.text = 'Setting up PCP identity...';
     const pcpDir = join(wsPath, '.pcp');
     mkdirSync(pcpDir, { recursive: true });
 
     const identity: WorkspaceIdentity = {
       agentId: options.agent || 'wren',
       context: `workspace-${name}`,
-      description: `Workspace: ${name}`,
+      description: options.purpose || `Workspace: ${name}`,
       workspace: name,
       branch,
       createdAt: new Date().toISOString(),
@@ -220,27 +193,23 @@ async function createWorkspace(name: string, options: { agent?: string }): Promi
     console.log(chalk.dim('  Agent:  ') + identity.agentId);
     console.log('');
     console.log(chalk.cyan('To start working:'));
-    console.log(chalk.dim(`  cd ${wsPath}`));
-    console.log(chalk.dim('  claude'));
+    console.log(chalk.dim(`  cd ${wsPath} && pcp`));
     console.log('');
     console.log(chalk.cyan('Or use:'));
-    console.log(chalk.dim(`  cd $(yarn ws path ${name})`));
+    console.log(chalk.dim(`  eval $(pcp ws cd ${name})`));
   } catch (error) {
     spinner.fail(`Failed to create workspace: ${error}`);
     process.exit(1);
   }
 }
 
-/**
- * List all workspaces
- */
 function listCommand(): void {
   const gitRoot = findGitRoot();
   const workspaces = listWorkspaces(gitRoot);
 
   if (workspaces.length === 0) {
     console.log(chalk.yellow('No workspaces found.'));
-    console.log(chalk.dim('Create one with: ws create <name>'));
+    console.log(chalk.dim('Create one with: pcp ws create <name>'));
     return;
   }
 
@@ -260,9 +229,6 @@ function listCommand(): void {
   }
 }
 
-/**
- * Remove a workspace (keeps branch)
- */
 async function removeWorkspace(name: string): Promise<void> {
   const spinner = ora(`Removing workspace: ${name}`).start();
 
@@ -277,16 +243,13 @@ async function removeWorkspace(name: string): Promise<void> {
 
     git(`worktree remove "${wsPath}"`, gitRoot);
     spinner.succeed(`Workspace removed: ${name}`);
-    console.log(chalk.dim('  Branch kept for PR. Use "ws clean" to also delete branch.'));
+    console.log(chalk.dim('  Branch kept for PR. Use "pcp ws clean" to also delete branch.'));
   } catch (error) {
     spinner.fail(`Failed to remove workspace: ${error}`);
     process.exit(1);
   }
 }
 
-/**
- * Clean a workspace (remove worktree and delete branch)
- */
 async function cleanWorkspace(name: string): Promise<void> {
   const spinner = ora(`Cleaning workspace: ${name}`).start();
 
@@ -295,13 +258,11 @@ async function cleanWorkspace(name: string): Promise<void> {
     const wsPath = getWorkspacePath(gitRoot, name);
     const branch = `workspace/${name}`;
 
-    // Remove worktree if exists
     if (existsSync(wsPath)) {
       spinner.text = 'Removing worktree...';
       git(`worktree remove "${wsPath}" --force`, gitRoot);
     }
 
-    // Delete branch if exists
     if (branchExists(branch, gitRoot)) {
       spinner.text = 'Deleting branch...';
       git(`branch -D "${branch}"`, gitRoot);
@@ -314,16 +275,12 @@ async function cleanWorkspace(name: string): Promise<void> {
   }
 }
 
-/**
- * Show status of all workspaces
- */
 function statusCommand(): void {
   const gitRoot = findGitRoot();
   const workspaces = listWorkspaces(gitRoot);
 
   console.log(chalk.bold('\nWorkspace Status:\n'));
 
-  // Main repo status
   console.log(chalk.cyan(`  main (${gitRoot})`));
   try {
     const status = git('status --short', gitRoot);
@@ -339,7 +296,6 @@ function statusCommand(): void {
   }
   console.log('');
 
-  // Workspace status
   for (const ws of workspaces) {
     console.log(chalk.cyan(`  ${ws.name} (${ws.branch})`));
     try {
@@ -358,9 +314,6 @@ function statusCommand(): void {
   }
 }
 
-/**
- * Output workspace path (for use with cd)
- */
 function pathCommand(name: string): void {
   const gitRoot = findGitRoot();
   const wsPath = getWorkspacePath(gitRoot, name);
@@ -370,51 +323,62 @@ function pathCommand(name: string): void {
     process.exit(1);
   }
 
-  // Just output the path for use with cd
   console.log(wsPath);
 }
 
+function cdCommand(name: string): void {
+  const gitRoot = findGitRoot();
+  const wsPath = getWorkspacePath(gitRoot, name);
+
+  if (!existsSync(wsPath)) {
+    console.error(`Workspace not found: ${name}`);
+    process.exit(1);
+  }
+
+  // Output shell command that can be eval'd
+  console.log(`cd "${wsPath}"`);
+}
+
 // ============================================================================
-// CLI Setup
+// Register Commands
 // ============================================================================
 
-program
-  .name('ws')
-  .description('PCP Workspaces - Orchestrate parallel development')
-  .version(VERSION);
+export function registerWorkspaceCommands(program: Command): void {
+  const ws = program
+    .command('ws')
+    .alias('workspace')
+    .description('Workspace management for parallel development');
 
-program
-  .command('create <name>')
-  .description('Create a new workspace with git worktree')
-  .option('-a, --agent <agent>', 'Agent ID for this workspace', 'wren')
-  .action(createWorkspace);
+  ws.command('create <name>')
+    .description('Create a new workspace with git worktree')
+    .option('-a, --agent <agent>', 'Agent ID for this workspace', 'wren')
+    .option('-p, --purpose <desc>', 'Description/purpose of the workspace')
+    .action(createWorkspace);
 
-program
-  .command('list')
-  .alias('ls')
-  .description('List all workspaces')
-  .action(listCommand);
+  ws.command('list')
+    .alias('ls')
+    .description('List all workspaces')
+    .action(listCommand);
 
-program
-  .command('remove <name>')
-  .alias('rm')
-  .description('Remove a workspace (keeps branch for PR)')
-  .action(removeWorkspace);
+  ws.command('remove <name>')
+    .alias('rm')
+    .description('Remove a workspace (keeps branch for PR)')
+    .action(removeWorkspace);
 
-program
-  .command('clean <name>')
-  .description('Remove workspace and delete branch')
-  .action(cleanWorkspace);
+  ws.command('clean <name>')
+    .description('Remove workspace and delete branch')
+    .action(cleanWorkspace);
 
-program
-  .command('status')
-  .alias('st')
-  .description('Show git status of all workspaces')
-  .action(statusCommand);
+  ws.command('status')
+    .alias('st')
+    .description('Show git status of all workspaces')
+    .action(statusCommand);
 
-program
-  .command('path <name>')
-  .description('Output workspace path (for use with cd)')
-  .action(pathCommand);
+  ws.command('path <name>')
+    .description('Output workspace path')
+    .action(pathCommand);
 
-program.parse();
+  ws.command('cd <name>')
+    .description('Output cd command (use with: eval $(pcp ws cd <name>))')
+    .action(cdCommand);
+}
