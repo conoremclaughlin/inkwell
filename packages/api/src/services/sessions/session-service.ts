@@ -17,11 +17,13 @@ import type {
   SessionStatus,
   SessionRequest,
   SessionResult,
+  ChannelResponse,
   ISessionService,
   ClaudeRunnerConfig,
   IClaudeRunner,
   ISessionRepository,
   IContextBuilder,
+  ToolCall,
 } from './types.js';
 import type { Json } from '../../data/supabase/types.js';
 import { SessionRepository } from './session-repository.js';
@@ -42,6 +44,8 @@ export interface SessionServiceConfig {
   defaultModel: string;
   /** Token threshold for triggering compaction */
   compactionThreshold: number;
+  /** Callback to route responses from async operations (compaction, etc.) */
+  responseHandler?: (responses: ChannelResponse[]) => Promise<void>;
 }
 
 const DEFAULT_CONFIG: SessionServiceConfig = {
@@ -65,6 +69,18 @@ export interface IActivityStream {
     platformChatId?: string;
     isDm?: boolean;
     payload?: Json;
+  }): Promise<{ id: string }>;
+
+  logActivity(params: {
+    userId: string;
+    agentId: string;
+    type: string;
+    subtype?: string;
+    content: string;
+    payload?: Json;
+    sessionId?: string;
+    platform?: string;
+    platformChatId?: string;
   }): Promise<{ id: string }>;
 }
 
@@ -301,7 +317,14 @@ export class SessionService implements ISessionService {
       config: runnerConfig,
     });
 
-    // 5. Update session with new Claude session ID and usage
+    // 5. Log tool calls to activity stream (fire-and-forget, don't block response)
+    if (result.toolCalls && result.toolCalls.length > 0) {
+      this.logToolCalls(userId, agentId, session.id, result.toolCalls, request).catch((err) => {
+        logger.warn('Failed to log tool calls to activity stream', { error: err });
+      });
+    }
+
+    // 6. Update session with new Claude session ID and usage
     if (result.claudeSessionId !== session.claudeSessionId) {
       await this.repository.update(session.id, {
         claudeSessionId: result.claudeSessionId,
@@ -425,10 +448,18 @@ export class SessionService implements ISessionService {
       return;
     }
 
-    logger.info('Starting compaction', { sessionId, claudeSessionId: session.claudeSessionId });
+    // Acquire database-backed compaction lock (atomic, multi-server safe)
+    const lockAcquired = await this.repository.tryAcquireCompactionLock(sessionId);
+    if (!lockAcquired) {
+      logger.info('Compaction already in progress, skipping', { sessionId });
+      return;
+    }
 
-    // Build compaction prompt
-    const compactionPrompt = `## CONTEXT COMPACTION REQUIRED
+    try {
+      logger.info('Starting compaction', { sessionId, claudeSessionId: session.claudeSessionId });
+
+      // Build compaction prompt
+      const compactionPrompt = `## CONTEXT COMPACTION REQUIRED
 
 Your context window is approaching its limit. Please:
 
@@ -445,43 +476,59 @@ Your context window is approaching its limit. Please:
 
 This session will continue with a fresh context after compaction. Your identity, values, and memories will persist - only the conversation history resets.`;
 
-    const context = await this.contextBuilder.buildMinimalContext(
-      session.userId,
-      session.agentId
-    );
+      const context = await this.contextBuilder.buildMinimalContext(
+        session.userId,
+        session.agentId
+      );
 
-    // Fetch user timezone for identity prompt
-    const fullContext = await this.contextBuilder.buildContext(
-      session.userId,
-      session.agentId,
-      session
-    );
-
-    const runnerConfig: ClaudeRunnerConfig = {
-      workingDirectory: this.config.defaultWorkingDirectory,
-      mcpConfigPath: this.config.mcpConfigPath,
-      model: this.config.defaultModel,
-      appendSystemPrompt: buildIdentityPrompt(
+      // Fetch user timezone for identity prompt
+      const fullContext = await this.contextBuilder.buildContext(
+        session.userId,
         session.agentId,
-        context.agent.name,
-        context.agent.soul,
-        fullContext.user.timezone
-      ),
-    };
+        session
+      );
 
-    // Run compaction message
-    const result = await this.claudeRunner.run(compactionPrompt, {
-      claudeSessionId: session.claudeSessionId,
-      config: runnerConfig,
-    });
+      const runnerConfig: ClaudeRunnerConfig = {
+        workingDirectory: this.config.defaultWorkingDirectory,
+        mcpConfigPath: this.config.mcpConfigPath,
+        model: this.config.defaultModel,
+        appendSystemPrompt: buildIdentityPrompt(
+          session.agentId,
+          context.agent.name,
+          context.agent.soul,
+          fullContext.user.timezone
+        ),
+      };
 
-    if (result.success) {
-      // Mark session as compacted with new Claude session ID
-      // The next message will start a fresh Claude session
-      await this.repository.markCompacted(sessionId, '');
-      logger.info('Compaction completed', { sessionId });
-    } else {
-      logger.error('Compaction failed', { sessionId, error: result.error });
+      // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session
+      const result = await this.claudeRunner.run(compactionPrompt, {
+        claudeSessionId: session.claudeSessionId,
+        config: runnerConfig,
+      });
+
+      // Route any responses from the compaction phase (e.g., "I'm consolidating my memories...")
+      if (result.responses.length > 0 && this.config.responseHandler) {
+        await this.config.responseHandler(result.responses).catch((err) => {
+          logger.warn('Failed to route compaction responses', { sessionId, error: err });
+        });
+      }
+
+      if (result.success) {
+        // Phase 2: Rotate Claude session — only after agent has persisted context
+        await this.repository.markCompacted(sessionId, '');
+        logger.info('Compaction completed (two-phase)', {
+          sessionId,
+          responsesRouted: result.responses.length,
+          toolCalls: result.toolCalls?.length || 0,
+        });
+      } else {
+        logger.error('Compaction failed', { sessionId, error: result.error });
+      }
+    } finally {
+      // Always release the lock, even if compaction fails
+      await this.repository.releaseCompactionLock(sessionId).catch((err) => {
+        logger.error('Failed to release compaction lock', { sessionId, error: err });
+      });
     }
   }
 
@@ -532,6 +579,45 @@ This session will continue with a fresh context after compaction. Your identity,
 
     logger.info('Session resumed', { sessionId });
     return updated;
+  }
+
+  /**
+   * Log tool calls to the activity stream for audit trail.
+   * Fire-and-forget: errors are caught by the caller and logged as warnings.
+   */
+  private async logToolCalls(
+    userId: string,
+    agentId: string,
+    sessionId: string,
+    toolCalls: ToolCall[],
+    request: SessionRequest
+  ): Promise<void> {
+    const MAX_INPUT_LENGTH = 10_000;
+
+    for (const toolCall of toolCalls) {
+      // Truncate large inputs to avoid bloating the activity stream
+      let inputPayload = toolCall.input;
+      const inputStr = JSON.stringify(inputPayload);
+      if (inputStr.length > MAX_INPUT_LENGTH) {
+        inputPayload = { _truncated: true, _length: inputStr.length, _preview: inputStr.slice(0, 500) };
+      }
+
+      await this.activityStream.logActivity({
+        userId,
+        agentId,
+        type: 'tool_call',
+        subtype: toolCall.toolName,
+        content: `${toolCall.toolName}(${Object.keys(toolCall.input).join(', ')})`,
+        payload: {
+          toolUseId: toolCall.toolUseId,
+          toolName: toolCall.toolName,
+          input: inputPayload,
+        } as unknown as Json,
+        sessionId,
+        platform: request.channel,
+        platformChatId: request.conversationId,
+      });
+    }
   }
 
   /**

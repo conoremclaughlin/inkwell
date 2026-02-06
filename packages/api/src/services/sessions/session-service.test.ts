@@ -127,6 +127,8 @@ describe('SessionService', () => {
       update: vi.fn().mockImplementation(async (id, updates) => createMockSession({ id, ...updates })),
       updateTokenUsage: vi.fn().mockResolvedValue(undefined),
       markCompacted: vi.fn().mockResolvedValue(undefined),
+      tryAcquireCompactionLock: vi.fn().mockResolvedValue(true),
+      releaseCompactionLock: vi.fn().mockResolvedValue(undefined),
     };
 
     mockContextBuilder = {
@@ -143,6 +145,7 @@ describe('SessionService', () => {
 
     mockActivityStream = {
       logMessage: vi.fn().mockResolvedValue({ id: 'msg-123' }),
+      logActivity: vi.fn().mockResolvedValue({ id: 'activity-123' }),
     };
 
     // Create service with injected dependencies
@@ -480,6 +483,110 @@ describe('SessionService', () => {
       // Should still succeed despite activity logging failure
       expect(result.success).toBe(true);
     });
+
+    it('should log tool calls to activity stream', async () => {
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      vi.mocked(mockClaudeRunner.run).mockResolvedValue(
+        createMockClaudeResult({
+          toolCalls: [
+            { toolUseId: 'tu-1', toolName: 'mcp__pcp__recall', input: { query: 'emails' } },
+            { toolUseId: 'tu-2', toolName: 'mcp__pcp__send_response', input: { content: 'Here are your emails' } },
+          ],
+        })
+      );
+
+      const request = createMockRequest();
+      await sessionService.handleMessage(request);
+
+      // Give fire-and-forget a tick to execute
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(mockActivityStream.logActivity).toHaveBeenCalledTimes(2);
+      expect(mockActivityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'tool_call',
+          subtype: 'mcp__pcp__recall',
+          content: 'mcp__pcp__recall(query)',
+          sessionId: 'session-123',
+        })
+      );
+      expect(mockActivityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'tool_call',
+          subtype: 'mcp__pcp__send_response',
+          content: 'mcp__pcp__send_response(content)',
+        })
+      );
+    });
+
+    it('should not log tool calls when there are none', async () => {
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      vi.mocked(mockClaudeRunner.run).mockResolvedValue(
+        createMockClaudeResult({ toolCalls: [] })
+      );
+
+      const request = createMockRequest();
+      await sessionService.handleMessage(request);
+
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(mockActivityStream.logActivity).not.toHaveBeenCalled();
+    });
+
+    it('should truncate large tool call inputs', async () => {
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      const largeInput = { data: 'x'.repeat(15_000) };
+      vi.mocked(mockClaudeRunner.run).mockResolvedValue(
+        createMockClaudeResult({
+          toolCalls: [
+            { toolUseId: 'tu-1', toolName: 'mcp__pcp__remember', input: largeInput },
+          ],
+        })
+      );
+
+      const request = createMockRequest();
+      await sessionService.handleMessage(request);
+
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(mockActivityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            input: expect.objectContaining({
+              _truncated: true,
+              _length: expect.any(Number),
+              _preview: expect.any(String),
+            }),
+          }),
+        })
+      );
+    });
+
+    it('should not block response delivery if tool call logging fails', async () => {
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+      vi.mocked(mockActivityStream.logActivity).mockRejectedValue(new Error('DB error'));
+
+      vi.mocked(mockClaudeRunner.run).mockResolvedValue(
+        createMockClaudeResult({
+          toolCalls: [
+            { toolUseId: 'tu-1', toolName: 'mcp__pcp__recall', input: { query: 'test' } },
+          ],
+        })
+      );
+
+      const request = createMockRequest();
+      const result = await sessionService.handleMessage(request);
+
+      // Response should still succeed even though tool call logging failed
+      expect(result.success).toBe(true);
+    });
   });
 
   describe('Compaction Triggering', () => {
@@ -516,6 +623,128 @@ describe('SessionService', () => {
 
       expect(result.success).toBe(true);
       expect(result.compactionTriggered).toBe(false);
+    });
+
+    it('should skip compaction when lock is already held (re-entry guard)', async () => {
+      const session = createMockSession({ claudeSessionId: 'claude-abc' });
+      vi.mocked(mockRepository.findById).mockResolvedValue(session);
+      vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(false);
+
+      await sessionService.triggerCompaction('session-123');
+
+      // Should NOT run compaction (lock not acquired)
+      expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+      expect(mockRepository.markCompacted).not.toHaveBeenCalled();
+      // Should NOT release a lock we never acquired
+      expect(mockRepository.releaseCompactionLock).not.toHaveBeenCalled();
+    });
+
+    it('should acquire and release lock around compaction', async () => {
+      const session = createMockSession({ claudeSessionId: 'claude-abc' });
+      vi.mocked(mockRepository.findById).mockResolvedValue(session);
+      vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+
+      vi.mocked(mockClaudeRunner.run).mockResolvedValue(
+        createMockClaudeResult({ success: true })
+      );
+
+      await sessionService.triggerCompaction('session-123');
+
+      // Should have acquired lock, run compaction, and released lock
+      expect(mockRepository.tryAcquireCompactionLock).toHaveBeenCalledWith('session-123');
+      expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+      expect(mockRepository.markCompacted).toHaveBeenCalledWith('session-123', '');
+      expect(mockRepository.releaseCompactionLock).toHaveBeenCalledWith('session-123');
+    });
+
+    it('should release lock even when compaction fails', async () => {
+      const session = createMockSession({ claudeSessionId: 'claude-abc' });
+      vi.mocked(mockRepository.findById).mockResolvedValue(session);
+      vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+
+      vi.mocked(mockClaudeRunner.run).mockRejectedValue(new Error('Process crashed'));
+
+      await expect(sessionService.triggerCompaction('session-123')).rejects.toThrow('Process crashed');
+
+      // Lock should still be released despite failure
+      expect(mockRepository.releaseCompactionLock).toHaveBeenCalledWith('session-123');
+    });
+
+    it('should route compaction responses via responseHandler (two-phase)', async () => {
+      const mockResponseHandler = vi.fn().mockResolvedValue(undefined);
+
+      // Create service with responseHandler
+      const serviceWithHandler = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          defaultModel: 'sonnet',
+          compactionThreshold: 150000,
+          responseHandler: mockResponseHandler,
+        }
+      );
+
+      const session = createMockSession({ claudeSessionId: 'claude-abc' });
+      vi.mocked(mockRepository.findById).mockResolvedValue(session);
+      vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+
+      const compactionResponses = [
+        {
+          channel: 'telegram' as const,
+          conversationId: 'chat-123',
+          content: "I'm consolidating my memories, one moment!",
+        },
+      ];
+
+      vi.mocked(mockClaudeRunner.run).mockResolvedValue(
+        createMockClaudeResult({ success: true, responses: compactionResponses })
+      );
+
+      await serviceWithHandler.triggerCompaction('session-123');
+
+      // Phase 1: Compaction responses should be routed
+      expect(mockResponseHandler).toHaveBeenCalledWith(compactionResponses);
+      // Phase 2: Session should be marked as compacted after responses routed
+      expect(mockRepository.markCompacted).toHaveBeenCalledWith('session-123', '');
+    });
+
+    it('should still complete compaction if response routing fails', async () => {
+      const mockResponseHandler = vi.fn().mockRejectedValue(new Error('Channel offline'));
+
+      const serviceWithHandler = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          defaultModel: 'sonnet',
+          compactionThreshold: 150000,
+          responseHandler: mockResponseHandler,
+        }
+      );
+
+      const session = createMockSession({ claudeSessionId: 'claude-abc' });
+      vi.mocked(mockRepository.findById).mockResolvedValue(session);
+      vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+
+      vi.mocked(mockClaudeRunner.run).mockResolvedValue(
+        createMockClaudeResult({
+          success: true,
+          responses: [{ channel: 'telegram' as const, conversationId: 'chat-123', content: 'Compacting...' }],
+        })
+      );
+
+      // Should not throw even though response routing failed
+      await serviceWithHandler.triggerCompaction('session-123');
+
+      // Compaction should still complete
+      expect(mockRepository.markCompacted).toHaveBeenCalledWith('session-123', '');
     });
   });
 

@@ -14,6 +14,7 @@ import type {
   ChannelResponse,
   ChannelType,
   IClaudeRunner,
+  ToolCall,
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
@@ -93,6 +94,7 @@ export class ClaudeRunner implements IClaudeRunner {
           responses: retryResult.responses,
           usage: retryResult.usage,
           finalTextResponse: retryResult.finalTextResponse,
+          toolCalls: retryResult.toolCalls,
         };
       }
 
@@ -102,6 +104,7 @@ export class ClaudeRunner implements IClaudeRunner {
         responses: result.responses,
         usage: result.usage,
         finalTextResponse: result.finalTextResponse,
+        toolCalls: result.toolCalls,
       };
     } catch (error) {
       logger.error('Claude Code process failed', {
@@ -159,6 +162,7 @@ export class ClaudeRunner implements IClaudeRunner {
     usage?: ClaudeUsageStats;
     resumeFailedNoSession?: boolean;
     finalTextResponse?: string;
+    toolCalls: ToolCall[];
   }> {
     return new Promise((resolve, reject) => {
       const proc = spawn('claude', args, {
@@ -174,6 +178,7 @@ export class ClaudeRunner implements IClaudeRunner {
 
       let stderr = '';
       const responses: ChannelResponse[] = [];
+      const toolCalls: ToolCall[] = [];
       let usage: ClaudeUsageStats | undefined;
       let resumeFailedNoSession = false;
       let finalTextResponse: string | undefined;
@@ -200,6 +205,7 @@ export class ClaudeRunner implements IClaudeRunner {
             resolve({
               responses,
               usage,
+              toolCalls,
               finalTextResponse: finalTextResponse || `[Process timed out after ${idleSecs}s idle]`,
             });
           }
@@ -220,6 +226,7 @@ export class ClaudeRunner implements IClaudeRunner {
           resolve({
             responses,
             usage,
+            toolCalls,
             finalTextResponse: finalTextResponse || '[Process hit hard timeout]',
           });
         }
@@ -236,6 +243,7 @@ export class ClaudeRunner implements IClaudeRunner {
           try {
             const parsed = JSON.parse(line);
             this.handleStreamEvent(parsed, responses);
+            this.captureToolCall(parsed, toolCalls);
 
             // Check for resume failure due to missing session
             if (parsed.type === 'result' && parsed.subtype === 'error_during_execution') {
@@ -302,7 +310,7 @@ export class ClaudeRunner implements IClaudeRunner {
 
         // Handle resume failure gracefully - don't reject, let caller retry
         if (resumeFailedNoSession) {
-          resolve({ responses, usage, resumeFailedNoSession: true, finalTextResponse });
+          resolve({ responses, usage, toolCalls, resumeFailedNoSession: true, finalTextResponse });
           return;
         }
 
@@ -315,7 +323,7 @@ export class ClaudeRunner implements IClaudeRunner {
           }
         }
 
-        resolve({ responses, usage, finalTextResponse });
+        resolve({ responses, usage, toolCalls, finalTextResponse });
       });
 
       // Send the message
@@ -342,6 +350,22 @@ export class ClaudeRunner implements IClaudeRunner {
       }, 5000);
     } catch {
       // Process already dead
+    }
+  }
+
+  /**
+   * Capture tool_use events for activity stream logging.
+   */
+  private captureToolCall(
+    event: Record<string, unknown>,
+    toolCalls: ToolCall[]
+  ): void {
+    if (event.type === 'tool_use') {
+      toolCalls.push({
+        toolUseId: (event.id as string) || '',
+        toolName: (event.name as string) || '',
+        input: (event.input as Record<string, unknown>) || {},
+      });
     }
   }
 

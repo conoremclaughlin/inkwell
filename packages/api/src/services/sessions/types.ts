@@ -131,6 +131,14 @@ export interface SessionResult {
   errorCode?: string;
 }
 
+// ─── Tool Call Tracking ───
+
+export interface ToolCall {
+  toolUseId: string;
+  toolName: string;
+  input: Record<string, unknown>;
+}
+
 // ─── Context Injection Types ───
 
 export interface AgentIdentity {
@@ -281,6 +289,19 @@ export interface ISessionRepository {
   ): Promise<void>;
 
   markCompacted(id: string, newClaudeSessionId: string): Promise<void>;
+
+  /**
+   * Atomically acquire a compaction lock for a session.
+   * Returns true if lock was acquired, false if already locked.
+   * Uses database-level atomicity (UPDATE WHERE compacting_since IS NULL).
+   * Stale locks older than staleLockMinutes are automatically reclaimed.
+   */
+  tryAcquireCompactionLock(id: string, staleLockMinutes?: number): Promise<boolean>;
+
+  /**
+   * Release the compaction lock for a session.
+   */
+  releaseCompactionLock(id: string): Promise<void>;
 }
 
 // ─── Context Builder Interface ───
@@ -324,6 +345,8 @@ export interface ClaudeRunnerResult {
   error?: string;
   /** The final text response from Claude (for auto-routing if no explicit send_response) */
   finalTextResponse?: string;
+  /** Tool calls captured during this run (for activity stream logging) */
+  toolCalls?: ToolCall[];
 }
 
 export interface IClaudeRunner {
