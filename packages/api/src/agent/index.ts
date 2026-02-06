@@ -17,7 +17,3 @@ export type { DirectApiConfig } from './backends/direct-api.backend';
 // Manager
 export { BackendManager, createBackendManager } from './backend-manager';
 export type { BackendManagerConfig } from './backend-manager';
-
-// Session Host
-export { SessionHost, createSessionHost } from './session-host';
-export type { SessionHostConfig, ChannelSender } from './session-host';

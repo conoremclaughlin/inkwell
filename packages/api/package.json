@@ -8,8 +8,6 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "dev:mcp": "tsx watch src/index.ts",
-    "myra:deprecated": "echo 'DEPRECATED: Myra is now triggered via heartbeat reminders through the PCP server. Use yarn server instead.' && tsx src/myra/index.ts",
-    "myra:dev:deprecated": "echo 'DEPRECATED: Myra is now triggered via heartbeat reminders through the PCP server. Use yarn server:dev instead.' && tsx watch src/myra/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
     "server": "tsx src/server.ts",
