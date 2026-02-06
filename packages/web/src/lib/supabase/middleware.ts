@@ -55,10 +55,16 @@ export async function updateSession(request: NextRequest) {
     const mcpPendingId = request.nextUrl.searchParams.get('pending_id');
 
     if (mcpRedirect && mcpPendingId) {
-      // MCP OAuth flow: user is already logged in, skip login form and go
-      // straight to the login page so client-side redirectToMcp() can fire
-      // with the existing session's access token.
-      return supabaseResponse;
+      // MCP OAuth flow: user is already logged in — redirect straight to the
+      // MCP callback with the access token. No login form flash.
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session?.access_token) {
+        const callbackUrl = new URL(mcpRedirect);
+        callbackUrl.searchParams.set('pending_id', mcpPendingId);
+        callbackUrl.searchParams.set('access_token', session.access_token);
+        return NextResponse.redirect(callbackUrl.toString());
+      }
+      // Session exists but no token — fall through to login form
     }
 
     // Normal case: redirect to dashboard
