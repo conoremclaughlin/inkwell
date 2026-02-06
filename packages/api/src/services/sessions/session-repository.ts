@@ -328,4 +328,73 @@ export class SessionRepository implements ISessionRepository {
       compactionCount: current.compactionCount + 1,
     });
   }
+
+  async tryAcquireCompactionLock(id: string, staleLockMinutes = 15): Promise<boolean> {
+    const now = new Date();
+
+    // First attempt: acquire lock where compacting_since IS NULL
+    const { data, error } = await this.supabase
+      .from('sessions')
+      .update({ compacting_since: now.toISOString() })
+      .eq('id', id)
+      .is('compacting_since', null)
+      .select('id');
+
+    if (error) {
+      logger.error('Error acquiring compaction lock', { id, error });
+      throw error;
+    }
+
+    if (data && data.length > 0) {
+      logger.info('Acquired compaction lock', { id });
+      return true;
+    }
+
+    // Lock is held — check if it's stale
+    const { data: session } = await this.supabase
+      .from('sessions')
+      .select('compacting_since')
+      .eq('id', id)
+      .single();
+
+    if (session?.compacting_since) {
+      const lockAge = now.getTime() - new Date(session.compacting_since).getTime();
+      const staleThresholdMs = staleLockMinutes * 60 * 1000;
+
+      if (lockAge > staleThresholdMs) {
+        // Stale lock — reclaim it atomically by matching the old timestamp
+        const { data: reclaimed } = await this.supabase
+          .from('sessions')
+          .update({ compacting_since: now.toISOString() })
+          .eq('id', id)
+          .eq('compacting_since', session.compacting_since)
+          .select('id');
+
+        if (reclaimed && reclaimed.length > 0) {
+          logger.warn('Reclaimed stale compaction lock', {
+            id,
+            staleSinceMinutes: Math.round(lockAge / 60_000),
+          });
+          return true;
+        }
+      }
+    }
+
+    logger.info('Compaction lock already held', { id });
+    return false;
+  }
+
+  async releaseCompactionLock(id: string): Promise<void> {
+    const { error } = await this.supabase
+      .from('sessions')
+      .update({ compacting_since: null })
+      .eq('id', id);
+
+    if (error) {
+      logger.error('Error releasing compaction lock', { id, error });
+      throw error;
+    }
+
+    logger.info('Released compaction lock', { id });
+  }
 }

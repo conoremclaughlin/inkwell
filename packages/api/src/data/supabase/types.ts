@@ -1727,6 +1727,7 @@ export type Database = {
         Row: {
           agent_id: string | null
           claude_session_id: string | null
+          compacting_since: string | null
           context: string | null
           ended_at: string | null
           id: string
@@ -1740,6 +1741,7 @@ export type Database = {
         Insert: {
           agent_id?: string | null
           claude_session_id?: string | null
+          compacting_since?: string | null
           context?: string | null
           ended_at?: string | null
           id?: string
@@ -1753,6 +1755,7 @@ export type Database = {
         Update: {
           agent_id?: string | null
           claude_session_id?: string | null
+          compacting_since?: string | null
           context?: string | null
           ended_at?: string | null
           id?: string
