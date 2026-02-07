@@ -34,6 +34,7 @@ export async function GET(request: Request) {
         const mcpCallbackUrl = new URL(mcpRedirect);
         mcpCallbackUrl.searchParams.set('pending_id', mcpPendingId!);
         mcpCallbackUrl.searchParams.set('access_token', data.session.access_token);
+        mcpCallbackUrl.searchParams.set('refresh_token', data.session.refresh_token);
         return NextResponse.redirect(mcpCallbackUrl.toString());
       }
 

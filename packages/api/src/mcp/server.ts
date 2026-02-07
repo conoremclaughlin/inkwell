@@ -3,9 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import express from 'express';
 import cors from 'cors';
-import crypto from 'crypto';
 import type { Server } from 'http';
-import { createClient } from '@supabase/supabase-js';
 import { MCP_SERVER_NAME, MCP_SERVER_VERSION, MCP_SERVER_DESCRIPTION } from '../config/constants';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
@@ -16,6 +14,7 @@ import adminRouter, { setWhatsAppListener } from '../routes/admin';
 import agentTriggerRouter, { getAgentGateway } from '../routes/agent-trigger';
 import { ChannelGateway, createChannelGateway, type ChannelGatewayConfig, type IncomingMessageHandler } from '../channels/gateway';
 import { setSessionContext } from '../utils/request-context';
+import { PcpAuthProvider } from './auth/pcp-auth-provider';
 
 export { setWhatsAppListener, getAgentGateway };
 
@@ -47,10 +46,12 @@ export class MCPServer {
   private toolsVersion = 0;
   private channelGateway: ChannelGateway | null = null;
   private config: MCPServerConfig;
+  private authProvider: PcpAuthProvider;
 
   constructor(dataComposer: DataComposer, config: MCPServerConfig = {}) {
     this.dataComposer = dataComposer;
     this.config = config;
+    this.authProvider = new PcpAuthProvider();
 
     // Load mini-apps once (shared across all sessions)
     this.miniApps = loadMiniApps();
@@ -123,40 +124,6 @@ export class MCPServer {
     const port = env.MCP_HTTP_PORT;
     const app = express();
 
-    // ============================================================================
-    // Supabase JWT validation helper
-    // ============================================================================
-    const validateSupabaseToken = async (authHeader: string | undefined): Promise<{ userId: string; email: string } | null> => {
-      if (!authHeader?.startsWith('Bearer ')) return null;
-      const token = authHeader.substring(7);
-
-      try {
-        const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-        const { data: { user }, error } = await supabase.auth.getUser(token);
-
-        if (error || !user) {
-          logger.debug('Supabase token validation failed', { error: error?.message });
-          return null;
-        }
-
-        const { data: pcpUser } = await supabase
-          .from('users')
-          .select('id, email')
-          .eq('email', user.email)
-          .single();
-
-        if (!pcpUser) {
-          logger.warn('Supabase user not found in PCP', { email: user.email });
-          return null;
-        }
-
-        return { userId: pcpUser.id, email: pcpUser.email };
-      } catch (error) {
-        logger.error('Error validating Supabase token', { error });
-        return null;
-      }
-    };
-
     // Enable CORS for web portal, MCP clients, and agents
     app.use(cors({
       origin: ['http://localhost:3001', 'http://localhost:3002', 'http://localhost:3003'],
@@ -199,7 +166,18 @@ export class MCPServer {
         logger.info('New MCP client connecting (Streamable HTTP)');
 
         // Validate auth if provided
-        const userData = await validateSupabaseToken(req.headers.authorization);
+        const userData = await this.authProvider.verifyAccessToken(req.headers.authorization);
+        if (!userData && req.headers.authorization) {
+          // Token was provided but invalid/expired — signal client to refresh
+          res.status(401)
+            .set('WWW-Authenticate', 'Bearer error="invalid_token"')
+            .json({
+              jsonrpc: '2.0',
+              error: { code: -32001, message: 'Invalid or expired access token' },
+              id: null,
+            });
+          return;
+        }
         if (userData) {
           setSessionContext({
             userId: userData.userId,
@@ -369,26 +347,8 @@ export class MCPServer {
     // ============================================================================
     // OAuth 2.0 endpoints for MCP authentication
     // ============================================================================
-    interface PendingAuth {
-      clientId: string;
-      codeChallenge: string;
-      redirectUri: string;
-      state: string;
-      expiresAt: number;
-    }
-    interface AuthCode {
-      clientId: string;
-      codeChallenge: string;
-      redirectUri: string;
-      supabaseToken: string;
-      userId: string;
-      userEmail: string;
-      expiresAt: number;
-    }
 
-    const pendingAuths = new Map<string, PendingAuth>();
-    const oauthCodes = new Map<string, AuthCode>();
-
+    // Dynamic client registration (RFC 7591)
     app.post('/register', express.json(), (req, res) => {
       logger.info('MCP /register called', { body: req.body });
 
@@ -406,6 +366,7 @@ export class MCPServer {
       });
     });
 
+    // Authorization endpoint — redirects to web portal for login
     app.get('/authorize', (req, res) => {
       const { client_id, redirect_uri, state, code_challenge, response_type } = req.query;
 
@@ -416,18 +377,16 @@ export class MCPServer {
         return;
       }
 
-      const pendingId = `pending-${Date.now()}-${Math.random().toString(36).substring(7)}`;
-
-      pendingAuths.set(pendingId, {
+      const pendingId = this.authProvider.createPendingAuth({
         clientId: client_id as string,
         codeChallenge: code_challenge as string,
         redirectUri: redirect_uri as string,
         state: state as string,
-        expiresAt: Date.now() + 10 * 60 * 1000,
       });
 
       const webPortalUrl = process.env.WEB_PORTAL_URL || 'http://localhost:3002';
-      const mcpCallback = `http://localhost:${port}/mcp/auth/callback`;
+      const baseUrl = env.MCP_BASE_URL || `http://localhost:${port}`;
+      const mcpCallback = `${baseUrl}/mcp/auth/callback`;
 
       const loginUrl = new URL(`${webPortalUrl}/login`);
       loginUrl.searchParams.set('redirect', mcpCallback);
@@ -437,132 +396,119 @@ export class MCPServer {
       res.redirect(loginUrl.toString());
     });
 
+    // Auth callback — receives Supabase tokens from web portal, creates auth code
     app.get('/mcp/auth/callback', async (req, res) => {
       const pendingId = req.query.pending_id as string;
       const accessToken = req.query.access_token as string;
+      const refreshToken = req.query.refresh_token as string;
 
-      logger.info('MCP /mcp/auth/callback called', { pendingId, hasToken: !!accessToken });
-
-      const pending = pendingAuths.get(pendingId);
-      if (!pending) {
-        res.status(400).send('Invalid or expired authorization request. Please try again.');
-        return;
-      }
-
-      if (Date.now() > pending.expiresAt) {
-        pendingAuths.delete(pendingId);
-        res.status(400).send('Authorization request expired. Please try again.');
-        return;
-      }
+      logger.info('MCP /mcp/auth/callback called', {
+        pendingId,
+        hasAccessToken: !!accessToken,
+        hasRefreshToken: !!refreshToken,
+      });
 
       if (!accessToken) {
         res.status(400).send('Missing access token. Please try logging in again.');
         return;
       }
 
-      try {
-        const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-        const { data: { user }, error: authError } = await supabase.auth.getUser(accessToken);
+      if (!refreshToken) {
+        res.status(400).send('Missing refresh token. Please try logging in again.');
+        return;
+      }
 
-        if (authError || !user) {
-          logger.error('Supabase auth verification failed', { error: authError });
-          res.status(401).send('Authentication failed. Please try again.');
+      const result = await this.authProvider.handleAuthCallback({
+        pendingId,
+        accessToken,
+        refreshToken,
+      });
+
+      if ('error' in result) {
+        const statusCode = result.error === 'server_error' ? 500
+          : result.error === 'access_denied' ? 403
+          : 400;
+        res.status(statusCode).send(result.error_description || result.error);
+        return;
+      }
+
+      const redirectUrl = new URL(result.redirectUri);
+      redirectUrl.searchParams.set('code', result.code);
+      if (result.state) {
+        redirectUrl.searchParams.set('state', result.state);
+      }
+
+      logger.info('MCP auth complete, redirecting to client');
+      res.redirect(redirectUrl.toString());
+    });
+
+    // Token endpoint — handles authorization_code and refresh_token grants
+    app.post('/token', express.urlencoded({ extended: true }), async (req, res) => {
+      const { grant_type, code, code_verifier, client_id, refresh_token } = req.body;
+
+      logger.info('MCP /token called', {
+        grant_type,
+        client_id,
+        hasCode: !!code,
+        hasVerifier: !!code_verifier,
+        hasRefreshToken: !!refresh_token,
+      });
+
+      if (grant_type === 'authorization_code') {
+        const result = await this.authProvider.exchangeAuthorizationCode({
+          code,
+          codeVerifier: code_verifier,
+          clientId: client_id,
+        });
+
+        if ('error' in result) {
+          res.status(400).json(result);
           return;
         }
 
-        const { data: pcpUser, error: userError } = await supabase
-          .from('users')
-          .select('id, email')
-          .eq('email', user.email)
-          .single();
-
-        if (userError || !pcpUser) {
-          logger.error('PCP user not found', { email: user.email, error: userError });
-          res.status(403).send('User not found in PCP system. Please contact support.');
+        res.json(result);
+      } else if (grant_type === 'refresh_token') {
+        if (!refresh_token) {
+          res.status(400).json({
+            error: 'invalid_request',
+            error_description: 'Missing refresh_token parameter',
+          });
           return;
         }
 
-        const code = `pcp-code-${Date.now()}-${Math.random().toString(36).substring(7)}`;
-
-        oauthCodes.set(code, {
-          clientId: pending.clientId,
-          codeChallenge: pending.codeChallenge,
-          redirectUri: pending.redirectUri,
-          supabaseToken: accessToken,
-          userId: pcpUser.id,
-          userEmail: pcpUser.email,
-          expiresAt: Date.now() + 10 * 60 * 1000,
+        const result = await this.authProvider.exchangeRefreshToken({
+          refreshToken: refresh_token,
+          clientId: client_id,
         });
 
-        pendingAuths.delete(pendingId);
-
-        const redirectUrl = new URL(pending.redirectUri);
-        redirectUrl.searchParams.set('code', code);
-        if (pending.state) {
-          redirectUrl.searchParams.set('state', pending.state);
+        if ('error' in result) {
+          res.status(400).json(result);
+          return;
         }
 
-        logger.info('MCP auth complete, redirecting to client', {
-          userId: pcpUser.id,
-          email: pcpUser.email,
+        res.json(result);
+      } else {
+        res.status(400).json({
+          error: 'unsupported_grant_type',
+          error_description: `Grant type '${grant_type}' is not supported`,
         });
-
-        res.redirect(redirectUrl.toString());
-      } catch (error) {
-        logger.error('Error completing MCP auth', { error });
-        res.status(500).send('Authentication error. Please try again.');
       }
     });
 
-    app.post('/token', express.urlencoded({ extended: true }), (req, res) => {
-      const { grant_type, code, code_verifier, client_id } = req.body;
-
-      logger.info('MCP /token called', { grant_type, client_id, hasCode: !!code, hasVerifier: !!code_verifier });
-
-      if (grant_type !== 'authorization_code') {
-        res.status(400).json({ error: 'unsupported_grant_type' });
-        return;
-      }
-
-      const codeData = oauthCodes.get(code);
-      if (!codeData) {
-        res.status(400).json({ error: 'invalid_grant', error_description: 'Authorization code not found' });
-        return;
-      }
-
-      if (Date.now() > codeData.expiresAt) {
-        oauthCodes.delete(code);
-        res.status(400).json({ error: 'invalid_grant', error_description: 'Authorization code expired' });
-        return;
-      }
-
-      if (codeData.codeChallenge && code_verifier) {
-        const computedChallenge = crypto
-          .createHash('sha256')
-          .update(code_verifier)
-          .digest('base64url');
-
-        if (computedChallenge !== codeData.codeChallenge) {
-          logger.warn('PKCE verification failed', { expected: codeData.codeChallenge, computed: computedChallenge });
-          res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
-          return;
-        }
-      }
-
-      oauthCodes.delete(code);
-
-      const expiresIn = 3600;
-
-      logger.info('MCP /token returning Supabase JWT', {
-        userId: codeData.userId,
-        email: codeData.userEmail,
-      });
+    // OAuth Authorization Server Metadata (RFC 8414)
+    app.get('/.well-known/oauth-authorization-server', (_req, res) => {
+      const baseUrl = env.MCP_BASE_URL || `http://localhost:${port}`;
 
       res.json({
-        access_token: codeData.supabaseToken,
-        token_type: 'Bearer',
-        expires_in: expiresIn,
-        scope: 'mcp:tools',
+        issuer: baseUrl,
+        authorization_endpoint: `${baseUrl}/authorize`,
+        token_endpoint: `${baseUrl}/token`,
+        registration_endpoint: `${baseUrl}/register`,
+        scopes_supported: ['mcp:tools'],
+        response_types_supported: ['code'],
+        grant_types_supported: ['authorization_code', 'refresh_token'],
+        token_endpoint_auth_methods_supported: ['client_secret_post'],
+        code_challenge_methods_supported: ['S256'],
       });
     });
 
@@ -600,6 +546,11 @@ export class MCPServer {
       logger.info(`MCP Server started with Streamable HTTP transport on port ${port}`);
       logger.info(`MCP endpoint: http://localhost:${port}/mcp`);
     });
+
+    // Periodic cleanup of expired MCP refresh tokens (every 6 hours)
+    setInterval(() => {
+      this.authProvider.cleanupExpiredDatabaseTokens();
+    }, 6 * 60 * 60 * 1000);
 
     // Initialize channel gateway if message handler is configured
     if (this.config.messageHandler) {

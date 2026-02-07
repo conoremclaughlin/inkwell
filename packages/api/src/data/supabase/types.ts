@@ -962,6 +962,53 @@ export type Database = {
           },
         ]
       }
+      mcp_tokens: {
+        Row: {
+          id: string
+          user_id: string
+          client_id: string
+          refresh_token: string
+          supabase_refresh_token: string
+          scopes: string[] | null
+          expires_at: string
+          created_at: string
+          updated_at: string
+          last_used_at: string | null
+        }
+        Insert: {
+          id?: string
+          user_id: string
+          client_id: string
+          refresh_token: string
+          supabase_refresh_token: string
+          scopes?: string[] | null
+          expires_at: string
+          created_at?: string
+          updated_at?: string
+          last_used_at?: string | null
+        }
+        Update: {
+          id?: string
+          user_id?: string
+          client_id?: string
+          refresh_token?: string
+          supabase_refresh_token?: string
+          scopes?: string[] | null
+          expires_at?: string
+          created_at?: string
+          updated_at?: string
+          last_used_at?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "mcp_tokens_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       memories: {
         Row: {
           agent_id: string | null
