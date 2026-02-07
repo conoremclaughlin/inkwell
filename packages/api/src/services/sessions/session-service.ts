@@ -306,7 +306,8 @@ export class SessionService implements ISessionService {
         agentId,
         injectedContext.agent.name,
         injectedContext.agent.soul,
-        injectedContext.user.timezone
+        injectedContext.user.timezone,
+        injectedContext.agent.heartbeat
       ),
     };
 
@@ -496,7 +497,8 @@ This session will continue with a fresh context after compaction. Your identity,
           session.agentId,
           context.agent.name,
           context.agent.soul,
-          fullContext.user.timezone
+          fullContext.user.timezone,
+          context.agent.heartbeat
         ),
       };
 

@@ -411,7 +411,8 @@ export function buildIdentityPrompt(
   agentId: string,
   agentName: string,
   soul?: string,
-  timezone?: string
+  timezone?: string,
+  heartbeat?: string
 ): string {
   let prompt = `## Identity Override (CRITICAL)
 
@@ -424,6 +425,10 @@ Do NOT run \`echo $AGENT_ID\` — you are running headlessly without shell acces
 
   if (soul) {
     prompt += `\n\n### Soul\n${soul}`;
+  }
+
+  if (heartbeat) {
+    prompt += `\n\n### Heartbeat Instructions\nFollow these instructions on every heartbeat wake-up. If this document is not immediately available, fetch it via \`get_identity(agentId: "${agentId}", file: "heartbeat")\`.\n\n${heartbeat}`;
   }
 
   // Add timezone handling guidance if timezone is provided

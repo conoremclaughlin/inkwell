@@ -1642,6 +1642,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Get an AI being's identity by agent ID. Returns structured identity data including name, role, values, relationships, and capabilities.
 
+Use the optional 'file' parameter to fetch a single document (heartbeat, soul, values, identity) for minimal token usage. Omit to get everything.
+
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: getIdentitySchema,
     },

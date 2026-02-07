@@ -33,6 +33,9 @@ export const saveIdentitySchema = userIdentifierBaseSchema.extend({
 
 export const getIdentitySchema = userIdentifierBaseSchema.extend({
   agentId: z.string().describe('Agent identifier to look up'),
+  file: z.enum(['heartbeat', 'soul', 'values', 'identity'])
+    .optional()
+    .describe('Fetch a single identity document to minimize token usage. Omit to get everything.'),
 });
 
 export const listIdentitiesSchema = userIdentifierBaseSchema.extend({});
@@ -46,6 +49,7 @@ export const restoreIdentitySchema = userIdentifierBaseSchema.extend({
   agentId: z.string().describe('Agent identifier to restore'),
   version: z.number().describe('Version number to restore to'),
 });
+
 
 // =====================================================
 // HELPERS
@@ -274,6 +278,48 @@ export async function handleGetIdentity(
     throw new Error(`Failed to get identity: ${error.message}`);
   }
 
+  // Single-file response: return just the requested document
+  if (params.file) {
+    let fileContent: unknown;
+
+    if (params.file === 'identity') {
+      fileContent = {
+        name: data.name,
+        role: data.role,
+        description: data.description,
+        values: data.values,
+        relationships: data.relationships,
+        capabilities: data.capabilities,
+      };
+    } else if (params.file === 'heartbeat') {
+      fileContent = data.heartbeat || null;
+    } else if (params.file === 'soul') {
+      fileContent = data.soul || null;
+    } else if (params.file === 'values') {
+      fileContent = data.values || null;
+    }
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            {
+              success: true,
+              agentId: params.agentId,
+              file: params.file,
+              content: fileContent,
+              version: data.version,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+
+  // Full response: return everything
   return {
     content: [
       {

@@ -34,7 +34,7 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
   metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
   expiresAt: z.string().datetime().optional().describe('When this message expires'),
   // Trigger options - automatically trigger the recipient after sending
-  trigger: z.boolean().optional().default(false).describe('If true, automatically trigger the recipient agent after sending (avoids separate trigger_agent call)'),
+  trigger: z.boolean().optional().describe('If true, automatically trigger the recipient agent after sending. Defaults to true for task_request and session_resume, false for notification and message.'),
   triggerType: z.enum(['task_complete', 'approval_needed', 'message', 'error', 'custom']).optional().describe('Type of trigger (only used if trigger=true)'),
   triggerSummary: z.string().optional().describe('Brief summary for the trigger (only used if trigger=true)'),
 });
@@ -79,10 +79,15 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     relatedArtifactUri,
     metadata = {},
     expiresAt,
-    trigger = false,
     triggerType,
     triggerSummary,
   } = parsed;
+
+  // Default trigger behavior based on message type:
+  // task_request and session_resume trigger immediately (time-sensitive handoffs)
+  // notification and message wait for natural wake-up (heartbeat)
+  const shouldTriggerByDefault = messageType === 'task_request' || messageType === 'session_resume';
+  const trigger = parsed.trigger ?? shouldTriggerByDefault;
 
   const { data: message, error } = await supabase
     .from('agent_inbox')
@@ -418,7 +423,7 @@ export const inboxToolDefinitions = [
   {
     name: 'send_to_inbox',
     description:
-      'Send a message to another agent\'s inbox. Use for cross-agent communication, task handoff, or session resume requests.',
+      'Send a message to another agent\'s inbox. Use for cross-agent communication, task handoff, or session resume requests.\n\nMessage types:\n- message: General communication\n- task_request: Request another agent to do work\n- session_resume: Request agent to resume a specific session\n- notification: FYI, no response needed\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
     schema: sendToInboxSchema,
     handler: handleSendToInbox,
   },
