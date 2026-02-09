@@ -59,10 +59,12 @@ export default function LoginForm() {
     const checkExistingSession = async () => {
       const supabase = createClient();
       const { data: { session } } = await supabase.auth.getSession();
-      if (session?.access_token) {
+      if (session?.access_token && session?.refresh_token) {
         setMcpRedirecting(true);
         redirectToMcp();
       }
+      // If session exists but refresh_token is missing, let user re-auth
+      // via the login form to get a fresh session with both tokens.
     };
 
     checkExistingSession();
@@ -93,10 +95,11 @@ export default function LoginForm() {
     const supabase = createClient();
     const { data: { session } } = await supabase.auth.getSession();
 
-    if (session?.access_token) {
+    if (session?.access_token && session?.refresh_token) {
       const callbackUrl = new URL(mcpRedirect!);
       callbackUrl.searchParams.set('pending_id', mcpPendingId!);
       callbackUrl.searchParams.set('access_token', session.access_token);
+      callbackUrl.searchParams.set('refresh_token', session.refresh_token);
       window.location.href = callbackUrl.toString();
     }
   };

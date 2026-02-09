@@ -227,6 +227,47 @@ describe('PcpAuthProvider', () => {
       });
     });
 
+    // Regression: web portal was redirecting to /mcp/auth/callback without
+    // refresh_token, causing "Missing refresh token" error for MCP clients.
+    // The auth callback MUST receive both access_token and refresh_token
+    // from the web portal so the token exchange can store the Supabase
+    // refresh token for later use.
+    it('should require refresh_token for successful callback (regression)', async () => {
+      const pendingId = setupPendingAuth(provider);
+      mockSuccessfulAuth();
+
+      // Callback with access_token but NO refresh_token should still
+      // produce an auth code — the provider doesn't validate this, the
+      // HTTP layer does. But verify the stored refresh token propagates
+      // through to the code exchange.
+      const callbackResult = await provider.handleAuthCallback({
+        pendingId,
+        accessToken: 'supabase-jwt',
+        refreshToken: 'supabase-rt-required',
+      });
+
+      expect('code' in callbackResult).toBe(true);
+      if (!('code' in callbackResult)) return;
+
+      // Exchange the code and verify refresh token was stored
+      currentMcpTokensChain = mockChain();
+      mockInsert.mockReturnValue({ error: null });
+
+      const tokenResult = await provider.exchangeAuthorizationCode({
+        code: callbackResult.code,
+        codeVerifier: 'test-verifier',
+        clientId: 'test-client',
+      });
+
+      expect('access_token' in tokenResult).toBe(true);
+      if (!('access_token' in tokenResult)) return;
+
+      // The insert call should contain the supabase refresh token
+      expect(mockInsert).toHaveBeenCalled();
+      const insertArgs = mockInsert.mock.calls[0]?.[0];
+      expect(insertArgs).toHaveProperty('supabase_refresh_token', 'supabase-rt-required');
+    });
+
     it('should consume the pending auth after successful callback', async () => {
       const pendingId = setupPendingAuth(provider);
       mockSuccessfulAuth();

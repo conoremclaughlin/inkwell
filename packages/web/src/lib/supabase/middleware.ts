@@ -55,16 +55,19 @@ export async function updateSession(request: NextRequest) {
     const mcpPendingId = request.nextUrl.searchParams.get('pending_id');
 
     if (mcpRedirect && mcpPendingId) {
-      // MCP OAuth flow: user is already logged in — redirect straight to the
-      // MCP callback with the access token. No login form flash.
+      // MCP OAuth flow: user is already logged in — try to redirect straight
+      // to the MCP callback with tokens. No login form flash.
       const { data: { session } } = await supabase.auth.getSession();
-      if (session?.access_token) {
+      if (session?.access_token && session?.refresh_token) {
         const callbackUrl = new URL(mcpRedirect);
         callbackUrl.searchParams.set('pending_id', mcpPendingId);
         callbackUrl.searchParams.set('access_token', session.access_token);
+        callbackUrl.searchParams.set('refresh_token', session.refresh_token);
         return NextResponse.redirect(callbackUrl.toString());
       }
-      // Session exists but no token — fall through to login form
+      // Can't get both tokens from middleware — let the login form handle it.
+      // The client-side Supabase client may have better access to the refresh token.
+      return supabaseResponse;
     }
 
     // Normal case: redirect to dashboard
