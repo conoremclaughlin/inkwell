@@ -30,6 +30,8 @@ personal-context-protocol/
 ├── packages/
 │   ├── api/              # PCP server (MCP tools, services, data layer)
 │   └── cli/              # SB CLI (sb command)
+├── stories/              # Feature specs and design docs
+│   └── cli/              # CLI-related stories
 ├── supabase/
 │   └── migrations/       # Database migrations
 ├── AGENTS.md             # Agent onboarding (points to CLAUDE.md)
@@ -37,6 +39,20 @@ personal-context-protocol/
 ├── CLAUDE.md             # Detailed agent guidelines
 └── README.md             # This file
 ```
+
+## Stories
+
+Feature work lives in `stories/`, grouped by domain. Each story contains specs, research, and the feature-specific source files that don't belong in a generic shared folder:
+
+```
+stories/
+├── cli/                  # CLI features (backends, flags, install)
+├── channels/             # Messaging integrations
+├── mcp/                  # MCP tools and server
+└── agents/               # Multi-agent orchestration
+```
+
+Stories are living documents — update them as the feature evolves.
 
 ## Key Technologies
 

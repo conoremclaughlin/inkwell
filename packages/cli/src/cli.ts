@@ -7,11 +7,12 @@
  * through to the underlying tool.
  *
  * Usage:
- *   sb                         Interactive Claude Code session
- *   sb "your prompt"           Run Claude with prompt (one-shot)
- *   sb --resume <id>           Pass --resume through to Claude
+ *   sb                         Interactive session (default: claude)
+ *   sb "your prompt"           One-shot prompt mode
+ *   sb -b codex "fix the bug"  Use Codex CLI backend
+ *   sb -b gemini "review this" Use Gemini CLI backend
+ *   sb --resume <id>           Passthrough flags to backend
  *   sb ws create <name>        Create a workspace
- *   sb agent status            Check agent status
  *   sb session list            List sessions
  */
 
@@ -20,6 +21,7 @@ import chalk from 'chalk';
 import { registerWorkspaceCommands } from './commands/workspace.js';
 import { registerAgentCommands } from './commands/agent.js';
 import { registerSessionCommands } from './commands/session.js';
+import { registerConfigCommands } from './commands/mcp.js';
 import { runClaude, runClaudeInteractive } from './commands/claude.js';
 
 const VERSION = '0.3.0';
@@ -35,6 +37,8 @@ const VERSION = '0.3.0';
 const SB_FLAGS: Record<string, { hasValue: boolean; key: string }> = {
   '-a':           { hasValue: true,  key: 'agent' },
   '--agent':      { hasValue: true,  key: 'agent' },
+  '-b':           { hasValue: true,  key: 'backend' },
+  '--backend':    { hasValue: true,  key: 'backend' },
   '-m':           { hasValue: true,  key: 'model' },
   '--model':      { hasValue: true,  key: 'model' },
   '-v':           { hasValue: false, key: 'verbose' },
@@ -45,11 +49,13 @@ const SB_FLAGS: Record<string, { hasValue: boolean; key: string }> = {
 interface ParsedArgs {
   sbOptions: {
     agent: string;
+    backend: string;
     model: string;
     session: boolean;
     verbose: boolean;
   };
   passthroughArgs: string[];
+  promptParts: string[];
   prompt: string;
 }
 
@@ -61,6 +67,7 @@ interface ParsedArgs {
 function extractArgs(argv: string[]): ParsedArgs {
   const sbOptions = {
     agent: 'wren',
+    backend: 'claude',
     model: 'sonnet',
     session: true,
     verbose: false,
@@ -78,6 +85,7 @@ function extractArgs(argv: string[]): ParsedArgs {
       if (flag.hasValue && i + 1 < argv.length) {
         const val = argv[++i];
         if (flag.key === 'agent') sbOptions.agent = val;
+        if (flag.key === 'backend') sbOptions.backend = val;
         if (flag.key === 'model') sbOptions.model = val;
       } else if (!flag.hasValue) {
         if (flag.key === 'noSession') sbOptions.session = false;
@@ -105,6 +113,7 @@ function extractArgs(argv: string[]): ParsedArgs {
   return {
     sbOptions,
     passthroughArgs,
+    promptParts,
     prompt: promptParts.join(' '),
   };
 }
@@ -120,14 +129,15 @@ program
   .allowUnknownOption(true)
   .allowExcessArguments(true)
   .option('-a, --agent <id>', 'Agent identity to use', 'wren')
-  .option('-m, --model <model>', 'Model to use (sonnet, opus, haiku)', 'sonnet')
+  .option('-b, --backend <name>', 'AI backend (claude, codex, gemini)', 'claude')
+  .option('-m, --model <model>', 'Model to use', 'sonnet')
   .option('--no-session', 'Disable session tracking')
   .option('-v, --verbose', 'Verbose output')
-  .argument('[prompt...]', 'Prompt to send to Claude (omit for interactive)')
+  .argument('[prompt...]', 'Prompt to send (omit for interactive)')
   .action(async () => {
     // We parse argv ourselves for clean passthrough — Commander's parsed
     // values aren't reliable for unknown flags with values.
-    const { sbOptions, passthroughArgs, prompt } = extractArgs(process.argv.slice(2));
+    const { sbOptions, passthroughArgs, promptParts, prompt } = extractArgs(process.argv.slice(2));
 
     if (!prompt && !passthroughArgs.length && !process.stdin.isTTY) {
       // Piped stdin — read it as the prompt
@@ -136,10 +146,10 @@ program
       for await (const chunk of process.stdin) {
         stdinData += chunk;
       }
-      await runClaude(stdinData.trim(), sbOptions, passthroughArgs);
+      await runClaude(stdinData.trim(), [stdinData.trim()], sbOptions, passthroughArgs);
     } else if (prompt) {
       // Prompt mode (one-shot)
-      await runClaude(prompt, sbOptions, passthroughArgs);
+      await runClaude(prompt, promptParts, sbOptions, passthroughArgs);
     } else {
       // No prompt — launch interactive session
       // Passthrough args (like --resume) still forwarded
@@ -151,6 +161,7 @@ program
 registerWorkspaceCommands(program);
 registerAgentCommands(program);
 registerSessionCommands(program);
+registerConfigCommands(program);
 
 // ============================================================================
 // Subcommand detection
