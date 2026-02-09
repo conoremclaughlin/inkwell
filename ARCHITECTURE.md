@@ -1,235 +1,211 @@
-# Personal Context Protocol - Architecture
+# Architecture
 
 ## Overview
 
-The Personal Context Protocol (PCP) is a system designed to capture, store, and surface your personal context (links, notes, tasks, reminders, conversations) across any AI interface. The key insight is that AI assistants become dramatically more useful when they "know you" - when they have access to your saved links, notes, tasks, and conversation history.
+PCP is a unified server that provides persistent context, memory, and identity for AI agents across multiple interfaces. A single process orchestrates MCP tools, channel listeners (Telegram, WhatsApp), session management, and scheduled tasks.
 
-## Core Architecture
+## System Diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         USER INTERFACES                                  │
-├─────────────┬─────────────┬─────────────┬─────────────┬────────────────┤
-│  Telegram   │  WhatsApp   │   Discord   │    Slack    │  Claude Code   │
-│    Bot      │    Bot      │     Bot     │     Bot     │    (Direct)    │
-└──────┬──────┴──────┬──────┴──────┬──────┴──────┬──────┴───────┬────────┘
-       │             │             │             │              │
-       └─────────────┴─────────────┴─────────────┴──────────────┘
-                                   │
-                    ┌──────────────▼──────────────┐
-                    │     CLAWDBOT BRIDGE         │
-                    │  (Message Normalization)    │
-                    └──────────────┬──────────────┘
-                                   │
-                    ┌──────────────▼──────────────┐
-                    │    CHANNEL ADAPTER          │
-                    │  (Context Extraction)       │
-                    │  - URL detection            │
-                    │  - Command parsing          │
-                    │  - Note extraction          │
-                    │  - Task detection           │
-                    │  - Reminder parsing         │
-                    └──────────────┬──────────────┘
-                                   │
-       ┌───────────────────────────┼───────────────────────────┐
-       │                           │                           │
-┌──────▼──────┐          ┌────────▼────────┐          ┌───────▼───────┐
-│  MCP SERVER │          │   DATA LAYER    │          │   AI LAYER    │
-│  (Tools)    │◄────────►│  (Supabase)     │◄────────►│ (Claude API)  │
-└─────────────┘          └─────────────────┘          └───────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                        USER INTERFACES                           │
+├──────────────┬──────────────┬──────────────┬─────────────────────┤
+│  Claude Code │   Telegram   │   WhatsApp   │   SB CLI (sb)       │
+│  (MCP/HTTP)  │  (Telegraf)  │  (Baileys)   │  (spawns Claude)    │
+└──────┬───────┴──────┬───────┴──────┬───────┴──────────┬──────────┘
+       │              │              │                   │
+       │              └──────┬───────┘                   │
+       │                     │                           │
+       ▼                     ▼                           ▼
+┌─────────────┐   ┌──────────────────┐         ┌──────────────┐
+│  MCP Server │   │  Channel Gateway │         │ Identity     │
+│  (HTTP/SSE) │   │  (Listeners)     │         │ Injection    │
+└──────┬──────┘   └────────┬─────────┘         │ (system      │
+       │                   │                   │  prompt)     │
+       │                   ▼                   └──────┬───────┘
+       │          ┌──────────────────┐                │
+       │          │  Session Service │◄───────────────┘
+       │          │  (Stateless)     │
+       │          └────────┬─────────┘
+       │                   │
+       ▼                   ▼
+┌─────────────────────────────────────┐
+│         MCP Tool Handlers           │
+│  (memory, tasks, sessions, links,   │
+│   inbox, calendar, email, skills)   │
+└──────────────────┬──────────────────┘
+                   │
+                   ▼
+┌─────────────────────────────────────┐
+│     Supabase (PostgreSQL)           │
+│     + pgvector + RLS                │
+└─────────────────────────────────────┘
 ```
 
-## Why Clawdbot?
+## Core Components
 
-[Clawdbot](https://github.com/clawdbot/clawdbot) is an open-source multi-platform messaging gateway that handles the complexity of integrating with various messaging platforms:
+### PCP Server (`src/server.ts`)
 
-- **Telegram** (grammY)
-- **WhatsApp** (Baileys/WPP)
-- **Discord** (discord.js)
-- **Slack** (Bolt)
-- **Signal** (signal-cli)
-- **iMessage** (BlueBubbles)
-- **Matrix** (matrix-js-sdk)
-- **MS Teams**
+The unified entry point. Starts all components in order:
 
-Instead of building and maintaining integrations for each platform, we leverage clawdbot's mature, battle-tested implementations as a **submodule**. This gives us:
+1. DataComposer (Supabase connection)
+2. SessionService (stateless message processor)
+3. MCP Server with ChannelGateway (HTTP on port 3001)
+4. Heartbeat service (scheduled reminders)
+5. Agent trigger handler
 
-1. **Immediate multi-platform support** - All platforms clawdbot supports work out of the box
-2. **Maintained integrations** - Platform API changes are handled upstream
-3. **Proven architecture** - Plugin system, message normalization, access control
-4. **Focus on value** - We focus on personal context, not messaging infrastructure
+Runs as a single pm2 process (`pcp`).
 
-## The Bridge Pattern
+### MCP Server (`src/mcp/server.ts`)
 
-The integration uses a **bridge pattern** that:
+Exposes PCP tools over HTTP/SSE at `http://localhost:3001/mcp`. Each client connection gets its own `McpServer + StreamableHTTPServerTransport` pair, managed in a session map.
 
-1. **Intercepts messages** from clawdbot's normalized context
-2. **Extracts personal context** (links, notes, tasks, reminders)
-3. **Stores context** in Supabase via our data layer
-4. **Optionally augments** AI responses with saved context
+Additional HTTP endpoints:
+- `/health` — service health check
+- `/api/agent/trigger` — inter-agent trigger
+- OAuth2 endpoints (`/authorize`, `/token`, `/register`)
 
-```typescript
-// In clawdbot's message handler:
-const result = await bridge.processContext(ctxPayload);
+### Channel Gateway (`src/channels/gateway.ts`)
 
-// Context is now saved, optionally inform the user
-if (result.saved.links > 0) {
-  // "Saved 3 links to your personal context"
-}
-```
+Manages messaging integrations. Currently supports:
+- **TelegramListener** — polling-based via Telegraf
+- **WhatsAppListener** — WhatsApp Web via Baileys
+
+Messages are optionally buffered (default 2s for grouping related messages), then routed to SessionService. Responses from agents are routed back to the originating channel.
+
+### Session Service (`src/services/sessions/session-service.ts`)
+
+Stateless, horizontally scalable message processor. All state lives in the database.
+
+**Processing flow:**
+1. Get or create session from DB
+2. Acquire processing lock (per agent+session)
+3. If locked, queue the message (FIFO)
+4. Process via ClaudeRunner (Claude API with context)
+5. Execute MCP tool calls from the response
+6. Route responses through ChannelGateway
+7. Release lock, process next queued message
+
+**Key property:** Processing locks prevent race conditions when the same session receives concurrent messages.
+
+### Heartbeat Service (`src/services/heartbeat.ts`)
+
+Processes scheduled reminders on a cron interval (default: every 5 minutes).
+
+1. Query DB for due reminders (`next_run_at <= now`, `status = 'active'`)
+2. Check quiet hours
+3. Deliver via SessionService (treated as an agent-channel message)
+4. Update state: increment `run_count`, calculate next `next_run_at`, or mark completed
+
+Reminders flow through the same SessionService pathway as user messages — the agent processes the reminder context and responds naturally.
+
+### Agent Gateway (`src/channels/agent-gateway.ts`)
+
+Handles inter-agent communication. When agent A triggers agent B:
+
+1. `send_to_inbox` stores the message in `agent_inbox` table
+2. `trigger_agent` HTTP POSTs to `/api/agent/trigger`
+3. AgentGateway dispatches to the target agent's handler
+4. Default handler builds a trigger message and calls SessionService
 
 ## Data Flow
 
-### Inbound (User → System)
+### Claude Code → MCP Tools
 
-1. User sends message on any platform (Telegram, WhatsApp, etc.)
-2. Clawdbot receives and normalizes the message
-3. Bridge converts to `InboundMessage` format
-4. Extractor identifies content (URLs, commands, etc.)
-5. Adapter saves extracted context to Supabase
-6. (Optional) Context augments AI response
+```
+Claude Code → HTTP POST /mcp (OAuth2 token) → MCP Server
+  → Tool call dispatched → Handler executes → Supabase query
+  → Result returned → Claude processes response
+```
 
-### Outbound (System → User)
+### Telegram/WhatsApp → Agent Response
 
-1. AI generates response (via Claude API or Claude Code)
-2. Response may include saved context
-3. Clawdbot delivers to original platform
+```
+User message → Listener → Buffer → ChannelGateway
+  → SessionService.handleMessage() → Acquire lock
+  → ClaudeRunner (Claude API) → MCP tool calls executed
+  → send_response captured → ChannelGateway → User
+```
 
-## User Identification
+### Agent Trigger (e.g., Wren → Myra)
 
-Users can be identified across platforms through:
+```
+Wren calls send_to_inbox() + trigger: true
+  → Message saved in agent_inbox
+  → HTTP POST /api/agent/trigger
+  → AgentGateway → SessionService.handleMessage(agentId='myra')
+  → Myra processes, responds via ChannelGateway
+```
 
-1. **User ID** - Direct UUID lookup
-2. **Email** - Account-linked email
-3. **Platform + Platform ID** - e.g., `telegram:123456789`
-4. **Phone Number** - E.164 format
+### SB CLI → Claude Code
 
-This enables cross-platform context - a link saved on Telegram is available when chatting on WhatsApp.
+```
+sb "fix the bug" → Identity injection (--append-system-prompt)
+  → Spawns claude with PCP identity + MCP config
+  → Claude Code connects to MCP server at localhost:3001
+  → Agent bootstraps, remembers who it is
+```
 
-## AI Integration
+## Multi-Agent Identity
 
-### Claude Code Integration (Recommended)
+Three agents share the same infrastructure with distinct identities and filtered memories:
 
-The most powerful integration is using this with Claude Code. Since Claude Code has full access to your codebase and tools, you can:
+| Agent | Interface | Nature |
+|-------|-----------|--------|
+| **Wren** | Claude Code (via `sb`) | Session-based development collaborator |
+| **Myra** | Telegram / WhatsApp | Persistent messaging bridge |
+| **Benson** | Discord / Slack | Conversational partner |
 
-1. **Use your existing Claude subscription** - No additional AI API costs
-2. **Leverage Claude Code's capabilities** - File access, code execution, tool use
-3. **Direct MCP tool access** - Claude Code can directly call MCP tools
+Identity is resolved from: system prompt override → `$AGENT_ID` env var → `.pcp/identity.json` → `~/.pcp/config.json`. Each agent has identity files at `~/.pcp/<agentId>/` and memories filtered by agentId.
 
-This model enables an incredibly cost-effective personal AI assistant:
-- ~$5/month for Supabase (generous free tier)
-- Your existing Claude Pro subscription
-- No per-message API costs
+## MCP Tools
 
-### Standalone API Integration
+60+ tools organized by domain:
 
-For platforms without Claude Code access:
+| Domain | Tools |
+|--------|-------|
+| **Bootstrap & Sessions** | `bootstrap`, `start_session`, `log_session`, `end_session` |
+| **Memory** | `remember`, `recall`, `forget`, `update_memory`, history/restore |
+| **Context & Projects** | `save_context`, `get_context`, `save_project`, `set_focus` |
+| **Communication** | `send_response`, `send_to_inbox`, `trigger_agent` |
+| **Data** | `save_link`, `create_task`, `create_reminder`, calendar, email |
+| **Identity** | `save_identity`, `get_identity`, permissions, audit log |
+| **Skills** | `list_skills`, `publish_skill`, `fork_skill` |
+| **Artifacts** | `create_artifact`, `update_artifact` (versioned shared docs) |
+| **Workspaces** | `create_workspace`, `list_workspaces`, `adopt_workspace` |
 
-1. **Anthropic API** - Direct Claude API calls
-2. **OpenAI API** - GPT-4 integration
-3. **Local Models** - Ollama, llama.cpp
+## Data Layer
+
+**Database:** Supabase PostgreSQL with pgvector for semantic search and Row Level Security for data isolation.
+
+**Repository pattern** via DataComposer (`src/data/composer.ts`):
+- Users, Links, Notes, Tasks, Reminders
+- Conversations, Context, Projects
+- Memory (with semantic search), Sessions
+- Activity Stream, Workspaces
+
+## Security
+
+- **Row Level Security (RLS)** on all tables — users can only access their own data
+- **OAuth2 token auth** for MCP connections (with refresh token support)
+- **Service key** used server-side only
+- **Permissions system** — per-user toggles for sensitive operations (web search, bash, etc.)
+- **Audit logging** — tracks sensitive operations with full context
+
+## Process Management
+
+Single pm2 configuration (`ecosystem.config.cjs`):
+
+| Process | Description |
+|---------|-------------|
+| `pcp` | Main server: MCP + channels + heartbeat + agent gateway |
+| `web` | Next.js admin dashboard (port 3002) |
 
 ## Key Design Decisions
 
-### 1. Submodule vs. Fork
-
-We use clawdbot as a **git submodule** rather than forking because:
-- Updates flow naturally via `git submodule update`
-- Clear separation of concerns
-- We can contribute improvements upstream
-- No maintenance burden for messaging infrastructure
-
-### 2. Bridge Pattern vs. Deep Integration
-
-We use a **bridge/adapter pattern** rather than modifying clawdbot internals:
-- Clawdbot remains unmodified
-- Our code is isolated and testable
-- Easy to upgrade clawdbot versions
-- Works with any clawdbot-compatible bot
-
-### 3. Supabase for Storage
-
-Supabase provides:
-- PostgreSQL with pgvector for semantic search
-- Row Level Security for data isolation
-- Realtime subscriptions for live updates
-- Edge Functions for serverless compute
-- Authentication built-in
-
-### 4. MCP as the API
-
-Model Context Protocol (MCP) provides:
-- Standard tool interface for AI agents
-- Works with Claude Desktop, Claude Code, and other MCP clients
-- Extensible and well-documented
-- Future-proof as MCP adoption grows
-
-## Future Architecture
-
-### Planned Enhancements
-
-1. **Semantic Search** - Voyage AI embeddings with pgvector
-2. **Context Augmentation** - Auto-inject relevant saved context into AI prompts
-3. **Cross-Platform Identity** - Unified identity across messaging platforms
-4. **Web/Mobile Apps** - Direct access to saved context
-5. **Browser Extension** - One-click save from any webpage
-
-### Scaling Considerations
-
-For high-volume deployments:
-- Supabase can be replaced with any PostgreSQL + vector store
-- Message queue (Redis/BullMQ) for async processing
-- CDN for media storage
-- Edge deployment for low latency
-
-## Reminder System
-
-The heartbeat service manages scheduled reminders stored in the `scheduled_reminders` table. It runs every 5 minutes via `node-cron` in development and `pg_cron` in production.
-
-### Delivery Flow
-
-1. **Heartbeat tick** — fetches due reminders (`next_run_at <= now`, `status = 'active'`)
-2. **Quiet hours check** — skips delivery if the user's `heartbeat_state` indicates quiet hours
-3. **Delivery routing:**
-   - **Direct channel** — if a delivery channel (e.g., Telegram) is registered in the same process, sends the message directly
-   - **Agent trigger fallback** — if no direct channel exists (e.g., Telegram listener lives in the PCP server, not the agent process), triggers the agent via the Agent Gateway. The agent processes the reminder (checks emails, calendar, etc.) and responds via `send_response`, which routes through the Channel Gateway to the user
-4. **State update** — increments `run_count`, calculates `next_run_at` using `cron-parser`, or marks completed for one-time reminders
-
-### Cron Scheduling
-
-Next-run times are calculated using the `cron-parser` library (`CronExpressionParser.parse`), which correctly handles complex patterns like `0 16-23,0-7 * * *` (ranges, lists, step values). Cron expressions are evaluated in the server's timezone by default.
-
-## Security Model
-
-### Data Isolation
-- Row Level Security (RLS) on all tables
-- Users can only access their own data
-- Service key only used server-side
-
-### Authentication
-- Platform-based identity verification
-- JWT tokens for API access
-- Optional 2FA support
-
-### Privacy
-- All data encrypted at rest (Supabase)
-- HTTPS only
-- No third-party data sharing
-- User-controlled data deletion
-
-## Getting Started
-
-See [README.md](./README.md) for installation and usage instructions.
-
-## Contributing
-
-We welcome contributions! Areas of interest:
-- New platform integrations
-- Improved context extraction
-- Better semantic search
-- UI/UX improvements
-- Documentation
-
-## License
-
-MIT License - see [LICENSE](./LICENSE) for details.
+1. **Stateless SessionService** — All state in the database. Processing locks prevent races. Enables horizontal scaling.
+2. **Unified server** — One process handles MCP, channels, heartbeat, and triggers. Simpler ops, shared state.
+3. **MCP as the API** — All agent capabilities exposed as MCP tools. Works with any MCP client.
+4. **Channel-agnostic routing** — SessionService doesn't know about Telegram/WhatsApp. ChannelGateway handles routing.
+5. **Heartbeat via SessionService** — Reminders are just messages. Same processing pipeline, same agent capabilities.
+6. **Identity injection** — The `sb` CLI injects identity via system prompt. The agent bootstraps from there.

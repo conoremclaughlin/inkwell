@@ -2,300 +2,146 @@
 
 > Be known to your AI compatriots
 
-A personal Model Context Protocol (MCP) server that manages your context across different messaging services and agents. This allows AI companions to easily access and manage your links, notes, tasks, reminders, and conversations through a standardized protocol.
+A system that captures and manages personal context across AI interfaces, enabling persistent memory, identity, and continuity across sessions. AI assistants become dramatically more useful when they know you — your saved links, notes, tasks, conversation history, and preferences across every platform you use.
 
-**The key insight**: AI assistants become dramatically more useful when they "know you" - when they have access to your saved links, notes, tasks, and conversation history across every platform you use.
+## Quick Start
 
-## Features
-
-- **MCP Server**: Exposes tools for AI agents to interact with your personal context
-- **Link Management**: Save, search, and tag URLs from any platform
-- **Note Taking**: Create and search notes with full-text search
-- **Task Management**: Create and manage tasks with priorities and due dates
-- **Reminder System**: Set reminders with recurrence support
-- **Conversation Storage**: Store and retrieve conversation history
-- **Universal Search**: Search across all your personal context
-- **Multi-Platform Messaging**: Telegram, WhatsApp, Discord, Slack, Signal, iMessage via [Clawdbot](https://github.com/clawdbot/clawdbot)
-- **Semantic Search**: Vector embeddings with Voyage AI and pgvector
-- **Flexible User Identity**: Look up users by email, phone, platform ID, or UUID
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Telegram │ WhatsApp │ Discord │ Slack │ Signal │ Claude Code  │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │
-            ┌─────────────▼─────────────┐
-            │    Clawdbot Bridge        │
-            │  (Message Normalization)  │
-            └─────────────┬─────────────┘
-                          │
-            ┌─────────────▼─────────────┐
-            │    MCP Server + Tools     │
-            └─────────────┬─────────────┘
-                          │
-            ┌─────────────▼─────────────┐
-            │   Supabase (PostgreSQL)   │
-            │   + pgvector + RLS        │
-            └───────────────────────────┘
-```
-
-- **Monorepo**: Yarn workspaces with packages for API and shared utilities
-- **MCP Server**: Built with `@modelcontextprotocol/sdk`
-- **Database**: Supabase (PostgreSQL) with Row Level Security and pgvector
-- **Messaging**: Multi-platform via Clawdbot (Telegram, WhatsApp, Discord, Slack, Signal, iMessage)
-- **AI Layer**: Claude Code (recommended), Anthropic API, or other providers
-
-See [ARCHITECTURE.md](./ARCHITECTURE.md) for detailed architecture documentation.
-
-## Cost Model
-
-This system is designed to be incredibly cost-effective:
-
-| Component | Cost |
-|-----------|------|
-| Supabase (database) | Free tier generous, ~$5/mo for moderate use |
-| Claude Pro subscription | $20/mo (your existing subscription) |
-| Clawdbot | Free (open source) |
-| **Total** | **~$5/mo on top of Claude Pro** |
-
-The key insight is using **Claude Code** as your AI layer - it can directly access MCP tools with your existing subscription. No per-message API costs!
-
-## Getting Started
-
-### Prerequisites
-
-- Node.js 18+
-- Yarn 1.22+
-- Supabase account (or local Supabase setup)
-- Telegram Bot Token (optional, for Telegram integration)
-
-### Installation
-
-1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/personal-context-protocol.git
-cd personal-context-protocol
-```
-
-2. Install dependencies:
-```bash
+# Install dependencies
 yarn install
-```
 
-3. Set up environment variables:
-```bash
-cp packages/api/.env.example packages/api/.env
-```
-
-Edit `packages/api/.env` with your configuration:
-```env
-# Database - Supabase
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_ANON_KEY=your-anon-key
-SUPABASE_SERVICE_KEY=your-service-key
-
-# MCP Server
-MCP_TRANSPORT=stdio  # stdio or http
-
-# Authentication
-JWT_SECRET=your-secret-key-min-32-chars
-```
-
-4. Set up Supabase database:
-   - Create a new Supabase project
-   - Run the migration: `supabase/migrations/001_initial_schema.sql`
-   - Or use Supabase CLI:
-```bash
-supabase db push
-```
-
-### Running the Server
-
-Development mode with stdio transport (for Claude Desktop):
-```bash
+# Start PCP server + agents (pm2)
 yarn dev
+
+# Install the CLI globally
+yarn workspace @personal-context/cli build
+yarn workspace @personal-context/cli install:cli
+
+# Launch an interactive session with your SB
+sb
 ```
 
-Build for production:
-```bash
-yarn build
-yarn start
-```
-
-## Using with Claude Desktop
-
-To use this MCP server with Claude Desktop, add it to your Claude Desktop configuration:
-
-**macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-**Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
-
-```json
-{
-  "mcpServers": {
-    "personal-context": {
-      "command": "node",
-      "args": ["/path/to/personal-context-protocol/packages/api/dist/index.js"],
-      "env": {
-        "SUPABASE_URL": "https://your-project.supabase.co",
-        "SUPABASE_ANON_KEY": "your-anon-key",
-        "SUPABASE_SERVICE_KEY": "your-service-key",
-        "JWT_SECRET": "your-secret-key",
-        "MCP_TRANSPORT": "stdio"
-      }
-    }
-  }
-}
-```
-
-Restart Claude Desktop and you should see the personal context tools available!
-
-## Available MCP Tools
-
-### Link Management
-- `save_link`: Save a URL with metadata and tags
-- `search_links`: Search saved links by query, tags, or date
-- `tag_link`: Add or remove tags from a link
-
-### User Identification
-
-All tools support flexible user identification - you don't need to know the user's UUID:
-
-- `userId`: Direct UUID lookup
-- `email`: Account email address
-- `platform` + `platformId`: Platform-specific ID (e.g., `telegram` + `123456789`)
-- `phone`: E.164 format phone number
-
-### (More tools coming soon)
-- Note management
-- Task management
-- Reminders
-- Context search
-
-## Multi-Platform Messaging (Clawdbot)
-
-This project uses [Clawdbot](https://github.com/clawdbot/clawdbot) as a git submodule for multi-platform messaging support. Clawdbot handles the complexity of integrating with:
-
-- **Telegram** (grammY)
-- **WhatsApp** (Baileys)
-- **Discord** (discord.js)
-- **Slack** (Bolt)
-- **Signal** (signal-cli)
-- **iMessage** (BlueBubbles)
-
-### How It Works
-
-1. Messages arrive through any platform via Clawdbot
-2. Our **bridge layer** normalizes the message format
-3. **Content extraction** identifies links, commands, notes
-4. **Data adapter** saves context to Supabase
-5. User gets confirmation across any platform
-
-### Commands (via Messaging)
-
-```
-/save <url>              # Save a link
-/note <text>             # Create a note
-/task <title>            # Create a task
-/remind <message> in 1h  # Set a reminder
-/links                   # List recent links
-/search <query>          # Search your context
-```
-
-### Updating Clawdbot
-
-```bash
-git submodule update --remote packages/clawdbot
-```
+See [packages/cli/README.md](./packages/cli/README.md) for full CLI documentation.
 
 ## Project Structure
 
 ```
 personal-context-protocol/
 ├── packages/
-│   ├── api/                      # Main API server
-│   │   ├── src/
-│   │   │   ├── channels/         # Platform integrations (adapter, bridge)
-│   │   │   ├── config/           # Configuration and environment
-│   │   │   ├── data/             # Data layer (composer, repositories, models)
-│   │   │   │   ├── models/       # Type definitions
-│   │   │   │   ├── repositories/ # Database operations
-│   │   │   │   └── supabase/     # Supabase client and types
-│   │   │   ├── mcp/              # MCP server and tools
-│   │   │   ├── services/         # Business logic (user resolver, etc.)
-│   │   │   ├── utils/            # Shared utilities
-│   │   │   └── index.ts          # Main entry point
-│   │   └── package.json
-│   └── clawdbot/                 # Git submodule - messaging gateway
-│       └── (see clawdbot repo)   # Telegram, WhatsApp, Discord, Slack, etc.
+│   ├── api/              # PCP server (MCP tools, services, data layer)
+│   └── cli/              # SB CLI (sb command)
 ├── supabase/
-│   └── migrations/               # Database migrations
-├── ARCHITECTURE.md               # Detailed architecture docs
-├── CLAUDE.md                     # Agent guidelines
-└── README.md                     # This file
+│   └── migrations/       # Database migrations
+├── AGENTS.md             # Agent onboarding (points to CLAUDE.md)
+├── ARCHITECTURE.md       # System architecture
+├── CLAUDE.md             # Detailed agent guidelines
+└── README.md             # This file
 ```
 
-## Database Schema
+## Key Technologies
 
-The system uses the following main tables:
-- `users` - User profiles and preferences
-- `links` - Saved URLs with metadata
-- `notes` - Personal notes
-- `tasks` - Task management
-- `conversations` - Chat conversations
-- `messages` - Individual messages
-- `reminders` - Scheduled reminders
+- **Runtime**: Node.js 18+, TypeScript, Yarn 4 workspaces
+- **MCP SDK**: `@modelcontextprotocol/sdk`
+- **Database**: Supabase (PostgreSQL + pgvector)
+- **Messaging**: Telegraf (Telegram), Baileys (WhatsApp)
+- **Process Management**: pm2
+- **CLI**: Commander.js
 
-All tables have Row Level Security (RLS) enabled for data isolation.
+## Architecture
+
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for system diagrams, data flow, and design decisions.
+
+## For AI Agents
+
+See [AGENTS.md](./AGENTS.md) for onboarding instructions. Detailed guidelines are in [CLAUDE.md](./CLAUDE.md).
 
 ## Development
 
-### Building
 ```bash
-yarn build
+yarn dev                   # Start all services (pm2)
+yarn build                 # Build all packages
+yarn type-check            # Type check all packages
+yarn logs:pcp              # View PCP server logs
+yarn pm2 list              # List running processes
+yarn pm2 restart pcp       # Restart PCP server
 ```
 
-### Type Checking
-```bash
-yarn type-check
+## Git Conventions
+
+### Commits
+
+We use the [Angular commit convention](https://github.com/angular/angular/blob/main/CONTRIBUTING.md):
+
+```
+<type>(<scope>): <short summary>
+  │       │             │
+  │       │             └─⫸ Imperative present tense. Not capitalized. No period.
+  │       │
+  │       └─⫸ Optional. Succinct, relevant to the initiative.
+  │
+  └─⫸ feat|fix|refactor|chore|docs|test|perf|build|ci|style
 ```
 
-### Linting
-```bash
-yarn lint
+Examples:
+```
+feat(cli): add global install via symlink
+fix(sessions): preserve existing fields on upsert
+refactor(mcp): extract identity resolution into service
+chore: bump typescript to 5.4
 ```
 
-## Roadmap
+### Branching
 
-- [x] MCP server with stdio transport
-- [x] Link management tools
-- [x] Supabase database with RLS
-- [x] pgvector for semantic search
-- [x] Voyage AI embeddings (1024 dimensions)
-- [x] Flexible user identification (email, phone, platform ID)
-- [x] Clawdbot integration (multi-platform messaging)
-- [x] Channel adapter and bridge architecture
-- [ ] Note management tools (in progress)
-- [ ] Task management tools (in progress)
-- [ ] Reminder tools (in progress)
-- [ ] Context search tools
-- [ ] HTTP transport for cloud deployment
-- [ ] REST API
-- [ ] Web frontend (Next.js)
-- [ ] Browser extension
-- [ ] Mobile app
+We follow [GitHub flow](https://www.geeksforgeeks.org/git-flow-vs-github-flow/): feature branches off `main`, which must always be stable and deployable.
 
-## Contributing
+```
+<initials or moniker>/<type>/<scope>
+  │                      │       │
+  │                      │       └─⫸ Kebab-case. Succinct description.
+  │                      │
+  │                      └─⫸ Same types as commits.
+  │
+  └─⫸ Your initials or unique moniker (e.g., cm, wren, myra)
+```
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Examples:
+```bash
+git checkout -b cm/feat/agent-orchestrator
+git checkout -b wren/fix/session-resume
+git checkout -b myra/chore/heartbeat-cleanup
+```
+
+When syncing with main: rebase first; if conflicts get messy, merge main in and move on.
+
+### Code Comments
+
+```
+<author>(<scope>): <short summary>
+  │         │             │
+  │         │             └─⫸ Be succinct. Present tense.
+  │         │
+  │         └─⫸ Optional. todo|bug|???|<commit-style scope>
+  │
+  └─⫸ Optional. Your initials or common name.
+```
+
+A plain comment needs no prefix — any comment is implicitly a note. Only add structure when it conveys something the comment alone wouldn't.
+
+Examples:
+```typescript
+// cm(todo): extract this into a shared utility
+// wren(bug): race condition when two agents write simultaneously
+// ???: unclear why this timeout is needed — removing it breaks auth
+// Simple explanation needs no prefix
+```
+
+## Coding Conventions
+
+- **camelCase** for variables and functions (acronyms treated as words: `userId`, `apiResponse`)
+- **PascalCase** for classes and types (`HttpClient`, `UserIdentity`)
+- **SCREAMING_SNAKE** for constants
+- Strict TypeScript, Zod for runtime validation, `async/await` over callbacks
 
 ## License
 
-MIT License - see LICENSE file for details
-
-## Acknowledgments
-
-- Built with [Model Context Protocol](https://modelcontextprotocol.io)
-- Powered by [Supabase](https://supabase.com)
-- Inspired by the need for unified personal context across AI agents
+MIT
