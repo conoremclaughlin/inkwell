@@ -7,6 +7,13 @@
     "pcp": {
       "type": "http",
       "url": "http://localhost:3001/mcp"
+    },
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_TOKEN}"
+      }
     }
   }
 }

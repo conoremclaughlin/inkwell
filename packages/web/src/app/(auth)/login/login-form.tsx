@@ -86,7 +86,8 @@ export default function LoginForm() {
         : '/login';
       window.history.replaceState({}, '', newUrl);
     }
-  }, [searchParams, isMcpAuth, mcpRedirect, mcpPendingId]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Run once on mount — searchParams causes infinite loop when URL is modified
 
   // Redirect to MCP callback with access token
   const redirectToMcp = async () => {

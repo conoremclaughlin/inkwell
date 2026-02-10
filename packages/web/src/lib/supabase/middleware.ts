@@ -44,6 +44,7 @@ export async function updateSession(request: NextRequest) {
     !request.nextUrl.pathname.startsWith('/api');
 
   if (!user && isProtectedRoute) {
+    console.log('[middleware] No user, redirecting to login:', request.nextUrl.pathname);
     const url = request.nextUrl.clone();
     url.pathname = '/login';
     return NextResponse.redirect(url);
@@ -54,11 +55,23 @@ export async function updateSession(request: NextRequest) {
     const mcpRedirect = request.nextUrl.searchParams.get('redirect');
     const mcpPendingId = request.nextUrl.searchParams.get('pending_id');
 
+    console.log('[middleware] User logged in, accessing /login', {
+      hasMcpParams: !!(mcpRedirect && mcpPendingId),
+      path: request.nextUrl.pathname,
+    });
+
     if (mcpRedirect && mcpPendingId) {
       // MCP OAuth flow: user is already logged in — try to redirect straight
       // to the MCP callback with tokens. No login form flash.
       const { data: { session } } = await supabase.auth.getSession();
-      if (session?.access_token && session?.refresh_token) {
+      const hasTokens = !!(session?.access_token && session?.refresh_token);
+      console.log('[middleware] MCP flow, session tokens:', {
+        hasAccessToken: !!session?.access_token,
+        hasRefreshToken: !!session?.refresh_token,
+      });
+
+      if (hasTokens) {
+        console.log('[middleware] Redirecting to MCP callback with tokens');
         const callbackUrl = new URL(mcpRedirect);
         callbackUrl.searchParams.set('pending_id', mcpPendingId);
         callbackUrl.searchParams.set('access_token', session.access_token);
@@ -67,10 +80,12 @@ export async function updateSession(request: NextRequest) {
       }
       // Can't get both tokens from middleware — let the login form handle it.
       // The client-side Supabase client may have better access to the refresh token.
+      console.log('[middleware] Missing tokens, letting login form handle MCP flow');
       return supabaseResponse;
     }
 
     // Normal case: redirect to dashboard
+    console.log('[middleware] Redirecting to dashboard');
     const url = request.nextUrl.clone();
     url.pathname = '/';
     return NextResponse.redirect(url);

@@ -130,15 +130,31 @@ export class PcpAuthProvider {
         return { error: 'access_denied', error_description: 'Authentication failed' };
       }
 
-      const { data: pcpUser, error: userError } = await this.supabase
+      // Look up or create PCP user
+      let { data: pcpUser, error: userError } = await this.supabase
         .from('users')
         .select('id, email')
         .eq('email', user.email!)
         .single();
 
-      if (userError || !pcpUser) {
-        logger.error('PCP user not found', { email: user.email, error: userError });
-        return { error: 'access_denied', error_description: 'User not found in PCP system' };
+      // Auto-create PCP user on first OAuth login
+      if (userError?.code === 'PGRST116') {
+        logger.info('Auto-creating PCP user on first MCP auth', { email: user.email });
+        const { data: newUser, error: createError } = await this.supabase
+          .from('users')
+          .insert({ email: user.email })
+          .select('id, email')
+          .single();
+
+        if (createError || !newUser) {
+          logger.error('Failed to create PCP user', { email: user.email, error: createError });
+          return { error: 'server_error', error_description: 'Failed to create user account' };
+        }
+
+        pcpUser = newUser;
+      } else if (userError || !pcpUser) {
+        logger.error('PCP user lookup failed', { email: user.email, error: userError });
+        return { error: 'access_denied', error_description: 'User lookup failed' };
       }
 
       // Create authorization code
