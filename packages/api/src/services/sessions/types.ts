@@ -154,6 +154,7 @@ export interface AgentIdentity {
   name: string;
   role: string;
   description?: string;
+  backend?: string;
   values: string[];
   capabilities: string[];
   soul?: string;
@@ -333,6 +334,15 @@ export interface IContextBuilder {
     userId: string,
     agentId: string
   ): Promise<Pick<InjectedContext, 'temporal' | 'agent'>>;
+
+  /**
+   * Resolve the preferred runtime backend for an agent identity.
+   * Returns raw backend string from DB (e.g. "claude", "codex", "gemini").
+   */
+  getAgentBackend(
+    userId: string,
+    agentId: string
+  ): Promise<string | null>;
 }
 
 // ─── Claude Runner Interface ───

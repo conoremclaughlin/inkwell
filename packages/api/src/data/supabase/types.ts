@@ -121,6 +121,7 @@ export type Database = {
       agent_identities: {
         Row: {
           agent_id: string
+          backend: string | null
           capabilities: Json | null
           created_at: string | null
           description: string | null
@@ -138,6 +139,7 @@ export type Database = {
         }
         Insert: {
           agent_id: string
+          backend?: string | null
           capabilities?: Json | null
           created_at?: string | null
           description?: string | null
@@ -155,6 +157,7 @@ export type Database = {
         }
         Update: {
           agent_id?: string
+          backend?: string | null
           capabilities?: Json | null
           created_at?: string | null
           description?: string | null
@@ -184,6 +187,7 @@ export type Database = {
         Row: {
           agent_id: string
           archived_at: string | null
+          backend: string | null
           capabilities: Json | null
           change_type: string
           created_at: string
@@ -203,6 +207,7 @@ export type Database = {
         Insert: {
           agent_id: string
           archived_at?: string | null
+          backend?: string | null
           capabilities?: Json | null
           change_type?: string
           created_at: string
@@ -222,6 +227,7 @@ export type Database = {
         Update: {
           agent_id?: string
           archived_at?: string | null
+          backend?: string | null
           capabilities?: Json | null
           change_type?: string
           created_at?: string

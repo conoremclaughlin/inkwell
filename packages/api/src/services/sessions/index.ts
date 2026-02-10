@@ -20,6 +20,7 @@ export { ContextBuilder, formatInjectedContext } from './context-builder.js';
 
 // Claude runner
 export { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
+export { CodexRunner } from './codex-runner.js';
 
 // Types
 export type {
