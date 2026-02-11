@@ -26,6 +26,11 @@ const path = require('path');
 const rootDir = __dirname;
 const apiDir = path.join(rootDir, 'packages/api');
 const webDir = path.join(rootDir, 'packages/web');
+const basePort = Number(process.env.PCP_PORT_BASE || 3001); // MCP-first base
+const apiPort = Number(process.env.PORT || basePort - 1);
+const mcpPort = Number(process.env.MCP_HTTP_PORT || basePort);
+const webPort = Number(process.env.WEB_PORT || basePort + 1);
+const myraPort = Number(process.env.MYRA_HTTP_PORT || basePort + 2);
 
 // Yarn workspaces hoists dependencies to root node_modules
 const tsxBin = path.join(rootDir, 'node_modules/.bin/tsx');
@@ -44,6 +49,9 @@ module.exports = {
       env: {
         NODE_ENV: 'development',
         MCP_TRANSPORT: 'http',
+        PORT: String(apiPort),
+        MCP_HTTP_PORT: String(mcpPort),
+        MYRA_HTTP_PORT: String(myraPort),
         ENABLE_WHATSAPP: 'true',
         AGENT_ID: 'myra',  // Identity for the Claude Code backend
       },
@@ -64,7 +72,7 @@ module.exports = {
       name: 'web',
       cwd: webDir,
       script: nextBin,
-      args: 'dev -p 3002',
+      args: `dev -p ${webPort}`,
       watch: false,
       env: {
         NODE_ENV: 'development',
