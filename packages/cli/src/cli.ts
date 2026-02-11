@@ -22,6 +22,7 @@ import { registerWorkspaceCommands } from './commands/workspace.js';
 import { registerAgentCommands } from './commands/agent.js';
 import { registerSessionCommands } from './commands/session.js';
 import { registerConfigCommands } from './commands/mcp.js';
+import { registerAwakenCommand } from './commands/awaken.js';
 import { runClaude, runClaudeInteractive } from './commands/claude.js';
 
 const VERSION = '0.3.0';
@@ -162,6 +163,7 @@ registerWorkspaceCommands(program);
 registerAgentCommands(program);
 registerSessionCommands(program);
 registerConfigCommands(program);
+registerAwakenCommand(program);
 
 // ============================================================================
 // Subcommand detection
