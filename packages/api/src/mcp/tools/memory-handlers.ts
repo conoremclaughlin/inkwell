@@ -40,6 +40,7 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
   metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
   expiresAt: z.string().datetime().optional().describe('Optional expiration date (ISO 8601)'),
   agentId: z.string().optional().describe('Which AI being created this memory (e.g., "wren", "benson"). Null = shared memory.'),
+  workspaceId: z.string().uuid().optional().describe('Workspace ID — used to auto-attach the correct session in parallel worktree scenarios. Stored in metadata, not as a first-class field.'),
 });
 
 export const recallSchema = userIdentifierBaseSchema.extend({
@@ -175,6 +176,7 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
     const activeSession = await dataComposer.repositories.memory.getActiveSession(
       user.id,
       params.agentId,
+      params.workspaceId,
     );
     sessionId = activeSession?.id;
   } catch {
@@ -184,6 +186,7 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
   const metadata = {
     ...params.metadata,
     ...(sessionId ? { sessionId } : {}),
+    ...(params.workspaceId ? { workspaceId: params.workspaceId } : {}),
   };
 
   const memory = await dataComposer.repositories.memory.remember({

@@ -826,6 +826,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
         expiresAt: z.string().datetime().optional().describe('Optional expiration date (ISO 8601)'),
         agentId: z.string().optional().describe('Which AI being created this memory (e.g., "wren", "benson"). Null = shared memory.'),
+        workspaceId: z.string().uuid().optional().describe('Workspace ID — helps auto-attach the correct session in parallel worktree scenarios. Stored in metadata.'),
       },
     },
     async (args) => {
