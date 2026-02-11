@@ -1949,6 +1949,7 @@ __metadata:
     jsonwebtoken: "npm:^9.0.2"
     link-preview-js: "npm:^3.2.0"
     node-cron: "npm:^4.2.1"
+    node-diff3: "npm:^3.2.0"
     qrcode: "npm:^1.5.4"
     qrcode-terminal: "npm:^0.12.0"
     telegraf: "npm:^4.15.0"
@@ -9937,6 +9938,13 @@ __metadata:
   version: 4.2.1
   resolution: "node-cron@npm:4.2.1"
   checksum: 10/7550b105e4aab772597383e24c4b31b6d5dc9604c96bcefb1a4b8a94a432b8835e3010a0dfc1d34492edfb64a2e55f334cf3ad0a76901b72de11ef506cbfd31a
+  languageName: node
+  linkType: hard
+
+"node-diff3@npm:^3.2.0":
+  version: 3.2.0
+  resolution: "node-diff3@npm:3.2.0"
+  checksum: 10/594cdf658d38285bf529e73eadb4abaa73ed05b45ff65614a99fb9be68408918ae332a4e16ceb691855127329b4d6103c9e1ced218f1560f062fbc865fafb592
   languageName: node
   linkType: hard
 
