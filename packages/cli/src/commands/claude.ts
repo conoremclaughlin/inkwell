@@ -11,7 +11,7 @@ import { getBackend, resolveAgentId } from '../backends/index.js';
 
 export interface SbOptions {
   agent: string;
-  model: string;
+  model: string | undefined;  // undefined = use backend's default
   session: boolean;
   verbose: boolean;
   backend: string;

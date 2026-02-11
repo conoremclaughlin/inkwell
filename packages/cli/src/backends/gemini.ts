@@ -19,8 +19,10 @@ export class GeminiAdapter implements BackendAdapter {
 
     const args: string[] = [];
 
-    // Model
-    args.push('-m', config.model);
+    // Model (only if explicitly specified)
+    if (config.model) {
+      args.push('-m', config.model);
+    }
 
     // Prompt mode: gemini uses -p for one-shot
     // Interactive is the default (no flag needed)

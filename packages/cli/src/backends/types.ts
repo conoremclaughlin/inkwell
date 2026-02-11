@@ -7,7 +7,7 @@
 
 export interface BackendConfig {
   agentId: string;
-  model: string;
+  model?: string;            // undefined = use backend's default model
   prompt?: string;           // undefined = interactive mode
   promptParts: string[];     // raw positional args (preserves shell word boundaries)
   passthroughArgs: string[];

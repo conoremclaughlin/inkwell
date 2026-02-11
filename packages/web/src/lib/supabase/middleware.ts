@@ -38,10 +38,11 @@ export async function updateSession(request: NextRequest) {
   } = await supabase.auth.getUser();
 
   // Protected routes - redirect to login if not authenticated
-  // Exclude: /login, /auth, /api (proxied to backend)
+  // Exclude: /login, /auth, /api (proxied to backend), /kindle/[token] (public landing)
   const isProtectedRoute = !request.nextUrl.pathname.startsWith('/login') &&
     !request.nextUrl.pathname.startsWith('/auth') &&
-    !request.nextUrl.pathname.startsWith('/api');
+    !request.nextUrl.pathname.startsWith('/api') &&
+    !request.nextUrl.pathname.match(/^\/kindle\/[^/]+$/);
 
   if (!user && isProtectedRoute) {
     console.log('[middleware] No user, redirecting to login:', request.nextUrl.pathname);

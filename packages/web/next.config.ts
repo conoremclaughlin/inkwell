@@ -14,6 +14,16 @@ const nextConfig: NextConfig = {
         source: '/api/admin/:path*',
         destination: `${process.env.API_URL || 'http://localhost:3001'}/api/admin/:path*`,
       },
+      // Chat endpoints go to MCP server
+      {
+        source: '/api/chat/:path*',
+        destination: `${process.env.API_URL || 'http://localhost:3001'}/api/chat/:path*`,
+      },
+      // Kindle endpoints go to MCP server
+      {
+        source: '/api/kindle/:path*',
+        destination: `${process.env.API_URL || 'http://localhost:3001'}/api/kindle/:path*`,
+      },
     ];
   },
 };

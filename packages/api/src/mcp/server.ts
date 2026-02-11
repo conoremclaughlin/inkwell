@@ -12,6 +12,7 @@ import { registerAllTools, setMiniAppsRegistry, setTelegramListener } from './to
 import { loadMiniApps, registerMiniAppTools, getMiniAppsInfo, type LoadedMiniApp } from '../mini-apps';
 import adminRouter, { setWhatsAppListener } from '../routes/admin';
 import agentTriggerRouter, { getAgentGateway } from '../routes/agent-trigger';
+import { createChatRouter } from '../routes/chat';
 import { ChannelGateway, createChannelGateway, type ChannelGatewayConfig, type IncomingMessageHandler } from '../channels/gateway';
 import { setSessionContext } from '../utils/request-context';
 import { PcpAuthProvider } from './auth/pcp-auth-provider';
@@ -23,6 +24,8 @@ export interface MCPServerConfig {
   channelGateway?: ChannelGatewayConfig;
   /** Handler for incoming messages from channels */
   messageHandler?: IncomingMessageHandler;
+  /** Getter for the session service (for chat routes) */
+  getSessionService?: () => import('../services/sessions/session-service').SessionService | null;
 }
 
 /** Tracked MCP client session (one per connected client) */
@@ -521,6 +524,21 @@ export class MCPServer {
 
     app.use('/api/agent', agentTriggerRouter);
     logger.info('Agent trigger routes registered at /api/agent');
+
+    if (this.config.getSessionService) {
+      const chatRouter = createChatRouter(this.config.getSessionService);
+      app.use('/api/chat', chatRouter);
+      logger.info('Chat API routes registered at /api/chat');
+    }
+
+    // Kindle routes (registered below after import)
+    import('../routes/kindle.js').then(({ createKindleRouter }) => {
+      const kindleRouter = createKindleRouter();
+      app.use('/api/kindle', kindleRouter);
+      logger.info('Kindle API routes registered at /api/kindle');
+    }).catch((err) => {
+      logger.warn('Kindle routes not loaded:', err.message);
+    });
 
     app.post('/refresh-tools', async (_req, res) => {
       try {

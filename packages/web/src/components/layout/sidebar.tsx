@@ -13,6 +13,7 @@ import {
   Link2,
   FileText,
   Puzzle,
+  MessageSquare,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { createClient } from '@/lib/supabase/client';
@@ -20,6 +21,7 @@ import { useRouter } from 'next/navigation';
 
 const navigation = [
   { name: 'Dashboard', href: '/', icon: Home },
+  { name: 'Chat', href: '/chat', icon: MessageSquare },
   { name: 'Trusted Users', href: '/trusted-users', icon: Users },
   { name: 'Groups', href: '/groups', icon: UsersRound },
   { name: 'Challenge Codes', href: '/challenge-codes', icon: Key },

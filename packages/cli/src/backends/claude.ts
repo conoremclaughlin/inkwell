@@ -1,13 +1,13 @@
 /**
  * Claude Code Backend Adapter
  *
- * Identity injection via --append-system-prompt <tmpfile>
+ * Identity injection via --append-system-prompt (inline text)
  * MCP config via --mcp-config <path>
  */
 
 import { existsSync } from 'fs';
 import { join } from 'path';
-import { createIdentityPromptFile } from './identity.js';
+import { buildIdentityPrompt } from './identity.js';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
 
 export class ClaudeAdapter implements BackendAdapter {
@@ -15,7 +15,7 @@ export class ClaudeAdapter implements BackendAdapter {
   readonly binary = 'claude';
 
   prepare(config: BackendConfig): PreparedBackend {
-    const { promptFile, cleanup } = createIdentityPromptFile(config.agentId);
+    const identityPrompt = buildIdentityPrompt(config.agentId);
 
     const args: string[] = [];
 
@@ -24,9 +24,13 @@ export class ClaudeAdapter implements BackendAdapter {
       args.push('-p');
     }
 
-    // Model + identity
-    args.push('--model', config.model);
-    args.push('--append-system-prompt', promptFile);
+    // Model (only if explicitly specified)
+    if (config.model) {
+      args.push('--model', config.model);
+    }
+
+    // Identity (inline text, no temp file needed)
+    args.push('--append-system-prompt', identityPrompt);
 
     // MCP config (if present in CWD)
     const mcpConfig = join(process.cwd(), '.mcp.json');
@@ -46,7 +50,7 @@ export class ClaudeAdapter implements BackendAdapter {
       binary: this.binary,
       args,
       env: { AGENT_ID: config.agentId },
-      cleanup,
+      cleanup: () => {}, // No temp file, no cleanup needed
     };
   }
 }

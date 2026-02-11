@@ -137,7 +137,7 @@ export class PcpAuthProvider {
         .eq('email', user.email!)
         .single();
 
-      // Auto-create PCP user on first OAuth login
+      // Auto-create PCP user on first OAuth login (if not found)
       if (userError?.code === 'PGRST116') {
         logger.info('Auto-creating PCP user on first MCP auth', { email: user.email });
         const { data: newUser, error: createError } = await this.supabase
@@ -146,12 +146,29 @@ export class PcpAuthProvider {
           .select('id, email')
           .single();
 
-        if (createError || !newUser) {
-          logger.error('Failed to create PCP user', { email: user.email, error: createError });
-          return { error: 'server_error', error_description: 'Failed to create user account' };
-        }
+        if (createError) {
+          // Check if user was created by another request (race condition or unique violation)
+          if (createError.code === '23505') {
+            logger.info('User already exists (race condition), retrying lookup', { email: user.email });
+            const { data: existingUser, error: retryError } = await this.supabase
+              .from('users')
+              .select('id, email')
+              .eq('email', user.email!)
+              .single();
 
-        pcpUser = newUser;
+            if (retryError || !existingUser) {
+              logger.error('Failed to fetch existing user after unique violation', { email: user.email, error: retryError });
+              return { error: 'server_error', error_description: 'User lookup failed' };
+            }
+
+            pcpUser = existingUser;
+          } else {
+            logger.error('Failed to create PCP user', { email: user.email, error: createError });
+            return { error: 'server_error', error_description: 'Failed to create user account' };
+          }
+        } else {
+          pcpUser = newUser;
+        }
       } else if (userError || !pcpUser) {
         logger.error('PCP user lookup failed', { email: user.email, error: userError });
         return { error: 'access_denied', error_description: 'User lookup failed' };

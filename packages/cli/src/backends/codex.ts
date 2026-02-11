@@ -22,8 +22,10 @@ export class CodexAdapter implements BackendAdapter {
     // Identity injection via config override
     args.push('--config', `model_instructions_file=${promptFile}`);
 
-    // Model
-    args.push('--model', config.model);
+    // Model (only if explicitly specified by user)
+    if (config.model) {
+      args.push('--model', config.model);
+    }
 
     // Passthrough flags
     args.push(...config.passthroughArgs);

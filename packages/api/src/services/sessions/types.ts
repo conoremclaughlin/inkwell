@@ -7,7 +7,7 @@
 // ─── Channel Types ───
 
 // Keep aligned with src/agent/types.ts ChannelType
-export type ChannelType = 'telegram' | 'terminal' | 'discord' | 'whatsapp' | 'http' | 'api' | 'agent';
+export type ChannelType = 'telegram' | 'terminal' | 'discord' | 'whatsapp' | 'http' | 'api' | 'agent' | 'web';
 
 export type ChatType = 'direct' | 'group' | 'supergroup' | 'channel';
 
