@@ -14,6 +14,14 @@ import { SkillsRepository } from './repository';
 import { loadAllSkills as loadLocalSkills } from './loader';
 import { checkEligibility } from './eligibility';
 import { logger } from '../utils/logger';
+import {
+  CloudSkillSourceProvider,
+  DEFAULT_SKILL_SOURCE_PRIORITY,
+  LocalSkillSourceProvider,
+  mergeSkillsByPriority,
+  type SkillSourceId,
+  type SkillSourceProvider,
+} from './providers';
 import type {
   LoadedSkill,
   SkillSummary,
@@ -24,14 +32,26 @@ import type {
   ListRegistrySkillsOptions,
   InstallSkillOptions,
   PublishSkillOptions,
-  SkillManifest,
 } from './types';
+
+interface CloudSkillsServiceOptions {
+  userSkillsPath?: string;
+  sourcePriority?: SkillSourceId[];
+  providers?: SkillSourceProvider[];
+}
 
 export class CloudSkillsService {
   private repository: SkillsRepository;
+  private providers: SkillSourceProvider[];
+  private sourcePriority: SkillSourceId[];
 
-  constructor(supabase: SupabaseClient) {
+  constructor(supabase: SupabaseClient, options: CloudSkillsServiceOptions = {}) {
     this.repository = new SkillsRepository(supabase);
+    this.sourcePriority = options.sourcePriority || DEFAULT_SKILL_SOURCE_PRIORITY;
+    this.providers = options.providers || [
+      new CloudSkillSourceProvider(this.repository),
+      new LocalSkillSourceProvider(options.userSkillsPath),
+    ];
   }
 
   // ===========================================================================
@@ -139,33 +159,19 @@ export class CloudSkillsService {
    * Used during bootstrap to get the user's complete skill set.
    */
   async loadUserSkills(userId: string): Promise<LoadedSkill[]> {
-    const skills: LoadedSkill[] = [];
-
-    // 1. Load local skills (always available)
-    const localSkills = loadLocalSkills();
-    skills.push(...localSkills);
-
-    // 2. Load user's installed cloud skills
-    try {
-      const cloudSkills = await this.repository.getUserInstalledSkills(userId);
-
-      for (const cloudSkill of cloudSkills) {
-        // Check if already loaded locally (local takes precedence)
-        const existsLocally = skills.some((s) => s.manifest.name === cloudSkill.name);
-        if (existsLocally) {
-          logger.debug(`Skill ${cloudSkill.name} exists locally, skipping cloud version`);
-          continue;
+    const loadResults = await Promise.all(
+      this.providers.map(async (provider) => {
+        try {
+          const skills = await provider.loadUserSkills(userId);
+          return { source: provider.id, skills };
+        } catch (error) {
+          logger.error(`Failed to load ${provider.id} skills; continuing with other sources`, error);
+          return { source: provider.id, skills: [] };
         }
+      })
+    );
 
-        // Convert to LoadedSkill format
-        const loadedSkill = this.cloudSkillToLoaded(cloudSkill);
-        skills.push(loadedSkill);
-      }
-    } catch (error) {
-      logger.error('Failed to load cloud skills, using local only:', error);
-    }
-
-    return skills;
+    return mergeSkillsByPriority(loadResults, this.sourcePriority);
   }
 
   /**
@@ -264,30 +270,6 @@ export class CloudSkillsService {
   // ===========================================================================
   // Helpers
   // ===========================================================================
-
-  /**
-   * Convert a cloud UserInstalledSkill to LoadedSkill format
-   */
-  private cloudSkillToLoaded(cloud: UserInstalledSkill): LoadedSkill {
-    const manifest: SkillManifest = {
-      ...cloud.resolvedManifest,
-      name: cloud.name,
-      version: cloud.resolvedVersion,
-      displayName: cloud.displayName,
-      description: cloud.description,
-      type: cloud.type,
-      category: cloud.category || undefined,
-      tags: cloud.tags,
-      emoji: cloud.emoji || undefined,
-    };
-
-    return {
-      manifest,
-      skillContent: cloud.resolvedContent,
-      sourcePath: `cloud://${cloud.skillId}`,
-      eligibility: checkEligibility(manifest.requirements),
-    };
-  }
 
   /**
    * Convert LoadedSkill to SkillSummary
