@@ -221,12 +221,15 @@ export class MCPServer {
           });
           const mcpServer = this.createMcpServerInstance();
 
-          // Clean up session when transport closes
+          // Clean up session when transport closes.
+          // Important: null out onclose before calling mcpServer.close() to prevent
+          // infinite recursion (transport.close → onclose → mcpServer.close → transport.close → ...)
           transport.onclose = () => {
             const sid = transport.sessionId;
             if (sid) {
               logger.info('MCP session closed', { sessionId: sid });
               this.sessions.delete(sid);
+              transport.onclose = undefined;
               mcpServer.close().catch((err) => {
                 logger.debug('Error closing MCP server for session', { sessionId: sid, error: err });
               });
