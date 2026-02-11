@@ -25,7 +25,8 @@ const optionalUrl = z.string().url().optional().or(z.literal('')).transform(val 
 const envSchema = z.object({
   // Server
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
-  PORT: z.string().transform(Number).default('3000'),
+  PCP_PORT_BASE: z.string().transform(Number).optional(),
+  PORT: z.string().transform(Number).optional(),
 
   // Database - Supabase (supports both old and new naming conventions)
   SUPABASE_URL: z.string().url(),
@@ -43,12 +44,12 @@ const envSchema = z.object({
 
   // MCP Server
   MCP_TRANSPORT: z.enum(['stdio', 'http']).default('stdio'),
-  MCP_HTTP_PORT: z.string().transform(Number).default('3001'),
+  MCP_HTTP_PORT: z.string().transform(Number).optional(),
   MCP_BASE_URL: optionalUrl, // Public base URL (e.g., https://pcp.example.com). Defaults to http://localhost:{MCP_HTTP_PORT}
   MCP_AUTH_TOKEN: optionalString,
 
   // Myra (persistent messaging process)
-  MYRA_HTTP_PORT: z.string().transform(Number).default('3003'),
+  MYRA_HTTP_PORT: z.string().transform(Number).optional(),
 
   // Authentication
   JWT_SECRET: z.string().min(32),
@@ -85,11 +86,38 @@ const parseEnv = () => {
     }
 
     // Create normalized keys (prefer new naming)
+    const hasBaseOverride = parsed.PCP_PORT_BASE !== undefined;
+    // Base is MCP-first: MCP=base, WEB=base+1, MYRA=base+2
+    const portBase = parsed.PCP_PORT_BASE ?? 3001;
+
+    // If PCP_PORT_BASE is provided and legacy defaults are still present,
+    // treat those defaults as unset so the base can drive derived ports.
+    const port =
+      parsed.PORT === undefined || (hasBaseOverride && parsed.PORT === 3000)
+        ? portBase - 1
+        : parsed.PORT;
+    const mcpHttpPort =
+      parsed.MCP_HTTP_PORT === undefined || (hasBaseOverride && parsed.MCP_HTTP_PORT === 3001)
+        ? portBase
+        : parsed.MCP_HTTP_PORT;
+    const myraHttpPort =
+      parsed.MYRA_HTTP_PORT === undefined || (hasBaseOverride && parsed.MYRA_HTTP_PORT === 3003)
+        ? portBase + 2
+        : parsed.MYRA_HTTP_PORT;
+
     return {
       ...parsed,
+      PCP_PORT_BASE: portBase,
+      PORT: port,
+      MCP_HTTP_PORT: mcpHttpPort,
+      MYRA_HTTP_PORT: myraHttpPort,
       SUPABASE_PUBLISHABLE_KEY: parsed.SUPABASE_PUBLISHABLE_KEY || parsed.SUPABASE_ANON_KEY,
       SUPABASE_SECRET_KEY: parsed.SUPABASE_SECRET_KEY || parsed.SUPABASE_SERVICE_KEY,
     } as typeof parsed & {
+      PCP_PORT_BASE: number;
+      PORT: number;
+      MCP_HTTP_PORT: number;
+      MYRA_HTTP_PORT: number;
       SUPABASE_PUBLISHABLE_KEY: string;
       SUPABASE_SECRET_KEY: string;
     };

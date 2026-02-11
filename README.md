@@ -23,6 +23,66 @@ sb
 
 See [packages/cli/README.md](./packages/cli/README.md) for full CLI documentation.
 
+## Database Setup (Supabase)
+
+PCP supports both:
+
+- **Remote Supabase** (hosted Supabase project)
+- **Local Supabase** (Docker + Supabase CLI)
+
+### Option A: Remote Supabase (quickest to start)
+
+1. Create/select a Supabase project.
+2. Copy your project URL + API keys.
+3. Fill `.env.local` from `.env.example`:
+   - `SUPABASE_URL`
+   - `SUPABASE_PUBLISHABLE_KEY`
+   - `SUPABASE_SECRET_KEY`
+4. Start PCP:
+
+```bash
+yarn dev
+```
+
+### Option B: Local Supabase (best for offline/dev parity)
+
+1. Install Supabase CLI and Docker:
+   - Supabase CLI install docs: https://supabase.com/docs/guides/cli/getting-started
+2. Start local Supabase from this repo root:
+
+```bash
+supabase start
+```
+
+3. Reset/apply migrations + seed data:
+
+```bash
+supabase db reset
+```
+
+4. Print local env values:
+
+```bash
+supabase status -o env
+```
+
+5. Map local values into `.env.local`:
+   - `API_URL` → `SUPABASE_URL`
+   - `ANON_KEY` → `SUPABASE_PUBLISHABLE_KEY`
+   - `SERVICE_ROLE_KEY` → `SUPABASE_SECRET_KEY`
+
+6. Start PCP:
+
+```bash
+yarn dev
+```
+
+Useful Supabase docs:
+
+- Local development workflow: https://supabase.com/docs/guides/cli/local-development
+- CLI reference (`start`, `status`, `db reset`, etc.): https://supabase.com/docs/reference/cli/start
+- API key types and guidance: https://supabase.com/docs/guides/api/api-keys
+
 ## Project Structure
 
 ```

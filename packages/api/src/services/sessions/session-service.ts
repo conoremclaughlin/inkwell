@@ -29,6 +29,7 @@ import type { Json } from '../../data/supabase/types.js';
 import { SessionRepository } from './session-repository.js';
 import { ContextBuilder } from './context-builder.js';
 import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
+import { CodexRunner } from './codex-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import { logger } from '../../utils/logger.js';
 
@@ -97,6 +98,7 @@ export class SessionService implements ISessionService {
   private repository: ISessionRepository;
   private contextBuilder: IContextBuilder;
   private claudeRunner: IClaudeRunner;
+  private codexRunner: IClaudeRunner;
   private activityStream: IActivityStream;
   private config: SessionServiceConfig;
 
@@ -125,11 +127,13 @@ export class SessionService implements ISessionService {
     contextBuilder: IContextBuilder,
     claudeRunner: IClaudeRunner,
     activityStream: IActivityStream,
-    config: Partial<SessionServiceConfig> = {}
+    config: Partial<SessionServiceConfig> = {},
+    codexRunner?: IClaudeRunner
   ) {
     this.repository = repository;
     this.contextBuilder = contextBuilder;
     this.claudeRunner = claudeRunner;
+    this.codexRunner = codexRunner || claudeRunner;
     this.activityStream = activityStream;
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
@@ -311,8 +315,16 @@ export class SessionService implements ISessionService {
       ),
     };
 
-    // 4. Run Claude Code
-    const result = await this.claudeRunner.run(formattedMessage, {
+    // 4. Select runtime backend and run
+    const resolvedBackend = this.resolveRuntimeBackend(
+      session.backend,
+      injectedContext.agent.backend
+    );
+    const runner = resolvedBackend === 'codex-cli'
+      ? this.codexRunner
+      : this.claudeRunner;
+
+    const result = await runner.run(formattedMessage, {
       claudeSessionId: session.claudeSessionId || undefined,
       injectedContext: session.claudeSessionId ? undefined : injectedContext,
       config: runnerConfig,
@@ -330,10 +342,12 @@ export class SessionService implements ISessionService {
       await this.repository.update(session.id, {
         claudeSessionId: result.claudeSessionId,
         messageCount: session.messageCount + 1,
+        backend: resolvedBackend,
       });
     } else {
       await this.repository.update(session.id, {
         messageCount: session.messageCount + 1,
+        backend: resolvedBackend,
       });
     }
 
@@ -382,6 +396,8 @@ export class SessionService implements ISessionService {
   ): Promise<Session> {
     const type = options?.type || 'primary';
 
+    const backend = await this.resolveAgentBackend(userId, agentId);
+
     // For primary sessions, try to find existing active session
     if (type === 'primary') {
       const existing = await this.repository.findByUserAndAgent(
@@ -413,7 +429,7 @@ export class SessionService implements ISessionService {
       totalOutputTokens: 0,
       messageCount: 0,
       tokenCount: 0,
-      backend: 'claude-code',
+      backend,
       model: this.config.defaultModel,
       lastCompactionAt: null,
       compactionCount: 0,
@@ -511,8 +527,13 @@ This session will continue with a fresh context after compaction. Your identity,
         ),
       };
 
+      const runtimeBackend = this.resolveRuntimeBackend(session.backend, context.agent.backend);
+      const runner = runtimeBackend === 'codex-cli'
+        ? this.codexRunner
+        : this.claudeRunner;
+
       // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session
-      const result = await this.claudeRunner.run(compactionPrompt, {
+      const result = await runner.run(compactionPrompt, {
         claudeSessionId: session.claudeSessionId,
         config: runnerConfig,
       });
@@ -541,6 +562,49 @@ This session will continue with a fresh context after compaction. Your identity,
         logger.error('Failed to release compaction lock', { sessionId, error: err });
       });
     }
+  }
+
+  /**
+   * Normalize backend value to runtime backend IDs used by sessions.
+   */
+  private normalizeBackend(raw: string | null | undefined): 'claude-code' | 'codex-cli' {
+    const value = (raw || '').toLowerCase().trim();
+    if (value === 'codex' || value === 'codex-cli') return 'codex-cli';
+    if (value === 'claude' || value === 'claude-code' || value === '') return 'claude-code';
+    if (value === 'gemini') {
+      logger.warn('Gemini backend configured but not yet supported in SessionService, falling back to claude-code');
+      return 'claude-code';
+    }
+    logger.warn('Unknown backend configured, falling back to claude-code', { raw });
+    return 'claude-code';
+  }
+
+  /**
+   * Resolve backend for a new session from agent identity.
+   */
+  private async resolveAgentBackend(userId: string, agentId: string): Promise<'claude-code' | 'codex-cli'> {
+    try {
+      const identityBackend = await this.contextBuilder.getAgentBackend(userId, agentId);
+      return this.normalizeBackend(identityBackend);
+    } catch (error) {
+      logger.warn('Failed to resolve agent backend, falling back to claude-code', {
+        userId,
+        agentId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return 'claude-code';
+    }
+  }
+
+  /**
+   * Resolve backend for this execution, prioritizing persisted session backend.
+   */
+  private resolveRuntimeBackend(
+    sessionBackend: string | null | undefined,
+    identityBackend: string | null | undefined
+  ): 'claude-code' | 'codex-cli' {
+    if (sessionBackend) return this.normalizeBackend(sessionBackend);
+    return this.normalizeBackend(identityBackend);
   }
 
   async endSession(sessionId: string, summary?: string): Promise<void> {
@@ -704,6 +768,7 @@ export function createSessionService(
     new ContextBuilder(supabase),
     new ClaudeRunner(),
     new ActivityStreamRepository(supabase),
-    config
+    config,
+    new CodexRunner()
   );
 }

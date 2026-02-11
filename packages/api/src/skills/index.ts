@@ -17,3 +17,4 @@ export * from './loader';
 export * from './service';
 export * from './repository';
 export * from './cloud-service';
+export * from './providers';

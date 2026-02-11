@@ -32,6 +32,7 @@ function mapAgentIdentity(row: DbAgentIdentity): AgentIdentity {
     name: row.name,
     role: row.role,
     description: row.description || undefined,
+    backend: row.backend || undefined,
     values: Array.isArray(row.values) ? (row.values as string[]) : [],
     capabilities: Array.isArray(row.capabilities) ? (row.capabilities as string[]) : [],
     soul: row.soul || undefined,
@@ -197,6 +198,26 @@ export class ContextBuilder implements IContextBuilder {
       agent: agentIdentity,
       temporal,
     };
+  }
+
+  async getAgentBackend(
+    userId: string,
+    agentId: string
+  ): Promise<string | null> {
+    const { data, error } = await this.supabase
+      .from('agent_identities')
+      .select('backend')
+      .eq('user_id', userId)
+      .eq('agent_id', agentId)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') return null;
+      logger.error('Error fetching agent backend', { userId, agentId, error });
+      return null;
+    }
+
+    return data?.backend || null;
   }
 
   private async getAgentIdentity(

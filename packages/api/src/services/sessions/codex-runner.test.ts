@@ -1,0 +1,120 @@
+import { describe, it, expect, vi, beforeEach, type Mock } from 'vitest';
+import { EventEmitter } from 'events';
+
+vi.mock('child_process', () => ({
+  spawn: vi.fn(),
+}));
+
+vi.mock('../../utils/logger.js', () => ({
+  logger: {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  },
+}));
+
+import { spawn } from 'child_process';
+import { CodexRunner } from './codex-runner.js';
+
+function createMockProcess() {
+  return Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    kill: vi.fn(),
+  });
+}
+
+describe('CodexRunner', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('should parse send_response tool calls and usage from codex json stream', async () => {
+    const mockProc = createMockProcess();
+    (spawn as Mock).mockReturnValue(mockProc);
+
+    const runner = new CodexRunner();
+    const runPromise = runner.run('hello', {
+      config: {
+        workingDirectory: process.cwd(),
+        mcpConfigPath: '',
+        model: 'gpt-5-codex',
+        appendSystemPrompt: 'identity override',
+      },
+    });
+
+    setTimeout(() => {
+      mockProc.stdout.emit('data', Buffer.from(
+        `${JSON.stringify({
+          type: 'tool_use',
+          id: 'tu-1',
+          name: 'mcp__pcp__send_response',
+          input: { channel: 'telegram', conversationId: 'chat-1', content: 'hi from codex' },
+        })}\n`
+      ));
+      mockProc.stdout.emit('data', Buffer.from(
+        `${JSON.stringify({
+          session_id: 'codex-session-123',
+          input_tokens: 12,
+          output_tokens: 5,
+          context_tokens: 42,
+          result: 'done',
+        })}\n`
+      ));
+      mockProc.emit('close', 0);
+    }, 5);
+
+    const result = await runPromise;
+    expect(result.success).toBe(true);
+    expect(result.claudeSessionId).toBe('codex-session-123');
+    expect(result.responses).toEqual([
+      {
+        channel: 'telegram',
+        conversationId: 'chat-1',
+        content: 'hi from codex',
+        format: undefined,
+        replyToMessageId: undefined,
+      },
+    ]);
+    expect(result.usage).toEqual({
+      contextTokens: 42,
+      inputTokens: 12,
+      outputTokens: 5,
+    });
+    expect(result.finalTextResponse).toBe('done');
+    expect(result.toolCalls?.length).toBe(1);
+  });
+
+  it('should run resume mode when session id exists', async () => {
+    const mockProc = createMockProcess();
+    (spawn as Mock).mockReturnValue(mockProc);
+
+    const runner = new CodexRunner();
+    const runPromise = runner.run('resume msg', {
+      claudeSessionId: 'existing-session-abc',
+      config: {
+        workingDirectory: process.cwd(),
+        mcpConfigPath: '',
+        model: 'gpt-5-codex',
+        appendSystemPrompt: 'identity override',
+      },
+    });
+
+    setTimeout(() => {
+      mockProc.stdout.emit('data', Buffer.from(`${JSON.stringify({ result: 'ok' })}\n`));
+      mockProc.emit('close', 0);
+    }, 5);
+
+    await runPromise;
+
+    expect(spawn).toHaveBeenCalledTimes(1);
+    const [, args] = (spawn as Mock).mock.calls[0] as [string, string[]];
+    expect(args[0]).toBe('exec');
+    expect(args[1]).toBe('resume');
+    expect(args).toContain('--json');
+    expect(args).toContain('existing-session-abc');
+    expect(args).toContain('resume msg');
+  });
+});
+

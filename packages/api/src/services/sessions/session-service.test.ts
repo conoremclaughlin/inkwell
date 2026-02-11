@@ -46,6 +46,7 @@ describe('SessionService', () => {
   let mockRepository: ISessionRepository;
   let mockContextBuilder: IContextBuilder;
   let mockClaudeRunner: IClaudeRunner;
+  let mockCodexRunner: IClaudeRunner;
   let mockActivityStream: IActivityStream;
 
   const createMockSession = (overrides: Partial<Session> = {}): Session => ({
@@ -141,10 +142,15 @@ describe('SessionService', () => {
         temporal: createMockInjectedContext().temporal,
         agent: createMockInjectedContext().agent,
       }),
+      getAgentBackend: vi.fn().mockResolvedValue('claude'),
     };
 
     mockClaudeRunner = {
       run: vi.fn().mockResolvedValue(createMockClaudeResult()),
+    };
+
+    mockCodexRunner = {
+      run: vi.fn().mockResolvedValue(createMockClaudeResult({ claudeSessionId: 'codex-session-1' })),
     };
 
     mockActivityStream = {
@@ -163,7 +169,8 @@ describe('SessionService', () => {
         mcpConfigPath: '/test/.mcp.json',
         defaultModel: 'sonnet',
         compactionThreshold: 150000,
-      }
+      },
+      mockCodexRunner
     );
   });
 
@@ -456,6 +463,41 @@ describe('SessionService', () => {
       );
     });
 
+    it('should resolve codex backend from agent identity when creating a new session', async () => {
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+      vi.mocked(mockContextBuilder.getAgentBackend).mockResolvedValue('codex');
+      vi.mocked(mockRepository.create).mockResolvedValue(createMockSession({ id: 'new-session' }));
+
+      const request = createMockRequest();
+      await sessionService.handleMessage(request);
+
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          backend: 'codex-cli',
+        })
+      );
+    });
+
+    it('should use codex runner when session backend is codex-cli', async () => {
+      const codexSession = createMockSession({
+        id: 'codex-session',
+        backend: 'codex-cli',
+        claudeSessionId: null,
+      });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(codexSession);
+
+      const request = createMockRequest({ content: 'Use codex backend please' });
+      const result = await sessionService.handleMessage(request);
+
+      expect(result.success).toBe(true);
+      expect(mockCodexRunner.run).toHaveBeenCalledTimes(1);
+      expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+      expect(mockRepository.update).toHaveBeenCalledWith(
+        'codex-session',
+        expect.objectContaining({ backend: 'codex-cli' })
+      );
+    });
+
     it('should increment messageCount after each processed message', async () => {
       const session = createMockSession({ messageCount: 5 });
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
@@ -523,10 +565,13 @@ describe('SessionService', () => {
       const request = createMockRequest();
       await sessionService.handleMessage(request);
 
-      expect(mockRepository.update).toHaveBeenCalledWith('session-123', {
-        claudeSessionId: 'new-claude-id',
-        messageCount: 1,
-      });
+      expect(mockRepository.update).toHaveBeenCalledWith('session-123',
+        expect.objectContaining({
+          claudeSessionId: 'new-claude-id',
+          messageCount: 1,
+          backend: 'claude-code',
+        })
+      );
     });
   });
 

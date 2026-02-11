@@ -44,6 +44,21 @@ git clone https://github.com/user/skill-name
 curl -o ~/.pcp/skills/my-skill.md https://raw.githubusercontent.com/user/repo/main/SKILL.md
 ```
 
+### From URL / Registry (curl)
+
+If a registry (PCP Hub, community index, or docs page) gives you a direct skill file URL:
+
+```bash
+mkdir -p ~/.pcp/skills
+curl -fsSL "https://example.com/skills/my-skill/SKILL.md" -o ~/.pcp/skills/my-skill.md
+```
+
+If the skill is a directory package, place it under:
+
+```text
+~/.pcp/skills/<skill-name>/
+```
+
 ### Future: PCP CLI (coming soon)
 
 ```bash
@@ -267,9 +282,11 @@ PCP supports cloud-based skill storage and distribution:
 
 ### Loading Order
 
-1. **Local skills** (`~/.pcp/skills/`) - Always loaded first
-2. **Cloud installations** - User's installed skills from registry
-3. **Deduplication** - Local skills take precedence over cloud
+Default source priority is deterministic:
+
+1. **Cloud installations** - User's installed skills from registry
+2. **Local skills** (`~/.pcp/skills/`) - Loaded after cloud
+3. **Deduplication** - Later sources override earlier ones, so local skills take precedence over cloud when names collide
 
 ### User Installation Flow
 
