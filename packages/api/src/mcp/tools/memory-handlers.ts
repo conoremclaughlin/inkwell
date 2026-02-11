@@ -76,17 +76,23 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
 
 export const logSessionSchema = userIdentifierBaseSchema.extend({
   sessionId: z.string().uuid().optional().describe('Session ID (uses active session if not provided)'),
+  agentId: z.string().optional().describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
+  workspaceId: z.string().uuid().optional().describe('Workspace ID for session resolution when sessionId not provided'),
   content: z.string().describe('Log entry content'),
   salience: salienceSchema.optional().describe('Importance level (default: medium)'),
 });
 
 export const endSessionSchema = userIdentifierBaseSchema.extend({
   sessionId: z.string().uuid().optional().describe('Session ID (uses active session if not provided)'),
+  agentId: z.string().optional().describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
+  workspaceId: z.string().uuid().optional().describe('Workspace ID for session resolution when sessionId not provided'),
   summary: z.string().optional().describe('End-of-session summary'),
 });
 
 export const getSessionSchema = userIdentifierBaseSchema.extend({
   sessionId: z.string().uuid().optional().describe('Session ID (returns active session if not provided)'),
+  agentId: z.string().optional().describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
+  workspaceId: z.string().uuid().optional().describe('Workspace ID for session resolution when sessionId not provided'),
   includeLogs: z.boolean().optional().describe('Include session logs (default: false)'),
 });
 
@@ -421,10 +427,14 @@ export async function handleLogSession(args: unknown, dataComposer: DataComposer
   const params = logSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
-  // Get session ID (use provided or find active)
+  // Get session ID (use provided or find active, scoped by agent+workspace)
   let sessionId = params.sessionId;
   if (!sessionId) {
-    const activeSession = await dataComposer.repositories.memory.getActiveSession(user.id);
+    const activeSession = await dataComposer.repositories.memory.getActiveSession(
+      user.id,
+      params.agentId,
+      params.workspaceId,
+    );
     if (!activeSession) {
       return {
         content: [
@@ -479,10 +489,14 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
   const params = endSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
-  // Get session ID (use provided or find active)
+  // Get session ID (use provided or find active, scoped by agent+workspace)
   let sessionId = params.sessionId;
   if (!sessionId) {
-    const activeSession = await dataComposer.repositories.memory.getActiveSession(user.id);
+    const activeSession = await dataComposer.repositories.memory.getActiveSession(
+      user.id,
+      params.agentId,
+      params.workspaceId,
+    );
     if (!activeSession) {
       return {
         content: [
@@ -558,7 +572,11 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
   if (params.sessionId) {
     session = await dataComposer.repositories.memory.getSession(params.sessionId);
   } else {
-    session = await dataComposer.repositories.memory.getActiveSession(user.id);
+    session = await dataComposer.repositories.memory.getActiveSession(
+      user.id,
+      params.agentId,
+      params.workspaceId,
+    );
   }
 
   if (!session) {

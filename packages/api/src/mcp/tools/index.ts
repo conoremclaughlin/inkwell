@@ -938,10 +938,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Start a new AI session. Sessions track work done across a conversation and can be logged to.
 
+If workspaceId is provided, the session is scoped to that workspace — allowing multiple active sessions per agent (one per workspace). Read workspaceId from .pcp/identity.json if available.
+
+If an active session already exists for this agent+workspace, it is returned instead of creating a new one.
+
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
         agentId: z.string().optional().describe('Agent identifier (e.g., "claude-code", "telegram-myra")'),
+        workspaceId: z.string().uuid().optional().describe('Workspace ID to scope this session to. Allows multiple active sessions per agent (one per workspace). Read from .pcp/identity.json.'),
         metadata: z.record(z.unknown()).optional().describe('Session metadata'),
       },
     },
@@ -968,6 +973,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       inputSchema: {
         ...userIdentifierFields,
         sessionId: z.string().uuid().optional().describe('Session ID (uses active session if not provided)'),
+        agentId: z.string().optional().describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
+        workspaceId: z.string().uuid().optional().describe('Workspace ID for session resolution when sessionId not provided'),
         content: z.string().describe('Log entry content'),
         salience: z.enum(['low', 'medium', 'high', 'critical']).optional().describe('Importance (default: medium)'),
       },
@@ -991,10 +998,14 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `End a session with an optional summary. The summary is automatically saved as a high-salience memory.
 
+Session resolution: sessionId (explicit) > agentId+workspaceId (scoped) > most recent active (fallback).
+
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
         sessionId: z.string().uuid().optional().describe('Session ID (uses active session if not provided)'),
+        agentId: z.string().optional().describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
+        workspaceId: z.string().uuid().optional().describe('Workspace ID for session resolution when sessionId not provided'),
         summary: z.string().optional().describe('End-of-session summary (saved as memory)'),
       },
     },
@@ -1021,6 +1032,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       inputSchema: {
         ...userIdentifierFields,
         sessionId: z.string().uuid().optional().describe('Session ID (returns active session if not provided)'),
+        agentId: z.string().optional().describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
+        workspaceId: z.string().uuid().optional().describe('Workspace ID for session resolution when sessionId not provided'),
         includeLogs: z.boolean().optional().describe('Include session logs (default: false)'),
       },
     },

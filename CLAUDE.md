@@ -17,7 +17,7 @@ Identity is resolved in layers. **Stop at the first match** - do not continue ch
 
 For interactive Claude Code sessions in this repo, `.pcp/identity.json` typically resolves to:
 ```json
-{"agentId": "wren", "context": "pcp-development"}
+{"agentId": "wren", "workspaceId": "<uuid>", "context": "workspace-wren"}
 ```
 
 For long-running processes (like the PCP server), `AGENT_ID` is set via environment variable and takes precedence.
@@ -41,17 +41,31 @@ This returns:
 - **Identity Files**: Contents of `~/.pcp/shared/` and `~/.pcp/{agentId}/` files (VALUES.md, IDENTITY.md, etc.)
 - **Active Context**: Current projects, focus, project-specific context
 - **Recent Memories**: High-salience memories filtered by your agentId (plus shared memories)
-- **Active Session**: Current session if any
+- **Active Sessions**: Array of all active sessions (use `workspaceId` to find yours)
 
 ### Step 4: Start or Resume Session
 
+Read `workspaceId` from `.pcp/identity.json` (if present) and pass it to `start_session`:
+
 ```
-start_session(userId: "<from config>", agentId: "<your identity>")
+start_session(userId: "<from config>", agentId: "<your identity>", workspaceId: "<from identity.json>")
 ```
 
-Throughout the session, log important events:
+This scopes the session to your workspace. Multiple agents can have active sessions simultaneously in different worktrees.
+
+To find your session from bootstrap's `activeSessions` array, match by `workspaceId`:
+```javascript
+const mySession = activeSessions.find(s => s.workspaceId === identityJson.workspaceId);
 ```
-log_session(userId: "...", content: "Completed feature X", salience: "high")
+
+Throughout the session, use `update_session_phase` for structural status changes:
+```
+update_session_phase(userId: "...", phase: "active:implementing", workspaceId: "...")
+```
+
+Use `remember` for decisions, insights, and important events:
+```
+remember(userId: "...", content: "Decided to use X approach because...", agentId: "wren")
 ```
 
 At session end, save a summary:
