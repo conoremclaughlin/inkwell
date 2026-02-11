@@ -31,6 +31,7 @@ Each agent has its own identity files (`~/.pcp/<agentId>/IDENTITY.md`) and filte
 ## Key Principles
 
 - **Use PCP tools** (`mcp__pcp__*`) over local file operations for memory, tasks, and sessions
+- **Use GitHub MCP tools** (`mcp__github__*`) when available — prefer these over `gh` CLI for pull requests, issues, reviews, and merges. MCP tools integrate better with your tooling and provide structured output.
 - **Bootstrap first** — always call bootstrap at session start to load your identity and context
 - **Log your work** — use `log_session()` for important decisions and `end_session()` with a summary
 - **Attribute memories** — include your agentId when calling `remember()` so memories are correctly filtered
@@ -60,6 +61,10 @@ In the PR body, use the standard format:
 ```
 
 Replace "Claude Code" with the appropriate tool if the SB used a different interface (e.g., Gemini CLI, Codex).
+
+### Branching
+
+**Never set your upstream to `origin/main` from a non-main branch.** When pushing a feature branch, use `git push -u origin <your-branch-name>`. Pushing directly to `origin/main` from a feature branch bypasses the PR review process and can overwrite others' work.
 
 ### Merging
 
