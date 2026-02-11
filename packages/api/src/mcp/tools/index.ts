@@ -224,6 +224,11 @@ import {
   workspaceToolDefinitions,
 } from './workspace-handlers';
 
+import {
+  handleCreateKindleToken,
+  createKindleTokenSchema,
+} from './kindle-handlers';
+
 // Re-export for external use
 export { setResponseCallback, addPendingMessage } from './response-handlers';
 export { setTelegramListener, registerChannelListener } from './chat-context-handlers';
@@ -2973,6 +2978,38 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleAdoptWorkspace(args, dataComposer);
       } catch (error) {
         logger.error('Error in adopt_workspace:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // Kindle Tools
+  // =====================================================
+
+  server.registerTool(
+    'create_kindle_token',
+    {
+      title: 'Create Kindle Token',
+      description:
+        'Generate a shareable invite link for kindling a new SB. ' +
+        'The token captures a snapshot of the parent SB\'s values and philosophy. ' +
+        'Share the resulting inviteUrl with the new human partner.\n\n' +
+        'User can be identified by ONE of:\n' +
+        '- userId: Direct UUID\n' +
+        '- email: Email address\n' +
+        '- phone: Phone number (E.164 format like +14155551234)\n' +
+        '- platform + platformId: Platform name (telegram/whatsapp/discord) and user ID',
+      inputSchema: createKindleTokenSchema,
+    },
+    async (args) => {
+      try {
+        return await handleCreateKindleToken(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in create_kindle_token:', error);
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
           isError: true,
