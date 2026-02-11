@@ -1023,15 +1023,15 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   // Fetch all context in parallel (including timezone and skills)
   const cloudSkillsService = getCloudSkillsService(dataComposer.getClient());
 
-  const [contexts, projects, focus, activeSession, recentMemories, dbIdentity, dbUserIdentity, userTimezone, userSkills] = await Promise.all([
+  const [contexts, projects, focus, activeSessions, recentMemories, dbIdentity, dbUserIdentity, userTimezone, userSkills] = await Promise.all([
     // Identity Core: all context summaries
     dataComposer.repositories.context.findAllByUser(user.id),
     // Active projects
     dataComposer.repositories.projects.findAllByUser(user.id, 'active'),
     // Current focus
     dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
-    // Active session (filter by agentId if provided)
-    dataComposer.repositories.memory.getActiveSession(user.id, agentId),
+    // All active sessions (filter by agentId if provided) — client picks the right one
+    dataComposer.repositories.memory.getActiveSessions(user.id, agentId),
     // Recent high-salience memories (filter by agentId if provided, include shared)
     includeMemories
       ? dataComposer.repositories.memory.recall(user.id, undefined, {
@@ -1133,7 +1133,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     projectCount: projects.length,
     memoryCount: recentMemories.length,
     skillCount: userSkills.length,
-    hasActiveSession: !!activeSession,
+    activeSessionCount: activeSessions.length,
     hasIdentityFiles: !!identityFiles,
     hasDbIdentity: !!dbIdentity,
     identitySource: dbIdentity?.description ? 'supabase' : (identityFiles?.self ? 'local' : 'none'),
@@ -1202,16 +1202,26 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
                 : null,
             },
 
-            // Active session (includes current_phase for real-time status)
-            session: activeSession
+            // Active session (most recent — backward compat)
+            session: activeSessions[0]
               ? {
-                  id: activeSession.id,
-                  agentId: activeSession.agentId,
-                  workspaceId: activeSession.workspaceId,
-                  currentPhase: activeSession.currentPhase || null,
-                  startedAt: activeSession.startedAt.toISOString(),
+                  id: activeSessions[0].id,
+                  agentId: activeSessions[0].agentId,
+                  workspaceId: activeSessions[0].workspaceId || null,
+                  currentPhase: activeSessions[0].currentPhase || null,
+                  startedAt: activeSessions[0].startedAt.toISOString(),
                 }
               : null,
+
+            // All active sessions — use workspaceId to pick the right one
+            // Match against .pcp/identity.json workspaceId in your local environment
+            activeSessions: activeSessions.map((s) => ({
+              id: s.id,
+              agentId: s.agentId,
+              workspaceId: s.workspaceId || null,
+              currentPhase: s.currentPhase || null,
+              startedAt: s.startedAt.toISOString(),
+            })),
 
             // Recent high-salience memories (filtered by agent if provided)
             recentMemories: recentMemories.map((m) => ({

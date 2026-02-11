@@ -344,6 +344,32 @@ export class MemoryRepository {
   }
 
   /**
+   * Get all active sessions for a user (without ended_at), ordered most recent first.
+   * Used by bootstrap to return all active sessions so the client can pick the right one.
+   */
+  async getActiveSessions(userId: string, agentId?: string): Promise<Session[]> {
+    let query = this.supabase
+      .from('sessions')
+      .select('*')
+      .eq('user_id', userId)
+      .is('ended_at', null)
+      .order('started_at', { ascending: false });
+
+    if (agentId) {
+      query = query.eq('agent_id', agentId);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      logger.error('Failed to get active sessions:', error);
+      throw new Error(`Failed to get active sessions: ${error.message}`);
+    }
+
+    return (data || []).map(this.rowToSession);
+  }
+
+  /**
    * List sessions for a user
    */
   async listSessions(
