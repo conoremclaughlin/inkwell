@@ -28,21 +28,11 @@ export interface MCPServerConfig {
   getSessionService?: () => import('../services/sessions/session-service').SessionService | null;
 }
 
-/** Tracked MCP client session (one per connected client) */
-interface McpSession {
-  server: McpServer;
-  transport: StreamableHTTPServerTransport;
-  createdAt: number;
-}
-
 export class MCPServer {
   /** Primary server instance (used for stdio transport only) */
   private server: McpServer;
   private dataComposer: DataComposer;
   private httpServer: Server | null = null;
-
-  /** Multi-client session management for HTTP transport */
-  private sessions = new Map<string, McpSession>();
 
   private miniApps: Map<string, LoadedMiniApp> = new Map();
   private miniAppsInfo: Array<{ name: string; version: string; description: string; triggers: string[]; functions: string[] }> = [];
@@ -135,189 +125,83 @@ export class MCPServer {
     }));
 
     // ============================================================================
-    // Streamable HTTP MCP endpoint (multi-client)
-    // Handles: POST (tool calls + initialize), GET (SSE stream), DELETE (session end)
+    // Streamable HTTP MCP endpoint (stateless)
+    // Each request gets a fresh transport — no session tracking, no stale sessions.
+    // Handles: POST (tool calls + initialize), DELETE (no-op)
     // ============================================================================
     app.post('/mcp', async (req, res) => {
-      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      const authHeader = req.headers.authorization;
+      const userData = await this.authProvider.verifyAccessToken(authHeader);
 
-      if (sessionId) {
-        // Existing session - route to correct transport
-        const session = this.sessions.get(sessionId);
-        if (!session) {
-          res.status(404).json({
+      // OAuth challenge for MCP clients (e.g. Gemini) when auth is required.
+      const isMissingAuth = !authHeader;
+      const isInvalidAuth = !!authHeader && !userData;
+      const shouldChallenge = isInvalidAuth || (env.MCP_REQUIRE_OAUTH && isMissingAuth);
+
+      if (shouldChallenge) {
+        const challengeParts = [
+          'Bearer realm="pcp"',
+          'scope="mcp:tools"',
+          `authorization_uri="${baseUrl}/authorize"`,
+          `resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`,
+        ];
+
+        if (isInvalidAuth) {
+          challengeParts.push('error="invalid_token"');
+        }
+
+        res.status(401)
+          .set('WWW-Authenticate', challengeParts.join(', '))
+          .json({
             jsonrpc: '2.0',
-            error: { code: -32000, message: 'Session not found. Client must re-initialize.' },
+            error: {
+              code: -32001,
+              message: isInvalidAuth
+                ? 'Invalid or expired access token'
+                : 'Authentication required',
+            },
             id: null,
           });
-          return;
-        }
+        return;
+      }
 
-        try {
-          await session.transport.handleRequest(req, res);
-        } catch (error) {
-          logger.error('Error handling MCP message:', { sessionId, error });
-          if (!res.headersSent) {
-            res.status(500).json({
-              jsonrpc: '2.0',
-              error: { code: -32603, message: 'Internal server error' },
-              id: null,
-            });
-          }
-        }
-      } else {
-        // New client - create session
-        logger.info('New MCP client connecting (Streamable HTTP)');
+      if (userData) {
+        setSessionContext({
+          userId: userData.userId,
+          email: userData.email,
+        });
+      }
 
-        const authHeader = req.headers.authorization;
-        const userData = await this.authProvider.verifyAccessToken(authHeader);
+      try {
+        // Stateless: fresh transport per request — no session IDs, no stale sessions
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: undefined,
+        });
+        const mcpServer = this.createMcpServerInstance();
 
-        // OAuth challenge for MCP clients (e.g. Gemini) when auth is required.
-        const isMissingAuth = !authHeader;
-        const isInvalidAuth = !!authHeader && !userData;
-        const shouldChallenge = isInvalidAuth || (env.MCP_REQUIRE_OAUTH && isMissingAuth);
+        await mcpServer.connect(transport);
+        await transport.handleRequest(req, res);
 
-        if (shouldChallenge) {
-          const challengeParts = [
-            'Bearer realm="pcp"',
-            'scope="mcp:tools"',
-            `authorization_uri="${baseUrl}/authorize"`,
-            `resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`,
-          ];
-
-          if (isInvalidAuth) {
-            challengeParts.push('error="invalid_token"');
-          }
-
-          res.status(401)
-            .set('WWW-Authenticate', challengeParts.join(', '))
-            .json({
-              jsonrpc: '2.0',
-              error: {
-                code: -32001,
-                message: isInvalidAuth
-                  ? 'Invalid or expired access token'
-                  : 'Authentication required',
-              },
-              id: null,
-            });
-          return;
-        }
-
-        if (userData) {
-          setSessionContext({
-            userId: userData.userId,
-            email: userData.email,
+        // Clean up after request completes
+        transport.onclose = undefined;
+        mcpServer.close().catch((err) => {
+          logger.debug('Error closing stateless MCP server instance', { error: err });
+        });
+      } catch (error) {
+        logger.error('Error handling MCP request:', error);
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Internal server error' },
+            id: null,
           });
-          logger.info('MCP session authenticated', {
-            userId: userData.userId,
-            email: userData.email,
-          });
-        }
-
-        try {
-          const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => `pcp-${crypto.randomUUID()}`,
-          });
-          const mcpServer = this.createMcpServerInstance();
-
-          // Clean up session when transport closes.
-          // Important: null out onclose before calling mcpServer.close() to prevent
-          // infinite recursion (transport.close → onclose → mcpServer.close → transport.close → ...)
-          transport.onclose = () => {
-            const sid = transport.sessionId;
-            if (sid) {
-              logger.info('MCP session closed', { sessionId: sid });
-              this.sessions.delete(sid);
-              transport.onclose = undefined;
-              mcpServer.close().catch((err) => {
-                logger.debug('Error closing MCP server for session', { sessionId: sid, error: err });
-              });
-            }
-          };
-
-          await mcpServer.connect(transport);
-
-          // Handle the initialize request (sessionId is generated during this call)
-          await transport.handleRequest(req, res);
-
-          // Store session after handleRequest (sessionId is now available)
-          if (transport.sessionId) {
-            this.sessions.set(transport.sessionId, {
-              server: mcpServer,
-              transport,
-              createdAt: Date.now(),
-            });
-            logger.info('MCP session created', {
-              sessionId: transport.sessionId,
-              activeSessions: this.sessions.size,
-            });
-          }
-        } catch (error) {
-          logger.error('Error creating MCP session:', error);
-          if (!res.headersSent) {
-            res.status(500).json({
-              jsonrpc: '2.0',
-              error: { code: -32603, message: 'Failed to create session' },
-              id: null,
-            });
-          }
         }
       }
     });
 
-    // GET /mcp - SSE stream for server-to-client notifications
-    app.get('/mcp', async (req, res) => {
-      const sessionId = req.headers['mcp-session-id'] as string | undefined;
-      if (!sessionId) {
-        res.status(400).json({ error: 'Missing mcp-session-id header' });
-        return;
-      }
-
-      const session = this.sessions.get(sessionId);
-      if (!session) {
-        res.status(404).json({ error: 'Session not found' });
-        return;
-      }
-
-      try {
-        await session.transport.handleRequest(req, res);
-      } catch (error) {
-        logger.error('Error handling SSE stream:', { sessionId, error });
-        if (!res.headersSent) {
-          res.status(500).json({ error: 'Internal server error' });
-        }
-      }
-    });
-
-    // DELETE /mcp - Session termination
-    app.delete('/mcp', async (req, res) => {
-      const sessionId = req.headers['mcp-session-id'] as string | undefined;
-      if (!sessionId) {
-        res.status(400).json({ error: 'Missing mcp-session-id header' });
-        return;
-      }
-
-      const session = this.sessions.get(sessionId);
-      if (!session) {
-        // Already gone - that's fine
-        res.status(204).end();
-        return;
-      }
-
-      try {
-        await session.transport.handleRequest(req, res);
-        await session.server.close();
-        this.sessions.delete(sessionId);
-        logger.info('MCP session terminated', { sessionId, activeSessions: this.sessions.size });
-      } catch (error) {
-        logger.error('Error terminating MCP session:', { sessionId, error });
-        // Clean up anyway
-        this.sessions.delete(sessionId);
-        if (!res.headersSent) {
-          res.status(204).end();
-        }
-      }
+    // DELETE /mcp - No-op in stateless mode (no sessions to terminate)
+    app.delete('/mcp', async (_req, res) => {
+      res.status(204).end();
     });
 
     // ============================================================================
@@ -359,7 +243,7 @@ export class MCPServer {
       checks.mcp = {
         status: 'ok',
         details: {
-          activeSessions: this.sessions.size,
+          mode: 'stateless',
           toolsVersion: this.toolsVersion,
           miniApps: this.miniAppsInfo.map((m) => m.name),
         },
@@ -694,17 +578,6 @@ export class MCPServer {
       this.channelGateway = null;
     }
 
-    // Close all active MCP sessions
-    for (const [sessionId, session] of this.sessions) {
-      try {
-        await session.server.close();
-        logger.debug('Closed MCP session', { sessionId });
-      } catch (error) {
-        logger.warn('Error closing MCP session:', { sessionId, error });
-      }
-    }
-    this.sessions.clear();
-
     // Close the primary server (stdio)
     try {
       await this.server.close();
@@ -768,10 +641,6 @@ export class MCPServer {
     return this.toolsVersion;
   }
 
-  /** Get count of active MCP sessions */
-  getActiveSessionCount(): number {
-    return this.sessions.size;
-  }
 }
 
 export async function createMCPServer(dataComposer: DataComposer, config?: MCPServerConfig): Promise<MCPServer> {

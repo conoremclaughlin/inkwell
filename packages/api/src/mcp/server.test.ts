@@ -1,8 +1,8 @@
 /**
- * Tests for MCP Streamable HTTP transport session management.
+ * Tests for MCP Streamable HTTP transport (stateless mode).
  *
  * Spins up a real HTTP server with mocked internals (DataComposer, mini-apps,
- * tools) and validates multi-client session lifecycle via fetch.
+ * tools) and validates stateless request handling via fetch.
  */
 
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
@@ -96,19 +96,15 @@ function makeToolsListRequest(id: number) {
   return { jsonrpc: '2.0', method: 'tools/list', params: {}, id };
 }
 
-/** POST to the MCP endpoint, optionally with a session ID header. */
+/** POST to the MCP endpoint. */
 async function mcpPost(
   baseUrl: string,
   body: unknown,
-  sessionId?: string,
 ): Promise<{ status: number; headers: Headers; body: string }> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     Accept: 'application/json, text/event-stream',
   };
-  if (sessionId) {
-    headers['mcp-session-id'] = sessionId;
-  }
   const res = await fetch(`${baseUrl}/mcp`, {
     method: 'POST',
     headers,
@@ -129,7 +125,7 @@ function parseSSEResult(body: string): unknown {
 // Test suite
 // ---------------------------------------------------------------------------
 
-describe('MCP StreamableHTTP Transport', () => {
+describe('MCP StreamableHTTP Transport (stateless)', () => {
   let server: MCPServer;
   let baseUrl: string;
 
@@ -164,16 +160,16 @@ describe('MCP StreamableHTTP Transport', () => {
   });
 
   // =========================================================================
-  // Session creation
+  // Stateless initialization
   // =========================================================================
 
-  it('should create a session on initialize and return mcp-session-id', async () => {
+  it('should handle initialize requests without returning a session ID', async () => {
     const res = await mcpPost(baseUrl, INITIALIZE_REQUEST);
 
     expect(res.status).toBe(200);
+    // Stateless mode: no session ID in response
     const sessionId = res.headers.get('mcp-session-id');
-    expect(sessionId).toBeTruthy();
-    expect(sessionId).toMatch(/^pcp-/);
+    expect(sessionId).toBeNull();
 
     const result = parseSSEResult(res.body) as any;
     expect(result.result.serverInfo.name).toBe('personal-context-protocol');
@@ -197,119 +193,53 @@ describe('MCP StreamableHTTP Transport', () => {
   });
 
   // =========================================================================
-  // Session persistence
+  // Stateless tool calls
   // =========================================================================
 
-  it('should route follow-up requests to the correct session', async () => {
-    // Initialize
-    const initRes = await mcpPost(baseUrl, INITIALIZE_REQUEST);
-    const sessionId = initRes.headers.get('mcp-session-id')!;
+  it('should handle tool list requests without session ID', async () => {
+    // In stateless mode, every request is self-contained — no session needed
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST);
+    expect(res.status).toBe(200);
 
-    // Follow-up with session ID — should succeed (not 404)
-    const listRes = await mcpPost(baseUrl, makeToolsListRequest(2), sessionId);
+    // A separate tools/list request (new transport) should also work
+    const listRes = await mcpPost(baseUrl, makeToolsListRequest(2));
     expect(listRes.status).toBe(200);
   });
 
-  // =========================================================================
-  // Multi-client isolation
-  // =========================================================================
+  it('should handle multiple concurrent requests independently', async () => {
+    const [res1, res2] = await Promise.all([
+      mcpPost(baseUrl, INITIALIZE_REQUEST),
+      mcpPost(baseUrl, { ...INITIALIZE_REQUEST, id: 10 }),
+    ]);
 
-  it('should support multiple independent client sessions', async () => {
-    // Create two clients
-    const res1 = await mcpPost(baseUrl, INITIALIZE_REQUEST);
-    const res2 = await mcpPost(baseUrl, { ...INITIALIZE_REQUEST, id: 10 });
+    expect(res1.status).toBe(200);
+    expect(res2.status).toBe(200);
 
-    const sid1 = res1.headers.get('mcp-session-id')!;
-    const sid2 = res2.headers.get('mcp-session-id')!;
-
-    expect(sid1).not.toBe(sid2);
-
-    // Both sessions work independently
-    const list1 = await mcpPost(baseUrl, makeToolsListRequest(3), sid1);
-    const list2 = await mcpPost(baseUrl, makeToolsListRequest(4), sid2);
-
-    expect(list1.status).toBe(200);
-    expect(list2.status).toBe(200);
+    // Neither should have a session ID
+    expect(res1.headers.get('mcp-session-id')).toBeNull();
+    expect(res2.headers.get('mcp-session-id')).toBeNull();
   });
 
   // =========================================================================
-  // Unknown session
+  // DELETE is a no-op
   // =========================================================================
 
-  it('should return 404 for unknown session ID', async () => {
-    const res = await mcpPost(
-      baseUrl,
-      makeToolsListRequest(5),
-      'pcp-nonexistent-session-id',
-    );
-    expect(res.status).toBe(404);
-
-    const body = JSON.parse(res.body);
-    expect(body.error.code).toBe(-32000);
-    expect(body.error.message).toContain('Session not found');
-  });
-
-  // =========================================================================
-  // Session count tracking
-  // =========================================================================
-
-  it('should track active session count', async () => {
-    const before = server.getActiveSessionCount();
-
-    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST);
-    expect(res.headers.get('mcp-session-id')).toBeTruthy();
-
-    expect(server.getActiveSessionCount()).toBeGreaterThan(before);
-  });
-
-  // =========================================================================
-  // DELETE session termination
-  // =========================================================================
-
-  it('should terminate a session via DELETE', async () => {
-    // Create a session
-    const initRes = await mcpPost(baseUrl, INITIALIZE_REQUEST);
-    const sessionId = initRes.headers.get('mcp-session-id')!;
-    const countBefore = server.getActiveSessionCount();
-
-    // Delete it
-    const deleteRes = await fetch(`${baseUrl}/mcp`, {
-      method: 'DELETE',
-      headers: { 'mcp-session-id': sessionId },
-    });
-    expect(deleteRes.status).toBe(200);
-
-    // Session should be gone
-    expect(server.getActiveSessionCount()).toBeLessThan(countBefore);
-
-    // Follow-up should 404
-    const followUp = await mcpPost(baseUrl, makeToolsListRequest(6), sessionId);
-    expect(followUp.status).toBe(404);
-  });
-
-  // =========================================================================
-  // GET without session
-  // =========================================================================
-
-  it('should return 400 on GET without session ID', async () => {
-    const res = await fetch(`${baseUrl}/mcp`);
-    expect(res.status).toBe(400);
-
-    const body = await res.json();
-    expect(body.error).toContain('mcp-session-id');
+  it('should return 204 on DELETE (no-op in stateless mode)', async () => {
+    const res = await fetch(`${baseUrl}/mcp`, { method: 'DELETE' });
+    expect(res.status).toBe(204);
   });
 
   // =========================================================================
   // Health check
   // =========================================================================
 
-  it('should report active sessions in health check', async () => {
+  it('should report stateless mode in health check', async () => {
     const res = await fetch(`${baseUrl}/health`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
     expect(body.status).toBe('healthy');
-    expect(body.checks.mcp.details.activeSessions).toBeGreaterThanOrEqual(0);
+    expect(body.checks.mcp.details.mode).toBe('stateless');
     expect(body.checks.mcp.details.toolsVersion).toBeDefined();
   });
 });
