@@ -1202,7 +1202,8 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
                 : null,
             },
 
-            // Active session (most recent — backward compat)
+            // [DEPRECATED] Single active session (most recent) — use activeSessions array instead.
+            // Will be removed in a future PR once all agents read activeSessions.
             session: activeSessions[0]
               ? {
                   id: activeSessions[0].id,
