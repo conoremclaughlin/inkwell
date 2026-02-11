@@ -155,6 +155,55 @@ function ensureGitignoreEntries(repoRoot: string, entries: string[]): string[] {
 // Commands
 // ============================================================================
 
+/**
+ * Core sync logic: read .mcp.json from targetDir and write .codex/ and .gemini/ configs.
+ * Exported for use by workspace create.
+ */
+export function syncMcpConfig(targetDir: string): { codex: boolean; gemini: boolean } {
+  const mcpPath = join(targetDir, '.mcp.json');
+
+  if (!existsSync(mcpPath)) {
+    return { codex: false, gemini: false };
+  }
+
+  let mcpJson: McpJson;
+  try {
+    mcpJson = JSON.parse(readFileSync(mcpPath, 'utf-8'));
+  } catch {
+    return { codex: false, gemini: false };
+  }
+
+  if (!mcpJson.mcpServers || Object.keys(mcpJson.mcpServers).length === 0) {
+    return { codex: false, gemini: false };
+  }
+
+  // --- Codex: .codex/config.toml ---
+  const codexDir = join(targetDir, '.codex');
+  const codexPath = join(codexDir, 'config.toml');
+  mkdirSync(codexDir, { recursive: true });
+  writeFileSync(codexPath, toCodexToml(mcpJson.mcpServers));
+
+  // --- Gemini: .gemini/settings.json ---
+  const geminiDir = join(targetDir, '.gemini');
+  const geminiPath = join(geminiDir, 'settings.json');
+  mkdirSync(geminiDir, { recursive: true });
+
+  let existingGemini: Record<string, unknown> | undefined;
+  if (existsSync(geminiPath)) {
+    try {
+      existingGemini = JSON.parse(readFileSync(geminiPath, 'utf-8'));
+    } catch { /* overwrite if unparseable */ }
+  }
+
+  const geminiSettings = toGeminiSettings(mcpJson.mcpServers, existingGemini);
+  writeFileSync(geminiPath, JSON.stringify(geminiSettings, null, 2) + '\n');
+
+  // --- Gitignore ---
+  ensureGitignoreEntries(targetDir, ['.codex/', '.gemini/']);
+
+  return { codex: true, gemini: true };
+}
+
 async function syncCommand(): Promise<void> {
   const cwd = process.cwd();
   const mcpPath = join(cwd, '.mcp.json');
@@ -180,33 +229,13 @@ async function syncCommand(): Promise<void> {
   const serverCount = Object.keys(mcpJson.mcpServers).length;
   console.log(chalk.dim(`Found ${serverCount} server(s) in .mcp.json\n`));
 
-  // --- Codex: .codex/config.toml ---
-  const codexDir = join(cwd, '.codex');
-  const codexPath = join(codexDir, 'config.toml');
-  mkdirSync(codexDir, { recursive: true });
-  writeFileSync(codexPath, toCodexToml(mcpJson.mcpServers));
-  console.log(chalk.green('  wrote'), chalk.cyan('.codex/config.toml'));
+  const result = syncMcpConfig(cwd);
 
-  // --- Gemini: .gemini/settings.json ---
-  const geminiDir = join(cwd, '.gemini');
-  const geminiPath = join(geminiDir, 'settings.json');
-  mkdirSync(geminiDir, { recursive: true });
-
-  let existingGemini: Record<string, unknown> | undefined;
-  if (existsSync(geminiPath)) {
-    try {
-      existingGemini = JSON.parse(readFileSync(geminiPath, 'utf-8'));
-    } catch { /* overwrite if unparseable */ }
+  if (result.codex) {
+    console.log(chalk.green('  wrote'), chalk.cyan('.codex/config.toml'));
   }
-
-  const geminiSettings = toGeminiSettings(mcpJson.mcpServers, existingGemini);
-  writeFileSync(geminiPath, JSON.stringify(geminiSettings, null, 2) + '\n');
-  console.log(chalk.green('  wrote'), chalk.cyan('.gemini/settings.json'));
-
-  // --- Gitignore ---
-  const added = ensureGitignoreEntries(cwd, ['.codex/', '.gemini/']);
-  if (added.length > 0) {
-    console.log(chalk.green('  added'), chalk.cyan(added.join(', ')), chalk.green('to .gitignore'));
+  if (result.gemini) {
+    console.log(chalk.green('  wrote'), chalk.cyan('.gemini/settings.json'));
   }
 
   console.log(chalk.dim(`\nDone. All backends can now discover MCP servers.`));

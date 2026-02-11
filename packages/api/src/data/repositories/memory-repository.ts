@@ -191,13 +191,18 @@ export class MemoryRepository {
    * Start a new session
    */
   async startSession(input: SessionCreateInput): Promise<Session> {
+    const insertData: Record<string, unknown> = {
+      user_id: input.userId,
+      agent_id: input.agentId,
+      metadata: input.metadata || {},
+    };
+    if (input.workspaceId !== undefined) {
+      insertData.workspace_id = input.workspaceId;
+    }
+
     const { data, error } = await this.supabase
       .from('sessions')
-      .insert({
-        user_id: input.userId,
-        agent_id: input.agentId,
-        metadata: input.metadata || {},
-      })
+      .insert(insertData)
       .select()
       .single();
 
@@ -252,9 +257,14 @@ export class MemoryRepository {
   }
 
   /**
-   * Get active session for a user (most recent without ended_at)
+   * Get active session for a user (most recent without ended_at).
+   *
+   * workspaceId behavior:
+   *   - undefined: don't filter by workspace (backward compat — finds any active session)
+   *   - null: match sessions with no workspace
+   *   - string: match that specific workspace
    */
-  async getActiveSession(userId: string, agentId?: string): Promise<Session | null> {
+  async getActiveSession(userId: string, agentId?: string, workspaceId?: string | null): Promise<Session | null> {
     let query = this.supabase
       .from('sessions')
       .select('*')
@@ -265,6 +275,14 @@ export class MemoryRepository {
 
     if (agentId) {
       query = query.eq('agent_id', agentId);
+    }
+
+    if (workspaceId !== undefined) {
+      if (workspaceId === null) {
+        query = query.is('workspace_id', null);
+      } else {
+        query = query.eq('workspace_id', workspaceId);
+      }
     }
 
     const { data, error } = await query.single();
@@ -283,7 +301,7 @@ export class MemoryRepository {
    */
   async listSessions(
     userId: string,
-    options: { limit?: number; offset?: number; agentId?: string } = {}
+    options: { limit?: number; offset?: number; agentId?: string; workspaceId?: string } = {}
   ): Promise<Session[]> {
     let query = this.supabase
       .from('sessions')
@@ -293,6 +311,10 @@ export class MemoryRepository {
 
     if (options.agentId) {
       query = query.eq('agent_id', options.agentId);
+    }
+
+    if (options.workspaceId) {
+      query = query.eq('workspace_id', options.workspaceId);
     }
 
     const limit = options.limit || 20;
@@ -600,6 +622,7 @@ export class MemoryRepository {
       id: row.id,
       userId: row.user_id,
       agentId: row.agent_id || undefined,
+      workspaceId: row.workspace_id || undefined,
       startedAt: new Date(row.started_at),
       endedAt: row.ended_at ? new Date(row.ended_at) : undefined,
       summary: row.summary || undefined,

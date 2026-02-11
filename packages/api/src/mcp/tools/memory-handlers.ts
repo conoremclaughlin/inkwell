@@ -70,6 +70,7 @@ export const updateMemorySchema = userIdentifierBaseSchema.extend({
 
 export const startSessionSchema = userIdentifierBaseSchema.extend({
   agentId: z.string().optional().describe('Identifier for the agent (e.g., "claude-code", "telegram-myra")'),
+  workspaceId: z.string().uuid().optional().describe('Workspace ID to scope this session to. Allows multiple active sessions per agent (one per workspace).'),
   metadata: z.record(z.unknown()).optional().describe('Additional session metadata'),
 });
 
@@ -91,6 +92,7 @@ export const getSessionSchema = userIdentifierBaseSchema.extend({
 
 export const listSessionsSchema = userIdentifierBaseSchema.extend({
   agentId: z.string().optional().describe('Filter by agent'),
+  workspaceId: z.string().uuid().optional().describe('Filter by workspace'),
   limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
 });
 
@@ -331,10 +333,11 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
   const params = startSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
-  // Check if there's already an active session for this agent
+  // Check if there's already an active session for this agent (scoped by workspace if provided)
   const existingSession = await dataComposer.repositories.memory.getActiveSession(
     user.id,
-    params.agentId
+    params.agentId,
+    params.workspaceId,
   );
 
   if (existingSession) {
@@ -350,6 +353,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
               session: {
                 id: existingSession.id,
                 agentId: existingSession.agentId,
+                workspaceId: existingSession.workspaceId,
                 startedAt: existingSession.startedAt.toISOString(),
                 isExisting: true,
               },
@@ -365,10 +369,11 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
   const session = await dataComposer.repositories.memory.startSession({
     userId: user.id,
     agentId: params.agentId,
+    workspaceId: params.workspaceId,
     metadata: params.metadata,
   });
 
-  logger.info(`Session started for user ${user.id}`, { sessionId: session.id, agentId: session.agentId });
+  logger.info(`Session started for user ${user.id}`, { sessionId: session.id, agentId: session.agentId, workspaceId: session.workspaceId });
 
   return {
     content: [
@@ -382,6 +387,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
             session: {
               id: session.id,
               agentId: session.agentId,
+              workspaceId: session.workspaceId,
               startedAt: session.startedAt.toISOString(),
             },
           },
@@ -510,6 +516,7 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
             session: {
               id: session.id,
               agentId: session.agentId,
+              workspaceId: session.workspaceId,
               startedAt: session.startedAt.toISOString(),
               endedAt: session.endedAt?.toISOString(),
               summary: session.summary,
@@ -565,6 +572,7 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
             session: {
               id: session.id,
               agentId: session.agentId,
+              workspaceId: session.workspaceId,
               startedAt: session.startedAt.toISOString(),
               endedAt: session.endedAt?.toISOString(),
               summary: session.summary,
@@ -591,6 +599,7 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
 
   const sessions = await dataComposer.repositories.memory.listSessions(user.id, {
     agentId: params.agentId,
+    workspaceId: params.workspaceId,
     limit: params.limit,
   });
 
@@ -606,6 +615,7 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
             sessions: sessions.map((s) => ({
               id: s.id,
               agentId: s.agentId,
+              workspaceId: s.workspaceId,
               startedAt: s.startedAt.toISOString(),
               endedAt: s.endedAt?.toISOString(),
               summary: s.summary,
@@ -977,6 +987,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
               ? {
                   id: activeSession.id,
                   agentId: activeSession.agentId,
+                  workspaceId: activeSession.workspaceId,
                   startedAt: activeSession.startedAt.toISOString(),
                 }
               : null,

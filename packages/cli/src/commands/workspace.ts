@@ -18,7 +18,7 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
 import { execSync } from 'child_process';
-import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, renameSync } from 'fs';
+import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, renameSync, cpSync } from 'fs';
 import { join, dirname, basename } from 'path';
 import { homedir } from 'os';
 
@@ -167,6 +167,82 @@ function getWorktreePaths(gitRoot: string): string[] {
 }
 
 // ============================================================================
+// Interactive helpers
+// ============================================================================
+
+interface InteractiveResult {
+  name: string;
+  branch: string;
+  configDirs: string[];
+}
+
+/**
+ * Run the full interactive workspace creation flow when name is omitted and stdin is a TTY.
+ * Returns the resolved name, branch, and config dirs to copy.
+ */
+async function runInteractiveFlow(agentId: string, gitRoot: string): Promise<InteractiveResult> {
+  const { input, checkbox } = await import('@inquirer/prompts');
+
+  // Step 1: Workspace name
+  const name = await input({
+    message: 'Workspace name',
+    default: 'new',
+  });
+
+  // Step 2: Branch name (derived, editable)
+  const defaultBranch = `${agentId}/workspace/${name}`;
+  const branch = await input({
+    message: 'Branch name',
+    default: defaultBranch,
+  });
+
+  // Step 3: Config directories to copy
+  const candidateDirs = ['.claude', '.codex', '.gemini'].filter(
+    (dir) => existsSync(join(gitRoot, dir)),
+  );
+
+  let configDirs: string[] = [];
+  if (candidateDirs.length > 0) {
+    configDirs = await checkbox({
+      message: 'Copy config folders?',
+      choices: candidateDirs.map((dir) => ({
+        name: dir,
+        value: dir,
+        checked: dir === '.claude',
+      })),
+    });
+  }
+
+  return { name, branch, configDirs };
+}
+
+/**
+ * Copy config directories from git root into the new workspace.
+ *
+ * - .claude/ is always copied as-is (hand-authored permissions)
+ * - .codex/, .gemini/ — if .mcp.json exists in the target, regenerate via syncMcpConfig instead
+ * - .pcp/identity.json is always freshly written (never copied)
+ */
+function copyConfigDirs(gitRoot: string, wsPath: string, dirs: string[]): void {
+  for (const dir of dirs) {
+    const source = join(gitRoot, dir);
+    const target = join(wsPath, dir);
+
+    if (!existsSync(source)) continue;
+
+    if (dir === '.claude') {
+      // Always copy as-is
+      cpSync(source, target, { recursive: true });
+    } else if ((dir === '.codex' || dir === '.gemini') && existsSync(join(wsPath, '.mcp.json'))) {
+      // Will be regenerated via syncMcpConfig — skip copying stale generated files
+      continue;
+    } else {
+      cpSync(source, target, { recursive: true });
+    }
+  }
+}
+
+// ============================================================================
 // Commands
 // ============================================================================
 
@@ -298,14 +374,19 @@ async function initWorkspace(parentName: string | undefined, options: { dryRun?:
   }
 }
 
-async function createWorkspace(name: string, options: { agent?: string; purpose?: string; branch?: string }): Promise<void> {
+async function createWorkspace(
+  name: string,
+  options: { agent?: string; purpose?: string; branch?: string; copyConfig?: boolean; configDirs?: string },
+  overrides?: { branch?: string; configDirsList?: string[] },
+): Promise<void> {
+  const agentId = options.agent || 'wren';
   const spinner = ora(`Creating workspace: ${name}`).start();
 
   try {
     const gitRoot = findGitRoot();
     const wsPath = getWorkspacePath(gitRoot, name);
-    // Allow custom branch name, default to workspace/<name>
-    const branch = options.branch || `workspace/${name}`;
+    // Priority: overrides (from interactive) > options (from flags) > default
+    const branch = overrides?.branch || options.branch || `${agentId}/workspace/${name}`;
 
     if (existsSync(wsPath)) {
       spinner.fail(`Workspace already exists at ${wsPath}`);
@@ -319,12 +400,33 @@ async function createWorkspace(name: string, options: { agent?: string; purpose?
       git(`worktree add -b "${branch}" "${wsPath}"`, gitRoot);
     }
 
+    // Determine which config dirs to copy
+    const configDirsList = overrides?.configDirsList
+      ?? (options.copyConfig ? (options.configDirs || '.claude').split(',').map(s => s.trim()) : []);
+
+    if (configDirsList.length > 0) {
+      spinner.text = 'Copying config directories...';
+      copyConfigDirs(gitRoot, wsPath, configDirsList);
+    }
+
+    // Regenerate .codex/.gemini via syncMcpConfig if .mcp.json exists in the new workspace
+    if (existsSync(join(wsPath, '.mcp.json'))) {
+      spinner.text = 'Syncing MCP config for backends...';
+      try {
+        const { syncMcpConfig } = await import('./mcp.js');
+        syncMcpConfig(wsPath);
+      } catch {
+        // syncMcpConfig not available or failed — not critical
+      }
+    }
+
     spinner.text = 'Setting up PCP identity...';
     const pcpDir = join(wsPath, '.pcp');
     mkdirSync(pcpDir, { recursive: true });
 
+    // Always write fresh identity.json (never copy from source)
     const identity: WorkspaceIdentity = {
-      agentId: options.agent || 'wren',
+      agentId,
       context: `workspace-${name}`,
       description: options.purpose || `Workspace: ${name}`,
       workspace: name,
@@ -340,6 +442,9 @@ async function createWorkspace(name: string, options: { agent?: string; purpose?
     console.log(chalk.dim('  Path:   ') + wsPath);
     console.log(chalk.dim('  Branch: ') + branch);
     console.log(chalk.dim('  Agent:  ') + identity.agentId);
+    if (configDirsList.length > 0) {
+      console.log(chalk.dim('  Config: ') + configDirsList.join(', '));
+    }
     console.log('');
     console.log(chalk.cyan('To start working:'));
     console.log(chalk.dim(`  cd ${wsPath} && sb`));
@@ -405,14 +510,38 @@ async function cleanWorkspace(name: string): Promise<void> {
   try {
     const gitRoot = findGitRoot();
     const wsPath = getWorkspacePath(gitRoot, name);
-    const branch = `workspace/${name}`;
+
+    // Read branch from identity.json if available, fall back to git worktree list
+    let branch: string | undefined;
+    const identityPath = join(wsPath, '.pcp', 'identity.json');
+    if (existsSync(identityPath)) {
+      try {
+        const identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
+        branch = identity.branch;
+      } catch {
+        // Fall through to worktree lookup
+      }
+    }
+
+    if (!branch) {
+      // Look up branch from git worktree list
+      const worktreeOutput = git('worktree list --porcelain', gitRoot);
+      let currentPath = '';
+      for (const line of worktreeOutput.split('\n')) {
+        if (line.startsWith('worktree ')) {
+          currentPath = line.substring(9);
+        } else if (line.startsWith('branch ') && currentPath === wsPath) {
+          branch = line.substring(7).replace('refs/heads/', '');
+        }
+      }
+    }
 
     if (existsSync(wsPath)) {
       spinner.text = 'Removing worktree...';
       git(`worktree remove "${wsPath}" --force`, gitRoot);
     }
 
-    if (branchExists(branch, gitRoot)) {
+    if (branch && branchExists(branch, gitRoot)) {
       spinner.text = 'Deleting branch...';
       git(`branch -D "${branch}"`, gitRoot);
     }
@@ -507,12 +636,31 @@ export function registerWorkspaceCommands(program: Command): void {
     .option('-n, --dry-run', 'Show planned moves without making changes')
     .action(initWorkspace);
 
-  ws.command('create <name>')
+  ws.command('create [name]')
     .description('Create a new workspace with git worktree')
     .option('-a, --agent <agent>', 'Agent ID for this workspace', 'wren')
     .option('-p, --purpose <desc>', 'Description/purpose of the workspace')
-    .option('-b, --branch <branch>', 'Custom branch name (default: workspace/<name>)')
-    .action(createWorkspace);
+    .option('-b, --branch <branch>', 'Custom branch name (default: <agentId>/workspace/<name>)')
+    .option('--copy-config', 'Copy config directories into the new workspace')
+    .option('--config-dirs <dirs>', 'Comma-separated config dirs to copy (default: .claude)', '.claude')
+    .action(async (name: string | undefined, options) => {
+      if (!name && process.stdin.isTTY) {
+        // Interactive mode: prompt for all values
+        try {
+          const gitRoot = findGitRoot();
+          const agentId = options.agent || 'wren';
+          const result = await runInteractiveFlow(agentId, gitRoot);
+          return createWorkspace(result.name, options, {
+            branch: result.branch,
+            configDirsList: result.configDirs,
+          });
+        } catch {
+          // User cancelled or inquirer failed — fall through to default
+        }
+      }
+      const resolvedName = name || 'new';
+      return createWorkspace(resolvedName, options);
+    });
 
   ws.command('list')
     .alias('ls')

@@ -259,6 +259,7 @@ describe('MemoryRepository', () => {
           id: 'session-123',
           user_id: 'user-456',
           agent_id: 'claude-code',
+          workspace_id: null,
           started_at: '2026-01-26T12:00:00Z',
           ended_at: null,
           summary: null,
@@ -275,7 +276,60 @@ describe('MemoryRepository', () => {
         expect(result.id).toBe('session-123');
         expect(result.userId).toBe('user-456');
         expect(result.agentId).toBe('claude-code');
+        expect(result.workspaceId).toBeUndefined();
         expect(result.endedAt).toBeUndefined();
+      });
+
+      it('should include workspace_id in insert when workspaceId is provided', async () => {
+        const mockSessionRow = {
+          id: 'session-ws',
+          user_id: 'user-456',
+          agent_id: 'wren',
+          workspace_id: 'ws-abc-123',
+          started_at: '2026-02-10T00:00:00Z',
+          ended_at: null,
+          summary: null,
+          metadata: {},
+        };
+
+        mockSupabase._setReturnData(mockSessionRow);
+
+        const result = await repo.startSession({
+          userId: 'user-456',
+          agentId: 'wren',
+          workspaceId: 'ws-abc-123',
+        });
+
+        expect(result.workspaceId).toBe('ws-abc-123');
+
+        // Verify insert was called with workspace_id
+        expect(mockSupabase._queryBuilder.insert).toHaveBeenCalledWith(
+          expect.objectContaining({ workspace_id: 'ws-abc-123' }),
+        );
+      });
+
+      it('should not include workspace_id in insert when workspaceId is omitted', async () => {
+        const mockSessionRow = {
+          id: 'session-no-ws',
+          user_id: 'user-456',
+          agent_id: 'wren',
+          workspace_id: null,
+          started_at: '2026-02-10T00:00:00Z',
+          ended_at: null,
+          summary: null,
+          metadata: {},
+        };
+
+        mockSupabase._setReturnData(mockSessionRow);
+
+        await repo.startSession({
+          userId: 'user-456',
+          agentId: 'wren',
+        });
+
+        // Verify insert was called WITHOUT workspace_id key
+        const insertCall = mockSupabase._queryBuilder.insert.mock.calls[0][0];
+        expect(insertCall).not.toHaveProperty('workspace_id');
       });
     });
 
@@ -285,6 +339,7 @@ describe('MemoryRepository', () => {
           id: 'session-123',
           user_id: 'user-456',
           agent_id: 'claude-code',
+          workspace_id: null,
           started_at: '2026-01-26T12:00:00Z',
           ended_at: '2026-01-26T14:00:00Z',
           summary: 'Session summary here',
@@ -306,6 +361,7 @@ describe('MemoryRepository', () => {
           id: 'session-123',
           user_id: 'user-456',
           agent_id: 'claude-code',
+          workspace_id: null,
           started_at: '2026-01-26T12:00:00Z',
           ended_at: null,
           summary: null,
@@ -327,6 +383,132 @@ describe('MemoryRepository', () => {
         const result = await repo.getActiveSession('user-456');
 
         expect(result).toBeNull();
+      });
+
+      it('should not filter by workspace when workspaceId is undefined (backward compat)', async () => {
+        const mockSessionRow = {
+          id: 'session-any-ws',
+          user_id: 'user-456',
+          agent_id: 'wren',
+          workspace_id: 'ws-something',
+          started_at: '2026-02-10T00:00:00Z',
+          ended_at: null,
+          summary: null,
+          metadata: {},
+        };
+
+        mockSupabase._setReturnData(mockSessionRow);
+
+        const result = await repo.getActiveSession('user-456', 'wren');
+
+        expect(result).not.toBeNull();
+        // workspace_id should not have been used as a filter
+        // eq should have been called for user_id and agent_id but NOT workspace_id
+        const eqCalls = mockSupabase._queryBuilder.eq.mock.calls;
+        const wsEqCalls = eqCalls.filter(([col]: [string]) => col === 'workspace_id');
+        expect(wsEqCalls).toHaveLength(0);
+
+        const isCalls = mockSupabase._queryBuilder.is.mock.calls;
+        const wsIsCalls = isCalls.filter(([col]: [string]) => col === 'workspace_id');
+        expect(wsIsCalls).toHaveLength(0);
+      });
+
+      it('should filter for null workspace when workspaceId is explicitly null', async () => {
+        const mockSessionRow = {
+          id: 'session-no-ws',
+          user_id: 'user-456',
+          agent_id: 'wren',
+          workspace_id: null,
+          started_at: '2026-02-10T00:00:00Z',
+          ended_at: null,
+          summary: null,
+          metadata: {},
+        };
+
+        mockSupabase._setReturnData(mockSessionRow);
+
+        await repo.getActiveSession('user-456', 'wren', null);
+
+        // Should have called is('workspace_id', null)
+        expect(mockSupabase._queryBuilder.is).toHaveBeenCalledWith('workspace_id', null);
+      });
+
+      it('should filter for specific workspace when workspaceId is a string', async () => {
+        const mockSessionRow = {
+          id: 'session-specific-ws',
+          user_id: 'user-456',
+          agent_id: 'wren',
+          workspace_id: 'ws-xyz',
+          started_at: '2026-02-10T00:00:00Z',
+          ended_at: null,
+          summary: null,
+          metadata: {},
+        };
+
+        mockSupabase._setReturnData(mockSessionRow);
+
+        await repo.getActiveSession('user-456', 'wren', 'ws-xyz');
+
+        // Should have called eq('workspace_id', 'ws-xyz')
+        expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('workspace_id', 'ws-xyz');
+      });
+    });
+
+    describe('listSessions', () => {
+      it('should filter by workspaceId when provided', async () => {
+        mockSupabase._setArrayData([]);
+
+        await repo.listSessions('user-456', { workspaceId: 'ws-filter' });
+
+        expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('workspace_id', 'ws-filter');
+      });
+
+      it('should not filter by workspace when workspaceId is omitted', async () => {
+        mockSupabase._setArrayData([]);
+
+        await repo.listSessions('user-456', { agentId: 'wren' });
+
+        const eqCalls = mockSupabase._queryBuilder.eq.mock.calls;
+        const wsEqCalls = eqCalls.filter(([col]: [string]) => col === 'workspace_id');
+        expect(wsEqCalls).toHaveLength(0);
+      });
+    });
+
+    describe('rowToSession mapping', () => {
+      it('should map workspace_id to workspaceId', async () => {
+        const mockSessionRow = {
+          id: 'session-map',
+          user_id: 'user-456',
+          agent_id: 'wren',
+          workspace_id: 'ws-mapped',
+          started_at: '2026-02-10T00:00:00Z',
+          ended_at: null,
+          summary: null,
+          metadata: {},
+        };
+
+        mockSupabase._setReturnData(mockSessionRow);
+
+        const result = await repo.getSession('session-map');
+        expect(result!.workspaceId).toBe('ws-mapped');
+      });
+
+      it('should map null workspace_id to undefined', async () => {
+        const mockSessionRow = {
+          id: 'session-null-ws',
+          user_id: 'user-456',
+          agent_id: 'wren',
+          workspace_id: null,
+          started_at: '2026-02-10T00:00:00Z',
+          ended_at: null,
+          summary: null,
+          metadata: {},
+        };
+
+        mockSupabase._setReturnData(mockSessionRow);
+
+        const result = await repo.getSession('session-null-ws');
+        expect(result!.workspaceId).toBeUndefined();
       });
     });
   });
