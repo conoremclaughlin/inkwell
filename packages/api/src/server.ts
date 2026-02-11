@@ -211,6 +211,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   // 4. Start MCP server with ChannelGateway
   logger.info('Starting MCP server with ChannelGateway...');
   mcpServer = await createMCPServer(dataComposer, {
+    getSessionService: () => sessionService,
     channelGateway: {
       enableTelegram: !!env.TELEGRAM_BOT_TOKEN,
       telegramPollingInterval: config.telegramPollingInterval || 1000,
