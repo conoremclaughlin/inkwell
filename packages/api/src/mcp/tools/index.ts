@@ -246,6 +246,36 @@ const userIdentifierFields = {
 };
 
 export function registerAllTools(server: McpServer, dataComposer: DataComposer): void {
+  // ---------------------------------------------------------------------------
+  // Timing diagnostics — wraps every tool handler to log execution time.
+  // Calls exceeding SLOW_TOOL_THRESHOLD_MS are logged at warn level.
+  // ---------------------------------------------------------------------------
+  const SLOW_TOOL_THRESHOLD_MS = 500;
+  const _originalRegisterTool = server.registerTool.bind(server);
+  (server as any).registerTool = (name: string, ...rest: any[]) => {
+    const handler = rest[rest.length - 1];
+    if (typeof handler === 'function') {
+      rest[rest.length - 1] = async (...handlerArgs: any[]) => {
+        const start = performance.now();
+        try {
+          const result = await handler(...handlerArgs);
+          const durationMs = Math.round(performance.now() - start);
+          if (durationMs > SLOW_TOOL_THRESHOLD_MS) {
+            logger.warn(`[timing] ${name}: ${durationMs}ms (SLOW)`);
+          } else {
+            logger.debug(`[timing] ${name}: ${durationMs}ms`);
+          }
+          return result;
+        } catch (error) {
+          const durationMs = Math.round(performance.now() - start);
+          logger.warn(`[timing] ${name}: ${durationMs}ms (ERROR)`);
+          throw error;
+        }
+      };
+    }
+    return (_originalRegisterTool as any)(name, ...rest);
+  };
+
   // Register save_link tool
   server.registerTool(
     'save_link',
@@ -3077,5 +3107,5 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     }
   );
 
-  logger.info('All MCP tools registered');
+  logger.info('All MCP tools registered (timing diagnostics enabled)');
 }

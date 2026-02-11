@@ -611,30 +611,13 @@ export class MCPServer {
   }
 
   /**
-   * Notify ALL connected clients that tools have changed.
+   * Notify clients that tools have changed.
+   * In stateless mode, each request gets a fresh server instance, so there are
+   * no persistent sessions to notify. We just bump the version counter.
    */
   async notifyToolsChanged(): Promise<void> {
     this.toolsVersion++;
-    logger.info(`Tools changed, notifying ${this.sessions.size} clients (version ${this.toolsVersion})`);
-
-    const errors: string[] = [];
-    for (const [sessionId, session] of this.sessions) {
-      try {
-        await session.server.server.notification({
-          method: 'notifications/tools/list_changed',
-          params: {},
-        });
-      } catch (error) {
-        errors.push(sessionId);
-        logger.debug('Could not send tools notification to session', { sessionId, error });
-      }
-    }
-
-    if (errors.length > 0) {
-      logger.debug(`Tools notification failed for ${errors.length}/${this.sessions.size} sessions`);
-    } else if (this.sessions.size > 0) {
-      logger.info('Tools list_changed notification sent to all sessions');
-    }
+    logger.info(`Tools changed (version ${this.toolsVersion})`);
   }
 
   getToolsVersion(): number {
