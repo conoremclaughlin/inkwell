@@ -1,6 +1,3 @@
-// Database types - Auto-generated from Supabase schema
-// Run `mcp__supabase__generate_typescript_types` to regenerate
-
 export type Json =
   | string
   | number
@@ -430,7 +427,6 @@ export type Database = {
           change_summary: string | null
           change_type: string | null
           changed_by_agent_id: string | null
-          changed_by_identity_id: string | null
           changed_by_user_id: string | null
           content: string
           created_at: string | null
@@ -444,7 +440,6 @@ export type Database = {
           change_summary?: string | null
           change_type?: string | null
           changed_by_agent_id?: string | null
-          changed_by_identity_id?: string | null
           changed_by_user_id?: string | null
           content: string
           created_at?: string | null
@@ -458,7 +453,6 @@ export type Database = {
           change_summary?: string | null
           change_type?: string | null
           changed_by_agent_id?: string | null
-          changed_by_identity_id?: string | null
           changed_by_user_id?: string | null
           content?: string
           created_at?: string | null
@@ -587,7 +581,6 @@ export type Database = {
           content_type: string | null
           created_at: string | null
           created_by_agent_id: string | null
-          created_by_identity_id: string | null
           id: string
           metadata: Json | null
           tags: string[] | null
@@ -606,7 +599,6 @@ export type Database = {
           content_type?: string | null
           created_at?: string | null
           created_by_agent_id?: string | null
-          created_by_identity_id?: string | null
           id?: string
           metadata?: Json | null
           tags?: string[] | null
@@ -625,7 +617,6 @@ export type Database = {
           content_type?: string | null
           created_at?: string | null
           created_by_agent_id?: string | null
-          created_by_identity_id?: string | null
           id?: string
           metadata?: Json | null
           tags?: string[] | null
@@ -1216,7 +1207,7 @@ export type Database = {
           last_used_at: string | null
           refresh_token: string
           scopes: string[] | null
-          supabase_refresh_token: string
+          supabase_refresh_token: string | null
           updated_at: string | null
           user_id: string
         }
@@ -1228,7 +1219,7 @@ export type Database = {
           last_used_at?: string | null
           refresh_token: string
           scopes?: string[] | null
-          supabase_refresh_token: string
+          supabase_refresh_token?: string | null
           updated_at?: string | null
           user_id: string
         }
@@ -1240,7 +1231,7 @@ export type Database = {
           last_used_at?: string | null
           refresh_token?: string
           scopes?: string[] | null
-          supabase_refresh_token?: string
+          supabase_refresh_token?: string | null
           updated_at?: string | null
           user_id?: string
         }

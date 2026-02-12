@@ -5,26 +5,22 @@ import { useSearchParams, useRouter } from 'next/navigation';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { createClient } from '@/lib/supabase/client';
+import { signInWithPassword, signInWithOtp } from '@/lib/auth/actions';
 
 type AuthMode = 'magic-link' | 'password';
 
 // Map common error messages to user-friendly text
 function getErrorMessage(error: string): string {
   const errorMap: Record<string, string> = {
-    'auth': 'Authentication failed. Please try again.',
+    auth: 'Authentication failed. Please try again.',
     'code challenge does not match previously saved code verifier':
       'Your magic link expired or was opened in a different browser. Please request a new one using the same browser.',
     'Email link is invalid or has expired':
       'This magic link has expired. Please request a new one.',
-    'No authentication code provided':
-      'Invalid login link. Please request a new magic link.',
-    'Invalid login credentials':
-      'Invalid email or password. Please try again.',
-    'Email not confirmed':
-      'Please confirm your email address before signing in.',
-    'rate limit':
-      'Too many requests. Please try signing in with password instead.',
+    'No authentication code provided': 'Invalid login link. Please request a new magic link.',
+    'Invalid login credentials': 'Invalid email or password. Please try again.',
+    'Email not confirmed': 'Please confirm your email address before signing in.',
+    'rate limit': 'Too many requests. Please try signing in with password instead.',
   };
 
   // Check for partial matches
@@ -48,27 +44,8 @@ export default function LoginForm() {
   const [mcpRedirecting, setMcpRedirecting] = useState(false);
 
   // MCP OAuth redirect params
-  const mcpRedirect = searchParams.get('redirect');
   const mcpPendingId = searchParams.get('pending_id');
-  const isMcpAuth = !!(mcpRedirect && mcpPendingId);
-
-  // If already logged in and this is an MCP auth flow, redirect immediately
-  useEffect(() => {
-    if (!isMcpAuth) return;
-
-    const checkExistingSession = async () => {
-      const supabase = createClient();
-      const { data: { session } } = await supabase.auth.getSession();
-      if (session?.access_token && session?.refresh_token) {
-        setMcpRedirecting(true);
-        redirectToMcp();
-      }
-      // If session exists but refresh_token is missing, let user re-auth
-      // via the login form to get a fresh session with both tokens.
-    };
-
-    checkExistingSession();
-  }, [isMcpAuth]); // eslint-disable-line react-hooks/exhaustive-deps
+  const isMcpAuth = !!mcpPendingId;
 
   // Check for error in URL params on mount
   useEffect(() => {
@@ -81,55 +58,30 @@ export default function LoginForm() {
         setAuthMode('password');
       }
       // Clear the error from URL without reload (preserve MCP params)
-      const newUrl = isMcpAuth
-        ? `/login?redirect=${encodeURIComponent(mcpRedirect!)}&pending_id=${mcpPendingId}`
-        : '/login';
+      const newUrl = isMcpAuth ? `/login?pending_id=${mcpPendingId}` : '/login';
       window.history.replaceState({}, '', newUrl);
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // Run once on mount — searchParams causes infinite loop when URL is modified
 
-  // Redirect to MCP callback with access token
-  const redirectToMcp = async () => {
-    if (!isMcpAuth) return;
-
-    const supabase = createClient();
-    const { data: { session } } = await supabase.auth.getSession();
-
-    if (session?.access_token && session?.refresh_token) {
-      const callbackUrl = new URL(mcpRedirect!);
-      callbackUrl.searchParams.set('pending_id', mcpPendingId!);
-      callbackUrl.searchParams.set('access_token', session.access_token);
-      callbackUrl.searchParams.set('refresh_token', session.refresh_token);
-      window.location.href = callbackUrl.toString();
-    }
-  };
-
   const handleMagicLink = async () => {
-    const supabase = createClient();
-
-    // For MCP auth, include the redirect info in the callback URL
+    // For MCP auth, include the pending_id in the callback URL
     const callbackUrl = isMcpAuth
-      ? `${window.location.origin}/auth/callback?mcp_redirect=${encodeURIComponent(mcpRedirect!)}&mcp_pending_id=${mcpPendingId}`
+      ? `${window.location.origin}/auth/callback?mcp_pending_id=${mcpPendingId}`
       : `${window.location.origin}/auth/callback`;
 
-    const { error } = await supabase.auth.signInWithOtp({
-      email,
-      options: {
-        emailRedirectTo: callbackUrl,
-      },
-    });
+    const result = await signInWithOtp(email, callbackUrl);
 
-    if (error) {
+    if ('error' in result) {
       // If rate limited, suggest password mode
-      if (error.message.toLowerCase().includes('rate')) {
+      if (result.error.toLowerCase().includes('rate')) {
         setMessage({
           type: 'error',
-          text: 'Rate limit reached. Please sign in with password instead.'
+          text: 'Rate limit reached. Please sign in with password instead.',
         });
         setAuthMode('password');
       } else {
-        setMessage({ type: 'error', text: error.message });
+        setMessage({ type: 'error', text: result.error });
       }
     } else {
       setMessage({
@@ -140,25 +92,18 @@ export default function LoginForm() {
   };
 
   const handlePassword = async () => {
-    const supabase = createClient();
-    const { error } = await supabase.auth.signInWithPassword({
-      email,
-      password,
-    });
+    const result = await signInWithPassword(email, password, mcpPendingId);
 
-    if (error) {
-      setMessage({ type: 'error', text: getErrorMessage(error.message) });
+    if ('error' in result) {
+      setMessage({ type: 'error', text: getErrorMessage(result.error) });
+    } else if ('mcpRedirectUrl' in result) {
+      // MCP flow: redirect to callback with tokens
+      setMcpRedirecting(true);
+      window.location.href = result.mcpRedirectUrl;
     } else {
-      // Successful login
-      if (isMcpAuth) {
-        // Show granting access view, then redirect to MCP callback
-        setMcpRedirecting(true);
-        await redirectToMcp();
-      } else {
-        // Normal dashboard redirect
-        router.push('/');
-        router.refresh();
-      }
+      // Normal dashboard redirect
+      router.push('/');
+      router.refresh();
     }
   };
 
@@ -292,8 +237,8 @@ export default function LoginForm() {
               {isLoading
                 ? 'Signing in...'
                 : authMode === 'magic-link'
-                ? 'Send Magic Link'
-                : 'Sign In'}
+                  ? 'Send Magic Link'
+                  : 'Sign In'}
             </Button>
           </form>
         </CardContent>

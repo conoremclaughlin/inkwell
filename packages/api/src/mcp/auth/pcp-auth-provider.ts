@@ -1,15 +1,16 @@
 /**
  * PCP OAuth Provider for MCP Authentication
  *
- * Handles the OAuth 2.0 authorization code flow with refresh token support.
- * Uses Supabase as the identity provider, issuing our own opaque refresh tokens
- * backed by stored Supabase refresh tokens for server-side session renewal.
+ * Issues self-signed JWTs as MCP access tokens (30-day expiry).
+ * Supabase is used only for initial identity verification during login.
+ * After that, all token operations are local (sign/verify with JWT_SECRET).
  *
- * Token chain: MCP client refresh_token -> this provider -> supabase.auth.refreshSession() -> fresh JWT
+ * Token chain: MCP client refresh_token (opaque, DB-backed) -> jwt.sign() -> self-issued JWT
  */
 
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
+import jwt from 'jsonwebtoken';
 import { env } from '../../config/env';
 import { logger } from '../../utils/logger';
 import type { Database } from '../../data/supabase/types';
@@ -26,12 +27,27 @@ export interface PendingAuth {
   expiresAt: number;
 }
 
+/** JWT payload for pending auth tokens (replaces in-memory Map) */
+interface PendingAuthPayload {
+  type: 'pending_auth';
+  clientId: string;
+  codeChallenge: string;
+  redirectUri: string;
+  state: string;
+}
+
+/** JWT payload for self-issued MCP access tokens */
+interface McpAccessTokenPayload {
+  type: 'mcp_access';
+  sub: string; // PCP user ID
+  email: string;
+  scope: string;
+}
+
 export interface AuthCode {
   clientId: string;
   codeChallenge: string;
   redirectUri: string;
-  supabaseToken: string;
-  supabaseRefreshToken: string;
   userId: string;
   userEmail: string;
   expiresAt: number;
@@ -60,31 +76,23 @@ export interface AuthCallbackResult {
 // Constants
 // ============================================================================
 
-// TODO: Consider extending Supabase JWT expiry to 30 days (2592000s) in dashboard
-// and updating this constant to match. Current 1-hour expiry works via refresh
-// tokens, but a longer JWT reduces refresh frequency for MCP clients.
-const ACCESS_TOKEN_LIFETIME = 3600; // 1 hour (Supabase JWT default)
+const ACCESS_TOKEN_LIFETIME_SECONDS = 30 * 24 * 60 * 60; // 30 days
 const REFRESH_TOKEN_LIFETIME_DAYS = 90;
 const REFRESH_TOKEN_LIFETIME_MS = REFRESH_TOKEN_LIFETIME_DAYS * 24 * 60 * 60 * 1000;
 const AUTH_CODE_LIFETIME_MS = 10 * 60 * 1000; // 10 minutes
-const PENDING_AUTH_LIFETIME_MS = 10 * 60 * 1000; // 10 minutes
+const PENDING_AUTH_LIFETIME_SECONDS = 600; // 10 minutes
 
 // ============================================================================
 // Provider
 // ============================================================================
 
 export class PcpAuthProvider {
-  private pendingAuths = new Map<string, PendingAuth>();
   private authCodes = new Map<string, AuthCode>();
   private supabase: SupabaseClient<Database>;
 
   constructor() {
     this.supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
       auth: {
-        // CRITICAL: persistSession must be false in server contexts.
-        // Without this, auth.refreshSession() stores a user session internally,
-        // causing subsequent PostgREST queries to use that user's JWT instead of
-        // the service role key — which subjects them to RLS and breaks lookups.
         autoRefreshToken: false,
         persistSession: false,
       },
@@ -101,15 +109,18 @@ export class PcpAuthProvider {
     redirectUri: string;
     state: string;
   }): string {
-    const pendingId = `pending-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
+    const payload: PendingAuthPayload = {
+      type: 'pending_auth',
+      clientId: params.clientId,
+      codeChallenge: params.codeChallenge,
+      redirectUri: params.redirectUri,
+      state: params.state,
+    };
 
-    this.pendingAuths.set(pendingId, {
-      ...params,
-      expiresAt: Date.now() + PENDING_AUTH_LIFETIME_MS,
+    return jwt.sign(payload, env.JWT_SECRET, {
+      expiresIn: PENDING_AUTH_LIFETIME_SECONDS,
+      jwtid: crypto.randomBytes(8).toString('hex'),
     });
-
-    this.cleanupExpired(this.pendingAuths);
-    return pendingId;
   }
 
   // --------------------------------------------------------------------------
@@ -119,21 +130,30 @@ export class PcpAuthProvider {
   async handleAuthCallback(params: {
     pendingId: string;
     accessToken: string;
-    refreshToken: string;
+    refreshToken?: string;
   }): Promise<AuthCallbackResult | OAuthErrorResponse> {
-    const pending = this.pendingAuths.get(params.pendingId);
-    if (!pending) {
-      return { error: 'invalid_request', error_description: 'Invalid or expired authorization request' };
-    }
-
-    if (Date.now() > pending.expiresAt) {
-      this.pendingAuths.delete(params.pendingId);
-      return { error: 'invalid_request', error_description: 'Authorization request expired' };
+    // Verify the signed pending auth JWT
+    let pending: PendingAuthPayload;
+    try {
+      const decoded = jwt.verify(params.pendingId, env.JWT_SECRET);
+      if (typeof decoded === 'string' || (decoded as PendingAuthPayload).type !== 'pending_auth') {
+        return { error: 'invalid_request', error_description: 'Invalid authorization request' };
+      }
+      pending = decoded as PendingAuthPayload;
+    } catch (err) {
+      const desc =
+        err instanceof jwt.TokenExpiredError
+          ? 'Authorization request expired'
+          : 'Invalid or expired authorization request';
+      return { error: 'invalid_request', error_description: desc };
     }
 
     try {
       // Verify Supabase token and resolve PCP user
-      const { data: { user }, error: authError } = await this.supabase.auth.getUser(params.accessToken);
+      const {
+        data: { user },
+        error: authError,
+      } = await this.supabase.auth.getUser(params.accessToken);
       if (authError || !user) {
         logger.error('Supabase auth verification failed in callback', { error: authError });
         return { error: 'access_denied', error_description: 'Authentication failed' };
@@ -158,7 +178,9 @@ export class PcpAuthProvider {
         if (createError) {
           // Check if user was created by another request (race condition or unique violation)
           if (createError.code === '23505') {
-            logger.info('User already exists (race condition), retrying lookup', { email: user.email });
+            logger.info('User already exists (race condition), retrying lookup', {
+              email: user.email,
+            });
             const { data: existingUser, error: retryError } = await this.supabase
               .from('users')
               .select('id, email')
@@ -166,7 +188,10 @@ export class PcpAuthProvider {
               .single();
 
             if (retryError || !existingUser) {
-              logger.error('Failed to fetch existing user after unique violation', { email: user.email, error: retryError });
+              logger.error('Failed to fetch existing user after unique violation', {
+                email: user.email,
+                error: retryError,
+              });
               return { error: 'server_error', error_description: 'User lookup failed' };
             }
 
@@ -190,14 +215,11 @@ export class PcpAuthProvider {
         clientId: pending.clientId,
         codeChallenge: pending.codeChallenge,
         redirectUri: pending.redirectUri,
-        supabaseToken: params.accessToken,
-        supabaseRefreshToken: params.refreshToken,
         userId: pcpUser.id,
         userEmail: pcpUser.email || '',
         expiresAt: Date.now() + AUTH_CODE_LIFETIME_MS,
       });
 
-      this.pendingAuths.delete(params.pendingId);
       this.cleanupExpired(this.authCodes);
 
       logger.info('MCP auth callback complete', { userId: pcpUser.id, email: pcpUser.email });
@@ -234,6 +256,14 @@ export class PcpAuthProvider {
 
     // Fall back to the client_id stored in the auth code (from /authorize).
     // Some clients (e.g. Codex) don't send client_id in the token exchange body.
+    // If a different client_id is explicitly provided, reject it.
+    if (params.clientId && params.clientId !== codeData.clientId) {
+      logger.warn('client_id mismatch in code exchange', {
+        expected: codeData.clientId,
+        received: params.clientId,
+      });
+      return { error: 'invalid_grant', error_description: 'Client ID mismatch' };
+    }
     const clientId = params.clientId || codeData.clientId;
 
     // Verify PKCE
@@ -257,16 +287,14 @@ export class PcpAuthProvider {
     const expiresAt = new Date(Date.now() + REFRESH_TOKEN_LIFETIME_MS);
 
     // Store in database
-    const { error: dbError } = await this.supabase
-      .from('mcp_tokens')
-      .insert({
-        user_id: codeData.userId,
-        client_id: clientId,
-        refresh_token: refreshToken,
-        supabase_refresh_token: codeData.supabaseRefreshToken,
-        scopes: ['mcp:tools'],
-        expires_at: expiresAt.toISOString(),
-      });
+    const { error: dbError } = await this.supabase.from('mcp_tokens').insert({
+      user_id: codeData.userId,
+      client_id: clientId,
+      refresh_token: refreshToken,
+      supabase_refresh_token: null,
+      scopes: ['mcp:tools'],
+      expires_at: expiresAt.toISOString(),
+    });
 
     if (dbError) {
       logger.error('Failed to store MCP token', { error: dbError });
@@ -276,6 +304,18 @@ export class PcpAuthProvider {
     // Consume the authorization code
     this.authCodes.delete(params.code);
 
+    // Sign our own JWT as the access token
+    const accessToken = jwt.sign(
+      {
+        type: 'mcp_access',
+        sub: codeData.userId,
+        email: codeData.userEmail,
+        scope: 'mcp:tools',
+      } satisfies McpAccessTokenPayload,
+      env.JWT_SECRET,
+      { expiresIn: ACCESS_TOKEN_LIFETIME_SECONDS }
+    );
+
     logger.info('MCP tokens issued', {
       userId: codeData.userId,
       email: codeData.userEmail,
@@ -284,10 +324,10 @@ export class PcpAuthProvider {
     });
 
     return {
-      access_token: codeData.supabaseToken,
+      access_token: accessToken,
       refresh_token: refreshToken,
       token_type: 'Bearer',
-      expires_in: ACCESS_TOKEN_LIFETIME,
+      expires_in: ACCESS_TOKEN_LIFETIME_SECONDS,
       scope: 'mcp:tools',
     };
   }
@@ -300,10 +340,10 @@ export class PcpAuthProvider {
     refreshToken: string;
     clientId: string;
   }): Promise<OAuthTokenResponse | OAuthErrorResponse> {
-    // Look up token in database
+    // Look up token in database, joining users table for email
     const { data: tokenRecord, error: lookupError } = await this.supabase
       .from('mcp_tokens')
-      .select('*')
+      .select('*, users(email)')
       .eq('refresh_token', params.refreshToken)
       .single();
 
@@ -328,31 +368,25 @@ export class PcpAuthProvider {
       return { error: 'invalid_grant', error_description: 'Refresh token expired' };
     }
 
-    // Use stored Supabase refresh token to get a fresh session
-    const { data: sessionData, error: refreshError } = await this.supabase.auth.refreshSession({
-      refresh_token: tokenRecord.supabase_refresh_token,
-    });
+    // Resolve user email from the join
+    const userEmail = (tokenRecord.users as unknown as { email: string | null })?.email || '';
 
-    if (refreshError || !sessionData.session) {
-      logger.error('Supabase token refresh failed', {
-        error: refreshError,
-        userId: tokenRecord.user_id,
-      });
-      // Expire the token so it's cleaned up, but don't delete (user can re-auth)
-      await this.supabase
-        .from('mcp_tokens')
-        .update({ expires_at: new Date().toISOString() })
-        .eq('id', tokenRecord.id);
-      return { error: 'invalid_grant', error_description: 'Unable to refresh session. Please re-authenticate.' };
-    }
+    // Sign a fresh self-issued JWT — no Supabase call needed
+    const accessToken = jwt.sign(
+      {
+        type: 'mcp_access',
+        sub: tokenRecord.user_id,
+        email: userEmail,
+        scope: 'mcp:tools',
+      } satisfies McpAccessTokenPayload,
+      env.JWT_SECRET,
+      { expiresIn: ACCESS_TOKEN_LIFETIME_SECONDS }
+    );
 
-    // Update stored Supabase refresh token (Supabase rotates on use)
+    // Update last_used_at
     await this.supabase
       .from('mcp_tokens')
-      .update({
-        supabase_refresh_token: sessionData.session.refresh_token,
-        last_used_at: new Date().toISOString(),
-      })
+      .update({ last_used_at: new Date().toISOString() })
       .eq('id', tokenRecord.id);
 
     logger.info('MCP token refreshed', {
@@ -361,10 +395,10 @@ export class PcpAuthProvider {
     });
 
     return {
-      access_token: sessionData.session.access_token,
-      refresh_token: params.refreshToken, // Keep same refresh token (don't rotate)
+      access_token: accessToken,
+      refresh_token: params.refreshToken,
       token_type: 'Bearer',
-      expires_in: ACCESS_TOKEN_LIFETIME,
+      expires_in: ACCESS_TOKEN_LIFETIME_SECONDS,
       scope: tokenRecord.scopes?.join(' ') || 'mcp:tools',
     };
   }
@@ -373,32 +407,18 @@ export class PcpAuthProvider {
   // Token verification (for /mcp endpoint auth)
   // --------------------------------------------------------------------------
 
-  async verifyAccessToken(authHeader: string | undefined): Promise<{ userId: string; email: string } | null> {
+  verifyAccessToken(authHeader: string | undefined): { userId: string; email: string } | null {
     if (!authHeader?.startsWith('Bearer ')) return null;
     const token = authHeader.substring(7);
 
     try {
-      const { data: { user }, error } = await this.supabase.auth.getUser(token);
-
-      if (error || !user) {
-        logger.debug('Supabase token validation failed', { error: error?.message });
+      const decoded = jwt.verify(token, env.JWT_SECRET);
+      if (typeof decoded === 'string' || (decoded as McpAccessTokenPayload).type !== 'mcp_access') {
         return null;
       }
-
-      const { data: pcpUser } = await this.supabase
-        .from('users')
-        .select('id, email')
-        .eq('email', user.email!)
-        .single();
-
-      if (!pcpUser) {
-        logger.warn('Supabase user not found in PCP', { email: user.email });
-        return null;
-      }
-
-      return { userId: pcpUser.id, email: pcpUser.email || '' };
-    } catch (error) {
-      logger.error('Error verifying access token', { error });
+      const payload = decoded as McpAccessTokenPayload;
+      return { userId: payload.sub, email: payload.email };
+    } catch {
       return null;
     }
   }

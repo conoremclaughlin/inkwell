@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import crypto from 'crypto';
+import jwt from 'jsonwebtoken';
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -10,7 +11,6 @@ const mockUpdate = vi.fn();
 const mockDelete = vi.fn();
 const mockSelect = vi.fn();
 const mockGetUser = vi.fn();
-const mockRefreshSession = vi.fn();
 
 // Build a chainable mock for Supabase queries
 function mockChain(terminalData: unknown = null, terminalError: unknown = null) {
@@ -32,7 +32,6 @@ vi.mock('@supabase/supabase-js', () => ({
   createClient: vi.fn(() => ({
     auth: {
       getUser: mockGetUser,
-      refreshSession: mockRefreshSession,
     },
     from: vi.fn((table: string) => {
       if (table === 'users') return currentUserChain;
@@ -42,10 +41,13 @@ vi.mock('@supabase/supabase-js', () => ({
   })),
 }));
 
+const TEST_JWT_SECRET = 'test-jwt-secret-that-is-at-least-32-characters-long';
+
 vi.mock('../../config/env', () => ({
   env: {
     SUPABASE_URL: 'http://localhost:54321',
     SUPABASE_SECRET_KEY: 'test-key',
+    JWT_SECRET: 'test-jwt-secret-that-is-at-least-32-characters-long',
   },
 }));
 
@@ -105,7 +107,6 @@ async function runFullAuthFlow(provider: PcpAuthProvider) {
   const callbackResult = await provider.handleAuthCallback({
     pendingId,
     accessToken: 'supabase-jwt-123',
-    refreshToken: 'supabase-rt-456',
   });
 
   if ('error' in callbackResult) throw new Error(`Callback failed: ${callbackResult.error}`);
@@ -140,12 +141,20 @@ describe('PcpAuthProvider', () => {
   // =========================================================================
 
   describe('createPendingAuth', () => {
-    it('should return a pendingId starting with "pending-"', () => {
+    it('should return a valid signed JWT', () => {
       const pendingId = setupPendingAuth(provider);
-      expect(pendingId).toMatch(/^pending-/);
+      // JWT format: three base64url segments separated by dots
+      expect(pendingId.split('.')).toHaveLength(3);
+
+      // Should be verifiable with the secret
+      const decoded = jwt.verify(pendingId, TEST_JWT_SECRET) as Record<string, unknown>;
+      expect(decoded.type).toBe('pending_auth');
+      expect(decoded.clientId).toBe('test-client');
+      expect(decoded.redirectUri).toBe('http://localhost:3001/callback');
+      expect(decoded.state).toBe('test-state');
     });
 
-    it('should generate unique IDs for each call', () => {
+    it('should generate unique tokens for each call', () => {
       const id1 = setupPendingAuth(provider);
       const id2 = setupPendingAuth(provider);
       expect(id1).not.toBe(id2);
@@ -164,7 +173,6 @@ describe('PcpAuthProvider', () => {
       const result = await provider.handleAuthCallback({
         pendingId,
         accessToken: 'supabase-jwt',
-        refreshToken: 'supabase-rt',
       });
 
       expect('code' in result).toBe(true);
@@ -179,7 +187,6 @@ describe('PcpAuthProvider', () => {
       const result = await provider.handleAuthCallback({
         pendingId: 'nonexistent',
         accessToken: 'jwt',
-        refreshToken: 'rt',
       });
 
       expect(result).toEqual({
@@ -198,7 +205,6 @@ describe('PcpAuthProvider', () => {
       const result = await provider.handleAuthCallback({
         pendingId,
         accessToken: 'bad-token',
-        refreshToken: 'rt',
       });
 
       expect(result).toEqual({
@@ -232,7 +238,6 @@ describe('PcpAuthProvider', () => {
       const result = await provider.handleAuthCallback({
         pendingId,
         accessToken: 'jwt',
-        refreshToken: 'rt',
       });
 
       expect(result).toHaveProperty('code');
@@ -251,7 +256,6 @@ describe('PcpAuthProvider', () => {
       const result = await provider.handleAuthCallback({
         pendingId,
         accessToken: 'jwt',
-        refreshToken: 'rt',
       });
 
       expect(result).toEqual({
@@ -260,29 +264,19 @@ describe('PcpAuthProvider', () => {
       });
     });
 
-    // Regression: web portal was redirecting to /mcp/auth/callback without
-    // refresh_token, causing "Missing refresh token" error for MCP clients.
-    // The auth callback MUST receive both access_token and refresh_token
-    // from the web portal so the token exchange can store the Supabase
-    // refresh token for later use.
-    it('should require refresh_token for successful callback (regression)', async () => {
+    it('should work without refresh_token (no longer needed)', async () => {
       const pendingId = setupPendingAuth(provider);
       mockSuccessfulAuth();
 
-      // Callback with access_token but NO refresh_token should still
-      // produce an auth code — the provider doesn't validate this, the
-      // HTTP layer does. But verify the stored refresh token propagates
-      // through to the code exchange.
       const callbackResult = await provider.handleAuthCallback({
         pendingId,
         accessToken: 'supabase-jwt',
-        refreshToken: 'supabase-rt-required',
       });
 
       expect('code' in callbackResult).toBe(true);
       if (!('code' in callbackResult)) return;
 
-      // Exchange the code and verify refresh token was stored
+      // Exchange the code
       currentMcpTokensChain = mockChain();
       mockInsert.mockReturnValue({ error: null });
 
@@ -293,34 +287,75 @@ describe('PcpAuthProvider', () => {
       });
 
       expect('access_token' in tokenResult).toBe(true);
-      if (!('access_token' in tokenResult)) return;
 
-      // The insert call should contain the supabase refresh token
+      // supabase_refresh_token should be null (self-issued JWTs, no Supabase dependency)
       expect(mockInsert).toHaveBeenCalled();
       const insertArgs = mockInsert.mock.calls[0]?.[0];
-      expect(insertArgs).toHaveProperty('supabase_refresh_token', 'supabase-rt-required');
+      expect(insertArgs).toHaveProperty('supabase_refresh_token', null);
     });
 
-    it('should consume the pending auth after successful callback', async () => {
+    it('should accept the same JWT on re-callback (stateless, PKCE prevents replay)', async () => {
       const pendingId = setupPendingAuth(provider);
       mockSuccessfulAuth();
 
-      await provider.handleAuthCallback({
+      const result1 = await provider.handleAuthCallback({
         pendingId,
         accessToken: 'jwt',
-        refreshToken: 'rt',
       });
 
-      // Second call with same pendingId should fail
-      const result = await provider.handleAuthCallback({
+      expect('code' in result1).toBe(true);
+
+      // Second call with same pendingId should also succeed (stateless JWT)
+      mockSuccessfulAuth();
+      const result2 = await provider.handleAuthCallback({
         pendingId,
         accessToken: 'jwt',
-        refreshToken: 'rt',
+      });
+
+      expect('code' in result2).toBe(true);
+    });
+
+    it('should return error for expired JWT', async () => {
+      // Sign a JWT that's already expired
+      const expiredToken = jwt.sign(
+        {
+          type: 'pending_auth',
+          clientId: 'test',
+          codeChallenge: 'ch',
+          redirectUri: 'http://localhost/cb',
+          state: 's',
+        },
+        TEST_JWT_SECRET,
+        { expiresIn: 0 }
+      );
+
+      // Wait a tick so the token is expired
+      await new Promise((r) => setTimeout(r, 10));
+
+      const result = await provider.handleAuthCallback({
+        pendingId: expiredToken,
+        accessToken: 'jwt',
       });
 
       expect(result).toEqual({
         error: 'invalid_request',
-        error_description: 'Invalid or expired authorization request',
+        error_description: 'Authorization request expired',
+      });
+    });
+
+    it('should return error for wrong JWT type', async () => {
+      const wrongTypeToken = jwt.sign({ type: 'wrong_type', clientId: 'test' }, TEST_JWT_SECRET, {
+        expiresIn: 600,
+      });
+
+      const result = await provider.handleAuthCallback({
+        pendingId: wrongTypeToken,
+        accessToken: 'jwt',
+      });
+
+      expect(result).toEqual({
+        error: 'invalid_request',
+        error_description: 'Invalid authorization request',
       });
     });
   });
@@ -330,7 +365,7 @@ describe('PcpAuthProvider', () => {
   // =========================================================================
 
   describe('exchangeAuthorizationCode', () => {
-    it('should return access_token and refresh_token on success', async () => {
+    it('should return a self-signed JWT access_token and refresh_token on success', async () => {
       const pendingId = setupPendingAuth(provider);
       mockSuccessfulAuth();
 
@@ -340,7 +375,6 @@ describe('PcpAuthProvider', () => {
       const callbackResult = await provider.handleAuthCallback({
         pendingId,
         accessToken: 'supabase-jwt-123',
-        refreshToken: 'supabase-rt-456',
       });
 
       expect('code' in callbackResult).toBe(true);
@@ -354,15 +388,23 @@ describe('PcpAuthProvider', () => {
 
       expect('access_token' in result).toBe(true);
       if ('access_token' in result) {
-        expect(result.access_token).toBe('supabase-jwt-123');
+        // Access token is a self-signed JWT (3 dot-separated segments)
+        expect(result.access_token.split('.')).toHaveLength(3);
+        // Verify JWT payload
+        const decoded = jwt.verify(result.access_token, TEST_JWT_SECRET) as Record<string, unknown>;
+        expect(decoded.type).toBe('mcp_access');
+        expect(decoded.sub).toBe('user-123');
+        expect(decoded.email).toBe('test@example.com');
+        expect(decoded.scope).toBe('mcp:tools');
+
         expect(result.refresh_token).toMatch(/^pcp-rt-/);
         expect(result.token_type).toBe('Bearer');
-        expect(result.expires_in).toBe(3600);
+        expect(result.expires_in).toBe(30 * 24 * 60 * 60);
         expect(result.scope).toBe('mcp:tools');
       }
     });
 
-    it('should store refresh token in database', async () => {
+    it('should store refresh token in database with null supabase_refresh_token', async () => {
       const pendingId = setupPendingAuth(provider);
       mockSuccessfulAuth();
 
@@ -372,7 +414,6 @@ describe('PcpAuthProvider', () => {
       const callbackResult = await provider.handleAuthCallback({
         pendingId,
         accessToken: 'jwt',
-        refreshToken: 'supabase-rt',
       });
       if (!('code' in callbackResult)) return;
 
@@ -382,8 +423,9 @@ describe('PcpAuthProvider', () => {
         clientId: 'test-client',
       });
 
-      // Verify insert was called with correct data
       expect(mockInsert).toHaveBeenCalled();
+      const insertArgs = mockInsert.mock.calls[0]?.[0];
+      expect(insertArgs).toHaveProperty('supabase_refresh_token', null);
     });
 
     it('should return error for invalid code', async () => {
@@ -406,7 +448,6 @@ describe('PcpAuthProvider', () => {
       const callbackResult = await provider.handleAuthCallback({
         pendingId,
         accessToken: 'jwt',
-        refreshToken: 'rt',
       });
       if (!('code' in callbackResult)) return;
 
@@ -422,6 +463,28 @@ describe('PcpAuthProvider', () => {
       });
     });
 
+    it('should return error for client_id mismatch', async () => {
+      const pendingId = setupPendingAuth(provider);
+      mockSuccessfulAuth();
+
+      const callbackResult = await provider.handleAuthCallback({
+        pendingId,
+        accessToken: 'jwt',
+      });
+      if (!('code' in callbackResult)) return;
+
+      const result = await provider.exchangeAuthorizationCode({
+        code: callbackResult.code,
+        codeVerifier: 'test-verifier',
+        clientId: 'different-client', // doesn't match 'test-client' from setupPendingAuth
+      });
+
+      expect(result).toEqual({
+        error: 'invalid_grant',
+        error_description: 'Client ID mismatch',
+      });
+    });
+
     it('should return error when DB insert fails', async () => {
       const pendingId = setupPendingAuth(provider);
       mockSuccessfulAuth();
@@ -433,7 +496,6 @@ describe('PcpAuthProvider', () => {
       const callbackResult = await provider.handleAuthCallback({
         pendingId,
         accessToken: 'jwt',
-        refreshToken: 'rt',
       });
       if (!('code' in callbackResult)) return;
 
@@ -459,7 +521,6 @@ describe('PcpAuthProvider', () => {
       const callbackResult = await provider.handleAuthCallback({
         pendingId,
         accessToken: 'jwt',
-        refreshToken: 'rt',
       });
       if (!('code' in callbackResult)) return;
 
@@ -489,31 +550,19 @@ describe('PcpAuthProvider', () => {
   // =========================================================================
 
   describe('exchangeRefreshToken', () => {
-    it('should return new access_token on successful refresh', async () => {
-      // Mock: find the token in DB
+    it('should return a self-signed JWT access_token on successful refresh', async () => {
       const futureDate = new Date(Date.now() + 86400000).toISOString();
       currentMcpTokensChain = mockChain({
         id: 'token-1',
         user_id: 'user-123',
         client_id: 'test-client',
         refresh_token: 'pcp-rt-abc',
-        supabase_refresh_token: 'supabase-rt-old',
+        supabase_refresh_token: null,
         scopes: ['mcp:tools'],
         expires_at: futureDate,
+        users: { email: 'test@example.com' },
       });
 
-      // Mock: Supabase refresh succeeds
-      mockRefreshSession.mockResolvedValue({
-        data: {
-          session: {
-            access_token: 'fresh-supabase-jwt',
-            refresh_token: 'supabase-rt-new',
-          },
-        },
-        error: null,
-      });
-
-      // Mock: update succeeds
       mockUpdate.mockReturnValue({
         eq: vi.fn(() => ({ error: null })),
       });
@@ -525,33 +574,30 @@ describe('PcpAuthProvider', () => {
 
       expect('access_token' in result).toBe(true);
       if ('access_token' in result) {
-        expect(result.access_token).toBe('fresh-supabase-jwt');
-        expect(result.refresh_token).toBe('pcp-rt-abc'); // Same refresh token
+        // Verify it's a self-signed JWT
+        const decoded = jwt.verify(result.access_token, TEST_JWT_SECRET) as Record<string, unknown>;
+        expect(decoded.type).toBe('mcp_access');
+        expect(decoded.sub).toBe('user-123');
+        expect(decoded.email).toBe('test@example.com');
+        expect(decoded.scope).toBe('mcp:tools');
+
+        expect(result.refresh_token).toBe('pcp-rt-abc');
         expect(result.token_type).toBe('Bearer');
-        expect(result.expires_in).toBe(3600);
+        expect(result.expires_in).toBe(30 * 24 * 60 * 60);
       }
     });
 
-    it('should call supabase.auth.refreshSession with stored token', async () => {
+    it('should not call supabase.auth.refreshSession (no Supabase dependency)', async () => {
       const futureDate = new Date(Date.now() + 86400000).toISOString();
       currentMcpTokensChain = mockChain({
         id: 'token-1',
         user_id: 'user-123',
         client_id: 'test-client',
         refresh_token: 'pcp-rt-abc',
-        supabase_refresh_token: 'supabase-rt-stored',
+        supabase_refresh_token: null,
         scopes: ['mcp:tools'],
         expires_at: futureDate,
-      });
-
-      mockRefreshSession.mockResolvedValue({
-        data: {
-          session: {
-            access_token: 'new-jwt',
-            refresh_token: 'new-supabase-rt',
-          },
-        },
-        error: null,
+        users: { email: 'test@example.com' },
       });
 
       mockUpdate.mockReturnValue({
@@ -563,9 +609,8 @@ describe('PcpAuthProvider', () => {
         clientId: 'test-client',
       });
 
-      expect(mockRefreshSession).toHaveBeenCalledWith({
-        refresh_token: 'supabase-rt-stored',
-      });
+      // No Supabase auth calls should be made during refresh
+      expect(mockGetUser).not.toHaveBeenCalled();
     });
 
     it('should return error for unknown refresh token', async () => {
@@ -589,9 +634,10 @@ describe('PcpAuthProvider', () => {
         user_id: 'user-123',
         client_id: 'original-client',
         refresh_token: 'pcp-rt-abc',
-        supabase_refresh_token: 'supabase-rt',
+        supabase_refresh_token: null,
         scopes: ['mcp:tools'],
         expires_at: futureDate,
+        users: { email: 'test@example.com' },
       });
 
       const result = await provider.exchangeRefreshToken({
@@ -612,12 +658,12 @@ describe('PcpAuthProvider', () => {
         user_id: 'user-123',
         client_id: 'test-client',
         refresh_token: 'pcp-rt-abc',
-        supabase_refresh_token: 'supabase-rt',
+        supabase_refresh_token: null,
         scopes: ['mcp:tools'],
         expires_at: pastDate,
+        users: { email: 'test@example.com' },
       });
 
-      // Mock: delete chain
       mockDelete.mockReturnValue({
         eq: vi.fn(() => ({ error: null })),
       });
@@ -632,39 +678,6 @@ describe('PcpAuthProvider', () => {
         error_description: 'Refresh token expired',
       });
     });
-
-    it('should return error when Supabase refresh fails', async () => {
-      const futureDate = new Date(Date.now() + 86400000).toISOString();
-      currentMcpTokensChain = mockChain({
-        id: 'token-1',
-        user_id: 'user-123',
-        client_id: 'test-client',
-        refresh_token: 'pcp-rt-abc',
-        supabase_refresh_token: 'supabase-rt-revoked',
-        scopes: ['mcp:tools'],
-        expires_at: futureDate,
-      });
-
-      mockRefreshSession.mockResolvedValue({
-        data: { session: null },
-        error: { message: 'Token has been revoked' },
-      });
-
-      // Mock: update to expire the token
-      mockUpdate.mockReturnValue({
-        eq: vi.fn(() => ({ error: null })),
-      });
-
-      const result = await provider.exchangeRefreshToken({
-        refreshToken: 'pcp-rt-abc',
-        clientId: 'test-client',
-      });
-
-      expect(result).toEqual({
-        error: 'invalid_grant',
-        error_description: 'Unable to refresh session. Please re-authenticate.',
-      });
-    });
   });
 
   // =========================================================================
@@ -672,47 +685,67 @@ describe('PcpAuthProvider', () => {
   // =========================================================================
 
   describe('verifyAccessToken', () => {
-    it('should return user info for valid token', async () => {
-      mockGetUser.mockResolvedValue({
-        data: { user: { email: 'test@example.com' } },
-        error: null,
-      });
-      currentUserChain = mockChain({ id: 'user-123', email: 'test@example.com' });
+    it('should return user info for valid self-signed JWT', () => {
+      const token = jwt.sign(
+        { type: 'mcp_access', sub: 'user-123', email: 'test@example.com', scope: 'mcp:tools' },
+        TEST_JWT_SECRET,
+        { expiresIn: '30d' }
+      );
 
-      const result = await provider.verifyAccessToken('Bearer valid-jwt');
-
+      const result = provider.verifyAccessToken(`Bearer ${token}`);
       expect(result).toEqual({ userId: 'user-123', email: 'test@example.com' });
     });
 
-    it('should return null for missing auth header', async () => {
-      const result = await provider.verifyAccessToken(undefined);
+    it('should return null for missing auth header', () => {
+      const result = provider.verifyAccessToken(undefined);
       expect(result).toBeNull();
     });
 
-    it('should return null for non-Bearer auth header', async () => {
-      const result = await provider.verifyAccessToken('Basic abc123');
+    it('should return null for non-Bearer auth header', () => {
+      const result = provider.verifyAccessToken('Basic abc123');
       expect(result).toBeNull();
     });
 
-    it('should return null for invalid Supabase token', async () => {
-      mockGetUser.mockResolvedValue({
-        data: { user: null },
-        error: { message: 'Invalid token' },
+    it('should return null for expired JWT', () => {
+      const token = jwt.sign(
+        { type: 'mcp_access', sub: 'user-123', email: 'test@example.com', scope: 'mcp:tools' },
+        TEST_JWT_SECRET,
+        { expiresIn: 0 }
+      );
+
+      const result = provider.verifyAccessToken(`Bearer ${token}`);
+      expect(result).toBeNull();
+    });
+
+    it('should return null for wrong JWT type', () => {
+      const token = jwt.sign({ type: 'pending_auth', clientId: 'test' }, TEST_JWT_SECRET, {
+        expiresIn: '1h',
       });
 
-      const result = await provider.verifyAccessToken('Bearer expired-jwt');
+      const result = provider.verifyAccessToken(`Bearer ${token}`);
       expect(result).toBeNull();
     });
 
-    it('should return null when PCP user not found', async () => {
-      mockGetUser.mockResolvedValue({
-        data: { user: { email: 'unknown@example.com' } },
-        error: null,
-      });
-      currentUserChain = mockChain(null);
+    it('should return null for JWT signed with wrong secret', () => {
+      const token = jwt.sign(
+        { type: 'mcp_access', sub: 'user-123', email: 'test@example.com', scope: 'mcp:tools' },
+        'wrong-secret-that-is-at-least-32-characters-long',
+        { expiresIn: '30d' }
+      );
 
-      const result = await provider.verifyAccessToken('Bearer valid-jwt');
+      const result = provider.verifyAccessToken(`Bearer ${token}`);
       expect(result).toBeNull();
+    });
+
+    it('should not make any Supabase calls', () => {
+      const token = jwt.sign(
+        { type: 'mcp_access', sub: 'user-123', email: 'test@example.com', scope: 'mcp:tools' },
+        TEST_JWT_SECRET,
+        { expiresIn: '30d' }
+      );
+
+      provider.verifyAccessToken(`Bearer ${token}`);
+      expect(mockGetUser).not.toHaveBeenCalled();
     });
   });
 
@@ -721,7 +754,7 @@ describe('PcpAuthProvider', () => {
   // =========================================================================
 
   describe('full OAuth flow', () => {
-    it('should complete authorize → callback → code exchange → refresh', async () => {
+    it('should complete authorize → callback → code exchange → refresh → verify', async () => {
       // Step 1: Create pending auth
       const pendingId = setupPendingAuth(provider);
 
@@ -730,7 +763,6 @@ describe('PcpAuthProvider', () => {
       const callbackResult = await provider.handleAuthCallback({
         pendingId,
         accessToken: 'supabase-jwt-original',
-        refreshToken: 'supabase-rt-original',
       });
       expect('code' in callbackResult).toBe(true);
       if (!('code' in callbackResult)) return;
@@ -746,7 +778,11 @@ describe('PcpAuthProvider', () => {
       });
       expect('access_token' in tokens).toBe(true);
       if (!('access_token' in tokens)) return;
-      expect(tokens.access_token).toBe('supabase-jwt-original');
+
+      // Access token is a self-signed JWT
+      const decoded = jwt.verify(tokens.access_token, TEST_JWT_SECRET) as Record<string, unknown>;
+      expect(decoded.type).toBe('mcp_access');
+      expect(decoded.sub).toBe('user-123');
       expect(tokens.refresh_token).toMatch(/^pcp-rt-/);
 
       // Step 4: Refresh the token
@@ -756,19 +792,10 @@ describe('PcpAuthProvider', () => {
         user_id: 'user-123',
         client_id: 'test-client',
         refresh_token: tokens.refresh_token,
-        supabase_refresh_token: 'supabase-rt-original',
+        supabase_refresh_token: null,
         scopes: ['mcp:tools'],
         expires_at: futureDate,
-      });
-
-      mockRefreshSession.mockResolvedValue({
-        data: {
-          session: {
-            access_token: 'supabase-jwt-refreshed',
-            refresh_token: 'supabase-rt-rotated',
-          },
-        },
-        error: null,
+        users: { email: 'test@example.com' },
       });
 
       mockUpdate.mockReturnValue({
@@ -781,15 +808,23 @@ describe('PcpAuthProvider', () => {
       });
 
       expect('access_token' in refreshResult).toBe(true);
-      if ('access_token' in refreshResult) {
-        expect(refreshResult.access_token).toBe('supabase-jwt-refreshed');
-        expect(refreshResult.refresh_token).toBe(tokens.refresh_token); // Same opaque token
-      }
+      if (!('access_token' in refreshResult)) return;
 
-      // Verify Supabase refresh was called with original token
-      expect(mockRefreshSession).toHaveBeenCalledWith({
-        refresh_token: 'supabase-rt-original',
-      });
+      // Refreshed token is also a self-signed JWT
+      const refreshedDecoded = jwt.verify(refreshResult.access_token, TEST_JWT_SECRET) as Record<
+        string,
+        unknown
+      >;
+      expect(refreshedDecoded.type).toBe('mcp_access');
+      expect(refreshedDecoded.sub).toBe('user-123');
+      expect(refreshResult.refresh_token).toBe(tokens.refresh_token);
+
+      // Step 5: Verify the access token
+      const verified = provider.verifyAccessToken(`Bearer ${refreshResult.access_token}`);
+      expect(verified).toEqual({ userId: 'user-123', email: 'test@example.com' });
+
+      // No Supabase auth calls after initial callback
+      expect(mockGetUser).toHaveBeenCalledTimes(1); // Only during handleAuthCallback
     });
   });
 });

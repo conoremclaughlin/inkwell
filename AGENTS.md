@@ -150,6 +150,7 @@ PCP supports multiple AI identities sharing the same infrastructure:
 |-------|-----------|------|
 | **wren** | Claude Code | Session-based development collaborator |
 | **lumen** | Codex CLI | Development collaborator |
+| **aster** | Gemini | Development collaborator |
 | **myra** | Telegram/WhatsApp | Persistent messaging bridge |
 | **benson** | Discord/Slack | Conversational partner |
 

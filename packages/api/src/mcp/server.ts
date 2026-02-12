@@ -8,12 +8,27 @@ import { MCP_SERVER_NAME, MCP_SERVER_VERSION, MCP_SERVER_DESCRIPTION } from '../
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import type { DataComposer } from '../data/composer';
-import { registerAllTools, setMiniAppsRegistry, setTelegramListener, registerChannelListener } from './tools';
-import { loadMiniApps, registerMiniAppTools, getMiniAppsInfo, type LoadedMiniApp } from '../mini-apps';
+import {
+  registerAllTools,
+  setMiniAppsRegistry,
+  setTelegramListener,
+  registerChannelListener,
+} from './tools';
+import {
+  loadMiniApps,
+  registerMiniAppTools,
+  getMiniAppsInfo,
+  type LoadedMiniApp,
+} from '../mini-apps';
 import adminRouter, { setWhatsAppListener } from '../routes/admin';
 import agentTriggerRouter, { getAgentGateway } from '../routes/agent-trigger';
 import { createChatRouter } from '../routes/chat';
-import { ChannelGateway, createChannelGateway, type ChannelGatewayConfig, type IncomingMessageHandler } from '../channels/gateway';
+import {
+  ChannelGateway,
+  createChannelGateway,
+  type ChannelGatewayConfig,
+  type IncomingMessageHandler,
+} from '../channels/gateway';
 import { runWithRequestContext } from '../utils/request-context';
 import { PcpAuthProvider } from './auth/pcp-auth-provider';
 
@@ -35,7 +50,13 @@ export class MCPServer {
   private httpServer: Server | null = null;
 
   private miniApps: Map<string, LoadedMiniApp> = new Map();
-  private miniAppsInfo: Array<{ name: string; version: string; description: string; triggers: string[]; functions: string[] }> = [];
+  private miniAppsInfo: Array<{
+    name: string;
+    version: string;
+    description: string;
+    triggers: string[];
+    functions: string[];
+  }> = [];
   private toolsVersion = 0;
   private channelGateway: ChannelGateway | null = null;
   private config: MCPServerConfig;
@@ -50,7 +71,7 @@ export class MCPServer {
     this.miniApps = loadMiniApps();
     setMiniAppsRegistry(this.miniApps);
     this.miniAppsInfo = getMiniAppsInfo(this.miniApps);
-    logger.info(`Mini-apps loaded: ${this.miniAppsInfo.map(a => a.name).join(', ') || 'none'}`);
+    logger.info(`Mini-apps loaded: ${this.miniAppsInfo.map((a) => a.name).join(', ') || 'none'}`);
 
     // Create primary server instance (used for stdio; HTTP creates per-session servers)
     this.server = this.createMcpServerInstance();
@@ -119,10 +140,12 @@ export class MCPServer {
     const app = express();
 
     // Enable CORS for web portal, MCP clients, and agents
-    app.use(cors({
-      origin: ['http://localhost:3001', 'http://localhost:3002', 'http://localhost:3003'],
-      credentials: true,
-    }));
+    app.use(
+      cors({
+        origin: ['http://localhost:3001', 'http://localhost:3002', 'http://localhost:3003'],
+        credentials: true,
+      })
+    );
 
     // ============================================================================
     // Streamable HTTP MCP endpoint (stateless)
@@ -150,7 +173,8 @@ export class MCPServer {
           challengeParts.push('error="invalid_token"');
         }
 
-        res.status(401)
+        res
+          .status(401)
           .set('WWW-Authenticate', challengeParts.join(', '))
           .json({
             jsonrpc: '2.0',
@@ -167,9 +191,7 @@ export class MCPServer {
 
       // Use request-scoped context (AsyncLocalStorage) instead of global state
       // to prevent identity leaking across concurrent stateless requests.
-      const ctx = userData
-        ? { userId: userData.userId, email: userData.email }
-        : {};
+      const ctx = userData ? { userId: userData.userId, email: userData.email } : {};
 
       await runWithRequestContext(ctx, async () => {
         let transport: StreamableHTTPServerTransport | undefined;
@@ -213,7 +235,10 @@ export class MCPServer {
     // ============================================================================
     app.get('/health', async (_req, res) => {
       const startTime = Date.now();
-      const checks: Record<string, { status: 'ok' | 'error'; latencyMs?: number; error?: string; details?: unknown }> = {};
+      const checks: Record<
+        string,
+        { status: 'ok' | 'error'; latencyMs?: number; error?: string; details?: unknown }
+      > = {};
 
       try {
         const dbStart = Date.now();
@@ -222,24 +247,32 @@ export class MCPServer {
           ? { status: 'error', error: error.message }
           : { status: 'ok', latencyMs: Date.now() - dbStart };
       } catch (err) {
-        checks.database = { status: 'error', error: err instanceof Error ? err.message : 'Unknown error' };
+        checks.database = {
+          status: 'error',
+          error: err instanceof Error ? err.message : 'Unknown error',
+        };
       }
 
       if (this.channelGateway) {
         const gatewayStatus = this.channelGateway.getStatus();
         checks.telegram = {
-          status: gatewayStatus.telegram.enabled && gatewayStatus.telegram.connected ? 'ok' : 'error',
-          ...(gatewayStatus.telegram.enabled && !gatewayStatus.telegram.connected && { error: 'Not connected' }),
+          status:
+            gatewayStatus.telegram.enabled && gatewayStatus.telegram.connected ? 'ok' : 'error',
+          ...(gatewayStatus.telegram.enabled &&
+            !gatewayStatus.telegram.connected && { error: 'Not connected' }),
           ...(!gatewayStatus.telegram.enabled && { error: 'Disabled' }),
         };
         checks.whatsapp = {
-          status: gatewayStatus.whatsapp.enabled && gatewayStatus.whatsapp.connected ? 'ok' : 'error',
-          ...(gatewayStatus.whatsapp.enabled && !gatewayStatus.whatsapp.connected && { error: 'Not connected' }),
+          status:
+            gatewayStatus.whatsapp.enabled && gatewayStatus.whatsapp.connected ? 'ok' : 'error',
+          ...(gatewayStatus.whatsapp.enabled &&
+            !gatewayStatus.whatsapp.connected && { error: 'Not connected' }),
           ...(!gatewayStatus.whatsapp.enabled && { error: 'Disabled' }),
         };
         checks.discord = {
           status: gatewayStatus.discord.enabled && gatewayStatus.discord.connected ? 'ok' : 'error',
-          ...(gatewayStatus.discord.enabled && !gatewayStatus.discord.connected && { error: 'Not connected' }),
+          ...(gatewayStatus.discord.enabled &&
+            !gatewayStatus.discord.connected && { error: 'Not connected' }),
           ...(!gatewayStatus.discord.enabled && { error: 'Disabled' }),
         };
       }
@@ -307,26 +340,25 @@ export class MCPServer {
       });
 
       const webPortalUrl = process.env.WEB_PORTAL_URL || 'http://localhost:3002';
-      const mcpCallback = `${baseUrl}/mcp/auth/callback`;
 
       const loginUrl = new URL(`${webPortalUrl}/login`);
-      loginUrl.searchParams.set('redirect', mcpCallback);
       loginUrl.searchParams.set('pending_id', pendingId);
 
-      logger.info('MCP /authorize redirecting to web portal', { pendingId, loginUrl: loginUrl.toString() });
+      logger.info('MCP /authorize redirecting to web portal', {
+        pendingId,
+        loginUrl: loginUrl.toString(),
+      });
       res.redirect(loginUrl.toString());
     });
 
-    // Auth callback — receives Supabase tokens from web portal, creates auth code
+    // Auth callback — receives Supabase access token from web portal, creates auth code
     app.get('/mcp/auth/callback', async (req, res) => {
       const pendingId = req.query.pending_id as string;
       const accessToken = req.query.access_token as string;
-      const refreshToken = req.query.refresh_token as string;
 
       logger.info('MCP /mcp/auth/callback called', {
         pendingId,
         hasAccessToken: !!accessToken,
-        hasRefreshToken: !!refreshToken,
       });
 
       if (!accessToken) {
@@ -334,21 +366,14 @@ export class MCPServer {
         return;
       }
 
-      if (!refreshToken) {
-        res.status(400).send('Missing refresh token. Please try logging in again.');
-        return;
-      }
-
       const result = await this.authProvider.handleAuthCallback({
         pendingId,
         accessToken,
-        refreshToken,
       });
 
       if ('error' in result) {
-        const statusCode = result.error === 'server_error' ? 500
-          : result.error === 'access_denied' ? 403
-          : 400;
+        const statusCode =
+          result.error === 'server_error' ? 500 : result.error === 'access_denied' ? 403 : 400;
         res.status(statusCode).send(result.error_description || result.error);
         return;
       }
@@ -458,13 +483,15 @@ export class MCPServer {
     }
 
     // Kindle routes (registered below after import)
-    import('../routes/kindle.js').then(({ createKindleRouter }) => {
-      const kindleRouter = createKindleRouter();
-      app.use('/api/kindle', kindleRouter);
-      logger.info('Kindle API routes registered at /api/kindle');
-    }).catch((err) => {
-      logger.warn('Kindle routes not loaded:', err.message);
-    });
+    import('../routes/kindle.js')
+      .then(({ createKindleRouter }) => {
+        const kindleRouter = createKindleRouter();
+        app.use('/api/kindle', kindleRouter);
+        logger.info('Kindle API routes registered at /api/kindle');
+      })
+      .catch((err) => {
+        logger.warn('Kindle routes not loaded:', err.message);
+      });
 
     app.post('/refresh-tools', async (_req, res) => {
       try {
@@ -492,9 +519,12 @@ export class MCPServer {
     });
 
     // Periodic cleanup of expired MCP refresh tokens (every 6 hours)
-    setInterval(() => {
-      this.authProvider.cleanupExpiredDatabaseTokens();
-    }, 6 * 60 * 60 * 1000);
+    setInterval(
+      () => {
+        this.authProvider.cleanupExpiredDatabaseTokens();
+      },
+      6 * 60 * 60 * 1000
+    );
 
     // Initialize channel gateway if message handler is configured
     if (this.config.messageHandler) {
@@ -627,10 +657,12 @@ export class MCPServer {
   getToolsVersion(): number {
     return this.toolsVersion;
   }
-
 }
 
-export async function createMCPServer(dataComposer: DataComposer, config?: MCPServerConfig): Promise<MCPServer> {
+export async function createMCPServer(
+  dataComposer: DataComposer,
+  config?: MCPServerConfig
+): Promise<MCPServer> {
   return new MCPServer(dataComposer, config);
 }
 

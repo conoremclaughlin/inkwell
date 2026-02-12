@@ -1,5 +1,4 @@
 import axios, { type AxiosError, type AxiosResponse } from 'axios';
-import { createClient } from '@/lib/supabase/client';
 import { getSelectedWorkspaceId } from '@/lib/workspace-selection';
 
 export interface ApiError extends Error {
@@ -8,7 +7,8 @@ export interface ApiError extends Error {
 }
 
 /**
- * Axios client with automatic Supabase auth injection.
+ * Axios client for API requests.
+ * Auth is injected by middleware — no client-side token handling needed.
  */
 const apiClient = axios.create({
   baseURL: '', // Use relative URLs for Next.js API routes
@@ -17,15 +17,8 @@ const apiClient = axios.create({
   },
 });
 
-// Request interceptor - inject auth token
+// Request interceptor - inject workspace scope header when selected.
 apiClient.interceptors.request.use(async (config) => {
-  const supabase = createClient();
-  const { data: { session } } = await supabase.auth.getSession();
-
-  if (session?.access_token) {
-    config.headers.Authorization = `Bearer ${session.access_token}`;
-  }
-
   const workspaceId = getSelectedWorkspaceId();
   if (workspaceId) {
     config.headers['X-PCP-Workspace-Id'] = workspaceId;
@@ -33,7 +26,6 @@ apiClient.interceptors.request.use(async (config) => {
 
   return config;
 });
-
 // Response interceptor - transform errors
 apiClient.interceptors.response.use(
   (response: AxiosResponse) => response,
