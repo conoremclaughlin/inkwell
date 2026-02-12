@@ -463,6 +463,28 @@ describe('PcpAuthProvider', () => {
       });
     });
 
+    it('should return error for client_id mismatch', async () => {
+      const pendingId = setupPendingAuth(provider);
+      mockSuccessfulAuth();
+
+      const callbackResult = await provider.handleAuthCallback({
+        pendingId,
+        accessToken: 'jwt',
+      });
+      if (!('code' in callbackResult)) return;
+
+      const result = await provider.exchangeAuthorizationCode({
+        code: callbackResult.code,
+        codeVerifier: 'test-verifier',
+        clientId: 'different-client', // doesn't match 'test-client' from setupPendingAuth
+      });
+
+      expect(result).toEqual({
+        error: 'invalid_grant',
+        error_description: 'Client ID mismatch',
+      });
+    });
+
     it('should return error when DB insert fails', async () => {
       const pendingId = setupPendingAuth(provider);
       mockSuccessfulAuth();

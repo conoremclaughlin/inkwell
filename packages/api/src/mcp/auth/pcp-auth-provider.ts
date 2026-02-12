@@ -256,6 +256,14 @@ export class PcpAuthProvider {
 
     // Fall back to the client_id stored in the auth code (from /authorize).
     // Some clients (e.g. Codex) don't send client_id in the token exchange body.
+    // If a different client_id is explicitly provided, reject it.
+    if (params.clientId && params.clientId !== codeData.clientId) {
+      logger.warn('client_id mismatch in code exchange', {
+        expected: codeData.clientId,
+        received: params.clientId,
+      });
+      return { error: 'invalid_grant', error_description: 'Client ID mismatch' };
+    }
     const clientId = params.clientId || codeData.clientId;
 
     // Verify PKCE
