@@ -10,6 +10,7 @@ import { createTableAwareSupabaseMock } from '../../test/table-aware-supabase-mo
 import {
   handleAddArtifactComment,
   handleCreateArtifact,
+  handleGetArtifact,
   handleListArtifactComments,
   handleUpdateArtifact,
 } from './artifact-handlers';
@@ -401,6 +402,129 @@ describe('handleUpdateArtifact', () => {
 describe('artifact comment + identity UUID flows', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it('handleGetArtifact includes comments when includeComments=true', async () => {
+    const supabase = createTableAwareSupabaseMock({
+      artifacts: [
+        {
+          maybeSingle: [{
+            data: {
+              id: '11111111-1111-1111-1111-111111111111',
+              uri: 'pcp://specs/test',
+              title: 'Test Spec',
+              content: '# Spec',
+              content_type: 'text/markdown',
+              artifact_type: 'spec',
+              created_by_agent_id: 'wren',
+              created_by_identity_id: null,
+              collaborators: ['wren', 'lumen'],
+              visibility: 'shared',
+              version: 2,
+              tags: ['memory'],
+              metadata: {},
+              created_at: '2026-02-11T00:00:00Z',
+              updated_at: '2026-02-11T01:00:00Z',
+            },
+            error: null,
+          }],
+        },
+      ],
+      artifact_comments: [
+        {
+          then: {
+            data: [
+              {
+                id: 'comment-1',
+                artifact_id: '11111111-1111-1111-1111-111111111111',
+                parent_comment_id: null,
+                content: 'Love this direction',
+                metadata: {},
+                created_by_agent_id: 'lumen',
+                created_by_identity_id: 'identity-1',
+                created_at: '2026-02-11T02:00:00Z',
+                updated_at: '2026-02-11T02:00:00Z',
+                user_id: '00000000-0000-0000-0000-000000000001',
+                deleted_at: null,
+              },
+            ],
+            error: null,
+          },
+        },
+      ],
+      agent_identities: [
+        {
+          then: {
+            data: [{ id: 'identity-1', agent_id: 'lumen', name: 'Lumen', backend: 'codex' }],
+            error: null,
+          },
+        },
+      ],
+    });
+
+    const result = await handleGetArtifact(
+      {
+        userId: '00000000-0000-0000-0000-000000000001',
+        artifactId: '11111111-1111-1111-1111-111111111111',
+        includeComments: true,
+      },
+      createMockDataComposer(supabase)
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.artifact.commentCount).toBe(1);
+    expect(parsed.artifact.comments[0]).toMatchObject({
+      id: 'comment-1',
+      createdByAgentId: 'lumen',
+      createdByIdentity: {
+        id: 'identity-1',
+        agentId: 'lumen',
+        name: 'Lumen',
+      },
+    });
+  });
+
+  it('handleGetArtifact keeps response lightweight by default (no comments)', async () => {
+    const supabase = createTableAwareSupabaseMock({
+      artifacts: [
+        {
+          maybeSingle: [{
+            data: {
+              id: '11111111-1111-1111-1111-111111111111',
+              uri: 'pcp://specs/test',
+              title: 'Test Spec',
+              content: '# Spec',
+              content_type: 'text/markdown',
+              artifact_type: 'spec',
+              created_by_agent_id: 'wren',
+              created_by_identity_id: null,
+              collaborators: ['wren', 'lumen'],
+              visibility: 'shared',
+              version: 2,
+              tags: ['memory'],
+              metadata: {},
+              created_at: '2026-02-11T00:00:00Z',
+              updated_at: '2026-02-11T01:00:00Z',
+            },
+            error: null,
+          }],
+        },
+      ],
+    });
+
+    const result = await handleGetArtifact(
+      {
+        userId: '00000000-0000-0000-0000-000000000001',
+        artifactId: '11111111-1111-1111-1111-111111111111',
+      },
+      createMockDataComposer(supabase)
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.artifact.comments).toBeUndefined();
+    expect(parsed.artifact.commentCount).toBeUndefined();
   });
 
   it('handleCreateArtifact stores created_by_identity_id and history changed_by_identity_id', async () => {

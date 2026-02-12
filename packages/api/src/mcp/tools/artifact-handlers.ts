@@ -38,6 +38,8 @@ const createArtifactSchema = userIdentifierBaseSchema.extend({
 const getArtifactSchema = userIdentifierBaseSchema.extend({
   uri: z.string().optional().describe('URI of the artifact'),
   artifactId: z.string().uuid().optional().describe('ID of the artifact'),
+  includeComments: z.boolean().optional().default(false).describe('Include comments in the response'),
+  commentLimit: z.number().min(1).max(200).optional().default(50).describe('Max comments when includeComments=true'),
 });
 
 const updateArtifactSchema = userIdentifierBaseSchema.extend({
@@ -241,7 +243,7 @@ export async function handleGetArtifact(
   const parsed = getArtifactSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { uri, artifactId } = parsed;
+  const { uri, artifactId, includeComments = false, commentLimit = 50 } = parsed;
   const query = resolveArtifactForUser(supabase, resolved.user.id, { uri, artifactId });
 
   const { data: artifact, error } = await query.maybeSingle();
@@ -263,6 +265,77 @@ export async function handleGetArtifact(
         },
       ],
     };
+  }
+
+  let comments: Array<{
+    id: string;
+    artifactId: string;
+    parentCommentId: string | null;
+    content: string;
+    metadata: Json | null;
+    createdByAgentId: string | null;
+    createdByIdentityId: string | null;
+    createdByIdentity: { id: string; agentId: string; name: string; backend: string | null } | null;
+    createdAt: string;
+    updatedAt: string;
+  }> = [];
+
+  if (includeComments) {
+    const { data: commentRows, error: commentsError } = await supabase
+      .from('artifact_comments')
+      .select('*')
+      .eq('artifact_id', artifact.id)
+      .eq('user_id', resolved.user.id)
+      .is('deleted_at', null)
+      .order('created_at', { ascending: true })
+      .limit(commentLimit);
+
+    if (commentsError) {
+      throw new Error(`Failed to get artifact comments: ${commentsError.message}`);
+    }
+
+    const identityIds = Array.from(
+      new Set((commentRows || []).map((c) => c.created_by_identity_id).filter(Boolean) as string[])
+    );
+
+    let identitiesById = new Map<string, { id: string; agent_id: string; name: string; backend: string | null }>();
+    if (identityIds.length > 0) {
+      const { data: identities, error: identitiesError } = await supabase
+        .from('agent_identities')
+        .select('id, agent_id, name, backend')
+        .in('id', identityIds);
+
+      if (identitiesError) {
+        throw new Error(`Failed to resolve artifact comment identities: ${identitiesError.message}`);
+      }
+
+      identitiesById = new Map((identities || []).map((identity) => [identity.id, identity]));
+    }
+
+    comments = (commentRows || []).map((comment) => {
+      const identity = comment.created_by_identity_id
+        ? identitiesById.get(comment.created_by_identity_id) ?? null
+        : null;
+      return {
+        id: comment.id,
+        artifactId: comment.artifact_id,
+        parentCommentId: comment.parent_comment_id,
+        content: comment.content,
+        metadata: comment.metadata,
+        createdByAgentId: comment.created_by_agent_id,
+        createdByIdentityId: comment.created_by_identity_id,
+        createdByIdentity: identity
+          ? {
+              id: identity.id,
+              agentId: identity.agent_id,
+              name: identity.name,
+              backend: identity.backend,
+            }
+          : null,
+        createdAt: comment.created_at,
+        updatedAt: comment.updated_at,
+      };
+    });
   }
 
   return {
@@ -287,6 +360,7 @@ export async function handleGetArtifact(
             metadata: artifact.metadata,
             createdAt: artifact.created_at,
             updatedAt: artifact.updated_at,
+            ...(includeComments ? { commentCount: comments.length, comments } : {}),
           },
         }),
       },
@@ -833,7 +907,7 @@ export const artifactToolDefinitions = [
   },
   {
     name: 'get_artifact',
-    description: 'Get an artifact by URI or ID. Returns the full content and metadata.',
+    description: 'Get an artifact by URI or ID. Returns the full content and metadata, with optional comments.',
     schema: getArtifactSchema,
     handler: handleGetArtifact,
   },
