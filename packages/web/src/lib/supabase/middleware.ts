@@ -1,5 +1,6 @@
 import { createServerClient } from '@supabase/ssr';
 import { NextResponse, type NextRequest } from 'next/server';
+import { isAllowedMcpRedirect } from '@/lib/auth/validate-redirect';
 
 export async function updateSession(request: NextRequest) {
   let supabaseResponse = NextResponse.next({
@@ -73,6 +74,15 @@ export async function updateSession(request: NextRequest) {
       });
 
       if (hasTokens) {
+        if (!isAllowedMcpRedirect(mcpRedirect)) {
+          console.log('[middleware] Rejected MCP redirect to untrusted origin:', mcpRedirect);
+          const url = request.nextUrl.clone();
+          url.pathname = '/login';
+          url.searchParams.delete('redirect');
+          url.searchParams.delete('pending_id');
+          url.search = '?error=' + encodeURIComponent('Invalid MCP redirect origin');
+          return NextResponse.redirect(url);
+        }
         console.log('[middleware] Redirecting to MCP callback with tokens');
         const callbackUrl = new URL(mcpRedirect);
         callbackUrl.searchParams.set('pending_id', mcpPendingId);

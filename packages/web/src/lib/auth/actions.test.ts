@@ -57,7 +57,7 @@ describe('auth server actions', () => {
       expect(result).toEqual({ error: 'Invalid login credentials' });
     });
 
-    it('returns mcpRedirectUrl for MCP OAuth flow', async () => {
+    it('returns mcpRedirectUrl for MCP OAuth flow with allowed origin', async () => {
       mockSignInWithPassword.mockResolvedValue({
         data: {
           session: {
@@ -71,16 +71,37 @@ describe('auth server actions', () => {
       const result = await signInWithPassword(
         'user@test.com',
         'password123',
-        'https://example.com/callback',
+        'http://localhost:3001/mcp/auth/callback',
         'pending-123'
       );
 
       expect(result).toHaveProperty('mcpRedirectUrl');
       const url = new URL((result as { mcpRedirectUrl: string }).mcpRedirectUrl);
-      expect(url.origin + url.pathname).toBe('https://example.com/callback');
+      expect(url.origin + url.pathname).toBe('http://localhost:3001/mcp/auth/callback');
       expect(url.searchParams.get('pending_id')).toBe('pending-123');
       expect(url.searchParams.get('access_token')).toBe('test-access-token');
       expect(url.searchParams.get('refresh_token')).toBe('test-refresh-token');
+    });
+
+    it('rejects MCP redirect to untrusted origin', async () => {
+      mockSignInWithPassword.mockResolvedValue({
+        data: {
+          session: {
+            access_token: 'stolen-token',
+            refresh_token: 'stolen-refresh',
+          },
+        },
+        error: null,
+      });
+
+      const result = await signInWithPassword(
+        'user@test.com',
+        'password123',
+        'https://evil.com/steal-tokens',
+        'pending-123'
+      );
+
+      expect(result).toEqual({ error: 'Invalid MCP redirect origin' });
     });
 
     it('returns success (not MCP redirect) when MCP params are null', async () => {

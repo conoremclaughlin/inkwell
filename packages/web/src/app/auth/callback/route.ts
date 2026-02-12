@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
+import { isAllowedMcpRedirect } from '@/lib/auth/validate-redirect';
 
 export async function GET(request: Request) {
   const { searchParams, origin } = new URL(request.url);
@@ -31,7 +32,12 @@ export async function GET(request: Request) {
     if (!exchangeError && data.session) {
       // If this is MCP auth, redirect to MCP callback with access token
       if (isMcpAuth) {
-        const mcpCallbackUrl = new URL(mcpRedirect);
+        if (!isAllowedMcpRedirect(mcpRedirect!)) {
+          return NextResponse.redirect(
+            `${origin}/login?error=${encodeURIComponent('Invalid MCP redirect origin')}`
+          );
+        }
+        const mcpCallbackUrl = new URL(mcpRedirect!);
         mcpCallbackUrl.searchParams.set('pending_id', mcpPendingId!);
         mcpCallbackUrl.searchParams.set('access_token', data.session.access_token);
         mcpCallbackUrl.searchParams.set('refresh_token', data.session.refresh_token);
@@ -51,5 +57,7 @@ export async function GET(request: Request) {
   }
 
   // No code provided
-  return NextResponse.redirect(`${origin}/login?error=${encodeURIComponent('No authentication code provided')}`);
+  return NextResponse.redirect(
+    `${origin}/login?error=${encodeURIComponent('No authentication code provided')}`
+  );
 }

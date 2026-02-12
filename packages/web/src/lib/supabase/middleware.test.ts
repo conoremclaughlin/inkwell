@@ -134,17 +134,43 @@ describe('middleware updateSession', () => {
       });
 
       const request = makeRequest(
-        'http://localhost:3002/login?redirect=https://example.com/callback&pending_id=pending-123'
+        'http://localhost:3002/login?redirect=http://localhost:3001/mcp/auth/callback&pending_id=pending-123'
       );
       const response = await updateSession(request);
 
       expect(response.status).toBe(307);
       const location = response.headers.get('location')!;
       const redirectUrl = new URL(location);
-      expect(redirectUrl.origin + redirectUrl.pathname).toBe('https://example.com/callback');
+      expect(redirectUrl.origin + redirectUrl.pathname).toBe(
+        'http://localhost:3001/mcp/auth/callback'
+      );
       expect(redirectUrl.searchParams.get('pending_id')).toBe('pending-123');
       expect(redirectUrl.searchParams.get('access_token')).toBe('mcp-access-token');
       expect(redirectUrl.searchParams.get('refresh_token')).toBe('mcp-refresh-token');
+    });
+
+    it('rejects MCP redirect to untrusted origin', async () => {
+      mockGetUser.mockResolvedValue({ data: { user: { id: 'user-1' } } });
+      mockGetSession.mockResolvedValue({
+        data: {
+          session: {
+            access_token: 'stolen-token',
+            refresh_token: 'stolen-refresh',
+          },
+        },
+      });
+
+      const request = makeRequest(
+        'http://localhost:3002/login?redirect=https://evil.com/steal&pending_id=pending-123'
+      );
+      const response = await updateSession(request);
+
+      expect(response.status).toBe(307);
+      const location = response.headers.get('location')!;
+      expect(location).toContain('/login');
+      expect(location).toContain('Invalid%20MCP%20redirect%20origin');
+      // Must NOT contain tokens
+      expect(location).not.toContain('stolen-token');
     });
 
     it('lets login page load if tokens are missing in MCP flow', async () => {
@@ -154,7 +180,7 @@ describe('middleware updateSession', () => {
       });
 
       const request = makeRequest(
-        'http://localhost:3002/login?redirect=https://example.com/callback&pending_id=pending-123'
+        'http://localhost:3002/login?redirect=http://localhost:3001/mcp/auth/callback&pending_id=pending-123'
       );
       const response = await updateSession(request);
 
