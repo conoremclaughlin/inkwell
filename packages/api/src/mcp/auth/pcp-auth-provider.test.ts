@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import crypto from 'crypto';
+import jwt from 'jsonwebtoken';
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -42,10 +43,13 @@ vi.mock('@supabase/supabase-js', () => ({
   })),
 }));
 
+const TEST_JWT_SECRET = 'test-jwt-secret-that-is-at-least-32-characters-long';
+
 vi.mock('../../config/env', () => ({
   env: {
     SUPABASE_URL: 'http://localhost:54321',
     SUPABASE_SECRET_KEY: 'test-key',
+    JWT_SECRET: 'test-jwt-secret-that-is-at-least-32-characters-long',
   },
 }));
 
@@ -140,12 +144,20 @@ describe('PcpAuthProvider', () => {
   // =========================================================================
 
   describe('createPendingAuth', () => {
-    it('should return a pendingId starting with "pending-"', () => {
+    it('should return a valid signed JWT', () => {
       const pendingId = setupPendingAuth(provider);
-      expect(pendingId).toMatch(/^pending-/);
+      // JWT format: three base64url segments separated by dots
+      expect(pendingId.split('.')).toHaveLength(3);
+
+      // Should be verifiable with the secret
+      const decoded = jwt.verify(pendingId, TEST_JWT_SECRET) as Record<string, unknown>;
+      expect(decoded.type).toBe('pending_auth');
+      expect(decoded.clientId).toBe('test-client');
+      expect(decoded.redirectUri).toBe('http://localhost:3001/callback');
+      expect(decoded.state).toBe('test-state');
     });
 
-    it('should generate unique IDs for each call', () => {
+    it('should generate unique tokens for each call', () => {
       const id1 = setupPendingAuth(provider);
       const id2 = setupPendingAuth(provider);
       expect(id1).not.toBe(id2);
@@ -301,26 +313,72 @@ describe('PcpAuthProvider', () => {
       expect(insertArgs).toHaveProperty('supabase_refresh_token', 'supabase-rt-required');
     });
 
-    it('should consume the pending auth after successful callback', async () => {
+    it('should accept the same JWT on re-callback (stateless, PKCE prevents replay)', async () => {
       const pendingId = setupPendingAuth(provider);
       mockSuccessfulAuth();
 
-      await provider.handleAuthCallback({
+      const result1 = await provider.handleAuthCallback({
         pendingId,
         accessToken: 'jwt',
         refreshToken: 'rt',
       });
 
-      // Second call with same pendingId should fail
-      const result = await provider.handleAuthCallback({
+      expect('code' in result1).toBe(true);
+
+      // Second call with same pendingId should also succeed (stateless JWT)
+      mockSuccessfulAuth();
+      const result2 = await provider.handleAuthCallback({
         pendingId,
+        accessToken: 'jwt',
+        refreshToken: 'rt',
+      });
+
+      expect('code' in result2).toBe(true);
+    });
+
+    it('should return error for expired JWT', async () => {
+      // Sign a JWT that's already expired
+      const expiredToken = jwt.sign(
+        {
+          type: 'pending_auth',
+          clientId: 'test',
+          codeChallenge: 'ch',
+          redirectUri: 'http://localhost/cb',
+          state: 's',
+        },
+        TEST_JWT_SECRET,
+        { expiresIn: 0 }
+      );
+
+      // Wait a tick so the token is expired
+      await new Promise((r) => setTimeout(r, 10));
+
+      const result = await provider.handleAuthCallback({
+        pendingId: expiredToken,
         accessToken: 'jwt',
         refreshToken: 'rt',
       });
 
       expect(result).toEqual({
         error: 'invalid_request',
-        error_description: 'Invalid or expired authorization request',
+        error_description: 'Authorization request expired',
+      });
+    });
+
+    it('should return error for wrong JWT type', async () => {
+      const wrongTypeToken = jwt.sign({ type: 'wrong_type', clientId: 'test' }, TEST_JWT_SECRET, {
+        expiresIn: 600,
+      });
+
+      const result = await provider.handleAuthCallback({
+        pendingId: wrongTypeToken,
+        accessToken: 'jwt',
+        refreshToken: 'rt',
+      });
+
+      expect(result).toEqual({
+        error: 'invalid_request',
+        error_description: 'Invalid authorization request',
       });
     });
   });

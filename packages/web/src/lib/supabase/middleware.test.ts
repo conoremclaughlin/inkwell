@@ -45,6 +45,8 @@ describe('middleware updateSession', () => {
     mockGetSession.mockResolvedValue({
       data: { session: { access_token: 'test-token-abc' } },
     });
+    // Middleware constructs callback URL from API_URL
+    process.env.API_URL = `http://localhost:${MCP_PORT}`;
   });
 
   describe('auth header injection', () => {
@@ -124,7 +126,7 @@ describe('middleware updateSession', () => {
   });
 
   describe('MCP OAuth flow', () => {
-    it('redirects logged-in user with MCP params to MCP callback', async () => {
+    it('redirects logged-in user with pending_id to MCP callback', async () => {
       mockGetUser.mockResolvedValue({ data: { user: { id: 'user-1' } } });
       mockGetSession.mockResolvedValue({
         data: {
@@ -135,9 +137,7 @@ describe('middleware updateSession', () => {
         },
       });
 
-      const request = makeRequest(
-        `/login?redirect=${encodeURIComponent(MCP_CALLBACK)}&pending_id=pending-123`
-      );
+      const request = makeRequest('/login?pending_id=pending-123');
       const response = await updateSession(request);
 
       expect(response.status).toBe(307);
@@ -149,37 +149,13 @@ describe('middleware updateSession', () => {
       expect(redirectUrl.searchParams.get('refresh_token')).toBe('mcp-refresh-token');
     });
 
-    it('rejects MCP redirect to untrusted origin', async () => {
-      mockGetUser.mockResolvedValue({ data: { user: { id: 'user-1' } } });
-      mockGetSession.mockResolvedValue({
-        data: {
-          session: {
-            access_token: 'stolen-token',
-            refresh_token: 'stolen-refresh',
-          },
-        },
-      });
-
-      const request = makeRequest('/login?redirect=https://evil.com/steal&pending_id=pending-123');
-      const response = await updateSession(request);
-
-      expect(response.status).toBe(307);
-      const location = response.headers.get('location')!;
-      expect(location).toContain('/login');
-      expect(location).toContain('Invalid%20MCP%20redirect%20origin');
-      // Must NOT contain tokens
-      expect(location).not.toContain('stolen-token');
-    });
-
     it('lets login page load if tokens are missing in MCP flow', async () => {
       mockGetUser.mockResolvedValue({ data: { user: { id: 'user-1' } } });
       mockGetSession.mockResolvedValue({
         data: { session: { access_token: 'at' } }, // no refresh_token
       });
 
-      const request = makeRequest(
-        `/login?redirect=${encodeURIComponent(MCP_CALLBACK)}&pending_id=pending-123`
-      );
+      const request = makeRequest('/login?pending_id=pending-123');
       const response = await updateSession(request);
 
       // Should NOT redirect — let login form handle it

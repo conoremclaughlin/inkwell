@@ -34,6 +34,8 @@ import { signInWithPassword, signInWithOtp, signOut } from './actions';
 describe('auth server actions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Actions construct callback URL from API_URL
+    process.env.API_URL = `http://localhost:${MCP_PORT}`;
   });
 
   describe('signInWithPassword', () => {
@@ -61,7 +63,7 @@ describe('auth server actions', () => {
       expect(result).toEqual({ error: 'Invalid login credentials' });
     });
 
-    it('returns mcpRedirectUrl for MCP OAuth flow with allowed origin', async () => {
+    it('returns mcpRedirectUrl for MCP OAuth flow', async () => {
       mockSignInWithPassword.mockResolvedValue({
         data: {
           session: {
@@ -72,12 +74,7 @@ describe('auth server actions', () => {
         error: null,
       });
 
-      const result = await signInWithPassword(
-        'user@test.com',
-        'password123',
-        MCP_CALLBACK,
-        'pending-123'
-      );
+      const result = await signInWithPassword('user@test.com', 'password123', 'pending-123');
 
       expect(result).toHaveProperty('mcpRedirectUrl');
       const url = new URL((result as { mcpRedirectUrl: string }).mcpRedirectUrl);
@@ -87,34 +84,13 @@ describe('auth server actions', () => {
       expect(url.searchParams.get('refresh_token')).toBe('test-refresh-token');
     });
 
-    it('rejects MCP redirect to untrusted origin', async () => {
-      mockSignInWithPassword.mockResolvedValue({
-        data: {
-          session: {
-            access_token: 'stolen-token',
-            refresh_token: 'stolen-refresh',
-          },
-        },
-        error: null,
-      });
-
-      const result = await signInWithPassword(
-        'user@test.com',
-        'password123',
-        'https://evil.com/steal-tokens',
-        'pending-123'
-      );
-
-      expect(result).toEqual({ error: 'Invalid MCP redirect origin' });
-    });
-
     it('returns success (not MCP redirect) when MCP params are null', async () => {
       mockSignInWithPassword.mockResolvedValue({
         data: { session: { access_token: 'at', refresh_token: 'rt' } },
         error: null,
       });
 
-      const result = await signInWithPassword('user@test.com', 'pass', null, null);
+      const result = await signInWithPassword('user@test.com', 'pass', null);
       expect(result).toEqual({ success: true });
     });
   });

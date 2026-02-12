@@ -44,9 +44,8 @@ export default function LoginForm() {
   const [mcpRedirecting, setMcpRedirecting] = useState(false);
 
   // MCP OAuth redirect params
-  const mcpRedirect = searchParams.get('redirect');
   const mcpPendingId = searchParams.get('pending_id');
-  const isMcpAuth = !!(mcpRedirect && mcpPendingId);
+  const isMcpAuth = !!mcpPendingId;
 
   // Check for error in URL params on mount
   useEffect(() => {
@@ -59,18 +58,16 @@ export default function LoginForm() {
         setAuthMode('password');
       }
       // Clear the error from URL without reload (preserve MCP params)
-      const newUrl = isMcpAuth
-        ? `/login?redirect=${encodeURIComponent(mcpRedirect!)}&pending_id=${mcpPendingId}`
-        : '/login';
+      const newUrl = isMcpAuth ? `/login?pending_id=${mcpPendingId}` : '/login';
       window.history.replaceState({}, '', newUrl);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // Run once on mount — searchParams causes infinite loop when URL is modified
 
   const handleMagicLink = async () => {
-    // For MCP auth, include the redirect info in the callback URL
+    // For MCP auth, include the pending_id in the callback URL
     const callbackUrl = isMcpAuth
-      ? `${window.location.origin}/auth/callback?mcp_redirect=${encodeURIComponent(mcpRedirect!)}&mcp_pending_id=${mcpPendingId}`
+      ? `${window.location.origin}/auth/callback?mcp_pending_id=${mcpPendingId}`
       : `${window.location.origin}/auth/callback`;
 
     const result = await signInWithOtp(email, callbackUrl);
@@ -95,7 +92,7 @@ export default function LoginForm() {
   };
 
   const handlePassword = async () => {
-    const result = await signInWithPassword(email, password, mcpRedirect, mcpPendingId);
+    const result = await signInWithPassword(email, password, mcpPendingId);
 
     if ('error' in result) {
       setMessage({ type: 'error', text: getErrorMessage(result.error) });

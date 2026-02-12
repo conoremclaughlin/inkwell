@@ -1,6 +1,5 @@
 import { createServerClient } from '@supabase/ssr';
 import { NextResponse, type NextRequest } from 'next/server';
-import { isAllowedMcpRedirect } from '@/lib/auth/validate-redirect';
 
 export async function updateSession(request: NextRequest) {
   let supabaseResponse = NextResponse.next({
@@ -53,15 +52,14 @@ export async function updateSession(request: NextRequest) {
 
   // Already logged in and trying to access login
   if (user && request.nextUrl.pathname.startsWith('/login')) {
-    const mcpRedirect = request.nextUrl.searchParams.get('redirect');
     const mcpPendingId = request.nextUrl.searchParams.get('pending_id');
 
     console.log('[middleware] User logged in, accessing /login', {
-      hasMcpParams: !!(mcpRedirect && mcpPendingId),
+      hasMcpPendingId: !!mcpPendingId,
       path: request.nextUrl.pathname,
     });
 
-    if (mcpRedirect && mcpPendingId) {
+    if (mcpPendingId) {
       // MCP OAuth flow: user is already logged in — try to redirect straight
       // to the MCP callback with tokens. No login form flash.
       const {
@@ -74,24 +72,16 @@ export async function updateSession(request: NextRequest) {
       });
 
       if (hasTokens) {
-        if (!isAllowedMcpRedirect(mcpRedirect)) {
-          console.log('[middleware] Rejected MCP redirect to untrusted origin:', mcpRedirect);
-          const url = request.nextUrl.clone();
-          url.pathname = '/login';
-          url.searchParams.delete('redirect');
-          url.searchParams.delete('pending_id');
-          url.search = '?error=' + encodeURIComponent('Invalid MCP redirect origin');
-          return NextResponse.redirect(url);
-        }
         console.log('[middleware] Redirecting to MCP callback with tokens');
-        const callbackUrl = new URL(mcpRedirect);
+        const apiUrl =
+          process.env.API_URL || `http://localhost:${process.env.PCP_PORT_BASE || 3001}`;
+        const callbackUrl = new URL(`${apiUrl}/mcp/auth/callback`);
         callbackUrl.searchParams.set('pending_id', mcpPendingId);
         callbackUrl.searchParams.set('access_token', session.access_token);
         callbackUrl.searchParams.set('refresh_token', session.refresh_token);
         return NextResponse.redirect(callbackUrl.toString());
       }
       // Can't get both tokens from middleware — let the login form handle it.
-      // The client-side Supabase client may have better access to the refresh token.
       console.log('[middleware] Missing tokens, letting login form handle MCP flow');
       return supabaseResponse;
     }

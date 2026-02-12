@@ -2,14 +2,12 @@
 
 import { redirect } from 'next/navigation';
 import { createClient } from '@/lib/supabase/server';
-import { isAllowedMcpRedirect } from './validate-redirect';
 
 type AuthResult = { success: true } | { error: string } | { mcpRedirectUrl: string };
 
 export async function signInWithPassword(
   email: string,
   password: string,
-  mcpRedirect?: string | null,
   mcpPendingId?: string | null
 ): Promise<AuthResult> {
   const supabase = await createClient();
@@ -24,11 +22,9 @@ export async function signInWithPassword(
   }
 
   // MCP OAuth flow: build callback URL with tokens
-  if (mcpRedirect && mcpPendingId && data.session) {
-    if (!isAllowedMcpRedirect(mcpRedirect)) {
-      return { error: 'Invalid MCP redirect origin' };
-    }
-    const callbackUrl = new URL(mcpRedirect);
+  if (mcpPendingId && data.session) {
+    const apiUrl = process.env.API_URL || `http://localhost:${process.env.PCP_PORT_BASE || 3001}`;
+    const callbackUrl = new URL(`${apiUrl}/mcp/auth/callback`);
     callbackUrl.searchParams.set('pending_id', mcpPendingId);
     callbackUrl.searchParams.set('access_token', data.session.access_token);
     callbackUrl.searchParams.set('refresh_token', data.session.refresh_token);
