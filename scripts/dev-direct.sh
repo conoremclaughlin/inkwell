@@ -10,11 +10,13 @@ export INIT_CWD="${ROOT_DIR}"
 BASE_PORT="${PCP_PORT_BASE:-3001}"
 WEB_PORT="${WEB_PORT:-$((BASE_PORT + 1))}"
 MYRA_PORT="${MYRA_HTTP_PORT:-$((BASE_PORT + 2))}"
+ENABLE_TELEGRAM="${ENABLE_TELEGRAM:-false}"
 
 echo "Starting direct dev mode"
 echo "  PCP_PORT_BASE=${BASE_PORT}"
 echo "  WEB_PORT=${WEB_PORT}"
 echo "  MYRA_HTTP_PORT=${MYRA_PORT}"
+echo "  ENABLE_TELEGRAM=${ENABLE_TELEGRAM}"
 
 cleanup() {
   if [[ -n "${API_PID:-}" ]]; then kill "${API_PID}" 2>/dev/null || true; fi
@@ -25,6 +27,7 @@ trap cleanup EXIT INT TERM
 (
   PCP_PORT_BASE="${BASE_PORT}" \
   MYRA_HTTP_PORT="${MYRA_PORT}" \
+  ENABLE_TELEGRAM="${ENABLE_TELEGRAM}" \
   ENABLE_WHATSAPP="${ENABLE_WHATSAPP:-false}" \
   ENABLE_DISCORD="${ENABLE_DISCORD:-false}" \
   yarn --cwd "${ROOT_DIR}" workspace @personal-context/api server
