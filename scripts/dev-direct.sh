@@ -6,6 +6,20 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PROJECT_CWD="${ROOT_DIR}"
 export INIT_CWD="${ROOT_DIR}"
 
+# Load root env files so both API + web get a consistent local dev environment.
+if [[ -f "${ROOT_DIR}/.env.local" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${ROOT_DIR}/.env.local"
+  set +a
+fi
+if [[ -f "${ROOT_DIR}/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${ROOT_DIR}/.env"
+  set +a
+fi
+
 # Run API + web directly (no PM2), useful for parallel worktrees.
 BASE_PORT="${PCP_PORT_BASE:-3001}"
 WEB_PORT="${WEB_PORT:-$((BASE_PORT + 1))}"
