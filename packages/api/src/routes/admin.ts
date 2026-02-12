@@ -149,11 +149,9 @@ router.use(adminAuthMiddleware);
  */
 router.get('/workspaces', async (req: Request, res: Response) => {
   try {
-    const authReq = req as Request & { pcpUserId: string; pcpWorkspaceId: string };
+    const authReq = req as AdminAuthRequest;
     const dataComposer = await getDataComposer();
     const workspaceRepo = dataComposer.repositories.workspaceContainers;
-
-    await workspaceRepo.ensurePersonalWorkspace(authReq.pcpUserId);
     const workspaces = await workspaceRepo.listByUser(authReq.pcpUserId, { includeArchived: false });
 
     res.json({
@@ -592,15 +590,18 @@ router.post('/heartbeat', async (_req: Request, res: Response) => {
 
 /**
  * GET /api/admin/reminders
- * List all reminders (admin view)
+ * List reminders for the active user + workspace (admin view)
  */
-router.get('/reminders', async (_req: Request, res: Response) => {
+router.get('/reminders', async (req: Request, res: Response) => {
   try {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const authReq = req as AdminAuthRequest;
 
     const { data, error } = await supabase
       .from('scheduled_reminders')
       .select('*, users(email, first_name)')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .order('next_run_at', { ascending: true })
       .limit(100);
 
@@ -1764,6 +1765,10 @@ router.delete('/connected-accounts/:id', async (req: Request, res: Response) => 
 
 import { getSkillsService, getCloudSkillsService, SkillType } from '../skills';
 
+// Skills registry/installations are currently user-scoped (not workspace-scoped).
+// We still read workspace context from AdminAuthRequest for consistency and for
+// future workspace-level policy expansion.
+
 /**
  * GET /api/admin/skills
  * List all available skills
@@ -1851,7 +1856,7 @@ router.get('/skills/registry', async (req: Request, res: Response) => {
   try {
     const { type, category, search, official, limit, offset } = req.query;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
     const result = await cloudService.browseRegistry(
@@ -1881,7 +1886,7 @@ router.get('/skills/registry/:idOrName', async (req: Request, res: Response) => 
   try {
     const { idOrName } = req.params;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
     const skill = await cloudService.getRegistrySkill(idOrName, authReq.pcpUserId);
@@ -1912,7 +1917,7 @@ router.post('/skills/install', async (req: Request, res: Response) => {
     }
 
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
     const result = await cloudService.installSkill({
@@ -1942,7 +1947,7 @@ router.delete('/skills/install/:skillId', async (req: Request, res: Response) =>
   try {
     const { skillId } = req.params;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
     const result = await cloudService.uninstallSkill(skillId, authReq.pcpUserId);
@@ -1968,7 +1973,7 @@ router.patch('/skills/install/:installationId', async (req: Request, res: Respon
     const { installationId } = req.params;
     const { enabled, versionPinned } = req.body;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
 
@@ -2005,7 +2010,7 @@ router.get('/skills/installed', async (req: Request, res: Response) => {
   try {
     const { type, category, search } = req.query;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
     const result = await cloudService.listAllSkills(authReq.pcpUserId, {
@@ -2031,7 +2036,7 @@ router.get('/skills/installed', async (req: Request, res: Response) => {
  */
 router.post('/skills/publish', async (req: Request, res: Response) => {
   try {
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
     const { name, displayName, description, type, category, tags, emoji, version, manifest, content, repositoryUrl, isPublic } = req.body;
 
     if (!name || !displayName || !description || !type || !version || !content) {
@@ -2074,7 +2079,7 @@ router.post('/skills/publish', async (req: Request, res: Response) => {
 router.patch('/skills/manage/:skillId', async (req: Request, res: Response) => {
   try {
     const { skillId } = req.params;
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
     const { displayName, description, category, tags, emoji, version, manifest, content, changelog } = req.body;
 
     if (!version) {
@@ -2114,7 +2119,7 @@ router.patch('/skills/manage/:skillId', async (req: Request, res: Response) => {
 router.delete('/skills/manage/:skillId', async (req: Request, res: Response) => {
   try {
     const { skillId } = req.params;
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
 
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
     const { SkillsRepository } = await import('../skills/repository.js');
@@ -2138,7 +2143,7 @@ router.delete('/skills/manage/:skillId', async (req: Request, res: Response) => 
 router.post('/skills/manage/:skillId/deprecate', async (req: Request, res: Response) => {
   try {
     const { skillId } = req.params;
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
     const { message } = req.body;
 
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
@@ -2166,7 +2171,7 @@ router.post('/skills/manage/:skillId/deprecate', async (req: Request, res: Respo
 router.post('/skills/manage/:skillId/fork', async (req: Request, res: Response) => {
   try {
     const { skillId } = req.params;
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
     const { name, displayName, description, category, tags } = req.body;
 
     if (!name) {

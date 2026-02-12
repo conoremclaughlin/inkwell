@@ -148,7 +148,8 @@ export function mergeWithContext<T extends Record<string, unknown>>(
 ): T & { userId?: string; email?: string; platform?: string; platformId?: string; workspaceId?: string } {
   const ctx = getUserFromContext();
   const reqCtx = getRequestContext();
-  if (!ctx && !reqCtx?.workspaceId) {
+  const sessCtx = getSessionContext();
+  if (!ctx && !reqCtx?.workspaceId && !sessCtx?.workspaceId) {
     return args as T & { userId?: string; email?: string; platform?: string; platformId?: string; workspaceId?: string };
   }
 
@@ -159,7 +160,7 @@ export function mergeWithContext<T extends Record<string, unknown>>(
     email: (args.email as string | undefined) ?? ctx?.email,
     platform: (args.platform as string | undefined) ?? ctx?.platform,
     platformId: (args.platformId as string | undefined) ?? ctx?.platformId,
-    workspaceId: (args.workspaceId as string | undefined) ?? reqCtx?.workspaceId,
+    workspaceId: (args.workspaceId as string | undefined) ?? reqCtx?.workspaceId ?? sessCtx?.workspaceId,
   };
 
   return merged as T & { userId?: string; email?: string; platform?: string; platformId?: string; workspaceId?: string };

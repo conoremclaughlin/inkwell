@@ -258,18 +258,6 @@ const userIdentifierFields = {
   platformId: z.string().optional().describe('Platform-specific user ID or username'),
 };
 
-const artifactToolsByName = new Map(
-  artifactToolDefinitions.map((definition) => [definition.name, definition])
-);
-
-function getArtifactToolSchema(name: string) {
-  const definition = artifactToolsByName.get(name);
-  if (!definition) {
-    throw new Error(`Artifact tool definition not found: ${name}`);
-  }
-  return definition.schema;
-}
-
 export function registerAllTools(server: McpServer, dataComposer: DataComposer): void {
   // ---------------------------------------------------------------------------
   // Timing diagnostics — wraps every tool handler to log execution time.

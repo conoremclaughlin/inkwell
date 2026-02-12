@@ -57,6 +57,9 @@ function getPcpServerUrl(): string {
 
 async function fetchPcp(path: string, options?: RequestInit): Promise<Response> {
   const url = `${getPcpServerUrl()}${path}`;
+  // Intentionally no Authorization header here:
+  // CLI workspace selection currently goes through MCP tool calls (`/api/mcp/call`)
+  // that resolve user context from explicit args (email/userId), matching other sb CLI commands.
   return fetch(url, {
     ...options,
     headers: {

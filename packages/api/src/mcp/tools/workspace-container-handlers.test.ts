@@ -4,6 +4,8 @@ import {
   listWorkspaceContainersSchema,
   handleCreateWorkspaceContainer,
   handleListWorkspaceContainers,
+  handleGetWorkspaceContainer,
+  handleUpdateWorkspaceContainer,
 } from './workspace-container-handlers';
 
 vi.mock('../../services/user-resolver', async (importOriginal) => {
@@ -115,5 +117,73 @@ describe('workspace-container handlers', () => {
     expect(mockDataComposer.repositories.workspaceContainers.ensurePersonalWorkspace).toHaveBeenCalledWith('user-123');
     expect(mockDataComposer.repositories.workspaceContainers.listByUser).toHaveBeenCalled();
   });
-});
 
+  it('get handler returns workspace when found', async () => {
+    mockDataComposer.repositories.workspaceContainers.findById.mockResolvedValue({
+      id: 'ws-1',
+      userId: 'user-123',
+      name: 'PCP Team',
+      slug: 'pcp-team',
+      type: 'team',
+      description: null,
+      metadata: {},
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      archivedAt: null,
+    });
+
+    const result = await handleGetWorkspaceContainer(
+      { email: 'test@test.com', workspaceId: '11111111-1111-1111-1111-111111111111' },
+      mockDataComposer as never,
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.workspace.id).toBe('ws-1');
+  });
+
+  it('get handler returns error when workspace is missing', async () => {
+    mockDataComposer.repositories.workspaceContainers.findById.mockResolvedValue(null);
+
+    const result = await handleGetWorkspaceContainer(
+      { email: 'test@test.com', workspaceId: '11111111-1111-1111-1111-111111111111' },
+      mockDataComposer as never,
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toBe('Workspace not found');
+    expect(result.isError).toBe(true);
+  });
+
+  it('update handler updates workspace fields', async () => {
+    mockDataComposer.repositories.workspaceContainers.update.mockResolvedValue({
+      id: 'ws-1',
+      userId: 'user-123',
+      name: 'PCP Team Updated',
+      slug: 'pcp-team-updated',
+      type: 'team',
+      description: 'new desc',
+      metadata: { hello: 'world' },
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-02T00:00:00.000Z',
+      archivedAt: null,
+    });
+
+    const result = await handleUpdateWorkspaceContainer(
+      {
+        email: 'test@test.com',
+        workspaceId: '11111111-1111-1111-1111-111111111111',
+        name: 'PCP Team Updated',
+        description: 'new desc',
+        metadata: { hello: 'world' },
+      },
+      mockDataComposer as never,
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.workspace.name).toBe('PCP Team Updated');
+    expect(mockDataComposer.repositories.workspaceContainers.update).toHaveBeenCalled();
+  });
+});
