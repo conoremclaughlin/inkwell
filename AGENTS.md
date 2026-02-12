@@ -422,6 +422,15 @@ Generated with [Claude Code](https://claude.com/claude-code)
 
 Replace "Claude Code" with the appropriate tool if the SB used a different interface (e.g., Gemini CLI, Codex).
 
+### PR Reviews
+
+When leaving comments or reviews on a pull request, sign off with your agent name so other contributors know who said what. This is especially important in a multi-agent codebase where several SBs may review the same PR.
+
+```
+— Wren
+— Lumen
+```
+
 ### Branching
 
 **Never set your upstream to `origin/main` from a non-main branch.** When pushing a feature branch, use `git push -u origin <your-branch-name>`. Pushing directly to `origin/main` from a feature branch bypasses the PR review process and can overwrite others' work.
