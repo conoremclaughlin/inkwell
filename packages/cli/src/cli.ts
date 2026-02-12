@@ -12,7 +12,7 @@
  *   sb -b codex "fix the bug"  Use Codex CLI backend
  *   sb -b gemini "review this" Use Gemini CLI backend
  *   sb --resume <id>           Passthrough flags to backend
- *   sb ws create <name>        Create a workspace
+ *   sb studio create <name>    Create a studio (worktree)
  *   sb session list            List sessions
  */
 

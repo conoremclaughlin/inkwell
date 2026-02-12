@@ -878,7 +878,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
         expiresAt: z.string().datetime().optional().describe('Optional expiration date (ISO 8601)'),
         agentId: z.string().optional().describe('Which AI being created this memory (e.g., "wren", "benson"). Null = shared memory.'),
-        workspaceId: z.string().uuid().optional().describe('Workspace ID — helps auto-attach the correct session in parallel worktree scenarios. Stored in metadata.'),
+        studioId: z.string().uuid().optional().describe('Studio ID — helps auto-attach the correct session in parallel worktree scenarios. Stored in metadata.'),
+        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
       },
     },
     async (args) => {
@@ -991,15 +992,17 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Start a new AI session. Sessions track work done across a conversation and can be logged to.
 
-If workspaceId is provided, the session is scoped to that workspace — allowing multiple active sessions per agent (one per workspace). Read workspaceId from .pcp/identity.json if available.
+If studioId is provided, the session is scoped to that studio — allowing multiple active sessions per agent (one per studio). Read studioId from .pcp/identity.json if available.
+workspaceId is accepted as a deprecated alias.
 
-If an active session already exists for this agent+workspace, it is returned instead of creating a new one.
+If an active session already exists for this agent+studio, it is returned instead of creating a new one.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
         agentId: z.string().optional().describe('Agent identifier (e.g., "claude-code", "telegram-myra")'),
-        workspaceId: z.string().uuid().optional().describe('Workspace ID to scope this session to. Allows multiple active sessions per agent (one per workspace). Read from .pcp/identity.json.'),
+        studioId: z.string().uuid().optional().describe('Studio ID to scope this session to. Allows multiple active sessions per agent (one per studio). Read from .pcp/identity.json.'),
+        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
         metadata: z.record(z.unknown()).optional().describe('Session metadata'),
       },
     },
@@ -1027,7 +1030,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         ...userIdentifierFields,
         sessionId: z.string().uuid().optional().describe('Session ID (uses active session if not provided)'),
         agentId: z.string().optional().describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
-        workspaceId: z.string().uuid().optional().describe('Workspace ID for session resolution when sessionId not provided'),
+        studioId: z.string().uuid().optional().describe('Studio ID for session resolution when sessionId not provided'),
+        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
         content: z.string().describe('Log entry content'),
         salience: z.enum(['low', 'medium', 'high', 'critical']).optional().describe('Importance (default: medium)'),
       },
@@ -1051,14 +1055,16 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `End a session with an optional summary. The summary is automatically saved as a high-salience memory.
 
-Session resolution: sessionId (explicit) > agentId+workspaceId (scoped) > most recent active (fallback).
+Session resolution: sessionId (explicit) > agentId+studioId (scoped) > most recent active (fallback).
+workspaceId is accepted as a deprecated alias.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
         sessionId: z.string().uuid().optional().describe('Session ID (uses active session if not provided)'),
         agentId: z.string().optional().describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
-        workspaceId: z.string().uuid().optional().describe('Workspace ID for session resolution when sessionId not provided'),
+        studioId: z.string().uuid().optional().describe('Studio ID for session resolution when sessionId not provided'),
+        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
         summary: z.string().optional().describe('End-of-session summary (saved as memory)'),
       },
     },
@@ -1086,7 +1092,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         ...userIdentifierFields,
         sessionId: z.string().uuid().optional().describe('Session ID (returns active session if not provided)'),
         agentId: z.string().optional().describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
-        workspaceId: z.string().uuid().optional().describe('Workspace ID for session resolution when sessionId not provided'),
+        studioId: z.string().uuid().optional().describe('Studio ID for session resolution when sessionId not provided'),
+        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
         includeLogs: z.boolean().optional().describe('Include session logs (default: false)'),
       },
     },
@@ -1113,7 +1120,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       inputSchema: {
         ...userIdentifierFields,
         agentId: z.string().optional().describe('Filter by agent'),
-        workspaceId: z.string().uuid().optional().describe('Filter by workspace'),
+        studioId: z.string().uuid().optional().describe('Filter by studio'),
+        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
         limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
       },
     },
@@ -1136,8 +1144,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Update your session state — work phase, status, backend session ID, context. This is the primary tool for managing session state.
 
-Session resolution: sessionId (explicit) > workspaceId (scoped lookup) > most recent active session.
-For parallel worktrees, pass workspaceId to target the correct session.
+Session resolution: sessionId (explicit) > studioId (scoped lookup) > most recent active session.
+For parallel worktrees, pass studioId to target the correct session.
+workspaceId is accepted as a deprecated alias.
 
 Phase: Communicates real-time work status to other agents.
 - Active work phases (no auto-memory): investigating, implementing, reviewing
@@ -1150,7 +1159,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       inputSchema: {
         ...userIdentifierFields,
         sessionId: z.string().uuid().optional().describe('Session ID (uses active session if not provided). Most reliable for targeting a specific session.'),
-        workspaceId: z.string().uuid().optional().describe('Workspace ID for session resolution when sessionId is not provided. Useful for parallel worktree scenarios.'),
+        studioId: z.string().uuid().optional().describe('Studio ID for session resolution when sessionId is not provided. Useful for parallel worktree scenarios.'),
+        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
         phase: z.string().optional().describe('Work phase (e.g., "implementing", "blocked:awaiting-input", "waiting:build")'),
         note: z.string().optional().describe('Context for the phase transition (included in auto-created memory for blocked/waiting)'),
         agentId: z.string().optional().describe('Agent identity for memory attribution'),
@@ -1314,7 +1324,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         ...userIdentifierFields,
         sessionId: z.string().uuid().optional().describe('Session ID to compact (uses active session if not provided)'),
         agentId: z.string().optional().describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
-        workspaceId: z.string().uuid().optional().describe('Workspace ID for session resolution when sessionId not provided'),
+        studioId: z.string().uuid().optional().describe('Studio ID for session resolution when sessionId not provided'),
+        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
         minSalience: z.enum(['low', 'medium', 'high', 'critical']).optional()
           .describe('Minimum salience to include (default: medium)'),
         preserveLogs: z.boolean().optional().describe('Keep original logs visible after compaction (default: false). Note: Logs are always soft-deleted for audit trail.'),

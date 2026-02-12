@@ -92,7 +92,32 @@ function createMockDataComposer() {
 // =====================================================
 
 describe('startSessionSchema', () => {
-  it('should accept workspaceId as optional UUID', () => {
+  it('should accept studioId as optional UUID', () => {
+    const result = startSessionSchema.safeParse({
+      email: 'test@test.com',
+      agentId: 'wren',
+      studioId: '550e8400-e29b-41d4-a716-446655440000',
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.studioId).toBe('550e8400-e29b-41d4-a716-446655440000');
+    }
+  });
+
+  it('should accept request without studioId', () => {
+    const result = startSessionSchema.safeParse({
+      email: 'test@test.com',
+      agentId: 'wren',
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.studioId).toBeUndefined();
+    }
+  });
+
+  it('should accept deprecated workspaceId alias', () => {
     const result = startSessionSchema.safeParse({
       email: 'test@test.com',
       agentId: 'wren',
@@ -100,28 +125,13 @@ describe('startSessionSchema', () => {
     });
 
     expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.data.workspaceId).toBe('550e8400-e29b-41d4-a716-446655440000');
-    }
   });
 
-  it('should accept request without workspaceId (backward compat)', () => {
+  it('should reject non-UUID studioId', () => {
     const result = startSessionSchema.safeParse({
       email: 'test@test.com',
       agentId: 'wren',
-    });
-
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.data.workspaceId).toBeUndefined();
-    }
-  });
-
-  it('should reject non-UUID workspaceId', () => {
-    const result = startSessionSchema.safeParse({
-      email: 'test@test.com',
-      agentId: 'wren',
-      workspaceId: 'not-a-uuid',
+      studioId: 'not-a-uuid',
     });
 
     expect(result.success).toBe(false);
@@ -130,7 +140,7 @@ describe('startSessionSchema', () => {
   it('should still require user identification', () => {
     const result = startSessionSchema.safeParse({
       agentId: 'wren',
-      workspaceId: '550e8400-e29b-41d4-a716-446655440000',
+      studioId: '550e8400-e29b-41d4-a716-446655440000',
     });
 
     // The base schema allows resolution by userId, email, phone, or platform+platformId
@@ -140,19 +150,19 @@ describe('startSessionSchema', () => {
 });
 
 describe('listSessionsSchema', () => {
-  it('should accept workspaceId as optional UUID', () => {
+  it('should accept studioId as optional UUID', () => {
     const result = listSessionsSchema.safeParse({
       email: 'test@test.com',
-      workspaceId: '550e8400-e29b-41d4-a716-446655440000',
+      studioId: '550e8400-e29b-41d4-a716-446655440000',
     });
 
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(result.data.workspaceId).toBe('550e8400-e29b-41d4-a716-446655440000');
+      expect(result.data.studioId).toBe('550e8400-e29b-41d4-a716-446655440000');
     }
   });
 
-  it('should accept request without workspaceId', () => {
+  it('should accept request without studioId', () => {
     const result = listSessionsSchema.safeParse({
       email: 'test@test.com',
       agentId: 'wren',
@@ -160,30 +170,39 @@ describe('listSessionsSchema', () => {
 
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(result.data.workspaceId).toBeUndefined();
+      expect(result.data.studioId).toBeUndefined();
     }
   });
 
-  it('should accept both agentId and workspaceId together', () => {
+  it('should accept both agentId and studioId together', () => {
     const result = listSessionsSchema.safeParse({
       email: 'test@test.com',
       agentId: 'wren',
-      workspaceId: '550e8400-e29b-41d4-a716-446655440000',
+      studioId: '550e8400-e29b-41d4-a716-446655440000',
       limit: 10,
     });
 
     expect(result.success).toBe(true);
     if (result.success) {
       expect(result.data.agentId).toBe('wren');
-      expect(result.data.workspaceId).toBe('550e8400-e29b-41d4-a716-446655440000');
+      expect(result.data.studioId).toBe('550e8400-e29b-41d4-a716-446655440000');
       expect(result.data.limit).toBe(10);
     }
   });
 
-  it('should reject non-UUID workspaceId', () => {
+  it('should accept deprecated workspaceId alias', () => {
     const result = listSessionsSchema.safeParse({
       email: 'test@test.com',
-      workspaceId: 'invalid',
+      workspaceId: '550e8400-e29b-41d4-a716-446655440000',
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it('should reject non-UUID studioId', () => {
+    const result = listSessionsSchema.safeParse({
+      email: 'test@test.com',
+      studioId: 'invalid',
     });
 
     expect(result.success).toBe(false);
@@ -241,7 +260,7 @@ describe('updateSessionPhaseSchema', () => {
       context: 'Working on session phase tests',
       workingDir: '/Users/test/project',
       agentId: 'wren',
-      workspaceId: '550e8400-e29b-41d4-a716-446655440099',
+      studioId: '550e8400-e29b-41d4-a716-446655440099',
     });
 
     expect(result.success).toBe(true);
@@ -318,6 +337,7 @@ describe('handleUpdateSessionPhase', () => {
     id: 'session-123',
     email: 'test@test.com',
     agentId: 'wren',
+    studioId: undefined,
     workspaceId: undefined,
     currentPhase: undefined,
     startedAt: new Date('2026-02-10T10:00:00Z'),
@@ -390,7 +410,38 @@ describe('handleUpdateSessionPhase', () => {
       expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith('user-123', 'wren', undefined);
     });
 
-    it('should resolve session by workspaceId when sessionId not provided', async () => {
+    it('should resolve session by studioId when sessionId not provided', async () => {
+      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockUpdatedSession);
+
+      const studioId = '550e8400-e29b-41d4-a716-446655440099';
+      await handleUpdateSessionPhase(
+        { email: 'test@test.com', phase: 'implementing', agentId: 'wren', studioId },
+        mockDataComposer as never
+      );
+
+      expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith('user-123', 'wren', studioId);
+    });
+
+    it('should prefer sessionId over studioId for resolution', async () => {
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockUpdatedSession);
+
+      const sessionId = '550e8400-e29b-41d4-a716-446655440000';
+      const studioId = '550e8400-e29b-41d4-a716-446655440099';
+      await handleUpdateSessionPhase(
+        { email: 'test@test.com', phase: 'reviewing', sessionId, studioId },
+        mockDataComposer as never
+      );
+
+      // When sessionId is provided, getActiveSession should NOT be called
+      expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
+      expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
+        sessionId,
+        expect.objectContaining({ currentPhase: 'reviewing' })
+      );
+    });
+
+    it('should support deprecated workspaceId alias for session resolution', async () => {
       mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockUpdatedSession);
 
@@ -401,24 +452,6 @@ describe('handleUpdateSessionPhase', () => {
       );
 
       expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith('user-123', 'wren', workspaceId);
-    });
-
-    it('should prefer sessionId over workspaceId for resolution', async () => {
-      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockUpdatedSession);
-
-      const sessionId = '550e8400-e29b-41d4-a716-446655440000';
-      const workspaceId = '550e8400-e29b-41d4-a716-446655440099';
-      await handleUpdateSessionPhase(
-        { email: 'test@test.com', phase: 'reviewing', sessionId, workspaceId },
-        mockDataComposer as never
-      );
-
-      // When sessionId is provided, getActiveSession should NOT be called
-      expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
-      expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
-        sessionId,
-        expect.objectContaining({ currentPhase: 'reviewing' })
-      );
     });
   });
 
@@ -938,6 +971,7 @@ describe('handleUpdateSessionPhase', () => {
     it('should include session info in response', async () => {
       const sessionWithWorkspace = {
         ...mockSession,
+        studioId: 'workspace-abc',
         workspaceId: 'workspace-abc',
         currentPhase: 'implementing',
       };
@@ -952,6 +986,7 @@ describe('handleUpdateSessionPhase', () => {
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.session.id).toBe('session-123');
       expect(parsed.session.agentId).toBe('wren');
+      expect(parsed.session.studioId).toBe('workspace-abc');
       expect(parsed.session.workspaceId).toBe('workspace-abc');
       expect(parsed.session.currentPhase).toBe('implementing');
     });

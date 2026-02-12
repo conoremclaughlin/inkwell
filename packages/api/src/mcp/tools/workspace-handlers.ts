@@ -220,8 +220,10 @@ export async function handleCreateWorkspace(args: unknown, dataComposer: DataCom
     message: `Workspace created at ${worktreePath}`,
     workspace: {
       id: workspace.id,
+      studioId: workspace.id,
       agentId: workspace.agentId,
       branch: workspace.branch,
+      worktreeFolder: path.basename(workspace.worktreePath),
       worktreePath: workspace.worktreePath,
       repoRoot: workspace.repoRoot,
       baseBranch: workspace.baseBranch,
@@ -263,8 +265,11 @@ export async function handleListWorkspaces(args: unknown, dataComposer: DataComp
     count: workspaces.length,
     workspaces: workspaces.map((w) => ({
       id: w.id,
+      studioId: w.id,
       agentId: w.agentId,
       branch: w.branch,
+      worktreePath: w.worktreePath,
+      worktreeFolder: path.basename(w.worktreePath),
       path: w.worktreePath,
       purpose: w.purpose,
       status: w.status,
@@ -300,8 +305,10 @@ export async function handleGetWorkspace(args: unknown, dataComposer: DataCompos
   return successResponse({
     workspace: {
       id: workspace.id,
+      studioId: workspace.id,
       agentId: workspace.agentId,
       branch: workspace.branch,
+      worktreeFolder: path.basename(workspace.worktreePath),
       worktreePath: workspace.worktreePath,
       repoRoot: workspace.repoRoot,
       baseBranch: workspace.baseBranch,
@@ -354,8 +361,10 @@ export async function handleUpdateWorkspace(args: unknown, dataComposer: DataCom
     message: 'Workspace updated',
     workspace: {
       id: updated.id,
+      studioId: updated.id,
       agentId: updated.agentId,
       branch: updated.branch,
+      worktreeFolder: path.basename(updated.worktreePath),
       worktreePath: updated.worktreePath,
       purpose: updated.purpose,
       status: updated.status,
@@ -475,8 +484,10 @@ export async function handleAdoptWorkspace(args: unknown, dataComposer: DataComp
     message: `Workspace adopted by ${agentId} and linked to session ${sessionId}`,
     workspace: {
       id: updated.id,
+      studioId: updated.id,
       agentId: updated.agentId,
       branch: updated.branch,
+      worktreeFolder: path.basename(updated.worktreePath),
       worktreePath: updated.worktreePath,
       purpose: updated.purpose,
       status: updated.status,
