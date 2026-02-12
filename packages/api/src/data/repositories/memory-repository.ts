@@ -198,6 +198,8 @@ export class MemoryRepository {
     };
     const scopedStudioId = input.studioId ?? input.workspaceId;
     if (scopedStudioId !== undefined) {
+      insertData.studio_id = scopedStudioId;
+      // Backward compatibility for older server versions still reading workspace_id.
       insertData.workspace_id = scopedStudioId;
     }
 
@@ -307,10 +309,10 @@ export class MemoryRepository {
   /**
    * Get active session for a user (most recent without ended_at).
    *
-   * studioId/workspaceId behavior:
-   *   - undefined: don't filter by studio/workspace (backward compat — finds any active session)
-   *   - null: match sessions with no studio/workspace
-   *   - string: match that specific studio/workspace
+   * studioId behavior:
+   *   - undefined: don't filter by studio (find any active session)
+   *   - null: match sessions with no studio
+   *   - string: match that specific studio
    */
   async getActiveSession(userId: string, agentId?: string, studioId?: string | null): Promise<Session | null> {
     let query = this.supabase
@@ -327,9 +329,9 @@ export class MemoryRepository {
 
     if (studioId !== undefined) {
       if (studioId === null) {
-        query = query.is('workspace_id', null);
+        query = query.is('studio_id', null);
       } else {
-        query = query.eq('workspace_id', studioId);
+        query = query.eq('studio_id', studioId);
       }
     }
 
@@ -389,7 +391,7 @@ export class MemoryRepository {
 
     const scopedStudioId = options.studioId ?? options.workspaceId;
     if (scopedStudioId) {
-      query = query.eq('workspace_id', scopedStudioId);
+      query = query.eq('studio_id', scopedStudioId);
     }
 
     const limit = options.limit || 20;
@@ -693,7 +695,7 @@ export class MemoryRepository {
   }
 
   private rowToSession(row: SessionRow): Session {
-    const studioId = row.workspace_id || undefined;
+    const studioId = row.studio_id || row.workspace_id || undefined;
     return {
       id: row.id,
       userId: row.user_id,

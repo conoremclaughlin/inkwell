@@ -137,6 +137,7 @@ export interface SessionRow {
   id: string;
   user_id: string;
   agent_id: string | null;
+  studio_id: string | null;
   workspace_id: string | null;
   current_phase: string | null;
   started_at: string;
