@@ -207,12 +207,45 @@ describe('PcpAuthProvider', () => {
       });
     });
 
-    it('should return error when PCP user not found', async () => {
+    it('should auto-create PCP user when not found and return auth code', async () => {
+      const pendingId = setupPendingAuth(provider);
+      mockGetUser.mockResolvedValue({
+        data: { user: { email: 'new@example.com' } },
+        error: null,
+      });
+
+      // First from('users') call: SELECT returns PGRST116 (not found)
+      // Second from('users') call: INSERT returns the new user
+      let userCallCount = 0;
+      const selectChain = mockChain(null, { code: 'PGRST116' });
+      const insertChain = mockChain({ id: 'new-user-123', email: 'new@example.com' });
+      const originalFrom = vi.mocked(provider['supabase'].from);
+      originalFrom.mockImplementation((table: string) => {
+        if (table === 'users') {
+          userCallCount++;
+          return userCallCount === 1 ? selectChain : insertChain;
+        }
+        if (table === 'mcp_tokens') return currentMcpTokensChain;
+        return mockChain();
+      });
+
+      const result = await provider.handleAuthCallback({
+        pendingId,
+        accessToken: 'jwt',
+        refreshToken: 'rt',
+      });
+
+      expect(result).toHaveProperty('code');
+      expect(result).toHaveProperty('redirectUri');
+    });
+
+    it('should return error when auto-create fails', async () => {
       const pendingId = setupPendingAuth(provider);
       mockGetUser.mockResolvedValue({
         data: { user: { email: 'unknown@example.com' } },
         error: null,
       });
+      // Mock returns PGRST116 for both SELECT and INSERT (chain is shared)
       currentUserChain = mockChain(null, { code: 'PGRST116' });
 
       const result = await provider.handleAuthCallback({
@@ -222,8 +255,8 @@ describe('PcpAuthProvider', () => {
       });
 
       expect(result).toEqual({
-        error: 'access_denied',
-        error_description: 'User not found in PCP system',
+        error: 'server_error',
+        error_description: 'Failed to create user account',
       });
     });
 

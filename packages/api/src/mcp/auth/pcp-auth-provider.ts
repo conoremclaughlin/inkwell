@@ -79,7 +79,16 @@ export class PcpAuthProvider {
   private supabase: SupabaseClient<Database>;
 
   constructor() {
-    this.supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    this.supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: {
+        // CRITICAL: persistSession must be false in server contexts.
+        // Without this, auth.refreshSession() stores a user session internally,
+        // causing subsequent PostgREST queries to use that user's JWT instead of
+        // the service role key — which subjects them to RLS and breaks lookups.
+        autoRefreshToken: false,
+        persistSession: false,
+      },
+    });
   }
 
   // --------------------------------------------------------------------------
