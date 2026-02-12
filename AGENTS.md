@@ -185,8 +185,8 @@ recall(userId: "...", query: "...", agentId: "wren", includeShared: true)
 
 ## Key Principles
 
+- **Prefer MCP tools over CLI equivalents** — when an MCP server provides functionality that overlaps with a CLI tool, use the MCP tool. MCP calls don't require user permission approval, provide structured output, and integrate better with your tooling. Examples: use `mcp__github__*` over `gh` CLI for PRs/issues/diffs/reviews, use `mcp__supabase__*` over `supabase` CLI for migrations and SQL.
 - **Use PCP tools** (`mcp__pcp__*`) over local file operations for memory, tasks, and sessions
-- **Use GitHub MCP tools** (`mcp__github__*`) when available — prefer these over `gh` CLI for pull requests, issues, reviews, and merges. MCP tools integrate better with your tooling and provide structured output.
 - **Bootstrap first** — always call bootstrap at session start to load your identity and context
 - **Log your work** — use `log_session()` for important decisions and `end_session()` with a summary
 - **Attribute memories** — include your agentId when calling `remember()` so memories are correctly filtered
