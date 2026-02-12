@@ -16,8 +16,7 @@ import {
   MessageSquare,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { createClient } from '@/lib/supabase/client';
-import { useRouter } from 'next/navigation';
+import { signOut } from '@/lib/auth/actions';
 
 const navigation = [
   { name: 'Dashboard', href: '/', icon: Home },
@@ -34,13 +33,6 @@ const navigation = [
 
 export function Sidebar() {
   const pathname = usePathname();
-  const router = useRouter();
-
-  const handleSignOut = async () => {
-    const supabase = createClient();
-    await supabase.auth.signOut();
-    router.push('/login');
-  };
 
   return (
     <div className="flex h-full w-64 flex-col bg-gray-900">
@@ -71,7 +63,7 @@ export function Sidebar() {
         </ul>
         <div className="px-3 pb-4">
           <button
-            onClick={handleSignOut}
+            onClick={() => signOut()}
             className="group flex w-full gap-x-3 rounded-md p-3 text-sm font-semibold leading-6 text-gray-400 hover:bg-gray-800 hover:text-white"
           >
             <LogOut className="h-6 w-6 shrink-0" />

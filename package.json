@@ -37,7 +37,8 @@
     "test": "yarn workspaces run test",
     "lint": "yarn workspaces run lint",
     "type-check": "yarn workspaces run type-check",
-    "clean": "yarn workspaces run clean && rm -rf node_modules && pm2 delete all"
+    "clean": "yarn workspaces run clean && rm -rf node_modules && pm2 delete all",
+    "prepare": "husky"
   },
   "engines": {
     "node": ">=18.0.0",
@@ -57,7 +58,13 @@
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "pm2": "^6.0.14"
+    "husky": "^9.1.7",
+    "lint-staged": "^16.2.7",
+    "pm2": "^6.0.14",
+    "prettier": "^3.8.1"
+  },
+  "lint-staged": {
+    "*.{ts,tsx,js,jsx,json,css,md}": "prettier --write"
   },
   "packageManager": "yarn@4.12.0"
 }

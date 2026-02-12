@@ -7,17 +7,15 @@ export async function updateSession(request: NextRequest) {
   });
 
   const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    process.env.SUPABASE_URL!,
+    process.env.SUPABASE_PUBLISHABLE_KEY!,
     {
       cookies: {
         getAll() {
           return request.cookies.getAll();
         },
         setAll(cookiesToSet: { name: string; value: string; options?: Record<string, unknown> }[]) {
-          cookiesToSet.forEach(({ name, value }) =>
-            request.cookies.set(name, value)
-          );
+          cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value));
           supabaseResponse = NextResponse.next({
             request,
           });
@@ -39,7 +37,8 @@ export async function updateSession(request: NextRequest) {
 
   // Protected routes - redirect to login if not authenticated
   // Exclude: /login, /auth, /api (proxied to backend), /kindle/[token] (public landing)
-  const isProtectedRoute = !request.nextUrl.pathname.startsWith('/login') &&
+  const isProtectedRoute =
+    !request.nextUrl.pathname.startsWith('/login') &&
     !request.nextUrl.pathname.startsWith('/auth') &&
     !request.nextUrl.pathname.startsWith('/api') &&
     !request.nextUrl.pathname.match(/^\/kindle\/[^/]+$/);
@@ -64,7 +63,9 @@ export async function updateSession(request: NextRequest) {
     if (mcpRedirect && mcpPendingId) {
       // MCP OAuth flow: user is already logged in — try to redirect straight
       // to the MCP callback with tokens. No login form flash.
-      const { data: { session } } = await supabase.auth.getSession();
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
       const hasTokens = !!(session?.access_token && session?.refresh_token);
       console.log('[middleware] MCP flow, session tokens:', {
         hasAccessToken: !!session?.access_token,
@@ -90,6 +91,33 @@ export async function updateSession(request: NextRequest) {
     const url = request.nextUrl.clone();
     url.pathname = '/';
     return NextResponse.redirect(url);
+  }
+
+  // Inject auth header for proxied API routes (admin, chat, kindle)
+  // Skip /api/auth/* (internal Next.js routes, not proxied)
+  const path = request.nextUrl.pathname;
+  if (path.startsWith('/api/') && !path.startsWith('/api/auth/')) {
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+    if (session?.access_token) {
+      // Clone the request headers and add Authorization
+      const requestHeaders = new Headers(request.headers);
+      requestHeaders.set('Authorization', `Bearer ${session.access_token}`);
+
+      const response = NextResponse.next({
+        request: {
+          headers: requestHeaders,
+        },
+      });
+
+      // Copy session-refresh cookies from supabaseResponse
+      supabaseResponse.cookies.getAll().forEach((cookie) => {
+        response.cookies.set(cookie.name, cookie.value, cookie);
+      });
+
+      return response;
+    }
   }
 
   return supabaseResponse;

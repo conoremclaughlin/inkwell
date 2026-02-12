@@ -1,5 +1,4 @@
 import axios, { type AxiosError, type AxiosResponse } from 'axios';
-import { createClient } from '@/lib/supabase/client';
 
 export interface ApiError extends Error {
   status: number;
@@ -7,25 +6,14 @@ export interface ApiError extends Error {
 }
 
 /**
- * Axios client with automatic Supabase auth injection.
+ * Axios client for API requests.
+ * Auth is injected by middleware — no client-side token handling needed.
  */
 const apiClient = axios.create({
   baseURL: '', // Use relative URLs for Next.js API routes
   headers: {
     'Content-Type': 'application/json',
   },
-});
-
-// Request interceptor - inject auth token
-apiClient.interceptors.request.use(async (config) => {
-  const supabase = createClient();
-  const { data: { session } } = await supabase.auth.getSession();
-
-  if (session?.access_token) {
-    config.headers.Authorization = `Bearer ${session.access_token}`;
-  }
-
-  return config;
 });
 
 // Response interceptor - transform errors

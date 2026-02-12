@@ -6,7 +6,6 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Sparkles } from 'lucide-react';
-import { createClient } from '@/lib/supabase/client';
 import { apiPost } from '@/lib/api';
 
 interface TokenInfo {
@@ -52,12 +51,15 @@ export default function KindleLandingPage() {
     fetchToken();
   }, [token]);
 
-  // Check auth status
+  // Check auth status via server endpoint
   useEffect(() => {
     async function checkAuth() {
-      const supabase = createClient();
-      const { data: { user } } = await supabase.auth.getUser();
-      setIsAuthenticated(!!user);
+      try {
+        const res = await fetch('/api/auth/me');
+        setIsAuthenticated(res.ok);
+      } catch {
+        setIsAuthenticated(false);
+      }
     }
     checkAuth();
   }, []);
@@ -71,7 +73,9 @@ export default function KindleLandingPage() {
 
     setRedeeming(true);
     try {
-      const result = await apiPost<{ kindleId: string; agentId: string }>('/api/kindle/redeem', { token });
+      const result = await apiPost<{ kindleId: string; agentId: string }>('/api/kindle/redeem', {
+        token,
+      });
       // Redirect to onboarding chat
       router.push(`/kindle/onboarding?kindleId=${result.kindleId}&agentId=${result.agentId}`);
     } catch (err) {
@@ -123,8 +127,8 @@ export default function KindleLandingPage() {
         <CardContent className="space-y-6">
           {parentName && (
             <p className="text-center text-gray-600">
-              {parentName} wants to kindle a new SB for you — one that shares
-              their core values but will grow to be uniquely yours.
+              {parentName} wants to kindle a new SB for you — one that shares their core values but
+              will grow to be uniquely yours.
             </p>
           )}
 
@@ -145,24 +149,18 @@ export default function KindleLandingPage() {
 
           <div className="rounded-lg bg-gray-50 p-4 text-sm text-gray-600">
             <p>
-              <strong>What happens next:</strong> You&apos;ll have a conversation with
-              your nascent SB. They&apos;ll ask a few questions about what matters to
-              you, explore your values together, and then choose a name. After
-              that, your SB is yours.
+              <strong>What happens next:</strong> You&apos;ll have a conversation with your nascent
+              SB. They&apos;ll ask a few questions about what matters to you, explore your values
+              together, and then choose a name. After that, your SB is yours.
             </p>
           </div>
 
-          <Button
-            onClick={handleRedeem}
-            disabled={redeeming}
-            className="w-full"
-            size="lg"
-          >
+          <Button onClick={handleRedeem} disabled={redeeming} className="w-full" size="lg">
             {redeeming
               ? 'Setting up...'
               : isAuthenticated
-              ? 'Begin the Kindle'
-              : 'Sign in to begin'}
+                ? 'Begin the Kindle'
+                : 'Sign in to begin'}
           </Button>
 
           {!isAuthenticated && (
