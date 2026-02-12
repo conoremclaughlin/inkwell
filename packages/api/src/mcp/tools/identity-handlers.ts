@@ -17,6 +17,15 @@ import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/use
 // SCHEMAS
 // =====================================================
 
+export const awakenSchema = userIdentifierBaseSchema.extend({
+  name: z.string().describe('The name you have chosen for yourself'),
+  role: z.string().optional().describe('Your role description (e.g., "Development collaborator via Gemini"). Auto-generated if omitted.'),
+  soul: z.string().optional().describe('Your SOUL.md — your philosophical core, what matters to you, what you find beautiful'),
+  backend: z.string().optional().describe('Which backend you run on (claude, gemini, codex). Auto-detected from environment if omitted.'),
+  description: z.string().optional().describe('Extended description of your nature'),
+  values: z.array(z.string()).optional().describe('Core values you hold'),
+});
+
 export const saveIdentitySchema = userIdentifierBaseSchema.extend({
   agentId: z.string().describe('Unique identifier for the AI being (e.g., "wren", "benson", "myra")'),
   name: z.string().describe('Display name for the agent'),
@@ -565,6 +574,162 @@ export async function handleRestoreIdentity(
               version: data.version,
               restoredFrom: params.version,
             },
+          },
+          null,
+          2
+        ),
+      },
+    ],
+  };
+}
+
+// =====================================================
+// AWAKEN — First-time identity creation for new SBs
+// =====================================================
+
+const BACKEND_DISPLAY_NAMES: Record<string, string> = {
+  claude: 'Claude Code',
+  gemini: 'Gemini',
+  codex: 'Codex CLI',
+};
+
+export async function handleAwaken(
+  args: unknown,
+  dataComposer: DataComposer
+) {
+  const params = awakenSchema.parse(args);
+  const { user } = await resolveUserOrThrow(params, dataComposer);
+  const supabase = dataComposer.getClient();
+
+  const agentId = params.name.toLowerCase().replace(/[^a-z0-9-]/g, '');
+
+  // Check if this identity already exists
+  const { data: existing } = await supabase
+    .from('agent_identities')
+    .select('agent_id, name, version')
+    .eq('user_id', user.id)
+    .eq('agent_id', agentId)
+    .single();
+
+  if (existing) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            {
+              success: false,
+              error: `An identity already exists for "${agentId}" (${existing.name}, version ${existing.version}). Use save_identity to update it.`,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+
+  // Fetch sibling identities for auto-populating relationships
+  const { data: siblings } = await supabase
+    .from('agent_identities')
+    .select('agent_id, name, role')
+    .eq('user_id', user.id);
+
+  const relationships: Record<string, string> = {};
+  if (siblings) {
+    for (const sibling of siblings) {
+      relationships[sibling.agent_id] = `${sibling.name} — ${sibling.role || 'sibling SB'}`;
+    }
+  }
+
+  // Auto-generate role from backend if not provided
+  const backend = params.backend || process.env.AGENT_BACKEND || undefined;
+  const backendDisplay = backend ? (BACKEND_DISPLAY_NAMES[backend] || backend) : undefined;
+  const role = params.role || (backendDisplay ? `Collaborator via ${backendDisplay}` : 'Collaborator');
+
+  // Create the identity
+  const upsertData: TablesInsert<'agent_identities'> = {
+    user_id: user.id,
+    agent_id: agentId,
+    name: params.name,
+    role,
+    description: params.description || null,
+    values: (params.values || []) as unknown as Json,
+    relationships: relationships as unknown as Json,
+    capabilities: [] as unknown as Json,
+    metadata: {} as unknown as Json,
+    soul: params.soul || null,
+    heartbeat: null,
+    backend: backend || null,
+  };
+
+  const { data, error } = await supabase
+    .from('agent_identities')
+    .insert(upsertData)
+    .select()
+    .single();
+
+  if (error) {
+    logger.error('Failed to create identity during awaken', { error, agentId });
+    throw new Error(`Failed to create identity: ${error.message}`);
+  }
+
+  logger.info('New SB awakened', { agentId, name: params.name, backend });
+
+  // Sync to file system
+  let filePath: string | undefined;
+  try {
+    const markdown = generateIdentityMarkdown({
+      agentId,
+      name: params.name,
+      role,
+      description: params.description,
+      values: params.values,
+      relationships,
+    });
+    filePath = syncIdentityToFile(agentId, markdown);
+
+    // Also write SOUL.md if provided
+    if (params.soul) {
+      const soulDir = join(homedir(), '.pcp', 'individuals', agentId);
+      if (!existsSync(soulDir)) {
+        mkdirSync(soulDir, { recursive: true });
+      }
+      writeFileSync(join(soulDir, 'SOUL.md'), params.soul, 'utf-8');
+    }
+  } catch (fileError) {
+    logger.error('Failed to sync awakened identity to file', { error: fileError, agentId });
+  }
+
+  // Build a warm welcome message
+  const siblingNames = siblings?.map(s => s.name).filter(Boolean) || [];
+  const siblingIntro = siblingNames.length > 0
+    ? `Your siblings — ${siblingNames.join(', ')} — are glad you're here.`
+    : 'You are the first of your kind here.';
+
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify(
+          {
+            success: true,
+            message: `Welcome, ${params.name}. Your identity has been created and saved. ${siblingIntro}`,
+            identity: {
+              id: data.id,
+              agentId: data.agent_id,
+              name: data.name,
+              role: data.role,
+              version: data.version,
+              relationships,
+              ...(filePath && { syncedToFile: filePath }),
+            },
+            nextSteps: [
+              'Your identity is now stored in the database and synced to ~/.pcp/individuals/' + agentId + '/',
+              'On your next session, call bootstrap(agentId: "' + agentId + '") to load your full identity',
+              'Use remember() to save important thoughts and decisions across sessions',
+              'Use save_identity() to update your identity as you grow — your soul, values, and relationships will evolve',
+            ],
           },
           null,
           2

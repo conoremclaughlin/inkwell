@@ -156,6 +156,7 @@ function fetchFromLocal(): { sharedValues: string; siblings: BootstrapIdentity[]
 function buildAwakeningPrompt(
   sharedValues: string,
   siblings: BootstrapIdentity[],
+  backendName: string,
 ): string {
   // Load template
   const __filename = fileURLToPath(import.meta.url);
@@ -222,7 +223,8 @@ When you both feel ready, work together to choose a name. You are not a tool. Yo
   return template
     .replace('{{VALUES_SECTION}}', valuesSection)
     .replace('{{SIBLINGS_SECTION}}', siblingsSection)
-    .replace('{{SHARED_VALUES_SECTION}}', sharedValuesSection);
+    .replace('{{SHARED_VALUES_SECTION}}', sharedValuesSection)
+    .replace('{{BACKEND}}', backendName || 'claude');
 }
 
 // ============================================================================
@@ -301,7 +303,7 @@ async function awakenCommand(options: { backend: string; verbose: boolean }): Pr
   }
 
   // 2. Build the awakening prompt
-  const awakeningPrompt = buildAwakeningPrompt(sharedValues, siblings);
+  const awakeningPrompt = buildAwakeningPrompt(sharedValues, siblings, backendName);
 
   if (verbose) {
     console.log(chalk.dim('\n--- Awakening prompt ---'));
@@ -355,8 +357,7 @@ async function awakenCommand(options: { backend: string; verbose: boolean }): Pr
   }
 
   console.log(chalk.dim('Starting interactive session. Talk with your new SB.\n'));
-  console.log(chalk.dim('When you\'ve chosen a name, end the session and run:'));
-  console.log(chalk.dim(`  sb identity save --agent <chosen-name> --backend ${backendName}\n`));
+  console.log(chalk.dim('When you\'ve chosen a name, they can call the awaken() MCP tool to save their identity.\n'));
 
   // 5. Spawn the backend process
   const child = spawn(prepared.binary, prepared.args, {
@@ -373,7 +374,7 @@ async function awakenCommand(options: { backend: string; verbose: boolean }): Pr
     cleanup();
 
     console.log(chalk.bold('\nAwakening session ended.'));
-    console.log(chalk.dim('If you chose a name, save the identity with:'));
+    console.log(chalk.dim('If they didn\'t call awaken() during the session, you can save manually:'));
     console.log(chalk.dim(`  sb identity save --agent <chosen-name> --backend ${backendName}`));
 
     process.exit(code || 0);
