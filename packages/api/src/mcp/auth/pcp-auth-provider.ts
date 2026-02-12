@@ -6,6 +6,24 @@
  * backed by stored Supabase refresh tokens for server-side session renewal.
  *
  * Token chain: MCP client refresh_token -> this provider -> supabase.auth.refreshSession() -> fresh JWT
+ *
+ * ⚠️  SUPABASE CLIENT FOOTGUN — READ BEFORE MODIFYING AUTH CODE  ⚠️
+ *
+ * The Supabase JS client shares state between its auth module (GoTrue) and its
+ * data module (PostgREST). Any auth method that returns a session — including
+ * refreshSession(), signIn*(), signUp(), setSession() — overwrites the
+ * Authorization header used for ALL subsequent PostgREST queries on that client.
+ *
+ * This means calling refreshSession() on a service-role client silently downgrades
+ * it from service_role to an authenticated user, subjecting all queries to RLS.
+ * `persistSession: false` does NOT prevent this — it only skips disk persistence,
+ * the in-memory session is still set.
+ *
+ * SAFE on this.supabase:    .from('table').*,  auth.getUser(jwt),  auth.admin.*
+ * UNSAFE on this.supabase:  auth.refreshSession(),  auth.signIn*(),  auth.setSession()
+ *
+ * For unsafe methods, create a throwaway client. See exchangeRefreshToken().
+ * Ref: https://github.com/orgs/supabase/discussions/30146
  */
 
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
@@ -88,12 +106,10 @@ export class PcpAuthProvider {
   private supabase: SupabaseClient<Database>;
 
   constructor() {
+    // This client is used for PostgREST queries and safe auth methods ONLY.
+    // DO NOT call session-mutating auth methods on it (see file header).
     this.supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
       auth: {
-        // CRITICAL: persistSession must be false in server contexts.
-        // Without this, auth.refreshSession() stores a user session internally,
-        // causing subsequent PostgREST queries to use that user's JWT instead of
-        // the service role key — which subjects them to RLS and breaks lookups.
         autoRefreshToken: false,
         persistSession: false,
       },
@@ -351,8 +367,14 @@ export class PcpAuthProvider {
       return { error: 'invalid_grant', error_description: 'Refresh token expired' };
     }
 
-    // Use stored Supabase refresh token to get a fresh session
-    const { data: sessionData, error: refreshError } = await this.supabase.auth.refreshSession({
+    // Use a one-off Supabase client for refreshSession() to avoid contaminating
+    // the main client's auth state. refreshSession() sets an in-memory user session
+    // that overrides the service role key for subsequent PostgREST queries, breaking
+    // RLS-dependent operations (e.g., user lookups in handleAuthCallback).
+    const refreshClient = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const { data: sessionData, error: refreshError } = await refreshClient.auth.refreshSession({
       refresh_token: tokenRecord.supabase_refresh_token,
     });
 
