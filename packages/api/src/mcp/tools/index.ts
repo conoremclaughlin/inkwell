@@ -2193,6 +2193,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Update an artifact. Automatically versions the content and tracks who made changes.
 
+Supports three-way merge: pass baseVersion (the version you read before editing) to enable automatic merging when another agent has edited the artifact since you read it. If changes don't overlap, they merge cleanly. If they conflict, you'll get structured conflict details and should re-read and retry.
+
+Omit baseVersion for legacy last-write-wins behavior (not recommended for collaborative editing).
+
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: artifactToolDefinitions[2].schema,
     },

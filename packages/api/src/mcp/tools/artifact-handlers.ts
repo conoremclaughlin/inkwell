@@ -6,6 +6,7 @@
  */
 
 import { z } from 'zod';
+import { merge as diff3Merge, diff3Merge as diff3MergeRegions } from 'node-diff3';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
@@ -43,6 +44,7 @@ const updateArtifactSchema = userIdentifierBaseSchema.extend({
   artifactId: z.string().uuid().optional().describe('ID of the artifact to update'),
   title: z.string().optional().describe('New title'),
   content: z.string().optional().describe('New content'),
+  baseVersion: z.number().int().optional().describe('Version this edit is based on. When provided, enables three-way merge: if the artifact has been modified since this version, the server will attempt to merge changes automatically. Omit for legacy last-write-wins behavior.'),
   agentId: z.string().optional().describe('Agent making the update'),
   collaborators: z.array(z.string()).optional().describe('Updated collaborator list'),
   tags: z.array(z.string()).optional().describe('Updated tags'),
@@ -233,7 +235,7 @@ export async function handleUpdateArtifact(
   const parsed = updateArtifactSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { uri, artifactId, title, content, agentId, collaborators, tags, changeSummary } = parsed;
+  const { uri, artifactId, title, content, baseVersion, agentId, collaborators, tags, changeSummary } = parsed;
 
   if (!uri && !artifactId) {
     throw new Error('Must provide either uri or artifactId');
@@ -261,6 +263,96 @@ export async function handleUpdateArtifact(
     }
   }
 
+  // Three-way merge logic when content is being updated and baseVersion is provided
+  let finalContent = content;
+  let mergePerformed = false;
+
+  if (content !== undefined && baseVersion !== undefined && baseVersion !== current.version) {
+    // Version mismatch — attempt three-way merge
+    logger.info('Version mismatch detected, attempting three-way merge', {
+      uri: current.uri,
+      baseVersion,
+      currentVersion: current.version,
+      agentId,
+    });
+
+    // Fetch the base version content from history
+    const { data: baseHistory, error: historyError } = await supabase
+      .from('artifact_history')
+      .select('content')
+      .eq('artifact_id', current.id)
+      .eq('version', baseVersion)
+      .single();
+
+    if (historyError || !baseHistory?.content) {
+      throw new Error(
+        `Cannot merge: base version ${baseVersion} not found in history. ` +
+        `Current version is ${current.version}. Re-read the artifact and try again.`
+      );
+    }
+
+    const baseContent = baseHistory.content;
+    const currentContent = current.content || '';
+    const incomingContent = content;
+
+    // Run three-way merge: merge(a, o, b) where a=incoming, o=base, b=current
+    // Use line-based splitting for markdown documents
+    const mergeOptions = {
+      excludeFalseConflicts: true,
+      stringSeparator: /\n/,
+    };
+    const mergeResult = diff3Merge(incomingContent, baseContent, currentContent, mergeOptions);
+
+    if (mergeResult.conflict) {
+      // Merge failed — return conflict details so the agent can resolve
+      const regions = diff3MergeRegions(incomingContent, baseContent, currentContent, mergeOptions);
+
+      const conflicts = regions
+        .filter((r): r is { conflict: { a: string[]; b: string[]; o: string[] } } => 'conflict' in r && r.conflict !== undefined)
+        .map((r) => ({
+          yours: r.conflict.a.join('\n'),
+          theirs: r.conflict.b.join('\n'),
+          original: r.conflict.o.join('\n'),
+        }));
+
+      logger.warn('Three-way merge conflict', {
+        uri: current.uri,
+        baseVersion,
+        currentVersion: current.version,
+        conflictCount: conflicts.length,
+        agentId,
+      });
+
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: false,
+              conflict: true,
+              message: `Merge conflict: ${conflicts.length} conflicting region(s). Both you and another editor modified the same sections since version ${baseVersion}. Re-read the artifact (now at version ${current.version}) and retry your edit.`,
+              currentVersion: current.version,
+              baseVersion,
+              conflicts,
+            }),
+          },
+        ],
+      };
+    }
+
+    // Clean merge — use the merged result
+    // node-diff3 splits on newlines and returns lines without separators, so rejoin with \n
+    finalContent = mergeResult.result.join('\n');
+    mergePerformed = true;
+
+    logger.info('Three-way merge succeeded', {
+      uri: current.uri,
+      baseVersion,
+      currentVersion: current.version,
+      agentId,
+    });
+  }
+
   const newVersion = (current.version ?? 0) + 1;
 
   // Build update object
@@ -275,22 +367,56 @@ export async function handleUpdateArtifact(
   };
 
   if (title !== undefined) updates.title = title;
-  if (content !== undefined) updates.content = content;
+  if (finalContent !== undefined) updates.content = finalContent;
   if (collaborators !== undefined) updates.collaborators = collaborators;
   if (tags !== undefined) updates.tags = tags;
+
+  // CAS (compare-and-swap) guard: only write if version hasn't changed since we read it.
+  // This prevents true race conditions where two concurrent writers both pass the
+  // merge check but then one silently overwrites the other.
+  const expectedVersion = current.version ?? 0;
 
   const { data: updated, error: updateError } = await supabase
     .from('artifacts')
     .update(updates)
     .eq('id', current.id)
+    .eq('version', expectedVersion)
     .select()
-    .single();
+    .maybeSingle();
 
   if (updateError) {
     throw new Error(`Failed to update artifact: ${updateError.message}`);
   }
 
+  // No row updated — another writer won the race
+  if (!updated) {
+    logger.warn('CAS conflict: artifact version changed during update', {
+      uri: current.uri,
+      expectedVersion,
+      agentId,
+    });
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({
+            success: false,
+            conflict: true,
+            staleWrite: true,
+            message: 'Artifact was modified by another writer during your update. Re-read the artifact and retry your edit with the new baseVersion.',
+          }),
+        },
+      ],
+    };
+  }
+
   // Create history entry for this update
+  const changeType = mergePerformed ? 'merge' : 'update';
+  const mergeSummary = mergePerformed
+    ? `Auto-merged with version ${current.version} (base: ${baseVersion}). ${changeSummary || ''}`
+    : changeSummary || null;
+
   await supabase.from('artifact_history').insert({
     artifact_id: current.id,
     version: newVersion,
@@ -298,11 +424,11 @@ export async function handleUpdateArtifact(
     content: updated.content,
     changed_by_agent_id: agentId || null,
     changed_by_user_id: agentId ? null : resolved.user.id,
-    change_type: 'update',
-    change_summary: changeSummary || null,
+    change_type: changeType,
+    change_summary: mergeSummary,
   });
 
-  logger.info('Artifact updated', { uri: current.uri, version: updated.version, agentId });
+  logger.info('Artifact updated', { uri: current.uri, version: updated.version, agentId, mergePerformed });
 
   return {
     content: [
@@ -310,7 +436,7 @@ export async function handleUpdateArtifact(
         type: 'text' as const,
         text: JSON.stringify({
           success: true,
-          message: 'Artifact updated',
+          message: mergePerformed ? 'Artifact updated (auto-merged)' : 'Artifact updated',
           artifact: {
             id: updated.id,
             uri: updated.uri,
@@ -319,6 +445,8 @@ export async function handleUpdateArtifact(
             updatedAt: updated.updated_at,
           },
           previousVersion: current.version,
+          mergePerformed,
+          ...(mergePerformed ? { mergedFromBase: baseVersion } : {}),
         }),
       },
     ],
@@ -468,7 +596,7 @@ export const artifactToolDefinitions = [
   {
     name: 'update_artifact',
     description:
-      'Update an artifact. Automatically versions the content and tracks who made changes.',
+      'Update an artifact. Supports three-way merge via baseVersion parameter to prevent data loss during concurrent edits. Pass baseVersion (from the version you read) to enable auto-merge.',
     schema: updateArtifactSchema,
     handler: handleUpdateArtifact,
   },
