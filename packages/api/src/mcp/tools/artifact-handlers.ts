@@ -7,10 +7,11 @@
 
 import { z } from 'zod';
 import { merge as diff3Merge, diff3Merge as diff3MergeRegions } from 'node-diff3';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
-import type { Json } from '../../data/supabase/types';
+import type { Database, Json } from '../../data/supabase/types';
 
 // ============== Schemas ==============
 
@@ -65,6 +66,79 @@ const getArtifactHistorySchema = userIdentifierBaseSchema.extend({
   limit: z.number().min(1).max(50).optional().default(10).describe('Max history entries'),
 });
 
+const addArtifactCommentSchema = userIdentifierBaseSchema.extend({
+  uri: z.string().optional().describe('URI of the artifact'),
+  artifactId: z.string().uuid().optional().describe('ID of the artifact'),
+  content: z.string().min(1).describe('Comment text'),
+  agentId: z.string().optional().describe('Agent authoring the comment'),
+  parentCommentId: z.string().uuid().optional().describe('Optional parent comment ID for threading'),
+  metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
+});
+
+const listArtifactCommentsSchema = userIdentifierBaseSchema.extend({
+  uri: z.string().optional().describe('URI of the artifact'),
+  artifactId: z.string().uuid().optional().describe('ID of the artifact'),
+  limit: z.number().min(1).max(200).optional().default(100).describe('Max comments to return'),
+});
+
+// ============== Helpers ==============
+
+async function resolveIdentityForAgent(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  agentId?: string
+) {
+  if (!agentId) return null;
+
+  const { data, error } = await supabase
+    .from('agent_identities')
+    .select('id, agent_id, name, backend')
+    .eq('user_id', userId)
+    .eq('agent_id', agentId)
+    .maybeSingle();
+
+  if (error) {
+    logger.warn('Failed to resolve identity UUID for agent slug; continuing with slug-only reference', {
+      userId,
+      agentId,
+      error: error.message,
+    });
+    return null;
+  }
+
+  if (!data) {
+    logger.warn('No identity row found for agent slug; continuing with slug-only reference', {
+      userId,
+      agentId,
+    });
+    return null;
+  }
+
+  return data;
+}
+
+function resolveArtifactForUser(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  params: { uri?: string; artifactId?: string },
+  selectColumns = '*'
+) {
+  const { uri, artifactId } = params;
+  if (!uri && !artifactId) {
+    throw new Error('Must provide either uri or artifactId');
+  }
+
+  let query = supabase.from('artifacts').select(selectColumns).eq('user_id', userId);
+
+  if (uri) {
+    query = query.eq('uri', uri);
+  } else if (artifactId) {
+    query = query.eq('id', artifactId);
+  }
+
+  return query;
+}
+
 // ============== Handlers ==============
 
 export async function handleCreateArtifact(
@@ -86,6 +160,7 @@ export async function handleCreateArtifact(
     tags = [],
     metadata = {},
   } = parsed;
+  const authorIdentity = await resolveIdentityForAgent(supabase, resolved.user.id, agentId);
 
   // Check if URI already exists
   const { data: existing } = await supabase
@@ -104,6 +179,7 @@ export async function handleCreateArtifact(
       uri,
       user_id: resolved.user.id,
       created_by_agent_id: agentId || null,
+      created_by_identity_id: authorIdentity?.id || null,
       title,
       content,
       artifact_type: artifactType,
@@ -128,6 +204,7 @@ export async function handleCreateArtifact(
     title,
     content,
     changed_by_agent_id: agentId || null,
+    changed_by_identity_id: authorIdentity?.id || null,
     changed_by_user_id: agentId ? null : resolved.user.id,
     change_type: 'create',
     change_summary: 'Initial creation',
@@ -165,18 +242,7 @@ export async function handleGetArtifact(
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const { uri, artifactId } = parsed;
-
-  if (!uri && !artifactId) {
-    throw new Error('Must provide either uri or artifactId');
-  }
-
-  let query = supabase.from('artifacts').select('*').eq('user_id', resolved.user.id);
-
-  if (uri) {
-    query = query.eq('uri', uri);
-  } else if (artifactId) {
-    query = query.eq('id', artifactId);
-  }
+  const query = resolveArtifactForUser(supabase, resolved.user.id, { uri, artifactId });
 
   const { data: artifact, error } = await query.maybeSingle();
 
@@ -213,6 +279,7 @@ export async function handleGetArtifact(
             contentType: artifact.content_type,
             artifactType: artifact.artifact_type,
             createdByAgentId: artifact.created_by_agent_id,
+            createdByIdentityId: artifact.created_by_identity_id,
             collaborators: artifact.collaborators,
             visibility: artifact.visibility,
             version: artifact.version,
@@ -236,19 +303,10 @@ export async function handleUpdateArtifact(
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const { uri, artifactId, title, content, baseVersion, agentId, collaborators, tags, changeSummary } = parsed;
-
-  if (!uri && !artifactId) {
-    throw new Error('Must provide either uri or artifactId');
-  }
+  const editorIdentity = await resolveIdentityForAgent(supabase, resolved.user.id, agentId);
 
   // First, get the current artifact
-  let query = supabase.from('artifacts').select('*').eq('user_id', resolved.user.id);
-
-  if (uri) {
-    query = query.eq('uri', uri);
-  } else if (artifactId) {
-    query = query.eq('id', artifactId);
-  }
+  const query = resolveArtifactForUser(supabase, resolved.user.id, { uri, artifactId });
 
   const { data: current, error: fetchError } = await query.single();
 
@@ -423,6 +481,7 @@ export async function handleUpdateArtifact(
     title: updated.title,
     content: updated.content,
     changed_by_agent_id: agentId || null,
+    changed_by_identity_id: editorIdentity?.id || null,
     changed_by_user_id: agentId ? null : resolved.user.id,
     change_type: changeType,
     change_summary: mergeSummary,
@@ -523,18 +582,13 @@ export async function handleGetArtifactHistory(
 
   const { uri, artifactId, limit = 10 } = parsed;
 
-  if (!uri && !artifactId) {
-    throw new Error('Must provide either uri or artifactId');
-  }
-
   // First get the artifact to verify ownership
-  let artifactQuery = supabase.from('artifacts').select('id').eq('user_id', resolved.user.id);
-
-  if (uri) {
-    artifactQuery = artifactQuery.eq('uri', uri);
-  } else if (artifactId) {
-    artifactQuery = artifactQuery.eq('id', artifactId);
-  }
+  const artifactQuery = resolveArtifactForUser(
+    supabase,
+    resolved.user.id,
+    { uri, artifactId },
+    'id'
+  );
 
   const { data: artifact, error: artifactError } = await artifactQuery.single();
 
@@ -566,11 +620,201 @@ export async function handleGetArtifactHistory(
             version: h.version,
             title: h.title,
             changedByAgentId: h.changed_by_agent_id,
+            changedByIdentityId: h.changed_by_identity_id,
             changedByUserId: h.changed_by_user_id,
             changeType: h.change_type,
             changeSummary: h.change_summary,
             createdAt: h.created_at,
           })),
+        }),
+      },
+    ],
+  };
+}
+
+export async function handleAddArtifactComment(
+  args: unknown,
+  dataComposer: DataComposer
+) {
+  const supabase = dataComposer.getClient();
+  const parsed = addArtifactCommentSchema.parse(args);
+  const resolved = await resolveUserOrThrow(parsed, dataComposer);
+
+  const { uri, artifactId, content, agentId, parentCommentId, metadata = {} } = parsed;
+  const trimmed = content.trim();
+  if (!trimmed) {
+    throw new Error('Comment content cannot be empty');
+  }
+
+  const { data: artifact, error: artifactError } = await resolveArtifactForUser(
+    supabase,
+    resolved.user.id,
+    { uri, artifactId }
+  ).single();
+
+  if (artifactError) {
+    throw new Error(`Artifact not found: ${uri || artifactId}`);
+  }
+
+  if (parentCommentId) {
+    const { data: parent, error: parentError } = await supabase
+      .from('artifact_comments')
+      .select('id')
+      .eq('id', parentCommentId)
+      .eq('artifact_id', artifact.id)
+      .eq('user_id', resolved.user.id)
+      .maybeSingle();
+
+    if (parentError || !parent) {
+      throw new Error(`Parent comment not found: ${parentCommentId}`);
+    }
+  }
+
+  const authorIdentity = await resolveIdentityForAgent(supabase, resolved.user.id, agentId);
+
+  const { data: created, error: createError } = await supabase
+    .from('artifact_comments')
+    .insert({
+      artifact_id: artifact.id,
+      user_id: resolved.user.id,
+      created_by_agent_id: agentId || null,
+      created_by_identity_id: authorIdentity?.id || null,
+      parent_comment_id: parentCommentId || null,
+      content: trimmed,
+      metadata: metadata as Json,
+    })
+    .select('*')
+    .single();
+
+  if (createError) {
+    throw new Error(`Failed to add artifact comment: ${createError.message}`);
+  }
+
+  logger.info('Artifact comment added', {
+    artifactId: artifact.id,
+    commentId: created.id,
+    agentId: agentId || null,
+    identityId: authorIdentity?.id || null,
+  });
+
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify({
+          success: true,
+          message: 'Artifact comment added',
+          comment: {
+            id: created.id,
+            artifactId: created.artifact_id,
+            parentCommentId: created.parent_comment_id,
+            content: created.content,
+            metadata: created.metadata,
+            createdByAgentId: created.created_by_agent_id,
+            createdByIdentityId: created.created_by_identity_id,
+            createdByIdentity: authorIdentity
+              ? {
+                  id: authorIdentity.id,
+                  agentId: authorIdentity.agent_id,
+                  name: authorIdentity.name,
+                  backend: authorIdentity.backend,
+                }
+              : null,
+            createdAt: created.created_at,
+            updatedAt: created.updated_at,
+          },
+        }),
+      },
+    ],
+  };
+}
+
+export async function handleListArtifactComments(
+  args: unknown,
+  dataComposer: DataComposer
+) {
+  const supabase = dataComposer.getClient();
+  const parsed = listArtifactCommentsSchema.parse(args);
+  const resolved = await resolveUserOrThrow(parsed, dataComposer);
+
+  const { uri, artifactId, limit = 100 } = parsed;
+
+  const { data: artifact, error: artifactError } = await resolveArtifactForUser(
+    supabase,
+    resolved.user.id,
+    { uri, artifactId }
+  ).single();
+
+  if (artifactError) {
+    throw new Error(`Artifact not found: ${uri || artifactId}`);
+  }
+
+  const { data: comments, error } = await supabase
+    .from('artifact_comments')
+    .select('*')
+    .eq('artifact_id', artifact.id)
+    .eq('user_id', resolved.user.id)
+    .is('deleted_at', null)
+    .order('created_at', { ascending: true })
+    .limit(limit);
+
+  if (error) {
+    throw new Error(`Failed to list artifact comments: ${error.message}`);
+  }
+
+  const identityIds = Array.from(
+    new Set((comments || []).map((c) => c.created_by_identity_id).filter(Boolean) as string[])
+  );
+
+  let identitiesById = new Map<string, { id: string; agent_id: string; name: string; backend: string | null }>();
+  if (identityIds.length > 0) {
+    const { data: identities, error: identitiesError } = await supabase
+      .from('agent_identities')
+      .select('id, agent_id, name, backend')
+      .in('id', identityIds);
+
+    if (identitiesError) {
+      throw new Error(`Failed to resolve comment identities: ${identitiesError.message}`);
+    }
+
+    identitiesById = new Map(
+      (identities || []).map((identity) => [identity.id, identity])
+    );
+  }
+
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify({
+          success: true,
+          artifactId: artifact.id,
+          artifactUri: artifact.uri,
+          count: comments?.length || 0,
+          comments: (comments || []).map((comment) => {
+            const identity = comment.created_by_identity_id
+              ? identitiesById.get(comment.created_by_identity_id) ?? null
+              : null;
+            return {
+              id: comment.id,
+              artifactId: comment.artifact_id,
+              parentCommentId: comment.parent_comment_id,
+              content: comment.content,
+              metadata: comment.metadata,
+              createdByAgentId: comment.created_by_agent_id,
+              createdByIdentityId: comment.created_by_identity_id,
+              createdByIdentity: identity
+                ? {
+                    id: identity.id,
+                    agentId: identity.agent_id,
+                    name: identity.name,
+                    backend: identity.backend,
+                  }
+                : null,
+              createdAt: comment.created_at,
+              updatedAt: comment.updated_at,
+            };
+          }),
         }),
       },
     ],
@@ -611,5 +855,18 @@ export const artifactToolDefinitions = [
     description: 'Get version history for an artifact.',
     schema: getArtifactHistorySchema,
     handler: handleGetArtifactHistory,
+  },
+  {
+    name: 'add_artifact_comment',
+    description:
+      'Add a comment to an artifact without modifying artifact content. Uses identity_id UUID as canonical author reference.',
+    schema: addArtifactCommentSchema,
+    handler: handleAddArtifactComment,
+  },
+  {
+    name: 'list_artifact_comments',
+    description: 'List comments for an artifact, including canonical identity UUID author metadata.',
+    schema: listArtifactCommentsSchema,
+    handler: handleListArtifactComments,
   },
 ];

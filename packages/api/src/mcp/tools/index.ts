@@ -152,6 +152,8 @@ import {
   handleUpdateArtifact,
   handleListArtifacts,
   handleGetArtifactHistory,
+  handleAddArtifactComment,
+  handleListArtifactComments,
   artifactToolDefinitions,
 } from './artifact-handlers';
 
@@ -245,13 +247,25 @@ const userIdentifierFields = {
   platformId: z.string().optional().describe('Platform-specific user ID or username'),
 };
 
+const artifactToolsByName = new Map(
+  artifactToolDefinitions.map((definition) => [definition.name, definition])
+);
+
+function getArtifactToolSchema(name: string) {
+  const definition = artifactToolsByName.get(name);
+  if (!definition) {
+    throw new Error(`Artifact tool definition not found: ${name}`);
+  }
+  return definition.schema;
+}
+
 export function registerAllTools(server: McpServer, dataComposer: DataComposer): void {
   // ---------------------------------------------------------------------------
   // Timing diagnostics — wraps every tool handler to log execution time.
   // Calls exceeding SLOW_TOOL_THRESHOLD_MS are logged at warn level.
   // ---------------------------------------------------------------------------
   const SLOW_TOOL_THRESHOLD_MS = 500;
-  const _originalRegisterTool = server.registerTool.bind(server);
+  const originalRegisterTool = server.registerTool.bind(server);
   (server as any).registerTool = (name: string, ...rest: any[]) => {
     const handler = rest[rest.length - 1];
     if (typeof handler === 'function') {
@@ -273,7 +287,15 @@ export function registerAllTools(server: McpServer, dataComposer: DataComposer):
         }
       };
     }
-    return (_originalRegisterTool as any)(name, ...rest);
+    return (originalRegisterTool as any)(name, ...rest);
+  };
+
+  const getArtifactToolSchema = (toolName: string) => {
+    const tool = artifactToolDefinitions.find((definition) => definition.name === toolName);
+    if (!tool) {
+      throw new Error(`Artifact tool schema not found: ${toolName}`);
+    }
+    return tool.schema;
   };
 
   // Register save_link tool
@@ -2182,7 +2204,7 @@ Update a PCP session's status and Claude session ID. Use this to mark your sessi
 Use for specs, designs, decisions, and shared documents that multiple beings may work on.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: artifactToolDefinitions[0].schema,
+      inputSchema: getArtifactToolSchema('create_artifact'),
     },
     async (args: Record<string, unknown>) => {
       try {
@@ -2203,7 +2225,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Get an artifact by URI or ID. Returns the full content and metadata.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: artifactToolDefinitions[1].schema,
+      inputSchema: getArtifactToolSchema('get_artifact'),
     },
     async (args: Record<string, unknown>) => {
       try {
@@ -2228,7 +2250,7 @@ Supports three-way merge: pass baseVersion (the version you read before editing)
 Omit baseVersion for legacy last-write-wins behavior (not recommended for collaborative editing).
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: artifactToolDefinitions[2].schema,
+      inputSchema: getArtifactToolSchema('update_artifact'),
     },
     async (args: Record<string, unknown>) => {
       try {
@@ -2249,7 +2271,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `List artifacts with optional filters for type, tags, visibility, and search.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: artifactToolDefinitions[3].schema,
+      inputSchema: getArtifactToolSchema('list_artifacts'),
     },
     async (args: Record<string, unknown>) => {
       try {
@@ -2270,13 +2292,58 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Get version history for an artifact. Shows all previous versions and who made changes.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: artifactToolDefinitions[4].schema,
+      inputSchema: getArtifactToolSchema('get_artifact_history'),
     },
     async (args: Record<string, unknown>) => {
       try {
         return await handleGetArtifactHistory(args, dataComposer);
       } catch (error) {
         logger.error('Error in get_artifact_history:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'add_artifact_comment',
+    {
+      description: `Add a comment to an artifact without modifying the artifact body.
+
+Use this for collaborative review/discussion to avoid overwrite conflicts.
+Stores canonical author identity via agent_identities.id while preserving agentId slug for display.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getArtifactToolSchema('add_artifact_comment'),
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleAddArtifactComment(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in add_artifact_comment:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'list_artifact_comments',
+    {
+      description: `List comments for an artifact, including canonical identity UUID author metadata.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getArtifactToolSchema('list_artifact_comments'),
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleListArtifactComments(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_artifact_comments:', error);
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
           isError: true,

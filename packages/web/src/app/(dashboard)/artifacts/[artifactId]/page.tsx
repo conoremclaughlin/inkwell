@@ -1,13 +1,13 @@
 'use client';
 
-import React from 'react';
+import React, { useState } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { ArrowLeft, BookOpen, Lightbulb, FileCheck, FileText, StickyNote, Eye, Users, Lock, History, Loader2 } from 'lucide-react';
-import { useApiQuery } from '@/lib/api';
+import { useApiPost, useApiQuery, useQueryClient } from '@/lib/api';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import clsx from 'clsx';
@@ -31,6 +31,31 @@ interface Artifact {
 
 interface ArtifactResponse {
   artifact: Artifact;
+}
+
+interface ArtifactCommentIdentity {
+  id: string;
+  agentId: string;
+  name: string;
+  backend: string | null;
+}
+
+interface ArtifactComment {
+  id: string;
+  artifactId: string;
+  parentCommentId: string | null;
+  content: string;
+  metadata?: Record<string, unknown>;
+  createdByAgentId: string | null;
+  createdByIdentityId: string | null;
+  createdByIdentity: ArtifactCommentIdentity | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface ArtifactCommentsResponse {
+  artifactId: string;
+  comments: ArtifactComment[];
 }
 
 const typeConfig = {
@@ -84,6 +109,9 @@ const visibilityConfig = {
 export default function ArtifactDetailPage() {
   const params = useParams();
   const artifactId = params.artifactId as string;
+  const queryClient = useQueryClient();
+  const [commentDraft, setCommentDraft] = useState('');
+  const [commentAgentId, setCommentAgentId] = useState('');
 
   const {
     data: artifactData,
@@ -93,8 +121,30 @@ export default function ArtifactDetailPage() {
     ['artifacts', artifactId],
     `/api/admin/artifacts/${artifactId}`
   );
+  const {
+    data: commentsData,
+    isLoading: commentsLoading,
+    error: commentsError,
+  } = useApiQuery<ArtifactCommentsResponse>(
+    ['artifact-comments', artifactId],
+    `/api/admin/artifacts/${artifactId}/comments`
+  );
+
+  const addCommentMutation = useApiPost<{ comment: ArtifactComment }, {
+    content: string;
+    agentId?: string;
+  }>(
+    `/api/admin/artifacts/${artifactId}/comments`,
+    {
+      onSuccess: () => {
+        setCommentDraft('');
+        queryClient.invalidateQueries({ queryKey: ['artifact-comments', artifactId] });
+      },
+    }
+  );
 
   const artifact = artifactData?.artifact ?? null;
+  const comments = commentsData?.comments ?? [];
 
   if (isLoading) {
     return (
@@ -131,6 +181,17 @@ export default function ArtifactDetailPage() {
   const visConfig = visibilityConfig[artifact.visibility] || visibilityConfig.private;
   const TypeIcon = config.icon;
   const VisIcon = visConfig.icon;
+  const commentsErrorMessage = commentsError?.message || addCommentMutation.error?.message;
+
+  const handleAddComment = (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!commentDraft.trim()) return;
+
+    addCommentMutation.mutate({
+      content: commentDraft.trim(),
+      ...(commentAgentId.trim() ? { agentId: commentAgentId.trim() } : {}),
+    });
+  };
 
   return (
     <div>
@@ -184,6 +245,79 @@ export default function ArtifactDetailPage() {
           <div className="prose prose-sm max-w-none prose-headings:font-semibold prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-0">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{artifact.content}</ReactMarkdown>
           </div>
+        </CardContent>
+      </Card>
+
+      {/* Comments */}
+      <Card className="mt-6">
+        <CardContent className="p-6">
+          <div className="mb-4 flex items-center justify-between">
+            <h2 className="text-lg font-semibold text-gray-900">Comments</h2>
+            <span className="text-sm text-gray-500">{comments.length}</span>
+          </div>
+
+          <form onSubmit={handleAddComment} className="mb-6 space-y-3">
+            <textarea
+              value={commentDraft}
+              onChange={(event) => setCommentDraft(event.target.value)}
+              placeholder="Add a comment about this artifact…"
+              rows={3}
+              className="w-full rounded-md border border-gray-300 p-3 text-sm focus:border-gray-400 focus:outline-none"
+            />
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <input
+                value={commentAgentId}
+                onChange={(event) => setCommentAgentId(event.target.value)}
+                placeholder="Agent ID (optional, e.g. lumen)"
+                className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm sm:max-w-xs focus:border-gray-400 focus:outline-none"
+              />
+              <Button
+                type="submit"
+                size="sm"
+                disabled={addCommentMutation.isPending || !commentDraft.trim()}
+              >
+                {addCommentMutation.isPending ? 'Posting…' : 'Post Comment'}
+              </Button>
+            </div>
+          </form>
+
+          {commentsErrorMessage && (
+            <div className="mb-4 rounded-md bg-red-50 p-3 text-sm text-red-700">
+              {commentsErrorMessage}
+            </div>
+          )}
+
+          {commentsLoading ? (
+            <p className="text-sm text-gray-500">Loading comments…</p>
+          ) : comments.length === 0 ? (
+            <p className="text-sm text-gray-500">No comments yet.</p>
+          ) : (
+            <div className="space-y-4">
+              {comments.map((comment) => {
+                const identityName =
+                  comment.createdByIdentity?.name ||
+                  comment.createdByIdentity?.agentId ||
+                  comment.createdByAgentId ||
+                  'Unknown';
+                return (
+                  <div key={comment.id} className="rounded-md border border-gray-200 p-4">
+                    <div className="mb-2 flex items-center justify-between text-xs text-gray-500">
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium text-gray-700">{identityName}</span>
+                        {comment.createdByIdentity?.backend && (
+                          <Badge variant="outline" className="text-[10px]">
+                            {comment.createdByIdentity.backend}
+                          </Badge>
+                        )}
+                      </div>
+                      <span>{new Date(comment.createdAt).toLocaleString()}</span>
+                    </div>
+                    <p className="whitespace-pre-wrap text-sm text-gray-800">{comment.content}</p>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </CardContent>
       </Card>
 

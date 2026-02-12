@@ -1373,6 +1373,7 @@ router.get('/artifacts/:id', async (req: Request, res: Response) => {
         contentType: artifact.content_type,
         artifactType: artifact.artifact_type,
         createdByAgentId: artifact.created_by_agent_id,
+        createdByIdentityId: artifact.created_by_identity_id,
         collaborators: artifact.collaborators,
         visibility: artifact.visibility,
         version: artifact.version,
@@ -1385,6 +1386,216 @@ router.get('/artifacts/:id', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to get artifact:', error);
     res.status(500).json({ error: 'Failed to get artifact' });
+  }
+});
+
+/**
+ * GET /api/admin/artifacts/:id/comments
+ * List comments for a specific artifact
+ */
+router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const authReq = req as Request & { pcpUserId: string };
+    const pcpUserId = authReq.pcpUserId;
+
+    const { data: artifact } = await supabase
+      .from('artifacts')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', pcpUserId)
+      .single();
+
+    if (!artifact) {
+      res.status(404).json({ error: 'Artifact not found' });
+      return;
+    }
+
+    const { data: comments, error } = await supabase
+      .from('artifact_comments')
+      .select('*')
+      .eq('artifact_id', id)
+      .eq('user_id', pcpUserId)
+      .is('deleted_at', null)
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      logger.error('Failed to list artifact comments:', error);
+      res.status(500).json({ error: 'Failed to list comments' });
+      return;
+    }
+
+    const identityIds = Array.from(
+      new Set((comments || []).map((c) => c.created_by_identity_id).filter(Boolean) as string[])
+    );
+
+    const identitiesById = new Map<string, { id: string; agent_id: string; name: string; backend: string | null }>();
+
+    if (identityIds.length > 0) {
+      const { data: identities, error: identitiesError } = await supabase
+        .from('agent_identities')
+        .select('id, agent_id, name, backend')
+        .in('id', identityIds);
+
+      if (identitiesError) {
+        logger.error('Failed to resolve artifact comment identities:', identitiesError);
+        res.status(500).json({ error: 'Failed to resolve comment identities' });
+        return;
+      }
+
+      for (const identity of identities || []) {
+        identitiesById.set(identity.id, identity);
+      }
+    }
+
+    res.json({
+      artifactId: id,
+      comments: (comments || []).map((comment) => {
+        const identity = comment.created_by_identity_id
+          ? identitiesById.get(comment.created_by_identity_id) ?? null
+          : null;
+        return {
+          id: comment.id,
+          artifactId: comment.artifact_id,
+          parentCommentId: comment.parent_comment_id,
+          content: comment.content,
+          metadata: comment.metadata,
+          createdByAgentId: comment.created_by_agent_id,
+          createdByIdentityId: comment.created_by_identity_id,
+          createdByIdentity: identity
+            ? {
+                id: identity.id,
+                agentId: identity.agent_id,
+                name: identity.name,
+                backend: identity.backend,
+              }
+            : null,
+          createdAt: comment.created_at,
+          updatedAt: comment.updated_at,
+        };
+      }),
+    });
+  } catch (error) {
+    logger.error('Failed to list artifact comments:', error);
+    res.status(500).json({ error: 'Failed to list comments' });
+  }
+});
+
+/**
+ * POST /api/admin/artifacts/:id/comments
+ * Add a comment to a specific artifact
+ */
+router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { content, agentId, parentCommentId, metadata } = req.body as {
+      content?: string;
+      agentId?: string;
+      parentCommentId?: string;
+      metadata?: Record<string, unknown>;
+    };
+    const trimmed = content?.trim() || '';
+
+    if (!trimmed) {
+      res.status(400).json({ error: 'content is required' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const authReq = req as Request & { pcpUserId: string };
+    const pcpUserId = authReq.pcpUserId;
+
+    const { data: artifact } = await supabase
+      .from('artifacts')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', pcpUserId)
+      .single();
+
+    if (!artifact) {
+      res.status(404).json({ error: 'Artifact not found' });
+      return;
+    }
+
+    if (parentCommentId) {
+      const { data: parent } = await supabase
+        .from('artifact_comments')
+        .select('id')
+        .eq('id', parentCommentId)
+        .eq('artifact_id', id)
+        .eq('user_id', pcpUserId)
+        .single();
+
+      if (!parent) {
+        res.status(400).json({ error: 'Invalid parentCommentId' });
+        return;
+      }
+    }
+
+    let identity: { id: string; agent_id: string; name: string; backend: string | null } | null = null;
+    if (agentId) {
+      const { data: identityRow, error: identityError } = await supabase
+        .from('agent_identities')
+        .select('id, agent_id, name, backend')
+        .eq('user_id', pcpUserId)
+        .eq('agent_id', agentId)
+        .single();
+
+      if (identityError || !identityRow) {
+        // Deliberately stricter than MCP tool behavior:
+        // dashboard/admin writes should reference a known identity explicitly,
+        // while MCP handlers allow slug-only fallback for backward compatibility.
+        res.status(400).json({ error: `Unknown agent identity: ${agentId}` });
+        return;
+      }
+      identity = identityRow;
+    }
+
+    const { data: comment, error } = await supabase
+      .from('artifact_comments')
+      .insert({
+        artifact_id: id,
+        user_id: pcpUserId,
+        created_by_agent_id: agentId || null,
+        created_by_identity_id: identity?.id || null,
+        parent_comment_id: parentCommentId || null,
+        content: trimmed,
+        metadata: metadata || {},
+      })
+      .select('*')
+      .single();
+
+    if (error || !comment) {
+      logger.error('Failed to create artifact comment:', error);
+      res.status(500).json({ error: 'Failed to create comment' });
+      return;
+    }
+
+    res.json({
+      comment: {
+        id: comment.id,
+        artifactId: comment.artifact_id,
+        parentCommentId: comment.parent_comment_id,
+        content: comment.content,
+        metadata: comment.metadata,
+        createdByAgentId: comment.created_by_agent_id,
+        createdByIdentityId: comment.created_by_identity_id,
+        createdByIdentity: identity
+          ? {
+              id: identity.id,
+              agentId: identity.agent_id,
+              name: identity.name,
+              backend: identity.backend,
+            }
+          : null,
+        createdAt: comment.created_at,
+        updatedAt: comment.updated_at,
+      },
+    });
+  } catch (error) {
+    logger.error('Failed to create artifact comment:', error);
+    res.status(500).json({ error: 'Failed to create comment' });
   }
 });
 
@@ -1444,6 +1655,7 @@ router.get('/artifacts/:id/history', async (req: Request, res: Response) => {
         title: h.title,
         content: h.content,
         changedByAgentId: h.changed_by_agent_id,
+        changedByIdentityId: h.changed_by_identity_id,
         changedByUserId: h.changed_by_user_id,
         changeType: h.change_type,
         changeSummary: h.change_summary,

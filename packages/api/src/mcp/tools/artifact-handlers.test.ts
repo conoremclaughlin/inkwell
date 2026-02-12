@@ -1,15 +1,18 @@
 /**
  * Artifact Handler Tests
  *
- * Tests for three-way merge logic in update_artifact.
+ * Covers three-way merge/CAS behavior plus comment + identity UUID flows.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { handleUpdateArtifact } from './artifact-handlers';
-
-// =====================================================
-// MOCK SETUP
-// =====================================================
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { DataComposer } from '../../data/composer';
+import { createTableAwareSupabaseMock } from '../../test/table-aware-supabase-mock';
+import {
+  handleAddArtifactComment,
+  handleCreateArtifact,
+  handleListArtifactComments,
+  handleUpdateArtifact,
+} from './artifact-handlers';
 
 vi.mock('../../services/user-resolver', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../services/user-resolver')>();
@@ -30,10 +33,6 @@ vi.mock('../../utils/logger', () => ({
     debug: vi.fn(),
   },
 }));
-
-// =====================================================
-// HELPERS
-// =====================================================
 
 function createMockSupabase(overrides: {
   artifact?: Record<string, unknown> | null;
@@ -58,6 +57,20 @@ function createMockSupabase(overrides: {
   const insertedHistory: Record<string, unknown>[] = [];
 
   const mockFrom = vi.fn().mockImplementation((table: string) => {
+    if (table === 'agent_identities') {
+      return {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              maybeSingle: vi.fn().mockResolvedValue({
+                data: null,
+                error: null,
+              }),
+            }),
+          }),
+        }),
+      };
+    }
     if (table === 'artifacts') {
       return {
         select: vi.fn().mockReturnValue({
@@ -72,7 +85,6 @@ function createMockSupabase(overrides: {
         }),
         update: vi.fn().mockImplementation((updates: Record<string, unknown>) => {
           Object.assign(updatedArtifact, updates);
-          // CAS guard: .eq('id', ...).eq('version', ...).select().maybeSingle()
           return {
             eq: vi.fn().mockReturnValue({
               eq: vi.fn().mockReturnValue({
@@ -113,20 +125,14 @@ function createMockSupabase(overrides: {
     supabase: { from: mockFrom },
     updatedArtifact,
     insertedHistory,
-    mockFrom,
   };
 }
 
 function createMockDataComposer(supabase: { from: ReturnType<typeof vi.fn> }) {
   return {
     getClient: () => supabase,
-    repositories: {},
-  } as unknown as Parameters<typeof handleUpdateArtifact>[1];
+  } as unknown as DataComposer;
 }
-
-// =====================================================
-// TESTS
-// =====================================================
 
 describe('handleUpdateArtifact', () => {
   beforeEach(() => {
@@ -165,7 +171,7 @@ describe('handleUpdateArtifact', () => {
           userId: '00000000-0000-0000-0000-000000000001',
           uri: 'pcp://test/doc',
           content: 'Updated content',
-          baseVersion: 1, // matches current version
+          baseVersion: 1,
           agentId: 'wren',
         },
         dataComposer,
@@ -180,13 +186,8 @@ describe('handleUpdateArtifact', () => {
 
   describe('three-way merge', () => {
     it('should auto-merge when changes are in different sections', async () => {
-      // Base (version 1): three sections
       const baseContent = '# Section A\nOriginal A content\n\n# Section B\nOriginal B content\n\n# Section C\nOriginal C content\n';
-
-      // Current (version 2): someone edited section B
       const currentContent = '# Section A\nOriginal A content\n\n# Section B\nModified B content by Myra\n\n# Section C\nOriginal C content\n';
-
-      // Incoming: agent edited section C (based on version 1)
       const incomingContent = '# Section A\nOriginal A content\n\n# Section B\nOriginal B content\n\n# Section C\nModified C content by Wren\n';
 
       const { supabase, updatedArtifact, insertedHistory } = createMockSupabase({
@@ -211,7 +212,7 @@ describe('handleUpdateArtifact', () => {
           userId: '00000000-0000-0000-0000-000000000001',
           uri: 'pcp://test/doc',
           content: incomingContent,
-          baseVersion: 1, // doesn't match current version 2
+          baseVersion: 1,
           agentId: 'wren',
         },
         dataComposer,
@@ -221,13 +222,8 @@ describe('handleUpdateArtifact', () => {
       expect(parsed.success).toBe(true);
       expect(parsed.mergePerformed).toBe(true);
       expect(parsed.mergedFromBase).toBe(1);
-
-      // The merged content should have Myra's B changes AND Wren's C changes
-      const merged = updatedArtifact.content as string;
-      expect(merged).toContain('Modified B content by Myra');
-      expect(merged).toContain('Modified C content by Wren');
-
-      // History should record it as a merge
+      expect((updatedArtifact.content as string)).toContain('Modified B content by Myra');
+      expect((updatedArtifact.content as string)).toContain('Modified C content by Wren');
       expect(insertedHistory[0].change_type).toBe('merge');
     });
 
@@ -269,13 +265,11 @@ describe('handleUpdateArtifact', () => {
       expect(parsed.conflict).toBe(true);
       expect(parsed.currentVersion).toBe(2);
       expect(parsed.baseVersion).toBe(1);
-      expect(parsed.conflicts).toBeDefined();
       expect(parsed.conflicts.length).toBeGreaterThan(0);
     });
 
     it('should handle false conflicts (both made same change) gracefully', async () => {
       const baseContent = '# Title\nOriginal content\n\n# Footer\nFooter content\n';
-      // Both editors made the exact same change
       const currentContent = '# Title\nSame new content\n\n# Footer\nFooter content\n';
       const incomingContent = '# Title\nSame new content\n\n# Footer\nFooter content\n';
 
@@ -308,7 +302,6 @@ describe('handleUpdateArtifact', () => {
       );
 
       const parsed = JSON.parse(result.content[0].text);
-      // excludeFalseConflicts: true means identical changes merge cleanly
       expect(parsed.success).toBe(true);
     });
 
@@ -348,7 +341,7 @@ describe('handleUpdateArtifact', () => {
   describe('CAS (compare-and-swap) guard', () => {
     it('should return staleWrite conflict when another writer wins the race', async () => {
       const { supabase } = createMockSupabase({
-        casFailure: true, // simulate another writer incrementing version between read and write
+        casFailure: true,
       });
       const dataComposer = createMockDataComposer(supabase);
 
@@ -371,7 +364,7 @@ describe('handleUpdateArtifact', () => {
 
   describe('non-content updates', () => {
     it('should not trigger merge for metadata-only updates even with baseVersion', async () => {
-      const { supabase, updatedArtifact } = createMockSupabase({
+      const { supabase } = createMockSupabase({
         artifact: {
           id: 'artifact-1',
           uri: 'pcp://test/doc',
@@ -392,7 +385,7 @@ describe('handleUpdateArtifact', () => {
           userId: '00000000-0000-0000-0000-000000000001',
           uri: 'pcp://test/doc',
           tags: ['new-tag'],
-          baseVersion: 1, // mismatches but no content change
+          baseVersion: 1,
           agentId: 'wren',
         },
         dataComposer,
@@ -402,5 +395,263 @@ describe('handleUpdateArtifact', () => {
       expect(parsed.success).toBe(true);
       expect(parsed.mergePerformed).toBeFalsy();
     });
+  });
+});
+
+describe('artifact comment + identity UUID flows', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('handleCreateArtifact stores created_by_identity_id and history changed_by_identity_id', async () => {
+    const supabase = createTableAwareSupabaseMock({
+      agent_identities: [
+        {
+          maybeSingle: [{ data: { id: 'identity-1', agent_id: 'lumen', name: 'Lumen', backend: 'codex' }, error: null }],
+        },
+      ],
+      artifacts: [
+        { maybeSingle: [{ data: null, error: null }] },
+        {
+          single: [{
+            data: {
+              id: 'artifact-1',
+              uri: 'pcp://specs/test',
+              title: 'Test Spec',
+              artifact_type: 'spec',
+              version: 1,
+              created_at: '2026-02-11T00:00:00Z',
+            },
+            error: null,
+          }],
+        },
+      ],
+      artifact_history: [{ then: { data: null, error: null } }],
+    });
+
+    const result = await handleCreateArtifact(
+      {
+        userId: '00000000-0000-0000-0000-000000000001',
+        uri: 'pcp://specs/test',
+        title: 'Test Spec',
+        content: '# Hello',
+        artifactType: 'spec',
+        agentId: 'lumen',
+      },
+      createMockDataComposer(supabase)
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+
+    const artifactInsertBuilder = supabase.calls.find((c) => c.table === 'artifacts' && (c.builder.insert as ReturnType<typeof vi.fn>).mock.calls.length > 0)?.builder;
+    const historyInsertBuilder = supabase.calls.find((c) => c.table === 'artifact_history')?.builder;
+
+    expect((artifactInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
+      created_by_agent_id: 'lumen',
+      created_by_identity_id: 'identity-1',
+    });
+    expect((historyInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
+      changed_by_agent_id: 'lumen',
+      changed_by_identity_id: 'identity-1',
+    });
+  });
+
+  it('handleCreateArtifact keeps slug behavior when identity row is missing', async () => {
+    const supabase = createTableAwareSupabaseMock({
+      agent_identities: [
+        { maybeSingle: [{ data: null, error: null }] },
+      ],
+      artifacts: [
+        { maybeSingle: [{ data: null, error: null }] },
+        {
+          single: [{
+            data: {
+              id: 'artifact-2',
+              uri: 'pcp://specs/slug-only',
+              title: 'Slug only',
+              artifact_type: 'spec',
+              version: 1,
+              created_at: '2026-02-11T00:00:00Z',
+            },
+            error: null,
+          }],
+        },
+      ],
+      artifact_history: [{ then: { data: null, error: null } }],
+    });
+
+    const result = await handleCreateArtifact(
+      {
+        userId: '550e8400-e29b-41d4-a716-446655440000',
+        uri: 'pcp://specs/slug-only',
+        title: 'Slug only',
+        content: '# Hi',
+        artifactType: 'spec',
+        agentId: 'unknown-agent-slug',
+      },
+      createMockDataComposer(supabase)
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+
+    const artifactInsertBuilder = supabase.calls.find((c) => c.table === 'artifacts' && (c.builder.insert as ReturnType<typeof vi.fn>).mock.calls.length > 0)?.builder;
+    const historyInsertBuilder = supabase.calls.find((c) => c.table === 'artifact_history')?.builder;
+
+    expect((artifactInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
+      created_by_agent_id: 'unknown-agent-slug',
+      created_by_identity_id: null,
+    });
+    expect((historyInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
+      changed_by_agent_id: 'unknown-agent-slug',
+      changed_by_identity_id: null,
+    });
+  });
+
+  it('handleAddArtifactComment resolves identity UUID and returns identity metadata', async () => {
+    const supabase = createTableAwareSupabaseMock({
+      artifacts: [
+        { single: [{ data: { id: '11111111-1111-1111-1111-111111111111', uri: 'pcp://specs/test' }, error: null }] },
+      ],
+      agent_identities: [
+        {
+          maybeSingle: [{ data: { id: 'identity-1', agent_id: 'lumen', name: 'Lumen', backend: 'codex' }, error: null }],
+        },
+      ],
+      artifact_comments: [
+        {
+          single: [{
+            data: {
+              id: 'comment-1',
+              artifact_id: '11111111-1111-1111-1111-111111111111',
+              user_id: '00000000-0000-0000-0000-000000000001',
+              parent_comment_id: null,
+              content: 'Great point.',
+              metadata: {},
+              created_by_agent_id: 'lumen',
+              created_by_identity_id: 'identity-1',
+              created_at: '2026-02-11T00:00:00Z',
+              updated_at: '2026-02-11T00:00:00Z',
+            },
+            error: null,
+          }],
+        },
+      ],
+    });
+
+    const result = await handleAddArtifactComment(
+      {
+        userId: '00000000-0000-0000-0000-000000000001',
+        artifactId: '11111111-1111-1111-1111-111111111111',
+        content: 'Great point.',
+        agentId: 'lumen',
+      },
+      createMockDataComposer(supabase)
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.comment.createdByIdentityId).toBe('identity-1');
+    expect(parsed.comment.createdByIdentity.agentId).toBe('lumen');
+
+    const commentsBuilder = supabase.calls.find((c) => c.table === 'artifact_comments')?.builder;
+    expect((commentsBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
+      created_by_agent_id: 'lumen',
+      created_by_identity_id: 'identity-1',
+      content: 'Great point.',
+    });
+  });
+
+  it('handleAddArtifactComment rejects invalid parent comment reference', async () => {
+    const supabase = createTableAwareSupabaseMock({
+      artifacts: [
+        { single: [{ data: { id: '11111111-1111-1111-1111-111111111111', uri: 'pcp://specs/test' }, error: null }] },
+      ],
+      artifact_comments: [
+        { maybeSingle: [{ data: null, error: null }] },
+      ],
+    });
+
+    await expect(
+      handleAddArtifactComment(
+        {
+          userId: '00000000-0000-0000-0000-000000000001',
+          artifactId: '11111111-1111-1111-1111-111111111111',
+          content: 'Replying to thread',
+          parentCommentId: '22222222-2222-2222-2222-222222222222',
+        },
+        createMockDataComposer(supabase)
+      )
+    ).rejects.toThrow('Parent comment not found');
+  });
+
+  it('handleListArtifactComments enriches comments with identity details', async () => {
+    const supabase = createTableAwareSupabaseMock({
+      artifacts: [
+        { single: [{ data: { id: '11111111-1111-1111-1111-111111111111', uri: 'pcp://specs/test' }, error: null }] },
+      ],
+      artifact_comments: [
+        {
+          then: {
+            data: [
+              {
+                id: 'comment-1',
+                artifact_id: '11111111-1111-1111-1111-111111111111',
+                parent_comment_id: null,
+                content: 'From Lumen',
+                metadata: {},
+                created_by_agent_id: 'lumen',
+                created_by_identity_id: 'identity-1',
+                created_at: '2026-02-11T00:00:00Z',
+                updated_at: '2026-02-11T00:00:00Z',
+                user_id: '00000000-0000-0000-0000-000000000001',
+                deleted_at: null,
+              },
+              {
+                id: 'comment-2',
+                artifact_id: '11111111-1111-1111-1111-111111111111',
+                parent_comment_id: null,
+                content: 'Anonymous note',
+                metadata: {},
+                created_by_agent_id: null,
+                created_by_identity_id: null,
+                created_at: '2026-02-11T00:05:00Z',
+                updated_at: '2026-02-11T00:05:00Z',
+                user_id: '00000000-0000-0000-0000-000000000001',
+                deleted_at: null,
+              },
+            ],
+            error: null,
+          },
+        },
+      ],
+      agent_identities: [
+        {
+          then: {
+            data: [{ id: 'identity-1', agent_id: 'lumen', name: 'Lumen', backend: 'codex' }],
+            error: null,
+          },
+        },
+      ],
+    });
+
+    const result = await handleListArtifactComments(
+      {
+        userId: '00000000-0000-0000-0000-000000000001',
+        artifactId: '11111111-1111-1111-1111-111111111111',
+      },
+      createMockDataComposer(supabase)
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.count).toBe(2);
+    expect(parsed.comments[0].createdByIdentity).toMatchObject({
+      id: 'identity-1',
+      agentId: 'lumen',
+      name: 'Lumen',
+    });
+    expect(parsed.comments[1].createdByIdentity).toBeNull();
   });
 });
