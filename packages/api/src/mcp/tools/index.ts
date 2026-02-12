@@ -228,6 +228,17 @@ import {
 } from './workspace-handlers';
 
 import {
+  handleCreateWorkspaceContainer,
+  handleListWorkspaceContainers,
+  handleGetWorkspaceContainer,
+  handleUpdateWorkspaceContainer,
+  createWorkspaceContainerSchema,
+  listWorkspaceContainersSchema,
+  getWorkspaceContainerSchema,
+  updateWorkspaceContainerSchema,
+} from './workspace-container-handlers';
+
+import {
   handleCreateKindleToken,
   createKindleTokenSchema,
 } from './kindle-handlers';
@@ -3025,7 +3036,97 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   );
 
   // =====================================================
-  // WORKSPACE TOOLS (git worktree management)
+  // WORKSPACE CONTAINER TOOLS (personal/team scope)
+  // =====================================================
+
+  server.registerTool(
+    'create_workspace_container',
+    {
+      description: `Create a top-level workspace container (personal/team scope). This is distinct from git worktree studios.
+
+Use this for Notion/Slack/Linear-style workspace boundaries.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: createWorkspaceContainerSchema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleCreateWorkspaceContainer(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in create_workspace_container:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'list_workspace_containers',
+    {
+      description: `List top-level workspace containers (personal/team scope). Ensures a default personal workspace exists unless disabled.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: listWorkspaceContainersSchema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleListWorkspaceContainers(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_workspace_containers:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_workspace_container',
+    {
+      description: `Get one workspace container by ID. Optionally include member list.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getWorkspaceContainerSchema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleGetWorkspaceContainer(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_workspace_container:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'update_workspace_container',
+    {
+      description: `Update workspace container metadata (name, slug, type, description, archive state).
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: updateWorkspaceContainerSchema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleUpdateWorkspaceContainer(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in update_workspace_container:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // STUDIO TOOLS (legacy `workspace` naming for git worktree management)
   // =====================================================
 
   server.registerTool(
@@ -3149,6 +3250,123 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleAdoptWorkspace(args, dataComposer);
       } catch (error) {
         logger.error('Error in adopt_workspace:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Studio-first aliases (preferred naming).
+  // Backward compatibility: legacy workspace tool names remain available above.
+
+  server.registerTool(
+    'create_studio',
+    {
+      description: `Create a new git worktree studio for isolated parallel work.`,
+      inputSchema: workspaceToolDefinitions[0].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleCreateWorkspace(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in create_studio:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'list_studios',
+    {
+      description: `List git worktree studios (legacy workspace records).`,
+      inputSchema: workspaceToolDefinitions[1].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleListWorkspaces(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_studios:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_studio',
+    {
+      description: `Get one git worktree studio by ID, branch, or path.`,
+      inputSchema: workspaceToolDefinitions[2].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleGetWorkspace(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_studio:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'update_studio',
+    {
+      description: `Update a git worktree studio status, purpose, or session link.`,
+      inputSchema: workspaceToolDefinitions[3].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleUpdateWorkspace(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in update_studio:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'close_studio',
+    {
+      description: `Close a git worktree studio and optionally clean worktree/branch.`,
+      inputSchema: workspaceToolDefinitions[4].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleCloseWorkspace(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in close_studio:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'adopt_studio',
+    {
+      description: `Adopt an existing git worktree studio into a new session.`,
+      inputSchema: workspaceToolDefinitions[5].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleAdoptWorkspace(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in adopt_studio:', error);
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
           isError: true,
