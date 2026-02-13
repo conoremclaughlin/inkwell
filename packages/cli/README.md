@@ -44,7 +44,7 @@ sb -- --some-future-flag
 echo "explain this" | sb
 
 # Subcommands
-sb ws create feat-auth          # Create workspace
+sb studio create feat-auth      # Create studio/workspace
 sb agent status                 # Check agent status
 sb session list                 # List sessions
 sb --help                       # Full help
@@ -71,24 +71,28 @@ The agent ID is resolved in order:
 
 ## Subcommands
 
-### Workspaces (`sb ws`)
+### Studios (`sb studio`)
 
-Git worktree management with per-workspace identity.
+Git worktree management with per-studio identity.
 
 ```bash
-sb ws create <name>             # Create workspace with git worktree
-sb ws list                      # List all workspaces
-sb ws status                    # Git status across all workspaces
-sb ws remove <name>             # Remove workspace (keeps branch)
-sb ws clean <name>              # Remove workspace + delete branch
-sb ws path <name>               # Print workspace path
-eval $(sb ws cd <name>)         # cd to workspace
+sb studio create <name>         # Create studio with git worktree
+sb studio list                  # List all studios
+sb studio status                # Git status across all studios
+sb studio remove <name>         # Remove studio (keeps branch)
+sb studio clean <name>          # Remove studio + delete branch
+sb studio path <name>           # Print studio path
+eval $(sb studio cd <name>)     # cd to studio
 ```
 
+Backwards compatibility aliases still work:
+- `sb ws ...`
+- `sb workspace ...`
+
 Options for `create`:
-- `-i, --identity <agent>` — Agent ID for this workspace (default: wren)
+- `-a, --agent <agent>` — Agent ID for this studio (default: wren)
 - `-p, --purpose <desc>` — Description
-- `-b, --branch <branch>` — Custom branch (default: `workspace/<name>`)
+- `-b, --branch <branch>` — Custom branch (default: `<agent>/workspace/<name>`)
 
 ### Agents (`sb agent`)
 

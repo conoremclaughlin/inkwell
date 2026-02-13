@@ -15,7 +15,11 @@ import type { Database, Json } from '../../data/supabase/types';
 
 // ============== Schemas ==============
 
-const createArtifactSchema = userIdentifierBaseSchema.extend({
+const workspaceScopedUserIdentifierSchema = userIdentifierBaseSchema.extend({
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
+});
+
+const createArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
   uri: z.string().describe('Unique URI for the artifact (e.g., "pcp://specs/orchestration")'),
   title: z.string().describe('Title of the artifact'),
   content: z.string().describe('Content (typically markdown)'),
@@ -35,14 +39,14 @@ const createArtifactSchema = userIdentifierBaseSchema.extend({
   metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
 });
 
-const getArtifactSchema = userIdentifierBaseSchema.extend({
+const getArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
   uri: z.string().optional().describe('URI of the artifact'),
   artifactId: z.string().uuid().optional().describe('ID of the artifact'),
   includeComments: z.boolean().optional().default(false).describe('Include comments in the response'),
   commentLimit: z.number().min(1).max(200).optional().default(50).describe('Max comments when includeComments=true'),
 });
 
-const updateArtifactSchema = userIdentifierBaseSchema.extend({
+const updateArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
   uri: z.string().optional().describe('URI of the artifact to update'),
   artifactId: z.string().uuid().optional().describe('ID of the artifact to update'),
   title: z.string().optional().describe('New title'),
@@ -54,7 +58,7 @@ const updateArtifactSchema = userIdentifierBaseSchema.extend({
   changeSummary: z.string().optional().describe('Summary of changes'),
 });
 
-const listArtifactsSchema = userIdentifierBaseSchema.extend({
+const listArtifactsSchema = workspaceScopedUserIdentifierSchema.extend({
   artifactType: z.string().optional().describe('Filter by type'),
   tags: z.array(z.string()).optional().describe('Filter by tags (any match)'),
   visibility: z.enum(['private', 'shared', 'public']).optional().describe('Filter by visibility'),
@@ -62,13 +66,13 @@ const listArtifactsSchema = userIdentifierBaseSchema.extend({
   limit: z.number().min(1).max(100).optional().default(20).describe('Max results'),
 });
 
-const getArtifactHistorySchema = userIdentifierBaseSchema.extend({
+const getArtifactHistorySchema = workspaceScopedUserIdentifierSchema.extend({
   uri: z.string().optional().describe('URI of the artifact'),
   artifactId: z.string().uuid().optional().describe('ID of the artifact'),
   limit: z.number().min(1).max(50).optional().default(10).describe('Max history entries'),
 });
 
-const addArtifactCommentSchema = userIdentifierBaseSchema.extend({
+const addArtifactCommentSchema = workspaceScopedUserIdentifierSchema.extend({
   uri: z.string().optional().describe('URI of the artifact'),
   artifactId: z.string().uuid().optional().describe('ID of the artifact'),
   content: z.string().min(1).describe('Comment text'),
@@ -77,7 +81,7 @@ const addArtifactCommentSchema = userIdentifierBaseSchema.extend({
   metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
 });
 
-const listArtifactCommentsSchema = userIdentifierBaseSchema.extend({
+const listArtifactCommentsSchema = workspaceScopedUserIdentifierSchema.extend({
   uri: z.string().optional().describe('URI of the artifact'),
   artifactId: z.string().uuid().optional().describe('ID of the artifact'),
   limit: z.number().min(1).max(200).optional().default(100).describe('Max comments to return'),
@@ -85,19 +89,27 @@ const listArtifactCommentsSchema = userIdentifierBaseSchema.extend({
 
 // ============== Helpers ==============
 
+function withWorkspaceFilter<T>(query: T, workspaceId?: string): T {
+  if (!workspaceId) return query;
+  return (query as { eq: (column: string, value: string) => T }).eq('workspace_id', workspaceId);
+}
+
 async function resolveIdentityForAgent(
   supabase: SupabaseClient<Database>,
   userId: string,
+  workspaceId: string | undefined,
   agentId?: string
 ) {
   if (!agentId) return null;
 
-  const { data, error } = await supabase
+  let query = supabase
     .from('agent_identities')
     .select('id, agent_id, name, backend')
     .eq('user_id', userId)
-    .eq('agent_id', agentId)
-    .maybeSingle();
+    .eq('agent_id', agentId);
+
+  query = withWorkspaceFilter(query, workspaceId);
+  const { data, error } = await query.maybeSingle();
 
   if (error) {
     logger.warn('Failed to resolve identity UUID for agent slug; continuing with slug-only reference', {
@@ -122,6 +134,7 @@ async function resolveIdentityForAgent(
 function resolveArtifactForUser(
   supabase: SupabaseClient<Database>,
   userId: string,
+  workspaceId: string | undefined,
   params: { uri?: string; artifactId?: string },
   selectColumns = '*'
 ) {
@@ -131,6 +144,7 @@ function resolveArtifactForUser(
   }
 
   let query = supabase.from('artifacts').select(selectColumns).eq('user_id', userId);
+  query = withWorkspaceFilter(query, workspaceId);
 
   if (uri) {
     query = query.eq('uri', uri);
@@ -161,15 +175,18 @@ export async function handleCreateArtifact(
     visibility = 'private',
     tags = [],
     metadata = {},
+    workspaceId,
   } = parsed;
-  const authorIdentity = await resolveIdentityForAgent(supabase, resolved.user.id, agentId);
+  const authorIdentity = await resolveIdentityForAgent(supabase, resolved.user.id, workspaceId, agentId);
 
   // Check if URI already exists
-  const { data: existing } = await supabase
+  let existingQuery = supabase
     .from('artifacts')
     .select('id')
-    .eq('uri', uri)
-    .maybeSingle();
+    .eq('user_id', resolved.user.id)
+    .eq('uri', uri);
+  existingQuery = withWorkspaceFilter(existingQuery, workspaceId);
+  const { data: existing } = await existingQuery.maybeSingle();
 
   if (existing) {
     throw new Error(`Artifact with URI "${uri}" already exists`);
@@ -180,6 +197,7 @@ export async function handleCreateArtifact(
     .insert({
       uri,
       user_id: resolved.user.id,
+      ...(workspaceId ? { workspace_id: workspaceId } : {}),
       created_by_agent_id: agentId || null,
       created_by_identity_id: authorIdentity?.id || null,
       title,
@@ -202,6 +220,7 @@ export async function handleCreateArtifact(
   // Create initial history entry
   await supabase.from('artifact_history').insert({
     artifact_id: artifact.id,
+    ...(workspaceId ? { workspace_id: workspaceId } : {}),
     version: 1,
     title,
     content,
@@ -243,8 +262,8 @@ export async function handleGetArtifact(
   const parsed = getArtifactSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { uri, artifactId, includeComments = false, commentLimit = 50 } = parsed;
-  const query = resolveArtifactForUser(supabase, resolved.user.id, { uri, artifactId });
+  const { uri, artifactId, includeComments = false, commentLimit = 50, workspaceId } = parsed;
+  const query = resolveArtifactForUser(supabase, resolved.user.id, workspaceId, { uri, artifactId });
 
   const { data: artifact, error } = await query.maybeSingle();
 
@@ -376,11 +395,22 @@ export async function handleUpdateArtifact(
   const parsed = updateArtifactSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { uri, artifactId, title, content, baseVersion, agentId, collaborators, tags, changeSummary } = parsed;
-  const editorIdentity = await resolveIdentityForAgent(supabase, resolved.user.id, agentId);
+  const {
+    uri,
+    artifactId,
+    title,
+    content,
+    baseVersion,
+    agentId,
+    collaborators,
+    tags,
+    changeSummary,
+    workspaceId,
+  } = parsed;
+  const editorIdentity = await resolveIdentityForAgent(supabase, resolved.user.id, workspaceId, agentId);
 
   // First, get the current artifact
-  const query = resolveArtifactForUser(supabase, resolved.user.id, { uri, artifactId });
+  const query = resolveArtifactForUser(supabase, resolved.user.id, workspaceId, { uri, artifactId });
 
   const { data: current, error: fetchError } = await query.single();
 
@@ -409,12 +439,13 @@ export async function handleUpdateArtifact(
     });
 
     // Fetch the base version content from history
-    const { data: baseHistory, error: historyError } = await supabase
+    let baseHistoryQuery = supabase
       .from('artifact_history')
       .select('content')
       .eq('artifact_id', current.id)
-      .eq('version', baseVersion)
-      .single();
+      .eq('version', baseVersion);
+    baseHistoryQuery = withWorkspaceFilter(baseHistoryQuery, workspaceId);
+    const { data: baseHistory, error: historyError } = await baseHistoryQuery.single();
 
     if (historyError || !baseHistory?.content) {
       throw new Error(
@@ -508,13 +539,13 @@ export async function handleUpdateArtifact(
   // merge check but then one silently overwrites the other.
   const expectedVersion = current.version ?? 0;
 
-  const { data: updated, error: updateError } = await supabase
+  let updateQuery = supabase
     .from('artifacts')
     .update(updates)
     .eq('id', current.id)
-    .eq('version', expectedVersion)
-    .select()
-    .maybeSingle();
+    .eq('version', expectedVersion);
+  updateQuery = withWorkspaceFilter(updateQuery, workspaceId);
+  const { data: updated, error: updateError } = await updateQuery.select().maybeSingle();
 
   if (updateError) {
     throw new Error(`Failed to update artifact: ${updateError.message}`);
@@ -551,6 +582,7 @@ export async function handleUpdateArtifact(
 
   await supabase.from('artifact_history').insert({
     artifact_id: current.id,
+    ...(workspaceId ? { workspace_id: workspaceId } : {}),
     version: newVersion,
     title: updated.title,
     content: updated.content,
@@ -594,14 +626,14 @@ export async function handleListArtifacts(
   const parsed = listArtifactsSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { artifactType, tags, visibility, search, limit = 20 } = parsed;
+  const { artifactType, tags, visibility, search, limit = 20, workspaceId } = parsed;
 
   let query = supabase
     .from('artifacts')
     .select('id, uri, title, artifact_type, visibility, version, tags, created_at, updated_at')
-    .eq('user_id', resolved.user.id)
-    .order('updated_at', { ascending: false })
-    .limit(limit);
+    .eq('user_id', resolved.user.id);
+  query = withWorkspaceFilter(query, workspaceId);
+  query = query.order('updated_at', { ascending: false }).limit(limit);
 
   if (artifactType) {
     query = query.eq('artifact_type', artifactType);
@@ -654,12 +686,13 @@ export async function handleGetArtifactHistory(
   const parsed = getArtifactHistorySchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { uri, artifactId, limit = 10 } = parsed;
+  const { uri, artifactId, limit = 10, workspaceId } = parsed;
 
   // First get the artifact to verify ownership
   const artifactQuery = resolveArtifactForUser(
     supabase,
     resolved.user.id,
+    workspaceId,
     { uri, artifactId },
     'id'
   );
@@ -670,10 +703,12 @@ export async function handleGetArtifactHistory(
     throw new Error(`Artifact not found: ${uri || artifactId}`);
   }
 
-  const { data: history, error } = await supabase
+  let historyQuery = supabase
     .from('artifact_history')
     .select('*')
-    .eq('artifact_id', artifact.id)
+    .eq('artifact_id', artifact.id);
+  historyQuery = withWorkspaceFilter(historyQuery, workspaceId);
+  const { data: history, error } = await historyQuery
     .order('version', { ascending: false })
     .limit(limit);
 
@@ -714,7 +749,7 @@ export async function handleAddArtifactComment(
   const parsed = addArtifactCommentSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { uri, artifactId, content, agentId, parentCommentId, metadata = {} } = parsed;
+  const { uri, artifactId, content, agentId, parentCommentId, metadata = {}, workspaceId } = parsed;
   const trimmed = content.trim();
   if (!trimmed) {
     throw new Error('Comment content cannot be empty');
@@ -723,6 +758,7 @@ export async function handleAddArtifactComment(
   const { data: artifact, error: artifactError } = await resolveArtifactForUser(
     supabase,
     resolved.user.id,
+    workspaceId,
     { uri, artifactId }
   ).single();
 
@@ -731,26 +767,28 @@ export async function handleAddArtifactComment(
   }
 
   if (parentCommentId) {
-    const { data: parent, error: parentError } = await supabase
+    let parentQuery = supabase
       .from('artifact_comments')
       .select('id')
       .eq('id', parentCommentId)
       .eq('artifact_id', artifact.id)
-      .eq('user_id', resolved.user.id)
-      .maybeSingle();
+      .eq('user_id', resolved.user.id);
+    parentQuery = withWorkspaceFilter(parentQuery, workspaceId);
+    const { data: parent, error: parentError } = await parentQuery.maybeSingle();
 
     if (parentError || !parent) {
       throw new Error(`Parent comment not found: ${parentCommentId}`);
     }
   }
 
-  const authorIdentity = await resolveIdentityForAgent(supabase, resolved.user.id, agentId);
+  const authorIdentity = await resolveIdentityForAgent(supabase, resolved.user.id, workspaceId, agentId);
 
   const { data: created, error: createError } = await supabase
     .from('artifact_comments')
     .insert({
       artifact_id: artifact.id,
       user_id: resolved.user.id,
+      ...(workspaceId ? { workspace_id: workspaceId } : {}),
       created_by_agent_id: agentId || null,
       created_by_identity_id: authorIdentity?.id || null,
       parent_comment_id: parentCommentId || null,
@@ -811,11 +849,12 @@ export async function handleListArtifactComments(
   const parsed = listArtifactCommentsSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { uri, artifactId, limit = 100 } = parsed;
+  const { uri, artifactId, limit = 100, workspaceId } = parsed;
 
   const { data: artifact, error: artifactError } = await resolveArtifactForUser(
     supabase,
     resolved.user.id,
+    workspaceId,
     { uri, artifactId }
   ).single();
 
@@ -823,12 +862,14 @@ export async function handleListArtifactComments(
     throw new Error(`Artifact not found: ${uri || artifactId}`);
   }
 
-  const { data: comments, error } = await supabase
+  let commentsQuery = supabase
     .from('artifact_comments')
     .select('*')
     .eq('artifact_id', artifact.id)
     .eq('user_id', resolved.user.id)
-    .is('deleted_at', null)
+    .is('deleted_at', null);
+  commentsQuery = withWorkspaceFilter(commentsQuery, workspaceId);
+  const { data: comments, error } = await commentsQuery
     .order('created_at', { ascending: true })
     .limit(limit);
 
@@ -842,10 +883,12 @@ export async function handleListArtifactComments(
 
   let identitiesById = new Map<string, { id: string; agent_id: string; name: string; backend: string | null }>();
   if (identityIds.length > 0) {
-    const { data: identities, error: identitiesError } = await supabase
+    let identitiesQuery = supabase
       .from('agent_identities')
       .select('id, agent_id, name, backend')
       .in('id', identityIds);
+    identitiesQuery = withWorkspaceFilter(identitiesQuery, workspaceId);
+    const { data: identities, error: identitiesError } = await identitiesQuery;
 
     if (identitiesError) {
       throw new Error(`Failed to resolve comment identities: ${identitiesError.message}`);

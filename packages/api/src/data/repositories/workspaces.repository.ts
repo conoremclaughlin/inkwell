@@ -198,6 +198,27 @@ export class WorkspacesRepository {
   }
 
   /**
+   * List workspaces by IDs for a specific user.
+   */
+  async listByIds(userId: string, ids: string[]): Promise<Workspace[]> {
+    if (ids.length === 0) {
+      return [];
+    }
+
+    const { data, error } = await this.client
+      .from('workspaces')
+      .select('*')
+      .eq('user_id', userId)
+      .in('id', ids);
+
+    if (error) {
+      throw new Error(`Failed to list workspaces by ids: ${error.message}`);
+    }
+
+    return (data || []).map((row) => this.mapRow(row as Record<string, unknown>));
+  }
+
+  /**
    * List active workspaces for a user (status in 'active' or 'idle')
    */
   async listActive(userId: string): Promise<Workspace[]> {

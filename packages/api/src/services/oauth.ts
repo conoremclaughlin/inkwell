@@ -8,6 +8,7 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
+import { getRequestContext, getSessionContext } from '../utils/request-context';
 
 // OAuth provider configurations
 interface OAuthProviderConfig {
@@ -41,6 +42,7 @@ const OAUTH_PROVIDERS: Record<string, OAuthProviderConfig> = {
 export interface ConnectedAccount {
   id: string;
   userId: string;
+  workspaceId: string | null;
   provider: string;
   providerAccountId: string;
   email: string | null;
@@ -68,6 +70,11 @@ class OAuthService {
 
   constructor() {
     this.supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+  }
+
+  private resolveWorkspaceId(workspaceId?: string | null): string | null | undefined {
+    if (workspaceId !== undefined) return workspaceId;
+    return getRequestContext()?.workspaceId ?? getSessionContext()?.workspaceId;
   }
 
   /**
@@ -305,39 +312,67 @@ class OAuthService {
     userId: string,
     provider: string,
     tokens: TokenResponse,
-    userInfo: { id: string; email?: string; name?: string; picture?: string }
+    userInfo: { id: string; email?: string; name?: string; picture?: string },
+    workspaceId?: string | null
   ): Promise<ConnectedAccount> {
     const expiresAt = tokens.expiresIn
       ? new Date(Date.now() + tokens.expiresIn * 1000).toISOString()
       : null;
 
     const scopes = tokens.scope?.split(' ') || [];
+    const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
 
-    const { data, error } = await this.supabase
+    let existingQuery = this.supabase
       .from('connected_accounts')
-      .upsert(
-        {
-          user_id: userId,
-          provider,
-          provider_account_id: userInfo.id,
-          email: userInfo.email || null,
-          display_name: userInfo.name || null,
-          avatar_url: userInfo.picture || null,
-          access_token: tokens.accessToken,
-          refresh_token: tokens.refreshToken || null,
-          token_type: tokens.tokenType,
-          expires_at: expiresAt,
-          scopes,
-          status: 'active',
-          last_error: null,
-          updated_at: new Date().toISOString(),
-        },
-        {
-          onConflict: 'user_id,provider,provider_account_id',
-        }
-      )
-      .select()
-      .single();
+      .select('id')
+      .eq('user_id', userId)
+      .eq('provider', provider)
+      .eq('provider_account_id', userInfo.id);
+
+    if (resolvedWorkspaceId === null) {
+      existingQuery = existingQuery.is('workspace_id', null);
+    } else if (resolvedWorkspaceId) {
+      existingQuery = existingQuery.eq('workspace_id', resolvedWorkspaceId);
+    }
+
+    const { data: existing, error: existingError } = await existingQuery
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (existingError) {
+      logger.error('Failed to look up connected account before save:', existingError);
+      throw new Error('Failed to save connected account');
+    }
+
+    const payload = {
+      user_id: userId,
+      provider,
+      provider_account_id: userInfo.id,
+      email: userInfo.email || null,
+      display_name: userInfo.name || null,
+      avatar_url: userInfo.picture || null,
+      access_token: tokens.accessToken,
+      refresh_token: tokens.refreshToken || null,
+      token_type: tokens.tokenType,
+      expires_at: expiresAt,
+      scopes,
+      status: 'active',
+      last_error: null,
+      updated_at: new Date().toISOString(),
+      ...(resolvedWorkspaceId !== undefined ? { workspace_id: resolvedWorkspaceId } : {}),
+    };
+
+    const saveQuery = existing
+      ? this.supabase
+          .from('connected_accounts')
+          .update(payload)
+          .eq('id', existing.id)
+      : this.supabase
+          .from('connected_accounts')
+          .insert(payload);
+
+    const { data, error } = await saveQuery.select().single();
 
     if (error) {
       logger.error('Failed to save connected account:', error);
@@ -350,12 +385,21 @@ class OAuthService {
   /**
    * Get all connected accounts for a user
    */
-  async getConnectedAccounts(userId: string): Promise<ConnectedAccount[]> {
-    const { data, error } = await this.supabase
+  async getConnectedAccounts(userId: string, workspaceId?: string | null): Promise<ConnectedAccount[]> {
+    const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
+    let query = this.supabase
       .from('connected_accounts')
       .select('*')
       .eq('user_id', userId)
       .order('created_at', { ascending: false });
+
+    if (resolvedWorkspaceId === null) {
+      query = query.is('workspace_id', null);
+    } else if (resolvedWorkspaceId) {
+      query = query.eq('workspace_id', resolvedWorkspaceId);
+    }
+
+    const { data, error } = await query;
 
     if (error) {
       logger.error('Failed to get connected accounts:', error);
@@ -370,17 +414,29 @@ class OAuthService {
    */
   async getConnectedAccount(
     userId: string,
-    provider: string
+    provider: string,
+    workspaceId?: string | null
   ): Promise<ConnectedAccount | null> {
-    const { data, error } = await this.supabase
+    const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
+    let query = this.supabase
       .from('connected_accounts')
       .select('*')
       .eq('user_id', userId)
       .eq('provider', provider)
-      .eq('status', 'active')
-      .single();
+      .eq('status', 'active');
 
-    if (error && error.code !== 'PGRST116') {
+    if (resolvedWorkspaceId === null) {
+      query = query.is('workspace_id', null);
+    } else if (resolvedWorkspaceId) {
+      query = query.eq('workspace_id', resolvedWorkspaceId);
+    }
+
+    const { data, error } = await query
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
       logger.error('Failed to get connected account:', error);
       throw new Error('Failed to get connected account');
     }
@@ -391,14 +447,25 @@ class OAuthService {
   /**
    * Get a valid access token, refreshing if necessary
    */
-  async getValidAccessToken(userId: string, provider: string): Promise<string> {
-    const { data: account, error } = await this.supabase
+  async getValidAccessToken(userId: string, provider: string, workspaceId?: string | null): Promise<string> {
+    const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
+    let query = this.supabase
       .from('connected_accounts')
       .select('*')
       .eq('user_id', userId)
       .eq('provider', provider)
-      .eq('status', 'active')
-      .single();
+      .eq('status', 'active');
+
+    if (resolvedWorkspaceId === null) {
+      query = query.is('workspace_id', null);
+    } else if (resolvedWorkspaceId) {
+      query = query.eq('workspace_id', resolvedWorkspaceId);
+    }
+
+    const { data: account, error } = await query
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     if (error || !account) {
       throw new Error(`No active ${provider} account found`);
@@ -459,14 +526,23 @@ class OAuthService {
   /**
    * Disconnect (revoke) a connected account
    */
-  async disconnectAccount(accountId: string, userId: string): Promise<void> {
+  async disconnectAccount(accountId: string, userId: string, workspaceId?: string | null): Promise<void> {
+    const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
+
     // First get the account to revoke the token
-    const { data: account } = await this.supabase
+    let accountQuery = this.supabase
       .from('connected_accounts')
       .select('*')
       .eq('id', accountId)
-      .eq('user_id', userId)
-      .single();
+      .eq('user_id', userId);
+
+    if (resolvedWorkspaceId === null) {
+      accountQuery = accountQuery.is('workspace_id', null);
+    } else if (resolvedWorkspaceId) {
+      accountQuery = accountQuery.eq('workspace_id', resolvedWorkspaceId);
+    }
+
+    const { data: account } = await accountQuery.single();
 
     if (!account) {
       throw new Error('Account not found');
@@ -486,11 +562,19 @@ class OAuthService {
     }
 
     // Delete the account record
-    const { error } = await this.supabase
+    let deleteQuery = this.supabase
       .from('connected_accounts')
       .delete()
       .eq('id', accountId)
       .eq('user_id', userId);
+
+    if (resolvedWorkspaceId === null) {
+      deleteQuery = deleteQuery.is('workspace_id', null);
+    } else if (resolvedWorkspaceId) {
+      deleteQuery = deleteQuery.eq('workspace_id', resolvedWorkspaceId);
+    }
+
+    const { error } = await deleteQuery;
 
     if (error) {
       throw new Error('Failed to disconnect account');
@@ -516,6 +600,7 @@ class OAuthService {
     return {
       id: row.id as string,
       userId: row.user_id as string,
+      workspaceId: (row.workspace_id as string) ?? null,
       provider: row.provider as string,
       providerAccountId: row.provider_account_id as string,
       email: row.email as string | null,

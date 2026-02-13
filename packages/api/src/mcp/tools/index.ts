@@ -230,6 +230,17 @@ import {
 } from './workspace-handlers';
 
 import {
+  handleCreateWorkspaceContainer,
+  handleListWorkspaceContainers,
+  handleGetWorkspaceContainer,
+  handleUpdateWorkspaceContainer,
+  createWorkspaceContainerSchema,
+  listWorkspaceContainersSchema,
+  getWorkspaceContainerSchema,
+  updateWorkspaceContainerSchema,
+} from './workspace-container-handlers';
+
+import {
   handleCreateKindleToken,
   createKindleTokenSchema,
 } from './kindle-handlers';
@@ -248,18 +259,6 @@ const userIdentifierFields = {
   platform: z.enum(['telegram', 'whatsapp', 'discord']).optional().describe('Platform name for lookup'),
   platformId: z.string().optional().describe('Platform-specific user ID or username'),
 };
-
-const artifactToolsByName = new Map(
-  artifactToolDefinitions.map((definition) => [definition.name, definition])
-);
-
-function getArtifactToolSchema(name: string) {
-  const definition = artifactToolsByName.get(name);
-  if (!definition) {
-    throw new Error(`Artifact tool definition not found: ${name}`);
-  }
-  return definition.schema;
-}
 
 export function registerAllTools(server: McpServer, dataComposer: DataComposer): void {
   // ---------------------------------------------------------------------------
@@ -880,7 +879,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
         expiresAt: z.string().datetime().optional().describe('Optional expiration date (ISO 8601)'),
         agentId: z.string().optional().describe('Which AI being created this memory (e.g., "wren", "benson"). Null = shared memory.'),
-        workspaceId: z.string().uuid().optional().describe('Workspace ID — helps auto-attach the correct session in parallel worktree scenarios. Stored in metadata.'),
+        studioId: z.string().uuid().optional().describe('Studio ID — helps auto-attach the correct session in parallel worktree scenarios. Stored in metadata.'),
+        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
       },
     },
     async (args) => {
@@ -993,15 +993,17 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Start a new AI session. Sessions track work done across a conversation and can be logged to.
 
-If workspaceId is provided, the session is scoped to that workspace — allowing multiple active sessions per agent (one per workspace). Read workspaceId from .pcp/identity.json if available.
+If studioId is provided, the session is scoped to that studio — allowing multiple active sessions per agent (one per studio). Read studioId from .pcp/identity.json if available.
+workspaceId is accepted as a deprecated alias.
 
-If an active session already exists for this agent+workspace, it is returned instead of creating a new one.
+If an active session already exists for this agent+studio, it is returned instead of creating a new one.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
         agentId: z.string().optional().describe('Agent identifier (e.g., "claude-code", "telegram-myra")'),
-        workspaceId: z.string().uuid().optional().describe('Workspace ID to scope this session to. Allows multiple active sessions per agent (one per workspace). Read from .pcp/identity.json.'),
+        studioId: z.string().uuid().optional().describe('Studio ID to scope this session to. Allows multiple active sessions per agent (one per studio). Read from .pcp/identity.json.'),
+        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
         metadata: z.record(z.unknown()).optional().describe('Session metadata'),
       },
     },
@@ -1029,7 +1031,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         ...userIdentifierFields,
         sessionId: z.string().uuid().optional().describe('Session ID (uses active session if not provided)'),
         agentId: z.string().optional().describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
-        workspaceId: z.string().uuid().optional().describe('Workspace ID for session resolution when sessionId not provided'),
+        studioId: z.string().uuid().optional().describe('Studio ID for session resolution when sessionId not provided'),
+        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
         content: z.string().describe('Log entry content'),
         salience: z.enum(['low', 'medium', 'high', 'critical']).optional().describe('Importance (default: medium)'),
       },
@@ -1053,14 +1056,16 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `End a session with an optional summary. The summary is automatically saved as a high-salience memory.
 
-Session resolution: sessionId (explicit) > agentId+workspaceId (scoped) > most recent active (fallback).
+Session resolution: sessionId (explicit) > agentId+studioId (scoped) > most recent active (fallback).
+workspaceId is accepted as a deprecated alias.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
         sessionId: z.string().uuid().optional().describe('Session ID (uses active session if not provided)'),
         agentId: z.string().optional().describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
-        workspaceId: z.string().uuid().optional().describe('Workspace ID for session resolution when sessionId not provided'),
+        studioId: z.string().uuid().optional().describe('Studio ID for session resolution when sessionId not provided'),
+        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
         summary: z.string().optional().describe('End-of-session summary (saved as memory)'),
       },
     },
@@ -1088,7 +1093,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         ...userIdentifierFields,
         sessionId: z.string().uuid().optional().describe('Session ID (returns active session if not provided)'),
         agentId: z.string().optional().describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
-        workspaceId: z.string().uuid().optional().describe('Workspace ID for session resolution when sessionId not provided'),
+        studioId: z.string().uuid().optional().describe('Studio ID for session resolution when sessionId not provided'),
+        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
         includeLogs: z.boolean().optional().describe('Include session logs (default: false)'),
       },
     },
@@ -1115,7 +1121,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       inputSchema: {
         ...userIdentifierFields,
         agentId: z.string().optional().describe('Filter by agent'),
-        workspaceId: z.string().uuid().optional().describe('Filter by workspace'),
+        studioId: z.string().uuid().optional().describe('Filter by studio'),
+        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
         limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
       },
     },
@@ -1138,8 +1145,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Update your session state — work phase, status, backend session ID, context. This is the primary tool for managing session state.
 
-Session resolution: sessionId (explicit) > workspaceId (scoped lookup) > most recent active session.
-For parallel worktrees, pass workspaceId to target the correct session.
+Session resolution: sessionId (explicit) > studioId (scoped lookup) > most recent active session.
+For parallel worktrees, pass studioId to target the correct session.
+workspaceId is accepted as a deprecated alias.
 
 Phase: Communicates real-time work status to other agents.
 - Active work phases (no auto-memory): investigating, implementing, reviewing
@@ -1152,7 +1160,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       inputSchema: {
         ...userIdentifierFields,
         sessionId: z.string().uuid().optional().describe('Session ID (uses active session if not provided). Most reliable for targeting a specific session.'),
-        workspaceId: z.string().uuid().optional().describe('Workspace ID for session resolution when sessionId is not provided. Useful for parallel worktree scenarios.'),
+        studioId: z.string().uuid().optional().describe('Studio ID for session resolution when sessionId is not provided. Useful for parallel worktree scenarios.'),
+        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
         phase: z.string().optional().describe('Work phase (e.g., "implementing", "blocked:awaiting-input", "waiting:build")'),
         note: z.string().optional().describe('Context for the phase transition (included in auto-created memory for blocked/waiting)'),
         agentId: z.string().optional().describe('Agent identity for memory attribution'),
@@ -1316,7 +1325,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         ...userIdentifierFields,
         sessionId: z.string().uuid().optional().describe('Session ID to compact (uses active session if not provided)'),
         agentId: z.string().optional().describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
-        workspaceId: z.string().uuid().optional().describe('Workspace ID for session resolution when sessionId not provided'),
+        studioId: z.string().uuid().optional().describe('Studio ID for session resolution when sessionId not provided'),
+        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
         minSalience: z.enum(['low', 'medium', 'high', 'critical']).optional()
           .describe('Minimum salience to include (default: medium)'),
         preserveLogs: z.boolean().optional().describe('Keep original logs visible after compaction (default: false). Note: Logs are always soft-deleted for audit trail.'),
@@ -3045,7 +3055,97 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   );
 
   // =====================================================
-  // WORKSPACE TOOLS (git worktree management)
+  // WORKSPACE CONTAINER TOOLS (personal/team scope)
+  // =====================================================
+
+  server.registerTool(
+    'create_workspace_container',
+    {
+      description: `Create a top-level workspace container (personal/team scope). This is distinct from git worktree studios.
+
+Use this for Notion/Slack/Linear-style workspace boundaries.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: createWorkspaceContainerSchema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleCreateWorkspaceContainer(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in create_workspace_container:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'list_workspace_containers',
+    {
+      description: `List top-level workspace containers (personal/team scope). Ensures a default personal workspace exists unless disabled.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: listWorkspaceContainersSchema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleListWorkspaceContainers(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_workspace_containers:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_workspace_container',
+    {
+      description: `Get one workspace container by ID. Optionally include member list.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getWorkspaceContainerSchema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleGetWorkspaceContainer(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_workspace_container:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'update_workspace_container',
+    {
+      description: `Update workspace container metadata (name, slug, type, description, archive state).
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: updateWorkspaceContainerSchema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleUpdateWorkspaceContainer(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in update_workspace_container:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // STUDIO TOOLS (legacy `workspace` naming for git worktree management)
   // =====================================================
 
   server.registerTool(
@@ -3169,6 +3269,123 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleAdoptWorkspace(args, dataComposer);
       } catch (error) {
         logger.error('Error in adopt_workspace:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Studio-first aliases (preferred naming).
+  // Backward compatibility: legacy workspace tool names remain available above.
+
+  server.registerTool(
+    'create_studio',
+    {
+      description: `Create a new git worktree studio for isolated parallel work.`,
+      inputSchema: workspaceToolDefinitions[0].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleCreateWorkspace(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in create_studio:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'list_studios',
+    {
+      description: `List git worktree studios (legacy workspace records).`,
+      inputSchema: workspaceToolDefinitions[1].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleListWorkspaces(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_studios:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_studio',
+    {
+      description: `Get one git worktree studio by ID, branch, or path.`,
+      inputSchema: workspaceToolDefinitions[2].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleGetWorkspace(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_studio:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'update_studio',
+    {
+      description: `Update a git worktree studio status, purpose, or session link.`,
+      inputSchema: workspaceToolDefinitions[3].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleUpdateWorkspace(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in update_studio:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'close_studio',
+    {
+      description: `Close a git worktree studio and optionally clean worktree/branch.`,
+      inputSchema: workspaceToolDefinitions[4].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleCloseWorkspace(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in close_studio:', error);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'adopt_studio',
+    {
+      description: `Adopt an existing git worktree studio into a new session.`,
+      inputSchema: workspaceToolDefinitions[5].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleAdoptWorkspace(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in adopt_studio:', error);
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
           isError: true,

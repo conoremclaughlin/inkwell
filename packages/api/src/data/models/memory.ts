@@ -65,6 +65,10 @@ export interface Session {
   id: string;
   userId: string;
   agentId?: string;
+  studioId?: string;
+  /**
+   * @deprecated Use studioId. Kept for backward compatibility during migration.
+   */
   workspaceId?: string;
   currentPhase?: string;
   startedAt: Date;
@@ -76,6 +80,10 @@ export interface Session {
 export interface SessionCreateInput {
   userId: string;
   agentId?: string;
+  studioId?: string;
+  /**
+   * @deprecated Use studioId. Kept for backward compatibility during migration.
+   */
   workspaceId?: string;
   metadata?: Record<string, unknown>;
 }
@@ -129,6 +137,7 @@ export interface SessionRow {
   id: string;
   user_id: string;
   agent_id: string | null;
+  studio_id: string | null;
   workspace_id: string | null;
   current_phase: string | null;
   started_at: string;

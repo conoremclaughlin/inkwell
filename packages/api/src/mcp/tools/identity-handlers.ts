@@ -27,6 +27,7 @@ export const awakenSchema = userIdentifierBaseSchema.extend({
 });
 
 export const saveIdentitySchema = userIdentifierBaseSchema.extend({
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
   agentId: z.string().describe('Unique identifier for the AI being (e.g., "wren", "benson", "myra")'),
   name: z.string().describe('Display name for the agent'),
   role: z.string().describe('Role description (e.g., "Development collaborator via Claude Code")'),
@@ -41,20 +42,25 @@ export const saveIdentitySchema = userIdentifierBaseSchema.extend({
 });
 
 export const getIdentitySchema = userIdentifierBaseSchema.extend({
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
   agentId: z.string().describe('Agent identifier to look up'),
   file: z.enum(['heartbeat', 'soul', 'values', 'identity'])
     .optional()
     .describe('Fetch a single identity document to minimize token usage. Omit to get everything.'),
 });
 
-export const listIdentitiesSchema = userIdentifierBaseSchema.extend({});
+export const listIdentitiesSchema = userIdentifierBaseSchema.extend({
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
+});
 
 export const getIdentityHistorySchema = userIdentifierBaseSchema.extend({
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
   agentId: z.string().describe('Agent identifier to get history for'),
   limit: z.number().min(1).max(50).optional().describe('Max history entries (default: 10)'),
 });
 
 export const restoreIdentitySchema = userIdentifierBaseSchema.extend({
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
   agentId: z.string().describe('Agent identifier to restore'),
   version: z.number().describe('Version number to restore to'),
 });
@@ -129,6 +135,11 @@ function generateIdentityMarkdown(identity: {
   return lines.join('\n');
 }
 
+function withWorkspaceFilter<T>(query: T, workspaceId?: string): T {
+  if (!workspaceId) return query;
+  return (query as { eq: (column: string, value: string) => T }).eq('workspace_id', workspaceId);
+}
+
 /**
  * Write identity to file system
  */
@@ -159,15 +170,30 @@ export async function handleSaveIdentity(
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();
 
-  const { agentId, name, role, description, values, relationships, capabilities, metadata, heartbeat, soul, syncToFile } = params;
+  const {
+    agentId,
+    name,
+    role,
+    description,
+    values,
+    relationships,
+    capabilities,
+    metadata,
+    heartbeat,
+    soul,
+    syncToFile,
+    workspaceId,
+  } = params;
 
   // Fetch existing record so omitted optional fields are preserved
-  const { data: existing } = await supabase
+  const { data: existing } = await withWorkspaceFilter(
+    supabase
     .from('agent_identities')
     .select('*')
     .eq('user_id', user.id)
-    .eq('agent_id', agentId)
-    .single();
+    .eq('agent_id', agentId),
+    workspaceId,
+  ).single();
 
   // Build upsert object, preserving existing values for omitted fields
   const upsertData: TablesInsert<'agent_identities'> = {
@@ -182,6 +208,7 @@ export async function handleSaveIdentity(
     metadata: (metadata !== undefined ? metadata : (existing?.metadata as unknown as Record<string, unknown> ?? {})) as unknown as Json,
     heartbeat: heartbeat !== undefined ? (heartbeat || null) : (existing?.heartbeat ?? null),
     soul: soul !== undefined ? (soul || null) : (existing?.soul ?? null),
+    ...(workspaceId ? { workspace_id: workspaceId } : {}),
   };
 
   // Use upsert to handle both create and update
@@ -256,12 +283,14 @@ export async function handleGetIdentity(
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();
 
-  const { data, error } = await supabase
+  let identityQuery = supabase
     .from('agent_identities')
     .select('*')
     .eq('user_id', user.id)
-    .eq('agent_id', params.agentId)
-    .single();
+    .eq('agent_id', params.agentId);
+
+  identityQuery = withWorkspaceFilter(identityQuery, params.workspaceId);
+  const { data, error } = await identityQuery.single();
 
   if (error) {
     if (error.code === 'PGRST116') {
@@ -370,11 +399,13 @@ export async function handleListIdentities(
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();
 
-  const { data, error } = await supabase
+  let listQuery = supabase
     .from('agent_identities')
     .select('*')
-    .eq('user_id', user.id)
-    .order('agent_id');
+    .eq('user_id', user.id);
+
+  listQuery = withWorkspaceFilter(listQuery, params.workspaceId);
+  const { data, error } = await listQuery.order('agent_id');
 
   if (error) {
     logger.error('Failed to list identities', { error });
@@ -424,12 +455,14 @@ export async function handleGetIdentityHistory(
   const limit = params.limit || 10;
 
   // First get the current identity to get its ID
-  const { data: current } = await supabase
+  let currentQuery = supabase
     .from('agent_identities')
     .select('id')
     .eq('user_id', user.id)
-    .eq('agent_id', params.agentId)
-    .single();
+    .eq('agent_id', params.agentId);
+
+  currentQuery = withWorkspaceFilter(currentQuery, params.workspaceId);
+  const { data: current } = await currentQuery.single();
 
   if (!current) {
     return {
@@ -452,10 +485,13 @@ export async function handleGetIdentityHistory(
   }
 
   // Get history entries
-  const { data, error } = await supabase
+  let historyQuery = supabase
     .from('agent_identity_history')
     .select('*')
-    .eq('identity_id', current.id)
+    .eq('identity_id', current.id);
+
+  historyQuery = withWorkspaceFilter(historyQuery, params.workspaceId);
+  const { data, error } = await historyQuery
     .order('archived_at', { ascending: false })
     .limit(limit);
 
@@ -509,24 +545,28 @@ export async function handleRestoreIdentity(
   const supabase = dataComposer.getClient();
 
   // First get the current identity
-  const { data: current } = await supabase
+  let currentQuery = supabase
     .from('agent_identities')
     .select('id')
     .eq('user_id', user.id)
-    .eq('agent_id', params.agentId)
-    .single();
+    .eq('agent_id', params.agentId);
+
+  currentQuery = withWorkspaceFilter(currentQuery, params.workspaceId);
+  const { data: current } = await currentQuery.single();
 
   if (!current) {
     throw new Error(`No identity found for agent: ${params.agentId}`);
   }
 
   // Find the history entry for the requested version
-  const { data: historyEntry, error: historyError } = await supabase
+  let restoreQuery = supabase
     .from('agent_identity_history')
     .select('*')
     .eq('identity_id', current.id)
-    .eq('version', params.version)
-    .single();
+    .eq('version', params.version);
+
+  restoreQuery = withWorkspaceFilter(restoreQuery, params.workspaceId);
+  const { data: historyEntry, error: historyError } = await restoreQuery.single();
 
   if (historyError || !historyEntry) {
     throw new Error(`Version ${params.version} not found in history for agent: ${params.agentId}`);

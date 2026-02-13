@@ -4,14 +4,14 @@
  * Manage git worktrees for parallel development with PCP identity.
  *
  * Commands:
- *   ws init [name]     Initialize parent directory structure
- *   ws create <name>   Create a new workspace
- *   ws list            List all workspaces
- *   ws remove <name>   Remove a workspace (keeps branch)
- *   ws clean <name>    Remove workspace and delete branch
- *   ws status          Show status of all workspaces
- *   ws path <name>     Output workspace path (for cd)
- *   ws cd <name>       Print cd command (use with: eval $(sb ws cd foo))
+ *   studio init [name]     Initialize parent directory structure
+ *   studio create <name>   Create a new workspace/studio
+ *   studio list            List all workspaces/studios
+ *   studio remove <name>   Remove a workspace/studio (keeps branch)
+ *   studio clean <name>    Remove workspace/studio and delete branch
+ *   studio status          Show status of all workspaces/studios
+ *   studio path <name>     Output workspace/studio path (for cd)
+ *   studio cd <name>       Print cd command (use with: eval $(sb studio cd foo))
  */
 
 import { Command } from 'commander';
@@ -282,8 +282,8 @@ function planInit(gitRoot: string, parentName: string): InitResult {
 async function initWorkspace(parentName: string | undefined, options: { dryRun?: boolean }): Promise<void> {
   if (!parentName) {
     console.error(chalk.red('Error: Parent directory name is required.'));
-    console.error(chalk.dim('Usage: sb ws init <parent-name>'));
-    console.error(chalk.dim('Example: sb ws init pcp'));
+    console.error(chalk.dim('Usage: sb studio init <parent-name>'));
+    console.error(chalk.dim('Example: sb studio init pcp'));
     process.exit(1);
   }
 
@@ -437,7 +437,7 @@ async function createWorkspace(
 
     writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
 
-    spinner.succeed(`Workspace created: ${name}`);
+    spinner.succeed(`Studio created: ${name}`);
     console.log('');
     console.log(chalk.dim('  Path:   ') + wsPath);
     console.log(chalk.dim('  Branch: ') + branch);
@@ -450,7 +450,7 @@ async function createWorkspace(
     console.log(chalk.dim(`  cd ${wsPath} && sb`));
     console.log('');
     console.log(chalk.cyan('Or use:'));
-    console.log(chalk.dim(`  eval $(sb ws cd ${name})`));
+    console.log(chalk.dim(`  eval $(sb studio cd ${name})`));
   } catch (error) {
     spinner.fail(`Failed to create workspace: ${error}`);
     process.exit(1);
@@ -463,14 +463,15 @@ function listCommand(): void {
 
   if (workspaces.length === 0) {
     console.log(chalk.yellow('No workspaces found.'));
-    console.log(chalk.dim('Create one with: sb ws create <name>'));
+    console.log(chalk.dim('Create one with: sb studio create <name>'));
     return;
   }
 
-  console.log(chalk.bold('\nPCP Workspaces:\n'));
+  console.log(chalk.bold('\nPCP Studios:\n'));
 
   for (const ws of workspaces) {
     console.log(chalk.cyan(`  ${ws.name}`));
+    console.log(chalk.dim(`    Folder: ${basename(ws.path)}`));
     console.log(chalk.dim(`    Path:   ${ws.path}`));
     console.log(chalk.dim(`    Branch: ${ws.branch}`));
     if (ws.identity) {
@@ -484,20 +485,20 @@ function listCommand(): void {
 }
 
 async function removeWorkspace(name: string): Promise<void> {
-  const spinner = ora(`Removing workspace: ${name}`).start();
+  const spinner = ora(`Removing studio: ${name}`).start();
 
   try {
     const gitRoot = findGitRoot();
     const wsPath = getWorkspacePath(gitRoot, name);
 
     if (!existsSync(wsPath)) {
-      spinner.fail(`Workspace not found: ${name}`);
+      spinner.fail(`Studio not found: ${name}`);
       process.exit(1);
     }
 
     git(`worktree remove "${wsPath}"`, gitRoot);
-    spinner.succeed(`Workspace removed: ${name}`);
-    console.log(chalk.dim('  Branch kept for PR. Use "sb ws clean" to also delete branch.'));
+    spinner.succeed(`Studio removed: ${name}`);
+    console.log(chalk.dim('  Branch kept for PR. Use "sb studio clean" to also delete branch.'));
   } catch (error) {
     spinner.fail(`Failed to remove workspace: ${error}`);
     process.exit(1);
@@ -505,7 +506,7 @@ async function removeWorkspace(name: string): Promise<void> {
 }
 
 async function cleanWorkspace(name: string): Promise<void> {
-  const spinner = ora(`Cleaning workspace: ${name}`).start();
+  const spinner = ora(`Cleaning studio: ${name}`).start();
 
   try {
     const gitRoot = findGitRoot();
@@ -546,7 +547,7 @@ async function cleanWorkspace(name: string): Promise<void> {
       git(`branch -D "${branch}"`, gitRoot);
     }
 
-    spinner.succeed(`Cleaned workspace: ${name}`);
+    spinner.succeed(`Cleaned studio: ${name}`);
   } catch (error) {
     spinner.fail(`Failed to clean workspace: ${error}`);
     process.exit(1);
@@ -557,7 +558,7 @@ function statusCommand(): void {
   const gitRoot = findGitRoot();
   const workspaces = listWorkspaces(gitRoot);
 
-  console.log(chalk.bold('\nWorkspace Status:\n'));
+  console.log(chalk.bold('\nStudio Status:\n'));
 
   console.log(chalk.cyan(`  main (${gitRoot})`));
   try {
@@ -597,7 +598,7 @@ function pathCommand(name: string): void {
   const wsPath = getWorkspacePath(gitRoot, name);
 
   if (!existsSync(wsPath)) {
-    console.error(`Workspace not found: ${name}`);
+    console.error(`Studio not found: ${name}`);
     process.exit(1);
   }
 
@@ -609,7 +610,7 @@ function cdCommand(name: string): void {
   const wsPath = getWorkspacePath(gitRoot, name);
 
   if (!existsSync(wsPath)) {
-    console.error(`Workspace not found: ${name}`);
+    console.error(`Studio not found: ${name}`);
     process.exit(1);
   }
 
@@ -627,9 +628,9 @@ export type { InitResult };
 
 export function registerWorkspaceCommands(program: Command): void {
   const ws = program
-    .command('ws')
-    .alias('workspace')
-    .description('Workspace management for parallel development');
+    .command('studio')
+    .alias('ws')
+    .description('Studio management for parallel development (worktree-backed)');
 
   ws.command('init [parent-name]')
     .description('Initialize parent directory structure (groups repo + worktrees)')
@@ -686,6 +687,6 @@ export function registerWorkspaceCommands(program: Command): void {
     .action(pathCommand);
 
   ws.command('cd <name>')
-    .description('Output cd command (use with: eval $(sb ws cd <name>))')
+    .description('Output cd command (use with: eval $(sb studio cd <name>))')
     .action(cdCommand);
 }

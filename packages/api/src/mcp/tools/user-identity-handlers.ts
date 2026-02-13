@@ -17,6 +17,7 @@ const userIdentifierFields = {
   phone: z.string().optional().describe('Phone number in E.164 format'),
   platformId: z.string().optional().describe('Platform-specific user ID'),
   platform: z.enum(['telegram', 'whatsapp', 'discord']).optional().describe('Platform for user lookup'),
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
 };
 
 // =====================================================
@@ -48,6 +49,11 @@ export const restoreUserIdentitySchema = z.object({
 // HANDLERS
 // =====================================================
 
+function withWorkspaceFilter<T>(query: T, workspaceId?: string): T {
+  if (!workspaceId) return query;
+  return (query as { eq: (column: string, value: string) => T }).eq('workspace_id', workspaceId);
+}
+
 /**
  * Save or update user identity (USER.md, VALUES.md)
  */
@@ -56,13 +62,15 @@ export async function handleSaveUserIdentity(args: unknown, dataComposer: DataCo
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
   const supabase = dataComposer.getClient();
+  const workspaceId = params.workspaceId;
 
   // Check if identity already exists
-  const { data: existing } = await supabase
+  let existingQuery = supabase
     .from('user_identity')
     .select('id, version')
-    .eq('user_id', user.id)
-    .single();
+    .eq('user_id', user.id);
+  existingQuery = withWorkspaceFilter(existingQuery, workspaceId);
+  const { data: existing } = await existingQuery.single();
 
   let result;
   if (existing) {
@@ -93,6 +101,7 @@ export async function handleSaveUserIdentity(args: unknown, dataComposer: DataCo
       .from('user_identity')
       .insert({
         user_id: user.id,
+        ...(workspaceId ? { workspace_id: workspaceId } : {}),
         user_profile_md: params.userProfileMd || null,
         shared_values_md: params.sharedValuesMd || null,
         process_md: params.processMd || null,
@@ -146,11 +155,12 @@ export async function handleGetUserIdentity(args: unknown, dataComposer: DataCom
 
   const supabase = dataComposer.getClient();
 
-  const { data, error } = await supabase
+  let identityQuery = supabase
     .from('user_identity')
     .select('*')
-    .eq('user_id', user.id)
-    .single();
+    .eq('user_id', user.id);
+  identityQuery = withWorkspaceFilter(identityQuery, params.workspaceId);
+  const { data, error } = await identityQuery.single();
 
   if (error && error.code !== 'PGRST116') {
     throw new Error(`Failed to get user identity: ${error.message}`);
@@ -215,17 +225,20 @@ export async function handleGetUserIdentityHistory(args: unknown, dataComposer: 
   const limit = params.limit || 10;
 
   // Get current identity
-  const { data: current } = await supabase
+  let currentQuery = supabase
     .from('user_identity')
     .select('*')
-    .eq('user_id', user.id)
-    .single();
+    .eq('user_id', user.id);
+  currentQuery = withWorkspaceFilter(currentQuery, params.workspaceId);
+  const { data: current } = await currentQuery.single();
 
   // Get history
-  const { data: history, error } = await supabase
+  let historyQuery = supabase
     .from('user_identity_history')
     .select('*')
-    .eq('user_id', user.id)
+    .eq('user_id', user.id);
+  historyQuery = withWorkspaceFilter(historyQuery, params.workspaceId);
+  const { data: history, error } = await historyQuery
     .order('version', { ascending: false })
     .limit(limit);
 
@@ -283,28 +296,29 @@ export async function handleRestoreUserIdentity(args: unknown, dataComposer: Dat
   const supabase = dataComposer.getClient();
 
   // Find the version to restore
-  const { data: versionToRestore, error: findError } = await supabase
+  let restoreQuery = supabase
     .from('user_identity_history')
     .select('*')
     .eq('user_id', user.id)
-    .eq('version', params.version)
-    .single();
+    .eq('version', params.version);
+  restoreQuery = withWorkspaceFilter(restoreQuery, params.workspaceId);
+  const { data: versionToRestore, error: findError } = await restoreQuery.single();
 
   if (findError || !versionToRestore) {
     throw new Error(`Version ${params.version} not found in history`);
   }
 
   // Update current identity with the historical values
-  const { data: result, error: updateError } = await supabase
+  let updateQuery = supabase
     .from('user_identity')
     .update({
       user_profile_md: versionToRestore.user_profile_md,
       shared_values_md: versionToRestore.shared_values_md,
       process_md: versionToRestore.process_md,
     })
-    .eq('user_id', user.id)
-    .select()
-    .single();
+    .eq('user_id', user.id);
+  updateQuery = withWorkspaceFilter(updateQuery, params.workspaceId);
+  const { data: result, error: updateError } = await updateQuery.select().single();
 
   if (updateError) {
     throw new Error(`Failed to restore user identity: ${updateError.message}`);

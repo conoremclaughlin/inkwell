@@ -259,6 +259,7 @@ describe('MemoryRepository', () => {
           id: 'session-123',
           user_id: 'user-456',
           agent_id: 'claude-code',
+          studio_id: null,
           workspace_id: null,
           started_at: '2026-01-26T12:00:00Z',
           ended_at: null,
@@ -276,15 +277,17 @@ describe('MemoryRepository', () => {
         expect(result.id).toBe('session-123');
         expect(result.userId).toBe('user-456');
         expect(result.agentId).toBe('claude-code');
+        expect(result.studioId).toBeUndefined();
         expect(result.workspaceId).toBeUndefined();
         expect(result.endedAt).toBeUndefined();
       });
 
-      it('should include workspace_id in insert when workspaceId is provided', async () => {
+      it('should include studio_id and workspace_id in insert when studioId is provided', async () => {
         const mockSessionRow = {
           id: 'session-ws',
           user_id: 'user-456',
           agent_id: 'wren',
+          studio_id: 'ws-abc-123',
           workspace_id: 'ws-abc-123',
           started_at: '2026-02-10T00:00:00Z',
           ended_at: null,
@@ -297,22 +300,57 @@ describe('MemoryRepository', () => {
         const result = await repo.startSession({
           userId: 'user-456',
           agentId: 'wren',
-          workspaceId: 'ws-abc-123',
+          studioId: 'ws-abc-123',
         });
 
+        expect(result.studioId).toBe('ws-abc-123');
         expect(result.workspaceId).toBe('ws-abc-123');
 
-        // Verify insert was called with workspace_id
+        // Verify insert was called with both studio_id (new) and workspace_id (legacy).
         expect(mockSupabase._queryBuilder.insert).toHaveBeenCalledWith(
-          expect.objectContaining({ workspace_id: 'ws-abc-123' }),
+          expect.objectContaining({
+            studio_id: 'ws-abc-123',
+            workspace_id: 'ws-abc-123',
+          }),
         );
       });
 
-      it('should not include workspace_id in insert when workspaceId is omitted', async () => {
+      it('should prefer studioId over workspaceId when both are provided', async () => {
+        const mockSessionRow = {
+          id: 'session-studio-wins',
+          user_id: 'user-456',
+          agent_id: 'wren',
+          studio_id: 'studio-abc',
+          workspace_id: 'studio-abc',
+          started_at: '2026-02-10T00:00:00Z',
+          ended_at: null,
+          summary: null,
+          metadata: {},
+        };
+
+        mockSupabase._setReturnData(mockSessionRow);
+
+        await repo.startSession({
+          userId: 'user-456',
+          agentId: 'wren',
+          studioId: 'studio-abc',
+          workspaceId: 'workspace-legacy',
+        });
+
+        expect(mockSupabase._queryBuilder.insert).toHaveBeenCalledWith(
+          expect.objectContaining({
+            studio_id: 'studio-abc',
+            workspace_id: 'studio-abc',
+          }),
+        );
+      });
+
+      it('should not include studio/workspace IDs in insert when studioId is omitted', async () => {
         const mockSessionRow = {
           id: 'session-no-ws',
           user_id: 'user-456',
           agent_id: 'wren',
+          studio_id: null,
           workspace_id: null,
           started_at: '2026-02-10T00:00:00Z',
           ended_at: null,
@@ -327,8 +365,9 @@ describe('MemoryRepository', () => {
           agentId: 'wren',
         });
 
-        // Verify insert was called WITHOUT workspace_id key
+        // Verify insert was called WITHOUT studio/workspace keys
         const insertCall = mockSupabase._queryBuilder.insert.mock.calls[0][0];
+        expect(insertCall).not.toHaveProperty('studio_id');
         expect(insertCall).not.toHaveProperty('workspace_id');
       });
     });
@@ -339,6 +378,7 @@ describe('MemoryRepository', () => {
           id: 'session-123',
           user_id: 'user-456',
           agent_id: 'claude-code',
+          studio_id: null,
           workspace_id: null,
           started_at: '2026-01-26T12:00:00Z',
           ended_at: '2026-01-26T14:00:00Z',
@@ -361,6 +401,7 @@ describe('MemoryRepository', () => {
           id: 'session-123',
           user_id: 'user-456',
           agent_id: 'claude-code',
+          studio_id: null,
           workspace_id: null,
           started_at: '2026-01-26T12:00:00Z',
           ended_at: null,
@@ -385,11 +426,12 @@ describe('MemoryRepository', () => {
         expect(result).toBeNull();
       });
 
-      it('should not filter by workspace when workspaceId is undefined (backward compat)', async () => {
+      it('should not filter by studio when studioId is undefined (backward compat)', async () => {
         const mockSessionRow = {
           id: 'session-any-ws',
           user_id: 'user-456',
           agent_id: 'wren',
+          studio_id: 'ws-something',
           workspace_id: 'ws-something',
           started_at: '2026-02-10T00:00:00Z',
           ended_at: null,
@@ -402,22 +444,23 @@ describe('MemoryRepository', () => {
         const result = await repo.getActiveSession('user-456', 'wren');
 
         expect(result).not.toBeNull();
-        // workspace_id should not have been used as a filter
-        // eq should have been called for user_id and agent_id but NOT workspace_id
+        // studio_id should not have been used as a filter
+        // eq should have been called for user_id and agent_id but NOT studio_id
         const eqCalls = mockSupabase._queryBuilder.eq.mock.calls;
-        const wsEqCalls = eqCalls.filter(([col]: [string]) => col === 'workspace_id');
+        const wsEqCalls = eqCalls.filter(([col]: [string]) => col === 'studio_id');
         expect(wsEqCalls).toHaveLength(0);
 
         const isCalls = mockSupabase._queryBuilder.is.mock.calls;
-        const wsIsCalls = isCalls.filter(([col]: [string]) => col === 'workspace_id');
+        const wsIsCalls = isCalls.filter(([col]: [string]) => col === 'studio_id');
         expect(wsIsCalls).toHaveLength(0);
       });
 
-      it('should filter for null workspace when workspaceId is explicitly null', async () => {
+      it('should filter for null studio when studioId is explicitly null', async () => {
         const mockSessionRow = {
           id: 'session-no-ws',
           user_id: 'user-456',
           agent_id: 'wren',
+          studio_id: null,
           workspace_id: null,
           started_at: '2026-02-10T00:00:00Z',
           ended_at: null,
@@ -429,15 +472,16 @@ describe('MemoryRepository', () => {
 
         await repo.getActiveSession('user-456', 'wren', null);
 
-        // Should have called is('workspace_id', null)
-        expect(mockSupabase._queryBuilder.is).toHaveBeenCalledWith('workspace_id', null);
+        // Should have called is('studio_id', null)
+        expect(mockSupabase._queryBuilder.is).toHaveBeenCalledWith('studio_id', null);
       });
 
-      it('should filter for specific workspace when workspaceId is a string', async () => {
+      it('should filter for specific studio when studioId is a string', async () => {
         const mockSessionRow = {
           id: 'session-specific-ws',
           user_id: 'user-456',
           agent_id: 'wren',
+          studio_id: 'ws-xyz',
           workspace_id: 'ws-xyz',
           started_at: '2026-02-10T00:00:00Z',
           ended_at: null,
@@ -449,37 +493,46 @@ describe('MemoryRepository', () => {
 
         await repo.getActiveSession('user-456', 'wren', 'ws-xyz');
 
-        // Should have called eq('workspace_id', 'ws-xyz')
-        expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('workspace_id', 'ws-xyz');
+        // Should have called eq('studio_id', 'ws-xyz')
+        expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('studio_id', 'ws-xyz');
       });
     });
 
     describe('listSessions', () => {
-      it('should filter by workspaceId when provided', async () => {
+      it('should filter by workspaceId alias when provided', async () => {
         mockSupabase._setArrayData([]);
 
         await repo.listSessions('user-456', { workspaceId: 'ws-filter' });
 
-        expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('workspace_id', 'ws-filter');
+        expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('studio_id', 'ws-filter');
       });
 
-      it('should not filter by workspace when workspaceId is omitted', async () => {
+      it('should filter by studioId when provided', async () => {
+        mockSupabase._setArrayData([]);
+
+        await repo.listSessions('user-456', { studioId: 'studio-filter' });
+
+        expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('studio_id', 'studio-filter');
+      });
+
+      it('should not filter by studio when workspaceId/studioId are omitted', async () => {
         mockSupabase._setArrayData([]);
 
         await repo.listSessions('user-456', { agentId: 'wren' });
 
         const eqCalls = mockSupabase._queryBuilder.eq.mock.calls;
-        const wsEqCalls = eqCalls.filter(([col]: [string]) => col === 'workspace_id');
+        const wsEqCalls = eqCalls.filter(([col]: [string]) => col === 'studio_id');
         expect(wsEqCalls).toHaveLength(0);
       });
     });
 
     describe('rowToSession mapping', () => {
-      it('should map workspace_id to workspaceId', async () => {
+      it('should map studio_id to both studioId and workspaceId', async () => {
         const mockSessionRow = {
           id: 'session-map',
           user_id: 'user-456',
           agent_id: 'wren',
+          studio_id: 'studio-mapped',
           workspace_id: 'ws-mapped',
           started_at: '2026-02-10T00:00:00Z',
           ended_at: null,
@@ -490,14 +543,36 @@ describe('MemoryRepository', () => {
         mockSupabase._setReturnData(mockSessionRow);
 
         const result = await repo.getSession('session-map');
-        expect(result!.workspaceId).toBe('ws-mapped');
+        expect(result!.studioId).toBe('studio-mapped');
+        expect(result!.workspaceId).toBe('studio-mapped');
       });
 
-      it('should map null workspace_id to undefined', async () => {
+      it('should fall back to workspace_id when studio_id is missing', async () => {
+        const mockSessionRow = {
+          id: 'session-fallback',
+          user_id: 'user-456',
+          agent_id: 'wren',
+          studio_id: null,
+          workspace_id: 'legacy-workspace-id',
+          started_at: '2026-02-10T00:00:00Z',
+          ended_at: null,
+          summary: null,
+          metadata: {},
+        };
+
+        mockSupabase._setReturnData(mockSessionRow);
+
+        const result = await repo.getSession('session-fallback');
+        expect(result!.studioId).toBe('legacy-workspace-id');
+        expect(result!.workspaceId).toBe('legacy-workspace-id');
+      });
+
+      it('should map null studio/workspace IDs to undefined', async () => {
         const mockSessionRow = {
           id: 'session-null-ws',
           user_id: 'user-456',
           agent_id: 'wren',
+          studio_id: null,
           workspace_id: null,
           started_at: '2026-02-10T00:00:00Z',
           ended_at: null,
@@ -508,6 +583,7 @@ describe('MemoryRepository', () => {
         mockSupabase._setReturnData(mockSessionRow);
 
         const result = await repo.getSession('session-null-ws');
+        expect(result!.studioId).toBeUndefined();
         expect(result!.workspaceId).toBeUndefined();
       });
     });
@@ -522,6 +598,7 @@ describe('MemoryRepository', () => {
       id: 'session-123',
       user_id: 'user-123',
       agent_id: 'wren',
+      studio_id: null,
       workspace_id: null,
       current_phase: 'implementing',
       started_at: '2026-02-10T10:00:00Z',
@@ -678,6 +755,7 @@ describe('MemoryRepository', () => {
         id: 'session-123',
         user_id: 'user-123',
         agent_id: 'wren',
+        studio_id: 'studio-abc',
         workspace_id: 'workspace-abc',
         current_phase: 'blocked:awaiting-input',
         started_at: '2026-02-10T10:00:00Z',
@@ -697,6 +775,7 @@ describe('MemoryRepository', () => {
         id: 'session-123',
         user_id: 'user-123',
         agent_id: 'wren',
+        studio_id: null,
         workspace_id: null,
         current_phase: null,
         started_at: '2026-02-10T10:00:00Z',

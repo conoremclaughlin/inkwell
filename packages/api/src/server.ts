@@ -211,10 +211,16 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
   // 4. Start MCP server with ChannelGateway
   logger.info('Starting MCP server with ChannelGateway...');
+  const enableTelegram =
+    process.env.ENABLE_TELEGRAM === 'true'
+      ? true
+      : process.env.ENABLE_TELEGRAM === 'false'
+        ? false
+        : !!env.TELEGRAM_BOT_TOKEN;
   mcpServer = await createMCPServer(dataComposer, {
     getSessionService: () => sessionService,
     channelGateway: {
-      enableTelegram: !!env.TELEGRAM_BOT_TOKEN,
+      enableTelegram,
       telegramPollingInterval: config.telegramPollingInterval || 1000,
       enableWhatsApp: config.enableWhatsApp ?? (process.env.ENABLE_WHATSAPP === 'true'),
       whatsappAccountId: config.whatsappAccountId || 'default',

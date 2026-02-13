@@ -8,6 +8,7 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { logger } from '../utils/logger';
 import { env } from '../config/env';
+import { getRequestContext, getSessionContext } from '../utils/request-context';
 import crypto from 'crypto';
 
 export type TrustLevel = 'owner' | 'admin' | 'member';
@@ -16,6 +17,7 @@ export type Platform = 'telegram' | 'whatsapp' | 'discord';
 interface TrustedUser {
   id: string;
   userId: string | null;
+  workspaceId: string | null;
   platform: Platform;
   platformUserId: string;
   trustLevel: TrustLevel;
@@ -25,6 +27,7 @@ interface TrustedUser {
 
 interface AuthorizedGroup {
   id: string;
+  workspaceId: string | null;
   platform: Platform;
   platformGroupId: string;
   groupName: string | null;
@@ -42,16 +45,32 @@ export class AuthorizationService {
     this.supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
   }
 
+  private resolveWorkspaceId(workspaceId?: string): string | undefined {
+    // During rollout we allow callers to omit workspaceId for backward compatibility.
+    // When available, prefer explicit arg, then request/session context.
+    return workspaceId ?? getRequestContext()?.workspaceId ?? getSessionContext()?.workspaceId;
+  }
+
   /**
    * Check if a user is trusted on a platform
    */
-  async isUserTrusted(platform: Platform, platformUserId: string): Promise<TrustedUser | null> {
-    const { data, error } = await this.supabase
+  async isUserTrusted(
+    platform: Platform,
+    platformUserId: string,
+    workspaceId?: string
+  ): Promise<TrustedUser | null> {
+    const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
+    let query = this.supabase
       .from('trusted_users')
       .select('*')
       .eq('platform', platform)
-      .eq('platform_user_id', platformUserId)
-      .single();
+      .eq('platform_user_id', platformUserId);
+
+    if (resolvedWorkspaceId) {
+      query = query.eq('workspace_id', resolvedWorkspaceId);
+    }
+
+    const { data, error } = await query.single();
 
     if (error || !data) {
       return null;
@@ -60,6 +79,7 @@ export class AuthorizationService {
     return {
       id: data.id,
       userId: data.user_id,
+      workspaceId: data.workspace_id,
       platform: data.platform,
       platformUserId: data.platform_user_id,
       trustLevel: data.trust_level,
@@ -71,14 +91,24 @@ export class AuthorizationService {
   /**
    * Check if a group is authorized
    */
-  async isGroupAuthorized(platform: Platform, platformGroupId: string): Promise<AuthorizedGroup | null> {
-    const { data, error } = await this.supabase
+  async isGroupAuthorized(
+    platform: Platform,
+    platformGroupId: string,
+    workspaceId?: string
+  ): Promise<AuthorizedGroup | null> {
+    const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
+    let query = this.supabase
       .from('authorized_groups')
       .select('*')
       .eq('platform', platform)
       .eq('platform_group_id', platformGroupId)
-      .eq('status', 'active')
-      .single();
+      .eq('status', 'active');
+
+    if (resolvedWorkspaceId) {
+      query = query.eq('workspace_id', resolvedWorkspaceId);
+    }
+
+    const { data, error } = await query.single();
 
     if (error || !data) {
       return null;
@@ -86,6 +116,7 @@ export class AuthorizationService {
 
     return {
       id: data.id,
+      workspaceId: data.workspace_id,
       platform: data.platform,
       platformGroupId: data.platform_group_id,
       groupName: data.group_name,
@@ -100,21 +131,32 @@ export class AuthorizationService {
    * Generate a challenge code for group authorization
    * Only trusted users can generate codes
    */
-  async generateChallengeCode(platform: Platform, platformUserId: string): Promise<string | null> {
+  async generateChallengeCode(
+    platform: Platform,
+    platformUserId: string,
+    workspaceId?: string
+  ): Promise<string | null> {
+    const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
     // Verify user is trusted
-    const trustedUser = await this.isUserTrusted(platform, platformUserId);
+    const trustedUser = await this.isUserTrusted(platform, platformUserId, resolvedWorkspaceId);
     if (!trustedUser) {
       logger.warn('Non-trusted user attempted to generate challenge code', { platform, platformUserId });
       return null;
     }
 
     // Check rate limit: max 5 active codes per user
-    const { count } = await this.supabase
+    let countQuery = this.supabase
       .from('group_challenge_codes')
       .select('*', { count: 'exact', head: true })
       .eq('created_by', trustedUser.userId)
       .is('used_at', null)
       .gt('expires_at', new Date().toISOString());
+
+    if (resolvedWorkspaceId) {
+      countQuery = countQuery.eq('workspace_id', resolvedWorkspaceId);
+    }
+
+    const { count } = await countQuery;
 
     if (count && count >= 5) {
       logger.warn('User exceeded challenge code rate limit', { userId: trustedUser.userId });
@@ -129,6 +171,7 @@ export class AuthorizationService {
       .insert({
         code,
         created_by: trustedUser.userId,
+        workspace_id: resolvedWorkspaceId || null,
       });
 
     if (error) {
@@ -147,23 +190,30 @@ export class AuthorizationService {
     platform: Platform,
     platformGroupId: string,
     groupName: string | null,
-    code: string
+    code: string,
+    workspaceId?: string
   ): Promise<{ success: boolean; error?: string }> {
+    const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
     // Find valid code
-    const { data: codeData, error: codeError } = await this.supabase
+    let codeQuery = this.supabase
       .from('group_challenge_codes')
       .select('*')
       .eq('code', code.toUpperCase())
       .is('used_at', null)
-      .gt('expires_at', new Date().toISOString())
-      .single();
+      .gt('expires_at', new Date().toISOString());
+
+    if (resolvedWorkspaceId) {
+      codeQuery = codeQuery.eq('workspace_id', resolvedWorkspaceId);
+    }
+
+    const { data: codeData, error: codeError } = await codeQuery.single();
 
     if (codeError || !codeData) {
       return { success: false, error: 'Invalid or expired code' };
     }
 
     // Check if group is already authorized
-    const existing = await this.isGroupAuthorized(platform, platformGroupId);
+    const existing = await this.isGroupAuthorized(platform, platformGroupId, resolvedWorkspaceId);
     if (existing) {
       return { success: false, error: 'Group is already authorized' };
     }
@@ -187,6 +237,7 @@ export class AuthorizationService {
         group_name: groupName,
         authorized_by: codeData.created_by,
         authorization_method: 'challenge_code',
+        workspace_id: resolvedWorkspaceId || codeData.workspace_id || null,
       });
 
     if (groupError) {
@@ -205,15 +256,17 @@ export class AuthorizationService {
     platform: Platform,
     platformGroupId: string,
     groupName: string | null,
-    platformUserId: string
+    platformUserId: string,
+    workspaceId?: string
   ): Promise<{ success: boolean; error?: string }> {
-    const trustedUser = await this.isUserTrusted(platform, platformUserId);
+    const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
+    const trustedUser = await this.isUserTrusted(platform, platformUserId, resolvedWorkspaceId);
     if (!trustedUser) {
       return { success: false, error: 'User is not trusted' };
     }
 
     // Check if already authorized
-    const existing = await this.isGroupAuthorized(platform, platformGroupId);
+    const existing = await this.isGroupAuthorized(platform, platformGroupId, resolvedWorkspaceId);
     if (existing) {
       return { success: true }; // Already authorized, that's fine
     }
@@ -226,6 +279,7 @@ export class AuthorizationService {
         group_name: groupName,
         authorized_by: trustedUser.userId,
         authorization_method: 'trusted_user',
+        workspace_id: resolvedWorkspaceId || null,
       });
 
     if (error) {
@@ -244,15 +298,17 @@ export class AuthorizationService {
   async revokeGroup(
     platform: Platform,
     platformGroupId: string,
-    revokedByPlatformUserId: string
+    revokedByPlatformUserId: string,
+    workspaceId?: string
   ): Promise<{ success: boolean; error?: string }> {
+    const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
     // Verify user has permission (owner or admin)
-    const trustedUser = await this.isUserTrusted(platform, revokedByPlatformUserId);
+    const trustedUser = await this.isUserTrusted(platform, revokedByPlatformUserId, resolvedWorkspaceId);
     if (!trustedUser || trustedUser.trustLevel === 'member') {
       return { success: false, error: 'Insufficient permissions' };
     }
 
-    const { error } = await this.supabase
+    let revokeQuery = this.supabase
       .from('authorized_groups')
       .update({
         status: 'revoked',
@@ -261,6 +317,12 @@ export class AuthorizationService {
       })
       .eq('platform', platform)
       .eq('platform_group_id', platformGroupId);
+
+    if (resolvedWorkspaceId) {
+      revokeQuery = revokeQuery.eq('workspace_id', resolvedWorkspaceId);
+    }
+
+    const { error } = await revokeQuery;
 
     if (error) {
       logger.error('Failed to revoke group', { error });
@@ -280,10 +342,12 @@ export class AuthorizationService {
     platformUserId: string,
     trustLevel: TrustLevel,
     addedByPlatformUserId: string,
-    userId?: string
+    userId?: string,
+    workspaceId?: string
   ): Promise<{ success: boolean; error?: string }> {
+    const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
     // Verify adder has permission
-    const adder = await this.isUserTrusted(platform, addedByPlatformUserId);
+    const adder = await this.isUserTrusted(platform, addedByPlatformUserId, resolvedWorkspaceId);
     if (!adder) {
       return { success: false, error: 'You are not a trusted user' };
     }
@@ -300,7 +364,7 @@ export class AuthorizationService {
     }
 
     // Check if already trusted
-    const existing = await this.isUserTrusted(platform, platformUserId);
+    const existing = await this.isUserTrusted(platform, platformUserId, resolvedWorkspaceId);
     if (existing) {
       return { success: false, error: 'User is already trusted' };
     }
@@ -313,6 +377,7 @@ export class AuthorizationService {
         platform_user_id: platformUserId,
         trust_level: trustLevel,
         added_by: adder.userId,
+        workspace_id: resolvedWorkspaceId || null,
       });
 
     if (error) {
@@ -327,7 +392,8 @@ export class AuthorizationService {
   /**
    * List all authorized groups for a platform
    */
-  async listAuthorizedGroups(platform?: Platform): Promise<AuthorizedGroup[]> {
+  async listAuthorizedGroups(platform?: Platform, workspaceId?: string): Promise<AuthorizedGroup[]> {
+    const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
     let query = this.supabase
       .from('authorized_groups')
       .select('*')
@@ -335,6 +401,9 @@ export class AuthorizationService {
 
     if (platform) {
       query = query.eq('platform', platform);
+    }
+    if (resolvedWorkspaceId) {
+      query = query.eq('workspace_id', resolvedWorkspaceId);
     }
 
     const { data, error } = await query;
@@ -345,6 +414,7 @@ export class AuthorizationService {
 
     return data.map((g) => ({
       id: g.id,
+      workspaceId: g.workspace_id,
       platform: g.platform,
       platformGroupId: g.platform_group_id,
       groupName: g.group_name,
@@ -358,13 +428,17 @@ export class AuthorizationService {
   /**
    * List all trusted users for a platform
    */
-  async listTrustedUsers(platform?: Platform): Promise<TrustedUser[]> {
+  async listTrustedUsers(platform?: Platform, workspaceId?: string): Promise<TrustedUser[]> {
+    const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
     let query = this.supabase
       .from('trusted_users')
       .select('*');
 
     if (platform) {
       query = query.eq('platform', platform);
+    }
+    if (resolvedWorkspaceId) {
+      query = query.eq('workspace_id', resolvedWorkspaceId);
     }
 
     const { data, error } = await query;
@@ -376,6 +450,7 @@ export class AuthorizationService {
     return data.map((u) => ({
       id: u.id,
       userId: u.user_id,
+      workspaceId: u.workspace_id,
       platform: u.platform,
       platformUserId: u.platform_user_id,
       trustLevel: u.trust_level,
