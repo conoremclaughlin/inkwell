@@ -161,10 +161,13 @@ export class ClaudeRunner implements IClaudeRunner {
     toolCalls: ToolCall[];
   }> {
     return new Promise((resolve, reject) => {
+      // Strip CLAUDECODE to prevent "nested session" detection when PCP is
+      // launched from inside a Claude Code session (e.g., via PM2).
+      const { CLAUDECODE, ...cleanEnv } = process.env;
       const proc = spawn('claude', args, {
         cwd: config.workingDirectory,
         env: {
-          ...process.env,
+          ...cleanEnv,
           // Ensure Claude Code uses correct paths
           HOME: process.env.HOME,
           PATH: process.env.PATH,

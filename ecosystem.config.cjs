@@ -55,6 +55,7 @@ module.exports = {
         ENABLE_WHATSAPP: 'true',
         ENABLE_DISCORD: 'false',
         AGENT_ID: 'myra',  // Identity for the Claude Code backend
+        CLAUDECODE: '',     // Prevent nested-session detection when spawning Claude Code
       },
       max_restarts: 10,
       restart_delay: 1000,

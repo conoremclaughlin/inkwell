@@ -165,9 +165,12 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
 
       logger.info(`Spawning Claude Code with args: ${args.join(' ')}`);
 
+      // Strip CLAUDECODE to prevent "nested session" detection when PCP is
+      // launched from inside a Claude Code session (e.g., via PM2).
+      const { CLAUDECODE, ...cleanEnv } = process.env;
       const proc = spawn('claude', args, {
         cwd: this.config.workingDirectory,
-        env: { ...process.env },
+        env: cleanEnv,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
 
