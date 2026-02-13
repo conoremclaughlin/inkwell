@@ -296,8 +296,8 @@ export class SessionService implements ISessionService {
     // 1. Build context for the agent
     const injectedContext = await this.contextBuilder.buildContext(userId, agentId, session);
 
-    // 2. Format the incoming message with sender info
-    const formattedMessage = this.formatMessage(request);
+    // 2. Format the incoming message with sender info + current timestamp
+    const formattedMessage = this.formatMessage(request, injectedContext.user.timezone);
 
     // 3. Build Claude runner config
     const runnerConfig: ClaudeRunnerConfig = {
@@ -701,12 +701,27 @@ This session will continue with a fresh context after compaction. Your identity,
    * External channel messages are wrapped in <untrusted-data> tags following
    * Supabase's proven pattern for prompt injection protection.
    */
-  private formatMessage(request: SessionRequest): string {
+  private formatMessage(request: SessionRequest, timezone?: string): string {
     const { sender, content, channel, conversationId, metadata } = request;
     const isExternalChannel =
       channel === 'telegram' || channel === 'whatsapp' || channel === 'discord';
 
     const lines: string[] = [];
+
+    // Add current timestamp so the agent always knows what time it is
+    const now = new Date();
+    const tz = timezone || 'UTC';
+    const localTime = now.toLocaleString('en-US', {
+      timeZone: tz,
+      weekday: 'short',
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      timeZoneName: 'short',
+    });
+    lines.push(`Current time: ${localTime}`);
 
     // Add trigger type context
     if (metadata?.triggerType === 'heartbeat') {

@@ -23,6 +23,29 @@ sb
 
 See [packages/cli/README.md](./packages/cli/README.md) for full CLI documentation.
 
+### MCP Configuration (Required)
+
+Each working directory (studio/worktree) that runs a backend needs a `.mcp.json` file so the agent can connect to the PCP MCP server, Supabase, and other services. Without it, **spawned agents will silently fail** — they cannot call MCP tools (including replying to users).
+
+Create `.mcp.json` in the project root (and each studio worktree):
+
+```json
+{
+  "mcpServers": {
+    "supabase": {
+      "type": "http",
+      "url": "https://mcp.supabase.com/mcp?project_ref=<your-project-ref>"
+    },
+    "pcp": {
+      "type": "http",
+      "url": "http://localhost:3001/mcp"
+    }
+  }
+}
+```
+
+Adjust the `pcp` URL if your studio runs on a different port. This file is `.gitignored` because each studio may use different ports — you must create it manually after cloning or resetting.
+
 ## Database Setup (Supabase)
 
 PCP supports both:
