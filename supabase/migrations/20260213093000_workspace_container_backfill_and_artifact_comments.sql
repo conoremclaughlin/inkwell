@@ -178,7 +178,18 @@ UPDATE public.authorized_groups ag
 SET workspace_id = wc.id
 FROM public.workspace_containers wc
 WHERE ag.workspace_id IS NULL
-  AND wc.user_id = COALESCE(ag.authorized_by, ag.revoked_by)
+  AND ag.authorized_by IS NOT NULL
+  AND wc.user_id = ag.authorized_by
+  AND wc.slug = 'personal'
+  AND wc.archived_at IS NULL;
+
+UPDATE public.authorized_groups ag
+SET workspace_id = wc.id
+FROM public.workspace_containers wc
+WHERE ag.workspace_id IS NULL
+  AND ag.authorized_by IS NULL
+  AND ag.revoked_by IS NOT NULL
+  AND wc.user_id = ag.revoked_by
   AND wc.slug = 'personal'
   AND wc.archived_at IS NULL;
 
