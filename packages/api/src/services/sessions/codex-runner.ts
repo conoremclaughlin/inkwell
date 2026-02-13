@@ -132,9 +132,11 @@ export class CodexRunner implements IClaudeRunner {
     sessionId?: string;
   }> {
     return new Promise((resolve, reject) => {
+      // Strip CLAUDECODE to prevent env leaking into subprocess
+      const { CLAUDECODE, ...cleanEnv } = process.env;
       const proc = spawn('codex', args, {
         cwd: config.workingDirectory,
-        env: { ...process.env, HOME: process.env.HOME, PATH: process.env.PATH },
+        env: { ...cleanEnv, HOME: process.env.HOME, PATH: process.env.PATH },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
 
