@@ -86,10 +86,13 @@ export async function handleCreateTask(
       },
     });
   } catch (error) {
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to create task',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to create task',
+      },
+      true
+    );
   }
 }
 
@@ -130,15 +133,15 @@ export async function handleListTasks(
     }
 
     // Get project names for context
-    const projectIds = [...new Set(tasks.map(t => t.project_id))];
+    const projectIds = [...new Set(tasks.map((t) => t.project_id))];
     const projects = await Promise.all(
-      projectIds.map(id => dataComposer.repositories.projects.findById(id))
+      projectIds.map((id) => dataComposer.repositories.projects.findById(id))
     );
-    const projectMap = new Map(projects.filter(Boolean).map(p => [p!.id, p!.name]));
+    const projectMap = new Map(projects.filter(Boolean).map((p) => [p!.id, p!.name]));
 
     return mcpResponse({
       success: true,
-      tasks: tasks.map(task => ({
+      tasks: tasks.map((task) => ({
         id: task.id,
         title: task.title,
         description: task.description,
@@ -152,10 +155,13 @@ export async function handleListTasks(
       })),
     });
   } catch (error) {
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to list tasks',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to list tasks',
+      },
+      true
+    );
   }
 }
 
@@ -214,10 +220,13 @@ export async function handleUpdateTask(
       },
     });
   } catch (error) {
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to update task',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to update task',
+      },
+      true
+    );
   }
 }
 
@@ -261,10 +270,13 @@ export async function handleCompleteTask(
       },
     });
   } catch (error) {
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to complete task',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to complete task',
+      },
+      true
+    );
   }
 }
 
@@ -304,15 +316,16 @@ export async function handleGetTaskStats(
         projectId: args.projectId,
         projectName: project.name,
         ...stats,
-        completionRate: stats.total > 0
-          ? Math.round((stats.completed / stats.total) * 100)
-          : 0,
+        completionRate: stats.total > 0 ? Math.round((stats.completed / stats.total) * 100) : 0,
       },
     });
   } catch (error) {
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to get task stats',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to get task stats',
+      },
+      true
+    );
   }
 }

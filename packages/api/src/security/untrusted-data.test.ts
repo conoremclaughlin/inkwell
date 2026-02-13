@@ -126,7 +126,7 @@ describe('validateExtractedData', () => {
     const result = validateExtractedData(extracted, { blockCode: true });
 
     expect(result.valid).toBe(false);
-    expect(result.violations.some(v => v.includes('Code pattern'))).toBe(true);
+    expect(result.violations.some((v) => v.includes('Code pattern'))).toBe(true);
   });
 
   it('should detect script tags', () => {
@@ -150,7 +150,7 @@ describe('validateExtractedData', () => {
     const result = validateExtractedData(extracted, { blockUrls: true });
 
     expect(result.valid).toBe(false);
-    expect(result.violations.some(v => v.includes('results[0].url'))).toBe(true);
+    expect(result.violations.some((v) => v.includes('results[0].url'))).toBe(true);
   });
 
   it('should pass clean data', () => {
@@ -258,7 +258,9 @@ describe('Integration: Injection Attack Scenarios', () => {
       const boundary = wrapped.match(/<(untrusted-email-[a-f0-9-]+)>/)?.[1];
 
       // The real boundary is a valid UUID that doesn't match any attack pattern
-      expect(boundary).toMatch(/untrusted-email-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/);
+      expect(boundary).toMatch(
+        /untrusted-email-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/
+      );
     }
   });
 
@@ -272,6 +274,6 @@ describe('Integration: Injection Attack Scenarios', () => {
     const validation = validateExtractedData(suspiciousExtraction, { blockUrls: true });
 
     expect(validation.valid).toBe(false);
-    expect(validation.violations.some(v => v.includes('URL'))).toBe(true);
+    expect(validation.violations.some((v) => v.includes('URL'))).toBe(true);
   });
 });

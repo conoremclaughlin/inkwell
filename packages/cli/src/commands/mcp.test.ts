@@ -46,14 +46,17 @@ describe('syncMcpConfig', () => {
   });
 
   it('should create .codex/config.toml from .mcp.json', () => {
-    writeFileSync(join(TEST_DIR, '.mcp.json'), JSON.stringify({
-      mcpServers: {
-        pcp: {
-          type: 'http',
-          url: 'http://localhost:3001/mcp',
+    writeFileSync(
+      join(TEST_DIR, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          pcp: {
+            type: 'http',
+            url: 'http://localhost:3001/mcp',
+          },
         },
-      },
-    }));
+      })
+    );
 
     const result = syncMcpConfig(TEST_DIR);
 
@@ -66,14 +69,17 @@ describe('syncMcpConfig', () => {
   });
 
   it('should create .gemini/settings.json from .mcp.json', () => {
-    writeFileSync(join(TEST_DIR, '.mcp.json'), JSON.stringify({
-      mcpServers: {
-        pcp: {
-          type: 'http',
-          url: 'http://localhost:3001/mcp',
+    writeFileSync(
+      join(TEST_DIR, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          pcp: {
+            type: 'http',
+            url: 'http://localhost:3001/mcp',
+          },
         },
-      },
-    }));
+      })
+    );
 
     const result = syncMcpConfig(TEST_DIR);
 
@@ -86,15 +92,18 @@ describe('syncMcpConfig', () => {
   });
 
   it('should handle servers with command and args', () => {
-    writeFileSync(join(TEST_DIR, '.mcp.json'), JSON.stringify({
-      mcpServers: {
-        supabase: {
-          command: 'npx',
-          args: ['@supabase/mcp-server', '--project-ref', 'abc123'],
-          env: { SUPABASE_KEY: 'test-key' },
+    writeFileSync(
+      join(TEST_DIR, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          supabase: {
+            command: 'npx',
+            args: ['@supabase/mcp-server', '--project-ref', 'abc123'],
+            env: { SUPABASE_KEY: 'test-key' },
+          },
         },
-      },
-    }));
+      })
+    );
 
     const result = syncMcpConfig(TEST_DIR);
 
@@ -109,13 +118,19 @@ describe('syncMcpConfig', () => {
     // Create existing settings
     const geminiDir = join(TEST_DIR, '.gemini');
     mkdirSync(geminiDir, { recursive: true });
-    writeFileSync(join(geminiDir, 'settings.json'), JSON.stringify({
-      existingKey: 'should-persist',
-    }));
+    writeFileSync(
+      join(geminiDir, 'settings.json'),
+      JSON.stringify({
+        existingKey: 'should-persist',
+      })
+    );
 
-    writeFileSync(join(TEST_DIR, '.mcp.json'), JSON.stringify({
-      mcpServers: { pcp: { url: 'http://localhost:3001/mcp' } },
-    }));
+    writeFileSync(
+      join(TEST_DIR, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: { pcp: { url: 'http://localhost:3001/mcp' } },
+      })
+    );
 
     syncMcpConfig(TEST_DIR);
 
@@ -125,9 +140,12 @@ describe('syncMcpConfig', () => {
   });
 
   it('should add .codex/ and .gemini/ to .gitignore', () => {
-    writeFileSync(join(TEST_DIR, '.mcp.json'), JSON.stringify({
-      mcpServers: { pcp: { url: 'http://localhost:3001/mcp' } },
-    }));
+    writeFileSync(
+      join(TEST_DIR, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: { pcp: { url: 'http://localhost:3001/mcp' } },
+      })
+    );
 
     syncMcpConfig(TEST_DIR);
 
@@ -137,9 +155,12 @@ describe('syncMcpConfig', () => {
   });
 
   it('should not duplicate gitignore entries on repeated runs', () => {
-    writeFileSync(join(TEST_DIR, '.mcp.json'), JSON.stringify({
-      mcpServers: { pcp: { url: 'http://localhost:3001/mcp' } },
-    }));
+    writeFileSync(
+      join(TEST_DIR, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: { pcp: { url: 'http://localhost:3001/mcp' } },
+      })
+    );
 
     syncMcpConfig(TEST_DIR);
     syncMcpConfig(TEST_DIR);
@@ -152,9 +173,12 @@ describe('syncMcpConfig', () => {
   it('should write to a custom target directory', () => {
     const subDir = join(TEST_DIR, 'my-workspace');
     mkdirSync(subDir, { recursive: true });
-    writeFileSync(join(subDir, '.mcp.json'), JSON.stringify({
-      mcpServers: { pcp: { url: 'http://localhost:3001/mcp' } },
-    }));
+    writeFileSync(
+      join(subDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: { pcp: { url: 'http://localhost:3001/mcp' } },
+      })
+    );
 
     const result = syncMcpConfig(subDir);
 

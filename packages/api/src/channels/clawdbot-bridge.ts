@@ -15,12 +15,7 @@
  */
 
 import type { ChannelAdapter } from './adapter';
-import type {
-  InboundMessage,
-  ChannelPlatform,
-  ChatType,
-  ProcessingResult,
-} from './types';
+import type { InboundMessage, ChannelPlatform, ChatType, ProcessingResult } from './types';
 import { logger } from '../utils/logger';
 
 /**

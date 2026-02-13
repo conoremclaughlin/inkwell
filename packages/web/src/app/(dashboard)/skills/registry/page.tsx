@@ -50,7 +50,10 @@ interface RegistryResponse {
   categories: string[];
 }
 
-const typeConfig: Record<SkillType, { label: string; icon: React.ReactNode; color: string; bgColor: string }> = {
+const typeConfig: Record<
+  SkillType,
+  { label: string; icon: React.ReactNode; color: string; bgColor: string }
+> = {
   'mini-app': {
     label: 'Mini App',
     icon: <Code className="h-4 w-4" />,
@@ -141,11 +144,7 @@ export default function SkillsRegistryPage() {
         </div>
       </div>
 
-      {error && (
-        <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">
-          {error.message}
-        </div>
-      )}
+      {error && <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">{error.message}</div>}
 
       {/* Search and Filters */}
       <Card className="mt-6">
@@ -255,9 +254,7 @@ export default function SkillsRegistryPage() {
                   </div>
 
                   {/* Description */}
-                  <p className="text-sm text-gray-600 mb-3 line-clamp-2">
-                    {skill.description}
-                  </p>
+                  <p className="text-sm text-gray-600 mb-3 line-clamp-2">{skill.description}</p>
 
                   {/* Tags */}
                   {skill.tags.length > 0 && (
@@ -271,9 +268,7 @@ export default function SkillsRegistryPage() {
                         </span>
                       ))}
                       {skill.tags.length > 3 && (
-                        <span className="text-xs text-gray-400">
-                          +{skill.tags.length - 3}
-                        </span>
+                        <span className="text-xs text-gray-400">+{skill.tags.length - 3}</span>
                       )}
                     </div>
                   )}

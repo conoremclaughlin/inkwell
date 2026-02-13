@@ -131,17 +131,11 @@ export default function RemindersPage() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold text-gray-900">Reminders</h1>
-          <p className="mt-2 text-gray-600">
-            View scheduled reminders across all users.
-          </p>
+          <p className="mt-2 text-gray-600">View scheduled reminders across all users.</p>
         </div>
       </div>
 
-      {error && (
-        <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">
-          {error.message}
-        </div>
-      )}
+      {error && <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">{error.message}</div>}
 
       {/* Stats */}
       <div className="grid grid-cols-4 gap-4 mt-6">
@@ -179,9 +173,7 @@ export default function RemindersPage() {
       <Card className="mt-6">
         <CardHeader>
           <CardTitle>All Reminders</CardTitle>
-          <CardDescription>
-            Sorted by next scheduled run time
-          </CardDescription>
+          <CardDescription>Sorted by next scheduled run time</CardDescription>
         </CardHeader>
         <CardContent>
           {isLoading ? (
@@ -191,7 +183,8 @@ export default function RemindersPage() {
               <Bell className="h-12 w-12 mx-auto text-gray-300 mb-3" />
               <p className="text-gray-500">No reminders scheduled yet.</p>
               <p className="text-sm text-gray-400 mt-1">
-                Use the <code className="bg-gray-100 px-1 rounded">create_reminder</code> tool to schedule one.
+                Use the <code className="bg-gray-100 px-1 rounded">create_reminder</code> tool to
+                schedule one.
               </p>
             </div>
           ) : (
@@ -205,7 +198,9 @@ export default function RemindersPage() {
                     key={reminder.id}
                     className={clsx(
                       'rounded-lg border p-4',
-                      reminder.status === 'active' ? 'border-green-200 bg-green-50/50' : 'border-gray-200'
+                      reminder.status === 'active'
+                        ? 'border-green-200 bg-green-50/50'
+                        : 'border-gray-200'
                     )}
                   >
                     <div className="flex items-start justify-between">

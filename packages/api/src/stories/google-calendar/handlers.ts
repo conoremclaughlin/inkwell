@@ -9,24 +9,20 @@ import { getGoogleCalendarService } from './service';
 import { resolveUserOrThrow } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
 import type { DataComposer } from '../../data/composer';
-import type { CalendarOperation, EventResponseStatus, UpdateableEventField, UpdateEventFields } from './types';
+import type {
+  CalendarOperation,
+  EventResponseStatus,
+  UpdateableEventField,
+  UpdateEventFields,
+} from './types';
 
 // Shared user identifier schema
 const userIdentifierBaseSchema = z.object({
   userId: z.string().uuid().optional().describe('User UUID (if known)'),
   email: z.string().email().optional().describe('User email address'),
-  phone: z
-    .string()
-    .optional()
-    .describe('Phone number in E.164 format (e.g., +14155551234)'),
-  platform: z
-    .enum(['telegram', 'whatsapp', 'discord'])
-    .optional()
-    .describe('Platform name'),
-  platformId: z
-    .string()
-    .optional()
-    .describe('Platform-specific user ID or username'),
+  phone: z.string().optional().describe('Phone number in E.164 format (e.g., +14155551234)'),
+  platform: z.enum(['telegram', 'whatsapp', 'discord']).optional().describe('Platform name'),
+  platformId: z.string().optional().describe('Platform-specific user ID or username'),
 });
 
 // Tool result type
@@ -92,9 +88,10 @@ export const BLOCKED_OPERATIONS: Set<CalendarOperation> = new Set([
  * @param operation The operation to check
  * @returns { allowed: boolean, reason?: string }
  */
-export function isCalendarOperationAllowed(
-  operation: CalendarOperation
-): { allowed: boolean; reason?: string } {
+export function isCalendarOperationAllowed(operation: CalendarOperation): {
+  allowed: boolean;
+  reason?: string;
+} {
   // Check blocked list first
   if (BLOCKED_OPERATIONS.has(operation)) {
     return {
@@ -124,22 +121,14 @@ export const listCalendarEventsSchema = userIdentifierBaseSchema.extend({
   startDate: z
     .string()
     .describe('Start of date range (ISO 8601 format, e.g., 2026-01-30T00:00:00Z)'),
-  endDate: z
-    .string()
-    .describe('End of date range (ISO 8601 format, e.g., 2026-02-06T00:00:00Z)'),
-  calendarId: z
-    .string()
-    .optional()
-    .describe('Calendar ID to query (default: "primary")'),
+  endDate: z.string().describe('End of date range (ISO 8601 format, e.g., 2026-02-06T00:00:00Z)'),
+  calendarId: z.string().optional().describe('Calendar ID to query (default: "primary")'),
   maxResults: z
     .number()
     .optional()
     .default(10)
     .describe('Maximum number of events to return (default: 10)'),
-  query: z
-    .string()
-    .optional()
-    .describe('Free text search query to filter events'),
+  query: z.string().optional().describe('Free text search query to filter events'),
 });
 
 export const getCalendarEventSchema = userIdentifierBaseSchema.extend({
@@ -165,7 +154,9 @@ const eventTimeSchema = z.object({
   dateTime: z
     .string()
     .optional()
-    .describe('DateTime in RFC3339 format (e.g., "2026-02-10T10:00:00-08:00"). Use this for timed events.'),
+    .describe(
+      'DateTime in RFC3339 format (e.g., "2026-02-10T10:00:00-08:00"). Use this for timed events.'
+    ),
   date: z
     .string()
     .optional()
@@ -182,18 +173,9 @@ export const updateCalendarEventSchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe('Calendar ID containing the event (default: "primary")'),
-  summary: z
-    .string()
-    .optional()
-    .describe('New title/summary for the event'),
-  description: z
-    .string()
-    .optional()
-    .describe('New description/notes for the event'),
-  location: z
-    .string()
-    .optional()
-    .describe('New location for the event'),
+  summary: z.string().optional().describe('New title/summary for the event'),
+  description: z.string().optional().describe('New description/notes for the event'),
+  location: z.string().optional().describe('New location for the event'),
   start: eventTimeSchema
     .optional()
     .describe('New start time. Use dateTime for timed events, date for all-day events.'),
@@ -204,10 +186,7 @@ export const updateCalendarEventSchema = userIdentifierBaseSchema.extend({
 
 export const createCalendarEventSchema = userIdentifierBaseSchema.extend({
   summary: z.string().describe('Event title/summary'),
-  description: z
-    .string()
-    .optional()
-    .describe('Event description or notes'),
+  description: z.string().optional().describe('Event description or notes'),
   location: z
     .string()
     .optional()
@@ -281,10 +260,9 @@ export async function handleListCalendars(
             {
               success: false,
               error: message,
-              hint:
-                message.includes('No active google account')
-                  ? 'User needs to connect their Google account in the web dashboard'
-                  : undefined,
+              hint: message.includes('No active google account')
+                ? 'User needs to connect their Google account in the web dashboard'
+                : undefined,
             },
             null,
             2
@@ -363,12 +341,11 @@ export async function handleListCalendarEvents(
             {
               success: false,
               error: message,
-              hint:
-                message.includes('No active google account')
-                  ? 'User needs to connect their Google account in the web dashboard'
-                  : message.includes('calendar.readonly')
-                    ? 'User needs to re-authorize Google with Calendar permissions'
-                    : undefined,
+              hint: message.includes('No active google account')
+                ? 'User needs to connect their Google account in the web dashboard'
+                : message.includes('calendar.readonly')
+                  ? 'User needs to re-authorize Google with Calendar permissions'
+                  : undefined,
             },
             null,
             2
@@ -544,14 +521,13 @@ export async function handleRespondToCalendarEvent(
             {
               success: false,
               error: message,
-              hint:
-                message.includes('not listed as an attendee')
-                  ? 'You can only respond to events where you are an invited attendee'
-                  : message.includes('No active google account')
-                    ? 'User needs to connect their Google account in the web dashboard'
-                    : message.includes('calendar.events')
-                      ? 'User needs to re-authorize Google with Calendar write permissions'
-                      : undefined,
+              hint: message.includes('not listed as an attendee')
+                ? 'You can only respond to events where you are an invited attendee'
+                : message.includes('No active google account')
+                  ? 'User needs to connect their Google account in the web dashboard'
+                  : message.includes('calendar.events')
+                    ? 'User needs to re-authorize Google with Calendar write permissions'
+                    : undefined,
             },
             null,
             2
@@ -617,7 +593,8 @@ export async function handleUpdateCalendarEvent(
           text: JSON.stringify(
             {
               success: false,
-              error: 'Must specify at least one field to update (summary, description, location, start, or end)',
+              error:
+                'Must specify at least one field to update (summary, description, location, start, or end)',
               allowedFields: Array.from(ALLOWED_UPDATE_FIELDS),
             },
             null,
@@ -718,14 +695,13 @@ export async function handleUpdateCalendarEvent(
             {
               success: false,
               error: message,
-              hint:
-                message.includes('No active google account')
-                  ? 'User needs to connect their Google account in the web dashboard'
-                  : message.includes('calendar.events')
-                    ? 'User needs to re-authorize Google with Calendar write permissions'
-                    : message.includes('403') || message.includes('forbidden')
-                      ? 'You may not have edit access to this event. Only the organizer or users with writer access can modify events.'
-                      : undefined,
+              hint: message.includes('No active google account')
+                ? 'User needs to connect their Google account in the web dashboard'
+                : message.includes('calendar.events')
+                  ? 'User needs to re-authorize Google with Calendar write permissions'
+                  : message.includes('403') || message.includes('forbidden')
+                    ? 'You may not have edit access to this event. Only the organizer or users with writer access can modify events.'
+                    : undefined,
             },
             null,
             2
@@ -835,12 +811,11 @@ export async function handleCreateCalendarEvent(
             {
               success: false,
               error: message,
-              hint:
-                message.includes('No active google account')
-                  ? 'User needs to connect their Google account in the web dashboard'
-                  : message.includes('calendar.events')
-                    ? 'User needs to re-authorize Google with Calendar write permissions'
-                    : undefined,
+              hint: message.includes('No active google account')
+                ? 'User needs to connect their Google account in the web dashboard'
+                : message.includes('calendar.events')
+                  ? 'User needs to re-authorize Google with Calendar write permissions'
+                  : undefined,
             },
             null,
             2

@@ -200,7 +200,10 @@ export function createAgentGatewayRoutes(app: {
   // POST /api/agent/trigger - receive triggers from other agents
   app.post('/api/agent/trigger', async (req: unknown, res: unknown) => {
     const request = req as { body: AgentTriggerPayload };
-    const response = res as { json: (data: unknown) => void; status: (code: number) => { json: (data: unknown) => void } };
+    const response = res as {
+      json: (data: unknown) => void;
+      status: (code: number) => { json: (data: unknown) => void };
+    };
 
     try {
       const payload = request.body;

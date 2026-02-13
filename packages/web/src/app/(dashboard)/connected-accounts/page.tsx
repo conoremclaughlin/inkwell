@@ -69,7 +69,10 @@ interface UpgradeScopesResponse {
   message?: string;
 }
 
-const providerConfig: Record<string, { label: string; icon: React.ReactNode; color: string; description: string }> = {
+const providerConfig: Record<
+  string,
+  { label: string; icon: React.ReactNode; color: string; description: string }
+> = {
   google: {
     label: 'Google',
     icon: <Mail className="h-5 w-5" />,
@@ -118,12 +121,18 @@ const scopeTranslations: Record<string, ScopeInfo> = {
   'https://www.googleapis.com/auth/gmail.send': { label: 'Send emails', group: 'email' },
   'https://www.googleapis.com/auth/gmail.modify': { label: 'Modify emails', group: 'email' },
   'https://mail.google.com/': { label: 'Full access', group: 'email' },
-  'https://www.googleapis.com/auth/calendar.readonly': { label: 'View calendar', group: 'calendar' },
-  'https://www.googleapis.com/auth/calendar.events.readonly': { label: 'View events', group: 'calendar' },
+  'https://www.googleapis.com/auth/calendar.readonly': {
+    label: 'View calendar',
+    group: 'calendar',
+  },
+  'https://www.googleapis.com/auth/calendar.events.readonly': {
+    label: 'View events',
+    group: 'calendar',
+  },
   'https://www.googleapis.com/auth/calendar.events': { label: 'Manage events', group: 'calendar' },
   'https://www.googleapis.com/auth/userinfo.email': { label: 'Email address', group: 'profile' },
   'https://www.googleapis.com/auth/userinfo.profile': { label: 'Profile info', group: 'profile' },
-  'openid': { label: 'OpenID', group: 'profile' },
+  openid: { label: 'OpenID', group: 'profile' },
 };
 
 const permissionGroups: Record<PermissionGroup, { label: string; icon: React.ReactNode }> = {
@@ -227,14 +236,17 @@ export default function ConnectedAccountsPage() {
   const providers = data?.providers ?? [];
 
   // Handle OAuth popup callback
-  const handleOAuthMessage = useCallback((event: MessageEvent) => {
-    if (event.data?.type === 'oauth-callback') {
-      setConnectingProvider(null);
-      if (event.data.success) {
-        refetch();
+  const handleOAuthMessage = useCallback(
+    (event: MessageEvent) => {
+      if (event.data?.type === 'oauth-callback') {
+        setConnectingProvider(null);
+        if (event.data.success) {
+          refetch();
+        }
       }
-    }
-  }, [refetch]);
+    },
+    [refetch]
+  );
 
   useEffect(() => {
     window.addEventListener('message', handleOAuthMessage);
@@ -336,8 +348,8 @@ export default function ConnectedAccountsPage() {
   };
 
   // Get providers that aren't connected yet
-  const availableProviders = providers.filter(p => {
-    const account = accounts.find(a => a.provider === p.name && a.status === 'active');
+  const availableProviders = providers.filter((p) => {
+    const account = accounts.find((a) => a.provider === p.name && a.status === 'active');
     return account === undefined && p.configured;
   });
 
@@ -352,11 +364,7 @@ export default function ConnectedAccountsPage() {
         </div>
       </div>
 
-      {error && (
-        <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">
-          {error.message}
-        </div>
-      )}
+      {error && <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">{error.message}</div>}
 
       {/* WhatsApp Connection */}
       <Link href="/connected-accounts/whatsapp" className="block mt-6">
@@ -369,7 +377,9 @@ export default function ConnectedAccountsPage() {
                 </div>
                 <div>
                   <h3 className="font-semibold text-gray-900">WhatsApp</h3>
-                  <p className="text-sm text-gray-500">Connect via QR code to enable WhatsApp messaging</p>
+                  <p className="text-sm text-gray-500">
+                    Connect via QR code to enable WhatsApp messaging
+                  </p>
                 </div>
               </div>
               <ChevronRight className="h-5 w-5 text-gray-400" />
@@ -422,7 +432,9 @@ export default function ConnectedAccountsPage() {
                             referrerPolicy="no-referrer"
                           />
                         ) : (
-                          <div className={clsx('p-3 rounded-full bg-white border', providerCfg.color)}>
+                          <div
+                            className={clsx('p-3 rounded-full bg-white border', providerCfg.color)}
+                          >
                             {providerCfg.icon}
                           </div>
                         )}
@@ -464,7 +476,9 @@ export default function ConnectedAccountsPage() {
                             onClick={() => handleOpenUpgradeModal(account)}
                           >
                             <Shield className="h-4 w-4" />
-                            {getMissingScopes(account).length > 0 ? 'Modify Permissions' : 'View Permissions'}
+                            {getMissingScopes(account).length > 0
+                              ? 'Modify Permissions'
+                              : 'View Permissions'}
                           </Button>
                         )}
                         {account.status === 'expired' && (
@@ -494,7 +508,12 @@ export default function ConnectedAccountsPage() {
                       <div className="mt-3 pt-3 border-t border-green-100">
                         <p className="text-xs text-gray-500 mb-3">Permissions granted:</p>
                         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                          {(Object.entries(groupScopes(account.scopes)) as [PermissionGroup, string[]][])
+                          {(
+                            Object.entries(groupScopes(account.scopes)) as [
+                              PermissionGroup,
+                              string[],
+                            ][]
+                          )
                             .filter(([, scopes]) => scopes.length > 0)
                             .map(([group, scopes]) => {
                               const groupConfig = permissionGroups[group];
@@ -506,7 +525,10 @@ export default function ConnectedAccountsPage() {
                                   </div>
                                   <div className="space-y-1">
                                     {scopes.map((scope) => (
-                                      <div key={scope} className="flex items-center gap-2 text-xs text-gray-600">
+                                      <div
+                                        key={scope}
+                                        className="flex items-center gap-2 text-xs text-gray-600"
+                                      >
                                         <CheckCircle className="h-3 w-3 text-green-500" />
                                         {translateScope(scope)}
                                       </div>
@@ -529,7 +551,9 @@ export default function ConnectedAccountsPage() {
                     <div className="w-full border-t border-gray-200" />
                   </div>
                   <div className="relative flex justify-center">
-                    <span className="bg-white px-3 text-xs text-gray-500">Available to connect</span>
+                    <span className="bg-white px-3 text-xs text-gray-500">
+                      Available to connect
+                    </span>
                   </div>
                 </div>
               )}
@@ -544,10 +568,7 @@ export default function ConnectedAccountsPage() {
                 };
 
                 return (
-                  <div
-                    key={provider.name}
-                    className="rounded-lg border border-gray-200 p-4"
-                  >
+                  <div key={provider.name} className="rounded-lg border border-gray-200 p-4">
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-4">
                         <div className={clsx('p-3 rounded-lg bg-gray-50 border', config.color)}>
@@ -619,7 +640,12 @@ export default function ConnectedAccountsPage() {
                 </h4>
                 <div className="bg-green-50 rounded-lg p-3 border border-green-100">
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    {(Object.entries(groupScopes(upgradeAccount.scopes)) as [PermissionGroup, string[]][])
+                    {(
+                      Object.entries(groupScopes(upgradeAccount.scopes)) as [
+                        PermissionGroup,
+                        string[],
+                      ][]
+                    )
                       .filter(([, scopes]) => scopes.length > 0)
                       .map(([group, scopes]) => {
                         const groupConfig = permissionGroups[group];
@@ -631,7 +657,10 @@ export default function ConnectedAccountsPage() {
                             </div>
                             <div className="space-y-1">
                               {scopes.map((scope) => (
-                                <div key={scope} className="flex items-center gap-2 text-xs text-gray-600">
+                                <div
+                                  key={scope}
+                                  className="flex items-center gap-2 text-xs text-gray-600"
+                                >
                                   <CheckCircle className="h-3 w-3 text-green-500" />
                                   {translateScope(scope)}
                                 </div>
@@ -666,7 +695,10 @@ export default function ConnectedAccountsPage() {
                             </div>
                             <div className="space-y-1">
                               {scopes.map((scope) => (
-                                <div key={scope} className="flex items-center gap-2 text-xs text-gray-600">
+                                <div
+                                  key={scope}
+                                  className="flex items-center gap-2 text-xs text-gray-600"
+                                >
                                   <div className="h-3 w-3 rounded border border-blue-400 bg-white" />
                                   {translateScope(scope)}
                                 </div>
@@ -678,7 +710,8 @@ export default function ConnectedAccountsPage() {
                   </div>
                 </div>
                 <p className="text-xs text-gray-500 mt-2">
-                  Click &quot;Add Permissions&quot; to authorize these additional permissions via Google.
+                  Click &quot;Add Permissions&quot; to authorize these additional permissions via
+                  Google.
                 </p>
               </div>
             )}
@@ -686,8 +719,9 @@ export default function ConnectedAccountsPage() {
             {/* Note about removing permissions */}
             <div className="bg-gray-50 rounded-lg p-3 border border-gray-200">
               <p className="text-xs text-gray-500">
-                <strong className="text-gray-600">Note:</strong> To remove permissions, you must disconnect this account
-                and reconnect with only the permissions you need. Google does not support revoking individual scopes.
+                <strong className="text-gray-600">Note:</strong> To remove permissions, you must
+                disconnect this account and reconnect with only the permissions you need. Google
+                does not support revoking individual scopes.
               </p>
             </div>
           </div>
@@ -701,10 +735,7 @@ export default function ConnectedAccountsPage() {
               Close
             </Button>
             {missingScopes.length > 0 && (
-              <Button
-                onClick={handleUpgradeScopes}
-                disabled={upgradingScopes}
-              >
+              <Button onClick={handleUpgradeScopes} disabled={upgradingScopes}>
                 {upgradingScopes ? (
                   <>
                     <RefreshCw className="mr-2 h-4 w-4 animate-spin" />

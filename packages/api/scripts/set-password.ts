@@ -7,7 +7,8 @@
 import { createClient } from '@supabase/supabase-js';
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const SUPABASE_SERVICE_KEY =
+  process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY!;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   console.error('Missing SUPABASE_URL or SUPABASE_SECRET_KEY');
@@ -31,14 +32,17 @@ async function setPassword() {
   });
 
   // Find user by email
-  const { data: { users }, error: listError } = await supabase.auth.admin.listUsers();
+  const {
+    data: { users },
+    error: listError,
+  } = await supabase.auth.admin.listUsers();
 
   if (listError) {
     console.error('Failed to list users:', listError);
     process.exit(1);
   }
 
-  const user = users.find(u => u.email === email);
+  const user = users.find((u) => u.email === email);
   if (!user) {
     console.error(`User not found: ${email}`);
     process.exit(1);

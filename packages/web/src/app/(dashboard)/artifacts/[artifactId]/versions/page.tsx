@@ -7,15 +7,23 @@ import Link from 'next/link';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { ArrowLeft, Loader2, BookOpen, Lightbulb, FileCheck, FileText, StickyNote } from 'lucide-react';
+import {
+  ArrowLeft,
+  Loader2,
+  BookOpen,
+  Lightbulb,
+  FileCheck,
+  FileText,
+  StickyNote,
+} from 'lucide-react';
 import { useApiQuery } from '@/lib/api';
 import clsx from 'clsx';
 
 // Dynamic import for TipTap diff viewer (client-only, heavy deps)
-const ArtifactVersionDiff = dynamic(
-  () => import('@/stories/diff-versions/artifact-version-diff'),
-  { ssr: false, loading: () => <p className="text-gray-500 p-4">Loading diff viewer...</p> }
-);
+const ArtifactVersionDiff = dynamic(() => import('@/stories/diff-versions/artifact-version-diff'), {
+  ssr: false,
+  loading: () => <p className="text-gray-500 p-4">Loading diff viewer...</p>,
+});
 
 interface Artifact {
   id: string;
@@ -173,7 +181,9 @@ export default function ArtifactVersionsPage() {
               ) : (
                 <div className="text-center text-gray-500 py-8">
                   <p className="font-medium">Original version</p>
-                  <p className="text-sm mt-1">This is the first version - no previous version to compare.</p>
+                  <p className="text-sm mt-1">
+                    This is the first version - no previous version to compare.
+                  </p>
                 </div>
               )}
             </CardContent>
@@ -197,9 +207,7 @@ export default function ArtifactVersionsPage() {
                       key={v.id}
                       className={clsx(
                         'relative cursor-pointer rounded-md py-4 pl-8 pr-4 transition-colors',
-                        isActive
-                          ? 'bg-blue-50 text-blue-900'
-                          : 'hover:bg-gray-50'
+                        isActive ? 'bg-blue-50 text-blue-900' : 'hover:bg-gray-50'
                       )}
                       onClick={() => setSelectedVersionIndex(i)}
                     >
@@ -219,9 +227,7 @@ export default function ArtifactVersionsPage() {
                       <span
                         className={clsx(
                           'absolute left-[7px] top-1/2 h-[10px] w-[10px] -translate-y-1/2 rounded-full border-2',
-                          isActive
-                            ? 'border-blue-500 bg-blue-500'
-                            : 'border-gray-300 bg-white'
+                          isActive ? 'border-blue-500 bg-blue-500' : 'border-gray-300 bg-white'
                         )}
                       />
 

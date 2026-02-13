@@ -331,7 +331,8 @@ export class ContactsRepository {
     if (updates.email !== undefined) updateData.email = updates.email;
     if (updates.phone !== undefined) updateData.phone = updates.phone;
     if (updates.telegramId !== undefined) updateData.telegram_id = updates.telegramId;
-    if (updates.telegramUsername !== undefined) updateData.telegram_username = updates.telegramUsername;
+    if (updates.telegramUsername !== undefined)
+      updateData.telegram_username = updates.telegramUsername;
     if (updates.imessageId !== undefined) updateData.imessage_id = updates.imessageId;
     if (updates.discordId !== undefined) updateData.discord_id = updates.discordId;
     if (updates.whatsappId !== undefined) updateData.whatsapp_id = updates.whatsappId;
@@ -354,10 +355,7 @@ export class ContactsRepository {
    * Delete a contact
    */
   async deleteContact(contactId: string): Promise<void> {
-    const { error } = await this.supabase
-      .from('contacts')
-      .delete()
-      .eq('id', contactId);
+    const { error } = await this.supabase.from('contacts').delete().eq('id', contactId);
 
     if (error) throw error;
   }

@@ -8,7 +8,10 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../../data/supabase/types.js';
-import { ContactsRepository, type ResolveNameResult } from '../../data/repositories/contacts-repository.js';
+import {
+  ContactsRepository,
+  type ResolveNameResult,
+} from '../../data/repositories/contacts-repository.js';
 import { logger } from '../../utils/logger.js';
 
 export interface RecordDebtOptions {
@@ -87,11 +90,27 @@ export class BillSplitService {
 
     // Validate inputs
     if (amount <= 0) {
-      return { success: false, from, to, amount, previousBalance: 0, newBalance: 0, error: 'Amount must be positive' };
+      return {
+        success: false,
+        from,
+        to,
+        amount,
+        previousBalance: 0,
+        newBalance: 0,
+        error: 'Amount must be positive',
+      };
     }
 
     if (from === to) {
-      return { success: false, from, to, amount, previousBalance: 0, newBalance: 0, error: 'Cannot owe yourself' };
+      return {
+        success: false,
+        from,
+        to,
+        amount,
+        previousBalance: 0,
+        newBalance: 0,
+        error: 'Cannot owe yourself',
+      };
     }
 
     let resolvedFrom = from;
@@ -161,7 +180,8 @@ export class BillSplitService {
 
       if (existingBalance) {
         // Update existing balance
-        const transactions = ((existingBalance.data as { transactions?: unknown[] })?.transactions || []);
+        const transactions =
+          (existingBalance.data as { transactions?: unknown[] })?.transactions || [];
         transactions.push({
           delta: amount,
           description,
@@ -200,13 +220,15 @@ export class BillSplitService {
               key: balanceKey,
               from: resolvedFrom,
               to: resolvedTo,
-              transactions: [{
-                delta: amount,
-                description,
-                recordedAt: recordedAt || new Date().toISOString(),
-                balanceAfter: newBalance,
-                debtId: debtRecord.id,
-              }],
+              transactions: [
+                {
+                  delta: amount,
+                  description,
+                  recordedAt: recordedAt || new Date().toISOString(),
+                  balanceAfter: newBalance,
+                  debtId: debtRecord.id,
+                },
+              ],
             } as Json,
             amount: newBalance,
             text: balanceKey,
@@ -284,7 +306,8 @@ export class BillSplitService {
     }
 
     // Determine amount to settle
-    const amountToSettle = amount !== undefined ? Math.min(amount, previousBalance) : previousBalance;
+    const amountToSettle =
+      amount !== undefined ? Math.min(amount, previousBalance) : previousBalance;
     const newBalance = previousBalance - amountToSettle;
 
     try {
@@ -315,7 +338,8 @@ export class BillSplitService {
 
       // Step 2: Update balance
       if (existingBalance) {
-        const transactions = ((existingBalance.data as { transactions?: unknown[] })?.transactions || []);
+        const transactions =
+          (existingBalance.data as { transactions?: unknown[] })?.transactions || [];
         transactions.push({
           delta: -amountToSettle,
           description,
@@ -329,7 +353,7 @@ export class BillSplitService {
           .from('mini_app_records')
           .update({
             amount: newBalance,
-            data: { ...existingBalance.data as object, transactions } as Json,
+            data: { ...(existingBalance.data as object), transactions } as Json,
             updated_at: new Date().toISOString(),
           })
           .eq('id', existingBalance.id);
@@ -363,13 +387,15 @@ export class BillSplitService {
   /**
    * Get all balances for a user
    */
-  async getBalances(userId: string): Promise<Array<{
-    key: string;
-    from: string;
-    to: string;
-    amount: number;
-    transactionCount: number;
-  }>> {
+  async getBalances(userId: string): Promise<
+    Array<{
+      key: string;
+      from: string;
+      to: string;
+      amount: number;
+      transactionCount: number;
+    }>
+  > {
     const { data, error } = await this.supabase
       .from('mini_app_records')
       .select('*')
@@ -384,7 +410,12 @@ export class BillSplitService {
     }
 
     return (data || []).map((record) => {
-      const recordData = record.data as { key?: string; from?: string; to?: string; transactions?: unknown[] };
+      const recordData = record.data as {
+        key?: string;
+        from?: string;
+        to?: string;
+        transactions?: unknown[];
+      };
       return {
         key: recordData.key || record.text || '',
         from: recordData.from || '',

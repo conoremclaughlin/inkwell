@@ -127,9 +127,9 @@ describe('calculateSplit', () => {
   it('should accept item names as assignment keys', () => {
     // AI might use item names instead of IDs
     const assignments: Assignments = {
-      'Burger': ['John'],
-      'salad': ['Sarah'],  // lowercase should work
-      'Fries': ['Mike'],
+      Burger: ['John'],
+      salad: ['Sarah'], // lowercase should work
+      Fries: ['Mike'],
     };
 
     const result = calculateSplit({ items, assignments });
@@ -229,9 +229,7 @@ describe('calculateSplit', () => {
   });
 
   it('should handle rounding correctly', () => {
-    const trickyItems: BillItem[] = [
-      { id: 'item-1', name: 'Item', price: 10.0, quantity: 1 },
-    ];
+    const trickyItems: BillItem[] = [{ id: 'item-1', name: 'Item', price: 10.0, quantity: 1 }];
 
     const assignments: Assignments = {
       'item-1': ['A', 'B', 'C'], // Split 3 ways: $3.33 each

@@ -41,7 +41,7 @@ export function calculateSplit(input: CalculateSplitInput): SplitResult {
     if (key === '[object Object]') {
       throw new Error(
         'Invalid assignment: item objects were used as keys instead of item IDs. ' +
-        'Use item.id (e.g., "item-1") as the key, not the item object itself.'
+          'Use item.id (e.g., "item-1") as the key, not the item object itself.'
       );
     }
 
@@ -149,9 +149,7 @@ export function calculateSplit(input: CalculateSplitInput): SplitResult {
 
   for (const person of peopleArray) {
     const personTotal = roundCurrency(
-      breakdown[person].itemsSubtotal +
-      breakdown[person].taxShare +
-      breakdown[person].tipShare
+      breakdown[person].itemsSubtotal + breakdown[person].taxShare + breakdown[person].tipShare
     );
     breakdown[person].total = personTotal;
     totals[person] = personTotal;
@@ -162,9 +160,7 @@ export function calculateSplit(input: CalculateSplitInput): SplitResult {
   const roundingError = roundCurrency(grandTotal - runningTotal);
   if (roundingError !== 0 && peopleCount > 0) {
     // Find person with highest total
-    const highestPayer = peopleArray.reduce((a, b) =>
-      totals[a] > totals[b] ? a : b
-    );
+    const highestPayer = peopleArray.reduce((a, b) => (totals[a] > totals[b] ? a : b));
     totals[highestPayer] = roundCurrency(totals[highestPayer] + roundingError);
     breakdown[highestPayer].total = totals[highestPayer];
   }
@@ -221,10 +217,7 @@ export function assignItem(
 /**
  * Unassign an item
  */
-export function unassignItem(
-  assignments: Assignments,
-  itemId: string
-): Assignments {
+export function unassignItem(assignments: Assignments, itemId: string): Assignments {
   const { [itemId]: _, ...rest } = assignments;
   return rest;
 }

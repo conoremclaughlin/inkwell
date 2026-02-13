@@ -53,13 +53,7 @@ export class GmailService {
   async listEmails(userId: string, options: ListEmailsOptions = {}): Promise<EmailSearchResult> {
     const gmail = await this.getClient(userId);
 
-    const {
-      maxResults = 10,
-      query,
-      labelIds,
-      pageToken,
-      includeSpamTrash = false,
-    } = options;
+    const { maxResults = 10, query, labelIds, pageToken, includeSpamTrash = false } = options;
 
     logger.info('Fetching emails', { userId, maxResults, query, labelIds });
 
@@ -119,16 +113,7 @@ export class GmailService {
   async sendEmail(userId: string, options: SendEmailOptions): Promise<Email> {
     const gmail = await this.getClient(userId);
 
-    const {
-      to,
-      cc,
-      bcc,
-      subject,
-      body,
-      isHtml = false,
-      replyToMessageId,
-      threadId,
-    } = options;
+    const { to, cc, bcc, subject, body, isHtml = false, replyToMessageId, threadId } = options;
 
     logger.info('Sending email', { userId, to, subject });
 
@@ -156,8 +141,8 @@ export class GmailService {
       });
 
       const originalHeaders = originalMessage.data.payload?.headers || [];
-      const messageIdHeader = originalHeaders.find(h => h.name === 'Message-ID')?.value;
-      const referencesHeader = originalHeaders.find(h => h.name === 'References')?.value;
+      const messageIdHeader = originalHeaders.find((h) => h.name === 'Message-ID')?.value;
+      const referencesHeader = originalHeaders.find((h) => h.name === 'References')?.value;
 
       if (messageIdHeader) {
         headers.push(`In-Reply-To: ${messageIdHeader}`);
@@ -208,7 +193,7 @@ export class GmailService {
     });
 
     const originalHeaders = originalMessage.data.payload?.headers || [];
-    const getHeader = (name: string) => originalHeaders.find(h => h.name === name)?.value;
+    const getHeader = (name: string) => originalHeaders.find((h) => h.name === name)?.value;
 
     const originalFrom = getHeader('From') || '';
     const originalTo = getHeader('To') || '';
@@ -221,19 +206,17 @@ export class GmailService {
 
     if (replyAll) {
       // Add original To and Cc recipients (excluding self)
-      const toAddresses = originalTo.split(',').map(e => this.parseEmailAddress(e.trim()).email);
+      const toAddresses = originalTo.split(',').map((e) => this.parseEmailAddress(e.trim()).email);
       const ccAddresses = originalCc
-        ? originalCc.split(',').map(e => this.parseEmailAddress(e.trim()).email)
+        ? originalCc.split(',').map((e) => this.parseEmailAddress(e.trim()).email)
         : [];
 
       // TODO: Filter out the user's own email
-      cc = [...toAddresses, ...ccAddresses].filter(e => e !== to[0]);
+      cc = [...toAddresses, ...ccAddresses].filter((e) => e !== to[0]);
     }
 
     // Build subject (add Re: if not already present)
-    const subject = originalSubject.startsWith('Re:')
-      ? originalSubject
-      : `Re: ${originalSubject}`;
+    const subject = originalSubject.startsWith('Re:') ? originalSubject : `Re: ${originalSubject}`;
 
     return this.sendEmail(userId, {
       to,
@@ -249,19 +232,13 @@ export class GmailService {
   /**
    * Create a draft email
    */
-  async createDraft(userId: string, options: DraftEmailOptions): Promise<{ draftId: string; message: Email }> {
+  async createDraft(
+    userId: string,
+    options: DraftEmailOptions
+  ): Promise<{ draftId: string; message: Email }> {
     const gmail = await this.getClient(userId);
 
-    const {
-      to,
-      cc,
-      bcc,
-      subject,
-      body,
-      isHtml = false,
-      replyToMessageId,
-      threadId,
-    } = options;
+    const { to, cc, bcc, subject, body, isHtml = false, replyToMessageId, threadId } = options;
 
     logger.info('Creating email draft', { userId, to, subject });
 
@@ -288,8 +265,8 @@ export class GmailService {
       });
 
       const originalHeaders = originalMessage.data.payload?.headers || [];
-      const messageIdHeader = originalHeaders.find(h => h.name === 'Message-ID')?.value;
-      const referencesHeader = originalHeaders.find(h => h.name === 'References')?.value;
+      const messageIdHeader = originalHeaders.find((h) => h.name === 'Message-ID')?.value;
+      const referencesHeader = originalHeaders.find((h) => h.name === 'References')?.value;
 
       if (messageIdHeader) {
         headers.push(`In-Reply-To: ${messageIdHeader}`);
@@ -427,10 +404,13 @@ export class GmailService {
       } catch (error) {
         const batchDuration = Date.now() - batchStartTime;
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-        const errorDetails = error instanceof Error ? {
-          name: error.name,
-          stack: error.stack?.split('\n').slice(0, 3).join(' | '),
-        } : {};
+        const errorDetails =
+          error instanceof Error
+            ? {
+                name: error.name,
+                stack: error.stack?.split('\n').slice(0, 3).join(' | '),
+              }
+            : {};
 
         // If batch fails, fall back to individual modifications to identify which failed
         logger.warn(`[Gmail:modifyEmails] Batch ${batchNum} failed after ${batchDuration}ms`, {
@@ -439,7 +419,10 @@ export class GmailService {
           ...errorDetails,
         });
 
-        logger.info(`[Gmail:modifyEmails] Falling back to individual modifications for ${batch.length} emails`, { userId });
+        logger.info(
+          `[Gmail:modifyEmails] Falling back to individual modifications for ${batch.length} emails`,
+          { userId }
+        );
 
         let individualSuccess = 0;
         let individualFailed = 0;
@@ -468,7 +451,8 @@ export class GmailService {
               });
             }
           } catch (individualError) {
-            const message = individualError instanceof Error ? individualError.message : 'Unknown error';
+            const message =
+              individualError instanceof Error ? individualError.message : 'Unknown error';
             failed.push({ messageId, error: message });
             individualFailed++;
             logger.warn('[Gmail:modifyEmails] Individual modify failed', {
@@ -521,7 +505,7 @@ export class GmailService {
   private mapMessage(message: gmail_v1.Schema$Message, includeBody = false): Email {
     const headers = message.payload?.headers || [];
     const getHeader = (name: string) =>
-      headers.find(h => h.name?.toLowerCase() === name.toLowerCase())?.value || '';
+      headers.find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value || '';
 
     const labelIds = message.labelIds || [];
 
@@ -541,9 +525,15 @@ export class GmailService {
       snippet: message.snippet || '',
       subject: getHeader('Subject'),
       from: this.parseEmailAddress(getHeader('From')),
-      to: getHeader('To').split(',').map(e => this.parseEmailAddress(e.trim())).filter(e => e.email),
+      to: getHeader('To')
+        .split(',')
+        .map((e) => this.parseEmailAddress(e.trim()))
+        .filter((e) => e.email),
       cc: getHeader('Cc')
-        ? getHeader('Cc').split(',').map(e => this.parseEmailAddress(e.trim())).filter(e => e.email)
+        ? getHeader('Cc')
+            .split(',')
+            .map((e) => this.parseEmailAddress(e.trim()))
+            .filter((e) => e.email)
         : undefined,
       date: getHeader('Date'),
       body,

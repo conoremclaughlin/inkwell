@@ -1,10 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database } from '../supabase/types';
-import type {
-  Reminder,
-  CreateReminderDTO,
-  UpdateReminderDTO,
-} from '../models/reminder.model';
+import type { Reminder, CreateReminderDTO, UpdateReminderDTO } from '../models/reminder.model';
 import { BaseRepository } from './base.repository';
 
 export class RemindersRepository extends BaseRepository {

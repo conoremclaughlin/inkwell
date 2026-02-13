@@ -14,8 +14,14 @@ const workspaceContainerTypeSchema = z.enum(['personal', 'team']);
 
 export const createWorkspaceContainerSchema = userIdentifierBaseSchema.extend({
   name: z.string().min(1).describe('Workspace display name (e.g., "Personal", "PCP Team")'),
-  slug: z.string().min(1).optional().describe('Stable workspace slug (generated from name when omitted)'),
-  type: workspaceContainerTypeSchema.optional().default('personal')
+  slug: z
+    .string()
+    .min(1)
+    .optional()
+    .describe('Stable workspace slug (generated from name when omitted)'),
+  type: workspaceContainerTypeSchema
+    .optional()
+    .default('personal')
     .describe('Workspace type: personal or team'),
   description: z.string().optional().describe('Optional workspace description'),
   metadata: z.record(z.unknown()).optional().describe('Optional workspace metadata'),
@@ -24,7 +30,11 @@ export const createWorkspaceContainerSchema = userIdentifierBaseSchema.extend({
 export const listWorkspaceContainersSchema = userIdentifierBaseSchema.extend({
   type: workspaceContainerTypeSchema.optional().describe('Optional type filter'),
   includeArchived: z.boolean().optional().default(false).describe('Include archived workspaces'),
-  ensurePersonal: z.boolean().optional().default(true).describe('Ensure a default personal workspace exists'),
+  ensurePersonal: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe('Ensure a default personal workspace exists'),
 });
 
 export const getWorkspaceContainerSchema = userIdentifierBaseSchema.extend({
@@ -129,10 +139,18 @@ export async function handleGetWorkspaceContainer(args: unknown, dataComposer: D
   const params = getWorkspaceContainerSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
-  const workspace = await dataComposer.repositories.workspaceContainers.findById(params.workspaceId, user.id);
+  const workspace = await dataComposer.repositories.workspaceContainers.findById(
+    params.workspaceId,
+    user.id
+  );
   if (!workspace) {
     return {
-      content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'Workspace not found' }) }],
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({ success: false, error: 'Workspace not found' }),
+        },
+      ],
       isError: true,
     };
   }
@@ -168,14 +186,23 @@ export async function handleUpdateWorkspaceContainer(args: unknown, dataComposer
   const params = updateWorkspaceContainerSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
-  const updated = await dataComposer.repositories.workspaceContainers.update(params.workspaceId, user.id, {
-    name: params.name,
-    slug: params.slug,
-    type: params.type as WorkspaceContainerType | undefined,
-    description: params.description,
-    metadata: toJsonObject(params.metadata),
-    archivedAt: params.archived === undefined ? undefined : (params.archived ? new Date().toISOString() : null),
-  });
+  const updated = await dataComposer.repositories.workspaceContainers.update(
+    params.workspaceId,
+    user.id,
+    {
+      name: params.name,
+      slug: params.slug,
+      type: params.type as WorkspaceContainerType | undefined,
+      description: params.description,
+      metadata: toJsonObject(params.metadata),
+      archivedAt:
+        params.archived === undefined
+          ? undefined
+          : params.archived
+            ? new Date().toISOString()
+            : null,
+    }
+  );
 
   return successResponse({
     user: { id: user.id, resolvedBy },

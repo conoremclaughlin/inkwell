@@ -31,20 +31,24 @@ function mcpResponse(data: object, isError = false): McpResponse {
 // ============================================================================
 
 export const triggerAgentSchema = z.object({
-  toAgentId: z.string()
-    .describe('Target agent ID to trigger (e.g., "myra", "wren")'),
-  fromAgentId: z.string()
-    .describe('Your agent ID (e.g., "claude-code", "wren")'),
-  triggerType: z.enum(['task_complete', 'approval_needed', 'message', 'error', 'custom'])
+  toAgentId: z.string().describe('Target agent ID to trigger (e.g., "myra", "wren")'),
+  fromAgentId: z.string().describe('Your agent ID (e.g., "claude-code", "wren")'),
+  triggerType: z
+    .enum(['task_complete', 'approval_needed', 'message', 'error', 'custom'])
     .describe('Type of trigger - helps recipient know how to handle'),
-  summary: z.string().optional()
-    .describe('Brief summary of what happened / why triggering'),
-  inboxMessageId: z.string().optional()
+  summary: z.string().optional().describe('Brief summary of what happened / why triggering'),
+  inboxMessageId: z
+    .string()
+    .optional()
     .describe('ID of the inbox message to process (from send_to_inbox)'),
-  priority: z.enum(['low', 'normal', 'high', 'urgent']).optional()
+  priority: z
+    .enum(['low', 'normal', 'high', 'urgent'])
+    .optional()
     .default('normal')
     .describe('Priority level for the trigger'),
-  metadata: z.record(z.unknown()).optional()
+  metadata: z
+    .record(z.unknown())
+    .optional()
     .describe('Additional context to pass to the target agent'),
 });
 
@@ -85,21 +89,27 @@ export async function handleTriggerAgent(
         message: `Agent ${args.toAgentId} triggered successfully`,
       });
     } else {
-      return mcpResponse({
-        success: false,
-        triggerId: result.triggerId,
-        error: result.error,
-        hint: result.error?.includes('No handler')
-          ? `Agent "${args.toAgentId}" may not be running or doesn't have a trigger handler registered`
-          : undefined,
-      }, true);
+      return mcpResponse(
+        {
+          success: false,
+          triggerId: result.triggerId,
+          error: result.error,
+          hint: result.error?.includes('No handler')
+            ? `Agent "${args.toAgentId}" may not be running or doesn't have a trigger handler registered`
+            : undefined,
+        },
+        true
+      );
     }
   } catch (error) {
     logger.error('Error in trigger_agent:', error);
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to trigger agent',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to trigger agent',
+      },
+      true
+    );
   }
 }
 
@@ -124,9 +134,12 @@ export async function handleListRegisteredAgents(
     });
   } catch (error) {
     logger.error('Error in list_registered_agents:', error);
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to list agents',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to list agents',
+      },
+      true
+    );
   }
 }

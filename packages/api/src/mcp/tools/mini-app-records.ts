@@ -86,7 +86,8 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
   server.registerTool(
     'save_mini_app_record',
     {
-      description: 'Save structured data for a mini-app. Use indexed fields (amount, dateValue, tags) for efficient querying.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
+      description:
+        'Save structured data for a mini-app. Use indexed fields (amount, dateValue, tags) for efficient querying.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
       inputSchema: saveRecordSchema,
     },
     async (args) => {
@@ -94,22 +95,28 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         const resolved = await resolveUser(args as Parameters<typeof resolveUser>[0], dataComposer);
         if (!resolved) {
           return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'User not found' }) }],
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({ success: false, error: 'User not found' }),
+              },
+            ],
             isError: true,
           };
         }
 
-        const { appName, type, data, amount, recordedAt, text, tags, relatedRecordId, metadata } = args as {
-          appName: string;
-          type: string;
-          data: Record<string, unknown>;
-          amount?: number;
-          recordedAt?: string;
-          text?: string;
-          tags?: string[];
-          relatedRecordId?: string;
-          metadata?: Record<string, unknown>;
-        };
+        const { appName, type, data, amount, recordedAt, text, tags, relatedRecordId, metadata } =
+          args as {
+            appName: string;
+            type: string;
+            data: Record<string, unknown>;
+            amount?: number;
+            recordedAt?: string;
+            text?: string;
+            tags?: string[];
+            relatedRecordId?: string;
+            metadata?: Record<string, unknown>;
+          };
 
         const { data: record, error } = await supabase
           .from('mini_app_records')
@@ -131,23 +138,30 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         if (error) throw error;
 
         return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify({
-              success: true,
-              record: {
-                id: record.id,
-                appName: record.app_name,
-                type: record.type,
-                createdAt: record.created_at,
-              },
-            }),
-          }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: true,
+                record: {
+                  id: record.id,
+                  appName: record.app_name,
+                  type: record.type,
+                  createdAt: record.created_at,
+                },
+              }),
+            },
+          ],
         };
       } catch (error) {
         logger.error('Error saving mini-app record:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: String(error) }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({ success: false, error: String(error) }),
+            },
+          ],
           isError: true,
         };
       }
@@ -158,7 +172,8 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
   server.registerTool(
     'query_mini_app_records',
     {
-      description: 'Query mini-app records with filters. Supports filtering by app, type, tags, amount range, date range, and full-text search.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
+      description:
+        'Query mini-app records with filters. Supports filtering by app, type, tags, amount range, date range, and full-text search.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
       inputSchema: queryRecordsSchema,
     },
     async (args) => {
@@ -166,12 +181,28 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         const resolved = await resolveUser(args as Parameters<typeof resolveUser>[0], dataComposer);
         if (!resolved) {
           return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'User not found' }) }],
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({ success: false, error: 'User not found' }),
+              },
+            ],
             isError: true,
           };
         }
 
-        const { appName, type, tags, minAmount, maxAmount, startDate, endDate, search, limit = 20, offset = 0 } = args as {
+        const {
+          appName,
+          type,
+          tags,
+          minAmount,
+          maxAmount,
+          startDate,
+          endDate,
+          search,
+          limit = 20,
+          offset = 0,
+        } = args as {
           appName?: string;
           type?: string;
           tags?: string[];
@@ -205,28 +236,35 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         if (error) throw error;
 
         return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify({
-              success: true,
-              count: records?.length || 0,
-              records: records?.map((r) => ({
-                id: r.id,
-                appName: r.app_name,
-                type: r.type,
-                data: r.data,
-                amount: r.amount,
-                recordedAt: r.recorded_at,
-                tags: r.tags,
-                createdAt: r.created_at,
-              })),
-            }),
-          }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: true,
+                count: records?.length || 0,
+                records: records?.map((r) => ({
+                  id: r.id,
+                  appName: r.app_name,
+                  type: r.type,
+                  data: r.data,
+                  amount: r.amount,
+                  recordedAt: r.recorded_at,
+                  tags: r.tags,
+                  createdAt: r.created_at,
+                })),
+              }),
+            },
+          ],
         };
       } catch (error) {
         logger.error('Error querying mini-app records:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: String(error) }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({ success: false, error: String(error) }),
+            },
+          ],
           isError: true,
         };
       }
@@ -237,7 +275,8 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
   server.registerTool(
     'get_mini_app_record',
     {
-      description: 'Get a specific mini-app record by ID.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
+      description:
+        'Get a specific mini-app record by ID.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
       inputSchema: getRecordSchema,
     },
     async (args) => {
@@ -245,7 +284,12 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         const resolved = await resolveUser(args as Parameters<typeof resolveUser>[0], dataComposer);
         if (!resolved) {
           return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'User not found' }) }],
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({ success: false, error: 'User not found' }),
+              },
+            ],
             isError: true,
           };
         }
@@ -262,30 +306,37 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         if (error) throw error;
 
         return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify({
-              success: true,
-              record: {
-                id: record.id,
-                appName: record.app_name,
-                type: record.type,
-                data: record.data,
-                amount: record.amount,
-                recordedAt: record.recorded_at,
-                text: record.text,
-                tags: record.tags,
-                metadata: record.metadata,
-                createdAt: record.created_at,
-                updatedAt: record.updated_at,
-              },
-            }),
-          }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: true,
+                record: {
+                  id: record.id,
+                  appName: record.app_name,
+                  type: record.type,
+                  data: record.data,
+                  amount: record.amount,
+                  recordedAt: record.recorded_at,
+                  text: record.text,
+                  tags: record.tags,
+                  metadata: record.metadata,
+                  createdAt: record.created_at,
+                  updatedAt: record.updated_at,
+                },
+              }),
+            },
+          ],
         };
       } catch (error) {
         logger.error('Error getting mini-app record:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: String(error) }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({ success: false, error: String(error) }),
+            },
+          ],
           isError: true,
         };
       }
@@ -296,7 +347,8 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
   server.registerTool(
     'delete_mini_app_record',
     {
-      description: 'Delete a mini-app record.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
+      description:
+        'Delete a mini-app record.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
       inputSchema: deleteRecordSchema,
     },
     async (args) => {
@@ -304,7 +356,12 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         const resolved = await resolveUser(args as Parameters<typeof resolveUser>[0], dataComposer);
         if (!resolved) {
           return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'User not found' }) }],
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({ success: false, error: 'User not found' }),
+              },
+            ],
             isError: true,
           };
         }
@@ -320,12 +377,19 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         if (error) throw error;
 
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: true, deleted: recordId }) }],
+          content: [
+            { type: 'text' as const, text: JSON.stringify({ success: true, deleted: recordId }) },
+          ],
         };
       } catch (error) {
         logger.error('Error deleting mini-app record:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: String(error) }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({ success: false, error: String(error) }),
+            },
+          ],
           isError: true,
         };
       }
@@ -336,7 +400,8 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
   server.registerTool(
     'update_mini_app_balance',
     {
-      description: 'Update a running balance by key (e.g., person name, account). Atomically adds/subtracts delta and records the transaction. Creates balance if it doesn\'t exist.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
+      description:
+        "Update a running balance by key (e.g., person name, account). Atomically adds/subtracts delta and records the transaction. Creates balance if it doesn't exist.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId",
       inputSchema: updateBalanceSchema,
     },
     async (args) => {
@@ -344,7 +409,12 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         const resolved = await resolveUser(args as Parameters<typeof resolveUser>[0], dataComposer);
         if (!resolved) {
           return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'User not found' }) }],
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({ success: false, error: 'User not found' }),
+              },
+            ],
             isError: true,
           };
         }
@@ -406,12 +476,14 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
               type: 'balance',
               data: {
                 key,
-                transactions: [{
-                  delta,
-                  description,
-                  recordedAt: recordedAt || new Date().toISOString(),
-                  balanceAfter: newBalance,
-                }],
+                transactions: [
+                  {
+                    delta,
+                    description,
+                    recordedAt: recordedAt || new Date().toISOString(),
+                    balanceAfter: newBalance,
+                  },
+                ],
               },
               amount: newBalance,
               text: key,
@@ -427,26 +499,35 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         }
 
         return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify({
-              success: true,
-              balance: {
-                id: balanceRecord.id,
-                appName: balanceRecord.app_name,
-                key,
-                previousBalance: existing ? (existing.amount || 0) : 0,
-                delta,
-                newBalance,
-                transactionCount: ((balanceRecord.data as { transactions?: unknown[] })?.transactions || []).length,
-              },
-            }),
-          }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: true,
+                balance: {
+                  id: balanceRecord.id,
+                  appName: balanceRecord.app_name,
+                  key,
+                  previousBalance: existing ? existing.amount || 0 : 0,
+                  delta,
+                  newBalance,
+                  transactionCount: (
+                    (balanceRecord.data as { transactions?: unknown[] })?.transactions || []
+                  ).length,
+                },
+              }),
+            },
+          ],
         };
       } catch (error) {
         logger.error('Error updating balance:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: String(error) }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({ success: false, error: String(error) }),
+            },
+          ],
           isError: true,
         };
       }
@@ -457,7 +538,8 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
   server.registerTool(
     'get_mini_app_balance',
     {
-      description: 'Get the current balance for a key. Returns balance amount and transaction history.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
+      description:
+        'Get the current balance for a key. Returns balance amount and transaction history.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
       inputSchema: {
         ...userIdentifierFields,
         appName: z.string().describe('Mini-app name'),
@@ -469,7 +551,12 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         const resolved = await resolveUser(args as Parameters<typeof resolveUser>[0], dataComposer);
         if (!resolved) {
           return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'User not found' }) }],
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({ success: false, error: 'User not found' }),
+              },
+            ],
             isError: true,
           };
         }
@@ -489,41 +576,58 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
 
         if (!record) {
           return {
-            content: [{
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: true,
-                found: false,
-                balance: { key, amount: 0, transactions: [] },
-              }),
-            }],
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  success: true,
+                  found: false,
+                  balance: { key, amount: 0, transactions: [] },
+                }),
+              },
+            ],
           };
         }
 
-        const data = record.data as { key: string; transactions?: Array<{ delta: number; description?: string; recordedAt: string; balanceAfter: number }> };
+        const data = record.data as {
+          key: string;
+          transactions?: Array<{
+            delta: number;
+            description?: string;
+            recordedAt: string;
+            balanceAfter: number;
+          }>;
+        };
 
         return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify({
-              success: true,
-              found: true,
-              balance: {
-                id: record.id,
-                key: data.key,
-                amount: record.amount,
-                transactions: data.transactions || [],
-                tags: record.tags,
-                createdAt: record.created_at,
-                updatedAt: record.updated_at,
-              },
-            }),
-          }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: true,
+                found: true,
+                balance: {
+                  id: record.id,
+                  key: data.key,
+                  amount: record.amount,
+                  transactions: data.transactions || [],
+                  tags: record.tags,
+                  createdAt: record.created_at,
+                  updatedAt: record.updated_at,
+                },
+              }),
+            },
+          ],
         };
       } catch (error) {
         logger.error('Error getting balance:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: String(error) }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({ success: false, error: String(error) }),
+            },
+          ],
           isError: true,
         };
       }
@@ -534,7 +638,8 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
   server.registerTool(
     'list_mini_app_balances',
     {
-      description: 'List all balances for a mini-app. Useful for seeing who owes what.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
+      description:
+        'List all balances for a mini-app. Useful for seeing who owes what.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
       inputSchema: {
         ...userIdentifierFields,
         appName: z.string().describe('Mini-app name'),
@@ -546,7 +651,12 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         const resolved = await resolveUser(args as Parameters<typeof resolveUser>[0], dataComposer);
         if (!resolved) {
           return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'User not found' }) }],
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({ success: false, error: 'User not found' }),
+              },
+            ],
             isError: true,
           };
         }
@@ -586,24 +696,31 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         const negative = balances.filter((b) => (b.amount || 0) < 0);
 
         return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify({
-              success: true,
-              count: balances.length,
-              summary: {
-                total,
-                positiveCount: positive.length,
-                negativeCount: negative.length,
-              },
-              balances,
-            }),
-          }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: true,
+                count: balances.length,
+                summary: {
+                  total,
+                  positiveCount: positive.length,
+                  negativeCount: negative.length,
+                },
+                balances,
+              }),
+            },
+          ],
         };
       } catch (error) {
         logger.error('Error listing balances:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: String(error) }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({ success: false, error: String(error) }),
+            },
+          ],
           isError: true,
         };
       }
@@ -614,7 +731,8 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
   server.registerTool(
     'record_mini_app_debt',
     {
-      description: 'Record that one person owes another. Use this for group bill splits to track who owes whom.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
+      description:
+        'Record that one person owes another. Use this for group bill splits to track who owes whom.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
       inputSchema: recordDebtSchema,
     },
     async (args) => {
@@ -622,7 +740,12 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         const resolved = await resolveUser(args as Parameters<typeof resolveUser>[0], dataComposer);
         if (!resolved) {
           return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'User not found' }) }],
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({ success: false, error: 'User not found' }),
+              },
+            ],
             isError: true,
           };
         }
@@ -639,14 +762,24 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
 
         if (amount <= 0) {
           return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'Amount must be positive' }) }],
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({ success: false, error: 'Amount must be positive' }),
+              },
+            ],
             isError: true,
           };
         }
 
         if (from === to) {
           return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'Cannot owe yourself' }) }],
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({ success: false, error: 'Cannot owe yourself' }),
+              },
+            ],
             isError: true,
           };
         }
@@ -670,25 +803,32 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         if (error) throw error;
 
         return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify({
-              success: true,
-              debt: {
-                id: record.id,
-                from,
-                to,
-                amount,
-                description,
-                createdAt: record.created_at,
-              },
-            }),
-          }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: true,
+                debt: {
+                  id: record.id,
+                  from,
+                  to,
+                  amount,
+                  description,
+                  createdAt: record.created_at,
+                },
+              }),
+            },
+          ],
         };
       } catch (error) {
         logger.error('Error recording debt:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: String(error) }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({ success: false, error: String(error) }),
+            },
+          ],
           isError: true,
         };
       }
@@ -699,7 +839,8 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
   server.registerTool(
     'get_mini_app_debts',
     {
-      description: 'Get all debts showing who owes whom. Can filter by person or tags, and optionally simplify/consolidate debts.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
+      description:
+        'Get all debts showing who owes whom. Can filter by person or tags, and optionally simplify/consolidate debts.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
       inputSchema: getDebtsSchema,
     },
     async (args) => {
@@ -707,12 +848,22 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         const resolved = await resolveUser(args as Parameters<typeof resolveUser>[0], dataComposer);
         if (!resolved) {
           return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'User not found' }) }],
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({ success: false, error: 'User not found' }),
+              },
+            ],
             isError: true,
           };
         }
 
-        const { appName, person, tags, simplify = true } = args as {
+        const {
+          appName,
+          person,
+          tags,
+          simplify = true,
+        } = args as {
           appName: string;
           person?: string;
           tags?: string[];
@@ -738,7 +889,12 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
 
         // Map records to Debt objects
         const debts: Debt[] = (records || []).map((r) => {
-          const data = r.data as { from: string; to: string; description?: string; settled: boolean };
+          const data = r.data as {
+            from: string;
+            to: string;
+            description?: string;
+            settled: boolean;
+          };
           return {
             from: data.from,
             to: data.to,
@@ -749,7 +905,12 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
 
         // Build full debt objects with extra fields for response
         let fullDebts = (records || []).map((r) => {
-          const data = r.data as { from: string; to: string; description?: string; settled: boolean };
+          const data = r.data as {
+            from: string;
+            to: string;
+            description?: string;
+            settled: boolean;
+          };
           return {
             id: r.id,
             from: data.from,
@@ -771,30 +932,34 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         }
 
         // Use utility functions for simplification and summary
-        const simplified = simplify && debtsToSimplify.length > 0
-          ? simplifyDebts(debtsToSimplify)
-          : [];
+        const simplified =
+          simplify && debtsToSimplify.length > 0 ? simplifyDebts(debtsToSimplify) : [];
 
-        const personSummary = person
-          ? calculatePersonSummary(debtsToSimplify, person)
-          : undefined;
+        const personSummary = person ? calculatePersonSummary(debtsToSimplify, person) : undefined;
 
         return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify({
-              success: true,
-              count: fullDebts.length,
-              debts: simplify ? undefined : fullDebts,
-              simplified: simplify ? simplified : undefined,
-              personSummary,
-            }),
-          }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: true,
+                count: fullDebts.length,
+                debts: simplify ? undefined : fullDebts,
+                simplified: simplify ? simplified : undefined,
+                personSummary,
+              }),
+            },
+          ],
         };
       } catch (error) {
         logger.error('Error getting debts:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: String(error) }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({ success: false, error: String(error) }),
+            },
+          ],
           isError: true,
         };
       }
@@ -805,7 +970,8 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
   server.registerTool(
     'settle_mini_app_debt',
     {
-      description: 'Mark a debt as settled/paid. Can settle by debt ID or by specifying the parties.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
+      description:
+        'Mark a debt as settled/paid. Can settle by debt ID or by specifying the parties.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
       inputSchema: {
         ...userIdentifierFields,
         appName: z.string().describe('Mini-app name'),
@@ -821,7 +987,12 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         const resolved = await resolveUser(args as Parameters<typeof resolveUser>[0], dataComposer);
         if (!resolved) {
           return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'User not found' }) }],
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({ success: false, error: 'User not found' }),
+              },
+            ],
             isError: true,
           };
         }
@@ -837,7 +1008,15 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
 
         if (!debtId && (!from || !to)) {
           return {
-            content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'Provide either debtId or both from and to' }) }],
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  success: false,
+                  error: 'Provide either debtId or both from and to',
+                }),
+              },
+            ],
             isError: true,
           };
         }
@@ -859,7 +1038,11 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
           const { error } = await supabase
             .from('mini_app_records')
             .update({
-              data: { ...(debt.data as object), settled: true, settledAt: new Date().toISOString() },
+              data: {
+                ...(debt.data as object),
+                settled: true,
+                settledAt: new Date().toISOString(),
+              },
               updated_at: new Date().toISOString(),
             })
             .eq('id', debtId);
@@ -891,7 +1074,11 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
             const { error } = await supabase
               .from('mini_app_records')
               .update({
-                data: { ...(debt.data as object), settled: true, settledAt: new Date().toISOString() },
+                data: {
+                  ...(debt.data as object),
+                  settled: true,
+                  settledAt: new Date().toISOString(),
+                },
                 updated_at: new Date().toISOString(),
               })
               .eq('id', debt.id);
@@ -904,19 +1091,26 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
         }
 
         return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify({
-              success: true,
-              settledCount,
-              settledAmount: Math.round(settledAmount * 100) / 100,
-            }),
-          }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: true,
+                settledCount,
+                settledAmount: Math.round(settledAmount * 100) / 100,
+              }),
+            },
+          ],
         };
       } catch (error) {
         logger.error('Error settling debt:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: String(error) }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({ success: false, error: String(error) }),
+            },
+          ],
           isError: true,
         };
       }

@@ -37,35 +37,19 @@ export { DEFAULT_CHANNEL_CONFIG } from './types';
 export { ChannelAdapter, createChannelAdapter } from './adapter';
 
 // Extractor utilities
-export {
-  extractContext,
-  extractLinks,
-  hasExtractableContent,
-} from './extractor';
+export { extractContext, extractLinks, hasExtractableContent } from './extractor';
 
 // Clawdbot integration
 export type { ClawdbotMsgContext } from './clawdbot-bridge';
-export {
-  ClawdbotBridge,
-  createClawdbotBridge,
-  convertClawdbotContext,
-} from './clawdbot-bridge';
+export { ClawdbotBridge, createClawdbotBridge, convertClawdbotContext } from './clawdbot-bridge';
 
 // Agent Gateway (agent-to-agent triggers)
 export type { AgentTriggerPayload, AgentTriggerResponse, TriggerCallback } from './agent-gateway';
-export {
-  AgentGateway,
-  getAgentGateway,
-  createAgentGatewayRoutes,
-} from './agent-gateway';
+export { AgentGateway, getAgentGateway, createAgentGatewayRoutes } from './agent-gateway';
 
 // Channel Gateway (Telegram/WhatsApp/Discord listeners)
 export type { ChannelGatewayConfig, IncomingMessageHandler, GatewayChannel } from './gateway';
-export {
-  ChannelGateway,
-  getChannelGateway,
-  createChannelGateway,
-} from './gateway';
+export { ChannelGateway, getChannelGateway, createChannelGateway } from './gateway';
 
 // Discord listener
 export { DiscordListener, createDiscordListener } from './discord-listener';

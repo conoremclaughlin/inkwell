@@ -113,12 +113,12 @@ export class MediaGroupBuffer {
     const first = messages[0];
 
     // Collect all media
-    const allMedia: MediaAttachment[] = messages.flatMap(m => m.media || []);
+    const allMedia: MediaAttachment[] = messages.flatMap((m) => m.media || []);
 
     // Find caption — the one message with real text (not placeholder like "[Image attached]")
     const placeholderPattern = /^\[.*attached\]$/;
-    const captionMessage = messages.find(m =>
-      m.body && m.body.trim() !== '' && !placeholderPattern.test(m.body.trim())
+    const captionMessage = messages.find(
+      (m) => m.body && m.body.trim() !== '' && !placeholderPattern.test(m.body.trim())
     );
 
     let body: string;
@@ -129,9 +129,7 @@ export class MediaGroupBuffer {
     }
 
     // Earliest timestamp
-    const timestamps = messages
-      .map(m => m.timestamp)
-      .filter((t): t is number => t !== undefined);
+    const timestamps = messages.map((m) => m.timestamp).filter((t): t is number => t !== undefined);
     const timestamp = timestamps.length > 0 ? Math.min(...timestamps) : first.timestamp;
 
     // Merge mentions
@@ -149,7 +147,7 @@ export class MediaGroupBuffer {
     }
 
     // Collect raw objects
-    const rawObjects = messages.map(m => m.raw).filter(r => r !== undefined);
+    const rawObjects = messages.map((m) => m.raw).filter((r) => r !== undefined);
 
     return {
       ...first,
@@ -157,9 +155,10 @@ export class MediaGroupBuffer {
       rawBody: body,
       timestamp,
       media: allMedia.length > 0 ? allMedia : undefined,
-      mentions: (allMentionedUsers.size > 0 || botMentioned)
-        ? { users: [...allMentionedUsers], botMentioned }
-        : first.mentions,
+      mentions:
+        allMentionedUsers.size > 0 || botMentioned
+          ? { users: [...allMentionedUsers], botMentioned }
+          : first.mentions,
       raw: rawObjects.length > 1 ? rawObjects : first.raw,
     };
   }
@@ -173,10 +172,14 @@ export class MediaGroupBuffer {
 
     const counts = new Map<string, number>();
     for (const item of media) {
-      const label = item.type === 'image' ? 'image'
-        : item.type === 'video' ? 'video'
-        : item.type === 'audio' ? 'audio'
-        : 'file';
+      const label =
+        item.type === 'image'
+          ? 'image'
+          : item.type === 'video'
+            ? 'video'
+            : item.type === 'audio'
+              ? 'audio'
+              : 'file';
       counts.set(label, (counts.get(label) || 0) + 1);
     }
 

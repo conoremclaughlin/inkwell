@@ -54,7 +54,11 @@ export default function WhatsAppPage() {
       console.log('[WhatsApp SSE] Raw event.data:', event.data.substring(0, 100) + '...');
       try {
         const data = JSON.parse(event.data);
-        console.log('[WhatsApp SSE] Parsed type:', data.type, data.type === 'qr' ? '(SVG length: ' + data.qr?.length + ')' : '');
+        console.log(
+          '[WhatsApp SSE] Parsed type:',
+          data.type,
+          data.type === 'qr' ? '(SVG length: ' + data.qr?.length + ')' : ''
+        );
         if (data.type === 'qr') {
           console.log('[WhatsApp SSE] Setting QR code, length:', data.qr?.length);
           setQrCode(data.qr);
@@ -117,7 +121,14 @@ export default function WhatsAppPage() {
   };
 
   // Debug logging
-  console.log('[WhatsApp Render] status:', status, 'qrCode length:', qrCode?.length, 'isLoading:', isLoading);
+  console.log(
+    '[WhatsApp Render] status:',
+    status,
+    'qrCode length:',
+    qrCode?.length,
+    'isLoading:',
+    isLoading
+  );
 
   return (
     <div>
@@ -136,11 +147,7 @@ export default function WhatsAppPage() {
         </div>
       </div>
 
-      {error && (
-        <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">
-          {error}
-        </div>
-      )}
+      {error && <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">{error}</div>}
 
       <div className="mt-8 grid gap-6 md:grid-cols-2">
         {/* Connection Status */}
@@ -154,9 +161,7 @@ export default function WhatsAppPage() {
               )}
               Connection Status
             </CardTitle>
-            <CardDescription>
-              Current WhatsApp connection state
-            </CardDescription>
+            <CardDescription>Current WhatsApp connection state</CardDescription>
           </CardHeader>
           <CardContent>
             {isLoading ? (
@@ -176,11 +181,7 @@ export default function WhatsAppPage() {
                   </div>
                 )}
                 {status?.connected && (
-                  <Button
-                    onClick={handleLogout}
-                    variant="destructive"
-                    className="w-full mt-4"
-                  >
+                  <Button onClick={handleLogout} variant="destructive" className="w-full mt-4">
                     Disconnect WhatsApp
                   </Button>
                 )}
@@ -196,18 +197,14 @@ export default function WhatsAppPage() {
               <QrCode className="h-5 w-5" />
               QR Code
             </CardTitle>
-            <CardDescription>
-              Scan with WhatsApp to link your device
-            </CardDescription>
+            <CardDescription>Scan with WhatsApp to link your device</CardDescription>
           </CardHeader>
           <CardContent>
             {status?.connected ? (
               <div className="flex flex-col items-center justify-center py-8 text-center">
                 <Wifi className="h-12 w-12 text-green-500 mb-4" />
                 <p className="text-gray-600">Already connected!</p>
-                <p className="text-sm text-gray-500 mt-2">
-                  Disconnect to show a new QR code.
-                </p>
+                <p className="text-sm text-gray-500 mt-2">Disconnect to show a new QR code.</p>
               </div>
             ) : qrCode ? (
               <div className="flex flex-col items-center">
@@ -216,7 +213,7 @@ export default function WhatsAppPage() {
                   dangerouslySetInnerHTML={{ __html: qrCode }}
                 />
                 <p className="mt-4 text-sm text-gray-500">
-                  Open WhatsApp {">"} Settings {">"} Linked Devices {">"} Link a Device
+                  Open WhatsApp {'>'} Settings {'>'} Linked Devices {'>'} Link a Device
                 </p>
               </div>
             ) : (

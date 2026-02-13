@@ -27,8 +27,16 @@ if (existsSync(envLocalPath)) {
 }
 
 // Helper to handle optional strings (treat empty string as undefined)
-const optionalString = z.string().optional().transform(val => val === '' ? undefined : val);
-const optionalUrl = z.string().url().optional().or(z.literal('')).transform(val => val === '' ? undefined : val);
+const optionalString = z
+  .string()
+  .optional()
+  .transform((val) => (val === '' ? undefined : val));
+const optionalUrl = z
+  .string()
+  .url()
+  .optional()
+  .or(z.literal(''))
+  .transform((val) => (val === '' ? undefined : val));
 
 // Environment variable schema
 const envSchema = z.object({
@@ -56,7 +64,10 @@ const envSchema = z.object({
   MCP_HTTP_PORT: z.string().transform(Number).optional(),
   MCP_BASE_URL: optionalUrl, // Public base URL (e.g., https://pcp.example.com). Defaults to http://localhost:{MCP_HTTP_PORT}
   MCP_AUTH_TOKEN: optionalString,
-  MCP_REQUIRE_OAUTH: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
+  MCP_REQUIRE_OAUTH: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
 
   // Myra (persistent messaging process)
   MYRA_HTTP_PORT: z.string().transform(Number).optional(),
@@ -94,8 +105,8 @@ const parseEnv = () => {
     if (!hasNewKeys && !hasOldKeys) {
       throw new Error(
         'Missing Supabase keys. Provide either:\n' +
-        '  - SUPABASE_PUBLISHABLE_KEY and SUPABASE_SECRET_KEY (recommended), or\n' +
-        '  - SUPABASE_ANON_KEY and SUPABASE_SERVICE_KEY (legacy)'
+          '  - SUPABASE_PUBLISHABLE_KEY and SUPABASE_SECRET_KEY (recommended), or\n' +
+          '  - SUPABASE_ANON_KEY and SUPABASE_SERVICE_KEY (legacy)'
       );
     }
 

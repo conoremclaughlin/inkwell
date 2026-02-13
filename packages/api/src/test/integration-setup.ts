@@ -20,8 +20,8 @@ try {
 } catch {
   throw new Error(
     'Integration tests require the Claude CLI to be installed.\n' +
-    'Install it from https://docs.anthropic.com/en/docs/claude-code\n' +
-    'Then run: yarn test:integration'
+      'Install it from https://docs.anthropic.com/en/docs/claude-code\n' +
+      'Then run: yarn test:integration'
   );
 }
 
@@ -35,6 +35,6 @@ const hasSupabaseKey = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_S
 if (!process.env.SUPABASE_URL || !hasSupabaseKey) {
   throw new Error(
     'Integration tests require SUPABASE_URL and SUPABASE_SECRET_KEY (or SUPABASE_SERVICE_KEY).\n' +
-    'Ensure .env.local is configured correctly.'
+      'Ensure .env.local is configured correctly.'
   );
 }

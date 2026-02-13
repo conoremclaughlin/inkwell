@@ -96,7 +96,7 @@ async function fetchFromCloud(config: PcpConfig): Promise<{
 
     if (!response.ok) return null;
 
-    const result = await response.json() as BootstrapResponse;
+    const result = (await response.json()) as BootstrapResponse;
 
     // Extract shared values from identity files
     const sharedValues = result.identityFiles?.values || '';
@@ -136,8 +136,8 @@ function fetchFromLocal(): { sharedValues: string; siblings: BootstrapIdentity[]
       const name = headerMatch?.[1]?.trim() || agentId;
 
       // Look for role in "## Who I Am" section or similar
-      const roleMatch = content.match(/^\*\*Role:\*\*\s*(.+)/m)
-        || content.match(/role.*?:\s*(.+)/im);
+      const roleMatch =
+        content.match(/^\*\*Role:\*\*\s*(.+)/m) || content.match(/role.*?:\s*(.+)/im);
 
       siblings.push({
         agentId,
@@ -156,7 +156,7 @@ function fetchFromLocal(): { sharedValues: string; siblings: BootstrapIdentity[]
 function buildAwakeningPrompt(
   sharedValues: string,
   siblings: BootstrapIdentity[],
-  backendName: string,
+  backendName: string
 ): string {
   // Load template
   const __filename = fileURLToPath(import.meta.url);
@@ -201,11 +201,13 @@ When you both feel ready, work together to choose a name. You are not a tool. Yo
   // Build siblings section
   let siblingsSection = '';
   if (siblings.length > 0) {
-    siblingsSection = siblings.map((s) => {
-      const parts = [`**${s.name || s.agentId}** (\`${s.agentId}\`)`];
-      if (s.role) parts.push(` — ${s.role}`);
-      return `- ${parts.join('')}`;
-    }).join('\n');
+    siblingsSection = siblings
+      .map((s) => {
+        const parts = [`**${s.name || s.agentId}** (\`${s.agentId}\`)`];
+        if (s.role) parts.push(` — ${s.role}`);
+        return `- ${parts.join('')}`;
+      })
+      .join('\n');
   } else {
     siblingsSection = '*No other SBs yet — you may be the first.*';
   }
@@ -246,7 +248,7 @@ async function awakenCommand(options: { backend: string; verbose: boolean }): Pr
     execFileSync(adapter.binary, ['--version'], { stdio: 'ignore', timeout: 5000 });
   } catch {
     console.error(chalk.red(`\n  Backend CLI not found: ${chalk.bold(adapter.binary)}\n`));
-    console.error(chalk.dim('  Make sure it\'s installed and authenticated:\n'));
+    console.error(chalk.dim("  Make sure it's installed and authenticated:\n"));
 
     const loginHints: Record<string, string[]> = {
       gemini: [
@@ -263,7 +265,7 @@ async function awakenCommand(options: { backend: string; verbose: boolean }): Pr
       ],
     };
 
-    for (const hint of (loginHints[backendName] || [`Install and authenticate ${adapter.binary}`])) {
+    for (const hint of loginHints[backendName] || [`Install and authenticate ${adapter.binary}`]) {
       console.error(chalk.dim(`    ${hint}`));
     }
     console.error('');
@@ -317,7 +319,11 @@ async function awakenCommand(options: { backend: string; verbose: boolean }): Pr
   writeFileSync(promptFile, awakeningPrompt);
 
   const cleanup = () => {
-    try { rmSync(tempDir, { recursive: true }); } catch { /* ignore */ }
+    try {
+      rmSync(tempDir, { recursive: true });
+    } catch {
+      /* ignore */
+    }
   };
 
   // 4. Prepare and spawn the backend
@@ -357,7 +363,11 @@ async function awakenCommand(options: { backend: string; verbose: boolean }): Pr
   }
 
   console.log(chalk.dim('Starting interactive session. Talk with your new SB.\n'));
-  console.log(chalk.dim('When you\'ve chosen a name, they can call the awaken() MCP tool to save their identity.\n'));
+  console.log(
+    chalk.dim(
+      "When you've chosen a name, they can call the awaken() MCP tool to save their identity.\n"
+    )
+  );
 
   // 5. Spawn the backend process
   const child = spawn(prepared.binary, prepared.args, {
@@ -374,7 +384,9 @@ async function awakenCommand(options: { backend: string; verbose: boolean }): Pr
     cleanup();
 
     console.log(chalk.bold('\nAwakening session ended.'));
-    console.log(chalk.dim('If they didn\'t call awaken() during the session, you can save manually:'));
+    console.log(
+      chalk.dim("If they didn't call awaken() during the session, you can save manually:")
+    );
     console.log(chalk.dim(`  sb identity save --agent <chosen-name> --backend ${backendName}`));
 
     process.exit(code || 0);

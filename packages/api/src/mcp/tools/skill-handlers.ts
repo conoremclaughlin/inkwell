@@ -97,10 +97,13 @@ export async function handleListSkills(
     });
   } catch (error) {
     logger.error('Error in list_skills:', error);
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to list skills',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to list skills',
+      },
+      true
+    );
   }
 }
 
@@ -118,10 +121,13 @@ export async function handleGetSkill(
 ): Promise<McpResponse> {
   try {
     if (!miniAppsRegistry) {
-      return mcpResponse({
-        success: false,
-        error: 'Skills registry not initialized.',
-      }, true);
+      return mcpResponse(
+        {
+          success: false,
+          error: 'Skills registry not initialized.',
+        },
+        true
+      );
     }
 
     const app = miniAppsRegistry.get(args.skillName);
@@ -140,11 +146,14 @@ export async function handleGetSkill(
         }
       }
 
-      return mcpResponse({
-        success: false,
-        error: `Skill "${args.skillName}" not found.`,
-        availableSkills: Array.from(miniAppsRegistry.keys()),
-      }, true);
+      return mcpResponse(
+        {
+          success: false,
+          error: `Skill "${args.skillName}" not found.`,
+          availableSkills: Array.from(miniAppsRegistry.keys()),
+        },
+        true
+      );
     }
 
     logger.info(`Skill loaded: ${args.skillName}`);
@@ -159,9 +168,12 @@ export async function handleGetSkill(
     });
   } catch (error) {
     logger.error('Error in get_skill:', error);
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to get skill',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to get skill',
+      },
+      true
+    );
   }
 }

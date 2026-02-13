@@ -59,7 +59,10 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
 
     // Verify the JWT with Supabase
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const { data: { user }, error } = await supabase.auth.getUser(token);
+    const {
+      data: { user },
+      error,
+    } = await supabase.auth.getUser(token);
 
     if (error || !user) {
       res.status(401).json({ error: 'Invalid token' });
@@ -103,7 +106,8 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     const isTrusted = trustedUsers.some((tu) => {
       if (tu.trustLevel === 'member') return false;
       if (tu.userId === pcpUser.id) return true;
-      if (tu.platform === 'telegram' && pcpUser.telegram_id?.toString() === tu.platformUserId) return true;
+      if (tu.platform === 'telegram' && pcpUser.telegram_id?.toString() === tu.platformUserId)
+        return true;
       if (tu.platform === 'whatsapp' && pcpUser.whatsapp_id === tu.platformUserId) return true;
       return false;
     });
@@ -114,7 +118,11 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     }
 
     // Attach user + PCP context to request
-    const authReq = req as Request & { user: typeof user; pcpUserId: string; pcpWorkspaceId: string };
+    const authReq = req as Request & {
+      user: typeof user;
+      pcpUserId: string;
+      pcpWorkspaceId: string;
+    };
     authReq.user = user;
     authReq.pcpUserId = pcpUser.id;
     authReq.pcpWorkspaceId = activeWorkspaceId;
@@ -152,7 +160,9 @@ router.get('/workspaces', async (req: Request, res: Response) => {
     const authReq = req as AdminAuthRequest;
     const dataComposer = await getDataComposer();
     const workspaceRepo = dataComposer.repositories.workspaceContainers;
-    const workspaces = await workspaceRepo.listByUser(authReq.pcpUserId, { includeArchived: false });
+    const workspaces = await workspaceRepo.listByUser(authReq.pcpUserId, {
+      includeArchived: false,
+    });
 
     res.json({
       currentWorkspaceId: authReq.pcpWorkspaceId,
@@ -234,16 +244,14 @@ router.post('/trusted-users', async (req: Request, res: Response) => {
     }
 
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const { error } = await supabase
-      .from('trusted_users')
-      .insert({
-        user_id: null,
-        platform,
-        platform_user_id: platformUserId,
-        trust_level: trustLevel || 'member',
-        added_by: authReq.pcpUserId,
-        workspace_id: authReq.pcpWorkspaceId,
-      });
+    const { error } = await supabase.from('trusted_users').insert({
+      user_id: null,
+      platform,
+      platform_user_id: platformUserId,
+      trust_level: trustLevel || 'member',
+      added_by: authReq.pcpUserId,
+      workspace_id: authReq.pcpWorkspaceId,
+    });
 
     if (error) {
       logger.error('Failed to add trusted user:', error);
@@ -439,8 +447,9 @@ router.post('/challenge-codes', async (req: Request, res: Response) => {
     }
 
     // Generate code
-    const code = Array.from({ length: 6 }, () =>
-      'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'[Math.floor(Math.random() * 36)]
+    const code = Array.from(
+      { length: 6 },
+      () => 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'[Math.floor(Math.random() * 36)]
     ).join('');
 
     const { data, error } = await supabase
@@ -522,7 +531,9 @@ router.get('/whatsapp/qr', (req: Request, res: Response) => {
   };
 
   const connectedHandler = (info: { jid: string; e164: string | null }) => {
-    res.write(`data: ${JSON.stringify({ type: 'connected', phoneNumber: info.e164 || info.jid })}\n\n`);
+    res.write(
+      `data: ${JSON.stringify({ type: 'connected', phoneNumber: info.e164 || info.jid })}\n\n`
+    );
   };
 
   const disconnectedHandler = () => {
@@ -1005,58 +1016,64 @@ router.get('/individuals/:agentId/memories/timeline', async (req: Request, res: 
  * GET /api/admin/individuals/:agentId/memories/:memoryId/history
  * Get version history for a specific memory
  */
-router.get('/individuals/:agentId/memories/:memoryId/history', async (req: Request, res: Response) => {
-  try {
-    const { memoryId } = req.params;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as AdminAuthRequest;
+router.get(
+  '/individuals/:agentId/memories/:memoryId/history',
+  async (req: Request, res: Response) => {
+    try {
+      const { memoryId } = req.params;
+      const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+      const authReq = req as AdminAuthRequest;
 
-    // Get memory history
-    const { data, error } = await supabase
-      .from('memory_history')
-      .select('*')
-      .eq('user_id', authReq.pcpUserId)
-      .eq('memory_id', memoryId)
-      .order('version', { ascending: false });
+      // Get memory history
+      const { data, error } = await supabase
+        .from('memory_history')
+        .select('*')
+        .eq('user_id', authReq.pcpUserId)
+        .eq('memory_id', memoryId)
+        .order('version', { ascending: false });
 
-    if (error) {
+      if (error) {
+        logger.error('Failed to get memory history:', error);
+        res.status(500).json({ error: 'Failed to get memory history' });
+        return;
+      }
+
+      res.json({
+        memoryId,
+        history: (data || []).map((h) => ({
+          id: h.id,
+          version: h.version,
+          content: h.content,
+          salience: h.salience,
+          source: h.source,
+          topics: h.topics,
+          metadata: h.metadata,
+          changeType: h.change_type,
+          createdAt: h.created_at,
+          archivedAt: h.archived_at,
+        })),
+      });
+    } catch (error) {
       logger.error('Failed to get memory history:', error);
       res.status(500).json({ error: 'Failed to get memory history' });
-      return;
     }
-
-    res.json({
-      memoryId,
-      history: (data || []).map((h) => ({
-        id: h.id,
-        version: h.version,
-        content: h.content,
-        salience: h.salience,
-        source: h.source,
-        topics: h.topics,
-        metadata: h.metadata,
-        changeType: h.change_type,
-        createdAt: h.created_at,
-        archivedAt: h.archived_at,
-      })),
-    });
-  } catch (error) {
-    logger.error('Failed to get memory history:', error);
-    res.status(500).json({ error: 'Failed to get memory history' });
   }
-});
+);
 
 // =============================================================================
 // Connected Accounts (OAuth)
 // =============================================================================
 
 // In-memory store for OAuth state (in production, use Redis or similar)
-const oauthStateStore = new Map<string, {
-  userId: string;
-  workspaceId: string;
-  provider: string;
-  expiresAt: number;
-}>();
+const oauthStateStore = new Map<
+  string,
+  {
+    userId: string;
+    workspaceId: string;
+    provider: string;
+    expiresAt: number;
+  }
+>();
 
 /**
  * GET /api/admin/connected-accounts
@@ -1069,7 +1086,7 @@ router.get('/connected-accounts', async (req: Request, res: Response) => {
     const oauthService = getOAuthService();
     const accounts = await oauthService.getConnectedAccounts(
       authReq.pcpUserId,
-      authReq.pcpWorkspaceId,
+      authReq.pcpWorkspaceId
     );
 
     // Get supported providers and their configuration status
@@ -1245,7 +1262,7 @@ router.get('/oauth/:provider/callback', async (req: Request, res: Response) => {
       provider,
       tokens,
       userInfo,
-      stateData.workspaceId,
+      stateData.workspaceId
     );
 
     sendHtmlResponse(true, `Successfully connected ${userInfo.email || provider} account.`);
@@ -1320,7 +1337,7 @@ router.post('/oauth/:provider/upgrade-scopes', async (req: Request, res: Respons
     if (missingScopes.length === 0) {
       res.json({
         needsUpgrade: false,
-        message: 'All required scopes are already granted'
+        message: 'All required scopes are already granted',
       });
       return;
     }
@@ -1503,7 +1520,10 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
       new Set((comments || []).map((c) => c.created_by_identity_id).filter(Boolean) as string[])
     );
 
-    const identitiesById = new Map<string, { id: string; agent_id: string; name: string; backend: string | null }>();
+    const identitiesById = new Map<
+      string,
+      { id: string; agent_id: string; name: string; backend: string | null }
+    >();
 
     if (identityIds.length > 0) {
       const { data: identities, error: identitiesError } = await supabase
@@ -1526,7 +1546,7 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
       artifactId: id,
       comments: (comments || []).map((comment) => {
         const identity = comment.created_by_identity_id
-          ? identitiesById.get(comment.created_by_identity_id) ?? null
+          ? (identitiesById.get(comment.created_by_identity_id) ?? null)
           : null;
         return {
           id: comment.id,
@@ -1609,7 +1629,8 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
       }
     }
 
-    let identity: { id: string; agent_id: string; name: string; backend: string | null } | null = null;
+    let identity: { id: string; agent_id: string; name: string; backend: string | null } | null =
+      null;
     if (agentId) {
       const { data: identityRow, error: identityError } = await supabase
         .from('agent_identities')
@@ -1988,7 +2009,11 @@ router.patch('/skills/install/:installationId', async (req: Request, res: Respon
 
     // Pin version
     if (versionPinned !== undefined) {
-      const result = await cloudService.pinSkillVersion(installationId, authReq.pcpUserId, versionPinned);
+      const result = await cloudService.pinSkillVersion(
+        installationId,
+        authReq.pcpUserId,
+        versionPinned
+      );
       if (!result.success) {
         res.status(400).json({ error: 'Failed to pin skill version' });
         return;
@@ -2037,10 +2062,25 @@ router.get('/skills/installed', async (req: Request, res: Response) => {
 router.post('/skills/publish', async (req: Request, res: Response) => {
   try {
     const authReq = req as AdminAuthRequest;
-    const { name, displayName, description, type, category, tags, emoji, version, manifest, content, repositoryUrl, isPublic } = req.body;
+    const {
+      name,
+      displayName,
+      description,
+      type,
+      category,
+      tags,
+      emoji,
+      version,
+      manifest,
+      content,
+      repositoryUrl,
+      isPublic,
+    } = req.body;
 
     if (!name || !displayName || !description || !type || !version || !content) {
-      res.status(400).json({ error: 'Missing required fields: name, displayName, description, type, version, content' });
+      res.status(400).json({
+        error: 'Missing required fields: name, displayName, description, type, version, content',
+      });
       return;
     }
 
@@ -2080,7 +2120,17 @@ router.patch('/skills/manage/:skillId', async (req: Request, res: Response) => {
   try {
     const { skillId } = req.params;
     const authReq = req as AdminAuthRequest;
-    const { displayName, description, category, tags, emoji, version, manifest, content, changelog } = req.body;
+    const {
+      displayName,
+      description,
+      category,
+      tags,
+      emoji,
+      version,
+      manifest,
+      content,
+      changelog,
+    } = req.body;
 
     if (!version) {
       res.status(400).json({ error: 'Version is required for updates' });

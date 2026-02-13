@@ -120,7 +120,9 @@ export class DirectApiBackend extends EventEmitter implements AgentBackend {
       content: this.formatUserMessage(message),
     });
 
-    logger.info(`Sending message via Direct API [${message.channel}]: ${message.content.substring(0, 100)}...`);
+    logger.info(
+      `Sending message via Direct API [${message.channel}]: ${message.content.substring(0, 100)}...`
+    );
 
     try {
       // Make API call
@@ -134,7 +136,6 @@ export class DirectApiBackend extends EventEmitter implements AgentBackend {
 
       // Process the response
       await this.processResponse(response, message);
-
     } catch (error) {
       this.lastError = error instanceof Error ? error.message : 'Unknown error';
       logger.error('Direct API error:', error);
@@ -237,7 +238,11 @@ export class DirectApiBackend extends EventEmitter implements AgentBackend {
     }
 
     // If no tool was called, send the text response directly
-    if (!response.content.some((b: Anthropic.ContentBlock) => b.type === 'tool_use') && textContent && this.responseHandler) {
+    if (
+      !response.content.some((b: Anthropic.ContentBlock) => b.type === 'tool_use') &&
+      textContent &&
+      this.responseHandler
+    ) {
       await this.responseHandler({
         channel: originalMessage.channel,
         conversationId: originalMessage.conversationId,

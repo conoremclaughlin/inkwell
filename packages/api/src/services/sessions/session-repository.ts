@@ -7,12 +7,7 @@
 
 import { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../../data/supabase/types.js';
-import type {
-  Session,
-  SessionStatus,
-  SessionType,
-  ISessionRepository,
-} from './types.js';
+import type { Session, SessionStatus, SessionType, ISessionRepository } from './types.js';
 import { logger } from '../../utils/logger.js';
 
 type DbSession = Database['public']['Tables']['sessions']['Row'];
@@ -104,11 +99,7 @@ export class SessionRepository implements ISessionRepository {
   constructor(private supabase: SupabaseClient<Database>) {}
 
   async findById(id: string): Promise<Session | null> {
-    const { data, error } = await this.supabase
-      .from('sessions')
-      .select('*')
-      .eq('id', id)
-      .single();
+    const { data, error } = await this.supabase.from('sessions').select('*').eq('id', id).single();
 
     if (error) {
       if (error.code === 'PGRST116') {
@@ -208,9 +199,7 @@ export class SessionRepository implements ISessionRepository {
     return sessions;
   }
 
-  async create(
-    session: Omit<Session, 'id' | 'startedAt' | 'lastActivityAt'>
-  ): Promise<Session> {
+  async create(session: Omit<Session, 'id' | 'startedAt' | 'lastActivityAt'>): Promise<Session> {
     const dbSession = mapSessionToDb(session);
 
     const { data, error } = await this.supabase

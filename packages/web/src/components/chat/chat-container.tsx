@@ -60,9 +60,7 @@ export function ChatContainer() {
   const selectedAgent = agents.find((a) => a.agentId === effectiveAgentId);
 
   // Send message mutation
-  const sendMutation = useApiPost<SendMessageResponse, SendMessageInput>(
-    '/api/chat/message'
-  );
+  const sendMutation = useApiPost<SendMessageResponse, SendMessageInput>('/api/chat/message');
 
   const handleSend = useCallback(
     async (content: string) => {
@@ -124,9 +122,7 @@ export function ChatContainer() {
 
   if (agentsLoading) {
     return (
-      <div className="flex h-full items-center justify-center text-gray-400">
-        Loading agents...
-      </div>
+      <div className="flex h-full items-center justify-center text-gray-400">Loading agents...</div>
     );
   }
 

@@ -128,11 +128,7 @@ export async function handleTagLink(args: unknown, dataComposer: DataComposer) {
 
   let link;
   if (params.addTags && params.addTags.length > 0) {
-    link = await dataComposer.repositories.links.addTags(
-      params.linkId,
-      user.id,
-      params.addTags
-    );
+    link = await dataComposer.repositories.links.addTags(params.linkId, user.id, params.addTags);
   }
 
   if (params.removeTags && params.removeTags.length > 0) {
@@ -143,7 +139,9 @@ export async function handleTagLink(args: unknown, dataComposer: DataComposer) {
     );
   }
 
-  logger.info(`Link tags updated: ${params.linkId} for user ${user.id} (resolved by ${resolvedBy})`);
+  logger.info(
+    `Link tags updated: ${params.linkId} for user ${user.id} (resolved by ${resolvedBy})`
+  );
 
   return {
     content: [

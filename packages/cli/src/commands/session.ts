@@ -96,7 +96,7 @@ async function listCommand(options: { agent?: string; limit?: string }): Promise
       process.exit(1);
     }
 
-    const result = await response.json() as SessionListResult;
+    const result = (await response.json()) as SessionListResult;
 
     console.log(chalk.bold('\nRecent Sessions:\n'));
 
@@ -106,11 +106,12 @@ async function listCommand(options: { agent?: string; limit?: string }): Promise
     }
 
     for (const session of result.sessions) {
-      const statusIcon = session.status === 'active'
-        ? chalk.green('●')
-        : session.status === 'completed'
-          ? chalk.dim('○')
-          : chalk.yellow('◐');
+      const statusIcon =
+        session.status === 'active'
+          ? chalk.green('●')
+          : session.status === 'completed'
+            ? chalk.dim('○')
+            : chalk.yellow('◐');
 
       const agent = session.agentId || 'unknown';
       const startedAt = new Date(session.startedAt);
@@ -118,14 +119,15 @@ async function listCommand(options: { agent?: string; limit?: string }): Promise
         ? formatDuration(new Date(session.endedAt).getTime() - startedAt.getTime())
         : 'ongoing';
 
-      console.log(`  ${statusIcon} ${chalk.cyan(session.id.substring(0, 8))} ${chalk.dim(`(${agent})`)}`);
+      console.log(
+        `  ${statusIcon} ${chalk.cyan(session.id.substring(0, 8))} ${chalk.dim(`(${agent})`)}`
+      );
       console.log(chalk.dim(`      Started: ${formatDate(startedAt)}`));
       console.log(chalk.dim(`      Duration: ${duration}`));
 
       if (session.summary) {
-        const summary = session.summary.length > 60
-          ? session.summary.substring(0, 60) + '...'
-          : session.summary;
+        const summary =
+          session.summary.length > 60 ? session.summary.substring(0, 60) + '...' : session.summary;
         console.log(chalk.dim(`      Summary: ${summary}`));
       }
       console.log('');
@@ -160,7 +162,7 @@ async function showCommand(sessionId: string): Promise<void> {
       process.exit(1);
     }
 
-    const session = await response.json() as Session;
+    const session = (await response.json()) as Session;
 
     console.log(chalk.bold(`\nSession: ${session.id}\n`));
     console.log(chalk.dim('  Agent:    ') + (session.agentId || 'unknown'));
@@ -223,7 +225,7 @@ async function resumeCommand(sessionId: string): Promise<void> {
       process.exit(1);
     }
 
-    const session = await response.json() as Session;
+    const session = (await response.json()) as Session;
 
     if (!session.claudeSessionId) {
       console.error(chalk.red('Session has no Claude session ID to resume'));
@@ -306,26 +308,19 @@ function formatDuration(ms: number): string {
 // ============================================================================
 
 export function registerSessionCommands(program: Command): void {
-  const session = program
-    .command('session')
-    .description('Manage PCP sessions');
+  const session = program.command('session').description('Manage PCP sessions');
 
-  session.command('list')
+  session
+    .command('list')
     .alias('ls')
     .description('List recent sessions')
     .option('-a, --agent <id>', 'Filter by agent')
     .option('-l, --limit <n>', 'Number of sessions', '10')
     .action(listCommand);
 
-  session.command('show <id>')
-    .description('Show session details')
-    .action(showCommand);
+  session.command('show <id>').description('Show session details').action(showCommand);
 
-  session.command('resume <id>')
-    .description('Resume a session')
-    .action(resumeCommand);
+  session.command('resume <id>').description('Resume a session').action(resumeCommand);
 
-  session.command('end [id]')
-    .description('End a session')
-    .action(endCommand);
+  session.command('end [id]').description('End a session').action(endCommand);
 }

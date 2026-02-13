@@ -166,16 +166,18 @@ export function validateExtractedData(
  * Use as a last-resort sanitization step.
  */
 export function sanitizeExtractedData(data: string): string {
-  return data
-    // Remove URLs
-    .replace(/https?:\/\/[^\s]+/gi, '[URL REMOVED]')
-    // Remove potential code blocks
-    .replace(/```[\s\S]*?```/g, '[CODE REMOVED]')
-    // Remove script tags
-    .replace(/<script[\s\S]*?<\/script>/gi, '[SCRIPT REMOVED]')
-    // Remove HTML tags
-    .replace(/<[^>]+>/g, '')
-    // Remove potential command patterns
-    .replace(/\$\([^)]+\)/g, '[COMMAND REMOVED]')
-    .replace(/`[^`]+`/g, '[INLINE CODE REMOVED]');
+  return (
+    data
+      // Remove URLs
+      .replace(/https?:\/\/[^\s]+/gi, '[URL REMOVED]')
+      // Remove potential code blocks
+      .replace(/```[\s\S]*?```/g, '[CODE REMOVED]')
+      // Remove script tags
+      .replace(/<script[\s\S]*?<\/script>/gi, '[SCRIPT REMOVED]')
+      // Remove HTML tags
+      .replace(/<[^>]+>/g, '')
+      // Remove potential command patterns
+      .replace(/\$\([^)]+\)/g, '[COMMAND REMOVED]')
+      .replace(/`[^`]+`/g, '[INLINE CODE REMOVED]')
+  );
 }

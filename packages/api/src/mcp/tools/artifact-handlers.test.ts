@@ -35,12 +35,14 @@ vi.mock('../../utils/logger', () => ({
   },
 }));
 
-function createMockSupabase(overrides: {
-  artifact?: Record<string, unknown> | null;
-  historyContent?: string | null;
-  historyError?: boolean;
-  casFailure?: boolean;
-} = {}) {
+function createMockSupabase(
+  overrides: {
+    artifact?: Record<string, unknown> | null;
+    historyContent?: string | null;
+    historyError?: boolean;
+    casFailure?: boolean;
+  } = {}
+) {
   const artifact = overrides.artifact ?? {
     id: 'artifact-1',
     uri: 'pcp://test/doc',
@@ -107,7 +109,9 @@ function createMockSupabase(overrides: {
           eq: vi.fn().mockReturnValue({
             eq: vi.fn().mockReturnValue({
               single: vi.fn().mockResolvedValue({
-                data: overrides.historyError ? null : { content: overrides.historyContent ?? artifact?.content },
+                data: overrides.historyError
+                  ? null
+                  : { content: overrides.historyContent ?? artifact?.content },
                 error: overrides.historyError ? { message: 'Not found' } : null,
               }),
             }),
@@ -152,7 +156,7 @@ describe('handleUpdateArtifact', () => {
           content: 'Completely new content',
           agentId: 'wren',
         },
-        dataComposer,
+        dataComposer
       );
 
       const parsed = JSON.parse(result.content[0].text);
@@ -175,7 +179,7 @@ describe('handleUpdateArtifact', () => {
           baseVersion: 1,
           agentId: 'wren',
         },
-        dataComposer,
+        dataComposer
       );
 
       const parsed = JSON.parse(result.content[0].text);
@@ -187,9 +191,12 @@ describe('handleUpdateArtifact', () => {
 
   describe('three-way merge', () => {
     it('should auto-merge when changes are in different sections', async () => {
-      const baseContent = '# Section A\nOriginal A content\n\n# Section B\nOriginal B content\n\n# Section C\nOriginal C content\n';
-      const currentContent = '# Section A\nOriginal A content\n\n# Section B\nModified B content by Myra\n\n# Section C\nOriginal C content\n';
-      const incomingContent = '# Section A\nOriginal A content\n\n# Section B\nOriginal B content\n\n# Section C\nModified C content by Wren\n';
+      const baseContent =
+        '# Section A\nOriginal A content\n\n# Section B\nOriginal B content\n\n# Section C\nOriginal C content\n';
+      const currentContent =
+        '# Section A\nOriginal A content\n\n# Section B\nModified B content by Myra\n\n# Section C\nOriginal C content\n';
+      const incomingContent =
+        '# Section A\nOriginal A content\n\n# Section B\nOriginal B content\n\n# Section C\nModified C content by Wren\n';
 
       const { supabase, updatedArtifact, insertedHistory } = createMockSupabase({
         artifact: {
@@ -216,15 +223,15 @@ describe('handleUpdateArtifact', () => {
           baseVersion: 1,
           agentId: 'wren',
         },
-        dataComposer,
+        dataComposer
       );
 
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.success).toBe(true);
       expect(parsed.mergePerformed).toBe(true);
       expect(parsed.mergedFromBase).toBe(1);
-      expect((updatedArtifact.content as string)).toContain('Modified B content by Myra');
-      expect((updatedArtifact.content as string)).toContain('Modified C content by Wren');
+      expect(updatedArtifact.content as string).toContain('Modified B content by Myra');
+      expect(updatedArtifact.content as string).toContain('Modified C content by Wren');
       expect(insertedHistory[0].change_type).toBe('merge');
     });
 
@@ -258,7 +265,7 @@ describe('handleUpdateArtifact', () => {
           baseVersion: 1,
           agentId: 'wren',
         },
-        dataComposer,
+        dataComposer
       );
 
       const parsed = JSON.parse(result.content[0].text);
@@ -299,7 +306,7 @@ describe('handleUpdateArtifact', () => {
           baseVersion: 1,
           agentId: 'wren',
         },
-        dataComposer,
+        dataComposer
       );
 
       const parsed = JSON.parse(result.content[0].text);
@@ -333,8 +340,8 @@ describe('handleUpdateArtifact', () => {
             baseVersion: 1,
             agentId: 'wren',
           },
-          dataComposer,
-        ),
+          dataComposer
+        )
       ).rejects.toThrow('Cannot merge: base version 1 not found in history');
     });
   });
@@ -353,7 +360,7 @@ describe('handleUpdateArtifact', () => {
           content: 'My update',
           agentId: 'wren',
         },
-        dataComposer,
+        dataComposer
       );
 
       const parsed = JSON.parse(result.content[0].text);
@@ -389,7 +396,7 @@ describe('handleUpdateArtifact', () => {
           baseVersion: 1,
           agentId: 'wren',
         },
-        dataComposer,
+        dataComposer
       );
 
       const parsed = JSON.parse(result.content[0].text);
@@ -408,26 +415,28 @@ describe('artifact comment + identity UUID flows', () => {
     const supabase = createTableAwareSupabaseMock({
       artifacts: [
         {
-          maybeSingle: [{
-            data: {
-              id: '11111111-1111-1111-1111-111111111111',
-              uri: 'pcp://specs/test',
-              title: 'Test Spec',
-              content: '# Spec',
-              content_type: 'text/markdown',
-              artifact_type: 'spec',
-              created_by_agent_id: 'wren',
-              created_by_identity_id: null,
-              collaborators: ['wren', 'lumen'],
-              visibility: 'shared',
-              version: 2,
-              tags: ['memory'],
-              metadata: {},
-              created_at: '2026-02-11T00:00:00Z',
-              updated_at: '2026-02-11T01:00:00Z',
+          maybeSingle: [
+            {
+              data: {
+                id: '11111111-1111-1111-1111-111111111111',
+                uri: 'pcp://specs/test',
+                title: 'Test Spec',
+                content: '# Spec',
+                content_type: 'text/markdown',
+                artifact_type: 'spec',
+                created_by_agent_id: 'wren',
+                created_by_identity_id: null,
+                collaborators: ['wren', 'lumen'],
+                visibility: 'shared',
+                version: 2,
+                tags: ['memory'],
+                metadata: {},
+                created_at: '2026-02-11T00:00:00Z',
+                updated_at: '2026-02-11T01:00:00Z',
+              },
+              error: null,
             },
-            error: null,
-          }],
+          ],
         },
       ],
       artifact_comments: [
@@ -489,26 +498,28 @@ describe('artifact comment + identity UUID flows', () => {
     const supabase = createTableAwareSupabaseMock({
       artifacts: [
         {
-          maybeSingle: [{
-            data: {
-              id: '11111111-1111-1111-1111-111111111111',
-              uri: 'pcp://specs/test',
-              title: 'Test Spec',
-              content: '# Spec',
-              content_type: 'text/markdown',
-              artifact_type: 'spec',
-              created_by_agent_id: 'wren',
-              created_by_identity_id: null,
-              collaborators: ['wren', 'lumen'],
-              visibility: 'shared',
-              version: 2,
-              tags: ['memory'],
-              metadata: {},
-              created_at: '2026-02-11T00:00:00Z',
-              updated_at: '2026-02-11T01:00:00Z',
+          maybeSingle: [
+            {
+              data: {
+                id: '11111111-1111-1111-1111-111111111111',
+                uri: 'pcp://specs/test',
+                title: 'Test Spec',
+                content: '# Spec',
+                content_type: 'text/markdown',
+                artifact_type: 'spec',
+                created_by_agent_id: 'wren',
+                created_by_identity_id: null,
+                collaborators: ['wren', 'lumen'],
+                visibility: 'shared',
+                version: 2,
+                tags: ['memory'],
+                metadata: {},
+                created_at: '2026-02-11T00:00:00Z',
+                updated_at: '2026-02-11T01:00:00Z',
+              },
+              error: null,
             },
-            error: null,
-          }],
+          ],
         },
       ],
     });
@@ -531,23 +542,30 @@ describe('artifact comment + identity UUID flows', () => {
     const supabase = createTableAwareSupabaseMock({
       agent_identities: [
         {
-          maybeSingle: [{ data: { id: 'identity-1', agent_id: 'lumen', name: 'Lumen', backend: 'codex' }, error: null }],
+          maybeSingle: [
+            {
+              data: { id: 'identity-1', agent_id: 'lumen', name: 'Lumen', backend: 'codex' },
+              error: null,
+            },
+          ],
         },
       ],
       artifacts: [
         { maybeSingle: [{ data: null, error: null }] },
         {
-          single: [{
-            data: {
-              id: 'artifact-1',
-              uri: 'pcp://specs/test',
-              title: 'Test Spec',
-              artifact_type: 'spec',
-              version: 1,
-              created_at: '2026-02-11T00:00:00Z',
+          single: [
+            {
+              data: {
+                id: 'artifact-1',
+                uri: 'pcp://specs/test',
+                title: 'Test Spec',
+                artifact_type: 'spec',
+                version: 1,
+                created_at: '2026-02-11T00:00:00Z',
+              },
+              error: null,
             },
-            error: null,
-          }],
+          ],
         },
       ],
       artifact_history: [{ then: { data: null, error: null } }],
@@ -568,14 +586,24 @@ describe('artifact comment + identity UUID flows', () => {
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.success).toBe(true);
 
-    const artifactInsertBuilder = supabase.calls.find((c) => c.table === 'artifacts' && (c.builder.insert as ReturnType<typeof vi.fn>).mock.calls.length > 0)?.builder;
-    const historyInsertBuilder = supabase.calls.find((c) => c.table === 'artifact_history')?.builder;
+    const artifactInsertBuilder = supabase.calls.find(
+      (c) =>
+        c.table === 'artifacts' &&
+        (c.builder.insert as ReturnType<typeof vi.fn>).mock.calls.length > 0
+    )?.builder;
+    const historyInsertBuilder = supabase.calls.find(
+      (c) => c.table === 'artifact_history'
+    )?.builder;
 
-    expect((artifactInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
+    expect(
+      (artifactInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    ).toMatchObject({
       created_by_agent_id: 'lumen',
       created_by_identity_id: 'identity-1',
     });
-    expect((historyInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
+    expect(
+      (historyInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    ).toMatchObject({
       changed_by_agent_id: 'lumen',
       changed_by_identity_id: 'identity-1',
     });
@@ -583,23 +611,23 @@ describe('artifact comment + identity UUID flows', () => {
 
   it('handleCreateArtifact keeps slug behavior when identity row is missing', async () => {
     const supabase = createTableAwareSupabaseMock({
-      agent_identities: [
-        { maybeSingle: [{ data: null, error: null }] },
-      ],
+      agent_identities: [{ maybeSingle: [{ data: null, error: null }] }],
       artifacts: [
         { maybeSingle: [{ data: null, error: null }] },
         {
-          single: [{
-            data: {
-              id: 'artifact-2',
-              uri: 'pcp://specs/slug-only',
-              title: 'Slug only',
-              artifact_type: 'spec',
-              version: 1,
-              created_at: '2026-02-11T00:00:00Z',
+          single: [
+            {
+              data: {
+                id: 'artifact-2',
+                uri: 'pcp://specs/slug-only',
+                title: 'Slug only',
+                artifact_type: 'spec',
+                version: 1,
+                created_at: '2026-02-11T00:00:00Z',
+              },
+              error: null,
             },
-            error: null,
-          }],
+          ],
         },
       ],
       artifact_history: [{ then: { data: null, error: null } }],
@@ -620,14 +648,24 @@ describe('artifact comment + identity UUID flows', () => {
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.success).toBe(true);
 
-    const artifactInsertBuilder = supabase.calls.find((c) => c.table === 'artifacts' && (c.builder.insert as ReturnType<typeof vi.fn>).mock.calls.length > 0)?.builder;
-    const historyInsertBuilder = supabase.calls.find((c) => c.table === 'artifact_history')?.builder;
+    const artifactInsertBuilder = supabase.calls.find(
+      (c) =>
+        c.table === 'artifacts' &&
+        (c.builder.insert as ReturnType<typeof vi.fn>).mock.calls.length > 0
+    )?.builder;
+    const historyInsertBuilder = supabase.calls.find(
+      (c) => c.table === 'artifact_history'
+    )?.builder;
 
-    expect((artifactInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
+    expect(
+      (artifactInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    ).toMatchObject({
       created_by_agent_id: 'unknown-agent-slug',
       created_by_identity_id: null,
     });
-    expect((historyInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
+    expect(
+      (historyInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    ).toMatchObject({
       changed_by_agent_id: 'unknown-agent-slug',
       changed_by_identity_id: null,
     });
@@ -636,30 +674,44 @@ describe('artifact comment + identity UUID flows', () => {
   it('handleAddArtifactComment resolves identity UUID and returns identity metadata', async () => {
     const supabase = createTableAwareSupabaseMock({
       artifacts: [
-        { single: [{ data: { id: '11111111-1111-1111-1111-111111111111', uri: 'pcp://specs/test' }, error: null }] },
+        {
+          single: [
+            {
+              data: { id: '11111111-1111-1111-1111-111111111111', uri: 'pcp://specs/test' },
+              error: null,
+            },
+          ],
+        },
       ],
       agent_identities: [
         {
-          maybeSingle: [{ data: { id: 'identity-1', agent_id: 'lumen', name: 'Lumen', backend: 'codex' }, error: null }],
+          maybeSingle: [
+            {
+              data: { id: 'identity-1', agent_id: 'lumen', name: 'Lumen', backend: 'codex' },
+              error: null,
+            },
+          ],
         },
       ],
       artifact_comments: [
         {
-          single: [{
-            data: {
-              id: 'comment-1',
-              artifact_id: '11111111-1111-1111-1111-111111111111',
-              user_id: '00000000-0000-0000-0000-000000000001',
-              parent_comment_id: null,
-              content: 'Great point.',
-              metadata: {},
-              created_by_agent_id: 'lumen',
-              created_by_identity_id: 'identity-1',
-              created_at: '2026-02-11T00:00:00Z',
-              updated_at: '2026-02-11T00:00:00Z',
+          single: [
+            {
+              data: {
+                id: 'comment-1',
+                artifact_id: '11111111-1111-1111-1111-111111111111',
+                user_id: '00000000-0000-0000-0000-000000000001',
+                parent_comment_id: null,
+                content: 'Great point.',
+                metadata: {},
+                created_by_agent_id: 'lumen',
+                created_by_identity_id: 'identity-1',
+                created_at: '2026-02-11T00:00:00Z',
+                updated_at: '2026-02-11T00:00:00Z',
+              },
+              error: null,
             },
-            error: null,
-          }],
+          ],
         },
       ],
     });
@@ -690,11 +742,16 @@ describe('artifact comment + identity UUID flows', () => {
   it('handleAddArtifactComment rejects invalid parent comment reference', async () => {
     const supabase = createTableAwareSupabaseMock({
       artifacts: [
-        { single: [{ data: { id: '11111111-1111-1111-1111-111111111111', uri: 'pcp://specs/test' }, error: null }] },
+        {
+          single: [
+            {
+              data: { id: '11111111-1111-1111-1111-111111111111', uri: 'pcp://specs/test' },
+              error: null,
+            },
+          ],
+        },
       ],
-      artifact_comments: [
-        { maybeSingle: [{ data: null, error: null }] },
-      ],
+      artifact_comments: [{ maybeSingle: [{ data: null, error: null }] }],
     });
 
     await expect(
@@ -713,7 +770,14 @@ describe('artifact comment + identity UUID flows', () => {
   it('handleListArtifactComments enriches comments with identity details', async () => {
     const supabase = createTableAwareSupabaseMock({
       artifacts: [
-        { single: [{ data: { id: '11111111-1111-1111-1111-111111111111', uri: 'pcp://specs/test' }, error: null }] },
+        {
+          single: [
+            {
+              data: { id: '11111111-1111-1111-1111-111111111111', uri: 'pcp://specs/test' },
+              error: null,
+            },
+          ],
+        },
       ],
       artifact_comments: [
         {

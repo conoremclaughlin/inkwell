@@ -10,11 +10,7 @@ interface ChatMessageListProps {
   agentName?: string;
 }
 
-export function ChatMessageList({
-  messages,
-  isProcessing,
-  agentName,
-}: ChatMessageListProps) {
+export function ChatMessageList({ messages, isProcessing, agentName }: ChatMessageListProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -31,11 +27,7 @@ export function ChatMessageList({
           </div>
         )}
         {messages.map((message) => (
-          <ChatMessage
-            key={message.id}
-            message={message}
-            agentName={agentName}
-          />
+          <ChatMessage key={message.id} message={message} agentName={agentName} />
         ))}
         {isProcessing && <TypingIndicator agentName={agentName} />}
         <div ref={bottomRef} />

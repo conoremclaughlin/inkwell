@@ -4,11 +4,7 @@ import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
 
 // Import all tool handlers
-import {
-  handleSaveLink,
-  handleSearchLinks,
-  handleTagLink,
-} from './link-handlers';
+import { handleSaveLink, handleSearchLinks, handleTagLink } from './link-handlers';
 
 import {
   handleSaveContext,
@@ -28,11 +24,7 @@ import {
   handleGetTaskStats,
 } from './task-handlers';
 
-import {
-  handleSendResponse,
-  handleGetPendingMessages,
-  handleMarkRead,
-} from './response-handlers';
+import { handleSendResponse, handleGetPendingMessages, handleMarkRead } from './response-handlers';
 
 import {
   handleRemember,
@@ -58,10 +50,7 @@ import {
   handleGetCacheStats,
 } from './chat-context-handlers';
 
-import {
-  handleListSkills,
-  handleGetSkill,
-} from './skill-handlers';
+import { handleListSkills, handleGetSkill } from './skill-handlers';
 
 import {
   handlePublishSkill,
@@ -240,10 +229,7 @@ import {
   updateWorkspaceContainerSchema,
 } from './workspace-container-handlers';
 
-import {
-  handleCreateKindleToken,
-  createKindleTokenSchema,
-} from './kindle-handlers';
+import { handleCreateKindleToken, createKindleTokenSchema } from './kindle-handlers';
 
 // Re-export for external use
 export { setResponseCallback, addPendingMessage } from './response-handlers';
@@ -256,7 +242,10 @@ const userIdentifierFields = {
   userId: z.string().uuid().optional().describe('User UUID (if known)'),
   email: z.string().email().optional().describe('User email address'),
   phone: z.string().optional().describe('Phone number in E.164 format (e.g., +14155551234)'),
-  platform: z.enum(['telegram', 'whatsapp', 'discord']).optional().describe('Platform name for lookup'),
+  platform: z
+    .enum(['telegram', 'whatsapp', 'discord'])
+    .optional()
+    .describe('Platform name for lookup'),
   platformId: z.string().optional().describe('Platform-specific user ID or username'),
 };
 
@@ -316,7 +305,10 @@ User can be identified by ONE of:
         title: z.string().optional().describe('Title of the link'),
         description: z.string().optional().describe('Description of the link'),
         tags: z.array(z.string()).optional().describe('Tags for categorization'),
-        source: z.enum(['telegram', 'whatsapp', 'discord', 'api']).optional().describe('Source platform'),
+        source: z
+          .enum(['telegram', 'whatsapp', 'discord', 'api'])
+          .optional()
+          .describe('Source platform'),
       },
     },
     async (args) => {
@@ -438,7 +430,9 @@ User can be identified by ONE of:
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
-        contextType: z.enum(['user', 'assistant', 'project', 'session', 'relationship']).describe('Type of context'),
+        contextType: z
+          .enum(['user', 'assistant', 'project', 'session', 'relationship'])
+          .describe('Type of context'),
         contextKey: z.string().optional().describe('Optional key for sub-context'),
         summary: z.string().describe('The summarized context to save'),
         metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
@@ -450,7 +444,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in save_context:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -466,7 +468,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
-        contextType: z.enum(['user', 'assistant', 'project', 'session', 'relationship']).optional().describe('Filter by type'),
+        contextType: z
+          .enum(['user', 'assistant', 'project', 'session', 'relationship'])
+          .optional()
+          .describe('Filter by type'),
         contextKey: z.string().optional().describe('Filter by key'),
       },
     },
@@ -476,7 +481,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_context:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -510,7 +523,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in save_project:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -535,7 +556,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in list_projects:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -561,7 +590,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_project:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -594,7 +631,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in set_focus:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -619,7 +664,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_focus:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -653,7 +706,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in create_task:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -671,7 +732,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         ...userIdentifierFields,
         projectId: z.string().uuid().optional().describe('Filter by project'),
         status: z.enum(['pending', 'in_progress', 'completed', 'blocked']).optional(),
-        activeOnly: z.boolean().optional().default(false).describe('Only show pending/in_progress tasks'),
+        activeOnly: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe('Only show pending/in_progress tasks'),
         limit: z.number().optional().default(50),
       },
     },
@@ -681,7 +746,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in list_tasks:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -711,7 +784,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in update_task:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -736,7 +817,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in complete_task:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -761,7 +850,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_task_stats:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -780,16 +877,16 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 
 This is the primary way to send responses back to users. Always use this tool instead of just outputting text.`,
       inputSchema: {
-        channel: z.enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'agent'])
+        channel: z
+          .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'agent'])
           .describe('Channel to send the response to'),
-        conversationId: z.string()
-          .describe('Conversation ID to route the response to'),
-        content: z.string()
-          .describe('The response content to send'),
-        format: z.enum(['text', 'markdown', 'code', 'json']).optional()
+        conversationId: z.string().describe('Conversation ID to route the response to'),
+        content: z.string().describe('The response content to send'),
+        format: z
+          .enum(['text', 'markdown', 'code', 'json'])
+          .optional()
           .describe('Format of the response content'),
-        replyToMessageId: z.string().optional()
-          .describe('Message ID to reply to (for threading)'),
+        replyToMessageId: z.string().optional().describe('Message ID to reply to (for threading)'),
       },
     },
     async (args) => {
@@ -798,7 +895,15 @@ This is the primary way to send responses back to users. Always use this tool in
       } catch (error) {
         logger.error('Error in send_response:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -811,14 +916,19 @@ This is the primary way to send responses back to users. Always use this tool in
     {
       description: `Get pending messages from other channels. Use this to check if there are new messages from Telegram or other platforms that need your attention.`,
       inputSchema: {
-        channel: z.enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'all']).optional()
+        channel: z
+          .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'all'])
+          .optional()
           .default('all')
           .describe('Filter by channel (default: all)'),
-        limit: z.number().min(1).max(50).optional()
+        limit: z
+          .number()
+          .min(1)
+          .max(50)
+          .optional()
           .default(10)
           .describe('Maximum messages to return'),
-        since: z.string().datetime().optional()
-          .describe('Only messages after this timestamp'),
+        since: z.string().datetime().optional().describe('Only messages after this timestamp'),
       },
     },
     async (args) => {
@@ -827,7 +937,15 @@ This is the primary way to send responses back to users. Always use this tool in
       } catch (error) {
         logger.error('Error in get_pending_messages:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -840,8 +958,7 @@ This is the primary way to send responses back to users. Always use this tool in
     {
       description: `Mark messages as read. Use this after you've processed pending messages.`,
       inputSchema: {
-        messageIds: z.array(z.string())
-          .describe('Message IDs to mark as read'),
+        messageIds: z.array(z.string()).describe('Message IDs to mark as read'),
       },
     },
     async (args) => {
@@ -850,7 +967,15 @@ This is the primary way to send responses back to users. Always use this tool in
       } catch (error) {
         logger.error('Error in mark_messages_read:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -871,16 +996,35 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       inputSchema: {
         ...userIdentifierFields,
         content: z.string().describe('The content to remember'),
-        source: z.enum(['conversation', 'observation', 'user_stated', 'inferred', 'session']).optional()
+        source: z
+          .enum(['conversation', 'observation', 'user_stated', 'inferred', 'session'])
+          .optional()
           .describe('Source of the memory (default: observation)'),
-        salience: z.enum(['low', 'medium', 'high', 'critical']).optional()
+        salience: z
+          .enum(['low', 'medium', 'high', 'critical'])
+          .optional()
           .describe('Importance level (default: medium)'),
         topics: z.array(z.string()).optional().describe('Topics for categorization'),
         metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
         expiresAt: z.string().datetime().optional().describe('Optional expiration date (ISO 8601)'),
-        agentId: z.string().optional().describe('Which AI being created this memory (e.g., "wren", "benson"). Null = shared memory.'),
-        studioId: z.string().uuid().optional().describe('Studio ID — helps auto-attach the correct session in parallel worktree scenarios. Stored in metadata.'),
-        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
+        agentId: z
+          .string()
+          .optional()
+          .describe(
+            'Which AI being created this memory (e.g., "wren", "benson"). Null = shared memory.'
+          ),
+        studioId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe(
+            'Studio ID — helps auto-attach the correct session in parallel worktree scenarios. Stored in metadata.'
+          ),
+        workspaceId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('[Deprecated] Workspace ID alias for studioId.'),
       },
     },
     async (args) => {
@@ -889,7 +1033,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in remember:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -906,15 +1058,27 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       inputSchema: {
         ...userIdentifierFields,
         query: z.string().optional().describe('Search query (text search for now)'),
-        source: z.enum(['conversation', 'observation', 'user_stated', 'inferred', 'session']).optional()
+        source: z
+          .enum(['conversation', 'observation', 'user_stated', 'inferred', 'session'])
+          .optional()
           .describe('Filter by source'),
-        salience: z.enum(['low', 'medium', 'high', 'critical']).optional()
+        salience: z
+          .enum(['low', 'medium', 'high', 'critical'])
+          .optional()
           .describe('Filter by salience'),
         topics: z.array(z.string()).optional().describe('Filter by topics (any match)'),
         limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
         includeExpired: z.boolean().optional().describe('Include expired memories'),
-        agentId: z.string().optional().describe('Filter by agent (e.g., "wren"). Omit to include all memories.'),
-        includeShared: z.boolean().optional().describe('Include shared memories (agentId=null) when filtering by agentId (default: true)'),
+        agentId: z
+          .string()
+          .optional()
+          .describe('Filter by agent (e.g., "wren"). Omit to include all memories.'),
+        includeShared: z
+          .boolean()
+          .optional()
+          .describe(
+            'Include shared memories (agentId=null) when filtering by agentId (default: true)'
+          ),
       },
     },
     async (args) => {
@@ -923,7 +1087,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in recall:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -948,7 +1120,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in forget:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -965,7 +1145,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       inputSchema: {
         ...userIdentifierFields,
         memoryId: z.string().uuid().describe('ID of the memory to update'),
-        salience: z.enum(['low', 'medium', 'high', 'critical']).optional().describe('New salience level'),
+        salience: z
+          .enum(['low', 'medium', 'high', 'critical'])
+          .optional()
+          .describe('New salience level'),
         topics: z.array(z.string()).optional().describe('New topics'),
         metadata: z.record(z.unknown()).optional().describe('Metadata to merge'),
       },
@@ -976,7 +1159,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in update_memory:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1001,9 +1192,22 @@ If an active session already exists for this agent+studio, it is returned instea
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
-        agentId: z.string().optional().describe('Agent identifier (e.g., "claude-code", "telegram-myra")'),
-        studioId: z.string().uuid().optional().describe('Studio ID to scope this session to. Allows multiple active sessions per agent (one per studio). Read from .pcp/identity.json.'),
-        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
+        agentId: z
+          .string()
+          .optional()
+          .describe('Agent identifier (e.g., "claude-code", "telegram-myra")'),
+        studioId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe(
+            'Studio ID to scope this session to. Allows multiple active sessions per agent (one per studio). Read from .pcp/identity.json.'
+          ),
+        workspaceId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('[Deprecated] Workspace ID alias for studioId.'),
         metadata: z.record(z.unknown()).optional().describe('Session metadata'),
       },
     },
@@ -1013,7 +1217,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in start_session:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1029,12 +1241,30 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
-        sessionId: z.string().uuid().optional().describe('Session ID (uses active session if not provided)'),
-        agentId: z.string().optional().describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
-        studioId: z.string().uuid().optional().describe('Studio ID for session resolution when sessionId not provided'),
-        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
+        sessionId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Session ID (uses active session if not provided)'),
+        agentId: z
+          .string()
+          .optional()
+          .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
+        studioId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Studio ID for session resolution when sessionId not provided'),
+        workspaceId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('[Deprecated] Workspace ID alias for studioId.'),
         content: z.string().describe('Log entry content'),
-        salience: z.enum(['low', 'medium', 'high', 'critical']).optional().describe('Importance (default: medium)'),
+        salience: z
+          .enum(['low', 'medium', 'high', 'critical'])
+          .optional()
+          .describe('Importance (default: medium)'),
       },
     },
     async (args) => {
@@ -1043,7 +1273,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in log_session:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1062,10 +1300,25 @@ workspaceId is accepted as a deprecated alias.
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
-        sessionId: z.string().uuid().optional().describe('Session ID (uses active session if not provided)'),
-        agentId: z.string().optional().describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
-        studioId: z.string().uuid().optional().describe('Studio ID for session resolution when sessionId not provided'),
-        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
+        sessionId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Session ID (uses active session if not provided)'),
+        agentId: z
+          .string()
+          .optional()
+          .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
+        studioId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Studio ID for session resolution when sessionId not provided'),
+        workspaceId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('[Deprecated] Workspace ID alias for studioId.'),
         summary: z.string().optional().describe('End-of-session summary (saved as memory)'),
       },
     },
@@ -1075,7 +1328,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in end_session:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1091,10 +1352,25 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
-        sessionId: z.string().uuid().optional().describe('Session ID (returns active session if not provided)'),
-        agentId: z.string().optional().describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
-        studioId: z.string().uuid().optional().describe('Studio ID for session resolution when sessionId not provided'),
-        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
+        sessionId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Session ID (returns active session if not provided)'),
+        agentId: z
+          .string()
+          .optional()
+          .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
+        studioId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Studio ID for session resolution when sessionId not provided'),
+        workspaceId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('[Deprecated] Workspace ID alias for studioId.'),
         includeLogs: z.boolean().optional().describe('Include session logs (default: false)'),
       },
     },
@@ -1104,7 +1380,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_session:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1122,7 +1406,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         ...userIdentifierFields,
         agentId: z.string().optional().describe('Filter by agent'),
         studioId: z.string().uuid().optional().describe('Filter by studio'),
-        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
+        workspaceId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('[Deprecated] Workspace ID alias for studioId.'),
         limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
       },
     },
@@ -1132,7 +1420,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in list_sessions:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1159,15 +1455,50 @@ Also sets: backendSessionId (for resume), status (active/paused/resumable/comple
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
-        sessionId: z.string().uuid().optional().describe('Session ID (uses active session if not provided). Most reliable for targeting a specific session.'),
-        studioId: z.string().uuid().optional().describe('Studio ID for session resolution when sessionId is not provided. Useful for parallel worktree scenarios.'),
-        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
-        phase: z.string().optional().describe('Work phase (e.g., "implementing", "blocked:awaiting-input", "waiting:build")'),
-        note: z.string().optional().describe('Context for the phase transition (included in auto-created memory for blocked/waiting)'),
+        sessionId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe(
+            'Session ID (uses active session if not provided). Most reliable for targeting a specific session.'
+          ),
+        studioId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe(
+            'Studio ID for session resolution when sessionId is not provided. Useful for parallel worktree scenarios.'
+          ),
+        workspaceId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('[Deprecated] Workspace ID alias for studioId.'),
+        phase: z
+          .string()
+          .optional()
+          .describe('Work phase (e.g., "implementing", "blocked:awaiting-input", "waiting:build")'),
+        note: z
+          .string()
+          .optional()
+          .describe(
+            'Context for the phase transition (included in auto-created memory for blocked/waiting)'
+          ),
         agentId: z.string().optional().describe('Agent identity for memory attribution'),
-        createTask: z.boolean().optional().describe('Create a PCP task for blocked/waiting phases (default: false)'),
-        backendSessionId: z.string().optional().describe('Backend-specific session ID for resumption (e.g., Claude Code session ID, Codex session ID)'),
-        status: z.enum(['active', 'paused', 'resumable', 'completed']).optional().describe('Session status'),
+        createTask: z
+          .boolean()
+          .optional()
+          .describe('Create a PCP task for blocked/waiting phases (default: false)'),
+        backendSessionId: z
+          .string()
+          .optional()
+          .describe(
+            'Backend-specific session ID for resumption (e.g., Claude Code session ID, Codex session ID)'
+          ),
+        status: z
+          .enum(['active', 'paused', 'resumable', 'completed'])
+          .optional()
+          .describe('Session status'),
         context: z.string().optional().describe('Brief context of current work state'),
         workingDir: z.string().optional().describe('Working directory'),
       },
@@ -1178,7 +1509,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in update_session_phase:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1207,7 +1546,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_memory_history:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1233,7 +1580,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_user_history:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1258,7 +1613,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in restore_memory:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1285,10 +1648,26 @@ Returns:
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
-        includeRecentMemories: z.boolean().optional().describe('Include recent high-salience memories (default: true)'),
-        memoryLimit: z.number().min(1).max(20).optional().describe('Max recent memories to include (default: 5)'),
-        agentId: z.string().optional().describe('Agent identity (e.g., "wren", "benson", "myra"). Loads identity files and filters memories.'),
-        identityBasePath: z.string().optional().describe('Base path for identity files (default: ~/.pcp)'),
+        includeRecentMemories: z
+          .boolean()
+          .optional()
+          .describe('Include recent high-salience memories (default: true)'),
+        memoryLimit: z
+          .number()
+          .min(1)
+          .max(20)
+          .optional()
+          .describe('Max recent memories to include (default: 5)'),
+        agentId: z
+          .string()
+          .optional()
+          .describe(
+            'Agent identity (e.g., "wren", "benson", "myra"). Loads identity files and filters memories.'
+          ),
+        identityBasePath: z
+          .string()
+          .optional()
+          .describe('Base path for identity files (default: ~/.pcp)'),
       },
     },
     async (args) => {
@@ -1297,7 +1676,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in bootstrap:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1323,13 +1710,35 @@ Use this to convert session activity into durable memories before ending a sessi
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
-        sessionId: z.string().uuid().optional().describe('Session ID to compact (uses active session if not provided)'),
-        agentId: z.string().optional().describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
-        studioId: z.string().uuid().optional().describe('Studio ID for session resolution when sessionId not provided'),
-        workspaceId: z.string().uuid().optional().describe('[Deprecated] Workspace ID alias for studioId.'),
-        minSalience: z.enum(['low', 'medium', 'high', 'critical']).optional()
+        sessionId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Session ID to compact (uses active session if not provided)'),
+        agentId: z
+          .string()
+          .optional()
+          .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
+        studioId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Studio ID for session resolution when sessionId not provided'),
+        workspaceId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('[Deprecated] Workspace ID alias for studioId.'),
+        minSalience: z
+          .enum(['low', 'medium', 'high', 'critical'])
+          .optional()
           .describe('Minimum salience to include (default: medium)'),
-        preserveLogs: z.boolean().optional().describe('Keep original logs visible after compaction (default: false). Note: Logs are always soft-deleted for audit trail.'),
+        preserveLogs: z
+          .boolean()
+          .optional()
+          .describe(
+            'Keep original logs visible after compaction (default: false). Note: Logs are always soft-deleted for audit trail.'
+          ),
       },
     },
     async (args) => {
@@ -1338,7 +1747,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in compact_session:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1364,7 +1781,15 @@ When a user's message matches a skill's triggers, use get_skill to read the full
       } catch (error) {
         logger.error('Error in list_skills:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1392,7 +1817,15 @@ The skill document contains:
       } catch (error) {
         logger.error('Error in get_skill:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1422,7 +1855,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in publish_skill:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1445,7 +1886,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in update_skill:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1468,7 +1917,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in fork_skill:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1491,7 +1948,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in deprecate_skill:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1514,7 +1979,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in delete_skill:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1538,21 +2011,36 @@ This implements the "summarize-and-forget" pattern:
 2. Summarize the relevant parts into your response
 3. Clear the cache - don't store conversation history long-term`,
       inputSchema: {
-        channel: z.enum(['telegram', 'discord', 'whatsapp'])
+        channel: z
+          .enum(['telegram', 'discord', 'whatsapp'])
           .describe('Channel to get context from'),
-        conversationId: z.string()
-          .describe('Conversation/chat ID to get history from'),
-        limit: z.number().min(1).max(100).optional()
+        conversationId: z.string().describe('Conversation/chat ID to get history from'),
+        limit: z
+          .number()
+          .min(1)
+          .max(100)
+          .optional()
           .describe('Maximum messages to return (default: 50)'),
       },
     },
     async (args) => {
       try {
-        return await handleGetChatContext(args as Parameters<typeof handleGetChatContext>[0], dataComposer);
+        return await handleGetChatContext(
+          args as Parameters<typeof handleGetChatContext>[0],
+          dataComposer
+        );
       } catch (error) {
         logger.error('Error in get_chat_context:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1567,19 +2055,30 @@ This implements the "summarize-and-forget" pattern:
 
 Part of the "summarize-and-forget" pattern - after you've extracted what you need from chat history, clear it to respect privacy.`,
       inputSchema: {
-        channel: z.enum(['telegram', 'discord', 'whatsapp'])
+        channel: z
+          .enum(['telegram', 'discord', 'whatsapp'])
           .describe('Channel to clear context for'),
-        conversationId: z.string()
-          .describe('Conversation/chat ID to clear'),
+        conversationId: z.string().describe('Conversation/chat ID to clear'),
       },
     },
     async (args) => {
       try {
-        return await handleClearChatContext(args as Parameters<typeof handleClearChatContext>[0], dataComposer);
+        return await handleClearChatContext(
+          args as Parameters<typeof handleClearChatContext>[0],
+          dataComposer
+        );
       } catch (error) {
         logger.error('Error in clear_chat_context:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1592,17 +2091,30 @@ Part of the "summarize-and-forget" pattern - after you've extracted what you nee
     {
       description: `Get statistics about the message cache. Useful for debugging and monitoring memory usage.`,
       inputSchema: {
-        channel: z.enum(['telegram', 'discord', 'whatsapp']).optional()
+        channel: z
+          .enum(['telegram', 'discord', 'whatsapp'])
+          .optional()
           .describe('Specific channel to get stats for (default: all)'),
       },
     },
     async (args) => {
       try {
-        return await handleGetCacheStats(args as Parameters<typeof handleGetCacheStats>[0], dataComposer);
+        return await handleGetCacheStats(
+          args as Parameters<typeof handleGetCacheStats>[0],
+          dataComposer
+        );
       } catch (error) {
         logger.error('Error in get_cache_stats:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1631,7 +2143,15 @@ Part of the "summarize-and-forget" pattern - after you've extracted what you nee
       } catch (error) {
         logger.error('Error in list_permissions:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1652,7 +2172,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_user_permissions:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1675,7 +2203,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in set_permission:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1696,7 +2232,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in reset_permission:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1717,7 +2261,15 @@ Filter by action, category, status, or user. Returns logs from the past N hours.
       } catch (error) {
         logger.error('Error in query_audit_log:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1738,7 +2290,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_activity_summary:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1771,7 +2331,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in awaken:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1792,7 +2360,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in save_identity:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1815,7 +2391,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_identity:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1836,7 +2420,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in list_identities:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1857,7 +2449,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_identity_history:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1878,7 +2478,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in restore_identity:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1906,7 +2514,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in save_user_identity:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1927,7 +2543,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_user_identity:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1948,7 +2572,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_user_identity_history:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -1969,7 +2601,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in restore_user_identity:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2005,7 +2645,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in create_reminder:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2026,7 +2674,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in list_reminders:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2047,7 +2703,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in update_reminder:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2068,7 +2732,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in cancel_reminder:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2089,7 +2761,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_reminder_history:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2113,7 +2793,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in set_quiet_hours:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2148,7 +2836,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in set_timezone:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2172,7 +2868,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_timezone:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2205,7 +2909,15 @@ Example workflow for Myra:
       } catch (error) {
         logger.error('Error in get_resumable_sessions:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2226,7 +2938,15 @@ Update a PCP session's status and Claude session ID. Use this to mark your sessi
       } catch (error) {
         logger.error('Error in update_session_status:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2253,7 +2973,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in create_artifact:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2274,7 +3002,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_artifact:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2299,7 +3035,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in update_artifact:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2320,7 +3064,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in list_artifacts:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2341,7 +3093,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_artifact_history:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2365,7 +3125,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in add_artifact_comment:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2386,7 +3154,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in list_artifact_comments:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2415,7 +3191,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in send_to_inbox:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2438,7 +3222,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_inbox:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2459,7 +3251,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in update_inbox_message:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2482,7 +3282,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_agent_status:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2511,7 +3319,15 @@ This is the "doorbell" - the inbox is the "mailbox". Use both together for relia
       } catch (error) {
         logger.error('Error in trigger_agent:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2530,7 +3346,15 @@ This is the "doorbell" - the inbox is the "mailbox". Use both together for relia
       } catch (error) {
         logger.error('Error in list_registered_agents:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2559,7 +3383,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in list_calendars:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2584,7 +3416,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in list_calendar_events:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2609,7 +3449,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_calendar_event:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2641,7 +3489,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in respond_to_calendar_event:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2678,7 +3534,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in update_calendar_event:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2709,7 +3573,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in create_calendar_event:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2743,7 +3615,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in list_emails:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2768,7 +3648,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_email:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2793,7 +3681,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in send_email:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2818,7 +3714,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in reply_to_email:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2843,7 +3747,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in draft_email:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2868,7 +3780,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in list_email_labels:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2904,7 +3824,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in modify_emails:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2940,7 +3868,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in log_activity:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2964,7 +3900,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in log_message:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -2991,7 +3935,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_activity:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3019,7 +3971,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_conversation_history:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3047,7 +4007,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_session_context:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3074,7 +4042,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in create_workspace_container:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3095,7 +4071,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in list_workspace_containers:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3116,7 +4100,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_workspace_container:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3137,7 +4129,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in update_workspace_container:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3165,7 +4165,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in create_workspace:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3186,7 +4194,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in list_workspaces:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3207,7 +4223,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_workspace:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3228,7 +4252,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in update_workspace:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3249,7 +4281,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in close_workspace:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3270,7 +4310,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in adopt_workspace:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3292,7 +4340,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in create_studio:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3311,7 +4367,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in list_studios:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3330,7 +4394,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in get_studio:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3349,7 +4421,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in update_studio:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3368,7 +4448,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in close_studio:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3387,7 +4475,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in adopt_studio:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }
@@ -3404,7 +4500,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       title: 'Create Kindle Token',
       description:
         'Generate a shareable invite link for kindling a new SB. ' +
-        'The token captures a snapshot of the parent SB\'s values and philosophy. ' +
+        "The token captures a snapshot of the parent SB's values and philosophy. " +
         'Share the resulting inviteUrl with the new human partner.\n\n' +
         'User can be identified by ONE of:\n' +
         '- userId: Direct UUID\n' +
@@ -3419,7 +4515,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       } catch (error) {
         logger.error('Error in create_kindle_token:', error);
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }) }],
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
           isError: true,
         };
       }

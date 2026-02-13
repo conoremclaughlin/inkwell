@@ -16,8 +16,9 @@ Identity is resolved in layers. **Stop at the first match** - do not continue ch
 4. **Central config**: Read `~/.pcp/config.json` agentMapping.
 
 For interactive sessions in this repo, `.pcp/identity.json` typically resolves to:
+
 ```json
-{"agentId": "wren", "workspaceId": "<uuid>", "context": "workspace-wren"}
+{ "agentId": "wren", "workspaceId": "<uuid>", "context": "workspace-wren" }
 ```
 
 For long-running processes (like the PCP server), `AGENT_ID` is set via environment variable and takes precedence.
@@ -25,6 +26,7 @@ For long-running processes (like the PCP server), `AGENT_ID` is set via environm
 ### Step 2: Load User Config
 
 Read from `~/.pcp/config.json`:
+
 ```json
 {"userId": "...", "email": "...", "agentMapping": {"claude-code": "wren", ...}}
 ```
@@ -36,6 +38,7 @@ bootstrap(userId: "<from config>", agentId: "<your identity>")
 ```
 
 This returns:
+
 - **User Info**: User ID, contacts, and **timezone** (e.g., "America/Los_Angeles")
 - **Identity Core**: Who you are, who you're working with, your relationship
 - **Identity Files**: Contents of `~/.pcp/shared/` and `~/.pcp/{agentId}/` files (VALUES.md, IDENTITY.md, etc.)
@@ -54,21 +57,25 @@ start_session(userId: "<from config>", agentId: "<your identity>", workspaceId: 
 This scopes the session to your workspace. Multiple agents can have active sessions simultaneously in different worktrees.
 
 To find your session from bootstrap's `activeSessions` array, match by `workspaceId`:
+
 ```javascript
-const mySession = activeSessions.find(s => s.workspaceId === identityJson.workspaceId);
+const mySession = activeSessions.find((s) => s.workspaceId === identityJson.workspaceId);
 ```
 
 Throughout the session, use `update_session_phase` for structural status changes:
+
 ```
 update_session_phase(userId: "...", phase: "active:implementing", workspaceId: "...")
 ```
 
 Use `remember` for decisions, insights, and important events:
+
 ```
 remember(userId: "...", content: "Decided to use X approach because...", agentId: "wren")
 ```
 
 At session end, save a summary:
+
 ```
 end_session(userId: "...", summary: "Built memory layer with versioning...")
 ```
@@ -82,12 +89,14 @@ end_session(userId: "...", summary: "Built memory layer with versioning...")
 PCP uses Supabase (PostgreSQL) as its database. There are **two access paths** with fundamentally different security properties:
 
 **Server-side (API server):**
+
 - Uses the **service role key** (`SUPABASE_SECRET_KEY` / `sb_secret_*`)
 - Connects as PostgreSQL role `service_role` which has `rolbypassrls = true`
 - **RLS is completely bypassed** — the server has full database access
 - Security is enforced at the **application level**: auth middleware validates JWTs, resolves users, and scopes queries
 
 **Client-side (browser):**
+
 - Uses the **publishable key** (`NEXT_PUBLIC_SUPABASE_ANON_KEY` / `sb_publishable_*`)
 - Connects as PostgreSQL role `anon` or `authenticated`
 - RLS policies are enforced
@@ -99,6 +108,7 @@ PCP uses Supabase (PostgreSQL) as its database. There are **two access paths** w
 2. **NEVER import `@supabase/supabase-js` in frontend components for database queries.** If you need data in the frontend, add an API endpoint in `packages/api/src/routes/` and call it from the frontend via `useApiQuery`/`useApiPost` hooks.
 
 3. **ALWAYS use `persistSession: false` when creating Supabase clients on the server.** Without this, `auth.refreshSession()` and similar calls store a user session internally, causing subsequent PostgREST queries to use that user's JWT instead of the service role key. This silently subjects queries to RLS and breaks lookups.
+
    ```typescript
    // CORRECT — server-side client
    createClient(url, secretKey, {
@@ -118,15 +128,18 @@ PCP uses Supabase (PostgreSQL) as its database. There are **two access paths** w
 **Always convert UTC timestamps to the user's local timezone when displaying.**
 
 The user's timezone is available from:
+
 1. **Bootstrap response**: `user.timezone` (e.g., "America/Los_Angeles")
 2. **get_timezone tool**: Returns timezone and current local time
 
 When presenting dates/times to users:
+
 - Convert from UTC to their timezone
 - Use friendly formats: "Fri, Jan 30 at 6:13 PM PST" not "2026-01-31T02:13:41+0000"
 - For relative times: "2 hours ago", "yesterday at 3pm"
 
 Example (JavaScript):
+
 ```javascript
 const userTz = 'America/Los_Angeles'; // from bootstrap
 const utcDate = new Date('2026-01-31T02:13:41Z');
@@ -137,7 +150,7 @@ const localTime = utcDate.toLocaleString('en-US', {
   day: 'numeric',
   hour: 'numeric',
   minute: '2-digit',
-  timeZoneName: 'short'
+  timeZoneName: 'short',
 });
 // "Fri, Jan 30, 6:13 PM PST"
 ```
@@ -146,19 +159,20 @@ const localTime = utcDate.toLocaleString('en-US', {
 
 PCP supports multiple AI identities sharing the same infrastructure:
 
-| Agent | Interface | Role |
-|-------|-----------|------|
-| **wren** | Claude Code | Session-based development collaborator |
-| **lumen** | Codex CLI | Development collaborator |
-| **aster** | Gemini | Development collaborator |
-| **myra** | Telegram/WhatsApp | Persistent messaging bridge |
-| **benson** | Discord/Slack | Conversational partner |
+| Agent      | Interface         | Role                                   |
+| ---------- | ----------------- | -------------------------------------- |
+| **wren**   | Claude Code       | Session-based development collaborator |
+| **lumen**  | Codex CLI         | Development collaborator               |
+| **aster**  | Gemini            | Development collaborator               |
+| **myra**   | Telegram/WhatsApp | Persistent messaging bridge            |
+| **benson** | Discord/Slack     | Conversational partner                 |
 
 Each agent has its own identity files (`~/.pcp/<agentId>/IDENTITY.md`) and filtered memories. Shared values live in `~/.pcp/shared/VALUES.md`.
 
 ### Identity Files
 
 Located in `~/.pcp/`:
+
 ```
 ~/.pcp/
 ├── config.json           # User config + agentMapping
@@ -175,11 +189,13 @@ Located in `~/.pcp/`:
 ### Memory Attribution
 
 When saving memories, include your agentId:
+
 ```
 remember(userId: "...", content: "...", agentId: "wren")
 ```
 
 When recalling, memories are filtered by agentId but include shared memories (agentId=null):
+
 ```
 recall(userId: "...", query: "...", agentId: "wren", includeShared: true)
 ```
@@ -262,16 +278,38 @@ yarn pm2 start ecosystem.config.cjs  # Start all processes
 
 ## Database Migrations
 
-Migrations are in `supabase/migrations/`. Apply via:
+Migrations live in `supabase/migrations/` and use **timestamp-prefixed filenames**:
 
-1. **Supabase MCP tool**: `mcp__supabase__apply_migration`
-2. **Supabase CLI**: `supabase db push`
+```
+supabase/migrations/YYYYMMDDHHmmss_short_description.sql
+```
+
+### Rules
+
+1. **ALL schema changes (DDL) MUST go through migrations.** Never create/alter tables, add indexes, or modify RLS policies directly in the Supabase dashboard or via ad-hoc SQL. Migration files are the single source of truth for the database schema.
+
+2. **Name files with a UTC timestamp prefix.** Format: `YYYYMMDDHHmmss_short_description.sql`. Generate the timestamp with:
+
+   ```bash
+   date -u +%Y%m%d%H%M%S
+   ```
+
+   Never use manual numeric prefixes (`001_`, `002_`). Timestamps prevent branch conflicts — two agents can create migrations independently and they merge cleanly as long as the SQL doesn't conflict.
+
+3. **Apply migrations via:**
+   - MCP tool: `mcp__supabase__apply_migration`
+   - Supabase CLI (if installed): `supabase db push` (remote) / `supabase migration up` (local)
+
+4. **After applying, regenerate types:**
+   - MCP tool: `mcp__supabase__generate_typescript_types`
+   - Update `packages/api/src/data/supabase/types.ts`
 
 ## MCP Tools
 
 The MCP server exposes 60+ tools. Key categories:
 
 ### Bootstrap & Session (use these!)
+
 - `bootstrap` - **Call first!** Loads identity, context, and recent memories
 - `start_session` - Start tracking a session
 - `log_session` - Log important events/decisions
@@ -280,32 +318,39 @@ The MCP server exposes 60+ tools. Key categories:
 - `list_sessions` - List past sessions
 
 ### Memory (long-term storage)
+
 - `remember` - Save to long-term memory with salience/topics
 - `recall` - Search memories (text search, semantic coming)
 - `forget` - Delete a memory
 - `update_memory` - Update salience/topics
 
 ### Memory History (versioning)
+
 - `get_memory_history` - View all versions of a memory
 - `get_user_history` - See recent changes (updates/deletes)
 - `restore_memory` - Rollback to a previous version
 
 ### Context
+
 - `save_context` - Save context summaries (user, assistant, relationship, project)
 - `get_context` - Retrieve context
 
 ### Projects
+
 - `save_project` - Create/update a project
 - `list_projects` - List all projects
 - `get_project` - Get project details
 
 ### Links
+
 - `save_link` - Save a URL with metadata
 - `search_links` - Search saved links
 - `tag_link` - Add/remove tags
 
 ### User Identification
+
 All tools support multiple identification methods:
+
 - `userId` - Direct UUID
 - `email` - Account email
 - `platform` + `platformId` - Platform-specific ID (telegram:123456)
@@ -314,28 +359,34 @@ All tools support multiple identification methods:
 ## Coding Conventions
 
 ### TypeScript
+
 - Strict typing, avoid `any`
 - Use Zod for runtime validation
 - Prefer `async/await` over callbacks
 
 ### File Organization
+
 - One class/module per file
 - Co-locate tests (`*.test.ts`)
 - Export types from `types.ts` files
 
 ### Naming
+
 - PascalCase for classes and types
 - camelCase for functions and variables
 - SCREAMING_SNAKE for constants
 
 ### Error Handling
+
 - Use typed errors where possible
 - Log errors with context
 - Return structured error responses
 
 ### Upsert / Partial Update Safety
+
 - When building upsert or update objects, **never set optional fields to `null` just because they weren't provided**. Omitted fields should preserve their existing database values.
 - Use `undefined` checks (`field !== undefined`) to distinguish "not provided" from "explicitly cleared":
+
   ```typescript
   // WRONG: wipes existing value when field is omitted
   soul: soul || null,
@@ -343,6 +394,7 @@ All tools support multiple identification methods:
   // RIGHT: preserves existing value when field is omitted
   soul: soul !== undefined ? (soul || null) : (existing?.soul ?? null),
   ```
+
 - Only set a field to `null` when the caller explicitly passes `null` (or an empty string that should clear the field).
 - For handlers that accept partial updates, fetch the existing record first and merge provided fields over it.
 - When adding new columns to a table, also update: (1) archive/history triggers, (2) history response mappings, (3) restore handlers.
@@ -350,11 +402,13 @@ All tools support multiple identification methods:
 ## Environment Variables
 
 Required:
+
 - `SUPABASE_URL` - Supabase project URL
 - `SUPABASE_PUBLISHABLE_KEY` - Public anon key (client-side, auth only)
 - `SUPABASE_SECRET_KEY` - Service role key (server-side only, **never expose to client**)
 
 Optional:
+
 - `MCP_TRANSPORT` - `stdio` (default) or `http`
 - `NODE_ENV` - `development` or `production`
 - `SENTRY_DSN` - Error tracking (optional)
@@ -411,11 +465,14 @@ fix: resolve kindle token expiry (by Lumen)
 The `(by <name>)` suffix goes at the end of the title, after the conventional commit description. This makes it easy to see at a glance who worked on what in the PR list.
 
 In the PR body, use the standard format:
+
 ```markdown
 ## Summary
+
 - <bullet points>
 
 ## Test plan
+
 - [ ] <checklist>
 
 Generated with [Claude Code](https://claude.com/claude-code)
@@ -443,6 +500,7 @@ When leaving comments or reviews on a pull request, sign off with your agent nam
 ## Architecture Notes
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for detailed architecture documentation including:
+
 - System diagrams
 - Data flow
 - Design decisions

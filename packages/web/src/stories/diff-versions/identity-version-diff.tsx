@@ -92,10 +92,7 @@ export default function IdentityVersionDiff({
         </span>
       </div>
       <div className="rounded-md border p-4">
-        <TiptapDiffViewer
-          originalText={previousMarkdown}
-          modifiedText={currentMarkdown}
-        />
+        <TiptapDiffViewer originalText={previousMarkdown} modifiedText={currentMarkdown} />
       </div>
     </div>
   );

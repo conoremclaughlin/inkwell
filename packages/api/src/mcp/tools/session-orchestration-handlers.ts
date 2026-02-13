@@ -14,7 +14,10 @@ import { z } from 'zod';
 // Schema for get_resumable_sessions
 export const getResumableSessionsSchema = {
   agentId: z.string().optional().describe('Filter by agent (e.g., "wren", "myra")'),
-  status: z.enum(['active', 'paused', 'resumable']).optional().describe('Filter by status (default: resumable)'),
+  status: z
+    .enum(['active', 'paused', 'resumable'])
+    .optional()
+    .describe('Filter by status (default: resumable)'),
 };
 
 // Schema for update_session_status
@@ -49,10 +52,7 @@ export async function handleGetResumableSessions(
   try {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
 
-    let query = supabase
-      .from('sessions')
-      .select('*')
-      .is('ended_at', null); // Only active/resumable sessions
+    let query = supabase.from('sessions').select('*').is('ended_at', null); // Only active/resumable sessions
 
     // Filter by status (default to 'resumable')
     const status = args.status || 'resumable';
@@ -70,10 +70,12 @@ export async function handleGetResumableSessions(
     if (error) {
       logger.error('Failed to get resumable sessions:', error);
       return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({ success: false, error: error.message }),
-        }],
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({ success: false, error: error.message }),
+          },
+        ],
       };
     }
 
@@ -87,34 +89,37 @@ export async function handleGetResumableSessions(
       context: s.context,
       startedAt: s.started_at,
       updatedAt: s.updated_at,
-      resumeCommand: s.claude_session_id
-        ? `claude --resume ${s.claude_session_id}`
-        : null,
+      resumeCommand: s.claude_session_id ? `claude --resume ${s.claude_session_id}` : null,
     }));
 
     return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          success: true,
-          count: sessions.length,
-          sessions,
-          hint: sessions.length > 0
-            ? 'Use the resumeCommand to continue a session. Pass a message with --message "your context here"'
-            : 'No resumable sessions found.',
-        }),
-      }],
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            count: sessions.length,
+            sessions,
+            hint:
+              sessions.length > 0
+                ? 'Use the resumeCommand to continue a session. Pass a message with --message "your context here"'
+                : 'No resumable sessions found.',
+          }),
+        },
+      ],
     };
   } catch (error) {
     logger.error('Error in get_resumable_sessions:', error);
     return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          success: false,
-          error: error instanceof Error ? error.message : 'Unknown error',
-        }),
-      }],
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error',
+          }),
+        },
+      ],
     };
   }
 }
@@ -163,39 +168,45 @@ export async function handleUpdateSessionStatus(
     if (error) {
       logger.error('Failed to update session status:', error);
       return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({ success: false, error: error.message }),
-        }],
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({ success: false, error: error.message }),
+          },
+        ],
       };
     }
 
     return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          success: true,
-          session: {
-            id: data.id,
-            agentId: data.agent_id,
-            claudeSessionId: data.claude_session_id,
-            status: data.status,
-            workingDir: data.working_dir,
-            context: data.context,
-          },
-        }),
-      }],
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            session: {
+              id: data.id,
+              agentId: data.agent_id,
+              claudeSessionId: data.claude_session_id,
+              status: data.status,
+              workingDir: data.working_dir,
+              context: data.context,
+            },
+          }),
+        },
+      ],
     };
   } catch (error) {
     logger.error('Error in update_session_status:', error);
     return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          success: false,
-          error: error instanceof Error ? error.message : 'Unknown error',
-        }),
-      }],
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error',
+          }),
+        },
+      ],
     };
   }
 }

@@ -62,18 +62,17 @@ export function loadMiniApps(): Map<string, LoadedMiniApp> {
       if (!existsSync(manifestPath)) continue;
 
       try {
-        const manifest: MiniAppManifest = JSON.parse(
-          readFileSync(manifestPath, 'utf-8')
-        );
+        const manifest: MiniAppManifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
 
-        const skillContent = existsSync(skillPath)
-          ? readFileSync(skillPath, 'utf-8')
-          : '';
+        const skillContent = existsSync(skillPath) ? readFileSync(skillPath, 'utf-8') : '';
 
         // Load functions based on app name
         let functions: Record<string, (...args: unknown[]) => unknown> = {};
         if (entry.name === 'bill-split') {
-          functions = billSplitFunctions as unknown as Record<string, (...args: unknown[]) => unknown>;
+          functions = billSplitFunctions as unknown as Record<
+            string,
+            (...args: unknown[]) => unknown
+          >;
         }
 
         miniApps.set(manifest.name, {

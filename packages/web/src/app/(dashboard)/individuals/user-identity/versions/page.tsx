@@ -11,10 +11,10 @@ import { useApiQuery } from '@/lib/api';
 import clsx from 'clsx';
 
 // Dynamic import for TipTap diff viewer (client-only, heavy deps)
-const MarkdownVersionDiff = dynamic(
-  () => import('@/stories/diff-versions/markdown-version-diff'),
-  { ssr: false, loading: () => <p className="text-gray-500 p-4">Loading diff viewer...</p> }
-);
+const MarkdownVersionDiff = dynamic(() => import('@/stories/diff-versions/markdown-version-diff'), {
+  ssr: false,
+  loading: () => <p className="text-gray-500 p-4">Loading diff viewer...</p>,
+});
 
 interface UserIdentity {
   id: string;
@@ -68,7 +68,10 @@ export default function UserIdentityVersionsPage() {
     data: historyData,
     isLoading: historyLoading,
     error: historyError,
-  } = useApiQuery<HistoryResponse>(['user-identity', 'history'], '/api/admin/user-identity/history');
+  } = useApiQuery<HistoryResponse>(
+    ['user-identity', 'history'],
+    '/api/admin/user-identity/history'
+  );
 
   const userIdentity = userIdentityData?.userIdentity ?? null;
   const history = historyData?.history ?? [];
@@ -99,9 +102,13 @@ export default function UserIdentityVersionsPage() {
   const hasValues = allVersions.some((v) => v.sharedValuesMd);
 
   // Check if specific files changed between versions
-  const userProfileChanged = selectedVersion && comparisonVersion &&
+  const userProfileChanged =
+    selectedVersion &&
+    comparisonVersion &&
     selectedVersion.userProfileMd !== comparisonVersion.userProfileMd;
-  const valuesChanged = selectedVersion && comparisonVersion &&
+  const valuesChanged =
+    selectedVersion &&
+    comparisonVersion &&
     selectedVersion.sharedValuesMd !== comparisonVersion.sharedValuesMd;
 
   if (isLoading) {
@@ -147,9 +154,7 @@ export default function UserIdentityVersionsPage() {
             </Link>
           </Button>
           <div>
-            <h1 className="text-2xl font-bold text-gray-900">
-              User Identity Version History
-            </h1>
+            <h1 className="text-2xl font-bold text-gray-900">User Identity Version History</h1>
             <p className="text-gray-600">
               {allVersions.length} version{allVersions.length !== 1 ? 's' : ''} available
             </p>
@@ -176,17 +181,25 @@ export default function UserIdentityVersionsPage() {
                   <div className="space-y-6">
                     {/* USER.md */}
                     {hasUserProfile && (
-                      <div className={clsx(
-                        'rounded-lg border',
-                        userProfileChanged ? 'border-amber-200 bg-amber-50/30' : 'border-gray-200 bg-gray-50/30'
-                      )}>
+                      <div
+                        className={clsx(
+                          'rounded-lg border',
+                          userProfileChanged
+                            ? 'border-amber-200 bg-amber-50/30'
+                            : 'border-gray-200 bg-gray-50/30'
+                        )}
+                      >
                         <div className="flex items-center gap-2 px-4 py-2 border-b bg-white/50 rounded-t-lg">
                           <User className="h-4 w-4 text-gray-600" />
                           <span className="font-mono text-sm font-medium">USER.md</span>
                           {userProfileChanged ? (
-                            <Badge variant="outline" className="ml-auto text-xs bg-amber-100">Changed</Badge>
+                            <Badge variant="outline" className="ml-auto text-xs bg-amber-100">
+                              Changed
+                            </Badge>
                           ) : (
-                            <Badge variant="outline" className="ml-auto text-xs text-gray-400">Unchanged</Badge>
+                            <Badge variant="outline" className="ml-auto text-xs text-gray-400">
+                              Unchanged
+                            </Badge>
                           )}
                         </div>
                         <div className="p-4">
@@ -204,17 +217,25 @@ export default function UserIdentityVersionsPage() {
 
                     {/* VALUES.md */}
                     {hasValues && (
-                      <div className={clsx(
-                        'rounded-lg border',
-                        valuesChanged ? 'border-amber-200 bg-amber-50/30' : 'border-gray-200 bg-gray-50/30'
-                      )}>
+                      <div
+                        className={clsx(
+                          'rounded-lg border',
+                          valuesChanged
+                            ? 'border-amber-200 bg-amber-50/30'
+                            : 'border-gray-200 bg-gray-50/30'
+                        )}
+                      >
                         <div className="flex items-center gap-2 px-4 py-2 border-b bg-white/50 rounded-t-lg">
                           <Heart className="h-4 w-4 text-gray-600" />
                           <span className="font-mono text-sm font-medium">VALUES.md</span>
                           {valuesChanged ? (
-                            <Badge variant="outline" className="ml-auto text-xs bg-amber-100">Changed</Badge>
+                            <Badge variant="outline" className="ml-auto text-xs bg-amber-100">
+                              Changed
+                            </Badge>
                           ) : (
-                            <Badge variant="outline" className="ml-auto text-xs text-gray-400">Unchanged</Badge>
+                            <Badge variant="outline" className="ml-auto text-xs text-gray-400">
+                              Unchanged
+                            </Badge>
                           )}
                         </div>
                         <div className="p-4">
@@ -266,19 +287,21 @@ export default function UserIdentityVersionsPage() {
                     >
                       {/* Timeline line */}
                       <span
-                        className={clsx('absolute left-[11px] w-[2px]', {
-                          'top-1/2 bottom-0': isFirst,
-                          'top-0 bottom-1/2': isLast,
-                          'top-0 bottom-0': !isFirst && !isLast,
-                        }, isActive ? 'bg-blue-500' : 'bg-gray-300')}
+                        className={clsx(
+                          'absolute left-[11px] w-[2px]',
+                          {
+                            'top-1/2 bottom-0': isFirst,
+                            'top-0 bottom-1/2': isLast,
+                            'top-0 bottom-0': !isFirst && !isLast,
+                          },
+                          isActive ? 'bg-blue-500' : 'bg-gray-300'
+                        )}
                       />
                       {/* Timeline dot */}
                       <span
                         className={clsx(
                           'absolute left-[7px] top-1/2 h-[10px] w-[10px] -translate-y-1/2 rounded-full border-2',
-                          isActive
-                            ? 'border-blue-500 bg-blue-500'
-                            : 'border-gray-300 bg-white'
+                          isActive ? 'border-blue-500 bg-blue-500' : 'border-gray-300 bg-white'
                         )}
                       />
 

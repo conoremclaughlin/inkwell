@@ -121,11 +121,7 @@ export class ClaudeRunner implements IClaudeRunner {
     }
   }
 
-  private buildArgs(
-    sessionId: string,
-    isResume: boolean,
-    config: ClaudeRunnerConfig
-  ): string[] {
+  private buildArgs(sessionId: string, isResume: boolean, config: ClaudeRunnerConfig): string[] {
     const args: string[] = ['--print', '--output-format', 'stream-json', '--verbose'];
 
     // Session handling
@@ -248,7 +244,9 @@ export class ClaudeRunner implements IClaudeRunner {
             // Check for resume failure due to missing session
             if (parsed.type === 'result' && parsed.subtype === 'error_during_execution') {
               const errors = parsed.errors as string[] | undefined;
-              if (errors?.some((e: string) => e.includes('No conversation found with session ID'))) {
+              if (
+                errors?.some((e: string) => e.includes('No conversation found with session ID'))
+              ) {
                 resumeFailedNoSession = true;
               }
             }
@@ -356,10 +354,7 @@ export class ClaudeRunner implements IClaudeRunner {
   /**
    * Capture tool_use events for activity stream logging.
    */
-  private captureToolCall(
-    event: Record<string, unknown>,
-    toolCalls: ToolCall[]
-  ): void {
+  private captureToolCall(event: Record<string, unknown>, toolCalls: ToolCall[]): void {
     if (event.type === 'tool_use') {
       toolCalls.push({
         toolUseId: (event.id as string) || '',
@@ -372,10 +367,7 @@ export class ClaudeRunner implements IClaudeRunner {
   /**
    * Handle a streaming JSON event from Claude Code.
    */
-  private handleStreamEvent(
-    event: Record<string, unknown>,
-    responses: ChannelResponse[]
-  ): void {
+  private handleStreamEvent(event: Record<string, unknown>, responses: ChannelResponse[]): void {
     // Look for tool calls, specifically send_response
     if (event.type === 'tool_use') {
       const toolName = event.name as string;

@@ -20,9 +20,18 @@
 
 import path from 'path';
 import { getDataComposer, DataComposer } from './data/composer';
-import { createSessionService, SessionService, type SessionServiceConfig } from './services/sessions';
+import {
+  createSessionService,
+  SessionService,
+  type SessionServiceConfig,
+} from './services/sessions';
 import type { SessionRequest, ChannelResponse, ChannelType } from './services/sessions';
-import { createMCPServer, MCPServer, type IncomingMessageHandler, type ChannelGateway } from './mcp/server';
+import {
+  createMCPServer,
+  MCPServer,
+  type IncomingMessageHandler,
+  type ChannelGateway,
+} from './mcp/server';
 import type { GatewayChannel } from './channels/gateway';
 import { initHeartbeatService, processHeartbeat, type DueReminder } from './services/heartbeat';
 import { setResponseCallback, hasExplicitResponse } from './mcp/tools/response-handlers';
@@ -72,7 +81,10 @@ async function routeResponses(responses: ChannelResponse[]): Promise<void> {
         contentLength: response.content.length,
       });
     } catch (error) {
-      logger.error(`Failed to route response to ${response.channel}:${response.conversationId}`, error);
+      logger.error(
+        `Failed to route response to ${response.channel}:${response.conversationId}`,
+        error
+      );
     }
   }
 }
@@ -170,7 +182,8 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
     // For external channels (telegram/whatsapp), ensure the conversation is released
     // and auto-route the text response if no explicit send_response was called
-    const isExternalChannel = channel === 'telegram' || channel === 'whatsapp' || channel === 'discord';
+    const isExternalChannel =
+      channel === 'telegram' || channel === 'whatsapp' || channel === 'discord';
     if (isExternalChannel && channelGateway) {
       // Check if send_response was called via MCP (tracked in response-handlers)
       const hadExplicitResponse = hasExplicitResponse(channel, conversationId);
@@ -182,11 +195,10 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
           conversationId,
           responseLength: result.finalTextResponse.length,
         });
-        await channelGateway.releaseConversation(
-          channel as GatewayChannel,
-          conversationId,
-          { content: result.finalTextResponse, format: 'markdown' }
-        );
+        await channelGateway.releaseConversation(channel as GatewayChannel, conversationId, {
+          content: result.finalTextResponse,
+          format: 'markdown',
+        });
       } else {
         // Just release the conversation (and process any pending messages)
         logger.debug('Explicit send_response detected, skipping auto-forward', {
@@ -194,10 +206,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
           conversationId,
           hadExplicitResponse,
         });
-        await channelGateway.releaseConversation(
-          channel as GatewayChannel,
-          conversationId
-        );
+        await channelGateway.releaseConversation(channel as GatewayChannel, conversationId);
       }
     }
 
@@ -222,7 +231,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     channelGateway: {
       enableTelegram,
       telegramPollingInterval: config.telegramPollingInterval || 1000,
-      enableWhatsApp: config.enableWhatsApp ?? (process.env.ENABLE_WHATSAPP === 'true'),
+      enableWhatsApp: config.enableWhatsApp ?? process.env.ENABLE_WHATSAPP === 'true',
       whatsappAccountId: config.whatsappAccountId || 'default',
       printWhatsAppQr: true,
       enableDiscord: process.env.ENABLE_DISCORD === 'true',
@@ -321,7 +330,9 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       logger.info('Heartbeat complete', stats);
     },
   });
-  logger.info(`Heartbeat service started (interval: ${heartbeatInterval}, local cron: ${enableLocalCron})`);
+  logger.info(
+    `Heartbeat service started (interval: ${heartbeatInterval}, local cron: ${enableLocalCron})`
+  );
 
   // 7. Register default trigger handler for stateless, database-driven agent routing
   // This handles triggers for ANY agent by looking up config from the database
@@ -336,7 +347,8 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     });
 
     // 1. Verify agent exists (either in agent_identities or known agents list)
-    const { data: agentIdentity } = await dataComposer!.getClient()
+    const { data: agentIdentity } = await dataComposer!
+      .getClient()
       .from('agent_identities')
       .select('agent_id')
       .eq('agent_id', targetAgentId)
@@ -355,7 +367,8 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     // 2. Resolve userId from inbox message (required for stateless processing)
     let userId: string | undefined;
     if (payload.inboxMessageId) {
-      const { data: inboxMsg } = await dataComposer!.getClient()
+      const { data: inboxMsg } = await dataComposer!
+        .getClient()
         .from('agent_inbox')
         .select('recipient_user_id')
         .eq('id', payload.inboxMessageId)
@@ -515,9 +528,15 @@ function printStatus(): void {
 
   const status = channelGateway?.getStatus();
   if (status) {
-    logger.info(`  Telegram: ${status.telegram.enabled ? (status.telegram.connected ? 'Connected' : 'Enabled') : 'Disabled'}`);
-    logger.info(`  WhatsApp: ${status.whatsapp.enabled ? (status.whatsapp.connected ? 'Connected' : 'Awaiting QR') : 'Disabled'}`);
-    logger.info(`  Discord: ${status.discord.enabled ? (status.discord.connected ? 'Connected' : 'Enabled') : 'Disabled'}`);
+    logger.info(
+      `  Telegram: ${status.telegram.enabled ? (status.telegram.connected ? 'Connected' : 'Enabled') : 'Disabled'}`
+    );
+    logger.info(
+      `  WhatsApp: ${status.whatsapp.enabled ? (status.whatsapp.connected ? 'Connected' : 'Awaiting QR') : 'Disabled'}`
+    );
+    logger.info(
+      `  Discord: ${status.discord.enabled ? (status.discord.connected ? 'Connected' : 'Enabled') : 'Disabled'}`
+    );
   }
 
   logger.info('='.repeat(60));

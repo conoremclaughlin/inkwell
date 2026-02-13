@@ -25,11 +25,7 @@ export type { Reminder } from './data/models/reminder.model';
 export type { Conversation } from './data/models/conversation.model';
 
 // User resolution
-export {
-  resolveUser,
-  resolveUserOrThrow,
-  userIdentifierSchema,
-} from './services/user-resolver';
+export { resolveUser, resolveUserOrThrow, userIdentifierSchema } from './services/user-resolver';
 
 // Channel integration (clawdbot bridge)
 export * from './channels';

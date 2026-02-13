@@ -44,24 +44,35 @@ function createChainableQueryBuilder(table: string) {
   const builder: Record<string, unknown> = {};
 
   const chainable = [
-    'select', 'insert', 'update', 'delete', 'upsert',
-    'eq', 'neq', 'lte', 'gte', 'lt', 'gt', 'in', 'is', 'or',
-    'order', 'limit', 'range', 'ilike', 'like',
+    'select',
+    'insert',
+    'update',
+    'delete',
+    'upsert',
+    'eq',
+    'neq',
+    'lte',
+    'gte',
+    'lt',
+    'gt',
+    'in',
+    'is',
+    'or',
+    'order',
+    'limit',
+    'range',
+    'ilike',
+    'like',
   ];
 
   for (const method of chainable) {
     builder[method] = vi.fn().mockReturnValue(builder);
   }
 
-  builder.single = vi.fn().mockImplementation(() =>
-    Promise.resolve(getNextResult(table))
-  );
+  builder.single = vi.fn().mockImplementation(() => Promise.resolve(getNextResult(table)));
 
   // Make the builder thenable so `await supabase.from(...).select(...)` works
-  builder.then = (
-    resolve: (value: unknown) => void,
-    reject?: (reason: unknown) => void,
-  ) => {
+  builder.then = (resolve: (value: unknown) => void, reject?: (reason: unknown) => void) => {
     const result = getNextResult(table);
     if (result.error && reject) {
       reject(result);
@@ -207,7 +218,10 @@ describe('Heartbeat Service', () => {
       const builder = tableBuilders.get('scheduled_reminders')!;
       expect(builder.insert).toHaveBeenCalled();
 
-      const insertArgs = (builder.insert as ReturnType<typeof vi.fn>).mock.calls[0][0] as Record<string, unknown>;
+      const insertArgs = (builder.insert as ReturnType<typeof vi.fn>).mock.calls[0][0] as Record<
+        string,
+        unknown
+      >;
       const nextRunAt = new Date(insertArgs.next_run_at as string);
 
       expect(nextRunAt.getTime()).not.toBeNaN();
@@ -253,7 +267,7 @@ describe('Heartbeat Service', () => {
           title: 'Check emails',
           description: 'Check for important emails and summarize',
           delivery_channel: 'telegram',
-        }),
+        })
       );
     });
 
@@ -274,7 +288,7 @@ describe('Heartbeat Service', () => {
         expect.objectContaining({
           reminder_id: 'rem-001',
           status: 'failed',
-        }),
+        })
       );
     });
 
@@ -296,7 +310,7 @@ describe('Heartbeat Service', () => {
           reminder_id: 'rem-001',
           status: 'failed',
           error_message: 'Session host unavailable',
-        }),
+        })
       );
     });
 
@@ -329,7 +343,10 @@ describe('Heartbeat Service', () => {
       const builder = tableBuilders.get('scheduled_reminders')!;
       expect(builder.update).toHaveBeenCalled();
 
-      const updateArgs = (builder.update as ReturnType<typeof vi.fn>).mock.calls[0][0] as Record<string, unknown>;
+      const updateArgs = (builder.update as ReturnType<typeof vi.fn>).mock.calls[0][0] as Record<
+        string,
+        unknown
+      >;
       expect(updateArgs.run_count).toBe(4);
 
       const nextRunAt = new Date(updateArgs.next_run_at as string);

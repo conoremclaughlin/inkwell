@@ -15,7 +15,9 @@ import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-
 // ============== Schemas ==============
 
 const sendToInboxSchema = userIdentifierBaseSchema.extend({
-  recipientAgentId: z.string().describe('Agent ID to send message to (e.g., "wren", "myra", "claude-code")'),
+  recipientAgentId: z
+    .string()
+    .describe('Agent ID to send message to (e.g., "wren", "myra", "claude-code")'),
   senderAgentId: z.string().optional().describe('Agent ID of sender (optional if from human)'),
   subject: z.string().optional().describe('Message subject'),
   content: z.string().describe('Message content'),
@@ -29,14 +31,29 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .optional()
     .default('normal')
     .describe('Message priority'),
-  relatedSessionId: z.string().uuid().optional().describe('Related session ID (for resume requests)'),
+  relatedSessionId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('Related session ID (for resume requests)'),
   relatedArtifactUri: z.string().optional().describe('Related artifact URI'),
   metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
   expiresAt: z.string().datetime().optional().describe('When this message expires'),
   // Trigger options - automatically trigger the recipient after sending
-  trigger: z.boolean().optional().describe('If true, automatically trigger the recipient agent after sending. Defaults to true for task_request and session_resume, false for notification and message.'),
-  triggerType: z.enum(['task_complete', 'approval_needed', 'message', 'error', 'custom']).optional().describe('Type of trigger (only used if trigger=true)'),
-  triggerSummary: z.string().optional().describe('Brief summary for the trigger (only used if trigger=true)'),
+  trigger: z
+    .boolean()
+    .optional()
+    .describe(
+      'If true, automatically trigger the recipient agent after sending. Defaults to true for task_request and session_resume, false for notification and message.'
+    ),
+  triggerType: z
+    .enum(['task_complete', 'approval_needed', 'message', 'error', 'custom'])
+    .optional()
+    .describe('Type of trigger (only used if trigger=true)'),
+  triggerSummary: z
+    .string()
+    .optional()
+    .describe('Brief summary for the trigger (only used if trigger=true)'),
 });
 
 const getInboxSchema = userIdentifierBaseSchema.extend({
@@ -123,7 +140,12 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   });
 
   // Optionally trigger the recipient agent
-  let triggerResult: { triggered: boolean; triggerId?: string; processed?: boolean; error?: string } = {
+  let triggerResult: {
+    triggered: boolean;
+    triggerId?: string;
+    processed?: boolean;
+    error?: string;
+  } = {
     triggered: false,
   };
 
@@ -140,7 +162,8 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
 
     // Fire-and-forget: don't await the trigger processing
     // The message is already in the inbox - we just need to wake the agent
-    gateway.processTrigger(payload)
+    gateway
+      .processTrigger(payload)
       .then((result) => {
         logger.info('Inbox message trigger completed', {
           messageId: message.id,
@@ -423,13 +446,13 @@ export const inboxToolDefinitions = [
   {
     name: 'send_to_inbox',
     description:
-      'Send a message to another agent\'s inbox. Use for cross-agent communication, task handoff, or session resume requests.\n\nMessage types:\n- message: General communication\n- task_request: Request another agent to do work\n- session_resume: Request agent to resume a specific session\n- notification: FYI, no response needed\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
+      "Send a message to another agent's inbox. Use for cross-agent communication, task handoff, or session resume requests.\n\nMessage types:\n- message: General communication\n- task_request: Request another agent to do work\n- session_resume: Request agent to resume a specific session\n- notification: FYI, no response needed\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId",
     schema: sendToInboxSchema,
     handler: handleSendToInbox,
   },
   {
     name: 'get_inbox',
-    description: 'Get messages from an agent\'s inbox. Returns unread messages by default.',
+    description: "Get messages from an agent's inbox. Returns unread messages by default.",
     schema: getInboxSchema,
     handler: handleGetInbox,
   },

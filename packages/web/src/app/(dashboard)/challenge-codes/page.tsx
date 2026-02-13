@@ -92,9 +92,7 @@ export default function ChallengeCodesPage() {
       </div>
 
       {errorMessage && (
-        <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">
-          {errorMessage}
-        </div>
+        <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">{errorMessage}</div>
       )}
 
       {activeCodes.length >= 5 && (
@@ -108,9 +106,7 @@ export default function ChallengeCodesPage() {
         <Card>
           <CardHeader>
             <CardTitle>How to Use</CardTitle>
-            <CardDescription>
-              Authorize a new group in 3 steps
-            </CardDescription>
+            <CardDescription>Authorize a new group in 3 steps</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="flex gap-3">
@@ -142,7 +138,8 @@ export default function ChallengeCodesPage() {
               <div>
                 <p className="font-medium">Send the authorize command</p>
                 <p className="text-sm text-gray-500">
-                  In the group, send: <code className="bg-gray-100 px-1 rounded">/authorize CODE</code>
+                  In the group, send:{' '}
+                  <code className="bg-gray-100 px-1 rounded">/authorize CODE</code>
                 </p>
               </div>
             </div>
@@ -153,9 +150,7 @@ export default function ChallengeCodesPage() {
         <Card>
           <CardHeader>
             <CardTitle>Active Codes</CardTitle>
-            <CardDescription>
-              {activeCodes.length} of 5 codes available
-            </CardDescription>
+            <CardDescription>{activeCodes.length} of 5 codes available</CardDescription>
           </CardHeader>
           <CardContent>
             {activeCodes.length === 0 ? (
@@ -170,19 +165,12 @@ export default function ChallengeCodesPage() {
                     className="flex items-center justify-between rounded-lg border p-3"
                   >
                     <div>
-                      <code className="text-2xl font-bold tracking-wider">
-                        {code.code}
-                      </code>
+                      <code className="text-2xl font-bold tracking-wider">{code.code}</code>
                       <p className="text-xs text-gray-500 mt-1">
-                        Expires{' '}
-                        {new Date(code.expiresAt).toLocaleString()}
+                        Expires {new Date(code.expiresAt).toLocaleString()}
                       </p>
                     </div>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => handleCopyCode(code.code)}
-                    >
+                    <Button variant="ghost" size="sm" onClick={() => handleCopyCode(code.code)}>
                       {copiedCode === code.code ? (
                         <Check className="h-4 w-4 text-green-500" />
                       ) : (
@@ -233,9 +221,7 @@ export default function ChallengeCodesPage() {
                       </td>
                       <td className="py-3 text-sm">
                         {code.usedForPlatform ? (
-                          <span className="text-gray-500">
-                            {code.usedForPlatform}
-                          </span>
+                          <span className="text-gray-500">{code.usedForPlatform}</span>
                         ) : (
                           <span className="text-gray-400">-</span>
                         )}

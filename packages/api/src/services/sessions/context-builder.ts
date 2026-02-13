@@ -117,19 +117,9 @@ function buildTemporalContext(timezone: string): TemporalContext {
 export class ContextBuilder implements IContextBuilder {
   constructor(private supabase: SupabaseClient<Database>) {}
 
-  async buildContext(
-    userId: string,
-    agentId: string,
-    session: Session
-  ): Promise<InjectedContext> {
+  async buildContext(userId: string, agentId: string, session: Session): Promise<InjectedContext> {
     // Fetch all required data in parallel
-    const [
-      agentIdentity,
-      user,
-      contacts,
-      recentMemories,
-      activeProjects,
-    ] = await Promise.all([
+    const [agentIdentity, user, contacts, recentMemories, activeProjects] = await Promise.all([
       this.getAgentIdentity(userId, agentId),
       this.getUser(userId),
       this.getContacts(userId),
@@ -200,10 +190,7 @@ export class ContextBuilder implements IContextBuilder {
     };
   }
 
-  async getAgentBackend(
-    userId: string,
-    agentId: string
-  ): Promise<string | null> {
+  async getAgentBackend(userId: string, agentId: string): Promise<string | null> {
     const { data, error } = await this.supabase
       .from('agent_identities')
       .select('backend')
@@ -220,10 +207,7 @@ export class ContextBuilder implements IContextBuilder {
     return data?.backend || null;
   }
 
-  private async getAgentIdentity(
-    userId: string,
-    agentId: string
-  ): Promise<AgentIdentity | null> {
+  private async getAgentIdentity(userId: string, agentId: string): Promise<AgentIdentity | null> {
     const { data, error } = await this.supabase
       .from('agent_identities')
       .select('*')
@@ -244,11 +228,7 @@ export class ContextBuilder implements IContextBuilder {
   }
 
   private async getUser(userId: string): Promise<DbUser | null> {
-    const { data, error } = await this.supabase
-      .from('users')
-      .select('*')
-      .eq('id', userId)
-      .single();
+    const { data, error } = await this.supabase.from('users').select('*').eq('id', userId).single();
 
     if (error) {
       if (error.code === 'PGRST116') {
@@ -352,9 +332,7 @@ ${memoryList}`);
 
   // Active projects (if any)
   if (context.activeProjects.length > 0) {
-    const projectList = context.activeProjects
-      .map((p) => `- ${p.name} (${p.status})`)
-      .join('\n');
+    const projectList = context.activeProjects.map((p) => `- ${p.name} (${p.status})`).join('\n');
     sections.push(`## Active Projects
 ${projectList}`);
   }

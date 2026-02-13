@@ -72,7 +72,10 @@ interface SkillsListResponse {
   totalCount: number;
 }
 
-const typeConfig: Record<SkillType, { label: string; icon: React.ReactNode; color: string; bgColor: string }> = {
+const typeConfig: Record<
+  SkillType,
+  { label: string; icon: React.ReactNode; color: string; bgColor: string }
+> = {
   'mini-app': {
     label: 'Mini App',
     icon: <Code className="h-4 w-4" />,
@@ -93,7 +96,10 @@ const typeConfig: Record<SkillType, { label: string; icon: React.ReactNode; colo
   },
 };
 
-const statusConfig: Record<SkillStatus, { label: string; icon: typeof CheckCircle; color: string; bgColor: string }> = {
+const statusConfig: Record<
+  SkillStatus,
+  { label: string; icon: typeof CheckCircle; color: string; bgColor: string }
+> = {
   available: {
     label: 'Available',
     icon: CheckCircle,
@@ -191,12 +197,15 @@ export default function SkillsPage() {
   };
 
   // Group skills by category
-  const skillsByCategory = skills.reduce((acc, skill) => {
-    const category = skill.category || 'Uncategorized';
-    if (!acc[category]) acc[category] = [];
-    acc[category].push(skill);
-    return acc;
-  }, {} as Record<string, SkillSummary[]>);
+  const skillsByCategory = skills.reduce(
+    (acc, skill) => {
+      const category = skill.category || 'Uncategorized';
+      if (!acc[category]) acc[category] = [];
+      acc[category].push(skill);
+      return acc;
+    },
+    {} as Record<string, SkillSummary[]>
+  );
 
   return (
     <div>
@@ -214,22 +223,14 @@ export default function SkillsPage() {
               Browse Registry
             </Button>
           </Link>
-          <Button
-            variant="outline"
-            onClick={handleRefresh}
-            disabled={isRefreshing}
-          >
+          <Button variant="outline" onClick={handleRefresh} disabled={isRefreshing}>
             <RefreshCw className={clsx('mr-2 h-4 w-4', isRefreshing && 'animate-spin')} />
             Refresh
           </Button>
         </div>
       </div>
 
-      {error && (
-        <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">
-          {error.message}
-        </div>
-      )}
+      {error && <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">{error.message}</div>}
 
       {/* Filters */}
       <Card className="mt-6">
@@ -330,9 +331,7 @@ export default function SkillsPage() {
       {/* Skills List */}
       {isLoading ? (
         <Card className="mt-6">
-          <CardContent className="p-8 text-center text-gray-500">
-            Loading skills...
-          </CardContent>
+          <CardContent className="p-8 text-center text-gray-500">Loading skills...</CardContent>
         </Card>
       ) : skills.length === 0 ? (
         <Card className="mt-6">
@@ -340,14 +339,11 @@ export default function SkillsPage() {
             <Puzzle className="h-12 w-12 mx-auto text-gray-300 mb-3" />
             <p className="text-gray-500 font-medium">No skills found</p>
             <p className="text-sm text-gray-400 mt-1 mb-4">
-              Get started by adding skills to <code className="bg-gray-100 px-1 rounded">~/.pcp/skills/</code>
+              Get started by adding skills to{' '}
+              <code className="bg-gray-100 px-1 rounded">~/.pcp/skills/</code>
             </p>
             <div className="flex justify-center gap-3">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setShowAddSkills(true)}
-              >
+              <Button variant="outline" size="sm" onClick={() => setShowAddSkills(true)}>
                 <FolderPlus className="mr-2 h-4 w-4" />
                 Learn How
               </Button>
@@ -395,21 +391,19 @@ export default function SkillsPage() {
                             </div>
                             <div>
                               <div className="flex items-center gap-2">
-                                <h3 className="font-medium text-gray-900">
-                                  {skill.displayName}
-                                </h3>
+                                <h3 className="font-medium text-gray-900">{skill.displayName}</h3>
                                 <Badge className={clsx('text-xs', typeCfg.bgColor, typeCfg.color)}>
                                   {typeCfg.icon}
                                   <span className="ml-1">{typeCfg.label}</span>
                                 </Badge>
-                                <Badge className={clsx('text-xs', statusCfg.bgColor, statusCfg.color)}>
+                                <Badge
+                                  className={clsx('text-xs', statusCfg.bgColor, statusCfg.color)}
+                                >
                                   <StatusIcon className="h-3 w-3 mr-1" />
                                   {statusCfg.label}
                                 </Badge>
                               </div>
-                              <p className="text-sm text-gray-600 mt-1">
-                                {skill.description}
-                              </p>
+                              <p className="text-sm text-gray-600 mt-1">{skill.description}</p>
 
                               {/* Triggers */}
                               {skill.triggers && skill.triggers.length > 0 && (
@@ -433,18 +427,34 @@ export default function SkillsPage() {
                               {/* Capabilities */}
                               {skill.capabilities && (
                                 <div className="flex gap-1 mt-2">
-                                  <CapabilityBadge name="Vision" enabled={skill.capabilities.vision} />
-                                  <CapabilityBadge name="Memory" enabled={skill.capabilities.memory} />
-                                  <CapabilityBadge name="Network" enabled={skill.capabilities.network} />
-                                  <CapabilityBadge name="Files" enabled={skill.capabilities.filesystem} />
-                                  <CapabilityBadge name="Shell" enabled={skill.capabilities.shell} />
+                                  <CapabilityBadge
+                                    name="Vision"
+                                    enabled={skill.capabilities.vision}
+                                  />
+                                  <CapabilityBadge
+                                    name="Memory"
+                                    enabled={skill.capabilities.memory}
+                                  />
+                                  <CapabilityBadge
+                                    name="Network"
+                                    enabled={skill.capabilities.network}
+                                  />
+                                  <CapabilityBadge
+                                    name="Files"
+                                    enabled={skill.capabilities.filesystem}
+                                  />
+                                  <CapabilityBadge
+                                    name="Shell"
+                                    enabled={skill.capabilities.shell}
+                                  />
                                 </div>
                               )}
 
                               {/* Function count for mini-apps */}
                               {skill.type === 'mini-app' && skill.functionCount !== undefined && (
                                 <p className="text-xs text-gray-400 mt-2">
-                                  {skill.functionCount} function{skill.functionCount !== 1 ? 's' : ''}
+                                  {skill.functionCount} function
+                                  {skill.functionCount !== 1 ? 's' : ''}
                                 </p>
                               )}
 
@@ -473,10 +483,7 @@ export default function SkillsPage() {
 
       {/* How to Add Skills */}
       <Card className="mt-6">
-        <CardHeader
-          className="cursor-pointer"
-          onClick={() => setShowAddSkills(!showAddSkills)}
-        >
+        <CardHeader className="cursor-pointer" onClick={() => setShowAddSkills(!showAddSkills)}>
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <FolderPlus className="h-5 w-5 text-gray-400" />
@@ -512,7 +519,9 @@ export default function SkillsPage() {
                   <Folder className="h-5 w-5 text-purple-500 shrink-0 mt-0.5" />
                   <div>
                     <code className="text-sm font-mono text-gray-800">Built-in skills</code>
-                    <p className="text-xs text-gray-500 mt-1">Ships with PCP, updated via releases</p>
+                    <p className="text-xs text-gray-500 mt-1">
+                      Ships with PCP, updated via releases
+                    </p>
                   </div>
                 </div>
               </div>
@@ -528,9 +537,7 @@ export default function SkillsPage() {
                     <Github className="h-5 w-5" />
                     <span className="font-medium">From GitHub</span>
                   </div>
-                  <p className="text-sm text-gray-600 mb-3">
-                    Clone a skill repository directly:
-                  </p>
+                  <p className="text-sm text-gray-600 mb-3">Clone a skill repository directly:</p>
                   <CodeBlock>{`cd ~/.pcp/skills
 git clone https://github.com/user/skill-name`}</CodeBlock>
                 </div>
@@ -541,9 +548,7 @@ git clone https://github.com/user/skill-name`}</CodeBlock>
                     <Download className="h-5 w-5" />
                     <span className="font-medium">Single File</span>
                   </div>
-                  <p className="text-sm text-gray-600 mb-3">
-                    Download a SKILL.md file directly:
-                  </p>
+                  <p className="text-sm text-gray-600 mb-3">Download a SKILL.md file directly:</p>
                   <CodeBlock>{`curl -o ~/.pcp/skills/my-skill.md \\
   https://example.com/SKILL.md`}</CodeBlock>
                 </div>

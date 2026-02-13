@@ -104,9 +104,7 @@ export function readSelfId(accountId = 'default'): { e164: string | null; jid: s
 /**
  * Load auth state for Baileys
  */
-export async function loadAuthState(
-  accountId = 'default'
-): Promise<{
+export async function loadAuthState(accountId = 'default'): Promise<{
   state: AuthenticationState;
   saveCreds: () => Promise<void>;
   authDir: string;
@@ -138,7 +136,10 @@ async function createBackup(authDir: string): Promise<void> {
   const backupPath = path.join(authDir, 'creds.json.bak');
 
   try {
-    const exists = await fs.stat(credsPath).then(() => true).catch(() => false);
+    const exists = await fs
+      .stat(credsPath)
+      .then(() => true)
+      .catch(() => false);
     if (!exists) return;
 
     const raw = await fs.readFile(credsPath, 'utf-8');
@@ -159,7 +160,10 @@ async function maybeRestoreFromBackup(authDir: string): Promise<void> {
 
   try {
     // Check if main creds exist and are valid
-    const mainExists = await fs.stat(credsPath).then(() => true).catch(() => false);
+    const mainExists = await fs
+      .stat(credsPath)
+      .then(() => true)
+      .catch(() => false);
     if (mainExists) {
       const raw = await fs.readFile(credsPath, 'utf-8');
       JSON.parse(raw); // Throws if invalid
@@ -167,7 +171,10 @@ async function maybeRestoreFromBackup(authDir: string): Promise<void> {
     }
 
     // Try to restore from backup
-    const backupExists = await fs.stat(backupPath).then(() => true).catch(() => false);
+    const backupExists = await fs
+      .stat(backupPath)
+      .then(() => true)
+      .catch(() => false);
     if (backupExists) {
       const backupRaw = await fs.readFile(backupPath, 'utf-8');
       JSON.parse(backupRaw); // Validate backup
@@ -206,7 +213,10 @@ export async function listAccounts(): Promise<string[]> {
     for (const entry of entries) {
       if (entry.isDirectory()) {
         const credsPath = path.join(CREDENTIALS_DIR, entry.name, 'creds.json');
-        const exists = await fs.stat(credsPath).then(() => true).catch(() => false);
+        const exists = await fs
+          .stat(credsPath)
+          .then(() => true)
+          .catch(() => false);
         if (exists) {
           accounts.push(entry.name);
         }

@@ -88,8 +88,8 @@ export class BackendManager extends EventEmitter {
       this.healthCheckTimer = null;
     }
 
-    const shutdownPromises = Array.from(this.backends.values()).map(
-      backend => backend.shutdown().catch(err => logger.error('Backend shutdown error:', err))
+    const shutdownPromises = Array.from(this.backends.values()).map((backend) =>
+      backend.shutdown().catch((err) => logger.error('Backend shutdown error:', err))
     );
 
     await Promise.all(shutdownPromises);
@@ -207,7 +207,7 @@ export class BackendManager extends EventEmitter {
    * Get the Claude Code backend (for pending message access)
    */
   getClaudeCodeBackend(): ClaudeCodeBackend | null {
-    return this.backends.get('claude-code') as ClaudeCodeBackend || null;
+    return (this.backends.get('claude-code') as ClaudeCodeBackend) || null;
   }
 
   /**

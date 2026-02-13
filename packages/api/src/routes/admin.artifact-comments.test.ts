@@ -83,9 +83,7 @@ describe('admin artifact comments routes', () => {
 
   it('GET /artifacts/:id/comments returns comments enriched with identity metadata', async () => {
     currentSupabaseMock = createTableAwareSupabaseMock({
-      artifacts: [
-        { single: [{ data: { id: 'artifact-1' }, error: null }] },
-      ],
+      artifacts: [{ single: [{ data: { id: 'artifact-1' }, error: null }] }],
       artifact_comments: [
         {
           then: {
@@ -135,28 +133,35 @@ describe('admin artifact comments routes', () => {
 
   it('POST /artifacts/:id/comments creates comment with canonical identity UUID', async () => {
     currentSupabaseMock = createTableAwareSupabaseMock({
-      artifacts: [
-        { single: [{ data: { id: 'artifact-1' }, error: null }] },
-      ],
+      artifacts: [{ single: [{ data: { id: 'artifact-1' }, error: null }] }],
       agent_identities: [
-        { single: [{ data: { id: 'identity-1', agent_id: 'lumen', name: 'Lumen', backend: 'codex' }, error: null }] },
+        {
+          single: [
+            {
+              data: { id: 'identity-1', agent_id: 'lumen', name: 'Lumen', backend: 'codex' },
+              error: null,
+            },
+          ],
+        },
       ],
       artifact_comments: [
         {
-          single: [{
-            data: {
-              id: 'comment-1',
-              artifact_id: 'artifact-1',
-              parent_comment_id: null,
-              content: 'Adding a review comment',
-              metadata: {},
-              created_by_agent_id: 'lumen',
-              created_by_identity_id: 'identity-1',
-              created_at: '2026-02-11T00:00:00Z',
-              updated_at: '2026-02-11T00:00:00Z',
+          single: [
+            {
+              data: {
+                id: 'comment-1',
+                artifact_id: 'artifact-1',
+                parent_comment_id: null,
+                content: 'Adding a review comment',
+                metadata: {},
+                created_by_agent_id: 'lumen',
+                created_by_identity_id: 'identity-1',
+                created_at: '2026-02-11T00:00:00Z',
+                updated_at: '2026-02-11T00:00:00Z',
+              },
+              error: null,
             },
-            error: null,
-          }],
+          ],
         },
       ],
     });
@@ -178,7 +183,9 @@ describe('admin artifact comments routes', () => {
     expect(payload.comment.createdByIdentityId).toBe('identity-1');
     expect(payload.comment.createdByIdentity.agentId).toBe('lumen');
 
-    const commentsBuilder = currentSupabaseMock.calls.find((c) => c.table === 'artifact_comments')?.builder;
+    const commentsBuilder = currentSupabaseMock.calls.find(
+      (c) => c.table === 'artifact_comments'
+    )?.builder;
     expect(commentsBuilder).toBeDefined();
     expect((commentsBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
       created_by_agent_id: 'lumen',

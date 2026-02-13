@@ -44,10 +44,7 @@ export class TasksRepository extends BaseRepository {
 
   async list(userId: string, options?: ListTasksOptions): Promise<Task[]> {
     try {
-      let query = this.client
-        .from('tasks')
-        .select('*')
-        .eq('user_id', userId);
+      let query = this.client.from('tasks').select('*').eq('user_id', userId);
 
       if (options?.status) {
         query = query.eq('status', options.status);
@@ -68,10 +65,7 @@ export class TasksRepository extends BaseRepository {
       }
 
       if (options?.offset) {
-        query = query.range(
-          options.offset,
-          options.offset + (options.limit || 20) - 1
-        );
+        query = query.range(options.offset, options.offset + (options.limit || 20) - 1);
       }
 
       const { data, error } = await query;
@@ -110,11 +104,7 @@ export class TasksRepository extends BaseRepository {
     }
   }
 
-  async updateStatus(
-    id: string,
-    userId: string,
-    status: string
-  ): Promise<Task> {
+  async updateStatus(id: string, userId: string, status: string): Promise<Task> {
     try {
       const updateData: Record<string, unknown> = { status };
 
@@ -140,11 +130,7 @@ export class TasksRepository extends BaseRepository {
 
   async delete(id: string, userId: string): Promise<void> {
     try {
-      const { error } = await this.client
-        .from('tasks')
-        .delete()
-        .eq('id', id)
-        .eq('user_id', userId);
+      const { error } = await this.client.from('tasks').delete().eq('id', id).eq('user_id', userId);
 
       if (error) throw error;
     } catch (error) {

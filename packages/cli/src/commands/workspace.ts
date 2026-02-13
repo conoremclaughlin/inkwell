@@ -18,7 +18,15 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
 import { execSync } from 'child_process';
-import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, renameSync, cpSync } from 'fs';
+import {
+  existsSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  cpSync,
+} from 'fs';
 import { join, dirname, basename } from 'path';
 import { homedir } from 'os';
 
@@ -197,8 +205,8 @@ async function runInteractiveFlow(agentId: string, gitRoot: string): Promise<Int
   });
 
   // Step 3: Config directories to copy
-  const candidateDirs = ['.claude', '.codex', '.gemini'].filter(
-    (dir) => existsSync(join(gitRoot, dir)),
+  const candidateDirs = ['.claude', '.codex', '.gemini'].filter((dir) =>
+    existsSync(join(gitRoot, dir))
   );
 
   let configDirs: string[] = [];
@@ -279,7 +287,10 @@ function planInit(gitRoot: string, parentName: string): InitResult {
   return { parentDir, moves };
 }
 
-async function initWorkspace(parentName: string | undefined, options: { dryRun?: boolean }): Promise<void> {
+async function initWorkspace(
+  parentName: string | undefined,
+  options: { dryRun?: boolean }
+): Promise<void> {
   if (!parentName) {
     console.error(chalk.red('Error: Parent directory name is required.'));
     console.error(chalk.dim('Usage: sb studio init <parent-name>'));
@@ -376,8 +387,14 @@ async function initWorkspace(parentName: string | undefined, options: { dryRun?:
 
 async function createWorkspace(
   name: string,
-  options: { agent?: string; purpose?: string; branch?: string; copyConfig?: boolean; configDirs?: string },
-  overrides?: { branch?: string; configDirsList?: string[] },
+  options: {
+    agent?: string;
+    purpose?: string;
+    branch?: string;
+    copyConfig?: boolean;
+    configDirs?: string;
+  },
+  overrides?: { branch?: string; configDirsList?: string[] }
 ): Promise<void> {
   const agentId = options.agent || 'wren';
   const spinner = ora(`Creating workspace: ${name}`).start();
@@ -401,8 +418,9 @@ async function createWorkspace(
     }
 
     // Determine which config dirs to copy
-    const configDirsList = overrides?.configDirsList
-      ?? (options.copyConfig ? (options.configDirs || '.claude').split(',').map(s => s.trim()) : []);
+    const configDirsList =
+      overrides?.configDirsList ??
+      (options.copyConfig ? (options.configDirs || '.claude').split(',').map((s) => s.trim()) : []);
 
     if (configDirsList.length > 0) {
       spinner.text = 'Copying config directories...';
@@ -623,7 +641,15 @@ function cdCommand(name: string): void {
 // ============================================================================
 
 // Exported for testing
-export { findGitRoot, getWorkspaceParent, getWorkspacePrefix, getWorkspacePath, getWorktreePaths, planInit, git };
+export {
+  findGitRoot,
+  getWorkspaceParent,
+  getWorkspacePrefix,
+  getWorkspacePath,
+  getWorktreePaths,
+  planInit,
+  git,
+};
 export type { InitResult };
 
 export function registerWorkspaceCommands(program: Command): void {
@@ -643,7 +669,11 @@ export function registerWorkspaceCommands(program: Command): void {
     .option('-p, --purpose <desc>', 'Description/purpose of the workspace')
     .option('-b, --branch <branch>', 'Custom branch name (default: <agentId>/workspace/<name>)')
     .option('--copy-config', 'Copy config directories into the new workspace')
-    .option('--config-dirs <dirs>', 'Comma-separated config dirs to copy (default: .claude)', '.claude')
+    .option(
+      '--config-dirs <dirs>',
+      'Comma-separated config dirs to copy (default: .claude)',
+      '.claude'
+    )
     .action(async (name: string | undefined, options) => {
       if (!name && process.stdin.isTTY) {
         // Interactive mode: prompt for all values
@@ -663,10 +693,7 @@ export function registerWorkspaceCommands(program: Command): void {
       return createWorkspace(resolvedName, options);
     });
 
-  ws.command('list')
-    .alias('ls')
-    .description('List all workspaces')
-    .action(listCommand);
+  ws.command('list').alias('ls').description('List all workspaces').action(listCommand);
 
   ws.command('remove <name>')
     .alias('rm')
@@ -682,9 +709,7 @@ export function registerWorkspaceCommands(program: Command): void {
     .description('Show git status of all workspaces')
     .action(statusCommand);
 
-  ws.command('path <name>')
-    .description('Output workspace path')
-    .action(pathCommand);
+  ws.command('path <name>').description('Output workspace path').action(pathCommand);
 
   ws.command('cd <name>')
     .description('Output cd command (use with: eval $(sb studio cd <name>))')

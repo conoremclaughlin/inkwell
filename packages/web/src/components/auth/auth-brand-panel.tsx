@@ -25,7 +25,8 @@ export function AuthBrandPanel() {
         <div>
           <h1 className="text-3xl font-bold text-white tracking-tight">Personal Context</h1>
           <p className="mt-3 text-lg text-indigo-200/80 max-w-sm leading-relaxed">
-            Your AI beings remember what matters to you — across every conversation, every interface.
+            Your AI beings remember what matters to you — across every conversation, every
+            interface.
           </p>
         </div>
 

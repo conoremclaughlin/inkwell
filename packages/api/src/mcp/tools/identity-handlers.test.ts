@@ -227,7 +227,8 @@ describe('Identity Handlers', () => {
           mockDataComposer as never
         );
 
-        const upsertCall = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock.calls[0];
+        const upsertCall = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock
+          .calls[0];
         const upsertData = upsertCall[0];
 
         expect(upsertData.soul).toBe(existingRecord.soul);
@@ -262,7 +263,8 @@ describe('Identity Handlers', () => {
           mockDataComposer as never
         );
 
-        const upsertData = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock.calls[0][0];
+        const upsertData = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock
+          .calls[0][0];
 
         expect(upsertData.soul).toBe(newSoul);
         expect(upsertData.heartbeat).toBe(existingRecord.heartbeat);
@@ -291,7 +293,8 @@ describe('Identity Handlers', () => {
           mockDataComposer as never
         );
 
-        const upsertData = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock.calls[0][0];
+        const upsertData = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock
+          .calls[0][0];
 
         expect(upsertData.heartbeat).toBe(newHeartbeat);
         expect(upsertData.soul).toBe(existingRecord.soul);
@@ -317,7 +320,8 @@ describe('Identity Handlers', () => {
           mockDataComposer as never
         );
 
-        const upsertData = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock.calls[0][0];
+        const upsertData = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock
+          .calls[0][0];
 
         expect(upsertData.soul).toBeNull();
         expect(upsertData.heartbeat).toBeNull();
@@ -344,7 +348,8 @@ describe('Identity Handlers', () => {
           mockDataComposer as never
         );
 
-        const upsertData = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock.calls[0][0];
+        const upsertData = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock
+          .calls[0][0];
 
         expect(upsertData.name).toBe('Myra Updated');
         expect(upsertData.soul).toBe(existingRecord.soul);
@@ -472,10 +477,7 @@ describe('Identity Handlers', () => {
 
       mockSupabase._setArrayData(mockIdentities);
 
-      const result = await handleListIdentities(
-        { userId: 'user-123' },
-        mockDataComposer as never
-      );
+      const result = await handleListIdentities({ userId: 'user-123' }, mockDataComposer as never);
 
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.success).toBe(true);
@@ -523,10 +525,7 @@ describe('Identity Handlers', () => {
 
       mockSupabase._setArrayData(mockIdentities);
 
-      const result = await handleListIdentities(
-        { userId: 'user-123' },
-        mockDataComposer as never
-      );
+      const result = await handleListIdentities({ userId: 'user-123' }, mockDataComposer as never);
 
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.success).toBe(true);
@@ -544,10 +543,7 @@ describe('Identity Handlers', () => {
     it('should return empty list when no identities exist', async () => {
       mockSupabase._setArrayData([]);
 
-      const result = await handleListIdentities(
-        { userId: 'user-123' },
-        mockDataComposer as never
-      );
+      const result = await handleListIdentities({ userId: 'user-123' }, mockDataComposer as never);
 
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.success).toBe(true);

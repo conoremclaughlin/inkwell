@@ -32,12 +32,12 @@ export class SessionFocusRepository extends BaseRepository {
     super(client);
   }
 
-  async findByUserAndSession(userId: string, sessionId?: string | null): Promise<SessionFocus | null> {
+  async findByUserAndSession(
+    userId: string,
+    sessionId?: string | null
+  ): Promise<SessionFocus | null> {
     try {
-      let query = this.client
-        .from('session_focus')
-        .select('*')
-        .eq('user_id', userId);
+      let query = this.client.from('session_focus').select('*').eq('user_id', userId);
 
       if (sessionId) {
         query = query.eq('session_id', sessionId);
@@ -106,10 +106,7 @@ export class SessionFocusRepository extends BaseRepository {
 
   async delete(userId: string, sessionId?: string | null): Promise<void> {
     try {
-      let query = this.client
-        .from('session_focus')
-        .delete()
-        .eq('user_id', userId);
+      let query = this.client.from('session_focus').delete().eq('user_id', userId);
 
       if (sessionId) {
         query = query.eq('session_id', sessionId);

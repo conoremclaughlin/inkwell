@@ -7,7 +7,15 @@
 // ─── Channel Types ───
 
 // Keep aligned with src/agent/types.ts ChannelType
-export type ChannelType = 'telegram' | 'terminal' | 'discord' | 'whatsapp' | 'http' | 'api' | 'agent' | 'web';
+export type ChannelType =
+  | 'telegram'
+  | 'terminal'
+  | 'discord'
+  | 'whatsapp'
+  | 'http'
+  | 'api'
+  | 'agent'
+  | 'web';
 
 export type ChatType = 'direct' | 'group' | 'supergroup' | 'channel';
 
@@ -320,11 +328,7 @@ export interface IContextBuilder {
    * Build the full injected context for an agent message.
    * Queries DB for identity, memories, projects, etc.
    */
-  buildContext(
-    userId: string,
-    agentId: string,
-    session: Session
-  ): Promise<InjectedContext>;
+  buildContext(userId: string, agentId: string, session: Session): Promise<InjectedContext>;
 
   /**
    * Build minimal context for a resumed session.
@@ -339,10 +343,7 @@ export interface IContextBuilder {
    * Resolve the preferred runtime backend for an agent identity.
    * Returns raw backend string from DB (e.g. "claude", "codex", "gemini").
    */
-  getAgentBackend(
-    userId: string,
-    agentId: string
-  ): Promise<string | null>;
+  getAgentBackend(userId: string, agentId: string): Promise<string | null>;
 }
 
 // ─── Claude Runner Interface ───

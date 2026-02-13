@@ -3,13 +3,7 @@
  * These types are designed to be compatible with clawdbot's message context format
  */
 
-export type ChannelPlatform =
-  | 'telegram'
-  | 'whatsapp'
-  | 'discord'
-  | 'slack'
-  | 'signal'
-  | 'imessage';
+export type ChannelPlatform = 'telegram' | 'whatsapp' | 'discord' | 'slack' | 'signal' | 'imessage';
 
 export type ChatType = 'direct' | 'group' | 'channel';
 
@@ -61,7 +55,7 @@ export interface InboundMessage {
 
   // Mentions (for group chat @mention detection)
   mentions?: {
-    users: string[];      // @usernames mentioned
+    users: string[]; // @usernames mentioned
     botMentioned: boolean; // Was the bot specifically @mentioned?
   };
 

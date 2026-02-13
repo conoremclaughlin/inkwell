@@ -33,7 +33,11 @@ interface TelegramApiResponse<T> {
   description?: string;
 }
 
-async function telegramApi<T>(token: string, method: string, params?: Record<string, unknown>): Promise<T> {
+async function telegramApi<T>(
+  token: string,
+  method: string,
+  params?: Record<string, unknown>
+): Promise<T> {
   const url = `${TELEGRAM_API}/bot${token}/${method}`;
   const response = await fetch(url, {
     method: 'POST',
@@ -41,7 +45,7 @@ async function telegramApi<T>(token: string, method: string, params?: Record<str
     body: params ? JSON.stringify(params) : undefined,
   });
 
-  const data = await response.json() as TelegramApiResponse<T>;
+  const data = (await response.json()) as TelegramApiResponse<T>;
   if (!data.ok) {
     throw new Error(`Telegram API error: ${data.description}`);
   }
@@ -103,7 +107,6 @@ async function main() {
 
       console.log(`✅ Message sent! Message ID: ${result.message_id}`);
     }
-
   } catch (error) {
     console.error('Error:', error);
     process.exit(1);

@@ -94,11 +94,14 @@ describe('MediaGroupBuffer', () => {
 
   it('combines three photos from an album', async () => {
     for (let i = 0; i < 3; i++) {
-      buffer.add('group-1', makeMessage({
-        messageId: `msg-${i}`,
-        timestamp: 1000 + i * 100,
-        media: [{ type: 'image', path: `/tmp/photo${i}.jpg` }],
-      }));
+      buffer.add(
+        'group-1',
+        makeMessage({
+          messageId: `msg-${i}`,
+          timestamp: 1000 + i * 100,
+          media: [{ type: 'image', path: `/tmp/photo${i}.jpg` }],
+        })
+      );
     }
 
     await vi.advanceTimersByTimeAsync(500);
@@ -194,10 +197,13 @@ describe('MediaGroupBuffer', () => {
 
   it('generates correct plural forms', async () => {
     for (let i = 0; i < 3; i++) {
-      buffer.add('group-1', makeMessage({
-        body: '[Video attached]',
-        media: [{ type: 'video', path: `/tmp/video${i}.mp4` }],
-      }));
+      buffer.add(
+        'group-1',
+        makeMessage({
+          body: '[Video attached]',
+          media: [{ type: 'video', path: `/tmp/video${i}.mp4` }],
+        })
+      );
     }
 
     await vi.advanceTimersByTimeAsync(500);

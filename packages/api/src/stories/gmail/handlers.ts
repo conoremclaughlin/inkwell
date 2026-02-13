@@ -14,18 +14,9 @@ import type { DataComposer } from '../../data/composer';
 const userIdentifierBaseSchema = z.object({
   userId: z.string().uuid().optional().describe('User UUID (if known)'),
   email: z.string().email().optional().describe('User email address'),
-  phone: z
-    .string()
-    .optional()
-    .describe('Phone number in E.164 format (e.g., +14155551234)'),
-  platform: z
-    .enum(['telegram', 'whatsapp', 'discord'])
-    .optional()
-    .describe('Platform name'),
-  platformId: z
-    .string()
-    .optional()
-    .describe('Platform-specific user ID or username'),
+  phone: z.string().optional().describe('Phone number in E.164 format (e.g., +14155551234)'),
+  platform: z.enum(['telegram', 'whatsapp', 'discord']).optional().describe('Platform name'),
+  platformId: z.string().optional().describe('Platform-specific user ID or username'),
 });
 
 // Tool result type
@@ -156,10 +147,7 @@ export const listEmailsSchema = userIdentifierBaseSchema.extend({
     .array(z.string())
     .optional()
     .describe('Filter by label IDs (e.g., ["INBOX", "UNREAD"])'),
-  pageToken: z
-    .string()
-    .optional()
-    .describe('Page token for pagination'),
+  pageToken: z.string().optional().describe('Page token for pagination'),
 });
 
 export const getEmailSchema = userIdentifierBaseSchema.extend({
@@ -177,7 +165,11 @@ export const sendEmailSchema = userIdentifierBaseSchema.extend({
   bcc: z.array(z.string().email()).optional().describe('BCC recipients'),
   subject: z.string().describe('Email subject line'),
   body: z.string().describe('Email body content'),
-  isHtml: z.boolean().optional().default(false).describe('Whether body is HTML (default: plain text)'),
+  isHtml: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe('Whether body is HTML (default: plain text)'),
 });
 
 export const replyToEmailSchema = userIdentifierBaseSchema.extend({
@@ -200,11 +192,7 @@ export const draftEmailSchema = userIdentifierBaseSchema.extend({
 export const listLabelsSchema = userIdentifierBaseSchema.extend({});
 
 export const modifyEmailsSchema = userIdentifierBaseSchema.extend({
-  messageIds: z
-    .array(z.string())
-    .min(1)
-    .max(100)
-    .describe('Email message IDs to modify (max 100)'),
+  messageIds: z.array(z.string()).min(1).max(100).describe('Email message IDs to modify (max 100)'),
   addLabelIds: z
     .array(z.string())
     .optional()
@@ -258,7 +246,7 @@ export async function handleListEmails(
                 searchQuery: params.query,
                 labelIds: params.labelIds,
               },
-              emails: result.emails.map(e => ({
+              emails: result.emails.map((e) => ({
                 id: e.id,
                 threadId: e.threadId,
                 subject: e.subject,
@@ -292,12 +280,11 @@ export async function handleListEmails(
             {
               success: false,
               error: message,
-              hint:
-                message.includes('No active google account')
-                  ? 'User needs to connect their Google account in the web dashboard'
-                  : message.includes('gmail')
-                    ? 'User needs to re-authorize Google with Gmail permissions'
-                    : undefined,
+              hint: message.includes('No active google account')
+                ? 'User needs to connect their Google account in the web dashboard'
+                : message.includes('gmail')
+                  ? 'User needs to re-authorize Google with Gmail permissions'
+                  : undefined,
             },
             null,
             2
@@ -442,10 +429,9 @@ export async function handleSendEmail(
             {
               success: false,
               error: message,
-              hint:
-                message.includes('gmail.send')
-                  ? 'User needs to re-authorize Google with Gmail send permissions'
-                  : undefined,
+              hint: message.includes('gmail.send')
+                ? 'User needs to re-authorize Google with Gmail send permissions'
+                : undefined,
             },
             null,
             2
@@ -799,10 +785,9 @@ export async function handleModifyEmails(
             {
               success: false,
               error: message,
-              hint:
-                message.includes('gmail.modify')
-                  ? 'User needs to re-authorize Google with Gmail modify permissions'
-                  : undefined,
+              hint: message.includes('gmail.modify')
+                ? 'User needs to re-authorize Google with Gmail modify permissions'
+                : undefined,
             },
             null,
             2

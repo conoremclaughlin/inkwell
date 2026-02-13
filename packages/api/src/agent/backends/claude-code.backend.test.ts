@@ -314,14 +314,18 @@ describe('Session Continuity', () => {
     });
 
     // Simulate Claude Code emitting system message with session_id
-    mockProcess.stdout.emit('data', Buffer.from(
-      '{"type":"system","subtype":"init","session_id":"sess-abc123"}\n'
-    ));
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from('{"type":"system","subtype":"init","session_id":"sess-abc123"}\n')
+    );
 
     // Emit result and close
-    mockProcess.stdout.emit('data', Buffer.from(
-      '{"type":"result","result":"Hi there","usage":{"input_tokens":100,"output_tokens":50}}\n'
-    ));
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        '{"type":"result","result":"Hi there","usage":{"input_tokens":100,"output_tokens":50}}\n'
+      )
+    );
     mockProcess.emit('close', 0);
     await messagePromise;
 
@@ -339,13 +343,20 @@ describe('Session Continuity', () => {
 
     // First message
     const msg1 = backend.sendMessage({
-      id: 'msg-1', channel: 'telegram', conversationId: 'c1',
-      sender: { id: 'u1' }, content: 'Hello', timestamp: new Date(),
+      id: 'msg-1',
+      channel: 'telegram',
+      conversationId: 'c1',
+      sender: { id: 'u1' },
+      content: 'Hello',
+      timestamp: new Date(),
     });
-    mockProcess.stdout.emit('data', Buffer.from(
-      '{"type":"system","session_id":"s1"}\n' +
-      '{"type":"result","result":"Hi","usage":{"input_tokens":1000,"output_tokens":500}}\n'
-    ));
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        '{"type":"system","session_id":"s1"}\n' +
+          '{"type":"result","result":"Hi","usage":{"input_tokens":1000,"output_tokens":500}}\n'
+      )
+    );
     mockProcess.emit('close', 0);
     await msg1;
 
@@ -356,23 +367,32 @@ describe('Session Continuity', () => {
     expect(usageEvents[0].cumulativeOutputTokens).toBe(500);
 
     // Second message — contextTokens reflects THIS turn, cumulative grows
-    (spawn as Mock).mockReturnValue(Object.assign(new EventEmitter(), {
-      stdout: new EventEmitter(),
-      stderr: new EventEmitter(),
-      stdin: { write: vi.fn(), end: vi.fn() },
-      kill: vi.fn(),
-    }));
+    (spawn as Mock).mockReturnValue(
+      Object.assign(new EventEmitter(), {
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        stdin: { write: vi.fn(), end: vi.fn() },
+        kill: vi.fn(),
+      })
+    );
 
     const msg2 = backend.sendMessage({
-      id: 'msg-2', channel: 'telegram', conversationId: 'c1',
-      sender: { id: 'u1' }, content: 'More', timestamp: new Date(),
+      id: 'msg-2',
+      channel: 'telegram',
+      conversationId: 'c1',
+      sender: { id: 'u1' },
+      content: 'More',
+      timestamp: new Date(),
     });
 
     const proc2 = (spawn as Mock).mock.results[(spawn as Mock).mock.results.length - 1].value;
-    proc2.stdout.emit('data', Buffer.from(
-      '{"type":"system","session_id":"s1"}\n' +
-      '{"type":"result","result":"Reply","usage":{"input_tokens":2000,"output_tokens":800}}\n'
-    ));
+    proc2.stdout.emit(
+      'data',
+      Buffer.from(
+        '{"type":"system","session_id":"s1"}\n' +
+          '{"type":"result","result":"Reply","usage":{"input_tokens":2000,"output_tokens":800}}\n'
+      )
+    );
     proc2.emit('close', 0);
     await msg2;
 
@@ -390,13 +410,20 @@ describe('Session Continuity', () => {
     await backend.initialize();
 
     const msg = backend.sendMessage({
-      id: 'msg-1', channel: 'telegram', conversationId: 'c1',
-      sender: { id: 'u1' }, content: 'Hello', timestamp: new Date(),
+      id: 'msg-1',
+      channel: 'telegram',
+      conversationId: 'c1',
+      sender: { id: 'u1' },
+      content: 'Hello',
+      timestamp: new Date(),
     });
-    mockProcess.stdout.emit('data', Buffer.from(
-      '{"type":"system","session_id":"s1"}\n' +
-      '{"type":"result","result":"Hi","usage":{"input_tokens":5000,"output_tokens":2000}}\n'
-    ));
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        '{"type":"system","session_id":"s1"}\n' +
+          '{"type":"result","result":"Hi","usage":{"input_tokens":5000,"output_tokens":2000}}\n'
+      )
+    );
     mockProcess.emit('close', 0);
     await msg;
 
@@ -413,13 +440,20 @@ describe('Session Continuity', () => {
 
     // Send a message to establish session and tokens
     const msg = backend.sendMessage({
-      id: 'msg-1', channel: 'telegram', conversationId: 'c1',
-      sender: { id: 'u1' }, content: 'Hello', timestamp: new Date(),
+      id: 'msg-1',
+      channel: 'telegram',
+      conversationId: 'c1',
+      sender: { id: 'u1' },
+      content: 'Hello',
+      timestamp: new Date(),
     });
-    mockProcess.stdout.emit('data', Buffer.from(
-      '{"type":"system","session_id":"sess-xyz"}\n' +
-      '{"type":"result","result":"Hi","usage":{"input_tokens":1000,"output_tokens":500}}\n'
-    ));
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        '{"type":"system","session_id":"sess-xyz"}\n' +
+          '{"type":"result","result":"Hi","usage":{"input_tokens":1000,"output_tokens":500}}\n'
+      )
+    );
     mockProcess.emit('close', 0);
     await msg;
 
@@ -441,16 +475,18 @@ describe('Session Continuity', () => {
     await backend.initialize();
 
     const msg = backend.sendMessage({
-      id: 'msg-1', channel: 'telegram', conversationId: 'c1',
-      sender: { id: 'u1' }, content: 'Hello', timestamp: new Date(),
+      id: 'msg-1',
+      channel: 'telegram',
+      conversationId: 'c1',
+      sender: { id: 'u1' },
+      content: 'Hello',
+      timestamp: new Date(),
     });
 
     // Before close, pending message should exist
     expect(backend.getPendingMessage()).not.toBeNull();
 
-    mockProcess.stdout.emit('data', Buffer.from(
-      '{"type":"result","result":"Hi"}\n'
-    ));
+    mockProcess.stdout.emit('data', Buffer.from('{"type":"result","result":"Hi"}\n'));
     mockProcess.emit('close', 0);
     await msg;
 
@@ -467,8 +503,12 @@ describe('Session Continuity', () => {
     await backend.resumeSession('existing-session-123');
 
     const msg = backend.sendMessage({
-      id: 'msg-1', channel: 'telegram', conversationId: 'c1',
-      sender: { id: 'u1' }, content: 'Continue', timestamp: new Date(),
+      id: 'msg-1',
+      channel: 'telegram',
+      conversationId: 'c1',
+      sender: { id: 'u1' },
+      content: 'Continue',
+      timestamp: new Date(),
     });
 
     // Check spawn was called with --resume flag
@@ -477,10 +517,13 @@ describe('Session Continuity', () => {
     expect(args).toContain('--resume');
     expect(args).toContain('existing-session-123');
 
-    mockProcess.stdout.emit('data', Buffer.from(
-      '{"type":"system","session_id":"existing-session-123"}\n' +
-      '{"type":"result","result":"Resumed"}\n'
-    ));
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        '{"type":"system","session_id":"existing-session-123"}\n' +
+          '{"type":"result","result":"Resumed"}\n'
+      )
+    );
     mockProcess.emit('close', 0);
     await msg;
   });
@@ -495,16 +538,22 @@ describe('Session Continuity', () => {
 
     // Send an internal message (like compaction)
     const msg = backend.sendMessage({
-      id: 'compaction-1', channel: 'agent', conversationId: 'compaction-myra',
-      sender: { id: 'system', name: 'System' }, content: 'Compact session',
+      id: 'compaction-1',
+      channel: 'agent',
+      conversationId: 'compaction-myra',
+      sender: { id: 'system', name: 'System' },
+      content: 'Compact session',
       timestamp: new Date(),
       metadata: { isInternal: true, isCompaction: true },
     });
 
-    mockProcess.stdout.emit('data', Buffer.from(
-      '{"type":"system","session_id":"s1"}\n' +
-      '{"type":"result","result":"Compaction complete","usage":{"input_tokens":500,"output_tokens":200}}\n'
-    ));
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        '{"type":"system","session_id":"s1"}\n' +
+          '{"type":"result","result":"Compaction complete","usage":{"input_tokens":500,"output_tokens":200}}\n'
+      )
+    );
     mockProcess.emit('close', 0);
     await msg;
 
@@ -517,20 +566,31 @@ describe('Session Continuity', () => {
     const backend = new ClaudeCodeBackend({ type: 'claude-code' });
     await backend.initialize();
 
-    const toolCalls: Array<{ toolUseId: string; toolName: string; input: Record<string, unknown> }> = [];
+    const toolCalls: Array<{
+      toolUseId: string;
+      toolName: string;
+      input: Record<string, unknown>;
+    }> = [];
     backend.on('tool:call', (data) => toolCalls.push(data));
 
     const msg = backend.sendMessage({
-      id: 'msg-1', channel: 'telegram', conversationId: 'c1',
-      sender: { id: 'u1' }, content: 'Check my emails', timestamp: new Date(),
+      id: 'msg-1',
+      channel: 'telegram',
+      conversationId: 'c1',
+      sender: { id: 'u1' },
+      content: 'Check my emails',
+      timestamp: new Date(),
     });
 
     // Emit assistant message with text + tool_use
-    mockProcess.stdout.emit('data', Buffer.from(
-      '{"type":"system","session_id":"s1"}\n' +
-      '{"type":"assistant","message":{"content":[{"type":"text","text":"Let me check."},{"type":"tool_use","id":"toolu_01ABC","name":"mcp__pcp__list_emails","input":{"userId":"user-456","maxResults":5}}]}}\n' +
-      '{"type":"result","result":"","usage":{"input_tokens":1000,"output_tokens":200}}\n'
-    ));
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        '{"type":"system","session_id":"s1"}\n' +
+          '{"type":"assistant","message":{"content":[{"type":"text","text":"Let me check."},{"type":"tool_use","id":"toolu_01ABC","name":"mcp__pcp__list_emails","input":{"userId":"user-456","maxResults":5}}]}}\n' +
+          '{"type":"result","result":"","usage":{"input_tokens":1000,"output_tokens":200}}\n'
+      )
+    );
     mockProcess.emit('close', 0);
     await msg;
 
@@ -551,16 +611,23 @@ describe('Session Continuity', () => {
     backend.on('tool:result', (data) => toolResults.push(data));
 
     const msg = backend.sendMessage({
-      id: 'msg-1', channel: 'telegram', conversationId: 'c1',
-      sender: { id: 'u1' }, content: 'Check emails', timestamp: new Date(),
+      id: 'msg-1',
+      channel: 'telegram',
+      conversationId: 'c1',
+      sender: { id: 'u1' },
+      content: 'Check emails',
+      timestamp: new Date(),
     });
 
     // Emit user message with tool_result (string content)
-    mockProcess.stdout.emit('data', Buffer.from(
-      '{"type":"system","session_id":"s1"}\n' +
-      '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01ABC","content":"{\\"emails\\":[],\\"count\\":0}"}]}}\n' +
-      '{"type":"result","result":"","usage":{"input_tokens":1000,"output_tokens":200}}\n'
-    ));
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        '{"type":"system","session_id":"s1"}\n' +
+          '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01ABC","content":"{\\"emails\\":[],\\"count\\":0}"}]}}\n' +
+          '{"type":"result","result":"","usage":{"input_tokens":1000,"output_tokens":200}}\n'
+      )
+    );
     mockProcess.emit('close', 0);
     await msg;
 
@@ -580,8 +647,12 @@ describe('Session Continuity', () => {
     backend.on('tool:result', (data) => toolResults.push(data));
 
     const msg = backend.sendMessage({
-      id: 'msg-1', channel: 'telegram', conversationId: 'c1',
-      sender: { id: 'u1' }, content: 'Test', timestamp: new Date(),
+      id: 'msg-1',
+      channel: 'telegram',
+      conversationId: 'c1',
+      sender: { id: 'u1' },
+      content: 'Test',
+      timestamp: new Date(),
     });
 
     // Emit user message with tool_result using array content (alternate format)
@@ -589,11 +660,14 @@ describe('Session Continuity', () => {
       { type: 'text', text: 'Part 1' },
       { type: 'text', text: ' Part 2' },
     ];
-    mockProcess.stdout.emit('data', Buffer.from(
-      `{"type":"system","session_id":"s1"}\n` +
-      `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_02DEF","content":${JSON.stringify(arrayContent)}}]}}\n` +
-      `{"type":"result","result":"","usage":{"input_tokens":1000,"output_tokens":200}}\n`
-    ));
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        `{"type":"system","session_id":"s1"}\n` +
+          `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_02DEF","content":${JSON.stringify(arrayContent)}}]}}\n` +
+          `{"type":"result","result":"","usage":{"input_tokens":1000,"output_tokens":200}}\n`
+      )
+    );
     mockProcess.emit('close', 0);
     await msg;
 
@@ -613,20 +687,27 @@ describe('Session Continuity', () => {
     backend.on('tool:result', (data) => toolResults.push(data));
 
     const msg = backend.sendMessage({
-      id: 'msg-1', channel: 'telegram', conversationId: 'c1',
-      sender: { id: 'u1' }, content: 'Check emails and calendar', timestamp: new Date(),
+      id: 'msg-1',
+      channel: 'telegram',
+      conversationId: 'c1',
+      sender: { id: 'u1' },
+      content: 'Check emails and calendar',
+      timestamp: new Date(),
     });
 
     // Multi-turn tool interaction
-    mockProcess.stdout.emit('data', Buffer.from(
-      '{"type":"system","session_id":"s1"}\n' +
-      // Assistant calls two tools
-      '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_A","name":"list_emails","input":{}},{"type":"tool_use","id":"toolu_B","name":"list_events","input":{}}]}}\n' +
-      // Results come back
-      '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_A","content":"emails"},{"type":"tool_result","tool_use_id":"toolu_B","content":"events"}]}}\n' +
-      // Final result
-      '{"type":"result","result":"Done","usage":{"input_tokens":2000,"output_tokens":400}}\n'
-    ));
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        '{"type":"system","session_id":"s1"}\n' +
+          // Assistant calls two tools
+          '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_A","name":"list_emails","input":{}},{"type":"tool_use","id":"toolu_B","name":"list_events","input":{}}]}}\n' +
+          // Results come back
+          '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_A","content":"emails"},{"type":"tool_result","tool_use_id":"toolu_B","content":"events"}]}}\n' +
+          // Final result
+          '{"type":"result","result":"Done","usage":{"input_tokens":2000,"output_tokens":400}}\n'
+      )
+    );
     mockProcess.emit('close', 0);
     await msg;
 
@@ -644,18 +725,24 @@ describe('Session Continuity', () => {
     await backend.initialize();
 
     const msg = backend.sendMessage({
-      id: 'msg-1', channel: 'telegram', conversationId: 'c1',
-      sender: { id: 'u1' }, content: 'Fresh start', timestamp: new Date(),
+      id: 'msg-1',
+      channel: 'telegram',
+      conversationId: 'c1',
+      sender: { id: 'u1' },
+      content: 'Fresh start',
+      timestamp: new Date(),
     });
 
     const spawnCall = (spawn as Mock).mock.calls[(spawn as Mock).mock.calls.length - 1];
     const args = spawnCall[1] as string[];
     expect(args).not.toContain('--resume');
 
-    mockProcess.stdout.emit('data', Buffer.from(
-      '{"type":"system","session_id":"new-sess"}\n' +
-      '{"type":"result","result":"New"}\n'
-    ));
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        '{"type":"system","session_id":"new-sess"}\n' + '{"type":"result","result":"New"}\n'
+      )
+    );
     mockProcess.emit('close', 0);
     await msg;
   });
@@ -692,16 +779,22 @@ describe('Fallback Auto-Response on Close', () => {
     backend.on('response', (r) => responses.push(r));
 
     const msg = backend.sendMessage({
-      id: 'msg-1', channel: 'telegram', conversationId: 'chat-123',
-      sender: { id: 'u1', name: 'TestUser' }, content: 'Hello',
+      id: 'msg-1',
+      channel: 'telegram',
+      conversationId: 'chat-123',
+      sender: { id: 'u1', name: 'TestUser' },
+      content: 'Hello',
       timestamp: new Date(),
     });
 
     // Simulate assistant text events but NO result event (e.g., Claude Code crashes mid-stream)
-    mockProcess.stdout.emit('data', Buffer.from(
-      '{"type":"system","session_id":"s1"}\n' +
-      '{"type":"assistant","message":{"content":[{"type":"text","text":"Here is my response"}]}}\n'
-    ));
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        '{"type":"system","session_id":"s1"}\n' +
+          '{"type":"assistant","message":{"content":[{"type":"text","text":"Here is my response"}]}}\n'
+      )
+    );
 
     // Process exits without ever emitting a result event
     mockProcess.emit('close', 1);
@@ -723,16 +816,23 @@ describe('Fallback Auto-Response on Close', () => {
     backend.on('response', (r) => responses.push(r));
 
     const msg = backend.sendMessage({
-      id: 'msg-1', channel: 'telegram', conversationId: 'chat-123',
-      sender: { id: 'u1' }, content: 'Hello', timestamp: new Date(),
+      id: 'msg-1',
+      channel: 'telegram',
+      conversationId: 'chat-123',
+      sender: { id: 'u1' },
+      content: 'Hello',
+      timestamp: new Date(),
     });
 
     // Normal flow: assistant text + result event
-    mockProcess.stdout.emit('data', Buffer.from(
-      '{"type":"system","session_id":"s1"}\n' +
-      '{"type":"assistant","message":{"content":[{"type":"text","text":"Response text"}]}}\n' +
-      '{"type":"result","result":"Response text","usage":{"input_tokens":100,"output_tokens":50}}\n'
-    ));
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        '{"type":"system","session_id":"s1"}\n' +
+          '{"type":"assistant","message":{"content":[{"type":"text","text":"Response text"}]}}\n' +
+          '{"type":"result","result":"Response text","usage":{"input_tokens":100,"output_tokens":50}}\n'
+      )
+    );
     mockProcess.emit('close', 0);
     await msg;
 
@@ -749,16 +849,22 @@ describe('Fallback Auto-Response on Close', () => {
     backend.on('response', (r) => responses.push(r));
 
     const msg = backend.sendMessage({
-      id: 'compaction-1', channel: 'agent', conversationId: 'compaction-myra',
-      sender: { id: 'system' }, content: 'Compact session',
+      id: 'compaction-1',
+      channel: 'agent',
+      conversationId: 'compaction-myra',
+      sender: { id: 'system' },
+      content: 'Compact session',
       timestamp: new Date(),
       metadata: { isInternal: true, isCompaction: true },
     });
 
     // Assistant text but no result, and it's an internal message
-    mockProcess.stdout.emit('data', Buffer.from(
-      '{"type":"assistant","message":{"content":[{"type":"text","text":"Compaction done"}]}}\n'
-    ));
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"Compaction done"}]}}\n'
+      )
+    );
     mockProcess.emit('close', 0);
     await msg;
 
@@ -774,13 +880,20 @@ describe('Fallback Auto-Response on Close', () => {
     backend.on('response', (r) => responses.push(r));
 
     const msg = backend.sendMessage({
-      id: 'msg-1', channel: 'telegram', conversationId: 'chat-123',
-      sender: { id: 'u1' }, content: 'Hello', timestamp: new Date(),
+      id: 'msg-1',
+      channel: 'telegram',
+      conversationId: 'chat-123',
+      sender: { id: 'u1' },
+      content: 'Hello',
+      timestamp: new Date(),
     });
 
-    mockProcess.stdout.emit('data', Buffer.from(
-      '{"type":"assistant","message":{"content":[{"type":"text","text":"Response text"}]}}\n'
-    ));
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"Response text"}]}}\n'
+      )
+    );
     mockProcess.emit('close', 1);
     await msg;
 
@@ -796,14 +909,16 @@ describe('Fallback Auto-Response on Close', () => {
     backend.on('response', (r) => responses.push(r));
 
     const msg = backend.sendMessage({
-      id: 'msg-1', channel: 'telegram', conversationId: 'chat-123',
-      sender: { id: 'u1' }, content: 'Hello', timestamp: new Date(),
+      id: 'msg-1',
+      channel: 'telegram',
+      conversationId: 'chat-123',
+      sender: { id: 'u1' },
+      content: 'Hello',
+      timestamp: new Date(),
     });
 
     // Process exits with no assistant text and no result
-    mockProcess.stdout.emit('data', Buffer.from(
-      '{"type":"system","session_id":"s1"}\n'
-    ));
+    mockProcess.stdout.emit('data', Buffer.from('{"type":"system","session_id":"s1"}\n'));
     mockProcess.emit('close', 1);
     await msg;
 
@@ -816,15 +931,22 @@ describe('Fallback Auto-Response on Close', () => {
     await backend.initialize();
 
     const msg = backend.sendMessage({
-      id: 'msg-1', channel: 'telegram', conversationId: 'chat-123',
-      sender: { id: 'u1' }, content: 'Hello', timestamp: new Date(),
+      id: 'msg-1',
+      channel: 'telegram',
+      conversationId: 'chat-123',
+      sender: { id: 'u1' },
+      content: 'Hello',
+      timestamp: new Date(),
     });
 
     expect(backend.getPendingMessage()).not.toBeNull();
 
-    mockProcess.stdout.emit('data', Buffer.from(
-      '{"type":"assistant","message":{"content":[{"type":"text","text":"Fallback text"}]}}\n'
-    ));
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"Fallback text"}]}}\n'
+      )
+    );
     mockProcess.emit('close', 1);
     await msg;
 

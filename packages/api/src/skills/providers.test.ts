@@ -38,7 +38,10 @@ describe('skill providers', () => {
     it('returns deterministic alphabetical ordering of final skills', () => {
       const merged = mergeSkillsByPriority(
         [
-          { source: 'cloud', skills: [makeLoadedSkill('zeta', 'cloud://z'), makeLoadedSkill('alpha', 'cloud://a')] },
+          {
+            source: 'cloud',
+            skills: [makeLoadedSkill('zeta', 'cloud://z'), makeLoadedSkill('alpha', 'cloud://a')],
+          },
         ],
         ['cloud', 'local']
       );

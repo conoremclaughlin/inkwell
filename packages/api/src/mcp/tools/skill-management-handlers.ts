@@ -17,10 +17,12 @@ import type { SkillType, SkillManifest } from '../../skills/types';
 
 function mcpResponse(data: Record<string, unknown>, isError = false) {
   return {
-    content: [{
-      type: 'text' as const,
-      text: JSON.stringify(data, null, 2),
-    }],
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify(data, null, 2),
+      },
+    ],
     ...(isError && { isError: true }),
   };
 }
@@ -86,10 +88,13 @@ export async function handlePublishSkill(
     });
   } catch (error) {
     logger.error('Error in publish_skill:', error);
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to publish skill',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to publish skill',
+      },
+      true
+    );
   }
 }
 
@@ -111,10 +116,7 @@ export const updateSkillSchema = {
   changelog: z.string().optional().describe('What changed in this version'),
 };
 
-export async function handleUpdateSkill(
-  args: Record<string, unknown>,
-  dataComposer: DataComposer
-) {
+export async function handleUpdateSkill(args: Record<string, unknown>, dataComposer: DataComposer) {
   try {
     const resolved = await resolveUser(args as Parameters<typeof resolveUser>[0], dataComposer);
     if (!resolved) {
@@ -155,10 +157,13 @@ export async function handleUpdateSkill(
     });
   } catch (error) {
     logger.error('Error in update_skill:', error);
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to update skill',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to update skill',
+      },
+      true
+    );
   }
 }
 
@@ -176,10 +181,7 @@ export const forkSkillSchema = {
   tags: z.array(z.string()).optional().describe('Custom tags'),
 };
 
-export async function handleForkSkill(
-  args: Record<string, unknown>,
-  dataComposer: DataComposer
-) {
+export async function handleForkSkill(args: Record<string, unknown>, dataComposer: DataComposer) {
   try {
     const resolved = await resolveUser(args as Parameters<typeof resolveUser>[0], dataComposer);
     if (!resolved) {
@@ -213,10 +215,13 @@ export async function handleForkSkill(
     });
   } catch (error) {
     logger.error('Error in fork_skill:', error);
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to fork skill',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to fork skill',
+      },
+      true
+    );
   }
 }
 
@@ -261,10 +266,13 @@ export async function handleDeprecateSkill(
     });
   } catch (error) {
     logger.error('Error in deprecate_skill:', error);
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to deprecate skill',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to deprecate skill',
+      },
+      true
+    );
   }
 }
 
@@ -277,10 +285,7 @@ export const deleteSkillSchema = {
   skillId: z.string().uuid().describe('Skill ID to delete'),
 };
 
-export async function handleDeleteSkill(
-  args: Record<string, unknown>,
-  dataComposer: DataComposer
-) {
+export async function handleDeleteSkill(args: Record<string, unknown>, dataComposer: DataComposer) {
   try {
     const resolved = await resolveUser(args as Parameters<typeof resolveUser>[0], dataComposer);
     if (!resolved) {
@@ -305,9 +310,12 @@ export async function handleDeleteSkill(
     });
   } catch (error) {
     logger.error('Error in delete_skill:', error);
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to delete skill',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to delete skill',
+      },
+      true
+    );
   }
 }

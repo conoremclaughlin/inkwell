@@ -293,7 +293,10 @@ describe('ActivityStreamRepository', () => {
       expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('contact_id', 'contact-789');
       expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('platform', 'telegram');
       expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('is_dm', true);
-      expect(mockSupabase._queryBuilder.in).toHaveBeenCalledWith('type', ['message_in', 'message_out']);
+      expect(mockSupabase._queryBuilder.in).toHaveBeenCalledWith('type', [
+        'message_in',
+        'message_out',
+      ]);
     });
 
     it('should support pagination with limit and offset', async () => {
@@ -502,7 +505,10 @@ describe('ActivityStreamRepository', () => {
 
       expect(result).toHaveLength(1);
       expect(result[0].type).toBe('tool_call');
-      expect(mockSupabase._queryBuilder.in).toHaveBeenCalledWith('type', ['tool_call', 'tool_result']);
+      expect(mockSupabase._queryBuilder.in).toHaveBeenCalledWith('type', [
+        'tool_call',
+        'tool_result',
+      ]);
     });
 
     it('should filter by date range', async () => {
@@ -514,8 +520,14 @@ describe('ActivityStreamRepository', () => {
         until: new Date('2026-02-02T00:00:00Z'),
       });
 
-      expect(mockSupabase._queryBuilder.gte).toHaveBeenCalledWith('created_at', '2026-02-01T00:00:00.000Z');
-      expect(mockSupabase._queryBuilder.lte).toHaveBeenCalledWith('created_at', '2026-02-02T00:00:00.000Z');
+      expect(mockSupabase._queryBuilder.gte).toHaveBeenCalledWith(
+        'created_at',
+        '2026-02-01T00:00:00.000Z'
+      );
+      expect(mockSupabase._queryBuilder.lte).toHaveBeenCalledWith(
+        'created_at',
+        '2026-02-02T00:00:00.000Z'
+      );
     });
 
     it('should support correlation ID filtering', async () => {
@@ -526,7 +538,10 @@ describe('ActivityStreamRepository', () => {
         correlationId: 'research-trail-123',
       });
 
-      expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('correlation_id', 'research-trail-123');
+      expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith(
+        'correlation_id',
+        'research-trail-123'
+      );
     });
   });
 

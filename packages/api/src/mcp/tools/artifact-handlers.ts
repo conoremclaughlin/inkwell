@@ -42,8 +42,18 @@ const createArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
 const getArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
   uri: z.string().optional().describe('URI of the artifact'),
   artifactId: z.string().uuid().optional().describe('ID of the artifact'),
-  includeComments: z.boolean().optional().default(false).describe('Include comments in the response'),
-  commentLimit: z.number().min(1).max(200).optional().default(50).describe('Max comments when includeComments=true'),
+  includeComments: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe('Include comments in the response'),
+  commentLimit: z
+    .number()
+    .min(1)
+    .max(200)
+    .optional()
+    .default(50)
+    .describe('Max comments when includeComments=true'),
 });
 
 const updateArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
@@ -51,7 +61,13 @@ const updateArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
   artifactId: z.string().uuid().optional().describe('ID of the artifact to update'),
   title: z.string().optional().describe('New title'),
   content: z.string().optional().describe('New content'),
-  baseVersion: z.number().int().optional().describe('Version this edit is based on. When provided, enables three-way merge: if the artifact has been modified since this version, the server will attempt to merge changes automatically. Omit for legacy last-write-wins behavior.'),
+  baseVersion: z
+    .number()
+    .int()
+    .optional()
+    .describe(
+      'Version this edit is based on. When provided, enables three-way merge: if the artifact has been modified since this version, the server will attempt to merge changes automatically. Omit for legacy last-write-wins behavior.'
+    ),
   agentId: z.string().optional().describe('Agent making the update'),
   collaborators: z.array(z.string()).optional().describe('Updated collaborator list'),
   tags: z.array(z.string()).optional().describe('Updated tags'),
@@ -77,7 +93,11 @@ const addArtifactCommentSchema = workspaceScopedUserIdentifierSchema.extend({
   artifactId: z.string().uuid().optional().describe('ID of the artifact'),
   content: z.string().min(1).describe('Comment text'),
   agentId: z.string().optional().describe('Agent authoring the comment'),
-  parentCommentId: z.string().uuid().optional().describe('Optional parent comment ID for threading'),
+  parentCommentId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('Optional parent comment ID for threading'),
   metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
 });
 
@@ -112,11 +132,14 @@ async function resolveIdentityForAgent(
   const { data, error } = await query.maybeSingle();
 
   if (error) {
-    logger.warn('Failed to resolve identity UUID for agent slug; continuing with slug-only reference', {
-      userId,
-      agentId,
-      error: error.message,
-    });
+    logger.warn(
+      'Failed to resolve identity UUID for agent slug; continuing with slug-only reference',
+      {
+        userId,
+        agentId,
+        error: error.message,
+      }
+    );
     return null;
   }
 
@@ -157,10 +180,7 @@ function resolveArtifactForUser(
 
 // ============== Handlers ==============
 
-export async function handleCreateArtifact(
-  args: unknown,
-  dataComposer: DataComposer
-) {
+export async function handleCreateArtifact(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
   const parsed = createArtifactSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
@@ -177,7 +197,12 @@ export async function handleCreateArtifact(
     metadata = {},
     workspaceId,
   } = parsed;
-  const authorIdentity = await resolveIdentityForAgent(supabase, resolved.user.id, workspaceId, agentId);
+  const authorIdentity = await resolveIdentityForAgent(
+    supabase,
+    resolved.user.id,
+    workspaceId,
+    agentId
+  );
 
   // Check if URI already exists
   let existingQuery = supabase
@@ -254,16 +279,16 @@ export async function handleCreateArtifact(
   };
 }
 
-export async function handleGetArtifact(
-  args: unknown,
-  dataComposer: DataComposer
-) {
+export async function handleGetArtifact(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
   const parsed = getArtifactSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const { uri, artifactId, includeComments = false, commentLimit = 50, workspaceId } = parsed;
-  const query = resolveArtifactForUser(supabase, resolved.user.id, workspaceId, { uri, artifactId });
+  const query = resolveArtifactForUser(supabase, resolved.user.id, workspaceId, {
+    uri,
+    artifactId,
+  });
 
   const { data: artifact, error } = await query.maybeSingle();
 
@@ -317,7 +342,10 @@ export async function handleGetArtifact(
       new Set((commentRows || []).map((c) => c.created_by_identity_id).filter(Boolean) as string[])
     );
 
-    let identitiesById = new Map<string, { id: string; agent_id: string; name: string; backend: string | null }>();
+    let identitiesById = new Map<
+      string,
+      { id: string; agent_id: string; name: string; backend: string | null }
+    >();
     if (identityIds.length > 0) {
       const { data: identities, error: identitiesError } = await supabase
         .from('agent_identities')
@@ -325,7 +353,9 @@ export async function handleGetArtifact(
         .in('id', identityIds);
 
       if (identitiesError) {
-        throw new Error(`Failed to resolve artifact comment identities: ${identitiesError.message}`);
+        throw new Error(
+          `Failed to resolve artifact comment identities: ${identitiesError.message}`
+        );
       }
 
       identitiesById = new Map((identities || []).map((identity) => [identity.id, identity]));
@@ -333,7 +363,7 @@ export async function handleGetArtifact(
 
     comments = (commentRows || []).map((comment) => {
       const identity = comment.created_by_identity_id
-        ? identitiesById.get(comment.created_by_identity_id) ?? null
+        ? (identitiesById.get(comment.created_by_identity_id) ?? null)
         : null;
       return {
         id: comment.id,
@@ -387,10 +417,7 @@ export async function handleGetArtifact(
   };
 }
 
-export async function handleUpdateArtifact(
-  args: unknown,
-  dataComposer: DataComposer
-) {
+export async function handleUpdateArtifact(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
   const parsed = updateArtifactSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
@@ -407,10 +434,18 @@ export async function handleUpdateArtifact(
     changeSummary,
     workspaceId,
   } = parsed;
-  const editorIdentity = await resolveIdentityForAgent(supabase, resolved.user.id, workspaceId, agentId);
+  const editorIdentity = await resolveIdentityForAgent(
+    supabase,
+    resolved.user.id,
+    workspaceId,
+    agentId
+  );
 
   // First, get the current artifact
-  const query = resolveArtifactForUser(supabase, resolved.user.id, workspaceId, { uri, artifactId });
+  const query = resolveArtifactForUser(supabase, resolved.user.id, workspaceId, {
+    uri,
+    artifactId,
+  });
 
   const { data: current, error: fetchError } = await query.single();
 
@@ -450,7 +485,7 @@ export async function handleUpdateArtifact(
     if (historyError || !baseHistory?.content) {
       throw new Error(
         `Cannot merge: base version ${baseVersion} not found in history. ` +
-        `Current version is ${current.version}. Re-read the artifact and try again.`
+          `Current version is ${current.version}. Re-read the artifact and try again.`
       );
     }
 
@@ -471,7 +506,10 @@ export async function handleUpdateArtifact(
       const regions = diff3MergeRegions(incomingContent, baseContent, currentContent, mergeOptions);
 
       const conflicts = regions
-        .filter((r): r is { conflict: { a: string[]; b: string[]; o: string[] } } => 'conflict' in r && r.conflict !== undefined)
+        .filter(
+          (r): r is { conflict: { a: string[]; b: string[]; o: string[] } } =>
+            'conflict' in r && r.conflict !== undefined
+        )
         .map((r) => ({
           yours: r.conflict.a.join('\n'),
           theirs: r.conflict.b.join('\n'),
@@ -567,7 +605,8 @@ export async function handleUpdateArtifact(
             success: false,
             conflict: true,
             staleWrite: true,
-            message: 'Artifact was modified by another writer during your update. Re-read the artifact and retry your edit with the new baseVersion.',
+            message:
+              'Artifact was modified by another writer during your update. Re-read the artifact and retry your edit with the new baseVersion.',
           }),
         },
       ],
@@ -593,7 +632,12 @@ export async function handleUpdateArtifact(
     change_summary: mergeSummary,
   });
 
-  logger.info('Artifact updated', { uri: current.uri, version: updated.version, agentId, mergePerformed });
+  logger.info('Artifact updated', {
+    uri: current.uri,
+    version: updated.version,
+    agentId,
+    mergePerformed,
+  });
 
   return {
     content: [
@@ -618,10 +662,7 @@ export async function handleUpdateArtifact(
   };
 }
 
-export async function handleListArtifacts(
-  args: unknown,
-  dataComposer: DataComposer
-) {
+export async function handleListArtifacts(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
   const parsed = listArtifactsSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
@@ -678,10 +719,7 @@ export async function handleListArtifacts(
   };
 }
 
-export async function handleGetArtifactHistory(
-  args: unknown,
-  dataComposer: DataComposer
-) {
+export async function handleGetArtifactHistory(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
   const parsed = getArtifactHistorySchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
@@ -703,10 +741,7 @@ export async function handleGetArtifactHistory(
     throw new Error(`Artifact not found: ${uri || artifactId}`);
   }
 
-  let historyQuery = supabase
-    .from('artifact_history')
-    .select('*')
-    .eq('artifact_id', artifact.id);
+  let historyQuery = supabase.from('artifact_history').select('*').eq('artifact_id', artifact.id);
   historyQuery = withWorkspaceFilter(historyQuery, workspaceId);
   const { data: history, error } = await historyQuery
     .order('version', { ascending: false })
@@ -741,10 +776,7 @@ export async function handleGetArtifactHistory(
   };
 }
 
-export async function handleAddArtifactComment(
-  args: unknown,
-  dataComposer: DataComposer
-) {
+export async function handleAddArtifactComment(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
   const parsed = addArtifactCommentSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
@@ -781,7 +813,12 @@ export async function handleAddArtifactComment(
     }
   }
 
-  const authorIdentity = await resolveIdentityForAgent(supabase, resolved.user.id, workspaceId, agentId);
+  const authorIdentity = await resolveIdentityForAgent(
+    supabase,
+    resolved.user.id,
+    workspaceId,
+    agentId
+  );
 
   const { data: created, error: createError } = await supabase
     .from('artifact_comments')
@@ -841,10 +878,7 @@ export async function handleAddArtifactComment(
   };
 }
 
-export async function handleListArtifactComments(
-  args: unknown,
-  dataComposer: DataComposer
-) {
+export async function handleListArtifactComments(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
   const parsed = listArtifactCommentsSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
@@ -881,7 +915,10 @@ export async function handleListArtifactComments(
     new Set((comments || []).map((c) => c.created_by_identity_id).filter(Boolean) as string[])
   );
 
-  let identitiesById = new Map<string, { id: string; agent_id: string; name: string; backend: string | null }>();
+  let identitiesById = new Map<
+    string,
+    { id: string; agent_id: string; name: string; backend: string | null }
+  >();
   if (identityIds.length > 0) {
     let identitiesQuery = supabase
       .from('agent_identities')
@@ -894,9 +931,7 @@ export async function handleListArtifactComments(
       throw new Error(`Failed to resolve comment identities: ${identitiesError.message}`);
     }
 
-    identitiesById = new Map(
-      (identities || []).map((identity) => [identity.id, identity])
-    );
+    identitiesById = new Map((identities || []).map((identity) => [identity.id, identity]));
   }
 
   return {
@@ -910,7 +945,7 @@ export async function handleListArtifactComments(
           count: comments?.length || 0,
           comments: (comments || []).map((comment) => {
             const identity = comment.created_by_identity_id
-              ? identitiesById.get(comment.created_by_identity_id) ?? null
+              ? (identitiesById.get(comment.created_by_identity_id) ?? null)
               : null;
             return {
               id: comment.id,
@@ -950,7 +985,8 @@ export const artifactToolDefinitions = [
   },
   {
     name: 'get_artifact',
-    description: 'Get an artifact by URI or ID. Returns the full content and metadata, with optional comments.',
+    description:
+      'Get an artifact by URI or ID. Returns the full content and metadata, with optional comments.',
     schema: getArtifactSchema,
     handler: handleGetArtifact,
   },
@@ -982,7 +1018,8 @@ export const artifactToolDefinitions = [
   },
   {
     name: 'list_artifact_comments',
-    description: 'List comments for an artifact, including canonical identity UUID author metadata.',
+    description:
+      'List comments for an artifact, including canonical identity UUID author metadata.',
     schema: listArtifactCommentsSchema,
     handler: handleListArtifactComments,
   },

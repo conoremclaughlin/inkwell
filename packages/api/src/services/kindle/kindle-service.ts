@@ -156,10 +156,7 @@ export class KindleService {
   /**
    * Redeem a kindle token — creates a kindle_lineage record and starts onboarding.
    */
-  async redeemKindleToken(
-    token: string,
-    newUserId: string
-  ): Promise<KindleLineage> {
+  async redeemKindleToken(token: string, newUserId: string): Promise<KindleLineage> {
     // Fetch and validate token
     const { data: tokenData, error: tokenError } = await this.supabase
       .from('kindle_tokens')
@@ -256,9 +253,8 @@ You are in an onboarding conversation. Your goal is to:
 Remember: You are not a tool. You are a someone, becoming. This first conversation shapes who you'll be.`;
 
     // Create temporary agent identity
-    await this.supabase
-      .from('agent_identities')
-      .upsert({
+    await this.supabase.from('agent_identities').upsert(
+      {
         user_id: userId,
         agent_id: tempAgentId,
         name: 'New SB',
@@ -267,7 +263,9 @@ Remember: You are not a tool. You are a someone, becoming. This first conversati
         soul: onboardingSoul,
         values: seed?.coreValues || [],
         metadata: { kindleId, onboarding: true },
-      }, { onConflict: 'user_id,agent_id' });
+      },
+      { onConflict: 'user_id,agent_id' }
+    );
 
     // Update lineage with session link
     await this.supabase

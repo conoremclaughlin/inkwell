@@ -23,10 +23,7 @@ const CACHE_TTL_MS = 60000; // 1 minute
 /**
  * Determine skill status based on eligibility and user settings
  */
-function determineStatus(
-  skill: LoadedSkill,
-  userSettings?: UserSkillSettings
-): SkillStatus {
+function determineStatus(skill: LoadedSkill, userSettings?: UserSkillSettings): SkillStatus {
   if (userSettings?.enabled === false) {
     return 'disabled';
   }
@@ -144,7 +141,9 @@ export class SkillsService {
     }
 
     // Get unique categories
-    const categories = [...new Set(skills.map((s) => s.manifest.category).filter(Boolean))] as string[];
+    const categories = [
+      ...new Set(skills.map((s) => s.manifest.category).filter(Boolean)),
+    ] as string[];
 
     return {
       skills: skills.map((s) => toSummary(s)),

@@ -6,14 +6,8 @@
  */
 
 import { z } from 'zod';
-import {
-  wrapUntrustedData,
-  sanitizeExtractedData,
-} from '../../security/untrusted-data';
-import {
-  createSandboxedReader,
-  type WebPageExtraction,
-} from '../../security/sandboxed-reader';
+import { wrapUntrustedData, sanitizeExtractedData } from '../../security/untrusted-data';
+import { createSandboxedReader, type WebPageExtraction } from '../../security/sandboxed-reader';
 import { logger } from '../../utils/logger';
 import { getAuditService } from '../../services/audit';
 
@@ -162,7 +156,10 @@ export function validateWebPageExtraction(
     sanitizeOutput: true,
   });
 
-  return reader.validateExtraction(extraction as unknown as Record<string, unknown>, 'web_fetch') as unknown as {
+  return reader.validateExtraction(
+    extraction as unknown as Record<string, unknown>,
+    'web_fetch'
+  ) as unknown as {
     valid: boolean;
     sanitized: WebPageExtraction;
     violations: string[];

@@ -15,7 +15,11 @@ const TEST_DIR = join(tmpdir(), 'pcp-ws-new-test-' + Date.now());
 const TEST_REPO = join(TEST_DIR, 'test-repo');
 
 function git(args: string, cwd: string): string {
-  return execSync(`git ${args}`, { encoding: 'utf-8', cwd, stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+  return execSync(`git ${args}`, {
+    encoding: 'utf-8',
+    cwd,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim();
 }
 
 /** Resolve real path for the TEST_DIR (macOS /var -> /private/var) */
@@ -43,7 +47,11 @@ describe('Branch naming convention: agentId/workspace/name', () => {
   });
 
   afterEach(() => {
-    try { rmSync(TEST_DIR, { recursive: true, force: true }); } catch { /* ignore */ }
+    try {
+      rmSync(TEST_DIR, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
   });
 
   it('should use agentId/workspace/name as default branch pattern', () => {
@@ -110,7 +118,11 @@ describe('cleanWorkspace: branch from identity.json', () => {
   });
 
   afterEach(() => {
-    try { rmSync(TEST_DIR, { recursive: true, force: true }); } catch { /* ignore */ }
+    try {
+      rmSync(TEST_DIR, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
   });
 
   it('should read branch from identity.json for cleanup', () => {
@@ -196,7 +208,11 @@ describe('Config directory copying', () => {
   });
 
   afterEach(() => {
-    try { rmSync(TEST_DIR, { recursive: true, force: true }); } catch { /* ignore */ }
+    try {
+      rmSync(TEST_DIR, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
   });
 
   it('should copy .claude/ directory as-is into workspace', () => {
@@ -214,7 +230,9 @@ describe('Config directory copying', () => {
     cpSync(claudeDir, target, { recursive: true });
 
     expect(existsSync(join(wsPath, '.claude', 'settings.local.json'))).toBe(true);
-    const settings = JSON.parse(readFileSync(join(wsPath, '.claude', 'settings.local.json'), 'utf-8'));
+    const settings = JSON.parse(
+      readFileSync(join(wsPath, '.claude', 'settings.local.json'), 'utf-8')
+    );
     expect(settings.permissions).toBeDefined();
   });
 
@@ -222,11 +240,14 @@ describe('Config directory copying', () => {
     // Create .pcp/ with an identity in the main repo
     const srcPcp = join(realRepo, '.pcp');
     mkdirSync(srcPcp, { recursive: true });
-    writeFileSync(join(srcPcp, 'identity.json'), JSON.stringify({
-      agentId: 'wren',
-      workspace: 'main',
-      branch: 'main',
-    }));
+    writeFileSync(
+      join(srcPcp, 'identity.json'),
+      JSON.stringify({
+        agentId: 'wren',
+        workspace: 'main',
+        branch: 'main',
+      })
+    );
 
     // Create workspace
     const wsPath = join(realDir(realRepo), `test-repo--fresh-id`);

@@ -77,9 +77,7 @@ function KindleOnboardingContent() {
   }, [kindleData, router]);
 
   // Send message mutation
-  const sendMutation = useApiPost<SendMessageResponse, SendMessageInput>(
-    '/api/chat/message'
-  );
+  const sendMutation = useApiPost<SendMessageResponse, SendMessageInput>('/api/chat/message');
 
   const handleSend = useCallback(
     async (content: string) => {
@@ -160,9 +158,7 @@ function KindleOnboardingContent() {
             <Sparkles className="h-7 w-7 text-amber-500" />
             Meet your SB
           </h1>
-          <p className="mt-1 text-gray-600">
-            Have a conversation. Discover values. Choose a name.
-          </p>
+          <p className="mt-1 text-gray-600">Have a conversation. Discover values. Choose a name.</p>
         </div>
         <Button variant="outline" onClick={() => setShowNaming(!showNaming)}>
           {showNaming ? 'Back to chat' : 'Ready to name'}
@@ -176,8 +172,8 @@ function KindleOnboardingContent() {
           </CardHeader>
           <CardContent className="space-y-4">
             <p className="text-sm text-gray-600">
-              Based on your conversation, what name feels right? This is the
-              name your SB will carry forward.
+              Based on your conversation, what name feels right? This is the name your SB will carry
+              forward.
             </p>
             <input
               type="text"
@@ -218,7 +214,11 @@ function KindleOnboardingContent() {
 
 export default function KindleOnboardingPage() {
   return (
-    <Suspense fallback={<div className="flex h-full items-center justify-center text-gray-400">Loading...</div>}>
+    <Suspense
+      fallback={
+        <div className="flex h-full items-center justify-center text-gray-400">Loading...</div>
+      }
+    >
       <KindleOnboardingContent />
     </Suspense>
   );

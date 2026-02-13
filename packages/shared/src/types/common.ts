@@ -1,6 +1,13 @@
 // Common types
 
-export type Platform = 'telegram' | 'whatsapp' | 'discord' | 'slack' | 'signal' | 'imessage' | 'api';
+export type Platform =
+  | 'telegram'
+  | 'whatsapp'
+  | 'discord'
+  | 'slack'
+  | 'signal'
+  | 'imessage'
+  | 'api';
 
 export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'cancelled';
 

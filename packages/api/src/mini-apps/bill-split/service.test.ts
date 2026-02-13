@@ -36,7 +36,7 @@ const createMockSupabase = () => {
         // Simulate database operations
         if (insertData) {
           const id = `mock-id-${++idCounter}`;
-          const record = { id, ...insertData as object, created_at: new Date().toISOString() };
+          const record = { id, ...(insertData as object), created_at: new Date().toISOString() };
           records.set(id, record);
           return Promise.resolve({ data: record, error: null });
         }
@@ -45,7 +45,7 @@ const createMockSupabase = () => {
           const id = filters['id'] as string;
           if (id && records.has(id)) {
             const existing = records.get(id) as object;
-            const updated = { ...existing, ...updateData as object };
+            const updated = { ...existing, ...(updateData as object) };
             records.set(id, updated);
             return Promise.resolve({ data: updated, error: null });
           }
@@ -264,8 +264,10 @@ describe('Bill Split Scenarios', () => {
 
         for (const contact of contacts) {
           // Check if input is a prefix or has high similarity
-          if (contact.name.toLowerCase().startsWith(lower) ||
-              lower.startsWith(contact.name.toLowerCase().slice(0, 2))) {
+          if (
+            contact.name.toLowerCase().startsWith(lower) ||
+            lower.startsWith(contact.name.toLowerCase().slice(0, 2))
+          ) {
             similar.push(contact.name);
           }
         }
@@ -333,7 +335,7 @@ describe('Edge Cases', () => {
 
   it('should handle unicode names', () => {
     const names = ['Dana', 'Charlie', 'José', 'François', '田中太郎'];
-    names.forEach(name => {
+    names.forEach((name) => {
       expect(name.length).toBeGreaterThan(0);
     });
   });

@@ -16,12 +16,7 @@ import pino from 'pino';
 import type { InboundMessage, ChannelPlatform } from './types';
 import { logger } from '../utils/logger';
 import { getAuthorizationService, type AuthorizationService } from '../services/authorization';
-import {
-  resolveAuthDir,
-  ensureAuthDir,
-  readSelfId,
-  loadAuthState,
-} from './whatsapp-auth';
+import { resolveAuthDir, ensureAuthDir, readSelfId, loadAuthState } from './whatsapp-auth';
 
 // Baileys types - use any since it's an ESM module and type imports are problematic
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -597,10 +592,7 @@ export class WhatsAppListener extends EventEmitter {
   /**
    * Convert WhatsApp message to InboundMessage format
    */
-  private async convertMessage(
-    msg: WAMessage,
-    isGroup: boolean
-  ): Promise<InboundMessage> {
+  private async convertMessage(msg: WAMessage, isGroup: boolean): Promise<InboundMessage> {
     const chatId = msg.key.remoteJid!;
     const senderId = isGroup ? msg.key.participant! : chatId;
     const senderE164 = this.jidToE164(senderId);
@@ -653,9 +645,7 @@ export class WhatsAppListener extends EventEmitter {
       message.replyTo = {
         id: contextInfo.stanzaId || '',
         body: quotedText,
-        sender: contextInfo.participant
-          ? this.jidToE164(contextInfo.participant)
-          : undefined,
+        sender: contextInfo.participant ? this.jidToE164(contextInfo.participant) : undefined,
       };
     }
 

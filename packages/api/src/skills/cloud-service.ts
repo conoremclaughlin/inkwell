@@ -76,7 +76,10 @@ export class CloudSkillsService {
   /**
    * Get detailed information about a skill in the registry
    */
-  async getRegistrySkill(idOrName: string, currentUserId?: string): Promise<RegistrySkillDetail | null> {
+  async getRegistrySkill(
+    idOrName: string,
+    currentUserId?: string
+  ): Promise<RegistrySkillDetail | null> {
     return this.repository.getRegistrySkill(idOrName, currentUserId);
   }
 
@@ -103,7 +106,10 @@ export class CloudSkillsService {
   /**
    * Uninstall a skill
    */
-  async uninstallSkill(skillId: string, userId: string): Promise<{ success: boolean; message: string }> {
+  async uninstallSkill(
+    skillId: string,
+    userId: string
+  ): Promise<{ success: boolean; message: string }> {
     try {
       await this.repository.uninstallSkill(skillId, userId);
       return { success: true, message: 'Skill uninstalled successfully' };
@@ -165,7 +171,10 @@ export class CloudSkillsService {
           const skills = await provider.loadUserSkills(userId);
           return { source: provider.id, skills };
         } catch (error) {
-          logger.error(`Failed to load ${provider.id} skills; continuing with other sources`, error);
+          logger.error(
+            `Failed to load ${provider.id} skills; continuing with other sources`,
+            error
+          );
           return { source: provider.id, skills: [] };
         }
       })
@@ -250,7 +259,9 @@ export class CloudSkillsService {
   /**
    * Publish a new skill to the registry
    */
-  async publishSkill(options: PublishSkillOptions): Promise<{ success: boolean; skillId?: string; message: string }> {
+  async publishSkill(
+    options: PublishSkillOptions
+  ): Promise<{ success: boolean; skillId?: string; message: string }> {
     try {
       const skill = await this.repository.publishSkill(options);
       return {

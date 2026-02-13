@@ -30,13 +30,18 @@ const WORK_TYPE_ABBREV: Record<string, string> = {
 const createWorkspaceSchema = userIdentifierBaseSchema.extend({
   agentId: z.string().describe('Agent ID creating the workspace (e.g., "wren")'),
   repoRoot: z.string().describe('Absolute path to the main repository root'),
-  slug: z.string().describe('Short slug for the workspace (used in branch name and worktree directory)'),
+  slug: z
+    .string()
+    .describe('Short slug for the workspace (used in branch name and worktree directory)'),
   workType: z
     .enum(['feature', 'bugfix', 'refactor', 'chore', 'experiment', 'other'])
     .optional()
     .default('feature')
     .describe('Type of work being done in this workspace'),
-  purpose: z.string().optional().describe('Human-readable description of what this workspace is for'),
+  purpose: z
+    .string()
+    .optional()
+    .describe('Human-readable description of what this workspace is for'),
   baseBranch: z.string().optional().default('main').describe('Branch to base the new worktree on'),
   sessionId: z.string().uuid().optional().describe('Session ID to link to this workspace'),
   skipGitOperations: z
@@ -69,10 +74,7 @@ const getWorkspaceSchema = userIdentifierBaseSchema.extend({
 const updateWorkspaceSchema = userIdentifierBaseSchema.extend({
   workspaceId: z.string().uuid().describe('Workspace UUID to update'),
   agentId: z.string().describe('Agent ID making the update'),
-  status: z
-    .enum(['active', 'idle', 'archived'])
-    .optional()
-    .describe('New workspace status'),
+  status: z.enum(['active', 'idle', 'archived']).optional().describe('New workspace status'),
   purpose: z.string().optional().describe('Updated purpose description'),
   sessionId: z.string().uuid().optional().describe('Session ID to link'),
   unlinkSession: z
@@ -402,7 +404,8 @@ export async function handleCloseWorkspace(args: unknown, dataComposer: DataComp
       });
       cleanupResults.worktreeRemoved = true;
     } catch (worktreeError) {
-      const errorMessage = worktreeError instanceof Error ? worktreeError.message : String(worktreeError);
+      const errorMessage =
+        worktreeError instanceof Error ? worktreeError.message : String(worktreeError);
       logger.warn('Failed to remove worktree (may already be gone)', {
         worktreePath: workspace.worktreePath,
         error: errorMessage,
@@ -516,8 +519,7 @@ export const workspaceToolDefinitions = [
   },
   {
     name: 'get_workspace',
-    description:
-      'Get full details of a workspace by its ID, branch name, or worktree path.',
+    description: 'Get full details of a workspace by its ID, branch name, or worktree path.',
     schema: getWorkspaceSchema,
     handler: handleGetWorkspace,
   },

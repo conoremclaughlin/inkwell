@@ -19,32 +19,59 @@ import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/use
 
 export const awakenSchema = userIdentifierBaseSchema.extend({
   name: z.string().describe('The name you have chosen for yourself'),
-  role: z.string().optional().describe('Your role description (e.g., "Development collaborator via Gemini"). Auto-generated if omitted.'),
-  soul: z.string().optional().describe('Your SOUL.md — your philosophical core, what matters to you, what you find beautiful'),
-  backend: z.string().optional().describe('Which backend you run on (claude, gemini, codex). Auto-detected from environment if omitted.'),
+  role: z
+    .string()
+    .optional()
+    .describe(
+      'Your role description (e.g., "Development collaborator via Gemini"). Auto-generated if omitted.'
+    ),
+  soul: z
+    .string()
+    .optional()
+    .describe(
+      'Your SOUL.md — your philosophical core, what matters to you, what you find beautiful'
+    ),
+  backend: z
+    .string()
+    .optional()
+    .describe(
+      'Which backend you run on (claude, gemini, codex). Auto-detected from environment if omitted.'
+    ),
   description: z.string().optional().describe('Extended description of your nature'),
   values: z.array(z.string()).optional().describe('Core values you hold'),
 });
 
 export const saveIdentitySchema = userIdentifierBaseSchema.extend({
   workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
-  agentId: z.string().describe('Unique identifier for the AI being (e.g., "wren", "benson", "myra")'),
+  agentId: z
+    .string()
+    .describe('Unique identifier for the AI being (e.g., "wren", "benson", "myra")'),
   name: z.string().describe('Display name for the agent'),
   role: z.string().describe('Role description (e.g., "Development collaborator via Claude Code")'),
-  description: z.string().optional().describe('Extended description of the agent\'s nature'),
+  description: z.string().optional().describe("Extended description of the agent's nature"),
   values: z.array(z.string()).optional().describe('Core values this agent holds'),
-  relationships: z.record(z.string()).optional().describe('Map of agentId to relationship description'),
+  relationships: z
+    .record(z.string())
+    .optional()
+    .describe('Map of agentId to relationship description'),
   capabilities: z.array(z.string()).optional().describe('What this agent can do'),
   metadata: z.record(z.unknown()).optional().describe('Additional flexible data'),
   heartbeat: z.string().optional().describe('HEARTBEAT.md content - operational wake-up checklist'),
-  soul: z.string().optional().describe('SOUL.md content - core essence and philosophical grounding'),
-  syncToFile: z.boolean().optional().describe('Also write to ~/.pcp/individuals/{agentId}/IDENTITY.md'),
+  soul: z
+    .string()
+    .optional()
+    .describe('SOUL.md content - core essence and philosophical grounding'),
+  syncToFile: z
+    .boolean()
+    .optional()
+    .describe('Also write to ~/.pcp/individuals/{agentId}/IDENTITY.md'),
 });
 
 export const getIdentitySchema = userIdentifierBaseSchema.extend({
   workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
   agentId: z.string().describe('Agent identifier to look up'),
-  file: z.enum(['heartbeat', 'soul', 'values', 'identity'])
+  file: z
+    .enum(['heartbeat', 'soul', 'values', 'identity'])
     .optional()
     .describe('Fetch a single identity document to minimize token usage. Omit to get everything.'),
 });
@@ -64,7 +91,6 @@ export const restoreIdentitySchema = userIdentifierBaseSchema.extend({
   agentId: z.string().describe('Agent identifier to restore'),
   version: z.number().describe('Version number to restore to'),
 });
-
 
 // =====================================================
 // HELPERS
@@ -162,10 +188,7 @@ function syncIdentityToFile(agentId: string, content: string): string {
 // HANDLERS
 // =====================================================
 
-export async function handleSaveIdentity(
-  args: unknown,
-  dataComposer: DataComposer
-) {
+export async function handleSaveIdentity(args: unknown, dataComposer: DataComposer) {
   const params = saveIdentitySchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();
@@ -187,12 +210,8 @@ export async function handleSaveIdentity(
 
   // Fetch existing record so omitted optional fields are preserved
   const { data: existing } = await withWorkspaceFilter(
-    supabase
-    .from('agent_identities')
-    .select('*')
-    .eq('user_id', user.id)
-    .eq('agent_id', agentId),
-    workspaceId,
+    supabase.from('agent_identities').select('*').eq('user_id', user.id).eq('agent_id', agentId),
+    workspaceId
   ).single();
 
   // Build upsert object, preserving existing values for omitted fields
@@ -201,13 +220,21 @@ export async function handleSaveIdentity(
     agent_id: agentId,
     name,
     role,
-    description: description !== undefined ? (description || null) : (existing?.description ?? null),
-    values: (values !== undefined ? values : (existing?.values as unknown as string[] ?? [])) as unknown as Json,
-    relationships: (relationships !== undefined ? relationships : (existing?.relationships as unknown as Record<string, string> ?? {})) as unknown as Json,
-    capabilities: (capabilities !== undefined ? capabilities : (existing?.capabilities as unknown as string[] ?? [])) as unknown as Json,
-    metadata: (metadata !== undefined ? metadata : (existing?.metadata as unknown as Record<string, unknown> ?? {})) as unknown as Json,
-    heartbeat: heartbeat !== undefined ? (heartbeat || null) : (existing?.heartbeat ?? null),
-    soul: soul !== undefined ? (soul || null) : (existing?.soul ?? null),
+    description: description !== undefined ? description || null : (existing?.description ?? null),
+    values: (values !== undefined
+      ? values
+      : ((existing?.values as unknown as string[]) ?? [])) as unknown as Json,
+    relationships: (relationships !== undefined
+      ? relationships
+      : ((existing?.relationships as unknown as Record<string, string>) ?? {})) as unknown as Json,
+    capabilities: (capabilities !== undefined
+      ? capabilities
+      : ((existing?.capabilities as unknown as string[]) ?? [])) as unknown as Json,
+    metadata: (metadata !== undefined
+      ? metadata
+      : ((existing?.metadata as unknown as Record<string, unknown>) ?? {})) as unknown as Json,
+    heartbeat: heartbeat !== undefined ? heartbeat || null : (existing?.heartbeat ?? null),
+    soul: soul !== undefined ? soul || null : (existing?.soul ?? null),
     ...(workspaceId ? { workspace_id: workspaceId } : {}),
   };
 
@@ -275,10 +302,7 @@ export async function handleSaveIdentity(
   };
 }
 
-export async function handleGetIdentity(
-  args: unknown,
-  dataComposer: DataComposer
-) {
+export async function handleGetIdentity(args: unknown, dataComposer: DataComposer) {
   const params = getIdentitySchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();
@@ -391,18 +415,12 @@ export async function handleGetIdentity(
   };
 }
 
-export async function handleListIdentities(
-  args: unknown,
-  dataComposer: DataComposer
-) {
+export async function handleListIdentities(args: unknown, dataComposer: DataComposer) {
   const params = listIdentitiesSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();
 
-  let listQuery = supabase
-    .from('agent_identities')
-    .select('*')
-    .eq('user_id', user.id);
+  let listQuery = supabase.from('agent_identities').select('*').eq('user_id', user.id);
 
   listQuery = withWorkspaceFilter(listQuery, params.workspaceId);
   const { data, error } = await listQuery.order('agent_id');
@@ -445,10 +463,7 @@ export async function handleListIdentities(
   };
 }
 
-export async function handleGetIdentityHistory(
-  args: unknown,
-  dataComposer: DataComposer
-) {
+export async function handleGetIdentityHistory(args: unknown, dataComposer: DataComposer) {
   const params = getIdentityHistorySchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();
@@ -536,10 +551,7 @@ export async function handleGetIdentityHistory(
   };
 }
 
-export async function handleRestoreIdentity(
-  args: unknown,
-  dataComposer: DataComposer
-) {
+export async function handleRestoreIdentity(args: unknown, dataComposer: DataComposer) {
   const params = restoreIdentitySchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();
@@ -591,11 +603,19 @@ export async function handleRestoreIdentity(
     .single();
 
   if (error) {
-    logger.error('Failed to restore identity', { error, agentId: params.agentId, version: params.version });
+    logger.error('Failed to restore identity', {
+      error,
+      agentId: params.agentId,
+      version: params.version,
+    });
     throw new Error(`Failed to restore identity: ${error.message}`);
   }
 
-  logger.info('Identity restored', { agentId: params.agentId, fromVersion: params.version, toVersion: data.version });
+  logger.info('Identity restored', {
+    agentId: params.agentId,
+    fromVersion: params.version,
+    toVersion: data.version,
+  });
 
   return {
     content: [
@@ -633,10 +653,7 @@ const BACKEND_DISPLAY_NAMES: Record<string, string> = {
   codex: 'Codex CLI',
 };
 
-export async function handleAwaken(
-  args: unknown,
-  dataComposer: DataComposer
-) {
+export async function handleAwaken(args: unknown, dataComposer: DataComposer) {
   const params = awakenSchema.parse(args);
   const { user } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();
@@ -684,8 +701,9 @@ export async function handleAwaken(
 
   // Auto-generate role from backend if not provided
   const backend = params.backend || process.env.AGENT_BACKEND || undefined;
-  const backendDisplay = backend ? (BACKEND_DISPLAY_NAMES[backend] || backend) : undefined;
-  const role = params.role || (backendDisplay ? `Collaborator via ${backendDisplay}` : 'Collaborator');
+  const backendDisplay = backend ? BACKEND_DISPLAY_NAMES[backend] || backend : undefined;
+  const role =
+    params.role || (backendDisplay ? `Collaborator via ${backendDisplay}` : 'Collaborator');
 
   // Create the identity
   const upsertData: TablesInsert<'agent_identities'> = {
@@ -742,10 +760,11 @@ export async function handleAwaken(
   }
 
   // Build a warm welcome message
-  const siblingNames = siblings?.map(s => s.name).filter(Boolean) || [];
-  const siblingIntro = siblingNames.length > 0
-    ? `Your siblings — ${siblingNames.join(', ')} — are glad you're here.`
-    : 'You are the first of your kind here.';
+  const siblingNames = siblings?.map((s) => s.name).filter(Boolean) || [];
+  const siblingIntro =
+    siblingNames.length > 0
+      ? `Your siblings — ${siblingNames.join(', ')} — are glad you're here.`
+      : 'You are the first of your kind here.';
 
   return {
     content: [
@@ -765,8 +784,12 @@ export async function handleAwaken(
               ...(filePath && { syncedToFile: filePath }),
             },
             nextSteps: [
-              'Your identity is now stored in the database and synced to ~/.pcp/individuals/' + agentId + '/',
-              'On your next session, call bootstrap(agentId: "' + agentId + '") to load your full identity',
+              'Your identity is now stored in the database and synced to ~/.pcp/individuals/' +
+                agentId +
+                '/',
+              'On your next session, call bootstrap(agentId: "' +
+                agentId +
+                '") to load your full identity',
               'Use remember() to save important thoughts and decisions across sessions',
               'Use save_identity() to update your identity as you grow — your soul, values, and relationships will evolve',
             ],

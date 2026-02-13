@@ -106,7 +106,7 @@ export function stopHeartbeatService(): void {
  * but not delivered (useful for dry runs or external HTTP triggers).
  */
 export async function processHeartbeat(
-  deliver?: (reminder: DueReminder) => Promise<boolean>,
+  deliver?: (reminder: DueReminder) => Promise<boolean>
 ): Promise<{
   processed: number;
   delivered: number;
@@ -175,7 +175,11 @@ export async function processHeartbeat(
     } catch (error) {
       logger.error(`Failed to process reminder ${reminder.id}:`, error);
       stats.failed++;
-      await recordDeliveryAttempt(reminder.id, 'failed', error instanceof Error ? error.message : 'Unknown error');
+      await recordDeliveryAttempt(
+        reminder.id,
+        'failed',
+        error instanceof Error ? error.message : 'Unknown error'
+      );
     }
   }
 
@@ -220,11 +224,7 @@ async function isInQuietHours(userId: string): Promise<boolean> {
 async function getUserTimezone(userId: string): Promise<string> {
   if (!supabase) return 'UTC';
 
-  const { data } = await supabase
-    .from('users')
-    .select('timezone')
-    .eq('id', userId)
-    .single();
+  const { data } = await supabase.from('users').select('timezone').eq('id', userId).single();
 
   return data?.timezone || 'UTC';
 }
@@ -239,8 +239,8 @@ async function updateReminderAfterDelivery(reminder: DueReminder): Promise<void>
   const newRunCount = reminder.run_count + 1;
 
   // Check if this is a one-time reminder or has reached max runs
-  const isCompleted = !reminder.cron_expression ||
-    (reminder.max_runs !== null && newRunCount >= reminder.max_runs);
+  const isCompleted =
+    !reminder.cron_expression || (reminder.max_runs !== null && newRunCount >= reminder.max_runs);
 
   if (isCompleted) {
     // Mark as completed
@@ -278,14 +278,12 @@ async function recordDeliveryAttempt(
 ): Promise<void> {
   if (!supabase) return;
 
-  await supabase
-    .from('reminder_history')
-    .insert({
-      reminder_id: reminderId,
-      status,
-      error_message: errorMessage || null,
-      delivered_at: status === 'delivered' ? new Date().toISOString() : null,
-    });
+  await supabase.from('reminder_history').insert({
+    reminder_id: reminderId,
+    status,
+    error_message: errorMessage || null,
+    delivered_at: status === 'delivered' ? new Date().toISOString() : null,
+  });
 }
 
 /**
@@ -325,9 +323,11 @@ export async function createReminder(params: {
   // Get user's timezone for cron interpretation
   const userTimezone = await getUserTimezone(params.userId);
 
-  const nextRunAt = params.runAt || (params.cronExpression
-    ? calculateNextRun(params.cronExpression, new Date(), userTimezone)
-    : new Date());
+  const nextRunAt =
+    params.runAt ||
+    (params.cronExpression
+      ? calculateNextRun(params.cronExpression, new Date(), userTimezone)
+      : new Date());
 
   const { data, error } = await supabase
     .from('scheduled_reminders')
