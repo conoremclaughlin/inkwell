@@ -711,16 +711,21 @@ This session will continue with a fresh context after compaction. Your identity,
     // Add current timestamp so the agent always knows what time it is
     const now = new Date();
     const tz = timezone || 'UTC';
-    const localTime = now.toLocaleString('en-US', {
-      timeZone: tz,
-      weekday: 'short',
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-      timeZoneName: 'short',
-    });
+    let localTime: string;
+    try {
+      localTime = now.toLocaleString('en-US', {
+        timeZone: tz,
+        weekday: 'short',
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        timeZoneName: 'short',
+      });
+    } catch {
+      localTime = now.toISOString();
+    }
     lines.push(`Current time: ${localTime}`);
 
     // Add trigger type context
