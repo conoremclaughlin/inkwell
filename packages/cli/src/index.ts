@@ -26,6 +26,7 @@ export interface PcpConfig {
   userId?: string;
   email?: string;
   agentMapping?: Record<string, string>;
+  workspaceId?: string;
 }
 
 export interface CreateWorkspaceOptions {

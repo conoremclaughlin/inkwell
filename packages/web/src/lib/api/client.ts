@@ -1,4 +1,5 @@
 import axios, { type AxiosError, type AxiosResponse } from 'axios';
+import { getSelectedWorkspaceId } from '@/lib/workspace-selection';
 
 export interface ApiError extends Error {
   status: number;
@@ -16,6 +17,15 @@ const apiClient = axios.create({
   },
 });
 
+// Request interceptor - inject workspace scope header when selected.
+apiClient.interceptors.request.use(async (config) => {
+  const workspaceId = getSelectedWorkspaceId();
+  if (workspaceId) {
+    config.headers['X-PCP-Workspace-Id'] = workspaceId;
+  }
+
+  return config;
+});
 // Response interceptor - transform errors
 apiClient.interceptors.response.use(
   (response: AxiosResponse) => response,

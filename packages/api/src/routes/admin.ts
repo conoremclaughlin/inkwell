@@ -15,11 +15,18 @@ import { getOAuthService } from '../services/oauth';
 import { logger } from '../utils/logger';
 import { env } from '../config/env';
 import { runWithRequestContext } from '../utils/request-context';
+import { getDataComposer } from '../data/composer';
 import crypto from 'crypto';
 
 // WhatsApp listener reference (set via setWhatsAppListener)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let whatsAppListener: any = null;
+
+type AdminAuthRequest = Request & {
+  user: { email?: string | null };
+  pcpUserId: string;
+  pcpWorkspaceId: string;
+};
 
 /**
  * Set the WhatsApp listener for admin endpoints
@@ -59,14 +66,6 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       return;
     }
 
-    // Check if user email is a trusted user with admin/owner privileges
-    // For now, we check if the user's email matches the owner
-    // In production, you'd want to check the trusted_users table
-    const authService = getAuthorizationService();
-
-    // Get all trusted users and check if this email has admin+ access
-    const trustedUsers = await authService.listTrustedUsers();
-
     // Look up the PCP user by email
     const { data: pcpUser } = await supabase
       .from('users')
@@ -79,7 +78,28 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       return;
     }
 
-    // Check if any of the user's platform IDs are trusted with admin/owner level
+    // Resolve active workspace container from header (or default to personal).
+    const dataComposer = await getDataComposer();
+    const workspaceRepo = dataComposer.repositories.workspaceContainers;
+    const requestedWorkspaceId = req.header('x-pcp-workspace-id')?.trim();
+
+    // Ensure every user always has at least one workspace container.
+    const personalWorkspace = await workspaceRepo.ensurePersonalWorkspace(pcpUser.id);
+
+    let activeWorkspaceId = personalWorkspace.id;
+    if (requestedWorkspaceId) {
+      const requestedWorkspace = await workspaceRepo.findById(requestedWorkspaceId, pcpUser.id);
+      if (!requestedWorkspace) {
+        res.status(403).json({ error: 'Workspace not found or not accessible' });
+        return;
+      }
+      activeWorkspaceId = requestedWorkspace.id;
+    }
+
+    // Check trusted-user access at the selected workspace scope.
+    const authService = getAuthorizationService();
+    const trustedUsers = await authService.listTrustedUsers(undefined, activeWorkspaceId);
+
     const isTrusted = trustedUsers.some((tu) => {
       if (tu.trustLevel === 'member') return false;
       if (tu.userId === pcpUser.id) return true;
@@ -93,16 +113,18 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       return;
     }
 
-    // Attach user and PCP user ID to request
-    const authReq = req as Request & { user: typeof user; pcpUserId: string };
+    // Attach user + PCP context to request
+    const authReq = req as Request & { user: typeof user; pcpUserId: string; pcpWorkspaceId: string };
     authReq.user = user;
     authReq.pcpUserId = pcpUser.id;
+    authReq.pcpWorkspaceId = activeWorkspaceId;
 
     // Wrap the rest of the request in context
     runWithRequestContext(
       {
         userId: pcpUser.id,
         email: user.email || undefined,
+        workspaceId: activeWorkspaceId,
       },
       () => next()
     );
@@ -118,6 +140,41 @@ const router = Router();
 router.use(adminAuthMiddleware);
 
 // =============================================================================
+// Workspace Containers
+// =============================================================================
+
+/**
+ * GET /api/admin/workspaces
+ * List workspace containers available to the authenticated user.
+ */
+router.get('/workspaces', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const dataComposer = await getDataComposer();
+    const workspaceRepo = dataComposer.repositories.workspaceContainers;
+    const workspaces = await workspaceRepo.listByUser(authReq.pcpUserId, { includeArchived: false });
+
+    res.json({
+      currentWorkspaceId: authReq.pcpWorkspaceId,
+      workspaces: workspaces.map((w) => ({
+        id: w.id,
+        name: w.name,
+        slug: w.slug,
+        type: w.type,
+        description: w.description,
+        metadata: w.metadata,
+        createdAt: w.createdAt,
+        updatedAt: w.updatedAt,
+        archivedAt: w.archivedAt,
+      })),
+    });
+  } catch (error) {
+    logger.error('Failed to list workspace containers:', error);
+    res.status(500).json({ error: 'Failed to list workspace containers' });
+  }
+});
+
+// =============================================================================
 // Trusted Users
 // =============================================================================
 
@@ -125,18 +182,30 @@ router.use(adminAuthMiddleware);
  * GET /api/admin/trusted-users
  * List all trusted users
  */
-router.get('/trusted-users', async (_req: Request, res: Response) => {
+router.get('/trusted-users', async (req: Request, res: Response) => {
   try {
-    const authService = getAuthorizationService();
-    const users = await authService.listTrustedUsers();
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const authReq = req as AdminAuthRequest;
+
+    const { data: users, error } = await supabase
+      .from('trusted_users')
+      .select('*')
+      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .order('added_at', { ascending: false });
+
+    if (error) {
+      logger.error('Failed to list trusted users:', error);
+      res.status(500).json({ error: 'Failed to list trusted users' });
+      return;
+    }
 
     res.json({
-      users: users.map((u) => ({
+      users: (users || []).map((u) => ({
         id: u.id,
         platform: u.platform,
-        platformUserId: u.platformUserId,
-        trustLevel: u.trustLevel,
-        addedAt: u.addedAt.toISOString(),
+        platformUserId: u.platform_user_id,
+        trustLevel: u.trust_level,
+        addedAt: u.added_at,
       })),
     });
   } catch (error) {
@@ -152,25 +221,33 @@ router.get('/trusted-users', async (_req: Request, res: Response) => {
 router.post('/trusted-users', async (req: Request, res: Response) => {
   try {
     const { platform, platformUserId, trustLevel } = req.body;
+    const authReq = req as AdminAuthRequest;
 
     if (!platform || !platformUserId) {
       res.status(400).json({ error: 'platform and platformUserId are required' });
       return;
     }
 
-    const authService = getAuthorizationService();
+    if (!['telegram', 'whatsapp', 'discord'].includes(platform)) {
+      res.status(400).json({ error: 'platform must be telegram, whatsapp, or discord' });
+      return;
+    }
 
-    // For admin dashboard, we use a system admin identity
-    // In production, you'd track who added the user
-    const result = await authService.addTrustedUser(
-      platform,
-      platformUserId,
-      trustLevel || 'member',
-      platformUserId // Self-add for now - in production use the admin's ID
-    );
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const { error } = await supabase
+      .from('trusted_users')
+      .insert({
+        user_id: null,
+        platform,
+        platform_user_id: platformUserId,
+        trust_level: trustLevel || 'member',
+        added_by: authReq.pcpUserId,
+        workspace_id: authReq.pcpWorkspaceId,
+      });
 
-    if (!result.success) {
-      res.status(400).json({ error: result.error });
+    if (error) {
+      logger.error('Failed to add trusted user:', error);
+      res.status(400).json({ error: error.message || 'Failed to add trusted user' });
       return;
     }
 
@@ -188,6 +265,7 @@ router.post('/trusted-users', async (req: Request, res: Response) => {
 router.delete('/trusted-users/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    const authReq = req as AdminAuthRequest;
 
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
 
@@ -196,6 +274,7 @@ router.delete('/trusted-users/:id', async (req: Request, res: Response) => {
       .from('trusted_users')
       .select('trust_level')
       .eq('id', id)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .single();
 
     if (user?.trust_level === 'owner') {
@@ -206,7 +285,8 @@ router.delete('/trusted-users/:id', async (req: Request, res: Response) => {
     const { error } = await supabase
       .from('trusted_users')
       .delete()
-      .eq('id', id);
+      .eq('id', id)
+      .eq('workspace_id', authReq.pcpWorkspaceId);
 
     if (error) {
       res.status(500).json({ error: 'Failed to delete user' });
@@ -228,13 +308,15 @@ router.delete('/trusted-users/:id', async (req: Request, res: Response) => {
  * GET /api/admin/groups
  * List all authorized groups
  */
-router.get('/groups', async (_req: Request, res: Response) => {
+router.get('/groups', async (req: Request, res: Response) => {
   try {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const authReq = req as AdminAuthRequest;
 
     const { data, error } = await supabase
       .from('authorized_groups')
       .select('*')
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .order('authorized_at', { ascending: false });
 
     if (error) {
@@ -266,6 +348,7 @@ router.get('/groups', async (_req: Request, res: Response) => {
 router.post('/groups/:id/revoke', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    const authReq = req as AdminAuthRequest;
 
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
 
@@ -274,8 +357,10 @@ router.post('/groups/:id/revoke', async (req: Request, res: Response) => {
       .update({
         status: 'revoked',
         revoked_at: new Date().toISOString(),
+        revoked_by: authReq.pcpUserId,
       })
-      .eq('id', id);
+      .eq('id', id)
+      .eq('workspace_id', authReq.pcpWorkspaceId);
 
     if (error) {
       res.status(500).json({ error: 'Failed to revoke group' });
@@ -297,13 +382,15 @@ router.post('/groups/:id/revoke', async (req: Request, res: Response) => {
  * GET /api/admin/challenge-codes
  * List all challenge codes
  */
-router.get('/challenge-codes', async (_req: Request, res: Response) => {
+router.get('/challenge-codes', async (req: Request, res: Response) => {
   try {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const authReq = req as AdminAuthRequest;
 
     const { data, error } = await supabase
       .from('group_challenge_codes')
       .select('*')
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .order('created_at', { ascending: false })
       .limit(50);
 
@@ -333,14 +420,16 @@ router.get('/challenge-codes', async (_req: Request, res: Response) => {
  * POST /api/admin/challenge-codes
  * Generate a new challenge code
  */
-router.post('/challenge-codes', async (_req: Request, res: Response) => {
+router.post('/challenge-codes', async (req: Request, res: Response) => {
   try {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const authReq = req as AdminAuthRequest;
 
     // Check rate limit
     const { count } = await supabase
       .from('group_challenge_codes')
       .select('*', { count: 'exact', head: true })
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .is('used_at', null)
       .gt('expires_at', new Date().toISOString());
 
@@ -356,7 +445,11 @@ router.post('/challenge-codes', async (_req: Request, res: Response) => {
 
     const { data, error } = await supabase
       .from('group_challenge_codes')
-      .insert({ code })
+      .insert({
+        code,
+        created_by: authReq.pcpUserId,
+        workspace_id: authReq.pcpWorkspaceId,
+      })
       .select()
       .single();
 
@@ -497,15 +590,18 @@ router.post('/heartbeat', async (_req: Request, res: Response) => {
 
 /**
  * GET /api/admin/reminders
- * List all reminders (admin view)
+ * List reminders for the active user + workspace (admin view)
  */
-router.get('/reminders', async (_req: Request, res: Response) => {
+router.get('/reminders', async (req: Request, res: Response) => {
   try {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const authReq = req as AdminAuthRequest;
 
     const { data, error } = await supabase
       .from('scheduled_reminders')
       .select('*, users(email, first_name)')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .order('next_run_at', { ascending: true })
       .limit(100);
 
@@ -542,14 +638,16 @@ router.get('/reminders', async (_req: Request, res: Response) => {
  * GET /api/admin/user-identity
  * Get user identity (USER.md, VALUES.md)
  */
-router.get('/user-identity', async (_req: Request, res: Response) => {
+router.get('/user-identity', async (req: Request, res: Response) => {
   try {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const authReq = req as AdminAuthRequest;
 
     const { data, error } = await supabase
       .from('user_identity')
       .select('*')
-      .limit(1)
+      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .single();
 
     if (error && error.code !== 'PGRST116') {
@@ -584,15 +682,17 @@ router.get('/user-identity', async (_req: Request, res: Response) => {
  * GET /api/admin/user-identity/history
  * Get version history for user identity
  */
-router.get('/user-identity/history', async (_req: Request, res: Response) => {
+router.get('/user-identity/history', async (req: Request, res: Response) => {
   try {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const authReq = req as AdminAuthRequest;
 
     // First get the user identity ID
     const { data: identity } = await supabase
       .from('user_identity')
       .select('id')
-      .limit(1)
+      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .single();
 
     if (!identity) {
@@ -605,6 +705,7 @@ router.get('/user-identity/history', async (_req: Request, res: Response) => {
       .from('user_identity_history')
       .select('*')
       .eq('identity_id', identity.id)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .order('archived_at', { ascending: false })
       .limit(20);
 
@@ -639,13 +740,16 @@ router.get('/user-identity/history', async (_req: Request, res: Response) => {
  * GET /api/admin/individuals
  * List all AI being identities
  */
-router.get('/individuals', async (_req: Request, res: Response) => {
+router.get('/individuals', async (req: Request, res: Response) => {
   try {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const authReq = req as AdminAuthRequest;
 
     const { data, error } = await supabase
       .from('agent_identities')
       .select('*')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .order('agent_id', { ascending: true });
 
     if (error) {
@@ -688,11 +792,14 @@ router.get('/individuals/:agentId/history', async (req: Request, res: Response) 
   try {
     const { agentId } = req.params;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const authReq = req as AdminAuthRequest;
 
     // First get the identity ID
     const { data: identity } = await supabase
       .from('agent_identities')
       .select('id')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .eq('agent_id', agentId)
       .single();
 
@@ -706,6 +813,7 @@ router.get('/individuals/:agentId/history', async (req: Request, res: Response) 
       .from('agent_identity_history')
       .select('*')
       .eq('identity_id', identity.id)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .order('archived_at', { ascending: false })
       .limit(20);
 
@@ -768,6 +876,7 @@ router.get('/individuals/:agentId/memories/timeline', async (req: Request, res: 
     const { agentId } = req.params;
     const limit = Math.min(parseInt(req.query.limit as string) || 100, 500);
     const offset = parseInt(req.query.offset as string) || 0;
+    const authReq = req as AdminAuthRequest;
 
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
     const timeline: TimelineEntry[] = [];
@@ -776,6 +885,7 @@ router.get('/individuals/:agentId/memories/timeline', async (req: Request, res: 
     const { data: memories, error: memoriesError } = await supabase
       .from('memories')
       .select('*')
+      .eq('user_id', authReq.pcpUserId)
       .eq('agent_id', agentId)
       .order('created_at', { ascending: false });
 
@@ -803,6 +913,7 @@ router.get('/individuals/:agentId/memories/timeline', async (req: Request, res: 
     const { data: history, error: historyError } = await supabase
       .from('memory_history')
       .select('*')
+      .eq('user_id', authReq.pcpUserId)
       .order('archived_at', { ascending: false });
 
     if (historyError) {
@@ -839,6 +950,7 @@ router.get('/individuals/:agentId/memories/timeline', async (req: Request, res: 
     const { data: sessions, error: sessionsError } = await supabase
       .from('sessions')
       .select('id')
+      .eq('user_id', authReq.pcpUserId)
       .eq('agent_id', agentId);
 
     if (sessionsError) {
@@ -897,11 +1009,13 @@ router.get('/individuals/:agentId/memories/:memoryId/history', async (req: Reque
   try {
     const { memoryId } = req.params;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const authReq = req as AdminAuthRequest;
 
     // Get memory history
     const { data, error } = await supabase
       .from('memory_history')
       .select('*')
+      .eq('user_id', authReq.pcpUserId)
       .eq('memory_id', memoryId)
       .order('version', { ascending: false });
 
@@ -937,7 +1051,12 @@ router.get('/individuals/:agentId/memories/:memoryId/history', async (req: Reque
 // =============================================================================
 
 // In-memory store for OAuth state (in production, use Redis or similar)
-const oauthStateStore = new Map<string, { userId: string; provider: string; expiresAt: number }>();
+const oauthStateStore = new Map<string, {
+  userId: string;
+  workspaceId: string;
+  provider: string;
+  expiresAt: number;
+}>();
 
 /**
  * GET /api/admin/connected-accounts
@@ -945,23 +1064,13 @@ const oauthStateStore = new Map<string, { userId: string; provider: string; expi
  */
 router.get('/connected-accounts', async (req: Request, res: Response) => {
   try {
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { user: { email: string } };
-
-    // Get the PCP user ID from the authenticated user's email
-    const { data: pcpUser } = await supabase
-      .from('users')
-      .select('id')
-      .eq('email', authReq.user.email)
-      .single();
-
-    if (!pcpUser) {
-      res.status(404).json({ error: 'User not found' });
-      return;
-    }
+    const authReq = req as AdminAuthRequest;
 
     const oauthService = getOAuthService();
-    const accounts = await oauthService.getConnectedAccounts(pcpUser.id);
+    const accounts = await oauthService.getConnectedAccounts(
+      authReq.pcpUserId,
+      authReq.pcpWorkspaceId,
+    );
 
     // Get supported providers and their configuration status
     const providers = oauthService.getSupportedProviders().map((provider) => ({
@@ -1000,24 +1109,10 @@ router.get('/oauth/:provider/authorize', async (req: Request, res: Response) => 
   try {
     const { provider } = req.params;
     const oauthService = getOAuthService();
+    const authReq = req as AdminAuthRequest;
 
     if (!oauthService.isProviderConfigured(provider)) {
       res.status(400).json({ error: `OAuth not configured for ${provider}` });
-      return;
-    }
-
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { user: { email: string } };
-
-    // Get the PCP user ID
-    const { data: pcpUser } = await supabase
-      .from('users')
-      .select('id')
-      .eq('email', authReq.user.email)
-      .single();
-
-    if (!pcpUser) {
-      res.status(404).json({ error: 'User not found' });
       return;
     }
 
@@ -1026,7 +1121,8 @@ router.get('/oauth/:provider/authorize', async (req: Request, res: Response) => 
 
     // Store state with user info (expires in 10 minutes)
     oauthStateStore.set(state, {
-      userId: pcpUser.id,
+      userId: authReq.pcpUserId,
+      workspaceId: authReq.pcpWorkspaceId,
       provider,
       expiresAt: Date.now() + 10 * 60 * 1000,
     });
@@ -1144,7 +1240,13 @@ router.get('/oauth/:provider/callback', async (req: Request, res: Response) => {
     const userInfo = await oauthService.getUserInfo(provider, tokens.accessToken);
 
     // Save connected account
-    await oauthService.saveConnectedAccount(stateData.userId, provider, tokens, userInfo);
+    await oauthService.saveConnectedAccount(
+      stateData.userId,
+      provider,
+      tokens,
+      userInfo,
+      stateData.workspaceId,
+    );
 
     sendHtmlResponse(true, `Successfully connected ${userInfo.email || provider} account.`);
   } catch (error) {
@@ -1184,6 +1286,7 @@ router.post('/oauth/:provider/upgrade-scopes', async (req: Request, res: Respons
     const { provider } = req.params;
     const { accountId } = req.body;
     const oauthService = getOAuthService();
+    const authReq = req as AdminAuthRequest;
 
     if (!oauthService.isProviderConfigured(provider)) {
       res.status(400).json({ error: `OAuth not configured for ${provider}` });
@@ -1196,26 +1299,14 @@ router.post('/oauth/:provider/upgrade-scopes', async (req: Request, res: Respons
     }
 
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { user: { email: string } };
-
-    // Get the PCP user
-    const { data: pcpUser } = await supabase
-      .from('users')
-      .select('id')
-      .eq('email', authReq.user.email)
-      .single();
-
-    if (!pcpUser) {
-      res.status(404).json({ error: 'User not found' });
-      return;
-    }
 
     // Get the connected account
     const { data: account, error: accountError } = await supabase
       .from('connected_accounts')
       .select('*')
       .eq('id', accountId)
-      .eq('user_id', pcpUser.id)
+      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .single();
 
     if (accountError || !account) {
@@ -1237,7 +1328,8 @@ router.post('/oauth/:provider/upgrade-scopes', async (req: Request, res: Respons
     // Generate state token
     const state = crypto.randomUUID();
     oauthStateStore.set(state, {
-      userId: pcpUser.id,
+      userId: authReq.pcpUserId,
+      workspaceId: authReq.pcpWorkspaceId,
       provider,
       expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes
     });
@@ -1285,24 +1377,13 @@ router.post('/oauth/:provider/upgrade-scopes', async (req: Request, res: Respons
 router.get('/artifacts', async (req: Request, res: Response) => {
   try {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { user: { email: string } };
-
-    // Get the PCP user ID from the authenticated user's email
-    const { data: pcpUser } = await supabase
-      .from('users')
-      .select('id')
-      .eq('email', authReq.user.email)
-      .single();
-
-    if (!pcpUser) {
-      res.status(404).json({ error: 'User not found' });
-      return;
-    }
+    const authReq = req as AdminAuthRequest;
 
     const { data, error } = await supabase
       .from('artifacts')
       .select('id, uri, title, artifact_type, visibility, version, tags, created_at, updated_at')
-      .eq('user_id', pcpUser.id)
+      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .order('updated_at', { ascending: false });
 
     if (error) {
@@ -1338,25 +1419,14 @@ router.get('/artifacts/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { user: { email: string } };
-
-    // Get the PCP user ID
-    const { data: pcpUser } = await supabase
-      .from('users')
-      .select('id')
-      .eq('email', authReq.user.email)
-      .single();
-
-    if (!pcpUser) {
-      res.status(404).json({ error: 'User not found' });
-      return;
-    }
+    const authReq = req as AdminAuthRequest;
 
     const { data: artifact, error } = await supabase
       .from('artifacts')
       .select('*')
       .eq('id', id)
-      .eq('user_id', pcpUser.id)
+      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .single();
 
     if (error || !artifact) {
@@ -1397,14 +1467,16 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
     const pcpUserId = authReq.pcpUserId;
+    const workspaceId = authReq.pcpWorkspaceId;
 
     const { data: artifact } = await supabase
       .from('artifacts')
       .select('id')
       .eq('id', id)
       .eq('user_id', pcpUserId)
+      .eq('workspace_id', workspaceId)
       .single();
 
     if (!artifact) {
@@ -1417,6 +1489,7 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
       .select('*')
       .eq('artifact_id', id)
       .eq('user_id', pcpUserId)
+      .eq('workspace_id', workspaceId)
       .is('deleted_at', null)
       .order('created_at', { ascending: true });
 
@@ -1503,14 +1576,16 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
     }
 
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
     const pcpUserId = authReq.pcpUserId;
+    const workspaceId = authReq.pcpWorkspaceId;
 
     const { data: artifact } = await supabase
       .from('artifacts')
       .select('id')
       .eq('id', id)
       .eq('user_id', pcpUserId)
+      .eq('workspace_id', workspaceId)
       .single();
 
     if (!artifact) {
@@ -1525,6 +1600,7 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
         .eq('id', parentCommentId)
         .eq('artifact_id', id)
         .eq('user_id', pcpUserId)
+        .eq('workspace_id', workspaceId)
         .single();
 
       if (!parent) {
@@ -1539,6 +1615,7 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
         .from('agent_identities')
         .select('id, agent_id, name, backend')
         .eq('user_id', pcpUserId)
+        .eq('workspace_id', workspaceId)
         .eq('agent_id', agentId)
         .single();
 
@@ -1557,6 +1634,7 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
       .insert({
         artifact_id: id,
         user_id: pcpUserId,
+        workspace_id: workspaceId,
         created_by_agent_id: agentId || null,
         created_by_identity_id: identity?.id || null,
         parent_comment_id: parentCommentId || null,
@@ -1607,26 +1685,15 @@ router.get('/artifacts/:id/history', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { user: { email: string } };
-
-    // Get the PCP user ID
-    const { data: pcpUser } = await supabase
-      .from('users')
-      .select('id')
-      .eq('email', authReq.user.email)
-      .single();
-
-    if (!pcpUser) {
-      res.status(404).json({ error: 'User not found' });
-      return;
-    }
+    const authReq = req as AdminAuthRequest;
 
     // Verify artifact ownership
     const { data: artifact } = await supabase
       .from('artifacts')
       .select('id')
       .eq('id', id)
-      .eq('user_id', pcpUser.id)
+      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .single();
 
     if (!artifact) {
@@ -1639,6 +1706,7 @@ router.get('/artifacts/:id/history', async (req: Request, res: Response) => {
       .from('artifact_history')
       .select('*')
       .eq('artifact_id', id)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .order('version', { ascending: false });
 
     if (error) {
@@ -1679,23 +1747,10 @@ router.get('/artifacts/:id/history', async (req: Request, res: Response) => {
 router.delete('/connected-accounts/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { user: { email: string } };
-
-    // Get the PCP user ID
-    const { data: pcpUser } = await supabase
-      .from('users')
-      .select('id')
-      .eq('email', authReq.user.email)
-      .single();
-
-    if (!pcpUser) {
-      res.status(404).json({ error: 'User not found' });
-      return;
-    }
+    const authReq = req as AdminAuthRequest;
 
     const oauthService = getOAuthService();
-    await oauthService.disconnectAccount(id, pcpUser.id);
+    await oauthService.disconnectAccount(id, authReq.pcpUserId, authReq.pcpWorkspaceId);
 
     res.json({ success: true });
   } catch (error) {
@@ -1709,6 +1764,10 @@ router.delete('/connected-accounts/:id', async (req: Request, res: Response) => 
 // =============================================================================
 
 import { getSkillsService, getCloudSkillsService, SkillType } from '../skills';
+
+// Skills registry/installations are currently user-scoped (not workspace-scoped).
+// We still read workspace context from AdminAuthRequest for consistency and for
+// future workspace-level policy expansion.
 
 /**
  * GET /api/admin/skills
@@ -1797,7 +1856,7 @@ router.get('/skills/registry', async (req: Request, res: Response) => {
   try {
     const { type, category, search, official, limit, offset } = req.query;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
     const result = await cloudService.browseRegistry(
@@ -1827,7 +1886,7 @@ router.get('/skills/registry/:idOrName', async (req: Request, res: Response) => 
   try {
     const { idOrName } = req.params;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
     const skill = await cloudService.getRegistrySkill(idOrName, authReq.pcpUserId);
@@ -1858,7 +1917,7 @@ router.post('/skills/install', async (req: Request, res: Response) => {
     }
 
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
     const result = await cloudService.installSkill({
@@ -1888,7 +1947,7 @@ router.delete('/skills/install/:skillId', async (req: Request, res: Response) =>
   try {
     const { skillId } = req.params;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
     const result = await cloudService.uninstallSkill(skillId, authReq.pcpUserId);
@@ -1914,7 +1973,7 @@ router.patch('/skills/install/:installationId', async (req: Request, res: Respon
     const { installationId } = req.params;
     const { enabled, versionPinned } = req.body;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
 
@@ -1951,7 +2010,7 @@ router.get('/skills/installed', async (req: Request, res: Response) => {
   try {
     const { type, category, search } = req.query;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
 
     const cloudService = getCloudSkillsService(supabase);
     const result = await cloudService.listAllSkills(authReq.pcpUserId, {
@@ -1977,7 +2036,7 @@ router.get('/skills/installed', async (req: Request, res: Response) => {
  */
 router.post('/skills/publish', async (req: Request, res: Response) => {
   try {
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
     const { name, displayName, description, type, category, tags, emoji, version, manifest, content, repositoryUrl, isPublic } = req.body;
 
     if (!name || !displayName || !description || !type || !version || !content) {
@@ -2020,7 +2079,7 @@ router.post('/skills/publish', async (req: Request, res: Response) => {
 router.patch('/skills/manage/:skillId', async (req: Request, res: Response) => {
   try {
     const { skillId } = req.params;
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
     const { displayName, description, category, tags, emoji, version, manifest, content, changelog } = req.body;
 
     if (!version) {
@@ -2060,7 +2119,7 @@ router.patch('/skills/manage/:skillId', async (req: Request, res: Response) => {
 router.delete('/skills/manage/:skillId', async (req: Request, res: Response) => {
   try {
     const { skillId } = req.params;
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
 
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
     const { SkillsRepository } = await import('../skills/repository.js');
@@ -2084,7 +2143,7 @@ router.delete('/skills/manage/:skillId', async (req: Request, res: Response) => 
 router.post('/skills/manage/:skillId/deprecate', async (req: Request, res: Response) => {
   try {
     const { skillId } = req.params;
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
     const { message } = req.body;
 
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
@@ -2112,7 +2171,7 @@ router.post('/skills/manage/:skillId/deprecate', async (req: Request, res: Respo
 router.post('/skills/manage/:skillId/fork', async (req: Request, res: Response) => {
   try {
     const { skillId } = req.params;
-    const authReq = req as Request & { pcpUserId: string };
+    const authReq = req as AdminAuthRequest;
     const { name, displayName, description, category, tags } = req.body;
 
     if (!name) {

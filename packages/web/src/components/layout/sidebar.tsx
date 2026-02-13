@@ -16,6 +16,10 @@ import {
   MessageSquare,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useRouter } from 'next/navigation';
+import { useApiQuery, useQueryClient } from '@/lib/api/hooks';
+import { getSelectedWorkspaceId, setSelectedWorkspaceId } from '@/lib/workspace-selection';
+import { useEffect, useMemo, useState } from 'react';
 import { signOut } from '@/lib/auth/actions';
 
 const navigation = [
@@ -31,13 +35,84 @@ const navigation = [
   { name: 'Skills', href: '/skills', icon: Puzzle },
 ];
 
+interface WorkspaceOption {
+  id: string;
+  name: string;
+  slug: string;
+  type: 'personal' | 'team';
+}
+
+interface WorkspaceListResponse {
+  currentWorkspaceId: string;
+  workspaces: WorkspaceOption[];
+}
+
 export function Sidebar() {
   const pathname = usePathname();
+  const router = useRouter();
+  const queryClient = useQueryClient();
+  const [selectedWorkspaceId, setSelectedWorkspaceState] = useState<string | null>(null);
+
+  const { data: workspaceData, isLoading: workspacesLoading } = useApiQuery<WorkspaceListResponse>(
+    ['workspace-containers'],
+    '/api/admin/workspaces',
+    {
+      retry: 1,
+    },
+  );
+
+  const workspaces = workspaceData?.workspaces || [];
+
+  useEffect(() => {
+    const locallySelected = getSelectedWorkspaceId();
+    if (locallySelected) {
+      setSelectedWorkspaceState(locallySelected);
+      return;
+    }
+
+    if (workspaceData?.currentWorkspaceId) {
+      setSelectedWorkspaceId(workspaceData.currentWorkspaceId);
+      setSelectedWorkspaceState(workspaceData.currentWorkspaceId);
+    }
+  }, [workspaceData?.currentWorkspaceId]);
+
+  const resolvedWorkspaceId = useMemo(() => {
+    if (selectedWorkspaceId) return selectedWorkspaceId;
+    return workspaceData?.currentWorkspaceId ?? '';
+  }, [selectedWorkspaceId, workspaceData?.currentWorkspaceId]);
+
+  const handleWorkspaceChange = (workspaceId: string) => {
+    setSelectedWorkspaceId(workspaceId);
+    setSelectedWorkspaceState(workspaceId);
+    // Force all data queries to refetch with the new workspace header.
+    queryClient.invalidateQueries();
+    router.refresh();
+  };
 
   return (
     <div className="flex h-full w-64 flex-col bg-gray-900">
       <div className="flex h-16 shrink-0 items-center px-6">
         <span className="text-xl font-bold text-white">PCP Admin</span>
+      </div>
+      <div className="px-4 pb-3">
+        <label className="mb-1 block text-xs font-semibold uppercase tracking-wide text-gray-400">
+          Workspace
+        </label>
+        <select
+          value={resolvedWorkspaceId}
+          onChange={(e) => handleWorkspaceChange(e.target.value)}
+          disabled={workspacesLoading || workspaces.length === 0}
+          className="w-full rounded-md border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-gray-500 focus:outline-none"
+        >
+          {workspaces.length === 0 && (
+            <option value="">No workspaces</option>
+          )}
+          {workspaces.map((workspace) => (
+            <option key={workspace.id} value={workspace.id}>
+              {workspace.name} ({workspace.type})
+            </option>
+          ))}
+        </select>
       </div>
       <nav className="flex flex-1 flex-col">
         <ul className="flex flex-1 flex-col gap-y-1 px-3">

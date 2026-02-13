@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-import { existsSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { resolve } from 'path';
 import { z } from 'zod';
 
@@ -9,12 +9,21 @@ import { z } from 'zod';
 // Files are loaded from project root
 const projectRoot = resolve(__dirname, '../../../../');
 
-// Load .env first (base), then .env.local (overrides)
-dotenv.config({ path: resolve(projectRoot, '.env') });
+// Load .env first (base)
+const envBaseResult = dotenv.config({ path: resolve(projectRoot, '.env') });
+const envBase = envBaseResult.parsed ?? {};
 
 const envLocalPath = resolve(projectRoot, '.env.local');
 if (existsSync(envLocalPath)) {
-  dotenv.config({ path: envLocalPath, override: true });
+  // Apply .env.local as overrides for .env, but NEVER override explicit shell env.
+  const envLocal = dotenv.parse(readFileSync(envLocalPath));
+  for (const [key, value] of Object.entries(envLocal)) {
+    const current = process.env[key];
+    const cameFromBaseEnv = current !== undefined && current === envBase[key];
+    if (current === undefined || cameFromBaseEnv) {
+      process.env[key] = value;
+    }
+  }
 }
 
 // Helper to handle optional strings (treat empty string as undefined)
