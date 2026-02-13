@@ -117,10 +117,10 @@ export class ChannelGateway extends EventEmitter {
     this.config = {
       enableTelegram: config.enableTelegram ?? !!env.TELEGRAM_BOT_TOKEN,
       telegramPollingInterval: config.telegramPollingInterval ?? 1000,
-      enableWhatsApp: config.enableWhatsApp ?? (process.env.ENABLE_WHATSAPP === 'true'),
+      enableWhatsApp: config.enableWhatsApp ?? process.env.ENABLE_WHATSAPP === 'true',
       whatsappAccountId: config.whatsappAccountId ?? 'default',
       printWhatsAppQr: config.printWhatsAppQr ?? true,
-      enableDiscord: config.enableDiscord ?? (process.env.ENABLE_DISCORD === 'true'),
+      enableDiscord: config.enableDiscord ?? process.env.ENABLE_DISCORD === 'true',
       messageBufferDelayMs: config.messageBufferDelayMs ?? DEFAULT_BUFFER_DELAY_MS,
       ...config,
     };
@@ -246,7 +246,11 @@ export class ChannelGateway extends EventEmitter {
     metadata?: {
       userId?: string;
       replyToMessageId?: string;
-      media?: Array<{ type: 'image' | 'video' | 'audio' | 'document'; path?: string; url?: string }>;
+      media?: Array<{
+        type: 'image' | 'video' | 'audio' | 'document';
+        path?: string;
+        url?: string;
+      }>;
       chatType?: 'direct' | 'group' | 'channel';
       mentions?: { users: string[]; botMentioned: boolean };
     }
@@ -288,7 +292,7 @@ export class ChannelGateway extends EventEmitter {
       logger.info(`Creating message buffer for ${key}, will flush in ${this.bufferDelayMs}ms`);
       const timer = setTimeout(() => {
         logger.info(`Buffer timer fired for ${key}`);
-        this.flushBuffer(key).catch(err => {
+        this.flushBuffer(key).catch((err) => {
           logger.error(`Error flushing buffer for ${key}:`, err);
         });
       }, this.bufferDelayMs);
@@ -297,11 +301,13 @@ export class ChannelGateway extends EventEmitter {
         channel,
         conversationId,
         sender,
-        messages: [{
-          content,
-          timestamp: new Date(),
-          media: metadata?.media,
-        }],
+        messages: [
+          {
+            content,
+            timestamp: new Date(),
+            media: metadata?.media,
+          },
+        ],
         timer,
         metadata: {
           userId: metadata?.userId,
@@ -342,7 +348,9 @@ export class ChannelGateway extends EventEmitter {
       } else {
         // Create new pending buffer
         this.pendingBuffers.set(key, buffer);
-        logger.info(`Queued ${buffer.messages.length} messages for ${key} (conversation already processing)`);
+        logger.info(
+          `Queued ${buffer.messages.length} messages for ${key} (conversation already processing)`
+        );
       }
       return;
     }
@@ -351,13 +359,10 @@ export class ChannelGateway extends EventEmitter {
     this.processingConversations.add(key);
 
     // Combine all message contents
-    const combinedContent = buffer.messages
-      .map(m => m.content)
-      .join('\n\n');
+    const combinedContent = buffer.messages.map((m) => m.content).join('\n\n');
 
     // Combine all media
-    const allMedia = buffer.messages
-      .flatMap(m => m.media || []);
+    const allMedia = buffer.messages.flatMap((m) => m.media || []);
 
     logger.info(`Flushing message buffer for ${key}`, {
       messageCount: buffer.messages.length,
@@ -395,7 +400,11 @@ export class ChannelGateway extends EventEmitter {
     metadata?: {
       userId?: string;
       replyToMessageId?: string;
-      media?: Array<{ type: 'image' | 'video' | 'audio' | 'document'; path?: string; url?: string }>;
+      media?: Array<{
+        type: 'image' | 'video' | 'audio' | 'document';
+        path?: string;
+        url?: string;
+      }>;
       chatType?: 'direct' | 'group' | 'channel';
       mentions?: { users: string[]; botMentioned: boolean };
     }
@@ -449,9 +458,7 @@ export class ChannelGateway extends EventEmitter {
     }
 
     // Pass resolved userId to message handler so SessionService can persist messages
-    const enrichedMetadata = userId && !metadata?.userId
-      ? { ...metadata, userId }
-      : metadata;
+    const enrichedMetadata = userId && !metadata?.userId ? { ...metadata, userId } : metadata;
 
     try {
       await this.messageHandler(channel, conversationId, sender, content, enrichedMetadata);
@@ -537,7 +544,10 @@ export class ChannelGateway extends EventEmitter {
                 isDm: true,
               });
             } catch (activityError) {
-              logger.warn('Failed to log outgoing WhatsApp message to activity stream:', activityError);
+              logger.warn(
+                'Failed to log outgoing WhatsApp message to activity stream:',
+                activityError
+              );
             }
           }
         }
@@ -563,7 +573,10 @@ export class ChannelGateway extends EventEmitter {
                 isDm: true,
               });
             } catch (activityError) {
-              logger.warn('Failed to log outgoing Discord message to activity stream:', activityError);
+              logger.warn(
+                'Failed to log outgoing Discord message to activity stream:',
+                activityError
+              );
             }
           }
         }
@@ -596,12 +609,9 @@ export class ChannelGateway extends EventEmitter {
       this.pendingBuffers.delete(key);
 
       // Combine all pending message contents
-      const combinedContent = pendingBuffer.messages
-        .map(m => m.content)
-        .join('\n\n');
+      const combinedContent = pendingBuffer.messages.map((m) => m.content).join('\n\n');
 
-      const allMedia = pendingBuffer.messages
-        .flatMap(m => m.media || []);
+      const allMedia = pendingBuffer.messages.flatMap((m) => m.media || []);
 
       logger.info(`Processing ${pendingBuffer.messages.length} pending messages for ${key}`, {
         messageCount: pendingBuffer.messages.length,
@@ -612,16 +622,10 @@ export class ChannelGateway extends EventEmitter {
       this.startTypingIndicator(conversationId, channel);
 
       // Forward to handler (conversation is still marked as processing)
-      await this.forwardToHandler(
-        channel,
-        conversationId,
-        pendingBuffer.sender,
-        combinedContent,
-        {
-          ...pendingBuffer.metadata,
-          media: allMedia.length > 0 ? allMedia : undefined,
-        }
-      );
+      await this.forwardToHandler(channel, conversationId, pendingBuffer.sender, combinedContent, {
+        ...pendingBuffer.metadata,
+        media: allMedia.length > 0 ? allMedia : undefined,
+      });
     } else {
       // No pending messages - release the processing lock
       this.processingConversations.delete(key);

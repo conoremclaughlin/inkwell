@@ -35,7 +35,9 @@ export async function handleSaveContext(args: unknown, dataComposer: DataCompose
     metadata: params.metadata || {},
   });
 
-  logger.info(`Context saved: ${context.context_type}/${context.context_key || 'default'} for user ${user.id}`);
+  logger.info(
+    `Context saved: ${context.context_type}/${context.context_key || 'default'} for user ${user.id}`
+  );
 
   return {
     content: [
@@ -184,10 +186,7 @@ export async function handleListProjects(args: unknown, dataComposer: DataCompos
   const params = listProjectsSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
-  const projects = await dataComposer.repositories.projects.findAllByUser(
-    user.id,
-    params.status
-  );
+  const projects = await dataComposer.repositories.projects.findAllByUser(user.id, params.status);
 
   logger.info(`Listed ${projects.length} projects for user ${user.id}`);
 

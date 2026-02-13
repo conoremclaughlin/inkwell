@@ -122,9 +122,14 @@ export async function resolveUser(
 
   // 3. Try platform + platformId
   if (effectiveIdentifier.platform && effectiveIdentifier.platformId) {
-    const user = await usersRepo.findByPlatformId(effectiveIdentifier.platform, effectiveIdentifier.platformId);
+    const user = await usersRepo.findByPlatformId(
+      effectiveIdentifier.platform,
+      effectiveIdentifier.platformId
+    );
     if (user) {
-      logger.debug(`User resolved by ${effectiveIdentifier.platform}: ${effectiveIdentifier.platformId}`);
+      logger.debug(
+        `User resolved by ${effectiveIdentifier.platform}: ${effectiveIdentifier.platformId}`
+      );
       return { user, resolvedBy: 'platform' };
     }
   }

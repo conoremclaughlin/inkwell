@@ -33,11 +33,13 @@ const COMMON_TIMEZONES = [
 // =====================================================
 
 export const setTimezoneSchema = userIdentifierBaseSchema.extend({
-  timezone: z.string().describe(
-    `IANA timezone identifier (e.g., "America/Los_Angeles", "Europe/London", "Asia/Tokyo"). ` +
-    `Common US timezones: America/New_York (Eastern), America/Chicago (Central), ` +
-    `America/Denver (Mountain), America/Los_Angeles (Pacific)`
-  ),
+  timezone: z
+    .string()
+    .describe(
+      `IANA timezone identifier (e.g., "America/Los_Angeles", "Europe/London", "Asia/Tokyo"). ` +
+        `Common US timezones: America/New_York (Eastern), America/Chicago (Central), ` +
+        `America/Denver (Mountain), America/Los_Angeles (Pacific)`
+    ),
 });
 
 export const getTimezoneSchema = userIdentifierBaseSchema.extend({});
@@ -49,10 +51,7 @@ export const getTimezoneSchema = userIdentifierBaseSchema.extend({});
 /**
  * Set the user's timezone
  */
-export async function handleSetTimezone(
-  args: unknown,
-  dataComposer: DataComposer
-) {
+export async function handleSetTimezone(args: unknown, dataComposer: DataComposer) {
   const params = setTimezoneSchema.parse(args);
   const { user } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();
@@ -71,10 +70,7 @@ export async function handleSetTimezone(
   }
 
   // Update user's timezone
-  const { error } = await supabase
-    .from('users')
-    .update({ timezone })
-    .eq('id', user.id);
+  const { error } = await supabase.from('users').update({ timezone }).eq('id', user.id);
 
   if (error) {
     logger.error('Failed to set timezone:', error);
@@ -107,10 +103,7 @@ export async function handleSetTimezone(
 /**
  * Get the user's timezone
  */
-export async function handleGetTimezone(
-  args: unknown,
-  dataComposer: DataComposer
-) {
+export async function handleGetTimezone(args: unknown, dataComposer: DataComposer) {
   const params = getTimezoneSchema.parse(args);
   const { user } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();

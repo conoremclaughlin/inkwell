@@ -275,9 +275,7 @@ describe('handleRespondToCalendarEvent', () => {
       end: { dateTime: '2026-02-10T11:00:00Z' },
       location: 'Conference Room A',
       organizer: { email: 'boss@example.com', displayName: 'Boss' },
-      attendees: [
-        { email: 'test@example.com', self: true, responseStatus: 'accepted' },
-      ],
+      attendees: [{ email: 'test@example.com', self: true, responseStatus: 'accepted' }],
     };
 
     const mockService = {
@@ -322,9 +320,7 @@ describe('handleRespondToCalendarEvent', () => {
       summary: 'Unwanted Meeting',
       start: { dateTime: '2026-02-10T10:00:00Z' },
       end: { dateTime: '2026-02-10T11:00:00Z' },
-      attendees: [
-        { email: 'test@example.com', self: true, responseStatus: 'declined' },
-      ],
+      attendees: [{ email: 'test@example.com', self: true, responseStatus: 'declined' }],
     };
 
     const mockService = {
@@ -358,9 +354,7 @@ describe('handleRespondToCalendarEvent', () => {
       summary: 'Maybe Meeting',
       start: { dateTime: '2026-02-10T10:00:00Z' },
       end: { dateTime: '2026-02-10T11:00:00Z' },
-      attendees: [
-        { email: 'test@example.com', self: true, responseStatus: 'tentative' },
-      ],
+      attendees: [{ email: 'test@example.com', self: true, responseStatus: 'tentative' }],
     };
 
     const mockService = {
@@ -389,9 +383,11 @@ describe('handleRespondToCalendarEvent', () => {
     });
 
     const mockService = {
-      respondToEvent: vi.fn().mockRejectedValue(
-        new Error('Cannot respond to this event: you are not listed as an attendee')
-      ),
+      respondToEvent: vi
+        .fn()
+        .mockRejectedValue(
+          new Error('Cannot respond to this event: you are not listed as an attendee')
+        ),
     };
     vi.mocked(getGoogleCalendarService).mockReturnValue(mockService as any);
 
@@ -418,9 +414,7 @@ describe('handleRespondToCalendarEvent', () => {
     });
 
     const mockService = {
-      respondToEvent: vi.fn().mockRejectedValue(
-        new Error('No active google account for user')
-      ),
+      respondToEvent: vi.fn().mockRejectedValue(new Error('No active google account for user')),
     };
     vi.mocked(getGoogleCalendarService).mockReturnValue(mockService as any);
 
@@ -446,9 +440,9 @@ describe('handleRespondToCalendarEvent', () => {
     });
 
     const mockService = {
-      respondToEvent: vi.fn().mockRejectedValue(
-        new Error('Insufficient permission for calendar.events.update')
-      ),
+      respondToEvent: vi
+        .fn()
+        .mockRejectedValue(new Error('Insufficient permission for calendar.events.update')),
     };
     vi.mocked(getGoogleCalendarService).mockReturnValue(mockService as any);
 
@@ -478,9 +472,7 @@ describe('handleRespondToCalendarEvent', () => {
       summary: 'Work Meeting',
       start: { dateTime: '2026-02-10T10:00:00Z' },
       end: { dateTime: '2026-02-10T11:00:00Z' },
-      attendees: [
-        { email: 'test@example.com', self: true, responseStatus: 'accepted' },
-      ],
+      attendees: [{ email: 'test@example.com', self: true, responseStatus: 'accepted' }],
     };
 
     const mockService = {
@@ -514,9 +506,11 @@ describe('Calendar Service respondToEvent', () => {
     // This is a contract test - the service should throw a specific error
     // when the user tries to respond to an event they're not invited to
     const mockService = {
-      respondToEvent: vi.fn().mockRejectedValue(
-        new Error('Cannot respond to this event: you are not listed as an attendee')
-      ),
+      respondToEvent: vi
+        .fn()
+        .mockRejectedValue(
+          new Error('Cannot respond to this event: you are not listed as an attendee')
+        ),
     };
 
     await expect(
@@ -702,7 +696,9 @@ describe('handleUpdateCalendarEvent', () => {
     expect(result.isError).toBeUndefined();
     const response = JSON.parse(result.content[0].text);
     expect(response.success).toBe(true);
-    expect(response.updatedFields).toEqual(expect.arrayContaining(['summary', 'description', 'location']));
+    expect(response.updatedFields).toEqual(
+      expect.arrayContaining(['summary', 'description', 'location'])
+    );
   });
 
   it('should return error when no fields provided', async () => {
@@ -733,9 +729,7 @@ describe('handleUpdateCalendarEvent', () => {
     });
 
     const mockService = {
-      updateEvent: vi.fn().mockRejectedValue(
-        new Error('No active google account for user')
-      ),
+      updateEvent: vi.fn().mockRejectedValue(new Error('No active google account for user')),
     };
     vi.mocked(getGoogleCalendarService).mockReturnValue(mockService as any);
 
@@ -761,9 +755,7 @@ describe('handleUpdateCalendarEvent', () => {
     });
 
     const mockService = {
-      updateEvent: vi.fn().mockRejectedValue(
-        new Error('403 Forbidden: Insufficient permissions')
-      ),
+      updateEvent: vi.fn().mockRejectedValue(new Error('403 Forbidden: Insufficient permissions')),
     };
     vi.mocked(getGoogleCalendarService).mockReturnValue(mockService as any);
 

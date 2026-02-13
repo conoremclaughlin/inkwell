@@ -210,7 +210,11 @@ export default function LoginForm() {
           </div>
         )}
 
-        <Button type="submit" className="w-full h-12 rounded-xl text-base font-semibold" disabled={isLoading}>
+        <Button
+          type="submit"
+          className="w-full h-12 rounded-xl text-base font-semibold"
+          disabled={isLoading}
+        >
           {isLoading ? (
             <span className="flex items-center gap-2">
               <Loader2 className="h-4 w-4 animate-spin" />

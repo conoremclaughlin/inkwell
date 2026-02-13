@@ -50,7 +50,8 @@ describe('SessionService Codex backend integration', () => {
     dataComposer = await getDataComposer();
 
     // Resolve known test user via existing echo identity (seeded by migration 008)
-    const { data: echoIdentity, error } = await dataComposer.getClient()
+    const { data: echoIdentity, error } = await dataComposer
+      .getClient()
       .from('agent_identities')
       .select('user_id')
       .eq('agent_id', 'echo')
@@ -65,7 +66,8 @@ describe('SessionService Codex backend integration', () => {
     testUserId = echoIdentity.user_id;
 
     // Ensure echo_codex identity exists and is configured for codex backend
-    const { data: existing } = await dataComposer.getClient()
+    const { data: existing } = await dataComposer
+      .getClient()
       .from('agent_identities')
       .select('id')
       .eq('user_id', testUserId)
@@ -73,7 +75,8 @@ describe('SessionService Codex backend integration', () => {
       .single();
 
     if (existing?.id) {
-      const { error: updateError } = await dataComposer.getClient()
+      const { error: updateError } = await dataComposer
+        .getClient()
         .from('agent_identities')
         .update({
           backend: 'codex',
@@ -86,7 +89,8 @@ describe('SessionService Codex backend integration', () => {
         throw new Error(`Failed to update echo_codex identity: ${updateError.message}`);
       }
     } else {
-      const { error: insertError } = await dataComposer.getClient()
+      const { error: insertError } = await dataComposer
+        .getClient()
         .from('agent_identities')
         .insert({
           user_id: testUserId,
@@ -123,7 +127,8 @@ describe('SessionService Codex backend integration', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     if (!dataComposer) return;
-    await dataComposer.getClient()
+    await dataComposer
+      .getClient()
       .from('sessions')
       .delete()
       .eq('user_id', testUserId)
@@ -132,13 +137,15 @@ describe('SessionService Codex backend integration', () => {
 
   afterAll(async () => {
     if (!dataComposer) return;
-    await dataComposer.getClient()
+    await dataComposer
+      .getClient()
       .from('sessions')
       .delete()
       .eq('user_id', testUserId)
       .eq('agent_id', 'echo_codex');
 
-    await dataComposer.getClient()
+    await dataComposer
+      .getClient()
       .from('agent_identities')
       .delete()
       .eq('user_id', testUserId)
@@ -165,7 +172,8 @@ describe('SessionService Codex backend integration', () => {
     expect(codexRunner.run).toHaveBeenCalledTimes(1);
     expect(claudeRunner.run).not.toHaveBeenCalled();
 
-    const { data: persisted } = await dataComposer.getClient()
+    const { data: persisted } = await dataComposer
+      .getClient()
       .from('sessions')
       .select('backend')
       .eq('id', result.sessionId)

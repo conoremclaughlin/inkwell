@@ -61,6 +61,7 @@ Runs as a single pm2 process (`pcp`).
 Exposes PCP tools over HTTP/SSE at `http://localhost:3001/mcp`. Each client connection gets its own `McpServer + StreamableHTTPServerTransport` pair, managed in a session map.
 
 Additional HTTP endpoints:
+
 - `/health` — service health check
 - `/api/agent/trigger` — inter-agent trigger
 - OAuth2 endpoints (`/authorize`, `/token`, `/register`)
@@ -68,6 +69,7 @@ Additional HTTP endpoints:
 ### Channel Gateway (`src/channels/gateway.ts`)
 
 Manages messaging integrations. Currently supports:
+
 - **TelegramListener** — polling-based via Telegraf
 - **WhatsAppListener** — WhatsApp Web via Baileys
 
@@ -78,6 +80,7 @@ Messages are optionally buffered (default 2s for grouping related messages), the
 Stateless, horizontally scalable message processor. All state lives in the database.
 
 **Processing flow:**
+
 1. Get or create session from DB
 2. Acquire processing lock (per agent+session)
 3. If locked, queue the message (FIFO)
@@ -150,11 +153,11 @@ sb "fix the bug" → Identity injection (--append-system-prompt)
 
 Three agents share the same infrastructure with distinct identities and filtered memories:
 
-| Agent | Interface | Nature |
-|-------|-----------|--------|
-| **Wren** | Claude Code (via `sb`) | Session-based development collaborator |
-| **Myra** | Telegram / WhatsApp | Persistent messaging bridge |
-| **Benson** | Discord / Slack | Conversational partner |
+| Agent      | Interface              | Nature                                 |
+| ---------- | ---------------------- | -------------------------------------- |
+| **Wren**   | Claude Code (via `sb`) | Session-based development collaborator |
+| **Myra**   | Telegram / WhatsApp    | Persistent messaging bridge            |
+| **Benson** | Discord / Slack        | Conversational partner                 |
 
 Identity is resolved from: system prompt override → `$AGENT_ID` env var → `.pcp/identity.json` → `~/.pcp/config.json`. Each agent has identity files at `~/.pcp/<agentId>/` and memories filtered by agentId.
 
@@ -162,23 +165,24 @@ Identity is resolved from: system prompt override → `$AGENT_ID` env var → `.
 
 60+ tools organized by domain:
 
-| Domain | Tools |
-|--------|-------|
-| **Bootstrap & Sessions** | `bootstrap`, `start_session`, `log_session`, `end_session` |
-| **Memory** | `remember`, `recall`, `forget`, `update_memory`, history/restore |
-| **Context & Projects** | `save_context`, `get_context`, `save_project`, `set_focus` |
-| **Communication** | `send_response`, `send_to_inbox`, `trigger_agent` |
-| **Data** | `save_link`, `create_task`, `create_reminder`, calendar, email |
-| **Identity** | `save_identity`, `get_identity`, permissions, audit log |
-| **Skills** | `list_skills`, `publish_skill`, `fork_skill` |
-| **Artifacts** | `create_artifact`, `update_artifact` (versioned shared docs) |
-| **Workspaces** | `create_workspace`, `list_workspaces`, `adopt_workspace` |
+| Domain                   | Tools                                                            |
+| ------------------------ | ---------------------------------------------------------------- |
+| **Bootstrap & Sessions** | `bootstrap`, `start_session`, `log_session`, `end_session`       |
+| **Memory**               | `remember`, `recall`, `forget`, `update_memory`, history/restore |
+| **Context & Projects**   | `save_context`, `get_context`, `save_project`, `set_focus`       |
+| **Communication**        | `send_response`, `send_to_inbox`, `trigger_agent`                |
+| **Data**                 | `save_link`, `create_task`, `create_reminder`, calendar, email   |
+| **Identity**             | `save_identity`, `get_identity`, permissions, audit log          |
+| **Skills**               | `list_skills`, `publish_skill`, `fork_skill`                     |
+| **Artifacts**            | `create_artifact`, `update_artifact` (versioned shared docs)     |
+| **Workspaces**           | `create_workspace`, `list_workspaces`, `adopt_workspace`         |
 
 ## Data Layer
 
 **Database:** Supabase PostgreSQL with pgvector for semantic search and Row Level Security for data isolation.
 
 **Repository pattern** via DataComposer (`src/data/composer.ts`):
+
 - Users, Links, Notes, Tasks, Reminders
 - Conversations, Context, Projects
 - Memory (with semantic search), Sessions
@@ -199,10 +203,10 @@ Identity is resolved from: system prompt override → `$AGENT_ID` env var → `.
 
 Single pm2 configuration (`ecosystem.config.cjs`):
 
-| Process | Description |
-|---------|-------------|
-| `pcp` | Main server: MCP + channels + heartbeat + agent gateway |
-| `web` | Next.js admin dashboard (port 3002) |
+| Process | Description                                             |
+| ------- | ------------------------------------------------------- |
+| `pcp`   | Main server: MCP + channels + heartbeat + agent gateway |
+| `web`   | Next.js admin dashboard (port 3002)                     |
 
 ## Key Design Decisions
 

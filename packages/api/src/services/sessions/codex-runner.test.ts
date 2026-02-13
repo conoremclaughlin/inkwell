@@ -45,23 +45,29 @@ describe('CodexRunner', () => {
     });
 
     setTimeout(() => {
-      mockProc.stdout.emit('data', Buffer.from(
-        `${JSON.stringify({
-          type: 'tool_use',
-          id: 'tu-1',
-          name: 'mcp__pcp__send_response',
-          input: { channel: 'telegram', conversationId: 'chat-1', content: 'hi from codex' },
-        })}\n`
-      ));
-      mockProc.stdout.emit('data', Buffer.from(
-        `${JSON.stringify({
-          session_id: 'codex-session-123',
-          input_tokens: 12,
-          output_tokens: 5,
-          context_tokens: 42,
-          result: 'done',
-        })}\n`
-      ));
+      mockProc.stdout.emit(
+        'data',
+        Buffer.from(
+          `${JSON.stringify({
+            type: 'tool_use',
+            id: 'tu-1',
+            name: 'mcp__pcp__send_response',
+            input: { channel: 'telegram', conversationId: 'chat-1', content: 'hi from codex' },
+          })}\n`
+        )
+      );
+      mockProc.stdout.emit(
+        'data',
+        Buffer.from(
+          `${JSON.stringify({
+            session_id: 'codex-session-123',
+            input_tokens: 12,
+            output_tokens: 5,
+            context_tokens: 42,
+            result: 'done',
+          })}\n`
+        )
+      );
       mockProc.emit('close', 0);
     }, 5);
 
@@ -117,4 +123,3 @@ describe('CodexRunner', () => {
     expect(args).toContain('resume msg');
   });
 });
-

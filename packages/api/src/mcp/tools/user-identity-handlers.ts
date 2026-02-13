@@ -16,7 +16,10 @@ const userIdentifierFields = {
   email: z.string().email().optional().describe('User email address'),
   phone: z.string().optional().describe('Phone number in E.164 format'),
   platformId: z.string().optional().describe('Platform-specific user ID'),
-  platform: z.enum(['telegram', 'whatsapp', 'discord']).optional().describe('Platform for user lookup'),
+  platform: z
+    .enum(['telegram', 'whatsapp', 'discord'])
+    .optional()
+    .describe('Platform for user lookup'),
   workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
 };
 
@@ -27,7 +30,10 @@ const userIdentifierFields = {
 export const saveUserIdentitySchema = z.object({
   ...userIdentifierFields,
   userProfileMd: z.string().optional().describe('USER.md content - who the human is'),
-  sharedValuesMd: z.string().optional().describe('VALUES.md content - shared values across all SBs'),
+  sharedValuesMd: z
+    .string()
+    .optional()
+    .describe('VALUES.md content - shared values across all SBs'),
   processMd: z.string().optional().describe('PROCESS.md content - shared team operational process'),
 });
 
@@ -65,10 +71,7 @@ export async function handleSaveUserIdentity(args: unknown, dataComposer: DataCo
   const workspaceId = params.workspaceId;
 
   // Check if identity already exists
-  let existingQuery = supabase
-    .from('user_identity')
-    .select('id, version')
-    .eq('user_id', user.id);
+  let existingQuery = supabase.from('user_identity').select('id, version').eq('user_id', user.id);
   existingQuery = withWorkspaceFilter(existingQuery, workspaceId);
   const { data: existing } = await existingQuery.single();
 
@@ -155,10 +158,7 @@ export async function handleGetUserIdentity(args: unknown, dataComposer: DataCom
 
   const supabase = dataComposer.getClient();
 
-  let identityQuery = supabase
-    .from('user_identity')
-    .select('*')
-    .eq('user_id', user.id);
+  let identityQuery = supabase.from('user_identity').select('*').eq('user_id', user.id);
   identityQuery = withWorkspaceFilter(identityQuery, params.workspaceId);
   const { data, error } = await identityQuery.single();
 
@@ -225,18 +225,12 @@ export async function handleGetUserIdentityHistory(args: unknown, dataComposer: 
   const limit = params.limit || 10;
 
   // Get current identity
-  let currentQuery = supabase
-    .from('user_identity')
-    .select('*')
-    .eq('user_id', user.id);
+  let currentQuery = supabase.from('user_identity').select('*').eq('user_id', user.id);
   currentQuery = withWorkspaceFilter(currentQuery, params.workspaceId);
   const { data: current } = await currentQuery.single();
 
   // Get history
-  let historyQuery = supabase
-    .from('user_identity_history')
-    .select('*')
-    .eq('user_id', user.id);
+  let historyQuery = supabase.from('user_identity_history').select('*').eq('user_id', user.id);
   historyQuery = withWorkspaceFilter(historyQuery, params.workspaceId);
   const { data: history, error } = await historyQuery
     .order('version', { ascending: false })

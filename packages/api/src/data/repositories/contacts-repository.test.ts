@@ -5,10 +5,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import {
-  calculateSimilarity,
-  levenshteinDistance,
-} from './contacts-repository';
+import { calculateSimilarity, levenshteinDistance } from './contacts-repository';
 
 describe('levenshteinDistance', () => {
   it('should return 0 for identical strings', () => {

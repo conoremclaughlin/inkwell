@@ -42,7 +42,9 @@ vi.mock('discord.js', () => {
   }
 
   class MockREST {
-    setToken() { return this; }
+    setToken() {
+      return this;
+    }
     put = vi.fn().mockResolvedValue(undefined);
   }
 
@@ -221,7 +223,9 @@ describe('DiscordListener', () => {
     });
 
     it('should ignore bot messages', async () => {
-      const msg = createMockMessage({ author: { ...createMockMessage().author as object, bot: true } });
+      const msg = createMockMessage({
+        author: { ...(createMockMessage().author as object), bot: true },
+      });
       await messageHandler(msg);
 
       expect(mockAuthService.isGroupAuthorized).not.toHaveBeenCalled();
@@ -262,7 +266,10 @@ describe('DiscordListener', () => {
       await messageHandler(msg);
 
       expect(mockAuthService.authorizeGroupWithCode).toHaveBeenCalledWith(
-        'discord', '444555666', 'Test Server', 'ABC123'
+        'discord',
+        '444555666',
+        'Test Server',
+        'ABC123'
       );
     });
 
@@ -464,7 +471,10 @@ describe('DiscordListener', () => {
       await messageHandler(msg);
 
       expect(mockAuthService.addTrustedUser).toHaveBeenCalledWith(
-        'discord', '789', 'admin', '111222333'
+        'discord',
+        '789',
+        'admin',
+        '111222333'
       );
     });
 
@@ -474,9 +484,7 @@ describe('DiscordListener', () => {
       const msg = createMockMessage({ guild: null, content: '/revoke-group 444555666' });
       await messageHandler(msg);
 
-      expect(mockAuthService.revokeGroup).toHaveBeenCalledWith(
-        'discord', '444555666', '111222333'
-      );
+      expect(mockAuthService.revokeGroup).toHaveBeenCalledWith('discord', '444555666', '111222333');
     });
   });
 

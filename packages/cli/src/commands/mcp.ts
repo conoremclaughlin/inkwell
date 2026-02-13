@@ -89,7 +89,7 @@ function tomlString(val: string): string {
  */
 function toGeminiSettings(
   servers: Record<string, McpServerConfig>,
-  existingSettings?: Record<string, unknown>,
+  existingSettings?: Record<string, unknown>
 ): Record<string, unknown> {
   const geminiServers: Record<string, Record<string, unknown>> = {};
 
@@ -139,7 +139,7 @@ function ensureGitignoreEntries(repoRoot: string, entries: string[]): string[] {
   }
 
   const lines = content.split('\n');
-  const missing = entries.filter(entry => !lines.some(line => line.trim() === entry));
+  const missing = entries.filter((entry) => !lines.some((line) => line.trim() === entry));
 
   if (missing.length > 0) {
     const suffix = content.endsWith('\n') ? '' : '\n';
@@ -192,7 +192,9 @@ export function syncMcpConfig(targetDir: string): { codex: boolean; gemini: bool
   if (existsSync(geminiPath)) {
     try {
       existingGemini = JSON.parse(readFileSync(geminiPath, 'utf-8'));
-    } catch { /* overwrite if unparseable */ }
+    } catch {
+      /* overwrite if unparseable */
+    }
   }
 
   const geminiSettings = toGeminiSettings(mcpJson.mcpServers, existingGemini);
@@ -246,11 +248,10 @@ async function syncCommand(): Promise<void> {
 // ============================================================================
 
 export function registerConfigCommands(program: Command): void {
-  const config = program
-    .command('config')
-    .description('Manage backend configuration');
+  const config = program.command('config').description('Manage backend configuration');
 
-  config.command('sync')
+  config
+    .command('sync')
     .description('Sync .mcp.json to Codex (.codex/config.toml) and Gemini (.gemini/settings.json)')
     .action(syncCommand);
 }

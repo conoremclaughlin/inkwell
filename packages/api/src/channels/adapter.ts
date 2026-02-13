@@ -6,10 +6,7 @@
 import type { DataComposer } from '../data/composer';
 import { resolveUser } from '../services/user-resolver';
 import { logger } from '../utils/logger';
-import {
-  extractContext,
-  hasExtractableContent,
-} from './extractor';
+import { extractContext, hasExtractableContent } from './extractor';
 import type {
   InboundMessage,
   ProcessingResult,
@@ -166,7 +163,10 @@ export class ChannelAdapter {
         try {
           const platform = this.mapPlatformToApi(message.platform);
           const recurrence = reminder.recurrence
-            ? { frequency: reminder.recurrence.frequency, interval: reminder.recurrence.interval ?? 1 }
+            ? {
+                frequency: reminder.recurrence.frequency,
+                interval: reminder.recurrence.interval ?? 1,
+              }
             : undefined;
           await this.dataComposer.repositories.reminders.create({
             user_id: result.userId!,
@@ -281,27 +281,19 @@ export class ChannelAdapter {
     const parts: string[] = [];
 
     if (result.saved.links > 0) {
-      parts.push(
-        `Saved ${result.saved.links} link${result.saved.links > 1 ? 's' : ''}`
-      );
+      parts.push(`Saved ${result.saved.links} link${result.saved.links > 1 ? 's' : ''}`);
     }
 
     if (result.saved.notes > 0) {
-      parts.push(
-        `Saved ${result.saved.notes} note${result.saved.notes > 1 ? 's' : ''}`
-      );
+      parts.push(`Saved ${result.saved.notes} note${result.saved.notes > 1 ? 's' : ''}`);
     }
 
     if (result.saved.tasks > 0) {
-      parts.push(
-        `Created ${result.saved.tasks} task${result.saved.tasks > 1 ? 's' : ''}`
-      );
+      parts.push(`Created ${result.saved.tasks} task${result.saved.tasks > 1 ? 's' : ''}`);
     }
 
     if (result.saved.reminders > 0) {
-      parts.push(
-        `Set ${result.saved.reminders} reminder${result.saved.reminders > 1 ? 's' : ''}`
-      );
+      parts.push(`Set ${result.saved.reminders} reminder${result.saved.reminders > 1 ? 's' : ''}`);
     }
 
     if (parts.length === 0) {

@@ -25,7 +25,8 @@ describe('Session Phase Integration', () => {
     dataComposer = await getDataComposer();
 
     // Find a test user (use the user who owns the echo agent from migration 008)
-    const { data: echoIdentity, error } = await dataComposer.getClient()
+    const { data: echoIdentity, error } = await dataComposer
+      .getClient()
       .from('agent_identities')
       .select('user_id')
       .eq('agent_id', 'echo')
@@ -43,7 +44,8 @@ describe('Session Phase Integration', () => {
   afterAll(async () => {
     // Clean up: end all test sessions
     if (createdSessionIds.length > 0) {
-      await dataComposer.getClient()
+      await dataComposer
+        .getClient()
         .from('sessions')
         .update({ ended_at: new Date().toISOString() })
         .in('id', createdSessionIds)
@@ -52,15 +54,13 @@ describe('Session Phase Integration', () => {
 
     // Clean up: delete test memories
     if (createdMemoryIds.length > 0) {
-      await dataComposer.getClient()
-        .from('memories')
-        .delete()
-        .in('id', createdMemoryIds);
+      await dataComposer.getClient().from('memories').delete().in('id', createdMemoryIds);
     }
   });
 
   it('should create a new session with the test agent', async () => {
-    const { data, error } = await dataComposer.getClient()
+    const { data, error } = await dataComposer
+      .getClient()
       .from('sessions')
       .insert({
         user_id: testUserId,
@@ -81,7 +81,8 @@ describe('Session Phase Integration', () => {
   });
 
   it('should update session phase to implementing', async () => {
-    const { data, error } = await dataComposer.getClient()
+    const { data, error } = await dataComposer
+      .getClient()
       .from('sessions')
       .update({ current_phase: 'implementing' })
       .eq('id', testSessionId)
@@ -95,7 +96,8 @@ describe('Session Phase Integration', () => {
   it('should update session with backend_session_id (writes to both columns)', async () => {
     const testBackendId = `integration-test-${Date.now()}`;
 
-    const { data, error } = await dataComposer.getClient()
+    const { data, error } = await dataComposer
+      .getClient()
       .from('sessions')
       .update({
         backend_session_id: testBackendId,
@@ -114,7 +116,8 @@ describe('Session Phase Integration', () => {
     const blockedPhase = 'blocked:integration-test-reason';
 
     // Update phase
-    const { data: sessionData, error: sessionError } = await dataComposer.getClient()
+    const { data: sessionData, error: sessionError } = await dataComposer
+      .getClient()
       .from('sessions')
       .update({ current_phase: blockedPhase })
       .eq('id', testSessionId)
@@ -125,7 +128,8 @@ describe('Session Phase Integration', () => {
     expect(sessionData!.current_phase).toBe(blockedPhase);
 
     // Create auto-memory (simulating what handleUpdateSessionPhase does)
-    const { data: memoryData, error: memoryError } = await dataComposer.getClient()
+    const { data: memoryData, error: memoryError } = await dataComposer
+      .getClient()
       .from('memories')
       .insert({
         user_id: testUserId,
@@ -145,7 +149,8 @@ describe('Session Phase Integration', () => {
   });
 
   it('should update session status and context metadata', async () => {
-    const { data, error } = await dataComposer.getClient()
+    const { data, error } = await dataComposer
+      .getClient()
       .from('sessions')
       .update({
         status: 'resumable',
@@ -163,7 +168,8 @@ describe('Session Phase Integration', () => {
   });
 
   it('should transition to complete phase', async () => {
-    const { data, error } = await dataComposer.getClient()
+    const { data, error } = await dataComposer
+      .getClient()
       .from('sessions')
       .update({ current_phase: 'complete' })
       .eq('id', testSessionId)
@@ -175,7 +181,8 @@ describe('Session Phase Integration', () => {
   });
 
   it('should end the session with a summary', async () => {
-    const { data, error } = await dataComposer.getClient()
+    const { data, error } = await dataComposer
+      .getClient()
       .from('sessions')
       .update({
         ended_at: new Date().toISOString(),
@@ -193,7 +200,8 @@ describe('Session Phase Integration', () => {
   it('should verify the auto-created memory exists with correct data', async () => {
     expect(createdMemoryIds.length).toBeGreaterThan(0);
 
-    const { data, error } = await dataComposer.getClient()
+    const { data, error } = await dataComposer
+      .getClient()
       .from('memories')
       .select('*')
       .eq('id', createdMemoryIds[0])
@@ -212,7 +220,8 @@ describe('Session Phase Integration', () => {
 
   it('should support parallel sessions for the same agent', async () => {
     // Create two sessions for the same agent (simulating parallel worktrees)
-    const { data: session1 } = await dataComposer.getClient()
+    const { data: session1 } = await dataComposer
+      .getClient()
       .from('sessions')
       .insert({
         user_id: testUserId,
@@ -222,7 +231,8 @@ describe('Session Phase Integration', () => {
       .select()
       .single();
 
-    const { data: session2 } = await dataComposer.getClient()
+    const { data: session2 } = await dataComposer
+      .getClient()
       .from('sessions')
       .insert({
         user_id: testUserId,
@@ -237,7 +247,8 @@ describe('Session Phase Integration', () => {
     createdSessionIds.push(session1!.id, session2!.id);
 
     // Both should be active simultaneously
-    const { data: activeSessions } = await dataComposer.getClient()
+    const { data: activeSessions } = await dataComposer
+      .getClient()
       .from('sessions')
       .select('id, current_phase')
       .eq('user_id', testUserId)
@@ -247,29 +258,33 @@ describe('Session Phase Integration', () => {
 
     // Should have at least 2 active sessions
     const testSessionIds = (activeSessions || [])
-      .filter(s => s.id === session1!.id || s.id === session2!.id)
-      .map(s => s.id);
+      .filter((s) => s.id === session1!.id || s.id === session2!.id)
+      .map((s) => s.id);
     expect(testSessionIds.length).toBe(2);
 
     // Update each independently
-    await dataComposer.getClient()
+    await dataComposer
+      .getClient()
       .from('sessions')
       .update({ current_phase: 'investigating' })
       .eq('id', session1!.id);
 
-    await dataComposer.getClient()
+    await dataComposer
+      .getClient()
       .from('sessions')
       .update({ current_phase: 'implementing' })
       .eq('id', session2!.id);
 
     // Verify independent phases
-    const { data: s1 } = await dataComposer.getClient()
+    const { data: s1 } = await dataComposer
+      .getClient()
       .from('sessions')
       .select('current_phase')
       .eq('id', session1!.id)
       .single();
 
-    const { data: s2 } = await dataComposer.getClient()
+    const { data: s2 } = await dataComposer
+      .getClient()
       .from('sessions')
       .select('current_phase')
       .eq('id', session2!.id)
@@ -279,7 +294,8 @@ describe('Session Phase Integration', () => {
     expect(s2!.current_phase).toBe('implementing');
 
     // Cleanup
-    await dataComposer.getClient()
+    await dataComposer
+      .getClient()
       .from('sessions')
       .update({ ended_at: new Date().toISOString() })
       .in('id', [session1!.id, session2!.id]);

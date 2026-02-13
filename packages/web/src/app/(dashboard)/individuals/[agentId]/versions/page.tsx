@@ -12,10 +12,10 @@ import { useApiQuery } from '@/lib/api';
 import clsx from 'clsx';
 
 // Dynamic import for TipTap diff viewer (client-only, heavy deps)
-const MarkdownVersionDiff = dynamic(
-  () => import('@/stories/diff-versions/markdown-version-diff'),
-  { ssr: false, loading: () => <p className="text-gray-500 p-4">Loading diff viewer...</p> }
-);
+const MarkdownVersionDiff = dynamic(() => import('@/stories/diff-versions/markdown-version-diff'), {
+  ssr: false,
+  loading: () => <p className="text-gray-500 p-4">Loading diff viewer...</p>,
+});
 
 interface Identity {
   id: string;
@@ -163,7 +163,9 @@ export default function VersionExplorerPage() {
   const comparisonVersion = allVersions[selectedVersionIndex + 1];
 
   // Determine which files have content across any version
-  const hasIdentity = allVersions.some((v) => v.description || v.values?.length || v.capabilities?.length || v.relationships);
+  const hasIdentity = allVersions.some(
+    (v) => v.description || v.values?.length || v.capabilities?.length || v.relationships
+  );
   const hasSoul = allVersions.some((v) => v.soul);
   const hasHeartbeat = allVersions.some((v) => v.heartbeat);
 
@@ -217,9 +219,7 @@ export default function VersionExplorerPage() {
             </Link>
           </Button>
           <div>
-            <h1 className="text-2xl font-bold text-gray-900">
-              {identity.name} Version History
-            </h1>
+            <h1 className="text-2xl font-bold text-gray-900">{identity.name} Version History</h1>
             <p className="text-gray-600">
               {allVersions.length} version{allVersions.length !== 1 ? 's' : ''} available
             </p>
@@ -245,17 +245,25 @@ export default function VersionExplorerPage() {
                   {/* Show all changed files like a git diff */}
                   <div className="space-y-6">
                     {/* IDENTITY.md */}
-                    <div className={clsx(
-                      'rounded-lg border',
-                      identityChanged ? 'border-amber-200 bg-amber-50/30' : 'border-gray-200 bg-gray-50/30'
-                    )}>
+                    <div
+                      className={clsx(
+                        'rounded-lg border',
+                        identityChanged
+                          ? 'border-amber-200 bg-amber-50/30'
+                          : 'border-gray-200 bg-gray-50/30'
+                      )}
+                    >
                       <div className="flex items-center gap-2 px-4 py-2 border-b bg-white/50 rounded-t-lg">
                         <FileText className="h-4 w-4 text-gray-600" />
                         <span className="font-mono text-sm font-medium">IDENTITY.md</span>
                         {identityChanged ? (
-                          <Badge variant="outline" className="ml-auto text-xs bg-amber-100">Changed</Badge>
+                          <Badge variant="outline" className="ml-auto text-xs bg-amber-100">
+                            Changed
+                          </Badge>
                         ) : (
-                          <Badge variant="outline" className="ml-auto text-xs text-gray-400">Unchanged</Badge>
+                          <Badge variant="outline" className="ml-auto text-xs text-gray-400">
+                            Unchanged
+                          </Badge>
                         )}
                       </div>
                       <div className="p-4">
@@ -271,17 +279,25 @@ export default function VersionExplorerPage() {
                     </div>
 
                     {/* SOUL.md */}
-                    <div className={clsx(
-                      'rounded-lg border',
-                      soulChanged ? 'border-amber-200 bg-amber-50/30' : 'border-gray-200 bg-gray-50/30'
-                    )}>
+                    <div
+                      className={clsx(
+                        'rounded-lg border',
+                        soulChanged
+                          ? 'border-amber-200 bg-amber-50/30'
+                          : 'border-gray-200 bg-gray-50/30'
+                      )}
+                    >
                       <div className="flex items-center gap-2 px-4 py-2 border-b bg-white/50 rounded-t-lg">
                         <Sparkles className="h-4 w-4 text-amber-500" />
                         <span className="font-mono text-sm font-medium">SOUL.md</span>
                         {soulChanged ? (
-                          <Badge variant="outline" className="ml-auto text-xs bg-amber-100">Changed</Badge>
+                          <Badge variant="outline" className="ml-auto text-xs bg-amber-100">
+                            Changed
+                          </Badge>
                         ) : (
-                          <Badge variant="outline" className="ml-auto text-xs text-gray-400">Unchanged</Badge>
+                          <Badge variant="outline" className="ml-auto text-xs text-gray-400">
+                            Unchanged
+                          </Badge>
                         )}
                       </div>
                       <div className="p-4">
@@ -297,17 +313,25 @@ export default function VersionExplorerPage() {
                     </div>
 
                     {/* HEARTBEAT.md */}
-                    <div className={clsx(
-                      'rounded-lg border',
-                      heartbeatChanged ? 'border-amber-200 bg-amber-50/30' : 'border-gray-200 bg-gray-50/30'
-                    )}>
+                    <div
+                      className={clsx(
+                        'rounded-lg border',
+                        heartbeatChanged
+                          ? 'border-amber-200 bg-amber-50/30'
+                          : 'border-gray-200 bg-gray-50/30'
+                      )}
+                    >
                       <div className="flex items-center gap-2 px-4 py-2 border-b bg-white/50 rounded-t-lg">
                         <Zap className="h-4 w-4 text-blue-500" />
                         <span className="font-mono text-sm font-medium">HEARTBEAT.md</span>
                         {heartbeatChanged ? (
-                          <Badge variant="outline" className="ml-auto text-xs bg-amber-100">Changed</Badge>
+                          <Badge variant="outline" className="ml-auto text-xs bg-amber-100">
+                            Changed
+                          </Badge>
                         ) : (
-                          <Badge variant="outline" className="ml-auto text-xs text-gray-400">Unchanged</Badge>
+                          <Badge variant="outline" className="ml-auto text-xs text-gray-400">
+                            Unchanged
+                          </Badge>
                         )}
                       </div>
                       <div className="p-4">
@@ -326,7 +350,9 @@ export default function VersionExplorerPage() {
               ) : (
                 <div className="text-center text-gray-500 py-8">
                   <p className="font-medium">Original version</p>
-                  <p className="text-sm mt-1">This is the first version - no previous version to compare.</p>
+                  <p className="text-sm mt-1">
+                    This is the first version - no previous version to compare.
+                  </p>
                 </div>
               )}
             </CardContent>
@@ -350,9 +376,7 @@ export default function VersionExplorerPage() {
                       key={v.id}
                       className={clsx(
                         'relative cursor-pointer rounded-md py-4 pl-8 pr-4 transition-colors',
-                        isActive
-                          ? 'bg-blue-50 text-blue-900'
-                          : 'hover:bg-gray-50'
+                        isActive ? 'bg-blue-50 text-blue-900' : 'hover:bg-gray-50'
                       )}
                       onClick={() => setSelectedVersionIndex(i)}
                     >
@@ -365,18 +389,14 @@ export default function VersionExplorerPage() {
                             'top-0 bottom-1/2': isLast,
                             'top-0 bottom-0': !isFirst && !isLast,
                           },
-                          isActive
-                            ? 'bg-blue-500'
-                            : 'bg-gray-300'
+                          isActive ? 'bg-blue-500' : 'bg-gray-300'
                         )}
                       />
                       {/* Timeline dot */}
                       <span
                         className={clsx(
                           'absolute left-[7px] top-1/2 h-[10px] w-[10px] -translate-y-1/2 rounded-full border-2',
-                          isActive
-                            ? 'border-blue-500 bg-blue-500'
-                            : 'border-gray-300 bg-white'
+                          isActive ? 'border-blue-500 bg-blue-500' : 'border-gray-300 bg-white'
                         )}
                       />
 

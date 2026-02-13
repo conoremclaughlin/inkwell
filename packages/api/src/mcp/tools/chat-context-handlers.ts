@@ -76,11 +76,13 @@ function mcpResponse(data: object, isError = false): McpResponse {
 // ============================================================================
 
 export const getChatContextSchema = z.object({
-  channel: z.enum(['telegram', 'discord', 'whatsapp'])
-    .describe('Channel to get context from'),
-  conversationId: z.string()
-    .describe('Conversation/chat ID to get history from'),
-  limit: z.number().min(1).max(100).optional()
+  channel: z.enum(['telegram', 'discord', 'whatsapp']).describe('Channel to get context from'),
+  conversationId: z.string().describe('Conversation/chat ID to get history from'),
+  limit: z
+    .number()
+    .min(1)
+    .max(100)
+    .optional()
     .default(50)
     .describe('Maximum messages to return (default: 50)'),
 });
@@ -93,11 +95,14 @@ export async function handleGetChatContext(
     const listener = channelListeners.get(args.channel);
 
     if (!listener) {
-      return mcpResponse({
-        success: false,
-        error: `No listener registered for channel: ${args.channel}`,
-        hint: 'The channel may not be configured or running.',
-      }, true);
+      return mcpResponse(
+        {
+          success: false,
+          error: `No listener registered for channel: ${args.channel}`,
+          hint: 'The channel may not be configured or running.',
+        },
+        true
+      );
     }
 
     // Clean up conversation ID (remove prefix if present)
@@ -139,10 +144,13 @@ export async function handleGetChatContext(
     });
   } catch (error) {
     logger.error('Error in get_chat_context:', error);
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to get chat context',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to get chat context',
+      },
+      true
+    );
   }
 }
 
@@ -151,10 +159,8 @@ export async function handleGetChatContext(
 // ============================================================================
 
 export const clearChatContextSchema = z.object({
-  channel: z.enum(['telegram', 'discord', 'whatsapp'])
-    .describe('Channel to clear context for'),
-  conversationId: z.string()
-    .describe('Conversation/chat ID to clear'),
+  channel: z.enum(['telegram', 'discord', 'whatsapp']).describe('Channel to clear context for'),
+  conversationId: z.string().describe('Conversation/chat ID to clear'),
 });
 
 export async function handleClearChatContext(
@@ -165,10 +171,13 @@ export async function handleClearChatContext(
     const listener = channelListeners.get(args.channel);
 
     if (!listener) {
-      return mcpResponse({
-        success: false,
-        error: `No listener registered for channel: ${args.channel}`,
-      }, true);
+      return mcpResponse(
+        {
+          success: false,
+          error: `No listener registered for channel: ${args.channel}`,
+        },
+        true
+      );
     }
 
     // Clean up conversation ID
@@ -188,10 +197,13 @@ export async function handleClearChatContext(
     });
   } catch (error) {
     logger.error('Error in clear_chat_context:', error);
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to clear chat context',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to clear chat context',
+      },
+      true
+    );
   }
 }
 
@@ -200,7 +212,9 @@ export async function handleClearChatContext(
 // ============================================================================
 
 export const getCacheStatsSchema = z.object({
-  channel: z.enum(['telegram', 'discord', 'whatsapp']).optional()
+  channel: z
+    .enum(['telegram', 'discord', 'whatsapp'])
+    .optional()
     .describe('Specific channel to get stats for (default: all)'),
 });
 
@@ -230,9 +244,12 @@ export async function handleGetCacheStats(
       registeredChannels: Array.from(channelListeners.keys()),
     });
   } catch (error) {
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to get cache stats',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to get cache stats',
+      },
+      true
+    );
   }
 }

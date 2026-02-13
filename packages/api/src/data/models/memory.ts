@@ -2,7 +2,13 @@
  * Memory and Session types for long-term memory storage
  */
 
-export type MemorySource = 'conversation' | 'observation' | 'user_stated' | 'inferred' | 'session' | 'reflection';
+export type MemorySource =
+  | 'conversation'
+  | 'observation'
+  | 'user_stated'
+  | 'inferred'
+  | 'session'
+  | 'reflection';
 export type Salience = 'low' | 'medium' | 'high' | 'critical';
 
 export interface Memory {
@@ -59,7 +65,13 @@ export interface MemorySearchOptions {
   includeShared?: boolean; // Include shared memories (agentId=null) when filtering. Default true.
 }
 
-export type SessionPhase = 'investigating' | 'implementing' | 'reviewing' | 'paused' | 'complete' | string;
+export type SessionPhase =
+  | 'investigating'
+  | 'implementing'
+  | 'reviewing'
+  | 'paused'
+  | 'complete'
+  | string;
 
 export interface Session {
   id: string;

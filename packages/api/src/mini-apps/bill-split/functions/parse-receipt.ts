@@ -47,8 +47,8 @@ function parseLine(line: string): ParsedLine | null {
     /^(cash|credit|debit|visa|mastercard|amex)/i,
     /^(thank you|thanks)/i,
     /^(receipt|order|check)/i,
-    /^\d{1,2}[\/\-]\d{1,2}/,  // Dates
-    /^\d{10,}/,  // Long numbers (phone, card numbers)
+    /^\d{1,2}[\/\-]\d{1,2}/, // Dates
+    /^\d{10,}/, // Long numbers (phone, card numbers)
   ];
 
   for (const pattern of skipPatterns) {
@@ -86,8 +86,8 @@ function parseLine(line: string): ParsedLine | null {
 
   // Clean up the item name
   let name = lineWithoutPrice
-    .replace(/[^\w\s\-'&]/g, ' ')  // Remove special chars except common ones
-    .replace(/\s+/g, ' ')          // Normalize whitespace
+    .replace(/[^\w\s\-'&]/g, ' ') // Remove special chars except common ones
+    .replace(/\s+/g, ' ') // Normalize whitespace
     .trim();
 
   // Skip if name is too short or looks like a number
@@ -102,7 +102,12 @@ function parseLine(line: string): ParsedLine | null {
 /**
  * Extract subtotal, tax, tip, total from text
  */
-function extractTotals(text: string): { subtotal?: number; tax?: number; tip?: number; total?: number } {
+function extractTotals(text: string): {
+  subtotal?: number;
+  tax?: number;
+  tip?: number;
+  total?: number;
+} {
   const result: { subtotal?: number; tax?: number; tip?: number; total?: number } = {};
   const lowerText = text.toLowerCase();
 
@@ -184,9 +189,7 @@ export function updateItem(
   itemId: string,
   updates: Partial<Omit<BillItem, 'id'>>
 ): BillItem[] {
-  return items.map((item) =>
-    item.id === itemId ? { ...item, ...updates } : item
-  );
+  return items.map((item) => (item.id === itemId ? { ...item, ...updates } : item));
 }
 
 /**

@@ -10,7 +10,11 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
 import { resolveUserOrThrow } from '../../services/user-resolver';
-import type { ActivityType, ActivityStatus, Json } from '../../data/repositories/activity-stream.repository';
+import type {
+  ActivityType,
+  ActivityStatus,
+  Json,
+} from '../../data/repositories/activity-stream.repository';
 
 // User identification fields (without platform to avoid conflict with activity platform)
 const userIdentifierFields = {
@@ -50,12 +54,29 @@ export const logActivitySchema = z.object({
   content: z.string().describe('Human-readable content/description of the activity'),
   sessionId: z.string().uuid().optional().describe('Session ID if within a session'),
   subtype: z.string().optional().describe('Optional subtype (e.g., tool name for tool_call)'),
-  payload: z.record(z.unknown()).optional().describe('Structured data specific to the activity type'),
-  contactId: z.string().uuid().optional().describe('Contact ID if activity involves another person'),
+  payload: z
+    .record(z.unknown())
+    .optional()
+    .describe('Structured data specific to the activity type'),
+  contactId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('Contact ID if activity involves another person'),
   parentId: z.string().uuid().optional().describe('Parent activity ID for hierarchical tracking'),
-  correlationId: z.string().uuid().optional().describe('Correlation ID for grouping related activities'),
-  platform: z.string().optional().describe('Activity platform (telegram, discord, whatsapp, slack, etc.)'),
-  platformMessageId: z.string().optional().describe('Platform-specific message ID for deduplication'),
+  correlationId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('Correlation ID for grouping related activities'),
+  platform: z
+    .string()
+    .optional()
+    .describe('Activity platform (telegram, discord, whatsapp, slack, etc.)'),
+  platformMessageId: z
+    .string()
+    .optional()
+    .describe('Platform-specific message ID for deduplication'),
   platformChatId: z.string().optional().describe('Platform-specific chat/conversation ID'),
   isDm: z.boolean().optional().describe('Whether this is a direct message (default: true)'),
   artifactId: z.string().uuid().optional().describe('Associated artifact ID'),
@@ -137,7 +158,10 @@ function extractUserIdentifier(params: {
 
 export async function handleLogActivity(args: unknown, dataComposer: DataComposer) {
   const params = logActivitySchema.parse(args);
-  const { user, resolvedBy } = await resolveUserOrThrow(extractUserIdentifier(params), dataComposer);
+  const { user, resolvedBy } = await resolveUserOrThrow(
+    extractUserIdentifier(params),
+    dataComposer
+  );
 
   const activity = await dataComposer.repositories.activityStream.logActivity({
     userId: user.id,
@@ -191,7 +215,10 @@ export async function handleLogActivity(args: unknown, dataComposer: DataCompose
 
 export async function handleLogMessage(args: unknown, dataComposer: DataComposer) {
   const params = logMessageSchema.parse(args);
-  const { user, resolvedBy } = await resolveUserOrThrow(extractUserIdentifier(params), dataComposer);
+  const { user, resolvedBy } = await resolveUserOrThrow(
+    extractUserIdentifier(params),
+    dataComposer
+  );
 
   const activity = await dataComposer.repositories.activityStream.logMessage({
     userId: user.id,
@@ -239,7 +266,10 @@ export async function handleLogMessage(args: unknown, dataComposer: DataComposer
 
 export async function handleGetActivity(args: unknown, dataComposer: DataComposer) {
   const params = getActivitySchema.parse(args);
-  const { user, resolvedBy } = await resolveUserOrThrow(extractUserIdentifier(params), dataComposer);
+  const { user, resolvedBy } = await resolveUserOrThrow(
+    extractUserIdentifier(params),
+    dataComposer
+  );
 
   const activities = await dataComposer.repositories.activityStream.getActivity(user.id, {
     sessionId: params.sessionId,
@@ -292,7 +322,10 @@ export async function handleGetActivity(args: unknown, dataComposer: DataCompose
 
 export async function handleGetConversationHistory(args: unknown, dataComposer: DataComposer) {
   const params = getConversationHistorySchema.parse(args);
-  const { user, resolvedBy } = await resolveUserOrThrow(extractUserIdentifier(params), dataComposer);
+  const { user, resolvedBy } = await resolveUserOrThrow(
+    extractUserIdentifier(params),
+    dataComposer
+  );
 
   const messages = await dataComposer.repositories.activityStream.getConversationHistory(user.id, {
     contactId: params.contactId,
@@ -339,7 +372,10 @@ export async function handleGetConversationHistory(args: unknown, dataComposer: 
 
 export async function handleGetSessionContext(args: unknown, dataComposer: DataComposer) {
   const params = getSessionContextSchema.parse(args);
-  const { user, resolvedBy } = await resolveUserOrThrow(extractUserIdentifier(params), dataComposer);
+  const { user, resolvedBy } = await resolveUserOrThrow(
+    extractUserIdentifier(params),
+    dataComposer
+  );
 
   const activities = await dataComposer.repositories.activityStream.getSessionResumptionContext(
     user.id,

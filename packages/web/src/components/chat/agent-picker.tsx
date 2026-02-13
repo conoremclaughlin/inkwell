@@ -15,11 +15,7 @@ interface AgentPickerProps {
   onSelect: (agentId: string) => void;
 }
 
-export function AgentPicker({
-  agents,
-  selectedAgentId,
-  onSelect,
-}: AgentPickerProps) {
+export function AgentPicker({ agents, selectedAgentId, onSelect }: AgentPickerProps) {
   if (agents.length === 0) return null;
 
   return (

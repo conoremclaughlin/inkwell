@@ -218,7 +218,10 @@ export function validateSearchExtraction(
     sanitizeOutput: true,
   });
 
-  return reader.validateExtraction(extraction as unknown as Record<string, unknown>, 'web_search') as unknown as {
+  return reader.validateExtraction(
+    extraction as unknown as Record<string, unknown>,
+    'web_search'
+  ) as unknown as {
     valid: boolean;
     sanitized: SearchResultExtraction;
     violations: string[];

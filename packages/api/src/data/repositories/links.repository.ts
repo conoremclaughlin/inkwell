@@ -10,11 +10,7 @@ export class LinksRepository extends BaseRepository {
 
   async create(linkData: CreateLinkDTO): Promise<Link> {
     try {
-      const { data, error } = await this.client
-        .from('links')
-        .insert(linkData)
-        .select()
-        .single();
+      const { data, error } = await this.client.from('links').insert(linkData).select().single();
 
       if (error) throw error;
       return data;
@@ -64,10 +60,7 @@ export class LinksRepository extends BaseRepository {
       }
 
       if (options?.offset) {
-        query = query.range(
-          options.offset,
-          options.offset + (options.limit || 20) - 1
-        );
+        query = query.range(options.offset, options.offset + (options.limit || 20) - 1);
       }
 
       const { data, error } = await query;
@@ -81,10 +74,7 @@ export class LinksRepository extends BaseRepository {
 
   async search(userId: string, options: SearchLinksOptions): Promise<Link[]> {
     try {
-      let query = this.client
-        .from('links')
-        .select('*')
-        .eq('user_id', userId);
+      let query = this.client.from('links').select('*').eq('user_id', userId);
 
       if (options.query) {
         query = query.or(
@@ -130,11 +120,7 @@ export class LinksRepository extends BaseRepository {
 
   async delete(id: string, userId: string): Promise<void> {
     try {
-      const { error } = await this.client
-        .from('links')
-        .delete()
-        .eq('id', id)
-        .eq('user_id', userId);
+      const { error } = await this.client.from('links').delete().eq('id', id).eq('user_id', userId);
 
       if (error) throw error;
     } catch (error) {

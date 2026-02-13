@@ -55,10 +55,7 @@ export function runWithRequestContext<T>(
   context: Omit<RequestContextData, 'timestamp'>,
   fn: () => T | Promise<T>
 ): T | Promise<T> {
-  return asyncLocalStorage.run(
-    { ...context, timestamp: new Date() },
-    fn
-  );
+  return asyncLocalStorage.run({ ...context, timestamp: new Date() }, fn);
 }
 
 /**
@@ -98,12 +95,14 @@ export function getRequestContext(): RequestContextData | undefined {
  * Checks request context first, then falls back to session context.
  * Returns the best available identifier, preferring userId > email > platform+platformId.
  */
-export function getUserFromContext(): {
-  userId?: string;
-  email?: string;
-  platform?: string;
-  platformId?: string;
-} | undefined {
+export function getUserFromContext():
+  | {
+      userId?: string;
+      email?: string;
+      platform?: string;
+      platformId?: string;
+    }
+  | undefined {
   // Try request context first (higher priority)
   const reqCtx = getRequestContext();
   if (reqCtx?.userId || reqCtx?.email || (reqCtx?.platform && reqCtx?.platformId)) {
@@ -145,12 +144,24 @@ export function hasUserContext(): boolean {
  */
 export function mergeWithContext<T extends Record<string, unknown>>(
   args: T
-): T & { userId?: string; email?: string; platform?: string; platformId?: string; workspaceId?: string } {
+): T & {
+  userId?: string;
+  email?: string;
+  platform?: string;
+  platformId?: string;
+  workspaceId?: string;
+} {
   const ctx = getUserFromContext();
   const reqCtx = getRequestContext();
   const sessCtx = getSessionContext();
   if (!ctx && !reqCtx?.workspaceId && !sessCtx?.workspaceId) {
-    return args as T & { userId?: string; email?: string; platform?: string; platformId?: string; workspaceId?: string };
+    return args as T & {
+      userId?: string;
+      email?: string;
+      platform?: string;
+      platformId?: string;
+      workspaceId?: string;
+    };
   }
 
   // Only fill in missing values from context
@@ -160,8 +171,15 @@ export function mergeWithContext<T extends Record<string, unknown>>(
     email: (args.email as string | undefined) ?? ctx?.email,
     platform: (args.platform as string | undefined) ?? ctx?.platform,
     platformId: (args.platformId as string | undefined) ?? ctx?.platformId,
-    workspaceId: (args.workspaceId as string | undefined) ?? reqCtx?.workspaceId ?? sessCtx?.workspaceId,
+    workspaceId:
+      (args.workspaceId as string | undefined) ?? reqCtx?.workspaceId ?? sessCtx?.workspaceId,
   };
 
-  return merged as T & { userId?: string; email?: string; platform?: string; platformId?: string; workspaceId?: string };
+  return merged as T & {
+    userId?: string;
+    email?: string;
+    platform?: string;
+    platformId?: string;
+    workspaceId?: string;
+  };
 }

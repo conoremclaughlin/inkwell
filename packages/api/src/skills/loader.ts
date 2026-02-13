@@ -46,7 +46,8 @@ function frontmatterToManifest(
   return {
     name,
     version: (frontmatter.version as string) || '1.0.0',
-    displayName: (frontmatter.displayName as string) || (frontmatter.display_name as string) || name,
+    displayName:
+      (frontmatter.displayName as string) || (frontmatter.display_name as string) || name,
     description: (frontmatter.description as string) || '',
     type: (frontmatter.type as SkillType) || 'guide',
     emoji: frontmatter.emoji as string,
@@ -187,10 +188,7 @@ export function loadAllSkills(userSkillsPath?: string): LoadedSkill[] {
 /**
  * Load a specific skill by name
  */
-export function loadSkillByName(
-  name: string,
-  userSkillsPath?: string
-): LoadedSkill | null {
+export function loadSkillByName(name: string, userSkillsPath?: string): LoadedSkill | null {
   const allSkills = loadAllSkills(userSkillsPath);
   return allSkills.find((s) => s.manifest.name === name) || null;
 }

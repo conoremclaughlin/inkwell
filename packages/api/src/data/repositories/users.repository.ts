@@ -10,11 +10,7 @@ export class UsersRepository extends BaseRepository {
 
   async findById(id: string): Promise<User | null> {
     try {
-      const { data, error } = await this.client
-        .from('users')
-        .select('*')
-        .eq('id', id)
-        .single();
+      const { data, error } = await this.client.from('users').select('*').eq('id', id).single();
 
       if (error && error.code !== 'PGRST116') throw error; // PGRST116 is "not found"
       return data;
@@ -98,10 +94,15 @@ export class UsersRepository extends BaseRepository {
     }
   }
 
-  async findByPlatformId(platform: 'telegram' | 'whatsapp' | 'discord', platformId: string | number): Promise<User | null> {
+  async findByPlatformId(
+    platform: 'telegram' | 'whatsapp' | 'discord',
+    platformId: string | number
+  ): Promise<User | null> {
     switch (platform) {
       case 'telegram':
-        return this.findByTelegramId(typeof platformId === 'string' ? parseInt(platformId, 10) : platformId);
+        return this.findByTelegramId(
+          typeof platformId === 'string' ? parseInt(platformId, 10) : platformId
+        );
       case 'whatsapp':
         return this.findByWhatsAppId(String(platformId));
       case 'discord':
@@ -113,11 +114,7 @@ export class UsersRepository extends BaseRepository {
 
   async create(userData: UserInsert): Promise<User> {
     try {
-      const { data, error } = await this.client
-        .from('users')
-        .insert(userData)
-        .select()
-        .single();
+      const { data, error } = await this.client.from('users').insert(userData).select().single();
 
       if (error) throw error;
       return data;

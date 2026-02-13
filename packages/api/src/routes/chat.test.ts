@@ -42,7 +42,18 @@ import type { Request, Response, NextFunction } from 'express';
 // Helper to build a chainable query mock
 function createChainableQuery(resolvedData: unknown, resolvedError: unknown = null) {
   const chain: Record<string, unknown> = {};
-  const methods = ['select', 'insert', 'update', 'delete', 'eq', 'neq', 'order', 'limit', 'is', 'in'];
+  const methods = [
+    'select',
+    'insert',
+    'update',
+    'delete',
+    'eq',
+    'neq',
+    'order',
+    'limit',
+    'is',
+    'in',
+  ];
 
   for (const method of methods) {
     chain[method] = vi.fn().mockReturnValue(chain);
@@ -241,8 +252,20 @@ describe('Chat Route Handlers', () => {
     it('should map snake_case DB rows to camelCase and reverse order', () => {
       // This mirrors the logic in chat.ts GET /history
       const dbRows = [
-        { id: 'msg-2', direction: 'out', content: 'Reply', agent_id: 'wren', created_at: '2026-02-10T01:00:00Z' },
-        { id: 'msg-1', direction: 'in', content: 'Hello', agent_id: 'wren', created_at: '2026-02-10T00:00:00Z' },
+        {
+          id: 'msg-2',
+          direction: 'out',
+          content: 'Reply',
+          agent_id: 'wren',
+          created_at: '2026-02-10T01:00:00Z',
+        },
+        {
+          id: 'msg-1',
+          direction: 'in',
+          content: 'Hello',
+          agent_id: 'wren',
+          created_at: '2026-02-10T00:00:00Z',
+        },
       ];
 
       const messages = dbRows.reverse().map((m) => ({

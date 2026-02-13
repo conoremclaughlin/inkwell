@@ -234,7 +234,10 @@ export class CodexRunner implements IClaudeRunner {
     }
   }
 
-  private createIdentityPromptTempFile(content: string): { promptPath: string; cleanup: () => void } {
+  private createIdentityPromptTempFile(content: string): {
+    promptPath: string;
+    cleanup: () => void;
+  } {
     const dir = mkdtempSync(join(tmpdir(), 'pcp-codex-'));
     const promptPath = join(dir, 'identity.md');
     writeFileSync(promptPath, content || 'Follow system identity instructions.');
@@ -252,7 +255,14 @@ export class CodexRunner implements IClaudeRunner {
 
   private extractSessionId(event: Record<string, unknown>): string | undefined {
     const queue: unknown[] = [event];
-    const sessionKeys = new Set(['session_id', 'sessionId', 'conversation_id', 'conversationId', 'thread_id', 'threadId']);
+    const sessionKeys = new Set([
+      'session_id',
+      'sessionId',
+      'conversation_id',
+      'conversationId',
+      'thread_id',
+      'threadId',
+    ]);
 
     while (queue.length > 0) {
       const current = queue.shift();
@@ -280,9 +290,12 @@ export class CodexRunner implements IClaudeRunner {
       const maybeOutput = obj.output_tokens;
       const maybeContext = obj.context_tokens;
       if (typeof maybeInput === 'number' && typeof maybeOutput === 'number') {
-        const cachedInput = typeof obj.cached_input_tokens === 'number' ? obj.cached_input_tokens : 0;
-        const cacheRead = typeof obj.cache_read_input_tokens === 'number' ? obj.cache_read_input_tokens : 0;
-        const cacheCreate = typeof obj.cache_creation_input_tokens === 'number' ? obj.cache_creation_input_tokens : 0;
+        const cachedInput =
+          typeof obj.cached_input_tokens === 'number' ? obj.cached_input_tokens : 0;
+        const cacheRead =
+          typeof obj.cache_read_input_tokens === 'number' ? obj.cache_read_input_tokens : 0;
+        const cacheCreate =
+          typeof obj.cache_creation_input_tokens === 'number' ? obj.cache_creation_input_tokens : 0;
         const totalInput = maybeInput + cachedInput + cacheRead + cacheCreate;
         return {
           contextTokens: typeof maybeContext === 'number' ? maybeContext : totalInput,
@@ -305,7 +318,7 @@ export class CodexRunner implements IClaudeRunner {
       event.output_text,
       event.text,
       (event.message as Record<string, unknown> | undefined)?.content,
-      ((event.item as Record<string, unknown> | undefined)?.text),
+      (event.item as Record<string, unknown> | undefined)?.text,
     ];
 
     for (const candidate of candidates) {
@@ -331,7 +344,10 @@ export class CodexRunner implements IClaudeRunner {
     return undefined;
   }
 
-  private extractToolData(event: Record<string, unknown>): { responses: ChannelResponse[]; toolCalls: ToolCall[] } {
+  private extractToolData(event: Record<string, unknown>): {
+    responses: ChannelResponse[];
+    toolCalls: ToolCall[];
+  } {
     const responses: ChannelResponse[] = [];
     const toolCalls: ToolCall[] = [];
     const queue: unknown[] = [event];
@@ -355,15 +371,24 @@ export class CodexRunner implements IClaudeRunner {
 
           if (name === 'mcp__pcp__send_response') {
             const channel = (input as Record<string, unknown>).channel as ChannelType | undefined;
-            const conversationId = (input as Record<string, unknown>).conversationId as string | undefined;
+            const conversationId = (input as Record<string, unknown>).conversationId as
+              | string
+              | undefined;
             const content = (input as Record<string, unknown>).content as string | undefined;
             if (channel && conversationId && content) {
               responses.push({
                 channel,
                 conversationId,
                 content,
-                format: (input as Record<string, unknown>).format as 'text' | 'markdown' | 'code' | 'json' | undefined,
-                replyToMessageId: (input as Record<string, unknown>).replyToMessageId as string | undefined,
+                format: (input as Record<string, unknown>).format as
+                  | 'text'
+                  | 'markdown'
+                  | 'code'
+                  | 'json'
+                  | undefined,
+                replyToMessageId: (input as Record<string, unknown>).replyToMessageId as
+                  | string
+                  | undefined,
               });
             }
           }

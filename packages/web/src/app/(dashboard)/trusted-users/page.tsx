@@ -42,26 +42,20 @@ export default function TrustedUsersPage() {
   );
 
   // Add user mutation
-  const addMutation = useApiPost<TrustedUsersResponse, AddUserInput>(
-    '/api/admin/trusted-users',
-    {
-      onSuccess: () => {
-        queryClient.invalidateQueries({ queryKey: ['trusted-users'] });
-        setShowAddForm(false);
-        setNewUser({ platform: 'whatsapp', platformUserId: '', trustLevel: 'member' });
-      },
-    }
-  );
+  const addMutation = useApiPost<TrustedUsersResponse, AddUserInput>('/api/admin/trusted-users', {
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['trusted-users'] });
+      setShowAddForm(false);
+      setNewUser({ platform: 'whatsapp', platformUserId: '', trustLevel: 'member' });
+    },
+  });
 
   // Delete user mutation
-  const deleteMutation = useApiDelete<void>(
-    '/api/admin/trusted-users',
-    {
-      onSuccess: () => {
-        queryClient.invalidateQueries({ queryKey: ['trusted-users'] });
-      },
-    }
-  );
+  const deleteMutation = useApiDelete<void>('/api/admin/trusted-users', {
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['trusted-users'] });
+    },
+  });
 
   const handleAddUser = (e: React.FormEvent) => {
     e.preventDefault();
@@ -74,7 +68,8 @@ export default function TrustedUsersPage() {
   };
 
   const users = data?.users ?? [];
-  const errorMessage = error?.message || addMutation.error?.message || deleteMutation.error?.message;
+  const errorMessage =
+    error?.message || addMutation.error?.message || deleteMutation.error?.message;
 
   const getTrustLevelBadge = (level: string) => {
     switch (level) {
@@ -103,18 +98,14 @@ export default function TrustedUsersPage() {
       </div>
 
       {errorMessage && (
-        <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">
-          {errorMessage}
-        </div>
+        <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">{errorMessage}</div>
       )}
 
       {showAddForm && (
         <Card className="mt-6">
           <CardHeader>
             <CardTitle>Add Trusted User</CardTitle>
-            <CardDescription>
-              Add a new user who can interact with Myra.
-            </CardDescription>
+            <CardDescription>Add a new user who can interact with Myra.</CardDescription>
           </CardHeader>
           <CardContent>
             <form onSubmit={handleAddUser} className="space-y-4">
@@ -124,9 +115,7 @@ export default function TrustedUsersPage() {
                   <select
                     className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background"
                     value={newUser.platform}
-                    onChange={(e) =>
-                      setNewUser({ ...newUser, platform: e.target.value })
-                    }
+                    onChange={(e) => setNewUser({ ...newUser, platform: e.target.value })}
                   >
                     <option value="whatsapp">WhatsApp</option>
                     <option value="telegram">Telegram</option>
@@ -140,13 +129,11 @@ export default function TrustedUsersPage() {
                       newUser.platform === 'whatsapp'
                         ? '+14155551234'
                         : newUser.platform === 'telegram'
-                        ? '123456789'
-                        : 'discord_user_id'
+                          ? '123456789'
+                          : 'discord_user_id'
                     }
                     value={newUser.platformUserId}
-                    onChange={(e) =>
-                      setNewUser({ ...newUser, platformUserId: e.target.value })
-                    }
+                    onChange={(e) => setNewUser({ ...newUser, platformUserId: e.target.value })}
                     required
                   />
                 </div>
@@ -155,9 +142,7 @@ export default function TrustedUsersPage() {
                   <select
                     className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background"
                     value={newUser.trustLevel}
-                    onChange={(e) =>
-                      setNewUser({ ...newUser, trustLevel: e.target.value })
-                    }
+                    onChange={(e) => setNewUser({ ...newUser, trustLevel: e.target.value })}
                   >
                     <option value="member">Member</option>
                     <option value="admin">Admin</option>
@@ -168,11 +153,7 @@ export default function TrustedUsersPage() {
                 <Button type="submit" disabled={addMutation.isPending}>
                   {addMutation.isPending ? 'Adding...' : 'Add User'}
                 </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => setShowAddForm(false)}
-                >
+                <Button type="button" variant="outline" onClick={() => setShowAddForm(false)}>
                   Cancel
                 </Button>
               </div>
@@ -211,9 +192,7 @@ export default function TrustedUsersPage() {
                       <td className="py-3">
                         <Badge variant="outline">{user.platform}</Badge>
                       </td>
-                      <td className="py-3 font-mono text-sm">
-                        {user.platformUserId}
-                      </td>
+                      <td className="py-3 font-mono text-sm">{user.platformUserId}</td>
                       <td className="py-3">{getTrustLevelBadge(user.trustLevel)}</td>
                       <td className="py-3 text-sm text-gray-500">
                         {new Date(user.addedAt).toLocaleDateString()}

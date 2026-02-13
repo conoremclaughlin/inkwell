@@ -21,24 +21,15 @@ export function ChatMessage({ message, agentName }: ChatMessageProps) {
   const isUser = message.direction === 'in';
 
   return (
-    <div
-      className={cn(
-        'flex w-full',
-        isUser ? 'justify-end' : 'justify-start'
-      )}
-    >
+    <div className={cn('flex w-full', isUser ? 'justify-end' : 'justify-start')}>
       <div
         className={cn(
           'max-w-[80%] rounded-2xl px-4 py-2.5',
-          isUser
-            ? 'bg-blue-600 text-white'
-            : 'bg-gray-100 text-gray-900'
+          isUser ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-900'
         )}
       >
         {!isUser && agentName && (
-          <div className="mb-1 text-xs font-medium text-gray-500">
-            {agentName}
-          </div>
+          <div className="mb-1 text-xs font-medium text-gray-500">{agentName}</div>
         )}
         <div
           className={cn(
@@ -48,9 +39,7 @@ export function ChatMessage({ message, agentName }: ChatMessageProps) {
               : 'prose-p:text-gray-900'
           )}
         >
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>
-            {message.content}
-          </ReactMarkdown>
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
         </div>
       </div>
     </div>

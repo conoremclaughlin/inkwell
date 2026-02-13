@@ -159,6 +159,7 @@ We use the [Angular commit convention](https://github.com/angular/angular/blob/m
 ```
 
 Examples:
+
 ```
 feat(cli): add global install via symlink
 fix(sessions): preserve existing fields on upsert
@@ -181,6 +182,7 @@ We follow [GitHub flow](https://www.geeksforgeeks.org/git-flow-vs-github-flow/):
 ```
 
 Examples:
+
 ```bash
 git checkout -b cm/feat/agent-orchestrator
 git checkout -b wren/fix/session-resume
@@ -204,6 +206,7 @@ When syncing with main: rebase first; if conflicts get messy, merge main in and 
 A plain comment needs no prefix — any comment is implicitly a note. Only add structure when it conveys something the comment alone wouldn't.
 
 Examples:
+
 ```typescript
 // cm(todo): extract this into a shared utility
 // wren(bug): race condition when two agents write simultaneously

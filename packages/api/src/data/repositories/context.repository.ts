@@ -48,9 +48,8 @@ export class ContextRepository extends BaseRepository {
         .eq('context_type', contextType);
 
       if (contextKey !== undefined) {
-        query = contextKey === null
-          ? query.is('context_key', null)
-          : query.eq('context_key', contextKey);
+        query =
+          contextKey === null ? query.is('context_key', null) : query.eq('context_key', contextKey);
       }
 
       const { data, error } = await query.single();
@@ -134,7 +133,11 @@ export class ContextRepository extends BaseRepository {
     }
   }
 
-  async delete(userId: string, contextType: ContextType, contextKey?: string | null): Promise<void> {
+  async delete(
+    userId: string,
+    contextType: ContextType,
+    contextKey?: string | null
+  ): Promise<void> {
     try {
       let query = this.client
         .from('context_summaries')
@@ -143,9 +146,8 @@ export class ContextRepository extends BaseRepository {
         .eq('context_type', contextType);
 
       if (contextKey !== undefined) {
-        query = contextKey === null
-          ? query.is('context_key', null)
-          : query.eq('context_key', contextKey);
+        query =
+          contextKey === null ? query.is('context_key', null) : query.eq('context_key', contextKey);
       }
 
       const { error } = await query;

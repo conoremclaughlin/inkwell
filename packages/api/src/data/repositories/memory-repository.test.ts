@@ -124,10 +124,12 @@ describe('MemoryRepository', () => {
     it('should throw on database error', async () => {
       mockSupabase._setReturnData(null, { message: 'Database error' });
 
-      await expect(repo.remember({
-        userId: 'user-456',
-        content: 'Test',
-      })).rejects.toThrow('Failed to create memory: Database error');
+      await expect(
+        repo.remember({
+          userId: 'user-456',
+          content: 'Test',
+        })
+      ).rejects.toThrow('Failed to create memory: Database error');
     });
   });
 
@@ -311,7 +313,7 @@ describe('MemoryRepository', () => {
           expect.objectContaining({
             studio_id: 'ws-abc-123',
             workspace_id: 'ws-abc-123',
-          }),
+          })
         );
       });
 
@@ -341,7 +343,7 @@ describe('MemoryRepository', () => {
           expect.objectContaining({
             studio_id: 'studio-abc',
             workspace_id: 'studio-abc',
-          }),
+          })
         );
       });
 
@@ -623,7 +625,8 @@ describe('MemoryRepository', () => {
       expect(result!.currentPhase).toBe('reviewing');
 
       expect(mockSupabase.from).toHaveBeenCalledWith('sessions');
-      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
+        .calls[0][0];
       expect(updateCall.current_phase).toBe('reviewing');
       // updated_at is handled by DB trigger, not the repository
       expect(updateCall).not.toHaveProperty('updated_at');
@@ -640,7 +643,8 @@ describe('MemoryRepository', () => {
         backendSessionId: 'claude-abc123',
       });
 
-      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
+        .calls[0][0];
       expect(updateCall.backend_session_id).toBe('claude-abc123');
       expect(updateCall.claude_session_id).toBe('claude-abc123');
     });
@@ -650,7 +654,8 @@ describe('MemoryRepository', () => {
 
       await repo.updateSession('session-123', { status: 'resumable' });
 
-      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
+        .calls[0][0];
       expect(updateCall.status).toBe('resumable');
     });
 
@@ -662,7 +667,8 @@ describe('MemoryRepository', () => {
         workingDir: '/Users/test/project',
       });
 
-      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
+        .calls[0][0];
       expect(updateCall.context).toBe('Working on tests');
       expect(updateCall.working_dir).toBe('/Users/test/project');
     });
@@ -678,7 +684,8 @@ describe('MemoryRepository', () => {
         workingDir: '/tmp',
       });
 
-      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
+        .calls[0][0];
       expect(updateCall.current_phase).toBe('implementing');
       expect(updateCall.status).toBe('active');
       expect(updateCall.backend_session_id).toBe('abc');
@@ -696,7 +703,8 @@ describe('MemoryRepository', () => {
         currentPhase: 'investigating',
       });
 
-      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
+        .calls[0][0];
       expect(updateCall.current_phase).toBe('investigating');
       // updated_at is handled by DB trigger, not the repository
       expect(updateCall).not.toHaveProperty('updated_at');
@@ -714,7 +722,8 @@ describe('MemoryRepository', () => {
         currentPhase: null,
       });
 
-      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
+        .calls[0][0];
       expect(updateCall.current_phase).toBeNull();
     });
 
@@ -838,7 +847,10 @@ describe('MemoryRepository', () => {
         await repo.getSessionLogsBySalience('session-123', 'high');
 
         // Should include 'high' and 'critical'
-        expect(mockSupabase._queryBuilder.in).toHaveBeenCalledWith('salience', ['high', 'critical']);
+        expect(mockSupabase._queryBuilder.in).toHaveBeenCalledWith('salience', [
+          'high',
+          'critical',
+        ]);
       });
 
       it('should exclude compacted logs by default', async () => {

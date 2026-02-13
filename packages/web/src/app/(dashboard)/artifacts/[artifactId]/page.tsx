@@ -6,7 +6,19 @@ import Link from 'next/link';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { ArrowLeft, BookOpen, Lightbulb, FileCheck, FileText, StickyNote, Eye, Users, Lock, History, Loader2 } from 'lucide-react';
+import {
+  ArrowLeft,
+  BookOpen,
+  Lightbulb,
+  FileCheck,
+  FileText,
+  StickyNote,
+  Eye,
+  Users,
+  Lock,
+  History,
+  Loader2,
+} from 'lucide-react';
 import { useApiPost, useApiQuery, useQueryClient } from '@/lib/api';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -130,18 +142,18 @@ export default function ArtifactDetailPage() {
     `/api/admin/artifacts/${artifactId}/comments`
   );
 
-  const addCommentMutation = useApiPost<{ comment: ArtifactComment }, {
-    content: string;
-    agentId?: string;
-  }>(
-    `/api/admin/artifacts/${artifactId}/comments`,
+  const addCommentMutation = useApiPost<
+    { comment: ArtifactComment },
     {
-      onSuccess: () => {
-        setCommentDraft('');
-        queryClient.invalidateQueries({ queryKey: ['artifact-comments', artifactId] });
-      },
+      content: string;
+      agentId?: string;
     }
-  );
+  >(`/api/admin/artifacts/${artifactId}/comments`, {
+    onSuccess: () => {
+      setCommentDraft('');
+      queryClient.invalidateQueries({ queryKey: ['artifact-comments', artifactId] });
+    },
+  });
 
   const artifact = artifactData?.artifact ?? null;
   const comments = commentsData?.comments ?? [];
@@ -324,9 +336,7 @@ export default function ArtifactDetailPage() {
       {/* Metadata footer */}
       <div className="mt-6 flex items-center justify-between text-sm text-gray-500">
         <div className="flex items-center gap-4">
-          {artifact.createdByAgentId && (
-            <span>Created by: {artifact.createdByAgentId}</span>
-          )}
+          {artifact.createdByAgentId && <span>Created by: {artifact.createdByAgentId}</span>}
           {artifact.collaborators && artifact.collaborators.length > 0 && (
             <span>Collaborators: {artifact.collaborators.join(', ')}</span>
           )}

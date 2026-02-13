@@ -11,7 +11,7 @@ import { getBackend, resolveAgentId } from '../backends/index.js';
 
 export interface SbOptions {
   agent: string;
-  model: string | undefined;  // undefined = use backend's default
+  model: string | undefined; // undefined = use backend's default
   session: boolean;
   verbose: boolean;
   backend: string;
@@ -24,7 +24,7 @@ export async function runClaude(
   prompt: string,
   promptParts: string[],
   options: SbOptions,
-  passthroughArgs: string[] = [],
+  passthroughArgs: string[] = []
 ): Promise<void> {
   const agentId = resolveAgentId(options.agent);
   const adapter = getBackend(options.backend);
@@ -70,7 +70,7 @@ export async function runClaude(
  */
 export async function runClaudeInteractive(
   options: SbOptions,
-  passthroughArgs: string[] = [],
+  passthroughArgs: string[] = []
 ): Promise<void> {
   const agentId = resolveAgentId(options.agent);
   const adapter = getBackend(options.backend);

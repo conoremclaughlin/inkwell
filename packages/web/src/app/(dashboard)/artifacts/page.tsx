@@ -3,7 +3,17 @@
 import Link from 'next/link';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { FileText, BookOpen, Lightbulb, FileCheck, StickyNote, Eye, Users, Lock, History } from 'lucide-react';
+import {
+  FileText,
+  BookOpen,
+  Lightbulb,
+  FileCheck,
+  StickyNote,
+  Eye,
+  Users,
+  Lock,
+  History,
+} from 'lucide-react';
 import { useApiQuery } from '@/lib/api';
 import clsx from 'clsx';
 
@@ -114,11 +124,7 @@ export default function ArtifactsPage() {
         </div>
       </div>
 
-      {error && (
-        <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">
-          {error.message}
-        </div>
-      )}
+      {error && <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">{error.message}</div>}
 
       {/* Stats */}
       <div className="grid grid-cols-6 gap-4 mt-6">
@@ -148,9 +154,7 @@ export default function ArtifactsPage() {
       <Card className="mt-6">
         <CardHeader>
           <CardTitle>All Artifacts</CardTitle>
-          <CardDescription>
-            Sorted by last updated
-          </CardDescription>
+          <CardDescription>Sorted by last updated</CardDescription>
         </CardHeader>
         <CardContent>
           {isLoading ? (
@@ -160,7 +164,8 @@ export default function ArtifactsPage() {
               <FileText className="h-12 w-12 mx-auto text-gray-300 mb-3" />
               <p className="text-gray-500">No artifacts yet.</p>
               <p className="text-sm text-gray-400 mt-1">
-                Use the <code className="bg-gray-100 px-1 rounded">create_artifact</code> tool to create one.
+                Use the <code className="bg-gray-100 px-1 rounded">create_artifact</code> tool to
+                create one.
               </p>
             </div>
           ) : (
@@ -197,9 +202,7 @@ export default function ArtifactsPage() {
                             </span>
                           )}
                         </div>
-                        <p className="text-sm text-gray-500 mt-1 font-mono">
-                          {artifact.uri}
-                        </p>
+                        <p className="text-sm text-gray-500 mt-1 font-mono">{artifact.uri}</p>
                         {artifact.tags && artifact.tags.length > 0 && (
                           <div className="flex flex-wrap gap-1 mt-2">
                             {artifact.tags.map((tag) => (

@@ -39,7 +39,11 @@ export function getResponseCallback(): ResponseCallback | null {
  * Check if a conversation has received an explicit send_response within the last N ms.
  * Used by server.ts to decide whether to auto-forward.
  */
-export function hasExplicitResponse(channel: string, conversationId: string, withinMs = 60000): boolean {
+export function hasExplicitResponse(
+  channel: string,
+  conversationId: string,
+  withinMs = 60000
+): boolean {
   const key = `${channel}:${conversationId}`;
   const timestamp = explicitResponseTracker.get(key);
   if (!timestamp) return false;
@@ -72,18 +76,17 @@ function markExplicitResponse(channel: string, conversationId: string): void {
 // ============================================================================
 
 export const sendResponseSchema = z.object({
-  channel: z.enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'agent'])
+  channel: z
+    .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'agent'])
     .describe('Channel to send the response to'),
-  conversationId: z.string()
-    .describe('Conversation ID to route the response to'),
-  content: z.string()
-    .describe('The response content to send'),
-  format: z.enum(['text', 'markdown', 'code', 'json']).optional()
+  conversationId: z.string().describe('Conversation ID to route the response to'),
+  content: z.string().describe('The response content to send'),
+  format: z
+    .enum(['text', 'markdown', 'code', 'json'])
+    .optional()
     .describe('Format of the response content'),
-  replyToMessageId: z.string().optional()
-    .describe('Message ID to reply to (for threading)'),
-  metadata: z.record(z.unknown()).optional()
-    .describe('Additional channel-specific metadata'),
+  replyToMessageId: z.string().optional().describe('Message ID to reply to (for threading)'),
+  metadata: z.record(z.unknown()).optional().describe('Additional channel-specific metadata'),
 });
 
 type McpResponse = {
@@ -143,17 +146,20 @@ export async function handleSendResponse(
         });
 
         if (!httpResponse.ok) {
-          const errorData = await httpResponse.json().catch(() => ({})) as { error?: string };
+          const errorData = (await httpResponse.json().catch(() => ({}))) as { error?: string };
           throw new Error(`Myra send failed: ${errorData.error || httpResponse.statusText}`);
         }
 
         logger.info(`Response sent to ${args.channel}:${args.conversationId} via Myra HTTP`);
       } else {
         logger.warn(`No routing available for channel: ${args.channel}`);
-        return mcpResponse({
-          success: false,
-          error: `No routing configured for channel: ${args.channel}`,
-        }, true);
+        return mcpResponse(
+          {
+            success: false,
+            error: `No routing configured for channel: ${args.channel}`,
+          },
+          true
+        );
       }
     }
 
@@ -165,10 +171,13 @@ export async function handleSendResponse(
     });
   } catch (error) {
     logger.error('Error in send_response:', error);
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to send response',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to send response',
+      },
+      true
+    );
   }
 }
 
@@ -177,14 +186,13 @@ export async function handleSendResponse(
 // ============================================================================
 
 export const getPendingMessagesSchema = z.object({
-  channel: z.enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'all']).optional()
+  channel: z
+    .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'all'])
+    .optional()
     .default('all')
     .describe('Filter by channel (default: all)'),
-  limit: z.number().min(1).max(50).optional()
-    .default(10)
-    .describe('Maximum messages to return'),
-  since: z.string().datetime().optional()
-    .describe('Only messages after this timestamp'),
+  limit: z.number().min(1).max(50).optional().default(10).describe('Maximum messages to return'),
+  since: z.string().datetime().optional().describe('Only messages after this timestamp'),
 });
 
 // In-memory message queue for cross-channel visibility
@@ -233,13 +241,13 @@ export async function handleGetPendingMessages(
 
     // Filter by channel
     if (args.channel && args.channel !== 'all') {
-      filtered = filtered.filter(m => m.channel === args.channel);
+      filtered = filtered.filter((m) => m.channel === args.channel);
     }
 
     // Filter by timestamp
     if (args.since) {
       const sinceDate = new Date(args.since);
-      filtered = filtered.filter(m => m.timestamp > sinceDate);
+      filtered = filtered.filter((m) => m.timestamp > sinceDate);
     }
 
     // Apply limit
@@ -247,7 +255,7 @@ export async function handleGetPendingMessages(
 
     return mcpResponse({
       success: true,
-      messages: filtered.map(m => ({
+      messages: filtered.map((m) => ({
         id: m.id,
         channel: m.channel,
         conversationId: m.conversationId,
@@ -256,13 +264,16 @@ export async function handleGetPendingMessages(
         timestamp: m.timestamp.toISOString(),
         read: m.read,
       })),
-      totalPending: pendingMessages.filter(m => !m.read).length,
+      totalPending: pendingMessages.filter((m) => !m.read).length,
     });
   } catch (error) {
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to get pending messages',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to get pending messages',
+      },
+      true
+    );
   }
 }
 
@@ -271,8 +282,7 @@ export async function handleGetPendingMessages(
 // ============================================================================
 
 export const markReadSchema = z.object({
-  messageIds: z.array(z.string())
-    .describe('Message IDs to mark as read'),
+  messageIds: z.array(z.string()).describe('Message IDs to mark as read'),
 });
 
 export async function handleMarkRead(
@@ -287,9 +297,12 @@ export async function handleMarkRead(
       markedRead: args.messageIds.length,
     });
   } catch (error) {
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to mark messages read',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to mark messages read',
+      },
+      true
+    );
   }
 }

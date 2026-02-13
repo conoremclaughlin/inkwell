@@ -120,11 +120,7 @@ export class WorkspacesRepository {
    * Find workspace by ID
    */
   async findById(id: string): Promise<Workspace | null> {
-    const { data, error } = await this.client
-      .from('workspaces')
-      .select('*')
-      .eq('id', id)
-      .single();
+    const { data, error } = await this.client.from('workspaces').select('*').eq('id', id).single();
 
     if (error && error.code !== 'PGRST116') {
       throw new Error(`Failed to find workspace: ${error.message}`);

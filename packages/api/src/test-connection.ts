@@ -16,8 +16,12 @@ async function testConnection() {
     logger.info(`   - Supabase URL: ${env.SUPABASE_URL}`);
     logger.info(`   - MCP Transport: ${env.MCP_TRANSPORT}`);
     logger.info(`   - Node Environment: ${env.NODE_ENV}`);
-    logger.info(`   - Telegram Bot: ${env.TELEGRAM_BOT_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
-    logger.info(`   - Benson Bot: ${env.TELEGRAM_BENSON_BOT_TOKEN ? '✓ Configured' : '✗ Not configured'}\n`);
+    logger.info(
+      `   - Telegram Bot: ${env.TELEGRAM_BOT_TOKEN ? '✓ Configured' : '✗ Not configured'}`
+    );
+    logger.info(
+      `   - Benson Bot: ${env.TELEGRAM_BENSON_BOT_TOKEN ? '✓ Configured' : '✗ Not configured'}\n`
+    );
 
     // Test 2: Database connection
     logger.info('🔌 Testing database connection...');

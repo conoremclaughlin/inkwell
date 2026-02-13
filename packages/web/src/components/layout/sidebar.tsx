@@ -58,7 +58,7 @@ export function Sidebar() {
     '/api/admin/workspaces',
     {
       retry: 1,
-    },
+    }
   );
 
   const workspaces = workspaceData?.workspaces || [];
@@ -104,9 +104,7 @@ export function Sidebar() {
           disabled={workspacesLoading || workspaces.length === 0}
           className="w-full rounded-md border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-gray-500 focus:outline-none"
         >
-          {workspaces.length === 0 && (
-            <option value="">No workspaces</option>
-          )}
+          {workspaces.length === 0 && <option value="">No workspaces</option>}
           {workspaces.map((workspace) => (
             <option key={workspace.id} value={workspace.id}>
               {workspace.name} ({workspace.type})

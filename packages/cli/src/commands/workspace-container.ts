@@ -79,9 +79,9 @@ function unwrapToolResult(payload: unknown): Record<string, unknown> {
     return direct;
   }
 
-  const mcpText = (direct.result as { content?: Array<{ text?: string }> } | undefined)
-    ?.content?.[0]?.text
-    || (direct.content as Array<{ text?: string }> | undefined)?.[0]?.text;
+  const mcpText =
+    (direct.result as { content?: Array<{ text?: string }> } | undefined)?.content?.[0]?.text ||
+    (direct.content as Array<{ text?: string }> | undefined)?.[0]?.text;
 
   if (typeof mcpText === 'string') {
     try {
@@ -95,7 +95,11 @@ function unwrapToolResult(payload: unknown): Record<string, unknown> {
   return direct;
 }
 
-async function listWorkspaceContainers(options: { all?: boolean; type?: 'personal' | 'team'; json?: boolean }): Promise<void> {
+async function listWorkspaceContainers(options: {
+  all?: boolean;
+  type?: 'personal' | 'team';
+  json?: boolean;
+}): Promise<void> {
   const config = getPcpConfig();
   if (!config?.email) {
     console.error(chalk.red('PCP not configured. Run: sb init'));
@@ -120,7 +124,7 @@ async function listWorkspaceContainers(options: { all?: boolean; type?: 'persona
     process.exit(1);
   }
 
-  const raw = await response.json() as unknown;
+  const raw = (await response.json()) as unknown;
   const parsed = unwrapToolResult(raw);
   const workspaces = Array.isArray(parsed.workspaces)
     ? (parsed.workspaces as WorkspaceContainer[])
@@ -143,7 +147,9 @@ async function listWorkspaceContainers(options: { all?: boolean; type?: 'persona
     const marker = selected ? chalk.green('●') : chalk.dim('○');
     const type = workspace.type === 'team' ? chalk.blue('team') : chalk.gray('personal');
 
-    console.log(`  ${marker} ${chalk.cyan(workspace.name)} ${chalk.dim(`(${workspace.slug})`)} ${type}`);
+    console.log(
+      `  ${marker} ${chalk.cyan(workspace.name)} ${chalk.dim(`(${workspace.slug})`)} ${type}`
+    );
     console.log(chalk.dim(`      id: ${workspace.id}`));
     if (workspace.description) {
       console.log(chalk.dim(`      ${workspace.description}`));
@@ -179,7 +185,7 @@ async function useWorkspaceContainer(workspaceRef: string): Promise<void> {
     process.exit(1);
   }
 
-  const raw = await response.json() as unknown;
+  const raw = (await response.json()) as unknown;
   const parsed = unwrapToolResult(raw);
   const workspaces = Array.isArray(parsed.workspaces)
     ? (parsed.workspaces as WorkspaceContainer[])
@@ -221,18 +227,21 @@ export function registerWorkspaceContainerCommands(program: Command): void {
     .command('workspace')
     .description('Product workspace container management (personal/team scope)');
 
-  workspace.command('list')
+  workspace
+    .command('list')
     .alias('ls')
     .option('--all', 'Include archived workspaces')
     .option('--type <type>', 'Filter by workspace type (personal|team)')
     .option('--json', 'Output JSON')
     .action(listWorkspaceContainers);
 
-  workspace.command('use <workspace-id-or-slug>')
+  workspace
+    .command('use <workspace-id-or-slug>')
     .description('Select the active workspace container for this machine')
     .action(useWorkspaceContainer);
 
-  workspace.command('current')
+  workspace
+    .command('current')
     .description('Print selected workspace container ID')
     .action(currentWorkspaceContainer);
 }

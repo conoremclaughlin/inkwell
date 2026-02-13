@@ -7,7 +7,15 @@
 
 import { EventEmitter } from 'events';
 
-export type ChannelType = 'telegram' | 'terminal' | 'discord' | 'whatsapp' | 'http' | 'api' | 'agent' | 'web';
+export type ChannelType =
+  | 'telegram'
+  | 'terminal'
+  | 'discord'
+  | 'whatsapp'
+  | 'http'
+  | 'api'
+  | 'agent'
+  | 'web';
 export type BackendType = 'claude-code' | 'direct-api';
 export type ResponseFormat = 'text' | 'markdown' | 'code' | 'json';
 
@@ -105,7 +113,7 @@ export interface AgentMessage {
 
   // Mention info for group chat behavior
   mentions?: {
-    users: string[];       // @usernames mentioned
+    users: string[]; // @usernames mentioned
     botMentioned: boolean; // Was the bot @mentioned or called by name?
   };
 

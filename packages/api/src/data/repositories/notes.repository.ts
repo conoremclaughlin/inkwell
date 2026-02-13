@@ -10,11 +10,7 @@ export class NotesRepository extends BaseRepository {
 
   async create(noteData: CreateNoteDTO): Promise<Note> {
     try {
-      const { data, error } = await this.client
-        .from('notes')
-        .insert(noteData)
-        .select()
-        .single();
+      const { data, error } = await this.client.from('notes').insert(noteData).select().single();
 
       if (error) throw error;
       return data;
@@ -56,10 +52,7 @@ export class NotesRepository extends BaseRepository {
       }
 
       if (options?.offset) {
-        query = query.range(
-          options.offset,
-          options.offset + (options.limit || 20) - 1
-        );
+        query = query.range(options.offset, options.offset + (options.limit || 20) - 1);
       }
 
       const { data, error } = await query;
@@ -73,15 +66,10 @@ export class NotesRepository extends BaseRepository {
 
   async search(userId: string, options: SearchNotesOptions): Promise<Note[]> {
     try {
-      let query = this.client
-        .from('notes')
-        .select('*')
-        .eq('user_id', userId);
+      let query = this.client.from('notes').select('*').eq('user_id', userId);
 
       if (options.query) {
-        query = query.or(
-          `title.ilike.%${options.query}%,content.ilike.%${options.query}%`
-        );
+        query = query.or(`title.ilike.%${options.query}%,content.ilike.%${options.query}%`);
       }
 
       if (options.tags?.length) {
@@ -122,11 +110,7 @@ export class NotesRepository extends BaseRepository {
 
   async delete(id: string, userId: string): Promise<void> {
     try {
-      const { error } = await this.client
-        .from('notes')
-        .delete()
-        .eq('id', id)
-        .eq('user_id', userId);
+      const { error } = await this.client.from('notes').delete().eq('id', id).eq('user_id', userId);
 
       if (error) throw error;
     } catch (error) {

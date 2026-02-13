@@ -157,7 +157,9 @@ export default function SignupForm() {
             autoComplete="new-password"
             className={cn(
               'h-12 rounded-xl px-4 text-base',
-              confirmPassword.length > 0 && !passwordsMatch && 'border-red-300 focus-visible:ring-red-500'
+              confirmPassword.length > 0 &&
+                !passwordsMatch &&
+                'border-red-300 focus-visible:ring-red-500'
             )}
           />
           {confirmPassword.length > 0 && !passwordsMatch && (

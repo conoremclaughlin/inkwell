@@ -64,9 +64,7 @@ export class PermissionsService {
       return this.definitionsCache;
     }
 
-    const { data, error } = await this.supabase
-      .from('permission_definitions')
-      .select('*');
+    const { data, error } = await this.supabase.from('permission_definitions').select('*');
 
     if (error || !data) {
       logger.error('Failed to load permission definitions', { error });

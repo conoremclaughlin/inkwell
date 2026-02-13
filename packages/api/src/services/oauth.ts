@@ -179,11 +179,7 @@ class OAuthService {
   /**
    * Exchange authorization code for tokens
    */
-  async exchangeCode(
-    provider: string,
-    code: string,
-    redirectUri: string
-  ): Promise<TokenResponse> {
+  async exchangeCode(provider: string, code: string, redirectUri: string): Promise<TokenResponse> {
     const config = OAUTH_PROVIDERS[provider];
     if (!config) {
       throw new Error(`Unknown OAuth provider: ${provider}`);
@@ -209,7 +205,7 @@ class OAuthService {
       throw new Error(`Failed to exchange code: ${error}`);
     }
 
-    const data = await response.json() as {
+    const data = (await response.json()) as {
       access_token: string;
       refresh_token?: string;
       expires_in?: number;
@@ -228,10 +224,7 @@ class OAuthService {
   /**
    * Refresh an expired access token
    */
-  async refreshAccessToken(
-    provider: string,
-    refreshToken: string
-  ): Promise<TokenResponse> {
+  async refreshAccessToken(provider: string, refreshToken: string): Promise<TokenResponse> {
     const config = OAUTH_PROVIDERS[provider];
     if (!config) {
       throw new Error(`Unknown OAuth provider: ${provider}`);
@@ -256,7 +249,7 @@ class OAuthService {
       throw new Error(`Failed to refresh token: ${error}`);
     }
 
-    const data = await response.json() as {
+    const data = (await response.json()) as {
       access_token: string;
       refresh_token?: string;
       expires_in?: number;
@@ -288,7 +281,7 @@ class OAuthService {
         throw new Error('Failed to fetch user info');
       }
 
-      const data = await response.json() as {
+      const data = (await response.json()) as {
         id: string;
         email?: string;
         name?: string;
@@ -364,13 +357,8 @@ class OAuthService {
     };
 
     const saveQuery = existing
-      ? this.supabase
-          .from('connected_accounts')
-          .update(payload)
-          .eq('id', existing.id)
-      : this.supabase
-          .from('connected_accounts')
-          .insert(payload);
+      ? this.supabase.from('connected_accounts').update(payload).eq('id', existing.id)
+      : this.supabase.from('connected_accounts').insert(payload);
 
     const { data, error } = await saveQuery.select().single();
 
@@ -385,7 +373,10 @@ class OAuthService {
   /**
    * Get all connected accounts for a user
    */
-  async getConnectedAccounts(userId: string, workspaceId?: string | null): Promise<ConnectedAccount[]> {
+  async getConnectedAccounts(
+    userId: string,
+    workspaceId?: string | null
+  ): Promise<ConnectedAccount[]> {
     const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
     let query = this.supabase
       .from('connected_accounts')
@@ -447,7 +438,11 @@ class OAuthService {
   /**
    * Get a valid access token, refreshing if necessary
    */
-  async getValidAccessToken(userId: string, provider: string, workspaceId?: string | null): Promise<string> {
+  async getValidAccessToken(
+    userId: string,
+    provider: string,
+    workspaceId?: string | null
+  ): Promise<string> {
     const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
     let query = this.supabase
       .from('connected_accounts')
@@ -526,7 +521,11 @@ class OAuthService {
   /**
    * Disconnect (revoke) a connected account
    */
-  async disconnectAccount(accountId: string, userId: string, workspaceId?: string | null): Promise<void> {
+  async disconnectAccount(
+    accountId: string,
+    userId: string,
+    workspaceId?: string | null
+  ): Promise<void> {
     const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
 
     // First get the account to revoke the token

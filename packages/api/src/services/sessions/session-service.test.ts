@@ -32,7 +32,7 @@ vi.mock('../../utils/logger.js', () => ({
 
 // Mock buildIdentityPrompt (imported function, not a class)
 vi.mock('./claude-runner.js', async (importOriginal) => {
-  const actual = await importOriginal() as Record<string, unknown>;
+  const actual = (await importOriginal()) as Record<string, unknown>;
   return {
     ...actual,
     buildIdentityPrompt: vi.fn(() => 'mocked-identity-prompt'),
@@ -111,7 +111,9 @@ describe('SessionService', () => {
     activeProjects: [],
   });
 
-  const createMockClaudeResult = (overrides: Partial<ClaudeRunnerResult> = {}): ClaudeRunnerResult => ({
+  const createMockClaudeResult = (
+    overrides: Partial<ClaudeRunnerResult> = {}
+  ): ClaudeRunnerResult => ({
     success: true,
     claudeSessionId: 'claude-abc',
     responses: [],
@@ -129,7 +131,9 @@ describe('SessionService', () => {
       findById: vi.fn().mockResolvedValue(null),
       findByUser: vi.fn().mockResolvedValue([]),
       create: vi.fn().mockImplementation(async (data) => createMockSession(data)),
-      update: vi.fn().mockImplementation(async (id, updates) => createMockSession({ id, ...updates })),
+      update: vi
+        .fn()
+        .mockImplementation(async (id, updates) => createMockSession({ id, ...updates })),
       updateTokenUsage: vi.fn().mockResolvedValue(undefined),
       markCompacted: vi.fn().mockResolvedValue(undefined),
       tryAcquireCompactionLock: vi.fn().mockResolvedValue(true),
@@ -150,7 +154,9 @@ describe('SessionService', () => {
     };
 
     mockCodexRunner = {
-      run: vi.fn().mockResolvedValue(createMockClaudeResult({ claudeSessionId: 'codex-session-1' })),
+      run: vi
+        .fn()
+        .mockResolvedValue(createMockClaudeResult({ claudeSessionId: 'codex-session-1' })),
     };
 
     mockActivityStream = {
@@ -381,8 +387,11 @@ describe('SessionService', () => {
       const processedChannels: string[] = [];
 
       vi.mocked(mockClaudeRunner.run).mockImplementation(async (message: string) => {
-        const channel = message.includes('telegram') ? 'telegram' :
-                       message.includes('HEARTBEAT') ? 'heartbeat' : 'unknown';
+        const channel = message.includes('telegram')
+          ? 'telegram'
+          : message.includes('HEARTBEAT')
+            ? 'heartbeat'
+            : 'unknown';
         processedChannels.push(channel);
         await new Promise((r) => setTimeout(r, 50));
         return createMockClaudeResult();
@@ -505,7 +514,8 @@ describe('SessionService', () => {
       const request = createMockRequest();
       await sessionService.handleMessage(request);
 
-      expect(mockRepository.update).toHaveBeenCalledWith('session-123',
+      expect(mockRepository.update).toHaveBeenCalledWith(
+        'session-123',
         expect.objectContaining({ messageCount: 6 })
       );
     });
@@ -544,7 +554,8 @@ describe('SessionService', () => {
       await sessionService.handleMessage(request);
 
       // Verify tokenCount = (3000+2000) + (1000+500) = 6500
-      expect(mockRepository.update).toHaveBeenCalledWith('session-123',
+      expect(mockRepository.update).toHaveBeenCalledWith(
+        'session-123',
         expect.objectContaining({
           contextTokens: 8000,
           totalInputTokens: 5000,
@@ -565,7 +576,8 @@ describe('SessionService', () => {
       const request = createMockRequest();
       await sessionService.handleMessage(request);
 
-      expect(mockRepository.update).toHaveBeenCalledWith('session-123',
+      expect(mockRepository.update).toHaveBeenCalledWith(
+        'session-123',
         expect.objectContaining({
           claudeSessionId: 'new-claude-id',
           messageCount: 1,
@@ -615,7 +627,11 @@ describe('SessionService', () => {
         createMockClaudeResult({
           toolCalls: [
             { toolUseId: 'tu-1', toolName: 'mcp__pcp__recall', input: { query: 'emails' } },
-            { toolUseId: 'tu-2', toolName: 'mcp__pcp__send_response', input: { content: 'Here are your emails' } },
+            {
+              toolUseId: 'tu-2',
+              toolName: 'mcp__pcp__send_response',
+              input: { content: 'Here are your emails' },
+            },
           ],
         })
       );
@@ -648,9 +664,7 @@ describe('SessionService', () => {
       const session = createMockSession();
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
 
-      vi.mocked(mockClaudeRunner.run).mockResolvedValue(
-        createMockClaudeResult({ toolCalls: [] })
-      );
+      vi.mocked(mockClaudeRunner.run).mockResolvedValue(createMockClaudeResult({ toolCalls: [] }));
 
       const request = createMockRequest();
       await sessionService.handleMessage(request);
@@ -667,9 +681,7 @@ describe('SessionService', () => {
       const largeInput = { data: 'x'.repeat(15_000) };
       vi.mocked(mockClaudeRunner.run).mockResolvedValue(
         createMockClaudeResult({
-          toolCalls: [
-            { toolUseId: 'tu-1', toolName: 'mcp__pcp__remember', input: largeInput },
-          ],
+          toolCalls: [{ toolUseId: 'tu-1', toolName: 'mcp__pcp__remember', input: largeInput }],
         })
       );
 
@@ -767,9 +779,7 @@ describe('SessionService', () => {
       vi.mocked(mockRepository.findById).mockResolvedValue(session);
       vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
 
-      vi.mocked(mockClaudeRunner.run).mockResolvedValue(
-        createMockClaudeResult({ success: true })
-      );
+      vi.mocked(mockClaudeRunner.run).mockResolvedValue(createMockClaudeResult({ success: true }));
 
       await sessionService.triggerCompaction('session-123');
 
@@ -787,7 +797,9 @@ describe('SessionService', () => {
 
       vi.mocked(mockClaudeRunner.run).mockRejectedValue(new Error('Process crashed'));
 
-      await expect(sessionService.triggerCompaction('session-123')).rejects.toThrow('Process crashed');
+      await expect(sessionService.triggerCompaction('session-123')).rejects.toThrow(
+        'Process crashed'
+      );
 
       // Lock should still be released despite failure
       expect(mockRepository.releaseCompactionLock).toHaveBeenCalledWith('session-123');
@@ -859,7 +871,9 @@ describe('SessionService', () => {
       vi.mocked(mockClaudeRunner.run).mockResolvedValue(
         createMockClaudeResult({
           success: true,
-          responses: [{ channel: 'telegram' as const, conversationId: 'chat-123', content: 'Compacting...' }],
+          responses: [
+            { channel: 'telegram' as const, conversationId: 'chat-123', content: 'Compacting...' },
+          ],
         })
       );
 

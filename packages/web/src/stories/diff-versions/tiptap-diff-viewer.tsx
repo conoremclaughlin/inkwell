@@ -8,20 +8,11 @@ import TextAlign from '@tiptap/extension-text-align';
 import Underline from '@tiptap/extension-underline';
 import { useEditor } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
-import {
-  DIFF_DELETE,
-  DIFF_EQUAL,
-  DIFF_INSERT,
-  diff_match_patch,
-} from 'diff-match-patch';
+import { DIFF_DELETE, DIFF_EQUAL, DIFF_INSERT, diff_match_patch } from 'diff-match-patch';
 import markdownit from 'markdown-it';
 import { Markdown } from 'tiptap-markdown';
 
-import {
-  DiffAddition,
-  DiffDeletion,
-  DiffUnchanged,
-} from './marks';
+import { DiffAddition, DiffDeletion, DiffUnchanged } from './marks';
 
 /**
  * TiptapDiffViewer - A component to visualize text differences using Tiptap
@@ -91,26 +82,15 @@ function diffTiptapDocs(a: TiptapNode[], b: TiptapNode[]): TiptapNode[] {
     }
 
     if (nodeA.type === 'text' && nodeB.type === 'text') {
-      result.push(
-        ...diffTextContent(
-          nodeA.text || '',
-          nodeB.text || '',
-          nodeA.marks,
-          nodeB.marks,
-        ),
-      );
+      result.push(...diffTextContent(nodeA.text || '', nodeB.text || '', nodeA.marks, nodeB.marks));
       continue;
     }
 
-    const childrenDiff = diffTiptapDocs(
-      nodeA.content || [],
-      nodeB.content || [],
-    );
+    const childrenDiff = diffTiptapDocs(nodeA.content || [], nodeB.content || []);
     const isUnchanged =
       childrenDiff.length === (nodeA.content || []).length &&
       childrenDiff.every(
-        (child, idx) =>
-          JSON.stringify(child) === JSON.stringify((nodeA.content || [])[idx]),
+        (child, idx) => JSON.stringify(child) === JSON.stringify((nodeA.content || [])[idx])
       );
 
     if (isUnchanged) {
@@ -131,9 +111,7 @@ function wrapWithDiffMark(node: TiptapNode, diffType: DiffType): TiptapNode {
     };
   }
 
-  const content = (node.content || []).map((child) =>
-    wrapWithDiffMark(child, diffType),
-  );
+  const content = (node.content || []).map((child) => wrapWithDiffMark(child, diffType));
   return {
     ...node,
     content,
@@ -142,7 +120,7 @@ function wrapWithDiffMark(node: TiptapNode, diffType: DiffType): TiptapNode {
 
 function generateDiffedDocFromTiptapDocs(
   originalDoc: TiptapNode[],
-  modifiedDoc: TiptapNode[],
+  modifiedDoc: TiptapNode[]
 ): { type: 'doc'; content: TiptapNode[] } {
   const content = diffTiptapDocs(originalDoc, modifiedDoc);
   return {
@@ -160,7 +138,7 @@ function diffTextContent(
   textA: string,
   textB: string,
   marksA?: TiptapNode['marks'],
-  marksB?: TiptapNode['marks'],
+  marksB?: TiptapNode['marks']
 ): TiptapNode[] {
   const diffs = dmp.diff_main(textA, textB);
   dmp.diff_cleanupSemantic(diffs);
@@ -203,29 +181,15 @@ const TiptapDiffViewer = ({ originalText = '', modifiedText = '' }) => {
 
   useEffect(() => {
     if (originalText !== undefined && modifiedText !== undefined) {
-      const originalDoc = parseMarkdownToTiptapDoc(
-        originalText,
-        CommonExtensions,
-      );
-      const modifiedDoc = parseMarkdownToTiptapDoc(
-        modifiedText,
-        CommonExtensions,
-      );
-      const data = generateDiffedDocFromTiptapDocs(
-        originalDoc.content,
-        modifiedDoc.content,
-      );
+      const originalDoc = parseMarkdownToTiptapDoc(originalText, CommonExtensions);
+      const modifiedDoc = parseMarkdownToTiptapDoc(modifiedText, CommonExtensions);
+      const data = generateDiffedDocFromTiptapDocs(originalDoc.content, modifiedDoc.content);
 
       setTiptapJson(data);
     }
   }, [originalText, modifiedText]);
 
-  const extensionsForDiffViewer = [
-    ...CommonExtensions,
-    DiffAddition,
-    DiffDeletion,
-    DiffUnchanged,
-  ];
+  const extensionsForDiffViewer = [...CommonExtensions, DiffAddition, DiffDeletion, DiffUnchanged];
 
   const editor = useEditor({
     extensions: extensionsForDiffViewer,

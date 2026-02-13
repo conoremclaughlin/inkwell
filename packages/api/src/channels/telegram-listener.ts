@@ -81,7 +81,22 @@ interface TelegramFile {
 }
 
 interface TelegramMessageEntity {
-  type: 'mention' | 'hashtag' | 'cashtag' | 'bot_command' | 'url' | 'email' | 'phone_number' | 'bold' | 'italic' | 'underline' | 'strikethrough' | 'code' | 'pre' | 'text_link' | 'text_mention';
+  type:
+    | 'mention'
+    | 'hashtag'
+    | 'cashtag'
+    | 'bot_command'
+    | 'url'
+    | 'email'
+    | 'phone_number'
+    | 'bold'
+    | 'italic'
+    | 'underline'
+    | 'strikethrough'
+    | 'code'
+    | 'pre'
+    | 'text_link'
+    | 'text_mention';
   offset: number;
   length: number;
   url?: string;
@@ -180,10 +195,9 @@ export class TelegramListener extends EventEmitter {
    */
   onMessage(callback: MessageCallback): void {
     this.messageCallback = callback;
-    this.mediaGroupBuffer = new MediaGroupBuffer(
-      (msg) => this.dispatchMessage(msg),
-      { flushDelayMs: 500 },
-    );
+    this.mediaGroupBuffer = new MediaGroupBuffer((msg) => this.dispatchMessage(msg), {
+      flushDelayMs: 500,
+    });
   }
 
   /**
@@ -287,7 +301,8 @@ export class TelegramListener extends EventEmitter {
 
     const chatId = String(telegramMessage.chat.id);
     const userId = telegramMessage.from ? String(telegramMessage.from.id) : null;
-    const isGroupChat = telegramMessage.chat.type === 'group' || telegramMessage.chat.type === 'supergroup';
+    const isGroupChat =
+      telegramMessage.chat.type === 'group' || telegramMessage.chat.type === 'supergroup';
     const text = telegramMessage.text || telegramMessage.caption || '';
 
     // ========== AUTHORIZATION CHECK (before any processing) ==========
@@ -332,7 +347,8 @@ export class TelegramListener extends EventEmitter {
     // Check if message has text or any media (photo, document, video, audio)
     const hasText = !!telegramMessage.text;
     const hasPhoto = !!telegramMessage.photo && telegramMessage.photo.length > 0;
-    const hasMedia = hasPhoto || !!telegramMessage.document || !!telegramMessage.video || !!telegramMessage.audio;
+    const hasMedia =
+      hasPhoto || !!telegramMessage.document || !!telegramMessage.video || !!telegramMessage.audio;
 
     if (!hasText && !hasMedia) {
       logger.debug('Skipping message without text or media');
@@ -418,7 +434,12 @@ export class TelegramListener extends EventEmitter {
     const code = parts[1];
     const groupName = msg.chat.title || null;
 
-    const result = await this.authService.authorizeGroupWithCode('telegram', chatId, groupName, code);
+    const result = await this.authService.authorizeGroupWithCode(
+      'telegram',
+      chatId,
+      groupName,
+      code
+    );
 
     if (result.success) {
       await this.sendMessage(chatId, `✓ Group authorized! I'm now active in this chat.`);
@@ -426,7 +447,10 @@ export class TelegramListener extends EventEmitter {
     } else {
       // Only respond with error if code was invalid (to avoid spam on random /authorize attempts)
       if (result.error === 'Invalid or expired code') {
-        await this.sendMessage(chatId, `✗ Invalid or expired code. Please get a new code from a trusted user.`);
+        await this.sendMessage(
+          chatId,
+          `✗ Invalid or expired code. Please get a new code from a trusted user.`
+        );
       }
     }
   }
@@ -544,7 +568,9 @@ export class TelegramListener extends EventEmitter {
     }
 
     const targetUserId = parts[1];
-    const trustLevel = (parts[2]?.toLowerCase() === 'admin' ? 'admin' : 'member') as 'admin' | 'member';
+    const trustLevel = (parts[2]?.toLowerCase() === 'admin' ? 'admin' : 'member') as
+      | 'admin'
+      | 'member';
 
     const result = await this.authService.addTrustedUser(
       'telegram',
@@ -591,7 +617,10 @@ export class TelegramListener extends EventEmitter {
         await this.apiCall('leaveChat', { chat_id: groupId });
         await this.sendMessage(chatId, `✓ Revoked and left group ${groupId}.`);
       } catch {
-        await this.sendMessage(chatId, `✓ Revoked group ${groupId}. (Could not leave - may have already left)`);
+        await this.sendMessage(
+          chatId,
+          `✓ Revoked group ${groupId}. (Could not leave - may have already left)`
+        );
       }
     } else {
       await this.sendMessage(chatId, `✗ ${result.error}`);
@@ -603,8 +632,8 @@ export class TelegramListener extends EventEmitter {
    * Convert Telegram message to InboundMessage format
    */
   private async convertMessage(msg: TelegramMessage): Promise<InboundMessage> {
-    const chatType = msg.chat.type === 'private' ? 'direct' :
-                     msg.chat.type === 'channel' ? 'channel' : 'group';
+    const chatType =
+      msg.chat.type === 'private' ? 'direct' : msg.chat.type === 'channel' ? 'channel' : 'group';
 
     // For photos, use caption as text body; for text messages use text
     const textContent = msg.text || msg.caption || '';
@@ -619,7 +648,9 @@ export class TelegramListener extends EventEmitter {
       sender: {
         id: msg.from ? String(msg.from.id) : String(msg.chat.id),
         username: msg.from?.username,
-        name: msg.from ? `${msg.from.first_name}${msg.from.last_name ? ' ' + msg.from.last_name : ''}` : undefined,
+        name: msg.from
+          ? `${msg.from.first_name}${msg.from.last_name ? ' ' + msg.from.last_name : ''}`
+          : undefined,
       },
       conversationId: String(msg.chat.id),
       conversationLabel: msg.chat.title || msg.chat.username || msg.chat.first_name,
@@ -635,8 +666,10 @@ export class TelegramListener extends EventEmitter {
       if (localPath) {
         mediaAttachments.push({ type: 'image', path: localPath });
         logger.info('Photo attachment downloaded', {
-          fileId: largestPhoto.file_id, localPath,
-          width: largestPhoto.width, height: largestPhoto.height,
+          fileId: largestPhoto.file_id,
+          localPath,
+          width: largestPhoto.width,
+          height: largestPhoto.height,
           hasCaption: !!msg.caption,
         });
       }
@@ -646,12 +679,16 @@ export class TelegramListener extends EventEmitter {
       const localPath = await this.downloadFile(msg.document.file_id);
       if (localPath) {
         mediaAttachments.push({
-          type: 'document', path: localPath,
-          filename: msg.document.file_name, contentType: msg.document.mime_type,
+          type: 'document',
+          path: localPath,
+          filename: msg.document.file_name,
+          contentType: msg.document.mime_type,
         });
         logger.info('Document attachment downloaded', {
-          fileId: msg.document.file_id, localPath,
-          filename: msg.document.file_name, mimeType: msg.document.mime_type,
+          fileId: msg.document.file_id,
+          localPath,
+          filename: msg.document.file_name,
+          mimeType: msg.document.mime_type,
         });
       }
     }
@@ -660,11 +697,15 @@ export class TelegramListener extends EventEmitter {
       const localPath = await this.downloadFile(msg.video.file_id);
       if (localPath) {
         mediaAttachments.push({
-          type: 'video', path: localPath,
-          filename: msg.video.file_name, contentType: msg.video.mime_type,
+          type: 'video',
+          path: localPath,
+          filename: msg.video.file_name,
+          contentType: msg.video.mime_type,
         });
         logger.info('Video attachment downloaded', {
-          fileId: msg.video.file_id, localPath, duration: msg.video.duration,
+          fileId: msg.video.file_id,
+          localPath,
+          duration: msg.video.duration,
         });
       }
     }
@@ -673,11 +714,15 @@ export class TelegramListener extends EventEmitter {
       const localPath = await this.downloadFile(msg.audio.file_id);
       if (localPath) {
         mediaAttachments.push({
-          type: 'audio', path: localPath,
-          filename: msg.audio.file_name, contentType: msg.audio.mime_type,
+          type: 'audio',
+          path: localPath,
+          filename: msg.audio.file_name,
+          contentType: msg.audio.mime_type,
         });
         logger.info('Audio attachment downloaded', {
-          fileId: msg.audio.file_id, localPath, duration: msg.audio.duration,
+          fileId: msg.audio.file_id,
+          localPath,
+          duration: msg.audio.duration,
         });
       }
     }
@@ -685,10 +730,14 @@ export class TelegramListener extends EventEmitter {
     if (mediaAttachments.length > 0) {
       message.media = mediaAttachments;
       if (!textContent) {
-        const type = mediaAttachments[0].type === 'image' ? 'Image'
-          : mediaAttachments[0].type === 'video' ? 'Video'
-          : mediaAttachments[0].type === 'audio' ? 'Audio'
-          : 'File';
+        const type =
+          mediaAttachments[0].type === 'image'
+            ? 'Image'
+            : mediaAttachments[0].type === 'video'
+              ? 'Video'
+              : mediaAttachments[0].type === 'audio'
+                ? 'Audio'
+                : 'File';
         message.body = `[${type} attached]`;
       }
     }
@@ -815,7 +864,7 @@ export class TelegramListener extends EventEmitter {
       body: params ? JSON.stringify(params) : undefined,
     });
 
-    const data = await response.json() as TelegramApiResponse<T>;
+    const data = (await response.json()) as TelegramApiResponse<T>;
 
     if (!data.ok) {
       throw new Error(`Telegram API error: ${data.description}`);
@@ -937,7 +986,9 @@ export class TelegramListener extends EventEmitter {
 
     if (filtered.length !== cache.length) {
       this.messageCache.set(chatId, filtered);
-      logger.debug(`Cleaned ${cache.length - filtered.length} expired messages from chat ${chatId}`);
+      logger.debug(
+        `Cleaned ${cache.length - filtered.length} expired messages from chat ${chatId}`
+      );
     }
   }
 

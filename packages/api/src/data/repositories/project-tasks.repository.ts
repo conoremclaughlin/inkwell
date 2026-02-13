@@ -238,10 +238,7 @@ export class ProjectTasksRepository {
    * Delete a task
    */
   async delete(id: string): Promise<void> {
-    const { error } = await this.client
-      .from('project_tasks')
-      .delete()
-      .eq('id', id);
+    const { error } = await this.client.from('project_tasks').delete().eq('id', id);
 
     if (error) {
       throw new Error(`Failed to delete task: ${error.message}`);
@@ -262,10 +259,10 @@ export class ProjectTasksRepository {
 
     return {
       total: tasks.length,
-      pending: tasks.filter(t => t.status === 'pending').length,
-      in_progress: tasks.filter(t => t.status === 'in_progress').length,
-      completed: tasks.filter(t => t.status === 'completed').length,
-      blocked: tasks.filter(t => t.status === 'blocked').length,
+      pending: tasks.filter((t) => t.status === 'pending').length,
+      in_progress: tasks.filter((t) => t.status === 'in_progress').length,
+      completed: tasks.filter((t) => t.status === 'completed').length,
+      blocked: tasks.filter((t) => t.status === 'blocked').length,
     };
   }
 }

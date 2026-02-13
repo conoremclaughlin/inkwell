@@ -170,10 +170,7 @@ export class DiscordListener extends EventEmitter {
     ];
 
     try {
-      await rest.put(
-        Routes.applicationCommands(this.applicationId),
-        { body: commands },
-      );
+      await rest.put(Routes.applicationCommands(this.applicationId), { body: commands });
       logger.info('Discord slash commands registered: /balances');
     } catch (error) {
       logger.error('Failed to register Discord slash commands:', error);
@@ -257,9 +254,14 @@ export class DiscordListener extends EventEmitter {
 
       // Check guild authorization if in a guild
       if (interaction.guild) {
-        const isAuthorized = await this.authService.isGroupAuthorized('discord', interaction.guild.id);
+        const isAuthorized = await this.authService.isGroupAuthorized(
+          'discord',
+          interaction.guild.id
+        );
         if (!isAuthorized) {
-          await interaction.editReply('This server is not authorized. Use `/authorize <code>` first.');
+          await interaction.editReply(
+            'This server is not authorized. Use `/authorize <code>` first.'
+          );
           return;
         }
       }
@@ -279,7 +281,9 @@ export class DiscordListener extends EventEmitter {
         },
         conversationId: interaction.channelId,
         conversationLabel: interaction.guild
-          ? (interaction.channel && 'name' in interaction.channel ? (interaction.channel.name ?? undefined) : undefined)
+          ? interaction.channel && 'name' in interaction.channel
+            ? (interaction.channel.name ?? undefined)
+            : undefined
           : interaction.user.username,
         groupSubject: interaction.guild?.name,
         mentions: { users: [], botMentioned: true },
@@ -343,14 +347,22 @@ export class DiscordListener extends EventEmitter {
     const code = parts[1];
     const groupName = msg.guild?.name || null;
 
-    const result = await this.authService.authorizeGroupWithCode('discord', guildId, groupName, code);
+    const result = await this.authService.authorizeGroupWithCode(
+      'discord',
+      guildId,
+      groupName,
+      code
+    );
 
     if (result.success) {
-      await this.sendMessage(msg.channelId, 'Group authorized! I\'m now active in this server.');
+      await this.sendMessage(msg.channelId, "Group authorized! I'm now active in this server.");
       logger.info('Discord guild authorized via challenge code', { guildId, groupName });
     } else {
       if (result.error === 'Invalid or expired code') {
-        await this.sendMessage(msg.channelId, 'Invalid or expired code. Please get a new code from a trusted user.');
+        await this.sendMessage(
+          msg.channelId,
+          'Invalid or expired code. Please get a new code from a trusted user.'
+        );
       }
     }
   }
@@ -399,12 +411,12 @@ export class DiscordListener extends EventEmitter {
         `Group authorization code: \`${code}\`\n\n` +
           `This code expires in 24 hours.\n` +
           `To authorize a server, add me to the server and send:\n` +
-          `/authorize ${code}`,
+          `/authorize ${code}`
       );
     } else {
       await this.sendMessage(
         channelId,
-        'Unable to generate code. You may have reached the limit of 5 active codes.',
+        'Unable to generate code. You may have reached the limit of 5 active codes.'
       );
     }
     return true;
@@ -420,7 +432,7 @@ export class DiscordListener extends EventEmitter {
       await this.sendMessage(channelId, 'No authorized Discord servers yet.');
     } else {
       const lines = groups.map(
-        (g) => `- ${g.groupName || g.platformGroupId} (${g.authorizationMethod})`,
+        (g) => `- ${g.groupName || g.platformGroupId} (${g.authorizationMethod})`
       );
       await this.sendMessage(channelId, `Authorized servers:\n${lines.join('\n')}`);
     }
@@ -446,25 +458,30 @@ export class DiscordListener extends EventEmitter {
    * Handle /add-trusted command
    * Usage: /add-trusted <userId> [admin|member]
    */
-  private async handleAddTrustedCommand(msg: DiscordMessage, addedByUserId: string): Promise<boolean> {
+  private async handleAddTrustedCommand(
+    msg: DiscordMessage,
+    addedByUserId: string
+  ): Promise<boolean> {
     const parts = msg.content.trim().split(/\s+/);
 
     if (parts.length < 2) {
       await this.sendMessage(
         msg.channelId,
-        'Usage: /add-trusted <discord_user_id> [admin|member]\nExample: /add-trusted 123456789 member',
+        'Usage: /add-trusted <discord_user_id> [admin|member]\nExample: /add-trusted 123456789 member'
       );
       return true;
     }
 
     const targetUserId = parts[1];
-    const trustLevel = (parts[2]?.toLowerCase() === 'admin' ? 'admin' : 'member') as 'admin' | 'member';
+    const trustLevel = (parts[2]?.toLowerCase() === 'admin' ? 'admin' : 'member') as
+      | 'admin'
+      | 'member';
 
     const result = await this.authService.addTrustedUser(
       'discord',
       targetUserId,
       trustLevel,
-      addedByUserId,
+      addedByUserId
     );
 
     if (result.success) {
@@ -485,7 +502,7 @@ export class DiscordListener extends EventEmitter {
     if (parts.length < 2) {
       await this.sendMessage(
         msg.channelId,
-        'Usage: /revoke-group <guild_id>\nExample: /revoke-group 1234567890',
+        'Usage: /revoke-group <guild_id>\nExample: /revoke-group 1234567890'
       );
       return true;
     }
@@ -501,10 +518,16 @@ export class DiscordListener extends EventEmitter {
           await guild.leave();
           await this.sendMessage(msg.channelId, `Revoked and left server ${groupId}.`);
         } else {
-          await this.sendMessage(msg.channelId, `Revoked server ${groupId}. (Not currently in that server)`);
+          await this.sendMessage(
+            msg.channelId,
+            `Revoked server ${groupId}. (Not currently in that server)`
+          );
         }
       } catch {
-        await this.sendMessage(msg.channelId, `Revoked server ${groupId}. (Could not leave - may have already left)`);
+        await this.sendMessage(
+          msg.channelId,
+          `Revoked server ${groupId}. (Could not leave - may have already left)`
+        );
       }
     } else {
       await this.sendMessage(msg.channelId, `Error: ${result.error}`);
@@ -541,7 +564,9 @@ export class DiscordListener extends EventEmitter {
       conversationId: msg.channelId,
       conversationLabel: isDm
         ? msg.author.username
-        : ('name' in msg.channel ? (msg.channel as TextChannel).name : undefined),
+        : 'name' in msg.channel
+          ? (msg.channel as TextChannel).name
+          : undefined,
       groupSubject: msg.guild?.name,
     };
 
@@ -568,10 +593,14 @@ export class DiscordListener extends EventEmitter {
     if (mediaAttachments.length > 0) {
       message.media = mediaAttachments;
       if (!body) {
-        const type = mediaAttachments[0].type === 'image' ? 'Image'
-          : mediaAttachments[0].type === 'video' ? 'Video'
-          : mediaAttachments[0].type === 'audio' ? 'Audio'
-          : 'File';
+        const type =
+          mediaAttachments[0].type === 'image'
+            ? 'Image'
+            : mediaAttachments[0].type === 'video'
+              ? 'Video'
+              : mediaAttachments[0].type === 'audio'
+                ? 'Audio'
+                : 'File';
         message.body = `[${type} attached]`;
       }
     }

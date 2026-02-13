@@ -37,7 +37,9 @@ export function resolveAgentId(cliAgent?: string): string {
     try {
       const identity: IdentityJson = JSON.parse(readFileSync(localIdentity, 'utf-8'));
       if (identity.agentId) return identity.agentId;
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   }
 
   const configPath = join(homedir(), '.pcp', 'config.json');
@@ -45,7 +47,9 @@ export function resolveAgentId(cliAgent?: string): string {
     try {
       const config: PcpConfig = JSON.parse(readFileSync(configPath, 'utf-8'));
       if (config.agentMapping?.['claude-code']) return config.agentMapping['claude-code'];
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   }
 
   return cliAgent || 'wren';
@@ -80,7 +84,10 @@ PCP tools persist across sessions and are shared with the user and other agents.
  * Write the identity prompt to a temp file.
  * Returns the file path and a cleanup function.
  */
-export function createIdentityPromptFile(agentId: string): { promptFile: string; cleanup: () => void } {
+export function createIdentityPromptFile(agentId: string): {
+  promptFile: string;
+  cleanup: () => void;
+} {
   const content = buildIdentityPrompt(agentId);
   const tempDir = mkdtempSync(join(tmpdir(), 'sb-'));
   const promptFile = join(tempDir, 'identity-prompt.md');
@@ -89,7 +96,11 @@ export function createIdentityPromptFile(agentId: string): { promptFile: string;
   return {
     promptFile,
     cleanup: () => {
-      try { rmSync(tempDir, { recursive: true }); } catch { /* ignore */ }
+      try {
+        rmSync(tempDir, { recursive: true });
+      } catch {
+        /* ignore */
+      }
     },
   };
 }

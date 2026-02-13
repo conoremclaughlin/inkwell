@@ -34,7 +34,9 @@ export function createKindleRouter(): Router {
       }
 
       if (tokenData.status !== 'active') {
-        res.status(410).json({ error: 'Token has already been used or expired', status: tokenData.status });
+        res
+          .status(410)
+          .json({ error: 'Token has already been used or expired', status: tokenData.status });
         return;
       }
 
@@ -69,11 +71,7 @@ export function createKindleRouter(): Router {
       const { agentId, expiresInHours } = req.body;
 
       const kindleService = getKindleService();
-      const token = await kindleService.createKindleToken(
-        userId,
-        agentId,
-        expiresInHours || 168
-      );
+      const token = await kindleService.createKindleToken(userId, agentId, expiresInHours || 168);
 
       const webPortalUrl = process.env.WEB_PORTAL_URL || 'http://localhost:3002';
       const inviteUrl = `${webPortalUrl}/kindle/${token.token}`;

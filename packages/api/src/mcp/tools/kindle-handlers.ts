@@ -12,10 +12,7 @@ import { getKindleService } from '../../services/kindle/kindle-service';
 import { logger } from '../../utils/logger';
 
 export const createKindleTokenSchema = userIdentifierBaseSchema.extend({
-  agentId: z
-    .string()
-    .optional()
-    .describe("Parent agent ID whose values will seed the new SB"),
+  agentId: z.string().optional().describe('Parent agent ID whose values will seed the new SB'),
   expiresInHours: z
     .number()
     .optional()
@@ -23,10 +20,7 @@ export const createKindleTokenSchema = userIdentifierBaseSchema.extend({
     .describe('Token expiry in hours (default: 168 = 7 days)'),
 });
 
-export async function handleCreateKindleToken(
-  args: unknown,
-  dataComposer: DataComposer
-) {
+export async function handleCreateKindleToken(args: unknown, dataComposer: DataComposer) {
   const params = createKindleTokenSchema.parse(args);
   const { user } = await resolveUserOrThrow(params, dataComposer);
 

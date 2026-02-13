@@ -13,12 +13,14 @@
   "state": {
     "schema": {
       "sessionId": "string",
-      "items": [{
-        "id": "string",
-        "name": "string",
-        "price": "number",
-        "quantity": "number"
-      }],
+      "items": [
+        {
+          "id": "string",
+          "name": "string",
+          "price": "number",
+          "quantity": "number"
+        }
+      ],
       "people": ["string"],
       "assignments": {
         "itemId": ["personName"]

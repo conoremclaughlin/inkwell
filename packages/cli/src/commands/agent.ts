@@ -80,7 +80,10 @@ async function fetchPcp(path: string, options?: RequestInit): Promise<Response> 
 // Commands
 // ============================================================================
 
-async function triggerAgent(agentId: string, options: { message?: string; priority?: string }): Promise<void> {
+async function triggerAgent(
+  agentId: string,
+  options: { message?: string; priority?: string }
+): Promise<void> {
   const spinner = ora(`Triggering agent: ${agentId}`).start();
 
   try {
@@ -115,7 +118,7 @@ async function triggerAgent(agentId: string, options: { message?: string; priori
       process.exit(1);
     }
 
-    const result = await inboxResponse.json() as TriggerResult;
+    const result = (await inboxResponse.json()) as TriggerResult;
     spinner.succeed(`Triggered ${agentId}`);
 
     if (result.trigger?.triggered) {
@@ -153,13 +156,14 @@ async function statusCommand(agentId?: string): Promise<void> {
       });
 
       if (response.ok) {
-        const result = await response.json() as AgentStatusResult;
+        const result = (await response.json()) as AgentStatusResult;
 
-        const statusIcon = result.status === 'active'
-          ? chalk.green('●')
-          : result.status === 'recently_active'
-            ? chalk.yellow('●')
-            : chalk.dim('○');
+        const statusIcon =
+          result.status === 'active'
+            ? chalk.green('●')
+            : result.status === 'recently_active'
+              ? chalk.yellow('●')
+              : chalk.dim('○');
 
         console.log(`  ${statusIcon} ${chalk.cyan(agent)}`);
         console.log(chalk.dim(`      Status: ${result.status}`));
@@ -212,7 +216,7 @@ async function inboxCommand(agentId?: string): Promise<void> {
       process.exit(1);
     }
 
-    const result = await response.json() as InboxResult;
+    const result = (await response.json()) as InboxResult;
 
     console.log(chalk.bold(`\nInbox for ${agent}:`));
     console.log(chalk.dim(`  ${result.unreadCount} unread\n`));
@@ -224,11 +228,12 @@ async function inboxCommand(agentId?: string): Promise<void> {
 
     for (const msg of result.messages) {
       const statusIcon = msg.status === 'unread' ? chalk.yellow('●') : chalk.dim('○');
-      const priorityBadge = msg.priority === 'urgent'
-        ? chalk.red('[URGENT]')
-        : msg.priority === 'high'
-          ? chalk.yellow('[HIGH]')
-          : '';
+      const priorityBadge =
+        msg.priority === 'urgent'
+          ? chalk.red('[URGENT]')
+          : msg.priority === 'high'
+            ? chalk.yellow('[HIGH]')
+            : '';
 
       console.log(`  ${statusIcon} ${priorityBadge} ${msg.subject || '(no subject)'}`);
       console.log(chalk.dim(`      From: ${msg.senderAgentId || 'user'}`));
@@ -276,26 +281,21 @@ function formatTimeAgo(date: Date): string {
 // ============================================================================
 
 export function registerAgentCommands(program: Command): void {
-  const agent = program
-    .command('agent')
-    .description('Interact with PCP agents');
+  const agent = program.command('agent').description('Interact with PCP agents');
 
-  agent.command('trigger <id>')
+  agent
+    .command('trigger <id>')
     .description('Trigger an agent to wake up')
     .option('-m, --message <msg>', 'Message to include')
     .option('-p, --priority <level>', 'Priority (low, normal, high, urgent)', 'normal')
     .action(triggerAgent);
 
-  agent.command('status [id]')
+  agent
+    .command('status [id]')
     .description('Check agent status (all agents if no ID)')
     .action(statusCommand);
 
-  agent.command('inbox [id]')
-    .description('Check agent inbox')
-    .action(inboxCommand);
+  agent.command('inbox [id]').description('Check agent inbox').action(inboxCommand);
 
-  agent.command('list')
-    .alias('ls')
-    .description('List known agents')
-    .action(listCommand);
+  agent.command('list').alias('ls').description('List known agents').action(listCommand);
 }

@@ -156,10 +156,15 @@ export async function handleSetPermission(args: unknown, dataComposer: DataCompo
     ? new Date(Date.now() + params.expiresInHours * 60 * 60 * 1000)
     : undefined;
 
-  const result = await service.setPermission(user.id, params.permissionId as PermissionId, params.enabled, {
-    reason: params.reason,
-    expiresAt,
-  });
+  const result = await service.setPermission(
+    user.id,
+    params.permissionId as PermissionId,
+    params.enabled,
+    {
+      reason: params.reason,
+      expiresAt,
+    }
+  );
 
   if (result.success) {
     // Log the permission change
@@ -204,7 +209,10 @@ export async function handleResetPermission(args: unknown, dataComposer: DataCom
   const service = getPermissionsService();
   await service.resetPermission(user.id, params.permissionId as PermissionId);
 
-  logger.info('Permission reset to default', { userId: user.id, permissionId: params.permissionId });
+  logger.info('Permission reset to default', {
+    userId: user.id,
+    permissionId: params.permissionId,
+  });
 
   return {
     content: [

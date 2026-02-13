@@ -376,7 +376,11 @@ describe('handleUpdateSessionPhase', () => {
       expect(parsed.session.currentPhase).toBe('implementing');
 
       // Verify repo calls
-      expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith('user-123', undefined, undefined);
+      expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith(
+        'user-123',
+        undefined,
+        undefined
+      );
       expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
         'session-123',
         expect.objectContaining({ currentPhase: 'implementing' })
@@ -387,7 +391,11 @@ describe('handleUpdateSessionPhase', () => {
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockUpdatedSession);
 
       const result = await handleUpdateSessionPhase(
-        { email: 'test@test.com', sessionId: '550e8400-e29b-41d4-a716-446655440000', phase: 'reviewing' },
+        {
+          email: 'test@test.com',
+          sessionId: '550e8400-e29b-41d4-a716-446655440000',
+          phase: 'reviewing',
+        },
         mockDataComposer as never
       );
 
@@ -407,7 +415,11 @@ describe('handleUpdateSessionPhase', () => {
         mockDataComposer as never
       );
 
-      expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith('user-123', 'wren', undefined);
+      expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith(
+        'user-123',
+        'wren',
+        undefined
+      );
     });
 
     it('should resolve session by studioId when sessionId not provided', async () => {
@@ -420,7 +432,11 @@ describe('handleUpdateSessionPhase', () => {
         mockDataComposer as never
       );
 
-      expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith('user-123', 'wren', studioId);
+      expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith(
+        'user-123',
+        'wren',
+        studioId
+      );
     });
 
     it('should prefer sessionId over studioId for resolution', async () => {
@@ -451,7 +467,11 @@ describe('handleUpdateSessionPhase', () => {
         mockDataComposer as never
       );
 
-      expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith('user-123', 'wren', workspaceId);
+      expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith(
+        'user-123',
+        'wren',
+        workspaceId
+      );
     });
   });
 
@@ -926,7 +946,11 @@ describe('handleUpdateSessionPhase', () => {
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(null);
 
       const result = await handleUpdateSessionPhase(
-        { email: 'test@test.com', sessionId: '00000000-0000-0000-0000-000000000000', phase: 'implementing' },
+        {
+          email: 'test@test.com',
+          sessionId: '00000000-0000-0000-0000-000000000000',
+          phase: 'implementing',
+        },
         mockDataComposer as never
       );
 

@@ -24,16 +24,14 @@ const TIME_PATTERNS = {
   // "at HH:MM" or "at H:MM AM/PM"
   atTime: /at\s+(\d{1,2}):(\d{2})(?:\s*(am|pm))?/i,
   // "tomorrow", "next week", etc.
-  named: /(tomorrow|tonight|next\s+(?:week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday))/i,
+  named:
+    /(tomorrow|tonight|next\s+(?:week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday))/i,
 };
 
 /**
  * Extract all context from an inbound message
  */
-export function extractContext(
-  message: InboundMessage,
-  config: ChannelConfig
-): ExtractedContext {
+export function extractContext(message: InboundMessage, config: ChannelConfig): ExtractedContext {
   const text = message.rawBody || message.body || '';
   const trimmed = text.trim();
 
@@ -354,15 +352,7 @@ function parseNamedTime(named: string): string | undefined {
   }
 
   // Day names
-  const dayNames = [
-    'sunday',
-    'monday',
-    'tuesday',
-    'wednesday',
-    'thursday',
-    'friday',
-    'saturday',
-  ];
+  const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
   const nextDayMatch = lower.match(/next\s+(\w+)/);
   if (nextDayMatch) {
     const dayIndex = dayNames.indexOf(nextDayMatch[1].toLowerCase());
@@ -383,10 +373,7 @@ function parseNamedTime(named: string): string | undefined {
 /**
  * Check if a message contains any extractable content
  */
-export function hasExtractableContent(
-  message: InboundMessage,
-  config: ChannelConfig
-): boolean {
+export function hasExtractableContent(message: InboundMessage, config: ChannelConfig): boolean {
   const text = message.rawBody || message.body || '';
 
   // Check for commands

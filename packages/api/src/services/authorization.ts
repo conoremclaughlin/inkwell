@@ -140,7 +140,10 @@ export class AuthorizationService {
     // Verify user is trusted
     const trustedUser = await this.isUserTrusted(platform, platformUserId, resolvedWorkspaceId);
     if (!trustedUser) {
-      logger.warn('Non-trusted user attempted to generate challenge code', { platform, platformUserId });
+      logger.warn('Non-trusted user attempted to generate challenge code', {
+        platform,
+        platformUserId,
+      });
       return null;
     }
 
@@ -166,13 +169,11 @@ export class AuthorizationService {
     // Generate a 6-character alphanumeric code
     const code = crypto.randomBytes(3).toString('hex').toUpperCase();
 
-    const { error } = await this.supabase
-      .from('group_challenge_codes')
-      .insert({
-        code,
-        created_by: trustedUser.userId,
-        workspace_id: resolvedWorkspaceId || null,
-      });
+    const { error } = await this.supabase.from('group_challenge_codes').insert({
+      code,
+      created_by: trustedUser.userId,
+      workspace_id: resolvedWorkspaceId || null,
+    });
 
     if (error) {
       logger.error('Failed to create challenge code', { error });
@@ -229,16 +230,14 @@ export class AuthorizationService {
       .eq('id', codeData.id);
 
     // Create authorized group
-    const { error: groupError } = await this.supabase
-      .from('authorized_groups')
-      .insert({
-        platform,
-        platform_group_id: platformGroupId,
-        group_name: groupName,
-        authorized_by: codeData.created_by,
-        authorization_method: 'challenge_code',
-        workspace_id: resolvedWorkspaceId || codeData.workspace_id || null,
-      });
+    const { error: groupError } = await this.supabase.from('authorized_groups').insert({
+      platform,
+      platform_group_id: platformGroupId,
+      group_name: groupName,
+      authorized_by: codeData.created_by,
+      authorization_method: 'challenge_code',
+      workspace_id: resolvedWorkspaceId || codeData.workspace_id || null,
+    });
 
     if (groupError) {
       logger.error('Failed to authorize group', { error: groupError });
@@ -271,23 +270,25 @@ export class AuthorizationService {
       return { success: true }; // Already authorized, that's fine
     }
 
-    const { error } = await this.supabase
-      .from('authorized_groups')
-      .insert({
-        platform,
-        platform_group_id: platformGroupId,
-        group_name: groupName,
-        authorized_by: trustedUser.userId,
-        authorization_method: 'trusted_user',
-        workspace_id: resolvedWorkspaceId || null,
-      });
+    const { error } = await this.supabase.from('authorized_groups').insert({
+      platform,
+      platform_group_id: platformGroupId,
+      group_name: groupName,
+      authorized_by: trustedUser.userId,
+      authorization_method: 'trusted_user',
+      workspace_id: resolvedWorkspaceId || null,
+    });
 
     if (error) {
       logger.error('Failed to authorize group', { error });
       return { success: false, error: 'Failed to authorize group' };
     }
 
-    logger.info('Group authorized by trusted user', { platform, platformGroupId, userId: trustedUser.userId });
+    logger.info('Group authorized by trusted user', {
+      platform,
+      platformGroupId,
+      userId: trustedUser.userId,
+    });
     return { success: true };
   }
 
@@ -303,7 +304,11 @@ export class AuthorizationService {
   ): Promise<{ success: boolean; error?: string }> {
     const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
     // Verify user has permission (owner or admin)
-    const trustedUser = await this.isUserTrusted(platform, revokedByPlatformUserId, resolvedWorkspaceId);
+    const trustedUser = await this.isUserTrusted(
+      platform,
+      revokedByPlatformUserId,
+      resolvedWorkspaceId
+    );
     if (!trustedUser || trustedUser.trustLevel === 'member') {
       return { success: false, error: 'Insufficient permissions' };
     }
@@ -369,35 +374,38 @@ export class AuthorizationService {
       return { success: false, error: 'User is already trusted' };
     }
 
-    const { error } = await this.supabase
-      .from('trusted_users')
-      .insert({
-        user_id: userId || null,
-        platform,
-        platform_user_id: platformUserId,
-        trust_level: trustLevel,
-        added_by: adder.userId,
-        workspace_id: resolvedWorkspaceId || null,
-      });
+    const { error } = await this.supabase.from('trusted_users').insert({
+      user_id: userId || null,
+      platform,
+      platform_user_id: platformUserId,
+      trust_level: trustLevel,
+      added_by: adder.userId,
+      workspace_id: resolvedWorkspaceId || null,
+    });
 
     if (error) {
       logger.error('Failed to add trusted user', { error });
       return { success: false, error: 'Failed to add trusted user' };
     }
 
-    logger.info('Trusted user added', { platform, platformUserId, trustLevel, addedBy: adder.userId });
+    logger.info('Trusted user added', {
+      platform,
+      platformUserId,
+      trustLevel,
+      addedBy: adder.userId,
+    });
     return { success: true };
   }
 
   /**
    * List all authorized groups for a platform
    */
-  async listAuthorizedGroups(platform?: Platform, workspaceId?: string): Promise<AuthorizedGroup[]> {
+  async listAuthorizedGroups(
+    platform?: Platform,
+    workspaceId?: string
+  ): Promise<AuthorizedGroup[]> {
     const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
-    let query = this.supabase
-      .from('authorized_groups')
-      .select('*')
-      .eq('status', 'active');
+    let query = this.supabase.from('authorized_groups').select('*').eq('status', 'active');
 
     if (platform) {
       query = query.eq('platform', platform);
@@ -430,9 +438,7 @@ export class AuthorizationService {
    */
   async listTrustedUsers(platform?: Platform, workspaceId?: string): Promise<TrustedUser[]> {
     const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
-    let query = this.supabase
-      .from('trusted_users')
-      .select('*');
+    let query = this.supabase.from('trusted_users').select('*');
 
     if (platform) {
       query = query.eq('platform', platform);

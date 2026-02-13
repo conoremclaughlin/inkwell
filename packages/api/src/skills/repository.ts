@@ -66,7 +66,9 @@ export class SkillsRepository {
       query = query.eq('is_official', isOfficial);
     }
     if (search) {
-      query = query.or(`name.ilike.%${search}%,display_name.ilike.%${search}%,description.ilike.%${search}%`);
+      query = query.or(
+        `name.ilike.%${search}%,display_name.ilike.%${search}%,description.ilike.%${search}%`
+      );
     }
 
     query = query.range(offset, offset + limit - 1);
@@ -114,7 +116,10 @@ export class SkillsRepository {
   /**
    * Get skill detail by ID or name
    */
-  async getRegistrySkill(idOrName: string, currentUserId?: string): Promise<RegistrySkillDetail | null> {
+  async getRegistrySkill(
+    idOrName: string,
+    currentUserId?: string
+  ): Promise<RegistrySkillDetail | null> {
     // Try by ID first, then by name
     let query = this.supabase.from('skills').select('*').eq('is_public', true);
 
@@ -386,9 +391,8 @@ export class SkillsRepository {
     }
 
     // Create initial version record in code (not relying on DB trigger)
-    const { error: versionError } = await this.supabase
-      .from('skill_versions')
-      .upsert({
+    const { error: versionError } = await this.supabase.from('skill_versions').upsert(
+      {
         skill_id: data.id,
         version,
         manifest: fullManifest,
@@ -396,7 +400,9 @@ export class SkillsRepository {
         changelog: 'Initial release',
         published_by: authorUserId || null,
         published_at: new Date().toISOString(),
-      }, { onConflict: 'skill_id,version' });
+      },
+      { onConflict: 'skill_id,version' }
+    );
 
     if (versionError) {
       logger.warn('Failed to create initial version record:', versionError);
@@ -525,7 +531,11 @@ export class SkillsRepository {
 
     // Official skills can only be modified by the original author (admin check done at API level)
     if (dbSkill.isOfficial && dbSkill.authorUserId !== userId) {
-      return { authorized: false, skill: dbSkill, reason: 'Official skills can only be modified by administrators' };
+      return {
+        authorized: false,
+        skill: dbSkill,
+        reason: 'Official skills can only be modified by administrators',
+      };
     }
 
     // Regular skill - check author
@@ -604,9 +614,8 @@ export class SkillsRepository {
     }
 
     // Create initial version record for forked skill
-    const { error: versionError } = await this.supabase
-      .from('skill_versions')
-      .upsert({
+    const { error: versionError } = await this.supabase.from('skill_versions').upsert(
+      {
         skill_id: data.id,
         version: '1.0.0',
         manifest: source.manifest,
@@ -614,7 +623,9 @@ export class SkillsRepository {
         changelog: `Forked from ${source.name}`,
         published_by: forkerUserId,
         published_at: new Date().toISOString(),
-      }, { onConflict: 'skill_id,version' });
+      },
+      { onConflict: 'skill_id,version' }
+    );
 
     if (versionError) {
       logger.warn('Failed to create version record for fork:', versionError);
@@ -734,9 +745,8 @@ export class SkillsRepository {
     const manifestChanged = JSON.stringify(newManifest) !== JSON.stringify(existingManifest);
 
     if (contentChanged || manifestChanged) {
-      const { error: versionError } = await this.supabase
-        .from('skill_versions')
-        .upsert({
+      const { error: versionError } = await this.supabase.from('skill_versions').upsert(
+        {
           skill_id: skillId,
           version: updates.version,
           manifest: newManifest,
@@ -744,7 +754,9 @@ export class SkillsRepository {
           changelog: updates.changelog || null,
           published_by: authorUserId,
           published_at: new Date().toISOString(),
-        }, { onConflict: 'skill_id,version' });
+        },
+        { onConflict: 'skill_id,version' }
+      );
 
       if (versionError) {
         // Log but don't fail - skill update succeeded
@@ -754,7 +766,9 @@ export class SkillsRepository {
       }
     }
 
-    logger.info(`Skill updated: ${existingSkill.name} to version ${updates.version} by user ${authorUserId}`);
+    logger.info(
+      `Skill updated: ${existingSkill.name} to version ${updates.version} by user ${authorUserId}`
+    );
     return toCamelCase<DbSkillWithManagement>(data);
   }
 

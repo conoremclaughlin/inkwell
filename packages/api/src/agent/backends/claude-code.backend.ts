@@ -85,8 +85,8 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
   private pendingMessage: AgentMessage | null = null;
 
   // Token tracking: per-turn for context window management, cumulative for monitoring
-  private currentContextTokens = 0;   // Latest turn's input tokens ≈ current context window size
-  private cumulativeInputTokens = 0;  // Running total across all turns (for monitoring/billing)
+  private currentContextTokens = 0; // Latest turn's input tokens ≈ current context window size
+  private cumulativeInputTokens = 0; // Running total across all turns (for monitoring/billing)
   private cumulativeOutputTokens = 0; // Running total across all turns
 
   // Temp file for system prompt
@@ -143,7 +143,9 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     // Format message with channel context
     const formattedInput = this.formatInput(message);
 
-    logger.info(`Sending message to Claude Code [${message.channel}]: ${message.content.substring(0, 100)}...`);
+    logger.info(
+      `Sending message to Claude Code [${message.channel}]: ${message.content.substring(0, 100)}...`
+    );
 
     // Spawn a Claude Code process for this message
     // Use --resume to continue the session if we have a session ID
@@ -215,11 +217,15 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
             if (parsed.type === 'user' && parsed.message?.content) {
               for (const block of parsed.message.content) {
                 if (block.type === 'tool_result' && block.tool_use_id) {
-                  const resultContent = typeof block.content === 'string'
-                    ? block.content
-                    : Array.isArray(block.content)
-                      ? block.content.filter((b) => b.type === 'text').map((b) => b.text).join('')
-                      : '';
+                  const resultContent =
+                    typeof block.content === 'string'
+                      ? block.content
+                      : Array.isArray(block.content)
+                        ? block.content
+                            .filter((b) => b.type === 'text')
+                            .map((b) => b.text)
+                            .join('')
+                        : '';
                   this.emit('tool:result', {
                     toolUseId: block.tool_use_id,
                     content: resultContent,
@@ -236,9 +242,10 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
               // Claude Code uses prompt caching, so full context window tokens =
               //   input_tokens (non-cached) + cache_read + cache_creation
               if (parsed.usage) {
-                const messageInputTokens = parsed.usage.input_tokens
-                  + (parsed.usage.cache_read_input_tokens ?? 0)
-                  + (parsed.usage.cache_creation_input_tokens ?? 0);
+                const messageInputTokens =
+                  parsed.usage.input_tokens +
+                  (parsed.usage.cache_read_input_tokens ?? 0) +
+                  (parsed.usage.cache_creation_input_tokens ?? 0);
                 const messageOutputTokens = parsed.usage.output_tokens;
                 // Current context window = this turn's total input (NOT cumulative)
                 this.currentContextTokens = messageInputTokens;
@@ -269,10 +276,18 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
               // Guard: Only emit response once per message to prevent duplicates from multiple 'result' events
               // Internal messages (compaction, system) should never trigger auto-response
               const isInternalMessage = this.pendingMessage?.metadata?.isInternal === true;
-              if (!responseEmitted && !this.config.disableAutoResponse && !isInternalMessage && this.pendingMessage && (parsed.result || responseContent)) {
+              if (
+                !responseEmitted &&
+                !this.config.disableAutoResponse &&
+                !isInternalMessage &&
+                this.pendingMessage &&
+                (parsed.result || responseContent)
+              ) {
                 responseEmitted = true;
                 const finalContent = parsed.result || responseContent;
-                logger.info(`Emitting auto-response for ${this.pendingMessage.channel}:${this.pendingMessage.conversationId}`);
+                logger.info(
+                  `Emitting auto-response for ${this.pendingMessage.channel}:${this.pendingMessage.conversationId}`
+                );
                 this.emit('response', {
                   channel: this.pendingMessage.channel,
                   conversationId: this.pendingMessage.conversationId,
@@ -289,7 +304,11 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
       proc.stderr?.on('data', (data: Buffer) => {
         const stderrMsg = data.toString();
         // Log errors at info level so they're visible
-        if (stderrMsg.includes('error') || stderrMsg.includes('Error') || stderrMsg.includes('failed')) {
+        if (
+          stderrMsg.includes('error') ||
+          stderrMsg.includes('Error') ||
+          stderrMsg.includes('failed')
+        ) {
           logger.info('Claude Code stderr (error):', stderrMsg);
         } else {
           logger.debug('Claude Code stderr:', stderrMsg);
@@ -314,7 +333,13 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
         // emit the response now so it reaches the channel (e.g., Telegram).
         // This handles cases where Claude Code exits before streaming the result JSON.
         const isInternalMessage = this.pendingMessage?.metadata?.isInternal === true;
-        if (!responseEmitted && !this.config.disableAutoResponse && !isInternalMessage && this.pendingMessage && responseContent.trim()) {
+        if (
+          !responseEmitted &&
+          !this.config.disableAutoResponse &&
+          !isInternalMessage &&
+          this.pendingMessage &&
+          responseContent.trim()
+        ) {
           responseEmitted = true;
           logger.warn('Claude Code exited without result event — emitting fallback auto-response', {
             channel: this.pendingMessage.channel,
@@ -404,10 +429,7 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
   }
 
   private buildArgs(): string[] {
-    const args = [
-      '--output-format', 'stream-json',
-      '--verbose',
-    ];
+    const args = ['--output-format', 'stream-json', '--verbose'];
 
     if (this.config.model) {
       args.push('--model', this.config.model);
@@ -465,10 +487,13 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     // - Resuming session: Minimal context (just time + brief identity reminder)
     if (message.injectedContext) {
       const isResuming = !!this.sessionId;
-      logger.debug(`Context injection: ${isResuming ? 'MINIMAL (resuming)' : 'FULL (new session)'}`, {
-        sessionId: this.sessionId,
-        hasIdentity: !!message.injectedContext.agentIdentity,
-      });
+      logger.debug(
+        `Context injection: ${isResuming ? 'MINIMAL (resuming)' : 'FULL (new session)'}`,
+        {
+          sessionId: this.sessionId,
+          hasIdentity: !!message.injectedContext.agentIdentity,
+        }
+      );
       if (isResuming) {
         parts.push(this.formatMinimalContext(message.injectedContext));
       } else {
@@ -600,7 +625,9 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
       sections.push('## Recent Context');
       for (const memory of context.recentMemories) {
         const topics = memory.topics.length > 0 ? ` [${memory.topics.join(', ')}]` : '';
-        sections.push(`- ${memory.content.substring(0, 200)}${memory.content.length > 200 ? '...' : ''}${topics}`);
+        sections.push(
+          `- ${memory.content.substring(0, 200)}${memory.content.length > 200 ? '...' : ''}${topics}`
+        );
       }
     }
 
@@ -611,8 +638,12 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
       sections.push('Recent messages from the activity stream (for continuity):');
       for (const msg of context.conversationHistory) {
         const direction = msg.direction === 'in' ? 'User' : 'You';
-        const time = new Date(msg.timestamp).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-        const preview = msg.content.length > 300 ? msg.content.substring(0, 300) + '...' : msg.content;
+        const time = new Date(msg.timestamp).toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit',
+        });
+        const preview =
+          msg.content.length > 300 ? msg.content.substring(0, 300) + '...' : msg.content;
         sections.push(`- [${time}] ${direction}: ${preview}`);
       }
     }
@@ -620,7 +651,9 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     // Recovery hint
     sections.push('');
     sections.push('## Context Recovery');
-    sections.push('If you need more context from previous conversations, use `recall` to search memories or `get_inbox` to check for recent messages from other agents.');
+    sections.push(
+      'If you need more context from previous conversations, use `recall` to search memories or `get_inbox` to check for recent messages from other agents.'
+    );
 
     sections.push('</user-context>');
     return sections.join('\n');
@@ -647,7 +680,6 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     parts.push('</context-update>');
     return parts.join('\n');
   }
-
 }
 
 /**

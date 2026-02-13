@@ -99,7 +99,7 @@ function makeToolsListRequest(id: number) {
 /** POST to the MCP endpoint. */
 async function mcpPost(
   baseUrl: string,
-  body: unknown,
+  body: unknown
 ): Promise<{ status: number; headers: Headers; body: string }> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',

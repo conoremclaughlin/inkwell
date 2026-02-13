@@ -37,14 +37,14 @@ const VERSION = '0.3.0';
  * Everything else is forwarded to the underlying AI tool.
  */
 const SB_FLAGS: Record<string, { hasValue: boolean; key: string }> = {
-  '-a':           { hasValue: true,  key: 'agent' },
-  '--agent':      { hasValue: true,  key: 'agent' },
-  '-b':           { hasValue: true,  key: 'backend' },
-  '--backend':    { hasValue: true,  key: 'backend' },
-  '-m':           { hasValue: true,  key: 'model' },
-  '--model':      { hasValue: true,  key: 'model' },
-  '-v':           { hasValue: false, key: 'verbose' },
-  '--verbose':    { hasValue: false, key: 'verbose' },
+  '-a': { hasValue: true, key: 'agent' },
+  '--agent': { hasValue: true, key: 'agent' },
+  '-b': { hasValue: true, key: 'backend' },
+  '--backend': { hasValue: true, key: 'backend' },
+  '-m': { hasValue: true, key: 'model' },
+  '--model': { hasValue: true, key: 'model' },
+  '-v': { hasValue: false, key: 'verbose' },
+  '--verbose': { hasValue: false, key: 'verbose' },
   '--no-session': { hasValue: false, key: 'noSession' },
 };
 
@@ -52,7 +52,7 @@ interface ParsedArgs {
   sbOptions: {
     agent: string;
     backend: string;
-    model: string | undefined;  // undefined = use backend's default
+    model: string | undefined; // undefined = use backend's default
     session: boolean;
     verbose: boolean;
   };
@@ -70,7 +70,7 @@ function extractArgs(argv: string[]): ParsedArgs {
   const sbOptions: ParsedArgs['sbOptions'] = {
     agent: 'wren',
     backend: 'claude',
-    model: undefined,  // undefined = use backend's default
+    model: undefined, // undefined = use backend's default
     session: true,
     verbose: false,
   };

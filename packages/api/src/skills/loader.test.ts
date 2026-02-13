@@ -35,7 +35,9 @@ describe('Skill Loader', () => {
     // Default: directories exist but are empty
     vi.mocked(existsSync).mockReturnValue(true);
     vi.mocked(readdirSync).mockReturnValue([]);
-    vi.mocked(statSync).mockReturnValue({ isDirectory: () => false } as ReturnType<typeof statSync>);
+    vi.mocked(statSync).mockReturnValue({ isDirectory: () => false } as ReturnType<
+      typeof statSync
+    >);
   });
 
   afterEach(() => {
@@ -79,7 +81,9 @@ This is the skill content.
         }
         return [] as unknown as ReturnType<typeof readdirSync>;
       });
-      vi.mocked(statSync).mockReturnValue({ isDirectory: () => false } as ReturnType<typeof statSync>);
+      vi.mocked(statSync).mockReturnValue({ isDirectory: () => false } as ReturnType<
+        typeof statSync
+      >);
       vi.mocked(readFileSync).mockReturnValue(skillContent);
 
       const skills = loadAllSkills('/test/user/skills');
@@ -112,7 +116,12 @@ Instructions for this skill.
 
       vi.mocked(existsSync).mockImplementation((p) => {
         const pathStr = String(p);
-        return pathStr.includes('manifest.yaml') || pathStr.includes('SKILL.md') || pathStr.includes('builtin') || pathStr.includes('user');
+        return (
+          pathStr.includes('manifest.yaml') ||
+          pathStr.includes('SKILL.md') ||
+          pathStr.includes('builtin') ||
+          pathStr.includes('user')
+        );
       });
       vi.mocked(readdirSync).mockImplementation((dir) => {
         if (String(dir).includes('builtin')) {
@@ -120,7 +129,9 @@ Instructions for this skill.
         }
         return [] as unknown as ReturnType<typeof readdirSync>;
       });
-      vi.mocked(statSync).mockReturnValue({ isDirectory: () => true } as ReturnType<typeof statSync>);
+      vi.mocked(statSync).mockReturnValue({ isDirectory: () => true } as ReturnType<
+        typeof statSync
+      >);
       vi.mocked(readFileSync).mockImplementation((p) => {
         if (String(p).includes('manifest.yaml')) {
           return manifestYaml;
@@ -149,7 +160,9 @@ Instructions for this skill.
         }
         return [] as unknown as ReturnType<typeof readdirSync>;
       });
-      vi.mocked(statSync).mockReturnValue({ isDirectory: () => false } as ReturnType<typeof statSync>);
+      vi.mocked(statSync).mockReturnValue({ isDirectory: () => false } as ReturnType<
+        typeof statSync
+      >);
       vi.mocked(readFileSync).mockImplementation((p) => {
         if (String(p).includes('README')) {
           return '# README';
@@ -190,7 +203,9 @@ Content
         }
         return [] as unknown as ReturnType<typeof readdirSync>;
       });
-      vi.mocked(statSync).mockReturnValue({ isDirectory: () => false } as ReturnType<typeof statSync>);
+      vi.mocked(statSync).mockReturnValue({ isDirectory: () => false } as ReturnType<
+        typeof statSync
+      >);
       vi.mocked(readFileSync).mockReturnValue(badSkill);
 
       // Should not throw, just skip the bad skill or return partial data
@@ -210,7 +225,9 @@ No YAML here.
         }
         return [] as unknown as ReturnType<typeof readdirSync>;
       });
-      vi.mocked(statSync).mockReturnValue({ isDirectory: () => false } as ReturnType<typeof statSync>);
+      vi.mocked(statSync).mockReturnValue({ isDirectory: () => false } as ReturnType<
+        typeof statSync
+      >);
       vi.mocked(readFileSync).mockReturnValue(noFrontmatter);
 
       const skills = loadAllSkills('/test/user/skills');
@@ -242,7 +259,9 @@ Found!
         }
         return [] as unknown as ReturnType<typeof readdirSync>;
       });
-      vi.mocked(statSync).mockReturnValue({ isDirectory: () => false } as ReturnType<typeof statSync>);
+      vi.mocked(statSync).mockReturnValue({ isDirectory: () => false } as ReturnType<
+        typeof statSync
+      >);
       vi.mocked(readFileSync).mockImplementation((p) => {
         if (String(p).includes('find-me')) {
           return skillContent;

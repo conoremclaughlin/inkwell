@@ -28,7 +28,8 @@ describe('AgentGateway Integration (database-driven)', () => {
     gateway = new AgentGateway();
 
     // Resolve test user (owner of echo agent identity)
-    const { data: echoIdentity, error } = await dataComposer.getClient()
+    const { data: echoIdentity, error } = await dataComposer
+      .getClient()
       .from('agent_identities')
       .select('user_id')
       .eq('agent_id', 'echo')
@@ -43,7 +44,8 @@ describe('AgentGateway Integration (database-driven)', () => {
     testUserId = echoIdentity.user_id;
 
     // Create a test inbox message for userId derivation tests
-    const { data: inboxMsg, error: inboxError } = await dataComposer.getClient()
+    const { data: inboxMsg, error: inboxError } = await dataComposer
+      .getClient()
       .from('agent_inbox')
       .insert({
         recipient_user_id: testUserId,
@@ -66,16 +68,14 @@ describe('AgentGateway Integration (database-driven)', () => {
   afterAll(async () => {
     // Cleanup test inbox message
     if (testInboxMessageId) {
-      await dataComposer.getClient()
-        .from('agent_inbox')
-        .delete()
-        .eq('id', testInboxMessageId);
+      await dataComposer.getClient().from('agent_inbox').delete().eq('id', testInboxMessageId);
     }
   });
 
   describe('agent validation via database', () => {
     it('should find echo agent in agent_identities table', async () => {
-      const { data } = await dataComposer.getClient()
+      const { data } = await dataComposer
+        .getClient()
         .from('agent_identities')
         .select('agent_id, name, role')
         .eq('agent_id', 'echo')
@@ -87,7 +87,8 @@ describe('AgentGateway Integration (database-driven)', () => {
     });
 
     it('should not find non-existent agent', async () => {
-      const { data } = await dataComposer.getClient()
+      const { data } = await dataComposer
+        .getClient()
         .from('agent_identities')
         .select('agent_id')
         .eq('agent_id', 'definitely-not-a-real-agent-xyz')
@@ -99,7 +100,8 @@ describe('AgentGateway Integration (database-driven)', () => {
 
   describe('userId derivation from inbox message', () => {
     it('should derive userId from inbox message', async () => {
-      const { data: inboxMsg } = await dataComposer.getClient()
+      const { data: inboxMsg } = await dataComposer
+        .getClient()
         .from('agent_inbox')
         .select('recipient_user_id')
         .eq('id', testInboxMessageId)
@@ -117,7 +119,8 @@ describe('AgentGateway Integration (database-driven)', () => {
       // Set up default handler that validates agent exists
       gateway.setDefaultHandler(async (payload) => {
         // Simulate the server.ts validation logic
-        const { data: agentIdentity } = await dataComposer.getClient()
+        const { data: agentIdentity } = await dataComposer
+          .getClient()
           .from('agent_identities')
           .select('agent_id')
           .eq('agent_id', payload.toAgentId)
@@ -133,7 +136,8 @@ describe('AgentGateway Integration (database-driven)', () => {
 
         // Derive userId from inbox message
         if (payload.inboxMessageId) {
-          const { data: inboxMsg } = await dataComposer.getClient()
+          const { data: inboxMsg } = await dataComposer
+            .getClient()
             .from('agent_inbox')
             .select('recipient_user_id')
             .eq('id', payload.inboxMessageId)
@@ -164,7 +168,8 @@ describe('AgentGateway Integration (database-driven)', () => {
 
     it('should reject trigger for unknown agent', async () => {
       gateway.setDefaultHandler(async (payload) => {
-        const { data: agentIdentity } = await dataComposer.getClient()
+        const { data: agentIdentity } = await dataComposer
+          .getClient()
           .from('agent_identities')
           .select('agent_id')
           .eq('agent_id', payload.toAgentId)
@@ -196,7 +201,8 @@ describe('AgentGateway Integration (database-driven)', () => {
       let processedAgentId: string | null = null;
 
       gateway.setDefaultHandler(async (payload) => {
-        const { data: agentIdentity } = await dataComposer.getClient()
+        const { data: agentIdentity } = await dataComposer
+          .getClient()
           .from('agent_identities')
           .select('agent_id')
           .eq('agent_id', payload.toAgentId)

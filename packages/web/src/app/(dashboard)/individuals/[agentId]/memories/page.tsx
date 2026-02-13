@@ -105,9 +105,8 @@ function TimelineCard({ entry }: { entry: TimelineEntry }) {
   const Icon = config.icon;
 
   const isLongContent = entry.content.length > 200;
-  const displayContent = expanded || !isLongContent
-    ? entry.content
-    : entry.content.substring(0, 200) + '...';
+  const displayContent =
+    expanded || !isLongContent ? entry.content : entry.content.substring(0, 200) + '...';
 
   return (
     <div className={clsx('relative pl-8')}>
@@ -125,9 +124,7 @@ function TimelineCard({ entry }: { entry: TimelineEntry }) {
           <div className="flex items-start justify-between mb-2">
             <div className="flex items-center gap-2">
               <Icon className={clsx('h-4 w-4', config.color)} />
-              <span className={clsx('text-sm font-medium', config.color)}>
-                {config.label}
-              </span>
+              <span className={clsx('text-sm font-medium', config.color)}>{config.label}</span>
               {entry.version && (
                 <Badge variant="outline" className="text-xs">
                   v{entry.version}
@@ -231,19 +228,22 @@ export default function MemoryTimelinePage() {
   });
 
   // Group by date
-  const groupedTimeline = filteredTimeline.reduce((groups, entry) => {
-    const date = new Date(entry.timestamp).toLocaleDateString('en-US', {
-      weekday: 'long',
-      month: 'long',
-      day: 'numeric',
-      year: 'numeric',
-    });
-    if (!groups[date]) {
-      groups[date] = [];
-    }
-    groups[date].push(entry);
-    return groups;
-  }, {} as Record<string, TimelineEntry[]>);
+  const groupedTimeline = filteredTimeline.reduce(
+    (groups, entry) => {
+      const date = new Date(entry.timestamp).toLocaleDateString('en-US', {
+        weekday: 'long',
+        month: 'long',
+        day: 'numeric',
+        year: 'numeric',
+      });
+      if (!groups[date]) {
+        groups[date] = [];
+      }
+      groups[date].push(entry);
+      return groups;
+    },
+    {} as Record<string, TimelineEntry[]>
+  );
 
   // Stats
   const stats = {
@@ -289,9 +289,7 @@ export default function MemoryTimelinePage() {
             <h1 className="text-2xl font-bold text-gray-900">
               {individual?.name || agentId} Memory Timeline
             </h1>
-            <p className="text-gray-600">
-              {data?.total || 0} total events
-            </p>
+            <p className="text-gray-600">{data?.total || 0} total events</p>
           </div>
         </div>
       </div>

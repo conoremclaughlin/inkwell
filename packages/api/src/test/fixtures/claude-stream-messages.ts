@@ -62,7 +62,8 @@ export const userWithListEmailsToolResult: ClaudeStreamMessage = {
               from: { name: 'Alex Chen', email: 'notifications@github.com' },
               to: [{ name: 'example-co/example-app', email: 'example-app@noreply.github.com' }],
               date: 'Tue, 03 Feb 2026 23:19:15 -0800',
-              snippet: '@devuser pushed 1 commit. a1b2c3d feat(api): add data sync endpoint for cross-env data transfer...',
+              snippet:
+                '@devuser pushed 1 commit. a1b2c3d feat(api): add data sync endpoint for cross-env data transfer...',
               isUnread: true,
               isStarred: false,
               hasAttachments: false,
@@ -86,7 +87,8 @@ export const userWithListEmailsToolResult: ClaudeStreamMessage = {
               from: { name: 'Scholar Inbox', email: 'noreply@scholar.example.com' },
               to: [{ email: 'user@example.com' }],
               date: 'Wed, 4 Feb 2026 06:00:20 +0100',
-              snippet: 'Dear user, a new Scholar Inbox digest has been created. Today, we found 76 articles relevant for you.',
+              snippet:
+                'Dear user, a new Scholar Inbox digest has been created. Today, we found 76 articles relevant for you.',
               isUnread: true,
               isStarred: false,
               hasAttachments: false,
@@ -108,7 +110,7 @@ export const assistantWithGetEmailToolUse: ClaudeStreamMessage = {
     content: [
       {
         type: 'text',
-        text: "Let me look at the GitHub PR notification in detail.",
+        text: 'Let me look at the GitHub PR notification in detail.',
       },
       {
         type: 'tool_use',
@@ -171,7 +173,8 @@ export const assistantWithSendResponse: ClaudeStreamMessage = {
           userId: '00000000-0000-0000-0000-000000000001',
           channel: 'telegram',
           conversationId: '123456789',
-          content: "You have 3 unread emails. The most notable is a GitHub PR notification — Alex pushed a commit to PR #42 adding a data management command.",
+          content:
+            'You have 3 unread emails. The most notable is a GitHub PR notification — Alex pushed a commit to PR #42 adding a data management command.',
         },
       },
     ],

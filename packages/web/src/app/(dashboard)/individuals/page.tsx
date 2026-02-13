@@ -111,7 +111,8 @@ function UserIdentityCard({ userIdentity }: { userIdentity: UserIdentity }) {
       <Card className="mb-6 border-dashed">
         <CardContent className="py-8">
           <p className="text-center text-gray-500">
-            No user identity files yet. Use the <code>save_user_identity</code> MCP tool to create USER.md and VALUES.md.
+            No user identity files yet. Use the <code>save_user_identity</code> MCP tool to create
+            USER.md and VALUES.md.
           </p>
         </CardContent>
       </Card>
@@ -244,7 +245,9 @@ function IdentityCard({ identity }: { identity: Identity }) {
               <span className="font-mono text-sm font-medium">SOUL.md</span>
             </div>
             <div className="p-4 prose prose-sm max-w-none dark:prose-invert prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-li:my-0">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{identity.soul || '*No soul content yet.*'}</ReactMarkdown>
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {identity.soul || '*No soul content yet.*'}
+              </ReactMarkdown>
             </div>
           </div>
 
@@ -255,7 +258,9 @@ function IdentityCard({ identity }: { identity: Identity }) {
               <span className="font-mono text-sm font-medium">HEARTBEAT.md</span>
             </div>
             <div className="p-4 prose prose-sm max-w-none dark:prose-invert prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-li:my-0">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{identity.heartbeat || '*No heartbeat content yet.*'}</ReactMarkdown>
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {identity.heartbeat || '*No heartbeat content yet.*'}
+              </ReactMarkdown>
             </div>
           </div>
         </div>
@@ -266,10 +271,8 @@ function IdentityCard({ identity }: { identity: Identity }) {
 
 export default function IndividualsPage() {
   // Fetch user identity (USER.md, VALUES.md)
-  const { data: userIdentityData, isLoading: userIdentityLoading } = useApiQuery<UserIdentityResponse>(
-    ['user-identity'],
-    '/api/admin/user-identity'
-  );
+  const { data: userIdentityData, isLoading: userIdentityLoading } =
+    useApiQuery<UserIdentityResponse>(['user-identity'], '/api/admin/user-identity');
 
   // Fetch individuals
   const { data, isLoading, error } = useApiQuery<IndividualsResponse>(
@@ -291,11 +294,7 @@ export default function IndividualsPage() {
         </div>
       </div>
 
-      {error && (
-        <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">
-          {error.message}
-        </div>
-      )}
+      {error && <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">{error.message}</div>}
 
       <div className="mt-6">
         {/* User Identity Section */}
@@ -316,7 +315,8 @@ export default function IndividualsPage() {
             <Card className="mb-6 border-dashed border-blue-200">
               <CardContent className="py-8">
                 <p className="text-center text-gray-500">
-                  No user identity files yet. Use the <code>save_user_identity</code> MCP tool to create USER.md and VALUES.md.
+                  No user identity files yet. Use the <code>save_user_identity</code> MCP tool to
+                  create USER.md and VALUES.md.
                 </p>
               </CardContent>
             </Card>

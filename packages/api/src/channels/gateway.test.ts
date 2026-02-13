@@ -321,10 +321,7 @@ describe('ChannelGateway', () => {
       processingConversations.add('telegram:chat456');
 
       // Call forwardToHandler directly — it should catch the error and release lock
-      await forwardToHandler(
-        'telegram', 'chat456',
-        { id: 'user1' }, 'Test message', {}
-      );
+      await forwardToHandler('telegram', 'chat456', { id: 'user1' }, 'Test message', {});
 
       // Lock should be released
       expect(processingConversations.has('telegram:chat456')).toBe(false);
@@ -486,13 +483,10 @@ describe('Activity Stream Integration', () => {
 
       const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
 
-      await forwardToHandler(
-        'telegram',
-        'group123',
-        { id: 'sender456' },
-        'Hello group',
-        { userId: 'user-uuid-123', chatType: 'group' }
-      );
+      await forwardToHandler('telegram', 'group123', { id: 'sender456' }, 'Hello group', {
+        userId: 'user-uuid-123',
+        chatType: 'group',
+      });
 
       expect(mockLogMessage).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -572,13 +566,9 @@ describe('Activity Stream Integration', () => {
 
       const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
 
-      await forwardToHandler(
-        'telegram',
-        'chat123',
-        { id: 'sender456' },
-        'Hello',
-        { userId: 'user-uuid-123' }
-      );
+      await forwardToHandler('telegram', 'chat123', { id: 'sender456' }, 'Hello', {
+        userId: 'user-uuid-123',
+      });
 
       // Handler should still be called despite logging error
       expect(handler).toHaveBeenCalledTimes(1);
@@ -590,13 +580,9 @@ describe('Activity Stream Integration', () => {
 
       const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
 
-      await forwardToHandler(
-        'telegram',
-        'chat123',
-        { id: 'sender456' },
-        'Hello',
-        { userId: 'user-uuid-123' }
-      );
+      await forwardToHandler('telegram', 'chat123', { id: 'sender456' }, 'Hello', {
+        userId: 'user-uuid-123',
+      });
 
       // Access the module-level conversationUserMap via the gateway's context
       // We can verify this by checking outbound logging works

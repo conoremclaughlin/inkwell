@@ -62,10 +62,7 @@ export class GoogleCalendarService {
   /**
    * List events within a date range
    */
-  async listEvents(
-    userId: string,
-    options: ListEventsOptions
-  ): Promise<CalendarEvent[]> {
+  async listEvents(userId: string, options: ListEventsOptions): Promise<CalendarEvent[]> {
     const calendar = await this.getClient(userId);
 
     const {
@@ -104,10 +101,7 @@ export class GoogleCalendarService {
   /**
    * Get a single event by ID
    */
-  async getEvent(
-    userId: string,
-    options: GetEventOptions
-  ): Promise<CalendarEvent> {
+  async getEvent(userId: string, options: GetEventOptions): Promise<CalendarEvent> {
     const calendar = await this.getClient(userId);
 
     const { calendarId = 'primary', eventId } = options;
@@ -128,10 +122,7 @@ export class GoogleCalendarService {
    * This updates the user's response status on the event. The user must be
    * an attendee of the event for this to work.
    */
-  async respondToEvent(
-    userId: string,
-    options: RespondToEventOptions
-  ): Promise<CalendarEvent> {
+  async respondToEvent(userId: string, options: RespondToEventOptions): Promise<CalendarEvent> {
     const calendar = await this.getClient(userId);
 
     const { calendarId = 'primary', eventId, responseStatus } = options;
@@ -155,9 +146,7 @@ export class GoogleCalendarService {
     const selfAttendeeIndex = attendees.findIndex((a) => a.self === true);
 
     if (selfAttendeeIndex === -1) {
-      throw new Error(
-        'Cannot respond to this event: you are not listed as an attendee'
-      );
+      throw new Error('Cannot respond to this event: you are not listed as an attendee');
     }
 
     // Update the user's response status
@@ -190,10 +179,7 @@ export class GoogleCalendarService {
    * This allows updating safe fields on events. The user should have edit
    * access to the event (typically the organizer or with writer access).
    */
-  async updateEvent(
-    userId: string,
-    options: UpdateEventOptions
-  ): Promise<CalendarEvent> {
+  async updateEvent(userId: string, options: UpdateEventOptions): Promise<CalendarEvent> {
     const calendar = await this.getClient(userId);
 
     const { calendarId = 'primary', eventId, fields } = options;
@@ -254,13 +240,18 @@ export class GoogleCalendarService {
   /**
    * Create a new calendar event.
    */
-  async createEvent(
-    userId: string,
-    options: CreateEventOptions
-  ): Promise<CalendarEvent> {
+  async createEvent(userId: string, options: CreateEventOptions): Promise<CalendarEvent> {
     const calendar = await this.getClient(userId);
 
-    const { calendarId = 'primary', summary, description, location, start, end, attendees } = options;
+    const {
+      calendarId = 'primary',
+      summary,
+      description,
+      location,
+      start,
+      end,
+      attendees,
+    } = options;
 
     logger.info('Creating calendar event', {
       userId,

@@ -100,15 +100,28 @@ export const createReminderSchema = z.object({
   ...userIdentifierSchema.shape,
   title: z.string().min(1).max(500).describe('Reminder title/message'),
   description: z.string().optional().describe('Additional details'),
-  deliveryChannel: z.enum(['telegram', 'whatsapp', 'email']).optional()
+  deliveryChannel: z
+    .enum(['telegram', 'whatsapp', 'email'])
+    .optional()
     .describe('How to deliver (default: uses platform from user lookup)'),
-  deliveryTarget: z.string().optional()
-    .describe('Specific target ID (default: uses user\'s platform ID)'),
-  cronExpression: z.string().optional()
+  deliveryTarget: z
+    .string()
+    .optional()
+    .describe("Specific target ID (default: uses user's platform ID)"),
+  cronExpression: z
+    .string()
+    .optional()
     .describe('Cron expression for recurring reminders (e.g., "0 9 * * *" for daily at 9am)'),
-  runAt: z.string().datetime().optional()
+  runAt: z
+    .string()
+    .datetime()
+    .optional()
     .describe('Specific time to run (ISO 8601). For one-time reminders.'),
-  maxRuns: z.number().int().positive().optional()
+  maxRuns: z
+    .number()
+    .int()
+    .positive()
+    .optional()
     .describe('Maximum number of times to run (for recurring reminders)'),
 });
 
@@ -130,7 +143,8 @@ export async function handleCreateReminder(
 
     if (!deliveryChannel) {
       // Use the platform from args if provided, or infer from resolution method
-      const inferredPlatform = args.platform || (resolved.resolvedBy === 'platform' ? args.platform : null);
+      const inferredPlatform =
+        args.platform || (resolved.resolvedBy === 'platform' ? args.platform : null);
 
       if (inferredPlatform === 'telegram') {
         deliveryChannel = 'telegram';
@@ -147,19 +161,25 @@ export async function handleCreateReminder(
           deliveryChannel = 'whatsapp';
           deliveryTarget = deliveryTarget || resolved.user.whatsapp_id;
         } else {
-          return mcpResponse({
-            success: false,
-            error: 'No delivery channel available. User has no telegram_id or whatsapp_id.',
-          }, true);
+          return mcpResponse(
+            {
+              success: false,
+              error: 'No delivery channel available. User has no telegram_id or whatsapp_id.',
+            },
+            true
+          );
         }
       }
     }
 
     if (!deliveryTarget) {
-      return mcpResponse({
-        success: false,
-        error: 'Could not determine delivery target. Please specify deliveryTarget.',
-      }, true);
+      return mcpResponse(
+        {
+          success: false,
+          error: 'Could not determine delivery target. Please specify deliveryTarget.',
+        },
+        true
+      );
     }
 
     // Calculate next run time
@@ -209,10 +229,13 @@ export async function handleCreateReminder(
       },
     });
   } catch (error) {
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to create reminder',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to create reminder',
+      },
+      true
+    );
   }
 }
 
@@ -222,10 +245,11 @@ export async function handleCreateReminder(
 
 export const listRemindersSchema = z.object({
   ...userIdentifierSchema.shape,
-  status: z.enum(['active', 'paused', 'completed', 'failed']).optional()
+  status: z
+    .enum(['active', 'paused', 'completed', 'failed'])
+    .optional()
     .describe('Filter by status (default: active)'),
-  includeCompleted: z.boolean().optional()
-    .describe('Include completed reminders (default: false)'),
+  includeCompleted: z.boolean().optional().describe('Include completed reminders (default: false)'),
   limit: z.number().min(1).max(100).optional().default(20),
 });
 
@@ -260,7 +284,7 @@ export async function handleListReminders(
       return mcpResponse({ success: false, error: error.message }, true);
     }
 
-    const mapReminder = (r: typeof data[0]) => ({
+    const mapReminder = (r: (typeof data)[0]) => ({
       id: r.id,
       title: r.title,
       description: r.description,
@@ -276,12 +300,16 @@ export async function handleListReminders(
 
     // Sort: active/paused first (by next_run_at), then completed/failed (by last_run_at desc)
     const active = (data || [])
-      .filter(r => r.status === 'active' || r.status === 'paused')
-      .sort((a, b) => new Date(a.next_run_at || 0).getTime() - new Date(b.next_run_at || 0).getTime());
+      .filter((r) => r.status === 'active' || r.status === 'paused')
+      .sort(
+        (a, b) => new Date(a.next_run_at || 0).getTime() - new Date(b.next_run_at || 0).getTime()
+      );
 
     const completed = (data || [])
-      .filter(r => r.status === 'completed' || r.status === 'failed')
-      .sort((a, b) => new Date(b.last_run_at || 0).getTime() - new Date(a.last_run_at || 0).getTime());
+      .filter((r) => r.status === 'completed' || r.status === 'failed')
+      .sort(
+        (a, b) => new Date(b.last_run_at || 0).getTime() - new Date(a.last_run_at || 0).getTime()
+      );
 
     // Return grouped response if there are completed reminders
     if (completed.length > 0 && args.includeCompleted) {
@@ -303,10 +331,13 @@ export async function handleListReminders(
       reminders: active.map(mapReminder),
     });
   } catch (error) {
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to list reminders',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to list reminders',
+      },
+      true
+    );
   }
 }
 
@@ -319,12 +350,12 @@ export const updateReminderSchema = z.object({
   reminderId: z.string().uuid().describe('Reminder ID to update'),
   title: z.string().min(1).max(500).optional(),
   description: z.string().optional(),
-  cronExpression: z.string().optional()
+  cronExpression: z
+    .string()
+    .optional()
     .describe('New cron expression (set to null to make one-time)'),
-  nextRunAt: z.string().datetime().optional()
-    .describe('Reschedule to specific time'),
-  status: z.enum(['active', 'paused']).optional()
-    .describe('Pause or resume the reminder'),
+  nextRunAt: z.string().datetime().optional().describe('Reschedule to specific time'),
+  status: z.enum(['active', 'paused']).optional().describe('Pause or resume the reminder'),
 });
 
 export async function handleUpdateReminder(
@@ -386,10 +417,13 @@ export async function handleUpdateReminder(
       },
     });
   } catch (error) {
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to update reminder',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to update reminder',
+      },
+      true
+    );
   }
 }
 
@@ -449,10 +483,13 @@ export async function handleCancelReminder(
       reminder: { id: existing.id, title: existing.title, status: 'completed' },
     });
   } catch (error) {
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to cancel reminder',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to cancel reminder',
+      },
+      true
+    );
   }
 }
 
@@ -508,7 +545,7 @@ export async function handleGetReminderHistory(
         id: reminder.id,
         title: reminder.title,
       },
-      history: (history || []).map(h => ({
+      history: (history || []).map((h) => ({
         id: h.id,
         triggeredAt: h.triggered_at,
         deliveredAt: h.delivered_at,
@@ -517,10 +554,13 @@ export async function handleGetReminderHistory(
       })),
     });
   } catch (error) {
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to get reminder history',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to get reminder history',
+      },
+      true
+    );
   }
 }
 
@@ -530,14 +570,18 @@ export async function handleGetReminderHistory(
 
 export const setQuietHoursSchema = z.object({
   ...userIdentifierSchema.shape,
-  quietStart: z.string().regex(/^\d{2}:\d{2}$/).optional()
+  quietStart: z
+    .string()
+    .regex(/^\d{2}:\d{2}$/)
+    .optional()
     .describe('Start of quiet hours (HH:MM, e.g., "23:00")'),
-  quietEnd: z.string().regex(/^\d{2}:\d{2}$/).optional()
+  quietEnd: z
+    .string()
+    .regex(/^\d{2}:\d{2}$/)
+    .optional()
     .describe('End of quiet hours (HH:MM, e.g., "08:00")'),
-  timezone: z.string().optional()
-    .describe('Timezone (e.g., "America/New_York"). Default: UTC'),
-  disable: z.boolean().optional()
-    .describe('Set to true to disable quiet hours'),
+  timezone: z.string().optional().describe('Timezone (e.g., "America/New_York"). Default: UTC'),
+  disable: z.boolean().optional().describe('Set to true to disable quiet hours'),
 });
 
 export async function handleSetQuietHours(
@@ -554,13 +598,11 @@ export async function handleSetQuietHours(
 
     if (args.disable) {
       // Clear quiet hours
-      const { error } = await supabase
-        .from('heartbeat_state')
-        .upsert({
-          user_id: resolved.user.id,
-          quiet_start: null,
-          quiet_end: null,
-        });
+      const { error } = await supabase.from('heartbeat_state').upsert({
+        user_id: resolved.user.id,
+        quiet_start: null,
+        quiet_end: null,
+      });
 
       if (error) {
         return mcpResponse({ success: false, error: error.message }, true);
@@ -573,10 +615,13 @@ export async function handleSetQuietHours(
     }
 
     if (!args.quietStart || !args.quietEnd) {
-      return mcpResponse({
-        success: false,
-        error: 'Both quietStart and quietEnd are required (or use disable: true)',
-      }, true);
+      return mcpResponse(
+        {
+          success: false,
+          error: 'Both quietStart and quietEnd are required (or use disable: true)',
+        },
+        true
+      );
     }
 
     const { data, error } = await supabase
@@ -603,9 +648,12 @@ export async function handleSetQuietHours(
       },
     });
   } catch (error) {
-    return mcpResponse({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to set quiet hours',
-    }, true);
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to set quiet hours',
+      },
+      true
+    );
   }
 }

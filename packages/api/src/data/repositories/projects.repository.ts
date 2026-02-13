@@ -46,11 +46,7 @@ export class ProjectsRepository extends BaseRepository {
 
   async findById(id: string): Promise<Project | null> {
     try {
-      const { data, error } = await this.client
-        .from('projects')
-        .select('*')
-        .eq('id', id)
-        .single();
+      const { data, error } = await this.client.from('projects').select('*').eq('id', id).single();
 
       if (error && error.code !== 'PGRST116') throw error;
       return data as Project | null;
@@ -149,10 +145,7 @@ export class ProjectsRepository extends BaseRepository {
 
   async delete(id: string): Promise<void> {
     try {
-      const { error } = await this.client
-        .from('projects')
-        .delete()
-        .eq('id', id);
+      const { error } = await this.client.from('projects').delete().eq('id', id);
 
       if (error) throw error;
     } catch (error) {

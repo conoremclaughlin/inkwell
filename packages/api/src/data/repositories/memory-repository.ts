@@ -122,11 +122,7 @@ export class MemoryRepository {
    * Get a specific memory by ID
    */
   async getMemory(id: string): Promise<Memory | null> {
-    const { data, error } = await this.supabase
-      .from('memories')
-      .select('*')
-      .eq('id', id)
-      .single();
+    const { data, error } = await this.supabase.from('memories').select('*').eq('id', id).single();
 
     if (error) {
       if (error.code === 'PGRST116') return null;
@@ -243,13 +239,16 @@ export class MemoryRepository {
   /**
    * Update a session's state (phase, status, backend session ID, etc.)
    */
-  async updateSession(sessionId: string, updates: {
-    currentPhase?: string | null;
-    status?: string;
-    backendSessionId?: string;
-    context?: string;
-    workingDir?: string;
-  }): Promise<Session | null> {
+  async updateSession(
+    sessionId: string,
+    updates: {
+      currentPhase?: string | null;
+      status?: string;
+      backendSessionId?: string;
+      context?: string;
+      workingDir?: string;
+    }
+  ): Promise<Session | null> {
     const dbUpdates: Record<string, unknown> = {};
     // Note: updated_at is handled by the database trigger (update_sessions_updated_at)
 
@@ -291,11 +290,7 @@ export class MemoryRepository {
    * Get a session by ID
    */
   async getSession(id: string): Promise<Session | null> {
-    const { data, error } = await this.supabase
-      .from('sessions')
-      .select('*')
-      .eq('id', id)
-      .single();
+    const { data, error } = await this.supabase.from('sessions').select('*').eq('id', id).single();
 
     if (error) {
       if (error.code === 'PGRST116') return null;
@@ -314,7 +309,11 @@ export class MemoryRepository {
    *   - null: match sessions with no studio
    *   - string: match that specific studio
    */
-  async getActiveSession(userId: string, agentId?: string, studioId?: string | null): Promise<Session | null> {
+  async getActiveSession(
+    userId: string,
+    agentId?: string,
+    studioId?: string | null
+  ): Promise<Session | null> {
     let query = this.supabase
       .from('sessions')
       .select('*')
@@ -377,7 +376,13 @@ export class MemoryRepository {
    */
   async listSessions(
     userId: string,
-    options: { limit?: number; offset?: number; agentId?: string; studioId?: string; workspaceId?: string } = {}
+    options: {
+      limit?: number;
+      offset?: number;
+      agentId?: string;
+      studioId?: string;
+      workspaceId?: string;
+    } = {}
   ): Promise<Session[]> {
     let query = this.supabase
       .from('sessions')
@@ -459,10 +464,7 @@ export class MemoryRepository {
   /**
    * Soft-delete session logs by marking them as compacted
    */
-  async markLogsCompacted(
-    sessionId: string,
-    memoryId?: string
-  ): Promise<number> {
+  async markLogsCompacted(sessionId: string, memoryId?: string): Promise<number> {
     const { data, error } = await this.supabase
       .from('session_logs')
       .update({
@@ -485,10 +487,7 @@ export class MemoryRepository {
    * Mark specific logs as compacted (for granular compaction)
    * Pass memoryId to link to the memory created from the log(s), or undefined if discarded
    */
-  async markSpecificLogsCompacted(
-    logIds: string[],
-    memoryId?: string
-  ): Promise<number> {
+  async markSpecificLogsCompacted(logIds: string[], memoryId?: string): Promise<number> {
     const { data, error } = await this.supabase
       .from('session_logs')
       .update({
@@ -644,7 +643,11 @@ export class MemoryRepository {
           source: history.source,
           salience: history.salience,
           topics: history.topics,
-          metadata: { ...history.metadata, restored_from_deleted: true, original_id: history.memoryId },
+          metadata: {
+            ...history.metadata,
+            restored_from_deleted: true,
+            original_id: history.memoryId,
+          },
         })
         .select()
         .single();

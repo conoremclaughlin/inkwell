@@ -91,14 +91,18 @@ describe('workspace-container handlers', () => {
 
     const result = await handleCreateWorkspaceContainer(
       { email: 'test@test.com', name: 'PCP Team', type: 'team' },
-      mockDataComposer as never,
+      mockDataComposer as never
     );
 
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.success).toBe(true);
     expect(parsed.workspace.id).toBe('ws-1');
     expect(mockDataComposer.repositories.workspaceContainers.create).toHaveBeenCalled();
-    expect(mockDataComposer.repositories.workspaceContainers.addMember).toHaveBeenCalledWith('ws-1', 'user-123', 'owner');
+    expect(mockDataComposer.repositories.workspaceContainers.addMember).toHaveBeenCalledWith(
+      'ws-1',
+      'user-123',
+      'owner'
+    );
   });
 
   it('list handler ensures personal workspace by default', async () => {
@@ -109,12 +113,14 @@ describe('workspace-container handlers', () => {
 
     const result = await handleListWorkspaceContainers(
       { email: 'test@test.com' },
-      mockDataComposer as never,
+      mockDataComposer as never
     );
 
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.success).toBe(true);
-    expect(mockDataComposer.repositories.workspaceContainers.ensurePersonalWorkspace).toHaveBeenCalledWith('user-123');
+    expect(
+      mockDataComposer.repositories.workspaceContainers.ensurePersonalWorkspace
+    ).toHaveBeenCalledWith('user-123');
     expect(mockDataComposer.repositories.workspaceContainers.listByUser).toHaveBeenCalled();
   });
 
@@ -134,7 +140,7 @@ describe('workspace-container handlers', () => {
 
     const result = await handleGetWorkspaceContainer(
       { email: 'test@test.com', workspaceId: '11111111-1111-1111-1111-111111111111' },
-      mockDataComposer as never,
+      mockDataComposer as never
     );
 
     const parsed = JSON.parse(result.content[0].text);
@@ -147,7 +153,7 @@ describe('workspace-container handlers', () => {
 
     const result = await handleGetWorkspaceContainer(
       { email: 'test@test.com', workspaceId: '11111111-1111-1111-1111-111111111111' },
-      mockDataComposer as never,
+      mockDataComposer as never
     );
 
     const parsed = JSON.parse(result.content[0].text);
@@ -178,7 +184,7 @@ describe('workspace-container handlers', () => {
         description: 'new desc',
         metadata: { hello: 'world' },
       },
-      mockDataComposer as never,
+      mockDataComposer as never
     );
 
     const parsed = JSON.parse(result.content[0].text);

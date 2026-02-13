@@ -134,9 +134,9 @@ describe('KindleService', () => {
     it('should throw on database error', async () => {
       mockSupabase._setReturnData(null, { message: 'insert failed' });
 
-      await expect(
-        service.createKindleToken('user-123')
-      ).rejects.toThrow('Failed to create kindle token: insert failed');
+      await expect(service.createKindleToken('user-123')).rejects.toThrow(
+        'Failed to create kindle token: insert failed'
+      );
     });
   });
 
@@ -215,9 +215,9 @@ describe('KindleService', () => {
     it('should reject invalid or inactive tokens', async () => {
       mockSupabase._setReturnData(null, { code: 'PGRST116', message: 'not found' });
 
-      await expect(
-        service.redeemKindleToken('invalid-token', 'new-user')
-      ).rejects.toThrow('Invalid or expired kindle token');
+      await expect(service.redeemKindleToken('invalid-token', 'new-user')).rejects.toThrow(
+        'Invalid or expired kindle token'
+      );
     });
 
     it('should reject expired tokens', async () => {
@@ -231,9 +231,9 @@ describe('KindleService', () => {
         expires_at: '2020-01-01T00:00:00Z', // expired
       });
 
-      await expect(
-        service.redeemKindleToken('abc123hex', 'new-user')
-      ).rejects.toThrow('Kindle token has expired');
+      await expect(service.redeemKindleToken('abc123hex', 'new-user')).rejects.toThrow(
+        'Kindle token has expired'
+      );
     });
   });
 
@@ -297,9 +297,9 @@ describe('KindleService', () => {
     it('should throw if kindle lineage not found', async () => {
       mockSupabase._setReturnData(null, { code: 'PGRST116', message: 'not found' });
 
-      await expect(
-        service.completeOnboarding('nonexistent', 'Ember')
-      ).rejects.toThrow('Kindle lineage not found');
+      await expect(service.completeOnboarding('nonexistent', 'Ember')).rejects.toThrow(
+        'Kindle lineage not found'
+      );
     });
   });
 

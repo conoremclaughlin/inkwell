@@ -118,10 +118,13 @@ export class WorkspaceContainersRepository {
     return data ? this.mapContainerRow(data as Record<string, unknown>) : null;
   }
 
-  async listByUser(userId: string, opts?: {
-    type?: WorkspaceContainerType;
-    includeArchived?: boolean;
-  }): Promise<WorkspaceContainer[]> {
+  async listByUser(
+    userId: string,
+    opts?: {
+      type?: WorkspaceContainerType;
+      includeArchived?: boolean;
+    }
+  ): Promise<WorkspaceContainer[]> {
     let query = this.client
       .from('workspace_containers')
       .select('*')
@@ -145,7 +148,11 @@ export class WorkspaceContainersRepository {
     return (data || []).map((row) => this.mapContainerRow(row as Record<string, unknown>));
   }
 
-  async update(id: string, userId: string, input: UpdateWorkspaceContainerInput): Promise<WorkspaceContainer> {
+  async update(
+    id: string,
+    userId: string,
+    input: UpdateWorkspaceContainerInput
+  ): Promise<WorkspaceContainer> {
     const updateData: WorkspaceContainersTable['Update'] = {};
 
     if (input.name !== undefined) updateData.name = input.name;
@@ -198,7 +205,11 @@ export class WorkspaceContainersRepository {
     return created;
   }
 
-  async addMember(workspaceId: string, memberUserId: string, role: WorkspaceMemberRole): Promise<WorkspaceMember> {
+  async addMember(
+    workspaceId: string,
+    memberUserId: string,
+    role: WorkspaceMemberRole
+  ): Promise<WorkspaceMember> {
     const insertData: WorkspaceMembersTable['Insert'] = {
       workspace_id: workspaceId,
       user_id: memberUserId,

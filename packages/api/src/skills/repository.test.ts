@@ -12,7 +12,19 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 // Helper to create a fluent mock that supports chaining
 function createFluentMock(finalResponse: { data: unknown; error: unknown; count?: number }) {
   const mock: Record<string, unknown> = {};
-  const methods = ['select', 'insert', 'update', 'delete', 'upsert', 'eq', 'not', 'or', 'order', 'range', 'single'];
+  const methods = [
+    'select',
+    'insert',
+    'update',
+    'delete',
+    'upsert',
+    'eq',
+    'not',
+    'or',
+    'order',
+    'range',
+    'single',
+  ];
 
   methods.forEach((method) => {
     mock[method] = vi.fn(() => mock);
@@ -306,8 +318,26 @@ describe('SkillsRepository', () => {
   describe('getSkillVersions', () => {
     it('should return version history for a skill', async () => {
       const mockVersions = [
-        { id: 'v2', skill_id: 'skill-1', version: '1.1.0', manifest: {}, content: 'v2', changelog: 'Update', published_by: null, published_at: '2024-02-01' },
-        { id: 'v1', skill_id: 'skill-1', version: '1.0.0', manifest: {}, content: 'v1', changelog: 'Initial', published_by: null, published_at: '2024-01-01' },
+        {
+          id: 'v2',
+          skill_id: 'skill-1',
+          version: '1.1.0',
+          manifest: {},
+          content: 'v2',
+          changelog: 'Update',
+          published_by: null,
+          published_at: '2024-02-01',
+        },
+        {
+          id: 'v1',
+          skill_id: 'skill-1',
+          version: '1.0.0',
+          manifest: {},
+          content: 'v1',
+          changelog: 'Initial',
+          published_by: null,
+          published_at: '2024-01-01',
+        },
       ];
 
       const fluentMock = createFluentMock({ data: mockVersions, error: null });
