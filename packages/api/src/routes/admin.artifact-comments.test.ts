@@ -114,6 +114,21 @@ describe('admin artifact comments routes', () => {
           },
         },
       ],
+      users: [
+        {
+          then: {
+            data: [
+              {
+                id: '550e8400-e29b-41d4-a716-446655440000',
+                first_name: 'Conor',
+                username: 'conor',
+                email: 'conor@example.com',
+              },
+            ],
+            error: null,
+          },
+        },
+      ],
     });
 
     const handler = getRouteHandler('/artifacts/:id/comments', 'get');
@@ -154,10 +169,25 @@ describe('admin artifact comments routes', () => {
                 parent_comment_id: null,
                 content: 'Adding a review comment',
                 metadata: {},
-                created_by_agent_id: 'lumen',
+                created_by_user_id: '550e8400-e29b-41d4-a716-446655440000',
                 created_by_identity_id: 'identity-1',
                 created_at: '2026-02-11T00:00:00Z',
                 updated_at: '2026-02-11T00:00:00Z',
+              },
+              error: null,
+            },
+          ],
+        },
+      ],
+      users: [
+        {
+          maybeSingle: [
+            {
+              data: {
+                id: '550e8400-e29b-41d4-a716-446655440000',
+                first_name: 'Conor',
+                username: 'conor',
+                email: 'conor@example.com',
               },
               error: null,
             },
@@ -188,7 +218,7 @@ describe('admin artifact comments routes', () => {
     )?.builder;
     expect(commentsBuilder).toBeDefined();
     expect((commentsBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
-      created_by_agent_id: 'lumen',
+      created_by_user_id: '550e8400-e29b-41d4-a716-446655440000',
       created_by_identity_id: 'identity-1',
       content: 'Adding a review comment',
     });

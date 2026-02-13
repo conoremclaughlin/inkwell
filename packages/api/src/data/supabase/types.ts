@@ -491,8 +491,8 @@ export type Database = {
           artifact_id: string;
           content: string;
           created_at: string | null;
-          created_by_agent_id: string | null;
           created_by_identity_id: string | null;
+          created_by_user_id: string | null;
           deleted_at: string | null;
           id: string;
           metadata: Json | null;
@@ -505,8 +505,8 @@ export type Database = {
           artifact_id: string;
           content: string;
           created_at?: string | null;
-          created_by_agent_id?: string | null;
           created_by_identity_id?: string | null;
+          created_by_user_id?: string | null;
           deleted_at?: string | null;
           id?: string;
           metadata?: Json | null;
@@ -519,8 +519,8 @@ export type Database = {
           artifact_id?: string;
           content?: string;
           created_at?: string | null;
-          created_by_agent_id?: string | null;
           created_by_identity_id?: string | null;
+          created_by_user_id?: string | null;
           deleted_at?: string | null;
           id?: string;
           metadata?: Json | null;
@@ -542,6 +542,13 @@ export type Database = {
             columns: ['created_by_identity_id'];
             isOneToOne: false;
             referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'artifact_comments_created_by_user_id_fkey';
+            columns: ['created_by_user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {

@@ -52,6 +52,13 @@ interface ArtifactCommentIdentity {
   backend: string | null;
 }
 
+interface ArtifactCommentUser {
+  id: string;
+  name: string | null;
+  username: string | null;
+  email: string | null;
+}
+
 interface ArtifactComment {
   id: string;
   artifactId: string;
@@ -59,6 +66,8 @@ interface ArtifactComment {
   content: string;
   metadata?: Record<string, unknown>;
   createdByAgentId: string | null;
+  createdByUserId: string | null;
+  createdByUser: ArtifactCommentUser | null;
   createdByIdentityId: string | null;
   createdByIdentity: ArtifactCommentIdentity | null;
   createdAt: string;
@@ -309,6 +318,9 @@ export default function ArtifactDetailPage() {
                 const identityName =
                   comment.createdByIdentity?.name ||
                   comment.createdByIdentity?.agentId ||
+                  comment.createdByUser?.name ||
+                  comment.createdByUser?.username ||
+                  comment.createdByUser?.email ||
                   comment.createdByAgentId ||
                   'You';
                 return (

@@ -28,6 +28,21 @@ type AdminAuthRequest = Request & {
   pcpWorkspaceId: string;
 };
 
+type CommentAuthorUser = {
+  id: string;
+  first_name: string | null;
+  username: string | null;
+  email: string | null;
+};
+
+function formatCommentAuthorUserName(user: CommentAuthorUser | null): string | null {
+  if (!user) return null;
+  if (user.first_name?.trim()) return user.first_name.trim();
+  if (user.username?.trim()) return user.username.trim();
+  if (user.email?.trim()) return user.email.trim();
+  return null;
+}
+
 /**
  * Set the WhatsApp listener for admin endpoints
  */
@@ -1519,11 +1534,19 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
     const identityIds = Array.from(
       new Set((comments || []).map((c) => c.created_by_identity_id).filter(Boolean) as string[])
     );
+    const commentAuthorUserIds = Array.from(
+      new Set(
+        (comments || [])
+          .map((c) => c.created_by_user_id || c.user_id)
+          .filter((value): value is string => typeof value === 'string' && value.length > 0)
+      )
+    );
 
     const identitiesById = new Map<
       string,
       { id: string; agent_id: string; name: string; backend: string | null }
     >();
+    const commentUsersById = new Map<string, CommentAuthorUser>();
 
     if (identityIds.length > 0) {
       const { data: identities, error: identitiesError } = await supabase
@@ -1542,11 +1565,32 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
       }
     }
 
+    if (commentAuthorUserIds.length > 0) {
+      const { data: commentUsers, error: commentUsersError } = await supabase
+        .from('users')
+        .select('id, first_name, username, email')
+        .in('id', commentAuthorUserIds);
+
+      if (commentUsersError) {
+        logger.error('Failed to resolve artifact comment users:', commentUsersError);
+        res.status(500).json({ error: 'Failed to resolve comment users' });
+        return;
+      }
+
+      for (const commentUser of commentUsers || []) {
+        commentUsersById.set(commentUser.id, commentUser);
+      }
+    }
+
     res.json({
       artifactId: id,
       comments: (comments || []).map((comment) => {
         const identity = comment.created_by_identity_id
           ? (identitiesById.get(comment.created_by_identity_id) ?? null)
+          : null;
+        const commentAuthorUserId = comment.created_by_user_id || comment.user_id || null;
+        const commentAuthorUser = commentAuthorUserId
+          ? (commentUsersById.get(commentAuthorUserId) ?? null)
           : null;
         return {
           id: comment.id,
@@ -1554,7 +1598,16 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
           parentCommentId: comment.parent_comment_id,
           content: comment.content,
           metadata: comment.metadata,
-          createdByAgentId: comment.created_by_agent_id,
+          createdByAgentId: identity?.agent_id ?? null,
+          createdByUserId: commentAuthorUserId,
+          createdByUser: commentAuthorUser
+            ? {
+                id: commentAuthorUser.id,
+                name: formatCommentAuthorUserName(commentAuthorUser),
+                username: commentAuthorUser.username,
+                email: commentAuthorUser.email,
+              }
+            : null,
           createdByIdentityId: comment.created_by_identity_id,
           createdByIdentity: identity
             ? {
@@ -1655,8 +1708,8 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
       .insert({
         artifact_id: id,
         user_id: pcpUserId,
+        created_by_user_id: pcpUserId,
         workspace_id: workspaceId,
-        created_by_agent_id: agentId || null,
         created_by_identity_id: identity?.id || null,
         parent_comment_id: parentCommentId || null,
         content: trimmed,
@@ -1671,6 +1724,12 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
       return;
     }
 
+    const { data: commentAuthorUser } = await supabase
+      .from('users')
+      .select('id, first_name, username, email')
+      .eq('id', pcpUserId)
+      .maybeSingle();
+
     res.json({
       comment: {
         id: comment.id,
@@ -1678,7 +1737,16 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
         parentCommentId: comment.parent_comment_id,
         content: comment.content,
         metadata: comment.metadata,
-        createdByAgentId: comment.created_by_agent_id,
+        createdByAgentId: identity?.agent_id ?? null,
+        createdByUserId: comment.created_by_user_id || pcpUserId,
+        createdByUser: commentAuthorUser
+          ? {
+              id: commentAuthorUser.id,
+              name: formatCommentAuthorUserName(commentAuthorUser),
+              username: commentAuthorUser.username,
+              email: commentAuthorUser.email,
+            }
+          : null,
         createdByIdentityId: comment.created_by_identity_id,
         createdByIdentity: identity
           ? {

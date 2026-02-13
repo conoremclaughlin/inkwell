@@ -154,6 +154,23 @@ async function resolveIdentityForAgent(
   return data;
 }
 
+type ArtifactCommentAuthorUser = {
+  id: string;
+  first_name: string | null;
+  username: string | null;
+  email: string | null;
+};
+
+function formatArtifactCommentAuthorUserName(
+  user: ArtifactCommentAuthorUser | null
+): string | null {
+  if (!user) return null;
+  if (user.first_name?.trim()) return user.first_name.trim();
+  if (user.username?.trim()) return user.username.trim();
+  if (user.email?.trim()) return user.email.trim();
+  return null;
+}
+
 function resolveArtifactForUser(
   supabase: SupabaseClient<Database>,
   userId: string,
@@ -318,6 +335,13 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
     content: string;
     metadata: Json | null;
     createdByAgentId: string | null;
+    createdByUserId: string | null;
+    createdByUser: {
+      id: string;
+      name: string | null;
+      username: string | null;
+      email: string | null;
+    } | null;
     createdByIdentityId: string | null;
     createdByIdentity: { id: string; agentId: string; name: string; backend: string | null } | null;
     createdAt: string;
@@ -341,11 +365,19 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
     const identityIds = Array.from(
       new Set((commentRows || []).map((c) => c.created_by_identity_id).filter(Boolean) as string[])
     );
+    const commentAuthorUserIds = Array.from(
+      new Set(
+        (commentRows || [])
+          .map((comment) => comment.created_by_user_id || comment.user_id)
+          .filter((value): value is string => typeof value === 'string' && value.length > 0)
+      )
+    );
 
     let identitiesById = new Map<
       string,
       { id: string; agent_id: string; name: string; backend: string | null }
     >();
+    let commentUsersById = new Map<string, ArtifactCommentAuthorUser>();
     if (identityIds.length > 0) {
       const { data: identities, error: identitiesError } = await supabase
         .from('agent_identities')
@@ -361,9 +393,26 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
       identitiesById = new Map((identities || []).map((identity) => [identity.id, identity]));
     }
 
+    if (commentAuthorUserIds.length > 0) {
+      const { data: commentUsers, error: commentUsersError } = await supabase
+        .from('users')
+        .select('id, first_name, username, email')
+        .in('id', commentAuthorUserIds);
+
+      if (commentUsersError) {
+        throw new Error(`Failed to resolve artifact comment users: ${commentUsersError.message}`);
+      }
+
+      commentUsersById = new Map((commentUsers || []).map((commentUser) => [commentUser.id, commentUser]));
+    }
+
     comments = (commentRows || []).map((comment) => {
       const identity = comment.created_by_identity_id
         ? (identitiesById.get(comment.created_by_identity_id) ?? null)
+        : null;
+      const commentAuthorUserId = comment.created_by_user_id || comment.user_id || null;
+      const commentAuthorUser = commentAuthorUserId
+        ? (commentUsersById.get(commentAuthorUserId) ?? null)
         : null;
       return {
         id: comment.id,
@@ -371,7 +420,16 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
         parentCommentId: comment.parent_comment_id,
         content: comment.content,
         metadata: comment.metadata,
-        createdByAgentId: comment.created_by_agent_id,
+        createdByAgentId: identity?.agent_id ?? null,
+        createdByUserId: commentAuthorUserId,
+        createdByUser: commentAuthorUser
+          ? {
+              id: commentAuthorUser.id,
+              name: formatArtifactCommentAuthorUserName(commentAuthorUser),
+              username: commentAuthorUser.username,
+              email: commentAuthorUser.email,
+            }
+          : null,
         createdByIdentityId: comment.created_by_identity_id,
         createdByIdentity: identity
           ? {
@@ -825,8 +883,8 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
     .insert({
       artifact_id: artifact.id,
       user_id: resolved.user.id,
+      created_by_user_id: resolved.user.id,
       ...(workspaceId ? { workspace_id: workspaceId } : {}),
-      created_by_agent_id: agentId || null,
       created_by_identity_id: authorIdentity?.id || null,
       parent_comment_id: parentCommentId || null,
       content: trimmed,
@@ -859,7 +917,14 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
             parentCommentId: created.parent_comment_id,
             content: created.content,
             metadata: created.metadata,
-            createdByAgentId: created.created_by_agent_id,
+            createdByAgentId: authorIdentity?.agent_id || null,
+            createdByUserId: created.created_by_user_id || resolved.user.id,
+            createdByUser: {
+              id: resolved.user.id,
+              name: formatArtifactCommentAuthorUserName(resolved.user),
+              username: resolved.user.username,
+              email: resolved.user.email,
+            },
             createdByIdentityId: created.created_by_identity_id,
             createdByIdentity: authorIdentity
               ? {
@@ -914,11 +979,19 @@ export async function handleListArtifactComments(args: unknown, dataComposer: Da
   const identityIds = Array.from(
     new Set((comments || []).map((c) => c.created_by_identity_id).filter(Boolean) as string[])
   );
+  const commentAuthorUserIds = Array.from(
+    new Set(
+      (comments || [])
+        .map((comment) => comment.created_by_user_id || comment.user_id)
+        .filter((value): value is string => typeof value === 'string' && value.length > 0)
+    )
+  );
 
   let identitiesById = new Map<
     string,
     { id: string; agent_id: string; name: string; backend: string | null }
   >();
+  let commentUsersById = new Map<string, ArtifactCommentAuthorUser>();
   if (identityIds.length > 0) {
     let identitiesQuery = supabase
       .from('agent_identities')
@@ -934,6 +1007,19 @@ export async function handleListArtifactComments(args: unknown, dataComposer: Da
     identitiesById = new Map((identities || []).map((identity) => [identity.id, identity]));
   }
 
+  if (commentAuthorUserIds.length > 0) {
+    const { data: commentUsers, error: commentUsersError } = await supabase
+      .from('users')
+      .select('id, first_name, username, email')
+      .in('id', commentAuthorUserIds);
+
+    if (commentUsersError) {
+      throw new Error(`Failed to resolve comment users: ${commentUsersError.message}`);
+    }
+
+    commentUsersById = new Map((commentUsers || []).map((commentUser) => [commentUser.id, commentUser]));
+  }
+
   return {
     content: [
       {
@@ -947,13 +1033,26 @@ export async function handleListArtifactComments(args: unknown, dataComposer: Da
             const identity = comment.created_by_identity_id
               ? (identitiesById.get(comment.created_by_identity_id) ?? null)
               : null;
+            const commentAuthorUserId = comment.created_by_user_id || comment.user_id || null;
+            const commentAuthorUser = commentAuthorUserId
+              ? (commentUsersById.get(commentAuthorUserId) ?? null)
+              : null;
             return {
               id: comment.id,
               artifactId: comment.artifact_id,
               parentCommentId: comment.parent_comment_id,
               content: comment.content,
               metadata: comment.metadata,
-              createdByAgentId: comment.created_by_agent_id,
+              createdByAgentId: identity?.agent_id ?? null,
+              createdByUserId: commentAuthorUserId,
+              createdByUser: commentAuthorUser
+                ? {
+                    id: commentAuthorUser.id,
+                    name: formatArtifactCommentAuthorUserName(commentAuthorUser),
+                    username: commentAuthorUser.username,
+                    email: commentAuthorUser.email,
+                  }
+                : null,
               createdByIdentityId: comment.created_by_identity_id,
               createdByIdentity: identity
                 ? {

@@ -449,7 +449,7 @@ describe('artifact comment + identity UUID flows', () => {
                 parent_comment_id: null,
                 content: 'Love this direction',
                 metadata: {},
-                created_by_agent_id: 'lumen',
+                created_by_user_id: '00000000-0000-0000-0000-000000000001',
                 created_by_identity_id: 'identity-1',
                 created_at: '2026-02-11T02:00:00Z',
                 updated_at: '2026-02-11T02:00:00Z',
@@ -465,6 +465,21 @@ describe('artifact comment + identity UUID flows', () => {
         {
           then: {
             data: [{ id: 'identity-1', agent_id: 'lumen', name: 'Lumen', backend: 'codex' }],
+            error: null,
+          },
+        },
+      ],
+      users: [
+        {
+          then: {
+            data: [
+              {
+                id: '00000000-0000-0000-0000-000000000001',
+                first_name: 'Conor',
+                username: 'conor',
+                email: 'conor@example.com',
+              },
+            ],
             error: null,
           },
         },
@@ -701,10 +716,10 @@ describe('artifact comment + identity UUID flows', () => {
                 id: 'comment-1',
                 artifact_id: '11111111-1111-1111-1111-111111111111',
                 user_id: '00000000-0000-0000-0000-000000000001',
+                created_by_user_id: '00000000-0000-0000-0000-000000000001',
                 parent_comment_id: null,
                 content: 'Great point.',
                 metadata: {},
-                created_by_agent_id: 'lumen',
                 created_by_identity_id: 'identity-1',
                 created_at: '2026-02-11T00:00:00Z',
                 updated_at: '2026-02-11T00:00:00Z',
@@ -733,7 +748,7 @@ describe('artifact comment + identity UUID flows', () => {
 
     const commentsBuilder = supabase.calls.find((c) => c.table === 'artifact_comments')?.builder;
     expect((commentsBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
-      created_by_agent_id: 'lumen',
+      created_by_user_id: '00000000-0000-0000-0000-000000000001',
       created_by_identity_id: 'identity-1',
       content: 'Great point.',
     });
@@ -789,7 +804,7 @@ describe('artifact comment + identity UUID flows', () => {
                 parent_comment_id: null,
                 content: 'From Lumen',
                 metadata: {},
-                created_by_agent_id: 'lumen',
+                created_by_user_id: '00000000-0000-0000-0000-000000000001',
                 created_by_identity_id: 'identity-1',
                 created_at: '2026-02-11T00:00:00Z',
                 updated_at: '2026-02-11T00:00:00Z',
@@ -802,7 +817,7 @@ describe('artifact comment + identity UUID flows', () => {
                 parent_comment_id: null,
                 content: 'Anonymous note',
                 metadata: {},
-                created_by_agent_id: null,
+                created_by_user_id: '00000000-0000-0000-0000-000000000001',
                 created_by_identity_id: null,
                 created_at: '2026-02-11T00:05:00Z',
                 updated_at: '2026-02-11T00:05:00Z',
@@ -818,6 +833,21 @@ describe('artifact comment + identity UUID flows', () => {
         {
           then: {
             data: [{ id: 'identity-1', agent_id: 'lumen', name: 'Lumen', backend: 'codex' }],
+            error: null,
+          },
+        },
+      ],
+      users: [
+        {
+          then: {
+            data: [
+              {
+                id: '00000000-0000-0000-0000-000000000001',
+                first_name: 'Conor',
+                username: 'conor',
+                email: 'conor@example.com',
+              },
+            ],
             error: null,
           },
         },
