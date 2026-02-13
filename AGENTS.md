@@ -218,6 +218,8 @@ Personal Context Protocol (PCP) is a system that captures and manages personal c
 
 Use extreme camelCase for variable and function names. Use PascalCase for class names and types. Use SCREAMING_SNAKE_CASE for constants. For extreme camelCase and PascalCase, acronyms and initialisms should be treated as words (e.g., `userId`, `HttpClient`, `apiResponse`).
 
+**Formatting**: Prettier runs automatically on every commit via Husky + lint-staged. You do NOT need to run prettier manually — just commit and it handles formatting for `*.{ts,tsx,js,jsx,json,css,md}` files. If you need to format without committing: `npx prettier --write "path/to/file"`.
+
 ## Project Structure
 
 ```
