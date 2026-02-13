@@ -94,9 +94,10 @@ personal-context-protocol/
 │   └── cli/              # CLI-related stories
 ├── supabase/
 │   └── migrations/       # Database migrations
-├── AGENTS.md             # Agent onboarding (points to CLAUDE.md)
+├── AGENTS.md             # Agent onboarding and guidelines
 ├── ARCHITECTURE.md       # System architecture
-├── CLAUDE.md             # Detailed agent guidelines
+├── CLAUDE.md             # Claude Code entrypoint (points to AGENTS.md)
+├── CONTRIBUTING.md       # Git, coding style, and PR conventions
 └── README.md             # This file
 ```
 
@@ -129,7 +130,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for system diagrams, data flow, and des
 
 ## For AI Agents
 
-See [AGENTS.md](./AGENTS.md) for onboarding instructions. Detailed guidelines are in [CLAUDE.md](./CLAUDE.md).
+See [AGENTS.md](./AGENTS.md) for onboarding instructions.
 
 ## Development
 
@@ -142,84 +143,9 @@ yarn pm2 list              # List running processes
 yarn pm2 restart pcp       # Restart PCP server
 ```
 
-## Git Conventions
+## Contributing
 
-### Commits
-
-We use the [Angular commit convention](https://github.com/angular/angular/blob/main/CONTRIBUTING.md):
-
-```
-<type>(<scope>): <short summary>
-  │       │             │
-  │       │             └─⫸ Imperative present tense. Not capitalized. No period.
-  │       │
-  │       └─⫸ Optional. Succinct, relevant to the initiative.
-  │
-  └─⫸ feat|fix|refactor|chore|docs|test|perf|build|ci|style
-```
-
-Examples:
-
-```
-feat(cli): add global install via symlink
-fix(sessions): preserve existing fields on upsert
-refactor(mcp): extract identity resolution into service
-chore: bump typescript to 5.4
-```
-
-### Branching
-
-We follow [GitHub flow](https://www.geeksforgeeks.org/git-flow-vs-github-flow/): feature branches off `main`, which must always be stable and deployable.
-
-```
-<initials or moniker>/<type>/<scope>
-  │                      │       │
-  │                      │       └─⫸ Kebab-case. Succinct description.
-  │                      │
-  │                      └─⫸ Same types as commits.
-  │
-  └─⫸ Your initials or unique moniker (e.g., cm, wren, myra)
-```
-
-Examples:
-
-```bash
-git checkout -b cm/feat/agent-orchestrator
-git checkout -b wren/fix/session-resume
-git checkout -b myra/chore/heartbeat-cleanup
-```
-
-When syncing with main: rebase first; if conflicts get messy, merge main in and move on.
-
-### Code Comments
-
-```
-<author>(<scope>): <short summary>
-  │         │             │
-  │         │             └─⫸ Be succinct. Present tense.
-  │         │
-  │         └─⫸ Optional. todo|bug|???|<commit-style scope>
-  │
-  └─⫸ Optional. Your initials or common name.
-```
-
-A plain comment needs no prefix — any comment is implicitly a note. Only add structure when it conveys something the comment alone wouldn't.
-
-Examples:
-
-```typescript
-// cm(todo): extract this into a shared utility
-// wren(bug): race condition when two agents write simultaneously
-// ???: unclear why this timeout is needed — removing it breaks auth
-// Simple explanation needs no prefix
-```
-
-## Coding Conventions
-
-- **camelCase** for variables and functions (acronyms treated as words: `userId`, `apiResponse`)
-- **PascalCase** for classes and types (`HttpClient`, `UserIdentity`)
-- **SCREAMING_SNAKE** for constants
-- Strict TypeScript, Zod for runtime validation, `async/await` over callbacks
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for git conventions, coding style, PR process, and coding conventions. This applies to both human and AI contributors.
 
 ## License
 

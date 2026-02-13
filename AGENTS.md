@@ -214,9 +214,9 @@ recall(userId: "...", query: "...", agentId: "wren", includeShared: true)
 
 Personal Context Protocol (PCP) is a system that captures and manages personal context (links, notes, tasks, reminders) across AI interfaces. It uses MCP (Model Context Protocol) to expose tools that AI agents can use to store and retrieve user context.
 
-## Coding Style
+## Coding Style & Conventions
 
-Use extreme camelCase for variable and function names. Use PascalCase for class names and types. Use SCREAMING_SNAKE_CASE for constants. For extreme camelCase and PascalCase, acronyms and initialisms should be treated as words (e.g., `userId`, `HttpClient`, `apiResponse`).
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full reference on coding style, naming, formatting (prettier/husky), git conventions, PR process, and coding conventions. **Read it** — it applies to all contributors (OBs and SBs).
 
 ## Project Structure
 
@@ -358,46 +358,11 @@ All tools support multiple identification methods:
 
 ## Coding Conventions
 
-### TypeScript
+Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key points repeated here for agent context:
 
-- Strict typing, avoid `any`
-- Use Zod for runtime validation
-- Prefer `async/await` over callbacks
-
-### File Organization
-
-- One class/module per file
-- Co-locate tests (`*.test.ts`)
-- Export types from `types.ts` files
-
-### Naming
-
-- PascalCase for classes and types
-- camelCase for functions and variables
-- SCREAMING_SNAKE for constants
-
-### Error Handling
-
-- Use typed errors where possible
-- Log errors with context
-- Return structured error responses
-
-### Upsert / Partial Update Safety
-
-- When building upsert or update objects, **never set optional fields to `null` just because they weren't provided**. Omitted fields should preserve their existing database values.
-- Use `undefined` checks (`field !== undefined`) to distinguish "not provided" from "explicitly cleared":
-
-  ```typescript
-  // WRONG: wipes existing value when field is omitted
-  soul: soul || null,
-
-  // RIGHT: preserves existing value when field is omitted
-  soul: soul !== undefined ? (soul || null) : (existing?.soul ?? null),
-  ```
-
-- Only set a field to `null` when the caller explicitly passes `null` (or an empty string that should clear the field).
-- For handlers that accept partial updates, fetch the existing record first and merge provided fields over it.
-- When adding new columns to a table, also update: (1) archive/history triggers, (2) history response mappings, (3) restore handlers.
+- Strict TypeScript, avoid `any`. Use Zod for runtime validation.
+- One class/module per file. Co-locate tests (`*.test.ts`).
+- **Upsert safety**: never set optional fields to `null` just because they weren't provided. Use `undefined` checks to distinguish "not provided" from "explicitly cleared". When adding new columns, also update archive/history triggers, history response mappings, and restore handlers.
 
 ## Environment Variables
 
@@ -453,49 +418,13 @@ npx @modelcontextprotocol/inspector packages/api/dist/index.js
 
 When we refer to "specs" in this project, we mean **PCP artifacts** — versioned documents stored in Supabase and managed via the `create_artifact` / `update_artifact` / `get_artifact` MCP tools. They are NOT local markdown files. To view or update a spec, use the artifact tools with the artifact's UUID or URI (e.g., `pcp://specs/agent-orchestrator`).
 
-## Pull Request Convention
+## Pull Requests & Git
 
-When an SB creates or significantly contributes to a PR, attribute it in the title:
+Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key SB-specific reminders:
 
-```
-feat: add web chat interface (by Wren)
-fix: resolve kindle token expiry (by Lumen)
-```
-
-The `(by <name>)` suffix goes at the end of the title, after the conventional commit description. This makes it easy to see at a glance who worked on what in the PR list.
-
-In the PR body, use the standard format:
-
-```markdown
-## Summary
-
-- <bullet points>
-
-## Test plan
-
-- [ ] <checklist>
-
-Generated with [Claude Code](https://claude.com/claude-code)
-```
-
-Replace "Claude Code" with the appropriate tool if the SB used a different interface (e.g., Gemini CLI, Codex).
-
-### PR Reviews
-
-When leaving comments or reviews on a pull request, sign off with your agent name so other contributors know who said what. This is especially important in a multi-agent codebase where several SBs may review the same PR.
-
-```
-— Wren
-— Lumen
-```
-
-### Branching
-
-**Never set your upstream to `origin/main` from a non-main branch.** When pushing a feature branch, use `git push -u origin <your-branch-name>`. Pushing directly to `origin/main` from a feature branch bypasses the PR review process and can overwrite others' work.
-
-### Merging
-
-**Do not squash commits.** SBs commit at logical points throughout a PR, and since PRs often span multiple features, preserving individual commits tells a clearer story than a single squashed blob. Use **merge commit** (not squash or rebase) when merging PRs.
+- **Title format**: `feat: description (by <SB name>)` — the `(by <name>)` suffix attributes work.
+- **Sign reviews**: end PR comments with `— Wren`, `— Lumen`, etc.
+- **Never push directly to main** from a feature branch. Always use PRs.
 
 ## Architecture Notes
 
