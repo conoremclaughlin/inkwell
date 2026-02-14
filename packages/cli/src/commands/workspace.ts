@@ -29,6 +29,7 @@ import {
 } from 'fs';
 import { join, dirname, basename } from 'path';
 import { homedir } from 'os';
+import { installHooks } from './hooks.js';
 
 interface WorkspaceIdentity {
   agentId: string;
@@ -455,6 +456,10 @@ async function createWorkspace(
 
     writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
 
+    // Auto-install PCP hooks
+    spinner.text = 'Installing PCP hooks...';
+    const { result: hooksResult, backend: hooksBackend } = installHooks(wsPath);
+
     spinner.succeed(`Studio created: ${name}`);
     console.log('');
     console.log(chalk.dim('  Path:   ') + wsPath);
@@ -462,6 +467,11 @@ async function createWorkspace(
     console.log(chalk.dim('  Agent:  ') + identity.agentId);
     if (configDirsList.length > 0) {
       console.log(chalk.dim('  Config: ') + configDirsList.join(', '));
+    }
+    if (hooksResult === 'installed') {
+      console.log(chalk.dim('  Hooks:  ') + `${hooksBackend.name} (installed)`);
+    } else if (hooksResult === 'already-installed') {
+      console.log(chalk.dim('  Hooks:  ') + `${hooksBackend.name} (already installed)`);
     }
     console.log('');
     console.log(chalk.cyan('To start working:'));

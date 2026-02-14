@@ -151,3 +151,6 @@ vite.config.ts.timestamp-*
 
 # Local PCP identity should be machine/user-specific
 .pcp/identity.json
+
+# PCP hook runtime state (transient, per-session)
+.pcp/runtime/
