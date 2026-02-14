@@ -2612,6 +2612,7 @@ export type Database = {
           email: string | null;
           first_name: string | null;
           id: string;
+          last_login_at: string | null;
           last_name: string | null;
           phone_number: string | null;
           preferences: Json | null;
@@ -2628,6 +2629,7 @@ export type Database = {
           email?: string | null;
           first_name?: string | null;
           id?: string;
+          last_login_at?: string | null;
           last_name?: string | null;
           phone_number?: string | null;
           preferences?: Json | null;
@@ -2644,6 +2646,7 @@ export type Database = {
           email?: string | null;
           first_name?: string | null;
           id?: string;
+          last_login_at?: string | null;
           last_name?: string | null;
           phone_number?: string | null;
           preferences?: Json | null;

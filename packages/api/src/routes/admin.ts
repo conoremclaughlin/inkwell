@@ -17,6 +17,8 @@ import { env } from '../config/env';
 import { runWithRequestContext } from '../utils/request-context';
 import { getDataComposer } from '../data/composer';
 import crypto from 'crypto';
+import type { WorkspaceMemberRole } from '../data/repositories/workspace-containers.repository';
+import { slugifyWorkspaceName } from '../utils/workspace-slug';
 
 // WhatsApp listener reference (set via setWhatsAppListener)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -26,6 +28,7 @@ type AdminAuthRequest = Request & {
   user: { email?: string | null };
   pcpUserId: string;
   pcpWorkspaceId: string;
+  pcpWorkspaceRole: WorkspaceMemberRole | 'trusted';
 };
 
 type CommentAuthorUser = {
@@ -34,6 +37,8 @@ type CommentAuthorUser = {
   username: string | null;
   email: string | null;
 };
+
+const LAST_LOGIN_UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 function formatCommentAuthorUserName(user: CommentAuthorUser | null): string | null {
   if (!user) return null;
@@ -73,7 +78,9 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     const token = authHeader.substring(7);
 
     // Verify the JWT with Supabase
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
     const {
       data: { user },
       error,
@@ -84,16 +91,68 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       return;
     }
 
-    // Look up the PCP user by email
-    const { data: pcpUser } = await supabase
+    // Look up (or create) PCP user by email.
+    // For newly signed-up users, this auto-provisions PCP identity on first authenticated request.
+    const normalizedEmail = user.email?.toLowerCase() ?? null;
+    let { data: pcpUser } = await supabase
       .from('users')
-      .select('id, telegram_id, whatsapp_id')
-      .eq('email', user.email)
+      .select('id, telegram_id, whatsapp_id, last_login_at')
+      .eq('email', normalizedEmail)
       .single();
 
     if (!pcpUser) {
-      res.status(403).json({ error: 'User not found in PCP system' });
-      return;
+      if (!normalizedEmail) {
+        res.status(403).json({ error: 'User email not available for PCP provisioning' });
+        return;
+      }
+
+      const { data: createdUser, error: createUserError } = await supabase
+        .from('users')
+        .insert({ email: normalizedEmail })
+        .select('id, telegram_id, whatsapp_id, last_login_at')
+        .single();
+
+      if (createUserError) {
+        // Handle race where parallel requests created the PCP user first.
+        const { data: racedUser } = await supabase
+          .from('users')
+          .select('id, telegram_id, whatsapp_id, last_login_at')
+          .eq('email', normalizedEmail)
+          .single();
+
+        if (!racedUser) {
+          logger.error('Failed to auto-provision PCP user during admin auth', {
+            email: normalizedEmail,
+            error: createUserError.message,
+          });
+          res.status(500).json({ error: 'Failed to provision PCP user' });
+          return;
+        }
+
+        pcpUser = racedUser;
+      } else {
+        pcpUser = createdUser;
+      }
+    }
+
+    const lastLoginAtMs = pcpUser.last_login_at ? new Date(pcpUser.last_login_at).getTime() : NaN;
+    const shouldUpdateLastLoginAt =
+      !pcpUser.last_login_at ||
+      Number.isNaN(lastLoginAtMs) ||
+      Date.now() - lastLoginAtMs >= LAST_LOGIN_UPDATE_INTERVAL_MS;
+
+    if (shouldUpdateLastLoginAt) {
+      const loginTimestamp = new Date().toISOString();
+      const { error: loginUpdateError } = await supabase
+        .from('users')
+        .update({ last_login_at: loginTimestamp })
+        .eq('id', pcpUser.id);
+      if (loginUpdateError) {
+        logger.warn('Failed to update users.last_login_at during admin auth', {
+          userId: pcpUser.id,
+          error: loginUpdateError.message,
+        });
+      }
     }
 
     // Resolve active workspace container from header (or default to personal).
@@ -101,35 +160,65 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     const workspaceRepo = dataComposer.repositories.workspaceContainers;
     const requestedWorkspaceId = req.header('x-pcp-workspace-id')?.trim();
 
-    // Ensure every user always has at least one workspace container.
-    const personalWorkspace = await workspaceRepo.ensurePersonalWorkspace(pcpUser.id);
+    const hasTrustedAdminAccess = async (workspaceId: string): Promise<boolean> => {
+      const authService = getAuthorizationService();
+      const trustedUsers = await authService.listTrustedUsers(undefined, workspaceId);
 
-    let activeWorkspaceId = personalWorkspace.id;
+      return trustedUsers.some((tu) => {
+        if (tu.trustLevel === 'member') return false;
+        if (tu.userId === pcpUser.id) return true;
+        if (tu.platform === 'telegram' && pcpUser.telegram_id?.toString() === tu.platformUserId) {
+          return true;
+        }
+        if (tu.platform === 'whatsapp' && pcpUser.whatsapp_id === tu.platformUserId) {
+          return true;
+        }
+        return false;
+      });
+    };
+
+    let activeWorkspaceId = '';
+    let activeWorkspaceRole: WorkspaceMemberRole | 'trusted' = 'trusted';
+    let hasDirectMembership = false;
+
     if (requestedWorkspaceId) {
       const requestedWorkspace = await workspaceRepo.findById(requestedWorkspaceId, pcpUser.id);
-      if (!requestedWorkspace) {
-        res.status(403).json({ error: 'Workspace not found or not accessible' });
-        return;
+      if (requestedWorkspace) {
+        activeWorkspaceId = requestedWorkspace.id;
+        hasDirectMembership = true;
+      } else {
+        const requestedWorkspaceExists = await workspaceRepo.findRawById(requestedWorkspaceId);
+        if (!requestedWorkspaceExists) {
+          res.status(404).json({ error: 'Workspace not found' });
+          return;
+        }
+
+        const trustedForRequestedWorkspace = await hasTrustedAdminAccess(requestedWorkspaceId);
+        if (!trustedForRequestedWorkspace) {
+          res.status(403).json({ error: 'Workspace not found or not accessible' });
+          return;
+        }
+
+        activeWorkspaceId = requestedWorkspaceId;
+        activeWorkspaceRole = 'trusted';
       }
-      activeWorkspaceId = requestedWorkspace.id;
+    } else {
+      // Ensure every user always has at least one workspace container.
+      const personalWorkspace = await workspaceRepo.ensurePersonalWorkspace(pcpUser.id);
+      activeWorkspaceId = personalWorkspace.id;
+      hasDirectMembership = true;
     }
 
-    // Check trusted-user access at the selected workspace scope.
-    const authService = getAuthorizationService();
-    const trustedUsers = await authService.listTrustedUsers(undefined, activeWorkspaceId);
+    if (!hasDirectMembership) {
+      const trustedForActiveWorkspace = await hasTrustedAdminAccess(activeWorkspaceId);
+      if (!trustedForActiveWorkspace) {
+        res.status(403).json({ error: 'Insufficient permissions' });
+        return;
+      }
+    }
 
-    const isTrusted = trustedUsers.some((tu) => {
-      if (tu.trustLevel === 'member') return false;
-      if (tu.userId === pcpUser.id) return true;
-      if (tu.platform === 'telegram' && pcpUser.telegram_id?.toString() === tu.platformUserId)
-        return true;
-      if (tu.platform === 'whatsapp' && pcpUser.whatsapp_id === tu.platformUserId) return true;
-      return false;
-    });
-
-    if (!isTrusted) {
-      res.status(403).json({ error: 'Insufficient permissions' });
-      return;
+    if (hasDirectMembership) {
+      activeWorkspaceRole = 'member';
     }
 
     // Attach user + PCP context to request
@@ -137,10 +226,12 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       user: typeof user;
       pcpUserId: string;
       pcpWorkspaceId: string;
+      pcpWorkspaceRole: WorkspaceMemberRole | 'trusted';
     };
     authReq.user = user;
     authReq.pcpUserId = pcpUser.id;
     authReq.pcpWorkspaceId = activeWorkspaceId;
+    authReq.pcpWorkspaceRole = activeWorkspaceRole || 'trusted';
 
     // Wrap the rest of the request in context
     runWithRequestContext(
@@ -175,17 +266,23 @@ router.get('/workspaces', async (req: Request, res: Response) => {
     const authReq = req as AdminAuthRequest;
     const dataComposer = await getDataComposer();
     const workspaceRepo = dataComposer.repositories.workspaceContainers;
-    const workspaces = await workspaceRepo.listByUser(authReq.pcpUserId, {
+    const workspaces = await workspaceRepo.listMembershipsByUser(authReq.pcpUserId, {
       includeArchived: false,
     });
 
+    const currentWorkspaceMembership = workspaces.find((workspace) => workspace.id === authReq.pcpWorkspaceId);
+    const currentWorkspaceRole = currentWorkspaceMembership?.role || authReq.pcpWorkspaceRole;
+
     res.json({
       currentWorkspaceId: authReq.pcpWorkspaceId,
+      currentWorkspaceRole,
       workspaces: workspaces.map((w) => ({
         id: w.id,
         name: w.name,
         slug: w.slug,
         type: w.type,
+        role: w.role,
+        membershipCreatedAt: w.membershipCreatedAt,
         description: w.description,
         metadata: w.metadata,
         createdAt: w.createdAt,
@@ -196,6 +293,187 @@ router.get('/workspaces', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to list workspace containers:', error);
     res.status(500).json({ error: 'Failed to list workspace containers' });
+  }
+});
+
+/**
+ * POST /api/admin/workspaces
+ * Create a new workspace container and make the caller owner.
+ */
+router.post('/workspaces', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const dataComposer = await getDataComposer();
+    const workspaceRepo = dataComposer.repositories.workspaceContainers;
+
+    const rawName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    if (!rawName) {
+      res.status(400).json({ error: 'name is required' });
+      return;
+    }
+
+    const rawType = req.body?.type;
+    const workspaceType = rawType === 'team' ? 'team' : 'personal';
+    const workspaceDescription =
+      typeof req.body?.description === 'string' && req.body.description.trim()
+        ? req.body.description.trim()
+        : undefined;
+    const workspaceSlug =
+      typeof req.body?.slug === 'string' && req.body.slug.trim()
+        ? slugifyWorkspaceName(req.body.slug)
+        : slugifyWorkspaceName(rawName);
+
+    const createdWorkspace = await workspaceRepo.create({
+      userId: authReq.pcpUserId,
+      name: rawName,
+      slug: workspaceSlug,
+      type: workspaceType,
+      description: workspaceDescription,
+    });
+
+    await workspaceRepo.addMember(createdWorkspace.id, authReq.pcpUserId, 'owner');
+
+    res.status(201).json({
+      workspace: {
+        id: createdWorkspace.id,
+        name: createdWorkspace.name,
+        slug: createdWorkspace.slug,
+        type: createdWorkspace.type,
+        role: 'owner',
+        description: createdWorkspace.description,
+        metadata: createdWorkspace.metadata,
+        createdAt: createdWorkspace.createdAt,
+        updatedAt: createdWorkspace.updatedAt,
+        archivedAt: createdWorkspace.archivedAt,
+      },
+    });
+  } catch (error) {
+    logger.error('Failed to create workspace container:', error);
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    if (message.toLowerCase().includes('duplicate')) {
+      res.status(409).json({ error: 'A workspace with that slug already exists for this owner' });
+      return;
+    }
+    res.status(500).json({ error: 'Failed to create workspace container' });
+  }
+});
+
+/**
+ * GET /api/admin/workspaces/:workspaceId/members
+ * List collaborators for a workspace.
+ */
+router.get('/workspaces/:workspaceId/members', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const dataComposer = await getDataComposer();
+    const workspaceRepo = dataComposer.repositories.workspaceContainers;
+    const workspaceId = req.params.workspaceId;
+
+    const workspace = await workspaceRepo.findById(workspaceId, authReq.pcpUserId);
+    if (!workspace) {
+      res.status(404).json({ error: 'Workspace not found or not accessible' });
+      return;
+    }
+
+    const canManage = await workspaceRepo.canManageWorkspace(workspaceId, authReq.pcpUserId);
+    const members = await workspaceRepo.listMembersWithUsers(workspaceId);
+
+    res.json({
+      workspace: {
+        id: workspace.id,
+        name: workspace.name,
+        slug: workspace.slug,
+        type: workspace.type,
+      },
+      canManage,
+      members: members.map((member) => ({
+        id: member.id,
+        userId: member.userId,
+        role: member.role,
+        createdAt: member.createdAt,
+        user: member.user,
+      })),
+    });
+  } catch (error) {
+    logger.error('Failed to list workspace members:', error);
+    res.status(500).json({ error: 'Failed to list workspace members' });
+  }
+});
+
+/**
+ * POST /api/admin/workspaces/:workspaceId/members
+ * Invite/add collaborator by email to workspace.
+ */
+router.post('/workspaces/:workspaceId/members', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const dataComposer = await getDataComposer();
+    const workspaceRepo = dataComposer.repositories.workspaceContainers;
+    const usersRepo = dataComposer.repositories.users;
+    const workspaceId = req.params.workspaceId;
+
+    const workspace = await workspaceRepo.findById(workspaceId, authReq.pcpUserId);
+    if (!workspace) {
+      res.status(404).json({ error: 'Workspace not found or not accessible' });
+      return;
+    }
+
+    const canManage = await workspaceRepo.canManageWorkspace(workspaceId, authReq.pcpUserId);
+    if (!canManage) {
+      res.status(403).json({ error: 'Only workspace owners/admins can invite collaborators' });
+      return;
+    }
+    const actingRole = await workspaceRepo.getMemberRole(workspaceId, authReq.pcpUserId);
+
+    const rawEmail = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    if (!rawEmail || !rawEmail.includes('@')) {
+      res.status(400).json({ error: 'A valid email is required' });
+      return;
+    }
+
+    const rawRole = typeof req.body?.role === 'string' ? req.body.role : 'member';
+    const allowedRoles: WorkspaceMemberRole[] = ['owner', 'admin', 'member', 'viewer'];
+    const memberRole: WorkspaceMemberRole = allowedRoles.includes(rawRole as WorkspaceMemberRole)
+      ? (rawRole as WorkspaceMemberRole)
+      : 'member';
+    if (memberRole === 'owner' && actingRole !== 'owner') {
+      res.status(403).json({ error: 'Only workspace owners can grant owner role' });
+      return;
+    }
+
+    let inviteeUser = await usersRepo.findByEmail(rawEmail);
+    let userWasCreated = false;
+
+    if (!inviteeUser) {
+      inviteeUser = await usersRepo.create({
+        email: rawEmail,
+      });
+      userWasCreated = true;
+      await workspaceRepo.ensurePersonalWorkspace(inviteeUser.id);
+    }
+
+    const membership = await workspaceRepo.addMember(workspaceId, inviteeUser.id, memberRole);
+
+    res.status(201).json({
+      member: {
+        id: membership.id,
+        workspaceId: membership.workspaceId,
+        userId: membership.userId,
+        role: membership.role,
+        createdAt: membership.createdAt,
+        user: {
+          id: inviteeUser.id,
+          email: inviteeUser.email,
+          firstName: inviteeUser.first_name,
+          username: inviteeUser.username,
+          lastLoginAt: inviteeUser.last_login_at,
+        },
+        userWasCreated,
+      },
+    });
+  } catch (error) {
+    logger.error('Failed to add workspace member:', error);
+    res.status(500).json({ error: 'Failed to add workspace member' });
   }
 });
 

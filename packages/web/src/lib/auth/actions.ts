@@ -2,6 +2,7 @@
 
 import { redirect } from 'next/navigation';
 import { createClient } from '@/lib/supabase/server';
+import { provisionPcpUserAndWorkspace } from '@/lib/auth/provision';
 
 type AuthResult = { success: true } | { error: string } | { mcpRedirectUrl: string };
 
@@ -19,6 +20,10 @@ export async function signInWithPassword(
 
   if (error) {
     return { error: error.message };
+  }
+
+  if (data.session?.access_token) {
+    await provisionPcpUserAndWorkspace(data.session.access_token);
   }
 
   // MCP OAuth flow: build callback URL with tokens

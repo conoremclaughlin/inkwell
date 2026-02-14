@@ -27,6 +27,36 @@ export async function updateSession(request: NextRequest) {
     }
   );
 
+  const path = request.nextUrl.pathname;
+  const isProxiedApiRoute = path.startsWith('/api/') && !path.startsWith('/api/auth/');
+
+  // Fast-path for proxied API routes: inject bearer token only.
+  // Skip getUser() to avoid duplicate Supabase round-trips on every API request.
+  if (isProxiedApiRoute) {
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+    if (session?.access_token) {
+      const requestHeaders = new Headers(request.headers);
+      requestHeaders.set('Authorization', `Bearer ${session.access_token}`);
+
+      const response = NextResponse.next({
+        request: {
+          headers: requestHeaders,
+        },
+      });
+
+      // Copy session-refresh cookies from supabaseResponse
+      supabaseResponse.cookies.getAll().forEach((cookie) => {
+        response.cookies.set(cookie.name, cookie.value, cookie);
+      });
+
+      return response;
+    }
+
+    return supabaseResponse;
+  }
+
   // IMPORTANT: Avoid writing any logic between createServerClient and
   // supabase.auth.getUser(). A simple mistake could make it very hard to debug
   // issues with users being randomly logged out.
@@ -91,33 +121,6 @@ export async function updateSession(request: NextRequest) {
     const url = request.nextUrl.clone();
     url.pathname = '/';
     return NextResponse.redirect(url);
-  }
-
-  // Inject auth header for proxied API routes (admin, chat, kindle)
-  // Skip /api/auth/* (internal Next.js routes, not proxied)
-  const path = request.nextUrl.pathname;
-  if (path.startsWith('/api/') && !path.startsWith('/api/auth/')) {
-    const {
-      data: { session },
-    } = await supabase.auth.getSession();
-    if (session?.access_token) {
-      // Clone the request headers and add Authorization
-      const requestHeaders = new Headers(request.headers);
-      requestHeaders.set('Authorization', `Bearer ${session.access_token}`);
-
-      const response = NextResponse.next({
-        request: {
-          headers: requestHeaders,
-        },
-      });
-
-      // Copy session-refresh cookies from supabaseResponse
-      supabaseResponse.cookies.getAll().forEach((cookie) => {
-        response.cookies.set(cookie.name, cookie.value, cookie);
-      });
-
-      return response;
-    }
   }
 
   return supabaseResponse;

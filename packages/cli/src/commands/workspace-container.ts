@@ -1,5 +1,5 @@
 /**
- * Workspace Container Commands
+ * Workspace Commands
  *
  * Manage product-level workspaces (personal/team scope).
  * These are distinct from local git worktree studios (`sb studio ...`).
@@ -23,6 +23,7 @@ interface WorkspaceContainer {
   name: string;
   slug: string;
   type: 'personal' | 'team';
+  role?: 'owner' | 'admin' | 'member' | 'viewer';
   description?: string | null;
   archivedAt?: string | null;
 }
@@ -136,19 +137,20 @@ async function listWorkspaceContainers(options: {
   }
 
   if (workspaces.length === 0) {
-    console.log(chalk.yellow('No workspace containers found.'));
+    console.log(chalk.yellow('No workspaces found.'));
     return;
   }
 
-  console.log(chalk.bold('\nWorkspace Containers:\n'));
+  console.log(chalk.bold('\nWorkspaces:\n'));
 
   for (const workspace of workspaces) {
     const selected = config.workspaceId === workspace.id;
     const marker = selected ? chalk.green('●') : chalk.dim('○');
     const type = workspace.type === 'team' ? chalk.blue('team') : chalk.gray('personal');
+    const role = workspace.role ? chalk.magenta(workspace.role) : chalk.dim('member');
 
     console.log(
-      `  ${marker} ${chalk.cyan(workspace.name)} ${chalk.dim(`(${workspace.slug})`)} ${type}`
+      `  ${marker} ${chalk.cyan(workspace.name)} ${chalk.dim(`(${workspace.slug})`)} ${type} ${role}`
     );
     console.log(chalk.dim(`      id: ${workspace.id}`));
     if (workspace.description) {
@@ -206,6 +208,220 @@ async function useWorkspaceContainer(workspaceRef: string): Promise<void> {
   console.log(chalk.dim(`  id: ${match.id}`));
 }
 
+async function resolveWorkspaceByRef(
+  workspaceRef: string,
+  config: PcpConfig
+): Promise<WorkspaceContainer> {
+  const response = await fetchPcp('/api/mcp/call', {
+    method: 'POST',
+    body: JSON.stringify({
+      tool: 'list_workspace_containers',
+      args: {
+        email: config.email,
+        includeArchived: false,
+        ensurePersonal: true,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to list workspaces: ${await response.text()}`);
+  }
+
+  const raw = (await response.json()) as unknown;
+  const parsed = unwrapToolResult(raw);
+  const workspaces = Array.isArray(parsed.workspaces)
+    ? (parsed.workspaces as WorkspaceContainer[])
+    : [];
+  const match = workspaces.find((workspace) => workspace.id === workspaceRef || workspace.slug === workspaceRef);
+
+  if (!match) {
+    throw new Error(`Workspace not found: ${workspaceRef}`);
+  }
+
+  return match;
+}
+
+async function createWorkspaceContainer(
+  name: string,
+  options: { type?: 'personal' | 'team'; description?: string; slug?: string; use?: boolean }
+): Promise<void> {
+  const config = getPcpConfig();
+  if (!config?.email) {
+    console.error(chalk.red('PCP not configured. Run: sb init'));
+    process.exit(1);
+  }
+
+  const response = await fetchPcp('/api/mcp/call', {
+    method: 'POST',
+    body: JSON.stringify({
+      tool: 'create_workspace_container',
+      args: {
+        email: config.email,
+        name,
+        type: options.type || 'team',
+        description: options.description,
+        slug: options.slug,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    console.error(chalk.red(`Failed to create workspace: ${await response.text()}`));
+    process.exit(1);
+  }
+
+  const raw = (await response.json()) as unknown;
+  const parsed = unwrapToolResult(raw);
+  const workspace = parsed.workspace as WorkspaceContainer | undefined;
+
+  if (!workspace?.id) {
+    console.error(chalk.red('Workspace creation failed'));
+    process.exit(1);
+  }
+
+  if (options.use) {
+    savePcpConfig({
+      ...config,
+      workspaceId: workspace.id,
+    });
+  }
+
+  console.log(chalk.green(`Created workspace: ${workspace.name} (${workspace.slug})`));
+  console.log(chalk.dim(`  id: ${workspace.id}`));
+  if (options.use) {
+    console.log(chalk.cyan('Selected as active workspace.'));
+  }
+}
+
+async function inviteWorkspaceMember(
+  workspaceRef: string,
+  inviteeEmail: string,
+  options: { role?: 'owner' | 'admin' | 'member' | 'viewer' }
+): Promise<void> {
+  const config = getPcpConfig();
+  if (!config?.email) {
+    console.error(chalk.red('PCP not configured. Run: sb init'));
+    process.exit(1);
+  }
+
+  let targetWorkspace: WorkspaceContainer;
+  try {
+    targetWorkspace = await resolveWorkspaceByRef(workspaceRef, config);
+  } catch (error) {
+    console.error(chalk.red(error instanceof Error ? error.message : 'Workspace lookup failed'));
+    process.exit(1);
+  }
+
+  const response = await fetchPcp('/api/mcp/call', {
+    method: 'POST',
+    body: JSON.stringify({
+      tool: 'add_workspace_member',
+      args: {
+        email: config.email,
+        workspaceId: targetWorkspace.id,
+        inviteeEmail,
+        role: options.role || 'member',
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    console.error(chalk.red(`Failed to invite member: ${await response.text()}`));
+    process.exit(1);
+  }
+
+  const raw = (await response.json()) as unknown;
+  const parsed = unwrapToolResult(raw);
+
+  if (parsed.success === false) {
+    console.error(chalk.red(`Failed to invite member: ${String(parsed.error || 'unknown error')}`));
+    process.exit(1);
+  }
+
+  const member = parsed.member as
+    | { role?: string; user?: { email?: string | null }; userWasCreated?: boolean }
+    | undefined;
+  console.log(
+    chalk.green(
+      `Added ${member?.user?.email || inviteeEmail} to ${targetWorkspace.name} as ${member?.role || options.role || 'member'}`
+    )
+  );
+  if (member?.userWasCreated) {
+    console.log(chalk.dim('Created placeholder PCP user for this email (will activate on first login).'));
+  }
+}
+
+async function listWorkspaceMembers(workspaceRef?: string): Promise<void> {
+  const config = getPcpConfig();
+  if (!config?.email) {
+    console.error(chalk.red('PCP not configured. Run: sb init'));
+    process.exit(1);
+  }
+
+  const targetRef = workspaceRef || config.workspaceId;
+  if (!targetRef) {
+    console.error(chalk.red('No workspace selected. Pass <id-or-slug> or run `sb workspace use` first.'));
+    process.exit(1);
+  }
+
+  let targetWorkspace: WorkspaceContainer;
+  try {
+    targetWorkspace = await resolveWorkspaceByRef(targetRef, config);
+  } catch (error) {
+    console.error(chalk.red(error instanceof Error ? error.message : 'Workspace lookup failed'));
+    process.exit(1);
+  }
+
+  const response = await fetchPcp('/api/mcp/call', {
+    method: 'POST',
+    body: JSON.stringify({
+      tool: 'get_workspace_container',
+      args: {
+        email: config.email,
+        workspaceId: targetWorkspace.id,
+        includeMembers: true,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    console.error(chalk.red(`Failed to list workspace members: ${await response.text()}`));
+    process.exit(1);
+  }
+
+  const raw = (await response.json()) as unknown;
+  const parsed = unwrapToolResult(raw);
+  const members = Array.isArray((parsed.workspace as { members?: unknown[] } | undefined)?.members)
+    ? ((parsed.workspace as { members?: unknown[] }).members as Array<{
+        role?: string;
+        user?: {
+          email?: string | null;
+          firstName?: string | null;
+          username?: string | null;
+          lastLoginAt?: string | null;
+        };
+        userId?: string;
+      }>)
+    : [];
+
+  console.log(chalk.bold(`\nMembers — ${targetWorkspace.name}\n`));
+  if (members.length === 0) {
+    console.log(chalk.yellow('No members found.'));
+    return;
+  }
+
+  for (const member of members) {
+    const label =
+      member.user?.firstName || member.user?.username || member.user?.email || member.userId || 'unknown';
+    const joinedLabel = member.user?.lastLoginAt ? 'joined' : 'invited';
+    console.log(
+      `  ${chalk.cyan(label)} ${chalk.dim(`(${member.role || 'member'})`)} ${chalk.gray(`[${joinedLabel}]`)}`
+    );
+  }
+  console.log('');
+}
+
 function currentWorkspaceContainer(): void {
   const config = getPcpConfig();
   if (!config) {
@@ -225,7 +441,7 @@ function currentWorkspaceContainer(): void {
 export function registerWorkspaceContainerCommands(program: Command): void {
   const workspace = program
     .command('workspace')
-    .description('Product workspace container management (personal/team scope)');
+    .description('Workspace management (personal/team scope)');
 
   workspace
     .command('list')
@@ -237,11 +453,35 @@ export function registerWorkspaceContainerCommands(program: Command): void {
 
   workspace
     .command('use <workspace-id-or-slug>')
-    .description('Select the active workspace container for this machine')
+    .description('Select the active workspace for this machine')
     .action(useWorkspaceContainer);
 
   workspace
+    .command('create <name>')
+    .description('Create a new workspace container')
+    .option('--type <type>', 'Workspace type (personal|team)', 'team')
+    .option('--description <description>', 'Workspace description')
+    .option('--slug <slug>', 'Workspace slug')
+    .option('--use', 'Select the created workspace after creation')
+    .action((name, options: { type?: 'personal' | 'team'; description?: string; slug?: string; use?: boolean }) =>
+      createWorkspaceContainer(name, options)
+    );
+
+  workspace
+    .command('invite <workspace-id-or-slug> <email>')
+    .description('Invite/add a collaborator to a workspace')
+    .option('--role <role>', 'Role (owner|admin|member|viewer)', 'member')
+    .action((workspaceRef, inviteeEmail, options: { role?: 'owner' | 'admin' | 'member' | 'viewer' }) =>
+      inviteWorkspaceMember(workspaceRef, inviteeEmail, options)
+    );
+
+  workspace
+    .command('members [workspace-id-or-slug]')
+    .description('List collaborators in a workspace')
+    .action(listWorkspaceMembers);
+
+  workspace
     .command('current')
-    .description('Print selected workspace container ID')
+    .description('Print selected workspace ID')
     .action(currentWorkspaceContainer);
 }
