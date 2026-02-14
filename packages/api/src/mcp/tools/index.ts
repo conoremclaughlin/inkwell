@@ -223,10 +223,12 @@ import {
   handleListWorkspaceContainers,
   handleGetWorkspaceContainer,
   handleUpdateWorkspaceContainer,
+  handleAddWorkspaceMember,
   createWorkspaceContainerSchema,
   listWorkspaceContainersSchema,
   getWorkspaceContainerSchema,
   updateWorkspaceContainerSchema,
+  addWorkspaceMemberSchema,
 } from './workspace-container-handlers';
 
 import { handleCreateKindleToken, createKindleTokenSchema } from './kindle-handlers';
@@ -4128,6 +4130,36 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleUpdateWorkspaceContainer(args, dataComposer);
       } catch (error) {
         logger.error('Error in update_workspace_container:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'add_workspace_member',
+    {
+      description: `Invite/add a collaborator to a workspace container by email.
+Creates a placeholder PCP user if needed, then grants workspace membership.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: addWorkspaceMemberSchema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleAddWorkspaceMember(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in add_workspace_member:', error);
         return {
           content: [
             {

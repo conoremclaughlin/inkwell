@@ -7,10 +7,14 @@
 import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
-import type { WorkspaceContainerType } from '../../data/repositories/workspace-containers.repository';
+import type {
+  WorkspaceContainerType,
+  WorkspaceMemberRole,
+} from '../../data/repositories/workspace-containers.repository';
 import type { Json } from '../../data/supabase/types';
 
 const workspaceContainerTypeSchema = z.enum(['personal', 'team']);
+const workspaceMemberRoleSchema = z.enum(['owner', 'admin', 'member', 'viewer']);
 
 export const createWorkspaceContainerSchema = userIdentifierBaseSchema.extend({
   name: z.string().min(1).describe('Workspace display name (e.g., "Personal", "PCP Team")'),
@@ -38,18 +42,24 @@ export const listWorkspaceContainersSchema = userIdentifierBaseSchema.extend({
 });
 
 export const getWorkspaceContainerSchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().describe('Workspace container UUID'),
+  workspaceId: z.string().uuid().describe('Workspace UUID'),
   includeMembers: z.boolean().optional().default(false).describe('Include workspace members'),
 });
 
 export const updateWorkspaceContainerSchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().describe('Workspace container UUID'),
+  workspaceId: z.string().uuid().describe('Workspace UUID'),
   name: z.string().min(1).optional(),
   slug: z.string().min(1).optional(),
   type: workspaceContainerTypeSchema.optional(),
   description: z.string().nullable().optional(),
   metadata: z.record(z.unknown()).optional(),
   archived: z.boolean().optional().describe('Set true to archive, false to unarchive'),
+});
+
+export const addWorkspaceMemberSchema = userIdentifierBaseSchema.extend({
+  workspaceId: z.string().uuid().describe('Workspace UUID'),
+  inviteeEmail: z.string().email().describe('Email address of collaborator to add'),
+  role: workspaceMemberRoleSchema.optional().default('member'),
 });
 
 function slugify(name: string): string {
@@ -65,6 +75,13 @@ function slugify(name: string): string {
 function successResponse(data: Record<string, unknown>) {
   return {
     content: [{ type: 'text' as const, text: JSON.stringify({ success: true, ...data }) }],
+  };
+}
+
+function errorResponse(message: string) {
+  return {
+    content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: message }) }],
+    isError: true,
   };
 }
 
@@ -112,7 +129,7 @@ export async function handleListWorkspaceContainers(args: unknown, dataComposer:
     await dataComposer.repositories.workspaceContainers.ensurePersonalWorkspace(user.id);
   }
 
-  const workspaces = await dataComposer.repositories.workspaceContainers.listByUser(user.id, {
+  const workspaces = await dataComposer.repositories.workspaceContainers.listMembershipsByUser(user.id, {
     type: params.type as WorkspaceContainerType | undefined,
     includeArchived: params.includeArchived,
   });
@@ -128,6 +145,8 @@ export async function handleListWorkspaceContainers(args: unknown, dataComposer:
       type: w.type,
       description: w.description,
       metadata: w.metadata,
+      role: w.role,
+      membershipCreatedAt: w.membershipCreatedAt,
       createdAt: w.createdAt,
       updatedAt: w.updatedAt,
       archivedAt: w.archivedAt,
@@ -156,7 +175,7 @@ export async function handleGetWorkspaceContainer(args: unknown, dataComposer: D
   }
 
   const members = params.includeMembers
-    ? await dataComposer.repositories.workspaceContainers.listMembers(workspace.id)
+    ? await dataComposer.repositories.workspaceContainers.listMembersWithUsers(workspace.id)
     : undefined;
 
   return successResponse({
@@ -177,6 +196,14 @@ export async function handleGetWorkspaceContainer(args: unknown, dataComposer: D
         userId: m.userId,
         role: m.role,
         createdAt: m.createdAt,
+        user: m.user
+          ? {
+              id: m.user.id,
+              email: m.user.email,
+              firstName: m.user.firstName,
+              username: m.user.username,
+            }
+          : null,
       })),
     },
   });
@@ -217,6 +244,66 @@ export async function handleUpdateWorkspaceContainer(args: unknown, dataComposer
       createdAt: updated.createdAt,
       updatedAt: updated.updatedAt,
       archivedAt: updated.archivedAt,
+    },
+  });
+}
+
+export async function handleAddWorkspaceMember(args: unknown, dataComposer: DataComposer) {
+  const params = addWorkspaceMemberSchema.parse(args);
+  const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
+
+  const workspace = await dataComposer.repositories.workspaceContainers.findById(
+    params.workspaceId,
+    user.id
+  );
+  if (!workspace) {
+    return errorResponse('Workspace not found or not accessible');
+  }
+
+  const canManage = await dataComposer.repositories.workspaceContainers.canManageWorkspace(
+    workspace.id,
+    user.id
+  );
+  if (!canManage) {
+    return errorResponse('Only workspace owners/admins can add collaborators');
+  }
+
+  const normalizedInviteeEmail = params.inviteeEmail.trim().toLowerCase();
+  let invitedUser = await dataComposer.repositories.users.findByEmail(normalizedInviteeEmail);
+  let userWasCreated = false;
+
+  if (!invitedUser) {
+    invitedUser = await dataComposer.repositories.users.create({
+      email: normalizedInviteeEmail,
+    });
+    userWasCreated = true;
+  }
+
+  const member = await dataComposer.repositories.workspaceContainers.addMember(
+    workspace.id,
+    invitedUser.id,
+    (params.role || 'member') as WorkspaceMemberRole
+  );
+
+  return successResponse({
+    user: { id: user.id, resolvedBy },
+    workspace: {
+      id: workspace.id,
+      name: workspace.name,
+      slug: workspace.slug,
+      type: workspace.type,
+    },
+    member: {
+      id: member.id,
+      workspaceId: member.workspaceId,
+      userId: member.userId,
+      role: member.role,
+      createdAt: member.createdAt,
+      user: {
+        id: invitedUser.id,
+        email: invitedUser.email,
+      },
+      userWasCreated,
     },
   });
 }

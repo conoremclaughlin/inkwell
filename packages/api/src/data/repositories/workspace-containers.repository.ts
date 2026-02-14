@@ -34,6 +34,22 @@ export interface WorkspaceMember {
   createdAt: string;
 }
 
+export interface WorkspaceMemberUser {
+  id: string;
+  email: string | null;
+  firstName: string | null;
+  username: string | null;
+}
+
+export interface WorkspaceMemberWithUser extends WorkspaceMember {
+  user: WorkspaceMemberUser | null;
+}
+
+export interface WorkspaceContainerMembership extends WorkspaceContainer {
+  role: WorkspaceMemberRole;
+  membershipCreatedAt: string;
+}
+
 export interface CreateWorkspaceContainerInput {
   userId: string;
   name: string;
@@ -80,6 +96,45 @@ export class WorkspaceContainersRepository {
     };
   }
 
+  async findRawById(id: string): Promise<WorkspaceContainer | null> {
+    const { data, error } = await this.client
+      .from('workspace_containers')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (error && error.code !== 'PGRST116') {
+      throw new Error(`Failed to find workspace container: ${error.message}`);
+    }
+
+    return data ? this.mapContainerRow(data as Record<string, unknown>) : null;
+  }
+
+  async findMembership(workspaceId: string, userId: string): Promise<WorkspaceMember | null> {
+    const { data, error } = await this.client
+      .from('workspace_members')
+      .select('*')
+      .eq('workspace_id', workspaceId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to find workspace membership: ${error.message}`);
+    }
+
+    return data ? this.mapMemberRow(data as Record<string, unknown>) : null;
+  }
+
+  async getMemberRole(workspaceId: string, userId: string): Promise<WorkspaceMemberRole | null> {
+    const membership = await this.findMembership(workspaceId, userId);
+    return membership?.role ?? null;
+  }
+
+  async canManageWorkspace(workspaceId: string, userId: string): Promise<boolean> {
+    const role = await this.getMemberRole(workspaceId, userId);
+    return role === 'owner' || role === 'admin';
+  }
+
   async create(input: CreateWorkspaceContainerInput): Promise<WorkspaceContainer> {
     const insertData: WorkspaceContainersTable['Insert'] = {
       user_id: input.userId,
@@ -104,31 +159,40 @@ export class WorkspaceContainersRepository {
   }
 
   async findById(id: string, userId: string): Promise<WorkspaceContainer | null> {
-    const { data, error } = await this.client
-      .from('workspace_containers')
-      .select('*')
-      .eq('id', id)
-      .eq('user_id', userId)
-      .single();
-
-    if (error && error.code !== 'PGRST116') {
-      throw new Error(`Failed to find workspace container: ${error.message}`);
+    const membership = await this.findMembership(id, userId);
+    if (!membership) {
+      return null;
     }
 
-    return data ? this.mapContainerRow(data as Record<string, unknown>) : null;
+    return this.findRawById(id);
   }
 
-  async listByUser(
+  async listMembershipsByUser(
     userId: string,
     opts?: {
       type?: WorkspaceContainerType;
       includeArchived?: boolean;
     }
-  ): Promise<WorkspaceContainer[]> {
+  ): Promise<WorkspaceContainerMembership[]> {
+    const { data: membershipRows, error: membershipError } = await this.client
+      .from('workspace_members')
+      .select('*')
+      .eq('user_id', userId);
+
+    if (membershipError) {
+      throw new Error(`Failed to list workspace memberships: ${membershipError.message}`);
+    }
+
+    const memberships = (membershipRows || []).map((row) => this.mapMemberRow(row as Record<string, unknown>));
+    if (memberships.length === 0) {
+      return [];
+    }
+
+    const workspaceIds = Array.from(new Set(memberships.map((membership) => membership.workspaceId)));
     let query = this.client
       .from('workspace_containers')
       .select('*')
-      .eq('user_id', userId)
+      .in('id', workspaceIds)
       .order('updated_at', { ascending: false });
 
     if (opts?.type) {
@@ -139,13 +203,56 @@ export class WorkspaceContainersRepository {
       query = query.is('archived_at', null);
     }
 
-    const { data, error } = await query;
-
-    if (error) {
-      throw new Error(`Failed to list workspace containers: ${error.message}`);
+    const { data: workspaceRows, error: workspaceError } = await query;
+    if (workspaceError) {
+      throw new Error(`Failed to list workspace containers: ${workspaceError.message}`);
     }
 
-    return (data || []).map((row) => this.mapContainerRow(row as Record<string, unknown>));
+    const workspaceById = new Map<string, WorkspaceContainer>();
+    for (const row of workspaceRows || []) {
+      const workspace = this.mapContainerRow(row as Record<string, unknown>);
+      workspaceById.set(workspace.id, workspace);
+    }
+
+    const membershipByWorkspaceId = new Map<string, WorkspaceMember>();
+    for (const membership of memberships) {
+      membershipByWorkspaceId.set(membership.workspaceId, membership);
+    }
+
+    const results: WorkspaceContainerMembership[] = [];
+    for (const workspace of workspaceById.values()) {
+      const membership = membershipByWorkspaceId.get(workspace.id);
+      if (!membership) continue;
+      results.push({
+        ...workspace,
+        role: membership.role,
+        membershipCreatedAt: membership.createdAt,
+      });
+    }
+
+    return results;
+  }
+
+  async listByUser(
+    userId: string,
+    opts?: {
+      type?: WorkspaceContainerType;
+      includeArchived?: boolean;
+    }
+  ): Promise<WorkspaceContainer[]> {
+    const memberships = await this.listMembershipsByUser(userId, opts);
+    return memberships.map((membership) => ({
+      id: membership.id,
+      userId: membership.userId,
+      name: membership.name,
+      slug: membership.slug,
+      type: membership.type,
+      description: membership.description,
+      metadata: membership.metadata,
+      createdAt: membership.createdAt,
+      updatedAt: membership.updatedAt,
+      archivedAt: membership.archivedAt,
+    }));
   }
 
   async update(
@@ -218,7 +325,10 @@ export class WorkspaceContainersRepository {
 
     const { data, error } = await this.client
       .from('workspace_members')
-      .insert(insertData)
+      .upsert(insertData, {
+        onConflict: 'workspace_id,user_id',
+        ignoreDuplicates: false,
+      })
       .select()
       .single();
 
@@ -241,5 +351,39 @@ export class WorkspaceContainersRepository {
     }
 
     return (data || []).map((row) => this.mapMemberRow(row as Record<string, unknown>));
+  }
+
+  async listMembersWithUsers(workspaceId: string): Promise<WorkspaceMemberWithUser[]> {
+    const members = await this.listMembers(workspaceId);
+    if (members.length === 0) {
+      return [];
+    }
+
+    const uniqueUserIds = Array.from(new Set(members.map((member) => member.userId)));
+    const { data: users, error } = await this.client
+      .from('users')
+      .select('id, email, first_name, username')
+      .in('id', uniqueUserIds);
+
+    if (error) {
+      throw new Error(`Failed to resolve workspace member profiles: ${error.message}`);
+    }
+
+    const usersById = new Map(
+      (users || []).map((user) => [
+        user.id,
+        {
+          id: user.id,
+          email: user.email,
+          firstName: user.first_name,
+          username: user.username,
+        } as WorkspaceMemberUser,
+      ])
+    );
+
+    return members.map((member) => ({
+      ...member,
+      user: usersById.get(member.userId) ?? null,
+    }));
   }
 }
