@@ -19,6 +19,12 @@ import { getDataComposer } from '../data/composer';
 import crypto from 'crypto';
 import type { WorkspaceMemberRole } from '../data/repositories/workspace-containers.repository';
 import { slugifyWorkspaceName } from '../utils/workspace-slug';
+import {
+  signPcpAccessToken,
+  verifyPcpAccessToken,
+  createRefreshToken,
+  exchangeRefreshToken,
+} from '../auth/pcp-tokens';
 
 // WhatsApp listener reference (set via setWhatsAppListener)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -39,6 +45,9 @@ type CommentAuthorUser = {
 };
 
 const LAST_LOGIN_UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS = 3600; // 1 hour
+const ADMIN_REFRESH_TOKEN_LIFETIME_DAYS = 90;
+const ADMIN_CLIENT_ID = 'dashboard';
 
 function formatCommentAuthorUserName(user: CommentAuthorUser | null): string | null {
   if (!user) return null;
@@ -57,9 +66,13 @@ export function setWhatsAppListener(listener: any): void {
 }
 
 /**
- * Admin auth middleware
- * Validates Supabase JWT and ensures user is a trusted admin/owner
- * Skips authentication for OAuth callback routes (they use state tokens)
+ * Admin auth middleware — three-tier verification:
+ *
+ * Tier 1: PCP admin access JWT (local jwt.verify, ~0ms)
+ * Tier 2: Refresh token exchange (1 DB call, ~once/hour)
+ * Tier 3: Supabase verification (network call, first login only)
+ *
+ * Skips authentication for OAuth callback routes (they use state tokens).
  */
 async function adminAuthMiddleware(req: Request, res: Response, next: NextFunction): Promise<void> {
   // Skip auth for OAuth callbacks (they use state tokens for security)
@@ -77,100 +90,165 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
 
     const token = authHeader.substring(7);
 
-    // Verify the JWT with Supabase
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
-    const {
-      data: { user },
-      error,
-    } = await supabase.auth.getUser(token);
 
-    if (error || !user) {
-      res.status(401).json({ error: 'Invalid token' });
-      return;
+    let pcpUserId: string | undefined;
+    let userEmail: string | undefined;
+    let issueTokenCookies = false;
+
+    // --- Tier 1: PCP admin access JWT (local, ~0ms) ---
+    const payload = verifyPcpAccessToken(token, 'pcp_admin');
+    if (payload) {
+      pcpUserId = payload.sub;
+      userEmail = payload.email;
     }
 
-    // Look up (or create) PCP user by email.
-    // For newly signed-up users, this auto-provisions PCP identity on first authenticated request.
-    const normalizedEmail = user.email?.toLowerCase() ?? null;
-    let { data: pcpUser } = await supabase
-      .from('users')
-      .select('id, telegram_id, whatsapp_id, last_login_at')
-      .eq('email', normalizedEmail)
-      .single();
+    // --- Tier 2: Refresh token exchange (1 DB call, ~once/hour) ---
+    if (!pcpUserId) {
+      const refreshCookie = req.cookies?.['pcp-admin-refresh'];
+      if (refreshCookie) {
+        const result = await exchangeRefreshToken(
+          supabase,
+          refreshCookie,
+          ADMIN_CLIENT_ID,
+          'pcp_admin',
+          ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS
+        );
+        if (result) {
+          pcpUserId = result.userId;
+          userEmail = result.email;
+          // Set new access token cookie (refresh token stays the same)
+          res.cookie('pcp-admin-token', result.accessToken, {
+            httpOnly: true,
+            secure: env.NODE_ENV === 'production',
+            sameSite: 'lax',
+            path: '/api/admin',
+            maxAge: ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS * 1000,
+          });
+        }
+      }
+    }
 
-    if (!pcpUser) {
-      if (!normalizedEmail) {
-        res.status(403).json({ error: 'User email not available for PCP provisioning' });
+    // --- Tier 3: Supabase verification (network call, first login only) ---
+    if (!pcpUserId) {
+      const {
+        data: { user },
+        error,
+      } = await supabase.auth.getUser(token);
+
+      if (error || !user) {
+        res.status(401).json({ error: 'Invalid token' });
         return;
       }
 
-      const { data: createdUser, error: createUserError } = await supabase
+      // Look up (or create) PCP user by email.
+      const normalizedEmail = user.email?.toLowerCase() ?? null;
+      let { data: pcpUser } = await supabase
         .from('users')
-        .insert({ email: normalizedEmail })
         .select('id, telegram_id, whatsapp_id, last_login_at')
+        .eq('email', normalizedEmail)
         .single();
 
-      if (createUserError) {
-        // Handle race where parallel requests created the PCP user first.
-        const { data: racedUser } = await supabase
-          .from('users')
-          .select('id, telegram_id, whatsapp_id, last_login_at')
-          .eq('email', normalizedEmail)
-          .single();
-
-        if (!racedUser) {
-          logger.error('Failed to auto-provision PCP user during admin auth', {
-            email: normalizedEmail,
-            error: createUserError.message,
-          });
-          res.status(500).json({ error: 'Failed to provision PCP user' });
+      if (!pcpUser) {
+        if (!normalizedEmail) {
+          res.status(403).json({ error: 'User email not available for PCP provisioning' });
           return;
         }
 
-        pcpUser = racedUser;
-      } else {
-        pcpUser = createdUser;
+        const { data: createdUser, error: createUserError } = await supabase
+          .from('users')
+          .insert({ email: normalizedEmail })
+          .select('id, telegram_id, whatsapp_id, last_login_at')
+          .single();
+
+        if (createUserError) {
+          const { data: racedUser } = await supabase
+            .from('users')
+            .select('id, telegram_id, whatsapp_id, last_login_at')
+            .eq('email', normalizedEmail)
+            .single();
+
+          if (!racedUser) {
+            logger.error('Failed to auto-provision PCP user during admin auth', {
+              email: normalizedEmail,
+              error: createUserError.message,
+            });
+            res.status(500).json({ error: 'Failed to provision PCP user' });
+            return;
+          }
+
+          pcpUser = racedUser;
+        } else {
+          pcpUser = createdUser;
+        }
       }
+
+      const lastLoginAtMs = pcpUser.last_login_at ? new Date(pcpUser.last_login_at).getTime() : NaN;
+      const shouldUpdateLastLoginAt =
+        !pcpUser.last_login_at ||
+        Number.isNaN(lastLoginAtMs) ||
+        Date.now() - lastLoginAtMs >= LAST_LOGIN_UPDATE_INTERVAL_MS;
+
+      if (shouldUpdateLastLoginAt) {
+        const loginTimestamp = new Date().toISOString();
+        const { error: loginUpdateError } = await supabase
+          .from('users')
+          .update({ last_login_at: loginTimestamp })
+          .eq('id', pcpUser.id);
+        if (loginUpdateError) {
+          logger.warn('Failed to update users.last_login_at during admin auth', {
+            userId: pcpUser.id,
+            error: loginUpdateError.message,
+          });
+        }
+      }
+
+      pcpUserId = pcpUser.id;
+      userEmail = normalizedEmail || user.email || undefined;
+      issueTokenCookies = true;
     }
 
-    const lastLoginAtMs = pcpUser.last_login_at ? new Date(pcpUser.last_login_at).getTime() : NaN;
-    const shouldUpdateLastLoginAt =
-      !pcpUser.last_login_at ||
-      Number.isNaN(lastLoginAtMs) ||
-      Date.now() - lastLoginAtMs >= LAST_LOGIN_UPDATE_INTERVAL_MS;
-
-    if (shouldUpdateLastLoginAt) {
-      const loginTimestamp = new Date().toISOString();
-      const { error: loginUpdateError } = await supabase
-        .from('users')
-        .update({ last_login_at: loginTimestamp })
-        .eq('id', pcpUser.id);
-      if (loginUpdateError) {
-        logger.warn('Failed to update users.last_login_at during admin auth', {
-          userId: pcpUser.id,
-          error: loginUpdateError.message,
-        });
-      }
-    }
-
-    // Resolve active workspace container from header (or default to personal).
+    // --- Workspace resolution (all tiers, 1 DB query) ---
     const dataComposer = await getDataComposer();
     const workspaceRepo = dataComposer.repositories.workspaceContainers;
     const requestedWorkspaceId = req.header('x-pcp-workspace-id')?.trim();
 
+    // For trusted-user resolution we need telegram/whatsapp IDs.
+    // Tier 1/2 don't have them in JWT claims, so fetch when needed.
+    let pcpUserRecord: {
+      id: string;
+      telegram_id: string | null;
+      whatsapp_id: string | null;
+    } | null = null;
+
+    const getPcpUserRecord = async () => {
+      if (!pcpUserRecord) {
+        const { data } = await supabase
+          .from('users')
+          .select('id, telegram_id, whatsapp_id')
+          .eq('id', pcpUserId!)
+          .single();
+        pcpUserRecord = data;
+      }
+      return pcpUserRecord;
+    };
+
     const hasTrustedAdminAccess = async (workspaceId: string): Promise<boolean> => {
+      const record = await getPcpUserRecord();
+      if (!record) return false;
+
       const authService = getAuthorizationService();
       const trustedUsers = await authService.listTrustedUsers(undefined, workspaceId);
 
       return trustedUsers.some((tu) => {
         if (tu.trustLevel === 'member') return false;
-        if (tu.userId === pcpUser.id) return true;
-        if (tu.platform === 'telegram' && pcpUser.telegram_id?.toString() === tu.platformUserId) {
+        if (tu.userId === record.id) return true;
+        if (tu.platform === 'telegram' && record.telegram_id?.toString() === tu.platformUserId) {
           return true;
         }
-        if (tu.platform === 'whatsapp' && pcpUser.whatsapp_id === tu.platformUserId) {
+        if (tu.platform === 'whatsapp' && record.whatsapp_id === tu.platformUserId) {
           return true;
         }
         return false;
@@ -182,7 +260,7 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     let hasDirectMembership = false;
 
     if (requestedWorkspaceId) {
-      const requestedWorkspace = await workspaceRepo.findById(requestedWorkspaceId, pcpUser.id);
+      const requestedWorkspace = await workspaceRepo.findById(requestedWorkspaceId, pcpUserId!);
       if (requestedWorkspace) {
         activeWorkspaceId = requestedWorkspace.id;
         hasDirectMembership = true;
@@ -203,8 +281,7 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
         activeWorkspaceRole = 'trusted';
       }
     } else {
-      // Ensure every user always has at least one workspace container.
-      const personalWorkspace = await workspaceRepo.ensurePersonalWorkspace(pcpUser.id);
+      const personalWorkspace = await workspaceRepo.ensurePersonalWorkspace(pcpUserId!);
       activeWorkspaceId = personalWorkspace.id;
       hasDirectMembership = true;
     }
@@ -221,23 +298,53 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       activeWorkspaceRole = 'member';
     }
 
+    // --- Issue cookies (Tier 3 success) ---
+    if (issueTokenCookies && pcpUserId && userEmail) {
+      const accessToken = signPcpAccessToken(
+        { type: 'pcp_admin', sub: pcpUserId, email: userEmail, scope: 'admin' },
+        ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS
+      );
+      try {
+        const { refreshToken } = await createRefreshToken(
+          supabase,
+          pcpUserId,
+          ADMIN_CLIENT_ID,
+          ['admin'],
+          ADMIN_REFRESH_TOKEN_LIFETIME_DAYS
+        );
+        res.cookie('pcp-admin-token', accessToken, {
+          httpOnly: true,
+          secure: env.NODE_ENV === 'production',
+          sameSite: 'lax',
+          path: '/api/admin',
+          maxAge: ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS * 1000,
+        });
+        res.cookie('pcp-admin-refresh', refreshToken, {
+          httpOnly: true,
+          secure: env.NODE_ENV === 'production',
+          sameSite: 'lax',
+          path: '/api/admin',
+          maxAge: ADMIN_REFRESH_TOKEN_LIFETIME_DAYS * 24 * 60 * 60 * 1000,
+        });
+      } catch (cookieError) {
+        // Non-fatal: auth succeeded, just couldn't issue PCP cookies.
+        // Next request will hit Tier 3 again.
+        logger.warn('Failed to issue PCP admin cookies', { error: cookieError });
+      }
+    }
+
     // Attach user + PCP context to request
-    const authReq = req as Request & {
-      user: typeof user;
-      pcpUserId: string;
-      pcpWorkspaceId: string;
-      pcpWorkspaceRole: WorkspaceMemberRole | 'trusted';
-    };
-    authReq.user = user;
-    authReq.pcpUserId = pcpUser.id;
+    const authReq = req as AdminAuthRequest;
+    authReq.user = { email: userEmail || null };
+    authReq.pcpUserId = pcpUserId!;
     authReq.pcpWorkspaceId = activeWorkspaceId;
     authReq.pcpWorkspaceRole = activeWorkspaceRole || 'trusted';
 
     // Wrap the rest of the request in context
     runWithRequestContext(
       {
-        userId: pcpUser.id,
-        email: user.email || undefined,
+        userId: pcpUserId!,
+        email: userEmail,
         workspaceId: activeWorkspaceId,
       },
       () => next()
@@ -270,7 +377,9 @@ router.get('/workspaces', async (req: Request, res: Response) => {
       includeArchived: false,
     });
 
-    const currentWorkspaceMembership = workspaces.find((workspace) => workspace.id === authReq.pcpWorkspaceId);
+    const currentWorkspaceMembership = workspaces.find(
+      (workspace) => workspace.id === authReq.pcpWorkspaceId
+    );
     const currentWorkspaceRole = currentWorkspaceMembership?.role || authReq.pcpWorkspaceRole;
 
     res.json({

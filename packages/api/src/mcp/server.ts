@@ -3,6 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import express from 'express';
 import cors from 'cors';
+import cookieParser from 'cookie-parser';
 import type { Server } from 'http';
 import { MCP_SERVER_NAME, MCP_SERVER_VERSION, MCP_SERVER_DESCRIPTION } from '../config/constants';
 import { env } from '../config/env';
@@ -470,6 +471,7 @@ export class MCPServer {
     // Admin & Agent routes
     // ============================================================================
     app.use(express.json());
+    app.use(cookieParser());
     app.use('/api/admin', adminRouter);
     logger.info('Admin API routes registered at /api/admin');
 

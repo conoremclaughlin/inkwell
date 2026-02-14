@@ -31,26 +31,32 @@ export async function updateSession(request: NextRequest) {
   const isProxiedApiRoute = path.startsWith('/api/') && !path.startsWith('/api/auth/');
 
   // Fast-path for proxied API routes: inject bearer token only.
-  // Skip getUser() to avoid duplicate Supabase round-trips on every API request.
+  // Prefers PCP admin JWT (local verification, no Supabase dependency).
   if (isProxiedApiRoute) {
+    const pcpToken = request.cookies.get('pcp-admin-token')?.value;
+
+    if (pcpToken) {
+      // PCP admin JWT available — use it directly, skip Supabase entirely.
+      const requestHeaders = new Headers(request.headers);
+      requestHeaders.set('Authorization', `Bearer ${pcpToken}`);
+      const response = NextResponse.next({ request: { headers: requestHeaders } });
+      supabaseResponse.cookies.getAll().forEach((cookie) => {
+        response.cookies.set(cookie.name, cookie.value, cookie);
+      });
+      return response;
+    }
+
+    // No PCP JWT — fall back to Supabase session token (first request after login).
     const {
       data: { session },
     } = await supabase.auth.getSession();
     if (session?.access_token) {
       const requestHeaders = new Headers(request.headers);
       requestHeaders.set('Authorization', `Bearer ${session.access_token}`);
-
-      const response = NextResponse.next({
-        request: {
-          headers: requestHeaders,
-        },
-      });
-
-      // Copy session-refresh cookies from supabaseResponse
+      const response = NextResponse.next({ request: { headers: requestHeaders } });
       supabaseResponse.cookies.getAll().forEach((cookie) => {
         response.cookies.set(cookie.name, cookie.value, cookie);
       });
-
       return response;
     }
 

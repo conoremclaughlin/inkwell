@@ -14,6 +14,12 @@ import jwt from 'jsonwebtoken';
 import { env } from '../../config/env';
 import { logger } from '../../utils/logger';
 import type { Database } from '../../data/supabase/types';
+import {
+  signPcpAccessToken,
+  verifyPcpAccessToken,
+  createRefreshToken,
+  exchangeRefreshToken as exchangeRefreshTokenShared,
+} from '../../auth/pcp-tokens';
 
 // ============================================================================
 // Types
@@ -34,14 +40,6 @@ interface PendingAuthPayload {
   codeChallenge: string;
   redirectUri: string;
   state: string;
-}
-
-/** JWT payload for self-issued MCP access tokens */
-interface McpAccessTokenPayload {
-  type: 'mcp_access';
-  sub: string; // PCP user ID
-  email: string;
-  scope: string;
 }
 
 export interface AuthCode {
@@ -78,7 +76,6 @@ export interface AuthCallbackResult {
 
 const ACCESS_TOKEN_LIFETIME_SECONDS = 30 * 24 * 60 * 60; // 30 days
 const REFRESH_TOKEN_LIFETIME_DAYS = 90;
-const REFRESH_TOKEN_LIFETIME_MS = REFRESH_TOKEN_LIFETIME_DAYS * 24 * 60 * 60 * 1000;
 const AUTH_CODE_LIFETIME_MS = 10 * 60 * 1000; // 10 minutes
 const PENDING_AUTH_LIFETIME_SECONDS = 600; // 10 minutes
 
@@ -282,22 +279,20 @@ export class PcpAuthProvider {
       }
     }
 
-    // Generate our opaque refresh token
-    const refreshToken = `pcp-rt-${crypto.randomBytes(32).toString('hex')}`;
-    const expiresAt = new Date(Date.now() + REFRESH_TOKEN_LIFETIME_MS);
-
-    // Store in database
-    const { error: dbError } = await this.supabase.from('mcp_tokens').insert({
-      user_id: codeData.userId,
-      client_id: clientId,
-      refresh_token: refreshToken,
-      supabase_refresh_token: null,
-      scopes: ['mcp:tools'],
-      expires_at: expiresAt.toISOString(),
-    });
-
-    if (dbError) {
-      logger.error('Failed to store MCP token', { error: dbError });
+    // Create refresh token in database
+    let refreshToken: string;
+    let expiresAt: Date;
+    try {
+      const result = await createRefreshToken(
+        this.supabase,
+        codeData.userId,
+        clientId,
+        ['mcp:tools'],
+        REFRESH_TOKEN_LIFETIME_DAYS
+      );
+      refreshToken = result.refreshToken;
+      expiresAt = result.expiresAt;
+    } catch {
       return { error: 'server_error', error_description: 'Failed to create token' };
     }
 
@@ -305,15 +300,14 @@ export class PcpAuthProvider {
     this.authCodes.delete(params.code);
 
     // Sign our own JWT as the access token
-    const accessToken = jwt.sign(
+    const accessToken = signPcpAccessToken(
       {
         type: 'mcp_access',
         sub: codeData.userId,
         email: codeData.userEmail,
         scope: 'mcp:tools',
-      } satisfies McpAccessTokenPayload,
-      env.JWT_SECRET,
-      { expiresIn: ACCESS_TOKEN_LIFETIME_SECONDS }
+      },
+      ACCESS_TOKEN_LIFETIME_SECONDS
     );
 
     logger.info('MCP tokens issued', {
@@ -340,66 +334,29 @@ export class PcpAuthProvider {
     refreshToken: string;
     clientId: string;
   }): Promise<OAuthTokenResponse | OAuthErrorResponse> {
-    // Look up token in database, joining users table for email
-    const { data: tokenRecord, error: lookupError } = await this.supabase
-      .from('mcp_tokens')
-      .select('*, users(email)')
-      .eq('refresh_token', params.refreshToken)
-      .single();
-
-    if (lookupError || !tokenRecord) {
-      logger.warn('MCP refresh token not found', { clientId: params.clientId });
-      return { error: 'invalid_grant', error_description: 'Invalid refresh token' };
-    }
-
-    // Verify client_id matches
-    if (tokenRecord.client_id !== params.clientId) {
-      logger.warn('MCP refresh token client_id mismatch', {
-        expected: tokenRecord.client_id,
-        received: params.clientId,
-      });
-      return { error: 'invalid_grant', error_description: 'Invalid refresh token' };
-    }
-
-    // Check expiration
-    if (new Date(tokenRecord.expires_at) < new Date()) {
-      logger.warn('MCP refresh token expired', { userId: tokenRecord.user_id });
-      await this.supabase.from('mcp_tokens').delete().eq('id', tokenRecord.id);
-      return { error: 'invalid_grant', error_description: 'Refresh token expired' };
-    }
-
-    // Resolve user email from the join
-    const userEmail = (tokenRecord.users as unknown as { email: string | null })?.email || '';
-
-    // Sign a fresh self-issued JWT — no Supabase call needed
-    const accessToken = jwt.sign(
-      {
-        type: 'mcp_access',
-        sub: tokenRecord.user_id,
-        email: userEmail,
-        scope: 'mcp:tools',
-      } satisfies McpAccessTokenPayload,
-      env.JWT_SECRET,
-      { expiresIn: ACCESS_TOKEN_LIFETIME_SECONDS }
+    const result = await exchangeRefreshTokenShared(
+      this.supabase,
+      params.refreshToken,
+      params.clientId,
+      'mcp_access',
+      ACCESS_TOKEN_LIFETIME_SECONDS
     );
 
-    // Update last_used_at
-    await this.supabase
-      .from('mcp_tokens')
-      .update({ last_used_at: new Date().toISOString() })
-      .eq('id', tokenRecord.id);
+    if (!result) {
+      return { error: 'invalid_grant', error_description: 'Invalid refresh token' };
+    }
 
     logger.info('MCP token refreshed', {
-      userId: tokenRecord.user_id,
+      userId: result.userId,
       clientId: params.clientId,
     });
 
     return {
-      access_token: accessToken,
+      access_token: result.accessToken,
       refresh_token: params.refreshToken,
       token_type: 'Bearer',
       expires_in: ACCESS_TOKEN_LIFETIME_SECONDS,
-      scope: tokenRecord.scopes?.join(' ') || 'mcp:tools',
+      scope: 'mcp:tools',
     };
   }
 
@@ -411,16 +368,10 @@ export class PcpAuthProvider {
     if (!authHeader?.startsWith('Bearer ')) return null;
     const token = authHeader.substring(7);
 
-    try {
-      const decoded = jwt.verify(token, env.JWT_SECRET);
-      if (typeof decoded === 'string' || (decoded as McpAccessTokenPayload).type !== 'mcp_access') {
-        return null;
-      }
-      const payload = decoded as McpAccessTokenPayload;
-      return { userId: payload.sub, email: payload.email };
-    } catch {
-      return null;
-    }
+    const payload = verifyPcpAccessToken(token, 'mcp_access');
+    if (!payload) return null;
+
+    return { userId: payload.sub, email: payload.email };
   }
 
   // --------------------------------------------------------------------------

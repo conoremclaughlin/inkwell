@@ -675,7 +675,7 @@ describe('PcpAuthProvider', () => {
 
       expect(result).toEqual({
         error: 'invalid_grant',
-        error_description: 'Refresh token expired',
+        error_description: 'Invalid refresh token',
       });
     });
   });
