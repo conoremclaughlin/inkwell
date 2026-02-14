@@ -1,25 +1,10 @@
 import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
+import type { Json } from '../../data/supabase/types';
 import { logger } from '../../utils/logger';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
 
 const VALID_STATUSES = ['healthy', 'degraded', 'error', 'not_configured'] as const;
-
-// Row type for the integration_health table (not yet in generated types)
-interface IntegrationHealthRow {
-  id: string;
-  user_id: string;
-  service: string;
-  status: string;
-  error_code: string | null;
-  error_message: string | null;
-  last_check_at: string;
-  last_healthy_at: string | null;
-  reported_by_agent_id: string | null;
-  metadata: Record<string, unknown>;
-  created_at: string;
-  updated_at: string;
-}
 
 export const updateIntegrationHealthSchema = userIdentifierBaseSchema.extend({
   service: z
@@ -53,20 +38,18 @@ export async function handleUpdateIntegrationHealth(args: unknown, dataComposer:
     error_code: isHealthy ? null : (params.errorCode ?? null),
     error_message: isHealthy ? null : (params.errorMessage ?? null),
     last_check_at: now,
-    ...(isHealthy ? { last_healthy_at: now } : {}),
+    last_healthy_at: isHealthy ? now : null,
     reported_by_agent_id: params.agentId ?? null,
-    metadata: params.metadata ?? {},
+    metadata: (params.metadata ?? {}) as Json,
     updated_at: now,
   };
 
-  // Cast through any — integration_health isn't in generated types yet.
-  // Remove after running generate_typescript_types post-migration.
-  const client = dataComposer.getClient() as any;
-  const { data, error } = (await client
+  const { data, error } = await dataComposer
+    .getClient()
     .from('integration_health')
     .upsert(upsertData, { onConflict: 'user_id,service' })
     .select()
-    .single()) as { data: IntegrationHealthRow | null; error: any };
+    .single();
 
   if (error || !data) {
     throw new Error(`Failed to update integration health: ${error?.message ?? 'no data returned'}`);
@@ -108,18 +91,18 @@ export async function handleGetIntegrationHealth(args: unknown, dataComposer: Da
   const params = getIntegrationHealthSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
-  // Cast through any — integration_health isn't in generated types yet.
-  const client = dataComposer.getClient() as any;
-  let query = client.from('integration_health').select('*').eq('user_id', user.id).order('service');
+  let query = dataComposer
+    .getClient()
+    .from('integration_health')
+    .select('*')
+    .eq('user_id', user.id)
+    .order('service');
 
   if (params.service) {
     query = query.eq('service', params.service);
   }
 
-  const { data, error } = (await query) as {
-    data: IntegrationHealthRow[] | null;
-    error: any;
-  };
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`Failed to get integration health: ${error.message}`);

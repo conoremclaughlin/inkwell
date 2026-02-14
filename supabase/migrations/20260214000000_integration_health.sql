@@ -10,7 +10,7 @@ CREATE TABLE integration_health (
   error_code text,
   error_message text,
   last_check_at timestamp with time zone DEFAULT now(),
-  last_healthy_at timestamp with time zone DEFAULT now(),
+  last_healthy_at timestamp with time zone,
   reported_by_agent_id text,
   metadata jsonb DEFAULT '{}'::jsonb,
   created_at timestamp with time zone DEFAULT now(),
