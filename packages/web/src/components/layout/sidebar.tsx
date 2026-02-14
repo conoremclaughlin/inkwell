@@ -407,7 +407,7 @@ export function Sidebar() {
                         onChange={(event) =>
                           setNewWorkspaceType(event.target.value as 'personal' | 'team')
                         }
-                        className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                        className="h-10 w-full rounded-md border border-input bg-background px-3 pr-10 text-sm"
                       >
                         <option value="team">Team</option>
                         <option value="personal">Personal</option>
@@ -438,7 +438,7 @@ export function Sidebar() {
                     <select
                       value={inviteTargetWorkspaceId}
                       onChange={(event) => setInviteWorkspaceId(event.target.value)}
-                      className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                      className="h-10 w-full rounded-md border border-input bg-background px-3 pr-10 text-sm"
                     >
                       {workspaces.map((workspace) => (
                         <option key={workspace.id} value={workspace.id}>
@@ -464,7 +464,7 @@ export function Sidebar() {
                         onChange={(event) =>
                           setInviteRole(event.target.value as 'owner' | 'admin' | 'member' | 'viewer')
                         }
-                        className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                        className="h-10 w-full rounded-md border border-input bg-background px-3 pr-10 text-sm"
                       >
                         <option value="member">member</option>
                         <option value="admin">admin</option>
