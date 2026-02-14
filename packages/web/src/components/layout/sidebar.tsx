@@ -77,6 +77,7 @@ interface WorkspaceMembersResponse {
       email: string | null;
       firstName: string | null;
       username: string | null;
+      lastLoginAt: string | null;
     } | null;
   }>;
 }
@@ -522,7 +523,10 @@ export function Sidebar() {
                                 member.user?.email ||
                                 member.userId}
                             </p>
-                            <p className="text-xs text-gray-500">{member.user?.email || member.userId}</p>
+                            <p className="text-xs text-gray-500">
+                              {member.user?.email || member.userId}
+                              {member.user?.lastLoginAt ? ' · joined' : ' · invited'}
+                            </p>
                           </div>
                           <span className="rounded-full bg-gray-100 px-2 py-1 text-xs text-gray-700">
                             {member.role}

@@ -39,6 +39,7 @@ export interface WorkspaceMemberUser {
   email: string | null;
   firstName: string | null;
   username: string | null;
+  lastLoginAt: string | null;
 }
 
 export interface WorkspaceMemberWithUser extends WorkspaceMember {
@@ -362,7 +363,7 @@ export class WorkspaceContainersRepository {
     const uniqueUserIds = Array.from(new Set(members.map((member) => member.userId)));
     const { data: users, error } = await this.client
       .from('users')
-      .select('id, email, first_name, username')
+      .select('id, email, first_name, username, last_login_at')
       .in('id', uniqueUserIds);
 
     if (error) {
@@ -377,6 +378,7 @@ export class WorkspaceContainersRepository {
           email: user.email,
           firstName: user.first_name,
           username: user.username,
+          lastLoginAt: user.last_login_at,
         } as WorkspaceMemberUser,
       ])
     );

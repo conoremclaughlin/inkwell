@@ -102,13 +102,25 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     // Look up the PCP user by email
     const { data: pcpUser } = await supabase
       .from('users')
-      .select('id, telegram_id, whatsapp_id')
+      .select('id, telegram_id, whatsapp_id, last_login_at')
       .eq('email', user.email)
       .single();
 
     if (!pcpUser) {
       res.status(403).json({ error: 'User not found in PCP system' });
       return;
+    }
+
+    const loginTimestamp = new Date().toISOString();
+    const { error: loginUpdateError } = await supabase
+      .from('users')
+      .update({ last_login_at: loginTimestamp })
+      .eq('id', pcpUser.id);
+    if (loginUpdateError) {
+      logger.warn('Failed to update users.last_login_at during admin auth', {
+        userId: pcpUser.id,
+        error: loginUpdateError.message,
+      });
     }
 
     // Resolve active workspace container from header (or default to personal).
@@ -405,6 +417,7 @@ router.post('/workspaces/:workspaceId/members', async (req: Request, res: Respon
           email: inviteeUser.email,
           firstName: inviteeUser.first_name,
           username: inviteeUser.username,
+          lastLoginAt: inviteeUser.last_login_at,
         },
         userWasCreated,
       },

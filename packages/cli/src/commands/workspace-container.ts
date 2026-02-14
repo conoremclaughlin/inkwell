@@ -395,7 +395,12 @@ async function listWorkspaceMembers(workspaceRef?: string): Promise<void> {
   const members = Array.isArray((parsed.workspace as { members?: unknown[] } | undefined)?.members)
     ? ((parsed.workspace as { members?: unknown[] }).members as Array<{
         role?: string;
-        user?: { email?: string | null; firstName?: string | null; username?: string | null };
+        user?: {
+          email?: string | null;
+          firstName?: string | null;
+          username?: string | null;
+          lastLoginAt?: string | null;
+        };
         userId?: string;
       }>)
     : [];
@@ -409,7 +414,10 @@ async function listWorkspaceMembers(workspaceRef?: string): Promise<void> {
   for (const member of members) {
     const label =
       member.user?.firstName || member.user?.username || member.user?.email || member.userId || 'unknown';
-    console.log(`  ${chalk.cyan(label)} ${chalk.dim(`(${member.role || 'member'})`)}`);
+    const joinedLabel = member.user?.lastLoginAt ? 'joined' : 'invited';
+    console.log(
+      `  ${chalk.cyan(label)} ${chalk.dim(`(${member.role || 'member'})`)} ${chalk.gray(`[${joinedLabel}]`)}`
+    );
   }
   console.log('');
 }

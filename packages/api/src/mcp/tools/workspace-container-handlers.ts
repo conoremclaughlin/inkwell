@@ -202,6 +202,7 @@ export async function handleGetWorkspaceContainer(args: unknown, dataComposer: D
               email: m.user.email,
               firstName: m.user.firstName,
               username: m.user.username,
+              lastLoginAt: m.user.lastLoginAt,
             }
           : null,
       })),
