@@ -125,13 +125,16 @@ export function Sidebar() {
 
   const workspaces = workspaceData?.workspaces || [];
   const selectedWorkspace = workspaces.find((workspace) => workspace.id === resolvedWorkspaceId) || null;
-  const userEmail = authMeData?.user?.email || 'Account';
-  const userInitial = userEmail.charAt(0).toUpperCase();
+  const userEmail = authMeData?.user?.email ?? '';
+  const userInitial = userEmail ? userEmail.charAt(0).toUpperCase() : '';
+  const workspaceName = selectedWorkspace?.name ?? '';
+  const workspaceTriggerLabel = workspaceName || '\u00A0';
+  const workspaceTitleLabel = workspaceName ? `${workspaceName} Workspace` : '\u00A0';
   const selectedWorkspaceRole =
     selectedWorkspace?.role ||
     (workspaceData?.currentWorkspaceRole && workspaceData.currentWorkspaceRole !== 'trusted'
       ? workspaceData.currentWorkspaceRole
-      : 'member');
+      : '');
   const inviteTargetWorkspaceId = inviteWorkspaceId || resolvedWorkspaceId;
   const workspaceMembersPath = inviteTargetWorkspaceId
     ? `/api/admin/workspaces/${inviteTargetWorkspaceId}/members`
@@ -285,10 +288,10 @@ export function Sidebar() {
         >
           <span className="flex min-w-0 items-center gap-2">
             <span className="flex h-7 w-7 items-center justify-center rounded bg-gray-600 text-xs font-semibold">
-              {userInitial || 'U'}
+              {userInitial}
             </span>
             <span className="truncate text-sm font-medium">
-              {selectedWorkspace?.name || 'Personal Workspace'}
+              {workspaceTriggerLabel}
             </span>
           </span>
           <ChevronDown className="h-4 w-4 shrink-0" />
@@ -297,11 +300,11 @@ export function Sidebar() {
         {accountMenuOpen && (
           <div className="absolute left-4 right-4 top-full z-30 mt-2 rounded-xl border border-gray-200 bg-white p-3 shadow-2xl">
             <div className="rounded-md border border-gray-200 bg-gray-50 p-2">
-              <p className="truncate text-sm font-semibold text-gray-900">
-                {selectedWorkspace?.name || 'Personal'} Workspace
+              <p className="truncate text-sm font-semibold text-gray-900">{workspaceTitleLabel}</p>
+              <p className="mt-1 truncate text-xs text-gray-500">{userEmail || '\u00A0'}</p>
+              <p className="truncate text-xs text-gray-500">
+                {selectedWorkspaceRole ? `Role: ${selectedWorkspaceRole}` : '\u00A0'}
               </p>
-              <p className="mt-1 truncate text-xs text-gray-500">{userEmail}</p>
-              <p className="truncate text-xs text-gray-500">Role: {selectedWorkspaceRole}</p>
             </div>
 
             <div className="mt-3 space-y-1 rounded-md border border-gray-200 bg-gray-50 p-2">
