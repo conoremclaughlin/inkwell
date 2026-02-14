@@ -35,7 +35,6 @@ import {
   DialogDescription,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from '@/components/ui/dialog';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 
@@ -57,7 +56,7 @@ interface WorkspaceOption {
   name: string;
   slug: string;
   type: 'personal' | 'team';
-  role: 'owner' | 'admin' | 'member' | 'viewer';
+  role?: 'owner' | 'admin' | 'member' | 'viewer';
 }
 
 interface WorkspaceListResponse {
@@ -128,6 +127,11 @@ export function Sidebar() {
   const selectedWorkspace = workspaces.find((workspace) => workspace.id === resolvedWorkspaceId) || null;
   const userEmail = authMeData?.user?.email || 'Account';
   const userInitial = userEmail.charAt(0).toUpperCase();
+  const selectedWorkspaceRole =
+    selectedWorkspace?.role ||
+    (workspaceData?.currentWorkspaceRole && workspaceData.currentWorkspaceRole !== 'trusted'
+      ? workspaceData.currentWorkspaceRole
+      : 'member');
   const inviteTargetWorkspaceId = inviteWorkspaceId || resolvedWorkspaceId;
   const workspaceMembersPath = inviteTargetWorkspaceId
     ? `/api/admin/workspaces/${inviteTargetWorkspaceId}/members`
@@ -288,17 +292,21 @@ export function Sidebar() {
         </div>
 
         {accountMenuOpen && (
-          <div className="absolute right-4 top-14 z-30 w-72 rounded-md border border-gray-200 bg-white p-3 shadow-xl">
-            <p className="truncate text-sm font-semibold text-gray-900">{userEmail}</p>
-            <p className="mt-1 text-xs text-gray-500">
-              {selectedWorkspace
-                ? `Workspace: ${selectedWorkspace.name} (${selectedWorkspace.role})`
-                : 'No workspace selected'}
-            </p>
+          <div className="absolute left-0 right-0 top-full z-30 border-b border-gray-200 bg-white px-4 py-3 shadow-xl">
+            <div className="rounded-md border border-gray-200 bg-gray-50 p-2">
+              <p className="truncate text-sm font-semibold text-gray-900">
+                {selectedWorkspace?.name || 'Personal'} Workspace
+              </p>
+              <p className="mt-1 truncate text-xs text-gray-500">{userEmail}</p>
+              <p className="truncate text-xs text-gray-500">Role: {selectedWorkspaceRole}</p>
+            </div>
 
             <div className="mt-3 space-y-1 rounded-md border border-gray-200 bg-gray-50 p-2">
               <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Workspaces</p>
-              {workspaces.length === 0 && <p className="text-xs text-gray-500">No workspaces yet</p>}
+              {workspacesLoading && <p className="text-xs text-gray-500">Loading workspaces...</p>}
+              {!workspacesLoading && workspaces.length === 0 && (
+                <p className="text-xs text-gray-500">No workspaces yet</p>
+              )}
               {workspaces.map((workspace) => {
                 const isSelected = workspace.id === resolvedWorkspaceId;
                 return (
@@ -311,7 +319,8 @@ export function Sidebar() {
                     className="flex w-full items-center justify-between rounded px-2 py-1 text-left text-sm text-gray-700 hover:bg-gray-100"
                   >
                     <span className="truncate">
-                      {workspace.name} <span className="text-xs text-gray-500">({workspace.role})</span>
+                      {workspace.name}{' '}
+                      <span className="text-xs text-gray-500">({workspace.role || 'member'})</span>
                     </span>
                     {isSelected && <Check className="h-4 w-4 text-gray-700" />}
                   </button>
@@ -327,7 +336,10 @@ export function Sidebar() {
                 }}
                 className="rounded border border-gray-300 px-2 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
               >
-                Workspaces
+                <span className="inline-flex items-center gap-1">
+                  <Building2 className="h-4 w-4" />
+                  Manage
+                </span>
               </button>
               <button
                 disabled
@@ -348,47 +360,8 @@ export function Sidebar() {
           </div>
         )}
       </div>
-      <div className="px-4 pb-3">
-        <label className="mb-1 block text-xs font-semibold uppercase tracking-wide text-gray-400">
-          Workspace
-        </label>
-        <select
-          value={resolvedWorkspaceId}
-          onChange={(e) => handleWorkspaceChange(e.target.value)}
-          disabled={workspacesLoading || workspaces.length === 0}
-          className="w-full rounded-md border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-gray-500 focus:outline-none"
-        >
-          {workspaces.length === 0 && <option value="">No workspaces</option>}
-          {workspaces.map((workspace) => (
-            <option key={workspace.id} value={workspace.id}>
-              {workspace.name} ({workspace.type})
-            </option>
-          ))}
-        </select>
-        <div className="mt-2">
-          {!isMounted && (
-            <Button
-              variant="outline"
-              size="sm"
-              disabled
-              className="w-full border-gray-700 bg-gray-800 text-gray-400"
-            >
-              <Building2 className="h-4 w-4" />
-              Manage Workspaces
-            </Button>
-          )}
-          {isMounted && (
-            <Dialog open={workspaceManagerOpen} onOpenChange={setWorkspaceManagerOpen}>
-            <DialogTrigger asChild>
-              <Button
-                variant="outline"
-                size="sm"
-                className="w-full border-gray-700 bg-gray-800 text-gray-100 hover:bg-gray-700 hover:text-white"
-              >
-                <Building2 className="h-4 w-4" />
-                Manage Workspaces
-              </Button>
-            </DialogTrigger>
+      {isMounted && (
+        <Dialog open={workspaceManagerOpen} onOpenChange={setWorkspaceManagerOpen}>
             <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-xl">
               <DialogHeader>
                 <DialogTitle>Workspace Studio</DialogTitle>
@@ -543,10 +516,8 @@ export function Sidebar() {
                 </p>
               )}
             </DialogContent>
-            </Dialog>
-          )}
-        </div>
-      </div>
+        </Dialog>
+      )}
       <nav className="flex flex-1 flex-col">
         <ul className="flex flex-1 flex-col gap-y-1 px-3">
           {navigation.map((item) => {
