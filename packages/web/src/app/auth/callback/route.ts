@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
+import { provisionPcpUserAndWorkspace } from '@/lib/auth/provision';
 
 export async function GET(request: Request) {
   const { searchParams, origin } = new URL(request.url);
@@ -28,6 +29,8 @@ export async function GET(request: Request) {
     const { data, error: exchangeError } = await supabase.auth.exchangeCodeForSession(code);
 
     if (!exchangeError && data.session) {
+      await provisionPcpUserAndWorkspace(data.session.access_token);
+
       // If this is MCP auth, redirect to MCP callback with tokens
       if (isMcpAuth) {
         const apiUrl =

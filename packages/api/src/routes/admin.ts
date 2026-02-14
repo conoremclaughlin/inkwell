@@ -91,16 +91,48 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       return;
     }
 
-    // Look up the PCP user by email
-    const { data: pcpUser } = await supabase
+    // Look up (or create) PCP user by email.
+    // For newly signed-up users, this auto-provisions PCP identity on first authenticated request.
+    const normalizedEmail = user.email?.toLowerCase() ?? null;
+    let { data: pcpUser } = await supabase
       .from('users')
       .select('id, telegram_id, whatsapp_id, last_login_at')
-      .eq('email', user.email)
+      .eq('email', normalizedEmail)
       .single();
 
     if (!pcpUser) {
-      res.status(403).json({ error: 'User not found in PCP system' });
-      return;
+      if (!normalizedEmail) {
+        res.status(403).json({ error: 'User email not available for PCP provisioning' });
+        return;
+      }
+
+      const { data: createdUser, error: createUserError } = await supabase
+        .from('users')
+        .insert({ email: normalizedEmail })
+        .select('id, telegram_id, whatsapp_id, last_login_at')
+        .single();
+
+      if (createUserError) {
+        // Handle race where parallel requests created the PCP user first.
+        const { data: racedUser } = await supabase
+          .from('users')
+          .select('id, telegram_id, whatsapp_id, last_login_at')
+          .eq('email', normalizedEmail)
+          .single();
+
+        if (!racedUser) {
+          logger.error('Failed to auto-provision PCP user during admin auth', {
+            email: normalizedEmail,
+            error: createUserError.message,
+          });
+          res.status(500).json({ error: 'Failed to provision PCP user' });
+          return;
+        }
+
+        pcpUser = racedUser;
+      } else {
+        pcpUser = createdUser;
+      }
     }
 
     const lastLoginAtMs = pcpUser.last_login_at ? new Date(pcpUser.last_login_at).getTime() : NaN;
