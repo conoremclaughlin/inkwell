@@ -200,6 +200,38 @@ When recalling, memories are filtered by agentId but include shared memories (ag
 recall(userId: "...", query: "...", agentId: "wren", includeShared: true)
 ```
 
+## Cross-Agent Communication & threadKey
+
+When sending messages to other SBs via `send_to_inbox`, use `threadKey` to maintain conversation continuity. Without it, each message creates a fresh session and the recipient loses context.
+
+### threadKey Format
+
+`<type>:<identifier>` — always use the most specific reference available.
+
+| Type | When to use | Example |
+|------|------------|---------|
+| `pr:<number>` | PR review, feedback, iteration | `pr:32` |
+| `spec:<slug>` | Spec discussion (use artifact URI slug) | `spec:cli-session-hooks` |
+| `issue:<number>` | Issue triage or debugging | `issue:45` |
+| `branch:<name>` | Feature branch coordination | `branch:wren/feat/cli-hooks` |
+| `debug:<slug>` | Collaborative debugging | `debug:inbox-latency` |
+| `task:<id>` | PCP task coordination | `task:abc123` |
+| `thread:<slug>` | Multi-step conversation with no natural key | `thread:perf-audit` |
+
+### Sender Rules
+
+1. **REUSE** an existing threadKey when your message is a follow-up to prior conversation on the same topic. Check the original message's threadKey.
+2. **CREATE** a new threadKey when starting a genuinely new topic, even with the same recipient.
+3. **DERIVE** the key from the most specific reference. If a PR review involves spec changes, use `pr:<number>` (the actionable unit), not `spec:<slug>`.
+4. **Keep identifiers stable** — use PR numbers, not PR titles. Use spec URI slugs, not descriptions.
+5. If no natural key exists for a multi-step conversation, use `thread:<short-slug>` with a descriptive slug.
+
+### Recipient Rules
+
+1. Your session was automatically matched to this thread. You have prior context from earlier messages.
+2. When replying via `send_to_inbox` or `send_response`, **ALWAYS pass the same threadKey** so the conversation stays in one session for all participants.
+3. If the thread is DONE (PR merged, spec finalized, issue closed), say so in your response. The session can be ended — future messages on the same key will start a fresh session.
+
 ## Key Principles
 
 - **Prefer MCP tools over CLI equivalents** — when an MCP server provides functionality that overlaps with a CLI tool, use the MCP tool. MCP calls don't require user permission approval, provide structured output, and integrate better with your tooling. Examples: use `mcp__github__*` over `gh` CLI for PRs/issues/diffs/reviews, use `mcp__supabase__*` over `supabase` CLI for migrations and SQL.
