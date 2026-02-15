@@ -29,6 +29,7 @@ function mapDbToSession(row: DbSession): Session {
     id: row.id,
     userId: row.user_id,
     agentId: row.agent_id || '',
+    identityId: row.identity_id || undefined,
     claudeSessionId: row.claude_session_id,
 
     type: (metadata.type as SessionType) || 'primary',
@@ -74,6 +75,7 @@ function mapSessionToDb(
   return {
     user_id: session.userId,
     agent_id: session.agentId,
+    identity_id: session.identityId || null,
     claude_session_id: session.claudeSessionId,
     status: session.status,
     ended_at: session.endedAt?.toISOString() || null,

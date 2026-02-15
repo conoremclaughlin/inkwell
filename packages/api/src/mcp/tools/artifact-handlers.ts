@@ -240,7 +240,6 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
       uri,
       user_id: resolved.user.id,
       ...(workspaceId ? { workspace_id: workspaceId } : {}),
-      created_by_agent_id: agentId || null,
       created_by_identity_id: authorIdentity?.id || null,
       title,
       content,
@@ -266,7 +265,6 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
     version: 1,
     title,
     content,
-    changed_by_agent_id: agentId || null,
     changed_by_identity_id: authorIdentity?.id || null,
     changed_by_user_id: agentId ? null : resolved.user.id,
     change_type: 'create',
@@ -403,7 +401,9 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
         throw new Error(`Failed to resolve artifact comment users: ${commentUsersError.message}`);
       }
 
-      commentUsersById = new Map((commentUsers || []).map((commentUser) => [commentUser.id, commentUser]));
+      commentUsersById = new Map(
+        (commentUsers || []).map((commentUser) => [commentUser.id, commentUser])
+      );
     }
 
     comments = (commentRows || []).map((comment) => {
@@ -458,7 +458,6 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
             content: artifact.content,
             contentType: artifact.content_type,
             artifactType: artifact.artifact_type,
-            createdByAgentId: artifact.created_by_agent_id,
             createdByIdentityId: artifact.created_by_identity_id,
             collaborators: artifact.collaborators,
             visibility: artifact.visibility,
@@ -513,7 +512,9 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
 
   // Check if agent has permission to edit
   if (agentId && current.collaborators && !current.collaborators.includes(agentId)) {
-    if (current.created_by_agent_id !== agentId) {
+    // Compare via identity UUID when available, fall back to collaborators list
+    const isCreator = editorIdentity && current.created_by_identity_id === editorIdentity.id;
+    if (!isCreator) {
       throw new Error(`Agent ${agentId} does not have permission to edit this artifact`);
     }
   }
@@ -683,7 +684,6 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     version: newVersion,
     title: updated.title,
     content: updated.content,
-    changed_by_agent_id: agentId || null,
     changed_by_identity_id: editorIdentity?.id || null,
     changed_by_user_id: agentId ? null : resolved.user.id,
     change_type: changeType,
@@ -821,7 +821,6 @@ export async function handleGetArtifactHistory(args: unknown, dataComposer: Data
             id: h.id,
             version: h.version,
             title: h.title,
-            changedByAgentId: h.changed_by_agent_id,
             changedByIdentityId: h.changed_by_identity_id,
             changedByUserId: h.changed_by_user_id,
             changeType: h.change_type,
@@ -1017,7 +1016,9 @@ export async function handleListArtifactComments(args: unknown, dataComposer: Da
       throw new Error(`Failed to resolve comment users: ${commentUsersError.message}`);
     }
 
-    commentUsersById = new Map((commentUsers || []).map((commentUser) => [commentUser.id, commentUser]));
+    commentUsersById = new Map(
+      (commentUsers || []).map((commentUser) => [commentUser.id, commentUser])
+    );
   }
 
   return {

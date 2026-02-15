@@ -50,8 +50,9 @@ export function createMockSupabaseClient() {
     queryBuilder[method] = vi.fn().mockReturnValue(queryBuilder);
   }
 
-  // single() returns a promise
+  // single() and maybeSingle() return a promise
   queryBuilder.single = vi.fn().mockImplementation(() => Promise.resolve(createResult()));
+  queryBuilder.maybeSingle = vi.fn().mockImplementation(() => Promise.resolve(createResult()));
 
   // Make queryBuilder thenable for direct await (for queries without .single())
   queryBuilder.then = (resolve: (value: { data: unknown; error: unknown }) => void) => {

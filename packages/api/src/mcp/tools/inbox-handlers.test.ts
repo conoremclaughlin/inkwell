@@ -40,10 +40,12 @@ vi.mock('../../channels/agent-gateway.js', () => ({
   }),
 }));
 
-function createMockSupabase(overrides: {
-  insertReturn?: { data: unknown; error: unknown };
-  selectReturn?: { data: unknown; error: unknown; count?: number };
-} = {}) {
+function createMockSupabase(
+  overrides: {
+    insertReturn?: { data: unknown; error: unknown };
+    selectReturn?: { data: unknown; error: unknown; count?: number };
+  } = {}
+) {
   const defaultMessage = {
     id: 'msg-123',
     created_at: '2026-02-15T10:00:00Z',
@@ -73,9 +75,9 @@ function createMockSupabase(overrides: {
       eq: vi.fn().mockReturnThis(),
       order: vi.fn().mockReturnThis(),
       limit: vi.fn().mockReturnThis(),
-      or: vi.fn().mockResolvedValue(
-        overrides.selectReturn || { data: [defaultMessage], error: null }
-      ),
+      or: vi
+        .fn()
+        .mockResolvedValue(overrides.selectReturn || { data: [defaultMessage], error: null }),
     }),
   };
 
@@ -90,8 +92,19 @@ function createMockSupabase(overrides: {
     }),
   };
 
+  // For identity resolution (resolveIdentityId calls .select().eq().eq().maybeSingle())
+  const identityChainable = {
+    select: vi.fn().mockReturnValue({
+      eq: vi.fn().mockReturnValue({
+        eq: vi.fn().mockReturnValue({
+          maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      }),
+    }),
+  };
+
   const fromFn = vi.fn().mockImplementation((table: string) => {
-    // Return different chainable objects depending on usage
+    if (table === 'agent_identities') return identityChainable;
     return chainable;
   });
 

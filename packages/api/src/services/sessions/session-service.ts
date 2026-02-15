@@ -31,6 +31,7 @@ import { ContextBuilder } from './context-builder.js';
 import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 import { CodexRunner } from './codex-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
+import { resolveIdentityId } from '../../auth/resolve-identity.js';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -101,6 +102,7 @@ export class SessionService implements ISessionService {
   private codexRunner: IClaudeRunner;
   private activityStream: IActivityStream;
   private config: SessionServiceConfig;
+  private supabase: SupabaseClient<Database> | null;
 
   /**
    * Processing lock per agent session.
@@ -128,7 +130,8 @@ export class SessionService implements ISessionService {
     claudeRunner: IClaudeRunner,
     activityStream: IActivityStream,
     config: Partial<SessionServiceConfig> = {},
-    codexRunner?: IClaudeRunner
+    codexRunner?: IClaudeRunner,
+    supabase?: SupabaseClient<Database>
   ) {
     this.repository = repository;
     this.contextBuilder = contextBuilder;
@@ -136,6 +139,7 @@ export class SessionService implements ISessionService {
     this.codexRunner = codexRunner || claudeRunner;
     this.activityStream = activityStream;
     this.config = { ...DEFAULT_CONFIG, ...config };
+    this.supabase = supabase || null;
   }
 
   async handleMessage(request: SessionRequest): Promise<SessionResult> {
@@ -409,10 +413,17 @@ export class SessionService implements ISessionService {
       }
     }
 
+    // Resolve canonical identity UUID
+    let identityId: string | undefined;
+    if (this.supabase) {
+      identityId = (await resolveIdentityId(this.supabase, userId, agentId)) || undefined;
+    }
+
     // Create new session
     const session = await this.repository.create({
       userId,
       agentId,
+      identityId,
       claudeSessionId: null,
       type,
       status: 'active',
@@ -799,6 +810,7 @@ export function createSessionService(
     new ClaudeRunner(),
     new ActivityStreamRepository(supabase),
     config,
-    new CodexRunner()
+    new CodexRunner(),
+    supabase
   );
 }

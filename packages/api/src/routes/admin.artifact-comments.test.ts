@@ -94,7 +94,6 @@ describe('admin artifact comments routes', () => {
                 parent_comment_id: null,
                 content: 'Looks good',
                 metadata: {},
-                created_by_agent_id: 'lumen',
                 created_by_identity_id: 'identity-1',
                 created_at: '2026-02-11T00:00:00Z',
                 updated_at: '2026-02-11T00:00:00Z',

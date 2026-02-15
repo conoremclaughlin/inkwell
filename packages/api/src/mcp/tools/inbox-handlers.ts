@@ -8,6 +8,7 @@
 import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
+import { resolveIdentityId } from '../../auth/resolve-identity';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
@@ -113,13 +114,21 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   const shouldTriggerByDefault = messageType === 'task_request' || messageType === 'session_resume';
   const trigger = parsed.trigger ?? shouldTriggerByDefault;
 
+  // Resolve canonical identity UUIDs for sender and recipient
+  const recipientIdentityId = await resolveIdentityId(supabase, resolved.user.id, recipientAgentId);
+  const senderIdentityId = senderAgentId
+    ? await resolveIdentityId(supabase, resolved.user.id, senderAgentId)
+    : null;
+
   const { data: message, error } = await supabase
     .from('agent_inbox')
     .insert({
       recipient_user_id: resolved.user.id,
       recipient_agent_id: recipientAgentId,
+      recipient_identity_id: recipientIdentityId,
       sender_user_id: senderAgentId ? null : resolved.user.id,
       sender_agent_id: senderAgentId || null,
+      sender_identity_id: senderIdentityId,
       subject,
       content,
       message_type: messageType,

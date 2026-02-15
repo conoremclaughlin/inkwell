@@ -3,6 +3,7 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
+import { resolveIdentityId } from '../../auth/resolve-identity';
 import { logger } from '../../utils/logger';
 import type {
   Memory,
@@ -29,6 +30,11 @@ export class MemoryRepository {
    * Create a new memory
    */
   async remember(input: MemoryCreateInput): Promise<Memory> {
+    const identityId =
+      input.agentId && input.userId
+        ? await resolveIdentityId(this.supabase, input.userId, input.agentId)
+        : null;
+
     const { data, error } = await this.supabase
       .from('memories')
       .insert({
@@ -40,6 +46,7 @@ export class MemoryRepository {
         metadata: input.metadata || {},
         expires_at: input.expiresAt?.toISOString(),
         agent_id: input.agentId || null,
+        identity_id: identityId,
       })
       .select()
       .single();
@@ -187,9 +194,15 @@ export class MemoryRepository {
    * Start a new session
    */
   async startSession(input: SessionCreateInput): Promise<Session> {
+    const identityId =
+      input.agentId && input.userId
+        ? await resolveIdentityId(this.supabase, input.userId, input.agentId)
+        : null;
+
     const insertData: Record<string, unknown> = {
       user_id: input.userId,
       agent_id: input.agentId,
+      identity_id: identityId,
       metadata: input.metadata || {},
     };
     const scopedStudioId = input.studioId ?? input.workspaceId;
