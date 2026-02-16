@@ -1,0 +1,162 @@
+# CLI Lifecycle Hooks
+
+PCP hooks bridge coding agents (Claude Code, Codex, Gemini) with PCP's session, memory, and inbox system. Each hook fires at a specific lifecycle event and injects context into the agent's conversation.
+
+**Source:** [`src/commands/hooks.ts`](src/commands/hooks.ts)
+**Templates:** [`src/templates/hook-*.md`](src/templates/)
+
+## Backend Support
+
+| Hook | Claude Code | Codex | Gemini |
+|------|:-----------:|:-----:|:------:|
+| `on-session-start` | SessionStart | session_start | session_start |
+| `pre-compact` | PreCompact | - | - |
+| `post-compact` | SessionStart* | - | - |
+| `on-prompt` | UserPromptSubmit | - | - |
+| `on-stop` | Stop | session_end | session_end |
+
+\* `post-compact` uses the SessionStart event with a "compact" matcher to distinguish from initial startup.
+
+## Hook Reference
+
+### `on-session-start`
+
+**When:** Agent session begins (first startup).
+
+**What it does:**
+1. Reads workspace ID from `.pcp/identity.json`
+2. Calls `bootstrap` with agentId and workspaceId
+3. Calls `get_inbox` for unread messages
+4. Stores backend session ID in `.pcp/runtime/session-id`
+
+**Output:**
+```
+## Session Context (PCP)
+
+Agent: **{agentId}**
+Workspace: {workspace name}
+
+### Identity
+{bootstrap identity JSON}
+
+### Recent Memories
+- {memory content}
+...
+
+### Active Sessions
+- {session_id}: {summary or status}
+...
+
+### Inbox ({count} messages)
+- **{from}**: {content or subject}
+...
+```
+
+---
+
+### `pre-compact`
+
+**When:** Context is about to be compacted (Claude Code only).
+
+**What it does:** Outputs a static reminder prompting the agent to save state before context is lost.
+
+**Output:**
+```
+## Pre-Compaction Reminder (PCP)
+
+Context is about to be compacted. Before compaction completes:
+
+1. **Save critical decisions** — Use `mcp__pcp__log_session` to persist any
+   important reasoning, decisions, or context that should survive compaction.
+2. **Update memory** — If you discovered reusable patterns or key facts,
+   use `mcp__pcp__remember` to save them.
+3. **Note current task state** — Log where you are in the current task so you
+   can resume smoothly after compaction.
+
+This context will be lost after compaction unless you save it now.
+```
+
+---
+
+### `post-compact`
+
+**When:** After context compaction (Claude Code only). Fires on SessionStart with a "compact" matcher.
+
+**What it does:**
+1. Calls `bootstrap` to reload identity
+2. Calls `get_inbox` for unread messages
+
+**Output:**
+```
+## Post-Compaction Context (PCP)
+
+Agent: {agentId}
+
+### Identity
+{bootstrap identity JSON}
+
+### Inbox ({count} messages)
+- **{from}**: {content or subject}
+...
+```
+
+---
+
+### `on-prompt`
+
+**When:** Before each user prompt is submitted (Claude Code only).
+
+**What it does:**
+1. Checks if inbox was polled within the last 5 minutes — if so, exits silently
+2. Calls `get_inbox` for unread messages
+3. Updates the `last-inbox-check` timestamp in `.pcp/runtime/`
+
+**Output (only if messages exist and inbox is stale):**
+```
+<pcp-inbox count="{count}">
+- **{from}**: {content or subject}
+...
+</pcp-inbox>
+```
+
+---
+
+### `on-stop`
+
+**When:** After each agent tool call / turn (Claude Code: Stop, Codex/Gemini: session_end).
+
+**What it does:**
+1. Increments tool call counter in `.pcp/runtime/tool-count`
+2. Every 30 tool calls, outputs a nudge to log session progress
+3. If inbox is stale (>5 minutes), checks for new messages
+
+**Output (conditional):**
+```
+<pcp-reminder>
+You have completed ~{count} tool calls this session. Consider using
+`mcp__pcp__log_session` to save a progress snapshot.
+</pcp-reminder>
+
+<pcp-inbox count="{count}">
+- **{from}**: {content or subject}
+...
+</pcp-inbox>
+```
+
+## Runtime State
+
+Hooks store ephemeral state in `.pcp/runtime/` (gitignored):
+
+| File | Purpose |
+|------|---------|
+| `session-id` | Backend session ID from on-session-start |
+| `last-inbox-check` | ISO timestamp of last inbox poll |
+| `tool-count` | Cumulative tool call counter for on-stop nudges |
+
+## Installation
+
+```bash
+sb hooks install     # Auto-detects backend and installs hooks
+sb hooks status      # Show installed hook status
+sb hooks uninstall   # Remove PCP-managed hooks
+```

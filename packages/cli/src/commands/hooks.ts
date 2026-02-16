@@ -18,9 +18,13 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { join } from 'path';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { homedir } from 'os';
 import { resolveAgentId } from '../backends/identity.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 // ============================================================================
 // Types
@@ -242,6 +246,77 @@ function readRuntimeFile(cwd: string, filename: string): string | null {
 function writeRuntimeFile(cwd: string, filename: string, content: string): void {
   const dir = ensureRuntimeDir(cwd);
   writeFileSync(join(dir, filename), content);
+}
+
+// ============================================================================
+// Template Loading
+// ============================================================================
+
+function loadTemplate(name: string): string {
+  // Try compiled output path first
+  const distPath = join(__dirname, '..', 'templates', `${name}.md`);
+  if (existsSync(distPath)) return readFileSync(distPath, 'utf-8');
+
+  // Fallback: source tree (development)
+  const srcPath = join(__dirname, '..', '..', 'src', 'templates', `${name}.md`);
+  if (existsSync(srcPath)) return readFileSync(srcPath, 'utf-8');
+
+  throw new Error(`Template not found: ${name}`);
+}
+
+function renderTemplate(template: string, vars: Record<string, string>): string {
+  let result = template;
+  for (const [key, value] of Object.entries(vars)) {
+    result = result.replaceAll(`{{${key}}}`, value);
+  }
+  // Clean up empty placeholder lines (blocks that had no data)
+  return result.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// ============================================================================
+// Shared Block Builders
+// ============================================================================
+
+function buildIdentityBlock(identity: unknown): string {
+  if (!identity) return '';
+  return `### Identity\n\`\`\`json\n${JSON.stringify(identity, null, 2)}\n\`\`\``;
+}
+
+function buildInboxBlock(messages: Array<Record<string, unknown>> | undefined): string {
+  if (!messages || messages.length === 0) return '';
+  const lines = [`### Inbox (${messages.length} message${messages.length === 1 ? '' : 's'})`];
+  for (const msg of messages) {
+    lines.push(`- **${msg.from || 'unknown'}**: ${msg.content || msg.subject || '(no content)'}`);
+  }
+  return lines.join('\n');
+}
+
+function buildInboxTag(messages: Array<Record<string, unknown>> | undefined): string {
+  if (!messages || messages.length === 0) return '';
+  const lines = [`<pcp-inbox count="${messages.length}">`];
+  for (const msg of messages) {
+    lines.push(`- **${msg.from || 'unknown'}**: ${msg.content || msg.subject || '(no content)'}`);
+  }
+  lines.push('</pcp-inbox>');
+  return lines.join('\n');
+}
+
+function buildMemoriesBlock(memories: Array<Record<string, unknown>> | undefined): string {
+  if (!memories || memories.length === 0) return '';
+  const lines = ['### Recent Memories'];
+  for (const mem of memories.slice(0, 5)) {
+    lines.push(`- ${mem.content || mem.key || JSON.stringify(mem)}`);
+  }
+  return lines.join('\n');
+}
+
+function buildSessionsBlock(sessions: Array<Record<string, unknown>> | undefined): string {
+  if (!sessions || sessions.length === 0) return '';
+  const lines = ['### Active Sessions'];
+  for (const s of sessions) {
+    lines.push(`- ${(s.id as string)?.substring(0, 8) || 'unknown'}: ${s.summary || s.status || 'active'}`);
+  }
+  return lines.join('\n');
 }
 
 // ============================================================================
@@ -619,21 +694,7 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
 
 async function preCompactHandler(): Promise<void> {
   await readStdin(); // consume stdin but we don't need it
-
-  // Output reminder to stdout — the backend injects this into the conversation
-  const output = [
-    '## Pre-Compaction Reminder (PCP)',
-    '',
-    'Context is about to be compacted. Before compaction completes:',
-    '',
-    '1. **Save critical decisions** — Use `mcp__pcp__log_session` to persist any important reasoning, decisions, or context that should survive compaction.',
-    '2. **Update memory** — If you discovered reusable patterns or key facts, use `mcp__pcp__remember` to save them.',
-    '3. **Note current task state** — Log where you are in the current task so you can resume smoothly after compaction.',
-    '',
-    'This context will be lost after compaction unless you save it now.',
-  ].join('\n');
-
-  process.stdout.write(output);
+  process.stdout.write(loadTemplate('hook-pre-compact'));
 }
 
 async function postCompactHandler(): Promise<void> {
@@ -642,12 +703,9 @@ async function postCompactHandler(): Promise<void> {
   const cwd = process.cwd();
   const config = getPcpConfig();
   const agentId = resolveAgentId();
-  const lines: string[] = [];
 
-  lines.push('## Post-Compaction Context (PCP)');
-  lines.push('');
-  lines.push(`Agent: ${agentId}`);
-  lines.push('');
+  let identityBlock = '';
+  let inboxBlock = '';
 
   // Bootstrap identity
   try {
@@ -655,17 +713,9 @@ async function postCompactHandler(): Promise<void> {
       email: config?.email,
       agentId,
     });
-
-    if (bootstrap.identity) {
-      lines.push('### Identity');
-      lines.push('```json');
-      lines.push(JSON.stringify(bootstrap.identity, null, 2));
-      lines.push('```');
-      lines.push('');
-    }
+    identityBlock = buildIdentityBlock(bootstrap.identity);
   } catch {
-    lines.push('*Could not reach PCP server for bootstrap.*');
-    lines.push('');
+    identityBlock = '*Could not reach PCP server for bootstrap.*';
   }
 
   // Check inbox
@@ -674,22 +724,20 @@ async function postCompactHandler(): Promise<void> {
       email: config?.email,
       agentId,
     });
-
-    const messages = inbox.messages as Array<Record<string, unknown>> | undefined;
-    if (messages && messages.length > 0) {
-      lines.push(`### Inbox (${messages.length} message${messages.length === 1 ? '' : 's'})`);
-      for (const msg of messages) {
-        lines.push(`- **${msg.from || 'unknown'}**: ${msg.content || msg.subject || '(no content)'}`);
-      }
-      lines.push('');
-    }
-
+    inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
     writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
   } catch {
     // Non-fatal
   }
 
-  process.stdout.write(lines.join('\n'));
+  const template = loadTemplate('hook-post-compact');
+  const output = renderTemplate(template, {
+    AGENT_ID: agentId,
+    IDENTITY_BLOCK: identityBlock,
+    INBOX_BLOCK: inboxBlock,
+  });
+
+  process.stdout.write(output);
 }
 
 async function onSessionStartHandler(): Promise<void> {
@@ -698,28 +746,27 @@ async function onSessionStartHandler(): Promise<void> {
   const cwd = process.cwd();
   const config = getPcpConfig();
   const agentId = resolveAgentId();
-  const lines: string[] = [];
-
-  lines.push('## Session Context (PCP)');
-  lines.push('');
-  lines.push(`Agent: **${agentId}**`);
 
   // Read workspace ID from identity.json
   const identityPath = join(cwd, '.pcp', 'identity.json');
   let workspaceId: string | undefined;
+  let workspaceLine = '';
   if (existsSync(identityPath)) {
     try {
       const identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
       workspaceId = identity.workspaceId;
       if (identity.workspace) {
-        lines.push(`Workspace: ${identity.workspace}`);
+        workspaceLine = `Workspace: ${identity.workspace}`;
       }
     } catch {
       // ignore
     }
   }
 
-  lines.push('');
+  let identityBlock = '';
+  let memoriesBlock = '';
+  let sessionsBlock = '';
+  let inboxBlock = '';
 
   // Bootstrap
   try {
@@ -730,39 +777,11 @@ async function onSessionStartHandler(): Promise<void> {
     if (workspaceId) bootstrapArgs.workspaceId = workspaceId;
 
     const bootstrap = await callPcpTool('bootstrap', bootstrapArgs);
-
-    if (bootstrap.identity) {
-      lines.push('### Identity');
-      lines.push('```json');
-      lines.push(JSON.stringify(bootstrap.identity, null, 2));
-      lines.push('```');
-      lines.push('');
-    }
-
-    if (bootstrap.recentMemories) {
-      const memories = bootstrap.recentMemories as Array<Record<string, unknown>>;
-      if (memories.length > 0) {
-        lines.push('### Recent Memories');
-        for (const mem of memories.slice(0, 5)) {
-          lines.push(`- ${mem.content || mem.key || JSON.stringify(mem)}`);
-        }
-        lines.push('');
-      }
-    }
-
-    if (bootstrap.activeSessions) {
-      const sessions = bootstrap.activeSessions as Array<Record<string, unknown>>;
-      if (sessions.length > 0) {
-        lines.push('### Active Sessions');
-        for (const s of sessions) {
-          lines.push(`- ${(s.id as string)?.substring(0, 8) || 'unknown'}: ${s.summary || s.status || 'active'}`);
-        }
-        lines.push('');
-      }
-    }
+    identityBlock = buildIdentityBlock(bootstrap.identity);
+    memoriesBlock = buildMemoriesBlock(bootstrap.recentMemories as Array<Record<string, unknown>> | undefined);
+    sessionsBlock = buildSessionsBlock(bootstrap.activeSessions as Array<Record<string, unknown>> | undefined);
   } catch {
-    lines.push('*Could not reach PCP server for bootstrap.*');
-    lines.push('');
+    identityBlock = '*Could not reach PCP server for bootstrap.*';
   }
 
   // Check inbox
@@ -771,16 +790,7 @@ async function onSessionStartHandler(): Promise<void> {
       email: config?.email,
       agentId,
     });
-
-    const messages = inbox.messages as Array<Record<string, unknown>> | undefined;
-    if (messages && messages.length > 0) {
-      lines.push(`### Inbox (${messages.length} message${messages.length === 1 ? '' : 's'})`);
-      for (const msg of messages) {
-        lines.push(`- **${msg.from || 'unknown'}**: ${msg.content || msg.subject || '(no content)'}`);
-      }
-      lines.push('');
-    }
-
+    inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
     writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
   } catch {
     // Non-fatal
@@ -791,7 +801,17 @@ async function onSessionStartHandler(): Promise<void> {
     writeRuntimeFile(cwd, 'session-id', String(stdin.session_id));
   }
 
-  process.stdout.write(lines.join('\n'));
+  const template = loadTemplate('hook-session-start');
+  const output = renderTemplate(template, {
+    AGENT_ID: agentId,
+    WORKSPACE_LINE: workspaceLine,
+    IDENTITY_BLOCK: identityBlock,
+    MEMORIES_BLOCK: memoriesBlock,
+    SESSIONS_BLOCK: sessionsBlock,
+    INBOX_BLOCK: inboxBlock,
+  });
+
+  process.stdout.write(output);
 }
 
 async function onPromptHandler(): Promise<void> {
@@ -824,14 +844,9 @@ async function onPromptHandler(): Promise<void> {
     writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
 
     const messages = inbox.messages as Array<Record<string, unknown>> | undefined;
-    if (messages && messages.length > 0) {
-      const lines: string[] = [];
-      lines.push(`<pcp-inbox count="${messages.length}">`);
-      for (const msg of messages) {
-        lines.push(`- **${msg.from || 'unknown'}**: ${msg.content || msg.subject || '(no content)'}`);
-      }
-      lines.push('</pcp-inbox>');
-      process.stdout.write(lines.join('\n'));
+    const inboxTag = buildInboxTag(messages);
+    if (inboxTag) {
+      process.stdout.write(inboxTag);
     }
   } catch {
     // Silent failure — don't interrupt the user's prompt
@@ -844,7 +859,7 @@ async function onStopHandler(): Promise<void> {
   const cwd = process.cwd();
   const config = getPcpConfig();
   const agentId = resolveAgentId();
-  const lines: string[] = [];
+  const parts: string[] = [];
 
   // Increment tool call counter
   const countStr = readRuntimeFile(cwd, 'tool-count');
@@ -853,12 +868,8 @@ async function onStopHandler(): Promise<void> {
 
   // Every ~30 calls, nudge to log session
   if (count % 30 === 0) {
-    lines.push('<pcp-reminder>');
-    lines.push(
-      `You have completed ~${count} tool calls this session. Consider using \`mcp__pcp__log_session\` to save a progress snapshot.`
-    );
-    lines.push('</pcp-reminder>');
-    lines.push('');
+    const template = loadTemplate('hook-on-stop');
+    parts.push(renderTemplate(template, { TOOL_COUNT: String(count) }));
   }
 
   // Check inbox if stale
@@ -879,23 +890,15 @@ async function onStopHandler(): Promise<void> {
 
       writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
 
-      const messages = inbox.messages as Array<Record<string, unknown>> | undefined;
-      if (messages && messages.length > 0) {
-        lines.push(`<pcp-inbox count="${messages.length}">`);
-        for (const msg of messages) {
-          lines.push(
-            `- **${msg.from || 'unknown'}**: ${msg.content || msg.subject || '(no content)'}`
-          );
-        }
-        lines.push('</pcp-inbox>');
-      }
+      const inboxTag = buildInboxTag(inbox.messages as Array<Record<string, unknown>> | undefined);
+      if (inboxTag) parts.push(inboxTag);
     } catch {
       // Silent
     }
   }
 
-  if (lines.length > 0) {
-    process.stdout.write(lines.join('\n'));
+  if (parts.length > 0) {
+    process.stdout.write(parts.join('\n\n'));
   }
 }
 

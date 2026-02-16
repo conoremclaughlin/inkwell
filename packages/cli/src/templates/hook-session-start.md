@@ -1,0 +1,12 @@
+## Session Context (PCP)
+
+Agent: **{{AGENT_ID}}**
+{{WORKSPACE_LINE}}
+
+{{IDENTITY_BLOCK}}
+
+{{MEMORIES_BLOCK}}
+
+{{SESSIONS_BLOCK}}
+
+{{INBOX_BLOCK}}
