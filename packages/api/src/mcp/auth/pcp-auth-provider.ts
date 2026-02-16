@@ -30,6 +30,7 @@ export interface PendingAuth {
   codeChallenge: string;
   redirectUri: string;
   state: string;
+  agentId?: string;
   expiresAt: number;
 }
 
@@ -40,6 +41,7 @@ interface PendingAuthPayload {
   codeChallenge: string;
   redirectUri: string;
   state: string;
+  agentId?: string;
 }
 
 export interface AuthCode {
@@ -48,6 +50,7 @@ export interface AuthCode {
   redirectUri: string;
   userId: string;
   userEmail: string;
+  agentId?: string;
   expiresAt: number;
 }
 
@@ -105,6 +108,7 @@ export class PcpAuthProvider {
     codeChallenge: string;
     redirectUri: string;
     state: string;
+    agentId?: string;
   }): string {
     const payload: PendingAuthPayload = {
       type: 'pending_auth',
@@ -112,6 +116,7 @@ export class PcpAuthProvider {
       codeChallenge: params.codeChallenge,
       redirectUri: params.redirectUri,
       state: params.state,
+      ...(params.agentId ? { agentId: params.agentId } : {}),
     };
 
     return jwt.sign(payload, env.JWT_SECRET, {
@@ -214,6 +219,7 @@ export class PcpAuthProvider {
         redirectUri: pending.redirectUri,
         userId: pcpUser.id,
         userEmail: pcpUser.email || '',
+        ...(pending.agentId ? { agentId: pending.agentId } : {}),
         expiresAt: Date.now() + AUTH_CODE_LIFETIME_MS,
       });
 
@@ -279,7 +285,25 @@ export class PcpAuthProvider {
       }
     }
 
-    // Create refresh token in database
+    // Resolve canonical identity UUID when agent_id is provided
+    let identityId: string | undefined;
+    if (codeData.agentId) {
+      const { data: identity } = await this.supabase
+        .from('agent_identities')
+        .select('id')
+        .eq('user_id', codeData.userId)
+        .eq('agent_id', codeData.agentId)
+        .maybeSingle();
+      identityId = identity?.id;
+      if (!identityId) {
+        logger.warn('No agent_identities record found for token binding', {
+          userId: codeData.userId,
+          agentId: codeData.agentId,
+        });
+      }
+    }
+
+    // Create refresh token in database (with optional identity binding)
     let refreshToken: string;
     let expiresAt: Date;
     try {
@@ -288,7 +312,9 @@ export class PcpAuthProvider {
         codeData.userId,
         clientId,
         ['mcp:tools'],
-        REFRESH_TOKEN_LIFETIME_DAYS
+        REFRESH_TOKEN_LIFETIME_DAYS,
+        codeData.agentId,
+        identityId
       );
       refreshToken = result.refreshToken;
       expiresAt = result.expiresAt;
@@ -299,13 +325,15 @@ export class PcpAuthProvider {
     // Consume the authorization code
     this.authCodes.delete(params.code);
 
-    // Sign our own JWT as the access token
+    // Sign our own JWT as the access token (with optional identity binding)
     const accessToken = signPcpAccessToken(
       {
         type: 'mcp_access',
         sub: codeData.userId,
         email: codeData.userEmail,
         scope: 'mcp:tools',
+        ...(codeData.agentId ? { agentId: codeData.agentId } : {}),
+        ...(identityId ? { identityId } : {}),
       },
       ACCESS_TOKEN_LIFETIME_SECONDS
     );
@@ -314,6 +342,8 @@ export class PcpAuthProvider {
       userId: codeData.userId,
       email: codeData.userEmail,
       clientId,
+      agentId: codeData.agentId || 'none',
+      identityId: identityId || 'none',
       refreshTokenExpires: expiresAt.toISOString(),
     });
 
@@ -364,14 +394,21 @@ export class PcpAuthProvider {
   // Token verification (for /mcp endpoint auth)
   // --------------------------------------------------------------------------
 
-  verifyAccessToken(authHeader: string | undefined): { userId: string; email: string } | null {
+  verifyAccessToken(
+    authHeader: string | undefined
+  ): { userId: string; email: string; agentId?: string; identityId?: string } | null {
     if (!authHeader?.startsWith('Bearer ')) return null;
     const token = authHeader.substring(7);
 
     const payload = verifyPcpAccessToken(token, 'mcp_access');
     if (!payload) return null;
 
-    return { userId: payload.sub, email: payload.email };
+    return {
+      userId: payload.sub,
+      email: payload.email,
+      ...(payload.agentId ? { agentId: payload.agentId } : {}),
+      ...(payload.identityId ? { identityId: payload.identityId } : {}),
+    };
   }
 
   // --------------------------------------------------------------------------

@@ -1287,10 +1287,12 @@ export type Database = {
       };
       mcp_tokens: {
         Row: {
+          agent_id: string | null;
           client_id: string;
           created_at: string | null;
           expires_at: string;
           id: string;
+          identity_id: string | null;
           last_used_at: string | null;
           refresh_token: string;
           scopes: string[] | null;
@@ -1299,10 +1301,12 @@ export type Database = {
           user_id: string;
         };
         Insert: {
+          agent_id?: string | null;
           client_id: string;
           created_at?: string | null;
           expires_at: string;
           id?: string;
+          identity_id?: string | null;
           last_used_at?: string | null;
           refresh_token: string;
           scopes?: string[] | null;
@@ -1311,10 +1315,12 @@ export type Database = {
           user_id: string;
         };
         Update: {
+          agent_id?: string | null;
           client_id?: string;
           created_at?: string | null;
           expires_at?: string;
           id?: string;
+          identity_id?: string | null;
           last_used_at?: string | null;
           refresh_token?: string;
           scopes?: string[] | null;
@@ -1323,6 +1329,13 @@ export type Database = {
           user_id?: string;
         };
         Relationships: [
+          {
+            foreignKeyName: 'mcp_tokens_identity_id_fkey';
+            columns: ['identity_id'];
+            isOneToOne: false;
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
           {
             foreignKeyName: 'mcp_tokens_user_id_fkey';
             columns: ['user_id'];

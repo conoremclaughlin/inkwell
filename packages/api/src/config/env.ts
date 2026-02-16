@@ -87,6 +87,9 @@ const envSchema = z.object({
   DISCORD_BOT_TOKEN: optionalString,
   DISCORD_APPLICATION_ID: optionalString,
 
+  // Identity enforcement
+  ENFORCE_IDENTITY_PINNING: z.enum(['true', 'false']).default('true'),
+
   // OAuth - Google
   GOOGLE_CLIENT_ID: optionalString,
   GOOGLE_CLIENT_SECRET: optionalString,

@@ -29,8 +29,10 @@ export interface RequestContextData {
   platform?: 'telegram' | 'whatsapp' | 'discord';
   /** Platform-specific user ID */
   platformId?: string;
-  /** Agent ID if known */
+  /** Agent ID if known (text label) */
   agentId?: string;
+  /** Canonical agent_identities UUID (strongest identity binding) */
+  identityId?: string;
   /** Session ID if in a session */
   sessionId?: string;
   /** Active product workspace container ID */
@@ -46,6 +48,10 @@ const asyncLocalStorage = new AsyncLocalStorage<RequestContextData>();
 // Session-scoped context (persists across requests in a session)
 // Used primarily for Claude Code where context is set at bootstrap
 let sessionContext: Omit<RequestContextData, 'timestamp'> | null = null;
+
+// Session-scoped identity pin (immutable once set by bootstrap or token)
+// Prevents mid-session identity changes (e.g. via prompt injection)
+let pinnedSessionAgentId: string | null = null;
 
 /**
  * Run a function with request context set.
@@ -136,6 +142,46 @@ export function hasUserContext(): boolean {
   const user = getUserFromContext();
   if (!user) return false;
   return !!(user.userId || user.email || (user.platform && user.platformId));
+}
+
+// ============================================================================
+// Identity Pinning
+// ============================================================================
+
+/**
+ * Pin the session to a specific agent identity.
+ * Once pinned, the identity is immutable for the session lifetime.
+ * Called by bootstrap() and when an agent-bound token is first used.
+ * Throws if already pinned to a different identity.
+ */
+export function pinSessionAgent(agentId: string): void {
+  if (pinnedSessionAgentId !== null && pinnedSessionAgentId !== agentId) {
+    throw new Error(
+      `Identity already pinned to "${pinnedSessionAgentId}". Cannot change to "${agentId}".`
+    );
+  }
+  pinnedSessionAgentId = agentId;
+}
+
+/**
+ * Get the pinned agent identity.
+ * Request context (HTTP token-bound agentId) takes priority over session pin (stdio).
+ * Returns null if no identity is pinned (human user or pre-bootstrap).
+ */
+export function getPinnedAgentId(): string | null {
+  // HTTP request context (token-bound) takes priority
+  const reqCtx = getRequestContext();
+  if (reqCtx?.agentId) return reqCtx.agentId;
+  // Fall back to session pin (stdio/bootstrap)
+  return pinnedSessionAgentId;
+}
+
+/**
+ * Clear the pinned agent identity.
+ * Used when cleaning up session state.
+ */
+export function clearPinnedAgent(): void {
+  pinnedSessionAgentId = null;
 }
 
 /**

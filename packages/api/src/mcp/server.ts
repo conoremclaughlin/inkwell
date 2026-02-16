@@ -192,7 +192,14 @@ export class MCPServer {
 
       // Use request-scoped context (AsyncLocalStorage) instead of global state
       // to prevent identity leaking across concurrent stateless requests.
-      const ctx = userData ? { userId: userData.userId, email: userData.email } : {};
+      const ctx = userData
+        ? {
+            userId: userData.userId,
+            email: userData.email,
+            agentId: userData.agentId,
+            identityId: userData.identityId,
+          }
+        : {};
 
       await runWithRequestContext(ctx, async () => {
         let transport: StreamableHTTPServerTransport | undefined;
@@ -324,9 +331,15 @@ export class MCPServer {
 
     // Authorization endpoint — redirects to web portal for login
     app.get('/authorize', (req, res) => {
-      const { client_id, redirect_uri, state, code_challenge, response_type } = req.query;
+      const { client_id, redirect_uri, state, code_challenge, response_type, agent_id } = req.query;
 
-      logger.info('MCP /authorize called', { client_id, redirect_uri, state, response_type });
+      logger.info('MCP /authorize called', {
+        client_id,
+        redirect_uri,
+        state,
+        response_type,
+        agent_id,
+      });
 
       if (response_type !== 'code') {
         res.status(400).json({ error: 'unsupported_response_type' });
@@ -338,6 +351,7 @@ export class MCPServer {
         codeChallenge: code_challenge as string,
         redirectUri: redirect_uri as string,
         state: state as string,
+        agentId: agent_id as string | undefined,
       });
 
       const webPortalUrl = process.env.WEB_PORTAL_URL || 'http://localhost:3002';

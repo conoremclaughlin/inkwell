@@ -11,6 +11,7 @@ import { homedir } from 'os';
 import type { DataComposer } from '../../data/composer';
 import type { Json, TablesInsert } from '../../data/supabase/types';
 import { logger } from '../../utils/logger';
+import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
 
 // =====================================================
@@ -194,7 +195,6 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
   const supabase = dataComposer.getClient();
 
   const {
-    agentId,
     name,
     role,
     description,
@@ -207,6 +207,8 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
     syncToFile,
     workspaceId,
   } = params;
+  // Enforce identity: pinned agents can only modify their own identity
+  const agentId = getEffectiveAgentId(params.agentId) ?? params.agentId;
 
   // Fetch existing record so omitted optional fields are preserved
   const { data: existing } = await withWorkspaceFilter(
