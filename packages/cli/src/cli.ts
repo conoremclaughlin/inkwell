@@ -24,6 +24,8 @@ import { registerAgentCommands } from './commands/agent.js';
 import { registerSessionCommands } from './commands/session.js';
 import { registerConfigCommands } from './commands/mcp.js';
 import { registerAwakenCommand } from './commands/awaken.js';
+import { registerHooksCommands } from './commands/hooks.js';
+import { registerInitCommand } from './commands/init.js';
 import { runClaude, runClaudeInteractive } from './commands/claude.js';
 
 const VERSION = '0.3.0';
@@ -167,6 +169,8 @@ registerAgentCommands(program);
 registerSessionCommands(program);
 registerConfigCommands(program);
 registerAwakenCommand(program);
+registerHooksCommands(program);
+registerInitCommand(program);
 
 // ============================================================================
 // Subcommand detection
