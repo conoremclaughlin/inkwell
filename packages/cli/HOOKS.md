@@ -3,6 +3,7 @@
 PCP hooks bridge coding agents (Claude Code, Codex, Gemini) with PCP's session, memory, and inbox system. Each hook fires at a specific lifecycle event and injects context into the agent's conversation.
 
 **Source:** [`src/commands/hooks.ts`](src/commands/hooks.ts)
+**Templates:** [`src/templates/hook-*.md`](src/templates/)
 
 ## Backend Support
 
