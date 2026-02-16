@@ -9,6 +9,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../supabase/types';
+import { resolveIdentityId } from '../../auth/resolve-identity';
 
 // Type alias for the table to help with Supabase generics
 type WorkspacesTable = Database['public']['Tables']['workspaces'];
@@ -38,6 +39,7 @@ export interface Workspace {
 export interface CreateWorkspaceInput {
   userId: string;
   agentId?: string;
+  identityId?: string;
   sessionId?: string;
   repoRoot: string;
   worktreePath: string;
@@ -89,9 +91,14 @@ export class WorkspacesRepository {
    * Create a new workspace
    */
   async create(input: CreateWorkspaceInput): Promise<Workspace> {
+    const identityId =
+      input.identityId ||
+      (input.agentId ? await resolveIdentityId(this.client, input.userId, input.agentId) : null);
+
     const insertData: WorkspacesTable['Insert'] = {
       user_id: input.userId,
       agent_id: input.agentId,
+      identity_id: identityId,
       session_id: input.sessionId,
       repo_root: input.repoRoot,
       worktree_path: input.worktreePath,

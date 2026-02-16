@@ -45,6 +45,7 @@ export interface Session {
   id: string;
   userId: string;
   agentId: string;
+  identityId?: string;
   claudeSessionId: string | null;
 
   type: SessionType;

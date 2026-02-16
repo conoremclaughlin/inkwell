@@ -51,7 +51,7 @@ function createMockSupabase(
     version: 1,
     metadata: {},
     collaborators: ['wren'],
-    created_by_agent_id: 'wren',
+    created_by_identity_id: null,
     created_at: '2026-01-01',
     updated_at: '2026-01-01',
   };
@@ -207,7 +207,7 @@ describe('handleUpdateArtifact', () => {
           version: 2,
           metadata: {},
           collaborators: ['wren', 'myra'],
-          created_by_agent_id: 'wren',
+          created_by_identity_id: null,
           created_at: '2026-01-01',
           updated_at: '2026-01-01',
         },
@@ -249,7 +249,7 @@ describe('handleUpdateArtifact', () => {
           version: 2,
           metadata: {},
           collaborators: ['wren', 'myra'],
-          created_by_agent_id: 'wren',
+          created_by_identity_id: null,
           created_at: '2026-01-01',
           updated_at: '2026-01-01',
         },
@@ -290,7 +290,7 @@ describe('handleUpdateArtifact', () => {
           version: 2,
           metadata: {},
           collaborators: ['wren'],
-          created_by_agent_id: 'wren',
+          created_by_identity_id: null,
           created_at: '2026-01-01',
           updated_at: '2026-01-01',
         },
@@ -323,7 +323,7 @@ describe('handleUpdateArtifact', () => {
           version: 5,
           metadata: {},
           collaborators: ['wren'],
-          created_by_agent_id: 'wren',
+          created_by_identity_id: null,
           created_at: '2026-01-01',
           updated_at: '2026-01-01',
         },
@@ -381,7 +381,7 @@ describe('handleUpdateArtifact', () => {
           version: 3,
           metadata: {},
           collaborators: ['wren'],
-          created_by_agent_id: 'wren',
+          created_by_identity_id: null,
           created_at: '2026-01-01',
           updated_at: '2026-01-01',
         },
@@ -424,7 +424,6 @@ describe('artifact comment + identity UUID flows', () => {
                 content: '# Spec',
                 content_type: 'text/markdown',
                 artifact_type: 'spec',
-                created_by_agent_id: 'wren',
                 created_by_identity_id: null,
                 collaborators: ['wren', 'lumen'],
                 visibility: 'shared',
@@ -522,7 +521,6 @@ describe('artifact comment + identity UUID flows', () => {
                 content: '# Spec',
                 content_type: 'text/markdown',
                 artifact_type: 'spec',
-                created_by_agent_id: 'wren',
                 created_by_identity_id: null,
                 collaborators: ['wren', 'lumen'],
                 visibility: 'shared',
@@ -613,13 +611,11 @@ describe('artifact comment + identity UUID flows', () => {
     expect(
       (artifactInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
     ).toMatchObject({
-      created_by_agent_id: 'lumen',
       created_by_identity_id: 'identity-1',
     });
     expect(
       (historyInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
     ).toMatchObject({
-      changed_by_agent_id: 'lumen',
       changed_by_identity_id: 'identity-1',
     });
   });
@@ -675,13 +671,11 @@ describe('artifact comment + identity UUID flows', () => {
     expect(
       (artifactInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
     ).toMatchObject({
-      created_by_agent_id: 'unknown-agent-slug',
       created_by_identity_id: null,
     });
     expect(
       (historyInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
     ).toMatchObject({
-      changed_by_agent_id: 'unknown-agent-slug',
       changed_by_identity_id: null,
     });
   });
