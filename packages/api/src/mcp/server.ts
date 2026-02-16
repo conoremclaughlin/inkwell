@@ -151,9 +151,10 @@ export class MCPServer {
     // ============================================================================
     // Streamable HTTP MCP endpoint (stateless)
     // Each request gets a fresh transport — no session tracking, no stale sessions.
-    // Handles: POST (tool calls + initialize), DELETE (no-op)
+    // Handles: POST (tool calls + initialize), GET (explicit 405 when no SSE stream
+    // is offered), DELETE (no-op)
     // ============================================================================
-    app.post('/mcp', async (req, res) => {
+    const handleMcpRequest = async (req: express.Request, res: express.Response) => {
       const authHeader = req.headers.authorization;
       const userData = await this.authProvider.verifyAccessToken(authHeader);
 
@@ -223,6 +224,18 @@ export class MCPServer {
             });
           }
         }
+      });
+    };
+
+    app.post('/mcp', handleMcpRequest);
+
+    // This stateless endpoint does not expose a standalone SSE stream.
+    // Streamable HTTP clients may probe GET /mcp; return explicit 405 per spec.
+    app.get('/mcp', (_req, res) => {
+      res.status(405).set('Allow', 'POST, DELETE').json({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Method not allowed.' },
+        id: null,
       });
     });
 

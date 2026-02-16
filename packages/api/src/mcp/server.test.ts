@@ -114,6 +114,16 @@ async function mcpPost(
   return { status: res.status, headers: res.headers, body: text };
 }
 
+/** GET the MCP endpoint. */
+async function mcpGet(
+  baseUrl: string,
+  headers: Record<string, string> = {}
+): Promise<{ status: number; headers: Headers; body: string }> {
+  const res = await fetch(`${baseUrl}/mcp`, { method: 'GET', headers });
+  const text = await res.text();
+  return { status: res.status, headers: res.headers, body: text };
+}
+
 /** Extract the JSON result from an SSE event stream body. */
 function parseSSEResult(body: string): unknown {
   const match = body.match(/^data: (.+)$/m);
@@ -190,6 +200,13 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     expect(body.error.message).toContain('Authentication required');
 
     (env as any).MCP_REQUIRE_OAUTH = false;
+  });
+
+  it('should expose GET /mcp for streamable-http clients', async () => {
+    // This server intentionally does not offer standalone SSE at GET /mcp.
+    // Per streamable-http compatibility, it should return explicit 405 (not 404).
+    const res = await mcpGet(baseUrl);
+    expect(res.status).toBe(405);
   });
 
   // =========================================================================

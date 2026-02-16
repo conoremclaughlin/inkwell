@@ -244,6 +244,11 @@ pm2 restart mcp
 2. Check port 3001 is accessible
 3. Verify `.mcp.json` config file exists
 
+## MCP Transport TODOs
+
+- Revisit full SSE stream support for `GET /mcp` in Streamable HTTP mode (resumability / server-pushed notifications).
+- Keep compatibility notes for Gemini CLI and other MCP clients that probe `GET /mcp` during discovery.
+
 ## Running Individual Processes
 
 For debugging, you can run processes individually without pm2:
