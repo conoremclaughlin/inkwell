@@ -82,6 +82,7 @@ export interface Session {
    * @deprecated Use studioId. Kept for backward compatibility during migration.
    */
   workspaceId?: string;
+  threadKey?: string;
   currentPhase?: string;
   startedAt: Date;
   endedAt?: Date;
@@ -97,6 +98,7 @@ export interface SessionCreateInput {
    * @deprecated Use studioId. Kept for backward compatibility during migration.
    */
   workspaceId?: string;
+  threadKey?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -151,6 +153,7 @@ export interface SessionRow {
   agent_id: string | null;
   studio_id: string | null;
   workspace_id: string | null;
+  thread_key: string | null;
   current_phase: string | null;
   started_at: string;
   ended_at: string | null;

@@ -46,6 +46,10 @@ export const triggerAgentSchema = z.object({
     .optional()
     .default('normal')
     .describe('Priority level for the trigger'),
+  threadKey: z
+    .string()
+    .optional()
+    .describe('Thread key for session routing on the recipient side (e.g., "pr:32")'),
   metadata: z
     .record(z.unknown())
     .optional()
@@ -77,6 +81,7 @@ export async function handleTriggerAgent(
       summary: args.summary,
       inboxMessageId: args.inboxMessageId,
       priority: args.priority,
+      threadKey: args.threadKey,
       metadata: args.metadata,
     };
 

@@ -39,6 +39,12 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
   relatedArtifactUri: z.string().optional().describe('Related artifact URI'),
   metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
   expiresAt: z.string().datetime().optional().describe('When this message expires'),
+  threadKey: z
+    .string()
+    .optional()
+    .describe(
+      'Thread key for conversation continuity (e.g., "pr:32", "spec:cli-hooks"). Messages with the same threadKey are routed to the same session on the recipient side. See PROCESS.md for format guidelines.'
+    ),
   // Trigger options - automatically trigger the recipient after sending
   trigger: z
     .boolean()
@@ -98,6 +104,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     expiresAt,
     triggerType,
     triggerSummary,
+    threadKey,
   } = parsed;
 
   // Default trigger behavior based on message type:
@@ -121,6 +128,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       related_artifact_uri: relatedArtifactUri || null,
       metadata: metadata as Json,
       expires_at: expiresAt || null,
+      thread_key: threadKey || null,
     })
     .select()
     .single();
@@ -158,6 +166,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       triggerType: triggerType || 'message',
       summary: triggerSummary || subject || `New ${messageType} from ${senderAgentId}`,
       priority,
+      threadKey,
     };
 
     // Fire-and-forget: don't await the trigger processing
@@ -208,8 +217,14 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           recipientAgentId,
           messageType,
           priority,
+          threadKey: threadKey || null,
           createdAt: message.created_at,
           trigger: triggerResult,
+          ...(!threadKey
+            ? {
+                hint: 'Consider adding a threadKey (e.g., "pr:32", "spec:cli-hooks") so the recipient can resume the same session for follow-up messages on this topic.',
+              }
+            : {}),
         }),
       },
     ],
@@ -276,6 +291,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
             priority: m.priority,
             status: m.status,
             senderAgentId: m.sender_agent_id,
+            threadKey: m.thread_key || null,
             relatedSessionId: m.related_session_id,
             relatedArtifactUri: m.related_artifact_uri,
             metadata: m.metadata,

@@ -11,6 +11,7 @@ import {
   listSessionsSchema,
   updateSessionPhaseSchema,
   handleUpdateSessionPhase,
+  handleStartSession,
 } from './memory-handlers';
 
 // =====================================================
@@ -58,6 +59,7 @@ vi.mock('../../skills/cloud-service', () => ({
 function createMockDataComposer() {
   const mockMemoryRepo = {
     getActiveSession: vi.fn(),
+    getActiveSessionByThreadKey: vi.fn(),
     updateSession: vi.fn(),
     remember: vi.fn(),
     startSession: vi.fn(),
@@ -1014,5 +1016,247 @@ describe('handleUpdateSessionPhase', () => {
       expect(parsed.session.workspaceId).toBe('workspace-abc');
       expect(parsed.session.currentPhase).toBe('implementing');
     });
+  });
+});
+
+// =====================================================
+// THREAD KEY TESTS
+// =====================================================
+
+describe('startSessionSchema - threadKey', () => {
+  it('should accept threadKey as optional string', () => {
+    const result = startSessionSchema.safeParse({
+      email: 'test@test.com',
+      agentId: 'lumen',
+      threadKey: 'pr:32',
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.threadKey).toBe('pr:32');
+    }
+  });
+
+  it('should accept request without threadKey', () => {
+    const result = startSessionSchema.safeParse({
+      email: 'test@test.com',
+      agentId: 'lumen',
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.threadKey).toBeUndefined();
+    }
+  });
+
+  it('should accept threadKey with studioId together', () => {
+    const result = startSessionSchema.safeParse({
+      email: 'test@test.com',
+      agentId: 'lumen',
+      threadKey: 'pr:32',
+      studioId: '550e8400-e29b-41d4-a716-446655440000',
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.threadKey).toBe('pr:32');
+      expect(result.data.studioId).toBe('550e8400-e29b-41d4-a716-446655440000');
+    }
+  });
+
+  it('should accept various threadKey formats', () => {
+    const formats = ['pr:32', 'spec:cli-hooks', 'issue:45', 'branch:wren/feat/x', 'thread:perf-audit'];
+    for (const key of formats) {
+      const result = startSessionSchema.safeParse({
+        email: 'test@test.com',
+        agentId: 'lumen',
+        threadKey: key,
+      });
+      expect(result.success).toBe(true);
+    }
+  });
+});
+
+describe('handleStartSession - threadKey matching', () => {
+  let mockDataComposer: ReturnType<typeof createMockDataComposer>;
+
+  const mockSession = {
+    id: 'session-existing',
+    userId: 'user-123',
+    agentId: 'lumen',
+    studioId: undefined,
+    workspaceId: undefined,
+    threadKey: 'pr:32',
+    currentPhase: 'reviewing',
+    startedAt: new Date('2026-02-10T10:00:00Z'),
+    endedAt: undefined,
+    summary: undefined,
+    metadata: {},
+  };
+
+  const mockNewSession = {
+    id: 'session-new',
+    userId: 'user-123',
+    agentId: 'lumen',
+    studioId: undefined,
+    workspaceId: undefined,
+    threadKey: 'pr:99',
+    currentPhase: undefined,
+    startedAt: new Date('2026-02-15T10:00:00Z'),
+    endedAt: undefined,
+    summary: undefined,
+    metadata: {},
+  };
+
+  beforeEach(() => {
+    mockDataComposer = createMockDataComposer();
+    vi.clearAllMocks();
+  });
+
+  it('should match existing session by threadKey', async () => {
+    mockDataComposer.repositories.memory.getActiveSessionByThreadKey.mockResolvedValue(mockSession);
+
+    const result = await handleStartSession(
+      { email: 'test@test.com', agentId: 'lumen', threadKey: 'pr:32' },
+      mockDataComposer as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.session.id).toBe('session-existing');
+    expect(parsed.session.threadKey).toBe('pr:32');
+    expect(parsed.session.isExisting).toBe(true);
+
+    // Should have queried by threadKey, scoped by studioId (undefined here)
+    expect(mockDataComposer.repositories.memory.getActiveSessionByThreadKey).toHaveBeenCalledWith(
+      'user-123',
+      'lumen',
+      'pr:32',
+      undefined
+    );
+    // Should NOT have fallen through to studioId lookup
+    expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
+    // Should NOT have created a new session
+    expect(mockDataComposer.repositories.memory.startSession).not.toHaveBeenCalled();
+  });
+
+  it('should fall through to studioId match when threadKey has no match', async () => {
+    mockDataComposer.repositories.memory.getActiveSessionByThreadKey.mockResolvedValue(null);
+    const studioSession = { ...mockSession, threadKey: undefined, studioId: 'studio-abc' };
+    mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(studioSession);
+
+    const result = await handleStartSession(
+      { email: 'test@test.com', agentId: 'lumen', threadKey: 'pr:999' },
+      mockDataComposer as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.session.isExisting).toBe(true);
+
+    // Should have tried threadKey first, then fallen through
+    expect(mockDataComposer.repositories.memory.getActiveSessionByThreadKey).toHaveBeenCalled();
+    expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalled();
+  });
+
+  it('should create new session with threadKey when no match found', async () => {
+    mockDataComposer.repositories.memory.getActiveSessionByThreadKey.mockResolvedValue(null);
+    mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(null);
+    mockDataComposer.repositories.memory.startSession.mockResolvedValue(mockNewSession);
+
+    const result = await handleStartSession(
+      { email: 'test@test.com', agentId: 'lumen', threadKey: 'pr:99' },
+      mockDataComposer as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.message).toBe('Session started successfully');
+    expect(parsed.session.id).toBe('session-new');
+    expect(parsed.session.threadKey).toBe('pr:99');
+
+    // Should have passed threadKey to startSession
+    expect(mockDataComposer.repositories.memory.startSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: 'user-123',
+        agentId: 'lumen',
+        threadKey: 'pr:99',
+      })
+    );
+  });
+
+  it('should scope threadKey lookup by studioId when provided', async () => {
+    const studioId = '550e8400-e29b-41d4-a716-446655440000';
+    mockDataComposer.repositories.memory.getActiveSessionByThreadKey.mockResolvedValue(mockSession);
+
+    await handleStartSession(
+      { email: 'test@test.com', agentId: 'lumen', threadKey: 'pr:32', studioId },
+      mockDataComposer as never
+    );
+
+    expect(mockDataComposer.repositories.memory.getActiveSessionByThreadKey).toHaveBeenCalledWith(
+      'user-123',
+      'lumen',
+      'pr:32',
+      studioId
+    );
+  });
+
+  it('should skip threadKey lookup when agentId is not provided', async () => {
+    mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(null);
+    mockDataComposer.repositories.memory.startSession.mockResolvedValue({
+      ...mockNewSession,
+      agentId: undefined,
+      threadKey: 'pr:99',
+    });
+
+    await handleStartSession(
+      { email: 'test@test.com', threadKey: 'pr:99' },
+      mockDataComposer as never
+    );
+
+    // threadKey lookup requires agentId, so should skip it
+    expect(mockDataComposer.repositories.memory.getActiveSessionByThreadKey).not.toHaveBeenCalled();
+    expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalled();
+  });
+
+  it('should skip threadKey lookup when threadKey is not provided', async () => {
+    mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(null);
+    mockDataComposer.repositories.memory.startSession.mockResolvedValue({
+      ...mockNewSession,
+      threadKey: undefined,
+    });
+
+    await handleStartSession(
+      { email: 'test@test.com', agentId: 'lumen' },
+      mockDataComposer as never
+    );
+
+    expect(mockDataComposer.repositories.memory.getActiveSessionByThreadKey).not.toHaveBeenCalled();
+  });
+
+  it('should include threadKey in existing session response', async () => {
+    mockDataComposer.repositories.memory.getActiveSessionByThreadKey.mockResolvedValue(mockSession);
+
+    const result = await handleStartSession(
+      { email: 'test@test.com', agentId: 'lumen', threadKey: 'pr:32' },
+      mockDataComposer as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.session.threadKey).toBe('pr:32');
+  });
+
+  it('should include null threadKey in response when not set', async () => {
+    const sessionNoThread = { ...mockSession, threadKey: undefined };
+    mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(sessionNoThread);
+
+    const result = await handleStartSession(
+      { email: 'test@test.com', agentId: 'lumen' },
+      mockDataComposer as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.session.threadKey).toBeNull();
   });
 });

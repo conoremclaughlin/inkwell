@@ -1193,10 +1193,12 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Start a new AI session. Sessions track work done across a conversation and can be logged to.
 
-If studioId is provided, the session is scoped to that studio — allowing multiple active sessions per agent (one per studio). Read studioId from .pcp/identity.json if available.
-workspaceId is accepted as a deprecated alias.
+Session matching priority:
+1. threadKey — if provided, returns an existing active session with the same agent+threadKey (enables cross-trigger session continuity, e.g., "pr:32").
+2. studioId — scopes the session to a studio, allowing multiple active sessions per agent (one per studio). Read from .pcp/identity.json.
+3. Default — returns any active session for the agent.
 
-If an active session already exists for this agent+studio, it is returned instead of creating a new one.
+workspaceId is accepted as a deprecated alias for studioId.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
@@ -1217,6 +1219,12 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .uuid()
           .optional()
           .describe('[Deprecated] Workspace ID alias for studioId.'),
+        threadKey: z
+          .string()
+          .optional()
+          .describe(
+            'Thread key for session routing (e.g., "pr:32"). If an active session with this threadKey exists for the same agent, it is returned instead of creating a new one.'
+          ),
         metadata: z.record(z.unknown()).optional().describe('Session metadata'),
       },
     },

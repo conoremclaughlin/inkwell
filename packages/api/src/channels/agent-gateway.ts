@@ -28,6 +28,8 @@ export interface AgentTriggerPayload {
   summary?: string;
   /** Priority level */
   priority?: 'low' | 'normal' | 'high' | 'urgent';
+  /** Thread key for session routing (e.g., "pr:32") */
+  threadKey?: string;
   /** Additional metadata */
   metadata?: Record<string, unknown>;
 }

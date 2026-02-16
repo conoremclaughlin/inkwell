@@ -198,6 +198,9 @@ export class MemoryRepository {
       // Backward compatibility for older server versions still reading workspace_id.
       insertData.workspace_id = scopedStudioId;
     }
+    if (input.threadKey) {
+      insertData.thread_key = input.threadKey;
+    }
 
     const { data, error } = await this.supabase
       .from('sessions')
@@ -340,6 +343,45 @@ export class MemoryRepository {
       if (error.code === 'PGRST116') return null;
       logger.error('Failed to get active session:', error);
       throw new Error(`Failed to get active session: ${error.message}`);
+    }
+
+    return data ? this.rowToSession(data) : null;
+  }
+
+  /**
+   * Get active session by threadKey for a user+agent, optionally scoped by studio.
+   * Returns the most recent active session with a matching thread_key, or null.
+   */
+  async getActiveSessionByThreadKey(
+    userId: string,
+    agentId: string,
+    threadKey: string,
+    studioId?: string | null
+  ): Promise<Session | null> {
+    let query = this.supabase
+      .from('sessions')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('agent_id', agentId)
+      .eq('thread_key', threadKey)
+      .is('ended_at', null)
+      .order('started_at', { ascending: false })
+      .limit(1);
+
+    if (studioId !== undefined) {
+      if (studioId === null) {
+        query = query.is('studio_id', null);
+      } else {
+        query = query.eq('studio_id', studioId);
+      }
+    }
+
+    const { data, error } = await query.single();
+
+    if (error) {
+      if (error.code === 'PGRST116') return null;
+      logger.error('Failed to get active session by threadKey:', error);
+      throw new Error(`Failed to get active session by threadKey: ${error.message}`);
     }
 
     return data ? this.rowToSession(data) : null;
@@ -705,6 +747,7 @@ export class MemoryRepository {
       agentId: row.agent_id || undefined,
       studioId,
       workspaceId: studioId,
+      threadKey: row.thread_key || undefined,
       currentPhase: row.current_phase || undefined,
       startedAt: new Date(row.started_at),
       endedAt: row.ended_at ? new Date(row.ended_at) : undefined,
