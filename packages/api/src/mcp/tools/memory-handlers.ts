@@ -11,7 +11,8 @@ import * as os from 'os';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
-import { setSessionContext } from '../../utils/request-context';
+import { setSessionContext, pinSessionAgent, getRequestContext } from '../../utils/request-context';
+import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import type { MemorySource, Salience } from '../../data/models/memory';
 import { getCloudSkillsService } from '../../skills/cloud-service';
 
@@ -41,7 +42,13 @@ function resolveStudioId(params: { studioId?: string; workspaceId?: string }): s
 /** Coerce a comma-separated string into a string array so callers can pass either format. */
 const topicsSchema = z
   .preprocess(
-    (val) => (typeof val === 'string' ? val.split(',').map((s) => s.trim()).filter(Boolean) : val),
+    (val) =>
+      typeof val === 'string'
+        ? val
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : val,
     z.array(z.string())
   )
   .optional();
@@ -355,6 +362,7 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
   const params = rememberSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const studioId = resolveStudioId(params);
+  const agentId = getEffectiveAgentId(params.agentId);
 
   // If there's an active session, attach its ID to the memory metadata for traceability.
   // Never require a session — memories are too important to lose.
@@ -362,7 +370,7 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
   try {
     const activeSession = await dataComposer.repositories.memory.getActiveSession(
       user.id,
-      params.agentId,
+      agentId,
       studioId
     );
     sessionId = activeSession?.id;
@@ -384,13 +392,13 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
     topics: params.topics,
     metadata,
     expiresAt: params.expiresAt ? new Date(params.expiresAt) : undefined,
-    agentId: params.agentId,
+    agentId,
   });
 
   logger.info(`Memory created for user ${user.id}`, {
     memoryId: memory.id,
     source: memory.source,
-    agentId: params.agentId,
+    agentId: agentId || 'none',
     sessionId: sessionId || 'none',
   });
 
@@ -549,16 +557,17 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
   const params = startSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const studioId = resolveStudioId(params);
+  const agentId = getEffectiveAgentId(params.agentId);
 
   // Session matching priority:
   // 1. threadKey match — find active session with same agent+threadKey
   // 2. studioId match — find active session scoped by agent+studio (existing behavior)
   let existingSession = null;
 
-  if (params.threadKey && params.agentId) {
+  if (params.threadKey && agentId) {
     existingSession = await dataComposer.repositories.memory.getActiveSessionByThreadKey(
       user.id,
-      params.agentId,
+      agentId,
       params.threadKey,
       studioId
     );
@@ -567,7 +576,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
   if (!existingSession) {
     existingSession = await dataComposer.repositories.memory.getActiveSession(
       user.id,
-      params.agentId,
+      agentId,
       studioId
     );
   }
@@ -602,7 +611,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
 
   const session = await dataComposer.repositories.memory.startSession({
     userId: user.id,
-    agentId: params.agentId,
+    agentId,
     studioId,
     workspaceId: params.workspaceId,
     threadKey: params.threadKey,
@@ -647,13 +656,14 @@ export async function handleLogSession(args: unknown, dataComposer: DataComposer
   const params = logSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const studioId = resolveStudioId(params);
+  const agentId = getEffectiveAgentId(params.agentId);
 
   // Get session ID (use provided or find active, scoped by agent+studio)
   let sessionId = params.sessionId;
   if (!sessionId) {
     const activeSession = await dataComposer.repositories.memory.getActiveSession(
       user.id,
-      params.agentId,
+      agentId,
       studioId
     );
     if (!activeSession) {
@@ -711,13 +721,14 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
   const params = endSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const studioId = resolveStudioId(params);
+  const agentId = getEffectiveAgentId(params.agentId);
 
   // Get session ID (use provided or find active, scoped by agent+studio)
   let sessionId = params.sessionId;
   if (!sessionId) {
     const activeSession = await dataComposer.repositories.memory.getActiveSession(
       user.id,
-      params.agentId,
+      agentId,
       studioId
     );
     if (!activeSession) {
@@ -1258,6 +1269,19 @@ export async function handleRestoreMemory(args: unknown, dataComposer: DataCompo
 export async function handleBootstrap(args: unknown, dataComposer: DataComposer) {
   const params = bootstrapSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
+
+  // Pin the agent identity for this session (immutable once set).
+  // If request context already has an agentId from a token, validate it matches.
+  if (params.agentId) {
+    const reqCtx = getRequestContext();
+    if (reqCtx?.agentId && reqCtx.agentId !== params.agentId) {
+      throw new Error(
+        `Token is bound to agent "${reqCtx.agentId}" but bootstrap was called with "${params.agentId}". ` +
+          `Use a token issued for this agent, or remove the agent_id from the token.`
+      );
+    }
+    pinSessionAgent(params.agentId);
+  }
 
   // Set session context so subsequent MCP tool calls can use this user
   setSessionContext({

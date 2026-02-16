@@ -9,6 +9,7 @@
 import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
+import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { resolveUserOrThrow } from '../../services/user-resolver';
 import type {
   ActivityType,
@@ -165,7 +166,7 @@ export async function handleLogActivity(args: unknown, dataComposer: DataCompose
 
   const activity = await dataComposer.repositories.activityStream.logActivity({
     userId: user.id,
-    agentId: params.agentId,
+    agentId: getEffectiveAgentId(params.agentId) ?? params.agentId,
     type: params.type as ActivityType,
     content: params.content,
     sessionId: params.sessionId,
@@ -222,7 +223,7 @@ export async function handleLogMessage(args: unknown, dataComposer: DataComposer
 
   const activity = await dataComposer.repositories.activityStream.logMessage({
     userId: user.id,
-    agentId: params.agentId,
+    agentId: getEffectiveAgentId(params.agentId) ?? params.agentId,
     direction: params.direction,
     content: params.content,
     sessionId: params.sessionId,

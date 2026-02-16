@@ -43,6 +43,9 @@ vi.mock('../../utils/logger', () => ({
 // Mock request-context
 vi.mock('../../utils/request-context', () => ({
   setSessionContext: vi.fn(),
+  pinSessionAgent: vi.fn(),
+  getPinnedAgentId: vi.fn().mockReturnValue(null),
+  getRequestContext: vi.fn().mockReturnValue(undefined),
 }));
 
 // Mock cloud skills
@@ -1065,7 +1068,13 @@ describe('startSessionSchema - threadKey', () => {
   });
 
   it('should accept various threadKey formats', () => {
-    const formats = ['pr:32', 'spec:cli-hooks', 'issue:45', 'branch:wren/feat/x', 'thread:perf-audit'];
+    const formats = [
+      'pr:32',
+      'spec:cli-hooks',
+      'issue:45',
+      'branch:wren/feat/x',
+      'thread:perf-audit',
+    ];
     for (const key of formats) {
       const result = startSessionSchema.safeParse({
         email: 'test@test.com',

@@ -22,6 +22,8 @@ export interface PcpTokenPayload {
   sub: string; // PCP user ID
   email: string;
   scope: string;
+  agentId?: string; // Bound agent identity label (absent for human users)
+  identityId?: string; // Canonical agent_identities UUID (strongest binding)
 }
 
 // ============================================================================
@@ -81,7 +83,9 @@ export async function createRefreshToken(
   userId: string,
   clientId: string,
   scopes: string[],
-  lifetimeDays: number
+  lifetimeDays: number,
+  agentId?: string,
+  identityId?: string
 ): Promise<{ refreshToken: string; expiresAt: Date }> {
   const refreshToken = `pcp-rt-${crypto.randomBytes(32).toString('hex')}`;
   const expiresAt = new Date(Date.now() + lifetimeDays * 24 * 60 * 60 * 1000);
@@ -93,6 +97,8 @@ export async function createRefreshToken(
     supabase_refresh_token: null,
     scopes,
     expires_at: expiresAt.toISOString(),
+    ...(agentId ? { agent_id: agentId } : {}),
+    ...(identityId ? { identity_id: identityId } : {}),
   });
 
   if (error) {
@@ -115,7 +121,13 @@ export async function exchangeRefreshToken(
   clientId: string,
   tokenType: PcpTokenPayload['type'],
   accessTokenLifetimeSeconds: number
-): Promise<{ accessToken: string; userId: string; email: string } | null> {
+): Promise<{
+  accessToken: string;
+  userId: string;
+  email: string;
+  agentId?: string;
+  identityId?: string;
+} | null> {
   const { data: tokenRecord, error: lookupError } = await supabase
     .from('mcp_tokens')
     .select('*, users(email)')
@@ -144,6 +156,9 @@ export async function exchangeRefreshToken(
   const userEmail = (tokenRecord.users as unknown as { email: string | null })?.email || '';
 
   const scope = tokenRecord.scopes?.join(' ') || 'mcp:tools';
+  const tokenAny = tokenRecord as Record<string, unknown>;
+  const agentId = tokenAny.agent_id as string | null;
+  const identityId = tokenAny.identity_id as string | null;
 
   const accessToken = signPcpAccessToken(
     {
@@ -151,6 +166,8 @@ export async function exchangeRefreshToken(
       sub: tokenRecord.user_id,
       email: userEmail,
       scope,
+      ...(agentId ? { agentId } : {}),
+      ...(identityId ? { identityId } : {}),
     },
     accessTokenLifetimeSeconds
   );
@@ -165,5 +182,7 @@ export async function exchangeRefreshToken(
     accessToken,
     userId: tokenRecord.user_id,
     email: userEmail,
+    ...(agentId ? { agentId } : {}),
+    ...(identityId ? { identityId } : {}),
   };
 }

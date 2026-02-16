@@ -11,6 +11,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
+import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import type { Database, Json } from '../../data/supabase/types';
 
 // ============== Schemas ==============
@@ -207,13 +208,13 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
     title,
     content,
     artifactType = 'document',
-    agentId,
     collaborators = [],
     visibility = 'private',
     tags = [],
     metadata = {},
     workspaceId,
   } = parsed;
+  const agentId = getEffectiveAgentId(parsed.agentId);
   const authorIdentity = await resolveIdentityForAgent(
     supabase,
     resolved.user.id,
@@ -485,12 +486,12 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     title,
     content,
     baseVersion,
-    agentId,
     collaborators,
     tags,
     changeSummary,
     workspaceId,
   } = parsed;
+  const agentId = getEffectiveAgentId(parsed.agentId);
   const editorIdentity = await resolveIdentityForAgent(
     supabase,
     resolved.user.id,

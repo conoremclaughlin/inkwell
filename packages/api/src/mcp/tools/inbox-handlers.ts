@@ -9,6 +9,7 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { resolveIdentityId } from '../../auth/resolve-identity';
+import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
@@ -94,7 +95,6 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
 
   const {
     recipientAgentId,
-    senderAgentId,
     subject,
     content,
     messageType = 'message',
@@ -107,6 +107,8 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     triggerSummary,
     threadKey,
   } = parsed;
+  // Enforce identity on sender (who is performing the action), not recipient (target)
+  const senderAgentId = getEffectiveAgentId(parsed.senderAgentId);
 
   // Default trigger behavior based on message type:
   // task_request and session_resume trigger immediately (time-sensitive handoffs)
@@ -245,7 +247,9 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   const parsed = getInboxSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { agentId, status = 'unread', priority, messageType, limit = 20 } = parsed;
+  const { status = 'unread', priority, messageType, limit = 20 } = parsed;
+  // Enforce identity: pinned agents can only read their own inbox
+  const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
 
   let query = supabase
     .from('agent_inbox')
