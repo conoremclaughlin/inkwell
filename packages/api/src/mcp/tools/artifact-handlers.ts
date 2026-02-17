@@ -6,7 +6,11 @@
  */
 
 import { z } from 'zod';
-import { merge as diff3Merge, diff3Merge as diff3MergeRegions } from 'node-diff3';
+// node-diff3 is ESM-only; dynamic import required from CJS context
+async function loadDiff3() {
+  const mod = await import('node-diff3');
+  return { diff3Merge: mod.merge, diff3MergeRegions: mod.diff3Merge };
+}
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
@@ -176,15 +180,14 @@ function resolveArtifactForUser(
   supabase: SupabaseClient<Database>,
   userId: string,
   workspaceId: string | undefined,
-  params: { uri?: string; artifactId?: string },
-  selectColumns = '*'
+  params: { uri?: string; artifactId?: string }
 ) {
   const { uri, artifactId } = params;
   if (!uri && !artifactId) {
     throw new Error('Must provide either uri or artifactId');
   }
 
-  let query = supabase.from('artifacts').select(selectColumns).eq('user_id', userId);
+  let query = supabase.from('artifacts').select('*').eq('user_id', userId);
   query = withWorkspaceFilter(query, workspaceId);
 
   if (uri) {
@@ -343,8 +346,8 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
     } | null;
     createdByIdentityId: string | null;
     createdByIdentity: { id: string; agentId: string; name: string; backend: string | null } | null;
-    createdAt: string;
-    updatedAt: string;
+    createdAt: string | null;
+    updatedAt: string | null;
   }> = [];
 
   if (includeComments) {
@@ -555,6 +558,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
 
     // Run three-way merge: merge(a, o, b) where a=incoming, o=base, b=current
     // Use line-based splitting for markdown documents
+    const { diff3Merge, diff3MergeRegions } = await loadDiff3();
     const mergeOptions = {
       excludeFalseConflicts: true,
       stringSeparator: /\n/,
@@ -566,15 +570,15 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
       const regions = diff3MergeRegions(incomingContent, baseContent, currentContent, mergeOptions);
 
       const conflicts = regions
-        .filter(
-          (r): r is { conflict: { a: string[]; b: string[]; o: string[] } } =>
-            'conflict' in r && r.conflict !== undefined
-        )
-        .map((r) => ({
-          yours: r.conflict.a.join('\n'),
-          theirs: r.conflict.b.join('\n'),
-          original: r.conflict.o.join('\n'),
-        }));
+        .filter((r) => 'conflict' in r && r.conflict !== undefined)
+        .map((r) => {
+          const c = (r as { conflict: { a: string[]; b: string[]; o: string[] } }).conflict;
+          return {
+            yours: c.a.join('\n'),
+            theirs: c.b.join('\n'),
+            original: c.o.join('\n'),
+          };
+        });
 
       logger.warn('Three-way merge conflict', {
         uri: current.uri,
@@ -786,13 +790,10 @@ export async function handleGetArtifactHistory(args: unknown, dataComposer: Data
   const { uri, artifactId, limit = 10, workspaceId } = parsed;
 
   // First get the artifact to verify ownership
-  const artifactQuery = resolveArtifactForUser(
-    supabase,
-    resolved.user.id,
-    workspaceId,
-    { uri, artifactId },
-    'id'
-  );
+  const artifactQuery = resolveArtifactForUser(supabase, resolved.user.id, workspaceId, {
+    uri,
+    artifactId,
+  });
 
   const { data: artifact, error: artifactError } = await artifactQuery.single();
 
