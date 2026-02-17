@@ -62,6 +62,9 @@ function mapDbToSession(row: DbSession): Session {
     lastActivityAt: row.started_at ? new Date(row.started_at) : new Date(),
     endedAt: row.ended_at ? new Date(row.ended_at) : null,
 
+    // Thread key
+    threadKey: row.thread_key || undefined,
+
     metadata: metadata,
   };
 }
@@ -83,6 +86,7 @@ function mapSessionToDb(
     token_count: session.tokenCount,
     backend: session.backend,
     model: session.model,
+    thread_key: session.threadKey || null,
     metadata: {
       type: session.type,
       taskDescription: session.taskDescription,
@@ -155,6 +159,29 @@ export class SessionRepository implements ISessionRepository {
     }
 
     return session;
+  }
+
+  async findByThreadKey(
+    userId: string,
+    agentId: string,
+    threadKey: string
+  ): Promise<Session | null> {
+    const { data, error } = await this.supabase
+      .from('sessions')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('agent_id', agentId)
+      .eq('thread_key', threadKey)
+      .is('ended_at', null)
+      .order('started_at', { ascending: false })
+      .limit(1);
+
+    if (error) {
+      logger.error('Error finding session by thread key', { userId, agentId, threadKey, error });
+      throw error;
+    }
+
+    return data && data.length > 0 ? mapDbToSession(data[0]) : null;
   }
 
   async findByUser(

@@ -100,6 +100,15 @@ export const createReminderSchema = z.object({
   ...userIdentifierSchema.shape,
   title: z.string().min(1).max(500).describe('Reminder title/message'),
   description: z.string().optional().describe('Additional details'),
+  agentId: z
+    .string()
+    .optional()
+    .describe('Agent that should handle this reminder (e.g., "myra", "lumen"). Resolved to identity_id.'),
+  identityId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('Direct identity UUID from agent_identities. Takes precedence over agentId.'),
   deliveryChannel: z
     .enum(['telegram', 'whatsapp', 'email'])
     .optional()
@@ -182,6 +191,40 @@ export async function handleCreateReminder(
       );
     }
 
+    // Resolve identity_id from agentId or direct identityId (always scoped to user)
+    let identityId: string | null = args.identityId || null;
+    if (identityId) {
+      // Validate direct identityId belongs to this user
+      const { data: owned } = await supabase
+        .from('agent_identities')
+        .select('id')
+        .eq('id', identityId)
+        .eq('user_id', resolved.user.id)
+        .single();
+      if (!owned) {
+        return mcpResponse(
+          { success: false, error: 'identityId not found or does not belong to this user.' },
+          true
+        );
+      }
+    } else if (args.agentId) {
+      const { data: identity } = await supabase
+        .from('agent_identities')
+        .select('id')
+        .eq('agent_id', args.agentId)
+        .eq('user_id', resolved.user.id)
+        .limit(1)
+        .single();
+      if (identity) {
+        identityId = identity.id;
+      } else {
+        return mcpResponse(
+          { success: false, error: `Unknown agent "${args.agentId}" for this user. Check agent_identities table.` },
+          true
+        );
+      }
+    }
+
     // Calculate next run time
     let nextRunAt: Date;
     if (args.runAt) {
@@ -202,6 +245,7 @@ export async function handleCreateReminder(
         description: args.description || null,
         delivery_channel: deliveryChannel,
         delivery_target: deliveryTarget,
+        identity_id: identityId,
         cron_expression: args.cronExpression || null,
         next_run_at: nextRunAt.toISOString(),
         max_runs: args.maxRuns || null,
@@ -220,6 +264,8 @@ export async function handleCreateReminder(
         id: data.id,
         title: data.title,
         description: data.description,
+        agentId: args.agentId || null,
+        identityId: data.identity_id,
         deliveryChannel: data.delivery_channel,
         deliveryTarget: data.delivery_target,
         cronExpression: data.cron_expression,
@@ -227,6 +273,9 @@ export async function handleCreateReminder(
         status: data.status,
         isRecurring: !!data.cron_expression,
       },
+      ...(!identityId
+        ? { hint: 'Consider adding agentId (e.g., "myra") to route this reminder to a specific agent.' }
+        : {}),
     });
   } catch (error) {
     return mcpResponse(
@@ -245,6 +294,7 @@ export async function handleCreateReminder(
 
 export const listRemindersSchema = z.object({
   ...userIdentifierSchema.shape,
+  agentId: z.string().optional().describe('Filter reminders assigned to a specific agent (e.g., "myra")'),
   status: z
     .enum(['active', 'paused', 'completed', 'failed'])
     .optional()
@@ -265,12 +315,38 @@ export async function handleListReminders(
 
     const supabase = getSupabase();
 
+    // Resolve identity_id filter if agentId provided (scoped to user)
+    let identityIdFilter: string | undefined;
+    if (args.agentId) {
+      const { data: identity } = await supabase
+        .from('agent_identities')
+        .select('id')
+        .eq('agent_id', args.agentId)
+        .eq('user_id', resolved.user.id)
+        .limit(1)
+        .single();
+      if (identity) {
+        identityIdFilter = identity.id;
+      } else {
+        // Unknown agent requested — return empty rather than silently ignoring the filter
+        return mcpResponse({
+          success: true,
+          reminders: [],
+          hint: `No agent "${args.agentId}" found for this user. No reminders to show.`,
+        });
+      }
+    }
+
     // Query all reminders if includeCompleted, otherwise only active/paused
     let query = supabase
       .from('scheduled_reminders')
       .select('*')
       .eq('user_id', resolved.user.id)
       .limit(args.limit || 20);
+
+    if (identityIdFilter) {
+      query = query.eq('identity_id', identityIdFilter);
+    }
 
     if (args.status) {
       query = query.eq('status', args.status);
@@ -288,6 +364,7 @@ export async function handleListReminders(
       id: r.id,
       title: r.title,
       description: r.description,
+      identityId: r.identity_id,
       deliveryChannel: r.delivery_channel,
       cronExpression: r.cron_expression,
       nextRunAt: r.next_run_at,
@@ -350,6 +427,7 @@ export const updateReminderSchema = z.object({
   reminderId: z.string().uuid().describe('Reminder ID to update'),
   title: z.string().min(1).max(500).optional(),
   description: z.string().optional(),
+  agentId: z.string().optional().describe('Reassign to a different agent (e.g., "myra")'),
   cronExpression: z
     .string()
     .optional()
@@ -386,6 +464,23 @@ export async function handleUpdateReminder(
     const updates: Record<string, unknown> = {};
     if (args.title !== undefined) updates.title = args.title;
     if (args.description !== undefined) updates.description = args.description;
+    if (args.agentId !== undefined) {
+      const { data: identity } = await supabase
+        .from('agent_identities')
+        .select('id')
+        .eq('agent_id', args.agentId)
+        .eq('user_id', resolved.user.id)
+        .limit(1)
+        .single();
+      if (identity) {
+        updates.identity_id = identity.id;
+      } else {
+        return mcpResponse(
+          { success: false, error: `Unknown agent "${args.agentId}" for this user.` },
+          true
+        );
+      }
+    }
     if (args.cronExpression !== undefined) updates.cron_expression = args.cronExpression || null;
     if (args.nextRunAt !== undefined) updates.next_run_at = args.nextRunAt;
     if (args.status !== undefined) updates.status = args.status;

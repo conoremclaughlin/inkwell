@@ -27,6 +27,7 @@ export interface DueReminder {
   description: string | null;
   delivery_channel: string;
   delivery_target: string | null;
+  identity_id: string | null;
   cron_expression: string | null;
   next_run_at: string;
   run_count: number;

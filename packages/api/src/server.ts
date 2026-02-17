@@ -276,8 +276,22 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
    * Deliver reminder via SessionService - same stateless flow as all other messages.
    */
   const deliverReminderViaSession = async (reminder: DueReminder): Promise<boolean> => {
-    // Resolve the userId from the reminder
     const userId = reminder.user_id;
+
+    // Resolve agent from reminder's identity_id, fall back to server default
+    let reminderAgentId = agentId;
+    if (reminder.identity_id && dataComposer) {
+      const { data: identity } = await dataComposer
+        .getClient()
+        .from('agent_identities')
+        .select('agent_id')
+        .eq('id', reminder.identity_id)
+        .single();
+      if (identity?.agent_id) {
+        reminderAgentId = identity.agent_id;
+        logger.debug(`[Heartbeat] Resolved agent from identity_id: ${reminderAgentId}`);
+      }
+    }
 
     const reminderContent = `[HEARTBEAT REMINDER]
 Title: ${reminder.title}
@@ -295,7 +309,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
 
     const request: SessionRequest = {
       userId,
-      agentId,
+      agentId: reminderAgentId,
       channel: 'agent',
       conversationId: `heartbeat:${reminder.id}`,
       sender: { id: 'system', name: 'heartbeat' },
@@ -346,7 +360,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       summary: payload.summary,
     });
 
-    // 1. Verify agent exists (either in agent_identities or known agents list)
+    // 1. Verify agent exists in agent_identities
     const { data: agentIdentity } = await dataComposer!
       .getClient()
       .from('agent_identities')
@@ -354,14 +368,9 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       .eq('agent_id', targetAgentId)
       .limit(1);
 
-    // Allow known agents even if not in agent_identities table yet
-    const knownAgents = ['myra', 'wren', 'benson'];
-    const isKnownAgent = knownAgents.includes(targetAgentId);
-    const existsInDb = agentIdentity && agentIdentity.length > 0;
-
-    if (!existsInDb && !isKnownAgent) {
+    if (!agentIdentity || agentIdentity.length === 0) {
       logger.error(`[Trigger] Unknown agent: ${targetAgentId}`);
-      throw new Error(`Unknown agent: ${targetAgentId}`);
+      throw new Error(`Unknown agent: ${targetAgentId}. Register in agent_identities first.`);
     }
 
     // 2. Resolve userId from inbox message (required for stateless processing)
@@ -402,12 +411,13 @@ If you need to message a user, use send_response with the appropriate channel an
       userId,
       agentId: targetAgentId,
       channel: 'agent',
-      conversationId: `trigger:${targetAgentId}`,
+      conversationId: payload.threadKey ? `trigger:${targetAgentId}:${payload.threadKey}` : `trigger:${targetAgentId}`,
       sender: { id: payload.fromAgentId, name: payload.fromAgentId },
       content: triggerMessage,
       metadata: {
         triggerType: 'agent',
         chatType: 'direct',
+        threadKey: payload.threadKey,
       },
     };
 

@@ -951,4 +951,170 @@ describe('SessionService', () => {
       expect(callLog).toHaveLength(3);
     });
   });
+
+  // ═══════════════════════════════════════════════════════════════
+  // ThreadKey Session Routing
+  // ═══════════════════════════════════════════════════════════════
+  describe('ThreadKey Session Routing', () => {
+    it('should pass threadKey from metadata to getOrCreateSession', async () => {
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+      vi.mocked(mockRepository.create).mockResolvedValue(
+        createMockSession({ id: 'thread-session', threadKey: 'pr:43' })
+      );
+
+      const request = createMockRequest({
+        metadata: { threadKey: 'pr:43', triggerType: 'agent', chatType: 'direct' },
+      });
+
+      const result = await sessionService.handleMessage(request);
+
+      expect(result.success).toBe(true);
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          threadKey: 'pr:43',
+        })
+      );
+    });
+
+    it('should store threadKey on created session', async () => {
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+      vi.mocked(mockRepository.create).mockResolvedValue(
+        createMockSession({ id: 'new-thread-session', threadKey: 'pr:99' })
+      );
+
+      const request = createMockRequest({
+        metadata: { threadKey: 'pr:99' },
+      });
+
+      await sessionService.handleMessage(request);
+
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          threadKey: 'pr:99',
+        })
+      );
+    });
+
+    it('should match existing session by threadKey when repository supports it', async () => {
+      const existingThreadSession = createMockSession({
+        id: 'existing-thread-session',
+        threadKey: 'pr:43',
+        claudeSessionId: 'claude-thread-abc',
+      });
+
+      // Add findByThreadKey to mock repository
+      const mockRepoWithThreadKey = {
+        ...mockRepository,
+        findByThreadKey: vi.fn().mockResolvedValue(existingThreadSession),
+      };
+
+      const serviceWithThreadKey = new SessionService(
+        mockRepoWithThreadKey,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          defaultModel: 'sonnet',
+          compactionThreshold: 150000,
+        },
+        mockCodexRunner
+      );
+
+      const request = createMockRequest({
+        metadata: { threadKey: 'pr:43', triggerType: 'agent', chatType: 'direct' },
+      });
+
+      const result = await serviceWithThreadKey.handleMessage(request);
+
+      expect(result.success).toBe(true);
+      expect(result.sessionId).toBe('existing-thread-session');
+      // threadKey match should be tried first
+      expect(mockRepoWithThreadKey.findByThreadKey).toHaveBeenCalledWith(
+        'user-456',
+        'myra',
+        'pr:43'
+      );
+      // Should NOT have created a new session
+      expect(mockRepoWithThreadKey.create).not.toHaveBeenCalled();
+    });
+
+    it('should fall back to general session match when threadKey has no match', async () => {
+      const existingSession = createMockSession({
+        id: 'general-session',
+        claudeSessionId: 'claude-general',
+      });
+
+      // Add findByThreadKey that returns null (no match)
+      const mockRepoWithThreadKey = {
+        ...mockRepository,
+        findByThreadKey: vi.fn().mockResolvedValue(null),
+        findByUserAndAgent: vi.fn().mockResolvedValue(existingSession),
+      };
+
+      const serviceWithThreadKey = new SessionService(
+        mockRepoWithThreadKey,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          defaultModel: 'sonnet',
+          compactionThreshold: 150000,
+        },
+        mockCodexRunner
+      );
+
+      const request = createMockRequest({
+        metadata: { threadKey: 'pr:999', triggerType: 'agent' },
+      });
+
+      const result = await serviceWithThreadKey.handleMessage(request);
+
+      expect(result.success).toBe(true);
+      expect(result.sessionId).toBe('general-session');
+      // threadKey tried first, then fell back
+      expect(mockRepoWithThreadKey.findByThreadKey).toHaveBeenCalledWith(
+        'user-456',
+        'myra',
+        'pr:999'
+      );
+      expect(mockRepoWithThreadKey.findByUserAndAgent).toHaveBeenCalled();
+    });
+
+    it('should not use threadKey matching when no threadKey provided', async () => {
+      const existingSession = createMockSession({ id: 'normal-session' });
+
+      const mockRepoWithThreadKey = {
+        ...mockRepository,
+        findByThreadKey: vi.fn(),
+        findByUserAndAgent: vi.fn().mockResolvedValue(existingSession),
+      };
+
+      const serviceWithThreadKey = new SessionService(
+        mockRepoWithThreadKey,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          defaultModel: 'sonnet',
+          compactionThreshold: 150000,
+        },
+        mockCodexRunner
+      );
+
+      const request = createMockRequest(); // No threadKey
+
+      await serviceWithThreadKey.handleMessage(request);
+
+      // findByThreadKey should NOT have been called
+      expect(mockRepoWithThreadKey.findByThreadKey).not.toHaveBeenCalled();
+      // Normal path should have been used
+      expect(mockRepoWithThreadKey.findByUserAndAgent).toHaveBeenCalled();
+    });
+  });
 });

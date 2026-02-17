@@ -2684,10 +2684,13 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Create a scheduled reminder. Can be one-time or recurring.
 
+Use agentId to assign which agent handles the reminder (e.g., "myra" for monitoring tasks,
+"lumen" for dev tasks). Without agentId, the reminder routes to the server's default agent.
+
 Examples:
 - "Remind me to call mom tomorrow at 9am" → runAt: "2024-01-28T09:00:00Z"
-- "Remind me daily at 9am to take vitamins" → cronExpression: "0 9 * * *"
-- "Remind me every weekday at 9am" → cronExpression: "0 9 * * 1-5"
+- "Remind me daily at 9am to take vitamins" → cronExpression: "0 9 * * *", agentId: "myra"
+- "Run nightly test suite" → cronExpression: "0 2 * * *", agentId: "lumen"
 
 Common cron patterns:
 - "0 9 * * *" - Daily at 9am
@@ -2723,6 +2726,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     'list_reminders',
     {
       description: `List a user's scheduled reminders. By default shows only active reminders.
+Use agentId to filter reminders assigned to a specific agent.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: listRemindersSchema,
@@ -2751,7 +2755,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'update_reminder',
     {
-      description: `Update an existing reminder. Can change title, description, schedule, or pause/resume.
+      description: `Update an existing reminder. Can change title, description, schedule, pause/resume, or reassign to a different agent via agentId.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: updateReminderSchema,
