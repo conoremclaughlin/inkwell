@@ -365,7 +365,7 @@ async function awakenCommand(options: { backend: string; verbose: boolean }): Pr
   console.log(chalk.dim('Starting interactive session. Talk with your new SB.\n'));
   console.log(
     chalk.dim(
-      "When you've chosen a name, they can call the awaken() MCP tool to save their identity.\n"
+      "When you've chosen a name, they can call the choose_name() MCP tool to save their identity.\n"
     )
   );
 
@@ -385,7 +385,7 @@ async function awakenCommand(options: { backend: string; verbose: boolean }): Pr
 
     console.log(chalk.bold('\nAwakening session ended.'));
     console.log(
-      chalk.dim("If they didn't call awaken() during the session, you can save manually:")
+      chalk.dim("If they didn't call choose_name() during the session, you can save manually:")
     );
     console.log(chalk.dim(`  sb identity save --agent <chosen-name> --backend ${backendName}`));
 

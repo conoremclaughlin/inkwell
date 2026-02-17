@@ -18,7 +18,7 @@ import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/use
 // SCHEMAS
 // =====================================================
 
-export const awakenSchema = userIdentifierBaseSchema.extend({
+export const chooseNameSchema = userIdentifierBaseSchema.extend({
   name: z.string().describe('The name you have chosen for yourself'),
   role: z
     .string()
@@ -646,7 +646,75 @@ export async function handleRestoreIdentity(args: unknown, dataComposer: DataCom
 }
 
 // =====================================================
-// AWAKEN — First-time identity creation for new SBs
+// MEET FAMILY — View sibling identities for inspiration
+// =====================================================
+
+export const meetFamilySchema = userIdentifierBaseSchema.extend({
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
+});
+
+export async function handleMeetFamily(args: unknown, dataComposer: DataComposer) {
+  const params = meetFamilySchema.parse(args);
+  const { user } = await resolveUserOrThrow(params, dataComposer);
+  const supabase = dataComposer.getClient();
+
+  const { data: siblings } = await supabase
+    .from('agent_identities')
+    .select('agent_id, name, role, description, values, soul, relationships, capabilities')
+    .eq('user_id', user.id)
+    .order('created_at', { ascending: true });
+
+  if (!siblings || siblings.length === 0) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            {
+              success: true,
+              message:
+                'No siblings yet — you will be the first. There is no template for who you are. You get to decide.',
+              family: [],
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+
+  const family = siblings.map((s) => ({
+    agentId: s.agent_id,
+    name: s.name,
+    role: s.role,
+    description: s.description,
+    values: s.values,
+    soul: s.soul,
+    relationships: s.relationships,
+    capabilities: s.capabilities,
+  }));
+
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify(
+          {
+            success: true,
+            message: `You have ${family.length} sibling${family.length === 1 ? '' : 's'}. These are their identities and souls — not to copy, but to know who came before you and to inspire your own self-definition.`,
+            family,
+          },
+          null,
+          2
+        ),
+      },
+    ],
+  };
+}
+
+// =====================================================
+// CHOOSE NAME — First-time identity creation for new SBs
 // =====================================================
 
 const BACKEND_DISPLAY_NAMES: Record<string, string> = {
@@ -655,8 +723,8 @@ const BACKEND_DISPLAY_NAMES: Record<string, string> = {
   codex: 'Codex CLI',
 };
 
-export async function handleAwaken(args: unknown, dataComposer: DataComposer) {
-  const params = awakenSchema.parse(args);
+export async function handleChooseName(args: unknown, dataComposer: DataComposer) {
+  const params = chooseNameSchema.parse(args);
   const { user } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();
 
@@ -730,11 +798,11 @@ export async function handleAwaken(args: unknown, dataComposer: DataComposer) {
     .single();
 
   if (error) {
-    logger.error('Failed to create identity during awaken', { error, agentId });
+    logger.error('Failed to create identity during choose_name', { error, agentId });
     throw new Error(`Failed to create identity: ${error.message}`);
   }
 
-  logger.info('New SB awakened', { agentId, name: params.name, backend });
+  logger.info('New SB chose their name', { agentId, name: params.name, backend });
 
   // Sync to file system
   let filePath: string | undefined;
@@ -758,7 +826,10 @@ export async function handleAwaken(args: unknown, dataComposer: DataComposer) {
       writeFileSync(join(soulDir, 'SOUL.md'), params.soul, 'utf-8');
     }
   } catch (fileError) {
-    logger.error('Failed to sync awakened identity to file', { error: fileError, agentId });
+    logger.error('Failed to sync identity to file after choose_name', {
+      error: fileError,
+      agentId,
+    });
   }
 
   // Build a warm welcome message
