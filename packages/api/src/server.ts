@@ -361,16 +361,18 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       studioHint: payload.studioHint,
     });
 
-    // 1. Resolve userId from inbox message (required for stateless processing)
+    // 1. Resolve userId (+ identity hint) from inbox message (required for stateless processing)
     let userId: string | undefined;
+    let recipientIdentityId: string | undefined;
     if (payload.inboxMessageId) {
       const { data: inboxMsg } = await dataComposer!
         .getClient()
         .from('agent_inbox')
-        .select('recipient_user_id')
+        .select('recipient_user_id, recipient_identity_id')
         .eq('id', payload.inboxMessageId)
         .single();
       userId = inboxMsg?.recipient_user_id;
+      recipientIdentityId = inboxMsg?.recipient_identity_id || undefined;
     }
 
     if (!userId) {
@@ -378,20 +380,74 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       throw new Error('Cannot process trigger without userId (inbox message required)');
     }
 
-    // 2. Verify target agent exists for this user
-    const { data: agentIdentity } = await dataComposer!
-      .getClient()
-      .from('agent_identities')
-      .select('agent_id')
-      .eq('user_id', userId)
-      .eq('agent_id', targetAgentId)
-      .limit(1);
+    // 2. Resolve and verify target identity for this user
+    // Prefer recipient_identity_id from inbox; fallback to user+agent_id with disambiguation.
+    let resolvedIdentityId = recipientIdentityId;
+    let resolvedWorkspaceContainerId: string | undefined;
+    const metadataWorkspaceId =
+      payload.metadata &&
+      typeof payload.metadata.workspaceId === 'string' &&
+      payload.metadata.workspaceId.length > 0
+        ? payload.metadata.workspaceId
+        : undefined;
 
-    if (!agentIdentity || agentIdentity.length === 0) {
-      logger.error(`[Trigger] Unknown agent for user: ${targetAgentId}`, { userId });
-      throw new Error(
-        `Unknown agent for user: ${targetAgentId}. Register in agent_identities first.`
-      );
+    if (resolvedIdentityId) {
+      const { data: identityRow } = await dataComposer!
+        .getClient()
+        .from('agent_identities')
+        .select('id, agent_id, workspace_id')
+        .eq('id', resolvedIdentityId)
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      if (!identityRow) {
+        throw new Error(
+          `Inbox recipient_identity_id is invalid for this user (${targetAgentId}). Re-send inbox message.`
+        );
+      }
+
+      if (identityRow.agent_id !== targetAgentId) {
+        throw new Error(
+          `Inbox recipient_identity_id targets "${identityRow.agent_id}", not "${targetAgentId}".`
+        );
+      }
+
+      resolvedWorkspaceContainerId = identityRow.workspace_id || undefined;
+    } else {
+      let identityQuery = dataComposer!
+        .getClient()
+        .from('agent_identities')
+        .select('id, workspace_id')
+        .eq('user_id', userId)
+        .eq('agent_id', targetAgentId);
+
+      if (metadataWorkspaceId) {
+        identityQuery = identityQuery.eq('workspace_id', metadataWorkspaceId);
+      }
+
+      const { data: identityRows, error: identityError } = await identityQuery;
+      if (identityError) {
+        throw new Error(`Failed to resolve target identity for ${targetAgentId}: ${identityError.message}`);
+      }
+
+      if (!identityRows || identityRows.length === 0) {
+        logger.error(`[Trigger] Unknown agent for user: ${targetAgentId}`, {
+          userId,
+          workspaceId: metadataWorkspaceId || null,
+        });
+        throw new Error(
+          `Unknown agent for user: ${targetAgentId}. Register in agent_identities first.`
+        );
+      }
+
+      if (identityRows.length > 1) {
+        throw new Error(
+          `Ambiguous identity for agent "${targetAgentId}" (multiple workspace-scoped identities). Include inboxMessageId with recipient_identity_id or pass metadata.workspaceId.`
+        );
+      } else {
+        resolvedIdentityId = identityRows[0].id;
+        resolvedWorkspaceContainerId = identityRows[0].workspace_id || undefined;
+      }
     }
 
     // 3. Build trigger message
@@ -427,6 +483,13 @@ If you need to message a user, use send_response with the appropriate channel an
         relatedSessionId: payload.relatedSessionId,
       },
     };
+
+    logger.info('[Trigger] Resolved target identity', {
+      userId,
+      agentId: targetAgentId,
+      identityId: resolvedIdentityId,
+      workspaceId: resolvedWorkspaceContainerId || null,
+    });
 
     const result = await sessionService!.handleMessage(request);
 
