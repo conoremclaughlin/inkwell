@@ -244,7 +244,7 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
   const { data, error } = await supabase
     .from('agent_identities')
     .upsert(upsertData, {
-      onConflict: 'user_id,agent_id',
+      onConflict: 'user_id,workspace_id,agent_id',
     })
     .select()
     .single();
