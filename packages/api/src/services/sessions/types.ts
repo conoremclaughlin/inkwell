@@ -77,6 +77,9 @@ export interface Session {
   lastActivityAt: Date;
   endedAt: Date | null;
 
+  // Thread key for topic-scoped session matching (e.g., "pr:43")
+  threadKey?: string;
+
   // Flexible metadata
   metadata: Record<string, unknown>;
 }
@@ -104,6 +107,8 @@ export interface SessionRequest {
     chatType?: ChatType;
     media?: MediaAttachment[];
     triggerType?: 'message' | 'heartbeat' | 'agent' | 'api';
+    // Thread key for topic-scoped session routing (e.g., "pr:43")
+    threadKey?: string;
     // For task sessions
     sessionType?: SessionType;
     taskDescription?: string;
@@ -230,6 +235,7 @@ export interface ISessionService {
       type?: SessionType;
       taskDescription?: string;
       parentSessionId?: string;
+      threadKey?: string;
     }
   ): Promise<Session>;
 

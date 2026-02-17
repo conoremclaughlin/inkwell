@@ -187,6 +187,7 @@ export class SessionService implements ISessionService {
         type: metadata?.sessionType || 'primary',
         taskDescription: metadata?.taskDescription,
         parentSessionId: metadata?.parentSessionId,
+        threadKey: metadata?.threadKey,
       });
 
       // 2. Build lock key - must be per agent + session to support sub-agents
@@ -271,6 +272,7 @@ export class SessionService implements ISessionService {
             type: pending.request.metadata?.sessionType || 'primary',
             taskDescription: pending.request.metadata?.taskDescription,
             parentSessionId: pending.request.metadata?.parentSessionId,
+            threadKey: pending.request.metadata?.threadKey,
           }
         );
 
@@ -392,6 +394,7 @@ export class SessionService implements ISessionService {
       type?: SessionType;
       taskDescription?: string;
       parentSessionId?: string;
+      threadKey?: string;
     }
   ): Promise<Session> {
     const type = options?.type || 'primary';
@@ -400,6 +403,21 @@ export class SessionService implements ISessionService {
 
     // For primary sessions, try to find existing active session
     if (type === 'primary') {
+      // ThreadKey match takes priority — find session scoped to this topic
+      if (options?.threadKey && 'findByThreadKey' in this.repository) {
+        const threadMatch = await (
+          this.repository as { findByThreadKey: (u: string, a: string, t: string) => Promise<Session | null> }
+        ).findByThreadKey(userId, agentId, options.threadKey);
+        if (threadMatch) {
+          logger.debug('Found existing session by threadKey', {
+            sessionId: threadMatch.id,
+            threadKey: options.threadKey,
+          });
+          return threadMatch;
+        }
+      }
+
+      // Fall back to general active session match
       const existing = await this.repository.findByUserAndAgent(userId, agentId, {
         type: 'primary',
       });
@@ -429,6 +447,7 @@ export class SessionService implements ISessionService {
       status: 'active',
       taskDescription: options?.taskDescription,
       parentSessionId: options?.parentSessionId,
+      threadKey: options?.threadKey,
       contextTokens: 0,
       totalInputTokens: 0,
       totalOutputTokens: 0,

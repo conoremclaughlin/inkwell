@@ -191,20 +191,35 @@ export async function handleCreateReminder(
       );
     }
 
-    // Resolve identity_id from agentId or direct identityId
+    // Resolve identity_id from agentId or direct identityId (always scoped to user)
     let identityId: string | null = args.identityId || null;
-    if (!identityId && args.agentId) {
+    if (identityId) {
+      // Validate direct identityId belongs to this user
+      const { data: owned } = await supabase
+        .from('agent_identities')
+        .select('id')
+        .eq('id', identityId)
+        .eq('user_id', resolved.user.id)
+        .single();
+      if (!owned) {
+        return mcpResponse(
+          { success: false, error: 'identityId not found or does not belong to this user.' },
+          true
+        );
+      }
+    } else if (args.agentId) {
       const { data: identity } = await supabase
         .from('agent_identities')
         .select('id')
         .eq('agent_id', args.agentId)
+        .eq('user_id', resolved.user.id)
         .limit(1)
         .single();
       if (identity) {
         identityId = identity.id;
       } else {
         return mcpResponse(
-          { success: false, error: `Unknown agent: ${args.agentId}. Check agent_identities table.` },
+          { success: false, error: `Unknown agent "${args.agentId}" for this user. Check agent_identities table.` },
           true
         );
       }
@@ -300,17 +315,25 @@ export async function handleListReminders(
 
     const supabase = getSupabase();
 
-    // Resolve identity_id filter if agentId provided
+    // Resolve identity_id filter if agentId provided (scoped to user)
     let identityIdFilter: string | undefined;
     if (args.agentId) {
       const { data: identity } = await supabase
         .from('agent_identities')
         .select('id')
         .eq('agent_id', args.agentId)
+        .eq('user_id', resolved.user.id)
         .limit(1)
         .single();
       if (identity) {
         identityIdFilter = identity.id;
+      } else {
+        // Unknown agent requested — return empty rather than silently ignoring the filter
+        return mcpResponse({
+          success: true,
+          reminders: [],
+          hint: `No agent "${args.agentId}" found for this user. No reminders to show.`,
+        });
       }
     }
 
@@ -446,13 +469,14 @@ export async function handleUpdateReminder(
         .from('agent_identities')
         .select('id')
         .eq('agent_id', args.agentId)
+        .eq('user_id', resolved.user.id)
         .limit(1)
         .single();
       if (identity) {
         updates.identity_id = identity.id;
       } else {
         return mcpResponse(
-          { success: false, error: `Unknown agent: ${args.agentId}` },
+          { success: false, error: `Unknown agent "${args.agentId}" for this user.` },
           true
         );
       }
