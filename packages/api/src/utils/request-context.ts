@@ -155,6 +155,19 @@ export function hasUserContext(): boolean {
  * Throws if already pinned to a different identity.
  */
 export function pinSessionAgent(agentId: string): void {
+  const reqCtx = getRequestContext();
+  if (reqCtx) {
+    // HTTP request scope: identity is token-bound per request.
+    // Never mutate the process-global pin in this mode.
+    return;
+  }
+
+  if (process.env.MCP_TRANSPORT === 'http') {
+    // Streamable HTTP server is long-lived and multi-client.
+    // Process-global pinning leaks identity across clients/sessions.
+    return;
+  }
+
   if (pinnedSessionAgentId !== null && pinnedSessionAgentId !== agentId) {
     throw new Error(
       `Identity already pinned to "${pinnedSessionAgentId}". Cannot change to "${agentId}".`
@@ -180,6 +193,9 @@ export function getPinnedAgentId(): string | null {
   if (reqCtx) {
     // HTTP mode: only trust the token-bound agentId, never the global pin
     return reqCtx.agentId ?? null;
+  }
+  if (process.env.MCP_TRANSPORT === 'http') {
+    return null;
   }
   // stdio mode: use the session pin from bootstrap()
   return pinnedSessionAgentId;
