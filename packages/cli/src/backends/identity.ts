@@ -32,13 +32,27 @@ export function resolveAgentId(cliAgent?: string): string {
     return cliAgent;
   }
 
-  const localIdentity = join(process.cwd(), '.pcp', 'identity.json');
-  if (existsSync(localIdentity)) {
-    try {
-      const identity: IdentityJson = JSON.parse(readFileSync(localIdentity, 'utf-8'));
-      if (identity.agentId) return identity.agentId;
-    } catch {
-      /* ignore */
+  // process.cwd() throws ENOENT if the working directory has been deleted
+  // (e.g., git worktree removed while a session was open)
+  let cwd: string | null = null;
+  try {
+    cwd = process.cwd();
+  } catch {
+    console.warn(
+      'warning: could not read current directory — you may be in an orphan directory.\n' +
+        '  Try: cd .. && cd -\n'
+    );
+  }
+
+  if (cwd) {
+    const localIdentity = join(cwd, '.pcp', 'identity.json');
+    if (existsSync(localIdentity)) {
+      try {
+        const identity: IdentityJson = JSON.parse(readFileSync(localIdentity, 'utf-8'));
+        if (identity.agentId) return identity.agentId;
+      } catch {
+        /* ignore */
+      }
     }
   }
 

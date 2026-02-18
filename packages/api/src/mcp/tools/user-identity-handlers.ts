@@ -11,15 +11,27 @@ import { logger } from '../../utils/logger';
 import { resolveUserOrThrow } from '../../services/user-resolver';
 
 // User identification fields
+// Usually unnecessary — userId and email are auto-resolved from OAuth token.
 const userIdentifierFields = {
-  userId: z.string().uuid().optional().describe('User UUID (if known)'),
-  email: z.string().email().optional().describe('User email address'),
+  userId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
+  email: z
+    .string()
+    .email()
+    .optional()
+    .describe('User email — usually unnecessary, auto-resolved from OAuth token'),
   phone: z.string().optional().describe('Phone number in E.164 format'),
-  platformId: z.string().optional().describe('Platform-specific user ID'),
+  platformId: z
+    .string()
+    .optional()
+    .describe('Platform-specific user ID — only needed for platform-based user lookup'),
   platform: z
     .enum(['telegram', 'whatsapp', 'discord'])
     .optional()
-    .describe('Platform for user lookup'),
+    .describe('Platform name — only needed for platform-based user lookup'),
   workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
 };
 

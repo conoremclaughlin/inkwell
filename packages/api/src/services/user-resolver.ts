@@ -10,17 +10,31 @@ import { getUserFromContext } from '../utils/request-context';
  */
 export const userIdentifierFields = {
   // Direct UUID lookup
-  userId: z.string().uuid().optional().describe('User UUID (if known)'),
+  userId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
 
   // Email lookup
-  email: z.string().email().optional().describe('User email address'),
+  email: z
+    .string()
+    .email()
+    .optional()
+    .describe('User email — usually unnecessary, auto-resolved from OAuth token'),
 
   // Phone lookup
   phone: z.string().optional().describe('Phone number in E.164 format (e.g., +14155551234)'),
 
   // Platform-based lookup
-  platform: z.enum(['telegram', 'whatsapp', 'discord']).optional().describe('Platform name'),
-  platformId: z.string().optional().describe('Platform-specific user ID or username'),
+  platform: z
+    .enum(['telegram', 'whatsapp', 'discord'])
+    .optional()
+    .describe('Platform name — only needed for platform-based user lookup'),
+  platformId: z
+    .string()
+    .optional()
+    .describe('Platform-specific user ID — only needed for platform-based user lookup'),
 };
 
 /**

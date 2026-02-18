@@ -11,11 +11,26 @@ import type { TaskStatus, TaskPriority } from '../../data/repositories/project-t
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
 
 // Common user identifier schema
+// Usually unnecessary — userId and email are auto-resolved from OAuth token.
 const userIdentifierSchema = z.object({
-  userId: z.string().uuid().optional().describe('Direct user UUID'),
-  email: z.string().email().optional().describe('User email address'),
-  platform: z.enum(['telegram', 'whatsapp', 'discord']).optional(),
-  platformId: z.string().optional().describe('Platform-specific user ID'),
+  userId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
+  email: z
+    .string()
+    .email()
+    .optional()
+    .describe('User email — usually unnecessary, auto-resolved from OAuth token'),
+  platform: z
+    .enum(['telegram', 'whatsapp', 'discord'])
+    .optional()
+    .describe('Platform name — only needed for platform-based user lookup'),
+  platformId: z
+    .string()
+    .optional()
+    .describe('Platform-specific user ID — only needed for platform-based user lookup'),
 });
 
 // ============================================================================

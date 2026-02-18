@@ -248,16 +248,28 @@ export { setTelegramListener, registerChannelListener } from './chat-context-han
 export { setMiniAppsRegistry } from './skill-handlers';
 
 // Shared schema for flexible user identification
-// Users can be identified by: userId, email, phone, or platform+platformId
+// Usually unnecessary — userId and email are auto-resolved from OAuth token.
+// Only needed for platform-based lookups or when operating without authentication.
 const userIdentifierFields = {
-  userId: z.string().uuid().optional().describe('User UUID (if known)'),
-  email: z.string().email().optional().describe('User email address'),
+  userId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
+  email: z
+    .string()
+    .email()
+    .optional()
+    .describe('User email — usually unnecessary, auto-resolved from OAuth token'),
   phone: z.string().optional().describe('Phone number in E.164 format (e.g., +14155551234)'),
   platform: z
     .enum(['telegram', 'whatsapp', 'discord'])
     .optional()
-    .describe('Platform name for lookup'),
-  platformId: z.string().optional().describe('Platform-specific user ID or username'),
+    .describe('Platform name — only needed for platform-based user lookup'),
+  platformId: z
+    .string()
+    .optional()
+    .describe('Platform-specific user ID — only needed for platform-based user lookup'),
 };
 
 export function registerAllTools(server: McpServer, dataComposer: DataComposer): void {

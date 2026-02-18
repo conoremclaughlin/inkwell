@@ -13,11 +13,26 @@ import { env } from '../../config/env';
 import type { Database } from '../../data/supabase/types';
 
 // Common user identifier schema
+// Usually unnecessary — userId and email are auto-resolved from OAuth token.
 const userIdentifierSchema = z.object({
-  userId: z.string().uuid().optional().describe('Direct user UUID'),
-  email: z.string().email().optional().describe('User email address'),
-  platform: z.enum(['telegram', 'whatsapp', 'discord']).optional(),
-  platformId: z.string().optional().describe('Platform-specific user ID'),
+  userId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
+  email: z
+    .string()
+    .email()
+    .optional()
+    .describe('User email — usually unnecessary, auto-resolved from OAuth token'),
+  platform: z
+    .enum(['telegram', 'whatsapp', 'discord'])
+    .optional()
+    .describe('Platform name — only needed for platform-based user lookup'),
+  platformId: z
+    .string()
+    .optional()
+    .describe('Platform-specific user ID — only needed for platform-based user lookup'),
 });
 
 type McpResponse = {
@@ -103,7 +118,9 @@ export const createReminderSchema = z.object({
   agentId: z
     .string()
     .optional()
-    .describe('Agent that should handle this reminder (e.g., "myra", "lumen"). Resolved to identity_id.'),
+    .describe(
+      'Agent that should handle this reminder (e.g., "myra", "lumen"). Resolved to identity_id.'
+    ),
   identityId: z
     .string()
     .uuid()
@@ -219,7 +236,10 @@ export async function handleCreateReminder(
         identityId = identity.id;
       } else {
         return mcpResponse(
-          { success: false, error: `Unknown agent "${args.agentId}" for this user. Check agent_identities table.` },
+          {
+            success: false,
+            error: `Unknown agent "${args.agentId}" for this user. Check agent_identities table.`,
+          },
           true
         );
       }
@@ -274,7 +294,9 @@ export async function handleCreateReminder(
         isRecurring: !!data.cron_expression,
       },
       ...(!identityId
-        ? { hint: 'Consider adding agentId (e.g., "myra") to route this reminder to a specific agent.' }
+        ? {
+            hint: 'Consider adding agentId (e.g., "myra") to route this reminder to a specific agent.',
+          }
         : {}),
     });
   } catch (error) {
@@ -294,7 +316,10 @@ export async function handleCreateReminder(
 
 export const listRemindersSchema = z.object({
   ...userIdentifierSchema.shape,
-  agentId: z.string().optional().describe('Filter reminders assigned to a specific agent (e.g., "myra")'),
+  agentId: z
+    .string()
+    .optional()
+    .describe('Filter reminders assigned to a specific agent (e.g., "myra")'),
   status: z
     .enum(['active', 'paused', 'completed', 'failed'])
     .optional()

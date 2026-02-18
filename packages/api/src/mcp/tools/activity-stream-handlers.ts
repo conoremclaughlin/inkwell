@@ -18,11 +18,25 @@ import type {
 } from '../../data/repositories/activity-stream.repository';
 
 // User identification fields (without platform to avoid conflict with activity platform)
+// Usually unnecessary — userId and email are auto-resolved from OAuth token.
 const userIdentifierFields = {
-  userId: z.string().uuid().optional().describe('User UUID (if known)'),
-  email: z.string().email().optional().describe('User email address'),
+  userId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
+  email: z
+    .string()
+    .email()
+    .optional()
+    .describe('User email — usually unnecessary, auto-resolved from OAuth token'),
   phone: z.string().optional().describe('Phone number in E.164 format (e.g., +14155551234)'),
-  platformId: z.string().optional().describe('Platform-specific user ID (requires userPlatform)'),
+  platformId: z
+    .string()
+    .optional()
+    .describe(
+      'Platform-specific user ID — only needed with userPlatform for platform-based lookup'
+    ),
   userPlatform: z
     .enum(['telegram', 'whatsapp', 'discord'])
     .optional()
