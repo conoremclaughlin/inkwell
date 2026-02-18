@@ -379,6 +379,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
             status: m.status,
             senderAgentId: m.sender_agent_id,
             threadKey: m.thread_key || null,
+            recipientSessionId: m.related_session_id,
             relatedSessionId: m.related_session_id,
             relatedArtifactUri: m.related_artifact_uri,
             metadata: m.metadata,
