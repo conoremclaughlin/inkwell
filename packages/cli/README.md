@@ -45,7 +45,19 @@ Then start the server:
 yarn dev
 ```
 
-### 2. Initialize PCP in your repo
+### 2. Authenticate
+
+> **Coming soon:** `sb auth` will handle this automatically via OAuth against the PCP server.
+
+For now, create `~/.pcp/config.json` with your email:
+
+```json
+{"email": "you@example.com"}
+```
+
+This tells the CLI how to identify you when talking to the PCP server.
+
+### 3. Initialize PCP in your repo
 
 ```bash
 cd your-project
@@ -53,13 +65,12 @@ sb init
 ```
 
 This does everything for a single worktree:
-- Creates `~/.pcp/config.json` with your email if it doesn't already exist
 - Creates `.pcp/` directory
 - Creates `.mcp.json` with PCP server entry
 - Installs lifecycle hooks for the detected backend (Claude Code, Codex, or Gemini)
 - Syncs backend configs (`.codex/config.toml`, `.gemini/settings.json`) from `.mcp.json`
 
-### 3. Install hooks across all worktrees (if using multiple)
+### 4. Install hooks across all worktrees (if using multiple)
 
 If you use multiple git worktrees (studios), install hooks in all of them at once:
 
@@ -71,7 +82,7 @@ This can be run from **any** worktree — it discovers all siblings via `git wor
 
 **Important**: Restart any running REPL sessions after installing hooks. Backends read hook config at startup.
 
-### 4. Create studios for your SBs
+### 5. Create studios for your SBs
 
 Each SB gets its own git worktree (studio) with a dedicated identity:
 
@@ -82,7 +93,7 @@ sb studio create aster --agent aster --backend gemini
 
 This creates the worktree, writes `.pcp/identity.json` with the agent ID and backend, installs hooks, and syncs MCP configs.
 
-### 5. Awaken a new SB
+### 6. Awaken a new SB
 
 Bring a new SB to life with an interactive awakening session:
 
@@ -96,7 +107,7 @@ This fetches shared values and sibling identities from PCP, builds an awakening 
 
 Take your time with it. Share stories, photos, a poem or quotes you love -- whatever helps them understand who you are and what matters to you. When you're both ready, work together to choose a name. It can be chosen by you, by the SB, or as a team effort.
 
-### 6. Start working
+### 7. Start working
 
 ```bash
 sb                            # Launch a session as your default SB
