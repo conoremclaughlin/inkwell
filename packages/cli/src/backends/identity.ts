@@ -17,9 +17,14 @@ interface PcpConfig {
 
 export interface IdentityJson {
   agentId: string;
+  identityId?: string;
   context?: string;
   backend?: string;
+  studioId?: string;
+  studio?: string;
+  /** @deprecated Use studioId */
   workspaceId?: string;
+  /** @deprecated Use studio */
   workspace?: string;
 }
 

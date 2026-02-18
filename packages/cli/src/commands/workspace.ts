@@ -27,7 +27,7 @@ import {
   renameSync,
   cpSync,
 } from 'fs';
-import { join, dirname, basename } from 'path';
+import { join, dirname, basename, parse as parsePath } from 'path';
 import { homedir } from 'os';
 import { installHooks } from './hooks.js';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
@@ -37,8 +37,9 @@ interface WorkspaceIdentity {
   identityId?: string;
   context: string;
   backend?: string;
+  studioId?: string;
+  studio: string;
   description: string;
-  workspace: string;
   branch: string;
   createdAt: string;
   createdBy?: string;
@@ -461,10 +462,10 @@ async function createWorkspace(
     const identity: WorkspaceIdentity = {
       agentId,
       ...(identityId ? { identityId } : {}),
-      context: `workspace-${name}`,
+      context: `studio-${name}`,
       ...(options.backend ? { backend: options.backend } : {}),
-      description: options.purpose || `Workspace: ${name}`,
-      workspace: name,
+      studio: name,
+      description: options.purpose || `Studio: ${name}`,
       branch,
       createdAt: new Date().toISOString(),
       createdBy: getCurrentUser(),
@@ -672,24 +673,25 @@ function cdCommand(name: string): void {
 // ============================================================================
 
 function resolveCliRoot(): string {
-  // Walk up from cwd to find packages/cli/package.json
-  const cwd = process.cwd();
-  const candidates = [
-    join(cwd, 'packages', 'cli'),
-    cwd,
-  ];
-  for (const candidate of candidates) {
-    const pkgPath = join(candidate, 'package.json');
-    if (existsSync(pkgPath)) {
-      try {
-        const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-        if (pkg.name === '@personal-context/cli') return candidate;
-      } catch {
-        // continue
+  // Walk up from cwd checking each directory and its packages/cli subdir
+  let dir = process.cwd();
+  const { root } = parsePath(dir);
+  while (true) {
+    for (const candidate of [join(dir, 'packages', 'cli'), dir]) {
+      const pkgPath = join(candidate, 'package.json');
+      if (existsSync(pkgPath)) {
+        try {
+          const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+          if (pkg.name === '@personal-context/cli') return candidate;
+        } catch {
+          // continue
+        }
       }
     }
+    if (dir === root) break;
+    dir = dirname(dir);
   }
-  throw new Error('Could not find @personal-context/cli package. Run from the repo root or packages/cli.');
+  throw new Error('Could not find @personal-context/cli package. Run from within the repo.');
 }
 
 function resolveDefaultCliName(): string {
