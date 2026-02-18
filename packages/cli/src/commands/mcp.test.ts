@@ -89,6 +89,7 @@ describe('syncMcpConfig', () => {
     const settings = JSON.parse(readFileSync(join(TEST_DIR, '.gemini', 'settings.json'), 'utf-8'));
     expect(settings.mcpServers.pcp).toBeDefined();
     expect(settings.mcpServers.pcp.url).toBe('http://localhost:3001/mcp');
+    expect(settings.mcpServers.pcp.type).toBe('http');
   });
 
   it('should handle servers with command and args', () => {
@@ -168,6 +169,51 @@ describe('syncMcpConfig', () => {
     const gitignore = readFileSync(join(TEST_DIR, '.gitignore'), 'utf-8');
     const codexMatches = gitignore.match(/\.codex\//g);
     expect(codexMatches).toHaveLength(1);
+  });
+
+  it('should convert Bearer ${ENV_VAR} headers to Codex bearer_token_env_var', () => {
+    writeFileSync(
+      join(TEST_DIR, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          github: {
+            type: 'http',
+            url: 'https://api.githubcopilot.com/mcp/',
+            headers: {
+              Authorization: 'Bearer ${GITHUB_TOKEN}',
+            },
+          },
+        },
+      })
+    );
+
+    syncMcpConfig(TEST_DIR);
+
+    const toml = readFileSync(join(TEST_DIR, '.codex', 'config.toml'), 'utf-8');
+    expect(toml).toContain('bearer_token_env_var = "GITHUB_TOKEN"');
+    expect(toml).not.toContain('http_headers');
+  });
+
+  it('should use http_headers for non-bearer auth in Codex', () => {
+    writeFileSync(
+      join(TEST_DIR, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          custom: {
+            url: 'https://example.com/mcp',
+            headers: {
+              'X-Api-Key': 'some-key',
+            },
+          },
+        },
+      })
+    );
+
+    syncMcpConfig(TEST_DIR);
+
+    const toml = readFileSync(join(TEST_DIR, '.codex', 'config.toml'), 'utf-8');
+    expect(toml).toContain('http_headers = { "X-Api-Key" = "some-key" }');
+    expect(toml).not.toContain('bearer_token_env_var');
   });
 
   it('should write to a custom target directory', () => {

@@ -68,8 +68,25 @@ function toCodexToml(servers: Record<string, McpServerConfig>): string {
     }
 
     if (config.headers) {
-      for (const [key, val] of Object.entries(config.headers)) {
-        lines.push(`http_headers = { ${tomlString(key)} = ${tomlString(val)} }`);
+      // Detect "Authorization: Bearer ${ENV_VAR}" pattern → Codex bearer_token_env_var
+      const authHeader = config.headers['Authorization'] || config.headers['authorization'];
+      const bearerMatch = authHeader?.match(/^Bearer \$\{(\w+)\}$/);
+
+      if (bearerMatch) {
+        lines.push(`bearer_token_env_var = ${tomlString(bearerMatch[1])}`);
+        // Emit remaining non-auth headers as http_headers if any
+        const remaining = Object.entries(config.headers).filter(
+          ([k]) => k.toLowerCase() !== 'authorization'
+        );
+        if (remaining.length > 0) {
+          const pairs = remaining.map(([k, v]) => `${tomlString(k)} = ${tomlString(v)}`).join(', ');
+          lines.push(`http_headers = { ${pairs} }`);
+        }
+      } else {
+        const pairs = Object.entries(config.headers)
+          .map(([k, v]) => `${tomlString(k)} = ${tomlString(v)}`)
+          .join(', ');
+        lines.push(`http_headers = { ${pairs} }`);
       }
     }
 
@@ -95,6 +112,10 @@ function toGeminiSettings(
 
   for (const [name, config] of Object.entries(servers)) {
     const server: Record<string, unknown> = {};
+
+    if (config.type) {
+      server.type = config.type;
+    }
 
     if (config.url) {
       server.url = config.url;
