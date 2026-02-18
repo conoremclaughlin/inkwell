@@ -309,7 +309,7 @@ function ThreadPanel({
   return (
     <div
       ref={panelRef}
-      className="fixed inset-y-0 right-0 z-40 flex w-full max-w-lg flex-col border-l border-gray-200 bg-white shadow-xl animate-in slide-in-from-right duration-200"
+      className="fixed inset-y-0 right-0 z-40 flex w-full max-w-lg flex-col border-l border-gray-200 bg-white shadow-xl animate-in slide-in-from-right duration-500"
     >
       {/* Header */}
       <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
@@ -456,7 +456,7 @@ export default function InboxPage() {
             setStatusFilter(e.target.value);
             setOffset(0);
           }}
-          className="appearance-none rounded-md border border-gray-300 bg-white py-1.5 pl-3 pr-8 text-sm text-gray-700 bg-[url('data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2216%22%20height%3D%2216%22%20fill%3D%22none%22%20stroke%3D%22%236b7280%22%20stroke-width%3D%222%22%3E%3Cpath%20d%3D%22m4%206%204%204%204-4%22%2F%3E%3C%2Fsvg%3E')] bg-[length:16px] bg-[right_8px_center] bg-no-repeat"
+          className="cursor-pointer appearance-none rounded-md border border-gray-300 bg-white py-1.5 pl-3 pr-8 text-sm text-gray-700 hover:border-gray-400 bg-[url('data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2216%22%20height%3D%2216%22%20fill%3D%22none%22%20stroke%3D%22%236b7280%22%20stroke-width%3D%222%22%3E%3Cpath%20d%3D%22m4%206%204%204%204-4%22%2F%3E%3C%2Fsvg%3E')] bg-[length:16px] bg-[right_8px_center] bg-no-repeat"
         >
           <option value="all">All statuses</option>
           <option value="unread">Unread</option>
@@ -470,7 +470,7 @@ export default function InboxPage() {
             setTypeFilter(e.target.value);
             setOffset(0);
           }}
-          className="appearance-none rounded-md border border-gray-300 bg-white py-1.5 pl-3 pr-8 text-sm text-gray-700 bg-[url('data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2216%22%20height%3D%2216%22%20fill%3D%22none%22%20stroke%3D%22%236b7280%22%20stroke-width%3D%222%22%3E%3Cpath%20d%3D%22m4%206%204%204%204-4%22%2F%3E%3C%2Fsvg%3E')] bg-[length:16px] bg-[right_8px_center] bg-no-repeat"
+          className="cursor-pointer appearance-none rounded-md border border-gray-300 bg-white py-1.5 pl-3 pr-8 text-sm text-gray-700 hover:border-gray-400 bg-[url('data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2216%22%20height%3D%2216%22%20fill%3D%22none%22%20stroke%3D%22%236b7280%22%20stroke-width%3D%222%22%3E%3Cpath%20d%3D%22m4%206%204%204%204-4%22%2F%3E%3C%2Fsvg%3E')] bg-[length:16px] bg-[right_8px_center] bg-no-repeat"
         >
           <option value="">All types</option>
           <option value="message">Message</option>
@@ -599,7 +599,12 @@ export default function InboxPage() {
       )}
 
       {/* Backdrop */}
-      {panelOpen && <div className="fixed inset-0 z-30 bg-black/20" onClick={closePanel} />}
+      {panelOpen && (
+        <div
+          className="fixed inset-0 z-30 bg-black/20 animate-in fade-in duration-500"
+          onClick={closePanel}
+        />
+      )}
 
       {/* Slide-out panel */}
       {selectedThread && (
