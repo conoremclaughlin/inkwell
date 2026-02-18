@@ -11,6 +11,7 @@ import { ContextLedger, estimateTokens } from '../repl/context-ledger.js';
 import { parseSlashCommand } from '../repl/slash.js';
 import { ToolMode, ToolPolicyState } from '../repl/tool-policy.js';
 import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../repl/skills.js';
+import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
 
 type ChatOptions = {
   agent?: string;
@@ -187,32 +188,19 @@ async function promptForToolApproval(
         `Allow ${tool}? [y] once, [s] this session, [a] always allow, [d] deny always, [n] cancel: `
       )
     )
-  )
-    .trim()
-    .toLowerCase();
+  ).trim();
 
-  if (answer === 'y' || answer === 'yes') {
-    toolPolicy.grantTool(tool, 1);
-    return true;
+  const result = applyToolApprovalChoice({
+    policy: toolPolicy,
+    tool,
+    sessionId,
+    choice: parseToolApprovalInput(answer),
+  });
+  if (result.message) {
+    const printer = result.approved ? chalk.green : chalk.yellow;
+    console.log(printer(result.message));
   }
-  if (answer === 's' || answer === 'session') {
-    if (!sessionId) {
-      console.log(chalk.yellow('No PCP session id available; falling back to one-time grant.'));
-      toolPolicy.grantTool(tool, 1);
-      return true;
-    }
-    toolPolicy.grantToolForSession(sessionId, tool);
-    return true;
-  }
-  if (answer === 'a' || answer === 'always') {
-    toolPolicy.allowTool(tool);
-    return true;
-  }
-  if (answer === 'd' || answer === 'deny') {
-    toolPolicy.denyTool(tool);
-    return false;
-  }
-  return false;
+  return result.approved;
 }
 
 function renderActiveSkills(skills: SkillInstruction[]): string {

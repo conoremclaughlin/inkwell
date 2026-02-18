@@ -13,7 +13,7 @@ export function compilePolicyPattern(pattern: string): RegExp | null {
   if (!normalized) return null;
   if (normalized === '*') return /^.*$/i;
   if (!normalized.includes('*')) return new RegExp(`^${escapeRegex(normalized)}$`, 'i');
-  return new RegExp(`^${escapeRegex(normalized).replaceAll('\\*', '.*')}$`, 'i');
+  return new RegExp(`^${escapeRegex(normalized).replaceAll('*', '.*')}$`, 'i');
 }
 
 export function matchesPolicyPattern(value: string, pattern: string): boolean {
