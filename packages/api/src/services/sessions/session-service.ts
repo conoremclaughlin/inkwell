@@ -502,7 +502,7 @@ export class SessionService implements ISessionService {
       messageCount: 0,
       tokenCount: 0,
       backend,
-      model: this.config.defaultModel,
+      model: null, // Set explicitly when known; runner model != verified session model
       lastCompactionAt: null,
       compactionCount: 0,
       endedAt: null,
@@ -635,11 +635,14 @@ export class SessionService implements ISessionService {
 
     // Codex is worktree-sensitive: keep a deterministic warning when no studio could be resolved.
     if (options.backend === 'codex-cli') {
-      logger.warn('No studio resolved for codex-cli request; falling back to default working directory', {
-        userId,
-        agentId,
-        defaultWorkingDirectory: this.config.defaultWorkingDirectory,
-      });
+      logger.warn(
+        'No studio resolved for codex-cli request; falling back to default working directory',
+        {
+          userId,
+          agentId,
+          defaultWorkingDirectory: this.config.defaultWorkingDirectory,
+        }
+      );
     }
 
     return undefined;

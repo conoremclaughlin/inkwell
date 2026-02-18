@@ -65,7 +65,6 @@ export interface ClaudeCodeConfig extends BackendConfig {
 }
 
 const DEFAULT_CONFIG: Partial<ClaudeCodeConfig> = {
-  model: 'sonnet',
   workingDirectory: process.cwd(),
   timeout: 300000, // 5 minutes for persistent session
 };

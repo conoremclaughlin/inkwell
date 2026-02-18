@@ -93,7 +93,7 @@ function summarizeObject(input: Record<string, unknown>): string {
     const toolUseId =
       typeof input.tool_use_id === 'string' ? input.tool_use_id.slice(0, 8) : 'unknown';
     const result =
-      input.content !== undefined ? stringifyCompact(input.content).slice(0, 320) : 'No result content';
+      input.content !== undefined ? stringifyCompact(input.content) : 'No result content';
     return `Tool result (${toolUseId}): ${result}`;
   }
 
@@ -102,6 +102,11 @@ function summarizeObject(input: Record<string, unknown>): string {
     const sessionId =
       typeof input.sessionId === 'string' ? ` · session ${input.sessionId.slice(0, 8)}` : '';
     return `Queue ${operation}${sessionId}`;
+  }
+
+  // Direct text block: {type: "text", text: "..."}
+  if (input.type === 'text' && typeof input.text === 'string') {
+    return input.text;
   }
 
   if (input.type === 'assistant' || input.type === 'user') {
@@ -123,10 +128,13 @@ function summarizeObject(input: Record<string, unknown>): string {
     }
   }
 
-  return stringifyCompact(input).slice(0, 420);
+  return stringifyCompact(input);
 }
 
-function formatEntryContent(rawContent: string, _backend: string | null | undefined): {
+function formatEntryContent(
+  rawContent: string,
+  _backend: string | null | undefined
+): {
   display: string;
   rawJson: string | null;
   kind: 'tool' | 'json' | 'text';
@@ -190,7 +198,8 @@ export default function SessionLogsPage() {
         <h1 className="text-3xl font-bold text-gray-900">Session Log</h1>
         {session && (
           <p className="mt-2 text-gray-600">
-            <span className="font-medium">{session.agentId}</span> · {session.backend || 'unknown backend'}
+            <span className="font-medium">{session.agentId}</span> ·{' '}
+            {session.backend || 'unknown backend'}
             {session.backendSessionId ? ` · ${session.backendSessionId}` : ''}
           </p>
         )}
@@ -301,7 +310,8 @@ export default function SessionLogsPage() {
             <div className="mt-4 flex items-center justify-between border-t border-gray-200 pt-4">
               <p className="text-xs text-gray-500">
                 Showing {pagination.offset + 1} -{' '}
-                {Math.min(pagination.offset + pagination.limit, pagination.total)} of {pagination.total}
+                {Math.min(pagination.offset + pagination.limit, pagination.total)} of{' '}
+                {pagination.total}
               </p>
               <div className="flex items-center gap-2">
                 <Button

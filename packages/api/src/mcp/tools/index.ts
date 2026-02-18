@@ -1248,6 +1248,14 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .describe(
             'Thread key for session routing (e.g., "pr:32"). If an active session with this threadKey exists for the same agent, it is returned instead of creating a new one.'
           ),
+        backend: z
+          .string()
+          .optional()
+          .describe('Backend runtime (e.g., "claude-code", "codex", "gemini")'),
+        model: z
+          .string()
+          .optional()
+          .describe('Model identifier (e.g., "opus-4-6", "sonnet", "o3")'),
         metadata: z.record(z.unknown()).optional().describe('Session metadata'),
       },
     },

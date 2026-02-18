@@ -943,6 +943,20 @@ async function onSessionStartHandler(): Promise<void> {
     // Non-fatal
   }
 
+  // Register PCP session with detected backend
+  const detectedBackend = detectBackend(cwd);
+  try {
+    const startArgs: Record<string, unknown> = {
+      email: config?.email,
+      agentId,
+      backend: detectedBackend.name,
+    };
+    if (studioId) startArgs.studioId = studioId;
+    await callPcpTool('start_session', startArgs);
+  } catch {
+    // Non-fatal — session tracking is best-effort
+  }
+
   // Store session ID if provided in stdin
   if (stdin.session_id) {
     writeRuntimeFile(cwd, 'session-id', String(stdin.session_id));

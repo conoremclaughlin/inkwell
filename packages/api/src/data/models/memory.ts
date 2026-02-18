@@ -99,6 +99,8 @@ export interface SessionCreateInput {
    */
   workspaceId?: string;
   threadKey?: string;
+  backend?: string;
+  model?: string;
   metadata?: Record<string, unknown>;
 }
 

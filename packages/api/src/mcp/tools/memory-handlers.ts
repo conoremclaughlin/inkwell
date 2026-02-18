@@ -137,6 +137,11 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
     .describe(
       'Thread key for session routing (e.g., "pr:32"). If an active session with this threadKey exists for the same agent, it is returned instead of creating a new one.'
     ),
+  backend: z
+    .string()
+    .optional()
+    .describe('Backend runtime (e.g., "claude-code", "codex", "gemini")'),
+  model: z.string().optional().describe('Model identifier (e.g., "opus-4-6", "sonnet", "o3")'),
   metadata: z.record(z.unknown()).optional().describe('Additional session metadata'),
 });
 
@@ -615,6 +620,8 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
     studioId,
     workspaceId: params.workspaceId,
     threadKey: params.threadKey,
+    backend: params.backend,
+    model: params.model,
     metadata: params.metadata,
   });
 

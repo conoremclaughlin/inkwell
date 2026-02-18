@@ -205,6 +205,8 @@ export class MemoryRepository {
       identity_id: identityId,
       metadata: input.metadata || {},
     };
+    if (input.backend) insertData.backend = input.backend;
+    if (input.model) insertData.model = input.model;
     const scopedStudioId = input.studioId ?? input.workspaceId;
     if (scopedStudioId !== undefined) {
       insertData.studio_id = scopedStudioId;
