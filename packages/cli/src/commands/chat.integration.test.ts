@@ -185,6 +185,54 @@ describe('runChat integration', () => {
     expect(transcript).toContain('"type":"session_attach"');
   });
 
+  it('supports interactive attach picker from active sessions', async () => {
+    testState.callToolImpl.mockImplementation(async (tool: string) => {
+      switch (tool) {
+        case 'bootstrap':
+          return { user: { timezone: 'America/Los_Angeles' } };
+        case 'list_sessions':
+          return {
+            sessions: [
+              {
+                id: 'sess-a111',
+                agentId: 'lumen',
+                status: 'active',
+                currentPhase: 'implementing',
+                threadKey: 'pr:61',
+              },
+              {
+                id: 'sess-b222',
+                agentId: 'lumen',
+                status: 'active',
+                currentPhase: 'reviewing',
+                threadKey: 'spec:cli-session-hooks',
+              },
+            ],
+          };
+        case 'get_inbox':
+          return { messages: [] };
+        default:
+          return { success: true };
+      }
+    });
+
+    // 2 -> choose second session in picker, then /quit interactive loop.
+    testState.inputs = ['2', '/quit'];
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      attach: true,
+      pollSeconds: '999',
+    });
+
+    expect(testState.pcpCalls.some((call) => call.tool === 'start_session')).toBe(false);
+    expect(testState.pcpCalls.some((call) => call.tool === 'end_session')).toBe(false);
+
+    const sessionStatusLine = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    expect(sessionStatusLine).toContain('Session: sess-b222');
+    expect(sessionStatusLine).toContain('Thread: spec:cli-session-hooks');
+  });
+
   it('supports gated /pcp tool execution with inline approval', async () => {
     testState.inputs = ['/pcp send_to_inbox {"recipientAgentId":"wren"}', 'y', '/quit'];
 

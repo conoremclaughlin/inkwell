@@ -29,6 +29,7 @@ type ChatOptions = {
   backend?: string;
   model?: string;
   threadKey?: string;
+  attach?: string | boolean;
   sessionId?: string;
   maxContextTokens?: string;
   pollSeconds?: string;
@@ -301,6 +302,48 @@ function printSessionsSnapshot(sessions: SessionSummary[]): void {
   console.log('');
 }
 
+function matchesAttachQuery(session: SessionSummary, query?: string): boolean {
+  if (!query) return true;
+  const haystack = `${session.id} ${session.agentId || ''} ${session.threadKey || ''} ${
+    session.currentPhase || session.status || ''
+  }`.toLowerCase();
+  return haystack.includes(query.toLowerCase());
+}
+
+async function pickSessionToAttach(
+  sessions: SessionSummary[],
+  query?: string
+): Promise<SessionSummary | undefined> {
+  const candidates = sessions.filter((session) => matchesAttachQuery(session, query));
+  if (candidates.length === 0) return undefined;
+  if (candidates.length === 1) return candidates[0];
+
+  console.log(chalk.bold('\nSelect session to attach:\n'));
+  for (let i = 0; i < candidates.length; i += 1) {
+    const session = candidates[i]!;
+    const phase = session.currentPhase || session.status || '-';
+    console.log(
+      chalk.dim(
+        `  ${String(i + 1).padStart(2, ' ')}. ${session.id.slice(0, 8)}  ${
+          session.agentId || '-'
+        }  ${phase}  ${session.threadKey || '-'}`
+      )
+    );
+  }
+  console.log('');
+
+  const rl = createInterface({ input, output });
+  try {
+    const answer = (await rl.question(chalk.green('Attach which session? [number, Enter=cancel]: '))).trim();
+    if (!answer) return undefined;
+    const index = Number.parseInt(answer, 10);
+    if (Number.isNaN(index) || index < 1 || index > candidates.length) return undefined;
+    return candidates[index - 1];
+  } finally {
+    rl.close();
+  }
+}
+
 async function promptForToolApproval(
   rl: ReturnType<typeof createInterface>,
   toolPolicy: ToolPolicyState,
@@ -433,6 +476,27 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }`,
       'bootstrap'
     );
+  }
+
+  if (options.attach && !runtime.sessionId) {
+    const attachQuery = typeof options.attach === 'string' ? options.attach.trim() : undefined;
+    const sessionsResult = (await pcp
+      .callTool('list_sessions', { agentId, status: 'active', limit: 30 })
+      .catch((error) => ({ error: String(error) }))) as Record<string, unknown>;
+
+    if ((sessionsResult as Record<string, unknown>).error) {
+      throw new Error(`Failed to list sessions for attach: ${String((sessionsResult as { error?: string }).error)}`);
+    }
+
+    const sessions = extractSessionSummaries(sessionsResult);
+    const selected = await pickSessionToAttach(sessions, attachQuery);
+    if (!selected) {
+      throw new Error('No matching active session selected for attach.');
+    }
+    runtime.sessionId = selected.id;
+    if (!runtime.threadKey && selected.threadKey) {
+      runtime.threadKey = selected.threadKey;
+    }
   }
 
   const attachedToExistingSession = Boolean(runtime.sessionId);
@@ -1060,6 +1124,7 @@ export function registerChatCommand(program: Command): void {
       .option('-b, --backend <name>', 'Backend: claude, codex, gemini', 'claude')
       .option('-m, --model <model>', 'Model override for backend')
       .option('--thread-key <key>', 'Thread key for PCP session routing')
+      .option('--attach [query]', 'Attach to an active session for this SB (optional query filter)')
       .option('--session-id <id>', 'Attach chat to an existing PCP session id')
       .option('--max-context-tokens <n>', 'Approximate context budget for transcript', '12000')
       .option('--poll-seconds <n>', 'Inbox polling interval seconds', '20')
