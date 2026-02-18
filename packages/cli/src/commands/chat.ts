@@ -2,8 +2,17 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import { createInterface } from 'readline/promises';
 import { stdin as input, stdout as output } from 'process';
-import { appendFileSync, mkdirSync } from 'fs';
-import { join } from 'path';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  unwatchFile,
+  watchFile,
+} from 'fs';
+import { isAbsolute, join } from 'path';
 import { readIdentityJson, resolveAgentId } from '../backends/identity.js';
 import { PcpClient } from '../lib/pcp-client.js';
 import { runBackendTurn } from '../repl/backend-runner.js';
@@ -20,9 +29,13 @@ type ChatOptions = {
   backend?: string;
   model?: string;
   threadKey?: string;
+  sessionId?: string;
   maxContextTokens?: string;
   pollSeconds?: string;
   tools?: string;
+  message?: string;
+  nonInteractive?: boolean;
+  tailTranscript?: string;
   verbose?: boolean;
 };
 
@@ -62,6 +75,118 @@ function ensureRuntimeTranscriptPath(sessionId?: string): string {
   mkdirSync(dir, { recursive: true });
   const safeSession = sessionId || 'local';
   return join(dir, `${safeSession}-${Date.now()}.jsonl`);
+}
+
+function findLatestTranscriptForSession(sessionId: string): string | undefined {
+  const dir = join(process.cwd(), '.pcp', 'runtime', 'repl');
+  if (!existsSync(dir)) return undefined;
+  const sessionPrefix = `${sessionId}-`;
+  const candidates = readdirSync(dir)
+    .filter((entry) => entry.startsWith(sessionPrefix) && entry.endsWith('.jsonl'))
+    .map((entry) => join(dir, entry))
+    .filter((fullPath) => {
+      try {
+        return statSync(fullPath).isFile();
+      } catch {
+        return false;
+      }
+    })
+    .sort((a, b) => {
+      try {
+        return statSync(b).mtimeMs - statSync(a).mtimeMs;
+      } catch {
+        return 0;
+      }
+    });
+  return candidates[0];
+}
+
+function resolveTranscriptTarget(target: string): string {
+  const trimmed = target.trim();
+  if (!trimmed) throw new Error('Empty transcript target');
+  if (isAbsolute(trimmed)) return trimmed;
+  if (trimmed.includes('/') || trimmed.endsWith('.jsonl')) {
+    return join(process.cwd(), trimmed);
+  }
+  const matched = findLatestTranscriptForSession(trimmed);
+  if (!matched) {
+    throw new Error(`No transcript found for session ${trimmed}`);
+  }
+  return matched;
+}
+
+function printTranscriptLine(rawLine: string): void {
+  if (!rawLine.trim()) return;
+  try {
+    const parsed = JSON.parse(rawLine) as Record<string, unknown>;
+    const ts = typeof parsed.ts === 'string' ? parsed.ts : '';
+    const type = typeof parsed.type === 'string' ? parsed.type : 'event';
+    const prefix = ts ? `${ts} ${type}` : type;
+
+    if (type === 'user' || type === 'assistant' || type === 'inbox') {
+      const content =
+        typeof parsed.content === 'string'
+          ? parsed.content
+          : typeof parsed.rendered === 'string'
+            ? parsed.rendered
+            : '';
+      console.log(`${chalk.dim(prefix)} ${content}`);
+      return;
+    }
+    if (type === 'pcp_tool') {
+      console.log(
+        `${chalk.dim(prefix)} ${String(parsed.tool || '')} ${JSON.stringify(parsed.args || {}, null, 0)}`
+      );
+      return;
+    }
+    console.log(`${chalk.dim(prefix)} ${JSON.stringify(parsed)}`);
+  } catch {
+    console.log(rawLine);
+  }
+}
+
+async function tailTranscript(target: string): Promise<void> {
+  const filePath = resolveTranscriptTarget(target);
+  if (!existsSync(filePath)) {
+    throw new Error(`Transcript not found: ${filePath}`);
+  }
+
+  const initial = readFileSync(filePath, 'utf-8');
+  const initialLines = initial.split('\n').filter(Boolean);
+  for (const line of initialLines) {
+    printTranscriptLine(line);
+  }
+
+  let lastSize = Buffer.byteLength(initial, 'utf-8');
+  console.log(chalk.dim(`\nWatching transcript: ${filePath}`));
+  console.log(chalk.dim('Press Ctrl+C to stop.\n'));
+
+  await new Promise<void>((resolve) => {
+    const pollMs = 750;
+    const handler = () => {
+      try {
+        const current = readFileSync(filePath, 'utf-8');
+        const currentSize = Buffer.byteLength(current, 'utf-8');
+        if (currentSize <= lastSize) return;
+        const appended = current.slice(lastSize);
+        lastSize = currentSize;
+        const lines = appended.split('\n').filter(Boolean);
+        for (const line of lines) {
+          printTranscriptLine(line);
+        }
+      } catch {
+        // no-op
+      }
+    };
+
+    watchFile(filePath, { interval: pollMs }, handler);
+    const stop = () => {
+      unwatchFile(filePath, handler);
+      process.off('SIGINT', stop);
+      resolve();
+    };
+    process.on('SIGINT', stop);
+  });
 }
 
 function appendTranscript(path: string, event: Record<string, unknown>): void {
@@ -255,6 +380,11 @@ function buildPromptEnvelope(
 }
 
 export async function runChat(options: ChatOptions): Promise<void> {
+  if (options.tailTranscript) {
+    await tailTranscript(options.tailTranscript);
+    return;
+  }
+
   const agentId = resolveAgentId(options.agent);
   const pcp = new PcpClient();
   const identity = readIdentityJson(process.cwd());
@@ -266,6 +396,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     toolMode:
       options.tools === 'off' ? 'off' : options.tools === 'privileged' ? 'privileged' : 'backend',
     threadKey: options.threadKey,
+    sessionId: options.sessionId?.trim() || undefined,
     maxContextTokens: Number.parseInt(options.maxContextTokens || '12000', 10),
     pollSeconds: Number.parseInt(options.pollSeconds || '20', 10),
     showSessionsWatch: false,
@@ -304,22 +435,30 @@ export async function runChat(options: ChatOptions): Promise<void> {
     );
   }
 
-  const startArgs: Record<string, unknown> = { agentId };
-  if (runtime.threadKey) startArgs.threadKey = runtime.threadKey;
-  if (identity?.workspaceId) {
-    startArgs.studioId = identity.workspaceId;
-    // Backward compatibility for older server builds.
-    startArgs.workspaceId = identity.workspaceId;
+  const attachedToExistingSession = Boolean(runtime.sessionId);
+  if (!runtime.sessionId) {
+    const startArgs: Record<string, unknown> = { agentId };
+    if (runtime.threadKey) startArgs.threadKey = runtime.threadKey;
+    if (identity?.workspaceId) {
+      startArgs.studioId = identity.workspaceId;
+      // Backward compatibility for older server builds.
+      startArgs.workspaceId = identity.workspaceId;
+    }
+
+    const sessionStartResult = (await pcp
+      .callTool('start_session', startArgs)
+      .catch((error) => ({ error: String(error) }))) as Record<string, unknown>;
+    runtime.sessionId = extractSessionId(sessionStartResult);
   }
 
-  const sessionStartResult = (await pcp
-    .callTool('start_session', startArgs)
-    .catch((error) => ({ error: String(error) }))) as Record<string, unknown>;
-  runtime.sessionId = extractSessionId(sessionStartResult);
-  runtime.transcriptPath = ensureRuntimeTranscriptPath(runtime.sessionId);
+  const existingTranscript =
+    runtime.sessionId && attachedToExistingSession
+      ? findLatestTranscriptForSession(runtime.sessionId)
+      : undefined;
+  runtime.transcriptPath = existingTranscript || ensureRuntimeTranscriptPath(runtime.sessionId);
 
   appendTranscript(runtime.transcriptPath, {
-    type: 'session_start',
+    type: attachedToExistingSession ? 'session_attach' : 'session_start',
     agentId,
     backend: runtime.backend,
     model: runtime.model || null,
@@ -328,7 +467,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     studioId: identity?.workspaceId || null,
   });
 
-  if (runtime.sessionId) {
+  if (runtime.sessionId && !attachedToExistingSession) {
     await pcp
       .callTool('update_session_phase', {
         agentId,
@@ -343,6 +482,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   console.log(chalk.dim(`Agent: ${agentId}`));
   console.log(chalk.dim(`Backend: ${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}`));
   if (runtime.threadKey) console.log(chalk.dim(`Thread: ${runtime.threadKey}`));
+  if (attachedToExistingSession) console.log(chalk.dim('Mode: attached to existing session'));
   if (runtime.sessionId) console.log(chalk.dim(`Session: ${runtime.sessionId}`));
   console.log(chalk.dim(`Transcript: ${runtime.transcriptPath}`));
   console.log(chalk.dim('Type /help for commands.\n'));
@@ -389,6 +529,86 @@ export async function runChat(options: ChatOptions): Promise<void> {
   pollTimer = setInterval(() => {
     void pollInbox(false);
   }, Math.max(runtime.pollSeconds, 5) * 1000);
+
+  const runUserTurn = async (raw: string) => {
+    if (!raw.trim()) return;
+    ledger.addEntry('user', raw, 'repl');
+    appendTranscript(runtime.transcriptPath, { type: 'user', content: raw });
+
+    if (runtime.sessionId) {
+      await pcp
+        .callTool('update_session_phase', {
+          agentId,
+          sessionId: runtime.sessionId,
+          phase: 'implementing',
+          status: 'active',
+        })
+        .catch(() => undefined);
+    }
+
+    const prompt = buildPromptEnvelope(agentId, runtime, ledger, raw);
+    const runResult = await runBackendTurn({
+      backend: runtime.backend,
+      agentId,
+      model: runtime.model,
+      prompt,
+      verbose: runtime.verbose,
+      // When tools are off, do not pass through backend tool passthrough flags.
+      passthroughArgs: toolPolicy.canUseBackendTools() ? [] : ['--allowedTools', ''],
+    });
+
+    let responseText = runResult.stdout.trim();
+    if (!responseText && runResult.stderr.trim()) {
+      responseText = runResult.stderr.trim();
+    }
+    if (!responseText) {
+      responseText = '(no output)';
+    }
+
+    ledger.addEntry('assistant', responseText, runtime.backend);
+    appendTranscript(runtime.transcriptPath, {
+      type: 'assistant',
+      backend: runtime.backend,
+      model: runtime.model || null,
+      success: runResult.success,
+      exitCode: runResult.exitCode,
+      durationMs: runResult.durationMs,
+      stderr: runResult.stderr || null,
+      content: responseText,
+      approxTokens: estimateTokens(responseText),
+    });
+
+    if (!runResult.success) {
+      console.log(chalk.red(`\n[${runtime.backend}] exit=${runResult.exitCode}`));
+      if (runResult.stderr) {
+        console.log(chalk.dim(runResult.stderr));
+      }
+    }
+
+    console.log(`\n${chalk.white(responseText)}\n`);
+  };
+
+  if (options.nonInteractive || options.message) {
+    const message = options.message?.trim();
+    if (!message) {
+      throw new Error('--non-interactive requires --message "<text>"');
+    }
+    await runUserTurn(message);
+    if (pollTimer) clearInterval(pollTimer);
+    const summary = summarizeForSessionEnd(ledger);
+    if (runtime.sessionId && !attachedToExistingSession) {
+      await pcp
+        .callTool('end_session', { agentId, sessionId: runtime.sessionId, summary })
+        .catch(() => undefined);
+    }
+    appendTranscript(runtime.transcriptPath, {
+      type: 'session_end',
+      sessionId: runtime.sessionId || null,
+      summary,
+      attached: attachedToExistingSession,
+    });
+    return;
+  }
 
   const rl = createInterface({ input, output });
   let keepRunning = true;
@@ -810,68 +1030,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
       continue;
     }
-
-    ledger.addEntry('user', raw, 'repl');
-    appendTranscript(runtime.transcriptPath, { type: 'user', content: raw });
-
-    if (runtime.sessionId) {
-      await pcp
-        .callTool('update_session_phase', {
-          agentId,
-          sessionId: runtime.sessionId,
-          phase: 'implementing',
-          status: 'active',
-        })
-        .catch(() => undefined);
-    }
-
-    const prompt = buildPromptEnvelope(agentId, runtime, ledger, raw);
-    const runResult = await runBackendTurn({
-      backend: runtime.backend,
-      agentId,
-      model: runtime.model,
-      prompt,
-      verbose: runtime.verbose,
-      // When tools are off, do not pass through backend tool passthrough flags.
-      passthroughArgs: toolPolicy.canUseBackendTools() ? [] : ['--allowedTools', ''],
-    });
-
-    let responseText = runResult.stdout.trim();
-    if (!responseText && runResult.stderr.trim()) {
-      responseText = runResult.stderr.trim();
-    }
-    if (!responseText) {
-      responseText = '(no output)';
-    }
-
-    ledger.addEntry('assistant', responseText, runtime.backend);
-    appendTranscript(runtime.transcriptPath, {
-      type: 'assistant',
-      backend: runtime.backend,
-      model: runtime.model || null,
-      success: runResult.success,
-      exitCode: runResult.exitCode,
-      durationMs: runResult.durationMs,
-      stderr: runResult.stderr || null,
-      content: responseText,
-      approxTokens: estimateTokens(responseText),
-    });
-
-    if (!runResult.success) {
-      console.log(chalk.red(`\n[${runtime.backend}] exit=${runResult.exitCode}`));
-      if (runResult.stderr) {
-        console.log(chalk.dim(runResult.stderr));
-      }
-    }
-
-    console.log(`\n${chalk.white(responseText)}\n`);
+    await runUserTurn(raw);
   }
 
   rl.close();
   if (pollTimer) clearInterval(pollTimer);
 
   const summary = summarizeForSessionEnd(ledger);
-  if (runtime.sessionId) {
+  if (runtime.sessionId && !attachedToExistingSession) {
     await pcp
       .callTool('end_session', { agentId, sessionId: runtime.sessionId, summary })
       .catch(() => undefined);
@@ -894,9 +1060,13 @@ export function registerChatCommand(program: Command): void {
       .option('-b, --backend <name>', 'Backend: claude, codex, gemini', 'claude')
       .option('-m, --model <model>', 'Model override for backend')
       .option('--thread-key <key>', 'Thread key for PCP session routing')
+      .option('--session-id <id>', 'Attach chat to an existing PCP session id')
       .option('--max-context-tokens <n>', 'Approximate context budget for transcript', '12000')
       .option('--poll-seconds <n>', 'Inbox polling interval seconds', '20')
       .option('--tools <mode>', 'Tool mode: backend|off|privileged', 'backend')
+      .option('--message <text>', 'Single-turn message for non-interactive mode')
+      .option('--non-interactive', 'Run one turn and exit (requires --message)')
+      .option('--tail-transcript <pathOrSession>', 'Tail transcript output by file path or session id')
       .option('-v, --verbose', 'Verbose backend passthrough output')
       .action((options: ChatOptions) => runChat(options));
 

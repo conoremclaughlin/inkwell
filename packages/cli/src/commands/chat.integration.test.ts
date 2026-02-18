@@ -147,6 +147,44 @@ describe('runChat integration', () => {
     expect(transcript).toContain('"type":"assistant"');
   });
 
+  it('supports non-interactive single turn mode', async () => {
+    await runChat({
+      agent: 'lumen',
+      backend: 'gemini',
+      nonInteractive: true,
+      message: 'heartbeat pulse',
+      pollSeconds: '999',
+    });
+
+    expect(testState.runBackendImpl).toHaveBeenCalledTimes(1);
+    const backendRequest = testState.runBackendImpl.mock.calls[0][0] as { prompt: string; backend: string };
+    expect(backendRequest.backend).toBe('gemini');
+    expect(backendRequest.prompt).toContain('Latest user message:\nheartbeat pulse');
+    // Newly created session in non-interactive mode should be ended.
+    expect(testState.pcpCalls.some((call) => call.tool === 'end_session')).toBe(true);
+  });
+
+  it('attaches to provided session id and does not end attached session', async () => {
+    testState.inputs = ['/quit'];
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      sessionId: 'sess-attach-1',
+      pollSeconds: '999',
+    });
+
+    // Attached mode skips start_session.
+    expect(testState.pcpCalls.some((call) => call.tool === 'start_session')).toBe(false);
+    // Attached mode should not end the existing session.
+    expect(testState.pcpCalls.some((call) => call.tool === 'end_session')).toBe(false);
+
+    const transcriptDir = join(testCwd, '.pcp', 'runtime', 'repl');
+    const transcriptFiles = readdirSync(transcriptDir).filter((entry) => entry.includes('sess-attach-1'));
+    expect(transcriptFiles.length).toBeGreaterThan(0);
+    const transcript = readFileSync(join(transcriptDir, transcriptFiles[0]!), 'utf-8');
+    expect(transcript).toContain('"type":"session_attach"');
+  });
+
   it('supports gated /pcp tool execution with inline approval', async () => {
     testState.inputs = ['/pcp send_to_inbox {"recipientAgentId":"wren"}', 'y', '/quit'];
 

@@ -321,6 +321,9 @@ sb alpha                         # Alias for sb chat
 sb chat -b codex                 # Use codex backend
 sb chat -b gemini                # Use gemini backend
 sb chat --thread-key pr:123      # Bind to collaborative thread
+sb chat --session-id <pcp-id>    # Attach to an existing PCP session
+sb chat --non-interactive --message "run heartbeat pass"
+sb chat --tail-transcript <session-or-path>  # Stream transcript output
 sb chat --max-context-tokens 16000
 sb chat --poll-seconds 10
 sb chat --tools off              # Disable backend-native tool usage
