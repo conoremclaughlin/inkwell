@@ -1040,17 +1040,19 @@ describe('SessionService', () => {
       expect(mockRepoWithThreadKey.create).not.toHaveBeenCalled();
     });
 
-    it('should fall back to general session match when threadKey has no match', async () => {
-      const existingSession = createMockSession({
-        id: 'general-session',
-        claudeSessionId: 'claude-general',
-      });
-
+    it('should create a new thread-scoped session when threadKey has no match', async () => {
       // Add findByThreadKey that returns null (no match)
       const mockRepoWithThreadKey = {
         ...mockRepository,
         findByThreadKey: vi.fn().mockResolvedValue(null),
-        findByUserAndAgent: vi.fn().mockResolvedValue(existingSession),
+        findByUserAndAgent: vi.fn(),
+        create: vi.fn().mockResolvedValue(
+          createMockSession({
+            id: 'new-thread-session',
+            threadKey: 'pr:999',
+            claudeSessionId: null,
+          })
+        ),
       };
 
       const serviceWithThreadKey = new SessionService(
@@ -1074,14 +1076,19 @@ describe('SessionService', () => {
       const result = await serviceWithThreadKey.handleMessage(request);
 
       expect(result.success).toBe(true);
-      expect(result.sessionId).toBe('general-session');
-      // threadKey tried first, then fell back
+      expect(result.sessionId).toBe('new-thread-session');
+      // threadKey tried first, then created dedicated thread session
       expect(mockRepoWithThreadKey.findByThreadKey).toHaveBeenCalledWith(
         'user-456',
         'myra',
         'pr:999'
       );
-      expect(mockRepoWithThreadKey.findByUserAndAgent).toHaveBeenCalled();
+      expect(mockRepoWithThreadKey.findByUserAndAgent).not.toHaveBeenCalled();
+      expect(mockRepoWithThreadKey.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          threadKey: 'pr:999',
+        })
+      );
     });
 
     it('should not use threadKey matching when no threadKey provided', async () => {

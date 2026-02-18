@@ -442,21 +442,39 @@ export class SessionService implements ISessionService {
           });
           return threadMatch;
         }
+
+        // Thread-scoped request with no match => create a dedicated new session.
+        // Do NOT reuse the generic active session; that would collapse distinct threads.
+        logger.debug('No existing thread-scoped session found; creating a new one', {
+          userId,
+          agentId,
+          threadKey: options.threadKey,
+          studioId: resolvedStudioId || null,
+        });
+      } else if (options?.threadKey) {
+        logger.debug('Repository lacks threadKey lookup support; creating a new thread session', {
+          userId,
+          agentId,
+          threadKey: options.threadKey,
+          studioId: resolvedStudioId || null,
+        });
       }
 
-      // Fall back to general active session match
-      const existing = await this.repository.findByUserAndAgent(userId, agentId, {
-        type: 'primary',
-        ...(resolvedStudioId ? { studioId: resolvedStudioId } : {}),
-      });
-
-      if (existing) {
-        logger.debug('Found existing session', {
-          sessionId: existing.id,
-          claudeSessionId: existing.claudeSessionId,
-          studioId: existing.studioId || null,
+      if (!options?.threadKey) {
+        // Fall back to general active session match only for non-threaded requests.
+        const existing = await this.repository.findByUserAndAgent(userId, agentId, {
+          type: 'primary',
+          ...(resolvedStudioId ? { studioId: resolvedStudioId } : {}),
         });
-        return existing;
+
+        if (existing) {
+          logger.debug('Found existing session', {
+            sessionId: existing.id,
+            claudeSessionId: existing.claudeSessionId,
+            studioId: existing.studioId || null,
+          });
+          return existing;
+        }
       }
     }
 
