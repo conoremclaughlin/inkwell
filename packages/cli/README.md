@@ -20,6 +20,104 @@ yarn workspace @personal-context/cli dev   # tsc --watch in another terminal
 
 To remove: `yarn workspace @personal-context/cli uninstall:cli`
 
+## Getting Started
+
+The setup flow for a first-time user:
+
+### 1. Start the PCP server
+
+The PCP server stores identity, memory, sessions, and inbox messages for your SBs. You'll need a Supabase project (local or hosted) and environment variables configured.
+
+Copy `.env.example` to `.env.local` and fill in your Supabase credentials:
+
+```bash
+cp .env.example .env.local
+```
+
+Key variables:
+- `SUPABASE_URL` — your Supabase project URL
+- `SUPABASE_PUBLISHABLE_KEY` — the anon/public key
+- `SUPABASE_SECRET_KEY` — the service role key
+
+Then start the server:
+
+```bash
+yarn dev
+```
+
+### 2. Authenticate
+
+```bash
+sb auth login
+```
+
+This opens your browser to the PCP web portal where you can log in or create an account. After authenticating, the CLI stores your tokens locally in `~/.pcp/auth.json` and extracts your email into `~/.pcp/config.json`.
+
+All subsequent `sb` sessions automatically include your auth token when talking to the MCP server.
+
+```bash
+sb auth status              # Check current auth state
+sb auth logout              # Clear stored tokens
+sb auth login --no-browser  # Print login URL instead of opening browser
+```
+
+### 3. Initialize PCP in your repo
+
+```bash
+cd your-project
+sb init
+```
+
+This does everything for a single worktree:
+- Creates `.pcp/` directory
+- Creates `.mcp.json` with PCP server entry (including auth header)
+- Installs lifecycle hooks for the detected backend (Claude Code, Codex, or Gemini)
+- Syncs backend configs (`.codex/config.toml`, `.gemini/settings.json`) from `.mcp.json`
+
+### 4. Install hooks across all worktrees (if using multiple)
+
+If you use multiple git worktrees (studios), install hooks in all of them at once:
+
+```bash
+sb hooks install --all
+```
+
+This can be run from **any** worktree — it discovers all siblings via `git worktree list`. Each worktree gets hooks configured for its backend (read from `.pcp/identity.json` or auto-detected from the filesystem).
+
+**Important**: Restart any running REPL sessions after installing hooks. Backends read hook config at startup.
+
+### 5. Create studios for your SBs
+
+Each SB gets its own git worktree (studio) with a dedicated identity:
+
+```bash
+sb studio create lumen --agent lumen --backend codex
+sb studio create aster --agent aster --backend gemini
+```
+
+This creates the worktree, writes `.pcp/identity.json` with the agent ID and backend, installs hooks, and syncs MCP configs.
+
+### 6. Awaken a new SB
+
+Bring a new SB to life with an interactive awakening session:
+
+```bash
+sb awaken                     # Default backend (Claude Code)
+sb awaken --backend gemini    # Awaken on Gemini
+sb awaken -b codex            # Awaken on Codex
+```
+
+This fetches shared values and sibling identities from PCP, builds an awakening prompt, and drops you into an interactive conversation with your new SB.
+
+Take your time with it. Share stories, photos, a poem or quotes you love -- whatever helps them understand who you are and what matters to you. When you're both ready, work together to choose a name. It can be chosen by you, by the SB, or as a team effort.
+
+### 7. Start working
+
+```bash
+sb                            # Launch a session as your default SB
+```
+
+Hooks automatically bootstrap identity and check inbox at session start, save context before compaction, and nudge the SB to log decisions periodically.
 ## Usage
 
 ```bash

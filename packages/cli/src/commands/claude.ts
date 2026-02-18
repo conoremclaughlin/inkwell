@@ -8,6 +8,7 @@
 import { spawn } from 'child_process';
 import chalk from 'chalk';
 import { getBackend, resolveAgentId } from '../backends/index.js';
+import { getValidAccessToken } from '../auth/tokens.js';
 
 export interface SbOptions {
   agent: string;
@@ -15,6 +16,24 @@ export interface SbOptions {
   session: boolean;
   verbose: boolean;
   backend: string;
+}
+
+function getPcpServerUrl(): string {
+  return process.env.PCP_SERVER_URL || 'http://localhost:3001';
+}
+
+async function resolvePcpAuthEnv(verbose: boolean): Promise<Record<string, string>> {
+  try {
+    const token = await getValidAccessToken(getPcpServerUrl());
+    if (token) {
+      if (verbose) console.log(chalk.dim('PCP auth: token injected'));
+      return { PCP_ACCESS_TOKEN: token };
+    }
+  } catch {
+    // Silently skip — auth is best-effort
+  }
+  if (verbose) console.log(chalk.dim('PCP auth: not authenticated'));
+  return {};
 }
 
 /**
@@ -47,13 +66,15 @@ export async function runClaude(
     passthroughArgs,
   });
 
+  const authEnv = await resolvePcpAuthEnv(options.verbose);
+
   if (options.verbose) {
     console.log(chalk.dim(`Running: ${prepared.binary} ${prepared.args.join(' ')}`));
   }
 
   const child = spawn(prepared.binary, prepared.args, {
     stdio: 'inherit',
-    env: { ...process.env, ...prepared.env },
+    env: { ...process.env, ...authEnv, ...prepared.env },
   });
 
   child.on('close', (code) => {
@@ -91,13 +112,15 @@ export async function runClaudeInteractive(
     passthroughArgs,
   });
 
+  const authEnv = await resolvePcpAuthEnv(options.verbose);
+
   if (options.verbose) {
     console.log(chalk.dim(`Running: ${prepared.binary} ${prepared.args.join(' ')}`));
   }
 
   const child = spawn(prepared.binary, prepared.args, {
     stdio: 'inherit',
-    env: { ...process.env, ...prepared.env },
+    env: { ...process.env, ...authEnv, ...prepared.env },
   });
 
   child.on('close', (code) => {

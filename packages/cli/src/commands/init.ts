@@ -15,6 +15,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { installHooks } from './hooks.js';
 import { syncMcpConfig } from './mcp.js';
+import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
 
 // ============================================================================
 // Helpers
@@ -47,6 +48,9 @@ function buildDefaultMcpJson(serverUrl: string): Record<string, unknown> {
       pcp: {
         type: 'http',
         url: `${serverUrl}/mcp`,
+        headers: {
+          Authorization: 'Bearer ${PCP_ACCESS_TOKEN}',
+        },
       },
     },
   };
@@ -87,7 +91,11 @@ function ensureMcpJson(cwd: string): InitStepResult {
         ...existing,
         mcpServers: {
           ...(servers || {}),
-          pcp: { type: 'http', url: `${serverUrl}/mcp` },
+          pcp: {
+            type: 'http',
+            url: `${serverUrl}/mcp`,
+            headers: { Authorization: 'Bearer ${PCP_ACCESS_TOKEN}' },
+          },
         },
       };
       writeFileSync(mcpPath, JSON.stringify(updated, null, 2) + '\n');
@@ -142,11 +150,15 @@ async function initCommand(options: { force?: boolean }): Promise<void> {
 
   console.log(chalk.bold('\nInitializing PCP...\n'));
 
-  if (config?.email) {
-    console.log(chalk.dim(`  User: ${config.email}`));
+  const auth = loadAuth();
+  if (auth && !isTokenExpired(auth)) {
+    const payload = decodeJwtPayload(auth.access_token);
+    console.log(chalk.dim(`  User: ${payload?.email || 'authenticated'}`));
+  } else if (config?.email) {
+    console.log(chalk.dim(`  User: ${config.email} (not authenticated)`));
+    console.log(chalk.yellow('  Run `sb auth login` to authenticate.'));
   } else {
-    console.log(chalk.yellow('  No ~/.pcp/config.json found. Some features may not work.'));
-    console.log(chalk.dim('  Create one with: echo \'{"email":"you@example.com"}\' > ~/.pcp/config.json'));
+    console.log(chalk.yellow('  Not authenticated. Run: sb auth login'));
   }
   console.log('');
 
