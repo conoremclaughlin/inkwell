@@ -90,7 +90,8 @@ function summarizeObject(input: Record<string, unknown>): string {
   }
 
   if (input.type === 'tool_result') {
-    const toolUseId = typeof input.tool_use_id === 'string' ? input.tool_use_id : 'unknown_tool_use';
+    const toolUseId =
+      typeof input.tool_use_id === 'string' ? input.tool_use_id.slice(0, 8) : 'unknown';
     const result =
       input.content !== undefined ? stringifyCompact(input.content).slice(0, 320) : 'No result content';
     return `Tool result (${toolUseId}): ${result}`;
@@ -125,7 +126,7 @@ function summarizeObject(input: Record<string, unknown>): string {
   return stringifyCompact(input).slice(0, 420);
 }
 
-function formatEntryContent(rawContent: string, backend: string | null | undefined): {
+function formatEntryContent(rawContent: string, _backend: string | null | undefined): {
   display: string;
   rawJson: string | null;
   kind: 'tool' | 'json' | 'text';
@@ -143,10 +144,8 @@ function formatEntryContent(rawContent: string, backend: string | null | undefin
     return { display: summary, rawJson, kind: 'tool' };
   }
 
-  if (backend?.toLowerCase().includes('codex') || backend?.toLowerCase().includes('claude')) {
-    return { display: summary, rawJson, kind: 'json' };
-  }
-
+  // Placeholder for future backend-specific formatting (codex/claude/gemini).
+  // For now, non-tool JSON payloads share one presentation.
   return { display: summary, rawJson, kind: 'json' };
 }
 
