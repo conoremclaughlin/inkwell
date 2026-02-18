@@ -52,7 +52,7 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .boolean()
     .optional()
     .describe(
-      'If true, automatically trigger the recipient agent after sending. Defaults to true for task_request and session_resume, false for notification and message.'
+      'If true, automatically trigger the recipient agent after sending. Defaults to true for all message types.'
     ),
   triggerType: z
     .enum(['task_complete', 'approval_needed', 'message', 'error', 'custom'])
@@ -109,11 +109,12 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   } = parsed;
   // Enforce identity on sender (who is performing the action), not recipient (target)
   const senderAgentId = getEffectiveAgentId(parsed.senderAgentId);
+  const triggerSenderId = senderAgentId || 'system';
 
-  // Default trigger behavior based on message type:
-  // task_request and session_resume trigger immediately (time-sensitive handoffs)
-  // notification and message wait for natural wake-up (heartbeat)
-  const shouldTriggerByDefault = messageType === 'task_request' || messageType === 'session_resume';
+  // Default trigger behavior:
+  // Always wake the recipient unless the caller explicitly opts out with trigger=false.
+  // This keeps SB-to-SB coordination immediate by default.
+  const shouldTriggerByDefault = true;
   const trigger = parsed.trigger ?? shouldTriggerByDefault;
 
   // Resolve canonical identity UUIDs for sender and recipient
@@ -168,16 +169,26 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     triggered: false,
   };
 
-  if (trigger && senderAgentId) {
+  if (trigger) {
     const gateway = getAgentGateway();
+    const metadataStudioId =
+      metadata && typeof metadata.studioId === 'string' && metadata.studioId.length > 0
+        ? metadata.studioId
+        : undefined;
+    const metadataStudioHint =
+      metadata && metadata.studioHint === 'main' ? ('main' as const) : undefined;
+
     const payload: AgentTriggerPayload = {
-      fromAgentId: senderAgentId,
+      fromAgentId: triggerSenderId,
       toAgentId: recipientAgentId,
       inboxMessageId: message.id,
       triggerType: triggerType || 'message',
-      summary: triggerSummary || subject || `New ${messageType} from ${senderAgentId}`,
+      summary: triggerSummary || subject || `New ${messageType} from ${triggerSenderId}`,
       priority,
       threadKey,
+      relatedSessionId,
+      studioId: metadataStudioId,
+      studioHint: metadataStudioHint,
     };
 
     // Fire-and-forget: don't await the trigger processing
@@ -209,12 +220,6 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       messageId: message.id,
       recipientAgentId,
     });
-  } else if (trigger && !senderAgentId) {
-    logger.warn('Trigger requested but no senderAgentId provided', { messageId: message.id });
-    triggerResult = {
-      triggered: false,
-      error: 'Cannot trigger without senderAgentId',
-    };
   }
 
   return {

@@ -157,7 +157,7 @@ function toSessionLogItem(row: {
   id: string;
   content: string;
   salience: string;
-  created_at: string | null;
+  created_at: string;
 }): SessionLogItem {
   return {
     id: `session_log:${row.id}`,
@@ -165,7 +165,7 @@ function toSessionLogItem(row: {
     type: `log:${row.salience}`,
     role: 'system',
     content: truncateText(row.content || ''),
-    timestamp: row.created_at || new Date(0).toISOString(),
+    timestamp: row.created_at,
   };
 }
 
@@ -318,7 +318,14 @@ async function fetchCloudSessionLogs(
   ]);
 
   const activityItems = (activityRows || []).map(toActivityLogItem);
-  const sessionItems = (sessionLogRows || []).map(toSessionLogItem);
+  const sessionItems = (sessionLogRows || [])
+    .filter(
+      (
+        row
+      ): row is { id: string; content: string; salience: string; created_at: string } =>
+        typeof row.created_at === 'string' && row.created_at.length > 0
+    )
+    .map(toSessionLogItem);
 
   return [...activityItems, ...sessionItems].sort(
     (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()

@@ -93,11 +93,12 @@ function createMockSupabase(
   };
 
   // For identity resolution (resolveIdentityId calls .select().eq().eq().maybeSingle())
+  const identityRows = [{ id: 'identity-123', workspace_id: 'workspace-1', updated_at: null }];
   const identityChainable = {
     select: vi.fn().mockReturnValue({
       eq: vi.fn().mockReturnValue({
         eq: vi.fn().mockReturnValue({
-          maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
+          order: vi.fn().mockResolvedValue({ data: identityRows, error: null }),
         }),
       }),
     }),
@@ -124,6 +125,10 @@ function createMockDataComposer(supabase?: ReturnType<typeof createMockSupabase>
 // =====================================================
 
 describe('handleSendToInbox - threadKey', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it('should include threadKey in DB insert when provided', async () => {
     const mockSb = createMockSupabase();
     const mockDc = createMockDataComposer(mockSb);
@@ -242,6 +247,80 @@ describe('handleSendToInbox - threadKey', () => {
     expect(mockGateway.processTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
         threadKey: 'pr:32',
+      })
+    );
+  });
+
+  it('should trigger by default for notification messages', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+
+    const mockSb = createMockSupabase();
+    const mockDc = createMockDataComposer(mockSb);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'myra',
+        senderAgentId: 'wren',
+        messageType: 'notification',
+        content: 'FYI',
+      },
+      mockDc as never
+    );
+
+    expect(mockGateway.processTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toAgentId: 'myra',
+      })
+    );
+  });
+
+  it('should pass relatedSessionId through trigger payload', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+
+    const mockSb = createMockSupabase();
+    const mockDc = createMockDataComposer(mockSb);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        messageType: 'session_resume',
+        relatedSessionId: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
+        content: 'Resume this session',
+      },
+      mockDc as never
+    );
+
+    expect(mockGateway.processTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        relatedSessionId: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
+      })
+    );
+  });
+
+  it('should trigger without senderAgentId using system sender', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+
+    const mockSb = createMockSupabase();
+    const mockDc = createMockDataComposer(mockSb);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        content: 'Human-sent coordination message',
+      },
+      mockDc as never
+    );
+
+    expect(mockGateway.processTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        fromAgentId: 'system',
       })
     );
   });
