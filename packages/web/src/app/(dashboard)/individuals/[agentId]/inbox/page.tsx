@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -8,8 +8,6 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import {
   ArrowLeft,
-  Bot,
-  ChevronDown,
   ChevronRight,
   ChevronLeft,
   Inbox,
@@ -17,6 +15,7 @@ import {
   MessageSquare,
   AlertCircle,
   User,
+  X,
 } from 'lucide-react';
 import { useApiQuery } from '@/lib/api';
 import clsx from 'clsx';
@@ -72,6 +71,10 @@ interface IndividualsResponse {
   individuals: { agentId: string; name: string }[];
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 function formatRelativeTime(date: string): string {
   const now = new Date();
   const target = new Date(date);
@@ -86,18 +89,21 @@ function formatRelativeTime(date: string): string {
   return `${diffDays}d ago`;
 }
 
-const priorityColors: Record<string, string> = {
-  urgent: 'bg-red-100 text-red-700 border-red-200',
-  high: 'bg-orange-100 text-orange-700 border-orange-200',
-  normal: 'bg-gray-100 text-gray-600 border-gray-200',
-  low: 'bg-gray-50 text-gray-400 border-gray-100',
-};
+function formatTimestamp(date: string): string {
+  const d = new Date(date);
+  const today = new Date();
+  const isToday = d.toDateString() === today.toDateString();
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  return isToday
+    ? `Today at ${time}`
+    : `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} at ${time}`;
+}
 
-const statusColors: Record<string, string> = {
-  unread: 'bg-blue-100 text-blue-700',
-  read: 'bg-gray-100 text-gray-600',
-  acknowledged: 'bg-green-100 text-green-700',
-  completed: 'bg-gray-100 text-gray-400',
+const priorityColors: Record<string, string> = {
+  urgent: 'bg-red-100 text-red-700',
+  high: 'bg-orange-100 text-orange-700',
+  normal: 'bg-gray-100 text-gray-600',
+  low: 'bg-gray-50 text-gray-400',
 };
 
 const typeColors: Record<string, string> = {
@@ -107,8 +113,7 @@ const typeColors: Record<string, string> = {
   notification: 'bg-amber-100 text-amber-700',
 };
 
-// Stable color per agent name — deterministic hash to pick from a palette
-const agentColors = [
+const agentColorPalette = [
   'bg-blue-600',
   'bg-green-600',
   'bg-purple-600',
@@ -122,18 +127,12 @@ const agentColors = [
 function agentColor(name: string): string {
   let hash = 0;
   for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) | 0;
-  return agentColors[Math.abs(hash) % agentColors.length];
+  return agentColorPalette[Math.abs(hash) % agentColorPalette.length];
 }
 
-function formatTimestamp(date: string): string {
-  const d = new Date(date);
-  const today = new Date();
-  const isToday = d.toDateString() === today.toDateString();
-  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-  return isToday
-    ? `Today at ${time}`
-    : `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} at ${time}`;
-}
+// ---------------------------------------------------------------------------
+// MessageItem — Discord/Slack-style chat bubble
+// ---------------------------------------------------------------------------
 
 function MessageItem({ message, compact }: { message: InboxMessage; compact?: boolean }) {
   const sender = message.senderAgentId || 'unknown';
@@ -142,7 +141,7 @@ function MessageItem({ message, compact }: { message: InboxMessage; compact?: bo
   return (
     <div
       className={clsx(
-        'group flex gap-3 hover:bg-gray-50/50 rounded-md px-2',
+        'group flex gap-3 rounded-md px-3 hover:bg-gray-50/50',
         compact ? 'py-0.5' : 'py-2'
       )}
     >
@@ -198,14 +197,7 @@ function MessageItem({ message, compact }: { message: InboxMessage; compact?: bo
           </div>
         )}
         {message.subject && <p className="text-sm font-medium text-gray-800">{message.subject}</p>}
-        <p
-          className={clsx(
-            'whitespace-pre-wrap break-words text-sm text-gray-700',
-            compact && 'ml-0'
-          )}
-        >
-          {message.content}
-        </p>
+        <p className="whitespace-pre-wrap break-words text-sm text-gray-700">{message.content}</p>
         {message.relatedArtifactUri && (
           <div className="mt-1 text-xs text-gray-400">
             <span className="font-mono">{message.relatedArtifactUri}</span>
@@ -226,70 +218,137 @@ function MessageItem({ message, compact }: { message: InboxMessage; compact?: bo
   );
 }
 
-function ThreadCard({ thread }: { thread: ThreadGroup }) {
-  const [expanded, setExpanded] = useState(false);
+// ---------------------------------------------------------------------------
+// ThreadRow — clickable row in the list (no expand, opens slide-out)
+// ---------------------------------------------------------------------------
+
+function ThreadRow({
+  thread,
+  isActive,
+  onClick,
+}: {
+  thread: ThreadGroup;
+  isActive: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={clsx(
+        'flex w-full items-center gap-3 rounded-lg border px-4 py-3 text-left transition-colors',
+        isActive
+          ? 'border-blue-300 bg-blue-50/50 ring-1 ring-blue-200'
+          : 'border-gray-200 bg-white hover:bg-gray-50/50'
+      )}
+    >
+      {/* Stacked participant avatars */}
+      <div className="flex -space-x-2 shrink-0">
+        {thread.participants.slice(0, 3).map((p) => (
+          <div
+            key={p}
+            className={clsx(
+              'flex h-7 w-7 items-center justify-center rounded-full text-white text-[10px] font-semibold ring-2 ring-white',
+              agentColor(p)
+            )}
+            title={p}
+          >
+            {p.slice(0, 2).toUpperCase()}
+          </div>
+        ))}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <Badge variant="outline" className="font-mono text-xs shrink-0">
+            {thread.threadKey}
+          </Badge>
+          <span className="text-xs text-gray-500">{thread.messageCount} msgs</span>
+          {thread.unreadCount > 0 && (
+            <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-blue-500 px-1.5 text-[10px] font-semibold text-white">
+              {thread.unreadCount}
+            </span>
+          )}
+        </div>
+        <p className="mt-0.5 text-sm text-gray-600 truncate">
+          {thread.latestMessage.subject || thread.latestMessage.content}
+        </p>
+      </div>
+      <div className="shrink-0 text-right">
+        <span className="text-xs text-gray-400">{formatRelativeTime(thread.lastMessageAt)}</span>
+        <ChevronRight className="mt-0.5 ml-auto h-4 w-4 text-gray-300" />
+      </div>
+    </button>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ThreadPanel — slide-out from right showing full conversation
+// ---------------------------------------------------------------------------
+
+function ThreadPanel({
+  thread,
+  messages,
+  agentId,
+  onClose,
+}: {
+  thread?: ThreadGroup;
+  messages?: InboxMessage[];
+  agentId: string;
+  onClose: () => void;
+}) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  // Scroll to bottom when thread changes
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'instant' });
+  }, [thread?.threadKey, messages?.[0]?.id]);
+
+  const displayMessages = thread?.messages || messages || [];
+  const title = thread?.threadKey || 'Message';
 
   return (
-    <div className="rounded-lg border border-gray-200 bg-white overflow-hidden">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="flex w-full items-center justify-between px-4 py-3 text-left hover:bg-gray-50/50 transition-colors"
-      >
-        <div className="flex items-center gap-3 min-w-0">
-          {/* Stacked participant avatars */}
-          <div className="flex -space-x-2">
-            {thread.participants.slice(0, 3).map((p) => (
-              <div
-                key={p}
-                className={clsx(
-                  'flex h-7 w-7 items-center justify-center rounded-full text-white text-[10px] font-semibold ring-2 ring-white',
-                  agentColor(p)
-                )}
-                title={p}
-              >
-                {p.slice(0, 2).toUpperCase()}
-              </div>
-            ))}
+    <div
+      ref={panelRef}
+      className="fixed inset-y-0 right-0 z-40 flex w-full max-w-lg flex-col border-l border-gray-200 bg-white shadow-xl animate-in slide-in-from-right duration-200"
+    >
+      {/* Header */}
+      <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <MessageSquare className="h-4 w-4 text-gray-500" />
+            <h2 className="text-sm font-semibold text-gray-900 truncate">{title}</h2>
           </div>
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <Badge variant="outline" className="font-mono text-xs shrink-0">
-                {thread.threadKey}
-              </Badge>
-              <span className="text-xs text-gray-500">{thread.messageCount} messages</span>
-              {thread.unreadCount > 0 && (
-                <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-blue-500 px-1.5 text-[10px] font-semibold text-white">
-                  {thread.unreadCount}
-                </span>
-              )}
+          {thread && (
+            <div className="mt-0.5 flex items-center gap-2 text-xs text-gray-500">
+              <span>{thread.messageCount} messages</span>
+              <span>&middot;</span>
+              <span>
+                {thread.participants.join(', ')} &rarr; {agentId}
+              </span>
             </div>
-            <p className="mt-0.5 text-sm text-gray-600 line-clamp-1 truncate">
-              {thread.latestMessage.subject || thread.latestMessage.content}
-            </p>
-          </div>
+          )}
         </div>
-        <div className="ml-4 flex shrink-0 items-center gap-2">
-          <span className="text-xs text-gray-400">{formatRelativeTime(thread.lastMessageAt)}</span>
-          <ChevronDown
-            className={clsx(
-              'h-4 w-4 text-gray-400 transition-transform',
-              !expanded && '-rotate-90'
-            )}
-          />
-        </div>
-      </button>
-      {expanded && (
-        <div className="border-t border-gray-100 bg-white px-2 py-2">
-          {thread.messages.map((msg, i) => {
-            const prevMsg = i > 0 ? thread.messages[i - 1] : null;
-            const sameSender = prevMsg?.senderAgentId === msg.senderAgentId;
-            return <MessageItem key={msg.id} message={msg} compact={sameSender} />;
-          })}
-        </div>
-      )}
+        <Button variant="ghost" size="sm" onClick={onClose} className="shrink-0">
+          <X className="h-4 w-4" />
+        </Button>
+      </div>
+
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto px-1 py-3">
+        {displayMessages.map((msg, i) => {
+          const prevMsg = i > 0 ? displayMessages[i - 1] : null;
+          const sameSender = prevMsg?.senderAgentId === msg.senderAgentId;
+          return <MessageItem key={msg.id} message={msg} compact={sameSender} />;
+        })}
+        <div ref={bottomRef} />
+      </div>
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// InboxPage
+// ---------------------------------------------------------------------------
 
 export default function InboxPage() {
   const params = useParams();
@@ -300,13 +359,31 @@ export default function InboxPage() {
   const [offset, setOffset] = useState(0);
   const limit = 20;
 
+  // Panel state: either a thread key or a flat message id
+  const [activeThread, setActiveThread] = useState<string | null>(null);
+  const [activeMessage, setActiveMessage] = useState<string | null>(null);
+
+  const closePanel = useCallback(() => {
+    setActiveThread(null);
+    setActiveMessage(null);
+  }, []);
+
+  // Close panel on Escape
+  useEffect(() => {
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') closePanel();
+    };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [closePanel]);
+
   const queryPath = useMemo(() => {
-    const params = new URLSearchParams();
-    params.set('limit', String(limit));
-    params.set('offset', String(offset));
-    if (statusFilter !== 'all') params.set('status', statusFilter);
-    if (typeFilter) params.set('messageType', typeFilter);
-    return `/api/admin/individuals/${agentId}/inbox?${params.toString()}`;
+    const qp = new URLSearchParams();
+    qp.set('limit', String(limit));
+    qp.set('offset', String(offset));
+    if (statusFilter !== 'all') qp.set('status', statusFilter);
+    if (typeFilter) qp.set('messageType', typeFilter);
+    return `/api/admin/individuals/${agentId}/inbox?${qp.toString()}`;
   }, [agentId, statusFilter, typeFilter, offset]);
 
   const { data, isLoading, error } = useApiQuery<InboxResponse>(
@@ -327,6 +404,14 @@ export default function InboxPage() {
   const threads = data?.threads || [];
   const flatMessages = data?.flatMessages || [];
   const pagination = data?.pagination;
+
+  const selectedThread = activeThread
+    ? threads.find((t) => t.threadKey === activeThread)
+    : undefined;
+  const selectedMessage = activeMessage
+    ? flatMessages.find((m) => m.id === activeMessage)
+    : undefined;
+  const panelOpen = !!selectedThread || !!selectedMessage;
 
   return (
     <div>
@@ -430,13 +515,19 @@ export default function InboxPage() {
                   <MessageSquare className="h-5 w-5" />
                   Threads
                 </CardTitle>
-                <CardDescription>
-                  Messages grouped by thread key for conversation continuity.
-                </CardDescription>
+                <CardDescription>Click a thread to view the full conversation.</CardDescription>
               </CardHeader>
-              <CardContent className="space-y-3">
+              <CardContent className="space-y-2">
                 {threads.map((thread) => (
-                  <ThreadCard key={thread.threadKey} thread={thread} />
+                  <ThreadRow
+                    key={thread.threadKey}
+                    thread={thread}
+                    isActive={activeThread === thread.threadKey}
+                    onClick={() => {
+                      setActiveMessage(null);
+                      setActiveThread(activeThread === thread.threadKey ? null : thread.threadKey);
+                    }}
+                  />
                 ))}
               </CardContent>
             </Card>
@@ -454,9 +545,21 @@ export default function InboxPage() {
                   Messages without a thread key, routed to {agentName}&apos;s main process.
                 </CardDescription>
               </CardHeader>
-              <CardContent className="space-y-3">
+              <CardContent className="space-y-1">
                 {flatMessages.map((msg) => (
-                  <MessageItem key={msg.id} message={msg} />
+                  <button
+                    key={msg.id}
+                    onClick={() => {
+                      setActiveThread(null);
+                      setActiveMessage(activeMessage === msg.id ? null : msg.id);
+                    }}
+                    className={clsx(
+                      'w-full text-left rounded-md transition-colors',
+                      activeMessage === msg.id && 'ring-1 ring-blue-200 bg-blue-50/50'
+                    )}
+                  >
+                    <MessageItem message={msg} />
+                  </button>
                 ))}
               </CardContent>
             </Card>
@@ -493,6 +596,17 @@ export default function InboxPage() {
             </Button>
           </div>
         </div>
+      )}
+
+      {/* Backdrop */}
+      {panelOpen && <div className="fixed inset-0 z-30 bg-black/20" onClick={closePanel} />}
+
+      {/* Slide-out panel */}
+      {selectedThread && (
+        <ThreadPanel thread={selectedThread} agentId={agentId} onClose={closePanel} />
+      )}
+      {selectedMessage && (
+        <ThreadPanel messages={[selectedMessage]} agentId={agentId} onClose={closePanel} />
       )}
     </div>
   );
