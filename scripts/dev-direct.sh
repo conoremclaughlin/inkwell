@@ -51,6 +51,32 @@ trap cleanup EXIT INT TERM
 ) &
 API_PID=$!
 
+# Ensure API actually boots before starting web (avoids silent ECONNREFUSED loops).
+wait_for_api() {
+  local health_url="${API_URL}/health"
+  local attempts=30
+
+  for ((i = 1; i <= attempts; i++)); do
+    if curl -fsS "${health_url}" >/dev/null 2>&1; then
+      echo "  API health check passed at ${health_url}"
+      return 0
+    fi
+
+    if ! kill -0 "${API_PID}" 2>/dev/null; then
+      echo "ERROR: API process exited before becoming healthy (pid=${API_PID})"
+      wait "${API_PID}" || true
+      return 1
+    fi
+
+    sleep 1
+  done
+
+  echo "ERROR: API did not become healthy within ${attempts}s (${health_url})"
+  return 1
+}
+
+wait_for_api
+
 (
   API_URL="${API_URL}" \
   yarn --cwd "${ROOT_DIR}" workspace @personal-context/web exec next dev -p "${WEB_PORT}"
