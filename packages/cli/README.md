@@ -183,6 +183,9 @@ sb studio remove <name>         # Remove studio (keeps branch)
 sb studio clean <name>          # Remove studio + delete branch
 sb studio path <name>           # Print studio path
 eval $(sb studio cd <name>)     # cd to studio
+sb studio cli                   # Build + link CLI as sb-<agent>
+sb studio cli --name sb-dev     # Custom binary name
+sb studio cli --unlink          # Remove linked binary
 ```
 
 Backwards compatibility aliases still work:

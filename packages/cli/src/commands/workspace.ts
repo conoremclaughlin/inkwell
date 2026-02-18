@@ -655,6 +655,116 @@ function cdCommand(name: string): void {
 }
 
 // ============================================================================
+// CLI Link
+// ============================================================================
+
+function resolveCliRoot(): string {
+  // Walk up from cwd to find packages/cli/package.json
+  const cwd = process.cwd();
+  const candidates = [
+    join(cwd, 'packages', 'cli'),
+    cwd,
+  ];
+  for (const candidate of candidates) {
+    const pkgPath = join(candidate, 'package.json');
+    if (existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+        if (pkg.name === '@personal-context/cli') return candidate;
+      } catch {
+        // continue
+      }
+    }
+  }
+  throw new Error('Could not find @personal-context/cli package. Run from the repo root or packages/cli.');
+}
+
+function resolveDefaultCliName(): string {
+  const cwd = process.cwd();
+  const identityPath = join(cwd, '.pcp', 'identity.json');
+  if (existsSync(identityPath)) {
+    try {
+      const identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
+      if (identity.agentId) return `sb-${identity.agentId}`;
+    } catch {
+      // fall through
+    }
+  }
+  // Fall back to directory-based name
+  const dirName = basename(cwd);
+  const match = dirName.match(/--(.+)$/);
+  if (match) return `sb-${match[1]}`;
+  return 'sb-dev';
+}
+
+async function cliLinkCommand(options: { name?: string; unlink?: boolean }): Promise<void> {
+  const binDir = join(homedir(), '.local', 'bin');
+  const name = options.name || resolveDefaultCliName();
+
+  if (options.unlink) {
+    const linkPath = join(binDir, name);
+    if (existsSync(linkPath)) {
+      const { unlinkSync } = await import('fs');
+      unlinkSync(linkPath);
+      console.log(chalk.green(`Unlinked: ${linkPath}`));
+    } else {
+      console.log(chalk.dim(`Not found: ${linkPath}`));
+    }
+    return;
+  }
+
+  let cliRoot: string;
+  try {
+    cliRoot = resolveCliRoot();
+  } catch (err) {
+    console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+    process.exit(1);
+    return;
+  }
+
+  const spinner = ora(`Building CLI from ${cliRoot}`).start();
+
+  try {
+    // Build
+    execSync('npx tsc', { cwd: cliRoot, stdio: 'pipe' });
+
+    // Copy templates (matches the build script)
+    const templatesSource = join(cliRoot, 'src', 'templates');
+    const templatesDest = join(cliRoot, 'dist', 'templates');
+    if (existsSync(templatesSource)) {
+      cpSync(templatesSource, templatesDest, { recursive: true });
+    }
+
+    // Ensure executable
+    const cliJs = join(cliRoot, 'dist', 'cli.js');
+    if (!existsSync(cliJs)) {
+      spinner.fail('Build succeeded but dist/cli.js not found');
+      process.exit(1);
+    }
+    execSync(`chmod +x "${cliJs}"`, { stdio: 'pipe' });
+
+    // Create symlink
+    mkdirSync(binDir, { recursive: true });
+    const linkPath = join(binDir, name);
+    const { symlinkSync, unlinkSync } = await import('fs');
+
+    // Remove existing symlink if present
+    if (existsSync(linkPath)) {
+      unlinkSync(linkPath);
+    }
+    symlinkSync(cliJs, linkPath);
+
+    spinner.succeed(`Linked: ${linkPath} → ${cliJs}`);
+    console.log('');
+    console.log(chalk.dim(`  Test it: ${name} --help`));
+    console.log(chalk.dim(`  Remove:  sb studio cli --unlink${options.name ? ` --name ${name}` : ''}`));
+  } catch (error) {
+    spinner.fail(`Failed: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  }
+}
+
+// ============================================================================
 // Register Commands
 // ============================================================================
 
@@ -733,4 +843,10 @@ export function registerWorkspaceCommands(program: Command): void {
   ws.command('cd <name>')
     .description('Output cd command (use with: eval $(sb studio cd <name>))')
     .action(cdCommand);
+
+  ws.command('cli')
+    .description('Build CLI and link as a named binary (default: sb-<agent>)')
+    .option('-n, --name <name>', 'Binary name (default: sb-<agent> from .pcp/identity.json)')
+    .option('--unlink', 'Remove the linked binary instead of creating it')
+    .action(cliLinkCommand);
 }
