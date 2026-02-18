@@ -59,11 +59,11 @@ export const triggerAgentSchema = z.object({
     .enum(['main'])
     .optional()
     .describe('Convenience studio routing hint (e.g., "main" to force shared main studio)'),
-  relatedSessionId: z
+  recipientSessionId: z
     .string()
     .uuid()
     .optional()
-    .describe('Optional related session ID to inherit studio scope from'),
+    .describe('Optional recipient session ID to inherit studio scope from'),
   metadata: z
     .record(z.unknown())
     .optional()
@@ -98,7 +98,7 @@ export async function handleTriggerAgent(
       threadKey: args.threadKey,
       studioId: args.studioId,
       studioHint: args.studioHint,
-      relatedSessionId: args.relatedSessionId,
+      recipientSessionId: args.recipientSessionId,
       metadata: args.metadata,
     };
 

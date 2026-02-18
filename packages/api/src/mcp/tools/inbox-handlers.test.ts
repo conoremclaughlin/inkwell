@@ -277,25 +277,6 @@ describe('handleSendToInbox - threadKey', () => {
     );
   });
 
-  it('should reject deprecated relatedSessionId input', async () => {
-    const mockSb = createMockSupabase();
-    const mockDc = createMockDataComposer(mockSb);
-
-    await expect(
-      handleSendToInbox(
-        {
-          email: 'test@test.com',
-          recipientAgentId: 'lumen',
-          senderAgentId: 'wren',
-          messageType: 'session_resume',
-          relatedSessionId: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
-          content: 'Resume this session',
-        },
-        mockDc as never
-      )
-    ).rejects.toThrow('relatedSessionId');
-  });
-
   it('should pass recipientSessionId through trigger payload', async () => {
     const { getAgentGateway } = await import('../../channels/agent-gateway.js');
     const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
@@ -317,7 +298,7 @@ describe('handleSendToInbox - threadKey', () => {
 
     expect(mockGateway.processTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
-        relatedSessionId: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
+        recipientSessionId: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
       })
     );
   });
@@ -348,7 +329,7 @@ describe('handleSendToInbox - threadKey', () => {
     );
     expect(mockGateway.processTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
-        relatedSessionId: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
+        recipientSessionId: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
       })
     );
     const parsed = JSON.parse(result.content[0].text);
@@ -428,7 +409,7 @@ describe('handleSendToInbox - threadKey', () => {
 });
 
 describe('handleGetInbox - recipient session naming', () => {
-  it('should include recipientSessionId and relatedSessionId for compatibility', async () => {
+  it('should include recipientSessionId in inbox messages', async () => {
     const message = {
       id: 'msg-123',
       created_at: '2026-02-15T10:00:00Z',
@@ -461,6 +442,5 @@ describe('handleGetInbox - recipient session naming', () => {
 
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.messages[0].recipientSessionId).toBe('b85490f5-0836-4bdd-8193-f6cfa2562a41');
-    expect(parsed.messages[0].relatedSessionId).toBe('b85490f5-0836-4bdd-8193-f6cfa2562a41');
   });
 });

@@ -190,7 +190,7 @@ export class SessionService implements ISessionService {
         threadKey: metadata?.threadKey,
         studioId: metadata?.studioId,
         studioHint: metadata?.studioHint,
-        relatedSessionId: metadata?.relatedSessionId,
+        recipientSessionId: metadata?.recipientSessionId,
       });
 
       // 2. Build lock key - must be per agent + session to support sub-agents
@@ -278,7 +278,7 @@ export class SessionService implements ISessionService {
             threadKey: pending.request.metadata?.threadKey,
             studioId: pending.request.metadata?.studioId,
             studioHint: pending.request.metadata?.studioHint,
-            relatedSessionId: pending.request.metadata?.relatedSessionId,
+            recipientSessionId: pending.request.metadata?.recipientSessionId,
           }
         );
 
@@ -410,7 +410,7 @@ export class SessionService implements ISessionService {
       threadKey?: string;
       studioId?: string;
       studioHint?: 'main';
-      relatedSessionId?: string;
+      recipientSessionId?: string;
     }
   ): Promise<Session> {
     const type = options?.type || 'primary';
@@ -420,7 +420,7 @@ export class SessionService implements ISessionService {
       threadKey: options?.threadKey,
       explicitStudioId: options?.studioId,
       studioHint: options?.studioHint,
-      relatedSessionId: options?.relatedSessionId,
+      recipientSessionId: options?.recipientSessionId,
       backend,
     });
 
@@ -527,7 +527,7 @@ export class SessionService implements ISessionService {
       threadKey?: string;
       explicitStudioId?: string;
       studioHint?: 'main';
-      relatedSessionId?: string;
+      recipientSessionId?: string;
       backend?: string;
     }
   ): Promise<string | undefined> {
@@ -545,11 +545,11 @@ export class SessionService implements ISessionService {
     }
 
     // 1) Related session scope (explicit resume continuity)
-    if (options.relatedSessionId) {
+    if (options.recipientSessionId) {
       const { data } = await this.supabase
         .from('sessions')
         .select('studio_id, workspace_id')
-        .eq('id', options.relatedSessionId)
+        .eq('id', options.recipientSessionId)
         .eq('user_id', userId)
         .maybeSingle();
 
