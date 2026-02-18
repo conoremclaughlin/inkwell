@@ -860,16 +860,17 @@ async function onSessionStartHandler(): Promise<void> {
   const config = getPcpConfig();
   const agentId = resolveAgentId();
 
-  // Read workspace ID from identity.json
+  // Read studio/workspace ID from identity.json
   const identityPath = join(cwd, '.pcp', 'identity.json');
-  let workspaceId: string | undefined;
-  let workspaceLine = '';
+  let studioId: string | undefined;
+  let studioLine = '';
   if (existsSync(identityPath)) {
     try {
       const identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
-      workspaceId = identity.workspaceId;
-      if (identity.workspace) {
-        workspaceLine = `Workspace: ${identity.workspace}`;
+      studioId = identity.studioId || identity.workspaceId;
+      const studioName = identity.studio || identity.workspace;
+      if (studioName) {
+        studioLine = `Studio: ${studioName}`;
       }
     } catch {
       // ignore
@@ -887,7 +888,7 @@ async function onSessionStartHandler(): Promise<void> {
       email: config?.email,
       agentId,
     };
-    if (workspaceId) bootstrapArgs.workspaceId = workspaceId;
+    if (studioId) bootstrapArgs.studioId = studioId;
 
     const bootstrap = await callPcpTool('bootstrap', bootstrapArgs);
     identityBlock = buildIdentityBlock(bootstrap.identity);
@@ -917,7 +918,7 @@ async function onSessionStartHandler(): Promise<void> {
   const template = loadTemplate('hook-session-start');
   const output = renderTemplate(template, {
     AGENT_ID: agentId,
-    WORKSPACE_LINE: workspaceLine,
+    WORKSPACE_LINE: studioLine,
     IDENTITY_BLOCK: identityBlock,
     MEMORIES_BLOCK: memoriesBlock,
     SESSIONS_BLOCK: sessionsBlock,

@@ -37,8 +37,9 @@ interface WorkspaceIdentity {
   identityId?: string;
   context: string;
   backend?: string;
+  studioId?: string;
+  studio: string;
   description: string;
-  workspace: string;
   branch: string;
   createdAt: string;
   createdBy?: string;
@@ -461,10 +462,10 @@ async function createWorkspace(
     const identity: WorkspaceIdentity = {
       agentId,
       ...(identityId ? { identityId } : {}),
-      context: `workspace-${name}`,
+      context: `studio-${name}`,
       ...(options.backend ? { backend: options.backend } : {}),
-      description: options.purpose || `Workspace: ${name}`,
-      workspace: name,
+      studio: name,
+      description: options.purpose || `Studio: ${name}`,
       branch,
       createdAt: new Date().toISOString(),
       createdBy: getCurrentUser(),

@@ -7,12 +7,16 @@
 
 export interface WorkspaceIdentity {
   agentId: string;
+  identityId?: string;
   context: string;
   description: string;
-  workspace: string;
+  studioId?: string;
+  studio: string;
   branch: string;
   createdAt: string;
   createdBy?: string;
+  /** @deprecated Use studio */
+  workspace?: string;
 }
 
 export interface WorkspaceInfo {
@@ -26,6 +30,8 @@ export interface PcpConfig {
   userId?: string;
   email?: string;
   agentMapping?: Record<string, string>;
+  studioId?: string;
+  /** @deprecated Use studioId */
   workspaceId?: string;
 }
 
