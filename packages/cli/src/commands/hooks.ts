@@ -203,13 +203,16 @@ function getPcpServerUrl(): string {
 
 let jsonRpcId = 1;
 
-async function callPcpTool(tool: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function callPcpTool(
+  tool: string,
+  args: Record<string, unknown>
+): Promise<Record<string, unknown>> {
   const url = `${getPcpServerUrl()}/mcp`;
   const response = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Accept': 'application/json',
+      Accept: 'application/json',
     },
     body: JSON.stringify({
       jsonrpc: '2.0',
@@ -343,7 +346,9 @@ function buildSessionsBlock(sessions: Array<Record<string, unknown>> | undefined
   if (!sessions || sessions.length === 0) return '';
   const lines = ['### Active Sessions'];
   for (const s of sessions) {
-    lines.push(`- ${(s.id as string)?.substring(0, 8) || 'unknown'}: ${s.summary || s.status || 'active'}`);
+    lines.push(
+      `- ${(s.id as string)?.substring(0, 8) || 'unknown'}: ${s.summary || s.status || 'active'}`
+    );
   }
   return lines.join('\n');
 }
@@ -355,34 +360,55 @@ function buildSessionsBlock(sessions: Array<Record<string, unknown>> | undefined
 /** Marker used to identify PCP-managed hook entries */
 const PCP_MARKER = 'pcp-managed';
 
+/**
+ * Resolve absolute path to the `sb` CLI binary from the main worktree's
+ * node_modules/.bin/sb. This ensures hooks work from PM2 and other
+ * environments where ~/.local/bin may not be in PATH.
+ */
+function resolveSbBinaryPath(cwd: string): string {
+  const worktrees = listWorktreePaths(cwd);
+  const mainWorktree = worktrees[0] || cwd;
+  const binPath = join(mainWorktree, 'node_modules', '.bin', 'sb');
+  if (existsSync(binPath)) return binPath;
+  // Fallback: bare `sb` (relies on PATH)
+  return 'sb';
+}
+
+/** Check if a hook command is PCP-managed (handles both bare `sb` and absolute paths) */
+function isPcpHookCommand(cmd: string | undefined): boolean {
+  if (!cmd) return false;
+  // Match bare `sb hooks ...` or `/abs/path/to/sb hooks ...`
+  return /\bsb hooks /.test(cmd);
+}
+
 type InstallResult = 'installed' | 'already-installed' | 'conflict';
 
-function buildClaudeCodeHooks(): Record<string, unknown> {
+function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
   return {
     hooks: {
       PreCompact: [
         {
-          hooks: [{ type: 'command', command: 'sb hooks pre-compact' }],
+          hooks: [{ type: 'command', command: `${sbPath} hooks pre-compact` }],
         },
       ],
       SessionStart: [
         {
           matcher: 'compact',
-          hooks: [{ type: 'command', command: 'sb hooks post-compact' }],
+          hooks: [{ type: 'command', command: `${sbPath} hooks post-compact` }],
         },
         {
           matcher: 'startup',
-          hooks: [{ type: 'command', command: 'sb hooks on-session-start' }],
+          hooks: [{ type: 'command', command: `${sbPath} hooks on-session-start` }],
         },
       ],
       UserPromptSubmit: [
         {
-          hooks: [{ type: 'command', command: 'sb hooks on-prompt' }],
+          hooks: [{ type: 'command', command: `${sbPath} hooks on-prompt` }],
         },
       ],
       Stop: [
         {
-          hooks: [{ type: 'command', command: 'sb hooks on-stop' }],
+          hooks: [{ type: 'command', command: `${sbPath} hooks on-stop` }],
         },
       ],
     },
@@ -390,8 +416,9 @@ function buildClaudeCodeHooks(): Record<string, unknown> {
 }
 
 /** Check if existing Claude Code hooks already match the PCP hooks we'd write */
-function claudeCodeHooksMatch(existing: Record<string, unknown>): boolean {
-  const target = buildClaudeCodeHooks();
+function claudeCodeHooksMatch(existing: Record<string, unknown>, cwd: string): boolean {
+  const sbPath = resolveSbBinaryPath(cwd);
+  const target = buildClaudeCodeHooks(sbPath);
   const existingHooksStr = JSON.stringify(existing.hooks);
   const targetHooksStr = JSON.stringify(target.hooks);
   return existingHooksStr === targetHooksStr;
@@ -415,7 +442,7 @@ function installClaudeCode(cwd: string, force: boolean): InstallResult {
   const existingHooks = existing.hooks as Record<string, unknown> | undefined;
   if (existingHooks && !force) {
     // Check if PCP hooks already match exactly
-    if (claudeCodeHooksMatch(existing)) {
+    if (claudeCodeHooksMatch(existing, cwd)) {
       return 'already-installed';
     }
 
@@ -425,10 +452,7 @@ function installClaudeCode(cwd: string, force: boolean): InstallResult {
       return entries.some((entry: Record<string, unknown>) => {
         const hooks = entry.hooks as Array<Record<string, unknown>> | undefined;
         if (!hooks) return false;
-        return hooks.some((h) => {
-          const cmd = h.command as string | undefined;
-          return cmd && !cmd.startsWith('sb hooks ');
-        });
+        return hooks.some((h) => !isPcpHookCommand(h.command as string | undefined));
       });
     });
 
@@ -437,7 +461,8 @@ function installClaudeCode(cwd: string, force: boolean): InstallResult {
     }
   }
 
-  const pcpHooks = buildClaudeCodeHooks();
+  const sbPath = resolveSbBinaryPath(cwd);
+  const pcpHooks = buildClaudeCodeHooks(sbPath);
 
   // Merge: keep existing non-hooks settings, replace hooks
   const merged = { ...existing, ...pcpHooks };
@@ -462,13 +487,15 @@ function installGemini(cwd: string, force: boolean): InstallResult {
   if (existing.hooks && !force) {
     // Check if our hooks are already there
     const hooksObj = existing.hooks as Record<string, unknown>;
-    const hasSessionStart = Array.isArray(hooksObj.session_start) &&
-      (hooksObj.session_start as Array<Record<string, unknown>>).some(
-        (h) => h.command === 'sb hooks on-session-start'
+    const hasSessionStart =
+      Array.isArray(hooksObj.session_start) &&
+      (hooksObj.session_start as Array<Record<string, unknown>>).some((h) =>
+        isPcpHookCommand(h.command as string | undefined)
       );
-    const hasSessionEnd = Array.isArray(hooksObj.session_end) &&
-      (hooksObj.session_end as Array<Record<string, unknown>>).some(
-        (h) => h.command === 'sb hooks on-stop'
+    const hasSessionEnd =
+      Array.isArray(hooksObj.session_end) &&
+      (hooksObj.session_end as Array<Record<string, unknown>>).some((h) =>
+        isPcpHookCommand(h.command as string | undefined)
       );
     if (hasSessionStart && hasSessionEnd) {
       return 'already-installed';
@@ -477,11 +504,12 @@ function installGemini(cwd: string, force: boolean): InstallResult {
     return 'conflict';
   }
 
+  const sbPath = resolveSbBinaryPath(cwd);
   const merged = {
     ...existing,
     hooks: {
-      session_start: [{ command: 'sb hooks on-session-start' }],
-      session_end: [{ command: 'sb hooks on-stop' }],
+      session_start: [{ command: `${sbPath} hooks on-session-start` }],
+      session_end: [{ command: `${sbPath} hooks on-stop` }],
     },
   };
 
@@ -510,12 +538,13 @@ function installCodex(cwd: string, force: boolean): InstallResult {
   // Remove existing PCP-managed hooks section if present
   const cleaned = removePcpTomlSection(existingContent);
 
+  const sbPath = resolveSbBinaryPath(cwd);
   const pcpSection = [
     '',
     `# ${PCP_MARKER}`,
     '[hooks]',
-    'session_start = "sb hooks on-session-start"',
-    'session_end = "sb hooks on-stop"',
+    `session_start = "${sbPath} hooks on-session-start"`,
+    `session_end = "${sbPath} hooks on-stop"`,
     `# end ${PCP_MARKER}`,
     '',
   ].join('\n');
@@ -750,14 +779,12 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
                 for (const h of hookList) {
                   const cmd = h.command as string;
                   const matcherSuffix = matcher ? ` (${matcher})` : '';
-                  const isPcp = cmd?.startsWith('sb hooks ');
-                  const icon = isPcp ? chalk.green('●') : chalk.dim('○');
+                  const icon = isPcpHookCommand(cmd) ? chalk.green('●') : chalk.dim('○');
                   console.log(`    ${icon} ${event}${matcherSuffix} → ${cmd}`);
                 }
               } else if (command) {
                 // Gemini/simpler format
-                const isPcp = command.startsWith('sb hooks ');
-                const icon = isPcp ? chalk.green('●') : chalk.dim('○');
+                const icon = isPcpHookCommand(command) ? chalk.green('●') : chalk.dim('○');
                 console.log(`    ${icon} ${event} → ${command}`);
               }
             }
@@ -790,7 +817,9 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
   // Show capabilities
   console.log(chalk.dim('\n  Capabilities:'));
   console.log(
-    chalk.dim(`    Compaction: ${backend.supportsCompaction ? chalk.green('yes') : chalk.yellow('no')}`)
+    chalk.dim(
+      `    Compaction: ${backend.supportsCompaction ? chalk.green('yes') : chalk.yellow('no')}`
+    )
   );
   console.log(
     chalk.dim(
@@ -892,8 +921,12 @@ async function onSessionStartHandler(): Promise<void> {
 
     const bootstrap = await callPcpTool('bootstrap', bootstrapArgs);
     identityBlock = buildIdentityBlock(bootstrap.identity);
-    memoriesBlock = buildMemoriesBlock(bootstrap.recentMemories as Array<Record<string, unknown>> | undefined);
-    sessionsBlock = buildSessionsBlock(bootstrap.activeSessions as Array<Record<string, unknown>> | undefined);
+    memoriesBlock = buildMemoriesBlock(
+      bootstrap.recentMemories as Array<Record<string, unknown>> | undefined
+    );
+    sessionsBlock = buildSessionsBlock(
+      bootstrap.activeSessions as Array<Record<string, unknown>> | undefined
+    );
   } catch {
     identityBlock = '*Could not reach PCP server for bootstrap.*';
   }

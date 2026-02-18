@@ -365,12 +365,18 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     let userId: string | undefined;
     let recipientIdentityId: string | undefined;
     if (payload.inboxMessageId) {
-      const { data: inboxMsg } = await dataComposer!
+      const { data: inboxMsg, error: inboxError } = await dataComposer!
         .getClient()
         .from('agent_inbox')
         .select('recipient_user_id, recipient_identity_id')
         .eq('id', payload.inboxMessageId)
         .single();
+      if (inboxError) {
+        logger.error('[Trigger] Failed to look up inbox message', {
+          inboxMessageId: payload.inboxMessageId,
+          error: inboxError.message,
+        });
+      }
       userId = inboxMsg?.recipient_user_id;
       recipientIdentityId = inboxMsg?.recipient_identity_id || undefined;
     }
@@ -427,7 +433,9 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
 
       const { data: identityRows, error: identityError } = await identityQuery;
       if (identityError) {
-        throw new Error(`Failed to resolve target identity for ${targetAgentId}: ${identityError.message}`);
+        throw new Error(
+          `Failed to resolve target identity for ${targetAgentId}: ${identityError.message}`
+        );
       }
 
       if (!identityRows || identityRows.length === 0) {
@@ -471,7 +479,9 @@ If you need to message a user, use send_response with the appropriate channel an
       userId,
       agentId: targetAgentId,
       channel: 'agent',
-      conversationId: payload.threadKey ? `trigger:${targetAgentId}:${payload.threadKey}` : `trigger:${targetAgentId}`,
+      conversationId: payload.threadKey
+        ? `trigger:${targetAgentId}:${payload.threadKey}`
+        : `trigger:${targetAgentId}`,
       sender: { id: payload.fromAgentId, name: payload.fromAgentId },
       content: triggerMessage,
       metadata: {

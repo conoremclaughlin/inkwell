@@ -141,6 +141,7 @@ export class CodexRunner implements IClaudeRunner {
       });
 
       let stderr = '';
+      const nonJsonLines: string[] = [];
       const responses: ChannelResponse[] = [];
       const toolCalls: ToolCall[] = [];
       let usage: CodexUsageStats | undefined;
@@ -183,7 +184,8 @@ export class CodexRunner implements IClaudeRunner {
             responses.push(...extracted.responses);
             toolCalls.push(...extracted.toolCalls);
           } catch {
-            // ignore non-JSON lines
+            // Capture non-JSON lines as diagnostic context
+            if (line.trim()) nonJsonLines.push(line.trim());
           }
         }
       });
@@ -206,7 +208,8 @@ export class CodexRunner implements IClaudeRunner {
         settled = true;
 
         if (code !== 0 && !finalTextResponse && responses.length === 0) {
-          reject(new Error(`Codex exited with code ${code}: ${stderr}`));
+          const diagnostic = stderr || nonJsonLines.join('\n') || '(no output)';
+          reject(new Error(`Codex exited with code ${code}: ${diagnostic}`));
           return;
         }
 

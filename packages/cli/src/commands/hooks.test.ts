@@ -61,26 +61,29 @@ describe('installHooks: Claude Code', () => {
     const configPath = join(TEST_DIR, '.claude', 'settings.local.json');
     const config = JSON.parse(readFileSync(configPath, 'utf-8'));
 
+    // Commands may be absolute paths (e.g., /path/to/node_modules/.bin/sb hooks ...)
+    // or bare `sb hooks ...` depending on whether node_modules/.bin/sb exists
+
     // PreCompact
-    expect(config.hooks.PreCompact[0].hooks[0].command).toBe('sb hooks pre-compact');
+    expect(config.hooks.PreCompact[0].hooks[0].command).toContain('sb hooks pre-compact');
 
     // SessionStart — compact matcher
     const compactEntry = config.hooks.SessionStart.find(
       (e: Record<string, unknown>) => e.matcher === 'compact'
     );
-    expect(compactEntry.hooks[0].command).toBe('sb hooks post-compact');
+    expect(compactEntry.hooks[0].command).toContain('sb hooks post-compact');
 
     // SessionStart — startup matcher
     const startupEntry = config.hooks.SessionStart.find(
       (e: Record<string, unknown>) => e.matcher === 'startup'
     );
-    expect(startupEntry.hooks[0].command).toBe('sb hooks on-session-start');
+    expect(startupEntry.hooks[0].command).toContain('sb hooks on-session-start');
 
     // UserPromptSubmit
-    expect(config.hooks.UserPromptSubmit[0].hooks[0].command).toBe('sb hooks on-prompt');
+    expect(config.hooks.UserPromptSubmit[0].hooks[0].command).toContain('sb hooks on-prompt');
 
     // Stop
-    expect(config.hooks.Stop[0].hooks[0].command).toBe('sb hooks on-stop');
+    expect(config.hooks.Stop[0].hooks[0].command).toContain('sb hooks on-stop');
   });
 
   it('should preserve existing non-hooks settings', () => {
@@ -93,9 +96,7 @@ describe('installHooks: Claude Code', () => {
 
     installHooks(TEST_DIR);
 
-    const config = JSON.parse(
-      readFileSync(join(configDir, 'settings.local.json'), 'utf-8')
-    );
+    const config = JSON.parse(readFileSync(join(configDir, 'settings.local.json'), 'utf-8'));
     expect(config.permissions.allow).toContain('Bash(git:*)');
     expect(config.hooks).toBeDefined();
   });
@@ -149,11 +150,9 @@ describe('installHooks: Claude Code', () => {
     const { result } = installHooks(TEST_DIR, { force: true });
     expect(result).toBe('installed');
 
-    const config = JSON.parse(
-      readFileSync(join(configDir, 'settings.local.json'), 'utf-8')
-    );
+    const config = JSON.parse(readFileSync(join(configDir, 'settings.local.json'), 'utf-8'));
     // Should now have PCP hooks, not the custom one
-    expect(config.hooks.Stop[0].hooks[0].command).toBe('sb hooks on-stop');
+    expect(config.hooks.Stop[0].hooks[0].command).toContain('sb hooks on-stop');
   });
 
   it('should allow re-install over existing PCP hooks without force', () => {
@@ -195,8 +194,8 @@ describe('installHooks: Gemini', () => {
     expect(existsSync(configPath)).toBe(true);
 
     const config = JSON.parse(readFileSync(configPath, 'utf-8'));
-    expect(config.hooks.session_start[0].command).toBe('sb hooks on-session-start');
-    expect(config.hooks.session_end[0].command).toBe('sb hooks on-stop');
+    expect(config.hooks.session_start[0].command).toContain('sb hooks on-session-start');
+    expect(config.hooks.session_end[0].command).toContain('sb hooks on-stop');
   });
 
   it('should preserve existing Gemini settings', () => {
@@ -209,9 +208,7 @@ describe('installHooks: Gemini', () => {
 
     installHooks(TEST_DIR, { backend: 'gemini' });
 
-    const config = JSON.parse(
-      readFileSync(join(configDir, 'settings.json'), 'utf-8')
-    );
+    const config = JSON.parse(readFileSync(join(configDir, 'settings.json'), 'utf-8'));
     expect(config.mcpServers.pcp.url).toBe('http://localhost:3001/mcp');
     expect(config.hooks).toBeDefined();
   });
@@ -257,8 +254,8 @@ describe('installHooks: Codex', () => {
     const content = readFileSync(configPath, 'utf-8');
     expect(content).toContain('# pcp-managed');
     expect(content).toContain('[hooks]');
-    expect(content).toContain('session_start = "sb hooks on-session-start"');
-    expect(content).toContain('session_end = "sb hooks on-stop"');
+    expect(content).toMatch(/session_start = ".*sb hooks on-session-start"/);
+    expect(content).toMatch(/session_end = ".*sb hooks on-stop"/);
     expect(content).toContain('# end pcp-managed');
   });
 
@@ -271,10 +268,7 @@ describe('installHooks: Codex', () => {
   it('should return conflict when non-PCP [hooks] exists', () => {
     const configDir = join(TEST_DIR, '.codex');
     mkdirSync(configDir, { recursive: true });
-    writeFileSync(
-      join(configDir, 'config.toml'),
-      '[hooks]\nsession_start = "other-tool start"\n'
-    );
+    writeFileSync(join(configDir, 'config.toml'), '[hooks]\nsession_start = "other-tool start"\n');
 
     const { result } = installHooks(TEST_DIR, { backend: 'codex' });
     expect(result).toBe('conflict');
@@ -308,7 +302,7 @@ describe('installHooks: Codex', () => {
     const endMarkers = content.match(/# end pcp-managed/g);
     expect(startMarkers).toHaveLength(1);
     expect(endMarkers).toHaveLength(1);
-    expect(content).toContain('session_start = "sb hooks on-session-start"');
+    expect(content).toMatch(/session_start = ".*sb hooks on-session-start"/);
   });
 });
 

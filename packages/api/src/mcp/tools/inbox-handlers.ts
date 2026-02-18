@@ -240,35 +240,47 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       studioHint: recipientStudioHint,
     };
 
-    // Fire-and-forget: don't await the trigger processing
-    // The message is already in the inbox - we just need to wake the agent
-    gateway
-      .processTrigger(payload)
-      .then((result) => {
-        logger.info('Inbox message trigger completed', {
-          messageId: message.id,
-          triggerId: result.triggerId,
-          processed: result.processed,
-          error: result.error,
-        });
-      })
-      .catch((error) => {
-        logger.error('Inbox message trigger failed', {
-          messageId: message.id,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      });
-
-    triggerResult = {
-      triggered: true,
-      triggerId: 'async', // Trigger ID assigned asynchronously
-      processed: undefined, // Processing happens in background
-    };
-
-    logger.info('Inbox message trigger dispatched (async)', {
+    // Await trigger with timeout so the sender sees the real result
+    const TRIGGER_TIMEOUT_MS = 30_000;
+    logger.info('Inbox message trigger dispatched', {
       messageId: message.id,
       recipientAgentId,
     });
+
+    try {
+      const result = await Promise.race([
+        gateway.processTrigger(payload),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Trigger timed out (30s)')), TRIGGER_TIMEOUT_MS)
+        ),
+      ]);
+
+      logger.info('Inbox message trigger completed', {
+        messageId: message.id,
+        triggerId: result.triggerId,
+        processed: result.processed,
+        error: result.error,
+      });
+
+      triggerResult = {
+        triggered: true,
+        triggerId: result.triggerId,
+        processed: result.processed,
+        error: result.error,
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      logger.error('Inbox message trigger failed', {
+        messageId: message.id,
+        error: errorMessage,
+      });
+
+      triggerResult = {
+        triggered: true,
+        processed: false,
+        error: errorMessage,
+      };
+    }
   }
 
   return {
