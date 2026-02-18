@@ -3,10 +3,17 @@
 import { useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
-import { ArrowLeft, ChevronLeft, ChevronRight, TerminalSquare } from 'lucide-react';
+import { ArrowLeft, Braces, ChevronLeft, ChevronRight, TerminalSquare, Wrench } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { useApiQuery } from '@/lib/api';
 import clsx from 'clsx';
 
@@ -47,10 +54,110 @@ function formatDate(date: string): string {
   return new Date(date).toLocaleString();
 }
 
+function safeJsonParse(input: string): unknown | null {
+  try {
+    return JSON.parse(input);
+  } catch {
+    return null;
+  }
+}
+
+function decodePossiblyDoubleEncodedJson(input: string): unknown | null {
+  const first = safeJsonParse(input);
+  if (first === null) return null;
+  if (typeof first === 'string') {
+    const second = safeJsonParse(first);
+    return second ?? first;
+  }
+  return first;
+}
+
+function stringifyCompact(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function summarizeObject(input: Record<string, unknown>): string {
+  if (input.type === 'tool_use') {
+    const toolName = typeof input.name === 'string' ? input.name : 'unknown_tool';
+    const toolInput =
+      input.input && typeof input.input === 'object' ? stringifyCompact(input.input) : undefined;
+    return toolInput ? `Tool call: ${toolName} ${toolInput}` : `Tool call: ${toolName}`;
+  }
+
+  if (input.type === 'tool_result') {
+    const toolUseId =
+      typeof input.tool_use_id === 'string' ? input.tool_use_id.slice(0, 8) : 'unknown';
+    const result =
+      input.content !== undefined ? stringifyCompact(input.content).slice(0, 320) : 'No result content';
+    return `Tool result (${toolUseId}): ${result}`;
+  }
+
+  if (input.type === 'queue-operation' || typeof input.operation === 'string') {
+    const operation = typeof input.operation === 'string' ? input.operation : 'operation';
+    const sessionId =
+      typeof input.sessionId === 'string' ? ` · session ${input.sessionId.slice(0, 8)}` : '';
+    return `Queue ${operation}${sessionId}`;
+  }
+
+  if (input.type === 'assistant' || input.type === 'user') {
+    const message = input.message;
+    if (message && typeof message === 'object' && !Array.isArray(message)) {
+      const content = (message as Record<string, unknown>).content;
+      if (Array.isArray(content)) {
+        const textBlock = content.find(
+          (block) =>
+            block &&
+            typeof block === 'object' &&
+            !Array.isArray(block) &&
+            (block as Record<string, unknown>).type === 'text'
+        ) as Record<string, unknown> | undefined;
+        if (textBlock && typeof textBlock.text === 'string' && textBlock.text.trim()) {
+          return textBlock.text;
+        }
+      }
+    }
+  }
+
+  return stringifyCompact(input).slice(0, 420);
+}
+
+function formatEntryContent(rawContent: string, _backend: string | null | undefined): {
+  display: string;
+  rawJson: string | null;
+  kind: 'tool' | 'json' | 'text';
+} {
+  const parsed = decodePossiblyDoubleEncodedJson(rawContent);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { display: rawContent, rawJson: null, kind: 'text' };
+  }
+
+  const parsedObj = parsed as Record<string, unknown>;
+  const rawJson = JSON.stringify(parsedObj, null, 2);
+  const summary = summarizeObject(parsedObj);
+
+  if (parsedObj.type === 'tool_use' || parsedObj.type === 'tool_result') {
+    return { display: summary, rawJson, kind: 'tool' };
+  }
+
+  // Placeholder for future backend-specific formatting (codex/claude/gemini).
+  // For now, non-tool JSON payloads share one presentation.
+  return { display: summary, rawJson, kind: 'json' };
+}
+
 export default function SessionLogsPage() {
   const params = useParams();
   const sessionId = params.sessionId as string;
   const [offset, setOffset] = useState(0);
+  const [rawModal, setRawModal] = useState<{
+    id: string;
+    type: string;
+    json: string;
+  } | null>(null);
   const limit = 50;
 
   const queryPath = useMemo(
@@ -113,8 +220,8 @@ export default function SessionLogsPage() {
           ) : (
             <div className="space-y-3">
               {logs.map((entry) => (
-                <div key={entry.id} className="rounded-md border border-gray-200 p-3">
-                  <div className="mb-2 flex items-center justify-between text-xs text-gray-500">
+                <div key={entry.id} className="rounded-md border border-gray-200 bg-white p-3">
+                  <div className="mb-2 flex items-center justify-between gap-3 text-xs text-gray-500">
                     <div className="flex items-center gap-2">
                       <Badge
                         variant="outline"
@@ -129,16 +236,66 @@ export default function SessionLogsPage() {
                       <Badge variant="outline">{entry.source}</Badge>
                       <span>{entry.type}</span>
                     </div>
-                    <span>{formatDate(entry.timestamp)}</span>
+                    <span className="shrink-0">{formatDate(entry.timestamp)}</span>
                   </div>
-                  <div className="flex items-start gap-2 text-sm text-gray-800">
-                    <TerminalSquare className="mt-0.5 h-4 w-4 shrink-0 text-gray-400" />
-                    <p className="whitespace-pre-wrap break-words">{entry.content}</p>
-                  </div>
+
+                  {(() => {
+                    const formatted = formatEntryContent(entry.content, session?.backend);
+                    return (
+                      <div className="space-y-2">
+                        <div className="flex items-start gap-2 text-sm text-gray-800">
+                          {formatted.kind === 'tool' ? (
+                            <Wrench className="mt-0.5 h-4 w-4 shrink-0 text-violet-500" />
+                          ) : formatted.kind === 'json' ? (
+                            <Braces className="mt-0.5 h-4 w-4 shrink-0 text-indigo-500" />
+                          ) : (
+                            <TerminalSquare className="mt-0.5 h-4 w-4 shrink-0 text-gray-400" />
+                          )}
+                          <p className="whitespace-pre-wrap break-words leading-relaxed">
+                            {formatted.display}
+                          </p>
+                        </div>
+                        {formatted.rawJson ? (
+                          <div className="flex justify-end">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 text-xs"
+                              onClick={() =>
+                                setRawModal({
+                                  id: entry.id,
+                                  type: entry.type,
+                                  json: formatted.rawJson || '{}',
+                                })
+                              }
+                            >
+                              View raw JSON
+                            </Button>
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })()}
                 </div>
               ))}
             </div>
           )}
+
+          <Dialog open={Boolean(rawModal)} onOpenChange={(open) => !open && setRawModal(null)}>
+            <DialogContent className="max-h-[80vh] overflow-hidden sm:max-w-2xl">
+              <DialogHeader>
+                <DialogTitle>Raw JSON</DialogTitle>
+                <DialogDescription>
+                  {rawModal ? `${rawModal.type} · ${rawModal.id}` : 'Session log payload'}
+                </DialogDescription>
+              </DialogHeader>
+              <div className="overflow-auto rounded-md border border-gray-200 bg-gray-950 p-3">
+                <pre className="whitespace-pre-wrap break-words font-mono text-xs text-gray-100">
+                  {rawModal?.json}
+                </pre>
+              </div>
+            </DialogContent>
+          </Dialog>
 
           {pagination && (
             <div className="mt-4 flex items-center justify-between border-t border-gray-200 pt-4">
