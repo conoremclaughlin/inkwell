@@ -32,6 +32,20 @@ describe('ToolPolicyState', () => {
     expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
   });
 
+  it('supports session-scoped grants', () => {
+    const policy = new ToolPolicyState('backend', { persist: false });
+    policy.grantToolForSession('sess-1', 'send_to_inbox');
+    expect(policy.canCallPcpTool('send_to_inbox', 'sess-1').allowed).toBe(true);
+    expect(policy.canCallPcpTool('send_to_inbox', 'sess-2').allowed).toBe(false);
+  });
+
+  it('expands group rules for allow', () => {
+    const policy = new ToolPolicyState('backend', { persist: false });
+    policy.allowTool('group:pcp-comms');
+    expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
+    expect(policy.canCallPcpTool('trigger_agent').allowed).toBe(true);
+  });
+
   it('persists allow rules and grants', () => {
     const dir = mkdtempSync(join(tmpdir(), 'policy-test-'));
     const policyPath = join(dir, 'tool-policy.json');

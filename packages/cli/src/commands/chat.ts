@@ -10,7 +10,7 @@ import { runBackendTurn } from '../repl/backend-runner.js';
 import { ContextLedger, estimateTokens } from '../repl/context-ledger.js';
 import { parseSlashCommand } from '../repl/slash.js';
 import { ToolMode, ToolPolicyState } from '../repl/tool-policy.js';
-import { discoverSkills } from '../repl/skills.js';
+import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../repl/skills.js';
 
 type ChatOptions = {
   agent?: string;
@@ -42,6 +42,7 @@ interface ChatRuntime {
   pollSeconds: number;
   showSessionsWatch: boolean;
   transcriptPath: string;
+  activeSkills: SkillInstruction[];
 }
 
 interface SessionSummary {
@@ -175,6 +176,7 @@ function printSessionsSnapshot(sessions: SessionSummary[]): void {
 async function promptForToolApproval(
   rl: ReturnType<typeof createInterface>,
   toolPolicy: ToolPolicyState,
+  sessionId: string | undefined,
   tool: string,
   reason: string
 ): Promise<boolean> {
@@ -182,7 +184,7 @@ async function promptForToolApproval(
   const answer = (
     await rl.question(
       chalk.yellow(
-        `Allow ${tool}? [y] once, [5] five times, [a] always allow, [d] deny always, [n] cancel: `
+        `Allow ${tool}? [y] once, [s] this session, [a] always allow, [d] deny always, [n] cancel: `
       )
     )
   )
@@ -193,8 +195,13 @@ async function promptForToolApproval(
     toolPolicy.grantTool(tool, 1);
     return true;
   }
-  if (answer === '5') {
-    toolPolicy.grantTool(tool, 5);
+  if (answer === 's' || answer === 'session') {
+    if (!sessionId) {
+      console.log(chalk.yellow('No PCP session id available; falling back to one-time grant.'));
+      toolPolicy.grantTool(tool, 1);
+      return true;
+    }
+    toolPolicy.grantToolForSession(sessionId, tool);
     return true;
   }
   if (answer === 'a' || answer === 'always') {
@@ -206,6 +213,16 @@ async function promptForToolApproval(
     return false;
   }
   return false;
+}
+
+function renderActiveSkills(skills: SkillInstruction[]): string {
+  if (skills.length === 0) return '';
+  return skills
+    .map(
+      (skill) =>
+        `\n[Active skill: ${skill.name} from ${skill.source}]\n${skill.content || '(no skill content loaded)'}`
+    )
+    .join('\n');
 }
 
 function buildPromptEnvelope(
@@ -231,10 +248,14 @@ function buildPromptEnvelope(
     runtime.toolMode === 'privileged'
       ? 'Backend-native tools are enabled and external actions are allowed when needed.'
       : '',
+    runtime.activeSkills.length > 0
+      ? `Active skills: ${runtime.activeSkills.map((skill) => skill.name).join(', ')}`
+      : '',
     runtime.threadKey ? `Thread key: ${runtime.threadKey}.` : '',
     '',
     'Conversation transcript:',
     transcript || '(empty)',
+    runtime.activeSkills.length > 0 ? `\nSkill instructions:${renderActiveSkills(runtime.activeSkills)}` : '',
     '',
     'Latest user message:',
     userMessage,
@@ -259,6 +280,7 @@ async function runChat(options: ChatOptions): Promise<void> {
     pollSeconds: Number.parseInt(options.pollSeconds || '20', 10),
     showSessionsWatch: false,
     transcriptPath: ensureRuntimeTranscriptPath(),
+    activeSkills: [],
   };
   const toolPolicy = new ToolPolicyState(runtime.toolMode);
 
@@ -401,6 +423,7 @@ async function runChat(options: ChatOptions): Promise<void> {
               '/model <id>                Set/clear model override',
               '/tools <backend|off|privileged>  Toggle backend-native tools/policy',
               '/grant <tool> [uses]       Grant blocked PCP tool for limited uses',
+              '/grant-session <tool>      Allow a tool for this PCP session only',
               '/allow <tool>               Persistently allow PCP tool',
               '/deny <tool>                Persistently deny PCP tool',
               '/policy                     Show tool policy + storage path',
@@ -408,7 +431,9 @@ async function runChat(options: ChatOptions): Promise<void> {
               '/thread [key]              Show/set active thread key',
               '/sessions [watch|off]      Show active sessions (or stream each turn)',
               '/skills                    List discovered local skills',
-              '/skill-allow <name>         Persistently allow skill when skill filter is active',
+              '/skill-allow <pattern>      Persistently allow skill(s) via pattern',
+              '/skill-use <name>           Activate a discovered skill for prompts',
+              '/skill-clear [name]         Clear active skills (or one skill)',
               '/bookmark [label]          Set context bookmark',
               '/bookmarks                 List bookmarks',
               '/eject <bookmark|last>     Eject context up to bookmark',
@@ -473,6 +498,14 @@ async function runChat(options: ChatOptions): Promise<void> {
             if (grants.length > 0) {
               console.log(chalk.dim(`Grants: ${grants.map((g) => `${g.tool}(${g.uses})`).join(', ')}`));
             }
+            const sessionGrants = toolPolicy.listSessionGrants(runtime.sessionId);
+            if (sessionGrants.length > 0) {
+              console.log(
+                chalk.dim(
+                  `Session grants: ${sessionGrants.map((g) => `${g.tool}(${g.uses})`).join(', ')}`
+                )
+              );
+            }
             break;
           }
           if (next !== 'backend' && next !== 'off' && next !== 'privileged') {
@@ -505,6 +538,20 @@ async function runChat(options: ChatOptions): Promise<void> {
           console.log(chalk.green(`Persistently allowed ${tool}`));
           break;
         }
+        case 'grant-session': {
+          const tool = slash.args[0];
+          if (!tool) {
+            console.log(chalk.yellow('Usage: /grant-session <tool>'));
+            break;
+          }
+          if (!runtime.sessionId) {
+            console.log(chalk.yellow('No PCP session id available.'));
+            break;
+          }
+          toolPolicy.grantToolForSession(runtime.sessionId, tool);
+          console.log(chalk.green(`Granted ${tool} for this PCP session.`));
+          break;
+        }
         case 'deny': {
           const tool = slash.args[0];
           if (!tool) {
@@ -531,6 +578,19 @@ async function runChat(options: ChatOptions): Promise<void> {
           if (prompt.length > 0) console.log(chalk.dim(`Prompt: ${prompt.join(', ')}`));
           const skills = toolPolicy.listAllowedSkills();
           if (skills.length > 0) console.log(chalk.dim(`Allowed skills: ${skills.join(', ')}`));
+          const sessionGrants = toolPolicy.listSessionGrants(runtime.sessionId);
+          if (sessionGrants.length > 0) {
+            console.log(
+              chalk.dim(
+                `Session grants: ${sessionGrants.map((entry) => `${entry.tool}(${entry.uses})`).join(', ')}`
+              )
+            );
+          }
+          if (runtime.activeSkills.length > 0) {
+            console.log(
+              chalk.dim(`Active skills: ${runtime.activeSkills.map((skill) => skill.name).join(', ')}`)
+            );
+          }
           console.log('');
           break;
         }
@@ -550,9 +610,15 @@ async function runChat(options: ChatOptions): Promise<void> {
               break;
             }
           }
-          const policy = toolPolicy.canCallPcpTool(tool);
+          const policy = toolPolicy.canCallPcpTool(tool, runtime.sessionId);
           if (!policy.allowed) {
-            const approved = await promptForToolApproval(rl, toolPolicy, tool, policy.reason);
+            const approved = await promptForToolApproval(
+              rl,
+              toolPolicy,
+              runtime.sessionId,
+              tool,
+              policy.reason
+            );
             if (!approved) {
               console.log(chalk.yellow(`Skipped ${tool}`));
               break;
@@ -575,7 +641,8 @@ async function runChat(options: ChatOptions): Promise<void> {
           const blocked = skills.length - visible.length;
           console.log(chalk.bold(`Discovered skills (${skills.length})`));
           for (const skill of visible.slice(0, 80)) {
-            console.log(chalk.dim(`- ${skill.name} [${skill.source}]`));
+            const active = runtime.activeSkills.some((entry) => entry.path === skill.path) ? ' *active*' : '';
+            console.log(chalk.dim(`- ${skill.name} [${skill.source}]${active}`));
           }
           if (visible.length > 80) {
             console.log(chalk.dim(`... and ${visible.length - 80} more visible skills`));
@@ -593,6 +660,47 @@ async function runChat(options: ChatOptions): Promise<void> {
           }
           toolPolicy.allowSkill(skill);
           console.log(chalk.green(`Allowed skill: ${skill}`));
+          break;
+        }
+        case 'skill-use': {
+          const name = slash.args.join(' ').trim();
+          if (!name) {
+            console.log(chalk.yellow('Usage: /skill-use <name>'));
+            break;
+          }
+          const skills = discoverSkills(process.cwd()).filter((skill) => skill.name === name);
+          if (skills.length === 0) {
+            console.log(chalk.yellow(`Skill not found: ${name}`));
+            break;
+          }
+          const [skill] = skills;
+          if (!toolPolicy.isSkillAllowed(skill.name)) {
+            console.log(chalk.yellow(`Skill blocked by allowlist policy: ${skill.name}`));
+            break;
+          }
+          const loaded = loadSkillInstruction(skill);
+          runtime.activeSkills = [
+            ...runtime.activeSkills.filter((entry) => entry.path !== loaded.path),
+            loaded,
+          ];
+          console.log(chalk.green(`Activated skill ${loaded.name}`));
+          break;
+        }
+        case 'skill-clear': {
+          const name = slash.args.join(' ').trim();
+          if (!name) {
+            runtime.activeSkills = [];
+            console.log(chalk.green('Cleared all active skills.'));
+            break;
+          }
+          const before = runtime.activeSkills.length;
+          runtime.activeSkills = runtime.activeSkills.filter((skill) => skill.name !== name);
+          const removed = before - runtime.activeSkills.length;
+          if (removed === 0) {
+            console.log(chalk.yellow(`No active skill matched: ${name}`));
+          } else {
+            console.log(chalk.green(`Cleared ${removed} active skill(s) for ${name}`));
+          }
           break;
         }
         case 'thread': {

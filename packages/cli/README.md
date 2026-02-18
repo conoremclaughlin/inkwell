@@ -327,7 +327,7 @@ sb chat --tools off              # Disable backend-native tool usage
 sb chat --tools privileged       # Allow broad tool execution
 ```
 
-When a blocked `/pcp` tool is attempted, REPL now prompts inline to allow once, allow 5x, allow always (persisted), or deny always.
+When a blocked `/pcp` tool is attempted, REPL prompts inline to allow once, allow for the active PCP session, allow always (persisted), or deny always.
 
 Inside REPL:
 
@@ -339,11 +339,14 @@ Inside REPL:
 - `/model <id>` set/clear model override
 - `/tools <backend|off|privileged>` adjust tool policy mode
 - `/grant <tool> [uses]` scoped grant for blocked PCP tool calls
+- `/grant-session <tool>` allow a blocked PCP tool for the current PCP session only
 - `/allow <tool>` persistently allow a PCP tool
 - `/deny <tool>` persistently deny a PCP tool
 - `/policy` inspect active policy and storage path
 - `/skills` list discovered local skills from .codex/.pcp/.claude/.gemini roots
-- `/skill-allow <name>` add a skill to persistent skill allowlist
+- `/skill-allow <pattern>` add skill pattern to persistent skill allowlist
+- `/skill-use <name>` activate a discovered skill and inject SKILL.md guidance into prompt context
+- `/skill-clear [name]` clear active skills
 - `/pcp <tool> [jsonArgs]` invoke PCP tools directly from REPL
 - `/usage` show approximate context token usage
 - `/session` show session/thread routing info

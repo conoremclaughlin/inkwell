@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, statSync } from 'fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 
@@ -6,6 +6,13 @@ export interface DiscoveredSkill {
   name: string;
   path: string;
   source: string;
+}
+
+export interface SkillInstruction {
+  name: string;
+  path: string;
+  source: string;
+  content: string;
 }
 
 function discoverFromDir(dir: string, source: string): DiscoveredSkill[] {
@@ -60,3 +67,21 @@ export function discoverSkills(cwd: string): DiscoveredSkill[] {
   return Array.from(dedupe.values()).sort((a, b) => a.name.localeCompare(b.name));
 }
 
+export function loadSkillInstruction(skill: DiscoveredSkill, maxChars = 8000): SkillInstruction {
+  const skillFile = join(skill.path, 'SKILL.md');
+  let content = '';
+  try {
+    content = readFileSync(skillFile, 'utf-8');
+  } catch {
+    content = '';
+  }
+  if (content.length > maxChars) {
+    content = `${content.slice(0, maxChars)}\n\n...[truncated]`;
+  }
+  return {
+    name: skill.name,
+    path: skill.path,
+    source: skill.source,
+    content,
+  };
+}
