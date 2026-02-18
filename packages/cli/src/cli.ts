@@ -19,7 +19,7 @@
 import { program } from 'commander';
 import chalk from 'chalk';
 import { registerStudioCommands } from './commands/studio.js';
-import { registerStudioContainerCommands } from './commands/studio-container.js';
+import { registerWorkspaceCommands } from './commands/workspace.js';
 import { registerAgentCommands } from './commands/agent.js';
 import { registerSessionCommands } from './commands/session.js';
 import { registerConfigCommands } from './commands/mcp.js';
@@ -165,7 +165,7 @@ program
 
 // Register subcommand groups
 registerStudioCommands(program);
-registerStudioContainerCommands(program);
+registerWorkspaceCommands(program);
 registerAgentCommands(program);
 registerSessionCommands(program);
 registerConfigCommands(program);

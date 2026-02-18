@@ -1,8 +1,9 @@
 /**
- * Workspace Container Commands
+ * Workspace Commands
  *
- * Manage product-level workspaces (personal/team scope).
- * These are distinct from local git worktree studios (`sb studio ...`).
+ * Manage product-level workspaces (personal/team scope) — the top-level
+ * container for artifacts, team SBs, reminders, and more.
+ * Distinct from local git worktree studios (`sb studio ...`).
  */
 
 import { Command } from 'commander';
@@ -18,7 +19,7 @@ interface PcpConfig {
   workspaceId?: string;
 }
 
-interface WorkspaceContainer {
+interface Workspace {
   id: string;
   name: string;
   slug: string;
@@ -96,7 +97,7 @@ function unwrapToolResult(payload: unknown): Record<string, unknown> {
   return direct;
 }
 
-async function listWorkspaceContainers(options: {
+async function listWorkspaces(options: {
   all?: boolean;
   type?: 'personal' | 'team';
   json?: boolean;
@@ -128,7 +129,7 @@ async function listWorkspaceContainers(options: {
   const raw = (await response.json()) as unknown;
   const parsed = unwrapToolResult(raw);
   const workspaces = Array.isArray(parsed.workspaces)
-    ? (parsed.workspaces as WorkspaceContainer[])
+    ? (parsed.workspaces as Workspace[])
     : [];
 
   if (options.json) {
@@ -163,7 +164,7 @@ async function listWorkspaceContainers(options: {
   }
 }
 
-async function useWorkspaceContainer(workspaceRef: string): Promise<void> {
+async function useWorkspace(workspaceRef: string): Promise<void> {
   const config = getPcpConfig();
   if (!config?.email) {
     console.error(chalk.red('PCP not configured. Run: sb init'));
@@ -190,7 +191,7 @@ async function useWorkspaceContainer(workspaceRef: string): Promise<void> {
   const raw = (await response.json()) as unknown;
   const parsed = unwrapToolResult(raw);
   const workspaces = Array.isArray(parsed.workspaces)
-    ? (parsed.workspaces as WorkspaceContainer[])
+    ? (parsed.workspaces as Workspace[])
     : [];
   const match = workspaces.find((w) => w.id === workspaceRef || w.slug === workspaceRef);
 
@@ -211,7 +212,7 @@ async function useWorkspaceContainer(workspaceRef: string): Promise<void> {
 async function resolveWorkspaceByRef(
   workspaceRef: string,
   config: PcpConfig
-): Promise<WorkspaceContainer> {
+): Promise<Workspace> {
   const response = await fetchPcp('/api/mcp/call', {
     method: 'POST',
     body: JSON.stringify({
@@ -231,7 +232,7 @@ async function resolveWorkspaceByRef(
   const raw = (await response.json()) as unknown;
   const parsed = unwrapToolResult(raw);
   const workspaces = Array.isArray(parsed.workspaces)
-    ? (parsed.workspaces as WorkspaceContainer[])
+    ? (parsed.workspaces as Workspace[])
     : [];
   const match = workspaces.find((workspace) => workspace.id === workspaceRef || workspace.slug === workspaceRef);
 
@@ -242,7 +243,7 @@ async function resolveWorkspaceByRef(
   return match;
 }
 
-async function createWorkspaceContainer(
+async function createWorkspace(
   name: string,
   options: { type?: 'personal' | 'team'; description?: string; slug?: string; use?: boolean }
 ): Promise<void> {
@@ -273,7 +274,7 @@ async function createWorkspaceContainer(
 
   const raw = (await response.json()) as unknown;
   const parsed = unwrapToolResult(raw);
-  const workspace = parsed.workspace as WorkspaceContainer | undefined;
+  const workspace = parsed.workspace as Workspace | undefined;
 
   if (!workspace?.id) {
     console.error(chalk.red('Workspace creation failed'));
@@ -305,7 +306,7 @@ async function inviteWorkspaceMember(
     process.exit(1);
   }
 
-  let targetWorkspace: WorkspaceContainer;
+  let targetWorkspace: Workspace;
   try {
     targetWorkspace = await resolveWorkspaceByRef(workspaceRef, config);
   } catch (error) {
@@ -365,7 +366,7 @@ async function listWorkspaceMembers(workspaceRef?: string): Promise<void> {
     process.exit(1);
   }
 
-  let targetWorkspace: WorkspaceContainer;
+  let targetWorkspace: Workspace;
   try {
     targetWorkspace = await resolveWorkspaceByRef(targetRef, config);
   } catch (error) {
@@ -422,7 +423,7 @@ async function listWorkspaceMembers(workspaceRef?: string): Promise<void> {
   console.log('');
 }
 
-function currentWorkspaceContainer(): void {
+function currentWorkspace(): void {
   const config = getPcpConfig();
   if (!config) {
     console.error(chalk.red('PCP not configured. Run: sb init'));
@@ -438,7 +439,7 @@ function currentWorkspaceContainer(): void {
   console.log(config.workspaceId);
 }
 
-export function registerStudioContainerCommands(program: Command): void {
+export function registerWorkspaceCommands(program: Command): void {
   const workspace = program
     .command('workspace')
     .description('Workspace management (personal/team scope)');
@@ -449,22 +450,22 @@ export function registerStudioContainerCommands(program: Command): void {
     .option('--all', 'Include archived workspaces')
     .option('--type <type>', 'Filter by workspace type (personal|team)')
     .option('--json', 'Output JSON')
-    .action(listWorkspaceContainers);
+    .action(listWorkspaces);
 
   workspace
     .command('use <workspace-id-or-slug>')
     .description('Select the active workspace for this machine')
-    .action(useWorkspaceContainer);
+    .action(useWorkspace);
 
   workspace
     .command('create <name>')
-    .description('Create a new workspace container')
+    .description('Create a new workspace')
     .option('--type <type>', 'Workspace type (personal|team)', 'team')
     .option('--description <description>', 'Workspace description')
     .option('--slug <slug>', 'Workspace slug')
     .option('--use', 'Select the created workspace after creation')
     .action((name, options: { type?: 'personal' | 'team'; description?: string; slug?: string; use?: boolean }) =>
-      createWorkspaceContainer(name, options)
+      createWorkspace(name, options)
     );
 
   workspace
@@ -483,5 +484,5 @@ export function registerStudioContainerCommands(program: Command): void {
   workspace
     .command('current')
     .description('Print selected workspace ID')
-    .action(currentWorkspaceContainer);
+    .action(currentWorkspace);
 }
