@@ -17,17 +17,21 @@ yarn dev
 yarn workspace @personal-context/cli build
 yarn workspace @personal-context/cli install:cli
 
+# Initialize PCP in this repo (hooks, .mcp.json, backend configs)
+sb init
+
+# Install hooks across all worktrees
+sb hooks install --all
+
 # Launch an interactive session with your SB
 sb
 ```
 
 See [packages/cli/README.md](./packages/cli/README.md) for full CLI documentation.
 
-### MCP Configuration (Required)
+### MCP Configuration
 
-Each working directory (studio/worktree) that runs a backend needs a `.mcp.json` file so the agent can connect to the PCP MCP server, Supabase, and other services. Without it, **spawned agents will silently fail** — they cannot call MCP tools (including replying to users).
-
-Create `.mcp.json` in the project root (and each studio worktree):
+Each working directory (studio/worktree) needs a `.mcp.json` file so the agent can connect to PCP and other MCP servers. `sb init` creates this automatically, but you can also create it manually:
 
 ```json
 {
@@ -44,7 +48,7 @@ Create `.mcp.json` in the project root (and each studio worktree):
 }
 ```
 
-Adjust the `pcp` URL if your studio runs on a different port. This file is `.gitignored` because each studio may use different ports — you must create it manually after cloning or resetting.
+`sb init` also syncs this to backend-specific formats (`.codex/config.toml`, `.gemini/settings.json`) and installs lifecycle hooks. Run `sb hooks install --all` to propagate hooks to all git worktrees at once.
 
 ## Database Setup (Supabase)
 

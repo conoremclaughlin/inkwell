@@ -34,6 +34,7 @@ import { installHooks } from './hooks.js';
 interface WorkspaceIdentity {
   agentId: string;
   context: string;
+  backend?: string;
   description: string;
   workspace: string;
   branch: string;
@@ -392,6 +393,7 @@ async function createWorkspace(
     agent?: string;
     purpose?: string;
     branch?: string;
+    backend?: string;
     copyConfig?: boolean;
     configDirs?: string;
   },
@@ -447,6 +449,7 @@ async function createWorkspace(
     const identity: WorkspaceIdentity = {
       agentId,
       context: `workspace-${name}`,
+      ...(options.backend ? { backend: options.backend } : {}),
       description: options.purpose || `Workspace: ${name}`,
       workspace: name,
       branch,
@@ -683,6 +686,7 @@ export function registerWorkspaceCommands(program: Command): void {
     .option('-a, --agent <agent>', 'Agent ID for this workspace', 'wren')
     .option('-p, --purpose <desc>', 'Description/purpose of the workspace')
     .option('-b, --branch <branch>', 'Custom branch name (default: <agentId>/workspace/<name>)')
+    .option('--backend <name>', 'Primary backend (claude-code, codex, gemini)')
     .option('--copy-config', 'Copy config directories into the new workspace')
     .option(
       '--config-dirs <dirs>',

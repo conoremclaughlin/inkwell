@@ -44,6 +44,8 @@ sb -- --some-future-flag
 echo "explain this" | sb
 
 # Subcommands
+sb init                         # Set up PCP in current repo
+sb hooks install --all          # Install hooks across all worktrees
 sb studio create feat-auth      # Create studio/workspace
 sb agent status                 # Check agent status
 sb session list                 # List sessions
@@ -102,6 +104,33 @@ sb agent trigger <id>           # Wake up an agent
 sb agent inbox [id]             # Check inbox
 sb agent list                   # List known agents
 ```
+
+### Hooks (`sb hooks`)
+
+Manage lifecycle hooks that connect CLI backends (Claude Code, Codex, Gemini) to PCP's session/memory/inbox system. Hooks fire on events like session start, compaction, and stop — injecting context, checking inbox, and saving state.
+
+```bash
+sb hooks install                   # Install for detected backend
+sb hooks install --all             # Install across ALL git worktrees
+sb hooks install -b codex          # Target a specific backend
+sb hooks install --force           # Overwrite non-PCP hooks
+
+sb hooks status                    # Show installed hooks
+sb hooks uninstall                 # Remove PCP hooks
+sb hooks uninstall --all           # Remove from all worktrees
+```
+
+Hooks are installed to **local-only** config by default (e.g., `.claude/settings.local.json`) so they don't leak into version control. `sb init` runs `sb hooks install` automatically.
+
+**Hook events:**
+
+| PCP Event | What it does | Claude Code | Codex | Gemini |
+|---|---|---|---|---|
+| `on-session-start` | Bootstrap identity + inbox | `SessionStart` | `session_start` | `session_start` |
+| `pre-compact` | Save context before compaction | `PreCompact` | — | — |
+| `post-compact` | Re-bootstrap after compaction | `SessionStart` | — | — |
+| `on-prompt` | Periodic inbox check | `UserPromptSubmit` | — | — |
+| `on-stop` | Session nudge + inbox check | `Stop` | `session_end` | `session_end` |
 
 ### Sessions (`sb session`)
 

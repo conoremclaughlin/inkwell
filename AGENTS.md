@@ -448,7 +448,14 @@ npx @modelcontextprotocol/inspector packages/api/dist/index.js
 
 ## Specs & Artifacts
 
-When we refer to "specs" in this project, we mean **PCP artifacts** — versioned documents stored in Supabase and managed via the `create_artifact` / `update_artifact` / `get_artifact` MCP tools. They are NOT local markdown files. To view or update a spec, use the artifact tools with the artifact's UUID or URI (e.g., `pcp://specs/agent-orchestrator`).
+When we refer to "specs" in this project, we mean **PCP artifacts** — versioned documents stored on the PCP server and managed via MCP tools. They are NOT local markdown files.
+
+- **Browse**: `list_artifacts(type: "spec")` to discover available specs
+- **Read**: `get_artifact(uri: "pcp://specs/cli-session-hooks")` to view a spec by URI
+- **Update**: `update_artifact(...)` to revise content (auto-increments version)
+- **Create**: `create_artifact(type: "spec", uri: "pcp://specs/<slug>", ...)` for new specs
+
+Spec URIs follow the pattern `pcp://specs/<slug>`. When referencing a spec in conversation, threadKeys, or code comments, use the URI slug (e.g., `spec:cli-session-hooks`).
 
 ## Pull Requests & Git
 

@@ -20,8 +20,9 @@ import chalk from 'chalk';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { execSync } from 'child_process';
 import { homedir } from 'os';
-import { resolveAgentId } from '../backends/identity.js';
+import { resolveAgentId, readIdentityJson } from '../backends/identity.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -100,6 +101,14 @@ interface PcpConfig {
 // ============================================================================
 
 function detectBackend(cwd: string): HookCapabilities {
+  // 1. Check .pcp/identity.json for explicit backend
+  const identity = readIdentityJson(cwd);
+  if (identity?.backend) {
+    const fromIdentity = getBackendByName(identity.backend);
+    if (fromIdentity) return fromIdentity;
+  }
+
+  // 2. Fallback to filesystem detection
   if (existsSync(join(cwd, '.claude'))) return CLAUDE_CODE;
   if (existsSync(join(cwd, '.gemini'))) return GEMINI;
   if (existsSync(join(cwd, 'codex.toml')) || existsSync(join(cwd, '.codex'))) return CODEX;
@@ -117,6 +126,26 @@ function getBackendByName(name: string): HookCapabilities {
       return GEMINI;
     default:
       return CLAUDE_CODE;
+  }
+}
+
+// ============================================================================
+// Git Worktree Discovery
+// ============================================================================
+
+function listWorktreePaths(cwd: string): string[] {
+  try {
+    const output = execSync('git worktree list --porcelain', {
+      cwd,
+      encoding: 'utf-8',
+      timeout: 5000,
+    });
+    return output
+      .split('\n')
+      .filter((line) => line.startsWith('worktree '))
+      .map((line) => line.slice('worktree '.length));
+  } catch {
+    return [cwd]; // fallback to current directory
   }
 }
 
@@ -536,12 +565,61 @@ export function installHooks(
   return { result, backend };
 }
 
+function printInstallResult(
+  targetDir: string,
+  result: InstallResult,
+  backend: HookCapabilities
+): void {
+  if (result === 'already-installed') {
+    console.log(chalk.dim(`  · ${targetDir} — up to date (${backend.name})`));
+    return;
+  }
+
+  if (result === 'conflict') {
+    console.log(chalk.yellow(`  ○ ${targetDir} — conflict (use --force)`));
+    return;
+  }
+
+  console.log(chalk.green(`  ✓ ${targetDir} — installed (${backend.name})`));
+  const events = backend.events;
+  if (events.preCompact)
+    console.log(chalk.dim(`      ${events.preCompact} → sb hooks pre-compact`));
+  if (events.postCompact)
+    console.log(chalk.dim(`      ${events.postCompact} (compact) → sb hooks post-compact`));
+  if (events.sessionStart)
+    console.log(chalk.dim(`      ${events.sessionStart} (startup) → sb hooks on-session-start`));
+  if (events.onPrompt) console.log(chalk.dim(`      ${events.onPrompt} → sb hooks on-prompt`));
+  if (events.onStop) console.log(chalk.dim(`      ${events.onStop} → sb hooks on-stop`));
+}
+
 async function installCommand(options: {
   backend?: string;
   local?: boolean;
   force?: boolean;
+  all?: boolean;
 }): Promise<void> {
   const cwd = process.cwd();
+
+  if (options.all) {
+    const worktrees = listWorktreePaths(cwd);
+    console.log(chalk.bold(`\nInstalling PCP hooks across ${worktrees.length} worktree(s):\n`));
+
+    let hasConflict = false;
+    for (const wt of worktrees) {
+      const { result, backend } = installHooks(wt, options);
+      printInstallResult(wt, result, backend);
+      if (result === 'conflict') hasConflict = true;
+    }
+
+    console.log('');
+    if (hasConflict) {
+      console.log(chalk.yellow('Some worktrees had conflicts. Use --force to overwrite.'));
+    } else {
+      console.log(chalk.dim('Done.'));
+    }
+    return;
+  }
+
   const { result, backend } = installHooks(cwd, options);
 
   console.log(chalk.dim(`Backend: ${backend.name}`));
@@ -571,8 +649,54 @@ async function installCommand(options: {
   console.log(chalk.dim(`\nConfig: ${backend.configPath}`));
 }
 
-async function uninstallCommand(options: { backend?: string }): Promise<void> {
+function uninstallFromDir(targetDir: string, backendName?: string): boolean {
+  const backend = backendName ? getBackendByName(backendName) : detectBackend(targetDir);
+  const configPath = join(targetDir, backend.configPath);
+
+  if (!existsSync(configPath)) return false;
+
+  switch (backend.name) {
+    case 'claude-code':
+    case 'gemini': {
+      const config = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
+      if (!config.hooks) return false;
+      delete config.hooks;
+      writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
+      break;
+    }
+    case 'codex': {
+      const content = readFileSync(configPath, 'utf-8');
+      if (!content.includes('pcp-managed')) return false;
+      const cleaned = removePcpTomlSection(content);
+      writeFileSync(configPath, cleaned);
+      break;
+    }
+  }
+
+  return true;
+}
+
+async function uninstallCommand(options: { backend?: string; all?: boolean }): Promise<void> {
   const cwd = process.cwd();
+
+  if (options.all) {
+    const worktrees = listWorktreePaths(cwd);
+    console.log(chalk.bold(`\nRemoving PCP hooks across ${worktrees.length} worktree(s):\n`));
+
+    for (const wt of worktrees) {
+      const backend = options.backend ? getBackendByName(options.backend) : detectBackend(wt);
+      const removed = uninstallFromDir(wt, options.backend);
+      if (removed) {
+        console.log(chalk.green(`  ✓ ${wt} — removed (${backend.name})`));
+      } else {
+        console.log(chalk.dim(`  · ${wt} — no hooks found`));
+      }
+    }
+
+    console.log(chalk.dim('\nDone.'));
+    return;
+  }
+
   const backend = options.backend ? getBackendByName(options.backend) : detectBackend(cwd);
   const configPath = join(cwd, backend.configPath);
 
@@ -581,23 +705,12 @@ async function uninstallCommand(options: { backend?: string }): Promise<void> {
     return;
   }
 
-  switch (backend.name) {
-    case 'claude-code':
-    case 'gemini': {
-      const config = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
-      delete config.hooks;
-      writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
-      break;
-    }
-    case 'codex': {
-      const content = readFileSync(configPath, 'utf-8');
-      const cleaned = removePcpTomlSection(content);
-      writeFileSync(configPath, cleaned);
-      break;
-    }
+  const removed = uninstallFromDir(cwd, options.backend);
+  if (removed) {
+    console.log(chalk.green(`PCP hooks removed from ${backend.configPath}`));
+  } else {
+    console.log(chalk.yellow('No PCP hooks found to remove.'));
   }
-
-  console.log(chalk.green(`PCP hooks removed from ${backend.configPath}`));
 }
 
 async function statusCommand(options: { backend?: string }): Promise<void> {
@@ -917,12 +1030,14 @@ export function registerHooksCommands(program: Command): void {
     .option('-b, --backend <name>', 'Backend to target (claude-code, codex, gemini)')
     .option('--local', 'Write to local config (default for Claude Code)', true)
     .option('-f, --force', 'Overwrite existing hooks')
+    .option('-a, --all', 'Install across all git worktrees')
     .action(installCommand);
 
   hooks
     .command('uninstall')
     .description('Remove PCP-managed hooks from backend config')
     .option('-b, --backend <name>', 'Backend to target')
+    .option('-a, --all', 'Uninstall from all git worktrees')
     .action(uninstallCommand);
 
   hooks

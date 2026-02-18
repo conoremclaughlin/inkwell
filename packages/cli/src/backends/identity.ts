@@ -15,9 +15,25 @@ interface PcpConfig {
   agentMapping?: Record<string, string>;
 }
 
-interface IdentityJson {
+export interface IdentityJson {
   agentId: string;
   context?: string;
+  backend?: string;
+  workspaceId?: string;
+  workspace?: string;
+}
+
+/**
+ * Read .pcp/identity.json from a directory. Returns null if not found/unparseable.
+ */
+export function readIdentityJson(cwd: string): IdentityJson | null {
+  const identityPath = join(cwd, '.pcp', 'identity.json');
+  if (!existsSync(identityPath)) return null;
+  try {
+    return JSON.parse(readFileSync(identityPath, 'utf-8'));
+  } catch {
+    return null;
+  }
 }
 
 /**
