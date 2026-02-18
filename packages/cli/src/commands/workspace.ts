@@ -30,9 +30,11 @@ import {
 import { join, dirname, basename } from 'path';
 import { homedir } from 'os';
 import { installHooks } from './hooks.js';
+import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
 
 interface WorkspaceIdentity {
   agentId: string;
+  identityId?: string;
   context: string;
   backend?: string;
   description: string;
@@ -445,9 +447,20 @@ async function createWorkspace(
     const pcpDir = join(wsPath, '.pcp');
     mkdirSync(pcpDir, { recursive: true });
 
+    // Resolve identityId from auth token if available
+    let identityId: string | undefined;
+    const auth = loadAuth();
+    if (auth && !isTokenExpired(auth)) {
+      const payload = decodeJwtPayload(auth.access_token);
+      if (payload?.identityId) {
+        identityId = payload.identityId;
+      }
+    }
+
     // Always write fresh identity.json (never copy from source)
     const identity: WorkspaceIdentity = {
       agentId,
+      ...(identityId ? { identityId } : {}),
       context: `workspace-${name}`,
       ...(options.backend ? { backend: options.backend } : {}),
       description: options.purpose || `Workspace: ${name}`,
