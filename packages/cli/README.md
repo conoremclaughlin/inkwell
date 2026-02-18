@@ -2,7 +2,7 @@
 
 A lightweight CLI that wraps AI coding tools with persistent identity. Type `sb` to start a session — your SB (Synthetically-born Being) knows who it is, who you are, and what you've been working on.
 
-Unrecognized flags are passed through to the underlying tool (Claude Code today, others in the future).
+Supports multiple backends: Claude Code, Codex, and Gemini CLI. Unrecognized flags and positional args are passed through to the underlying tool.
 
 ## Global Install
 
@@ -118,48 +118,82 @@ sb                            # Launch a session as your default SB
 ```
 
 Hooks automatically bootstrap identity and check inbox at session start, save context before compaction, and nudge the SB to log decisions periodically.
+
 ## Usage
 
+Running `sb` always starts a **new** interactive session with the backend. It does not resume a previous session unless you explicitly pass a resume flag.
+
 ```bash
-# Interactive session (default)
-sb                              # Launch Claude Code as wren
-sb -a myra                      # Launch as myra
+# Interactive session (starts new)
+sb                              # New Claude Code session as wren
+sb -a lumen                     # New session as lumen
+sb -b codex                     # New Codex session
+sb -b gemini                    # New Gemini session
 sb -m opus                      # Use opus model
 
 # Prompt mode (one-shot)
 sb "fix the login bug"
-sb -m opus "refactor auth"
+sb -b codex "refactor the auth module"
+sb -m opus "explain this function"
+```
 
-# Passthrough flags to Claude Code
-sb --resume abc123              # Resume a session
-sb --continue                   # Continue last session
-sb --allowedTools "Read,Write"  # Restrict tools
+### Resuming sessions
 
-# Explicit passthrough with --
-sb -- --some-future-flag
+Each backend has its own resume mechanism. `sb` passes unrecognized flags and positional args through to the backend, so you use the backend's native syntax:
 
-# Pipe input
-echo "explain this" | sb
+```bash
+# Claude Code: --resume or --continue flags
+sb --resume abc123              # Resume a specific Claude Code session
+sb --continue                   # Continue the most recent session
 
-# Subcommands
-sb init                         # Set up PCP in current repo
-sb hooks install --all          # Install hooks across all worktrees
-sb studio create feat-auth      # Create studio/workspace
-sb agent status                 # Check agent status
-sb session list                 # List sessions
-sb --help                       # Full help
+# Codex: positional `resume` subcommand
+sb -a lumen -b codex resume 019c6e3e-9219-70d1-b5dd-f35931c45190
+
+# Gemini: --session flag
+sb -b gemini --session abc123
+```
+
+You can also manage PCP-level sessions (which track identity, logs, and context across backend sessions):
+
+```bash
+sb session list                 # List recent PCP sessions
+sb session show <id>            # Show session details + backend session ID
+sb session resume <id>          # Print the backend resume command
+sb session end [id]             # End a PCP session
+```
+
+### Flag passthrough
+
+Any flag `sb` doesn't recognize is forwarded to the backend. You can also use `--` to force everything after it to pass through:
+
+```bash
+sb --allowedTools "Read,Write"  # Forwarded to Claude Code
+sb -b codex --approval-mode full-auto  # Forwarded to Codex
+sb -- --some-future-flag        # Explicit passthrough boundary
+echo "explain this" | sb        # Pipe input as prompt
 ```
 
 ### SB Options
 
-| Flag                  | Description                 | Default                               |
-| --------------------- | --------------------------- | ------------------------------------- |
-| `-a, --agent <id>`    | Agent identity              | `wren` (or from `.pcp/identity.json`) |
-| `-m, --model <model>` | Model (sonnet, opus, haiku) | `sonnet`                              |
-| `--no-session`        | Disable session tracking    | enabled                               |
-| `-v, --verbose`       | Show debug output           | off                                   |
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-a, --agent <id>` | Agent identity | from `.pcp/identity.json` |
+| `-b, --backend <name>` | AI backend | from `.pcp/identity.json`, or `claude` |
+| `--no-session` | Disable session tracking | enabled |
+| `-v, --verbose` | Show debug output | off |
 
-Any flag not listed above is forwarded to Claude Code.
+Any flag not listed above is forwarded to the backend.
+
+### Quick reference
+
+```bash
+sb init                         # Set up PCP in current repo
+sb hooks install --all          # Install hooks across all worktrees
+sb studio create feat-auth      # Create a studio (git worktree)
+sb agent status                 # Check agent status
+sb workspace list               # List workspaces (team/personal)
+sb --help                       # Full help
+```
 
 ### Identity Resolution
 
@@ -169,6 +203,11 @@ The agent ID is resolved in order:
 2. `.pcp/identity.json` in current directory
 3. `~/.pcp/config.json` → `agentMapping.claude-code`
 4. Default: `wren`
+
+The backend is resolved similarly:
+1. `-b` / `--backend` flag
+2. `.pcp/identity.json` → `backend` field
+3. Default: `claude`
 
 ## Subcommands
 
@@ -189,10 +228,7 @@ sb studio cli --name sb-dev     # Custom binary name
 sb studio cli --unlink          # Remove linked binary
 ```
 
-Backwards compatibility aliases still work:
-
-- `sb ws ...`
-- `sb workspace ...`
+`sb ws` is a shorthand alias for `sb studio`.
 
 Options for `create`:
 
@@ -245,6 +281,30 @@ sb session show <id>            # Session details
 sb session resume <id>          # Resume a session
 sb session end [id]             # End a session
 ```
+
+### Workspaces (`sb workspace`)
+
+Product-level workspaces for managing artifacts, team SBs, reminders, and more. Distinct from studios (local git worktrees).
+
+```bash
+sb workspace list               # List your workspaces
+sb workspace list --type team   # Filter by type (personal|team)
+sb workspace list --all         # Include archived workspaces
+sb workspace create <name>      # Create a new workspace
+sb workspace use <id-or-slug>   # Select active workspace for this machine
+sb workspace current            # Print selected workspace ID
+sb workspace invite <ws> <email>  # Invite a collaborator
+sb workspace members [ws]       # List workspace members
+```
+
+Options for `create`:
+- `--type <type>` — Workspace type: `personal` or `team` (default: team)
+- `--description <desc>` — Workspace description
+- `--slug <slug>` — URL-friendly slug
+- `--use` — Select the created workspace immediately
+
+Options for `invite`:
+- `--role <role>` — Role: `owner`, `admin`, `member`, or `viewer` (default: member)
 
 ## Environment Variables
 
