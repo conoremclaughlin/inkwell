@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import Link from 'next/link';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import {
@@ -12,6 +13,7 @@ import {
   ChevronDown,
   Hash,
   FolderGit2,
+  MessageSquare,
 } from 'lucide-react';
 import { useApiQuery } from '@/lib/api';
 import clsx from 'clsx';
@@ -43,6 +45,14 @@ interface Session {
   updatedAt: string;
   endedAt: string | null;
   workspace: SessionWorkspace | null;
+  preview: Array<{
+    id: string;
+    source: 'activity_stream' | 'session_logs' | 'local_transcript';
+    type: string;
+    role: 'in' | 'out' | 'system';
+    content: string;
+    timestamp: string;
+  }>;
 }
 
 interface SessionsResponse {
@@ -151,6 +161,31 @@ function SessionCard({ session }: { session: Session }) {
             {session.backend && <span>{session.backend}</span>}
             {session.model && <span>{session.model}</span>}
           </div>
+
+          {/* Preview messages */}
+          {session.preview && session.preview.length > 0 ? (
+            <div className="mt-3 rounded-md border border-gray-200 bg-white/70 p-2 space-y-1">
+              {session.preview.map((item) => (
+                <div key={item.id} className="text-xs text-gray-600">
+                  <span
+                    className={clsx(
+                      'mr-1.5 inline-block rounded px-1 py-0.5 text-[10px] uppercase tracking-wide',
+                      item.role === 'in' && 'bg-slate-100 text-slate-600',
+                      item.role === 'out' && 'bg-blue-100 text-blue-700',
+                      item.role === 'system' && 'bg-amber-100 text-amber-700'
+                    )}
+                  >
+                    {item.role}
+                  </span>
+                  <span className="text-gray-500">{item.content}</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="mt-3 text-xs text-gray-400">
+              No cloud log preview yet. Open full log for local transcript fallback.
+            </div>
+          )}
         </div>
         <div className="text-right text-sm shrink-0 ml-4">
           <div className="text-xs text-gray-400">Updated</div>
@@ -178,6 +213,15 @@ function SessionCard({ session }: { session: Session }) {
       {expanded && (
         <div className="mt-3 pt-3 border-t border-gray-200">
           <div className="rounded-md bg-gray-50 p-3 text-xs space-y-3">
+            <div>
+              <Link
+                href={`/sessions/${session.id}`}
+                className="inline-flex items-center gap-1.5 rounded border border-gray-300 bg-white px-2 py-1 text-xs font-medium text-gray-700 hover:bg-gray-100"
+              >
+                <MessageSquare className="h-3.5 w-3.5" />
+                View full log
+              </Link>
+            </div>
             {/* Session IDs */}
             <div>
               <div className="flex items-center gap-1.5 font-medium text-gray-700 mb-1.5">

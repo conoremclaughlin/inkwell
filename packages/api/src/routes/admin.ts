@@ -9,7 +9,7 @@
  */
 
 import { Router, Request, Response, NextFunction } from 'express';
-import { createClient } from '@supabase/supabase-js';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { getAuthorizationService } from '../services/authorization';
 import { getOAuthService } from '../services/oauth';
 import { logger } from '../utils/logger';
@@ -17,6 +17,9 @@ import { env } from '../config/env';
 import { runWithRequestContext } from '../utils/request-context';
 import { getDataComposer } from '../data/composer';
 import crypto from 'crypto';
+import { promises as fs } from 'fs';
+import os from 'os';
+import path from 'path';
 import type { WorkspaceMemberRole } from '../data/repositories/workspace-containers.repository';
 import { slugifyWorkspaceName } from '../utils/workspace-slug';
 import {
@@ -25,6 +28,7 @@ import {
   createRefreshToken,
   exchangeRefreshToken,
 } from '../auth/pcp-tokens';
+import type { Database } from '../data/supabase/types';
 
 // WhatsApp listener reference (set via setWhatsAppListener)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -47,6 +51,10 @@ type CommentAuthorUser = {
 const ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS = 3600; // 1 hour
 const ADMIN_REFRESH_TOKEN_LIFETIME_DAYS = 90;
 const ADMIN_CLIENT_ID = 'dashboard';
+const DEFAULT_SESSION_LOG_LIMIT = 50;
+const MAX_SESSION_LOG_LIMIT = 200;
+const ACTIVITY_PREVIEW_LIMIT_PER_SESSION = 3;
+const LOCAL_TRANSCRIPT_LINE_LIMIT = 200;
 
 function formatCommentAuthorUserName(user: CommentAuthorUser | null): string | null {
   if (!user) return null;
@@ -54,6 +62,267 @@ function formatCommentAuthorUserName(user: CommentAuthorUser | null): string | n
   if (user.username?.trim()) return user.username.trim();
   if (user.email?.trim()) return user.email.trim();
   return null;
+}
+
+type SessionPreviewItem = {
+  id: string;
+  source: 'activity_stream' | 'session_logs' | 'local_transcript';
+  type: string;
+  role: 'in' | 'out' | 'system';
+  content: string;
+  timestamp: string;
+};
+
+type SessionLogItem = SessionPreviewItem & {
+  metadata?: Record<string, unknown>;
+};
+
+function truncateText(input: string, max = 280): string {
+  const compact = input.replace(/\s+/g, ' ').trim();
+  if (compact.length <= max) return compact;
+  return `${compact.slice(0, max - 1)}…`;
+}
+
+function pickContentFromUnknown(input: unknown): string {
+  if (!input) return '';
+  if (typeof input === 'string') return input;
+  if (Array.isArray(input)) {
+    const text = input
+      .map((item) => (typeof item === 'string' ? item : JSON.stringify(item)))
+      .join(' ');
+    return text;
+  }
+  if (typeof input === 'object') {
+    const obj = input as Record<string, unknown>;
+    const directCandidates = [
+      obj.content,
+      obj.message,
+      obj.text,
+      obj.output,
+      obj.input,
+      obj.summary,
+      obj.delta,
+      obj.reasoning,
+      obj.response,
+      obj.body,
+    ];
+    for (const candidate of directCandidates) {
+      if (typeof candidate === 'string' && candidate.trim()) return candidate;
+      if (Array.isArray(candidate)) {
+        const parts = candidate
+          .map((entry) => (typeof entry === 'string' ? entry : JSON.stringify(entry)))
+          .join(' ');
+        if (parts.trim()) return parts;
+      }
+      if (candidate && typeof candidate === 'object') {
+        const nested = pickContentFromUnknown(candidate);
+        if (nested) return nested;
+      }
+    }
+    return JSON.stringify(obj);
+  }
+  return String(input);
+}
+
+function roleFromActivityType(type: string): 'in' | 'out' | 'system' {
+  if (type === 'message_in') return 'in';
+  if (type === 'message_out') return 'out';
+  return 'system';
+}
+
+function toActivityLogItem(row: {
+  id: string;
+  type: string;
+  subtype: string | null;
+  content: string;
+  created_at: string;
+  payload: unknown;
+}): SessionLogItem {
+  const fallbackContent = row.content || '';
+  const payloadContent = pickContentFromUnknown(row.payload);
+  const combined = payloadContent || fallbackContent;
+
+  return {
+    id: `activity:${row.id}`,
+    source: 'activity_stream',
+    type: row.subtype || row.type,
+    role: roleFromActivityType(row.type),
+    content: truncateText(combined),
+    timestamp: row.created_at,
+    metadata: row.payload && typeof row.payload === 'object' ? (row.payload as Record<string, unknown>) : undefined,
+  };
+}
+
+function toSessionLogItem(row: {
+  id: string;
+  content: string;
+  salience: string;
+  created_at: string | null;
+}): SessionLogItem {
+  return {
+    id: `session_log:${row.id}`,
+    source: 'session_logs',
+    type: `log:${row.salience}`,
+    role: 'system',
+    content: truncateText(row.content || ''),
+    timestamp: row.created_at || new Date(0).toISOString(),
+  };
+}
+
+async function findTranscriptFile(
+  rootDir: string,
+  targetFileName: string,
+  maxDepth: number
+): Promise<string | null> {
+  async function walk(dir: string, depth: number): Promise<string | null> {
+    if (depth > maxDepth) return null;
+    let entries: Array<{
+      name: string;
+      isFile: () => boolean;
+      isDirectory: () => boolean;
+    }>;
+    try {
+      entries = (await fs.readdir(dir, {
+        withFileTypes: true,
+        encoding: 'utf8',
+      })) as unknown as Array<{
+        name: string;
+        isFile: () => boolean;
+        isDirectory: () => boolean;
+      }>;
+    } catch {
+      return null;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isFile() && entry.name === targetFileName) return fullPath;
+    }
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const fullPath = path.join(dir, entry.name);
+      const found = await walk(fullPath, depth + 1);
+      if (found) return found;
+    }
+
+    return null;
+  }
+
+  return walk(rootDir, 0);
+}
+
+async function tryReadLocalTranscript(
+  backendSessionId: string | null,
+  backend: string | null
+): Promise<SessionLogItem[]> {
+  if (!backendSessionId) return [];
+
+  const transcriptFileName = `${backendSessionId}.jsonl`;
+  const roots = [path.join(os.homedir(), '.claude', 'projects')];
+  if (backend?.toLowerCase().includes('codex')) {
+    roots.push(path.join(os.homedir(), '.codex', 'sessions'));
+    roots.push(path.join(os.homedir(), '.codex', 'projects'));
+  }
+
+  let transcriptPath: string | null = null;
+  for (const root of roots) {
+    transcriptPath = await findTranscriptFile(root, transcriptFileName, 5);
+    if (transcriptPath) break;
+  }
+  if (!transcriptPath) return [];
+
+  let fileContent = '';
+  try {
+    fileContent = await fs.readFile(transcriptPath, 'utf8');
+  } catch {
+    return [];
+  }
+
+  const lines = fileContent
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const recent = lines.slice(-LOCAL_TRANSCRIPT_LINE_LIMIT);
+  const items: SessionLogItem[] = [];
+
+  for (let i = 0; i < recent.length; i++) {
+    const line = recent[i];
+    try {
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      const timestampCandidate =
+        parsed.timestamp ||
+        parsed.created_at ||
+        parsed.createdAt ||
+        parsed.time ||
+        parsed.ts ||
+        null;
+      const timestamp =
+        typeof timestampCandidate === 'string' && timestampCandidate
+          ? timestampCandidate
+          : new Date(0).toISOString();
+
+      const rawType =
+        (typeof parsed.type === 'string' && parsed.type) ||
+        (typeof parsed.event === 'string' && parsed.event) ||
+        'local';
+      const role: 'in' | 'out' | 'system' =
+        rawType.includes('user') || rawType.includes('input')
+          ? 'in'
+          : rawType.includes('assistant') || rawType.includes('output')
+            ? 'out'
+            : 'system';
+
+      const content = truncateText(pickContentFromUnknown(parsed));
+      if (!content) continue;
+
+      items.push({
+        id: `local:${i}`,
+        source: 'local_transcript',
+        type: rawType,
+        role,
+        content,
+        timestamp,
+        metadata: {
+          path: transcriptPath,
+        },
+      });
+    } catch {
+      // Ignore non-JSON lines.
+    }
+  }
+
+  return items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+}
+
+async function fetchCloudSessionLogs(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  sessionId: string
+): Promise<SessionLogItem[]> {
+  const [{ data: activityRows }, { data: sessionLogRows }] = await Promise.all([
+    supabase
+      .from('activity_stream')
+      .select('id, type, subtype, content, created_at, payload')
+      .eq('user_id', userId)
+      .eq('session_id', sessionId)
+      .order('created_at', { ascending: false })
+      .limit(2000),
+    supabase
+      .from('session_logs')
+      .select('id, content, salience, created_at')
+      .eq('session_id', sessionId)
+      .order('created_at', { ascending: false })
+      .limit(1000),
+  ]);
+
+  const activityItems = (activityRows || []).map(toActivityLogItem);
+  const sessionItems = (sessionLogRows || []).map(toSessionLogItem);
+
+  return [...activityItems, ...sessionItems].sort(
+    (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+  );
 }
 
 /**
@@ -2383,7 +2652,71 @@ router.get('/sessions', async (req: Request, res: Response) => {
       }
     }
 
-    // 4. Compute stats
+    // 4. Build a small preview feed per session (cloud logs first).
+    const previewsBySessionId = new Map<string, SessionPreviewItem[]>();
+    if (sessionIds.length > 0) {
+      const [{ data: activityRows }, { data: sessionLogRows }] = await Promise.all([
+        supabase
+          .from('activity_stream')
+          .select('id, session_id, type, subtype, content, created_at, payload')
+          .eq('user_id', authReq.pcpUserId)
+          .in('session_id', sessionIds)
+          .order('created_at', { ascending: false })
+          .limit(Math.min(2000, Math.max(300, sessionIds.length * 8))),
+        supabase
+          .from('session_logs')
+          .select('id, session_id, content, salience, created_at')
+          .in('session_id', sessionIds)
+          .order('created_at', { ascending: false })
+          .limit(Math.min(1000, Math.max(200, sessionIds.length * 4))),
+      ]);
+
+      const mergedBySession = new Map<string, SessionLogItem[]>();
+      for (const row of activityRows || []) {
+        if (!row.session_id) continue;
+        const list = mergedBySession.get(row.session_id) || [];
+        list.push(
+          toActivityLogItem({
+            id: row.id,
+            type: row.type,
+            subtype: row.subtype,
+            content: row.content,
+            created_at: row.created_at,
+            payload: row.payload,
+          })
+        );
+        mergedBySession.set(row.session_id, list);
+      }
+      for (const row of sessionLogRows || []) {
+        const list = mergedBySession.get(row.session_id) || [];
+        list.push(
+          toSessionLogItem({
+            id: row.id,
+            content: row.content,
+            salience: row.salience,
+            created_at: row.created_at,
+          })
+        );
+        mergedBySession.set(row.session_id, list);
+      }
+
+      for (const [sessionId, items] of mergedBySession.entries()) {
+        const preview = [...items]
+          .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+          .slice(0, ACTIVITY_PREVIEW_LIMIT_PER_SESSION)
+          .map((item) => ({
+            id: item.id,
+            source: item.source,
+            type: item.type,
+            role: item.role,
+            content: item.content,
+            timestamp: item.timestamp,
+          }));
+        previewsBySessionId.set(sessionId, preview);
+      }
+    }
+
+    // 5. Compute stats
     const stats = {
       active: sessionRows.filter(
         (s) => s.status === 'active' && !s.current_phase?.startsWith('blocked')
@@ -2414,6 +2747,7 @@ router.get('/sessions', async (req: Request, res: Response) => {
           startedAt: s.started_at,
           updatedAt: s.updated_at,
           endedAt: s.ended_at,
+          preview: previewsBySessionId.get(s.id) || [],
           workspace: workspacesBySessionId.get(s.id) || null,
           studio:
             studiosById.get(s.studio_id || s.workspace_id || '') || workspacesBySessionId.get(s.id) || null,
@@ -2423,6 +2757,79 @@ router.get('/sessions', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to list sessions:', error);
     res.status(500).json({ error: 'Failed to list sessions' });
+  }
+});
+
+/**
+ * GET /api/admin/sessions/:id/logs
+ * Get merged session logs (activity stream + session_logs + optional local transcript fallback)
+ */
+router.get('/sessions/:id/logs', async (req: Request, res: Response) => {
+  try {
+    const sessionId = req.params.id;
+    const authReq = req as AdminAuthRequest;
+    const limit = Math.min(
+      MAX_SESSION_LOG_LIMIT,
+      Math.max(1, Number.parseInt(String(req.query.limit || DEFAULT_SESSION_LOG_LIMIT), 10) || DEFAULT_SESSION_LOG_LIMIT)
+    );
+    const offset = Math.max(0, Number.parseInt(String(req.query.offset || 0), 10) || 0);
+    const includeLocal = req.query.includeLocal !== 'false';
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { data: session, error: sessionError } = await supabase
+      .from('sessions')
+      .select('id, agent_id, status, current_phase, started_at, updated_at, ended_at, backend, backend_session_id, claude_session_id')
+      .eq('id', sessionId)
+      .eq('user_id', authReq.pcpUserId)
+      .single();
+
+    if (sessionError || !session) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const [cloudLogs, localLogs] = await Promise.all([
+      fetchCloudSessionLogs(supabase, authReq.pcpUserId, sessionId),
+      includeLocal
+        ? tryReadLocalTranscript(session.backend_session_id || session.claude_session_id, session.backend)
+        : Promise.resolve([]),
+    ]);
+
+    const merged = [...cloudLogs, ...localLogs].sort(
+      (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+    );
+    const page = merged.slice(offset, offset + limit);
+
+    res.json({
+      session: {
+        id: session.id,
+        agentId: session.agent_id,
+        status: session.status,
+        currentPhase: session.current_phase,
+        backend: session.backend,
+        backendSessionId: session.backend_session_id || session.claude_session_id || null,
+        startedAt: session.started_at,
+        updatedAt: session.updated_at,
+        endedAt: session.ended_at,
+      },
+      logs: page,
+      pagination: {
+        total: merged.length,
+        limit,
+        offset,
+        hasMore: offset + page.length < merged.length,
+      },
+      sources: {
+        cloud: cloudLogs.length,
+        local: localLogs.length,
+      },
+    });
+  } catch (error) {
+    logger.error('Failed to get session logs:', error);
+    res.status(500).json({ error: 'Failed to get session logs' });
   }
 });
 
