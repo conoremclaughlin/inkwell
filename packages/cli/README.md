@@ -189,6 +189,7 @@ Any flag not listed above is forwarded to the backend.
 ```bash
 sb init                         # Set up PCP in current repo
 sb doctor                       # Check linked studio CLI binary health
+sb doctor --fix                 # Prompt to relink current studio binary
 sb chat                         # First-class PCP REPL (experimental)
 sb chat -b codex                # REPL using Codex backend
 sb hooks install --all          # Install hooks across all worktrees

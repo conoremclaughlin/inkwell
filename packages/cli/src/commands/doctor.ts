@@ -1,5 +1,8 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
+import { execSync } from 'child_process';
+import { createInterface } from 'readline/promises';
+import { stdin as input, stdout as output } from 'process';
 import {
   existsSync,
   lstatSync,
@@ -194,7 +197,11 @@ function iconForStatus(status: CheckStatus): string {
   return chalk.red('✗');
 }
 
-async function doctorCommand(options: { name?: string; json?: boolean }): Promise<void> {
+function buildFixCommand(binaryName: string): string {
+  return `sb studio cli --name ${binaryName}`;
+}
+
+async function doctorCommand(options: { name?: string; json?: boolean; fix?: boolean }): Promise<void> {
   const result = analyzeCliLink({ name: options.name });
 
   if (options.json) {
@@ -224,6 +231,48 @@ async function doctorCommand(options: { name?: string; json?: boolean }): Promis
   console.log('');
 
   const hasFailure = result.checks.some((check) => check.status === 'fail');
+  const hasStudioMismatch = result.checks.some(
+    (check) => check.name === 'Studio target match' && check.status === 'warn'
+  );
+  const needsFix = hasFailure || hasStudioMismatch;
+
+  if (needsFix) {
+    const fixCmd = buildFixCommand(result.binaryName);
+    console.log(chalk.bold('Suggested fix'));
+    console.log(
+      chalk.dim(
+        `  From the studio you want this alias to point to, run:\n` +
+          `  ${fixCmd}\n` +
+          `  (If needed first: cd /path/to/your-studio)`
+      )
+    );
+
+    if (options.fix) {
+      const rl = createInterface({ input, output });
+      try {
+        const answer = (
+          await rl.question(chalk.yellow(`\nRun that fix now from current directory? [y/N]: `))
+        )
+          .trim()
+          .toLowerCase();
+        if (answer === 'y' || answer === 'yes') {
+          execSync(fixCmd, { stdio: 'inherit' });
+          console.log(chalk.green('\nApplied fix command.'));
+        } else {
+          console.log(chalk.dim('Skipped fix command.'));
+        }
+      } catch (error) {
+        console.error(chalk.red(`Failed to apply fix: ${String(error)}`));
+        process.exit(1);
+      } finally {
+        rl.close();
+      }
+    } else {
+      console.log(chalk.dim('\nTip: run sb doctor --fix to confirm and apply from this directory.'));
+    }
+    console.log('');
+  }
+
   if (hasFailure) {
     process.exit(1);
   }
@@ -235,5 +284,6 @@ export function registerDoctorCommand(program: Command): void {
     .description('Inspect studio-linked SB CLI binary and target health')
     .option('-n, --name <name>', 'Binary name (default: sb-<agent>)')
     .option('--json', 'Output machine-readable JSON')
+    .option('--fix', 'Prompt to run studio link fix command from current directory')
     .action(doctorCommand);
 }
