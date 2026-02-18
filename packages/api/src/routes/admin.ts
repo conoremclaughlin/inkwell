@@ -1836,7 +1836,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       relatedSessionId: m.related_session_id,
       relatedArtifactUri: m.related_artifact_uri,
       metadata: m.metadata as Record<string, unknown> | null,
-      createdAt: m.created_at,
+      createdAt: m.created_at ?? new Date().toISOString(),
       readAt: m.read_at,
       acknowledgedAt: m.acknowledged_at,
       expiresAt: m.expires_at,
