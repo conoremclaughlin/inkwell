@@ -17,6 +17,34 @@ const apiClient = axios.create({
   },
 });
 
+let invalidTokenRecoveryInFlight = false;
+
+function isInvalidTokenAuthFailure(error: AxiosError<{ error?: string }>): boolean {
+  const status = error.response?.status;
+  const serverMessage = error.response?.data?.error?.trim().toLowerCase();
+  const requestUrl = error.config?.url || '';
+
+  return (
+    status === 401 &&
+    serverMessage === 'invalid token' &&
+    requestUrl.startsWith('/api/admin/') &&
+    !requestUrl.startsWith('/api/admin/auth/logout')
+  );
+}
+
+async function handleInvalidTokenLogout(): Promise<void> {
+  if (invalidTokenRecoveryInFlight || typeof window === 'undefined') return;
+  invalidTokenRecoveryInFlight = true;
+
+  try {
+    await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
+  } catch {
+    // Best-effort cleanup only.
+  } finally {
+    window.location.assign('/login?reason=session-expired');
+  }
+}
+
 // Request interceptor - inject workspace scope header when selected.
 apiClient.interceptors.request.use(async (config) => {
   const workspaceId = getSelectedWorkspaceId();
@@ -30,6 +58,10 @@ apiClient.interceptors.request.use(async (config) => {
 apiClient.interceptors.response.use(
   (response: AxiosResponse) => response,
   (error: AxiosError<{ error?: string }>) => {
+    if (isInvalidTokenAuthFailure(error)) {
+      void handleInvalidTokenLogout();
+    }
+
     const apiError = new Error(
       error.response?.data?.error || error.message || 'Request failed'
     ) as ApiError;
