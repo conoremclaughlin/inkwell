@@ -1,5 +1,5 @@
 /**
- * Workspace Commands
+ * Workspace Container Commands
  *
  * Manage product-level workspaces (personal/team scope).
  * These are distinct from local git worktree studios (`sb studio ...`).

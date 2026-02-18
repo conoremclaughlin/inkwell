@@ -1,16 +1,16 @@
 /**
- * Workspace Commands
+ * Studio Commands
  *
  * Manage git worktrees for parallel development with PCP identity.
  *
  * Commands:
  *   studio init [name]     Initialize parent directory structure
- *   studio create <name>   Create a new workspace/studio
- *   studio list            List all workspaces/studios
- *   studio remove <name>   Remove a workspace/studio (keeps branch)
- *   studio clean <name>    Remove workspace/studio and delete branch
- *   studio status          Show status of all workspaces/studios
- *   studio path <name>     Output workspace/studio path (for cd)
+ *   studio create <name>   Create a new studio
+ *   studio list            List all studios
+ *   studio remove <name>   Remove a studio (keeps branch)
+ *   studio clean <name>    Remove studio and delete branch
+ *   studio status          Show status of all studios
+ *   studio path <name>     Output studio path (for cd)
  *   studio cd <name>       Print cd command (use with: eval $(sb studio cd foo))
  */
 
@@ -32,7 +32,7 @@ import { homedir } from 'os';
 import { installHooks } from './hooks.js';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
 
-interface WorkspaceIdentity {
+interface StudioIdentity {
   agentId: string;
   identityId?: string;
   context: string;
@@ -45,11 +45,11 @@ interface WorkspaceIdentity {
   createdBy?: string;
 }
 
-interface WorkspaceInfo {
+interface StudioInfo {
   name: string;
   path: string;
   branch: string;
-  identity?: WorkspaceIdentity;
+  identity?: StudioIdentity;
 }
 
 // ============================================================================
@@ -66,17 +66,17 @@ function findGitRoot(): string {
   }
 }
 
-function getWorkspaceParent(gitRoot: string): string {
+function getStudioParent(gitRoot: string): string {
   return dirname(gitRoot);
 }
 
-function getWorkspacePrefix(gitRoot: string): string {
+function getStudioPrefix(gitRoot: string): string {
   // Use the repo folder name as prefix (e.g., "personal-context-protocol" -> "personal-context-protocol--")
   return `${basename(gitRoot)}--`;
 }
 
-function getWorkspacePath(gitRoot: string, name: string): string {
-  return join(getWorkspaceParent(gitRoot), `${getWorkspacePrefix(gitRoot)}${name}`);
+function getStudioPath(gitRoot: string, name: string): string {
+  return join(getStudioParent(gitRoot), `${getStudioPrefix(gitRoot)}${name}`);
 }
 
 function git(args: string, cwd?: string): string {
@@ -118,9 +118,9 @@ function getCurrentUser(): string | undefined {
   }
 }
 
-function listWorkspaces(gitRoot: string): WorkspaceInfo[] {
-  const parentDir = getWorkspaceParent(gitRoot);
-  const workspaces: WorkspaceInfo[] = [];
+function listStudios(gitRoot: string): StudioInfo[] {
+  const parentDir = getStudioParent(gitRoot);
+  const studios: StudioInfo[] = [];
 
   const worktreeOutput = git('worktree list --porcelain', gitRoot);
   const worktrees = new Map<string, string>();
@@ -134,7 +134,7 @@ function listWorkspaces(gitRoot: string): WorkspaceInfo[] {
     }
   }
 
-  const prefix = getWorkspacePrefix(gitRoot);
+  const prefix = getStudioPrefix(gitRoot);
   if (existsSync(parentDir)) {
     for (const entry of readdirSync(parentDir)) {
       if (entry.startsWith(prefix)) {
@@ -142,7 +142,7 @@ function listWorkspaces(gitRoot: string): WorkspaceInfo[] {
         const name = entry.slice(prefix.length);
         const branch = worktrees.get(wsPath) || 'unknown';
 
-        let identity: WorkspaceIdentity | undefined;
+        let identity: StudioIdentity | undefined;
         const identityPath = join(wsPath, '.pcp', 'identity.json');
         if (existsSync(identityPath)) {
           try {
@@ -152,12 +152,12 @@ function listWorkspaces(gitRoot: string): WorkspaceInfo[] {
           }
         }
 
-        workspaces.push({ name, path: wsPath, branch, identity });
+        studios.push({ name, path: wsPath, branch, identity });
       }
     }
   }
 
-  return workspaces;
+  return studios;
 }
 
 /**
@@ -190,20 +190,20 @@ interface InteractiveResult {
 }
 
 /**
- * Run the full interactive workspace creation flow when name is omitted and stdin is a TTY.
+ * Run the full interactive studio creation flow when name is omitted and stdin is a TTY.
  * Returns the resolved name, branch, and config dirs to copy.
  */
 async function runInteractiveFlow(agentId: string, gitRoot: string): Promise<InteractiveResult> {
   const { input, checkbox } = await import('@inquirer/prompts');
 
-  // Step 1: Workspace name
+  // Step 1: Studio name
   const name = await input({
-    message: 'Workspace name',
+    message: 'Studio name',
     default: 'new',
   });
 
   // Step 2: Branch name (derived, editable)
-  const defaultBranch = `${agentId}/workspace/${name}`;
+  const defaultBranch = `${agentId}/studio/${name}`;
   const branch = await input({
     message: 'Branch name',
     default: defaultBranch,
@@ -230,7 +230,7 @@ async function runInteractiveFlow(agentId: string, gitRoot: string): Promise<Int
 }
 
 /**
- * Copy config directories from git root into the new workspace.
+ * Copy config directories from git root into the new studio.
  *
  * - .claude/ is always copied as-is (hand-authored permissions)
  * - .codex/, .gemini/ — if .mcp.json exists in the target, regenerate via syncMcpConfig instead
@@ -268,7 +268,7 @@ interface InitResult {
  * Plan the init migration: figure out what needs to move where.
  */
 function planInit(gitRoot: string, parentName: string): InitResult {
-  const grandparent = getWorkspaceParent(gitRoot);
+  const grandparent = getStudioParent(gitRoot);
   const repoName = basename(gitRoot);
   const parentDir = join(grandparent, parentName);
 
@@ -278,7 +278,7 @@ function planInit(gitRoot: string, parentName: string): InitResult {
   moves.push({ from: gitRoot, to: join(parentDir, repoName) });
 
   // Find existing worktrees that are siblings of the main repo
-  const prefix = getWorkspacePrefix(gitRoot);
+  const prefix = getStudioPrefix(gitRoot);
   const worktreePaths = getWorktreePaths(gitRoot);
 
   for (const wtPath of worktreePaths) {
@@ -292,7 +292,7 @@ function planInit(gitRoot: string, parentName: string): InitResult {
   return { parentDir, moves };
 }
 
-async function initWorkspace(
+async function initStudio(
   parentName: string | undefined,
   options: { dryRun?: boolean }
 ): Promise<void> {
@@ -390,7 +390,7 @@ async function initWorkspace(
   }
 }
 
-async function createWorkspace(
+async function createStudio(
   name: string,
   options: {
     agent?: string;
@@ -403,16 +403,16 @@ async function createWorkspace(
   overrides?: { branch?: string; configDirsList?: string[] }
 ): Promise<void> {
   const agentId = options.agent || 'wren';
-  const spinner = ora(`Creating workspace: ${name}`).start();
+  const spinner = ora(`Creating studio: ${name}`).start();
 
   try {
     const gitRoot = findGitRoot();
-    const wsPath = getWorkspacePath(gitRoot, name);
+    const wsPath = getStudioPath(gitRoot, name);
     // Priority: overrides (from interactive) > options (from flags) > default
-    const branch = overrides?.branch || options.branch || `${agentId}/workspace/${name}`;
+    const branch = overrides?.branch || options.branch || `${agentId}/studio/${name}`;
 
     if (existsSync(wsPath)) {
-      spinner.fail(`Workspace already exists at ${wsPath}`);
+      spinner.fail(`Studio already exists at ${wsPath}`);
       process.exit(1);
     }
 
@@ -433,7 +433,7 @@ async function createWorkspace(
       copyConfigDirs(gitRoot, wsPath, configDirsList);
     }
 
-    // Regenerate .codex/.gemini via syncMcpConfig if .mcp.json exists in the new workspace
+    // Regenerate .codex/.gemini via syncMcpConfig if .mcp.json exists in the new studio
     if (existsSync(join(wsPath, '.mcp.json'))) {
       spinner.text = 'Syncing MCP config for backends...';
       try {
@@ -459,7 +459,7 @@ async function createWorkspace(
     }
 
     // Always write fresh identity.json (never copy from source)
-    const identity: WorkspaceIdentity = {
+    const identity: StudioIdentity = {
       agentId,
       ...(identityId ? { identityId } : {}),
       context: `studio-${name}`,
@@ -502,24 +502,24 @@ async function createWorkspace(
     console.log(chalk.cyan('Or use:'));
     console.log(chalk.dim(`  eval $(sb studio cd ${name})`));
   } catch (error) {
-    spinner.fail(`Failed to create workspace: ${error}`);
+    spinner.fail(`Failed to create studio: ${error}`);
     process.exit(1);
   }
 }
 
 function listCommand(): void {
   const gitRoot = findGitRoot();
-  const workspaces = listWorkspaces(gitRoot);
+  const studios = listStudios(gitRoot);
 
-  if (workspaces.length === 0) {
-    console.log(chalk.yellow('No workspaces found.'));
+  if (studios.length === 0) {
+    console.log(chalk.yellow('No studios found.'));
     console.log(chalk.dim('Create one with: sb studio create <name>'));
     return;
   }
 
   console.log(chalk.bold('\nPCP Studios:\n'));
 
-  for (const ws of workspaces) {
+  for (const ws of studios) {
     console.log(chalk.cyan(`  ${ws.name}`));
     console.log(chalk.dim(`    Folder: ${basename(ws.path)}`));
     console.log(chalk.dim(`    Path:   ${ws.path}`));
@@ -534,12 +534,12 @@ function listCommand(): void {
   }
 }
 
-async function removeWorkspace(name: string): Promise<void> {
+async function removeStudio(name: string): Promise<void> {
   const spinner = ora(`Removing studio: ${name}`).start();
 
   try {
     const gitRoot = findGitRoot();
-    const wsPath = getWorkspacePath(gitRoot, name);
+    const wsPath = getStudioPath(gitRoot, name);
 
     if (!existsSync(wsPath)) {
       spinner.fail(`Studio not found: ${name}`);
@@ -550,17 +550,17 @@ async function removeWorkspace(name: string): Promise<void> {
     spinner.succeed(`Studio removed: ${name}`);
     console.log(chalk.dim('  Branch kept for PR. Use "sb studio clean" to also delete branch.'));
   } catch (error) {
-    spinner.fail(`Failed to remove workspace: ${error}`);
+    spinner.fail(`Failed to remove studio: ${error}`);
     process.exit(1);
   }
 }
 
-async function cleanWorkspace(name: string): Promise<void> {
+async function cleanStudio(name: string): Promise<void> {
   const spinner = ora(`Cleaning studio: ${name}`).start();
 
   try {
     const gitRoot = findGitRoot();
-    const wsPath = getWorkspacePath(gitRoot, name);
+    const wsPath = getStudioPath(gitRoot, name);
 
     // Read branch from identity.json if available, fall back to git worktree list
     let branch: string | undefined;
@@ -599,14 +599,14 @@ async function cleanWorkspace(name: string): Promise<void> {
 
     spinner.succeed(`Cleaned studio: ${name}`);
   } catch (error) {
-    spinner.fail(`Failed to clean workspace: ${error}`);
+    spinner.fail(`Failed to clean studio: ${error}`);
     process.exit(1);
   }
 }
 
 function statusCommand(): void {
   const gitRoot = findGitRoot();
-  const workspaces = listWorkspaces(gitRoot);
+  const studios = listStudios(gitRoot);
 
   console.log(chalk.bold('\nStudio Status:\n'));
 
@@ -625,10 +625,10 @@ function statusCommand(): void {
   }
   console.log('');
 
-  for (const ws of workspaces) {
-    console.log(chalk.cyan(`  ${ws.name} (${ws.branch})`));
+  for (const studio of studios) {
+    console.log(chalk.cyan(`  ${studio.name} (${studio.branch})`));
     try {
-      const status = git('status --short', ws.path);
+      const status = git('status --short', studio.path);
       if (status) {
         for (const line of status.split('\n')) {
           console.log(chalk.dim(`    ${line}`));
@@ -645,7 +645,7 @@ function statusCommand(): void {
 
 function pathCommand(name: string): void {
   const gitRoot = findGitRoot();
-  const wsPath = getWorkspacePath(gitRoot, name);
+  const wsPath = getStudioPath(gitRoot, name);
 
   if (!existsSync(wsPath)) {
     console.error(`Studio not found: ${name}`);
@@ -657,7 +657,7 @@ function pathCommand(name: string): void {
 
 function cdCommand(name: string): void {
   const gitRoot = findGitRoot();
-  const wsPath = getWorkspacePath(gitRoot, name);
+  const wsPath = getStudioPath(gitRoot, name);
 
   if (!existsSync(wsPath)) {
     console.error(`Studio not found: ${name}`);
@@ -786,9 +786,9 @@ async function cliLinkCommand(options: { name?: string; unlink?: boolean }): Pro
 // Exported for testing
 export {
   findGitRoot,
-  getWorkspaceParent,
-  getWorkspacePrefix,
-  getWorkspacePath,
+  getStudioParent,
+  getStudioPrefix,
+  getStudioPath,
   getWorktreePaths,
   planInit,
   git,
@@ -804,15 +804,15 @@ export function registerStudioCommands(program: Command): void {
   ws.command('init [parent-name]')
     .description('Initialize parent directory structure (groups repo + worktrees)')
     .option('-n, --dry-run', 'Show planned moves without making changes')
-    .action(initWorkspace);
+    .action(initStudio);
 
   ws.command('create [name]')
-    .description('Create a new workspace with git worktree')
-    .option('-a, --agent <agent>', 'Agent ID for this workspace', 'wren')
-    .option('-p, --purpose <desc>', 'Description/purpose of the workspace')
-    .option('-b, --branch <branch>', 'Custom branch name (default: <agentId>/workspace/<name>)')
-    .option('--backend <name>', 'Primary backend (claude-code, codex, gemini)')
-    .option('--copy-config', 'Copy config directories into the new workspace')
+    .description('Create a new studio with git worktree')
+    .option('-a, --agent <agent>', 'Agent ID for this studio', 'wren')
+    .option('-p, --purpose <desc>', 'Description/purpose of the studio')
+    .option('-br, --branch <branch>', 'Custom branch name (default: <agentId>/studio/<name>)')
+    .option('-b, --backend <name>', 'Primary backend (claude-code, codex, gemini)')
+    .option('--copy-config', 'Copy config directories into the new studio')
     .option(
       '--config-dirs <dirs>',
       'Comma-separated config dirs to copy (default: .claude)',
@@ -825,7 +825,7 @@ export function registerStudioCommands(program: Command): void {
           const gitRoot = findGitRoot();
           const agentId = options.agent || 'wren';
           const result = await runInteractiveFlow(agentId, gitRoot);
-          return createWorkspace(result.name, options, {
+          return createStudio(result.name, options, {
             branch: result.branch,
             configDirsList: result.configDirs,
           });
@@ -834,26 +834,26 @@ export function registerStudioCommands(program: Command): void {
         }
       }
       const resolvedName = name || 'new';
-      return createWorkspace(resolvedName, options);
+      return createStudio(resolvedName, options);
     });
 
-  ws.command('list').alias('ls').description('List all workspaces').action(listCommand);
+  ws.command('list').alias('ls').description('List all studios').action(listCommand);
 
   ws.command('remove <name>')
     .alias('rm')
-    .description('Remove a workspace (keeps branch for PR)')
-    .action(removeWorkspace);
+    .description('Remove a studio (keeps branch for PR)')
+    .action(removeStudio);
 
   ws.command('clean <name>')
-    .description('Remove workspace and delete branch')
-    .action(cleanWorkspace);
+    .description('Remove studio and delete branch')
+    .action(cleanStudio);
 
   ws.command('status')
     .alias('st')
-    .description('Show git status of all workspaces')
+    .description('Show git status of all studios')
     .action(statusCommand);
 
-  ws.command('path <name>').description('Output workspace path').action(pathCommand);
+  ws.command('path <name>').description('Output studio path').action(pathCommand);
 
   ws.command('cd <name>')
     .description('Output cd command (use with: eval $(sb studio cd <name>))')

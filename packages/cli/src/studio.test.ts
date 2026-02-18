@@ -1,8 +1,8 @@
 /**
- * Workspace Management Tests
+ * Studio Management Tests
  *
- * Tests for the PCP Workspaces CLI functionality.
- * These tests verify workspace creation, listing, and cleanup.
+ * Tests for the PCP Studios CLI functionality.
+ * These tests verify studio creation, listing, and cleanup.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -12,7 +12,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 
 // Test utilities
-const TEST_DIR = join(tmpdir(), 'pcp-workspace-tests');
+const TEST_DIR = join(tmpdir(), 'pcp-studio-tests');
 const TEST_REPO = join(TEST_DIR, 'test-repo');
 
 /**
@@ -71,30 +71,30 @@ function cleanupTestRepo(): void {
   }
 }
 
-describe('Workspace Identity', () => {
+describe('Studio Identity', () => {
   it('should create valid identity JSON structure', () => {
     const identity = {
       agentId: 'wren',
-      context: 'workspace-test-feature',
-      description: 'Workspace: test-feature',
-      workspace: 'test-feature',
-      branch: 'workspace/test-feature',
+      context: 'studio-test-feature',
+      description: 'Studio: test-feature',
+      studio: 'test-feature',
+      branch: 'wren/studio/test-feature',
       createdAt: new Date().toISOString(),
       createdBy: 'test@test.com',
     };
 
     expect(identity.agentId).toBe('wren');
-    expect(identity.context).toContain('workspace-');
-    expect(identity.branch).toMatch(/^workspace\//);
+    expect(identity.context).toContain('studio-');
+    expect(identity.branch).toMatch(/^wren\/studio\//);
     expect(identity.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
-  it('should allow different agent IDs for different workspaces', () => {
-    const wrenWorkspace = { agentId: 'wren', workspace: 'frontend' };
-    const bensonWorkspace = { agentId: 'benson', workspace: 'backend' };
+  it('should allow different agent IDs for different studios', () => {
+    const wrenStudio = { agentId: 'wren', studio: 'frontend' };
+    const bensonStudio = { agentId: 'benson', studio: 'backend' };
 
-    expect(wrenWorkspace.agentId).not.toBe(bensonWorkspace.agentId);
-    expect(wrenWorkspace.workspace).not.toBe(bensonWorkspace.workspace);
+    expect(wrenStudio.agentId).not.toBe(bensonStudio.agentId);
+    expect(wrenStudio.studio).not.toBe(bensonStudio.studio);
   });
 });
 
@@ -108,8 +108,8 @@ describe('Git Worktree Operations', () => {
   });
 
   it('should create a worktree with a new branch', () => {
-    const worktreePath = join(TEST_DIR, 'pcp-ws-feature1');
-    const branchName = 'workspace/feature1';
+    const worktreePath = join(TEST_DIR, 'test-repo--feature1');
+    const branchName = 'wren/studio/feature1';
 
     // Create worktree
     execSync(`git worktree add -b "${branchName}" "${worktreePath}"`, {
@@ -122,7 +122,7 @@ describe('Git Worktree Operations', () => {
 
     // Verify branch was created
     const branches = execSync('git branch', { cwd: TEST_REPO, encoding: 'utf-8' });
-    expect(branches).toContain('workspace/feature1');
+    expect(branches).toContain('wren/studio/feature1');
 
     // Verify worktree is on correct branch
     const currentBranch = execSync('git branch --show-current', {
@@ -133,10 +133,10 @@ describe('Git Worktree Operations', () => {
   });
 
   it('should list all worktrees', () => {
-    const worktreePath = join(TEST_DIR, 'pcp-ws-feature2');
+    const worktreePath = join(TEST_DIR, 'test-repo--feature2');
 
     // Create worktree
-    execSync(`git worktree add -b "workspace/feature2" "${worktreePath}"`, {
+    execSync(`git worktree add -b "wren/studio/feature2" "${worktreePath}"`, {
       cwd: TEST_REPO,
       stdio: 'pipe',
     });
@@ -152,8 +152,8 @@ describe('Git Worktree Operations', () => {
   });
 
   it('should remove a worktree while keeping the branch', () => {
-    const worktreePath = join(TEST_DIR, 'pcp-ws-feature3');
-    const branchName = 'workspace/feature3';
+    const worktreePath = join(TEST_DIR, 'test-repo--feature3');
+    const branchName = 'wren/studio/feature3';
 
     // Create worktree
     execSync(`git worktree add -b "${branchName}" "${worktreePath}"`, {
@@ -176,8 +176,8 @@ describe('Git Worktree Operations', () => {
   });
 
   it('should clean up worktree and delete branch', () => {
-    const worktreePath = join(TEST_DIR, 'pcp-ws-feature4');
-    const branchName = 'workspace/feature4';
+    const worktreePath = join(TEST_DIR, 'test-repo--feature4');
+    const branchName = 'wren/studio/feature4';
 
     // Create worktree
     execSync(`git worktree add -b "${branchName}" "${worktreePath}"`, {
@@ -202,7 +202,7 @@ describe('Git Worktree Operations', () => {
   });
 });
 
-describe('Workspace PCP Identity Integration', () => {
+describe('Studio PCP Identity Integration', () => {
   beforeEach(() => {
     initTestRepo();
   });
@@ -212,10 +212,10 @@ describe('Workspace PCP Identity Integration', () => {
   });
 
   it('should create .pcp/identity.json in worktree', () => {
-    const worktreePath = join(TEST_DIR, 'pcp-ws-feature5');
+    const worktreePath = join(TEST_DIR, 'test-repo--feature5');
 
     // Create worktree
-    execSync(`git worktree add -b "workspace/feature5" "${worktreePath}"`, {
+    execSync(`git worktree add -b "wren/studio/feature5" "${worktreePath}"`, {
       cwd: TEST_REPO,
       stdio: 'pipe',
     });
@@ -226,10 +226,10 @@ describe('Workspace PCP Identity Integration', () => {
 
     const identity = {
       agentId: 'wren',
-      context: 'workspace-feature5',
-      description: 'Workspace: feature5',
-      workspace: 'feature5',
-      branch: 'workspace/feature5',
+      context: 'studio-feature5',
+      description: 'Studio: feature5',
+      studio: 'feature5',
+      branch: 'wren/studio/feature5',
       createdAt: new Date().toISOString(),
     };
 
@@ -241,19 +241,19 @@ describe('Workspace PCP Identity Integration', () => {
 
     const savedIdentity = JSON.parse(readFileSync(identityPath, 'utf-8'));
     expect(savedIdentity.agentId).toBe('wren');
-    expect(savedIdentity.workspace).toBe('feature5');
+    expect(savedIdentity.studio).toBe('feature5');
   });
 
-  it('should allow multiple workspaces with different contexts', () => {
-    const ws1Path = join(TEST_DIR, 'pcp-ws-frontend');
-    const ws2Path = join(TEST_DIR, 'pcp-ws-backend');
+  it('should allow multiple studios with different contexts', () => {
+    const ws1Path = join(TEST_DIR, 'test-repo--frontend');
+    const ws2Path = join(TEST_DIR, 'test-repo--backend');
 
     // Create two worktrees
-    execSync(`git worktree add -b "workspace/frontend" "${ws1Path}"`, {
+    execSync(`git worktree add -b "wren/studio/frontend" "${ws1Path}"`, {
       cwd: TEST_REPO,
       stdio: 'pipe',
     });
-    execSync(`git worktree add -b "workspace/backend" "${ws2Path}"`, {
+    execSync(`git worktree add -b "wren/studio/backend" "${ws2Path}"`, {
       cwd: TEST_REPO,
       stdio: 'pipe',
     });
@@ -264,43 +264,43 @@ describe('Workspace PCP Identity Integration', () => {
 
     writeFileSync(
       join(ws1Path, '.pcp', 'identity.json'),
-      JSON.stringify({ agentId: 'wren', context: 'workspace-frontend' }, null, 2)
+      JSON.stringify({ agentId: 'wren', context: 'studio-frontend' }, null, 2)
     );
     writeFileSync(
       join(ws2Path, '.pcp', 'identity.json'),
-      JSON.stringify({ agentId: 'wren', context: 'workspace-backend' }, null, 2)
+      JSON.stringify({ agentId: 'wren', context: 'studio-backend' }, null, 2)
     );
 
     // Verify both exist with different contexts
     const id1 = JSON.parse(readFileSync(join(ws1Path, '.pcp', 'identity.json'), 'utf-8'));
     const id2 = JSON.parse(readFileSync(join(ws2Path, '.pcp', 'identity.json'), 'utf-8'));
 
-    expect(id1.context).toBe('workspace-frontend');
-    expect(id2.context).toBe('workspace-backend');
+    expect(id1.context).toBe('studio-frontend');
+    expect(id2.context).toBe('studio-backend');
     expect(id1.agentId).toBe(id2.agentId); // Same agent, different contexts
   });
 });
 
-describe('Workspace Naming Conventions', () => {
-  it('should use pcp-ws- prefix for workspace directories', () => {
-    const workspaceName = 'my-feature';
-    const expectedDir = `pcp-ws-${workspaceName}`;
+describe('Studio Naming Conventions', () => {
+  it('should use repo-name-- prefix for studio directories', () => {
+    const studioName = 'my-feature';
+    const expectedDir = `test-repo--${studioName}`;
 
-    expect(expectedDir).toBe('pcp-ws-my-feature');
+    expect(expectedDir).toBe('test-repo--my-feature');
   });
 
-  it('should use workspace/ prefix for branch names', () => {
-    const workspaceName = 'auth-refactor';
-    const expectedBranch = `workspace/${workspaceName}`;
+  it('should use agentId/studio/ prefix for branch names', () => {
+    const studioName = 'auth-refactor';
+    const expectedBranch = `wren/studio/${studioName}`;
 
-    expect(expectedBranch).toBe('workspace/auth-refactor');
+    expect(expectedBranch).toBe('wren/studio/auth-refactor');
   });
 
   it('should generate valid context names', () => {
-    const workspaceName = 'api-optimization';
-    const expectedContext = `workspace-${workspaceName}`;
+    const studioName = 'api-optimization';
+    const expectedContext = `studio-${studioName}`;
 
-    expect(expectedContext).toBe('workspace-api-optimization');
+    expect(expectedContext).toBe('studio-api-optimization');
     expect(expectedContext).not.toContain(' ');
     expect(expectedContext).not.toContain('/');
   });

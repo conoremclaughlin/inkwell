@@ -195,7 +195,8 @@ Backwards compatibility aliases still work:
 Options for `create`:
 - `-a, --agent <agent>` — Agent ID for this studio (default: wren)
 - `-p, --purpose <desc>` — Description
-- `-b, --branch <branch>` — Custom branch (default: `<agent>/workspace/<name>`)
+- `-b, --backend <name>` — Primary backend (claude-code, codex, gemini)
+- `-br, --branch <branch>` — Custom branch (default: `<agent>/studio/<name>`)
 
 ### Agents (`sb agent`)
 

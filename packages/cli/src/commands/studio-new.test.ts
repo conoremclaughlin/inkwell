@@ -1,8 +1,8 @@
 /**
- * Workspace New Feature Tests
+ * Studio Feature Tests
  *
- * Tests for workspace branch naming convention, config copying,
- * and cleanWorkspace identity.json-based branch resolution.
+ * Tests for studio branch naming convention, config copying,
+ * and cleanStudio identity.json-based branch resolution.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -39,7 +39,7 @@ function initRepo(): string {
   return git('rev-parse --show-toplevel', TEST_REPO);
 }
 
-describe('Branch naming convention: agentId/workspace/name', () => {
+describe('Branch naming convention: agentId/studio/name', () => {
   let realRepo: string;
 
   beforeEach(() => {
@@ -54,10 +54,10 @@ describe('Branch naming convention: agentId/workspace/name', () => {
     }
   });
 
-  it('should use agentId/workspace/name as default branch pattern', () => {
+  it('should use agentId/studio/name as default branch pattern', () => {
     const agentId = 'wren';
     const name = 'feature-auth';
-    const expectedBranch = `${agentId}/workspace/${name}`;
+    const expectedBranch = `${agentId}/studio/${name}`;
 
     const wsPath = join(realDir(realRepo), `test-repo--${name}`);
     git(`worktree add -b "${expectedBranch}" "${wsPath}"`, realRepo);
@@ -69,22 +69,22 @@ describe('Branch naming convention: agentId/workspace/name', () => {
     expect(currentBranch).toBe(expectedBranch);
   });
 
-  it('should support different agents with the same workspace name', () => {
+  it('should support different agents with the same studio name', () => {
     const wsPath1 = join(realDir(realRepo), `test-repo--ws1`);
     const wsPath2 = join(realDir(realRepo), `test-repo--ws2`);
 
-    git(`worktree add -b "wren/workspace/shared" "${wsPath1}"`, realRepo);
-    git(`worktree add -b "myra/workspace/shared" "${wsPath2}"`, realRepo);
+    git(`worktree add -b "wren/studio/shared" "${wsPath1}"`, realRepo);
+    git(`worktree add -b "myra/studio/shared" "${wsPath2}"`, realRepo);
 
     const branches = git('branch', realRepo);
-    expect(branches).toContain('wren/workspace/shared');
-    expect(branches).toContain('myra/workspace/shared');
+    expect(branches).toContain('wren/studio/shared');
+    expect(branches).toContain('myra/studio/shared');
   });
 
   it('should produce correct identity.json with new branch format', () => {
     const agentId = 'benson';
     const name = 'api-v2';
-    const branch = `${agentId}/workspace/${name}`;
+    const branch = `${agentId}/studio/${name}`;
     const wsPath = join(realDir(realRepo), `test-repo--${name}`);
 
     git(`worktree add -b "${branch}" "${wsPath}"`, realRepo);
@@ -94,9 +94,9 @@ describe('Branch naming convention: agentId/workspace/name', () => {
 
     const identity = {
       agentId,
-      context: `workspace-${name}`,
-      description: `Workspace: ${name}`,
-      workspace: name,
+      context: `studio-${name}`,
+      description: `Studio: ${name}`,
+      studio: name,
       branch,
       createdAt: new Date().toISOString(),
       createdBy: 'test@test.com',
@@ -104,13 +104,40 @@ describe('Branch naming convention: agentId/workspace/name', () => {
     writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
 
     const saved = JSON.parse(readFileSync(join(pcpDir, 'identity.json'), 'utf-8'));
-    expect(saved.branch).toBe('benson/workspace/api-v2');
+    expect(saved.branch).toBe('benson/studio/api-v2');
     expect(saved.agentId).toBe('benson');
-    expect(saved.workspace).toBe('api-v2');
+    expect(saved.studio).toBe('api-v2');
+  });
+
+  it('should still read legacy identity.json with workspace field', () => {
+    const agentId = 'wren';
+    const name = 'legacy-ws';
+    const branch = `${agentId}/workspace/${name}`;
+    const wsPath = join(realDir(realRepo), `test-repo--${name}`);
+
+    git(`worktree add -b "${branch}" "${wsPath}"`, realRepo);
+
+    const pcpDir = join(wsPath, '.pcp');
+    mkdirSync(pcpDir, { recursive: true });
+
+    // Old format with workspace field
+    const identity = {
+      agentId,
+      context: `workspace-${name}`,
+      description: `Workspace: ${name}`,
+      workspace: name,
+      branch,
+      createdAt: new Date().toISOString(),
+    };
+    writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
+
+    const saved = JSON.parse(readFileSync(join(pcpDir, 'identity.json'), 'utf-8'));
+    expect(saved.workspace).toBe('legacy-ws');
+    expect(saved.branch).toBe('wren/workspace/legacy-ws');
   });
 });
 
-describe('cleanWorkspace: branch from identity.json', () => {
+describe('cleanStudio: branch from identity.json', () => {
   let realRepo: string;
 
   beforeEach(() => {
@@ -126,7 +153,7 @@ describe('cleanWorkspace: branch from identity.json', () => {
   });
 
   it('should read branch from identity.json for cleanup', () => {
-    const branch = 'wren/workspace/cleanup-test';
+    const branch = 'wren/studio/cleanup-test';
     const wsPath = join(realDir(realRepo), `test-repo--cleanup-test`);
 
     git(`worktree add -b "${branch}" "${wsPath}"`, realRepo);
@@ -136,7 +163,7 @@ describe('cleanWorkspace: branch from identity.json', () => {
     mkdirSync(pcpDir, { recursive: true });
     writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify({ branch }));
 
-    // Read it back — simulating what cleanWorkspace does
+    // Read it back — simulating what cleanStudio does
     const identity = JSON.parse(readFileSync(join(pcpDir, 'identity.json'), 'utf-8'));
     expect(identity.branch).toBe(branch);
 
@@ -150,7 +177,7 @@ describe('cleanWorkspace: branch from identity.json', () => {
   });
 
   it('should fall back to git worktree list when identity.json is missing', () => {
-    const branch = 'wren/workspace/no-identity';
+    const branch = 'wren/studio/no-identity';
     const wsPath = join(realDir(realRepo), `test-repo--no-identity`);
 
     git(`worktree add -b "${branch}" "${wsPath}"`, realRepo);
@@ -179,7 +206,7 @@ describe('cleanWorkspace: branch from identity.json', () => {
   });
 
   it('should handle identity.json with legacy workspace/ branch format', () => {
-    // Even if someone has an old identity.json, cleanWorkspace should work
+    // Even if someone has an old identity.json, cleanStudio should work
     const legacyBranch = 'workspace/legacy-test';
     const wsPath = join(realDir(realRepo), `test-repo--legacy-test`);
 
@@ -215,17 +242,17 @@ describe('Config directory copying', () => {
     }
   });
 
-  it('should copy .claude/ directory as-is into workspace', () => {
+  it('should copy .claude/ directory as-is into studio', () => {
     // Create .claude/ in the repo with settings
     const claudeDir = join(realRepo, '.claude');
     mkdirSync(claudeDir, { recursive: true });
     writeFileSync(join(claudeDir, 'settings.local.json'), JSON.stringify({ permissions: {} }));
 
-    // Create workspace
+    // Create studio
     const wsPath = join(realDir(realRepo), `test-repo--config-test`);
-    git(`worktree add -b "wren/workspace/config-test" "${wsPath}"`, realRepo);
+    git(`worktree add -b "wren/studio/config-test" "${wsPath}"`, realRepo);
 
-    // Copy .claude/ into workspace (simulating copyConfigDirs behavior)
+    // Copy .claude/ into studio (simulating copyConfigDirs behavior)
     const target = join(wsPath, '.claude');
     cpSync(claudeDir, target, { recursive: true });
 
@@ -244,34 +271,34 @@ describe('Config directory copying', () => {
       join(srcPcp, 'identity.json'),
       JSON.stringify({
         agentId: 'wren',
-        workspace: 'main',
+        studio: 'main',
         branch: 'main',
       })
     );
 
-    // Create workspace
+    // Create studio
     const wsPath = join(realDir(realRepo), `test-repo--fresh-id`);
-    git(`worktree add -b "wren/workspace/fresh-id" "${wsPath}"`, realRepo);
+    git(`worktree add -b "wren/studio/fresh-id" "${wsPath}"`, realRepo);
 
-    // Write fresh identity (simulating createWorkspace behavior)
+    // Write fresh identity (simulating createStudio behavior)
     const wsPcp = join(wsPath, '.pcp');
     mkdirSync(wsPcp, { recursive: true });
     const freshIdentity = {
       agentId: 'wren',
-      context: 'workspace-fresh-id',
-      workspace: 'fresh-id',
-      branch: 'wren/workspace/fresh-id',
+      context: 'studio-fresh-id',
+      studio: 'fresh-id',
+      branch: 'wren/studio/fresh-id',
       createdAt: new Date().toISOString(),
     };
     writeFileSync(join(wsPcp, 'identity.json'), JSON.stringify(freshIdentity, null, 2));
 
     const wsIdentity = JSON.parse(readFileSync(join(wsPcp, 'identity.json'), 'utf-8'));
-    expect(wsIdentity.workspace).toBe('fresh-id');
-    expect(wsIdentity.branch).toBe('wren/workspace/fresh-id');
+    expect(wsIdentity.studio).toBe('fresh-id');
+    expect(wsIdentity.branch).toBe('wren/studio/fresh-id');
 
     // Confirm main repo identity wasn't touched
     const mainIdentity = JSON.parse(readFileSync(join(srcPcp, 'identity.json'), 'utf-8'));
-    expect(mainIdentity.workspace).toBe('main');
+    expect(mainIdentity.studio).toBe('main');
   });
 
   it('should handle copying multiple config directories', () => {
@@ -282,7 +309,7 @@ describe('Config directory copying', () => {
     writeFileSync(join(realRepo, '.codex', 'config.toml'), '# test');
 
     const wsPath = join(realDir(realRepo), `test-repo--multi-config`);
-    git(`worktree add -b "wren/workspace/multi-config" "${wsPath}"`, realRepo);
+    git(`worktree add -b "wren/studio/multi-config" "${wsPath}"`, realRepo);
 
     // Copy both
     for (const dir of ['.claude', '.codex']) {
@@ -296,7 +323,7 @@ describe('Config directory copying', () => {
   it('should not copy config dirs that do not exist in source', () => {
     // .gemini/ doesn't exist in the repo
     const wsPath = join(realDir(realRepo), `test-repo--no-gemini`);
-    git(`worktree add -b "wren/workspace/no-gemini" "${wsPath}"`, realRepo);
+    git(`worktree add -b "wren/studio/no-gemini" "${wsPath}"`, realRepo);
 
     // Attempt to copy .gemini/ (should be a no-op)
     const geminiSrc = join(realRepo, '.gemini');
@@ -308,7 +335,7 @@ describe('Config directory copying', () => {
   });
 });
 
-describe('Workspace name defaults', () => {
+describe('Studio name defaults', () => {
   it('should default name to "new" when not provided and not TTY', () => {
     // Simulating the non-interactive path
     const name: string | undefined = undefined;
@@ -325,7 +352,7 @@ describe('Workspace name defaults', () => {
   it('should derive correct branch from agentId and name', () => {
     const agentId = 'myra';
     const name = 'monitoring';
-    const branch = `${agentId}/workspace/${name}`;
-    expect(branch).toBe('myra/workspace/monitoring');
+    const branch = `${agentId}/studio/${name}`;
+    expect(branch).toBe('myra/studio/monitoring');
   });
 });
