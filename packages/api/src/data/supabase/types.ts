@@ -290,7 +290,7 @@ export type Database = {
           recipient_identity_id: string | null;
           recipient_user_id: string;
           related_artifact_uri: string | null;
-          related_session_id: string | null;
+          recipient_session_id: string | null;
           sender_agent_id: string | null;
           sender_identity_id: string | null;
           sender_user_id: string | null;
@@ -312,7 +312,7 @@ export type Database = {
           recipient_identity_id?: string | null;
           recipient_user_id: string;
           related_artifact_uri?: string | null;
-          related_session_id?: string | null;
+          recipient_session_id?: string | null;
           sender_agent_id?: string | null;
           sender_identity_id?: string | null;
           sender_user_id?: string | null;
@@ -334,7 +334,7 @@ export type Database = {
           recipient_identity_id?: string | null;
           recipient_user_id?: string;
           related_artifact_uri?: string | null;
-          related_session_id?: string | null;
+          recipient_session_id?: string | null;
           sender_agent_id?: string | null;
           sender_identity_id?: string | null;
           sender_user_id?: string | null;
@@ -358,8 +358,8 @@ export type Database = {
             referencedColumns: ['id'];
           },
           {
-            foreignKeyName: 'agent_inbox_related_session_id_fkey';
-            columns: ['related_session_id'];
+            foreignKeyName: 'agent_inbox_recipient_session_id_fkey';
+            columns: ['recipient_session_id'];
             isOneToOne: false;
             referencedRelation: 'sessions';
             referencedColumns: ['id'];

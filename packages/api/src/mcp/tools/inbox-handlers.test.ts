@@ -57,7 +57,7 @@ function createMockSupabase(
     message_type: 'task_request',
     priority: 'normal',
     status: 'unread',
-    related_session_id: null,
+    recipient_session_id: null,
     related_artifact_uri: null,
     metadata: {},
     read_at: null,
@@ -324,7 +324,7 @@ describe('handleSendToInbox - threadKey', () => {
 
     expect(mockSb._chainable.insert).toHaveBeenCalledWith(
       expect.objectContaining({
-        related_session_id: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
+        recipient_session_id: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
       })
     );
     expect(mockGateway.processTrigger).toHaveBeenCalledWith(
@@ -421,7 +421,7 @@ describe('handleGetInbox - recipient session naming', () => {
       message_type: 'session_resume',
       priority: 'normal',
       status: 'unread',
-      related_session_id: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
+      recipient_session_id: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
       related_artifact_uri: null,
       metadata: {},
       read_at: null,

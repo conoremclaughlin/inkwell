@@ -359,7 +359,7 @@ CREATE TABLE agent_inbox (
   content text NOT NULL,
   message_type text NOT NULL DEFAULT 'message'::text,
   priority text NOT NULL DEFAULT 'normal'::text,
-  related_session_id uuid,
+  recipient_session_id uuid,
   related_artifact_uri text,
   status text NOT NULL DEFAULT 'unread'::text,
   read_at timestamp with time zone,
@@ -829,7 +829,7 @@ ALTER TABLE agent_identity_history ADD CONSTRAINT agent_identity_history_user_id
 
 -- agent_inbox
 ALTER TABLE agent_inbox ADD CONSTRAINT agent_inbox_recipient_user_id_fkey FOREIGN KEY (recipient_user_id) REFERENCES users(id) ON DELETE CASCADE;
-ALTER TABLE agent_inbox ADD CONSTRAINT agent_inbox_related_session_id_fkey FOREIGN KEY (related_session_id) REFERENCES sessions(id) ON DELETE NO ACTION;
+ALTER TABLE agent_inbox ADD CONSTRAINT agent_inbox_recipient_session_id_fkey FOREIGN KEY (recipient_session_id) REFERENCES sessions(id) ON DELETE NO ACTION;
 ALTER TABLE agent_inbox ADD CONSTRAINT agent_inbox_sender_user_id_fkey FOREIGN KEY (sender_user_id) REFERENCES users(id) ON DELETE SET NULL;
 
 -- agent_sessions
@@ -1019,7 +1019,7 @@ CREATE INDEX idx_agent_identity_history_user_id ON public.agent_identity_history
 CREATE INDEX idx_agent_inbox_priority ON public.agent_inbox USING btree (recipient_user_id, recipient_agent_id, priority, created_at) WHERE (status = 'unread'::text);
 CREATE INDEX idx_agent_inbox_recipient ON public.agent_inbox USING btree (recipient_user_id, recipient_agent_id, status);
 CREATE INDEX idx_agent_inbox_sender ON public.agent_inbox USING btree (sender_user_id, sender_agent_id);
-CREATE INDEX idx_agent_inbox_session ON public.agent_inbox USING btree (related_session_id) WHERE (related_session_id IS NOT NULL);
+CREATE INDEX idx_agent_inbox_recipient_session ON public.agent_inbox USING btree (recipient_session_id) WHERE (recipient_session_id IS NOT NULL);
 
 -- agent_sessions
 CREATE INDEX idx_agent_sessions_last_activity ON public.agent_sessions USING btree (last_activity_at);
@@ -2202,7 +2202,7 @@ COMMENT ON COLUMN agent_identities.backend IS 'CLI backend for this agent: claud
 
 -- agent_inbox
 COMMENT ON COLUMN agent_inbox.message_type IS 'Type of message: message (general), task_request (work request), session_resume (wake up request), notification (FYI)';
-COMMENT ON COLUMN agent_inbox.related_session_id IS 'For session_resume messages, the session to continue';
+COMMENT ON COLUMN agent_inbox.recipient_session_id IS 'For session_resume messages, the recipient session to continue';
 
 -- agent_sessions
 COMMENT ON COLUMN agent_sessions.session_id IS 'Claude Code or agent session ID for resumption';
