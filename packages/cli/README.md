@@ -188,6 +188,8 @@ Any flag not listed above is forwarded to the backend.
 
 ```bash
 sb init                         # Set up PCP in current repo
+sb chat                         # First-class PCP REPL (experimental)
+sb chat -b codex                # REPL using Codex backend
 sb hooks install --all          # Install hooks across all worktrees
 sb studio create feat-auth      # Create a studio (git worktree)
 sb agent status                 # Check agent status
@@ -308,6 +310,33 @@ Options for `create`:
 Options for `invite`:
 
 - `--role <role>` — Role: `owner`, `admin`, `member`, or `viewer` (default: member)
+
+### First-Class REPL (`sb chat`) (experimental)
+
+`sb chat` is the native PCP REPL where PCP controls session lifecycle and context instead of relying solely on backend CLI compaction behavior.
+
+```bash
+sb chat                          # Start REPL (default backend: claude)
+sb chat -b codex                 # Use codex backend
+sb chat -b gemini                # Use gemini backend
+sb chat --thread-key pr:123      # Bind to collaborative thread
+sb chat --max-context-tokens 16000
+sb chat --poll-seconds 10
+sb chat --tools off              # Disable backend-native tool usage
+```
+
+Inside REPL:
+
+- `/inbox` force inbox refresh
+- `/bookmark [label]` create a context bookmark
+- `/eject <bookmark|last>` eject context up to bookmark (and persist a `remember` checkpoint)
+- `/backend <claude|codex|gemini>` switch backend
+- `/model <id>` set/clear model override
+- `/tools <backend|off>` toggle backend-native tools
+- `/pcp <tool> [jsonArgs]` invoke PCP tools directly from REPL
+- `/usage` show approximate context token usage
+- `/session` show session/thread routing info
+- `/quit` end REPL and close PCP session
 
 ## Environment Variables
 

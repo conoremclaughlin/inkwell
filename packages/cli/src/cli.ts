@@ -27,6 +27,7 @@ import { registerAwakenCommand } from './commands/awaken.js';
 import { registerHooksCommands } from './commands/hooks.js';
 import { registerInitCommand } from './commands/init.js';
 import { registerAuthCommands } from './commands/auth.js';
+import { registerChatCommand } from './commands/chat.js';
 import { runClaude, runClaudeInteractive } from './commands/claude.js';
 import { resolveBackend } from './backends/index.js';
 
@@ -177,6 +178,7 @@ registerAwakenCommand(program);
 registerHooksCommands(program);
 registerInitCommand(program);
 registerAuthCommands(program);
+registerChatCommand(program);
 
 // ============================================================================
 // Subcommand detection
