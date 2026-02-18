@@ -12,6 +12,7 @@ import { resolveIdentityId } from '../../auth/resolve-identity';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
+import { getRequestContext, getSessionContext } from '../../utils/request-context';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
 
 // ============== Schemas ==============
@@ -33,11 +34,25 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .optional()
     .default('normal')
     .describe('Message priority'),
+  recipientSessionId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('Recipient session ID to resume/route to (preferred)'),
   relatedSessionId: z
     .string()
     .uuid()
     .optional()
-    .describe('Related session ID (for resume requests)'),
+    .describe('Deprecated alias for recipientSessionId'),
+  recipientStudioId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('Recipient studio ID hint for session routing'),
+  recipientStudioHint: z
+    .enum(['main'])
+    .optional()
+    .describe('Recipient studio routing hint (e.g., "main")'),
   relatedArtifactUri: z.string().optional().describe('Related artifact URI'),
   metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
   expiresAt: z.string().datetime().optional().describe('When this message expires'),
@@ -99,7 +114,10 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     content,
     messageType = 'message',
     priority = 'normal',
+    recipientSessionId,
     relatedSessionId,
+    recipientStudioId,
+    recipientStudioHint,
     relatedArtifactUri,
     metadata = {},
     expiresAt,
@@ -110,12 +128,51 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   // Enforce identity on sender (who is performing the action), not recipient (target)
   const senderAgentId = getEffectiveAgentId(parsed.senderAgentId);
   const triggerSenderId = senderAgentId || 'system';
+  const effectiveRecipientSessionId = recipientSessionId || relatedSessionId;
 
   // Default trigger behavior:
   // Always wake the recipient unless the caller explicitly opts out with trigger=false.
   // This keeps SB-to-SB coordination immediate by default.
   const shouldTriggerByDefault = true;
   const trigger = parsed.trigger ?? shouldTriggerByDefault;
+
+  const hasRoutingAnchor = Boolean(
+    threadKey || effectiveRecipientSessionId || recipientStudioId || recipientStudioHint
+  );
+  const requiresRoutingAnchor = Boolean(senderAgentId) && messageType !== 'message';
+  if (requiresRoutingAnchor && !hasRoutingAnchor) {
+    throw new Error(
+      'Missing routing anchor. Provide one of: threadKey, recipientSessionId, recipientStudioId, or recipientStudioHint.'
+    );
+  }
+
+  const reqCtx = getRequestContext();
+  const sessCtx = getSessionContext();
+  const senderSessionId = reqCtx?.sessionId || sessCtx?.sessionId || null;
+  const senderStudioId = reqCtx?.workspaceId || sessCtx?.workspaceId || null;
+  const metadataRecord =
+    metadata && typeof metadata === 'object' ? (metadata as Record<string, unknown>) : {};
+  const existingPcp =
+    metadataRecord.pcp && typeof metadataRecord.pcp === 'object'
+      ? (metadataRecord.pcp as Record<string, unknown>)
+      : {};
+  const enrichedMetadata = {
+    ...metadataRecord,
+    pcp: {
+      ...existingPcp,
+      sender: {
+        agentId: triggerSenderId,
+        sessionId: senderSessionId,
+        studioId: senderStudioId,
+      },
+      recipient: {
+        threadKey: threadKey || null,
+        sessionId: effectiveRecipientSessionId || null,
+        studioId: recipientStudioId || null,
+        studioHint: recipientStudioHint || null,
+      },
+    },
+  };
 
   // Resolve canonical identity UUIDs for sender and recipient
   const recipientIdentityId = await resolveIdentityId(supabase, resolved.user.id, recipientAgentId);
@@ -136,9 +193,9 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       content,
       message_type: messageType,
       priority,
-      related_session_id: relatedSessionId || null,
+      related_session_id: effectiveRecipientSessionId || null,
       related_artifact_uri: relatedArtifactUri || null,
-      metadata: metadata as Json,
+      metadata: enrichedMetadata as Json,
       expires_at: expiresAt || null,
       thread_key: threadKey || null,
     })
@@ -171,13 +228,6 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
 
   if (trigger) {
     const gateway = getAgentGateway();
-    const metadataStudioId =
-      metadata && typeof metadata.studioId === 'string' && metadata.studioId.length > 0
-        ? metadata.studioId
-        : undefined;
-    const metadataStudioHint =
-      metadata && metadata.studioHint === 'main' ? ('main' as const) : undefined;
-
     const payload: AgentTriggerPayload = {
       fromAgentId: triggerSenderId,
       toAgentId: recipientAgentId,
@@ -186,9 +236,9 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       summary: triggerSummary || subject || `New ${messageType} from ${triggerSenderId}`,
       priority,
       threadKey,
-      relatedSessionId,
-      studioId: metadataStudioId,
-      studioHint: metadataStudioHint,
+      relatedSessionId: effectiveRecipientSessionId,
+      studioId: recipientStudioId,
+      studioHint: recipientStudioHint,
     };
 
     // Fire-and-forget: don't await the trigger processing
@@ -234,8 +284,13 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           messageType,
           priority,
           threadKey: threadKey || null,
+          recipientSessionId: effectiveRecipientSessionId || null,
+          recipientStudioId: recipientStudioId || null,
+          recipientStudioHint: recipientStudioHint || null,
           createdAt: message.created_at,
           trigger: triggerResult,
+          // Backward compatibility
+          relatedSessionId: effectiveRecipientSessionId || null,
           ...(!threadKey
             ? {
                 hint: 'Consider adding a threadKey (e.g., "pr:32", "spec:cli-hooks") so the recipient can resume the same session for follow-up messages on this topic.',

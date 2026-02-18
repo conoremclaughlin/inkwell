@@ -264,6 +264,7 @@ describe('handleSendToInbox - threadKey', () => {
         recipientAgentId: 'myra',
         senderAgentId: 'wren',
         messageType: 'notification',
+        threadKey: 'pr:32',
         content: 'FYI',
       },
       mockDc as never
@@ -300,6 +301,55 @@ describe('handleSendToInbox - threadKey', () => {
         relatedSessionId: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
       })
     );
+  });
+
+  it('should support recipientSessionId as preferred routing field', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+
+    const mockSb = createMockSupabase();
+    const mockDc = createMockDataComposer(mockSb);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        messageType: 'session_resume',
+        recipientSessionId: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
+        content: 'Resume this session',
+      },
+      mockDc as never
+    );
+
+    expect(mockSb._chainable.insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        related_session_id: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
+      })
+    );
+    expect(mockGateway.processTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        relatedSessionId: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
+      })
+    );
+  });
+
+  it('should require routing anchor for non-message cross-agent handoffs', async () => {
+    const mockSb = createMockSupabase();
+    const mockDc = createMockDataComposer(mockSb);
+
+    await expect(
+      handleSendToInbox(
+        {
+          email: 'test@test.com',
+          recipientAgentId: 'lumen',
+          senderAgentId: 'wren',
+          messageType: 'task_request',
+          content: 'Please do this work',
+        },
+        mockDc as never
+      )
+    ).rejects.toThrow('Missing routing anchor');
   });
 
   it('should trigger without senderAgentId using system sender', async () => {
