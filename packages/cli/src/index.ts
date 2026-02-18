@@ -5,7 +5,7 @@
  * For CLI usage, see cli.ts
  */
 
-export interface WorkspaceIdentity {
+export interface StudioIdentity {
   agentId: string;
   identityId?: string;
   context: string;
@@ -19,12 +19,18 @@ export interface WorkspaceIdentity {
   workspace?: string;
 }
 
-export interface WorkspaceInfo {
+/** @deprecated Use StudioIdentity */
+export type WorkspaceIdentity = StudioIdentity;
+
+export interface StudioInfo {
   name: string;
   path: string;
   branch: string;
-  identity?: WorkspaceIdentity;
+  identity?: StudioIdentity;
 }
+
+/** @deprecated Use StudioInfo */
+export type WorkspaceInfo = StudioInfo;
 
 export interface PcpConfig {
   userId?: string;
@@ -35,12 +41,15 @@ export interface PcpConfig {
   workspaceId?: string;
 }
 
-export interface CreateWorkspaceOptions {
+export interface CreateStudioOptions {
   name: string;
   agentId?: string;
   gitRoot?: string;
   purpose?: string;
 }
+
+/** @deprecated Use CreateStudioOptions */
+export type CreateWorkspaceOptions = CreateStudioOptions;
 
 // Re-export command modules for programmatic use
 export { runClaude, runClaudeInteractive } from './commands/claude.js';

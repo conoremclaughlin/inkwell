@@ -1,867 +1,488 @@
 /**
  * Workspace Commands
  *
- * Manage git worktrees for parallel development with PCP identity.
- *
- * Commands:
- *   studio init [name]     Initialize parent directory structure
- *   studio create <name>   Create a new workspace/studio
- *   studio list            List all workspaces/studios
- *   studio remove <name>   Remove a workspace/studio (keeps branch)
- *   studio clean <name>    Remove workspace/studio and delete branch
- *   studio status          Show status of all workspaces/studios
- *   studio path <name>     Output workspace/studio path (for cd)
- *   studio cd <name>       Print cd command (use with: eval $(sb studio cd foo))
+ * Manage product-level workspaces (personal/team scope) — the top-level
+ * container for artifacts, team SBs, reminders, and more.
+ * Distinct from local git worktree studios (`sb studio ...`).
  */
 
 import { Command } from 'commander';
 import chalk from 'chalk';
-import ora from 'ora';
-import { execSync } from 'child_process';
-import {
-  existsSync,
-  mkdirSync,
-  writeFileSync,
-  readFileSync,
-  readdirSync,
-  renameSync,
-  cpSync,
-} from 'fs';
-import { join, dirname, basename, parse as parsePath } from 'path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
-import { installHooks } from './hooks.js';
-import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
+import { join } from 'path';
 
-interface WorkspaceIdentity {
-  agentId: string;
-  identityId?: string;
-  context: string;
-  backend?: string;
-  studioId?: string;
-  studio: string;
-  description: string;
-  branch: string;
-  createdAt: string;
-  createdBy?: string;
+interface PcpConfig {
+  userId?: string;
+  email?: string;
+  agentMapping?: Record<string, string>;
+  workspaceId?: string;
 }
 
-interface WorkspaceInfo {
+interface Workspace {
+  id: string;
   name: string;
-  path: string;
-  branch: string;
-  identity?: WorkspaceIdentity;
+  slug: string;
+  type: 'personal' | 'team';
+  role?: 'owner' | 'admin' | 'member' | 'viewer';
+  description?: string | null;
+  archivedAt?: string | null;
 }
 
-// ============================================================================
-// Helpers
-// ============================================================================
+function getConfigPath(): string {
+  return join(homedir(), '.pcp', 'config.json');
+}
 
-function findGitRoot(): string {
+function getPcpConfig(): PcpConfig | null {
+  const configPath = getConfigPath();
+  if (!existsSync(configPath)) return null;
+
   try {
-    const result = execSync('git rev-parse --show-toplevel', { encoding: 'utf-8' });
-    return result.trim();
+    return JSON.parse(readFileSync(configPath, 'utf-8'));
   } catch {
-    console.error(chalk.red('Error: Not in a git repository'));
-    process.exit(1);
+    return null;
   }
 }
 
-function getWorkspaceParent(gitRoot: string): string {
-  return dirname(gitRoot);
-}
-
-function getWorkspacePrefix(gitRoot: string): string {
-  // Use the repo folder name as prefix (e.g., "personal-context-protocol" -> "personal-context-protocol--")
-  return `${basename(gitRoot)}--`;
-}
-
-function getWorkspacePath(gitRoot: string, name: string): string {
-  return join(getWorkspaceParent(gitRoot), `${getWorkspacePrefix(gitRoot)}${name}`);
-}
-
-function git(args: string, cwd?: string): string {
-  try {
-    return execSync(`git ${args}`, {
-      encoding: 'utf-8',
-      cwd: cwd || process.cwd(),
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }).trim();
-  } catch (error: unknown) {
-    const err = error as { stderr?: string; message?: string };
-    throw new Error(err.stderr || err.message || 'Git command failed');
+function savePcpConfig(config: PcpConfig): void {
+  const configPath = getConfigPath();
+  const configDir = join(homedir(), '.pcp');
+  if (!existsSync(configDir)) {
+    mkdirSync(configDir, { recursive: true });
   }
+  writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
 }
 
-function branchExists(branch: string, cwd?: string): boolean {
-  try {
-    git(`show-ref --verify --quiet refs/heads/${branch}`, cwd);
-    return true;
-  } catch {
-    return false;
-  }
+function getPcpServerUrl(): string {
+  return process.env.PCP_SERVER_URL || 'http://localhost:3001';
 }
 
-function getCurrentUser(): string | undefined {
-  const pcpConfigPath = join(homedir(), '.pcp', 'config.json');
-  if (existsSync(pcpConfigPath)) {
-    try {
-      const config = JSON.parse(readFileSync(pcpConfigPath, 'utf-8'));
-      return config.email || config.userId;
-    } catch {
-      // Fall through
-    }
-  }
-  try {
-    return git('config user.email');
-  } catch {
-    return undefined;
-  }
-}
-
-function listWorkspaces(gitRoot: string): WorkspaceInfo[] {
-  const parentDir = getWorkspaceParent(gitRoot);
-  const workspaces: WorkspaceInfo[] = [];
-
-  const worktreeOutput = git('worktree list --porcelain', gitRoot);
-  const worktrees = new Map<string, string>();
-
-  let currentPath = '';
-  for (const line of worktreeOutput.split('\n')) {
-    if (line.startsWith('worktree ')) {
-      currentPath = line.substring(9);
-    } else if (line.startsWith('branch ')) {
-      worktrees.set(currentPath, line.substring(7).replace('refs/heads/', ''));
-    }
-  }
-
-  const prefix = getWorkspacePrefix(gitRoot);
-  if (existsSync(parentDir)) {
-    for (const entry of readdirSync(parentDir)) {
-      if (entry.startsWith(prefix)) {
-        const wsPath = join(parentDir, entry);
-        const name = entry.slice(prefix.length);
-        const branch = worktrees.get(wsPath) || 'unknown';
-
-        let identity: WorkspaceIdentity | undefined;
-        const identityPath = join(wsPath, '.pcp', 'identity.json');
-        if (existsSync(identityPath)) {
-          try {
-            identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
-          } catch {
-            // Ignore
-          }
-        }
-
-        workspaces.push({ name, path: wsPath, branch, identity });
-      }
-    }
-  }
-
-  return workspaces;
-}
-
-/**
- * Get all worktree paths registered with git (excluding the main worktree).
- */
-function getWorktreePaths(gitRoot: string): string[] {
-  const output = git('worktree list --porcelain', gitRoot);
-  const paths: string[] = [];
-
-  for (const line of output.split('\n')) {
-    if (line.startsWith('worktree ')) {
-      const path = line.substring(9);
-      if (path !== gitRoot) {
-        paths.push(path);
-      }
-    }
-  }
-
-  return paths;
-}
-
-// ============================================================================
-// Interactive helpers
-// ============================================================================
-
-interface InteractiveResult {
-  name: string;
-  branch: string;
-  configDirs: string[];
-}
-
-/**
- * Run the full interactive workspace creation flow when name is omitted and stdin is a TTY.
- * Returns the resolved name, branch, and config dirs to copy.
- */
-async function runInteractiveFlow(agentId: string, gitRoot: string): Promise<InteractiveResult> {
-  const { input, checkbox } = await import('@inquirer/prompts');
-
-  // Step 1: Workspace name
-  const name = await input({
-    message: 'Workspace name',
-    default: 'new',
+async function fetchPcp(path: string, options?: RequestInit): Promise<Response> {
+  const url = `${getPcpServerUrl()}${path}`;
+  // Intentionally no Authorization header here:
+  // CLI workspace selection currently goes through MCP tool calls (`/api/mcp/call`)
+  // that resolve user context from explicit args (email/userId), matching other sb CLI commands.
+  return fetch(url, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...options?.headers,
+    },
   });
-
-  // Step 2: Branch name (derived, editable)
-  const defaultBranch = `${agentId}/workspace/${name}`;
-  const branch = await input({
-    message: 'Branch name',
-    default: defaultBranch,
-  });
-
-  // Step 3: Config directories to copy
-  const candidateDirs = ['.claude', '.codex', '.gemini'].filter((dir) =>
-    existsSync(join(gitRoot, dir))
-  );
-
-  let configDirs: string[] = [];
-  if (candidateDirs.length > 0) {
-    configDirs = await checkbox({
-      message: 'Copy config folders?',
-      choices: candidateDirs.map((dir) => ({
-        name: dir,
-        value: dir,
-        checked: dir === '.claude',
-      })),
-    });
-  }
-
-  return { name, branch, configDirs };
 }
 
-/**
- * Copy config directories from git root into the new workspace.
- *
- * - .claude/ is always copied as-is (hand-authored permissions)
- * - .codex/, .gemini/ — if .mcp.json exists in the target, regenerate via syncMcpConfig instead
- * - .pcp/identity.json is always freshly written (never copied)
- */
-function copyConfigDirs(gitRoot: string, wsPath: string, dirs: string[]): void {
-  for (const dir of dirs) {
-    const source = join(gitRoot, dir);
-    const target = join(wsPath, dir);
-
-    if (!existsSync(source)) continue;
-
-    if (dir === '.claude') {
-      // Always copy as-is
-      cpSync(source, target, { recursive: true });
-    } else if ((dir === '.codex' || dir === '.gemini') && existsSync(join(wsPath, '.mcp.json'))) {
-      // Will be regenerated via syncMcpConfig — skip copying stale generated files
-      continue;
-    } else {
-      cpSync(source, target, { recursive: true });
-    }
-  }
-}
-
-// ============================================================================
-// Commands
-// ============================================================================
-
-interface InitResult {
-  parentDir: string;
-  moves: Array<{ from: string; to: string }>;
-}
-
-/**
- * Plan the init migration: figure out what needs to move where.
- */
-function planInit(gitRoot: string, parentName: string): InitResult {
-  const grandparent = getWorkspaceParent(gitRoot);
-  const repoName = basename(gitRoot);
-  const parentDir = join(grandparent, parentName);
-
-  const moves: Array<{ from: string; to: string }> = [];
-
-  // Main repo move
-  moves.push({ from: gitRoot, to: join(parentDir, repoName) });
-
-  // Find existing worktrees that are siblings of the main repo
-  const prefix = getWorkspacePrefix(gitRoot);
-  const worktreePaths = getWorktreePaths(gitRoot);
-
-  for (const wtPath of worktreePaths) {
-    const wtName = basename(wtPath);
-    // Only move worktrees that follow our naming convention (siblings with prefix)
-    if (wtName.startsWith(prefix) && dirname(wtPath) === grandparent) {
-      moves.push({ from: wtPath, to: join(parentDir, wtName) });
-    }
+function unwrapToolResult(payload: unknown): Record<string, unknown> {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('Invalid response payload');
   }
 
-  return { parentDir, moves };
-}
-
-async function initWorkspace(
-  parentName: string | undefined,
-  options: { dryRun?: boolean }
-): Promise<void> {
-  if (!parentName) {
-    console.error(chalk.red('Error: Parent directory name is required.'));
-    console.error(chalk.dim('Usage: sb studio init <parent-name>'));
-    console.error(chalk.dim('Example: sb studio init pcp'));
-    process.exit(1);
+  const direct = payload as Record<string, unknown>;
+  if (Array.isArray(direct.workspaces)) {
+    return direct;
   }
 
-  const gitRoot = findGitRoot();
-  const { parentDir, moves } = planInit(gitRoot, parentName);
+  const mcpText =
+    (direct.result as { content?: Array<{ text?: string }> } | undefined)?.content?.[0]?.text ||
+    (direct.content as Array<{ text?: string }> | undefined)?.[0]?.text;
 
-  // Validate: parent directory must not already exist
-  if (existsSync(parentDir)) {
-    console.error(chalk.red(`Error: Directory already exists: ${parentDir}`));
-    console.error(chalk.dim('Choose a different name or remove the existing directory.'));
-    process.exit(1);
-  }
-
-  // Validate: no target paths should exist
-  for (const move of moves) {
-    if (existsSync(move.to)) {
-      console.error(chalk.red(`Error: Target path already exists: ${move.to}`));
-      process.exit(1);
-    }
-  }
-
-  if (options.dryRun) {
-    console.log(chalk.bold('\nDry run — planned moves:\n'));
-    console.log(chalk.dim(`  Create: ${parentDir}/`));
-    console.log('');
-    for (const move of moves) {
-      console.log(chalk.dim(`  ${move.from}`));
-      console.log(chalk.cyan(`    → ${move.to}`));
-      console.log('');
-    }
-    console.log(chalk.yellow('No changes made (--dry-run).'));
-    return;
-  }
-
-  const spinner = ora('Initializing parent directory structure').start();
-
-  try {
-    // Create parent directory
-    spinner.text = `Creating ${parentDir}`;
-    mkdirSync(parentDir, { recursive: true });
-
-    // Move worktrees first (before moving the main repo, since git refs point to main)
-    const worktreeMoves = moves.filter((m) => m.from !== gitRoot);
-    for (const move of worktreeMoves) {
-      spinner.text = `Moving ${basename(move.from)}`;
-      renameSync(move.from, move.to);
-    }
-
-    // Move main repo last
-    const mainMove = moves.find((m) => m.from === gitRoot)!;
-    spinner.text = `Moving ${basename(mainMove.from)}`;
-    renameSync(mainMove.from, mainMove.to);
-
-    // Repair git worktree cross-references
-    spinner.text = 'Repairing git worktree references';
-    const newWorktreePaths = worktreeMoves.map((m) => `"${m.to}"`).join(' ');
-    if (newWorktreePaths) {
-      git(`worktree repair ${newWorktreePaths}`, mainMove.to);
-    }
-
-    spinner.succeed('Parent directory initialized');
-    console.log('');
-    console.log(chalk.bold('Moves:'));
-    for (const move of moves) {
-      console.log(chalk.dim(`  ${move.from}`));
-      console.log(chalk.cyan(`    → ${move.to}`));
-    }
-    console.log('');
-    console.log(chalk.cyan('Next steps:'));
-    console.log(chalk.dim(`  cd ${mainMove.to}`));
-    console.log('');
-    console.log(chalk.dim('Note: Claude Code sessions from the old path will not carry over.'));
-    console.log(chalk.dim('PCP memories persist automatically via bootstrap.'));
-  } catch (error) {
-    spinner.fail(`Failed to initialize: ${error}`);
-    console.error('');
-    console.error(chalk.yellow('Some moves may have partially completed.'));
-    console.error(chalk.yellow('Check the state of these directories:'));
-    console.error(chalk.dim(`  ${parentDir}`));
-    for (const move of moves) {
-      console.error(chalk.dim(`  ${move.from}`));
-      console.error(chalk.dim(`  ${move.to}`));
-    }
-    console.error('');
-    console.error(chalk.yellow('If worktree references are broken, run from the main repo:'));
-    console.error(chalk.dim('  git worktree repair <worktree-paths...>'));
-    process.exit(1);
-  }
-}
-
-async function createWorkspace(
-  name: string,
-  options: {
-    agent?: string;
-    purpose?: string;
-    branch?: string;
-    backend?: string;
-    copyConfig?: boolean;
-    configDirs?: string;
-  },
-  overrides?: { branch?: string; configDirsList?: string[] }
-): Promise<void> {
-  const agentId = options.agent || 'wren';
-  const spinner = ora(`Creating workspace: ${name}`).start();
-
-  try {
-    const gitRoot = findGitRoot();
-    const wsPath = getWorkspacePath(gitRoot, name);
-    // Priority: overrides (from interactive) > options (from flags) > default
-    const branch = overrides?.branch || options.branch || `${agentId}/workspace/${name}`;
-
-    if (existsSync(wsPath)) {
-      spinner.fail(`Workspace already exists at ${wsPath}`);
-      process.exit(1);
-    }
-
-    spinner.text = 'Creating git worktree...';
-    if (branchExists(branch, gitRoot)) {
-      git(`worktree add "${wsPath}" "${branch}"`, gitRoot);
-    } else {
-      git(`worktree add -b "${branch}" "${wsPath}"`, gitRoot);
-    }
-
-    // Determine which config dirs to copy
-    const configDirsList =
-      overrides?.configDirsList ??
-      (options.copyConfig ? (options.configDirs || '.claude').split(',').map((s) => s.trim()) : []);
-
-    if (configDirsList.length > 0) {
-      spinner.text = 'Copying config directories...';
-      copyConfigDirs(gitRoot, wsPath, configDirsList);
-    }
-
-    // Regenerate .codex/.gemini via syncMcpConfig if .mcp.json exists in the new workspace
-    if (existsSync(join(wsPath, '.mcp.json'))) {
-      spinner.text = 'Syncing MCP config for backends...';
-      try {
-        const { syncMcpConfig } = await import('./mcp.js');
-        syncMcpConfig(wsPath);
-      } catch {
-        // syncMcpConfig not available or failed — not critical
-      }
-    }
-
-    spinner.text = 'Setting up PCP identity...';
-    const pcpDir = join(wsPath, '.pcp');
-    mkdirSync(pcpDir, { recursive: true });
-
-    // Resolve identityId from auth token if available
-    let identityId: string | undefined;
-    const auth = loadAuth();
-    if (auth && !isTokenExpired(auth)) {
-      const payload = decodeJwtPayload(auth.access_token);
-      if (payload?.identityId) {
-        identityId = payload.identityId;
-      }
-    }
-
-    // Always write fresh identity.json (never copy from source)
-    const identity: WorkspaceIdentity = {
-      agentId,
-      ...(identityId ? { identityId } : {}),
-      context: `studio-${name}`,
-      ...(options.backend ? { backend: options.backend } : {}),
-      studio: name,
-      description: options.purpose || `Studio: ${name}`,
-      branch,
-      createdAt: new Date().toISOString(),
-      createdBy: getCurrentUser(),
-    };
-
-    writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
-
-    // Auto-install PCP hooks
-    spinner.text = 'Installing PCP hooks...';
-    const { result: hooksResult, backend: hooksBackend } = installHooks(wsPath);
-
-    spinner.succeed(`Studio created: ${name}`);
-    console.log('');
-    console.log(chalk.dim('  Path:   ') + wsPath);
-    console.log(chalk.dim('  Branch: ') + branch);
-    console.log(chalk.dim('  Agent:  ') + identity.agentId);
-    if (configDirsList.length > 0) {
-      console.log(chalk.dim('  Config: ') + configDirsList.join(', '));
-    }
-    if (hooksResult === 'installed') {
-      console.log(chalk.dim('  Hooks:  ') + `${hooksBackend.name} (installed)`);
-    } else if (hooksResult === 'already-installed') {
-      console.log(chalk.dim('  Hooks:  ') + `${hooksBackend.name} (already installed)`);
-    } else if (hooksResult === 'conflict') {
-      console.log(
-        chalk.yellow('  Hooks:  ') +
-          `skipped — existing non-PCP hooks in ${hooksBackend.configPath}. Run: sb hooks install --force`
-      );
-    }
-    console.log('');
-    console.log(chalk.cyan('To start working:'));
-    console.log(chalk.dim(`  cd ${wsPath} && sb`));
-    console.log('');
-    console.log(chalk.cyan('Or use:'));
-    console.log(chalk.dim(`  eval $(sb studio cd ${name})`));
-  } catch (error) {
-    spinner.fail(`Failed to create workspace: ${error}`);
-    process.exit(1);
-  }
-}
-
-function listCommand(): void {
-  const gitRoot = findGitRoot();
-  const workspaces = listWorkspaces(gitRoot);
-
-  if (workspaces.length === 0) {
-    console.log(chalk.yellow('No workspaces found.'));
-    console.log(chalk.dim('Create one with: sb studio create <name>'));
-    return;
-  }
-
-  console.log(chalk.bold('\nPCP Studios:\n'));
-
-  for (const ws of workspaces) {
-    console.log(chalk.cyan(`  ${ws.name}`));
-    console.log(chalk.dim(`    Folder: ${basename(ws.path)}`));
-    console.log(chalk.dim(`    Path:   ${ws.path}`));
-    console.log(chalk.dim(`    Branch: ${ws.branch}`));
-    if (ws.identity) {
-      console.log(chalk.dim(`    Agent:  ${ws.identity.agentId}`));
-      if (ws.identity.createdBy) {
-        console.log(chalk.dim(`    Owner:  ${ws.identity.createdBy}`));
-      }
-    }
-    console.log('');
-  }
-}
-
-async function removeWorkspace(name: string): Promise<void> {
-  const spinner = ora(`Removing studio: ${name}`).start();
-
-  try {
-    const gitRoot = findGitRoot();
-    const wsPath = getWorkspacePath(gitRoot, name);
-
-    if (!existsSync(wsPath)) {
-      spinner.fail(`Studio not found: ${name}`);
-      process.exit(1);
-    }
-
-    git(`worktree remove "${wsPath}"`, gitRoot);
-    spinner.succeed(`Studio removed: ${name}`);
-    console.log(chalk.dim('  Branch kept for PR. Use "sb studio clean" to also delete branch.'));
-  } catch (error) {
-    spinner.fail(`Failed to remove workspace: ${error}`);
-    process.exit(1);
-  }
-}
-
-async function cleanWorkspace(name: string): Promise<void> {
-  const spinner = ora(`Cleaning studio: ${name}`).start();
-
-  try {
-    const gitRoot = findGitRoot();
-    const wsPath = getWorkspacePath(gitRoot, name);
-
-    // Read branch from identity.json if available, fall back to git worktree list
-    let branch: string | undefined;
-    const identityPath = join(wsPath, '.pcp', 'identity.json');
-    if (existsSync(identityPath)) {
-      try {
-        const identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
-        branch = identity.branch;
-      } catch {
-        // Fall through to worktree lookup
-      }
-    }
-
-    if (!branch) {
-      // Look up branch from git worktree list
-      const worktreeOutput = git('worktree list --porcelain', gitRoot);
-      let currentPath = '';
-      for (const line of worktreeOutput.split('\n')) {
-        if (line.startsWith('worktree ')) {
-          currentPath = line.substring(9);
-        } else if (line.startsWith('branch ') && currentPath === wsPath) {
-          branch = line.substring(7).replace('refs/heads/', '');
-        }
-      }
-    }
-
-    if (existsSync(wsPath)) {
-      spinner.text = 'Removing worktree...';
-      git(`worktree remove "${wsPath}" --force`, gitRoot);
-    }
-
-    if (branch && branchExists(branch, gitRoot)) {
-      spinner.text = 'Deleting branch...';
-      git(`branch -D "${branch}"`, gitRoot);
-    }
-
-    spinner.succeed(`Cleaned studio: ${name}`);
-  } catch (error) {
-    spinner.fail(`Failed to clean workspace: ${error}`);
-    process.exit(1);
-  }
-}
-
-function statusCommand(): void {
-  const gitRoot = findGitRoot();
-  const workspaces = listWorkspaces(gitRoot);
-
-  console.log(chalk.bold('\nStudio Status:\n'));
-
-  console.log(chalk.cyan(`  main (${gitRoot})`));
-  try {
-    const status = git('status --short', gitRoot);
-    if (status) {
-      for (const line of status.split('\n')) {
-        console.log(chalk.dim(`    ${line}`));
-      }
-    } else {
-      console.log(chalk.green('    Clean'));
-    }
-  } catch {
-    console.log(chalk.red('    Error getting status'));
-  }
-  console.log('');
-
-  for (const ws of workspaces) {
-    console.log(chalk.cyan(`  ${ws.name} (${ws.branch})`));
+  if (typeof mcpText === 'string') {
     try {
-      const status = git('status --short', ws.path);
-      if (status) {
-        for (const line of status.split('\n')) {
-          console.log(chalk.dim(`    ${line}`));
-        }
-      } else {
-        console.log(chalk.green('    Clean'));
-      }
-    } catch {
-      console.log(chalk.red('    Error getting status'));
-    }
-    console.log('');
-  }
-}
-
-function pathCommand(name: string): void {
-  const gitRoot = findGitRoot();
-  const wsPath = getWorkspacePath(gitRoot, name);
-
-  if (!existsSync(wsPath)) {
-    console.error(`Studio not found: ${name}`);
-    process.exit(1);
-  }
-
-  console.log(wsPath);
-}
-
-function cdCommand(name: string): void {
-  const gitRoot = findGitRoot();
-  const wsPath = getWorkspacePath(gitRoot, name);
-
-  if (!existsSync(wsPath)) {
-    console.error(`Studio not found: ${name}`);
-    process.exit(1);
-  }
-
-  // Output shell command that can be eval'd
-  console.log(`cd "${wsPath}"`);
-}
-
-// ============================================================================
-// CLI Link
-// ============================================================================
-
-function resolveCliRoot(): string {
-  // Walk up from cwd checking each directory and its packages/cli subdir
-  let dir = process.cwd();
-  const { root } = parsePath(dir);
-  while (true) {
-    for (const candidate of [join(dir, 'packages', 'cli'), dir]) {
-      const pkgPath = join(candidate, 'package.json');
-      if (existsSync(pkgPath)) {
-        try {
-          const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-          if (pkg.name === '@personal-context/cli') return candidate;
-        } catch {
-          // continue
-        }
-      }
-    }
-    if (dir === root) break;
-    dir = dirname(dir);
-  }
-  throw new Error('Could not find @personal-context/cli package. Run from within the repo.');
-}
-
-function resolveDefaultCliName(): string {
-  const cwd = process.cwd();
-  const identityPath = join(cwd, '.pcp', 'identity.json');
-  if (existsSync(identityPath)) {
-    try {
-      const identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
-      if (identity.agentId) return `sb-${identity.agentId}`;
+      const parsed = JSON.parse(mcpText) as Record<string, unknown>;
+      return parsed;
     } catch {
       // fall through
     }
   }
-  // Fall back to directory-based name
-  const dirName = basename(cwd);
-  const match = dirName.match(/--(.+)$/);
-  if (match) return `sb-${match[1]}`;
-  return 'sb-dev';
+
+  return direct;
 }
 
-async function cliLinkCommand(options: { name?: string; unlink?: boolean }): Promise<void> {
-  const binDir = join(homedir(), '.local', 'bin');
-  const name = options.name || resolveDefaultCliName();
-
-  if (options.unlink) {
-    const linkPath = join(binDir, name);
-    if (existsSync(linkPath)) {
-      const { unlinkSync } = await import('fs');
-      unlinkSync(linkPath);
-      console.log(chalk.green(`Unlinked: ${linkPath}`));
-    } else {
-      console.log(chalk.dim(`Not found: ${linkPath}`));
-    }
-    return;
-  }
-
-  let cliRoot: string;
-  try {
-    cliRoot = resolveCliRoot();
-  } catch (err) {
-    console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+async function listWorkspaces(options: {
+  all?: boolean;
+  type?: 'personal' | 'team';
+  json?: boolean;
+}): Promise<void> {
+  const config = getPcpConfig();
+  if (!config?.email) {
+    console.error(chalk.red('PCP not configured. Run: sb init'));
     process.exit(1);
+  }
+
+  const response = await fetchPcp('/api/mcp/call', {
+    method: 'POST',
+    body: JSON.stringify({
+      tool: 'list_workspace_containers',
+      args: {
+        email: config.email,
+        includeArchived: options.all === true,
+        type: options.type,
+        ensurePersonal: true,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    console.error(chalk.red(`Failed to list workspaces: ${await response.text()}`));
+    process.exit(1);
+  }
+
+  const raw = (await response.json()) as unknown;
+  const parsed = unwrapToolResult(raw);
+  const workspaces = Array.isArray(parsed.workspaces)
+    ? (parsed.workspaces as Workspace[])
+    : [];
+
+  if (options.json) {
+    console.log(JSON.stringify({ selectedWorkspaceId: config.workspaceId, workspaces }, null, 2));
     return;
   }
 
-  const spinner = ora(`Building CLI from ${cliRoot}`).start();
+  if (workspaces.length === 0) {
+    console.log(chalk.yellow('No workspaces found.'));
+    return;
+  }
 
-  try {
-    // Build
-    execSync('npx tsc', { cwd: cliRoot, stdio: 'pipe' });
+  console.log(chalk.bold('\nWorkspaces:\n'));
 
-    // Copy templates (matches the build script)
-    const templatesSource = join(cliRoot, 'src', 'templates');
-    const templatesDest = join(cliRoot, 'dist', 'templates');
-    if (existsSync(templatesSource)) {
-      cpSync(templatesSource, templatesDest, { recursive: true });
+  for (const workspace of workspaces) {
+    const selected = config.workspaceId === workspace.id;
+    const marker = selected ? chalk.green('●') : chalk.dim('○');
+    const type = workspace.type === 'team' ? chalk.blue('team') : chalk.gray('personal');
+    const role = workspace.role ? chalk.magenta(workspace.role) : chalk.dim('member');
+
+    console.log(
+      `  ${marker} ${chalk.cyan(workspace.name)} ${chalk.dim(`(${workspace.slug})`)} ${type} ${role}`
+    );
+    console.log(chalk.dim(`      id: ${workspace.id}`));
+    if (workspace.description) {
+      console.log(chalk.dim(`      ${workspace.description}`));
     }
-
-    // Ensure executable
-    const cliJs = join(cliRoot, 'dist', 'cli.js');
-    if (!existsSync(cliJs)) {
-      spinner.fail('Build succeeded but dist/cli.js not found');
-      process.exit(1);
+    if (workspace.archivedAt) {
+      console.log(chalk.yellow(`      archived: ${workspace.archivedAt}`));
     }
-    execSync(`chmod +x "${cliJs}"`, { stdio: 'pipe' });
-
-    // Create symlink
-    mkdirSync(binDir, { recursive: true });
-    const linkPath = join(binDir, name);
-    const { symlinkSync, unlinkSync } = await import('fs');
-
-    // Remove existing symlink if present
-    if (existsSync(linkPath)) {
-      unlinkSync(linkPath);
-    }
-    symlinkSync(cliJs, linkPath);
-
-    spinner.succeed(`Linked: ${linkPath} → ${cliJs}`);
     console.log('');
-    console.log(chalk.dim(`  Test it: ${name} --help`));
-    console.log(chalk.dim(`  Remove:  sb studio cli --unlink${options.name ? ` --name ${name}` : ''}`));
-  } catch (error) {
-    spinner.fail(`Failed: ${error instanceof Error ? error.message : String(error)}`);
-    process.exit(1);
   }
 }
 
-// ============================================================================
-// Register Commands
-// ============================================================================
+async function useWorkspace(workspaceRef: string): Promise<void> {
+  const config = getPcpConfig();
+  if (!config?.email) {
+    console.error(chalk.red('PCP not configured. Run: sb init'));
+    process.exit(1);
+  }
 
-// Exported for testing
-export {
-  findGitRoot,
-  getWorkspaceParent,
-  getWorkspacePrefix,
-  getWorkspacePath,
-  getWorktreePaths,
-  planInit,
-  git,
-};
-export type { InitResult };
+  const response = await fetchPcp('/api/mcp/call', {
+    method: 'POST',
+    body: JSON.stringify({
+      tool: 'list_workspace_containers',
+      args: {
+        email: config.email,
+        includeArchived: false,
+        ensurePersonal: true,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    console.error(chalk.red(`Failed to list workspaces: ${await response.text()}`));
+    process.exit(1);
+  }
+
+  const raw = (await response.json()) as unknown;
+  const parsed = unwrapToolResult(raw);
+  const workspaces = Array.isArray(parsed.workspaces)
+    ? (parsed.workspaces as Workspace[])
+    : [];
+  const match = workspaces.find((w) => w.id === workspaceRef || w.slug === workspaceRef);
+
+  if (!match) {
+    console.error(chalk.red(`Workspace not found: ${workspaceRef}`));
+    process.exit(1);
+  }
+
+  savePcpConfig({
+    ...config,
+    workspaceId: match.id,
+  });
+
+  console.log(chalk.green(`Selected workspace: ${match.name} (${match.slug})`));
+  console.log(chalk.dim(`  id: ${match.id}`));
+}
+
+async function resolveWorkspaceByRef(
+  workspaceRef: string,
+  config: PcpConfig
+): Promise<Workspace> {
+  const response = await fetchPcp('/api/mcp/call', {
+    method: 'POST',
+    body: JSON.stringify({
+      tool: 'list_workspace_containers',
+      args: {
+        email: config.email,
+        includeArchived: false,
+        ensurePersonal: true,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to list workspaces: ${await response.text()}`);
+  }
+
+  const raw = (await response.json()) as unknown;
+  const parsed = unwrapToolResult(raw);
+  const workspaces = Array.isArray(parsed.workspaces)
+    ? (parsed.workspaces as Workspace[])
+    : [];
+  const match = workspaces.find((workspace) => workspace.id === workspaceRef || workspace.slug === workspaceRef);
+
+  if (!match) {
+    throw new Error(`Workspace not found: ${workspaceRef}`);
+  }
+
+  return match;
+}
+
+async function createWorkspace(
+  name: string,
+  options: { type?: 'personal' | 'team'; description?: string; slug?: string; use?: boolean }
+): Promise<void> {
+  const config = getPcpConfig();
+  if (!config?.email) {
+    console.error(chalk.red('PCP not configured. Run: sb init'));
+    process.exit(1);
+  }
+
+  const response = await fetchPcp('/api/mcp/call', {
+    method: 'POST',
+    body: JSON.stringify({
+      tool: 'create_workspace_container',
+      args: {
+        email: config.email,
+        name,
+        type: options.type || 'team',
+        description: options.description,
+        slug: options.slug,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    console.error(chalk.red(`Failed to create workspace: ${await response.text()}`));
+    process.exit(1);
+  }
+
+  const raw = (await response.json()) as unknown;
+  const parsed = unwrapToolResult(raw);
+  const workspace = parsed.workspace as Workspace | undefined;
+
+  if (!workspace?.id) {
+    console.error(chalk.red('Workspace creation failed'));
+    process.exit(1);
+  }
+
+  if (options.use) {
+    savePcpConfig({
+      ...config,
+      workspaceId: workspace.id,
+    });
+  }
+
+  console.log(chalk.green(`Created workspace: ${workspace.name} (${workspace.slug})`));
+  console.log(chalk.dim(`  id: ${workspace.id}`));
+  if (options.use) {
+    console.log(chalk.cyan('Selected as active workspace.'));
+  }
+}
+
+async function inviteWorkspaceMember(
+  workspaceRef: string,
+  inviteeEmail: string,
+  options: { role?: 'owner' | 'admin' | 'member' | 'viewer' }
+): Promise<void> {
+  const config = getPcpConfig();
+  if (!config?.email) {
+    console.error(chalk.red('PCP not configured. Run: sb init'));
+    process.exit(1);
+  }
+
+  let targetWorkspace: Workspace;
+  try {
+    targetWorkspace = await resolveWorkspaceByRef(workspaceRef, config);
+  } catch (error) {
+    console.error(chalk.red(error instanceof Error ? error.message : 'Workspace lookup failed'));
+    process.exit(1);
+  }
+
+  const response = await fetchPcp('/api/mcp/call', {
+    method: 'POST',
+    body: JSON.stringify({
+      tool: 'add_workspace_member',
+      args: {
+        email: config.email,
+        workspaceId: targetWorkspace.id,
+        inviteeEmail,
+        role: options.role || 'member',
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    console.error(chalk.red(`Failed to invite member: ${await response.text()}`));
+    process.exit(1);
+  }
+
+  const raw = (await response.json()) as unknown;
+  const parsed = unwrapToolResult(raw);
+
+  if (parsed.success === false) {
+    console.error(chalk.red(`Failed to invite member: ${String(parsed.error || 'unknown error')}`));
+    process.exit(1);
+  }
+
+  const member = parsed.member as
+    | { role?: string; user?: { email?: string | null }; userWasCreated?: boolean }
+    | undefined;
+  console.log(
+    chalk.green(
+      `Added ${member?.user?.email || inviteeEmail} to ${targetWorkspace.name} as ${member?.role || options.role || 'member'}`
+    )
+  );
+  if (member?.userWasCreated) {
+    console.log(chalk.dim('Created placeholder PCP user for this email (will activate on first login).'));
+  }
+}
+
+async function listWorkspaceMembers(workspaceRef?: string): Promise<void> {
+  const config = getPcpConfig();
+  if (!config?.email) {
+    console.error(chalk.red('PCP not configured. Run: sb init'));
+    process.exit(1);
+  }
+
+  const targetRef = workspaceRef || config.workspaceId;
+  if (!targetRef) {
+    console.error(chalk.red('No workspace selected. Pass <id-or-slug> or run `sb workspace use` first.'));
+    process.exit(1);
+  }
+
+  let targetWorkspace: Workspace;
+  try {
+    targetWorkspace = await resolveWorkspaceByRef(targetRef, config);
+  } catch (error) {
+    console.error(chalk.red(error instanceof Error ? error.message : 'Workspace lookup failed'));
+    process.exit(1);
+  }
+
+  const response = await fetchPcp('/api/mcp/call', {
+    method: 'POST',
+    body: JSON.stringify({
+      tool: 'get_workspace_container',
+      args: {
+        email: config.email,
+        workspaceId: targetWorkspace.id,
+        includeMembers: true,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    console.error(chalk.red(`Failed to list workspace members: ${await response.text()}`));
+    process.exit(1);
+  }
+
+  const raw = (await response.json()) as unknown;
+  const parsed = unwrapToolResult(raw);
+  const members = Array.isArray((parsed.workspace as { members?: unknown[] } | undefined)?.members)
+    ? ((parsed.workspace as { members?: unknown[] }).members as Array<{
+        role?: string;
+        user?: {
+          email?: string | null;
+          firstName?: string | null;
+          username?: string | null;
+          lastLoginAt?: string | null;
+        };
+        userId?: string;
+      }>)
+    : [];
+
+  console.log(chalk.bold(`\nMembers — ${targetWorkspace.name}\n`));
+  if (members.length === 0) {
+    console.log(chalk.yellow('No members found.'));
+    return;
+  }
+
+  for (const member of members) {
+    const label =
+      member.user?.firstName || member.user?.username || member.user?.email || member.userId || 'unknown';
+    const joinedLabel = member.user?.lastLoginAt ? 'joined' : 'invited';
+    console.log(
+      `  ${chalk.cyan(label)} ${chalk.dim(`(${member.role || 'member'})`)} ${chalk.gray(`[${joinedLabel}]`)}`
+    );
+  }
+  console.log('');
+}
+
+function currentWorkspace(): void {
+  const config = getPcpConfig();
+  if (!config) {
+    console.error(chalk.red('PCP not configured. Run: sb init'));
+    process.exit(1);
+  }
+
+  if (!config.workspaceId) {
+    console.log(chalk.yellow('No workspace selected.'));
+    console.log(chalk.dim('Use `sb workspace use <id-or-slug>` to select one.'));
+    return;
+  }
+
+  console.log(config.workspaceId);
+}
 
 export function registerWorkspaceCommands(program: Command): void {
-  const ws = program
-    .command('studio')
-    .alias('ws')
-    .description('Studio management for parallel development (worktree-backed)');
+  const workspace = program
+    .command('workspace')
+    .description('Workspace management (personal/team scope)');
 
-  ws.command('init [parent-name]')
-    .description('Initialize parent directory structure (groups repo + worktrees)')
-    .option('-n, --dry-run', 'Show planned moves without making changes')
-    .action(initWorkspace);
+  workspace
+    .command('list')
+    .alias('ls')
+    .option('--all', 'Include archived workspaces')
+    .option('--type <type>', 'Filter by workspace type (personal|team)')
+    .option('--json', 'Output JSON')
+    .action(listWorkspaces);
 
-  ws.command('create [name]')
-    .description('Create a new workspace with git worktree')
-    .option('-a, --agent <agent>', 'Agent ID for this workspace', 'wren')
-    .option('-p, --purpose <desc>', 'Description/purpose of the workspace')
-    .option('-b, --branch <branch>', 'Custom branch name (default: <agentId>/workspace/<name>)')
-    .option('--backend <name>', 'Primary backend (claude-code, codex, gemini)')
-    .option('--copy-config', 'Copy config directories into the new workspace')
-    .option(
-      '--config-dirs <dirs>',
-      'Comma-separated config dirs to copy (default: .claude)',
-      '.claude'
-    )
-    .action(async (name: string | undefined, options) => {
-      if (!name && process.stdin.isTTY) {
-        // Interactive mode: prompt for all values
-        try {
-          const gitRoot = findGitRoot();
-          const agentId = options.agent || 'wren';
-          const result = await runInteractiveFlow(agentId, gitRoot);
-          return createWorkspace(result.name, options, {
-            branch: result.branch,
-            configDirsList: result.configDirs,
-          });
-        } catch {
-          // User cancelled or inquirer failed — fall through to default
-        }
-      }
-      const resolvedName = name || 'new';
-      return createWorkspace(resolvedName, options);
-    });
+  workspace
+    .command('use <workspace-id-or-slug>')
+    .description('Select the active workspace for this machine')
+    .action(useWorkspace);
 
-  ws.command('list').alias('ls').description('List all workspaces').action(listCommand);
+  workspace
+    .command('create <name>')
+    .description('Create a new workspace')
+    .option('--type <type>', 'Workspace type (personal|team)', 'team')
+    .option('--description <description>', 'Workspace description')
+    .option('--slug <slug>', 'Workspace slug')
+    .option('--use', 'Select the created workspace after creation')
+    .action((name, options: { type?: 'personal' | 'team'; description?: string; slug?: string; use?: boolean }) =>
+      createWorkspace(name, options)
+    );
 
-  ws.command('remove <name>')
-    .alias('rm')
-    .description('Remove a workspace (keeps branch for PR)')
-    .action(removeWorkspace);
+  workspace
+    .command('invite <workspace-id-or-slug> <email>')
+    .description('Invite/add a collaborator to a workspace')
+    .option('--role <role>', 'Role (owner|admin|member|viewer)', 'member')
+    .action((workspaceRef, inviteeEmail, options: { role?: 'owner' | 'admin' | 'member' | 'viewer' }) =>
+      inviteWorkspaceMember(workspaceRef, inviteeEmail, options)
+    );
 
-  ws.command('clean <name>')
-    .description('Remove workspace and delete branch')
-    .action(cleanWorkspace);
+  workspace
+    .command('members [workspace-id-or-slug]')
+    .description('List collaborators in a workspace')
+    .action(listWorkspaceMembers);
 
-  ws.command('status')
-    .alias('st')
-    .description('Show git status of all workspaces')
-    .action(statusCommand);
-
-  ws.command('path <name>').description('Output workspace path').action(pathCommand);
-
-  ws.command('cd <name>')
-    .description('Output cd command (use with: eval $(sb studio cd <name>))')
-    .action(cdCommand);
-
-  ws.command('cli')
-    .description('Build CLI and link as a named binary (default: sb-<agent>)')
-    .option('-n, --name <name>', 'Binary name (default: sb-<agent> from .pcp/identity.json)')
-    .option('--unlink', 'Remove the linked binary instead of creating it')
-    .action(cliLinkCommand);
+  workspace
+    .command('current')
+    .description('Print selected workspace ID')
+    .action(currentWorkspace);
 }

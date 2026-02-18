@@ -1,5 +1,5 @@
 /**
- * Workspace Command Tests
+ * Studio Command Tests
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -7,7 +7,7 @@ import { execSync } from 'child_process';
 import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync, renameSync } from 'fs';
 import { join, basename } from 'path';
 import { tmpdir } from 'os';
-import { planInit, getWorktreePaths, type InitResult } from './workspace.js';
+import { planInit, getWorktreePaths, type InitResult } from './studio.js';
 
 type Move = InitResult['moves'][number];
 
@@ -19,7 +19,7 @@ function git(args: string, cwd: string): string {
   return execSync(`git ${args}`, { encoding: 'utf-8', cwd }).trim();
 }
 
-describe('Workspace Commands', () => {
+describe('Studio Commands', () => {
   beforeEach(() => {
     // Create test directory and git repo
     mkdirSync(TEST_REPO, { recursive: true });
@@ -89,11 +89,10 @@ describe('Workspace Commands', () => {
     });
   });
 
-  describe('Workspace identity', () => {
+  describe('Studio identity', () => {
     it('should create identity.json in .pcp directory', () => {
-      // New format: <repo-name>--<workspace-name>
       const worktreePath = join(TEST_DIR, 'test-repo--test');
-      git(`worktree add -b wren/workspace/test "${worktreePath}"`, TEST_REPO);
+      git(`worktree add -b wren/studio/test "${worktreePath}"`, TEST_REPO);
 
       // Create .pcp identity like the CLI would
       const pcpDir = join(worktreePath, '.pcp');
@@ -101,10 +100,10 @@ describe('Workspace Commands', () => {
 
       const identity = {
         agentId: 'wren',
-        context: 'workspace-test',
-        description: 'Test workspace',
-        workspace: 'test',
-        branch: 'wren/workspace/test',
+        context: 'studio-test',
+        description: 'Test studio',
+        studio: 'test',
+        branch: 'wren/studio/test',
         createdAt: new Date().toISOString(),
       };
 
@@ -115,24 +114,23 @@ describe('Workspace Commands', () => {
 
       const savedIdentity = JSON.parse(readFileSync(join(pcpDir, 'identity.json'), 'utf-8'));
       expect(savedIdentity.agentId).toBe('wren');
-      expect(savedIdentity.workspace).toBe('test');
-      expect(savedIdentity.branch).toBe('wren/workspace/test');
+      expect(savedIdentity.studio).toBe('test');
+      expect(savedIdentity.branch).toBe('wren/studio/test');
     });
 
     it('should support custom agent ID', () => {
-      // New format: <repo-name>--<workspace-name>
       const worktreePath = join(TEST_DIR, 'test-repo--myra');
-      git(`worktree add -b myra/workspace/myra "${worktreePath}"`, TEST_REPO);
+      git(`worktree add -b myra/studio/myra "${worktreePath}"`, TEST_REPO);
 
       const pcpDir = join(worktreePath, '.pcp');
       mkdirSync(pcpDir, { recursive: true });
 
       const identity = {
         agentId: 'myra',
-        context: 'workspace-myra',
-        description: 'Myra workspace',
-        workspace: 'myra',
-        branch: 'myra/workspace/myra',
+        context: 'studio-myra',
+        description: 'Myra studio',
+        studio: 'myra',
+        branch: 'myra/studio/myra',
         createdAt: new Date().toISOString(),
       };
 
@@ -141,24 +139,46 @@ describe('Workspace Commands', () => {
       const savedIdentity = JSON.parse(readFileSync(join(pcpDir, 'identity.json'), 'utf-8'));
       expect(savedIdentity.agentId).toBe('myra');
     });
+
+    it('should read legacy identity.json with workspace field', () => {
+      const worktreePath = join(TEST_DIR, 'test-repo--legacy');
+      git(`worktree add -b wren/workspace/legacy "${worktreePath}"`, TEST_REPO);
+
+      const pcpDir = join(worktreePath, '.pcp');
+      mkdirSync(pcpDir, { recursive: true });
+
+      // Old format with workspace field
+      const identity = {
+        agentId: 'wren',
+        context: 'workspace-legacy',
+        description: 'Legacy workspace',
+        workspace: 'legacy',
+        branch: 'wren/workspace/legacy',
+        createdAt: new Date().toISOString(),
+      };
+
+      writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
+
+      const savedIdentity = JSON.parse(readFileSync(join(pcpDir, 'identity.json'), 'utf-8'));
+      expect(savedIdentity.agentId).toBe('wren');
+      expect(savedIdentity.workspace).toBe('legacy');
+    });
   });
 
-  describe('Workspace naming convention', () => {
-    it('should use repo-name-- prefix for workspace directories', () => {
-      const workspaceName = 'feature-x';
-      // New format: <repo-name>--<workspace-name>
-      const expectedPath = join(TEST_DIR, `test-repo--${workspaceName}`);
+  describe('Studio naming convention', () => {
+    it('should use repo-name-- prefix for studio directories', () => {
+      const studioName = 'feature-x';
+      const expectedPath = join(TEST_DIR, `test-repo--${studioName}`);
 
-      git(`worktree add -b wren/workspace/${workspaceName} "${expectedPath}"`, TEST_REPO);
+      git(`worktree add -b wren/studio/${studioName} "${expectedPath}"`, TEST_REPO);
 
       expect(existsSync(expectedPath)).toBe(true);
     });
 
-    it('should use agentId/workspace/ prefix for branches', () => {
-      const workspaceName = 'bugfix-y';
-      const branchName = `wren/workspace/${workspaceName}`;
-      // New format: <repo-name>--<workspace-name>
-      const worktreePath = join(TEST_DIR, `test-repo--${workspaceName}`);
+    it('should use agentId/studio/ prefix for branches', () => {
+      const studioName = 'bugfix-y';
+      const branchName = `wren/studio/${studioName}`;
+      const worktreePath = join(TEST_DIR, `test-repo--${studioName}`);
 
       git(`worktree add -b "${branchName}" "${worktreePath}"`, TEST_REPO);
 
@@ -168,7 +188,7 @@ describe('Workspace Commands', () => {
   });
 });
 
-describe('Workspace init', () => {
+describe('Studio init', () => {
   // macOS resolves /var -> /private/var, so we need the real path
   let realTestDir: string;
   let realTestRepo: string;
@@ -207,7 +227,7 @@ describe('Workspace init', () => {
 
     it('should include existing worktrees in the plan', () => {
       const wtPath = join(realTestDir, 'test-repo--myra');
-      git(`worktree add -b myra/workspace/myra "${wtPath}"`, realTestRepo);
+      git(`worktree add -b myra/studio/myra "${wtPath}"`, realTestRepo);
 
       const result = planInit(realTestRepo, 'pcp');
 
@@ -239,8 +259,8 @@ describe('Workspace init', () => {
     it('should return worktree paths excluding main', () => {
       const wt1 = join(realTestDir, 'test-repo--alpha');
       const wt2 = join(realTestDir, 'test-repo--beta');
-      git(`worktree add -b wren/workspace/alpha "${wt1}"`, realTestRepo);
-      git(`worktree add -b wren/workspace/beta "${wt2}"`, realTestRepo);
+      git(`worktree add -b wren/studio/alpha "${wt1}"`, realTestRepo);
+      git(`worktree add -b wren/studio/beta "${wt2}"`, realTestRepo);
 
       const paths = getWorktreePaths(realTestRepo);
       expect(paths).toHaveLength(2);
@@ -253,12 +273,12 @@ describe('Workspace init', () => {
     it('should move repo and worktrees into parent directory', () => {
       // Create a worktree
       const wtPath = join(realTestDir, 'test-repo--wren');
-      git(`worktree add -b wren/workspace/wren "${wtPath}"`, realTestRepo);
+      git(`worktree add -b wren/studio/wren "${wtPath}"`, realTestRepo);
 
       // Plan the init
       const { parentDir, moves } = planInit(realTestRepo, 'pcp');
 
-      // Execute the moves (same logic as initWorkspace but without spinner/process.exit)
+      // Execute the moves (same logic as initStudio but without spinner/process.exit)
       mkdirSync(parentDir, { recursive: true });
 
       // Move worktrees first
@@ -286,7 +306,7 @@ describe('Workspace init', () => {
       // Verify git still works from new main location
       const branches = git('branch', mainMove.to);
       expect(branches).toContain('main');
-      expect(branches).toContain('wren/workspace/wren');
+      expect(branches).toContain('wren/studio/wren');
 
       // Verify worktree list shows correct new paths
       const worktreeList = git('worktree list', mainMove.to);
@@ -315,9 +335,9 @@ describe('Workspace init', () => {
       const wt1 = join(realTestDir, 'test-repo--alpha');
       const wt2 = join(realTestDir, 'test-repo--beta');
       const wt3 = join(realTestDir, 'test-repo--gamma');
-      git(`worktree add -b wren/workspace/alpha "${wt1}"`, realTestRepo);
-      git(`worktree add -b wren/workspace/beta "${wt2}"`, realTestRepo);
-      git(`worktree add -b wren/workspace/gamma "${wt3}"`, realTestRepo);
+      git(`worktree add -b wren/studio/alpha "${wt1}"`, realTestRepo);
+      git(`worktree add -b wren/studio/beta "${wt2}"`, realTestRepo);
+      git(`worktree add -b wren/studio/gamma "${wt3}"`, realTestRepo);
 
       const { parentDir, moves } = planInit(realTestRepo, 'multi');
 
