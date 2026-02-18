@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import {
   ArrowLeft,
+  Bot,
   ChevronDown,
   ChevronRight,
   ChevronLeft,
@@ -15,6 +16,7 @@ import {
   Mail,
   MessageSquare,
   AlertCircle,
+  User,
 } from 'lucide-react';
 import { useApiQuery } from '@/lib/api';
 import clsx from 'clsx';
@@ -105,57 +107,120 @@ const typeColors: Record<string, string> = {
   notification: 'bg-amber-100 text-amber-700',
 };
 
-function MessageItem({ message }: { message: InboxMessage }) {
+// Stable color per agent name — deterministic hash to pick from a palette
+const agentColors = [
+  'bg-blue-600',
+  'bg-green-600',
+  'bg-purple-600',
+  'bg-orange-600',
+  'bg-pink-600',
+  'bg-teal-600',
+  'bg-indigo-600',
+  'bg-rose-600',
+];
+
+function agentColor(name: string): string {
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) | 0;
+  return agentColors[Math.abs(hash) % agentColors.length];
+}
+
+function formatTimestamp(date: string): string {
+  const d = new Date(date);
+  const today = new Date();
+  const isToday = d.toDateString() === today.toDateString();
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  return isToday
+    ? `Today at ${time}`
+    : `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} at ${time}`;
+}
+
+function MessageItem({ message, compact }: { message: InboxMessage; compact?: boolean }) {
+  const sender = message.senderAgentId || 'unknown';
+  const isAgent = !!message.senderAgentId;
+
   return (
-    <div className="rounded-md border border-gray-200 bg-white p-3">
-      <div className="mb-2 flex items-center justify-between text-xs text-gray-500">
-        <div className="flex items-center gap-2">
-          {message.senderAgentId && (
-            <Badge variant="outline" className="font-mono text-xs">
-              {message.senderAgentId}
-            </Badge>
-          )}
-          <Badge
-            className={clsx('text-[10px]', typeColors[message.messageType] || typeColors.message)}
-          >
-            {message.messageType}
-          </Badge>
-          <Badge
-            className={clsx('text-[10px]', statusColors[message.status] || statusColors.unread)}
-          >
-            {message.status}
-          </Badge>
-          {message.priority !== 'normal' && (
-            <Badge
-              className={clsx(
-                'text-[10px]',
-                priorityColors[message.priority] || priorityColors.normal
-              )}
-            >
-              {message.priority}
-            </Badge>
-          )}
-        </div>
-        <span>{formatRelativeTime(message.createdAt)}</span>
-      </div>
-      {message.subject && (
-        <p className="mb-1 text-sm font-medium text-gray-800">{message.subject}</p>
+    <div
+      className={clsx(
+        'group flex gap-3 hover:bg-gray-50/50 rounded-md px-2',
+        compact ? 'py-0.5' : 'py-2'
       )}
-      <p className="whitespace-pre-wrap break-words text-sm text-gray-700">{message.content}</p>
-      {(message.relatedSessionId || message.relatedArtifactUri) && (
-        <div className="mt-2 flex items-center gap-2 text-xs text-gray-400">
-          {message.relatedSessionId && (
-            <Link
-              href={`/sessions/${message.relatedSessionId}`}
-              className="underline hover:text-gray-600"
-            >
-              Session
-            </Link>
+    >
+      {/* Avatar */}
+      {!compact ? (
+        <div
+          className={clsx(
+            'flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-white text-xs font-semibold',
+            isAgent ? agentColor(sender) : 'bg-gray-400'
           )}
-          {message.relatedArtifactUri && (
-            <span className="font-mono">{message.relatedArtifactUri}</span>
-          )}
+        >
+          {isAgent ? sender.slice(0, 2).toUpperCase() : <User className="h-4 w-4" />}
         </div>
+      ) : (
+        <div className="w-9 shrink-0" />
+      )}
+
+      {/* Content */}
+      <div className="min-w-0 flex-1">
+        {!compact && (
+          <div className="flex items-baseline gap-2 flex-wrap">
+            <span className="text-sm font-semibold text-gray-900">{sender}</span>
+            <span className="text-xs text-gray-400">{formatTimestamp(message.createdAt)}</span>
+            {message.messageType !== 'message' && (
+              <Badge
+                className={clsx(
+                  'text-[10px] px-1.5 py-0',
+                  typeColors[message.messageType] || typeColors.message
+                )}
+              >
+                {message.messageType.replace('_', ' ')}
+              </Badge>
+            )}
+            {message.priority !== 'normal' && (
+              <Badge
+                className={clsx(
+                  'text-[10px] px-1.5 py-0',
+                  priorityColors[message.priority] || priorityColors.normal
+                )}
+              >
+                {message.priority}
+              </Badge>
+            )}
+            {message.relatedSessionId && (
+              <Link
+                href={`/sessions/${message.relatedSessionId}`}
+                className="text-[10px] text-blue-500 hover:text-blue-700 hover:underline"
+              >
+                session
+              </Link>
+            )}
+            {message.status === 'unread' && <span className="h-2 w-2 rounded-full bg-blue-500" />}
+          </div>
+        )}
+        {message.subject && <p className="text-sm font-medium text-gray-800">{message.subject}</p>}
+        <p
+          className={clsx(
+            'whitespace-pre-wrap break-words text-sm text-gray-700',
+            compact && 'ml-0'
+          )}
+        >
+          {message.content}
+        </p>
+        {message.relatedArtifactUri && (
+          <div className="mt-1 text-xs text-gray-400">
+            <span className="font-mono">{message.relatedArtifactUri}</span>
+          </div>
+        )}
+      </div>
+
+      {/* Hover timestamp for compact messages */}
+      {compact && (
+        <span className="shrink-0 text-[10px] text-gray-300 opacity-0 group-hover:opacity-100 transition-opacity self-center">
+          {new Date(message.createdAt).toLocaleTimeString([], {
+            hour: 'numeric',
+            minute: '2-digit',
+          })}
+        </span>
       )}
     </div>
   );
@@ -165,49 +230,61 @@ function ThreadCard({ thread }: { thread: ThreadGroup }) {
   const [expanded, setExpanded] = useState(false);
 
   return (
-    <div className="rounded-lg border border-gray-200 bg-white">
+    <div className="rounded-lg border border-gray-200 bg-white overflow-hidden">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="flex w-full items-start justify-between p-4 text-left hover:bg-gray-50/50 transition-colors"
+        className="flex w-full items-center justify-between px-4 py-3 text-left hover:bg-gray-50/50 transition-colors"
       >
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 flex-wrap">
-            <Badge variant="outline" className="font-mono text-xs">
-              {thread.threadKey}
-            </Badge>
-            <span className="text-xs text-gray-500">{thread.messageCount} messages</span>
-            {thread.unreadCount > 0 && (
-              <Badge className="bg-blue-100 text-blue-700 text-[10px]">
-                {thread.unreadCount} unread
-              </Badge>
-            )}
-          </div>
-          <div className="mt-1 flex items-center gap-2 text-xs text-gray-500">
-            <span>Participants:</span>
-            {thread.participants.map((p) => (
-              <Badge key={p} variant="outline" className="text-[10px] font-mono">
-                {p}
-              </Badge>
+        <div className="flex items-center gap-3 min-w-0">
+          {/* Stacked participant avatars */}
+          <div className="flex -space-x-2">
+            {thread.participants.slice(0, 3).map((p) => (
+              <div
+                key={p}
+                className={clsx(
+                  'flex h-7 w-7 items-center justify-center rounded-full text-white text-[10px] font-semibold ring-2 ring-white',
+                  agentColor(p)
+                )}
+                title={p}
+              >
+                {p.slice(0, 2).toUpperCase()}
+              </div>
             ))}
           </div>
-          <p className="mt-1.5 text-sm text-gray-600 line-clamp-2">
-            {thread.latestMessage.subject || thread.latestMessage.content}
-          </p>
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <Badge variant="outline" className="font-mono text-xs shrink-0">
+                {thread.threadKey}
+              </Badge>
+              <span className="text-xs text-gray-500">{thread.messageCount} messages</span>
+              {thread.unreadCount > 0 && (
+                <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-blue-500 px-1.5 text-[10px] font-semibold text-white">
+                  {thread.unreadCount}
+                </span>
+              )}
+            </div>
+            <p className="mt-0.5 text-sm text-gray-600 line-clamp-1 truncate">
+              {thread.latestMessage.subject || thread.latestMessage.content}
+            </p>
+          </div>
         </div>
         <div className="ml-4 flex shrink-0 items-center gap-2">
           <span className="text-xs text-gray-400">{formatRelativeTime(thread.lastMessageAt)}</span>
-          {expanded ? (
-            <ChevronDown className="h-4 w-4 text-gray-400" />
-          ) : (
-            <ChevronRight className="h-4 w-4 text-gray-400" />
-          )}
+          <ChevronDown
+            className={clsx(
+              'h-4 w-4 text-gray-400 transition-transform',
+              !expanded && '-rotate-90'
+            )}
+          />
         </div>
       </button>
       {expanded && (
-        <div className="border-t border-gray-200 bg-gray-50/30 p-4 space-y-3">
-          {thread.messages.map((msg) => (
-            <MessageItem key={msg.id} message={msg} />
-          ))}
+        <div className="border-t border-gray-100 bg-white px-2 py-2">
+          {thread.messages.map((msg, i) => {
+            const prevMsg = i > 0 ? thread.messages[i - 1] : null;
+            const sameSender = prevMsg?.senderAgentId === msg.senderAgentId;
+            return <MessageItem key={msg.id} message={msg} compact={sameSender} />;
+          })}
         </div>
       )}
     </div>
