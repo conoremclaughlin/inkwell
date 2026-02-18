@@ -34,8 +34,8 @@ export interface AgentTriggerPayload {
   studioId?: string;
   /** Convenience studio routing hint */
   studioHint?: 'main';
-  /** Related session to inherit studio scope from */
-  relatedSessionId?: string;
+  /** Recipient session to inherit studio scope from */
+  recipientSessionId?: string;
   /** Additional metadata */
   metadata?: Record<string, unknown>;
 }

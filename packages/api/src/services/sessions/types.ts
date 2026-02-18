@@ -115,8 +115,8 @@ export interface SessionRequest {
     studioId?: string;
     // Convenience routing hint (e.g., force main studio without UUID lookup)
     studioHint?: 'main';
-    // Related session to inherit studio scope from
-    relatedSessionId?: string;
+    // Recipient session to inherit studio scope from
+    recipientSessionId?: string;
     // For task sessions
     sessionType?: SessionType;
     taskDescription?: string;
@@ -246,7 +246,7 @@ export interface ISessionService {
       threadKey?: string;
       studioId?: string;
       studioHint?: 'main';
-      relatedSessionId?: string;
+      recipientSessionId?: string;
     }
   ): Promise<Session>;
 

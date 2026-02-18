@@ -480,7 +480,7 @@ If you need to message a user, use send_response with the appropriate channel an
         threadKey: payload.threadKey,
         studioId: payload.studioId,
         studioHint: payload.studioHint,
-        relatedSessionId: payload.relatedSessionId,
+        recipientSessionId: payload.recipientSessionId,
       },
     };
 

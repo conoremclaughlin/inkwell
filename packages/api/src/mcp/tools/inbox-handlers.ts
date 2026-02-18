@@ -99,17 +99,6 @@ const getAgentStatusSchema = userIdentifierBaseSchema.extend({
 // ============== Handlers ==============
 
 export async function handleSendToInbox(args: unknown, dataComposer: DataComposer) {
-  if (
-    args &&
-    typeof args === 'object' &&
-    !Array.isArray(args) &&
-    Object.prototype.hasOwnProperty.call(args, 'relatedSessionId')
-  ) {
-    throw new Error(
-      '`relatedSessionId` has been retired for send_to_inbox. Use `recipientSessionId`.'
-    );
-  }
-
   const supabase = dataComposer.getClient();
   const parsed = sendToInboxSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
@@ -246,7 +235,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       summary: triggerSummary || subject || `New ${messageType} from ${triggerSenderId}`,
       priority,
       threadKey,
-      relatedSessionId: effectiveRecipientSessionId,
+      recipientSessionId: effectiveRecipientSessionId,
       studioId: recipientStudioId,
       studioHint: recipientStudioHint,
     };
@@ -379,7 +368,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
             status: m.status,
             senderAgentId: m.sender_agent_id,
             threadKey: m.thread_key || null,
-            relatedSessionId: m.related_session_id,
+            recipientSessionId: m.related_session_id,
             relatedArtifactUri: m.related_artifact_uri,
             metadata: m.metadata,
             createdAt: m.created_at,
