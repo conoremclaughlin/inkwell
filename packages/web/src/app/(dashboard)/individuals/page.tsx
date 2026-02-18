@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { History, Brain, Sparkles, FileText, User, Heart, Zap } from 'lucide-react';
+import { History, Brain, Sparkles, FileText, User, Heart, Zap, Inbox } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useApiQuery } from '@/lib/api';
@@ -210,6 +210,12 @@ function IdentityCard({ identity }: { identity: Identity }) {
           </div>
           <div className="flex items-center gap-2">
             <Badge variant="secondary">v{identity.version}</Badge>
+            <Button variant="outline" size="sm" asChild>
+              <Link href={`/individuals/${identity.agentId}/inbox`}>
+                <Inbox className="mr-1 h-4 w-4" />
+                Inbox
+              </Link>
+            </Button>
             <Button variant="outline" size="sm" asChild>
               <Link href={`/individuals/${identity.agentId}/memories`}>
                 <Brain className="mr-1 h-4 w-4" />

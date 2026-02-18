@@ -3260,7 +3260,7 @@ Message types:
 Trigger defaults:
 - task_request / session_resume / notification: trigger recipient wake-up by default
 - message: does not trigger by default
-- Any default can be overridden with the `trigger` boolean flag
+- Any default can be overridden with the \`trigger\` boolean flag
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: inboxToolDefinitions[0].schema,
