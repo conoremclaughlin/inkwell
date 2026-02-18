@@ -277,7 +277,26 @@ describe('handleSendToInbox - threadKey', () => {
     );
   });
 
-  it('should pass relatedSessionId through trigger payload', async () => {
+  it('should reject deprecated relatedSessionId input', async () => {
+    const mockSb = createMockSupabase();
+    const mockDc = createMockDataComposer(mockSb);
+
+    await expect(
+      handleSendToInbox(
+        {
+          email: 'test@test.com',
+          recipientAgentId: 'lumen',
+          senderAgentId: 'wren',
+          messageType: 'session_resume',
+          relatedSessionId: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
+          content: 'Resume this session',
+        },
+        mockDc as never
+      )
+    ).rejects.toThrow('relatedSessionId');
+  });
+
+  it('should pass recipientSessionId through trigger payload', async () => {
     const { getAgentGateway } = await import('../../channels/agent-gateway.js');
     const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
 
@@ -290,7 +309,7 @@ describe('handleSendToInbox - threadKey', () => {
         recipientAgentId: 'lumen',
         senderAgentId: 'wren',
         messageType: 'session_resume',
-        relatedSessionId: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
+        recipientSessionId: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
         content: 'Resume this session',
       },
       mockDc as never
@@ -310,7 +329,7 @@ describe('handleSendToInbox - threadKey', () => {
     const mockSb = createMockSupabase();
     const mockDc = createMockDataComposer(mockSb);
 
-    await handleSendToInbox(
+    const result = await handleSendToInbox(
       {
         email: 'test@test.com',
         recipientAgentId: 'lumen',
@@ -332,6 +351,8 @@ describe('handleSendToInbox - threadKey', () => {
         relatedSessionId: 'b85490f5-0836-4bdd-8193-f6cfa2562a41',
       })
     );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.recipientSessionId).toBe('b85490f5-0836-4bdd-8193-f6cfa2562a41');
   });
 
   it('should trigger without senderAgentId using system sender', async () => {

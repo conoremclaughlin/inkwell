@@ -39,11 +39,6 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .uuid()
     .optional()
     .describe('Recipient session ID to resume/route to (preferred)'),
-  relatedSessionId: z
-    .string()
-    .uuid()
-    .optional()
-    .describe('Deprecated alias for recipientSessionId'),
   recipientStudioId: z
     .string()
     .uuid()
@@ -104,6 +99,17 @@ const getAgentStatusSchema = userIdentifierBaseSchema.extend({
 // ============== Handlers ==============
 
 export async function handleSendToInbox(args: unknown, dataComposer: DataComposer) {
+  if (
+    args &&
+    typeof args === 'object' &&
+    !Array.isArray(args) &&
+    Object.prototype.hasOwnProperty.call(args, 'relatedSessionId')
+  ) {
+    throw new Error(
+      '`relatedSessionId` has been retired for send_to_inbox. Use `recipientSessionId`.'
+    );
+  }
+
   const supabase = dataComposer.getClient();
   const parsed = sendToInboxSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
@@ -115,7 +121,6 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     messageType = 'message',
     priority = 'normal',
     recipientSessionId,
-    relatedSessionId,
     recipientStudioId,
     recipientStudioHint,
     relatedArtifactUri,
@@ -128,7 +133,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   // Enforce identity on sender (who is performing the action), not recipient (target)
   const senderAgentId = getEffectiveAgentId(parsed.senderAgentId);
   const triggerSenderId = senderAgentId || 'system';
-  const effectiveRecipientSessionId = recipientSessionId || relatedSessionId;
+  const effectiveRecipientSessionId = recipientSessionId;
 
   // Default trigger behavior:
   // Wake recipient by default for actionable handoffs, but not for casual messages.
@@ -294,8 +299,6 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           recipientStudioHint: recipientStudioHint || null,
           createdAt: message.created_at,
           trigger: triggerResult,
-          // Backward compatibility
-          relatedSessionId: effectiveRecipientSessionId || null,
           ...(missingRoutingAnchor
             ? {
                 routingHint:
