@@ -43,6 +43,8 @@ describe('Hierarchical Memory Integration', () => {
   });
 
   afterAll(async () => {
+    if (!dataComposer) return;
+
     // Clean up test memories
     if (createdMemoryIds.length > 0) {
       await dataComposer.getClient().from('memories').delete().in('id', createdMemoryIds);
