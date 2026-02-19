@@ -43,13 +43,13 @@ export function readIdentityJson(cwd: string): IdentityJson | null {
 
 /**
  * Resolve agent ID from multiple sources:
- * 1. CLI --agent flag (if explicitly changed from default)
+ * 1. CLI --agent flag (if provided)
  * 2. .pcp/identity.json in current directory
  * 3. ~/.pcp/config.json agentMapping
- * 4. Default: 'wren'
+ * 4. null (no identity configured)
  */
-export function resolveAgentId(cliAgent?: string): string {
-  if (cliAgent && cliAgent !== 'wren') {
+export function resolveAgentId(cliAgent?: string): string | null {
+  if (cliAgent) {
     return cliAgent;
   }
 
@@ -87,7 +87,33 @@ export function resolveAgentId(cliAgent?: string): string {
     }
   }
 
-  return cliAgent || 'wren';
+  return null;
+}
+
+/**
+ * Resolve backend from multiple sources:
+ * 1. CLI --backend flag (if provided)
+ * 2. .pcp/identity.json → backend field
+ * 3. Default: 'claude'
+ */
+export function resolveBackend(cliBackend?: string): string {
+  if (cliBackend) {
+    return cliBackend;
+  }
+
+  let cwd: string | null = null;
+  try {
+    cwd = process.cwd();
+  } catch {
+    // Fall through to default
+  }
+
+  if (cwd) {
+    const identity = readIdentityJson(cwd);
+    if (identity?.backend) return identity.backend;
+  }
+
+  return 'claude';
 }
 
 /**

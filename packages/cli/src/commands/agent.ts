@@ -16,6 +16,7 @@ import ora from 'ora';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { resolveAgentId } from '../backends/identity.js';
 
 interface PcpConfig {
   userId?: string;
@@ -195,7 +196,11 @@ async function inboxCommand(agentId?: string): Promise<void> {
     process.exit(1);
   }
 
-  const agent = agentId || 'wren';
+  const agent = agentId || resolveAgentId();
+  if (!agent) {
+    console.error(chalk.red('No agent identity configured. Pass an agent ID or run `sb init`.'));
+    process.exit(1);
+  }
 
   try {
     const response = await fetchPcp('/api/mcp/call', {

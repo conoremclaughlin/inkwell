@@ -11,7 +11,7 @@ import { getBackend, resolveAgentId } from '../backends/index.js';
 import { getValidAccessToken } from '../auth/tokens.js';
 
 export interface SbOptions {
-  agent: string;
+  agent: string | undefined;
   model: string | undefined; // undefined = use backend's default
   session: boolean;
   verbose: boolean;
@@ -46,6 +46,12 @@ export async function runClaude(
   passthroughArgs: string[] = []
 ): Promise<void> {
   const agentId = resolveAgentId(options.agent);
+  if (!agentId) {
+    console.error(chalk.red('No agent identity configured.'));
+    console.error(chalk.dim('Run `sb init` to set up PCP in this repo, or `sb awaken` to create a new SB.'));
+    console.error(chalk.dim('Or pass `-a <agent>` to specify one directly.'));
+    process.exit(1);
+  }
   const adapter = getBackend(options.backend);
 
   if (options.verbose) {
@@ -94,6 +100,12 @@ export async function runClaudeInteractive(
   passthroughArgs: string[] = []
 ): Promise<void> {
   const agentId = resolveAgentId(options.agent);
+  if (!agentId) {
+    console.error(chalk.red('No agent identity configured.'));
+    console.error(chalk.dim('Run `sb init` to set up PCP in this repo, or `sb awaken` to create a new SB.'));
+    console.error(chalk.dim('Or pass `-a <agent>` to specify one directly.'));
+    process.exit(1);
+  }
   const adapter = getBackend(options.backend);
 
   if (options.verbose) {
