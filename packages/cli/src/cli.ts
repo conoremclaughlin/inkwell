@@ -28,6 +28,7 @@ import { registerHooksCommands } from './commands/hooks.js';
 import { registerInitCommand } from './commands/init.js';
 import { registerAuthCommands } from './commands/auth.js';
 import { runClaude, runClaudeInteractive } from './commands/claude.js';
+import { resolveBackend } from './backends/index.js';
 
 const VERSION = '0.3.0';
 
@@ -54,7 +55,7 @@ const SB_FLAGS: Record<string, { hasValue: boolean; key: string }> = {
 interface ParsedArgs {
   sbOptions: {
     agent: string | undefined;
-    backend: string;
+    backend: string | undefined;
     model: string | undefined; // undefined = use backend's default
     session: boolean;
     verbose: boolean;
@@ -72,7 +73,7 @@ interface ParsedArgs {
 function extractArgs(argv: string[]): ParsedArgs {
   const sbOptions: ParsedArgs['sbOptions'] = {
     agent: undefined,
-    backend: 'claude',
+    backend: undefined,
     model: undefined, // undefined = use backend's default
     session: true,
     verbose: false,
@@ -145,6 +146,9 @@ program
     // values aren't reliable for unknown flags with values.
     const { sbOptions, passthroughArgs, promptParts, prompt } = extractArgs(process.argv.slice(2));
 
+    // Resolve backend from identity.json if not explicitly set
+    const resolvedOptions = { ...sbOptions, backend: resolveBackend(sbOptions.backend) };
+
     if (!prompt && !passthroughArgs.length && !process.stdin.isTTY) {
       // Piped stdin — read it as the prompt
       let stdinData = '';
@@ -152,14 +156,14 @@ program
       for await (const chunk of process.stdin) {
         stdinData += chunk;
       }
-      await runClaude(stdinData.trim(), [stdinData.trim()], sbOptions, passthroughArgs);
+      await runClaude(stdinData.trim(), [stdinData.trim()], resolvedOptions, passthroughArgs);
     } else if (prompt) {
       // Prompt mode (one-shot)
-      await runClaude(prompt, promptParts, sbOptions, passthroughArgs);
+      await runClaude(prompt, promptParts, resolvedOptions, passthroughArgs);
     } else {
       // No prompt — launch interactive session
       // Passthrough args (like --resume) still forwarded
-      await runClaudeInteractive(sbOptions, passthroughArgs);
+      await runClaudeInteractive(resolvedOptions, passthroughArgs);
     }
   });
 

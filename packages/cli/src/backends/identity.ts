@@ -91,6 +91,32 @@ export function resolveAgentId(cliAgent?: string): string | null {
 }
 
 /**
+ * Resolve backend from multiple sources:
+ * 1. CLI --backend flag (if provided)
+ * 2. .pcp/identity.json → backend field
+ * 3. Default: 'claude'
+ */
+export function resolveBackend(cliBackend?: string): string {
+  if (cliBackend) {
+    return cliBackend;
+  }
+
+  let cwd: string | null = null;
+  try {
+    cwd = process.cwd();
+  } catch {
+    // Fall through to default
+  }
+
+  if (cwd) {
+    const identity = readIdentityJson(cwd);
+    if (identity?.backend) return identity.backend;
+  }
+
+  return 'claude';
+}
+
+/**
  * Build the identity prompt content. Same across all backends.
  */
 export function buildIdentityPrompt(agentId: string): string {

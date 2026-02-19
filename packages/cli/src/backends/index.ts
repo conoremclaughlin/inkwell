@@ -5,7 +5,7 @@
  */
 
 export type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
-export { resolveAgentId } from './identity.js';
+export { resolveAgentId, resolveBackend } from './identity.js';
 
 import { ClaudeAdapter } from './claude.js';
 import { CodexAdapter } from './codex.js';
