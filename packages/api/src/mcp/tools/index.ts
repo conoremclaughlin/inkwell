@@ -1035,6 +1035,12 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .describe(
             'Primary structured topic key following type:identifier convention (e.g., "project:pcp/memory", "decision:jwt-auth", "convention:git"). Auto-added to topics array.'
           ),
+        topicSummary: z
+          .string()
+          .optional()
+          .describe(
+            'Short description of the topic (shown in bootstrap topic index header). Only needed when creating a new topic or updating its description.'
+          ),
         source: z
           .enum(['conversation', 'observation', 'user_stated', 'inferred', 'session'])
           .optional()

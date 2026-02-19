@@ -86,7 +86,7 @@ interface TopicGroup {
  * Build a budget-constrained knowledge summary from memories grouped by topic.
  * Returns both the formatted summary text and a topic index for overflow.
  */
-function buildKnowledgeSummary(memories: import('../../data/models/memory').Memory[]): {
+export function buildKnowledgeSummary(memories: import('../../data/models/memory').Memory[]): {
   knowledgeSummary: string;
   topicIndex: Array<{
     topicKey: string;
@@ -103,7 +103,7 @@ function buildKnowledgeSummary(memories: import('../../data/models/memory').Memo
 
   for (const m of memories) {
     const key = m.topicKey || (m.topics.length > 0 ? m.topics[0] : 'uncategorized');
-    const displayText = m.summary || truncateContent(m.content, 200);
+    const displayText = truncateContent(m.summary || m.content, 200);
     const createdAt = m.createdAt.toISOString().slice(0, 10); // YYYY-MM-DD
 
     if (!groups.has(key)) {
@@ -146,7 +146,7 @@ function buildKnowledgeSummary(memories: import('../../data/models/memory').Memo
   for (const group of sortedGroups) {
     // Format this group
     const header = group.topicSummary
-      ? `### ${group.topicKey} — ${group.topicSummary}\n`
+      ? `### ${group.topicKey} — ${truncateContent(group.topicSummary, 120)}\n`
       : `### ${group.topicKey}\n`;
 
     let groupText = header;
@@ -165,15 +165,19 @@ function buildKnowledgeSummary(memories: import('../../data/models/memory').Memo
       const firstMem = group.memories[0];
       const partialText =
         header + `- ${firstMem.displayText} (${firstMem.salience}, ${firstMem.createdAt})\n`;
-      if (group.memories.length > 1) {
-        const remaining = group.memories.length - 1;
-        summary += partialText + `  ... and ${remaining} more memories\n\n`;
+      const suffix =
+        group.memories.length > 1
+          ? `  ... and ${group.memories.length - 1} more memories\n\n`
+          : '\n';
+      const totalPartial = partialText + suffix;
+      if (charsUsed + totalPartial.length <= budget) {
+        summary += totalPartial;
+        charsUsed += totalPartial.length;
+        memoriesIncluded += 1;
+        includedTopics.add(group.topicKey);
       } else {
-        summary += partialText + '\n';
+        overflowTopics.push(group);
       }
-      charsUsed += partialText.length + 30;
-      memoriesIncluded += 1;
-      includedTopics.add(group.topicKey);
     } else {
       overflowTopics.push(group);
     }
@@ -1631,24 +1635,26 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
       }
     : null;
 
-  // Build knowledge summary (or use cache)
+  // Build knowledge summary (or use cache for the text)
   let knowledgeSummaryResult: ReturnType<typeof buildKnowledgeSummary> | null = null;
   let cachedSummary: string | null = null;
 
   if (includeMemories && knowledgeMemories.length > 0) {
-    // Try cache first
+    // Always build the full result (needed for topicIndex regardless of cache)
+    knowledgeSummaryResult = buildKnowledgeSummary(knowledgeMemories);
+
+    // Try cache for the summary text (avoid regenerating the formatted string)
     try {
       const cached = await dataComposer.repositories.memory.getCachedSummary(user.id, agentId);
       if (cached) {
         cachedSummary = cached.summaryText;
       }
     } catch {
-      // Cache miss or error — compute fresh
+      // Cache miss or error — use freshly computed
     }
 
     if (!cachedSummary) {
-      knowledgeSummaryResult = buildKnowledgeSummary(knowledgeMemories);
-      // Cache in background (don't block response)
+      // Cache the computed summary in background (don't block response)
       dataComposer.repositories.memory
         .setCachedSummary(
           user.id,

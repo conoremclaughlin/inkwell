@@ -35,6 +35,8 @@ export interface MemoryHistory {
   memoryId: string;
   userId: string;
   content: string;
+  summary?: string;
+  topicKey?: string;
   source: MemorySource;
   salience: Salience;
   topics: string[];

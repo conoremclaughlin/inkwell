@@ -794,6 +794,8 @@ export class MemoryRepository {
         .from('memories')
         .update({
           content: history.content,
+          summary: history.summary || null,
+          topic_key: history.topicKey || null,
           salience: history.salience,
           topics: history.topics,
           metadata: { ...history.metadata, restored_from_version: history.version },
@@ -816,6 +818,8 @@ export class MemoryRepository {
         .insert({
           user_id: userId,
           content: history.content,
+          summary: history.summary || null,
+          topic_key: history.topicKey || null,
           source: history.source,
           salience: history.salience,
           topics: history.topics,
@@ -864,6 +868,8 @@ export class MemoryRepository {
       memoryId: row.memory_id,
       userId: row.user_id,
       content: row.content,
+      summary: row.summary || undefined,
+      topicKey: row.topic_key || undefined,
       source: row.source,
       salience: row.salience,
       topics: row.topics,
