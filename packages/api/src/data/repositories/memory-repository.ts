@@ -136,13 +136,19 @@ export class MemoryRepository {
   /**
    * Fetch memories for the bootstrap knowledge summary.
    * Returns all critical memories + recent high memories, ordered by salience (critical first) then recency.
+   *
+   * High memories use a "last N days OR last M, whichever is more" strategy:
+   * fetches both a time-windowed set and a count-limited set, then merges.
+   *
+   * @param highLimit Min high memories to include regardless of age (default 10)
+   * @param highWindowDays Time window for recent high memories (default 7)
    */
   async getKnowledgeMemories(
     userId: string,
     agentId?: string,
-    highLimit: number = 50
+    highLimit: number = 10,
+    highWindowDays: number = 7
   ): Promise<Memory[]> {
-    // Fetch critical and high in parallel
     const buildQuery = (salience: string, limit: number) => {
       let q = this.supabase
         .from('memories')
@@ -159,20 +165,56 @@ export class MemoryRepository {
       return q;
     };
 
-    const [criticalResult, highResult] = await Promise.all([
-      buildQuery('critical', 100),
+    const buildWindowedQuery = (salience: string, windowDays: number, limit: number) => {
+      const cutoff = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000).toISOString();
+      let q = this.supabase
+        .from('memories')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('salience', salience)
+        .or('expires_at.is.null,expires_at.gt.now()')
+        .gte('created_at', cutoff)
+        .order('created_at', { ascending: false })
+        .limit(limit);
+
+      if (agentId) {
+        q = q.or(`agent_id.eq.${agentId},agent_id.is.null`);
+      }
+      return q;
+    };
+
+    // Fetch critical + two high strategies in parallel
+    const [criticalResult, highByCountResult, highByWindowResult] = await Promise.all([
+      buildQuery('critical', 30),
       buildQuery('high', highLimit),
+      buildWindowedQuery('high', highWindowDays, 50),
     ]);
 
     if (criticalResult.error) {
       logger.error('Failed to fetch critical memories:', criticalResult.error);
     }
-    if (highResult.error) {
-      logger.error('Failed to fetch high memories:', highResult.error);
+    if (highByCountResult.error) {
+      logger.error('Failed to fetch high memories (by count):', highByCountResult.error);
+    }
+    if (highByWindowResult.error) {
+      logger.error('Failed to fetch high memories (by window):', highByWindowResult.error);
     }
 
     const criticalMemories = (criticalResult.data || []).map(this.rowToMemory);
-    const highMemories = (highResult.data || []).map(this.rowToMemory);
+
+    // Merge the two high strategies — dedupe by ID, keep recency order
+    const highById = new Map<string, Memory>();
+    for (const row of highByCountResult.data || []) {
+      const mem = this.rowToMemory(row);
+      highById.set(mem.id, mem);
+    }
+    for (const row of highByWindowResult.data || []) {
+      const mem = this.rowToMemory(row);
+      if (!highById.has(mem.id)) highById.set(mem.id, mem);
+    }
+    const highMemories = Array.from(highById.values()).sort(
+      (a, b) => b.createdAt.getTime() - a.createdAt.getTime()
+    );
 
     // Critical first, then high — both ordered by recency within their tier
     return [...criticalMemories, ...highMemories];

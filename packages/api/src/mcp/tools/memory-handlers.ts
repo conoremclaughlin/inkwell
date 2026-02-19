@@ -103,7 +103,11 @@ export function buildKnowledgeSummary(memories: import('../../data/models/memory
 
   for (const m of memories) {
     const key = m.topicKey || (m.topics.length > 0 ? m.topics[0] : 'uncategorized');
-    const displayText = truncateContent(m.summary || m.content, 200);
+    // Critical memories get full content (core identity, worth the budget).
+    // High memories get truncated. Skip summary when it's identical to content.
+    const rawText = m.summary && m.summary !== m.content ? m.summary : m.content;
+    const displayText =
+      m.salience === 'critical' ? truncateContent(rawText, 1000) : truncateContent(rawText, 200);
     const createdAt = m.createdAt.toISOString().slice(0, 10); // YYYY-MM-DD
 
     if (!groups.has(key)) {
@@ -476,7 +480,7 @@ export const bootstrapSchema = userIdentifierBaseSchema.extend({
     .max(100)
     .optional()
     .describe(
-      'Max high-salience memories to fetch for the knowledge summary (default: 50). Critical memories are always included regardless.'
+      'Max high-salience memories to fetch for knowledge summary (default: 50). Critical memories always included regardless.'
     ),
   agentId: z
     .string()
@@ -1471,7 +1475,6 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   });
 
   const includeMemories = params.includeRecentMemories !== false;
-  const memoryLimit = params.memoryLimit || 50; // Increased default — knowledge summary uses budget, not count
   const agentId = params.agentId;
   const basePath = params.identityBasePath || path.join(os.homedir(), '.pcp');
 
@@ -1535,7 +1538,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     dataComposer.repositories.memory.getActiveSessions(user.id, agentId),
     // Knowledge memories: all critical + recent high (for knowledge summary)
     includeMemories
-      ? dataComposer.repositories.memory.getKnowledgeMemories(user.id, agentId, memoryLimit)
+      ? dataComposer.repositories.memory.getKnowledgeMemories(user.id, agentId)
       : Promise.resolve([]),
     // Database identity (for cloud agents, includes metadata, heartbeat, soul)
     agentId
@@ -1753,19 +1756,6 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
                 : null,
             },
 
-            // [DEPRECATED] Single active session (most recent) — use activeSessions array instead.
-            // Will be removed in a future PR once all agents read activeSessions.
-            session: activeSessions[0]
-              ? {
-                  id: activeSessions[0].id,
-                  agentId: activeSessions[0].agentId,
-                  studioId: activeSessions[0].studioId || null,
-                  workspaceId: activeSessions[0].workspaceId || null,
-                  currentPhase: activeSessions[0].currentPhase || null,
-                  startedAt: activeSessions[0].startedAt.toISOString(),
-                }
-              : null,
-
             // All active sessions — use studioId to pick the right one
             // Match against .pcp/identity.json studioId/workspaceId in your local environment
             activeSessions: activeSessions.map((s) => ({
@@ -1785,20 +1775,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
             // Topic index: all topics with counts + recency (navigate with recall(topics: [...]))
             topicIndex: topicIndex.length > 0 ? topicIndex : null,
 
-            // [BACKWARD COMPAT] Flat memory array — prefer knowledgeSummary above
-            recentMemories: knowledgeMemories.map((m) => ({
-              id: m.id,
-              content: m.summary || truncateContent(m.content, 300),
-              summary: m.summary || null,
-              topicKey: m.topicKey || null,
-              source: m.source,
-              salience: m.salience,
-              topics: m.topics,
-              agentId: m.agentId,
-              createdAt: m.createdAt.toISOString(),
-            })),
-
-            // Database identity (for cloud agents - includes heartbeat, soul, metadata)
+            // Database identity (structural fields only — heartbeat/soul already in identityFiles)
             dbIdentity: dbIdentity
               ? {
                   agentId: dbIdentity.agent_id,
@@ -1808,8 +1785,6 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
                   values: dbIdentity.values,
                   capabilities: dbIdentity.capabilities,
                   relationships: dbIdentity.relationships,
-                  heartbeat: dbIdentity.heartbeat,
-                  soul: dbIdentity.soul,
                   metadata: dbIdentity.metadata,
                   version: dbIdentity.version,
                 }

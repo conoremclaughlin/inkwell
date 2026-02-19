@@ -1137,10 +1137,26 @@ describe('MemoryRepository', () => {
 
       await repo.getKnowledgeMemories('user-456', undefined, 25);
 
-      // The limit calls: 100 for critical, 25 for high
+      // 3 queries: critical (30), high by count (25), high by window (50)
       const limitCalls = (mockSupabase._queryBuilder.limit as ReturnType<typeof vi.fn>).mock.calls;
-      expect(limitCalls).toContainEqual([100]);
+      expect(limitCalls).toContainEqual([30]);
       expect(limitCalls).toContainEqual([25]);
+      expect(limitCalls).toContainEqual([50]);
+    });
+
+    it('should apply time window for high memories', async () => {
+      mockSupabase._setArrayData([]);
+
+      await repo.getKnowledgeMemories('user-456', undefined, 10, 14);
+
+      // gte should be called for the windowed high query
+      const gteCalls = (mockSupabase._queryBuilder.gte as ReturnType<typeof vi.fn>).mock.calls;
+      const createdAtFilter = gteCalls.find(([col]: [string]) => col === 'created_at');
+      expect(createdAtFilter).toBeDefined();
+      const cutoff = new Date(createdAtFilter![1]);
+      const daysAgo = (Date.now() - cutoff.getTime()) / (24 * 60 * 60 * 1000);
+      expect(daysAgo).toBeGreaterThan(13);
+      expect(daysAgo).toBeLessThan(15);
     });
   });
 
