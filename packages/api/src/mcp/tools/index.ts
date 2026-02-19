@@ -1015,14 +1015,33 @@ This is the primary way to send responses back to users. Always use this tool in
     {
       description: `Save something to long-term memory. Memories persist across sessions and can be recalled later.
 
+Use topicKey to categorize memories with structured topic keys following type:identifier convention (e.g., "project:pcp/memory", "decision:jwt-auth", "convention:git", "domain:real-estate"). This builds the knowledge map that's loaded at bootstrap.
+
+Use summary to provide a one-liner when the full content is long/detailed. The summary is what appears in the bootstrap knowledge summary.
+
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
         content: z.string().describe('The content to remember'),
-        source: z
-          .enum(['conversation', 'observation', 'user_stated', 'inferred', 'session'])
+        summary: z
+          .string()
           .optional()
-          .describe('Source of the memory (default: observation)'),
+          .describe(
+            'One-liner summary of this memory. Used in bootstrap knowledge summary instead of full content. Provide when content is long/detailed.'
+          ),
+        topicKey: z
+          .string()
+          .optional()
+          .describe(
+            'Primary structured topic key following type:identifier convention (e.g., "project:pcp/memory", "decision:jwt-auth", "convention:git"). Auto-added to topics array.'
+          ),
+        topicSummary: z
+          .string()
+          .optional()
+          .describe(
+            'Short description of the topic (shown in bootstrap topic index header). Only needed when creating a new topic or updating its description.'
+          ),
+        source: z.string().optional().describe('Source of the memory (default: observation)'),
         salience: z
           .enum(['low', 'medium', 'high', 'critical'])
           .optional()
@@ -1084,10 +1103,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       inputSchema: {
         ...userIdentifierFields,
         query: z.string().optional().describe('Search query (text search for now)'),
-        source: z
-          .enum(['conversation', 'observation', 'user_stated', 'inferred', 'session'])
-          .optional()
-          .describe('Filter by source'),
+        source: z.string().optional().describe('Filter by source'),
         salience: z
           .enum(['low', 'medium', 'high', 'critical'])
           .optional()

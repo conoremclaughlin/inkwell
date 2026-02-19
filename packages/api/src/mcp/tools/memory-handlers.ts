@@ -54,11 +54,175 @@ const topicsSchema = z
   .optional();
 
 // =====================================================
+// KNOWLEDGE SUMMARY BUILDER
+// =====================================================
+
+/** Default character budget for the bootstrap knowledge summary. Override with BOOTSTRAP_MEMORY_BUDGET env var. */
+const DEFAULT_MEMORY_BUDGET = 8000;
+
+function getMemoryBudget(): number {
+  const envBudget = process.env.BOOTSTRAP_MEMORY_BUDGET;
+  if (envBudget) {
+    const parsed = parseInt(envBudget, 10);
+    if (!isNaN(parsed) && parsed > 0) return parsed;
+  }
+  return DEFAULT_MEMORY_BUDGET;
+}
+
+interface TopicGroup {
+  topicKey: string;
+  memories: Array<{
+    id: string;
+    displayText: string;
+    salience: string;
+    createdAt: string;
+  }>;
+  memoryCount: number;
+  lastActivity: string;
+  topicSummary?: string; // From metadata.topicSummary on the most recent memory
+}
+
+/**
+ * Build a budget-constrained knowledge summary from memories grouped by topic.
+ * Returns both the formatted summary text and a topic index for overflow.
+ */
+export function buildKnowledgeSummary(memories: import('../../data/models/memory').Memory[]): {
+  knowledgeSummary: string;
+  topicIndex: Array<{
+    topicKey: string;
+    memoryCount: number;
+    lastActivity: string;
+    topicSummary?: string;
+  }>;
+  memoriesIncluded: number;
+} {
+  const budget = getMemoryBudget();
+
+  // Group memories by topicKey (or first topic, or 'uncategorized')
+  const groups = new Map<string, TopicGroup>();
+
+  for (const m of memories) {
+    const key = m.topicKey || (m.topics.length > 0 ? m.topics[0] : 'uncategorized');
+    const displayText = truncateContent(m.summary || m.content, 200);
+    const createdAt = m.createdAt.toISOString().slice(0, 10); // YYYY-MM-DD
+
+    if (!groups.has(key)) {
+      groups.set(key, {
+        topicKey: key,
+        memories: [],
+        memoryCount: 0,
+        lastActivity: createdAt,
+        topicSummary: (m.metadata?.topicSummary as string) || undefined,
+      });
+    }
+
+    const group = groups.get(key)!;
+    group.memories.push({
+      id: m.id,
+      displayText,
+      salience: m.salience,
+      createdAt,
+    });
+    group.memoryCount++;
+    if (createdAt > group.lastActivity) group.lastActivity = createdAt;
+    // Use topicSummary from the most recent memory that has one
+    if (!group.topicSummary && m.metadata?.topicSummary) {
+      group.topicSummary = m.metadata.topicSummary as string;
+    }
+  }
+
+  // Sort groups: most recent activity first
+  const sortedGroups = Array.from(groups.values()).sort((a, b) =>
+    b.lastActivity.localeCompare(a.lastActivity)
+  );
+
+  // Build the summary within budget
+  let summary = '';
+  let charsUsed = 0;
+  let memoriesIncluded = 0;
+  const includedTopics = new Set<string>();
+  const overflowTopics: typeof sortedGroups = [];
+
+  for (const group of sortedGroups) {
+    // Format this group
+    const header = group.topicSummary
+      ? `### ${group.topicKey} — ${truncateContent(group.topicSummary, 120)}\n`
+      : `### ${group.topicKey}\n`;
+
+    let groupText = header;
+    for (const mem of group.memories) {
+      groupText += `- ${mem.displayText} (${mem.salience}, ${mem.createdAt})\n`;
+    }
+    groupText += '\n';
+
+    if (charsUsed + groupText.length <= budget) {
+      summary += groupText;
+      charsUsed += groupText.length;
+      memoriesIncluded += group.memories.length;
+      includedTopics.add(group.topicKey);
+    } else if (charsUsed + header.length + 50 <= budget) {
+      // Try to fit at least the header + first memory
+      const firstMem = group.memories[0];
+      const partialText =
+        header + `- ${firstMem.displayText} (${firstMem.salience}, ${firstMem.createdAt})\n`;
+      const suffix =
+        group.memories.length > 1
+          ? `  ... and ${group.memories.length - 1} more memories\n\n`
+          : '\n';
+      const totalPartial = partialText + suffix;
+      if (charsUsed + totalPartial.length <= budget) {
+        summary += totalPartial;
+        charsUsed += totalPartial.length;
+        memoriesIncluded += 1;
+        includedTopics.add(group.topicKey);
+      } else {
+        overflowTopics.push(group);
+      }
+    } else {
+      overflowTopics.push(group);
+    }
+  }
+
+  // Build topic index from ALL topics (including overflow)
+  const topicIndex = sortedGroups.map((g) => ({
+    topicKey: g.topicKey,
+    memoryCount: g.memoryCount,
+    lastActivity: g.lastActivity,
+    topicSummary: g.topicSummary,
+  }));
+
+  return { knowledgeSummary: summary.trim(), topicIndex, memoriesIncluded };
+}
+
+function truncateContent(content: string, maxLen: number): string {
+  if (content.length <= maxLen) return content;
+  return content.slice(0, maxLen - 3) + '...';
+}
+
+// =====================================================
 // MEMORY TOOLS
 // =====================================================
 
 export const rememberSchema = userIdentifierBaseSchema.extend({
   content: z.string().describe('The content to remember'),
+  summary: z
+    .string()
+    .optional()
+    .describe(
+      'One-liner summary of this memory. Used in bootstrap knowledge summary instead of full content. Provide when content is long/detailed.'
+    ),
+  topicKey: z
+    .string()
+    .optional()
+    .describe(
+      'Primary structured topic key following type:identifier convention (e.g., "project:pcp/memory", "decision:jwt-auth", "convention:git"). Auto-added to topics array.'
+    ),
+  topicSummary: z
+    .string()
+    .optional()
+    .describe(
+      'One-liner description of the topic itself (not this memory). Used to build the topic index at bootstrap. Only needed when creating a new topic or updating its description.'
+    ),
   source: memorySourceSchema.optional().describe('Source of the memory (default: observation)'),
   salience: salienceSchema.optional().describe('Importance level (default: medium)'),
   topics: topicsSchema.describe('Topics for categorization'),
@@ -309,9 +473,11 @@ export const bootstrapSchema = userIdentifierBaseSchema.extend({
   memoryLimit: z
     .number()
     .min(1)
-    .max(20)
+    .max(100)
     .optional()
-    .describe('Max recent memories to include (default: 5)'),
+    .describe(
+      'Max high-salience memories to fetch for the knowledge summary (default: 50). Critical memories are always included regardless.'
+    ),
   agentId: z
     .string()
     .optional()
@@ -387,11 +553,14 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
     ...params.metadata,
     ...(sessionId ? { sessionId } : {}),
     ...(studioId ? { studioId, workspaceId: studioId } : {}),
+    ...(params.topicSummary ? { topicSummary: params.topicSummary } : {}),
   };
 
   const memory = await dataComposer.repositories.memory.remember({
     userId: user.id,
     content: params.content,
+    summary: params.summary,
+    topicKey: params.topicKey,
     source: params.source as MemorySource,
     salience: params.salience as Salience,
     topics: params.topics,
@@ -418,6 +587,8 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
             user: { id: user.id, resolvedBy },
             memory: {
               id: memory.id,
+              summary: memory.summary || null,
+              topicKey: memory.topicKey || null,
               source: memory.source,
               salience: memory.salience,
               topics: memory.topics,
@@ -464,6 +635,8 @@ export async function handleRecall(args: unknown, dataComposer: DataComposer) {
             memories: memories.map((m) => ({
               id: m.id,
               content: m.content,
+              summary: m.summary || null,
+              topicKey: m.topicKey || null,
               source: m.source,
               salience: m.salience,
               topics: m.topics,
@@ -1298,7 +1471,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   });
 
   const includeMemories = params.includeRecentMemories !== false;
-  const memoryLimit = params.memoryLimit || 5;
+  const memoryLimit = params.memoryLimit || 50; // Increased default — knowledge summary uses budget, not count
   const agentId = params.agentId;
   const basePath = params.identityBasePath || path.join(os.homedir(), '.pcp');
 
@@ -1346,7 +1519,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     projects,
     focus,
     activeSessions,
-    recentMemories,
+    knowledgeMemories,
     dbIdentity,
     dbUserIdentity,
     userTimezone,
@@ -1360,14 +1533,9 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
     // All active sessions (filter by agentId if provided) — client picks the right one
     dataComposer.repositories.memory.getActiveSessions(user.id, agentId),
-    // Recent high-salience memories (filter by agentId if provided, include shared)
+    // Knowledge memories: all critical + recent high (for knowledge summary)
     includeMemories
-      ? dataComposer.repositories.memory.recall(user.id, undefined, {
-          salience: 'high',
-          limit: memoryLimit,
-          agentId: agentId,
-          includeShared: true,
-        })
+      ? dataComposer.repositories.memory.getKnowledgeMemories(user.id, agentId, memoryLimit)
       : Promise.resolve([]),
     // Database identity (for cloud agents, includes metadata, heartbeat, soul)
     agentId
@@ -1467,11 +1635,48 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
       }
     : null;
 
+  // Build knowledge summary (or use cache for the text)
+  let knowledgeSummaryResult: ReturnType<typeof buildKnowledgeSummary> | null = null;
+  let cachedSummary: string | null = null;
+
+  if (includeMemories && knowledgeMemories.length > 0) {
+    // Always build the full result (needed for topicIndex regardless of cache)
+    knowledgeSummaryResult = buildKnowledgeSummary(knowledgeMemories);
+
+    // Try cache for the summary text (avoid regenerating the formatted string)
+    try {
+      const cached = await dataComposer.repositories.memory.getCachedSummary(user.id, agentId);
+      if (cached) {
+        cachedSummary = cached.summaryText;
+      }
+    } catch {
+      // Cache miss or error — use freshly computed
+    }
+
+    if (!cachedSummary) {
+      // Cache the computed summary in background (don't block response)
+      dataComposer.repositories.memory
+        .setCachedSummary(
+          user.id,
+          agentId,
+          knowledgeSummaryResult.knowledgeSummary,
+          knowledgeMemories.length
+        )
+        .catch(() => {}); // Fire and forget
+    }
+  }
+
+  const knowledgeSummary = cachedSummary || knowledgeSummaryResult?.knowledgeSummary || '';
+  const topicIndex = knowledgeSummaryResult?.topicIndex || [];
+
   logger.info(`Bootstrap loaded for user ${user.id}`, {
     agentId: agentId || 'none',
     contextCount: contexts.length,
     projectCount: projects.length,
-    memoryCount: recentMemories.length,
+    memoryCount: knowledgeMemories.length,
+    knowledgeSummaryChars: knowledgeSummary.length,
+    topicCount: topicIndex.length,
+    usedCache: !!cachedSummary,
     skillCount: userSkills.length,
     activeSessionCount: activeSessions.length,
     hasIdentityFiles: !!identityFiles,
@@ -1573,10 +1778,19 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
               startedAt: s.startedAt.toISOString(),
             })),
 
-            // Recent high-salience memories (filtered by agent if provided)
-            recentMemories: recentMemories.map((m) => ({
+            // Knowledge summary: budget-constrained, grouped by topic (critical + high salience)
+            // This is the MEMORY.md equivalent — read this first for what you know
+            knowledgeSummary: knowledgeSummary || null,
+
+            // Topic index: all topics with counts + recency (navigate with recall(topics: [...]))
+            topicIndex: topicIndex.length > 0 ? topicIndex : null,
+
+            // [BACKWARD COMPAT] Flat memory array — prefer knowledgeSummary above
+            recentMemories: knowledgeMemories.map((m) => ({
               id: m.id,
-              content: m.content,
+              content: m.summary || truncateContent(m.content, 300),
+              summary: m.summary || null,
+              topicKey: m.topicKey || null,
               source: m.source,
               salience: m.salience,
               topics: m.topics,

@@ -35,14 +35,22 @@ export class MemoryRepository {
         ? await resolveIdentityId(this.supabase, input.userId, input.agentId)
         : null;
 
+    // If topicKey is provided, ensure it's included in topics array
+    const topics = input.topics || [];
+    if (input.topicKey && !topics.includes(input.topicKey)) {
+      topics.unshift(input.topicKey);
+    }
+
     const { data, error } = await this.supabase
       .from('memories')
       .insert({
         user_id: input.userId,
         content: input.content,
+        summary: input.summary || null,
+        topic_key: input.topicKey || null,
         source: input.source || 'observation',
         salience: input.salience || 'medium',
-        topics: input.topics || [],
+        topics,
         metadata: input.metadata || {},
         expires_at: input.expiresAt?.toISOString(),
         agent_id: input.agentId || null,
@@ -123,6 +131,117 @@ export class MemoryRepository {
     }
 
     return (data || []).map(this.rowToMemory);
+  }
+
+  /**
+   * Fetch memories for the bootstrap knowledge summary.
+   * Returns all critical memories + recent high memories, ordered by salience (critical first) then recency.
+   */
+  async getKnowledgeMemories(
+    userId: string,
+    agentId?: string,
+    highLimit: number = 50
+  ): Promise<Memory[]> {
+    // Fetch critical and high in parallel
+    const buildQuery = (salience: string, limit: number) => {
+      let q = this.supabase
+        .from('memories')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('salience', salience)
+        .or('expires_at.is.null,expires_at.gt.now()')
+        .order('created_at', { ascending: false })
+        .limit(limit);
+
+      if (agentId) {
+        q = q.or(`agent_id.eq.${agentId},agent_id.is.null`);
+      }
+      return q;
+    };
+
+    const [criticalResult, highResult] = await Promise.all([
+      buildQuery('critical', 100),
+      buildQuery('high', highLimit),
+    ]);
+
+    if (criticalResult.error) {
+      logger.error('Failed to fetch critical memories:', criticalResult.error);
+    }
+    if (highResult.error) {
+      logger.error('Failed to fetch high memories:', highResult.error);
+    }
+
+    const criticalMemories = (criticalResult.data || []).map(this.rowToMemory);
+    const highMemories = (highResult.data || []).map(this.rowToMemory);
+
+    // Critical first, then high — both ordered by recency within their tier
+    return [...criticalMemories, ...highMemories];
+  }
+
+  // ==================== MEMORY SUMMARY CACHE ====================
+
+  /**
+   * Get cached memory summary if it's still fresh (no new memories since computation).
+   */
+  async getCachedSummary(
+    userId: string,
+    agentId?: string
+  ): Promise<{ summaryText: string; computedAt: Date; memoryCount: number } | null> {
+    const cacheKey = agentId || '__shared__';
+    const { data, error } = await this.supabase
+      .from('memory_summary_cache')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('agent_id', cacheKey)
+      .single();
+
+    if (error || !data) return null;
+
+    // Check freshness: is there a memory newer than the cache?
+    let freshnessQuery = this.supabase
+      .from('memories')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .gt('created_at', data.computed_at);
+
+    if (agentId) {
+      freshnessQuery = freshnessQuery.or(`agent_id.eq.${agentId},agent_id.is.null`);
+    }
+
+    const { count } = await freshnessQuery;
+    if (count && count > 0) return null; // Cache is stale
+
+    return {
+      summaryText: data.summary_text,
+      computedAt: new Date(data.computed_at),
+      memoryCount: data.memory_count,
+    };
+  }
+
+  /**
+   * Save a computed memory summary to the cache.
+   */
+  async setCachedSummary(
+    userId: string,
+    agentId: string | undefined,
+    summaryText: string,
+    memoryCount: number
+  ): Promise<void> {
+    const cacheKey = agentId || '__shared__';
+    const { error } = await this.supabase.from('memory_summary_cache').upsert(
+      {
+        user_id: userId,
+        agent_id: cacheKey,
+        summary_text: summaryText,
+        computed_at: new Date().toISOString(),
+        memory_count: memoryCount,
+      },
+      { onConflict: 'user_id,agent_id' }
+    );
+
+    if (error) {
+      logger.warn('Failed to cache memory summary:', error);
+    }
   }
 
   /**
@@ -675,6 +794,8 @@ export class MemoryRepository {
         .from('memories')
         .update({
           content: history.content,
+          summary: history.summary || null,
+          topic_key: history.topicKey || null,
           salience: history.salience,
           topics: history.topics,
           metadata: { ...history.metadata, restored_from_version: history.version },
@@ -697,6 +818,8 @@ export class MemoryRepository {
         .insert({
           user_id: userId,
           content: history.content,
+          summary: history.summary || null,
+          topic_key: history.topicKey || null,
           source: history.source,
           salience: history.salience,
           topics: history.topics,
@@ -725,6 +848,8 @@ export class MemoryRepository {
       id: row.id,
       userId: row.user_id,
       content: row.content,
+      summary: row.summary || undefined,
+      topicKey: row.topic_key || undefined,
       source: row.source,
       salience: row.salience,
       topics: row.topics,
@@ -743,6 +868,8 @@ export class MemoryRepository {
       memoryId: row.memory_id,
       userId: row.user_id,
       content: row.content,
+      summary: row.summary || undefined,
+      topicKey: row.topic_key || undefined,
       source: row.source,
       salience: row.salience,
       topics: row.topics,

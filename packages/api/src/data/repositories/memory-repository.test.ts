@@ -862,4 +862,353 @@ describe('MemoryRepository', () => {
       });
     });
   });
+
+  // =====================================================
+  // Hierarchical Memory (Phase 1): summary, topicKey, knowledge queries, cache
+  // =====================================================
+
+  describe('remember with summary and topicKey', () => {
+    it('should pass summary and topic_key to insert', async () => {
+      const mockRow = {
+        id: 'mem-hm-1',
+        user_id: 'user-456',
+        content: 'Detailed content about JWT auth decision',
+        summary: 'Using self-issued JWTs with 30-day expiry',
+        topic_key: 'decision:jwt-auth',
+        source: 'session',
+        salience: 'high',
+        topics: ['decision:jwt-auth', 'auth'],
+        agent_id: null,
+        embedding: null,
+        metadata: {},
+        version: 1,
+        created_at: '2026-02-18T12:00:00Z',
+        expires_at: null,
+      };
+
+      mockSupabase._setReturnData(mockRow);
+
+      const result = await repo.remember({
+        userId: 'user-456',
+        content: 'Detailed content about JWT auth decision',
+        summary: 'Using self-issued JWTs with 30-day expiry',
+        topicKey: 'decision:jwt-auth',
+        source: 'session',
+        salience: 'high',
+        topics: ['auth'],
+      });
+
+      // Verify insert included summary and topic_key
+      expect(mockSupabase._queryBuilder.insert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          summary: 'Using self-issued JWTs with 30-day expiry',
+          topic_key: 'decision:jwt-auth',
+        })
+      );
+
+      // Verify result maps new fields
+      expect(result.summary).toBe('Using self-issued JWTs with 30-day expiry');
+      expect(result.topicKey).toBe('decision:jwt-auth');
+    });
+
+    it('should auto-prepend topicKey to topics array', async () => {
+      const mockRow = {
+        id: 'mem-hm-2',
+        user_id: 'user-456',
+        content: 'Some content',
+        summary: null,
+        topic_key: 'project:pcp',
+        source: 'observation',
+        salience: 'medium',
+        topics: ['project:pcp', 'dev'],
+        agent_id: null,
+        embedding: null,
+        metadata: {},
+        version: 1,
+        created_at: '2026-02-18T12:00:00Z',
+        expires_at: null,
+      };
+
+      mockSupabase._setReturnData(mockRow);
+
+      await repo.remember({
+        userId: 'user-456',
+        content: 'Some content',
+        topicKey: 'project:pcp',
+        topics: ['dev'],
+      });
+
+      // topicKey should be prepended to topics
+      expect(mockSupabase._queryBuilder.insert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          topics: ['project:pcp', 'dev'],
+        })
+      );
+    });
+
+    it('should not duplicate topicKey in topics if already present', async () => {
+      const mockRow = {
+        id: 'mem-hm-3',
+        user_id: 'user-456',
+        content: 'Some content',
+        summary: null,
+        topic_key: 'project:pcp',
+        source: 'observation',
+        salience: 'medium',
+        topics: ['project:pcp', 'dev'],
+        agent_id: null,
+        embedding: null,
+        metadata: {},
+        version: 1,
+        created_at: '2026-02-18T12:00:00Z',
+        expires_at: null,
+      };
+
+      mockSupabase._setReturnData(mockRow);
+
+      await repo.remember({
+        userId: 'user-456',
+        content: 'Some content',
+        topicKey: 'project:pcp',
+        topics: ['project:pcp', 'dev'],
+      });
+
+      // Should NOT have duplicated project:pcp
+      expect(mockSupabase._queryBuilder.insert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          topics: ['project:pcp', 'dev'],
+        })
+      );
+    });
+
+    it('should pass null when summary and topicKey are not provided', async () => {
+      const mockRow = {
+        id: 'mem-hm-4',
+        user_id: 'user-456',
+        content: 'Plain memory',
+        summary: null,
+        topic_key: null,
+        source: 'observation',
+        salience: 'medium',
+        topics: [],
+        agent_id: null,
+        embedding: null,
+        metadata: {},
+        version: 1,
+        created_at: '2026-02-18T12:00:00Z',
+        expires_at: null,
+      };
+
+      mockSupabase._setReturnData(mockRow);
+
+      const result = await repo.remember({
+        userId: 'user-456',
+        content: 'Plain memory',
+      });
+
+      expect(mockSupabase._queryBuilder.insert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          summary: null,
+          topic_key: null,
+        })
+      );
+
+      // null maps to undefined in the domain model
+      expect(result.summary).toBeUndefined();
+      expect(result.topicKey).toBeUndefined();
+    });
+  });
+
+  describe('rowToMemory mapping for new fields', () => {
+    it('should map summary and topicKey from row', async () => {
+      const mockRow = {
+        id: 'mem-map-1',
+        user_id: 'user-456',
+        content: 'Full content here',
+        summary: 'Short summary',
+        topic_key: 'convention:git',
+        source: 'user_stated',
+        salience: 'high',
+        topics: ['convention:git'],
+        agent_id: 'wren',
+        embedding: null,
+        metadata: {},
+        version: 1,
+        created_at: '2026-02-18T12:00:00Z',
+        expires_at: null,
+      };
+
+      mockSupabase._setReturnData(mockRow);
+      const result = await repo.getMemory('mem-map-1');
+
+      expect(result!.summary).toBe('Short summary');
+      expect(result!.topicKey).toBe('convention:git');
+    });
+
+    it('should map null summary/topic_key to undefined', async () => {
+      const mockRow = {
+        id: 'mem-map-2',
+        user_id: 'user-456',
+        content: 'Content',
+        summary: null,
+        topic_key: null,
+        source: 'observation',
+        salience: 'medium',
+        topics: [],
+        agent_id: null,
+        embedding: null,
+        metadata: {},
+        version: 1,
+        created_at: '2026-02-18T12:00:00Z',
+        expires_at: null,
+      };
+
+      mockSupabase._setReturnData(mockRow);
+      const result = await repo.getMemory('mem-map-2');
+
+      expect(result!.summary).toBeUndefined();
+      expect(result!.topicKey).toBeUndefined();
+    });
+  });
+
+  describe('getKnowledgeMemories', () => {
+    it('should query for critical and high salience memories', async () => {
+      // The mock returns the same data for both parallel queries,
+      // which means we'll get duplicates. That's a mock limitation.
+      // We're testing that the method runs, calls the right table, and maps correctly.
+      const mockMemories = [
+        {
+          id: 'mem-k1',
+          user_id: 'user-456',
+          content: 'Critical info',
+          summary: 'Critical one-liner',
+          topic_key: 'decision:auth',
+          source: 'user_stated',
+          salience: 'critical',
+          topics: ['decision:auth'],
+          agent_id: null,
+          embedding: null,
+          metadata: {},
+          version: 1,
+          created_at: '2026-02-18T12:00:00Z',
+          expires_at: null,
+        },
+      ];
+
+      mockSupabase._setArrayData(mockMemories);
+
+      const results = await repo.getKnowledgeMemories('user-456');
+
+      // Should have called from('memories') and filtered by salience
+      expect(mockSupabase.from).toHaveBeenCalledWith('memories');
+      expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('user_id', 'user-456');
+      expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('salience', 'critical');
+      expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('salience', 'high');
+
+      // Results should be mapped Memory objects
+      expect(results.length).toBeGreaterThan(0);
+      expect(results[0].summary).toBe('Critical one-liner');
+      expect(results[0].topicKey).toBe('decision:auth');
+    });
+
+    it('should filter by agentId when provided', async () => {
+      mockSupabase._setArrayData([]);
+
+      await repo.getKnowledgeMemories('user-456', 'wren');
+
+      expect(mockSupabase._queryBuilder.or).toHaveBeenCalledWith(
+        'agent_id.eq.wren,agent_id.is.null'
+      );
+    });
+
+    it('should not filter by agentId when not provided', async () => {
+      mockSupabase._setArrayData([]);
+
+      await repo.getKnowledgeMemories('user-456');
+
+      // or() should still be called for expires_at, but not for agent_id
+      const orCalls = (mockSupabase._queryBuilder.or as ReturnType<typeof vi.fn>).mock.calls;
+      const agentOrCalls = orCalls.filter(([arg]: [string]) => arg.includes('agent_id'));
+      expect(agentOrCalls).toHaveLength(0);
+    });
+
+    it('should respect highLimit parameter', async () => {
+      mockSupabase._setArrayData([]);
+
+      await repo.getKnowledgeMemories('user-456', undefined, 25);
+
+      // The limit calls: 100 for critical, 25 for high
+      const limitCalls = (mockSupabase._queryBuilder.limit as ReturnType<typeof vi.fn>).mock.calls;
+      expect(limitCalls).toContainEqual([100]);
+      expect(limitCalls).toContainEqual([25]);
+    });
+  });
+
+  describe('getCachedSummary', () => {
+    it('should return null when no cache exists', async () => {
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+
+      const result = await repo.getCachedSummary('user-456');
+
+      expect(result).toBeNull();
+      expect(mockSupabase.from).toHaveBeenCalledWith('memory_summary_cache');
+    });
+
+    it('should use __shared__ as default agent_id', async () => {
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+
+      await repo.getCachedSummary('user-456');
+
+      expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('agent_id', '__shared__');
+    });
+
+    it('should use provided agentId for cache key', async () => {
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+
+      await repo.getCachedSummary('user-456', 'wren');
+
+      expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('agent_id', 'wren');
+    });
+  });
+
+  describe('setCachedSummary', () => {
+    it('should upsert cache entry with correct fields', async () => {
+      mockSupabase._setReturnData(null); // upsert returns void-like
+
+      await repo.setCachedSummary('user-456', 'wren', 'Summary text here', 42);
+
+      expect(mockSupabase.from).toHaveBeenCalledWith('memory_summary_cache');
+      expect(mockSupabase._queryBuilder.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          user_id: 'user-456',
+          agent_id: 'wren',
+          summary_text: 'Summary text here',
+          memory_count: 42,
+        }),
+        { onConflict: 'user_id,agent_id' }
+      );
+    });
+
+    it('should use __shared__ when agentId is undefined', async () => {
+      mockSupabase._setReturnData(null);
+
+      await repo.setCachedSummary('user-456', undefined, 'Shared summary', 10);
+
+      expect(mockSupabase._queryBuilder.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agent_id: '__shared__',
+        }),
+        expect.anything()
+      );
+    });
+
+    it('should not throw on error (warns only)', async () => {
+      mockSupabase._setReturnData(null, { message: 'Write failed' });
+
+      // Should not throw
+      await expect(
+        repo.setCachedSummary('user-456', 'wren', 'Summary', 5)
+      ).resolves.toBeUndefined();
+    });
+  });
 });

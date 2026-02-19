@@ -1269,3 +1269,256 @@ describe('handleStartSession - threadKey matching', () => {
     expect(parsed.session.threadKey).toBeNull();
   });
 });
+
+// =====================================================
+// HIERARCHICAL MEMORY TESTS
+// =====================================================
+
+import { rememberSchema, buildKnowledgeSummary } from './memory-handlers';
+import type { Memory } from '../../data/models/memory';
+
+describe('rememberSchema - hierarchical memory fields', () => {
+  it('should accept summary field', () => {
+    const result = rememberSchema.safeParse({
+      email: 'test@test.com',
+      content: 'Full detailed content about JWT auth...',
+      summary: 'Self-issued JWTs for MCP auth',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.summary).toBe('Self-issued JWTs for MCP auth');
+    }
+  });
+
+  it('should accept topicKey field', () => {
+    const result = rememberSchema.safeParse({
+      email: 'test@test.com',
+      content: 'Some memory content',
+      topicKey: 'decision:jwt-auth',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.topicKey).toBe('decision:jwt-auth');
+    }
+  });
+
+  it('should accept topicSummary field', () => {
+    const result = rememberSchema.safeParse({
+      email: 'test@test.com',
+      content: 'Some memory content',
+      topicKey: 'project:pcp/memory',
+      topicSummary: 'Hierarchical memory design for PCP',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.topicSummary).toBe('Hierarchical memory design for PCP');
+    }
+  });
+
+  it('should accept all hierarchical fields together', () => {
+    const result = rememberSchema.safeParse({
+      email: 'test@test.com',
+      content: 'Detailed content...',
+      summary: 'One-liner summary',
+      topicKey: 'convention:git',
+      topicSummary: 'Git workflow conventions',
+      salience: 'high',
+      topics: ['git', 'conventions'],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('should work without hierarchical fields (backward compat)', () => {
+    const result = rememberSchema.safeParse({
+      email: 'test@test.com',
+      content: 'Simple memory without new fields',
+      salience: 'medium',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.summary).toBeUndefined();
+      expect(result.data.topicKey).toBeUndefined();
+      expect(result.data.topicSummary).toBeUndefined();
+    }
+  });
+});
+
+describe('buildKnowledgeSummary', () => {
+  function makeMemory(overrides: Partial<Memory> & { content: string }): Memory {
+    return {
+      id: `mem-${Math.random().toString(36).slice(2, 8)}`,
+      userId: 'user-123',
+      source: 'observation',
+      salience: 'high',
+      topics: [],
+      metadata: {},
+      version: 1,
+      createdAt: new Date('2026-02-15T12:00:00Z'),
+      ...overrides,
+    };
+  }
+
+  it('should group memories by topicKey', () => {
+    const memories = [
+      makeMemory({
+        content: 'JWT auth approach',
+        topicKey: 'decision:jwt-auth',
+        topics: ['decision:jwt-auth'],
+      }),
+      makeMemory({
+        content: 'Git workflow rules',
+        topicKey: 'convention:git',
+        topics: ['convention:git'],
+      }),
+      makeMemory({
+        content: 'More JWT details',
+        topicKey: 'decision:jwt-auth',
+        topics: ['decision:jwt-auth'],
+      }),
+    ];
+
+    const result = buildKnowledgeSummary(memories);
+
+    expect(result.topicIndex).toHaveLength(2);
+    const jwtTopic = result.topicIndex.find((t) => t.topicKey === 'decision:jwt-auth');
+    const gitTopic = result.topicIndex.find((t) => t.topicKey === 'convention:git');
+    expect(jwtTopic?.memoryCount).toBe(2);
+    expect(gitTopic?.memoryCount).toBe(1);
+  });
+
+  it('should use summary field when available', () => {
+    const memories = [
+      makeMemory({
+        content: 'Very long detailed content about JWT authentication...',
+        summary: 'Self-issued JWTs for MCP auth',
+        topicKey: 'decision:jwt-auth',
+        topics: ['decision:jwt-auth'],
+      }),
+    ];
+
+    const result = buildKnowledgeSummary(memories);
+
+    expect(result.knowledgeSummary).toContain('Self-issued JWTs for MCP auth');
+    expect(result.knowledgeSummary).not.toContain('Very long detailed');
+  });
+
+  it('should truncate content when no summary is provided', () => {
+    const longContent = 'A'.repeat(500);
+    const memories = [
+      makeMemory({
+        content: longContent,
+        topicKey: 'test:long',
+        topics: ['test:long'],
+      }),
+    ];
+
+    const result = buildKnowledgeSummary(memories);
+
+    // Should be truncated to ~200 chars + '...'
+    expect(result.knowledgeSummary.length).toBeLessThan(500);
+    expect(result.knowledgeSummary).toContain('...');
+  });
+
+  it('should truncate long summaries to prevent budget bypass', () => {
+    const longSummary = 'B'.repeat(500);
+    const memories = [
+      makeMemory({
+        content: 'Full content',
+        summary: longSummary,
+        topicKey: 'test:long-summary',
+        topics: ['test:long-summary'],
+      }),
+    ];
+
+    const result = buildKnowledgeSummary(memories);
+
+    // The summary should be truncated to 200 chars, not used raw
+    expect(result.knowledgeSummary).not.toContain(longSummary);
+    expect(result.knowledgeSummary).toContain('...');
+  });
+
+  it('should fall back to first topic when no topicKey', () => {
+    const memories = [makeMemory({ content: 'No topic key', topics: ['fallback-topic'] })];
+
+    const result = buildKnowledgeSummary(memories);
+
+    expect(result.topicIndex[0].topicKey).toBe('fallback-topic');
+  });
+
+  it('should use "uncategorized" when no topics at all', () => {
+    const memories = [makeMemory({ content: 'No topics or topicKey', topics: [] })];
+
+    const result = buildKnowledgeSummary(memories);
+
+    expect(result.topicIndex[0].topicKey).toBe('uncategorized');
+  });
+
+  it('should include topicSummary from metadata', () => {
+    const memories = [
+      makeMemory({
+        content: 'Some content',
+        topicKey: 'project:pcp',
+        topics: ['project:pcp'],
+        metadata: { topicSummary: 'Personal Context Protocol' },
+      }),
+    ];
+
+    const result = buildKnowledgeSummary(memories);
+
+    expect(result.knowledgeSummary).toContain('project:pcp — Personal Context Protocol');
+    expect(result.topicIndex[0].topicSummary).toBe('Personal Context Protocol');
+  });
+
+  it('should respect character budget', () => {
+    // Create many memories that would exceed a small budget
+    process.env.BOOTSTRAP_MEMORY_BUDGET = '200';
+    const memories = Array.from({ length: 10 }, (_, i) =>
+      makeMemory({
+        content: `Memory ${i}: ${'x'.repeat(100)}`,
+        topicKey: `topic:${i}`,
+        topics: [`topic:${i}`],
+      })
+    );
+
+    const result = buildKnowledgeSummary(memories);
+
+    // knowledgeSummary should be within budget
+    expect(result.knowledgeSummary.length).toBeLessThanOrEqual(250); // some overhead for headers
+    // But topic index should include all topics
+    expect(result.topicIndex).toHaveLength(10);
+    // memoriesIncluded should be less than total
+    expect(result.memoriesIncluded).toBeLessThan(10);
+
+    delete process.env.BOOTSTRAP_MEMORY_BUDGET;
+  });
+
+  it('should return empty summary for empty memories array', () => {
+    const result = buildKnowledgeSummary([]);
+
+    expect(result.knowledgeSummary).toBe('');
+    expect(result.topicIndex).toHaveLength(0);
+    expect(result.memoriesIncluded).toBe(0);
+  });
+
+  it('should sort topics by most recent activity first', () => {
+    const memories = [
+      makeMemory({
+        content: 'Old topic',
+        topicKey: 'topic:old',
+        topics: ['topic:old'],
+        createdAt: new Date('2026-01-01T00:00:00Z'),
+      }),
+      makeMemory({
+        content: 'New topic',
+        topicKey: 'topic:new',
+        topics: ['topic:new'],
+        createdAt: new Date('2026-02-18T00:00:00Z'),
+      }),
+    ];
+
+    const result = buildKnowledgeSummary(memories);
+
+    expect(result.topicIndex[0].topicKey).toBe('topic:new');
+    expect(result.topicIndex[1].topicKey).toBe('topic:old');
+  });
+});

@@ -9,6 +9,8 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import type { TaskStatus, TaskPriority } from '../../data/repositories/project-tasks.repository';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
+import { getEffectiveAgentId } from '../../auth/enforce-identity';
+import { logger } from '../../utils/logger';
 
 // Common user identifier schema
 // Usually unnecessary — userId and email are auto-resolved from OAuth token.
@@ -274,6 +276,29 @@ export async function handleCompleteTask(
     }
 
     const task = await dataComposer.repositories.projectTasks.completeTask(args.taskId);
+
+    // Auto-remember: persist task completion as a memory for session continuity
+    try {
+      const agentId = getEffectiveAgentId(undefined);
+      const salience = task.priority === 'high' || task.priority === 'critical' ? 'high' : 'medium';
+      const topics = [`task:${task.id}`, ...(task.tags || [])];
+      if (task.project_id) topics.push(`project:${task.project_id}`);
+
+      await dataComposer.repositories.memory.remember({
+        userId: resolved.user.id,
+        content: `Completed task: ${task.title}${task.description ? ` — ${task.description}` : ''}`,
+        summary: `Completed: ${task.title}`,
+        topicKey: task.project_id ? `project:${task.project_id}` : undefined,
+        source: 'session',
+        salience: salience as 'medium' | 'high',
+        topics,
+        agentId: agentId || undefined,
+        metadata: { taskId: task.id, autoCreated: true },
+      });
+    } catch (err) {
+      // Non-fatal — task completion is the primary action, memory is best-effort
+      logger.warn('Failed to auto-remember task completion:', err);
+    }
 
     return mcpResponse({
       success: true,
