@@ -53,7 +53,7 @@ const SB_FLAGS: Record<string, { hasValue: boolean; key: string }> = {
 
 interface ParsedArgs {
   sbOptions: {
-    agent: string;
+    agent: string | undefined;
     backend: string;
     model: string | undefined; // undefined = use backend's default
     session: boolean;
@@ -71,7 +71,7 @@ interface ParsedArgs {
  */
 function extractArgs(argv: string[]): ParsedArgs {
   const sbOptions: ParsedArgs['sbOptions'] = {
-    agent: 'wren',
+    agent: undefined,
     backend: 'claude',
     model: undefined, // undefined = use backend's default
     session: true,
@@ -134,7 +134,7 @@ program
   .enablePositionalOptions()
   .allowUnknownOption(true)
   .allowExcessArguments(true)
-  .option('-a, --agent <id>', 'Agent identity to use', 'wren')
+  .option('-a, --agent <id>', 'Agent identity to use')
   .option('-b, --backend <name>', 'AI backend (claude, codex, gemini)', 'claude')
   .option('-m, --model <model>', 'Model to use (defaults to backend-specific)')
   .option('--no-session', 'Disable session tracking')

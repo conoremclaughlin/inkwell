@@ -43,13 +43,13 @@ export function readIdentityJson(cwd: string): IdentityJson | null {
 
 /**
  * Resolve agent ID from multiple sources:
- * 1. CLI --agent flag (if explicitly changed from default)
+ * 1. CLI --agent flag (if provided)
  * 2. .pcp/identity.json in current directory
  * 3. ~/.pcp/config.json agentMapping
- * 4. Default: 'wren'
+ * 4. null (no identity configured)
  */
-export function resolveAgentId(cliAgent?: string): string {
-  if (cliAgent && cliAgent !== 'wren') {
+export function resolveAgentId(cliAgent?: string): string | null {
+  if (cliAgent) {
     return cliAgent;
   }
 
@@ -87,7 +87,7 @@ export function resolveAgentId(cliAgent?: string): string {
     }
   }
 
-  return cliAgent || 'wren';
+  return null;
 }
 
 /**

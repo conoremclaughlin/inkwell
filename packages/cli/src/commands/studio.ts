@@ -31,6 +31,7 @@ import { join, dirname, basename, parse as parsePath } from 'path';
 import { homedir } from 'os';
 import { installHooks } from './hooks.js';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
+import { resolveAgentId } from '../backends/identity.js';
 
 interface StudioIdentity {
   agentId: string;
@@ -402,7 +403,7 @@ async function createStudio(
   },
   overrides?: { branch?: string; configDirsList?: string[] }
 ): Promise<void> {
-  const agentId = options.agent || 'wren';
+  const agentId = options.agent || resolveAgentId() || 'sb';
   const spinner = ora(`Creating studio: ${name}`).start();
 
   try {
@@ -808,7 +809,7 @@ export function registerStudioCommands(program: Command): void {
 
   ws.command('create [name]')
     .description('Create a new studio with git worktree')
-    .option('-a, --agent <agent>', 'Agent ID for this studio', 'wren')
+    .option('-a, --agent <agent>', 'Agent ID for this studio')
     .option('-p, --purpose <desc>', 'Description/purpose of the studio')
     .option('-br, --branch <branch>', 'Custom branch name (default: <agentId>/studio/main)')
     .option('-b, --backend <name>', 'Primary backend (claude-code, codex, gemini)')
@@ -823,7 +824,7 @@ export function registerStudioCommands(program: Command): void {
         // Interactive mode: prompt for all values
         try {
           const gitRoot = findGitRoot();
-          const agentId = options.agent || 'wren';
+          const agentId = options.agent || resolveAgentId() || 'sb';
           const result = await runInteractiveFlow(agentId, gitRoot);
           return createStudio(result.name, options, {
             branch: result.branch,

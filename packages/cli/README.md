@@ -114,7 +114,7 @@ Take your time with it. Share stories, photos, a poem or quotes you love -- what
 ### 7. Start working
 
 ```bash
-sb                            # Launch a session as your default SB
+sb                            # Launch a session as your SB
 ```
 
 Hooks automatically bootstrap identity and check inbox at session start, save context before compaction, and nudge the SB to log decisions periodically.
@@ -125,7 +125,7 @@ Running `sb` always starts a **new** interactive session with the backend. It do
 
 ```bash
 # Interactive session (starts new)
-sb                              # New Claude Code session as wren
+sb                              # New Claude Code session
 sb -a lumen                     # New session as lumen
 sb -b codex                     # New Codex session
 sb -b gemini                    # New Gemini session
@@ -200,7 +200,7 @@ The agent ID is resolved in order:
 1. `-a` / `--agent` flag
 2. `.pcp/identity.json` in current directory
 3. `~/.pcp/config.json` → `agentMapping.claude-code`
-4. Default: `wren`
+4. Error — run `sb init` or `sb awaken` to configure identity
 
 The backend is resolved similarly:
 1. `-b` / `--backend` flag

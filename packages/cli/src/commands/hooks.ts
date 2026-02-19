@@ -861,7 +861,7 @@ async function postCompactHandler(): Promise<void> {
 
   const cwd = process.cwd();
   const config = getPcpConfig();
-  const agentId = resolveAgentId();
+  const agentId = resolveAgentId() || 'unknown';
 
   let identityBlock = '';
   let inboxBlock = '';
@@ -904,7 +904,7 @@ async function onSessionStartHandler(): Promise<void> {
 
   const cwd = process.cwd();
   const config = getPcpConfig();
-  const agentId = resolveAgentId();
+  const agentId = resolveAgentId() || 'unknown';
 
   // Read studio/workspace ID from identity.json
   const identityPath = join(cwd, '.pcp', 'identity.json');
@@ -997,7 +997,7 @@ async function onPromptHandler(): Promise<void> {
 
   const cwd = process.cwd();
   const config = getPcpConfig();
-  const agentId = resolveAgentId();
+  const agentId = resolveAgentId() || 'unknown';
 
   // Check if inbox check is stale (> 5 minutes)
   const lastCheck = readRuntimeFile(cwd, 'last-inbox-check');
@@ -1036,7 +1036,7 @@ async function onStopHandler(): Promise<void> {
 
   const cwd = process.cwd();
   const config = getPcpConfig();
-  const agentId = resolveAgentId();
+  const agentId = resolveAgentId() || 'unknown';
   const parts: string[] = [];
 
   // Increment tool call counter
