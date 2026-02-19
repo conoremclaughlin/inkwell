@@ -229,13 +229,13 @@ Hooks are installed to **local-only** config by default (e.g., `.claude/settings
 
 **Hook events:**
 
-| PCP Event          | What it does                   | Claude Code        | Codex           | Gemini          |
-| ------------------ | ------------------------------ | ------------------ | --------------- | --------------- |
-| `on-session-start` | Bootstrap identity + inbox     | `SessionStart`     | `session_start` | `session_start` |
-| `pre-compact`      | Save context before compaction | `PreCompact`       | —               | `PreCompress`   |
-| `post-compact`     | Re-bootstrap after compaction  | `SessionStart`     | —               | —               |
-| `on-prompt`        | Periodic inbox check           | `UserPromptSubmit` | —               | —               |
-| `on-stop`          | Session nudge + inbox check    | `Stop`             | `session_end`   | `session_end`   |
+| PCP Event          | What it does                   | Claude Code        | Codex              | Gemini          |
+| ------------------ | ------------------------------ | ------------------ | ------------------ | --------------- |
+| `on-session-start` | Bootstrap identity + inbox     | `SessionStart`     | `SessionStart`     | `SessionStart`  |
+| `pre-compact`      | Save context before compaction | `PreCompact`       | —                  | `PreCompress`   |
+| `post-compact`     | Re-bootstrap after compaction  | `SessionStart`     | —                  | —               |
+| `on-prompt`        | Periodic inbox check           | `UserPromptSubmit` | `UserPromptSubmit` | —               |
+| `on-stop`          | Session nudge + inbox check    | `Stop`             | `AfterAgent`       | `AfterAgent`    |
 
 ### Sessions (`sb session`)
 

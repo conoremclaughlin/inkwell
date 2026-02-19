@@ -66,14 +66,14 @@ const CODEX: HookCapabilities = {
   configPath: '.codex/config.toml',
   configFormat: 'toml',
   events: {
-    sessionStart: 'session_start',
+    sessionStart: 'SessionStart',
     preCompact: null,
     postCompact: null,
-    onPrompt: null,
-    onStop: 'session_end',
+    onPrompt: 'UserPromptSubmit',
+    onStop: 'AfterAgent',
   },
   supportsCompaction: false,
-  supportsPromptHook: false,
+  supportsPromptHook: true,
 };
 
 const GEMINI: HookCapabilities = {
@@ -81,11 +81,11 @@ const GEMINI: HookCapabilities = {
   configPath: '.gemini/settings.json',
   configFormat: 'json',
   events: {
-    sessionStart: 'session_start',
+    sessionStart: 'SessionStart',
     preCompact: 'PreCompress',
     postCompact: null,
     onPrompt: null,
-    onStop: 'session_end',
+    onStop: 'AfterAgent',
   },
   supportsCompaction: true,
   supportsPromptHook: false,
@@ -484,32 +484,44 @@ function installGemini(cwd: string, force: boolean): InstallResult {
     }
   }
 
+  const sbPath = resolveSbBinaryPath(cwd);
+  const pcpHooks: Record<string, unknown> = {
+    [GEMINI.events.sessionStart!]: [{ command: `${sbPath} hooks on-session-start` }],
+    [GEMINI.events.onStop!]: [{ command: `${sbPath} hooks on-stop` }],
+    [GEMINI.events.preCompact!]: [{ command: `${sbPath} hooks pre-compact` }],
+  };
+
   if (existing.hooks && !force) {
     // Check if our hooks are already there
     const hooksObj = existing.hooks as Record<string, unknown>;
-    const hasSessionStart =
-      Array.isArray(hooksObj.session_start) &&
-      (hooksObj.session_start as Array<Record<string, unknown>>).some((h) =>
-        isPcpHookCommand(h.command as string | undefined)
-      );
-    const hasSessionEnd =
-      Array.isArray(hooksObj.session_end) &&
-      (hooksObj.session_end as Array<Record<string, unknown>>).some((h) =>
-        isPcpHookCommand(h.command as string | undefined)
-      );
-    if (hasSessionStart && hasSessionEnd) {
+    const allPresent = Object.entries(pcpHooks).every(([event, targetEntries]) => {
+      const existingEntries = hooksObj[event];
+      if (!Array.isArray(existingEntries)) return false;
+      const targetCmd = (targetEntries as any)[0].command;
+      return existingEntries.some((h: any) => h.command === targetCmd);
+    });
+
+    if (allPresent) {
       return 'already-installed';
     }
 
-    return 'conflict';
+    // Check for any non-PCP hooks in these specific events
+    const hasConflict = Object.keys(pcpHooks).some((event) => {
+      const entries = hooksObj[event];
+      if (!Array.isArray(entries)) return false;
+      return entries.some((h: any) => !isPcpHookCommand(h.command));
+    });
+
+    if (hasConflict) {
+      return 'conflict';
+    }
   }
 
-  const sbPath = resolveSbBinaryPath(cwd);
   const merged = {
     ...existing,
     hooks: {
-      session_start: [{ command: `${sbPath} hooks on-session-start` }],
-      session_end: [{ command: `${sbPath} hooks on-stop` }],
+      ...(existing.hooks as Record<string, unknown> || {}),
+      ...pcpHooks,
     },
   };
 
@@ -542,9 +554,14 @@ function installCodex(cwd: string, force: boolean): InstallResult {
   const pcpSection = [
     '',
     `# ${PCP_MARKER}`,
-    '[hooks]',
-    `session_start = "${sbPath} hooks on-session-start"`,
-    `session_end = "${sbPath} hooks on-stop"`,
+    '[[hooks.SessionStart]]',
+    `command = "${sbPath} hooks on-session-start"`,
+    '',
+    '[[hooks.UserPromptSubmit]]',
+    `command = "${sbPath} hooks on-prompt"`,
+    '',
+    '[[hooks.AfterAgent]]',
+    `command = "${sbPath} hooks on-stop"`,
     `# end ${PCP_MARKER}`,
     '',
   ].join('\n');

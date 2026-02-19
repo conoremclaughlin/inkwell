@@ -194,8 +194,9 @@ describe('installHooks: Gemini', () => {
     expect(existsSync(configPath)).toBe(true);
 
     const config = JSON.parse(readFileSync(configPath, 'utf-8'));
-    expect(config.hooks.session_start[0].command).toContain('sb hooks on-session-start');
-    expect(config.hooks.session_end[0].command).toContain('sb hooks on-stop');
+    expect(config.hooks.SessionStart[0].command).toContain('sb hooks on-session-start');
+    expect(config.hooks.AfterAgent[0].command).toContain('sb hooks on-stop');
+    expect(config.hooks.PreCompress[0].command).toContain('sb hooks pre-compact');
   });
 
   it('should preserve existing Gemini settings', () => {
@@ -224,7 +225,7 @@ describe('installHooks: Gemini', () => {
     mkdirSync(configDir, { recursive: true });
     writeFileSync(
       join(configDir, 'settings.json'),
-      JSON.stringify({ hooks: { session_start: [{ command: 'other-tool start' }] } })
+      JSON.stringify({ hooks: { SessionStart: [{ command: 'other-tool start' }] } })
     );
 
     const { result } = installHooks(TEST_DIR, { backend: 'gemini' });
@@ -253,9 +254,12 @@ describe('installHooks: Codex', () => {
 
     const content = readFileSync(configPath, 'utf-8');
     expect(content).toContain('# pcp-managed');
-    expect(content).toContain('[hooks]');
-    expect(content).toMatch(/session_start = ".*sb hooks on-session-start"/);
-    expect(content).toMatch(/session_end = ".*sb hooks on-stop"/);
+    expect(content).toContain('[[hooks.SessionStart]]');
+    expect(content).toMatch(/command = ".*sb hooks on-session-start"/);
+    expect(content).toContain('[[hooks.UserPromptSubmit]]');
+    expect(content).toMatch(/command = ".*sb hooks on-prompt"/);
+    expect(content).toContain('[[hooks.AfterAgent]]');
+    expect(content).toMatch(/command = ".*sb hooks on-stop"/);
     expect(content).toContain('# end pcp-managed');
   });
 
@@ -302,7 +306,7 @@ describe('installHooks: Codex', () => {
     const endMarkers = content.match(/# end pcp-managed/g);
     expect(startMarkers).toHaveLength(1);
     expect(endMarkers).toHaveLength(1);
-    expect(content).toMatch(/session_start = ".*sb hooks on-session-start"/);
+    expect(content).toMatch(/command = ".*sb hooks on-session-start"/);
   });
 });
 
