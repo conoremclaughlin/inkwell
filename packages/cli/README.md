@@ -373,7 +373,7 @@ Inside REPL:
 - `/skill-use <name>` activate a discovered skill and inject SKILL.md guidance into prompt context
 - `/skill-clear [name]` clear active skills
 - `/pcp <tool> [jsonArgs]` invoke PCP tools directly from REPL
-- `/usage` show approximate context token usage
+- `/usage` show visual context token meter (budget %, delta since last turn, per-role breakdown)
 - `/session` show session/thread routing info
 - `/quit` end REPL and close PCP session
 

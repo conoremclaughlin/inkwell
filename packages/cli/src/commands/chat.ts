@@ -281,14 +281,48 @@ function summarizeForSessionEnd(ledger: ContextLedger): string {
   return `REPL summary:\n${snippets.map((s) => `- ${s}`).join('\n')}`;
 }
 
-function printUsage(ledger: ContextLedger, maxContextTokens: number): void {
+function buildTokenMeter(pct: number, width = 24): string {
+  const clamped = Math.max(0, Math.min(100, pct));
+  const filled = Math.round((clamped / 100) * width);
+  const empty = Math.max(0, width - filled);
+  return `${'█'.repeat(filled)}${'░'.repeat(empty)}`;
+}
+
+function printUsage(ledger: ContextLedger, maxContextTokens: number, previousTotal?: number): number {
+  const entries = ledger.listEntries();
   const total = ledger.totalTokens();
   const pct = maxContextTokens > 0 ? Math.min((total / maxContextTokens) * 100, 999) : 0;
+  const displayPct = Math.min(pct, 100);
+  const delta = previousTotal === undefined ? 0 : total - previousTotal;
+  const deltaLabel =
+    previousTotal === undefined
+      ? ''
+      : `  ${delta >= 0 ? '+' : ''}${delta.toLocaleString()} tok`;
+
+  let user = 0;
+  let assistant = 0;
+  let inbox = 0;
+  let system = 0;
+  for (const entry of entries) {
+    if (entry.role === 'user') user += entry.approxTokens;
+    else if (entry.role === 'assistant') assistant += entry.approxTokens;
+    else if (entry.role === 'inbox') inbox += entry.approxTokens;
+    else system += entry.approxTokens;
+  }
+
+  const bar = buildTokenMeter(displayPct);
+  const color =
+    pct >= 95 ? chalk.red : pct >= 80 ? chalk.yellow : pct >= 60 ? chalk.hex('#f59e0b') : chalk.green;
+  const header = `Context: ~${total.toLocaleString()} / ${maxContextTokens.toLocaleString()} tok (${pct.toFixed(1)}%)${deltaLabel}`;
+  console.log(color(header));
   console.log(
-    chalk.dim(
-      `Context: ~${total.toLocaleString()} tok / ${maxContextTokens.toLocaleString()} (${pct.toFixed(1)}%)`
-    )
+    color(`[${bar}]`) +
+      chalk.dim(
+        `  entries:${entries.length}  user:${user.toLocaleString()}  assistant:${assistant.toLocaleString()}  inbox:${inbox.toLocaleString()}  system:${system.toLocaleString()}`
+      )
   );
+
+  return total;
 }
 
 function formatStartedAt(value?: string): string {
@@ -707,13 +741,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   const rl = createInterface({ input, output });
   let keepRunning = true;
+  let lastUsageTotal: number | undefined;
 
   while (keepRunning) {
     if (runtime.showSessionsWatch) {
       const snapshot = await refreshSessionsSnapshot(false);
       printSessionsSnapshot(snapshot);
     }
-    printUsage(ledger, runtime.maxContextTokens);
+    lastUsageTotal = printUsage(ledger, runtime.maxContextTokens, lastUsageTotal);
     const raw = (await rl.question(chalk.green(`${agentId}> `))).trim();
     if (!raw) continue;
 
@@ -1118,7 +1153,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           break;
         }
         case 'usage':
-          printUsage(ledger, runtime.maxContextTokens);
+          lastUsageTotal = printUsage(ledger, runtime.maxContextTokens, lastUsageTotal);
           break;
         default:
           console.log(chalk.yellow(`Unknown command: /${slash.name}`));
