@@ -4,11 +4,19 @@
 
 A system that captures and manages personal context across AI interfaces, enabling persistent memory, identity, and continuity across sessions. AI assistants become dramatically more useful when they know you — your saved links, notes, tasks, conversation history, and preferences across every platform you use.
 
+## Prerequisites
+
+PCP requires a **Supabase** database (PostgreSQL). You can use either a hosted Supabase project or run one locally via Docker. See [Database Setup](#database-setup-supabase) below for both options.
+
+You'll need a `.env.local` file with your Supabase credentials before starting the server — without it, the PCP server will fail to connect. Copy `.env.example` and fill in your `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, and `SUPABASE_SECRET_KEY`.
+
 ## Quick Start
 
 ```bash
 # Install dependencies
 yarn install
+
+# Set up Supabase (see Database Setup section) and create .env.local first!
 
 # Start PCP server + agents (pm2)
 yarn dev
