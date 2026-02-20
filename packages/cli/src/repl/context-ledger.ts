@@ -82,14 +82,29 @@ export class ContextLedger {
   }
 
   public ejectToBookmark(ref: string): LedgerEjectResult | null {
+    const preview = this.previewEjectToBookmark(ref);
+    if (!preview) {
+      return null;
+    }
+
+    const cutoff = Math.min(preview.bookmark.entryIndex, this.entries.length - 1);
+    this.entries = cutoff < 0 ? this.entries : this.entries.slice(cutoff + 1);
+
+    // Remove bookmarks at/inside the ejected region.
+    this.bookmarks = this.bookmarks
+      .filter((b) => b.entryIndex > cutoff)
+      .map((b) => ({ ...b, entryIndex: b.entryIndex - (cutoff + 1) }));
+
+    return preview;
+  }
+
+  public previewEjectToBookmark(ref: string): LedgerEjectResult | null {
     const bookmark =
       ref === 'last'
         ? this.bookmarks[this.bookmarks.length - 1]
         : this.bookmarks.find((b) => b.id === ref || b.label === ref);
 
-    if (!bookmark) {
-      return null;
-    }
+    if (!bookmark) return null;
 
     const cutoff = Math.min(bookmark.entryIndex, this.entries.length - 1);
     if (cutoff < 0) {
@@ -98,13 +113,6 @@ export class ContextLedger {
 
     const removedEntries = this.entries.slice(0, cutoff + 1);
     const removedTokens = removedEntries.reduce((sum, entry) => sum + entry.approxTokens, 0);
-    this.entries = this.entries.slice(cutoff + 1);
-
-    // Remove bookmarks at/inside the ejected region.
-    this.bookmarks = this.bookmarks
-      .filter((b) => b.entryIndex > cutoff)
-      .map((b) => ({ ...b, entryIndex: b.entryIndex - (cutoff + 1) }));
-
     return { bookmark, removedEntries, removedTokens };
   }
 
@@ -132,4 +140,3 @@ export class ContextLedger {
       .join('\n\n');
   }
 }
-

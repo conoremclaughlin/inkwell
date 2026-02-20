@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import { getBackend } from '../backends/index.js';
+import { extractBackendTokenUsage, type BackendTokenUsage } from './token-usage.js';
 
 export interface BackendRunRequest {
   backend: string;
@@ -18,6 +19,7 @@ export interface BackendRunResult {
   exitCode: number;
   durationMs: number;
   command: string;
+  usage?: BackendTokenUsage;
 }
 
 export async function runBackendTurn(request: BackendRunRequest): Promise<BackendRunResult> {
@@ -62,13 +64,16 @@ export async function runBackendTurn(request: BackendRunRequest): Promise<Backen
       resolved = true;
       if (timeoutHandle) clearTimeout(timeoutHandle);
       prepared.cleanup();
+      const trimmedStdout = stdout.trim();
+      const trimmedStderr = stderr.trim();
       resolve({
         success: exitCode === 0,
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
+        stdout: trimmedStdout,
+        stderr: trimmedStderr,
         exitCode,
         durationMs: Date.now() - started,
         command,
+        usage: extractBackendTokenUsage(request.backend, trimmedStdout, trimmedStderr),
       });
     };
 
@@ -86,4 +91,3 @@ export async function runBackendTurn(request: BackendRunRequest): Promise<Backen
     child.on('close', (code) => finalize(code ?? 1));
   });
 }
-

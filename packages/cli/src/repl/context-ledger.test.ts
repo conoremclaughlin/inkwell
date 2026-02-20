@@ -33,6 +33,17 @@ describe('ContextLedger', () => {
     expect(ledger.listEntries().map((entry) => entry.content)).toEqual(['two', 'three']);
   });
 
+  it('previews ejection without mutating entries', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('user', 'a');
+    const bookmark = ledger.createBookmark('first');
+    ledger.addEntry('assistant', 'b');
+
+    const preview = ledger.previewEjectToBookmark(bookmark.id);
+    expect(preview?.removedEntries.map((entry) => entry.content)).toEqual(['a']);
+    expect(ledger.listEntries().map((entry) => entry.content)).toEqual(['a', 'b']);
+  });
+
   it('builds transcript respecting maxTokens', () => {
     const ledger = new ContextLedger();
     ledger.addEntry('user', '1111111111'); // ~3 tokens
@@ -45,4 +56,3 @@ describe('ContextLedger', () => {
     expect(transcript).not.toContain('1111111111');
   });
 });
-

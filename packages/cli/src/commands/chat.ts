@@ -19,6 +19,7 @@ import { runBackendTurn } from '../repl/backend-runner.js';
 import { ContextLedger, estimateTokens } from '../repl/context-ledger.js';
 import { parseSlashCommand } from '../repl/slash.js';
 import { ToolMode, ToolPolicyState } from '../repl/tool-policy.js';
+import { formatBackendTokenUsage, type BackendTokenUsage } from '../repl/token-usage.js';
 import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../repl/skills.js';
 import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
 import { ensurePcpToolAllowed } from '../repl/tool-gate.js';
@@ -339,7 +340,12 @@ function buildTokenMeter(pct: number, width = 24): string {
   return `${'█'.repeat(filled)}${'░'.repeat(empty)}`;
 }
 
-function printUsage(ledger: ContextLedger, maxContextTokens: number, previousTotal?: number): number {
+function printUsage(
+  ledger: ContextLedger,
+  maxContextTokens: number,
+  previousTotal?: number,
+  lastBackendUsage?: BackendTokenUsage
+): number {
   const entries = ledger.listEntries();
   const total = ledger.totalTokens();
   const pct = maxContextTokens > 0 ? Math.min((total / maxContextTokens) * 100, 999) : 0;
@@ -372,6 +378,9 @@ function printUsage(ledger: ContextLedger, maxContextTokens: number, previousTot
         `  entries:${entries.length}  user:${user.toLocaleString()}  assistant:${assistant.toLocaleString()}  inbox:${inbox.toLocaleString()}  system:${system.toLocaleString()}`
       )
   );
+  if (lastBackendUsage) {
+    console.log(chalk.dim(`Last backend usage: ${formatBackendTokenUsage(lastBackendUsage)}`));
+  }
 
   return total;
 }
@@ -571,6 +580,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let sessionsCache: SessionSummary[] = [];
   let sessionsCacheAt = 0;
   let activitySince = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  let lastBackendUsage: BackendTokenUsage | undefined;
 
   const bootstrapResult = (await pcp
     .callTool('bootstrap', { agentId })
@@ -812,7 +822,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       stderr: runResult.stderr || null,
       content: responseText,
       approxTokens: estimateTokens(responseText),
+      usage: runResult.usage || null,
     });
+    lastBackendUsage = runResult.usage;
 
     if (!runResult.success) {
       console.log(chalk.red(`\n[${runtime.backend}] exit=${runResult.exitCode}`));
@@ -822,6 +834,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
 
     console.log(`\n${chalk.white(responseText)}\n`);
+    if (runResult.usage) {
+      console.log(chalk.dim(`↳ ${formatBackendTokenUsage(runResult.usage)}\n`));
+    }
   };
 
   if (options.nonInteractive || options.message) {
@@ -855,7 +870,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const snapshot = await refreshSessionsSnapshot(false);
       printSessionsSnapshot(snapshot);
     }
-    lastUsageTotal = printUsage(ledger, runtime.maxContextTokens, lastUsageTotal);
+    lastUsageTotal = printUsage(ledger, runtime.maxContextTokens, lastUsageTotal, lastBackendUsage);
     const raw = (await rl.question(chalk.green(`${agentId}> `))).trim();
     if (!raw) continue;
 
@@ -883,6 +898,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '/thread [key]              Show/set active thread key',
               '/sessions [watch|off]      Show active sessions (or stream each turn)',
               '/skills                    List discovered local skills',
+              '/skill-trust <all|trusted-only>  Set skill trust policy mode',
               '/skill-allow <pattern>      Persistently allow skill(s) via pattern',
               '/path-allow-read <glob>      Persistently allow local reads for matching paths',
               '/path-allow-write <glob>     Persistently allow local writes for matching paths',
@@ -891,6 +907,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '/bookmark [label]          Set context bookmark',
               '/bookmarks                 List bookmarks',
               '/eject <bookmark|last>     Eject context up to bookmark',
+              '/eject <bookmark|last> --force  Eject without confirmation',
               '/context                   Show recent context entries',
               '/usage                     Show context token estimate',
               '',
@@ -1033,6 +1050,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           console.log(chalk.bold('\nTool policy'));
           console.log(chalk.dim(`Path: ${toolPolicy.getPolicyPath()}`));
           console.log(chalk.dim(`Mode: ${toolPolicy.getMode()}`));
+          console.log(chalk.dim(`Skill trust mode: ${toolPolicy.getSkillTrustMode()}`));
           const grants = toolPolicy.listGrants();
           if (grants.length > 0) {
             console.log(chalk.dim(`Grants: ${grants.map((entry) => `${entry.tool}(${entry.uses})`).join(', ')}`));
@@ -1105,10 +1123,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const visible = filtered.visible;
           const blockedByPolicy = filtered.blockedBySkill.length;
           const blockedByPath = filtered.blockedByPath.length;
+          const blockedByTrust = filtered.blockedByTrust.length;
           console.log(chalk.bold(`Discovered skills (${skills.length})`));
           for (const skill of visible.slice(0, 80)) {
             const active = runtime.activeSkills.some((entry) => entry.path === skill.path) ? ' *active*' : '';
-            console.log(chalk.dim(`- ${skill.name} [${skill.source}]${active}`));
+            const trust = skill.trustLevel === 'trusted' ? chalk.green(skill.trustLevel) : skill.trustLevel;
+            const provenance = skill.provenance?.registry ? ` registry:${skill.provenance.registry}` : '';
+            console.log(chalk.dim(`- ${skill.name} [${skill.source}] trust=${trust}${provenance}${active}`));
           }
           if (visible.length > 80) {
             console.log(chalk.dim(`... and ${visible.length - 80} more visible skills`));
@@ -1119,6 +1140,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
           if (blockedByPath > 0) {
             console.log(chalk.yellow(`${blockedByPath} skills hidden by read-path allowlist policy`));
           }
+          if (blockedByTrust > 0) {
+            console.log(chalk.yellow(`${blockedByTrust} skills hidden by trust policy mode`));
+          }
+          break;
+        }
+        case 'skill-trust': {
+          const mode = (slash.args[0] || '').trim();
+          if (!mode || !['all', 'trusted-only'].includes(mode)) {
+            console.log(chalk.yellow('Usage: /skill-trust <all|trusted-only>'));
+            break;
+          }
+          toolPolicy.setSkillTrustMode(mode as 'all' | 'trusted-only');
+          console.log(chalk.green(`Skill trust mode set to ${mode}`));
           break;
         }
         case 'skill-allow': {
@@ -1224,13 +1258,46 @@ export async function runChat(options: ChatOptions): Promise<void> {
           break;
         }
         case 'eject': {
-          const ref = slash.args[0] || 'last';
+          const force = slash.args.includes('--force') || slash.args.includes('force');
+          const ref = slash.args.find((arg) => arg !== '--force' && arg !== 'force') || 'last';
+          const preview = ledger.previewEjectToBookmark(ref);
+          if (!preview) {
+            console.log(chalk.yellow(`Bookmark not found: ${ref}`));
+            break;
+          }
+          const removedCount = preview.removedEntries.length;
+
+          if (!force && removedCount > 0) {
+            const maybeLargeEject = preview.removedTokens >= 1500 || removedCount >= 8;
+            if (maybeLargeEject) {
+              const previewLines = preview.removedEntries
+                .slice(-3)
+                .map((entry) => `- ${entry.role}: ${entry.content.slice(0, 80).replace(/\\s+/g, ' ')}`);
+              console.log(
+                chalk.yellow(
+                  `About to eject ${removedCount} entries (~${preview.removedTokens} tok) up to ${preview.bookmark.id}.`
+                )
+              );
+              if (previewLines.length) {
+                console.log(chalk.dim('Recent entries in eject range:'));
+                for (const line of previewLines) console.log(chalk.dim(line));
+              }
+              const confirm = (
+                await rl.question(chalk.yellow('Proceed with ejection? [y/N]: '))
+              ).trim();
+              if (!['y', 'yes'].includes(confirm.toLowerCase())) {
+                console.log(chalk.dim('Ejection cancelled.'));
+                break;
+              }
+            }
+          }
+
           const result = ledger.ejectToBookmark(ref);
           if (!result) {
             console.log(chalk.yellow(`Bookmark not found: ${ref}`));
             break;
           }
-          const removedCount = result.removedEntries.length;
+
           console.log(
             chalk.green(
               `Ejected ${removedCount} entries (~${result.removedTokens} tok) up to ${result.bookmark.id}`
@@ -1274,7 +1341,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
           break;
         }
         case 'usage':
-          lastUsageTotal = printUsage(ledger, runtime.maxContextTokens, lastUsageTotal);
+          lastUsageTotal = printUsage(
+            ledger,
+            runtime.maxContextTokens,
+            lastUsageTotal,
+            lastBackendUsage
+          );
           break;
         default:
           console.log(chalk.yellow(`Unknown command: /${slash.name}`));

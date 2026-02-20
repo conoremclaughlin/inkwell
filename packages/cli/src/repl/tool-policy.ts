@@ -9,6 +9,7 @@ import {
 } from '@personal-context/shared';
 
 export type ToolMode = 'backend' | 'off' | 'privileged';
+export type SkillTrustMode = 'all' | 'trusted-only';
 
 export interface ToolPolicyDecision {
   allowed: boolean;
@@ -24,6 +25,7 @@ export interface ToolPolicyOptions {
 interface PersistedToolPolicy {
   version: 1;
   mode?: ToolMode;
+  skillTrustMode?: SkillTrustMode;
   safeTools?: string[];
   allowTools?: string[];
   denyTools?: string[];
@@ -89,6 +91,7 @@ function addToolSpec(target: Set<string>, spec: string): void {
 
 export class ToolPolicyState {
   private mode: ToolMode;
+  private skillTrustMode: SkillTrustMode = 'all';
   private persist: boolean;
   private policyPath: string;
   private safeTools = new Set<string>();
@@ -119,6 +122,7 @@ export class ToolPolicyState {
     const payload: PersistedToolPolicy = {
       version: 1,
       mode: this.mode,
+      skillTrustMode: this.skillTrustMode,
       safeTools: Array.from(this.safeTools).sort(),
       allowTools: Array.from(this.allowTools).sort(),
       denyTools: Array.from(this.denyTools).sort(),
@@ -145,6 +149,9 @@ export class ToolPolicyState {
       const parsed = JSON.parse(readFileSync(this.policyPath, 'utf-8')) as PersistedToolPolicy;
       if (parsed.mode) {
         this.mode = parsed.mode;
+      }
+      if (parsed.skillTrustMode === 'all' || parsed.skillTrustMode === 'trusted-only') {
+        this.skillTrustMode = parsed.skillTrustMode;
       }
       for (const tool of parsed.safeTools || []) addToolSpec(this.safeTools, tool);
       for (const tool of parsed.allowTools || []) addToolSpec(this.allowTools, tool);
@@ -175,6 +182,20 @@ export class ToolPolicyState {
 
   public getPolicyPath(): string {
     return this.policyPath;
+  }
+
+  public getSkillTrustMode(): SkillTrustMode {
+    return this.skillTrustMode;
+  }
+
+  public setSkillTrustMode(mode: SkillTrustMode): void {
+    this.skillTrustMode = mode;
+    this.saveToDisk();
+  }
+
+  public isSkillTrustAllowed(level: 'trusted' | 'local' | 'untrusted'): boolean {
+    if (this.skillTrustMode === 'all') return true;
+    return level === 'trusted';
   }
 
   public listSafeTools(): string[] {

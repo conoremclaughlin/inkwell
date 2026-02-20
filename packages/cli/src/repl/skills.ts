@@ -6,13 +6,51 @@ export interface DiscoveredSkill {
   name: string;
   path: string;
   source: string;
+  trustLevel: 'trusted' | 'local' | 'untrusted';
+  provenance?: SkillProvenance;
 }
 
 export interface SkillInstruction {
   name: string;
   path: string;
   source: string;
+  trustLevel: 'trusted' | 'local' | 'untrusted';
+  provenance?: SkillProvenance;
   content: string;
+}
+
+export interface SkillProvenance {
+  registry?: string;
+  installSource?: string;
+  sourceUrl?: string;
+  installedAt?: string;
+  digest?: string;
+  trusted?: boolean;
+}
+
+function inferTrustLevel(
+  source: string,
+  provenance?: SkillProvenance
+): 'trusted' | 'local' | 'untrusted' {
+  if (provenance?.trusted) return 'trusted';
+  if (source.startsWith('repo:')) return 'trusted';
+  if (source.startsWith('home:')) return 'local';
+  return 'untrusted';
+}
+
+function loadProvenance(skillPath: string): SkillProvenance | undefined {
+  const candidates = ['skill-provenance.json', 'provenance.json', '.pcp-skill.json'];
+  for (const name of candidates) {
+    const filePath = join(skillPath, name);
+    if (!existsSync(filePath)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as SkillProvenance;
+      return parsed;
+    } catch {
+      // Ignore malformed metadata.
+    }
+  }
+  return undefined;
 }
 
 function discoverFromDir(dir: string, source: string): DiscoveredSkill[] {
@@ -25,7 +63,14 @@ function discoverFromDir(dir: string, source: string): DiscoveredSkill[] {
     const skillPath = join(dir, entry.name);
     const marker = join(skillPath, 'SKILL.md');
     if (existsSync(marker)) {
-      skills.push({ name: entry.name, path: skillPath, source });
+      const provenance = loadProvenance(skillPath);
+      skills.push({
+        name: entry.name,
+        path: skillPath,
+        source,
+        provenance,
+        trustLevel: inferTrustLevel(source, provenance),
+      });
       continue;
     }
 
@@ -37,7 +82,14 @@ function discoverFromDir(dir: string, source: string): DiscoveredSkill[] {
         if (!nestedEntry.isDirectory()) continue;
         const nestedPath = join(nested, nestedEntry.name);
         if (existsSync(join(nestedPath, 'SKILL.md'))) {
-          skills.push({ name: `${entry.name}/.system/${nestedEntry.name}`, path: nestedPath, source });
+          const provenance = loadProvenance(nestedPath);
+          skills.push({
+            name: `${entry.name}/.system/${nestedEntry.name}`,
+            path: nestedPath,
+            source,
+            provenance,
+            trustLevel: inferTrustLevel(source, provenance),
+          });
         }
       }
     }
@@ -82,6 +134,8 @@ export function loadSkillInstruction(skill: DiscoveredSkill, maxChars = 8000): S
     name: skill.name,
     path: skill.path,
     source: skill.source,
+    trustLevel: skill.trustLevel,
+    provenance: skill.provenance,
     content,
   };
 }

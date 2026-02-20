@@ -368,13 +368,14 @@ Inside REPL:
 - `/deny <tool>` persistently deny a PCP tool
 - `/policy` inspect active policy and storage path
 - `/skills` list discovered local skills from .codex/.pcp/.claude/.gemini roots
+- `/skill-trust <all|trusted-only>` set trust policy mode for skill activation
 - `/skill-allow <pattern>` add skill pattern to persistent skill allowlist
 - `/path-allow-read <glob>` add a persistent local read allowlist pattern for skills/context files
 - `/path-allow-write <glob>` add a persistent local write allowlist pattern
 - `/skill-use <name>` activate a discovered skill and inject SKILL.md guidance into prompt context
 - `/skill-clear [name]` clear active skills
 - `/pcp <tool> [jsonArgs]` invoke PCP tools directly from REPL
-- `/usage` show visual context token meter (budget %, delta since last turn, per-role breakdown)
+- `/usage` show visual context token meter (budget %, delta since last turn, per-role breakdown + backend usage when available)
 - `/session` show session/thread routing info
 - `/quit` end REPL and close PCP session
 

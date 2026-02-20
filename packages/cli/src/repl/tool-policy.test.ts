@@ -72,6 +72,7 @@ describe('ToolPolicyState', () => {
     const policy = new ToolPolicyState('backend', { persist: true, policyPath });
 
     policy.setMode('off');
+    policy.setSkillTrustMode('trusted-only');
     policy.allowTool('send_to_inbox');
     policy.denyTool('trigger_agent');
     policy.addPromptTool('remember');
@@ -81,6 +82,7 @@ describe('ToolPolicyState', () => {
 
     const reloaded = new ToolPolicyState('backend', { persist: true, policyPath });
     expect(reloaded.getMode()).toBe('off');
+    expect(reloaded.getSkillTrustMode()).toBe('trusted-only');
     expect(reloaded.getPolicyPath()).toBe(policyPath);
     expect(reloaded.listSafeTools()).toContain('bootstrap');
     expect(reloaded.listAllowTools()).toContain('send_to_inbox');
@@ -143,6 +145,16 @@ describe('ToolPolicyState', () => {
     expect(policy.isSkillAllowed('screenshot')).toBe(true);
     expect(policy.isSkillAllowed('policy')).toBe(true);
     expect(policy.isSkillAllowed('unknown')).toBe(false);
+  });
+
+  it('enforces skill trust mode', () => {
+    const policy = new ToolPolicyState('backend', { persist: false });
+    expect(policy.isSkillTrustAllowed('trusted')).toBe(true);
+    expect(policy.isSkillTrustAllowed('local')).toBe(true);
+    policy.setSkillTrustMode('trusted-only');
+    expect(policy.isSkillTrustAllowed('trusted')).toBe(true);
+    expect(policy.isSkillTrustAllowed('local')).toBe(false);
+    expect(policy.isSkillTrustAllowed('untrusted')).toBe(false);
   });
 
   it('ignores malformed persisted policy file', () => {

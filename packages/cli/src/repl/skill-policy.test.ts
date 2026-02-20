@@ -4,9 +4,19 @@ import { canActivateSkill, filterSkillsByPolicy } from './skill-policy.js';
 
 describe('skill policy integration', () => {
   const skills = [
-    { name: 'playwright', path: '/Users/conor/.codex/skills/playwright', source: 'home:~/.codex/skills' },
-    { name: 'screenshot', path: '/Users/conor/.codex/skills/screenshot', source: 'home:~/.codex/skills' },
-    { name: 'secret', path: '/etc/pcp/skills/secret', source: 'system' },
+    {
+      name: 'playwright',
+      path: '/Users/conor/.codex/skills/playwright',
+      source: 'home:~/.codex/skills',
+      trustLevel: 'local' as const,
+    },
+    {
+      name: 'screenshot',
+      path: '/Users/conor/.codex/skills/screenshot',
+      source: 'home:~/.codex/skills',
+      trustLevel: 'local' as const,
+    },
+    { name: 'secret', path: '/etc/pcp/skills/secret', source: 'system', trustLevel: 'untrusted' as const },
   ];
 
   it('filters by both skill allowlist and read-path allowlist', () => {
@@ -18,6 +28,7 @@ describe('skill policy integration', () => {
     expect(result.visible.map((skill) => skill.name)).toEqual(['playwright']);
     expect(result.blockedBySkill.map((skill) => skill.name)).toEqual(['screenshot']);
     expect(result.blockedByPath.map((skill) => skill.name)).toEqual(['secret']);
+    expect(result.blockedByTrust).toHaveLength(0);
   });
 
   it('returns activation reason when blocked', () => {
@@ -34,6 +45,24 @@ describe('skill policy integration', () => {
     expect(canActivateSkill(skills[2], policy)).toEqual({
       allowed: false,
       reason: 'Skill path blocked by read allowlist policy: /etc/pcp/skills/secret',
+    });
+  });
+
+  it('blocks untrusted skills when trust mode is trusted-only', () => {
+    const policy = new ToolPolicyState('backend', { persist: false });
+    policy.setSkillTrustMode('trusted-only');
+    policy.setAllowedSkills(['*']);
+
+    const result = filterSkillsByPolicy(skills, policy);
+    expect(result.visible).toHaveLength(0);
+    expect(result.blockedByTrust.map((skill) => skill.name).sort()).toEqual([
+      'playwright',
+      'screenshot',
+      'secret',
+    ]);
+    expect(canActivateSkill(skills[0], policy)).toEqual({
+      allowed: false,
+      reason: 'Skill blocked by trust policy (local); set /skill-trust all to allow.',
     });
   });
 });

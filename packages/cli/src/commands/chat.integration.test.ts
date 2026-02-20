@@ -346,8 +346,8 @@ describe('runChat integration', () => {
 
   it('applies read-path policy to skill listing and activation', async () => {
     testState.discoverSkillsImpl.mockReturnValue([
-      { name: 'allowed-skill', path: '/allowed/skills/a', source: 'test' },
-      { name: 'blocked-skill', path: '/blocked/skills/b', source: 'test' },
+      { name: 'allowed-skill', path: '/allowed/skills/a', source: 'test', trustLevel: 'trusted' },
+      { name: 'blocked-skill', path: '/blocked/skills/b', source: 'test', trustLevel: 'trusted' },
     ]);
 
     testState.inputs = [
@@ -367,5 +367,73 @@ describe('runChat integration', () => {
     expect(logText).toContain('- allowed-skill [test]');
     expect(logText).toContain('1 skills hidden by read-path allowlist policy');
     expect(logText).toContain('Skill path blocked by read allowlist policy: /blocked/skills/b');
+  });
+
+  it('enforces skill trust mode in REPL skill activation', async () => {
+    testState.discoverSkillsImpl.mockReturnValue([
+      { name: 'local-skill', path: '/allowed/skills/a', source: 'test', trustLevel: 'local' },
+    ]);
+
+    testState.inputs = ['/skill-trust trusted-only', '/skills', '/skill-use local-skill', '/quit'];
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      pollSeconds: '999',
+    });
+
+    const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    expect(logText).toContain('Skill trust mode set to trusted-only');
+    expect(logText).toContain('1 skills hidden by trust policy mode');
+    expect(logText).toContain('Skill blocked by trust policy (local); set /skill-trust all to allow.');
+  });
+
+  it('renders backend token usage when available', async () => {
+    testState.runBackendImpl.mockResolvedValue({
+      success: true,
+      stdout: 'done',
+      stderr: '',
+      exitCode: 0,
+      durationMs: 5,
+      command: 'mock',
+      usage: {
+        backend: 'claude',
+        source: 'json',
+        inputTokens: 1200,
+        outputTokens: 400,
+        totalTokens: 1600,
+      },
+    });
+
+    testState.inputs = ['show usage', '/usage', '/quit'];
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      pollSeconds: '999',
+    });
+
+    const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    expect(logText).toContain('claude usage (json): in 1,200 · out 400 · total 1,600');
+    expect(logText).toContain('Last backend usage: claude usage (json): in 1,200 · out 400 · total 1,600');
+  });
+
+  it('requires confirmation before large context ejection and allows cancel', async () => {
+    const huge = 'x'.repeat(7000);
+    testState.inputs = [huge, '/bookmark heavy', 'follow-up', '/eject heavy', 'n', '/quit'];
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      pollSeconds: '999',
+    });
+
+    const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    expect(logText).toContain('About to eject');
+    expect(logText).toContain('Ejection cancelled.');
+
+    const replDir = join(testCwd, '.pcp', 'runtime', 'repl');
+    const transcriptFiles = readdirSync(replDir).filter((entry) => entry.endsWith('.jsonl'));
+    const transcript = readFileSync(join(replDir, transcriptFiles[0]!), 'utf-8');
+    expect(transcript).not.toContain('"type":"context_eject"');
   });
 });

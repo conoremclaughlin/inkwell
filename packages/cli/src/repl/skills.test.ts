@@ -39,4 +39,22 @@ describe('discoverSkills', () => {
     expect(loaded.content.length).toBeGreaterThan(40);
     expect(loaded.content).toContain('...[truncated]');
   });
+
+  it('captures provenance metadata and trust level', () => {
+    const root = mkdtempSync(join(tmpdir(), 'sb-skills-'));
+    dirs.push(root);
+
+    const skillDir = join(root, '.pcp', 'skills', 'registry-skill');
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(join(skillDir, 'SKILL.md'), '# Registry skill\\n');
+    writeFileSync(
+      join(skillDir, 'skill-provenance.json'),
+      JSON.stringify({ registry: 'clawhub', sourceUrl: 'https://clawhub.ai/skills/x', trusted: true })
+    );
+
+    const [skill] = discoverSkills(root).filter((entry) => entry.name === 'registry-skill');
+    expect(skill).toBeDefined();
+    expect(skill?.trustLevel).toBe('trusted');
+    expect(skill?.provenance?.registry).toBe('clawhub');
+  });
 });
