@@ -874,7 +874,7 @@ async function postCompactHandler(): Promise<void> {
     });
     identityBlock = buildIdentityBlock(bootstrap.identity);
   } catch {
-    identityBlock = '*Could not reach PCP server for bootstrap.*';
+    identityBlock = '*FAILED: Could not reach PCP server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
   }
 
   // Check inbox
@@ -886,7 +886,7 @@ async function postCompactHandler(): Promise<void> {
     inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
     writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
   } catch {
-    // Non-fatal
+    inboxBlock = '*FAILED: Could not reach PCP server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
   }
 
   const template = loadTemplate('hook-post-compact');
@@ -945,7 +945,7 @@ async function onSessionStartHandler(): Promise<void> {
       bootstrap.activeSessions as Array<Record<string, unknown>> | undefined
     );
   } catch {
-    identityBlock = '*Could not reach PCP server for bootstrap.*';
+    identityBlock = '*FAILED: Could not reach PCP server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
   }
 
   // Check inbox
@@ -957,7 +957,7 @@ async function onSessionStartHandler(): Promise<void> {
     inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
     writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
   } catch {
-    // Non-fatal
+    inboxBlock = '*FAILED: Could not reach PCP server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
   }
 
   // Register PCP session with detected backend
@@ -971,7 +971,9 @@ async function onSessionStartHandler(): Promise<void> {
     if (studioId) startArgs.studioId = studioId;
     await callPcpTool('start_session', startArgs);
   } catch {
-    // Non-fatal — session tracking is best-effort
+    // Session tracking failure isn't shown to the SB (no block for it),
+    // but it means the session won't be tracked. The bootstrap failure
+    // message above will already alert about server connectivity.
   }
 
   // Store session ID if provided in stdin
