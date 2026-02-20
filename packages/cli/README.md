@@ -325,6 +325,8 @@ Options for `invite`:
 sb mission                     # Snapshot of active sessions + unread inbox by SB
 sb mission --watch             # Live refresh dashboard
 sb mission -a lumen            # Filter to one SB
+sb mission --attach lumen      # Print attach command for latest lumen session
+sb mission --attach b85490f5   # Resolve attach command from session ID prefix
 sb mission --json              # Machine-readable output
 ```
 ### First-Class REPL (`sb chat`) (experimental)

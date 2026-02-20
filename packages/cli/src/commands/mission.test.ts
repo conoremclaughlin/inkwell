@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { extractUnreadCount, summarizeMissionRows } from './mission.js';
+import { extractUnreadCount, resolveAttachCommand, summarizeMissionRows } from './mission.js';
 import type { Session } from './session.js';
 
 describe('summarizeMissionRows', () => {
@@ -73,5 +73,48 @@ describe('extractUnreadCount', () => {
 
   it('falls back to nested data.unreadCount', () => {
     expect(extractUnreadCount({ data: { unreadCount: 9 } })).toBe(9);
+  });
+});
+
+describe('resolveAttachCommand', () => {
+  const sessions: Session[] = [
+    {
+      id: 'abc12345-aaaa',
+      agentId: 'lumen',
+      status: 'active',
+      startedAt: '2026-02-20T10:00:00.000Z',
+    },
+    {
+      id: 'def67890-bbbb',
+      agentId: 'lumen',
+      status: 'active',
+      startedAt: '2026-02-20T11:00:00.000Z',
+    },
+    {
+      id: 'wren1111-cccc',
+      agentId: 'wren',
+      status: 'active',
+      startedAt: '2026-02-20T11:30:00.000Z',
+    },
+  ];
+
+  it('resolves direct session-id prefix first', () => {
+    expect(resolveAttachCommand(sessions, 'abc1')).toEqual({
+      command: 'sb chat -a lumen --session-id abc12345-aaaa',
+      sessionId: 'abc12345-aaaa',
+      agentId: 'lumen',
+    });
+  });
+
+  it('resolves latest session for agent target', () => {
+    expect(resolveAttachCommand(sessions, 'lumen')).toEqual({
+      command: 'sb chat -a lumen --session-id def67890-bbbb',
+      sessionId: 'def67890-bbbb',
+      agentId: 'lumen',
+    });
+  });
+
+  it('returns null when no target matches', () => {
+    expect(resolveAttachCommand(sessions, 'missing')).toBeNull();
   });
 });

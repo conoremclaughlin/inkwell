@@ -8,6 +8,7 @@ interface MissionOptions {
   limit?: string;
   watch?: boolean;
   interval?: string;
+  attach?: string;
   json?: boolean;
 }
 
@@ -25,6 +26,36 @@ interface MissionSnapshot {
   rows: MissionRow[];
   sessions: Session[];
   generatedAt: string;
+}
+
+export function resolveAttachCommand(
+  sessions: Session[],
+  target: string
+): { command: string; sessionId: string; agentId: string } | null {
+  const trimmed = target.trim();
+  if (!trimmed) return null;
+
+  const directMatch = sessions.find((session) => session.id.startsWith(trimmed));
+  if (directMatch) {
+    const agentId = directMatch.agentId || 'wren';
+    return {
+      command: `sb chat -a ${agentId} --session-id ${directMatch.id}`,
+      sessionId: directMatch.id,
+      agentId,
+    };
+  }
+
+  const byAgent = sessions
+    .filter((session) => (session.agentId || '').toLowerCase() === trimmed.toLowerCase())
+    .sort((a, b) => Date.parse(b.startedAt || '') - Date.parse(a.startedAt || ''))[0];
+  if (!byAgent) return null;
+
+  const agentId = byAgent.agentId || trimmed;
+  return {
+    command: `sb chat -a ${agentId} --session-id ${byAgent.id}`,
+    sessionId: byAgent.id,
+    agentId,
+  };
 }
 
 function parseSessions(result: Record<string, unknown>): Session[] {
@@ -229,6 +260,30 @@ async function runMission(options: MissionOptions): Promise<void> {
 
   const renderOnce = async (): Promise<void> => {
     const snapshot = await fetchMissionSnapshot(options);
+    if (options.attach) {
+      const attach = resolveAttachCommand(snapshot.sessions, options.attach);
+      if (!attach) {
+        throw new Error(`No active session matched attach target: ${options.attach}`);
+      }
+      if (options.json) {
+        console.log(
+          JSON.stringify(
+            {
+              ...snapshot,
+              attach,
+            },
+            null,
+            2
+          )
+        );
+        return;
+      }
+      console.log(chalk.bold('\nResolved attach target\n'));
+      console.log(chalk.dim(`agent:   ${attach.agentId}`));
+      console.log(chalk.dim(`session: ${attach.sessionId}`));
+      console.log(chalk.green(`\n${attach.command}\n`));
+      return;
+    }
     if (options.json) {
       console.log(JSON.stringify(snapshot, null, 2));
       return;
@@ -274,6 +329,7 @@ export function registerMissionCommand(program: Command): void {
     .option('-l, --limit <n>', 'Session query limit', '40')
     .option('-w, --watch', 'Continuously refresh mission control')
     .option('-i, --interval <seconds>', 'Refresh interval when --watch is enabled', '6')
+    .option('--attach <target>', 'Resolve quick attach command for agent or session-id prefix')
     .option('--json', 'Output JSON')
     .action(async (options: MissionOptions) => {
       try {
