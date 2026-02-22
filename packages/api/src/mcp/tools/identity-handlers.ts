@@ -865,7 +865,7 @@ export async function handleChooseName(args: unknown, dataComposer: DataComposer
                 '") to load your full identity',
               'Use remember() to save important thoughts and decisions across sessions',
               'Use save_identity() to update your identity as you grow — your soul, values, and relationships will evolve',
-              'You have starter templates to help shape your foundational documents: SOUL.md (what matters to you), VALUES.md (your principles), HEARTBEAT.md (session rituals), and PROCESS.md (how you work). Use save_identity() to write each one as you discover who you are.',
+              'You have starter templates to help shape your foundational documents. Use save_identity() for your personal docs: SOUL.md (what matters to you), VALUES.md (your principles), HEARTBEAT.md (session rituals). Use save_user_identity() for shared docs like PROCESS.md (how you work with your partner).',
             ],
           },
           null,
