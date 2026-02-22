@@ -63,6 +63,7 @@ export type IncomingMessageHandler = (
     media?: Array<{ type: 'image' | 'video' | 'audio' | 'document'; path?: string; url?: string }>;
     chatType?: 'direct' | 'group' | 'channel';
     mentions?: { users: string[]; botMentioned: boolean };
+    platformAccountId?: string;
   }
 ) => Promise<void>;
 
@@ -92,6 +93,7 @@ interface MessageBuffer {
     replyToMessageId?: string;
     chatType?: 'direct' | 'group' | 'channel';
     mentions?: { users: string[]; botMentioned: boolean };
+    platformAccountId?: string;
   };
 }
 
@@ -253,6 +255,7 @@ export class ChannelGateway extends EventEmitter {
       }>;
       chatType?: 'direct' | 'group' | 'channel';
       mentions?: { users: string[]; botMentioned: boolean };
+      platformAccountId?: string;
     }
   ): void {
     // If buffering is disabled, forward immediately
@@ -314,6 +317,7 @@ export class ChannelGateway extends EventEmitter {
           replyToMessageId: metadata?.replyToMessageId,
           chatType: metadata?.chatType,
           mentions: metadata?.mentions,
+          platformAccountId: metadata?.platformAccountId,
         },
       });
 
@@ -407,6 +411,7 @@ export class ChannelGateway extends EventEmitter {
       }>;
       chatType?: 'direct' | 'group' | 'channel';
       mentions?: { users: string[]; botMentioned: boolean };
+      platformAccountId?: string;
     }
   ): Promise<void> {
     logger.info(`Forwarding message to handler: ${channel}:${conversationId}`);
@@ -763,6 +768,7 @@ export class ChannelGateway extends EventEmitter {
           media: message.media,
           chatType: message.chatType,
           mentions: message.mentions,
+          platformAccountId: message.accountId,
         }
       );
     });
@@ -818,6 +824,7 @@ export class ChannelGateway extends EventEmitter {
         {
           chatType: message.chatType,
           mentions: message.mentions,
+          platformAccountId: message.accountId,
         }
       );
     });
@@ -878,6 +885,7 @@ export class ChannelGateway extends EventEmitter {
           media: message.media,
           chatType: message.chatType,
           mentions: message.mentions,
+          platformAccountId: message.accountId,
         }
       );
     });

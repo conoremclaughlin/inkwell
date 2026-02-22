@@ -612,6 +612,9 @@ export class WhatsAppListener extends EventEmitter {
       }
     }
 
+    // Account ID from WhatsApp self JID (e.g. "+16266621947")
+    const accountId = this.selfJid ? this.jidToE164(this.selfJid) : undefined;
+
     const message: InboundMessage = {
       body: text,
       rawBody: text,
@@ -619,6 +622,7 @@ export class WhatsAppListener extends EventEmitter {
       messageId: msg.key.id!,
       platform: 'whatsapp' as ChannelPlatform,
       chatType: isGroup ? 'group' : 'direct',
+      accountId,
       sender: {
         id: senderE164,
         name: senderName || undefined,
