@@ -2076,7 +2076,6 @@ __metadata:
   resolution: "@personal-context/cli@workspace:packages/cli"
   dependencies:
     "@inquirer/prompts": "npm:^8.2.0"
-    "@personal-context/templates": "npm:*"
     "@types/node": "npm:^20.10.0"
     chalk: "npm:^5.3.0"
     commander: "npm:^12.1.0"
@@ -2104,12 +2103,9 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@personal-context/templates@npm:*, @personal-context/templates@workspace:packages/templates":
+"@personal-context/templates@workspace:packages/templates":
   version: 0.0.0-use.local
   resolution: "@personal-context/templates@workspace:packages/templates"
-  dependencies:
-    "@types/node": "npm:^20.10.0"
-    typescript: "npm:^5.3.0"
   languageName: unknown
   linkType: soft
 

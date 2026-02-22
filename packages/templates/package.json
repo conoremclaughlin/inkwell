@@ -2,16 +2,5 @@
   "name": "@personal-context/templates",
   "version": "1.0.0",
   "private": true,
-  "description": "Shared identity templates for PCP — awakening prompts and document starters",
-  "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "scripts": {
-    "build": "tsc",
-    "clean": "rm -rf dist"
-  },
-  "devDependencies": {
-    "@types/node": "^20.10.0",
-    "typescript": "^5.3.0"
-  }
+  "description": "Shared identity templates for PCP — awakening prompts and document starters"
 }

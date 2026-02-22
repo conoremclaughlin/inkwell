@@ -17,10 +17,29 @@ import { spawn, execFileSync } from 'child_process';
 import chalk from 'chalk';
 import ora from 'ora';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'fs';
-import { join } from 'path';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { homedir, tmpdir } from 'os';
 import { getBackend, BACKEND_NAMES } from '../backends/index.js';
-import { templates, renderTemplate } from '@personal-context/templates';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Shared templates live in the sibling packages/templates/ directory.
+// From dist/commands/ or src/commands/, go up to the CLI package root, then to ../templates/.
+const TEMPLATES_DIR = join(__dirname, '..', '..', '..', 'templates');
+
+function loadSharedTemplate(relativePath: string): string {
+  return readFileSync(join(TEMPLATES_DIR, relativePath), 'utf-8');
+}
+
+function renderTemplate(template: string, vars: Record<string, string>): string {
+  let result = template;
+  for (const [key, value] of Object.entries(vars)) {
+    result = result.replaceAll(`{{${key}}}`, value);
+  }
+  return result.replace(/\n{3,}/g, '\n\n');
+}
 
 // ============================================================================
 // Types
@@ -187,7 +206,7 @@ function buildAwakeningPrompt(
     sharedValuesSection = sharedValues.trim();
   }
 
-  return renderTemplate(templates.awaken, {
+  return renderTemplate(loadSharedTemplate('awaken.md'), {
     VALUES_SECTION: valuesSection,
     SIBLINGS_SECTION: siblingsSection,
     SHARED_VALUES_SECTION: sharedValuesSection,
