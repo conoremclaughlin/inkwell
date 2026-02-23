@@ -7,13 +7,13 @@ PCP hooks bridge coding agents (Claude Code, Codex, Gemini) with PCP's session, 
 
 ## Backend Support
 
-| Hook | Claude Code | Codex | Gemini |
-|------|:-----------:|:-----:|:------:|
-| `on-session-start` | SessionStart | session_start | session_start |
-| `pre-compact` | PreCompact | - | - |
-| `post-compact` | SessionStart* | - | - |
-| `on-prompt` | UserPromptSubmit | - | - |
-| `on-stop` | Stop | session_end | session_end |
+| Hook               |   Claude Code    |     Codex     |    Gemini    |
+| ------------------ | :--------------: | :-----------: | :----------: |
+| `on-session-start` |   SessionStart   | session_start | SessionStart |
+| `pre-compact`      |    PreCompact    |       -       | PreCompress  |
+| `post-compact`     |  SessionStart\*  |       -       |      -       |
+| `on-prompt`        | UserPromptSubmit |  user_prompt  | BeforeAgent  |
+| `on-stop`          |       Stop       |  session_end  |  AfterAgent  |
 
 \* `post-compact` uses the SessionStart event with a "compact" matcher to distinguish from initial startup.
 
@@ -24,6 +24,7 @@ PCP hooks bridge coding agents (Claude Code, Codex, Gemini) with PCP's session, 
 **When:** Agent session begins (first startup).
 
 **What it does:**
+
 1. Reads workspace ID from `.pcp/identity.json`
 2. Calls `bootstrap` with agentId and workspaceId
 3. Calls `get_inbox` for unread messages
@@ -33,6 +34,7 @@ PCP hooks bridge coding agents (Claude Code, Codex, Gemini) with PCP's session, 
 7. Links backend session ID to PCP session via `update_session_phase(sessionId, backendSessionId)`
 
 **Output:**
+
 ```
 ## Session Context (PCP)
 
@@ -64,6 +66,7 @@ Workspace: {workspace name}
 **What it does:** Outputs a static reminder prompting the agent to save state before context is lost.
 
 **Output:**
+
 ```
 ## Pre-Compaction Reminder (PCP)
 
@@ -86,10 +89,12 @@ This context will be lost after compaction unless you save it now.
 **When:** After context compaction (Claude Code only). Fires on SessionStart with a "compact" matcher.
 
 **What it does:**
+
 1. Calls `bootstrap` to reload identity
 2. Calls `get_inbox` for unread messages
 
 **Output:**
+
 ```
 ## Post-Compaction Context (PCP)
 
@@ -107,14 +112,17 @@ Agent: {agentId}
 
 ### `on-prompt`
 
-**When:** Before each user prompt is submitted (Claude Code only).
+**When:** Before each user prompt is submitted (Claude Code: `UserPromptSubmit`, Codex: `user_prompt`, Gemini: `BeforeAgent`).
 
 **What it does:**
-1. Checks if inbox was polled within the last 5 minutes — if so, exits silently
-2. Calls `get_inbox` for unread messages
-3. Updates the `last-inbox-check` timestamp in `.pcp/runtime/`
+
+1. Marks runtime phase as `runtime:generating` via `update_session_phase(sessionId, phase)`
+2. Checks if inbox was polled within the last 5 minutes — if so, exits silently
+3. Calls `get_inbox` for unread messages
+4. Updates the `last-inbox-check` timestamp in `.pcp/runtime/`
 
 **Output (only if messages exist and inbox is stale):**
+
 ```
 <pcp-inbox count="{count}">
 - **{from}**: {content or subject}
@@ -126,14 +134,17 @@ Agent: {agentId}
 
 ### `on-stop`
 
-**When:** After each agent tool call / turn (Claude Code: Stop, Codex/Gemini: session_end).
+**When:** After each agent tool call / turn (Claude Code: Stop, Codex: session_end, Gemini: AfterAgent).
 
 **What it does:**
-1. Increments tool call counter in `.pcp/runtime/tool-count`
-2. Every 30 tool calls, outputs a nudge to log session progress
-3. If inbox is stale (>5 minutes), checks for new messages
+
+1. Marks runtime phase as `runtime:idle` via `update_session_phase(sessionId, phase)`
+2. Increments tool call counter in `.pcp/runtime/tool-count`
+3. Every 30 tool calls, outputs a nudge to log session progress
+4. If inbox is stale (>5 minutes), checks for new messages
 
 **Output (conditional):**
+
 ```
 <pcp-reminder>
 You have completed ~{count} tool calls this session. Consider using
@@ -150,13 +161,13 @@ You have completed ~{count} tool calls this session. Consider using
 
 Hooks store ephemeral state in `.pcp/runtime/` (gitignored):
 
-| File | Purpose |
-|------|---------|
-| `sessions.json` | Runtime session registry (list of PCP sessions + backend session IDs + current pointer) |
-| `pcp-session-id` | Current PCP session UUID (legacy convenience file) |
-| `session-id` | Backend session ID from on-session-start (legacy convenience file) |
-| `last-inbox-check` | ISO timestamp of last inbox poll |
-| `tool-count` | Cumulative tool call counter for on-stop nudges |
+| File               | Purpose                                                                                 |
+| ------------------ | --------------------------------------------------------------------------------------- |
+| `sessions.json`    | Runtime session registry (list of PCP sessions + backend session IDs + current pointer) |
+| `pcp-session-id`   | Current PCP session UUID (legacy convenience file)                                      |
+| `session-id`       | Backend session ID from on-session-start (legacy convenience file)                      |
+| `last-inbox-check` | ISO timestamp of last inbox poll                                                        |
+| `tool-count`       | Cumulative tool call counter for on-stop nudges                                         |
 
 ## Installation
 

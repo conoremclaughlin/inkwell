@@ -2975,7 +2975,7 @@ router.get('/sessions', async (req: Request, res: Response) => {
         const identity = s.agent_id ? identitiesByAgentId.get(s.agent_id) : null;
         return {
           id: s.id,
-          backendSessionId: s.claude_session_id || null,
+          backendSessionId: s.backend_session_id || s.claude_session_id || null,
           agentId: s.agent_id,
           agentName: identity?.name || s.agent_id || 'Unknown',
           agentRole: identity?.role || null,

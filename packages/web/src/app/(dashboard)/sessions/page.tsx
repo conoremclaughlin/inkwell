@@ -8,6 +8,7 @@ import {
   Activity,
   AlertTriangle,
   Pause,
+  CircleDot,
   Monitor,
   GitBranch,
   ChevronDown,
@@ -78,22 +79,87 @@ function isBlocked(session: Session): boolean {
   return session.currentPhase?.startsWith('blocked') ?? false;
 }
 
+function isGenerating(session: Session): boolean {
+  return session.currentPhase === 'runtime:generating';
+}
+
+function isRuntimeIdle(session: Session): boolean {
+  return session.currentPhase === 'runtime:idle';
+}
+
+function formatPhaseLabel(phase: string | null): string | null {
+  if (!phase) return null;
+  if (!phase.startsWith('runtime:')) return phase;
+  const runtimeState = phase.replace('runtime:', '');
+  return `Runtime: ${runtimeState}`;
+}
+
+function getSessionState(session: Session): {
+  label: string;
+  cardClass: string;
+  badgeClass: string;
+  phaseClass: string;
+} {
+  if (isBlocked(session)) {
+    return {
+      label: 'Blocked',
+      cardClass: 'border-amber-300 bg-amber-50/50',
+      badgeClass: 'bg-amber-100 text-amber-700',
+      phaseClass: 'font-medium text-amber-700',
+    };
+  }
+
+  if (session.status === 'paused') {
+    return {
+      label: 'Paused',
+      cardClass: 'border-gray-200',
+      badgeClass: 'bg-gray-100 text-gray-600',
+      phaseClass: 'text-gray-600',
+    };
+  }
+
+  if (isGenerating(session)) {
+    return {
+      label: 'Generating',
+      cardClass: 'border-blue-200 bg-blue-50/50',
+      badgeClass: 'bg-blue-100 text-blue-700',
+      phaseClass: 'font-medium text-blue-700',
+    };
+  }
+
+  if (isRuntimeIdle(session)) {
+    return {
+      label: 'Idle',
+      cardClass: 'border-green-200 bg-green-50/50',
+      badgeClass: 'bg-green-100 text-green-700',
+      phaseClass: 'text-green-700',
+    };
+  }
+
+  if (session.status === 'active') {
+    return {
+      label: 'Active',
+      cardClass: 'border-green-200 bg-green-50/50',
+      badgeClass: 'bg-green-100 text-green-700',
+      phaseClass: 'text-gray-600',
+    };
+  }
+
+  return {
+    label: session.status,
+    cardClass: 'border-gray-200',
+    badgeClass: 'bg-gray-100 text-gray-600',
+    phaseClass: 'text-gray-600',
+  };
+}
+
 function SessionCard({ session }: { session: Session }) {
   const [expanded, setExpanded] = useState(false);
-  const blocked = isBlocked(session);
-  const active = session.status === 'active' && !blocked;
-  const paused = session.status === 'paused';
+  const state = getSessionState(session);
+  const phaseLabel = formatPhaseLabel(session.currentPhase);
 
   return (
-    <div
-      className={clsx(
-        'rounded-lg border p-4',
-        blocked && 'border-amber-300 bg-amber-50/50',
-        active && 'border-green-200 bg-green-50/50',
-        paused && 'border-gray-200',
-        !blocked && !active && !paused && 'border-gray-200'
-      )}
-    >
+    <div className={clsx('rounded-lg border p-4', state.cardClass)}>
       <div className="flex items-start justify-between">
         <div className="flex-1">
           <div className="flex items-center gap-2 flex-wrap">
@@ -101,30 +167,11 @@ function SessionCard({ session }: { session: Session }) {
             <Badge variant="outline" className="text-xs font-mono">
               {session.agentId}
             </Badge>
-            <Badge
-              className={clsx(
-                'text-xs',
-                blocked && 'bg-amber-100 text-amber-700',
-                active && 'bg-green-100 text-green-700',
-                paused && 'bg-gray-100 text-gray-600',
-                !blocked && !active && !paused && 'bg-gray-100 text-gray-600'
-              )}
-            >
-              {blocked ? 'Blocked' : session.status}
-            </Badge>
+            <Badge className={clsx('text-xs', state.badgeClass)}>{state.label}</Badge>
           </div>
 
           {/* Phase - prominent for blocked sessions */}
-          {session.currentPhase && (
-            <p
-              className={clsx(
-                'text-sm mt-1',
-                blocked ? 'font-medium text-amber-700' : 'text-gray-600'
-              )}
-            >
-              {session.currentPhase}
-            </p>
-          )}
+          {phaseLabel && <p className={clsx('text-sm mt-1', state.phaseClass)}>{phaseLabel}</p>}
 
           {/* Context / Summary */}
           {session.context && (
@@ -189,9 +236,7 @@ function SessionCard({ session }: { session: Session }) {
         </div>
         <div className="text-right text-sm shrink-0 ml-4">
           <div className="text-xs text-gray-400">Updated</div>
-          <div className="font-medium text-gray-700">
-            {formatRelativeTime(session.updatedAt)}
-          </div>
+          <div className="font-medium text-gray-700">{formatRelativeTime(session.updatedAt)}</div>
           <div className="text-xs text-gray-400 mt-1">
             Started {formatRelativeTime(session.startedAt)}
           </div>
@@ -203,9 +248,7 @@ function SessionCard({ session }: { session: Session }) {
         onClick={() => setExpanded(!expanded)}
         className="flex items-center gap-1 mt-3 text-xs text-gray-400 hover:text-gray-600 transition-colors"
       >
-        <ChevronDown
-          className={clsx('h-3 w-3 transition-transform', expanded && 'rotate-180')}
-        />
+        <ChevronDown className={clsx('h-3 w-3 transition-transform', expanded && 'rotate-180')} />
         {expanded ? 'Hide details' : 'Show details'}
       </button>
 
@@ -301,6 +344,8 @@ export default function SessionsPage() {
 
   const stats = data?.stats ?? { active: 0, blocked: 0, paused: 0, total: 0 };
   const sessions = data?.sessions ?? [];
+  const generatingCount = sessions.filter((session) => isGenerating(session)).length;
+  const idleCount = sessions.filter((session) => isRuntimeIdle(session)).length;
 
   return (
     <div>
@@ -316,12 +361,19 @@ export default function SessionsPage() {
       {error && <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">{error.message}</div>}
 
       {/* Stats */}
-      <div className="grid grid-cols-4 gap-4 mt-6">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mt-6">
         <Card>
           <CardContent className="p-4 text-center">
-            <Activity className="h-5 w-5 mx-auto text-green-600 mb-1" />
-            <div className="text-2xl font-bold text-green-600">{stats.active}</div>
-            <div className="text-xs text-gray-500">Active</div>
+            <Activity className="h-5 w-5 mx-auto text-blue-600 mb-1" />
+            <div className="text-2xl font-bold text-blue-600">{generatingCount}</div>
+            <div className="text-xs text-gray-500">Generating</div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4 text-center">
+            <CircleDot className="h-5 w-5 mx-auto text-green-600 mb-1" />
+            <div className="text-2xl font-bold text-green-600">{idleCount}</div>
+            <div className="text-xs text-gray-500">Runtime Idle</div>
           </CardContent>
         </Card>
         <Card>

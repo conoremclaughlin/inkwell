@@ -35,6 +35,7 @@ cp .env.example .env.local
 ```
 
 Key variables:
+
 - `SUPABASE_URL` — your Supabase project URL
 - `SUPABASE_PUBLISHABLE_KEY` — the anon/public key
 - `SUPABASE_SECRET_KEY` — the service role key
@@ -69,6 +70,7 @@ sb init
 ```
 
 This does everything for a single worktree:
+
 - Creates `.pcp/` directory
 - Creates `.mcp.json` with PCP server entry (including auth header)
 - Installs lifecycle hooks for the detected backend (Claude Code, Codex, or Gemini)
@@ -173,12 +175,12 @@ echo "explain this" | sb        # Pipe input as prompt
 
 ### SB Options
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-a, --agent <id>` | Agent identity | from `.pcp/identity.json` |
-| `-b, --backend <name>` | AI backend | from `.pcp/identity.json`, or `claude` |
-| `--no-session` | Disable session tracking | enabled |
-| `-v, --verbose` | Show debug output | off |
+| Flag                   | Description              | Default                                |
+| ---------------------- | ------------------------ | -------------------------------------- |
+| `-a, --agent <id>`     | Agent identity           | from `.pcp/identity.json`              |
+| `-b, --backend <name>` | AI backend               | from `.pcp/identity.json`, or `claude` |
+| `--no-session`         | Disable session tracking | enabled                                |
+| `-v, --verbose`        | Show debug output        | off                                    |
 
 Any flag not listed above is forwarded to the backend.
 
@@ -203,6 +205,7 @@ The agent ID is resolved in order:
 4. Error — run `sb init` or `sb awaken` to configure identity
 
 The backend is resolved similarly:
+
 1. `-b` / `--backend` flag
 2. `.pcp/identity.json` → `backend` field
 3. Default: `claude`
@@ -263,13 +266,13 @@ Hooks are installed to **local-only** config by default (e.g., `.claude/settings
 
 **Hook events:**
 
-| PCP Event          | What it does                   | Claude Code        | Codex              | Gemini          |
-| ------------------ | ------------------------------ | ------------------ | ------------------ | --------------- |
-| `on-session-start` | Bootstrap identity + inbox     | `SessionStart`     | `session_start`    | `SessionStart`  |
-| `pre-compact`      | Save context before compaction | `PreCompact`       | —                  | `PreCompress`   |
-| `post-compact`     | Re-bootstrap after compaction  | `SessionStart`     | —                  | —               |
-| `on-prompt`        | Periodic inbox check           | `UserPromptSubmit` | `user_prompt`      | —               |
-| `on-stop`          | Session nudge + inbox check    | `Stop`             | `session_end`      | `AfterAgent`    |
+| PCP Event          | What it does                   | Claude Code        | Codex           | Gemini         |
+| ------------------ | ------------------------------ | ------------------ | --------------- | -------------- |
+| `on-session-start` | Bootstrap identity + inbox     | `SessionStart`     | `session_start` | `SessionStart` |
+| `pre-compact`      | Save context before compaction | `PreCompact`       | —               | `PreCompress`  |
+| `post-compact`     | Re-bootstrap after compaction  | `SessionStart`     | —               | —              |
+| `on-prompt`        | Periodic inbox check           | `UserPromptSubmit` | `user_prompt`   | `BeforeAgent`  |
+| `on-stop`          | Session nudge + inbox check    | `Stop`             | `session_end`   | `AfterAgent`   |
 
 ### Sessions (`sb session`)
 
@@ -296,12 +299,14 @@ sb workspace members [ws]       # List workspace members
 ```
 
 Options for `create`:
+
 - `--type <type>` — Workspace type: `personal` or `team` (default: team)
 - `--description <desc>` — Workspace description
 - `--slug <slug>` — URL-friendly slug
 - `--use` — Select the created workspace immediately
 
 Options for `invite`:
+
 - `--role <role>` — Role: `owner`, `admin`, `member`, or `viewer` (default: member)
 
 ## Environment Variables

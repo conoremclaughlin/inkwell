@@ -23,7 +23,11 @@ import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 import { homedir } from 'os';
 import { resolveAgentId, readIdentityJson } from '../backends/identity.js';
-import { setCurrentRuntimeSession, upsertRuntimeSession } from '../session/runtime.js';
+import {
+  getCurrentRuntimeSession,
+  setCurrentRuntimeSession,
+  upsertRuntimeSession,
+} from '../session/runtime.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -85,11 +89,11 @@ const GEMINI: HookCapabilities = {
     sessionStart: 'SessionStart',
     preCompact: 'PreCompress',
     postCompact: null,
-    onPrompt: null,
+    onPrompt: 'BeforeAgent',
     onStop: 'AfterAgent',
   },
   supportsCompaction: true,
-  supportsPromptHook: false,
+  supportsPromptHook: true,
 };
 
 interface PcpConfig {
@@ -279,6 +283,48 @@ function readRuntimeFile(cwd: string, filename: string): string | null {
 function writeRuntimeFile(cwd: string, filename: string, content: string): void {
   const dir = ensureRuntimeDir(cwd);
   writeFileSync(join(dir, filename), content);
+}
+
+function normalizeSessionBackend(backendName: string): string {
+  // Hook backend names and session/backend adapter names differ for Claude:
+  // - hooks backend: "claude-code"
+  // - session/backend adapter: "claude"
+  return backendName === 'claude-code' ? 'claude' : backendName;
+}
+
+function resolveActivePcpSessionId(cwd: string): string | undefined {
+  const detectedBackend = detectBackend(cwd);
+  const sessionBackend = normalizeSessionBackend(detectedBackend.name);
+
+  const current = getCurrentRuntimeSession(cwd, sessionBackend);
+  if (current?.pcpSessionId) return current.pcpSessionId;
+
+  const fromLegacyFile = readRuntimeFile(cwd, 'pcp-session-id');
+  if (fromLegacyFile) return fromLegacyFile;
+
+  return undefined;
+}
+
+async function updateRuntimeGenerationState(
+  cwd: string,
+  config: PcpConfig | null,
+  agentId: string,
+  phase: string
+): Promise<void> {
+  const sessionId = resolveActivePcpSessionId(cwd);
+  if (!sessionId) return;
+
+  try {
+    await callPcpTool('update_session_phase', {
+      email: config?.email,
+      agentId,
+      sessionId,
+      phase,
+      status: 'active',
+    });
+  } catch {
+    // Non-fatal; hook execution should not fail due to transient session sync issues.
+  }
 }
 
 function extractBackendSessionId(stdin: Record<string, unknown>): string | undefined {
@@ -506,9 +552,40 @@ function installGemini(cwd: string, force: boolean): InstallResult {
 
   const sbPath = resolveSbBinaryPath(cwd);
   const pcpHooks: Record<string, unknown> = {
-    [GEMINI.events.sessionStart!]: [{ command: `${sbPath} hooks on-session-start` }],
-    [GEMINI.events.onStop!]: [{ command: `${sbPath} hooks on-stop` }],
-    [GEMINI.events.preCompact!]: [{ command: `${sbPath} hooks pre-compact` }],
+    [GEMINI.events.sessionStart!]: [
+      { hooks: [{ type: 'command', command: `${sbPath} hooks on-session-start` }] },
+    ],
+    [GEMINI.events.onPrompt!]: [
+      { hooks: [{ type: 'command', command: `${sbPath} hooks on-prompt` }] },
+    ],
+    [GEMINI.events.onStop!]: [{ hooks: [{ type: 'command', command: `${sbPath} hooks on-stop` }] }],
+    [GEMINI.events.preCompact!]: [
+      { hooks: [{ type: 'command', command: `${sbPath} hooks pre-compact` }] },
+    ],
+  };
+
+  const entryHasCommand = (entry: unknown, targetCommand: string): boolean => {
+    if (!entry || typeof entry !== 'object') return false;
+    const entryObj = entry as Record<string, unknown>;
+    if (typeof entryObj.command === 'string') {
+      return entryObj.command === targetCommand;
+    }
+    const hooks = entryObj.hooks as Array<Record<string, unknown>> | undefined;
+    if (!Array.isArray(hooks)) return false;
+    return hooks.some((h) => h && typeof h.command === 'string' && h.command === targetCommand);
+  };
+
+  const entryHasNonPcpCommand = (entry: unknown): boolean => {
+    if (!entry || typeof entry !== 'object') return false;
+    const entryObj = entry as Record<string, unknown>;
+    if (typeof entryObj.command === 'string') {
+      return !isPcpHookCommand(entryObj.command);
+    }
+    const hooks = entryObj.hooks as Array<Record<string, unknown>> | undefined;
+    if (!Array.isArray(hooks)) return false;
+    return hooks.some(
+      (h) => h && typeof h.command === 'string' && !isPcpHookCommand(h.command as string)
+    );
   };
 
   if (existing.hooks && !force) {
@@ -517,8 +594,13 @@ function installGemini(cwd: string, force: boolean): InstallResult {
     const allPresent = Object.entries(pcpHooks).every(([event, targetEntries]) => {
       const existingEntries = hooksObj[event];
       if (!Array.isArray(existingEntries)) return false;
-      const targetCmd = (targetEntries as any)[0].command;
-      return existingEntries.some((h: any) => h.command === targetCmd);
+      const targetCmd = (
+        (targetEntries as Array<Record<string, unknown>>)[0]?.hooks as
+          | Array<Record<string, unknown>>
+          | undefined
+      )?.[0]?.command as string | undefined;
+      if (!targetCmd) return false;
+      return existingEntries.some((entry) => entryHasCommand(entry, targetCmd));
     });
 
     if (allPresent) {
@@ -529,7 +611,7 @@ function installGemini(cwd: string, force: boolean): InstallResult {
     const hasConflict = Object.keys(pcpHooks).some((event) => {
       const entries = hooksObj[event];
       if (!Array.isArray(entries)) return false;
-      return entries.some((h: any) => !isPcpHookCommand(h.command));
+      return entries.some((entry) => entryHasNonPcpCommand(entry));
     });
 
     if (hasConflict) {
@@ -540,7 +622,7 @@ function installGemini(cwd: string, force: boolean): InstallResult {
   const merged = {
     ...existing,
     hooks: {
-      ...(existing.hooks as Record<string, unknown> || {}),
+      ...((existing.hooks as Record<string, unknown>) || {}),
       ...pcpHooks,
     },
   };
@@ -890,7 +972,8 @@ async function postCompactHandler(): Promise<void> {
     });
     identityBlock = buildIdentityBlock(bootstrap.identity);
   } catch {
-    identityBlock = '*FAILED: Could not reach PCP server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
+    identityBlock =
+      '*FAILED: Could not reach PCP server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
   }
 
   // Check inbox
@@ -902,7 +985,8 @@ async function postCompactHandler(): Promise<void> {
     inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
     writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
   } catch {
-    inboxBlock = '*FAILED: Could not reach PCP server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
+    inboxBlock =
+      '*FAILED: Could not reach PCP server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
   }
 
   const template = loadTemplate('hook-post-compact');
@@ -963,7 +1047,8 @@ async function onSessionStartHandler(): Promise<void> {
       bootstrap.activeSessions as Array<Record<string, unknown>> | undefined
     );
   } catch {
-    identityBlock = '*FAILED: Could not reach PCP server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
+    identityBlock =
+      '*FAILED: Could not reach PCP server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
   }
 
   // Check inbox
@@ -975,15 +1060,13 @@ async function onSessionStartHandler(): Promise<void> {
     inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
     writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
   } catch {
-    inboxBlock = '*FAILED: Could not reach PCP server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
+    inboxBlock =
+      '*FAILED: Could not reach PCP server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
   }
 
   // Register PCP session with detected backend
   const detectedBackend = detectBackend(cwd);
-  // Hook backend names and session backend names differ for Claude:
-  // - hooks backend: "claude-code"
-  // - session/backend adapter: "claude"
-  const sessionBackend = detectedBackend.name === 'claude-code' ? 'claude' : detectedBackend.name;
+  const sessionBackend = normalizeSessionBackend(detectedBackend.name);
   let pcpSessionId: string | undefined;
   let pcpThreadKey: string | undefined;
   const backendSessionId = extractBackendSessionId(stdin);
@@ -1040,16 +1123,19 @@ async function onSessionStartHandler(): Promise<void> {
     });
   }
 
-  // Link backend-specific session id to the PCP session for deterministic routing/resume.
-  if (pcpSessionId && backendSessionId) {
+  // Keep an explicit runtime phase for dashboard "generating vs idle" visualization.
+  // Startup phase should always settle to idle.
+  if (pcpSessionId) {
     try {
-      await callPcpTool('update_session_phase', {
+      const updateArgs: Record<string, unknown> = {
         email: config?.email,
         agentId,
         sessionId: pcpSessionId,
-        backendSessionId,
+        phase: 'runtime:idle',
         status: 'active',
-      });
+      };
+      if (backendSessionId) updateArgs.backendSessionId = backendSessionId;
+      await callPcpTool('update_session_phase', updateArgs);
     } catch {
       // Non-fatal; startup should continue even if linkage fails.
     }
@@ -1074,6 +1160,9 @@ async function onPromptHandler(): Promise<void> {
   const cwd = process.cwd();
   const config = getPcpConfig();
   const agentId = resolveAgentId() || 'unknown';
+
+  // Mark session as actively generating at prompt start.
+  await updateRuntimeGenerationState(cwd, config, agentId, 'runtime:generating');
 
   // Check if inbox check is stale (> 5 minutes)
   const lastCheck = readRuntimeFile(cwd, 'last-inbox-check');
@@ -1114,6 +1203,9 @@ async function onStopHandler(): Promise<void> {
   const config = getPcpConfig();
   const agentId = resolveAgentId() || 'unknown';
   const parts: string[] = [];
+
+  // Mark session as idle after each completed backend turn.
+  await updateRuntimeGenerationState(cwd, config, agentId, 'runtime:idle');
 
   // Increment tool call counter
   const countStr = readRuntimeFile(cwd, 'tool-count');

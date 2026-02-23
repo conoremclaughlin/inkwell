@@ -194,9 +194,10 @@ describe('installHooks: Gemini', () => {
     expect(existsSync(configPath)).toBe(true);
 
     const config = JSON.parse(readFileSync(configPath, 'utf-8'));
-    expect(config.hooks.SessionStart[0].command).toContain('sb hooks on-session-start');
-    expect(config.hooks.AfterAgent[0].command).toContain('sb hooks on-stop');
-    expect(config.hooks.PreCompress[0].command).toContain('sb hooks pre-compact');
+    expect(config.hooks.SessionStart[0].hooks[0].command).toContain('sb hooks on-session-start');
+    expect(config.hooks.BeforeAgent[0].hooks[0].command).toContain('sb hooks on-prompt');
+    expect(config.hooks.AfterAgent[0].hooks[0].command).toContain('sb hooks on-stop');
+    expect(config.hooks.PreCompress[0].hooks[0].command).toContain('sb hooks pre-compact');
   });
 
   it('should preserve existing Gemini settings', () => {

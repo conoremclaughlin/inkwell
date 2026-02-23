@@ -54,6 +54,36 @@ function formatDate(date: string): string {
   return new Date(date).toLocaleString();
 }
 
+function isGenerating(phase: string | null): boolean {
+  return phase === 'runtime:generating';
+}
+
+function isRuntimeIdle(phase: string | null): boolean {
+  return phase === 'runtime:idle';
+}
+
+function isBlocked(phase: string | null): boolean {
+  return phase?.startsWith('blocked') ?? false;
+}
+
+function sessionStatusBadge(
+  status: string,
+  phase: string | null
+): { label: string; className: string } {
+  if (isBlocked(phase)) return { label: 'Blocked', className: 'bg-amber-100 text-amber-700' };
+  if (status === 'paused') return { label: 'Paused', className: 'bg-gray-100 text-gray-600' };
+  if (isGenerating(phase)) return { label: 'Generating', className: 'bg-blue-100 text-blue-700' };
+  if (isRuntimeIdle(phase)) return { label: 'Idle', className: 'bg-green-100 text-green-700' };
+  if (status === 'active') return { label: 'Active', className: 'bg-green-100 text-green-700' };
+  return { label: status, className: 'bg-gray-100 text-gray-600' };
+}
+
+function formatPhaseLabel(phase: string | null): string | null {
+  if (!phase) return null;
+  if (!phase.startsWith('runtime:')) return phase;
+  return `Runtime: ${phase.replace('runtime:', '')}`;
+}
+
 function safeJsonParse(input: string): unknown | null {
   try {
     return JSON.parse(input);
@@ -182,6 +212,8 @@ export default function SessionLogsPage() {
   const logs = data?.logs || [];
   const pagination = data?.pagination;
   const session = data?.session;
+  const statusBadge = session ? sessionStatusBadge(session.status, session.currentPhase) : null;
+  const phaseLabel = formatPhaseLabel(session?.currentPhase || null);
 
   return (
     <div>
@@ -197,11 +229,25 @@ export default function SessionLogsPage() {
       <div className="mb-6">
         <h1 className="text-3xl font-bold text-gray-900">Session Log</h1>
         {session && (
-          <p className="mt-2 text-gray-600">
-            <span className="font-medium">{session.agentId}</span> ·{' '}
-            {session.backend || 'unknown backend'}
-            {session.backendSessionId ? ` · ${session.backendSessionId}` : ''}
-          </p>
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-gray-600">
+            <span className="font-medium">{session.agentId}</span>
+            <span>·</span>
+            <span>{session.backend || 'unknown backend'}</span>
+            {statusBadge ? (
+              <Badge className={clsx('text-xs', statusBadge.className)}>{statusBadge.label}</Badge>
+            ) : null}
+            {phaseLabel ? (
+              <Badge variant="outline" className="text-xs">
+                {phaseLabel}
+              </Badge>
+            ) : null}
+            {session.backendSessionId ? (
+              <>
+                <span>·</span>
+                <code className="font-mono text-xs">{session.backendSessionId}</code>
+              </>
+            ) : null}
+          </div>
         )}
       </div>
 
