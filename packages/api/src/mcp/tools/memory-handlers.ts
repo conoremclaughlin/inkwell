@@ -283,6 +283,13 @@ export const updateMemorySchema = userIdentifierBaseSchema.extend({
 // =====================================================
 
 export const startSessionSchema = userIdentifierBaseSchema.extend({
+  sessionId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe(
+      'Optional PCP session UUID to use when creating a new session. Useful for client-generated canonical IDs.'
+    ),
   agentId: z
     .string()
     .optional()
@@ -311,6 +318,10 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
     .describe('Backend runtime (e.g., "claude-code", "codex", "gemini")'),
   model: z.string().optional().describe('Model identifier (e.g., "opus-4-6", "sonnet", "o3")'),
   metadata: z.record(z.unknown()).optional().describe('Additional session metadata'),
+  forceNew: z
+    .boolean()
+    .optional()
+    .describe('If true, create a new session even if an active one already exists for this scope.'),
 });
 
 export const logSessionSchema = userIdentifierBaseSchema.extend({
@@ -746,7 +757,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
   // 2. studioId match — find active session scoped by agent+studio (existing behavior)
   let existingSession = null;
 
-  if (params.threadKey && agentId) {
+  if (!params.forceNew && params.threadKey && agentId) {
     existingSession = await dataComposer.repositories.memory.getActiveSessionByThreadKey(
       user.id,
       agentId,
@@ -755,7 +766,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
     );
   }
 
-  if (!existingSession) {
+  if (!params.forceNew && !existingSession) {
     existingSession = await dataComposer.repositories.memory.getActiveSession(
       user.id,
       agentId,
@@ -779,6 +790,11 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
                 studioId: existingSession.studioId,
                 workspaceId: existingSession.workspaceId,
                 threadKey: existingSession.threadKey || null,
+                status: existingSession.status || null,
+                backend: existingSession.backend || null,
+                model: existingSession.model || null,
+                backendSessionId: existingSession.backendSessionId || null,
+                claudeSessionId: existingSession.claudeSessionId || null,
                 startedAt: existingSession.startedAt.toISOString(),
                 isExisting: true,
               },
@@ -792,6 +808,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
   }
 
   const session = await dataComposer.repositories.memory.startSession({
+    id: params.sessionId,
     userId: user.id,
     agentId,
     studioId,
@@ -825,6 +842,11 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
               studioId: session.studioId,
               workspaceId: session.workspaceId,
               threadKey: session.threadKey || null,
+              status: session.status || null,
+              backend: session.backend || null,
+              model: session.model || null,
+              backendSessionId: session.backendSessionId || null,
+              claudeSessionId: session.claudeSessionId || null,
               startedAt: session.startedAt.toISOString(),
             },
           },
@@ -970,6 +992,13 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
               studioId: session.studioId,
               workspaceId: session.workspaceId,
               currentPhase: session.currentPhase || null,
+              status: session.status || null,
+              backend: session.backend || null,
+              model: session.model || null,
+              backendSessionId: session.backendSessionId || null,
+              claudeSessionId: session.claudeSessionId || null,
+              context: session.context || null,
+              workingDir: session.workingDir || null,
               startedAt: session.startedAt.toISOString(),
               endedAt: session.endedAt?.toISOString(),
               summary: session.summary,
@@ -1099,6 +1128,13 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
                   })()
                 : null,
               currentPhase: s.currentPhase || null,
+              status: s.status || null,
+              backend: s.backend || null,
+              model: s.model || null,
+              backendSessionId: s.backendSessionId || null,
+              claudeSessionId: s.claudeSessionId || null,
+              context: s.context || null,
+              workingDir: s.workingDir || null,
               startedAt: s.startedAt.toISOString(),
               endedAt: s.endedAt?.toISOString(),
               summary: s.summary,

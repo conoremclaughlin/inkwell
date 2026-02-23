@@ -27,7 +27,10 @@ PCP hooks bridge coding agents (Claude Code, Codex, Gemini) with PCP's session, 
 1. Reads workspace ID from `.pcp/identity.json`
 2. Calls `bootstrap` with agentId and workspaceId
 3. Calls `get_inbox` for unread messages
-4. Stores backend session ID in `.pcp/runtime/session-id`
+4. Resolves PCP session ID (`PCP_SESSION_ID` env from launcher, or `start_session` fallback)
+5. Stores runtime session state in `.pcp/runtime/sessions.json` (multi-session list + current pointer)
+6. Stores backend session ID in `.pcp/runtime/session-id` (legacy compatibility)
+7. Links backend session ID to PCP session via `update_session_phase(sessionId, backendSessionId)`
 
 **Output:**
 ```
@@ -149,7 +152,9 @@ Hooks store ephemeral state in `.pcp/runtime/` (gitignored):
 
 | File | Purpose |
 |------|---------|
-| `session-id` | Backend session ID from on-session-start |
+| `sessions.json` | Runtime session registry (list of PCP sessions + backend session IDs + current pointer) |
+| `pcp-session-id` | Current PCP session UUID (legacy convenience file) |
+| `session-id` | Backend session ID from on-session-start (legacy convenience file) |
 | `last-inbox-check` | ISO timestamp of last inbox poll |
 | `tool-count` | Cumulative tool call counter for on-stop nudges |
 

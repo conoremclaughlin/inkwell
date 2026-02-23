@@ -27,7 +27,7 @@ import {
   renameSync,
   cpSync,
 } from 'fs';
-import { join, dirname, basename, parse as parsePath } from 'path';
+import { join, dirname, basename, parse as parsePath, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
 import { installHooks } from './hooks.js';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
@@ -71,9 +71,32 @@ function getStudioParent(gitRoot: string): string {
   return dirname(gitRoot);
 }
 
+function resolveCanonicalRepoRoot(gitRoot: string): string {
+  const gitFile = join(gitRoot, '.git');
+  if (!existsSync(gitFile)) return gitRoot;
+
+  try {
+    const stat = readFileSync(gitFile, 'utf-8');
+    const match = stat.match(/^gitdir:\s*(.+)\s*$/m);
+    if (!match) return gitRoot;
+
+    const gitDirPath = resolvePath(gitRoot, match[1]);
+    const marker = `${join('.git', 'worktrees')}`;
+    const idx = gitDirPath.lastIndexOf(marker);
+    if (idx === -1) return gitRoot;
+
+    // /path/to/repo/.git/worktrees/name -> /path/to/repo
+    return gitDirPath.slice(0, idx);
+  } catch {
+    return gitRoot;
+  }
+}
+
 function getStudioPrefix(gitRoot: string): string {
-  // Use the repo folder name as prefix (e.g., "personal-context-protocol" -> "personal-context-protocol--")
-  return `${basename(gitRoot)}--`;
+  // Use canonical repo name (main worktree), not the current worktree folder.
+  // This avoids nested prefixes like repo--lumen--alpha when run from repo--lumen.
+  const canonicalRoot = resolveCanonicalRepoRoot(gitRoot);
+  return `${basename(canonicalRoot)}--`;
 }
 
 function getStudioPath(gitRoot: string, name: string): string {

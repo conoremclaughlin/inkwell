@@ -17,6 +17,7 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { resolveAgentId } from '../backends/identity.js';
+import { getCurrentRuntimeSession } from '../session/runtime.js';
 
 interface PcpConfig {
   userId?: string;
@@ -83,7 +84,14 @@ async function fetchPcp(path: string, options?: RequestInit): Promise<Response> 
 
 async function triggerAgent(
   agentId: string,
-  options: { message?: string; priority?: string }
+  options: {
+    message?: string;
+    priority?: string;
+    threadKey?: string;
+    recipientSessionId?: string;
+    studioId?: string;
+    studioHint?: string;
+  }
 ): Promise<void> {
   const spinner = ora(`Triggering agent: ${agentId}`).start();
 
@@ -95,6 +103,9 @@ async function triggerAgent(
     }
 
     // First, send to inbox
+    const currentRuntime = getCurrentRuntimeSession(process.cwd());
+    const threadKey = options.threadKey || currentRuntime?.threadKey;
+
     const inboxResponse = await fetchPcp('/api/mcp/call', {
       method: 'POST',
       body: JSON.stringify({
@@ -106,6 +117,10 @@ async function triggerAgent(
           content: options.message || `CLI trigger at ${new Date().toISOString()}`,
           messageType: 'message',
           priority: options.priority || 'normal',
+          ...(threadKey ? { threadKey } : {}),
+          ...(options.recipientSessionId ? { recipientSessionId: options.recipientSessionId } : {}),
+          ...(options.studioId ? { recipientStudioId: options.studioId } : {}),
+          ...(options.studioHint ? { recipientStudioHint: options.studioHint } : {}),
           trigger: true,
           triggerType: 'message',
           triggerSummary: options.message || 'CLI trigger',
@@ -293,6 +308,10 @@ export function registerAgentCommands(program: Command): void {
     .description('Trigger an agent to wake up')
     .option('-m, --message <msg>', 'Message to include')
     .option('-p, --priority <level>', 'Priority (low, normal, high, urgent)', 'normal')
+    .option('--thread-key <key>', 'Thread key for continuity (e.g., pr:75)')
+    .option('--recipient-session-id <id>', 'Recipient session UUID')
+    .option('--studio-id <id>', 'Recipient studio UUID')
+    .option('--studio-hint <hint>', 'Recipient studio routing hint (e.g., main)')
     .action(triggerAgent);
 
   agent

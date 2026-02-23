@@ -1242,6 +1242,8 @@ Session matching priority:
 
 workspaceId is accepted as a deprecated alias for studioId.
 
+When forceNew=true, start_session always creates a new session (skips active-session reuse). You can optionally provide sessionId to set a client-generated canonical UUID.
+
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
@@ -1249,6 +1251,13 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .string()
           .optional()
           .describe('Agent identifier (e.g., "claude-code", "telegram-myra")'),
+        sessionId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe(
+            'Optional PCP session UUID to use when creating a new session (typically with forceNew=true).'
+          ),
         studioId: z
           .string()
           .uuid()
@@ -1276,6 +1285,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .optional()
           .describe('Model identifier (e.g., "opus-4-6", "sonnet", "o3")'),
         metadata: z.record(z.unknown()).optional().describe('Session metadata'),
+        forceNew: z
+          .boolean()
+          .optional()
+          .describe('If true, create a new session even if an active one exists for this scope.'),
       },
     },
     async (args) => {

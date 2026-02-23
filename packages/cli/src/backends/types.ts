@@ -11,6 +11,8 @@ export interface BackendConfig {
   prompt?: string; // undefined = interactive mode
   promptParts: string[]; // raw positional args (preserves shell word boundaries)
   passthroughArgs: string[];
+  pcpSessionId?: string;
+  backendSessionId?: string;
 }
 
 export interface PreparedBackend {

@@ -7,7 +7,7 @@ import { execSync } from 'child_process';
 import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync, renameSync } from 'fs';
 import { join, basename } from 'path';
 import { tmpdir } from 'os';
-import { planInit, getWorktreePaths, type InitResult } from './studio.js';
+import { planInit, getWorktreePaths, getStudioPrefix, type InitResult } from './studio.js';
 
 type Move = InitResult['moves'][number];
 
@@ -362,5 +362,18 @@ describe('Studio init', () => {
         expect(worktreeList).toContain(wm.to);
       }
     });
+  });
+});
+
+describe('Studio prefix resolution', () => {
+  it('should derive prefix from canonical repo when running in a worktree', () => {
+    const mainRepo = join(TEST_DIR, 'personal-context-protocol');
+    const worktree = join(TEST_DIR, 'personal-context-protocol--lumen');
+    const gitDir = join(mainRepo, '.git', 'worktrees', 'lumen');
+
+    mkdirSync(worktree, { recursive: true });
+    writeFileSync(join(worktree, '.git'), `gitdir: ${gitDir}\n`);
+
+    expect(getStudioPrefix(worktree)).toBe('personal-context-protocol--');
   });
 });

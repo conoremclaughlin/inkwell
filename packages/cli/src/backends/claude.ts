@@ -32,6 +32,14 @@ export class ClaudeAdapter implements BackendAdapter {
     // Identity (inline text, no temp file needed)
     args.push('--append-system-prompt', identityPrompt);
 
+    // Session routing
+    if (config.backendSessionId) {
+      args.push('--resume', config.backendSessionId);
+    } else if (config.pcpSessionId) {
+      // Keep Claude session ID aligned with PCP session ID when possible
+      args.push('--session-id', config.pcpSessionId);
+    }
+
     // MCP config (if present in CWD)
     const mcpConfig = join(process.cwd(), '.mcp.json');
     if (existsSync(mcpConfig)) {
@@ -49,7 +57,10 @@ export class ClaudeAdapter implements BackendAdapter {
     return {
       binary: this.binary,
       args,
-      env: { AGENT_ID: config.agentId },
+      env: {
+        AGENT_ID: config.agentId,
+        ...(config.pcpSessionId ? { PCP_SESSION_ID: config.pcpSessionId } : {}),
+      },
       cleanup: () => {}, // No temp file, no cleanup needed
     };
   }

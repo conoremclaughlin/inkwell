@@ -39,7 +39,10 @@ export class CodexAdapter implements BackendAdapter {
     return {
       binary: this.binary,
       args,
-      env: { AGENT_ID: config.agentId },
+      env: {
+        AGENT_ID: config.agentId,
+        ...(config.pcpSessionId ? { PCP_SESSION_ID: config.pcpSessionId } : {}),
+      },
       cleanup,
     };
   }

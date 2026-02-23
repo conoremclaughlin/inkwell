@@ -91,14 +91,23 @@ export interface Session {
    */
   workspaceId?: string;
   threadKey?: string;
+  status?: string;
   currentPhase?: string;
+  backend?: string;
+  model?: string;
+  backendSessionId?: string;
+  claudeSessionId?: string;
+  workingDir?: string;
+  context?: string;
   startedAt: Date;
   endedAt?: Date;
   summary?: string;
+  updatedAt?: Date;
   metadata: Record<string, unknown>;
 }
 
 export interface SessionCreateInput {
+  id?: string;
   userId: string;
   agentId?: string;
   studioId?: string;
@@ -168,10 +177,18 @@ export interface SessionRow {
   studio_id: string | null;
   workspace_id: string | null;
   thread_key: string | null;
+  status?: string | null;
   current_phase: string | null;
+  backend?: string | null;
+  model?: string | null;
+  backend_session_id?: string | null;
+  claude_session_id?: string | null;
+  working_dir?: string | null;
+  context?: string | null;
   started_at: string;
   ended_at: string | null;
   summary: string | null;
+  updated_at?: string | null;
   metadata: Record<string, unknown>;
 }
 

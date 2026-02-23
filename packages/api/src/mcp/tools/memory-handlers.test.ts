@@ -152,6 +152,21 @@ describe('startSessionSchema', () => {
     // With none of these, it should still parse (resolution happens at handler level)
     expect(result.success).toBe(true);
   });
+
+  it('should accept client-provided sessionId and forceNew', () => {
+    const result = startSessionSchema.safeParse({
+      email: 'test@test.com',
+      agentId: 'wren',
+      sessionId: '550e8400-e29b-41d4-a716-446655440000',
+      forceNew: true,
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.sessionId).toBe('550e8400-e29b-41d4-a716-446655440000');
+      expect(result.data.forceNew).toBe(true);
+    }
+  });
 });
 
 describe('listSessionsSchema', () => {
@@ -1267,6 +1282,51 @@ describe('handleStartSession - threadKey matching', () => {
 
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.session.threadKey).toBeNull();
+  });
+
+  it('should create new session when forceNew is true even if active exists', async () => {
+    mockDataComposer.repositories.memory.getActiveSessionByThreadKey.mockResolvedValue(mockSession);
+    mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
+    mockDataComposer.repositories.memory.startSession.mockResolvedValue(mockNewSession);
+
+    const result = await handleStartSession(
+      {
+        email: 'test@test.com',
+        agentId: 'lumen',
+        threadKey: 'pr:32',
+        forceNew: true,
+      },
+      mockDataComposer as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.session.id).toBe('session-new');
+    expect(mockDataComposer.repositories.memory.getActiveSessionByThreadKey).not.toHaveBeenCalled();
+    expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
+    expect(mockDataComposer.repositories.memory.startSession).toHaveBeenCalled();
+  });
+
+  it('should pass sessionId through to startSession', async () => {
+    mockDataComposer.repositories.memory.getActiveSessionByThreadKey.mockResolvedValue(null);
+    mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(null);
+    mockDataComposer.repositories.memory.startSession.mockResolvedValue(mockNewSession);
+
+    await handleStartSession(
+      {
+        email: 'test@test.com',
+        agentId: 'lumen',
+        forceNew: true,
+        sessionId: '550e8400-e29b-41d4-a716-446655440000',
+      },
+      mockDataComposer as never
+    );
+
+    expect(mockDataComposer.repositories.memory.startSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: '550e8400-e29b-41d4-a716-446655440000',
+      })
+    );
   });
 });
 

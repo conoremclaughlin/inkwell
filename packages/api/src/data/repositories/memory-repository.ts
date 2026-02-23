@@ -361,6 +361,7 @@ export class MemoryRepository {
         : null;
 
     const insertData: Record<string, unknown> = {
+      ...(input.id ? { id: input.id } : {}),
       user_id: input.userId,
       agent_id: input.agentId,
       identity_id: identityId,
@@ -932,10 +933,18 @@ export class MemoryRepository {
       studioId,
       workspaceId: studioId,
       threadKey: row.thread_key || undefined,
+      status: row.status || undefined,
       currentPhase: row.current_phase || undefined,
+      backend: row.backend || undefined,
+      model: row.model || undefined,
+      backendSessionId: row.backend_session_id || undefined,
+      claudeSessionId: row.claude_session_id || undefined,
+      workingDir: row.working_dir || undefined,
+      context: row.context || undefined,
       startedAt: new Date(row.started_at),
       endedAt: row.ended_at ? new Date(row.ended_at) : undefined,
       summary: row.summary || undefined,
+      updatedAt: row.updated_at ? new Date(row.updated_at) : undefined,
       metadata: row.metadata,
     };
   }
