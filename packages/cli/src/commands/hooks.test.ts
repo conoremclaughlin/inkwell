@@ -254,12 +254,10 @@ describe('installHooks: Codex', () => {
 
     const content = readFileSync(configPath, 'utf-8');
     expect(content).toContain('# pcp-managed');
-    expect(content).toContain('[[hooks.SessionStart]]');
-    expect(content).toMatch(/command = ".*sb hooks on-session-start"/);
-    expect(content).toContain('[[hooks.UserPromptSubmit]]');
-    expect(content).toMatch(/command = ".*sb hooks on-prompt"/);
-    expect(content).toContain('[[hooks.AfterAgent]]');
-    expect(content).toMatch(/command = ".*sb hooks on-stop"/);
+    expect(content).toContain('[hooks]');
+    expect(content).toMatch(/session_start = ".*sb hooks on-session-start"/);
+    expect(content).toMatch(/session_end = ".*sb hooks on-stop"/);
+    expect(content).toMatch(/user_prompt = ".*sb hooks on-prompt"/);
     expect(content).toContain('# end pcp-managed');
   });
 
@@ -306,7 +304,7 @@ describe('installHooks: Codex', () => {
     const endMarkers = content.match(/# end pcp-managed/g);
     expect(startMarkers).toHaveLength(1);
     expect(endMarkers).toHaveLength(1);
-    expect(content).toMatch(/command = ".*sb hooks on-session-start"/);
+    expect(content).toMatch(/session_start = ".*sb hooks on-session-start"/);
   });
 });
 
