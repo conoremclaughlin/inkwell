@@ -36,6 +36,7 @@ import type { GatewayChannel } from './channels/gateway';
 import { initHeartbeatService, processHeartbeat, type DueReminder } from './services/heartbeat';
 import { setResponseCallback, hasExplicitResponse } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
+import { resolveRouteAgentId } from './services/routing/resolve-route';
 import { logger } from './utils/logger';
 import { env } from './config/env';
 
@@ -152,10 +153,34 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       return;
     }
 
+    // Resolve agent from channel_routes, fall back to server default (AGENT_ID env)
+    let routedAgentId = agentId;
+    const route = await resolveRouteAgentId(
+      dataComposer!.getClient(),
+      userId,
+      channel,
+      metadata?.platformAccountId,
+      conversationId
+    );
+    if (route) {
+      routedAgentId = route.agentId;
+      logger.debug(`[Route] Resolved agent from channel_routes`, {
+        platform: channel,
+        agentId: route.agentId,
+        identityId: route.identityId,
+        routeId: route.routeId,
+      });
+    } else {
+      logger.warn(
+        `[Route] No channel_route found for ${channel}, falling back to AGENT_ID=${agentId}`,
+        { userId, platform: channel, conversationId }
+      );
+    }
+
     // Build SessionRequest
     const request: SessionRequest = {
       userId,
-      agentId,
+      agentId: routedAgentId,
       channel: channel as ChannelType,
       conversationId,
       sender: {

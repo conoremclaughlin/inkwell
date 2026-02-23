@@ -168,6 +168,7 @@ export class TelegramListener extends EventEmitter {
   private messageCallback?: MessageCallback;
   private mediaGroupBuffer: MediaGroupBuffer | null = null;
   private authService: AuthorizationService;
+  private botUsername: string | null = null;
 
   // Ephemeral message cache - keyed by chatId, stores last N messages
   // Auto-cleaned periodically, never persisted to disk
@@ -215,6 +216,7 @@ export class TelegramListener extends EventEmitter {
     // Get bot info
     try {
       const me = await this.apiCall<TelegramUser>('getMe');
+      this.botUsername = me.username || String(me.id);
       logger.info(`Telegram bot connected: @${me.username} (${me.id})`);
       this.emit('connected', me);
     } catch (error) {
@@ -645,6 +647,7 @@ export class TelegramListener extends EventEmitter {
       messageId: String(msg.message_id),
       platform: 'telegram' as ChannelPlatform,
       chatType,
+      accountId: this.botUsername || undefined,
       sender: {
         id: msg.from ? String(msg.from.id) : String(msg.chat.id),
         username: msg.from?.username,
