@@ -353,7 +353,7 @@ export async function runClaude(
   options: SbOptions,
   passthroughArgs: string[] = []
 ): Promise<void> {
-  const agentId = resolveAgentId(options.agent);
+  const agentId = resolveAgentId(options.agent, options.backend);
   if (!agentId) {
     console.error(chalk.red('No agent identity configured.'));
     console.error(chalk.dim('Run `sb init` to set up PCP in this repo, or `sb awaken` to create a new SB.'));
@@ -470,7 +470,7 @@ export async function runClaudeInteractive(
   options: SbOptions,
   passthroughArgs: string[] = []
 ): Promise<void> {
-  const agentId = resolveAgentId(options.agent);
+  const agentId = resolveAgentId(options.agent, options.backend);
   if (!agentId) {
     console.error(chalk.red('No agent identity configured.'));
     console.error(chalk.dim('Run `sb init` to set up PCP in this repo, or `sb awaken` to create a new SB.'));

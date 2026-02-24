@@ -44,13 +44,19 @@ export function readIdentityJson(cwd: string): IdentityJson | null {
 /**
  * Resolve agent ID from multiple sources:
  * 1. CLI --agent flag (if provided)
- * 2. .pcp/identity.json in current directory
- * 3. ~/.pcp/config.json agentMapping
- * 4. null (no identity configured)
+ * 2. AGENT_ID env var (propagated by sb launcher into backend/hook subprocesses)
+ * 3. .pcp/identity.json in current directory
+ * 4. ~/.pcp/config.json agentMapping (backend-aware when possible)
+ * 5. null (no identity configured)
  */
-export function resolveAgentId(cliAgent?: string): string | null {
+export function resolveAgentId(cliAgent?: string, backendHint?: string): string | null {
   if (cliAgent) {
     return cliAgent;
+  }
+
+  const envAgent = process.env.AGENT_ID?.trim();
+  if (envAgent) {
+    return envAgent;
   }
 
   // process.cwd() throws ENOENT if the working directory has been deleted
@@ -81,7 +87,29 @@ export function resolveAgentId(cliAgent?: string): string | null {
   if (existsSync(configPath)) {
     try {
       const config: PcpConfig = JSON.parse(readFileSync(configPath, 'utf-8'));
-      if (config.agentMapping?.['claude-code']) return config.agentMapping['claude-code'];
+      const mapping = config.agentMapping || {};
+
+      const normalized = (backendHint || process.env.SB_BACKEND || process.env.PCP_BACKEND || '')
+        .toLowerCase()
+        .trim();
+      const backendKeyCandidates: string[] =
+        normalized === 'claude' || normalized === 'claude-code'
+          ? ['claude-code', 'claude']
+          : normalized === 'codex' || normalized === 'codex-cli'
+            ? ['codex-cli', 'codex']
+            : normalized === 'gemini' || normalized === 'gemini-cli'
+              ? ['gemini-cli', 'gemini']
+              : [];
+
+      for (const key of backendKeyCandidates) {
+        if (mapping[key]) return mapping[key];
+      }
+
+      // Back-compat fallback for legacy single-agent setups.
+      const fallbackKeys = ['claude-code', 'codex-cli', 'gemini-cli', 'claude', 'codex', 'gemini'];
+      for (const key of fallbackKeys) {
+        if (mapping[key]) return mapping[key];
+      }
     } catch {
       /* ignore */
     }
