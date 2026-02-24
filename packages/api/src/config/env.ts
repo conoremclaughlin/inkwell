@@ -1,29 +1,94 @@
 import dotenv from 'dotenv';
 import { existsSync, readFileSync } from 'fs';
-import { resolve } from 'path';
+import { resolve, basename } from 'path';
 import { z } from 'zod';
 
-// Load environment variables with priority:
-// 1. .env.local (highest priority, gitignored, local overrides)
-// 2. .env (base config, can be committed)
-// Files are loaded from project root
+// Load environment variables with priority (highest wins):
+// 1. Shell environment (always wins)
+// 2. .env.local (gitignored, machine-specific overrides)
+// 3. .env.{NODE_ENV} (environment-specific: .env.development, .env.production, .env.test)
+// 4. .env (base config, can be committed)
+//
+// Shorthand aliases: .env.dev → .env.development, .env.prod → .env.production
+// Files are loaded from project root.
 const projectRoot = resolve(__dirname, '../../../../');
 
-// Load .env first (base)
-const envBaseResult = dotenv.config({ path: resolve(projectRoot, '.env') });
-const envBase = envBaseResult.parsed ?? {};
+// Detect NODE_ENV early (before loading files, so we know which env file to pick)
+const nodeEnv = process.env.NODE_ENV || 'development';
 
-const envLocalPath = resolve(projectRoot, '.env.local');
-if (existsSync(envLocalPath)) {
-  // Apply .env.local as overrides for .env, but NEVER override explicit shell env.
-  const envLocal = dotenv.parse(readFileSync(envLocalPath));
-  for (const [key, value] of Object.entries(envLocal)) {
-    const current = process.env[key];
-    const cameFromBaseEnv = current !== undefined && current === envBase[key];
-    if (current === undefined || cameFromBaseEnv) {
-      process.env[key] = value;
+// Map shorthand aliases to canonical names
+const envAliases: Record<string, string> = {
+  dev: 'development',
+  prod: 'production',
+};
+
+/**
+ * Resolve the environment-specific .env file path.
+ * Checks canonical name first (.env.development), then shorthand (.env.dev).
+ */
+function resolveEnvFile(envName: string): string | null {
+  const canonical = resolve(projectRoot, `.env.${envName}`);
+  if (existsSync(canonical)) return canonical;
+
+  // Check shorthand alias (e.g., .env.dev for development)
+  for (const [short, long] of Object.entries(envAliases)) {
+    if (long === envName) {
+      const alias = resolve(projectRoot, `.env.${short}`);
+      if (existsSync(alias)) return alias;
     }
   }
+  return null;
+}
+
+/**
+ * Apply vars from a parsed env file into process.env.
+ * Only sets a var if it's not already set by a higher-priority source.
+ */
+function applyEnvLayer(parsed: Record<string, string>, appliedBy: Set<string>): void {
+  for (const [key, value] of Object.entries(parsed)) {
+    if (!appliedBy.has(key) && process.env[key] === undefined) {
+      process.env[key] = value;
+      appliedBy.add(key);
+    }
+  }
+}
+
+// Track which files were loaded for console output
+const loadedFiles: string[] = [];
+// Track keys set by higher-priority layers so lower layers don't overwrite
+const appliedBy = new Set<string>();
+
+// Snapshot shell env keys before any file loading
+const shellEnvKeys = new Set(Object.keys(process.env));
+for (const key of shellEnvKeys) appliedBy.add(key);
+
+// Layer 1 (highest file priority): .env.local
+const envLocalPath = resolve(projectRoot, '.env.local');
+if (existsSync(envLocalPath)) {
+  const parsed = dotenv.parse(readFileSync(envLocalPath));
+  applyEnvLayer(parsed, appliedBy);
+  loadedFiles.push('.env.local');
+}
+
+// Layer 2: .env.{NODE_ENV} (e.g., .env.development, .env.dev, .env.production, .env.prod)
+const envSpecificPath = resolveEnvFile(nodeEnv);
+if (envSpecificPath) {
+  const parsed = dotenv.parse(readFileSync(envSpecificPath));
+  applyEnvLayer(parsed, appliedBy);
+  loadedFiles.push(basename(envSpecificPath));
+}
+
+// Layer 3 (lowest file priority): .env
+const envBasePath = resolve(projectRoot, '.env');
+if (existsSync(envBasePath)) {
+  const parsed = dotenv.parse(readFileSync(envBasePath));
+  applyEnvLayer(parsed, appliedBy);
+  loadedFiles.push('.env');
+}
+
+// Log which env files are active
+if (loadedFiles.length > 0) {
+  console.log(`[env] Loaded: ${loadedFiles.join(' → ')} (NODE_ENV=${nodeEnv})`);
 }
 
 // Helper to handle optional strings (treat empty string as undefined)
