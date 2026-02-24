@@ -61,6 +61,7 @@ export class CodexRunner implements IClaudeRunner {
         isResume,
         workingDirectory: config.workingDirectory,
         messageLength: fullMessage.length,
+        hasPcpAccessToken: !!config.pcpAccessToken,
       });
 
       const result = await this.spawnProcess(args, config);
@@ -136,7 +137,12 @@ export class CodexRunner implements IClaudeRunner {
       const { CLAUDECODE, ...cleanEnv } = process.env;
       const proc = spawn('codex', args, {
         cwd: config.workingDirectory,
-        env: { ...cleanEnv, HOME: process.env.HOME, PATH: process.env.PATH },
+        env: {
+          ...cleanEnv,
+          HOME: process.env.HOME,
+          PATH: process.env.PATH,
+          ...(config.pcpAccessToken ? { PCP_ACCESS_TOKEN: config.pcpAccessToken } : {}),
+        },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
 

@@ -122,4 +122,35 @@ describe('CodexRunner', () => {
     expect(args).toContain('existing-session-abc');
     expect(args).toContain('resume msg');
   });
+
+  it('injects PCP_ACCESS_TOKEN into codex subprocess env when provided', async () => {
+    const mockProc = createMockProcess();
+    (spawn as Mock).mockReturnValue(mockProc);
+
+    const runner = new CodexRunner();
+    const runPromise = runner.run('hello', {
+      config: {
+        workingDirectory: process.cwd(),
+        mcpConfigPath: '',
+        model: 'gpt-5-codex',
+        appendSystemPrompt: 'identity override',
+        pcpAccessToken: 'test-pcp-token',
+      },
+    });
+
+    setTimeout(() => {
+      mockProc.stdout.emit('data', Buffer.from(`${JSON.stringify({ result: 'ok' })}\n`));
+      mockProc.emit('close', 0);
+    }, 5);
+
+    await runPromise;
+
+    expect(spawn).toHaveBeenCalledTimes(1);
+    const [, , options] = (spawn as Mock).mock.calls[0] as [
+      string,
+      string[],
+      { env?: Record<string, string> }
+    ];
+    expect(options.env?.PCP_ACCESS_TOKEN).toBe('test-pcp-token');
+  });
 });

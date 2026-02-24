@@ -26,6 +26,7 @@ import {
   readdirSync,
   renameSync,
   cpSync,
+  statSync,
 } from 'fs';
 import { join, dirname, basename, parse as parsePath, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
@@ -51,6 +52,14 @@ interface StudioInfo {
   path: string;
   branch: string;
   identity?: StudioIdentity;
+}
+
+interface RenameIdentity {
+  studio?: string;
+  workspace?: string;
+  context?: string;
+  description?: string;
+  [key: string]: unknown;
 }
 
 // ============================================================================
@@ -86,7 +95,7 @@ function resolveCanonicalRepoRoot(gitRoot: string): string {
     if (idx === -1) return gitRoot;
 
     // /path/to/repo/.git/worktrees/name -> /path/to/repo
-    return gitDirPath.slice(0, idx);
+    return resolvePath(gitDirPath.slice(0, idx));
   } catch {
     return gitRoot;
   }
@@ -213,6 +222,19 @@ interface InteractiveResult {
   configDirs: string[];
 }
 
+function isPromptCancelError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const maybe = err as { name?: string; message?: string };
+  const name = maybe.name || '';
+  const message = maybe.message || '';
+
+  return (
+    name === 'ExitPromptError' ||
+    name === 'AbortPromptError' ||
+    /force closed|ctrl\+c|sigint|cancell?ed|aborted/i.test(message)
+  );
+}
+
 /**
  * Run the full interactive studio creation flow when name is omitted and stdin is a TTY.
  * Returns the resolved name, branch, and config dirs to copy.
@@ -260,9 +282,9 @@ async function runInteractiveFlow(agentId: string, gitRoot: string): Promise<Int
  * - .codex/, .gemini/ — if .mcp.json exists in the target, regenerate via syncMcpConfig instead
  * - .pcp/identity.json is always freshly written (never copied)
  */
-function copyConfigDirs(gitRoot: string, wsPath: string, dirs: string[]): void {
+function copyConfigDirs(sourceRoot: string, wsPath: string, dirs: string[]): void {
   for (const dir of dirs) {
-    const source = join(gitRoot, dir);
+    const source = join(sourceRoot, dir);
     const target = join(wsPath, dir);
 
     if (!existsSync(source)) continue;
@@ -276,6 +298,87 @@ function copyConfigDirs(gitRoot: string, wsPath: string, dirs: string[]): void {
     } else {
       cpSync(source, target, { recursive: true });
     }
+  }
+}
+
+function resolveCopySourceRoot(gitRoot: string, copyFrom?: string): string {
+  const canonicalRoot = resolveCanonicalRepoRoot(gitRoot);
+  if (!copyFrom || copyFrom === 'main') {
+    return canonicalRoot;
+  }
+
+  const explicitPath = resolvePath(copyFrom);
+  if (existsSync(explicitPath)) {
+    if (!statSync(explicitPath).isDirectory()) {
+      throw new Error(`--copy-from must point to a directory: ${copyFrom}`);
+    }
+    return explicitPath;
+  }
+
+  const studioPath = getStudioPath(gitRoot, copyFrom);
+  if (existsSync(studioPath)) {
+    return studioPath;
+  }
+
+  throw new Error(`Copy source not found: ${copyFrom}`);
+}
+
+/**
+ * Copy .mcp.json and .env.local when missing in the new studio.
+ * These are local bootstrap files and should be present by default.
+ */
+function copyBootstrapFiles(sourceRoot: string, wsPath: string): string[] {
+  if (sourceRoot === wsPath) return [];
+
+  const copied: string[] = [];
+  for (const file of ['.mcp.json', '.env.local']) {
+    const source = join(sourceRoot, file);
+    const target = join(wsPath, file);
+    if (existsSync(source) && !existsSync(target)) {
+      cpSync(source, target);
+      copied.push(file);
+    }
+  }
+  return copied;
+}
+
+function updateIdentityForStudioRename(wsPath: string, from: string, to: string): boolean {
+  const identityPath = join(wsPath, '.pcp', 'identity.json');
+  if (!existsSync(identityPath)) return false;
+
+  try {
+    const identity = JSON.parse(readFileSync(identityPath, 'utf-8')) as RenameIdentity;
+    let changed = false;
+
+    if (identity.studio !== to) {
+      identity.studio = to;
+      changed = true;
+    }
+
+    if (identity.workspace && identity.workspace === from) {
+      identity.workspace = to;
+      changed = true;
+    }
+
+    if (identity.context === `studio-${from}` || identity.context === `workspace-${from}`) {
+      identity.context = `studio-${to}`;
+      changed = true;
+    }
+
+    if (
+      identity.description === `Studio: ${from}` ||
+      identity.description === `Workspace: ${from}`
+    ) {
+      identity.description = `Studio: ${to}`;
+      changed = true;
+    }
+
+    if (changed) {
+      writeFileSync(identityPath, JSON.stringify(identity, null, 2));
+    }
+    return changed;
+  } catch {
+    return false;
   }
 }
 
@@ -423,6 +526,7 @@ async function createStudio(
     backend?: string;
     copyConfig?: boolean;
     configDirs?: string;
+    copyFrom?: string;
   },
   overrides?: { branch?: string; configDirsList?: string[] }
 ): Promise<void> {
@@ -431,6 +535,7 @@ async function createStudio(
 
   try {
     const gitRoot = findGitRoot();
+    const copySourceRoot = resolveCopySourceRoot(gitRoot, options.copyFrom);
     const wsPath = getStudioPath(gitRoot, name);
     // Priority: overrides (from interactive) > options (from flags) > default
     const branch = overrides?.branch || options.branch || `${agentId}/studio/main`;
@@ -447,6 +552,9 @@ async function createStudio(
       git(`worktree add -b "${branch}" "${wsPath}"`, gitRoot);
     }
 
+    spinner.text = 'Copying bootstrap files...';
+    const copiedBootstrapFiles = copyBootstrapFiles(copySourceRoot, wsPath);
+
     // Determine which config dirs to copy
     const configDirsList =
       overrides?.configDirsList ??
@@ -454,7 +562,7 @@ async function createStudio(
 
     if (configDirsList.length > 0) {
       spinner.text = 'Copying config directories...';
-      copyConfigDirs(gitRoot, wsPath, configDirsList);
+      copyConfigDirs(copySourceRoot, wsPath, configDirsList);
     }
 
     // Regenerate .codex/.gemini via syncMcpConfig if .mcp.json exists in the new studio
@@ -509,6 +617,12 @@ async function createStudio(
     if (configDirsList.length > 0) {
       console.log(chalk.dim('  Config: ') + configDirsList.join(', '));
     }
+    if (copiedBootstrapFiles.length > 0) {
+      console.log(chalk.dim('  Files:  ') + copiedBootstrapFiles.join(', '));
+    }
+    if (options.copyFrom) {
+      console.log(chalk.dim('  Source: ') + copySourceRoot);
+    }
     if (hooksResult === 'installed') {
       console.log(chalk.dim('  Hooks:  ') + `${hooksBackend.name} (installed)`);
     } else if (hooksResult === 'already-installed') {
@@ -527,6 +641,48 @@ async function createStudio(
     console.log(chalk.dim(`  eval $(sb studio cd ${name})`));
   } catch (error) {
     spinner.fail(`Failed to create studio: ${error}`);
+    process.exit(1);
+  }
+}
+
+async function renameStudio(from: string, to: string): Promise<void> {
+  const spinner = ora(`Renaming studio: ${from} → ${to}`).start();
+
+  try {
+    const gitRoot = findGitRoot();
+    const fromPath = getStudioPath(gitRoot, from);
+    const toPath = getStudioPath(gitRoot, to);
+
+    if (!existsSync(fromPath)) {
+      spinner.fail(`Studio not found: ${from}`);
+      process.exit(1);
+    }
+
+    if (existsSync(toPath)) {
+      spinner.fail(`Target studio already exists: ${to}`);
+      process.exit(1);
+    }
+
+    git(`worktree move "${fromPath}" "${toPath}"`, gitRoot);
+
+    spinner.text = 'Updating studio identity metadata...';
+    const updatedIdentity = updateIdentityForStudioRename(toPath, from, to);
+
+    // Intentionally keep existing branch name unchanged.
+    // Studio names are path/identity labels; branch naming is an independent concern.
+    const branch = git('branch --show-current', toPath);
+
+    spinner.succeed(`Studio renamed: ${from} → ${to}`);
+    console.log('');
+    console.log(chalk.dim('  Path:   ') + toPath);
+    console.log(chalk.dim('  Branch: ') + branch + chalk.dim(' (unchanged)'));
+    if (updatedIdentity) {
+      console.log(chalk.dim('  Identity updated: ') + chalk.green('.pcp/identity.json'));
+    }
+  } catch (error) {
+    spinner.fail(
+      `Failed to rename studio: ${error instanceof Error ? error.message : String(error)}`
+    );
     process.exit(1);
   }
 }
@@ -814,6 +970,8 @@ export {
   getStudioPrefix,
   getStudioPath,
   getWorktreePaths,
+  updateIdentityForStudioRename,
+  resolveCopySourceRoot,
   planInit,
   git,
 };
@@ -842,19 +1000,30 @@ export function registerStudioCommands(program: Command): void {
       'Comma-separated config dirs to copy (default: .claude)',
       '.claude'
     )
+    .option(
+      '--copy-from <source>',
+      'Copy bootstrap files (.mcp.json, .env.local) and config dirs from source studio/path (default: main worktree)'
+    )
     .action(async (name: string | undefined, options) => {
       if (!name && process.stdin.isTTY) {
         // Interactive mode: prompt for all values
         try {
           const gitRoot = findGitRoot();
+          const copySourceRoot = resolveCopySourceRoot(gitRoot, options.copyFrom);
           const agentId = options.agent || resolveAgentId() || 'sb';
-          const result = await runInteractiveFlow(agentId, gitRoot);
+          const result = await runInteractiveFlow(agentId, copySourceRoot);
           return createStudio(result.name, options, {
             branch: result.branch,
             configDirsList: result.configDirs,
           });
-        } catch {
-          // User cancelled or inquirer failed — fall through to default
+        } catch (err) {
+          if (isPromptCancelError(err)) {
+            console.log(chalk.yellow('\nStudio creation canceled.'));
+            process.exit(130);
+          }
+          const message = err instanceof Error ? err.message : String(err);
+          console.error(chalk.red(`Interactive studio creation failed: ${message}`));
+          process.exit(1);
         }
       }
       const resolvedName = name || 'new';
@@ -876,6 +1045,11 @@ export function registerStudioCommands(program: Command): void {
     .alias('st')
     .description('Show git status of all studios')
     .action(statusCommand);
+
+  ws.command('rename <from> <to>')
+    .alias('mv')
+    .description('Rename a studio (moves worktree path and updates identity metadata)')
+    .action(renameStudio);
 
   ws.command('path <name>').description('Output studio path').action(pathCommand);
 

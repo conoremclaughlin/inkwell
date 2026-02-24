@@ -381,6 +381,7 @@ export interface ClaudeRunnerConfig {
   model: string;
   systemPrompt?: string;
   appendSystemPrompt?: string;
+  pcpAccessToken?: string;
 }
 
 export interface ClaudeRunnerResult {

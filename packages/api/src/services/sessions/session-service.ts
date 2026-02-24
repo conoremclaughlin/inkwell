@@ -10,6 +10,7 @@
 
 import { randomUUID } from 'crypto';
 import { SupabaseClient } from '@supabase/supabase-js';
+import jwt from 'jsonwebtoken';
 import type { Database } from '../../data/supabase/types.js';
 import type {
   Session,
@@ -318,7 +319,14 @@ export class SessionService implements ISessionService {
       session.studioId
     );
 
-    // 3. Build Claude runner config
+    // 3. Build runner config
+    const pcpAccessToken = this.createRunnerAccessToken(
+      userId,
+      agentId,
+      injectedContext.user.email,
+      session.identityId
+    );
+
     const runnerConfig: ClaudeRunnerConfig = {
       workingDirectory: resolvedWorkingDirectory,
       mcpConfigPath: this.config.mcpConfigPath,
@@ -330,6 +338,7 @@ export class SessionService implements ISessionService {
         injectedContext.user.timezone,
         injectedContext.agent.heartbeat
       ),
+      ...(pcpAccessToken ? { pcpAccessToken } : {}),
     };
 
     // 4. Select runtime backend and run
@@ -398,6 +407,43 @@ export class SessionService implements ISessionService {
       finalTextResponse: result.finalTextResponse,
       error: result.error,
     };
+  }
+
+  private createRunnerAccessToken(
+    userId: string,
+    agentId: string,
+    email?: string,
+    identityId?: string
+  ): string | undefined {
+    if (!email) {
+      logger.warn('Cannot inject PCP access token for backend runner: missing user email', {
+        userId,
+        agentId,
+      });
+      return undefined;
+    }
+
+    const jwtSecret = process.env.JWT_SECRET;
+    if (!jwtSecret) {
+      logger.warn('Cannot inject PCP access token for backend runner: JWT_SECRET missing', {
+        userId,
+        agentId,
+      });
+      return undefined;
+    }
+
+    return jwt.sign(
+      {
+        type: 'mcp_access',
+        sub: userId,
+        email,
+        scope: 'mcp:tools',
+        ...(agentId ? { agentId } : {}),
+        ...(identityId ? { identityId } : {}),
+      },
+      jwtSecret,
+      { expiresIn: 60 * 60 }
+    );
   }
 
   async getOrCreateSession(
@@ -781,6 +827,13 @@ This session will continue with a fresh context after compaction. Your identity,
         session.studioId
       );
 
+      const compactionToken = this.createRunnerAccessToken(
+        session.userId,
+        session.agentId,
+        fullContext.user.email,
+        session.identityId
+      );
+
       const runnerConfig: ClaudeRunnerConfig = {
         workingDirectory: compactionWorkingDirectory,
         mcpConfigPath: this.config.mcpConfigPath,
@@ -792,6 +845,7 @@ This session will continue with a fresh context after compaction. Your identity,
           fullContext.user.timezone,
           context.agent.heartbeat
         ),
+        ...(compactionToken ? { pcpAccessToken: compactionToken } : {}),
       };
 
       const runtimeBackend = this.resolveRuntimeBackend(session.backend, context.agent.backend);
