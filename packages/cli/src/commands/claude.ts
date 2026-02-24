@@ -109,9 +109,18 @@ function getIdentityContextFromIdentityJson(cwd = process.cwd()): {
   }
 }
 
-function hasBackendSessionOverride(backend: string, passthroughArgs: string[]): boolean {
+function hasBackendSessionOverride(
+  backend: string,
+  passthroughArgs: string[],
+  promptParts: string[]
+): boolean {
   const lowered = passthroughArgs.map((arg) => arg.toLowerCase());
   const has = (flag: string) => lowered.includes(flag.toLowerCase());
+
+  const promptLowered = promptParts.map((part) => part.toLowerCase());
+  if (backend === 'codex' && promptLowered[0] === 'resume') {
+    return true;
+  }
 
   if (backend === 'claude') {
     return (
@@ -219,9 +228,10 @@ async function ensurePcpSessionContext(
   agentId: string,
   backend: string,
   passthroughArgs: string[],
+  promptParts: string[],
   verbose: boolean
 ): Promise<{ pcpSessionId?: string; backendSessionId?: string }> {
-  if (hasBackendSessionOverride(backend, passthroughArgs)) return {};
+  if (hasBackendSessionOverride(backend, passthroughArgs, promptParts)) return {};
 
   const config = getPcpConfig();
   const email = config?.email;
@@ -362,7 +372,7 @@ export async function runClaude(
   }
   const adapter = getBackend(options.backend);
   const sessionContext = options.session
-    ? await ensurePcpSessionContext(agentId, options.backend, passthroughArgs, options.verbose)
+    ? await ensurePcpSessionContext(agentId, options.backend, passthroughArgs, promptParts, options.verbose)
     : {};
   const runtimeLinkId = options.session ? randomUUID() : undefined;
   const { studioId, identityId } = getIdentityContextFromIdentityJson(process.cwd());
@@ -479,7 +489,7 @@ export async function runClaudeInteractive(
   }
   const adapter = getBackend(options.backend);
   const sessionContext = options.session
-    ? await ensurePcpSessionContext(agentId, options.backend, passthroughArgs, options.verbose)
+    ? await ensurePcpSessionContext(agentId, options.backend, passthroughArgs, [], options.verbose)
     : {};
   const runtimeLinkId = options.session ? randomUUID() : undefined;
   const { studioId, identityId } = getIdentityContextFromIdentityJson(process.cwd());
