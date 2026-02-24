@@ -94,8 +94,23 @@ export class UsersRepository extends BaseRepository {
     }
   }
 
+  async findBySlackId(slackId: string): Promise<User | null> {
+    try {
+      const { data, error } = await this.client
+        .from('users')
+        .select('*')
+        .eq('slack_id', slackId)
+        .single();
+
+      if (error && error.code !== 'PGRST116') throw error;
+      return data;
+    } catch (error) {
+      this.handleError(error, 'findBySlackId');
+    }
+  }
+
   async findByPlatformId(
-    platform: 'telegram' | 'whatsapp' | 'discord',
+    platform: 'telegram' | 'whatsapp' | 'discord' | 'slack',
     platformId: string | number
   ): Promise<User | null> {
     switch (platform) {
@@ -107,6 +122,8 @@ export class UsersRepository extends BaseRepository {
         return this.findByWhatsAppId(String(platformId));
       case 'discord':
         return this.findByDiscordId(String(platformId));
+      case 'slack':
+        return this.findBySlackId(String(platformId));
       default:
         return null;
     }

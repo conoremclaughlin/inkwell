@@ -602,6 +602,14 @@ export class MCPServer {
       }
     });
 
+    this.channelGateway.on('slack:connected', () => {
+      const listener = this.channelGateway?.getSlackListener();
+      if (listener) {
+        registerChannelListener('slack', listener);
+        logger.info('Slack listener registered with MCP tools');
+      }
+    });
+
     await this.channelGateway.start();
 
     const telegramListener = this.channelGateway.getTelegramListener();
@@ -617,6 +625,11 @@ export class MCPServer {
     const discordListener = this.channelGateway.getDiscordListener();
     if (discordListener) {
       registerChannelListener('discord', discordListener);
+    }
+
+    const slackListener = this.channelGateway.getSlackListener();
+    if (slackListener) {
+      registerChannelListener('slack', slackListener);
     }
 
     logger.info('ChannelGateway started', this.channelGateway.getStatus());

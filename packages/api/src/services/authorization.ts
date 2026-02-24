@@ -12,7 +12,7 @@ import { getRequestContext, getSessionContext } from '../utils/request-context';
 import crypto from 'crypto';
 
 export type TrustLevel = 'owner' | 'admin' | 'member';
-export type Platform = 'telegram' | 'whatsapp' | 'discord';
+export type Platform = 'telegram' | 'whatsapp' | 'discord' | 'slack';
 
 interface TrustedUser {
   id: string;

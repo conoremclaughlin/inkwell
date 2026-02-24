@@ -26,6 +26,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.71.2",
     "@modelcontextprotocol/sdk": "^1.26.0",
+    "@slack/bolt": "^4.6.0",
     "@supabase/supabase-js": "^2.39.3",
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "bcrypt": "^5.1.1",

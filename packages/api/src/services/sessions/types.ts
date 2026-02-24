@@ -12,6 +12,7 @@ export type ChannelType =
   | 'terminal'
   | 'discord'
   | 'whatsapp'
+  | 'slack'
   | 'http'
   | 'api'
   | 'agent'

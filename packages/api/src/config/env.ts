@@ -87,6 +87,10 @@ const envSchema = z.object({
   DISCORD_BOT_TOKEN: optionalString,
   DISCORD_APPLICATION_ID: optionalString,
 
+  // Slack Bot
+  SLACK_BOT_TOKEN: optionalString,
+  SLACK_APP_TOKEN: optionalString,
+
   // Identity enforcement
   ENFORCE_IDENTITY_PINNING: z.enum(['true', 'false']).default('true'),
 

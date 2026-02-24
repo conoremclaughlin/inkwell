@@ -77,7 +77,7 @@ function markExplicitResponse(channel: string, conversationId: string): void {
 
 export const sendResponseSchema = z.object({
   channel: z
-    .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'agent'])
+    .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'slack', 'http', 'api', 'agent'])
     .describe('Channel to send the response to'),
   conversationId: z.string().describe('Conversation ID to route the response to'),
   content: z.string().describe('The response content to send'),
@@ -133,7 +133,7 @@ export async function handleSendResponse(
       logger.info(`Response sent to ${args.channel}:${args.conversationId} via local callback`);
     } else {
       // Fallback: route through Myra's HTTP endpoint for external channels
-      if (args.channel === 'telegram' || args.channel === 'whatsapp') {
+      if (args.channel === 'telegram' || args.channel === 'whatsapp' || args.channel === 'slack') {
         logger.info(`Routing ${args.channel} message through Myra's HTTP endpoint`);
         const httpResponse = await fetch(MYRA_SEND_ENDPOINT, {
           method: 'POST',
@@ -187,7 +187,7 @@ export async function handleSendResponse(
 
 export const getPendingMessagesSchema = z.object({
   channel: z
-    .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'all'])
+    .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'slack', 'http', 'api', 'all'])
     .optional()
     .default('all')
     .describe('Filter by channel (default: all)'),

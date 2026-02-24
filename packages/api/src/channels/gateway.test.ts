@@ -412,6 +412,113 @@ describe('Gateway Status', () => {
   });
 });
 
+describe('isAgentMentioned', () => {
+  let gateway: ChannelGateway;
+
+  beforeEach(() => {
+    gateway = new ChannelGateway({
+      enableTelegram: false,
+      enableWhatsApp: false,
+    });
+  });
+
+  const isAgentMentioned = (
+    gw: ChannelGateway,
+    text: string,
+    mentions?: { users: string[]; botMentioned: boolean }
+  ) => (gw as any).isAgentMentioned(text, mentions);
+
+  it('returns true when botMentioned is true', () => {
+    expect(isAgentMentioned(gateway, 'hello', { users: [], botMentioned: true })).toBe(true);
+  });
+
+  it('returns false with no mentions and no known agent names', () => {
+    expect(isAgentMentioned(gateway, 'hello world', { users: [], botMentioned: false })).toBe(
+      false
+    );
+  });
+
+  it('returns false with no mentions argument', () => {
+    expect(isAgentMentioned(gateway, 'hello world')).toBe(false);
+  });
+
+  it('returns true when mentioned username matches a known agent name', () => {
+    gateway.setKnownAgentNames(['wren', 'myra', 'benson']);
+    expect(
+      isAgentMentioned(gateway, 'hello', { users: ['@wren'], botMentioned: false })
+    ).toBe(true);
+  });
+
+  it('matches mentioned usernames case-insensitively', () => {
+    gateway.setKnownAgentNames(['wren']);
+    expect(
+      isAgentMentioned(gateway, 'hello', { users: ['WREN'], botMentioned: false })
+    ).toBe(true);
+  });
+
+  it('strips @ prefix from mentioned usernames', () => {
+    gateway.setKnownAgentNames(['myra']);
+    expect(
+      isAgentMentioned(gateway, 'hello', { users: ['@myra'], botMentioned: false })
+    ).toBe(true);
+  });
+
+  it('returns true when agent name appears in message text', () => {
+    gateway.setKnownAgentNames(['wren', 'myra']);
+    expect(
+      isAgentMentioned(gateway, 'hey wren, can you help?', { users: [], botMentioned: false })
+    ).toBe(true);
+  });
+
+  it('uses word boundaries for text matching', () => {
+    gateway.setKnownAgentNames(['wren']);
+    // "wrench" should NOT match "wren"
+    expect(
+      isAgentMentioned(gateway, 'pass me the wrench', { users: [], botMentioned: false })
+    ).toBe(false);
+  });
+
+  it('skips text matching for very short agent names (< 3 chars)', () => {
+    gateway.setKnownAgentNames(['ab']);
+    // "ab" is too short for text matching (would cause false positives)
+    expect(
+      isAgentMentioned(gateway, 'the ab test worked', { users: [], botMentioned: false })
+    ).toBe(false);
+  });
+
+  it('returns false when mentioned username does not match any agent', () => {
+    gateway.setKnownAgentNames(['wren', 'myra']);
+    expect(
+      isAgentMentioned(gateway, 'hello', { users: ['someuser'], botMentioned: false })
+    ).toBe(false);
+  });
+
+  it('handles multiple mentioned usernames', () => {
+    gateway.setKnownAgentNames(['wren', 'myra']);
+    expect(
+      isAgentMentioned(gateway, 'hello', {
+        users: ['randomuser', 'myra'],
+        botMentioned: false,
+      })
+    ).toBe(true);
+  });
+
+  it('safely handles agent names with regex metacharacters', () => {
+    gateway.setKnownAgentNames(['agent+1', 'bot.v2']);
+    // Should not throw, and should match literally
+    expect(
+      isAgentMentioned(gateway, 'hey agent+1!', { users: [], botMentioned: false })
+    ).toBe(true);
+    expect(
+      isAgentMentioned(gateway, 'ask bot.v2 about it', { users: [], botMentioned: false })
+    ).toBe(true);
+    // "+" unescaped would match "agent1" — escaped should NOT
+    expect(
+      isAgentMentioned(gateway, 'hey agent1 help', { users: [], botMentioned: false })
+    ).toBe(false);
+  });
+});
+
 describe('Activity Stream Integration', () => {
   let gateway: ChannelGateway;
   let mockLogMessage: Mock;

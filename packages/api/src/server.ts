@@ -37,6 +37,7 @@ import { initHeartbeatService, processHeartbeat, type DueReminder } from './serv
 import { setResponseCallback, hasExplicitResponse } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
 import { resolveRouteAgentId } from './services/routing/resolve-route';
+import { resolveAgentFromMention } from './services/routing/resolve-mention';
 import { logger } from './utils/logger';
 import { env } from './config/env';
 
@@ -153,28 +154,53 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       return;
     }
 
-    // Resolve agent from channel_routes, fall back to server default (AGENT_ID env)
+    // Resolve agent: mention → channel_routes → AGENT_ID env fallback
     let routedAgentId = agentId;
-    const route = await resolveRouteAgentId(
-      dataComposer!.getClient(),
-      userId,
-      channel,
-      metadata?.platformAccountId,
-      conversationId
-    );
-    if (route) {
-      routedAgentId = route.agentId;
-      logger.debug(`[Route] Resolved agent from channel_routes`, {
-        platform: channel,
-        agentId: route.agentId,
-        identityId: route.identityId,
-        routeId: route.routeId,
-      });
-    } else {
-      logger.warn(
-        `[Route] No channel_route found for ${channel}, falling back to AGENT_ID=${agentId}`,
-        { userId, platform: channel, conversationId }
+    const isGroupChat = metadata?.chatType === 'group' || metadata?.chatType === 'channel';
+
+    // For group chats, try mention-based routing first
+    // Always call for group chats — text matching works even without platform mentions
+    // (e.g., WhatsApp has no native @mentions, Slack bot mention excluded from users array)
+    if (isGroupChat) {
+      const mentionMatch = await resolveAgentFromMention(
+        dataComposer!.getClient(),
+        userId,
+        content,
+        metadata?.mentions?.users ?? []
       );
+      if (mentionMatch) {
+        routedAgentId = mentionMatch.agentId;
+        logger.debug(`[Route] Resolved agent from @mention`, {
+          platform: channel,
+          agentId: mentionMatch.agentId,
+          identityId: mentionMatch.identityId,
+        });
+      }
+    }
+
+    // If mention didn't match, try channel_routes specificity cascade
+    if (routedAgentId === agentId) {
+      const route = await resolveRouteAgentId(
+        dataComposer!.getClient(),
+        userId,
+        channel,
+        metadata?.platformAccountId,
+        conversationId
+      );
+      if (route) {
+        routedAgentId = route.agentId;
+        logger.debug(`[Route] Resolved agent from channel_routes`, {
+          platform: channel,
+          agentId: route.agentId,
+          identityId: route.identityId,
+          routeId: route.routeId,
+        });
+      } else {
+        logger.warn(
+          `[Route] No channel_route found for ${channel}, falling back to AGENT_ID=${agentId}`,
+          { userId, platform: channel, conversationId }
+        );
+      }
     }
 
     // Build SessionRequest
@@ -208,7 +234,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     // For external channels (telegram/whatsapp), ensure the conversation is released
     // and auto-route the text response if no explicit send_response was called
     const isExternalChannel =
-      channel === 'telegram' || channel === 'whatsapp' || channel === 'discord';
+      channel === 'telegram' || channel === 'whatsapp' || channel === 'discord' || channel === 'slack';
     if (isExternalChannel && channelGateway) {
       // Check if send_response was called via MCP (tracked in response-handlers)
       const hadExplicitResponse = hasExplicitResponse(channel, conversationId);
@@ -260,6 +286,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       whatsappAccountId: config.whatsappAccountId || 'default',
       printWhatsAppQr: true,
       enableDiscord: process.env.ENABLE_DISCORD === 'true',
+      enableSlack: process.env.ENABLE_SLACK === 'true',
     },
     messageHandler,
   });
@@ -275,6 +302,24 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   channelGateway = mcpServer.getChannelGateway();
   if (channelGateway) {
     logger.info('ChannelGateway ready', channelGateway.getStatus());
+
+    // Load known agent names for dynamic mention detection in group chats
+    try {
+      const { data: identities } = await dataComposer!
+        .getClient()
+        .from('agent_identities')
+        .select('agent_id, name');
+      if (identities && identities.length > 0) {
+        const names = new Set<string>();
+        for (const identity of identities) {
+          names.add(identity.agent_id);
+          if (identity.name) names.add(identity.name);
+        }
+        channelGateway.setKnownAgentNames([...names]);
+      }
+    } catch (err) {
+      logger.warn('Failed to load agent names for mention detection:', err);
+    }
 
     // Register the response callback so send_response MCP calls route through ChannelGateway
     setResponseCallback(async (response) => {
@@ -557,6 +602,7 @@ If you need to message a user, use send_response with the appropriate channel an
   if (status?.telegram.enabled) enabledChannels.push('Telegram');
   if (status?.whatsapp.enabled) enabledChannels.push('WhatsApp');
   if (status?.discord.enabled) enabledChannels.push('Discord');
+  if (status?.slack.enabled) enabledChannels.push('Slack');
 
   if (enabledChannels.length > 0) {
     logger.info(`Send a message via ${enabledChannels.join(' or ')} to start a conversation.`);
@@ -621,6 +667,19 @@ async function resolveUserId(
       }
 
       return user.id;
+    } else if (channel === 'slack') {
+      let user = await dataComposer.repositories.users.findBySlackId(senderId);
+
+      if (!user) {
+        user = await dataComposer.repositories.users.create({
+          slack_id: senderId,
+          first_name: senderName?.split(' ')[0],
+          last_name: senderName?.split(' ').slice(1).join(' ') || undefined,
+        });
+        logger.info(`Created new Slack user: ${user.id}`);
+      }
+
+      return user.id;
     }
   } catch (error) {
     logger.error('Failed to resolve user:', error);
@@ -651,6 +710,9 @@ function printStatus(): void {
     );
     logger.info(
       `  Discord: ${status.discord.enabled ? (status.discord.connected ? 'Connected' : 'Enabled') : 'Disabled'}`
+    );
+    logger.info(
+      `  Slack: ${status.slack.enabled ? (status.slack.connected ? 'Connected' : 'Enabled') : 'Disabled'}`
     );
   }
 

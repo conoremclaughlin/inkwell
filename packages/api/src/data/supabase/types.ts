@@ -2689,6 +2689,7 @@ export type Database = {
           last_name: string | null;
           phone_number: string | null;
           preferences: Json | null;
+          slack_id: string | null;
           telegram_id: number | null;
           telegram_username: string | null;
           timezone: string | null;
@@ -2706,6 +2707,7 @@ export type Database = {
           last_name?: string | null;
           phone_number?: string | null;
           preferences?: Json | null;
+          slack_id?: string | null;
           telegram_id?: number | null;
           telegram_username?: string | null;
           timezone?: string | null;
@@ -2723,6 +2725,7 @@ export type Database = {
           last_name?: string | null;
           phone_number?: string | null;
           preferences?: Json | null;
+          slack_id?: string | null;
           telegram_id?: number | null;
           telegram_username?: string | null;
           timezone?: string | null;

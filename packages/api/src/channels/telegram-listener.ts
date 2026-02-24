@@ -755,17 +755,14 @@ export class TelegramListener extends EventEmitter {
         // Extract the @username from the text
         const mentionText = textContent.substring(entity.offset, entity.offset + entity.length);
         mentionedUsers.push(mentionText);
-        // Check if it's our bot
-        if (mentionText.toLowerCase() === '@myra_help_bot') {
+        // Check if it's our bot (dynamic — uses bot's actual username)
+        if (
+          this.botUsername &&
+          mentionText.toLowerCase() === `@${this.botUsername.toLowerCase()}`
+        ) {
           botMentioned = true;
         }
       }
-    }
-
-    // Also check for name mentions (case-insensitive)
-    const lowerText = textContent.toLowerCase();
-    if (lowerText.includes('myra')) {
-      botMentioned = true;
     }
 
     message.mentions = {

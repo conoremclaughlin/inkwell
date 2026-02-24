@@ -269,11 +269,8 @@ export class WhatsAppListener extends EventEmitter {
         return;
       }
 
-      // Check for mention/trigger in group
-      if (!this.shouldRespondInGroup(text)) {
-        logger.debug(`Ignoring non-triggered message in WhatsApp group: ${chatId}`);
-        return;
-      }
+      // Group mention filtering is handled by the ChannelGateway's isAgentMentioned()
+      // which uses dynamic agent names. The listener passes all authorized group messages through.
     } else {
       // DM: Check if user is trusted
       const trustedUser = await this.authService.isUserTrusted('whatsapp', senderE164);
@@ -358,18 +355,6 @@ export class WhatsAppListener extends EventEmitter {
     // JID format: 1234567890@s.whatsapp.net or 1234567890:123@s.whatsapp.net
     const match = jid.match(/^(\d+)/);
     return match ? `+${match[1]}` : jid;
-  }
-
-  /**
-   * Check if message should trigger bot in group
-   */
-  private shouldRespondInGroup(text: string): boolean {
-    const lowerText = text.toLowerCase();
-
-    // Check for @mention (WhatsApp uses @phone for mentions)
-    // Also check for name mentions
-    const triggers = ['myra', '@myra', 'hey myra', 'hi myra'];
-    return triggers.some((t) => lowerText.includes(t));
   }
 
   /**
@@ -632,11 +617,11 @@ export class WhatsAppListener extends EventEmitter {
       groupSubject,
     };
 
-    // Check for mentions
-    const lowerText = text.toLowerCase();
+    // WhatsApp doesn't have native bot @mentions.
+    // Agent name matching is handled by ChannelGateway.isAgentMentioned().
     message.mentions = {
       users: [],
-      botMentioned: lowerText.includes('myra'),
+      botMentioned: false,
     };
 
     // Handle quoted/reply message

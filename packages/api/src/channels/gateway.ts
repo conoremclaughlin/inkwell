@@ -16,6 +16,7 @@ import { EventEmitter } from 'events';
 import { createTelegramListener, TelegramListener } from './telegram-listener';
 import { createWhatsAppListener, WhatsAppListener } from './whatsapp-listener';
 import { createDiscordListener, DiscordListener } from './discord-listener';
+import { createSlackListener, SlackListener } from './slack-listener';
 import { setResponseCallback, type ResponseCallback } from '../mcp/tools/response-handlers';
 import type { AgentResponse } from '../agent/types';
 import type { DataComposer } from '../data/composer';
@@ -24,7 +25,7 @@ import { env } from '../config/env';
 import telegramifyMarkdown from 'telegramify-markdown';
 
 // Supported messaging channels
-export type GatewayChannel = 'telegram' | 'whatsapp' | 'discord';
+export type GatewayChannel = 'telegram' | 'whatsapp' | 'discord' | 'slack';
 
 // Activity stream - conversation to user mapping for outbound message logging
 const conversationUserMap = new Map<string, string>(); // conversationId -> userId
@@ -46,6 +47,8 @@ export interface ChannelGatewayConfig {
   onWhatsAppQr?: (qr: string) => void;
   /** Whether to enable Discord listener */
   enableDiscord?: boolean;
+  /** Whether to enable Slack listener */
+  enableSlack?: boolean;
   /** Message buffer delay in ms (default: 2000). Set to 0 to disable buffering. */
   messageBufferDelayMs?: number;
   /** Data composer for activity stream logging */
@@ -101,6 +104,7 @@ export class ChannelGateway extends EventEmitter {
   private telegramListener: TelegramListener | null = null;
   private whatsappListener: WhatsAppListener | null = null;
   private discordListener: DiscordListener | null = null;
+  private slackListener: SlackListener | null = null;
   private config: ChannelGatewayConfig;
   private messageHandler: IncomingMessageHandler | null = null;
   private dataComposer: DataComposer | null = null;
@@ -114,6 +118,9 @@ export class ChannelGateway extends EventEmitter {
   private processingConversations: Set<string> = new Set();
   private pendingBuffers: Map<string, MessageBuffer> = new Map();
 
+  // Known agent names for mention detection in group chats
+  private knownAgentNames: Set<string> = new Set();
+
   constructor(config: ChannelGatewayConfig = {}) {
     super();
     this.config = {
@@ -123,6 +130,7 @@ export class ChannelGateway extends EventEmitter {
       whatsappAccountId: config.whatsappAccountId ?? 'default',
       printWhatsAppQr: config.printWhatsAppQr ?? true,
       enableDiscord: config.enableDiscord ?? process.env.ENABLE_DISCORD === 'true',
+      enableSlack: config.enableSlack ?? process.env.ENABLE_SLACK === 'true',
       messageBufferDelayMs: config.messageBufferDelayMs ?? DEFAULT_BUFFER_DELAY_MS,
       ...config,
     };
@@ -135,6 +143,50 @@ export class ChannelGateway extends EventEmitter {
    */
   setMessageHandler(handler: IncomingMessageHandler): void {
     this.messageHandler = handler;
+  }
+
+  /**
+   * Set known agent names for dynamic mention detection in group chats.
+   * Called on startup after querying agent_identities from the DB.
+   */
+  setKnownAgentNames(names: string[]): void {
+    this.knownAgentNames = new Set(names.map((n) => n.toLowerCase()));
+    logger.info(`ChannelGateway: known agent names updated`, {
+      names: [...this.knownAgentNames],
+    });
+  }
+
+  /**
+   * Check if any known agent (or the platform bot itself) is mentioned.
+   * Used as the gate for processing group messages.
+   */
+  private isAgentMentioned(
+    text: string,
+    mentions?: { users: string[]; botMentioned: boolean }
+  ): boolean {
+    // Platform-native bot mention (e.g., @myra_help_bot in Telegram, <@UBOTID> in Slack)
+    if (mentions?.botMentioned) return true;
+
+    // Check mentioned usernames against known agent names
+    if (mentions?.users?.length) {
+      for (const mentioned of mentions.users) {
+        const mentionedLower = mentioned.toLowerCase().replace(/^@/, '');
+        if (this.knownAgentNames.has(mentionedLower)) return true;
+      }
+    }
+
+    // Check message text for agent names (word-boundary match)
+    if (this.knownAgentNames.size > 0) {
+      const textLower = text.toLowerCase();
+      for (const name of this.knownAgentNames) {
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        if (name.length >= 3 && new RegExp(`\\b${escaped}\\b`).test(textLower)) {
+          return true;
+        }
+      }
+    }
+
+    return false;
   }
 
   /**
@@ -173,11 +225,19 @@ export class ChannelGateway extends EventEmitter {
       logger.info('Discord listener disabled (set ENABLE_DISCORD=true to enable)');
     }
 
+    // Start Slack listener
+    if (this.config.enableSlack) {
+      await this.startSlack();
+    } else {
+      logger.info('Slack listener disabled (set ENABLE_SLACK=true to enable)');
+    }
+
     this.started = true;
     logger.info('ChannelGateway started', {
       telegram: !!this.telegramListener,
       whatsapp: !!this.whatsappListener,
       discord: !!this.discordListener,
+      slack: !!this.slackListener,
     });
   }
 
@@ -220,6 +280,11 @@ export class ChannelGateway extends EventEmitter {
     if (this.discordListener) {
       await this.discordListener.stop();
       this.discordListener = null;
+    }
+
+    if (this.slackListener) {
+      await this.slackListener.stop();
+      this.slackListener = null;
     }
 
     this.started = false;
@@ -426,7 +491,7 @@ export class ChannelGateway extends EventEmitter {
     if (!userId && this.dataComposer && sender.id) {
       try {
         const user = await this.dataComposer.repositories.users.findByPlatformId(
-          channel as 'telegram' | 'whatsapp' | 'discord',
+          channel as 'telegram' | 'whatsapp' | 'discord' | 'slack',
           sender.id
         );
         if (user) {
@@ -489,6 +554,11 @@ export class ChannelGateway extends EventEmitter {
           );
         } else if (channel === 'discord' && this.discordListener) {
           await this.discordListener.sendMessage(
+            conversationId,
+            'Sorry, I encountered an error processing your message. Please try again.'
+          );
+        } else if (channel === 'slack' && this.slackListener) {
+          await this.slackListener.sendMessage(
             conversationId,
             'Sorry, I encountered an error processing your message. Please try again.'
           );
@@ -580,6 +650,35 @@ export class ChannelGateway extends EventEmitter {
             } catch (activityError) {
               logger.warn(
                 'Failed to log outgoing Discord message to activity stream:',
+                activityError
+              );
+            }
+          }
+        }
+        break;
+
+      case 'slack':
+        if (!this.slackListener) {
+          throw new Error('Slack listener not available');
+        }
+        await this.slackListener.sendMessage(conversationId, content);
+        // Log outgoing Slack message to activity stream
+        {
+          const userId = conversationUserMap.get(conversationId);
+          if (this.dataComposer && userId) {
+            try {
+              await this.dataComposer.repositories.activityStream.logMessage({
+                userId,
+                agentId: 'slack', // Will be resolved by routing
+                direction: 'out',
+                content,
+                platform: 'slack',
+                platformChatId: conversationId,
+                isDm: true,
+              });
+            } catch (activityError) {
+              logger.warn(
+                'Failed to log outgoing Slack message to activity stream:',
                 activityError
               );
             }
@@ -746,11 +845,10 @@ export class ChannelGateway extends EventEmitter {
       const senderId = message.sender.id || 'unknown';
       const conversationId = message.conversationId || senderId;
       const isGroupChat = message.chatType === 'group';
-      const botMentioned = message.mentions?.botMentioned ?? false;
 
-      // In group chats, only respond if bot is mentioned
-      if (isGroupChat && !botMentioned) {
-        logger.debug('Skipping group message - bot not mentioned');
+      // In group chats, only respond if bot or any known agent is mentioned
+      if (isGroupChat && !this.isAgentMentioned(message.body, message.mentions)) {
+        logger.debug('Skipping group message - no agent mentioned');
         return;
       }
 
@@ -804,11 +902,10 @@ export class ChannelGateway extends EventEmitter {
       const senderId = message.sender.id || 'unknown';
       const conversationId = message.conversationId || senderId;
       const isGroupChat = message.chatType === 'group';
-      const botMentioned = message.mentions?.botMentioned ?? false;
 
-      // In group chats, only respond if bot is mentioned
-      if (isGroupChat && !botMentioned) {
-        logger.debug('Skipping WhatsApp group message - bot not mentioned');
+      // In group chats, only respond if bot or any known agent is mentioned
+      if (isGroupChat && !this.isAgentMentioned(message.body, message.mentions)) {
+        logger.debug('Skipping WhatsApp group message - no agent mentioned');
         return;
       }
 
@@ -906,6 +1003,66 @@ export class ChannelGateway extends EventEmitter {
   }
 
   /**
+   * Start Slack listener
+   */
+  private async startSlack(): Promise<void> {
+    if (!env.SLACK_BOT_TOKEN || !env.SLACK_APP_TOKEN) {
+      logger.warn('SLACK_BOT_TOKEN or SLACK_APP_TOKEN not set - Slack listener disabled');
+      return;
+    }
+
+    logger.info('Creating Slack listener...');
+    this.slackListener = createSlackListener({
+      botToken: env.SLACK_BOT_TOKEN,
+      appToken: env.SLACK_APP_TOKEN,
+    });
+
+    // Wire up message handling
+    this.slackListener.onMessage(async (message) => {
+      const senderId = message.sender.id || 'unknown';
+      const conversationId = message.conversationId || senderId;
+      const isGroupChat = message.chatType === 'group' || message.chatType === 'channel';
+
+      // In group chats, only respond if bot or any known agent is mentioned
+      if (isGroupChat && !this.isAgentMentioned(message.body, message.mentions)) {
+        logger.debug('Skipping Slack group message - no agent mentioned');
+        return;
+      }
+
+      // Start typing indicator (no-op for Slack, but keeps pattern consistent)
+      this.startTypingIndicator(conversationId, 'slack');
+
+      // Buffer the message
+      this.bufferMessage(
+        'slack',
+        conversationId,
+        { id: senderId, name: message.sender.name || message.sender.username },
+        message.body,
+        {
+          media: message.media,
+          chatType: message.chatType,
+          mentions: message.mentions,
+          platformAccountId: message.accountId,
+        }
+      );
+    });
+
+    // Forward events
+    this.slackListener.on('connected', (bot: { username: string; id: string }) => {
+      logger.info(`Slack bot connected: @${bot.username} (${bot.id})`);
+      this.emit('slack:connected', bot);
+    });
+
+    this.slackListener.on('error', (error: Error) => {
+      logger.error('Slack listener error:', error);
+      this.emit('slack:error', error);
+    });
+
+    await this.slackListener.start();
+    logger.info('Slack listener started');
+  }
+
+  /**
    * Start a typing indicator that refreshes every 4s
    */
   private startTypingIndicator(conversationId: string, channel: GatewayChannel): void {
@@ -918,6 +1075,8 @@ export class ChannelGateway extends EventEmitter {
         this.whatsappListener.sendTypingIndicator(conversationId);
       } else if (channel === 'discord' && this.discordListener) {
         this.discordListener.sendTypingIndicator(conversationId);
+      } else if (channel === 'slack' && this.slackListener) {
+        this.slackListener.sendTypingIndicator(conversationId);
       }
     };
 
@@ -974,6 +1133,10 @@ export class ChannelGateway extends EventEmitter {
     return this.discordListener;
   }
 
+  getSlackListener(): SlackListener | null {
+    return this.slackListener;
+  }
+
   isStarted(): boolean {
     return this.started;
   }
@@ -983,6 +1146,7 @@ export class ChannelGateway extends EventEmitter {
     telegram: { enabled: boolean; connected: boolean };
     whatsapp: { enabled: boolean; connected: boolean };
     discord: { enabled: boolean; connected: boolean };
+    slack: { enabled: boolean; connected: boolean };
   } {
     return {
       started: this.started,
@@ -997,6 +1161,10 @@ export class ChannelGateway extends EventEmitter {
       discord: {
         enabled: this.config.enableDiscord ?? false,
         connected: this.discordListener?.connected ?? false,
+      },
+      slack: {
+        enabled: this.config.enableSlack ?? false,
+        connected: this.slackListener?.connected ?? false,
       },
     };
   }
