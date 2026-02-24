@@ -18,6 +18,9 @@ sb
 yarn workspace @personal-context/cli dev   # tsc --watch in another terminal
 ```
 
+`install:cli` links `sb` to `~/.pcp/bin/sb` and also creates a compatibility symlink at
+`~/.local/bin/sb`.
+
 To remove: `yarn workspace @personal-context/cli uninstall:cli`
 
 ## Getting Started
@@ -224,7 +227,7 @@ sb studio remove <name>         # Remove studio (keeps branch)
 sb studio clean <name>          # Remove studio + delete branch
 sb studio path <name>           # Print studio path
 eval $(sb studio cd <name>)     # cd to studio
-sb studio cli                   # Build + link CLI as sb-<agent>
+sb studio cli                   # Build + link CLI as sb-<agent> in ~/.pcp/bin
 sb studio cli --name sb-dev     # Custom binary name
 sb studio cli --unlink          # Remove linked binary
 ```
