@@ -587,7 +587,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     return;
   }
 
-  const agentId = resolveAgentId(options.agent);
+  const resolvedAgentId = resolveAgentId(options.agent);
+  if (!resolvedAgentId) {
+    throw new Error('Could not resolve agent identity. Run `sb init` or pass `--agent <id>`.');
+  }
+  const agentId: string = resolvedAgentId;
   const pcp = new PcpClient();
   const identity = readIdentityJson(process.cwd());
 
@@ -752,7 +756,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         } else {
           const verified = verifyDelegationToken(msg.delegationToken, secret, {
             expectedDelegateeAgentId: agentId,
-            expectedThreadKey: runtime.threadKey,
+            expectedThreadKey: runtime.threadKey ?? undefined,
           });
           if (verified.valid && verified.payload) {
             const scopes = verified.payload.scopes.join(',');
