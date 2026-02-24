@@ -419,6 +419,41 @@ function buildSessionsBlock(sessions: Array<Record<string, unknown>> | undefined
   return lines.join('\n');
 }
 
+function buildSkillsBlock(skills: Array<Record<string, unknown>> | undefined): string {
+  if (!skills || skills.length === 0) return '';
+
+  const lines = ['### Available Skills'];
+  lines.push('');
+  lines.push('Call `get_skill` with a skill name for full instructions.');
+  lines.push('');
+
+  const guideContents: string[] = [];
+
+  for (const skill of skills) {
+    const name = skill.name as string;
+    const type = skill.type as string;
+    const desc = skill.description as string;
+    const displayName = (skill.displayName as string) || name;
+    // triggers comes as a flat keywords array from list_skills summary
+    const triggers = skill.triggers as string[] | undefined;
+    const triggerStr = triggers?.length ? ` — triggers: ${triggers.join(', ')}` : '';
+
+    if (type === 'guide' && skill.content) {
+      lines.push(`- **${displayName}** (guide): ${desc}${triggerStr} — *active, see below*`);
+      guideContents.push(`#### ${displayName}\n\n${skill.content}`);
+    } else {
+      lines.push(`- **${displayName}** (${type}): ${desc}${triggerStr}`);
+    }
+  }
+
+  if (guideContents.length > 0) {
+    lines.push('');
+    lines.push(...guideContents);
+  }
+
+  return lines.join('\n');
+}
+
 // ============================================================================
 // Install / Uninstall / Status
 // ============================================================================
@@ -963,6 +998,7 @@ async function postCompactHandler(): Promise<void> {
 
   let identityBlock = '';
   let inboxBlock = '';
+  let skillsBlock = '';
 
   // Bootstrap identity
   try {
@@ -989,10 +1025,21 @@ async function postCompactHandler(): Promise<void> {
       '*FAILED: Could not reach PCP server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
   }
 
+  // Load available skills
+  try {
+    const skillsResult = await callPcpTool('list_skills', { includeContent: true });
+    skillsBlock = buildSkillsBlock(
+      skillsResult.skills as Array<Record<string, unknown>> | undefined
+    );
+  } catch {
+    // Non-fatal
+  }
+
   const template = loadTemplate('hook-post-compact');
   const output = renderTemplate(template, {
     AGENT_ID: agentId,
     IDENTITY_BLOCK: identityBlock,
+    SKILLS_BLOCK: skillsBlock,
     INBOX_BLOCK: inboxBlock,
   });
 
@@ -1029,6 +1076,7 @@ async function onSessionStartHandler(): Promise<void> {
   let memoriesBlock = '';
   let sessionsBlock = '';
   let inboxBlock = '';
+  let skillsBlock = '';
 
   // Bootstrap
   try {
@@ -1062,6 +1110,16 @@ async function onSessionStartHandler(): Promise<void> {
   } catch {
     inboxBlock =
       '*FAILED: Could not reach PCP server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
+  }
+
+  // Load available skills (guide content included inline)
+  try {
+    const skillsResult = await callPcpTool('list_skills', { includeContent: true });
+    skillsBlock = buildSkillsBlock(
+      skillsResult.skills as Array<Record<string, unknown>> | undefined
+    );
+  } catch {
+    // Non-fatal: skills are a nice-to-have at session start
   }
 
   // Register PCP session with detected backend
@@ -1148,6 +1206,7 @@ async function onSessionStartHandler(): Promise<void> {
     IDENTITY_BLOCK: identityBlock,
     MEMORIES_BLOCK: memoriesBlock,
     SESSIONS_BLOCK: sessionsBlock,
+    SKILLS_BLOCK: skillsBlock,
     INBOX_BLOCK: inboxBlock,
   });
 
