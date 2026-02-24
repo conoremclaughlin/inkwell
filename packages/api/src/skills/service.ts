@@ -5,7 +5,7 @@
  * user settings integration, and status tracking.
  */
 
-import { loadAllSkills, loadSkillByName, getSkillPaths } from './loader';
+import { loadAllSkills, loadSkillByName, getSkillPaths, type SkillLoadOptions } from './loader';
 import type {
   LoadedSkill,
   SkillSummary,
@@ -82,10 +82,10 @@ function toDetail(skill: LoadedSkill, userSettings?: UserSkillSettings): SkillDe
  * Skills Service
  */
 export class SkillsService {
-  private userSkillsPath?: string;
+  private loadOptions: SkillLoadOptions;
 
-  constructor(userSkillsPath?: string) {
-    this.userSkillsPath = userSkillsPath;
+  constructor(options?: SkillLoadOptions) {
+    this.loadOptions = options || {};
   }
 
   /**
@@ -97,7 +97,7 @@ export class SkillsService {
       return skillsCache;
     }
 
-    skillsCache = loadAllSkills(this.userSkillsPath);
+    skillsCache = loadAllSkills(this.loadOptions);
     cacheTimestamp = now;
     return skillsCache;
   }
@@ -156,7 +156,7 @@ export class SkillsService {
    * Get skill details by name
    */
   getSkill(name: string): SkillDetail | null {
-    const skill = loadSkillByName(name, this.userSkillsPath);
+    const skill = loadSkillByName(name, this.loadOptions);
     if (!skill) return null;
     return toDetail(skill);
   }
@@ -174,14 +174,14 @@ export class SkillsService {
    * Get skill paths being scanned
    */
   getSkillPaths(): string[] {
-    return getSkillPaths(this.userSkillsPath);
+    return getSkillPaths(this.loadOptions);
   }
 
   /**
    * Check if a specific skill is eligible
    */
   checkSkillEligibility(name: string): { eligible: boolean; message?: string } {
-    const skill = loadSkillByName(name, this.userSkillsPath);
+    const skill = loadSkillByName(name, this.loadOptions);
     if (!skill) {
       return { eligible: false, message: `Skill "${name}" not found` };
     }
@@ -198,9 +198,9 @@ let serviceInstance: SkillsService | null = null;
 /**
  * Get the skills service singleton
  */
-export function getSkillsService(userSkillsPath?: string): SkillsService {
+export function getSkillsService(options?: SkillLoadOptions): SkillsService {
   if (!serviceInstance) {
-    serviceInstance = new SkillsService(userSkillsPath);
+    serviceInstance = new SkillsService(options);
   }
   return serviceInstance;
 }

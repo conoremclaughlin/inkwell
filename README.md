@@ -162,6 +162,12 @@ Stories are living documents — update them as the feature evolves.
 - **Process Management**: pm2
 - **CLI**: Commander.js
 
+## Skills
+
+PCP supports extensible skills using the [AgentSkills format](https://docs.openclaw.ai/tools/skills). Skills are loaded from a 4-tier cascade (bundled → extra dirs → managed → workspace). Compatible with [ClawHub](https://clawhub.com) for community skill installation.
+
+See [`packages/api/src/skills/README.md`](./packages/api/src/skills/README.md) for the full reference and [AGENTS.md](./AGENTS.md#skills) for agent-facing docs.
+
 ## Architecture
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for system diagrams, data flow, and design decisions.

@@ -1,22 +1,40 @@
 /**
  * Skill Loader
  *
- * Loads skills from the filesystem. Skills can be:
- * - SKILL.md files with YAML frontmatter (like clawdbot)
+ * Loads skills from the filesystem using a 4-tier precedence cascade
+ * (inspired by the AgentSkills format: https://docs.openclaw.ai/tools/skills).
+ *
+ * Skills can be:
+ * - SKILL.md files with YAML frontmatter
  * - Directories with manifest.yaml + SKILL.md
  *
- * Default skill locations:
- * 1. Built-in: packages/api/src/skills/builtin/
- * 2. User skills: ~/.pcp/skills/
+ * Loading order (lowest → highest precedence, later overrides by name):
+ * 1. Built-in:  packages/api/src/skills/builtin/   (shipped with PCP)
+ * 2. Extra dirs: configurable paths                 (ClawHub interop, etc.)
+ * 3. Managed:   ~/.pcp/skills/                      (user-installed, all SBs)
+ * 4. Workspace:  <cwd>/.pcp/skills/                 (per-worktree, per-SB)
  */
 
 import { readFileSync, readdirSync, existsSync, statSync } from 'fs';
-import { join, basename } from 'path';
+import { join, basename, dirname } from 'path';
 import * as yaml from 'yaml';
 import type { SkillManifest, LoadedSkill, SkillType } from './types';
 import { checkEligibility } from './eligibility';
 
 const BUILTIN_SKILLS_PATH = join(__dirname, 'builtin');
+const HOME = process.env.HOME || '';
+
+/**
+ * Options for skill loading.
+ */
+export interface SkillLoadOptions {
+  /** Override the default ~/.pcp/skills/ managed path */
+  userSkillsPath?: string;
+  /** Working directory for workspace-level skills (<cwd>/.pcp/skills/) */
+  workspacePath?: string;
+  /** Additional skill directories (e.g., ["~/.openclaw/skills"]) */
+  extraDirs?: string[];
+}
 
 /**
  * Parse YAML frontmatter from markdown content
@@ -71,6 +89,14 @@ function frontmatterToManifest(
 }
 
 /**
+ * Replace {baseDir} placeholder with the skill's source directory path.
+ * This lets SKILL.md reference bundled scripts relative to its own directory.
+ */
+function resolveBaseDir(content: string, sourcePath: string): string {
+  return content.replace(/\{baseDir\}/g, sourcePath);
+}
+
+/**
  * Load a single skill from a SKILL.md file
  */
 function loadSkillFromFile(filePath: string): LoadedSkill | null {
@@ -80,10 +106,11 @@ function loadSkillFromFile(filePath: string): LoadedSkill | null {
 
     const manifest = frontmatterToManifest(frontmatter, basename(filePath));
     const eligibility = checkEligibility(manifest.requirements);
+    const skillContent = resolveBaseDir(body, dirname(filePath));
 
     return {
       manifest,
-      skillContent: body,
+      skillContent,
       sourcePath: filePath,
       eligibility,
     };
@@ -114,6 +141,7 @@ function loadSkillFromDirectory(dirPath: string): LoadedSkill | null {
         skillContent = body;
       }
 
+      skillContent = resolveBaseDir(skillContent, dirPath);
       const eligibility = checkEligibility(manifest.requirements);
 
       return {
@@ -170,33 +198,88 @@ function scanDirectory(dirPath: string): LoadedSkill[] {
 }
 
 /**
- * Load all skills from default locations
+ * Expand ~ to $HOME in a path
  */
-export function loadAllSkills(userSkillsPath?: string): LoadedSkill[] {
-  const skills: LoadedSkill[] = [];
+function expandHome(p: string): string {
+  return p.replace(/^~/, HOME);
+}
 
-  // Load built-in skills
-  skills.push(...scanDirectory(BUILTIN_SKILLS_PATH));
+/**
+ * Load all skills using the 4-tier precedence cascade.
+ *
+ * Accepts either the legacy single-string `userSkillsPath` parameter
+ * or the full `SkillLoadOptions` object.
+ */
+export function loadAllSkills(options?: string | SkillLoadOptions): LoadedSkill[] {
+  // Backwards compat: accept bare string as userSkillsPath
+  const opts: SkillLoadOptions =
+    typeof options === 'string' ? { userSkillsPath: options } : options || {};
 
-  // Load user skills
-  const userPath = userSkillsPath || join(process.env.HOME || '', '.pcp', 'skills');
-  skills.push(...scanDirectory(userPath));
+  // Map keyed by skill name — last write wins (higher precedence overrides)
+  const skills = new Map<string, LoadedSkill>();
 
-  return skills;
+  // Tier 1: Built-in (lowest precedence)
+  for (const s of scanDirectory(BUILTIN_SKILLS_PATH)) {
+    skills.set(s.manifest.name, s);
+  }
+
+  // Tier 2: Extra dirs (ClawHub, etc.)
+  if (opts.extraDirs) {
+    for (const dir of opts.extraDirs) {
+      for (const s of scanDirectory(expandHome(dir))) {
+        skills.set(s.manifest.name, s);
+      }
+    }
+  }
+
+  // Tier 3: Managed (~/.pcp/skills/)
+  const userPath = opts.userSkillsPath || join(HOME, '.pcp', 'skills');
+  for (const s of scanDirectory(userPath)) {
+    skills.set(s.manifest.name, s);
+  }
+
+  // Tier 4: Workspace (<cwd>/.pcp/skills/) — highest precedence
+  if (opts.workspacePath) {
+    const wsSkillsPath = join(opts.workspacePath, '.pcp', 'skills');
+    for (const s of scanDirectory(wsSkillsPath)) {
+      skills.set(s.manifest.name, s);
+    }
+  }
+
+  return Array.from(skills.values());
 }
 
 /**
  * Load a specific skill by name
  */
-export function loadSkillByName(name: string, userSkillsPath?: string): LoadedSkill | null {
-  const allSkills = loadAllSkills(userSkillsPath);
+export function loadSkillByName(
+  name: string,
+  options?: string | SkillLoadOptions
+): LoadedSkill | null {
+  const allSkills = loadAllSkills(options);
   return allSkills.find((s) => s.manifest.name === name) || null;
 }
 
 /**
- * Get skill paths being scanned
+ * Get all skill paths being scanned
  */
-export function getSkillPaths(userSkillsPath?: string): string[] {
-  const userPath = userSkillsPath || join(process.env.HOME || '', '.pcp', 'skills');
-  return [BUILTIN_SKILLS_PATH, userPath];
+export function getSkillPaths(options?: string | SkillLoadOptions): string[] {
+  const opts: SkillLoadOptions =
+    typeof options === 'string' ? { userSkillsPath: options } : options || {};
+
+  const paths = [BUILTIN_SKILLS_PATH];
+
+  if (opts.extraDirs) {
+    for (const dir of opts.extraDirs) {
+      paths.push(expandHome(dir));
+    }
+  }
+
+  paths.push(opts.userSkillsPath || join(HOME, '.pcp', 'skills'));
+
+  if (opts.workspacePath) {
+    paths.push(join(opts.workspacePath, '.pcp', 'skills'));
+  }
+
+  return paths;
 }
