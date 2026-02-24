@@ -119,6 +119,7 @@ Agent: {agentId}
 
 1. Marks runtime phase as `runtime:generating` via `update_session_phase(sessionId, phase)`
 2. Reconciles backend session ID linkage if the hook payload includes a session ID
+   - short-circuits on local `sessions.json` if linkage is already known
 3. Checks if inbox was polled within the last 5 minutes — if so, exits silently
 4. Calls `get_inbox` for unread messages
 5. Updates the `last-inbox-check` timestamp in `.pcp/runtime/`
@@ -142,6 +143,7 @@ Agent: {agentId}
 
 1. Marks runtime phase as `runtime:idle` via `update_session_phase(sessionId, phase)`
 2. Reconciles backend session ID linkage if the hook payload includes a session ID
+   - short-circuits on local `sessions.json` if linkage is already known
 3. Increments tool call counter in `.pcp/runtime/tool-count`
 4. Every 30 tool calls, outputs a nudge to log session progress
 5. If inbox is stale (>5 minutes), checks for new messages

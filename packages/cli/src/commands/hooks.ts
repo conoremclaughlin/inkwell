@@ -22,12 +22,12 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 import { homedir } from 'os';
-import { randomUUID } from 'crypto';
 import { resolveAgentId, readIdentityJson } from '../backends/identity.js';
 import { getValidAccessToken } from '../auth/tokens.js';
 import {
   findRuntimeSessionByLinkId,
   getCurrentRuntimeSession,
+  listRuntimeSessions,
   setCurrentRuntimeSession,
   upsertRuntimeSession,
 } from '../session/runtime.js';
@@ -356,10 +356,10 @@ function getIdentitySessionContext(cwd: string): {
   }
 }
 
-function getRuntimeLinkId(): string {
+function getRuntimeLinkId(): string | undefined {
   const candidate = process.env.PCP_RUNTIME_LINK_ID;
   if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
-  return randomUUID();
+  return undefined;
 }
 
 async function findPcpSessionByBackendSessionId(
@@ -408,19 +408,21 @@ async function reconcileBackendSignal(
   config: PcpConfig | null,
   agentId: string,
   stdin: Record<string, unknown>,
-  options?: { initialPcpSessionId?: string; initialThreadKey?: string }
+  options?: { initialPcpSessionId?: string; initialThreadKey?: string; startedAt?: string }
 ): Promise<{ pcpSessionId?: string; threadKey?: string; backendSessionId?: string }> {
   const detectedBackend = detectBackend(cwd);
   const sessionBackend = normalizeSessionBackend(detectedBackend.name);
   const backendSessionId = extractBackendSessionId(stdin);
   const runtimeLinkId = getRuntimeLinkId();
-  writeRuntimeFile(cwd, 'runtime-link-id', runtimeLinkId);
+  if (runtimeLinkId) {
+    writeRuntimeFile(cwd, 'runtime-link-id', runtimeLinkId);
+  }
   const { studioId, identityId } = getIdentitySessionContext(cwd);
 
   let pcpSessionId = options?.initialPcpSessionId || resolveActivePcpSessionId(cwd);
   let threadKey = options?.initialThreadKey;
 
-  if (!pcpSessionId) {
+  if (!pcpSessionId && runtimeLinkId) {
     const linked = findRuntimeSessionByLinkId(cwd, runtimeLinkId, {
       backend: sessionBackend,
       agentId,
@@ -432,7 +434,36 @@ async function reconcileBackendSignal(
     }
   }
 
-  if (backendSessionId) {
+  if (!pcpSessionId && backendSessionId) {
+    const linkedByBackendSessionId = listRuntimeSessions(cwd, sessionBackend).find(
+      (session) =>
+        session.agentId === agentId &&
+        (!studioId || session.studioId === studioId) &&
+        (session.backendSessionId === backendSessionId ||
+          session.backendSessionIds?.includes(backendSessionId))
+    );
+    if (linkedByBackendSessionId?.pcpSessionId) {
+      pcpSessionId = linkedByBackendSessionId.pcpSessionId;
+      if (linkedByBackendSessionId.threadKey) threadKey = linkedByBackendSessionId.threadKey;
+    }
+  }
+
+  let hasLocalBackendLink = false;
+  if (backendSessionId && pcpSessionId) {
+    const local = listRuntimeSessions(cwd, sessionBackend).find(
+      (session) =>
+        session.pcpSessionId === pcpSessionId &&
+        session.agentId === agentId &&
+        (!studioId || session.studioId === studioId)
+    );
+    hasLocalBackendLink = !!(
+      local &&
+      (local.backendSessionId === backendSessionId ||
+        local.backendSessionIds?.includes(backendSessionId))
+    );
+  }
+
+  if (backendSessionId && !hasLocalBackendLink) {
     // Reconcile mismatched pcpSessionId/backendSessionId by checking existing server-side links first.
     const matched = await findPcpSessionByBackendSessionId(
       config,
@@ -467,8 +498,9 @@ async function reconcileBackendSignal(
     ...(identityId ? { identityId } : {}),
     ...(studioId ? { studioId } : {}),
     ...(threadKey ? { threadKey } : {}),
-    runtimeLinkId,
+    ...(runtimeLinkId ? { runtimeLinkId } : {}),
     ...(backendSessionId ? { backendSessionId } : {}),
+    ...(options?.startedAt ? { startedAt: options.startedAt } : {}),
     updatedAt: new Date().toISOString(),
   });
   setCurrentRuntimeSession(cwd, pcpSessionId, sessionBackend, {
@@ -1318,24 +1350,15 @@ async function onSessionStartHandler(): Promise<void> {
     // message above will already alert about server connectivity.
   }
 
+  const startedAt = new Date().toISOString();
   const reconciled = await reconcileBackendSignal(cwd, config, agentId, stdin, {
     initialPcpSessionId: pcpSessionId,
     initialThreadKey: pcpThreadKey,
+    startedAt,
   });
   pcpSessionId = reconciled.pcpSessionId || pcpSessionId;
   pcpThreadKey = reconciled.threadKey || pcpThreadKey;
   const backendSessionId = reconciled.backendSessionId;
-
-  if (pcpSessionId) {
-    upsertRuntimeSession(cwd, {
-      pcpSessionId,
-      backend: sessionBackend,
-      agentId,
-      ...(pcpThreadKey ? { threadKey: pcpThreadKey } : {}),
-      startedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    });
-  }
 
   // Keep an explicit runtime phase for dashboard "generating vs idle" visualization.
   // Startup phase should always settle to idle.

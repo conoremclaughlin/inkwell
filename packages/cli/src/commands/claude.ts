@@ -141,6 +141,80 @@ async function callPcpTool<T = Record<string, unknown>>(tool: string, args: obje
   return (await response.json()) as T;
 }
 
+function extractBackendSessionIdFromEvent(event: Record<string, unknown>): string | undefined {
+  const queue: unknown[] = [event];
+  const sessionKeys = new Set([
+    'session_id',
+    'sessionId',
+    'conversation_id',
+    'conversationId',
+    'thread_id',
+    'threadId',
+  ]);
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || typeof current !== 'object') continue;
+    const obj = current as Record<string, unknown>;
+
+    for (const [key, value] of Object.entries(obj)) {
+      if (typeof value === 'string' && sessionKeys.has(key) && value.trim()) {
+        return value.trim();
+      }
+      if (value && typeof value === 'object') queue.push(value);
+    }
+  }
+
+  return undefined;
+}
+
+function parseSessionIdFromJsonLine(line: string): string | undefined {
+  try {
+    const parsed = JSON.parse(line) as Record<string, unknown>;
+    return extractBackendSessionIdFromEvent(parsed);
+  } catch {
+    return undefined;
+  }
+}
+
+async function persistBackendSessionLink(
+  options: {
+    pcpSessionId?: string;
+    backendSessionId?: string;
+    backend: string;
+    agentId: string;
+    runtimeLinkId?: string;
+    studioId?: string;
+    identityId?: string;
+    email?: string;
+  }
+): Promise<void> {
+  if (!options.pcpSessionId || !options.backendSessionId) return;
+
+  upsertRuntimeSession(process.cwd(), {
+    pcpSessionId: options.pcpSessionId,
+    backend: options.backend,
+    agentId: options.agentId,
+    ...(options.identityId ? { identityId: options.identityId } : {}),
+    ...(options.studioId ? { studioId: options.studioId } : {}),
+    ...(options.runtimeLinkId ? { runtimeLinkId: options.runtimeLinkId } : {}),
+    backendSessionId: options.backendSessionId,
+    updatedAt: new Date().toISOString(),
+  });
+
+  try {
+    await callPcpTool('update_session_phase', {
+      email: options.email,
+      agentId: options.agentId,
+      sessionId: options.pcpSessionId,
+      backendSessionId: options.backendSessionId,
+      status: 'active',
+    });
+  } catch {
+    // Best-effort linkage update only.
+  }
+}
+
 async function ensurePcpSessionContext(
   agentId: string,
   backend: string,
@@ -331,8 +405,22 @@ export async function runClaude(
     console.log(chalk.dim(`Running: ${prepared.binary} ${prepared.args.join(' ')}`));
   }
 
+  const pcpConfig = getPcpConfig();
+  let capturedBackendSessionId = sessionContext.backendSessionId;
+  let stdoutLineBuffer = '';
+  const consumeOutputChunk = (chunkText: string): void => {
+    stdoutLineBuffer += chunkText;
+    const lines = stdoutLineBuffer.split('\n');
+    stdoutLineBuffer = lines.pop() || '';
+
+    for (const line of lines) {
+      const parsedSessionId = parseSessionIdFromJsonLine(line.trim());
+      if (parsedSessionId) capturedBackendSessionId = parsedSessionId;
+    }
+  };
+
   const child = spawn(prepared.binary, prepared.args, {
-    stdio: 'inherit',
+    stdio: ['inherit', 'pipe', 'pipe'],
     env: {
       ...process.env,
       ...authEnv,
@@ -341,8 +429,33 @@ export async function runClaude(
     },
   });
 
-  child.on('close', (code) => {
+  child.stdout?.on('data', (chunk) => {
+    process.stdout.write(chunk);
+    consumeOutputChunk(chunk.toString());
+  });
+
+  child.stderr?.on('data', (chunk) => {
+    process.stderr.write(chunk);
+  });
+
+  child.on('close', async (code) => {
     prepared.cleanup();
+    if (stdoutLineBuffer.trim()) {
+      const parsedSessionId = parseSessionIdFromJsonLine(stdoutLineBuffer.trim());
+      if (parsedSessionId) capturedBackendSessionId = parsedSessionId;
+    }
+
+    await persistBackendSessionLink({
+      pcpSessionId: sessionContext.pcpSessionId,
+      backendSessionId: capturedBackendSessionId,
+      backend: options.backend,
+      agentId,
+      runtimeLinkId,
+      studioId,
+      identityId,
+      email: pcpConfig?.email,
+    });
+
     if (code !== 0) process.exit(code || 1);
   });
 
