@@ -159,12 +159,14 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     const isGroupChat = metadata?.chatType === 'group' || metadata?.chatType === 'channel';
 
     // For group chats, try mention-based routing first
-    if (isGroupChat && metadata?.mentions?.users?.length) {
+    // Always call for group chats — text matching works even without platform mentions
+    // (e.g., WhatsApp has no native @mentions, Slack bot mention excluded from users array)
+    if (isGroupChat) {
       const mentionMatch = await resolveAgentFromMention(
         dataComposer!.getClient(),
         userId,
         content,
-        metadata.mentions.users
+        metadata?.mentions?.users ?? []
       );
       if (mentionMatch) {
         routedAgentId = mentionMatch.agentId;

@@ -502,6 +502,21 @@ describe('isAgentMentioned', () => {
       })
     ).toBe(true);
   });
+
+  it('safely handles agent names with regex metacharacters', () => {
+    gateway.setKnownAgentNames(['agent+1', 'bot.v2']);
+    // Should not throw, and should match literally
+    expect(
+      isAgentMentioned(gateway, 'hey agent+1!', { users: [], botMentioned: false })
+    ).toBe(true);
+    expect(
+      isAgentMentioned(gateway, 'ask bot.v2 about it', { users: [], botMentioned: false })
+    ).toBe(true);
+    // "+" unescaped would match "agent1" — escaped should NOT
+    expect(
+      isAgentMentioned(gateway, 'hey agent1 help', { users: [], botMentioned: false })
+    ).toBe(false);
+  });
 });
 
 describe('Activity Stream Integration', () => {

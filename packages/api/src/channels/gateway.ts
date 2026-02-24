@@ -179,7 +179,8 @@ export class ChannelGateway extends EventEmitter {
     if (this.knownAgentNames.size > 0) {
       const textLower = text.toLowerCase();
       for (const name of this.knownAgentNames) {
-        if (name.length >= 3 && new RegExp(`\\b${name}\\b`).test(textLower)) {
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        if (name.length >= 3 && new RegExp(`\\b${escaped}\\b`).test(textLower)) {
           return true;
         }
       }
