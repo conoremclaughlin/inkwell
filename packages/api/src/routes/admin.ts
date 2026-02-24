@@ -48,6 +48,29 @@ type CommentAuthorUser = {
   email: string | null;
 };
 
+type ChannelRouteIdentityRow = {
+  id: string;
+  agent_id: string;
+  name: string;
+  role: string;
+  backend: string | null;
+  workspace_id?: string | null;
+};
+
+type ChannelRouteRow = {
+  id: string;
+  user_id: string;
+  identity_id: string;
+  platform: string;
+  platform_account_id: string | null;
+  chat_id: string | null;
+  is_active: boolean;
+  metadata: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+  agent_identities: ChannelRouteIdentityRow | ChannelRouteIdentityRow[] | null;
+};
+
 const ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS = 3600; // 1 hour
 const ADMIN_REFRESH_TOKEN_LIFETIME_DAYS = 90;
 const ADMIN_CLIENT_ID = 'dashboard';
@@ -81,6 +104,55 @@ function truncateText(input: string, max = 280): string {
   const compact = input.replace(/\s+/g, ' ').trim();
   if (compact.length <= max) return compact;
   return `${compact.slice(0, max - 1)}…`;
+}
+
+function normalizeNullableText(input: unknown): string | null {
+  if (typeof input !== 'string') return null;
+  const normalized = input.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function parseRouteMetadata(input: unknown): Record<string, unknown> {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return {};
+  }
+
+  return input as Record<string, unknown>;
+}
+
+function extractRouteIdentity(route: ChannelRouteRow): ChannelRouteIdentityRow | null {
+  if (!route.agent_identities) return null;
+  if (Array.isArray(route.agent_identities)) {
+    return route.agent_identities[0] || null;
+  }
+
+  return route.agent_identities;
+}
+
+function toRoutingRoute(
+  route: ChannelRouteRow,
+  reminderCountByIdentity: Map<string, number>,
+  nextReminderByIdentity: Map<string, string | null>
+) {
+  const identity = extractRouteIdentity(route);
+
+  return {
+    id: route.id,
+    identityId: route.identity_id,
+    agentId: identity?.agent_id ?? null,
+    agentName: identity?.name ?? null,
+    agentRole: identity?.role ?? null,
+    backend: identity?.backend ?? null,
+    platform: route.platform,
+    platformAccountId: route.platform_account_id,
+    chatId: route.chat_id,
+    isActive: route.is_active,
+    metadata: route.metadata || {},
+    createdAt: route.created_at,
+    updatedAt: route.updated_at,
+    activeReminderCount: reminderCountByIdentity.get(route.identity_id) || 0,
+    nextReminderAt: nextReminderByIdentity.get(route.identity_id) || null,
+  };
 }
 
 function pickContentFromUnknown(input: unknown): string {
@@ -1284,8 +1356,22 @@ router.post('/whatsapp/logout', async (_req: Request, res: Response) => {
  * Process heartbeat - check for due reminders and execute them
  * Called by pg_cron in production or node-cron locally
  */
-router.post('/heartbeat', async (_req: Request, res: Response) => {
+router.post('/heartbeat', async (req: Request, res: Response) => {
   try {
+    const heartbeatEnabled =
+      process.env.ENABLE_HEARTBEAT_SERVICE !== 'false' &&
+      process.env.ENABLE_HEARTBEATS !== 'false' &&
+      process.env.ENABLE_REMINDERS !== 'false';
+    const forceRun = req.query.force === 'true';
+
+    if (!heartbeatEnabled && !forceRun) {
+      res.status(503).json({
+        error:
+          'Heartbeat processing is disabled on this server. Set ENABLE_HEARTBEAT_SERVICE=true or call with ?force=true for a manual run.',
+      });
+      return;
+    }
+
     // Import dynamically to avoid circular dependencies
     const { processHeartbeat } = await import('../services/heartbeat.js');
     const stats = await processHeartbeat();
@@ -1298,6 +1384,579 @@ router.post('/heartbeat', async (_req: Request, res: Response) => {
   } catch (error) {
     logger.error('Heartbeat processing failed:', error);
     res.status(500).json({ error: 'Heartbeat processing failed' });
+  }
+});
+
+// =============================================================================
+// Routing
+// =============================================================================
+
+/**
+ * GET /api/admin/routing
+ * List channel_routes for the active workspace + route health summary.
+ */
+router.get('/routing', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { data: routesData, error: routesError } = await supabase
+      .from('channel_routes')
+      .select(
+        `
+        id,
+        user_id,
+        identity_id,
+        platform,
+        platform_account_id,
+        chat_id,
+        is_active,
+        metadata,
+        created_at,
+        updated_at,
+        agent_identities!inner (
+          id,
+          agent_id,
+          name,
+          role,
+          backend,
+          workspace_id
+        )
+      `
+      )
+      .eq('user_id', authReq.pcpUserId)
+      .eq('agent_identities.workspace_id', authReq.pcpWorkspaceId)
+      .order('updated_at', { ascending: false });
+
+    if (routesError) {
+      logger.error('Failed to list channel routes:', routesError);
+      res.status(500).json({ error: 'Failed to list channel routes' });
+      return;
+    }
+
+    const routeRows = (routesData || []) as unknown as ChannelRouteRow[];
+
+    const { data: identitiesData, error: identitiesError } = await supabase
+      .from('agent_identities')
+      .select('id, agent_id, name, role, backend')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .order('agent_id', { ascending: true });
+
+    if (identitiesError) {
+      logger.error('Failed to list identities for routing:', identitiesError);
+      res.status(500).json({ error: 'Failed to list identities' });
+      return;
+    }
+
+    const identityIds = (identitiesData || []).map((identity) => identity.id);
+    const reminderCountByIdentity = new Map<string, number>();
+    const nextReminderByIdentity = new Map<string, string | null>();
+
+    if (identityIds.length > 0) {
+      const { data: remindersData, error: remindersError } = await supabase
+        .from('scheduled_reminders')
+        .select('identity_id, next_run_at, status')
+        .eq('user_id', authReq.pcpUserId)
+        .in('identity_id', identityIds)
+        .in('status', ['active', 'paused']);
+
+      if (remindersError) {
+        logger.error('Failed to summarize reminders for routing:', remindersError);
+      } else {
+        for (const reminder of remindersData || []) {
+          if (!reminder.identity_id) continue;
+          const currentCount = reminderCountByIdentity.get(reminder.identity_id) || 0;
+          reminderCountByIdentity.set(reminder.identity_id, currentCount + 1);
+
+          const nextExisting = nextReminderByIdentity.get(reminder.identity_id);
+          if (!reminder.next_run_at) continue;
+          if (!nextExisting || new Date(reminder.next_run_at) < new Date(nextExisting)) {
+            nextReminderByIdentity.set(reminder.identity_id, reminder.next_run_at);
+          }
+        }
+      }
+    }
+
+    const { count: unassignedReminderCount, error: unassignedReminderError } = await supabase
+      .from('scheduled_reminders')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', authReq.pcpUserId)
+      .is('identity_id', null)
+      .in('status', ['active', 'paused']);
+
+    if (unassignedReminderError) {
+      logger.error('Failed to count unassigned reminders for routing:', unassignedReminderError);
+    }
+
+    const routes = routeRows.map((route) =>
+      toRoutingRoute(route, reminderCountByIdentity, nextReminderByIdentity)
+    );
+
+    const heartbeatProcessingEnabled =
+      process.env.ENABLE_HEARTBEAT_SERVICE !== 'false' &&
+      process.env.ENABLE_HEARTBEATS !== 'false' &&
+      process.env.ENABLE_REMINDERS !== 'false';
+
+    const uniqueAgents = new Set(routes.map((route) => route.agentId).filter(Boolean));
+    const uniquePlatforms = new Set(routes.map((route) => route.platform));
+
+    res.json({
+      heartbeatProcessingEnabled,
+      summary: {
+        totalRoutes: routes.length,
+        activeRoutes: routes.filter((route) => route.isActive).length,
+        agentsWithRoutes: uniqueAgents.size,
+        platformsCovered: uniquePlatforms.size,
+        unassignedReminderCount: unassignedReminderCount || 0,
+      },
+      identities: (identitiesData || []).map((identity) => ({
+        id: identity.id,
+        agentId: identity.agent_id,
+        name: identity.name,
+        role: identity.role,
+        backend: identity.backend,
+      })),
+      routes,
+    });
+  } catch (error) {
+    logger.error('Failed to list routing data:', error);
+    res.status(500).json({ error: 'Failed to list routing data' });
+  }
+});
+
+/**
+ * GET /api/admin/routing/agents/:agentId
+ * Get routing detail for a specific SB.
+ */
+router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
+  try {
+    const { agentId } = req.params;
+    const authReq = req as AdminAuthRequest;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { data: identity, error: identityError } = await supabase
+      .from('agent_identities')
+      .select('id, agent_id, name, role, description, backend, workspace_id, updated_at')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .eq('agent_id', agentId)
+      .single();
+
+    if (identityError || !identity) {
+      res.status(404).json({ error: 'Agent not found for this workspace' });
+      return;
+    }
+
+    const { data: routesData, error: routesError } = await supabase
+      .from('channel_routes')
+      .select(
+        `
+        id,
+        user_id,
+        identity_id,
+        platform,
+        platform_account_id,
+        chat_id,
+        is_active,
+        metadata,
+        created_at,
+        updated_at,
+        agent_identities!inner (
+          id,
+          agent_id,
+          name,
+          role,
+          backend,
+          workspace_id
+        )
+      `
+      )
+      .eq('user_id', authReq.pcpUserId)
+      .eq('identity_id', identity.id)
+      .eq('agent_identities.workspace_id', authReq.pcpWorkspaceId)
+      .order('updated_at', { ascending: false });
+
+    if (routesError) {
+      logger.error('Failed to list routes for agent:', routesError);
+      res.status(500).json({ error: 'Failed to list routes for agent' });
+      return;
+    }
+
+    const { data: remindersData, error: remindersError } = await supabase
+      .from('scheduled_reminders')
+      .select(
+        `
+        id,
+        title,
+        description,
+        delivery_channel,
+        delivery_target,
+        cron_expression,
+        next_run_at,
+        last_run_at,
+        status,
+        run_count,
+        max_runs,
+        identity_id
+      `
+      )
+      .eq('user_id', authReq.pcpUserId)
+      .eq('identity_id', identity.id)
+      .order('next_run_at', { ascending: true })
+      .limit(100);
+
+    if (remindersError) {
+      logger.error('Failed to list reminders for route detail:', remindersError);
+      res.status(500).json({ error: 'Failed to list reminders for route detail' });
+      return;
+    }
+
+    const reminderCountByIdentity = new Map<string, number>();
+    const nextReminderByIdentity = new Map<string, string | null>();
+    if ((remindersData || []).length > 0) {
+      reminderCountByIdentity.set(identity.id, remindersData?.length || 0);
+      const nextReminder = (remindersData || [])
+        .map((reminder) => reminder.next_run_at)
+        .find((nextRunAt) => nextRunAt != null);
+      nextReminderByIdentity.set(identity.id, nextReminder || null);
+    }
+
+    const routeRows = (routesData || []) as unknown as ChannelRouteRow[];
+    const routes = routeRows.map((route) =>
+      toRoutingRoute(route, reminderCountByIdentity, nextReminderByIdentity)
+    );
+
+    const heartbeatProcessingEnabled =
+      process.env.ENABLE_HEARTBEAT_SERVICE !== 'false' &&
+      process.env.ENABLE_HEARTBEATS !== 'false' &&
+      process.env.ENABLE_REMINDERS !== 'false';
+
+    res.json({
+      heartbeatProcessingEnabled,
+      agent: {
+        id: identity.id,
+        agentId: identity.agent_id,
+        name: identity.name,
+        role: identity.role,
+        description: identity.description,
+        backend: identity.backend,
+        updatedAt: identity.updated_at,
+      },
+      routes,
+      reminders: (remindersData || []).map((reminder) => ({
+        id: reminder.id,
+        title: reminder.title,
+        description: reminder.description,
+        deliveryChannel: reminder.delivery_channel,
+        deliveryTarget: reminder.delivery_target,
+        cronExpression: reminder.cron_expression,
+        nextRunAt: reminder.next_run_at,
+        lastRunAt: reminder.last_run_at,
+        status: reminder.status,
+        runCount: reminder.run_count,
+        maxRuns: reminder.max_runs,
+        identityId: reminder.identity_id,
+      })),
+    });
+  } catch (error) {
+    logger.error('Failed to load routing agent detail:', error);
+    res.status(500).json({ error: 'Failed to load routing agent detail' });
+  }
+});
+
+/**
+ * POST /api/admin/routing/routes
+ * Create a channel route.
+ */
+router.post('/routing/routes', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const body = (req.body || {}) as Record<string, unknown>;
+
+    const identityId = normalizeNullableText(body.identityId);
+    const platform = normalizeNullableText(body.platform)?.toLowerCase();
+    const platformAccountId = normalizeNullableText(body.platformAccountId);
+    const chatId = normalizeNullableText(body.chatId);
+    const isActive = typeof body.isActive === 'boolean' ? body.isActive : true;
+    const metadata = parseRouteMetadata(body.metadata);
+
+    if (!identityId || !platform) {
+      res.status(400).json({ error: 'identityId and platform are required' });
+      return;
+    }
+
+    const { data: identity, error: identityError } = await supabase
+      .from('agent_identities')
+      .select('id')
+      .eq('id', identityId)
+      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .single();
+
+    if (identityError || !identity) {
+      res.status(400).json({ error: 'identityId must belong to an agent in the active workspace' });
+      return;
+    }
+
+    const { data: inserted, error: insertError } = await supabase
+      .from('channel_routes')
+      .insert({
+        user_id: authReq.pcpUserId,
+        identity_id: identityId,
+        platform,
+        platform_account_id: platformAccountId,
+        chat_id: chatId,
+        is_active: isActive,
+        metadata,
+      })
+      .select(
+        `
+        id,
+        user_id,
+        identity_id,
+        platform,
+        platform_account_id,
+        chat_id,
+        is_active,
+        metadata,
+        created_at,
+        updated_at,
+        agent_identities!inner (
+          id,
+          agent_id,
+          name,
+          role,
+          backend,
+          workspace_id
+        )
+      `
+      )
+      .single();
+
+    if (insertError) {
+      if (insertError.code === '23505') {
+        res.status(409).json({
+          error:
+            'A route already exists for this platform/account/chat scope. Edit that route instead.',
+        });
+        return;
+      }
+
+      logger.error('Failed to create channel route:', insertError);
+      res.status(500).json({ error: 'Failed to create channel route' });
+      return;
+    }
+
+    const insertedRoute = inserted as unknown as ChannelRouteRow;
+    res.status(201).json({
+      route: toRoutingRoute(insertedRoute, new Map(), new Map()),
+    });
+  } catch (error) {
+    logger.error('Failed to create channel route:', error);
+    res.status(500).json({ error: 'Failed to create channel route' });
+  }
+});
+
+/**
+ * PATCH /api/admin/routing/routes/:routeId
+ * Update a channel route.
+ */
+router.patch('/routing/routes/:routeId', async (req: Request, res: Response) => {
+  try {
+    const { routeId } = req.params;
+    const authReq = req as AdminAuthRequest;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { data: existing, error: existingError } = await supabase
+      .from('channel_routes')
+      .select(
+        `
+        id,
+        identity_id,
+        agent_identities!inner ( workspace_id )
+      `
+      )
+      .eq('id', routeId)
+      .eq('user_id', authReq.pcpUserId)
+      .eq('agent_identities.workspace_id', authReq.pcpWorkspaceId)
+      .single();
+
+    if (existingError || !existing) {
+      res.status(404).json({ error: 'Route not found in the active workspace' });
+      return;
+    }
+
+    const body = (req.body || {}) as Record<string, unknown>;
+    const updates: Record<string, unknown> = {};
+
+    if ('identityId' in body) {
+      const identityId = normalizeNullableText(body.identityId);
+      if (!identityId) {
+        res.status(400).json({ error: 'identityId cannot be empty' });
+        return;
+      }
+
+      const { data: identity, error: identityError } = await supabase
+        .from('agent_identities')
+        .select('id')
+        .eq('id', identityId)
+        .eq('user_id', authReq.pcpUserId)
+        .eq('workspace_id', authReq.pcpWorkspaceId)
+        .single();
+
+      if (identityError || !identity) {
+        res
+          .status(400)
+          .json({ error: 'identityId must belong to an agent in the active workspace' });
+        return;
+      }
+
+      updates.identity_id = identityId;
+    }
+
+    if ('platform' in body) {
+      const platform = normalizeNullableText(body.platform)?.toLowerCase();
+      if (!platform) {
+        res.status(400).json({ error: 'platform cannot be empty' });
+        return;
+      }
+      updates.platform = platform;
+    }
+
+    if ('platformAccountId' in body) {
+      updates.platform_account_id = normalizeNullableText(body.platformAccountId);
+    }
+
+    if ('chatId' in body) {
+      updates.chat_id = normalizeNullableText(body.chatId);
+    }
+
+    if ('isActive' in body) {
+      if (typeof body.isActive !== 'boolean') {
+        res.status(400).json({ error: 'isActive must be a boolean' });
+        return;
+      }
+      updates.is_active = body.isActive;
+    }
+
+    if ('metadata' in body) {
+      updates.metadata = parseRouteMetadata(body.metadata);
+    }
+
+    if (Object.keys(updates).length === 0) {
+      res.status(400).json({ error: 'No valid fields provided for update' });
+      return;
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('channel_routes')
+      .update(updates)
+      .eq('id', routeId)
+      .eq('user_id', authReq.pcpUserId)
+      .select(
+        `
+        id,
+        user_id,
+        identity_id,
+        platform,
+        platform_account_id,
+        chat_id,
+        is_active,
+        metadata,
+        created_at,
+        updated_at,
+        agent_identities!inner (
+          id,
+          agent_id,
+          name,
+          role,
+          backend,
+          workspace_id
+        )
+      `
+      )
+      .single();
+
+    if (updateError) {
+      if (updateError.code === '23505') {
+        res.status(409).json({
+          error:
+            'A route already exists for this platform/account/chat scope. Edit that route instead.',
+        });
+        return;
+      }
+
+      logger.error('Failed to update channel route:', updateError);
+      res.status(500).json({ error: 'Failed to update channel route' });
+      return;
+    }
+
+    const updatedRoute = updated as unknown as ChannelRouteRow;
+    res.json({
+      route: toRoutingRoute(updatedRoute, new Map(), new Map()),
+    });
+  } catch (error) {
+    logger.error('Failed to update channel route:', error);
+    res.status(500).json({ error: 'Failed to update channel route' });
+  }
+});
+
+/**
+ * DELETE /api/admin/routing/routes/:routeId
+ * Delete a channel route.
+ */
+router.delete('/routing/routes/:routeId', async (req: Request, res: Response) => {
+  try {
+    const { routeId } = req.params;
+    const authReq = req as AdminAuthRequest;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { data: existing, error: existingError } = await supabase
+      .from('channel_routes')
+      .select(
+        `
+        id,
+        agent_identities!inner ( workspace_id )
+      `
+      )
+      .eq('id', routeId)
+      .eq('user_id', authReq.pcpUserId)
+      .eq('agent_identities.workspace_id', authReq.pcpWorkspaceId)
+      .single();
+
+    if (existingError || !existing) {
+      res.status(404).json({ error: 'Route not found in the active workspace' });
+      return;
+    }
+
+    const { error: deleteError } = await supabase
+      .from('channel_routes')
+      .delete()
+      .eq('id', routeId)
+      .eq('user_id', authReq.pcpUserId);
+
+    if (deleteError) {
+      logger.error('Failed to delete channel route:', deleteError);
+      res.status(500).json({ error: 'Failed to delete channel route' });
+      return;
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    logger.error('Failed to delete channel route:', error);
+    res.status(500).json({ error: 'Failed to delete channel route' });
   }
 });
 
@@ -1326,12 +1985,14 @@ router.get('/reminders', async (req: Request, res: Response) => {
       reminders: (data || []).map((r) => ({
         id: r.id,
         userId: r.user_id,
+        identityId: r.identity_id,
         title: r.title,
         description: r.description,
         cronExpression: r.cron_expression,
         nextRunAt: r.next_run_at,
         lastRunAt: r.last_run_at,
         deliveryChannel: r.delivery_channel,
+        deliveryTarget: r.delivery_target,
         status: r.status,
         runCount: r.run_count,
         maxRuns: r.max_runs,

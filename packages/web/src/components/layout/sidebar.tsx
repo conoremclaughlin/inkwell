@@ -21,6 +21,7 @@ import {
   Check,
   Settings,
   Activity,
+  Route,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useRouter } from 'next/navigation';
@@ -49,6 +50,7 @@ const navigation = [
   { name: 'Individuals', href: '/individuals', icon: Bot },
   { name: 'Artifacts', href: '/artifacts', icon: FileText },
   { name: 'Reminders', href: '/reminders', icon: Bell },
+  { name: 'Routing', href: '/routing', icon: Route },
   { name: 'Connections', href: '/connected-accounts', icon: Link2 },
   { name: 'Skills', href: '/skills', icon: Puzzle },
 ];
