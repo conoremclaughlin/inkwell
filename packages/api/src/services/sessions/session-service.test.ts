@@ -465,7 +465,7 @@ describe('SessionService', () => {
       expect(mockRepository.create).toHaveBeenCalledWith(
         expect.objectContaining({
           backend: 'claude-code',
-          model: 'sonnet',
+          model: null, // model is deferred — set when runner reports it, not at creation
           messageCount: 0,
           tokenCount: 0,
         })
