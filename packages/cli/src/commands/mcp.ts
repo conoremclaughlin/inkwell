@@ -10,7 +10,8 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { join } from 'path';
+import { execSync } from 'child_process';
+import { join, relative, resolve as resolvePath } from 'path';
 
 // ============================================================================
 // Types
@@ -28,6 +29,12 @@ interface McpServerConfig {
 
 interface McpJson {
   mcpServers: Record<string, McpServerConfig>;
+}
+
+interface SyncSource {
+  mcpPath: string;
+  envPath?: string;
+  from: 'local' | 'main';
 }
 
 const CODEX_MANAGED_START = '# pcp-managed:start mcp_servers';
@@ -367,12 +374,72 @@ function ensureGitignoreEntries(repoRoot: string, entries: string[]): string[] {
 // Commands
 // ============================================================================
 
+function resolveCanonicalRepoRoot(gitRoot: string): string {
+  const gitFile = join(gitRoot, '.git');
+  if (!existsSync(gitFile)) return gitRoot;
+
+  try {
+    const stat = readFileSync(gitFile, 'utf-8');
+    const match = stat.match(/^gitdir:\s*(.+)\s*$/m);
+    if (!match) return gitRoot;
+
+    const gitDirPath = resolvePath(gitRoot, match[1]);
+    const marker = `${join('.git', 'worktrees')}`;
+    const idx = gitDirPath.lastIndexOf(marker);
+    if (idx === -1) return gitRoot;
+
+    // /path/to/repo/.git/worktrees/name -> /path/to/repo
+    return resolvePath(gitDirPath.slice(0, idx));
+  } catch {
+    return gitRoot;
+  }
+}
+
+function resolveSyncSource(targetDir: string): SyncSource | null {
+  const localMcp = join(targetDir, '.mcp.json');
+  if (existsSync(localMcp)) {
+    return {
+      mcpPath: localMcp,
+      ...(existsSync(join(targetDir, '.env.local')) ? { envPath: join(targetDir, '.env.local') } : {}),
+      from: 'local',
+    };
+  }
+
+  try {
+    const gitRoot = execSync('git rev-parse --show-toplevel', {
+      cwd: targetDir,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    const canonicalRoot = resolveCanonicalRepoRoot(gitRoot);
+    if (canonicalRoot !== targetDir) {
+      const mainMcp = join(canonicalRoot, '.mcp.json');
+      if (existsSync(mainMcp)) {
+        return {
+          mcpPath: mainMcp,
+          ...(existsSync(join(canonicalRoot, '.env.local'))
+            ? { envPath: join(canonicalRoot, '.env.local') }
+            : {}),
+          from: 'main',
+        };
+      }
+    }
+  } catch {
+    // Not in a git repo or git unavailable — no fallback
+  }
+
+  return null;
+}
+
 /**
  * Core sync logic: read .mcp.json from targetDir and write .codex/ and .gemini/ configs.
  * Exported for use by workspace create.
  */
-export function syncMcpConfig(targetDir: string): { codex: boolean; gemini: boolean } {
-  const mcpPath = join(targetDir, '.mcp.json');
+export function syncMcpConfig(
+  targetDir: string,
+  options?: { sourceMcpPath?: string; sourceEnvPath?: string }
+): { codex: boolean; gemini: boolean } {
+  const mcpPath = options?.sourceMcpPath || join(targetDir, '.mcp.json');
 
   if (!existsSync(mcpPath)) {
     return { codex: false, gemini: false };
@@ -390,7 +457,9 @@ export function syncMcpConfig(targetDir: string): { codex: boolean; gemini: bool
   }
 
   // --- Resolve env vars from .env.local ---
-  const envLocal = parseEnvFile(join(targetDir, '.env.local'));
+  const sourceEnv = options?.sourceEnvPath ? parseEnvFile(options.sourceEnvPath) : {};
+  const targetEnv = parseEnvFile(join(targetDir, '.env.local'));
+  const envLocal = { ...sourceEnv, ...targetEnv };
   const servers = injectEnvLocal(mcpJson.mcpServers, envLocal);
 
   // --- Codex: .codex/config.toml ---
@@ -426,18 +495,19 @@ export function syncMcpConfig(targetDir: string): { codex: boolean; gemini: bool
 
 async function syncCommand(): Promise<void> {
   const cwd = process.cwd();
-  const mcpPath = join(cwd, '.mcp.json');
+  const source = resolveSyncSource(cwd);
 
-  if (!existsSync(mcpPath)) {
+  if (!source) {
     console.error(chalk.red('No .mcp.json found in current directory'));
+    console.error(chalk.dim('Tip: new studios copy .mcp.json/.env.local from main by default.'));
     process.exit(1);
   }
 
   let mcpJson: McpJson;
   try {
-    mcpJson = JSON.parse(readFileSync(mcpPath, 'utf-8'));
+    mcpJson = JSON.parse(readFileSync(source.mcpPath, 'utf-8'));
   } catch (err) {
-    console.error(chalk.red(`Failed to parse .mcp.json: ${err}`));
+    console.error(chalk.red(`Failed to parse .mcp.json (${source.mcpPath}): ${err}`));
     process.exit(1);
   }
 
@@ -449,9 +519,44 @@ async function syncCommand(): Promise<void> {
   const serverCount = Object.keys(mcpJson.mcpServers).length;
   const envLocalPath = join(cwd, '.env.local');
   const hasEnvLocal = existsSync(envLocalPath);
-  console.log(chalk.dim(`Found ${serverCount} server(s) in .mcp.json${hasEnvLocal ? ' + .env.local' : ''}\n`));
+  const sourceEnvExists = !!(source.envPath && existsSync(source.envPath));
+  const sourcePathRelative = relative(cwd, source.mcpPath);
+  const sourcePathDisplay =
+    sourcePathRelative === '' ? '.mcp.json' : sourcePathRelative.startsWith('.') ? sourcePathRelative : `./${sourcePathRelative}`;
 
-  const result = syncMcpConfig(cwd);
+  if (source.from === 'main') {
+    console.log(chalk.yellow('Warning: local .mcp.json is missing in this studio.'));
+    console.log(chalk.dim(`  Falling back to root main: ${sourcePathDisplay}`));
+    if (!hasEnvLocal && sourceEnvExists) {
+      console.log(chalk.dim('  Also using root main .env.local for referenced ${VAR} values.'));
+    }
+    console.log(chalk.dim('  If this is not preferred:'));
+    console.log(chalk.dim('    1) Add .mcp.json/.env.local to this studio, then rerun `sb config sync`'));
+    console.log(
+      chalk.dim(
+        '    2) Or create a new studio from a specific source: `sb studio create <slug> --copy-from <studio-path>`'
+      )
+    );
+    console.log('');
+  }
+
+  const sourceLabel =
+    source.from === 'local'
+      ? '.mcp.json'
+      : `${sourcePathDisplay} ${chalk.dim('(fallback from root main worktree)')}`;
+
+  console.log(
+    chalk.dim(
+      `Found ${serverCount} server(s) in ${sourceLabel}${
+        hasEnvLocal ? ' + .env.local' : sourceEnvExists ? ' + main .env.local' : ''
+      }\n`
+    )
+  );
+
+  const result = syncMcpConfig(cwd, {
+    sourceMcpPath: source.mcpPath,
+    ...(source.envPath ? { sourceEnvPath: source.envPath } : {}),
+  });
 
   if (result.codex) {
     console.log(chalk.green('  wrote'), chalk.cyan('.codex/config.toml'));
@@ -460,8 +565,11 @@ async function syncCommand(): Promise<void> {
     console.log(chalk.green('  wrote'), chalk.cyan('.gemini/settings.json'));
   }
 
-  if (hasEnvLocal) {
-    const envVars = parseEnvFile(envLocalPath);
+  if (hasEnvLocal || sourceEnvExists) {
+    const envVars = {
+      ...(source.envPath ? parseEnvFile(source.envPath) : {}),
+      ...parseEnvFile(envLocalPath),
+    };
     const allRefs = new Set<string>();
     for (const config of Object.values(mcpJson.mcpServers)) {
       for (const v of findTemplateVars(config)) allRefs.add(v);

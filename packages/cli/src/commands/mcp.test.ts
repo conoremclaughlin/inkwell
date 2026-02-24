@@ -340,6 +340,37 @@ describe('syncMcpConfig', () => {
     expect(settings.mcpServers.github.env).toBeUndefined();
   });
 
+  it('should support syncing from external source .mcp.json and .env.local', () => {
+    const sourceDir = join(TEST_DIR, 'source');
+    const targetDir = join(TEST_DIR, 'target');
+    mkdirSync(sourceDir, { recursive: true });
+    mkdirSync(targetDir, { recursive: true });
+
+    writeFileSync(
+      join(sourceDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          github: {
+            url: 'https://api.githubcopilot.com/mcp/',
+            headers: { Authorization: 'Bearer ${GITHUB_TOKEN}' },
+          },
+        },
+      })
+    );
+    writeFileSync(join(sourceDir, '.env.local'), 'GITHUB_TOKEN=source-token\n');
+
+    const result = syncMcpConfig(targetDir, {
+      sourceMcpPath: join(sourceDir, '.mcp.json'),
+      sourceEnvPath: join(sourceDir, '.env.local'),
+    });
+    expect(result.codex).toBe(true);
+    expect(result.gemini).toBe(true);
+
+    const toml = readFileSync(join(targetDir, '.codex', 'config.toml'), 'utf-8');
+    expect(toml).toContain('bearer_token_env_var = "GITHUB_TOKEN"');
+    expect(toml).toContain('"GITHUB_TOKEN" = "source-token"');
+  });
+
   it('should preserve existing hooks while replacing managed MCP block', () => {
     mkdirSync(join(TEST_DIR, '.codex'), { recursive: true });
     writeFileSync(
