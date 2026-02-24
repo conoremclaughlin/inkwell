@@ -668,14 +668,21 @@ async function renameStudio(from: string, to: string): Promise<void> {
     spinner.text = 'Updating studio identity metadata...';
     const updatedIdentity = updateIdentityForStudioRename(toPath, from, to);
 
+    // Intentionally keep existing branch name unchanged.
+    // Studio names are path/identity labels; branch naming is an independent concern.
+    const branch = git('branch --show-current', toPath);
+
     spinner.succeed(`Studio renamed: ${from} → ${to}`);
     console.log('');
     console.log(chalk.dim('  Path:   ') + toPath);
+    console.log(chalk.dim('  Branch: ') + branch + chalk.dim(' (unchanged)'));
     if (updatedIdentity) {
       console.log(chalk.dim('  Identity updated: ') + chalk.green('.pcp/identity.json'));
     }
   } catch (error) {
-    spinner.fail(`Failed to rename studio: ${error}`);
+    spinner.fail(
+      `Failed to rename studio: ${error instanceof Error ? error.message : String(error)}`
+    );
     process.exit(1);
   }
 }
