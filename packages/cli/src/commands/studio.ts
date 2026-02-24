@@ -28,7 +28,14 @@ import {
   cpSync,
   statSync,
 } from 'fs';
-import { join, dirname, basename, parse as parsePath, resolve as resolvePath } from 'path';
+import {
+  join,
+  dirname,
+  basename,
+  parse as parsePath,
+  resolve as resolvePath,
+  delimiter as pathDelimiter,
+} from 'path';
 import { homedir } from 'os';
 import { installHooks } from './hooks.js';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
@@ -967,6 +974,19 @@ async function cliLinkCommand(options: { name?: string; unlink?: boolean }): Pro
 
     spinner.succeed(`Linked: ${primaryLinkPath} → ${cliJs}`);
     console.log(chalk.dim(`  Compatibility link: ${compatLinkPath} → ${primaryLinkPath}`));
+
+    const pathEntries = (process.env.PATH || '').split(pathDelimiter);
+    if (!pathEntries.includes(primaryBinDir) && !pathEntries.includes(compatBinDir)) {
+      console.log(
+        chalk.yellow(
+          `  PATH warning: neither ${primaryBinDir} nor ${compatBinDir} is currently in PATH`
+        )
+      );
+      console.log(
+        chalk.dim(`  Add one of them to your shell profile so '${name}' resolves in new shells.`)
+      );
+    }
+
     console.log('');
     console.log(chalk.dim(`  Test it: ${name} --help`));
     console.log(chalk.dim(`  Remove:  sb studio cli --unlink${options.name ? ` --name ${name}` : ''}`));

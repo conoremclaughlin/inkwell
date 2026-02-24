@@ -20,6 +20,7 @@ yarn workspace @personal-context/cli dev   # tsc --watch in another terminal
 
 `install:cli` links `sb` to `~/.pcp/bin/sb` and also creates a compatibility symlink at
 `~/.local/bin/sb`.
+If neither `~/.pcp/bin` nor `~/.local/bin` is in your `PATH`, the installer prints a warning.
 
 To remove: `yarn workspace @personal-context/cli uninstall:cli`
 
