@@ -5,7 +5,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { execSync } from 'child_process';
 import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync, renameSync } from 'fs';
-import { join, basename } from 'path';
+import { join, basename, delimiter as pathDelimiter } from 'path';
 import { tmpdir } from 'os';
 import {
   planInit,
@@ -13,6 +13,8 @@ import {
   getStudioPrefix,
   resolveCopySourceRoot,
   updateIdentityForStudioRename,
+  getCliLinkTargets,
+  shouldWarnMissingCliBinPath,
   type InitResult,
 } from './studio.js';
 
@@ -192,6 +194,35 @@ describe('Studio Commands', () => {
       const branches = git('branch', TEST_REPO);
       expect(branches).toContain(branchName);
     });
+  });
+});
+
+describe('CLI link path helpers', () => {
+  it('should resolve ~/.pcp/bin as primary and ~/.local/bin as compatibility path', () => {
+    const targets = getCliLinkTargets('/tmp/home', 'sb-lumen');
+    expect(targets.primaryBinDir).toBe('/tmp/home/.pcp/bin');
+    expect(targets.compatBinDir).toBe('/tmp/home/.local/bin');
+    expect(targets.primaryLinkPath).toBe('/tmp/home/.pcp/bin/sb-lumen');
+    expect(targets.compatLinkPath).toBe('/tmp/home/.local/bin/sb-lumen');
+  });
+
+  it('should not warn when PATH includes primary bin dir', () => {
+    const targets = getCliLinkTargets('/tmp/home', 'sb-lumen');
+    expect(
+      shouldWarnMissingCliBinPath(['/usr/bin', targets.primaryBinDir].join(pathDelimiter), targets)
+    ).toBe(false);
+  });
+
+  it('should not warn when PATH includes compatibility bin dir', () => {
+    const targets = getCliLinkTargets('/tmp/home', 'sb-lumen');
+    expect(
+      shouldWarnMissingCliBinPath(['/usr/bin', targets.compatBinDir].join(pathDelimiter), targets)
+    ).toBe(false);
+  });
+
+  it('should warn when PATH includes neither PCP nor compatibility bin dirs', () => {
+    const targets = getCliLinkTargets('/tmp/home', 'sb-lumen');
+    expect(shouldWarnMissingCliBinPath(['/usr/bin', '/bin'].join(pathDelimiter), targets)).toBe(true);
   });
 });
 

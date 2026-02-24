@@ -899,12 +899,33 @@ function resolveDefaultCliName(): string {
   return 'sb-dev';
 }
 
+type CliLinkTargets = {
+  primaryBinDir: string;
+  compatBinDir: string;
+  primaryLinkPath: string;
+  compatLinkPath: string;
+};
+
+function getCliLinkTargets(homeDir: string, name: string): CliLinkTargets {
+  const primaryBinDir = join(homeDir, '.pcp', 'bin');
+  const compatBinDir = join(homeDir, '.local', 'bin');
+  return {
+    primaryBinDir,
+    compatBinDir,
+    primaryLinkPath: join(primaryBinDir, name),
+    compatLinkPath: join(compatBinDir, name),
+  };
+}
+
+function shouldWarnMissingCliBinPath(pathValue: string | undefined, targets: CliLinkTargets): boolean {
+  const pathEntries = (pathValue || '').split(pathDelimiter);
+  return !pathEntries.includes(targets.primaryBinDir) && !pathEntries.includes(targets.compatBinDir);
+}
+
 async function cliLinkCommand(options: { name?: string; unlink?: boolean }): Promise<void> {
-  const primaryBinDir = join(homedir(), '.pcp', 'bin');
-  const compatBinDir = join(homedir(), '.local', 'bin');
   const name = options.name || resolveDefaultCliName();
-  const primaryLinkPath = join(primaryBinDir, name);
-  const compatLinkPath = join(compatBinDir, name);
+  const targets = getCliLinkTargets(homedir(), name);
+  const { primaryBinDir, compatBinDir, primaryLinkPath, compatLinkPath } = targets;
 
   if (options.unlink) {
     let removed = false;
@@ -975,8 +996,7 @@ async function cliLinkCommand(options: { name?: string; unlink?: boolean }): Pro
     spinner.succeed(`Linked: ${primaryLinkPath} → ${cliJs}`);
     console.log(chalk.dim(`  Compatibility link: ${compatLinkPath} → ${primaryLinkPath}`));
 
-    const pathEntries = (process.env.PATH || '').split(pathDelimiter);
-    if (!pathEntries.includes(primaryBinDir) && !pathEntries.includes(compatBinDir)) {
+    if (shouldWarnMissingCliBinPath(process.env.PATH, targets)) {
       console.log(
         chalk.yellow(
           `  PATH warning: neither ${primaryBinDir} nor ${compatBinDir} is currently in PATH`
@@ -1009,6 +1029,8 @@ export {
   getWorktreePaths,
   updateIdentityForStudioRename,
   resolveCopySourceRoot,
+  getCliLinkTargets,
+  shouldWarnMissingCliBinPath,
   planInit,
   git,
 };
