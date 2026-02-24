@@ -26,6 +26,7 @@ import {
   readdirSync,
   renameSync,
   cpSync,
+  statSync,
 } from 'fs';
 import { join, dirname, basename, parse as parsePath, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
@@ -86,7 +87,7 @@ function resolveCanonicalRepoRoot(gitRoot: string): string {
     if (idx === -1) return gitRoot;
 
     // /path/to/repo/.git/worktrees/name -> /path/to/repo
-    return gitDirPath.slice(0, idx);
+    return resolvePath(gitDirPath.slice(0, idx));
   } catch {
     return gitRoot;
   }
@@ -260,9 +261,9 @@ async function runInteractiveFlow(agentId: string, gitRoot: string): Promise<Int
  * - .codex/, .gemini/ — if .mcp.json exists in the target, regenerate via syncMcpConfig instead
  * - .pcp/identity.json is always freshly written (never copied)
  */
-function copyConfigDirs(gitRoot: string, wsPath: string, dirs: string[]): void {
+function copyConfigDirs(sourceRoot: string, wsPath: string, dirs: string[]): void {
   for (const dir of dirs) {
-    const source = join(gitRoot, dir);
+    const source = join(sourceRoot, dir);
     const target = join(wsPath, dir);
 
     if (!existsSync(source)) continue;
@@ -277,6 +278,47 @@ function copyConfigDirs(gitRoot: string, wsPath: string, dirs: string[]): void {
       cpSync(source, target, { recursive: true });
     }
   }
+}
+
+function resolveCopySourceRoot(gitRoot: string, copyFrom?: string): string {
+  const canonicalRoot = resolveCanonicalRepoRoot(gitRoot);
+  if (!copyFrom || copyFrom === 'main') {
+    return canonicalRoot;
+  }
+
+  const explicitPath = resolvePath(copyFrom);
+  if (existsSync(explicitPath)) {
+    if (!statSync(explicitPath).isDirectory()) {
+      throw new Error(`--copy-from must point to a directory: ${copyFrom}`);
+    }
+    return explicitPath;
+  }
+
+  const studioPath = getStudioPath(gitRoot, copyFrom);
+  if (existsSync(studioPath)) {
+    return studioPath;
+  }
+
+  throw new Error(`Copy source not found: ${copyFrom}`);
+}
+
+/**
+ * Copy .mcp.json and .env.local when missing in the new studio.
+ * These are local bootstrap files and should be present by default.
+ */
+function copyBootstrapFiles(sourceRoot: string, wsPath: string): string[] {
+  if (sourceRoot === wsPath) return [];
+
+  const copied: string[] = [];
+  for (const file of ['.mcp.json', '.env.local']) {
+    const source = join(sourceRoot, file);
+    const target = join(wsPath, file);
+    if (existsSync(source) && !existsSync(target)) {
+      cpSync(source, target);
+      copied.push(file);
+    }
+  }
+  return copied;
 }
 
 // ============================================================================
@@ -423,6 +465,7 @@ async function createStudio(
     backend?: string;
     copyConfig?: boolean;
     configDirs?: string;
+    copyFrom?: string;
   },
   overrides?: { branch?: string; configDirsList?: string[] }
 ): Promise<void> {
@@ -431,6 +474,7 @@ async function createStudio(
 
   try {
     const gitRoot = findGitRoot();
+    const copySourceRoot = resolveCopySourceRoot(gitRoot, options.copyFrom);
     const wsPath = getStudioPath(gitRoot, name);
     // Priority: overrides (from interactive) > options (from flags) > default
     const branch = overrides?.branch || options.branch || `${agentId}/studio/main`;
@@ -447,6 +491,9 @@ async function createStudio(
       git(`worktree add -b "${branch}" "${wsPath}"`, gitRoot);
     }
 
+    spinner.text = 'Copying bootstrap files...';
+    const copiedBootstrapFiles = copyBootstrapFiles(copySourceRoot, wsPath);
+
     // Determine which config dirs to copy
     const configDirsList =
       overrides?.configDirsList ??
@@ -454,7 +501,7 @@ async function createStudio(
 
     if (configDirsList.length > 0) {
       spinner.text = 'Copying config directories...';
-      copyConfigDirs(gitRoot, wsPath, configDirsList);
+      copyConfigDirs(copySourceRoot, wsPath, configDirsList);
     }
 
     // Regenerate .codex/.gemini via syncMcpConfig if .mcp.json exists in the new studio
@@ -508,6 +555,12 @@ async function createStudio(
     console.log(chalk.dim('  Agent:  ') + identity.agentId);
     if (configDirsList.length > 0) {
       console.log(chalk.dim('  Config: ') + configDirsList.join(', '));
+    }
+    if (copiedBootstrapFiles.length > 0) {
+      console.log(chalk.dim('  Files:  ') + copiedBootstrapFiles.join(', '));
+    }
+    if (options.copyFrom) {
+      console.log(chalk.dim('  Source: ') + copySourceRoot);
     }
     if (hooksResult === 'installed') {
       console.log(chalk.dim('  Hooks:  ') + `${hooksBackend.name} (installed)`);
@@ -814,6 +867,7 @@ export {
   getStudioPrefix,
   getStudioPath,
   getWorktreePaths,
+  resolveCopySourceRoot,
   planInit,
   git,
 };
@@ -842,13 +896,18 @@ export function registerStudioCommands(program: Command): void {
       'Comma-separated config dirs to copy (default: .claude)',
       '.claude'
     )
+    .option(
+      '--copy-from <source>',
+      'Copy bootstrap files (.mcp.json, .env.local) and config dirs from source studio/path (default: main worktree)'
+    )
     .action(async (name: string | undefined, options) => {
       if (!name && process.stdin.isTTY) {
         // Interactive mode: prompt for all values
         try {
           const gitRoot = findGitRoot();
+          const copySourceRoot = resolveCopySourceRoot(gitRoot, options.copyFrom);
           const agentId = options.agent || resolveAgentId() || 'sb';
-          const result = await runInteractiveFlow(agentId, gitRoot);
+          const result = await runInteractiveFlow(agentId, copySourceRoot);
           return createStudio(result.name, options, {
             branch: result.branch,
             configDirsList: result.configDirs,

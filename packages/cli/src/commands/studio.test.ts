@@ -7,7 +7,13 @@ import { execSync } from 'child_process';
 import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync, renameSync } from 'fs';
 import { join, basename } from 'path';
 import { tmpdir } from 'os';
-import { planInit, getWorktreePaths, getStudioPrefix, type InitResult } from './studio.js';
+import {
+  planInit,
+  getWorktreePaths,
+  getStudioPrefix,
+  resolveCopySourceRoot,
+  type InitResult,
+} from './studio.js';
 
 type Move = InitResult['moves'][number];
 
@@ -362,6 +368,50 @@ describe('Studio init', () => {
         expect(worktreeList).toContain(wm.to);
       }
     });
+  });
+});
+
+describe('resolveCopySourceRoot', () => {
+  beforeEach(() => {
+    mkdirSync(TEST_REPO, { recursive: true });
+    git('init', TEST_REPO);
+    git('config user.email "test@test.com"', TEST_REPO);
+    git('config user.name "Test User"', TEST_REPO);
+    writeFileSync(join(TEST_REPO, 'README.md'), '# Test Repo');
+    git('add .', TEST_REPO);
+    git('commit -m "Initial commit"', TEST_REPO);
+  });
+
+  afterEach(() => {
+    try {
+      rmSync(TEST_DIR, { recursive: true, force: true });
+    } catch {
+      // Ignore cleanup errors
+    }
+  });
+
+  it('returns canonical main repo by default, even when called from a worktree path', () => {
+    const mainRepo = git('rev-parse --show-toplevel', TEST_REPO);
+    const studioPath = join(mainRepo, '..', 'test-repo--alpha');
+    git(`worktree add -b wren/studio/alpha "${studioPath}"`, mainRepo);
+
+    expect(resolveCopySourceRoot(studioPath)).toBe(mainRepo);
+  });
+
+  it('supports --copy-from as a named studio', () => {
+    const mainRepo = git('rev-parse --show-toplevel', TEST_REPO);
+    const studioPath = join(mainRepo, '..', 'test-repo--alpha');
+    git(`worktree add -b wren/studio/alpha "${studioPath}"`, mainRepo);
+
+    expect(resolveCopySourceRoot(mainRepo, 'alpha')).toBe(studioPath);
+  });
+
+  it('supports --copy-from as an explicit path', () => {
+    const mainRepo = git('rev-parse --show-toplevel', TEST_REPO);
+    const customSource = join(mainRepo, '..', 'custom-source');
+    mkdirSync(customSource, { recursive: true });
+
+    expect(resolveCopySourceRoot(mainRepo, customSource)).toBe(customSource);
   });
 });
 

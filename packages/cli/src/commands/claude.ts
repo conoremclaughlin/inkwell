@@ -47,6 +47,19 @@ interface ListSessionsResult {
   sessions?: PcpSessionSummary[];
 }
 
+function isPromptCancelError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const maybe = err as { name?: string; message?: string };
+  const name = maybe.name || '';
+  const message = maybe.message || '';
+
+  return (
+    name === 'ExitPromptError' ||
+    name === 'AbortPromptError' ||
+    /force closed|ctrl\+c|sigint|cancell?ed|aborted/i.test(message)
+  );
+}
+
 function getPcpServerUrl(): string {
   return process.env.PCP_SERVER_URL || 'http://localhost:3001';
 }
@@ -195,7 +208,11 @@ async function ensurePcpSessionContext(
       } else {
         chosen = activeSessions.find((s) => s.id === selection);
       }
-    } catch {
+    } catch (err) {
+      if (isPromptCancelError(err)) {
+        console.log(chalk.yellow('\nSession selection canceled.'));
+        process.exit(130);
+      }
       // Prompt canceled or unavailable; fallback to start new.
     }
   }
