@@ -1,13 +1,15 @@
 /**
  * MCP Tool Handlers for Skills
  *
- * Enables Claude to discover and read mini-app skill instructions.
- * Following the clawdbot pattern: list available skills, read on-demand.
+ * Enables AI agents to discover and read skill instructions.
+ * Uses the SkillsService (4-tier cascade) for all skill types,
+ * plus the miniAppsRegistry for dynamic MCP tool registration.
  */
 
 import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
+import { getSkillsService } from '../../skills/service';
 
 // Type for loaded mini-app (matches loader.ts)
 interface LoadedMiniApp {
@@ -28,19 +30,20 @@ interface LoadedMiniApp {
 }
 
 // Registry of loaded mini-apps (set by server startup)
+// Used for dynamic MCP tool registration — separate from SkillsService browsing
 let miniAppsRegistry: Map<string, LoadedMiniApp> | null = null;
 
 /**
- * Register the loaded mini-apps for skill access
+ * Register the loaded mini-apps for dynamic tool access
  * Called by server.ts after loading mini-apps
  */
 export function setMiniAppsRegistry(miniApps: Map<string, LoadedMiniApp>): void {
   miniAppsRegistry = miniApps;
-  logger.info(`Skills registry initialized with ${miniApps.size} mini-apps`);
+  logger.info(`Mini-apps registry initialized with ${miniApps.size} mini-apps`);
 }
 
 /**
- * Get the mini-apps registry
+ * Get the mini-apps registry (for dynamic tool registration)
  */
 export function getMiniAppsRegistry(): Map<string, LoadedMiniApp> | null {
   return miniAppsRegistry;
@@ -66,34 +69,58 @@ function mcpResponse(data: object, isError = false): McpResponse {
 // LIST SKILLS
 // ============================================================================
 
-export const listSkillsSchema = z.object({});
+export const listSkillsSchema = z.object({
+  includeContent: z
+    .boolean()
+    .optional()
+    .describe('Include full skill content for guide-type skills (for session injection)'),
+});
 
 export async function handleListSkills(
-  _args: z.infer<typeof listSkillsSchema>,
+  args: z.infer<typeof listSkillsSchema>,
   _dataComposer: DataComposer
 ): Promise<McpResponse> {
   try {
-    if (!miniAppsRegistry || miniAppsRegistry.size === 0) {
+    const service = getSkillsService();
+    const { skills: allSkills } = service.listSkills();
+
+    if (allSkills.length === 0) {
       return mcpResponse({
         success: true,
         skills: [],
-        message: 'No mini-app skills loaded.',
+        message: 'No skills loaded.',
       });
     }
 
-    const skills = Array.from(miniAppsRegistry.entries()).map(([name, app]) => ({
-      name,
-      version: app.manifest.version,
-      description: app.manifest.description,
-      triggers: app.manifest.triggers.keywords,
-      functions: app.manifest.functions.map((f) => f.name),
-      hasSkillDoc: app.skillContent.length > 0,
-    }));
+    const skills = allSkills.map((s) => {
+      const base: Record<string, unknown> = {
+        name: s.name,
+        displayName: s.displayName,
+        type: s.type,
+        version: s.version,
+        description: s.description,
+        status: s.status,
+        triggers: s.triggers,
+        functionCount: s.functionCount,
+        capabilities: s.capabilities,
+      };
+
+      // Include full content for guides when requested (for hook injection)
+      if (args.includeContent && s.type === 'guide' && s.eligibility?.eligible !== false) {
+        const detail = service.getSkill(s.name);
+        if (detail?.skillContent) {
+          base.content = detail.skillContent;
+        }
+      }
+
+      return base;
+    });
 
     return mcpResponse({
       success: true,
       skills,
-      usage: 'When a user message matches a trigger, call get_skill to read the full instructions.',
+      usage:
+        'Call get_skill with a skill name for full instructions. Guide skills are behavioral — follow their instructions when active.',
     });
   } catch (error) {
     logger.error('Error in list_skills:', error);
@@ -112,7 +139,7 @@ export async function handleListSkills(
 // ============================================================================
 
 export const getSkillSchema = z.object({
-  skillName: z.string().describe('Name of the skill/mini-app to get instructions for'),
+  skillName: z.string().describe('Name of the skill to get instructions for'),
 });
 
 export async function handleGetSkill(
@@ -120,28 +147,25 @@ export async function handleGetSkill(
   _dataComposer: DataComposer
 ): Promise<McpResponse> {
   try {
-    if (!miniAppsRegistry) {
-      return mcpResponse(
-        {
-          success: false,
-          error: 'Skills registry not initialized.',
-        },
-        true
-      );
-    }
+    const service = getSkillsService();
+    const detail = service.getSkill(args.skillName);
 
-    const app = miniAppsRegistry.get(args.skillName);
-    if (!app) {
+    if (!detail) {
       // Try case-insensitive match
-      for (const [name, miniApp] of miniAppsRegistry) {
-        if (name.toLowerCase() === args.skillName.toLowerCase()) {
+      const { skills: allSkills } = service.listSkills();
+      const match = allSkills.find((s) => s.name.toLowerCase() === args.skillName.toLowerCase());
+      if (match) {
+        const matchDetail = service.getSkill(match.name);
+        if (matchDetail) {
           return mcpResponse({
             success: true,
-            skillName: name,
-            version: miniApp.manifest.version,
-            description: miniApp.manifest.description,
-            content: miniApp.skillContent || 'No skill documentation available.',
-            functions: miniApp.manifest.functions,
+            skillName: match.name,
+            type: matchDetail.manifest.type,
+            version: matchDetail.manifest.version,
+            description: matchDetail.manifest.description,
+            content: matchDetail.skillContent || 'No skill documentation available.',
+            functions: matchDetail.manifest.functions,
+            triggers: matchDetail.manifest.triggers,
           });
         }
       }
@@ -150,7 +174,7 @@ export async function handleGetSkill(
         {
           success: false,
           error: `Skill "${args.skillName}" not found.`,
-          availableSkills: Array.from(miniAppsRegistry.keys()),
+          availableSkills: allSkills.map((s) => s.name),
         },
         true
       );
@@ -161,10 +185,12 @@ export async function handleGetSkill(
     return mcpResponse({
       success: true,
       skillName: args.skillName,
-      version: app.manifest.version,
-      description: app.manifest.description,
-      content: app.skillContent || 'No skill documentation available.',
-      functions: app.manifest.functions,
+      type: detail.manifest.type,
+      version: detail.manifest.version,
+      description: detail.manifest.description,
+      content: detail.skillContent || 'No skill documentation available.',
+      functions: detail.manifest.functions,
+      triggers: detail.manifest.triggers,
     });
   } catch (error) {
     logger.error('Error in get_skill:', error);

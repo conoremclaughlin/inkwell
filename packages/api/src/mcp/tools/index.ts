@@ -1850,14 +1850,19 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'list_skills',
     {
-      description: `List all available mini-app skills. Each skill provides specialized capabilities (like bill splitting, expense tracking, etc.).
+      description: `List all available skills (guides, mini-apps, CLI tools). Each skill provides specialized capabilities.
 
-When a user's message matches a skill's triggers, use get_skill to read the full instructions before proceeding.`,
-      inputSchema: {},
+When a user's message matches a skill's triggers, use get_skill to read the full instructions before proceeding. Guide-type skills are behavioral instructions that should be followed when active.`,
+      inputSchema: {
+        includeContent: z
+          .boolean()
+          .optional()
+          .describe('Include full content for guide-type skills (for session injection)'),
+      },
     },
-    async () => {
+    async (args) => {
       try {
-        return await handleListSkills({}, dataComposer);
+        return await handleListSkills(args as Parameters<typeof handleListSkills>[0], dataComposer);
       } catch (error) {
         logger.error('Error in list_skills:', error);
         return {
@@ -1880,15 +1885,15 @@ When a user's message matches a skill's triggers, use get_skill to read the full
   server.registerTool(
     'get_skill',
     {
-      description: `Get the full skill documentation (SKILL.md) for a mini-app. Read this before using a skill's functions.
+      description: `Get the full skill documentation (SKILL.md) for a skill. Read this before using a skill's functions or following a guide.
 
 The skill document contains:
-- Conversation flow guidelines
+- Behavioral instructions (guides)
+- Conversation flow guidelines (mini-apps)
 - How to use the skill's functions correctly
-- Edge case handling
-- Formatting instructions`,
+- Edge case handling`,
       inputSchema: {
-        skillName: z.string().describe('Name of the skill/mini-app to get instructions for'),
+        skillName: z.string().describe('Name of the skill to get instructions for'),
       },
     },
     async (args) => {
