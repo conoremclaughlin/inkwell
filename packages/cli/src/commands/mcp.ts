@@ -65,7 +65,10 @@ export function parseEnvFile(filePath: string): Record<string, string> {
     let value = trimmed.slice(eqIdx + 1).trim();
 
     // Strip surrounding quotes
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
       value = value.slice(1, -1);
     } else {
       // Strip inline comments for unquoted values
@@ -170,7 +173,8 @@ function toCodexToml(servers: Record<string, McpServerConfig>): string {
       lines.push(`args = [${config.args.map(tomlString).join(', ')}]`);
     }
 
-    if (config.env && Object.keys(config.env).length > 0) {
+    // Codex only supports `env` for stdio servers, not streamable_http (url-based)
+    if (config.env && Object.keys(config.env).length > 0 && !config.url) {
       const pairs = Object.entries(config.env)
         .map(([k, v]) => `${tomlString(k)} = ${tomlString(v)}`)
         .join(', ');
@@ -400,7 +404,9 @@ function resolveSyncSource(targetDir: string): SyncSource | null {
   if (existsSync(localMcp)) {
     return {
       mcpPath: localMcp,
-      ...(existsSync(join(targetDir, '.env.local')) ? { envPath: join(targetDir, '.env.local') } : {}),
+      ...(existsSync(join(targetDir, '.env.local'))
+        ? { envPath: join(targetDir, '.env.local') }
+        : {}),
       from: 'local',
     };
   }
@@ -522,7 +528,11 @@ async function syncCommand(): Promise<void> {
   const sourceEnvExists = !!(source.envPath && existsSync(source.envPath));
   const sourcePathRelative = relative(cwd, source.mcpPath);
   const sourcePathDisplay =
-    sourcePathRelative === '' ? '.mcp.json' : sourcePathRelative.startsWith('.') ? sourcePathRelative : `./${sourcePathRelative}`;
+    sourcePathRelative === ''
+      ? '.mcp.json'
+      : sourcePathRelative.startsWith('.')
+        ? sourcePathRelative
+        : `./${sourcePathRelative}`;
 
   if (source.from === 'main') {
     console.log(chalk.yellow('Warning: local .mcp.json is missing in this studio.'));
@@ -531,7 +541,9 @@ async function syncCommand(): Promise<void> {
       console.log(chalk.dim('  Also using root main .env.local for referenced ${VAR} values.'));
     }
     console.log(chalk.dim('  If this is not preferred:'));
-    console.log(chalk.dim('    1) Add .mcp.json/.env.local to this studio, then rerun `sb config sync`'));
+    console.log(
+      chalk.dim('    1) Add .mcp.json/.env.local to this studio, then rerun `sb config sync`')
+    );
     console.log(
       chalk.dim(
         '    2) Or create a new studio from a specific source: `sb studio create <slug> --copy-from <studio-path>`'

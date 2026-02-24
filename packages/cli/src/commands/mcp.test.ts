@@ -236,7 +236,28 @@ describe('syncMcpConfig', () => {
     expect(existsSync(join(TEST_DIR, '.codex'))).toBe(false);
   });
 
-  it('should inject .env.local vars referenced by ${VAR} into Codex env', () => {
+  it('should emit env block for stdio servers in Codex TOML', () => {
+    writeFileSync(
+      join(TEST_DIR, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          supabase: {
+            command: 'npx',
+            args: ['@supabase/mcp-server'],
+            env: { SUPABASE_KEY: 'test-key' },
+          },
+        },
+      })
+    );
+
+    syncMcpConfig(TEST_DIR);
+
+    const toml = readFileSync(join(TEST_DIR, '.codex', 'config.toml'), 'utf-8');
+    expect(toml).toContain('env = {');
+    expect(toml).toContain('"SUPABASE_KEY" = "test-key"');
+  });
+
+  it('should NOT emit env for streamable_http servers in Codex TOML', () => {
     writeFileSync(
       join(TEST_DIR, '.mcp.json'),
       JSON.stringify({
@@ -255,7 +276,8 @@ describe('syncMcpConfig', () => {
 
     const toml = readFileSync(join(TEST_DIR, '.codex', 'config.toml'), 'utf-8');
     expect(toml).toContain('bearer_token_env_var = "GITHUB_TOKEN"');
-    expect(toml).toContain('"GITHUB_TOKEN" = "ghp_test123"');
+    // env block must NOT appear for url-based (streamable_http) servers
+    expect(toml).not.toContain('env = {');
   });
 
   it('should inject .env.local vars into Gemini env', () => {
@@ -368,7 +390,8 @@ describe('syncMcpConfig', () => {
 
     const toml = readFileSync(join(targetDir, '.codex', 'config.toml'), 'utf-8');
     expect(toml).toContain('bearer_token_env_var = "GITHUB_TOKEN"');
-    expect(toml).toContain('"GITHUB_TOKEN" = "source-token"');
+    // env block should NOT appear for url-based servers in Codex TOML
+    expect(toml).not.toContain('env = {');
   });
 
   it('should preserve existing hooks while replacing managed MCP block', () => {
