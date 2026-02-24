@@ -13,6 +13,7 @@ import type { Json, TablesInsert } from '../../data/supabase/types';
 import { logger } from '../../utils/logger';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
+import { ensureDefaultReminders } from '../../services/heartbeat';
 
 // =====================================================
 // SCHEMAS
@@ -255,6 +256,17 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
   }
 
   logger.info('Identity saved', { agentId, version: data.version });
+
+  // Seed default reminders on first creation only
+  if (data.version === 1) {
+    ensureDefaultReminders({
+      userId: user.id,
+      identityId: data.id,
+      agentId,
+      deliveryChannel: user.telegram_id ? 'telegram' : user.whatsapp_id ? 'whatsapp' : undefined,
+      deliveryTarget: user.telegram_id?.toString() ?? user.whatsapp_id ?? undefined,
+    }).catch(() => {});
+  }
 
   // Optionally sync to file system
   let filePath: string | undefined;
@@ -803,6 +815,15 @@ export async function handleChooseName(args: unknown, dataComposer: DataComposer
   }
 
   logger.info('New SB chose their name', { agentId, name: params.name, backend });
+
+  // Seed default reminders (best-effort, non-blocking)
+  ensureDefaultReminders({
+    userId: user.id,
+    identityId: data.id,
+    agentId,
+    deliveryChannel: user.telegram_id ? 'telegram' : user.whatsapp_id ? 'whatsapp' : undefined,
+    deliveryTarget: user.telegram_id?.toString() ?? user.whatsapp_id ?? undefined,
+  }).catch(() => {});
 
   // Sync to file system
   let filePath: string | undefined;

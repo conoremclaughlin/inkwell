@@ -316,6 +316,8 @@ export async function createReminder(params: {
   cronExpression?: string;
   runAt?: Date;
   maxRuns?: number;
+  identityId?: string;
+  metadata?: Record<string, unknown>;
 }): Promise<{ id: string } | null> {
   if (!supabase) {
     supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
@@ -341,6 +343,8 @@ export async function createReminder(params: {
       cron_expression: params.cronExpression || null,
       next_run_at: nextRunAt.toISOString(),
       max_runs: params.maxRuns || null,
+      identity_id: params.identityId || null,
+      metadata: (params.metadata as Record<string, unknown>) || {},
     })
     .select('id')
     .single();
@@ -352,6 +356,101 @@ export async function createReminder(params: {
 
   logger.info('Created reminder', { id: data.id, title: params.title });
   return { id: data.id };
+}
+
+/**
+ * Ensure default reminders exist for a newly created identity.
+ * Idempotent: checks metadata->>reminderType to avoid duplicates.
+ * Fails gracefully: logs warnings but never throws.
+ */
+export async function ensureDefaultReminders(params: {
+  userId: string;
+  identityId: string;
+  agentId: string;
+  deliveryChannel?: string;
+  deliveryTarget?: string;
+}): Promise<void> {
+  try {
+    if (!supabase) {
+      supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    }
+
+    // Resolve delivery channel if not pre-resolved by caller
+    let deliveryChannel = params.deliveryChannel;
+    let deliveryTarget = params.deliveryTarget;
+
+    if (!deliveryChannel || !deliveryTarget) {
+      const { data: user } = await supabase
+        .from('users')
+        .select('telegram_id, whatsapp_id')
+        .eq('id', params.userId)
+        .single();
+
+      if (!user) {
+        logger.warn('ensureDefaultReminders: user not found, skipping', {
+          userId: params.userId,
+        });
+        return;
+      }
+
+      if (user.telegram_id) {
+        deliveryChannel = 'telegram';
+        deliveryTarget = user.telegram_id.toString();
+      } else if (user.whatsapp_id) {
+        deliveryChannel = 'whatsapp';
+        deliveryTarget = user.whatsapp_id;
+      } else {
+        logger.warn('ensureDefaultReminders: no delivery channel available, skipping', {
+          userId: params.userId,
+          agentId: params.agentId,
+        });
+        return;
+      }
+    }
+
+    // Idempotency: check if a daily-checkin already exists for this identity
+    const { data: existing } = await supabase
+      .from('scheduled_reminders')
+      .select('id')
+      .eq('user_id', params.userId)
+      .eq('identity_id', params.identityId)
+      .in('status', ['active', 'paused'])
+      .filter('metadata->>reminderType', 'eq', 'daily-checkin')
+      .limit(1);
+
+    if (existing && existing.length > 0) {
+      logger.debug('ensureDefaultReminders: daily-checkin already exists, skipping', {
+        identityId: params.identityId,
+        existingReminderId: existing[0].id,
+      });
+      return;
+    }
+
+    const result = await createReminder({
+      userId: params.userId,
+      title: 'Daily check-in',
+      description: `Good morning! Time for your daily check-in with ${params.agentId}.`,
+      deliveryChannel,
+      deliveryTarget,
+      cronExpression: '0 9 * * *',
+      identityId: params.identityId,
+      metadata: { autoCreated: true, reminderType: 'daily-checkin' },
+    });
+
+    if (result) {
+      logger.info('ensureDefaultReminders: created daily check-in', {
+        reminderId: result.id,
+        identityId: params.identityId,
+        agentId: params.agentId,
+      });
+    }
+  } catch (error) {
+    logger.error('ensureDefaultReminders: failed (non-fatal)', {
+      error: error instanceof Error ? error.message : error,
+      userId: params.userId,
+      identityId: params.identityId,
+    });
+  }
 }
 
 /**

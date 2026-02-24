@@ -63,6 +63,8 @@ function createChainableQueryBuilder(table: string) {
     'range',
     'ilike',
     'like',
+    'filter',
+    'contains',
   ];
 
   for (const method of chainable) {
@@ -109,6 +111,7 @@ import {
   stopHeartbeatService,
   processHeartbeat,
   createReminder,
+  ensureDefaultReminders,
 } from './heartbeat.js';
 
 // ─── Helpers ───
@@ -381,6 +384,110 @@ describe('Heartbeat Service', () => {
 
       expect(stats).toEqual({ processed: 0, delivered: 0, failed: 0, skipped: 0 });
       expect(mockDeliver).not.toHaveBeenCalled();
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // ensureDefaultReminders — identity-creation seeding
+  // ═══════════════════════════════════════════════════════════════
+  describe('ensureDefaultReminders', () => {
+    it('should create a daily-checkin reminder for a new identity', async () => {
+      // No existing checkin (idempotency check returns empty)
+      setQueryResult('scheduled_reminders', []);
+      // getUserTimezone returns UTC
+      setQueryResult('users', { timezone: null });
+      // createReminder insert succeeds
+      setQueryResult('scheduled_reminders', { id: 'rem-default-001' });
+
+      await ensureDefaultReminders({
+        userId: TEST_USER_ID,
+        identityId: 'identity-001',
+        agentId: 'wren',
+        deliveryChannel: 'telegram',
+        deliveryTarget: '123456789',
+      });
+
+      const builder = tableBuilders.get('scheduled_reminders')!;
+      expect(builder.insert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: 'Daily check-in',
+          identity_id: 'identity-001',
+          cron_expression: '0 9 * * *',
+          delivery_channel: 'telegram',
+          delivery_target: '123456789',
+          metadata: { autoCreated: true, reminderType: 'daily-checkin' },
+        })
+      );
+    });
+
+    it('should skip if daily-checkin already exists (idempotency)', async () => {
+      // Idempotency check finds existing reminder
+      setQueryResult('scheduled_reminders', [{ id: 'existing-rem' }]);
+
+      await ensureDefaultReminders({
+        userId: TEST_USER_ID,
+        identityId: 'identity-001',
+        agentId: 'wren',
+        deliveryChannel: 'telegram',
+        deliveryTarget: '123456789',
+      });
+
+      const builder = tableBuilders.get('scheduled_reminders')!;
+      expect(builder.insert).not.toHaveBeenCalled();
+    });
+
+    it('should resolve delivery channel from user when not pre-resolved', async () => {
+      // User lookup returns telegram_id
+      setQueryResult('users', { telegram_id: '987654321', whatsapp_id: null });
+      // Idempotency check returns empty
+      setQueryResult('scheduled_reminders', []);
+      // getUserTimezone
+      setQueryResult('users', { timezone: null });
+      // createReminder insert succeeds
+      setQueryResult('scheduled_reminders', { id: 'rem-default-002' });
+
+      await ensureDefaultReminders({
+        userId: TEST_USER_ID,
+        identityId: 'identity-002',
+        agentId: 'myra',
+        // No deliveryChannel/deliveryTarget — should resolve from user
+      });
+
+      const builder = tableBuilders.get('scheduled_reminders')!;
+      expect(builder.insert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          delivery_channel: 'telegram',
+          delivery_target: '987654321',
+        })
+      );
+    });
+
+    it('should skip if no delivery channel available', async () => {
+      // User has neither telegram nor whatsapp
+      setQueryResult('users', { telegram_id: null, whatsapp_id: null });
+
+      await ensureDefaultReminders({
+        userId: TEST_USER_ID,
+        identityId: 'identity-003',
+        agentId: 'wren',
+      });
+
+      // No scheduled_reminders queries should happen at all
+      const builder = tableBuilders.get('scheduled_reminders');
+      expect(builder).toBeUndefined();
+    });
+
+    it('should not throw on database errors', async () => {
+      // User lookup fails
+      setQueryResult('users', null, { message: 'Connection refused' });
+
+      await expect(
+        ensureDefaultReminders({
+          userId: TEST_USER_ID,
+          identityId: 'identity-004',
+          agentId: 'wren',
+        })
+      ).resolves.toBeUndefined();
     });
   });
 });
