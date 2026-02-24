@@ -5,11 +5,11 @@
  * idempotency, conflict detection, and uninstall.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { installHooks } from './hooks.js';
+import { installHooks, callPcpTool } from './hooks.js';
 
 const TEST_DIR = join(tmpdir(), 'pcp-hooks-test-' + Date.now());
 
@@ -348,5 +348,74 @@ describe('installHooks: detection priority', () => {
     mkdirSync(join(TEST_DIR, '.codex'), { recursive: true });
     const { backend } = installHooks(TEST_DIR);
     expect(backend.name).toBe('gemini');
+  });
+});
+
+// ============================================================================
+// callPcpTool auth header regression
+// ============================================================================
+
+vi.mock('../auth/tokens.js', () => ({
+  getValidAccessToken: vi.fn(),
+  loadAuth: vi.fn(),
+  isTokenExpired: vi.fn(),
+  decodeJwtPayload: vi.fn(),
+}));
+
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import * as tokensMod from '../auth/tokens.js';
+const mockedGetValidAccessToken = vi.mocked(tokensMod.getValidAccessToken);
+
+describe('callPcpTool: auth header', () => {
+  let fetchSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        jsonrpc: '2.0',
+        result: { content: [{ text: '{"success":true}' }] },
+        id: 1,
+      }),
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('should send Authorization header when CLI token is available', async () => {
+    mockedGetValidAccessToken.mockResolvedValue('test-jwt-token');
+
+    await callPcpTool('bootstrap', { agentId: 'wren' });
+
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    const [, options] = fetchSpy.mock.calls[0];
+    expect(options.headers).toHaveProperty('Authorization', 'Bearer test-jwt-token');
+  });
+
+  it('should omit Authorization header when no token is available', async () => {
+    mockedGetValidAccessToken.mockResolvedValue(null);
+
+    await callPcpTool('bootstrap', { agentId: 'wren' });
+
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    const [, options] = fetchSpy.mock.calls[0];
+    expect(options.headers).not.toHaveProperty('Authorization');
+  });
+
+  it('should send correct JSON-RPC payload', async () => {
+    mockedGetValidAccessToken.mockResolvedValue('token');
+
+    await callPcpTool('get_inbox', { agentId: 'wren', status: 'unread' });
+
+    const [url, options] = fetchSpy.mock.calls[0];
+    expect(url).toContain('/mcp');
+    const body = JSON.parse(options.body);
+    expect(body.method).toBe('tools/call');
+    expect(body.params.name).toBe('get_inbox');
+    expect(body.params.arguments).toEqual({ agentId: 'wren', status: 'unread' });
   });
 });
