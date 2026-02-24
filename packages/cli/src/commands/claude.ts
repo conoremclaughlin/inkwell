@@ -290,6 +290,21 @@ export async function runClaude(
   const sessionContext = options.session
     ? await ensurePcpSessionContext(agentId, options.backend, passthroughArgs, options.verbose)
     : {};
+  const runtimeLinkId = options.session ? randomUUID() : undefined;
+  const { studioId, identityId } = getIdentityContextFromIdentityJson(process.cwd());
+
+  if (sessionContext.pcpSessionId && runtimeLinkId) {
+    upsertRuntimeSession(process.cwd(), {
+      pcpSessionId: sessionContext.pcpSessionId,
+      backend: options.backend,
+      agentId,
+      ...(identityId ? { identityId } : {}),
+      ...(studioId ? { studioId } : {}),
+      runtimeLinkId,
+      ...(sessionContext.backendSessionId ? { backendSessionId: sessionContext.backendSessionId } : {}),
+      updatedAt: new Date().toISOString(),
+    });
+  }
 
   if (options.verbose) {
     console.log(chalk.dim(`Backend: ${adapter.name}`));
@@ -318,7 +333,12 @@ export async function runClaude(
 
   const child = spawn(prepared.binary, prepared.args, {
     stdio: 'inherit',
-    env: { ...process.env, ...authEnv, ...prepared.env },
+    env: {
+      ...process.env,
+      ...authEnv,
+      ...prepared.env,
+      ...(runtimeLinkId ? { PCP_RUNTIME_LINK_ID: runtimeLinkId } : {}),
+    },
   });
 
   child.on('close', (code) => {
@@ -348,6 +368,21 @@ export async function runClaudeInteractive(
   const sessionContext = options.session
     ? await ensurePcpSessionContext(agentId, options.backend, passthroughArgs, options.verbose)
     : {};
+  const runtimeLinkId = options.session ? randomUUID() : undefined;
+  const { studioId, identityId } = getIdentityContextFromIdentityJson(process.cwd());
+
+  if (sessionContext.pcpSessionId && runtimeLinkId) {
+    upsertRuntimeSession(process.cwd(), {
+      pcpSessionId: sessionContext.pcpSessionId,
+      backend: options.backend,
+      agentId,
+      ...(identityId ? { identityId } : {}),
+      ...(studioId ? { studioId } : {}),
+      runtimeLinkId,
+      ...(sessionContext.backendSessionId ? { backendSessionId: sessionContext.backendSessionId } : {}),
+      updatedAt: new Date().toISOString(),
+    });
+  }
 
   if (options.verbose) {
     console.log(chalk.dim(`Backend: ${adapter.name}`));
@@ -374,7 +409,12 @@ export async function runClaudeInteractive(
 
   const child = spawn(prepared.binary, prepared.args, {
     stdio: 'inherit',
-    env: { ...process.env, ...authEnv, ...prepared.env },
+    env: {
+      ...process.env,
+      ...authEnv,
+      ...prepared.env,
+      ...(runtimeLinkId ? { PCP_RUNTIME_LINK_ID: runtimeLinkId } : {}),
+    },
   });
 
   child.on('close', (code) => {
