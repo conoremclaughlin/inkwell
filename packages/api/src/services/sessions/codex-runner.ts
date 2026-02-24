@@ -23,6 +23,8 @@ import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 
 const PROCESS_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+const DIAGNOSTIC_MAX_CHARS = 4000;
+const DIAGNOSTIC_MAX_LINES = 20;
 
 interface CodexUsageStats {
   contextTokens: number;
@@ -148,6 +150,12 @@ export class CodexRunner implements IClaudeRunner {
 
       let stderr = '';
       const nonJsonLines: string[] = [];
+      let stdoutRemainder = '';
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      const parsedEventTypes: string[] = [];
+      const parsedErrorMessages: string[] = [];
+      let parsedEventCount = 0;
       const responses: ChannelResponse[] = [];
       const toolCalls: ToolCall[] = [];
       let usage: CodexUsageStats | undefined;
@@ -170,12 +178,29 @@ export class CodexRunner implements IClaudeRunner {
       }, PROCESS_TIMEOUT_MS);
 
       proc.stdout.on('data', (data) => {
+        stdoutBytes += data.length;
         const chunk = data.toString();
-        const lines = chunk.split('\n').filter((line: string) => line.trim());
+        const combined = `${stdoutRemainder}${chunk}`;
+        const lines = combined.split('\n');
+        stdoutRemainder = lines.pop() ?? '';
 
         for (const line of lines) {
+          if (!line.trim()) continue;
           try {
             const parsed = JSON.parse(line) as Record<string, unknown>;
+            parsedEventCount += 1;
+            if (typeof parsed.type === 'string') {
+              parsedEventTypes.push(parsed.type);
+              if (parsedEventTypes.length > DIAGNOSTIC_MAX_LINES) {
+                parsedEventTypes.shift();
+              }
+            }
+            if (parsed.type === 'error' && typeof parsed.message === 'string') {
+              parsedErrorMessages.push(parsed.message);
+              if (parsedErrorMessages.length > DIAGNOSTIC_MAX_LINES) {
+                parsedErrorMessages.shift();
+              }
+            }
 
             const maybeSessionId = this.extractSessionId(parsed);
             if (maybeSessionId) resolvedSessionId = maybeSessionId;
@@ -191,12 +216,18 @@ export class CodexRunner implements IClaudeRunner {
             toolCalls.push(...extracted.toolCalls);
           } catch {
             // Capture non-JSON lines as diagnostic context
-            if (line.trim()) nonJsonLines.push(line.trim());
+            if (line.trim()) {
+              nonJsonLines.push(line.trim());
+              if (nonJsonLines.length > DIAGNOSTIC_MAX_LINES) {
+                nonJsonLines.shift();
+              }
+            }
           }
         }
       });
 
       proc.stderr.on('data', (data) => {
+        stderrBytes += data.length;
         stderr += data.toString();
       });
 
@@ -208,13 +239,77 @@ export class CodexRunner implements IClaudeRunner {
         }
       });
 
-      proc.on('close', (code) => {
+      proc.on('close', (code, signal) => {
         clearTimeout(timeout);
         if (settled) return;
         settled = true;
 
+        if (stdoutRemainder.trim()) {
+          try {
+            const parsed = JSON.parse(stdoutRemainder) as Record<string, unknown>;
+            parsedEventCount += 1;
+            if (typeof parsed.type === 'string') {
+              parsedEventTypes.push(parsed.type);
+              if (parsedEventTypes.length > DIAGNOSTIC_MAX_LINES) {
+                parsedEventTypes.shift();
+              }
+            }
+            if (parsed.type === 'error' && typeof parsed.message === 'string') {
+              parsedErrorMessages.push(parsed.message);
+              if (parsedErrorMessages.length > DIAGNOSTIC_MAX_LINES) {
+                parsedErrorMessages.shift();
+              }
+            }
+            const maybeSessionId = this.extractSessionId(parsed);
+            if (maybeSessionId) resolvedSessionId = maybeSessionId;
+            const maybeUsage = this.extractUsage(parsed);
+            if (maybeUsage) usage = maybeUsage;
+            const maybeText = this.extractFinalText(parsed);
+            if (maybeText) finalTextResponse = maybeText;
+            const extracted = this.extractToolData(parsed);
+            responses.push(...extracted.responses);
+            toolCalls.push(...extracted.toolCalls);
+          } catch {
+            nonJsonLines.push(stdoutRemainder.trim());
+            if (nonJsonLines.length > DIAGNOSTIC_MAX_LINES) {
+              nonJsonLines.shift();
+            }
+          }
+        }
+
         if (code !== 0 && !finalTextResponse && responses.length === 0) {
-          const diagnostic = stderr || nonJsonLines.join('\n') || '(no output)';
+          const stderrTrimmed = stderr.trim();
+          const nonJsonText = nonJsonLines.join('\n').trim();
+          const startupOnlyEvents =
+            parsedEventTypes.length > 0 &&
+            parsedEventTypes.every((type) => type === 'thread.started' || type === 'turn.started');
+
+          const diagnostics: string[] = [];
+          diagnostics.push(
+            `exitCode=${code ?? 'null'} signal=${signal ?? 'none'} stdoutBytes=${stdoutBytes} stderrBytes=${stderrBytes}`
+          );
+          if (parsedEventCount > 0) {
+            const uniqueTypes = Array.from(new Set(parsedEventTypes));
+            diagnostics.push(
+              `parsedEvents=${parsedEventCount} types=${uniqueTypes.join(',') || '(none)'}`
+            );
+          }
+          if (parsedErrorMessages.length > 0) {
+            diagnostics.push(`parsedErrorMessages:\n${parsedErrorMessages.join('\n')}`);
+          }
+          if (stderrTrimmed) {
+            diagnostics.push(`stderr:\n${stderrTrimmed}`);
+          } else if (nonJsonText) {
+            diagnostics.push(`stdout(non-json):\n${nonJsonText}`);
+          } else if (startupOnlyEvents) {
+            diagnostics.push(
+              'Codex emitted startup events only (thread.started/turn.started) then exited before completion.'
+            );
+          } else {
+            diagnostics.push('No stderr and no non-JSON stdout captured.');
+          }
+
+          const diagnostic = diagnostics.join('\n\n').slice(0, DIAGNOSTIC_MAX_CHARS);
           reject(new Error(`Codex exited with code ${code}: ${diagnostic}`));
           return;
         }
