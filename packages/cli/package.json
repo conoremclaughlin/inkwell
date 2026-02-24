@@ -10,6 +10,7 @@
   "scripts": {
     "build": "tsc && cp -r src/templates dist/templates",
     "dev": "tsc --watch",
+    "dev:live": "tsc && cp -r src/templates dist/templates && chmod +x dist/cli.js && mkdir -p \"$HOME/.local/bin\" && ln -sf \"$(pwd)/dist/cli.js\" \"$HOME/.local/bin/sb\" && echo '✓ sb linked to '\"$(pwd)/dist/cli.js\" && tsc --watch",
     "cli": "tsx src/cli.ts",
     "install:cli": "chmod +x dist/cli.js && mkdir -p \"$HOME/.local/bin\" && ln -sf \"$(pwd)/dist/cli.js\" \"$HOME/.local/bin/sb\" && echo 'Linked: $HOME/.local/bin/sb → dist/cli.js'",
     "uninstall:cli": "rm -f \"$HOME/.local/bin/sb\" && echo 'Unlinked: $HOME/.local/bin/sb'",
