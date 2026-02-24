@@ -23,6 +23,7 @@ import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 import { homedir } from 'os';
 import { resolveAgentId, readIdentityJson } from '../backends/identity.js';
+import { getValidAccessToken } from '../auth/tokens.js';
 import {
   getCurrentRuntimeSession,
   setCurrentRuntimeSession,
@@ -208,17 +209,27 @@ function getPcpServerUrl(): string {
 
 let jsonRpcId = 1;
 
-async function callPcpTool(
+export async function callPcpTool(
   tool: string,
   args: Record<string, unknown>
 ): Promise<Record<string, unknown>> {
-  const url = `${getPcpServerUrl()}/mcp`;
+  const serverUrl = getPcpServerUrl();
+  const url = `${serverUrl}/mcp`;
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+  };
+
+  // Attach CLI auth token so hooks pass OAuth checks on the MCP server
+  const token = await getValidAccessToken(serverUrl);
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
   const response = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    },
+    headers,
     body: JSON.stringify({
       jsonrpc: '2.0',
       method: 'tools/call',
