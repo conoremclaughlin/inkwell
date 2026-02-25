@@ -73,6 +73,14 @@ interface TelegramAudio {
   file_size?: number;
 }
 
+interface TelegramVoice {
+  file_id: string;
+  file_unique_id: string;
+  duration: number;
+  mime_type?: string;
+  file_size?: number;
+}
+
 interface TelegramFile {
   file_id: string;
   file_unique_id: string;
@@ -114,6 +122,7 @@ interface TelegramMessage {
   document?: TelegramDocument;
   video?: TelegramVideo;
   audio?: TelegramAudio;
+  voice?: TelegramVoice;
   media_group_id?: string;
   entities?: TelegramMessageEntity[];
   caption_entities?: TelegramMessageEntity[];
@@ -346,11 +355,15 @@ export class TelegramListener extends EventEmitter {
 
     // ========== NORMAL MESSAGE PROCESSING ==========
 
-    // Check if message has text or any media (photo, document, video, audio)
-    const hasText = !!telegramMessage.text;
+    // Check if message has text/caption or any media (photo, document, video, audio, voice)
+    const hasText = !!telegramMessage.text || !!telegramMessage.caption;
     const hasPhoto = !!telegramMessage.photo && telegramMessage.photo.length > 0;
     const hasMedia =
-      hasPhoto || !!telegramMessage.document || !!telegramMessage.video || !!telegramMessage.audio;
+      hasPhoto ||
+      !!telegramMessage.document ||
+      !!telegramMessage.video ||
+      !!telegramMessage.audio ||
+      !!telegramMessage.voice;
 
     if (!hasText && !hasMedia) {
       logger.debug('Skipping message without text or media');
@@ -660,7 +673,7 @@ export class TelegramListener extends EventEmitter {
       groupSubject: msg.chat.title,
     };
 
-    // Handle media attachments (photo, document, video, audio)
+    // Handle media attachments (photo, document, video, audio, voice)
     const mediaAttachments: import('./types').MediaAttachment[] = [];
 
     if (msg.photo && msg.photo.length > 0) {
@@ -726,6 +739,23 @@ export class TelegramListener extends EventEmitter {
           fileId: msg.audio.file_id,
           localPath,
           duration: msg.audio.duration,
+        });
+      }
+    }
+
+    if (msg.voice) {
+      const localPath = await this.downloadFile(msg.voice.file_id);
+      if (localPath) {
+        mediaAttachments.push({
+          type: 'audio',
+          path: localPath,
+          filename: 'voice-note.ogg',
+          contentType: msg.voice.mime_type || 'audio/ogg',
+        });
+        logger.info('Voice attachment downloaded', {
+          fileId: msg.voice.file_id,
+          localPath,
+          duration: msg.voice.duration,
         });
       }
     }

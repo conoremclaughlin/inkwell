@@ -22,6 +22,8 @@ import type { AgentResponse } from '../agent/types';
 import type { DataComposer } from '../data/composer';
 import { logger } from '../utils/logger';
 import { env } from '../config/env';
+import type { InboundMessage } from './types';
+import { AudioTranscriptionService } from './audio-transcription';
 import telegramifyMarkdown from 'telegramify-markdown';
 
 // Supported messaging channels
@@ -120,6 +122,8 @@ export class ChannelGateway extends EventEmitter {
 
   // Known agent names for mention detection in group chats
   private knownAgentNames: Set<string> = new Set();
+  private audioTranscriptionService: AudioTranscriptionService =
+    AudioTranscriptionService.fromEnv();
 
   constructor(config: ChannelGatewayConfig = {}) {
     super();
@@ -187,6 +191,35 @@ export class ChannelGateway extends EventEmitter {
     }
 
     return false;
+  }
+
+  private isAudioPlaceholder(text: string): boolean {
+    const trimmed = text.trim();
+    if (!trimmed) return true;
+    if (/^\[(audio|voice)(?: [^\]]*)?attached\]$/i.test(trimmed)) return true;
+    if (/^<media:audio>/i.test(trimmed)) return true;
+    return false;
+  }
+
+  private async maybeInjectAudioTranscript(message: InboundMessage): Promise<void> {
+    if (!this.audioTranscriptionService.isEnabled()) return;
+    if (!message.media || message.media.length === 0) return;
+
+    const firstAudio = message.media.find((item) => item.type === 'audio' && item.path);
+    if (!firstAudio?.path) return;
+
+    const body = message.body?.trim() || '';
+    if (!this.isAudioPlaceholder(body)) return;
+
+    const transcript = await this.audioTranscriptionService.transcribe({
+      filePath: firstAudio.path,
+      contentType: firstAudio.contentType,
+      filename: firstAudio.filename,
+    });
+    if (!transcript) return;
+
+    message.body = `[Audio transcript]\n${transcript}`;
+    message.rawBody = message.body;
   }
 
   /**
@@ -846,6 +879,8 @@ export class ChannelGateway extends EventEmitter {
       const conversationId = message.conversationId || senderId;
       const isGroupChat = message.chatType === 'group';
 
+      await this.maybeInjectAudioTranscript(message);
+
       // In group chats, only respond if bot or any known agent is mentioned
       if (isGroupChat && !this.isAgentMentioned(message.body, message.mentions)) {
         logger.debug('Skipping group message - no agent mentioned');
@@ -1022,6 +1057,8 @@ export class ChannelGateway extends EventEmitter {
       const senderId = message.sender.id || 'unknown';
       const conversationId = message.conversationId || senderId;
       const isGroupChat = message.chatType === 'group' || message.chatType === 'channel';
+
+      await this.maybeInjectAudioTranscript(message);
 
       // In group chats, only respond if bot or any known agent is mentioned
       if (isGroupChat && !this.isAgentMentioned(message.body, message.mentions)) {
