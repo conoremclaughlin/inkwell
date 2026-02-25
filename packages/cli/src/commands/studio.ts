@@ -336,11 +336,21 @@ const BUILTIN_ROLE_TEMPLATES = ['reviewer', 'builder', 'product'] as const;
 type BuiltinRoleTemplate = (typeof BUILTIN_ROLE_TEMPLATES)[number];
 
 /**
+ * Validate a template name to prevent path traversal.
+ * Only allows alphanumeric, hyphens, and underscores.
+ */
+function isValidTemplateName(name: string): boolean {
+  return /^[a-zA-Z0-9_-]+$/.test(name);
+}
+
+/**
  * Resolve a role template ROLE.md by name.
  * Checks: built-in templates → ~/.pcp/studio-templates/<name>/ROLE.md
  * Returns the ROLE.md content, or null if not found.
  */
 function resolveRoleTemplate(templateName: string): string | null {
+  if (!isValidTemplateName(templateName)) return null;
+
   // Built-in templates (shipped with CLI)
   const distPath = join(__dirname, '..', 'templates', 'studio-roles', `${templateName}.md`);
   if (existsSync(distPath)) return readFileSync(distPath, 'utf-8');
@@ -1113,6 +1123,7 @@ export {
   resolveCopySourceRoot,
   resolveRoleTemplate,
   listRoleTemplates,
+  isValidTemplateName,
   BUILTIN_ROLE_TEMPLATES,
   getCliLinkTargets,
   shouldWarnMissingCliBinPath,

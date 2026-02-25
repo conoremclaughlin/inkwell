@@ -2834,6 +2834,7 @@ export type Database = {
           metadata: Json | null;
           purpose: string | null;
           repo_root: string;
+          role_template: string | null;
           session_id: string | null;
           status: string;
           updated_at: string | null;
@@ -2853,6 +2854,7 @@ export type Database = {
           metadata?: Json | null;
           purpose?: string | null;
           repo_root: string;
+          role_template?: string | null;
           session_id?: string | null;
           status?: string;
           updated_at?: string | null;
@@ -2872,6 +2874,7 @@ export type Database = {
           metadata?: Json | null;
           purpose?: string | null;
           repo_root?: string;
+          role_template?: string | null;
           session_id?: string | null;
           status?: string;
           updated_at?: string | null;
