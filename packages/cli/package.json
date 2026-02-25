@@ -14,6 +14,7 @@
     "cli": "tsx src/cli.ts",
     "install:cli": "chmod +x dist/cli.js && mkdir -p \"$HOME/.pcp/bin\" \"$HOME/.local/bin\" && ln -sf \"$(pwd)/dist/cli.js\" \"$HOME/.pcp/bin/sb\" && ln -sf \"$HOME/.pcp/bin/sb\" \"$HOME/.local/bin/sb\" && echo \"Linked: $HOME/.pcp/bin/sb → dist/cli.js (compat: $HOME/.local/bin/sb)\" && if ! printf '%s' \":$PATH:\" | grep -q \":$HOME/.pcp/bin:\" && ! printf '%s' \":$PATH:\" | grep -q \":$HOME/.local/bin:\"; then echo \"⚠️  PATH warning: neither $HOME/.pcp/bin nor $HOME/.local/bin is in PATH\"; echo \"   Add one of them in your shell profile so 'sb' resolves in new shells.\"; fi",
     "uninstall:cli": "rm -f \"$HOME/.pcp/bin/sb\" \"$HOME/.local/bin/sb\" && echo \"Unlinked: $HOME/.pcp/bin/sb and $HOME/.local/bin/sb\"",
+    "type-check": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "clean": "rm -rf dist"

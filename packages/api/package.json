@@ -20,7 +20,7 @@
     "test:connection": "tsx src/test-connection.ts",
     "test:channels": "tsx src/test-channels.ts",
     "lint": "eslint src --ext .ts",
-    "type-check": "tsc --noEmit",
+    "type-check": "yarn workspace @personal-context/shared build && tsc --noEmit",
     "clean": "rm -rf dist"
   },
   "dependencies": {

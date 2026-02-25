@@ -542,9 +542,17 @@ export class MCPServer {
     // ============================================================================
     // Start listening
     // ============================================================================
-    this.httpServer = app.listen(port, () => {
-      logger.info(`MCP Server started with Streamable HTTP transport on port ${port}`);
-      logger.info(`MCP endpoint: http://localhost:${port}/mcp`);
+    const host = process.env.NODE_ENV === 'test' ? '127.0.0.1' : '0.0.0.0';
+    this.httpServer = await new Promise<Server>((resolve, reject) => {
+      const server = app.listen(port, host, () => {
+        logger.info(`MCP Server started with Streamable HTTP transport on ${host}:${port}`);
+        logger.info(`MCP endpoint: http://localhost:${port}/mcp`);
+        resolve(server);
+      });
+
+      server.on('error', (error) => {
+        reject(error);
+      });
     });
 
     // Periodic cleanup of expired MCP refresh tokens (every 6 hours)

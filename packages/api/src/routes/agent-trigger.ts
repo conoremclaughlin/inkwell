@@ -9,7 +9,7 @@ import { Router } from 'express';
 import { getAgentGateway, type AgentTriggerPayload } from '../channels/agent-gateway';
 import { logger } from '../utils/logger';
 
-const router = Router();
+const router: Router = Router();
 
 /**
  * POST /api/agent/trigger

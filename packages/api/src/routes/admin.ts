@@ -705,7 +705,7 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
   }
 }
 
-const router = Router();
+const router: Router = Router();
 
 // =============================================================================
 // Auth Logout (before auth middleware — doesn't require active session)

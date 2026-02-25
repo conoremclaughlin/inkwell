@@ -17,7 +17,7 @@ import { CronExpressionParser } from 'cron-parser';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { env } from '../config/env.js';
 import { logger } from '../utils/logger.js';
-import type { Database } from '../data/supabase/types.js';
+import type { Database, Json } from '../data/supabase/types.js';
 
 // DueReminder is the subset of fields we need for processing
 export interface DueReminder {
@@ -317,7 +317,7 @@ export async function createReminder(params: {
   runAt?: Date;
   maxRuns?: number;
   identityId?: string;
-  metadata?: Record<string, unknown>;
+  metadata?: Json;
 }): Promise<{ id: string } | null> {
   if (!supabase) {
     supabase = createClient<Database>(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
@@ -344,7 +344,7 @@ export async function createReminder(params: {
       next_run_at: nextRunAt.toISOString(),
       max_runs: params.maxRuns || null,
       identity_id: params.identityId || null,
-      metadata: (params.metadata as Record<string, unknown>) || {},
+      metadata: params.metadata ?? {},
     })
     .select('id')
     .single();
