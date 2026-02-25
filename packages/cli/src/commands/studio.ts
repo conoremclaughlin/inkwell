@@ -28,7 +28,14 @@ import {
   cpSync,
   statSync,
 } from 'fs';
-import { join, dirname, basename, parse as parsePath, resolve as resolvePath } from 'path';
+import {
+  join,
+  dirname,
+  basename,
+  parse as parsePath,
+  resolve as resolvePath,
+  delimiter as pathDelimiter,
+} from 'path';
 import { homedir } from 'os';
 import { installHooks } from './hooks.js';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
@@ -967,18 +974,56 @@ function resolveDefaultCliName(): string {
   return 'sb-dev';
 }
 
+type CliLinkTargets = {
+  primaryBinDir: string;
+  compatBinDir: string;
+  primaryLinkPath: string;
+  compatLinkPath: string;
+};
+
+function getCliLinkTargets(homeDir: string, name: string): CliLinkTargets {
+  const primaryBinDir = join(homeDir, '.pcp', 'bin');
+  const compatBinDir = join(homeDir, '.local', 'bin');
+  return {
+    primaryBinDir,
+    compatBinDir,
+    primaryLinkPath: join(primaryBinDir, name),
+    compatLinkPath: join(compatBinDir, name),
+  };
+}
+
+function shouldWarnMissingCliBinPath(
+  pathValue: string | undefined,
+  targets: CliLinkTargets
+): boolean {
+  const pathEntries = (pathValue || '').split(pathDelimiter);
+  return (
+    !pathEntries.includes(targets.primaryBinDir) && !pathEntries.includes(targets.compatBinDir)
+  );
+}
+
 async function cliLinkCommand(options: { name?: string; unlink?: boolean }): Promise<void> {
-  const binDir = join(homedir(), '.local', 'bin');
   const name = options.name || resolveDefaultCliName();
+  const targets = getCliLinkTargets(homedir(), name);
+  const { primaryBinDir, compatBinDir, primaryLinkPath, compatLinkPath } = targets;
 
   if (options.unlink) {
-    const linkPath = join(binDir, name);
-    if (existsSync(linkPath)) {
+    let removed = false;
+    if (existsSync(primaryLinkPath)) {
       const { unlinkSync } = await import('fs');
-      unlinkSync(linkPath);
-      console.log(chalk.green(`Unlinked: ${linkPath}`));
-    } else {
-      console.log(chalk.dim(`Not found: ${linkPath}`));
+      unlinkSync(primaryLinkPath);
+      console.log(chalk.green(`Unlinked: ${primaryLinkPath}`));
+      removed = true;
+    }
+    if (existsSync(compatLinkPath)) {
+      const { unlinkSync } = await import('fs');
+      unlinkSync(compatLinkPath);
+      console.log(chalk.green(`Unlinked compatibility link: ${compatLinkPath}`));
+      removed = true;
+    }
+    if (!removed) {
+      console.log(chalk.dim(`Not found: ${primaryLinkPath}`));
+      console.log(chalk.dim(`Not found: ${compatLinkPath}`));
     }
     return;
   }
@@ -1014,17 +1059,34 @@ async function cliLinkCommand(options: { name?: string; unlink?: boolean }): Pro
     execSync(`chmod +x "${cliJs}"`, { stdio: 'pipe' });
 
     // Create symlink
-    mkdirSync(binDir, { recursive: true });
-    const linkPath = join(binDir, name);
+    mkdirSync(primaryBinDir, { recursive: true });
+    mkdirSync(compatBinDir, { recursive: true });
     const { symlinkSync, unlinkSync } = await import('fs');
 
     // Remove existing symlink if present
-    if (existsSync(linkPath)) {
-      unlinkSync(linkPath);
+    if (existsSync(primaryLinkPath)) {
+      unlinkSync(primaryLinkPath);
     }
-    symlinkSync(cliJs, linkPath);
+    if (existsSync(compatLinkPath)) {
+      unlinkSync(compatLinkPath);
+    }
+    symlinkSync(cliJs, primaryLinkPath);
+    symlinkSync(primaryLinkPath, compatLinkPath);
 
-    spinner.succeed(`Linked: ${linkPath} → ${cliJs}`);
+    spinner.succeed(`Linked: ${primaryLinkPath} → ${cliJs}`);
+    console.log(chalk.dim(`  Compatibility link: ${compatLinkPath} → ${primaryLinkPath}`));
+
+    if (shouldWarnMissingCliBinPath(process.env.PATH, targets)) {
+      console.log(
+        chalk.yellow(
+          `  PATH warning: neither ${primaryBinDir} nor ${compatBinDir} is currently in PATH`
+        )
+      );
+      console.log(
+        chalk.dim(`  Add one of them to your shell profile so '${name}' resolves in new shells.`)
+      );
+    }
+
     console.log('');
     console.log(chalk.dim(`  Test it: ${name} --help`));
     console.log(
@@ -1052,6 +1114,8 @@ export {
   resolveRoleTemplate,
   listRoleTemplates,
   BUILTIN_ROLE_TEMPLATES,
+  getCliLinkTargets,
+  shouldWarnMissingCliBinPath,
   planInit,
   git,
 };
@@ -1137,7 +1201,7 @@ export function registerStudioCommands(program: Command): void {
     .action(cdCommand);
 
   ws.command('cli')
-    .description('Build CLI and link as a named binary (default: sb-<agent>)')
+    .description('Build CLI and link as a named binary in ~/.pcp/bin (default: sb-<agent>)')
     .option('-n, --name <name>', 'Binary name (default: sb-<agent> from .pcp/identity.json)')
     .option('--unlink', 'Remove the linked binary instead of creating it')
     .action(cliLinkCommand);

@@ -111,7 +111,7 @@ async function listWorkspaces(options: {
   const response = await fetchPcp('/api/mcp/call', {
     method: 'POST',
     body: JSON.stringify({
-      tool: 'list_workspace_containers',
+      tool: 'list_workspaces',
       args: {
         email: config.email,
         includeArchived: options.all === true,
@@ -128,9 +128,7 @@ async function listWorkspaces(options: {
 
   const raw = (await response.json()) as unknown;
   const parsed = unwrapToolResult(raw);
-  const workspaces = Array.isArray(parsed.workspaces)
-    ? (parsed.workspaces as Workspace[])
-    : [];
+  const workspaces = Array.isArray(parsed.workspaces) ? (parsed.workspaces as Workspace[]) : [];
 
   if (options.json) {
     console.log(JSON.stringify({ selectedWorkspaceId: config.workspaceId, workspaces }, null, 2));
@@ -174,7 +172,7 @@ async function useWorkspace(workspaceRef: string): Promise<void> {
   const response = await fetchPcp('/api/mcp/call', {
     method: 'POST',
     body: JSON.stringify({
-      tool: 'list_workspace_containers',
+      tool: 'list_workspaces',
       args: {
         email: config.email,
         includeArchived: false,
@@ -190,9 +188,7 @@ async function useWorkspace(workspaceRef: string): Promise<void> {
 
   const raw = (await response.json()) as unknown;
   const parsed = unwrapToolResult(raw);
-  const workspaces = Array.isArray(parsed.workspaces)
-    ? (parsed.workspaces as Workspace[])
-    : [];
+  const workspaces = Array.isArray(parsed.workspaces) ? (parsed.workspaces as Workspace[]) : [];
   const match = workspaces.find((w) => w.id === workspaceRef || w.slug === workspaceRef);
 
   if (!match) {
@@ -209,14 +205,11 @@ async function useWorkspace(workspaceRef: string): Promise<void> {
   console.log(chalk.dim(`  id: ${match.id}`));
 }
 
-async function resolveWorkspaceByRef(
-  workspaceRef: string,
-  config: PcpConfig
-): Promise<Workspace> {
+async function resolveWorkspaceByRef(workspaceRef: string, config: PcpConfig): Promise<Workspace> {
   const response = await fetchPcp('/api/mcp/call', {
     method: 'POST',
     body: JSON.stringify({
-      tool: 'list_workspace_containers',
+      tool: 'list_workspaces',
       args: {
         email: config.email,
         includeArchived: false,
@@ -231,10 +224,10 @@ async function resolveWorkspaceByRef(
 
   const raw = (await response.json()) as unknown;
   const parsed = unwrapToolResult(raw);
-  const workspaces = Array.isArray(parsed.workspaces)
-    ? (parsed.workspaces as Workspace[])
-    : [];
-  const match = workspaces.find((workspace) => workspace.id === workspaceRef || workspace.slug === workspaceRef);
+  const workspaces = Array.isArray(parsed.workspaces) ? (parsed.workspaces as Workspace[]) : [];
+  const match = workspaces.find(
+    (workspace) => workspace.id === workspaceRef || workspace.slug === workspaceRef
+  );
 
   if (!match) {
     throw new Error(`Workspace not found: ${workspaceRef}`);
@@ -256,7 +249,7 @@ async function createWorkspace(
   const response = await fetchPcp('/api/mcp/call', {
     method: 'POST',
     body: JSON.stringify({
-      tool: 'create_workspace_container',
+      tool: 'create_workspace',
       args: {
         email: config.email,
         name,
@@ -349,7 +342,9 @@ async function inviteWorkspaceMember(
     )
   );
   if (member?.userWasCreated) {
-    console.log(chalk.dim('Created placeholder PCP user for this email (will activate on first login).'));
+    console.log(
+      chalk.dim('Created placeholder PCP user for this email (will activate on first login).')
+    );
   }
 }
 
@@ -362,7 +357,9 @@ async function listWorkspaceMembers(workspaceRef?: string): Promise<void> {
 
   const targetRef = workspaceRef || config.workspaceId;
   if (!targetRef) {
-    console.error(chalk.red('No workspace selected. Pass <id-or-slug> or run `sb workspace use` first.'));
+    console.error(
+      chalk.red('No workspace selected. Pass <id-or-slug> or run `sb workspace use` first.')
+    );
     process.exit(1);
   }
 
@@ -377,7 +374,7 @@ async function listWorkspaceMembers(workspaceRef?: string): Promise<void> {
   const response = await fetchPcp('/api/mcp/call', {
     method: 'POST',
     body: JSON.stringify({
-      tool: 'get_workspace_container',
+      tool: 'get_workspace',
       args: {
         email: config.email,
         workspaceId: targetWorkspace.id,
@@ -414,7 +411,11 @@ async function listWorkspaceMembers(workspaceRef?: string): Promise<void> {
 
   for (const member of members) {
     const label =
-      member.user?.firstName || member.user?.username || member.user?.email || member.userId || 'unknown';
+      member.user?.firstName ||
+      member.user?.username ||
+      member.user?.email ||
+      member.userId ||
+      'unknown';
     const joinedLabel = member.user?.lastLoginAt ? 'joined' : 'invited';
     console.log(
       `  ${chalk.cyan(label)} ${chalk.dim(`(${member.role || 'member'})`)} ${chalk.gray(`[${joinedLabel}]`)}`
@@ -464,16 +465,20 @@ export function registerWorkspaceCommands(program: Command): void {
     .option('--description <description>', 'Workspace description')
     .option('--slug <slug>', 'Workspace slug')
     .option('--use', 'Select the created workspace after creation')
-    .action((name, options: { type?: 'personal' | 'team'; description?: string; slug?: string; use?: boolean }) =>
-      createWorkspace(name, options)
+    .action(
+      (
+        name,
+        options: { type?: 'personal' | 'team'; description?: string; slug?: string; use?: boolean }
+      ) => createWorkspace(name, options)
     );
 
   workspace
     .command('invite <workspace-id-or-slug> <email>')
     .description('Invite/add a collaborator to a workspace')
     .option('--role <role>', 'Role (owner|admin|member|viewer)', 'member')
-    .action((workspaceRef, inviteeEmail, options: { role?: 'owner' | 'admin' | 'member' | 'viewer' }) =>
-      inviteWorkspaceMember(workspaceRef, inviteeEmail, options)
+    .action(
+      (workspaceRef, inviteeEmail, options: { role?: 'owner' | 'admin' | 'member' | 'viewer' }) =>
+        inviteWorkspaceMember(workspaceRef, inviteeEmail, options)
     );
 
   workspace
@@ -481,8 +486,5 @@ export function registerWorkspaceCommands(program: Command): void {
     .description('List collaborators in a workspace')
     .action(listWorkspaceMembers);
 
-  workspace
-    .command('current')
-    .description('Print selected workspace ID')
-    .action(currentWorkspace);
+  workspace.command('current').description('Print selected workspace ID').action(currentWorkspace);
 }

@@ -32,7 +32,7 @@ const userIdentifierFields = {
     .enum(['telegram', 'whatsapp', 'discord'])
     .optional()
     .describe('Platform name — only needed for platform-based user lookup'),
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
 };
 
 // =====================================================

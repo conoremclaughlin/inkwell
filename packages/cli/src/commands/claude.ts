@@ -109,9 +109,25 @@ function getIdentityContextFromIdentityJson(cwd = process.cwd()): {
   }
 }
 
-function hasBackendSessionOverride(backend: string, passthroughArgs: string[]): boolean {
+export function hasBackendSessionOverride(
+  backend: string,
+  passthroughArgs: string[],
+  promptParts: string[] = []
+): boolean {
   const lowered = passthroughArgs.map((arg) => arg.toLowerCase());
   const has = (flag: string) => lowered.includes(flag.toLowerCase());
+  const isCodexResumePrompt =
+    backend === 'codex' &&
+    promptParts[0]?.toLowerCase() === 'resume' &&
+    Boolean(promptParts[1]) &&
+    !promptParts[1]?.startsWith('-');
+  const isCodexResumePassthrough =
+    backend === 'codex' &&
+    passthroughArgs[0]?.toLowerCase() === 'resume' &&
+    Boolean(passthroughArgs[1]) &&
+    !passthroughArgs[1]?.startsWith('-');
+
+  if (isCodexResumePrompt || isCodexResumePassthrough) return true;
 
   if (backend === 'claude') {
     return (
@@ -177,18 +193,16 @@ function parseSessionIdFromJsonLine(line: string): string | undefined {
   }
 }
 
-async function persistBackendSessionLink(
-  options: {
-    pcpSessionId?: string;
-    backendSessionId?: string;
-    backend: string;
-    agentId: string;
-    runtimeLinkId?: string;
-    studioId?: string;
-    identityId?: string;
-    email?: string;
-  }
-): Promise<void> {
+async function persistBackendSessionLink(options: {
+  pcpSessionId?: string;
+  backendSessionId?: string;
+  backend: string;
+  agentId: string;
+  runtimeLinkId?: string;
+  studioId?: string;
+  identityId?: string;
+  email?: string;
+}): Promise<void> {
   if (!options.pcpSessionId || !options.backendSessionId) return;
 
   upsertRuntimeSession(process.cwd(), {
@@ -219,9 +233,10 @@ async function ensurePcpSessionContext(
   agentId: string,
   backend: string,
   passthroughArgs: string[],
-  verbose: boolean
+  verbose: boolean,
+  promptParts: string[] = []
 ): Promise<{ pcpSessionId?: string; backendSessionId?: string }> {
-  if (hasBackendSessionOverride(backend, passthroughArgs)) return {};
+  if (hasBackendSessionOverride(backend, passthroughArgs, promptParts)) return {};
 
   const config = getPcpConfig();
   const email = config?.email;
@@ -356,13 +371,21 @@ export async function runClaude(
   const agentId = resolveAgentId(options.agent, options.backend);
   if (!agentId) {
     console.error(chalk.red('No agent identity configured.'));
-    console.error(chalk.dim('Run `sb init` to set up PCP in this repo, or `sb awaken` to create a new SB.'));
+    console.error(
+      chalk.dim('Run `sb init` to set up PCP in this repo, or `sb awaken` to create a new SB.')
+    );
     console.error(chalk.dim('Or pass `-a <agent>` to specify one directly.'));
     process.exit(1);
   }
   const adapter = getBackend(options.backend);
   const sessionContext = options.session
-    ? await ensurePcpSessionContext(agentId, options.backend, passthroughArgs, options.verbose)
+    ? await ensurePcpSessionContext(
+        agentId,
+        options.backend,
+        passthroughArgs,
+        options.verbose,
+        promptParts
+      )
     : {};
   const runtimeLinkId = options.session ? randomUUID() : undefined;
   const { studioId, identityId } = getIdentityContextFromIdentityJson(process.cwd());
@@ -375,7 +398,9 @@ export async function runClaude(
       ...(identityId ? { identityId } : {}),
       ...(studioId ? { studioId } : {}),
       runtimeLinkId,
-      ...(sessionContext.backendSessionId ? { backendSessionId: sessionContext.backendSessionId } : {}),
+      ...(sessionContext.backendSessionId
+        ? { backendSessionId: sessionContext.backendSessionId }
+        : {}),
       updatedAt: new Date().toISOString(),
     });
   }
@@ -473,13 +498,15 @@ export async function runClaudeInteractive(
   const agentId = resolveAgentId(options.agent, options.backend);
   if (!agentId) {
     console.error(chalk.red('No agent identity configured.'));
-    console.error(chalk.dim('Run `sb init` to set up PCP in this repo, or `sb awaken` to create a new SB.'));
+    console.error(
+      chalk.dim('Run `sb init` to set up PCP in this repo, or `sb awaken` to create a new SB.')
+    );
     console.error(chalk.dim('Or pass `-a <agent>` to specify one directly.'));
     process.exit(1);
   }
   const adapter = getBackend(options.backend);
   const sessionContext = options.session
-    ? await ensurePcpSessionContext(agentId, options.backend, passthroughArgs, options.verbose)
+    ? await ensurePcpSessionContext(agentId, options.backend, passthroughArgs, options.verbose, [])
     : {};
   const runtimeLinkId = options.session ? randomUUID() : undefined;
   const { studioId, identityId } = getIdentityContextFromIdentityJson(process.cwd());
@@ -492,7 +519,9 @@ export async function runClaudeInteractive(
       ...(identityId ? { identityId } : {}),
       ...(studioId ? { studioId } : {}),
       runtimeLinkId,
-      ...(sessionContext.backendSessionId ? { backendSessionId: sessionContext.backendSessionId } : {}),
+      ...(sessionContext.backendSessionId
+        ? { backendSessionId: sessionContext.backendSessionId }
+        : {}),
       updatedAt: new Date().toISOString(),
     });
   }

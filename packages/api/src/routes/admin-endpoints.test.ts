@@ -51,7 +51,7 @@ const mockListTrustedUsers = vi.fn();
 vi.mock('../data/composer', () => ({
   getDataComposer: vi.fn(async () => ({
     repositories: {
-      workspaceContainers: {
+      workspaces: {
         findById: mockFindById,
         findRawById: mockFindRawById,
         ensurePersonalWorkspace: mockEnsurePersonalWorkspace,
@@ -135,9 +135,7 @@ function createQueryChain(resolvedData: unknown[] | null = [], error: unknown = 
   chain.order = vi.fn(() => chain);
   chain.limit = vi.fn(() => chain);
   chain.range = vi.fn(() => chain);
-  chain.maybeSingle = vi.fn(() =>
-    Promise.resolve({ data: resolvedData?.[0] ?? null, error })
-  );
+  chain.maybeSingle = vi.fn(() => Promise.resolve({ data: resolvedData?.[0] ?? null, error }));
   chain.single = vi.fn(() =>
     Promise.resolve({
       data: resolvedData?.[0] ?? null,
@@ -145,8 +143,7 @@ function createQueryChain(resolvedData: unknown[] | null = [], error: unknown = 
     })
   );
   // Default: resolve the chain as a list query (used by .then() or await)
-  chain.then = (resolve: (val: any) => any) =>
-    resolve({ data: resolvedData, error });
+  chain.then = (resolve: (val: any) => any) => resolve({ data: resolvedData, error });
   return chain;
 }
 
@@ -165,9 +162,7 @@ function findRouteHandler(
   );
   if (!layer) return null;
   // Express stores handlers in route.stack — find the async handler
-  const handler = layer.route.stack.find(
-    (s: any) => s.handle && s.handle.length <= 3
-  );
+  const handler = layer.route.stack.find((s: any) => s.handle && s.handle.length <= 3);
   return handler?.handle ?? null;
 }
 

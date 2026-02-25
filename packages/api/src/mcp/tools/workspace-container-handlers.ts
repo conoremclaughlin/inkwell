@@ -1,5 +1,5 @@
 /**
- * Workspace Container Handlers
+ * Workspace Handlers
  *
  * Product-level workspaces (personal/team), distinct from git worktree studios.
  */
@@ -8,16 +8,16 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import type {
-  WorkspaceContainerType,
+  WorkspaceType,
   WorkspaceMemberRole,
-} from '../../data/repositories/workspace-containers.repository';
+} from '../../data/repositories/workspaces.repository';
 import type { Json } from '../../data/supabase/types';
 import { slugifyWorkspaceName } from '../../utils/workspace-slug';
 
 const workspaceContainerTypeSchema = z.enum(['personal', 'team']);
 const workspaceMemberRoleSchema = z.enum(['owner', 'admin', 'member', 'viewer']);
 
-export const createWorkspaceContainerSchema = userIdentifierBaseSchema.extend({
+export const createWorkspaceSchema = userIdentifierBaseSchema.extend({
   name: z.string().min(1).describe('Workspace display name (e.g., "Personal", "PCP Team")'),
   slug: z
     .string()
@@ -32,7 +32,7 @@ export const createWorkspaceContainerSchema = userIdentifierBaseSchema.extend({
   metadata: z.record(z.unknown()).optional().describe('Optional workspace metadata'),
 });
 
-export const listWorkspaceContainersSchema = userIdentifierBaseSchema.extend({
+export const listWorkspacesSchema = userIdentifierBaseSchema.extend({
   type: workspaceContainerTypeSchema.optional().describe('Optional type filter'),
   includeArchived: z.boolean().optional().default(false).describe('Include archived workspaces'),
   ensurePersonal: z
@@ -42,12 +42,12 @@ export const listWorkspaceContainersSchema = userIdentifierBaseSchema.extend({
     .describe('Ensure a default personal workspace exists'),
 });
 
-export const getWorkspaceContainerSchema = userIdentifierBaseSchema.extend({
+export const getWorkspaceSchema = userIdentifierBaseSchema.extend({
   workspaceId: z.string().uuid().describe('Workspace UUID'),
   includeMembers: z.boolean().optional().default(false).describe('Include workspace members'),
 });
 
-export const updateWorkspaceContainerSchema = userIdentifierBaseSchema.extend({
+export const updateWorkspaceSchema = userIdentifierBaseSchema.extend({
   workspaceId: z.string().uuid().describe('Workspace UUID'),
   name: z.string().min(1).optional(),
   slug: z.string().min(1).optional(),
@@ -80,20 +80,20 @@ function toJsonObject(value: Record<string, unknown> | undefined): Json | undefi
   return value as Json | undefined;
 }
 
-export async function handleCreateWorkspaceContainer(args: unknown, dataComposer: DataComposer) {
-  const params = createWorkspaceContainerSchema.parse(args);
+export async function handleCreateWorkspace(args: unknown, dataComposer: DataComposer) {
+  const params = createWorkspaceSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
-  const workspace = await dataComposer.repositories.workspaceContainers.create({
+  const workspace = await dataComposer.repositories.workspaces.create({
     userId: user.id,
     name: params.name,
     slug: params.slug || slugifyWorkspaceName(params.name),
-    type: (params.type || 'personal') as WorkspaceContainerType,
+    type: (params.type || 'personal') as WorkspaceType,
     description: params.description,
     metadata: toJsonObject(params.metadata),
   });
 
-  await dataComposer.repositories.workspaceContainers.addMember(workspace.id, user.id, 'owner');
+  await dataComposer.repositories.workspaces.addMember(workspace.id, user.id, 'owner');
 
   return successResponse({
     user: { id: user.id, resolvedBy },
@@ -112,16 +112,16 @@ export async function handleCreateWorkspaceContainer(args: unknown, dataComposer
   });
 }
 
-export async function handleListWorkspaceContainers(args: unknown, dataComposer: DataComposer) {
-  const params = listWorkspaceContainersSchema.parse(args);
+export async function handleListWorkspaces(args: unknown, dataComposer: DataComposer) {
+  const params = listWorkspacesSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
   if (params.ensurePersonal !== false) {
-    await dataComposer.repositories.workspaceContainers.ensurePersonalWorkspace(user.id);
+    await dataComposer.repositories.workspaces.ensurePersonalWorkspace(user.id);
   }
 
-  const workspaces = await dataComposer.repositories.workspaceContainers.listMembershipsByUser(user.id, {
-    type: params.type as WorkspaceContainerType | undefined,
+  const workspaces = await dataComposer.repositories.workspaces.listMembershipsByUser(user.id, {
+    type: params.type as WorkspaceType | undefined,
     includeArchived: params.includeArchived,
   });
 
@@ -145,11 +145,11 @@ export async function handleListWorkspaceContainers(args: unknown, dataComposer:
   });
 }
 
-export async function handleGetWorkspaceContainer(args: unknown, dataComposer: DataComposer) {
-  const params = getWorkspaceContainerSchema.parse(args);
+export async function handleGetWorkspace(args: unknown, dataComposer: DataComposer) {
+  const params = getWorkspaceSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
-  const workspace = await dataComposer.repositories.workspaceContainers.findById(
+  const workspace = await dataComposer.repositories.workspaces.findById(
     params.workspaceId,
     user.id
   );
@@ -166,7 +166,7 @@ export async function handleGetWorkspaceContainer(args: unknown, dataComposer: D
   }
 
   const members = params.includeMembers
-    ? await dataComposer.repositories.workspaceContainers.listMembersWithUsers(workspace.id)
+    ? await dataComposer.repositories.workspaces.listMembersWithUsers(workspace.id)
     : undefined;
 
   return successResponse({
@@ -201,27 +201,19 @@ export async function handleGetWorkspaceContainer(args: unknown, dataComposer: D
   });
 }
 
-export async function handleUpdateWorkspaceContainer(args: unknown, dataComposer: DataComposer) {
-  const params = updateWorkspaceContainerSchema.parse(args);
+export async function handleUpdateWorkspace(args: unknown, dataComposer: DataComposer) {
+  const params = updateWorkspaceSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
-  const updated = await dataComposer.repositories.workspaceContainers.update(
-    params.workspaceId,
-    user.id,
-    {
-      name: params.name,
-      slug: params.slug,
-      type: params.type as WorkspaceContainerType | undefined,
-      description: params.description,
-      metadata: toJsonObject(params.metadata),
-      archivedAt:
-        params.archived === undefined
-          ? undefined
-          : params.archived
-            ? new Date().toISOString()
-            : null,
-    }
-  );
+  const updated = await dataComposer.repositories.workspaces.update(params.workspaceId, user.id, {
+    name: params.name,
+    slug: params.slug,
+    type: params.type as WorkspaceType | undefined,
+    description: params.description,
+    metadata: toJsonObject(params.metadata),
+    archivedAt:
+      params.archived === undefined ? undefined : params.archived ? new Date().toISOString() : null,
+  });
 
   return successResponse({
     user: { id: user.id, resolvedBy },
@@ -244,7 +236,7 @@ export async function handleAddWorkspaceMember(args: unknown, dataComposer: Data
   const params = addWorkspaceMemberSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
-  const workspace = await dataComposer.repositories.workspaceContainers.findById(
+  const workspace = await dataComposer.repositories.workspaces.findById(
     params.workspaceId,
     user.id
   );
@@ -252,7 +244,7 @@ export async function handleAddWorkspaceMember(args: unknown, dataComposer: Data
     return errorResponse('Workspace not found or not accessible');
   }
 
-  const canManage = await dataComposer.repositories.workspaceContainers.canManageWorkspace(
+  const canManage = await dataComposer.repositories.workspaces.canManageWorkspace(
     workspace.id,
     user.id
   );
@@ -260,7 +252,7 @@ export async function handleAddWorkspaceMember(args: unknown, dataComposer: Data
     return errorResponse('Only workspace owners/admins can add collaborators');
   }
 
-  const actingRole = await dataComposer.repositories.workspaceContainers.getMemberRole(
+  const actingRole = await dataComposer.repositories.workspaces.getMemberRole(
     workspace.id,
     user.id
   );
@@ -279,7 +271,7 @@ export async function handleAddWorkspaceMember(args: unknown, dataComposer: Data
     userWasCreated = true;
   }
 
-  const member = await dataComposer.repositories.workspaceContainers.addMember(
+  const member = await dataComposer.repositories.workspaces.addMember(
     workspace.id,
     invitedUser.id,
     (params.role || 'member') as WorkspaceMemberRole

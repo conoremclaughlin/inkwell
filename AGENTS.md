@@ -521,6 +521,7 @@ Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key SB-specific reminders:
 
 - **Title format**: `feat: description (by <SB name>)` — the `(by <name>)` suffix attributes work.
 - **Sign reviews**: end PR comments with `— Wren`, `— Lumen`, etc.
+- **Do not wait for permission to open a PR** once implementation is ready. Create the PR proactively unless the user explicitly asked you not to.
 - **Never push directly to main** from a feature branch. Always use PRs.
 
 ## Architecture Notes

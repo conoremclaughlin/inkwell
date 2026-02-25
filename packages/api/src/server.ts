@@ -234,7 +234,10 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     // For external channels (telegram/whatsapp), ensure the conversation is released
     // and auto-route the text response if no explicit send_response was called
     const isExternalChannel =
-      channel === 'telegram' || channel === 'whatsapp' || channel === 'discord' || channel === 'slack';
+      channel === 'telegram' ||
+      channel === 'whatsapp' ||
+      channel === 'discord' ||
+      channel === 'slack';
     if (isExternalChannel && channelGateway) {
       // Check if send_response was called via MCP (tracked in response-handlers)
       const hadExplicitResponse = hasExplicitResponse(channel, conversationId);
@@ -339,7 +342,16 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   }
 
   // 6. Initialize heartbeat service for scheduled reminders
-  const enableLocalCron = process.env.NODE_ENV !== 'production';
+  // Useful for secondary/local dev servers where we want API/MCP without
+  // participating in global reminder delivery.
+  const heartbeatServiceEnabled =
+    process.env.ENABLE_HEARTBEAT_SERVICE !== 'false' &&
+    process.env.ENABLE_HEARTBEATS !== 'false' &&
+    process.env.ENABLE_REMINDERS !== 'false';
+  const enableLocalCron =
+    process.env.ENABLE_LOCAL_CRON !== undefined
+      ? process.env.ENABLE_LOCAL_CRON === 'true'
+      : process.env.NODE_ENV !== 'production';
   const heartbeatInterval = process.env.HEARTBEAT_INTERVAL || '*/5 * * * *';
 
   /**
@@ -405,18 +417,24 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     }
   };
 
-  initHeartbeatService({
-    interval: heartbeatInterval,
-    enableLocalCron,
-    onHeartbeat: async () => {
-      logger.info('Heartbeat tick — processing due reminders');
-      const stats = await processHeartbeat(deliverReminderViaSession);
-      logger.info('Heartbeat complete', stats);
-    },
-  });
-  logger.info(
-    `Heartbeat service started (interval: ${heartbeatInterval}, local cron: ${enableLocalCron})`
-  );
+  if (heartbeatServiceEnabled) {
+    initHeartbeatService({
+      interval: heartbeatInterval,
+      enableLocalCron,
+      onHeartbeat: async () => {
+        logger.info('Heartbeat tick — processing due reminders');
+        const stats = await processHeartbeat(deliverReminderViaSession);
+        logger.info('Heartbeat complete', stats);
+      },
+    });
+    logger.info(
+      `Heartbeat service started (interval: ${heartbeatInterval}, local cron: ${enableLocalCron})`
+    );
+  } else {
+    logger.warn(
+      'Heartbeat service disabled via env (ENABLE_HEARTBEAT_SERVICE/ENABLE_HEARTBEATS/ENABLE_REMINDERS=false). Scheduled reminders will not be processed on this server.'
+    );
+  }
 
   // 7. Register default trigger handler for stateless, database-driven agent routing
   // This handles triggers for ANY agent by looking up config from the database
@@ -459,7 +477,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     // 2. Resolve and verify target identity for this user
     // Prefer recipient_identity_id from inbox; fallback to user+agent_id with disambiguation.
     let resolvedIdentityId = recipientIdentityId;
-    let resolvedWorkspaceContainerId: string | undefined;
+    let resolvedWorkspaceId: string | undefined;
     const metadataWorkspaceId =
       payload.metadata &&
       typeof payload.metadata.workspaceId === 'string' &&
@@ -488,7 +506,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         );
       }
 
-      resolvedWorkspaceContainerId = identityRow.workspace_id || undefined;
+      resolvedWorkspaceId = identityRow.workspace_id || undefined;
     } else {
       let identityQuery = dataComposer!
         .getClient()
@@ -524,7 +542,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         );
       } else {
         resolvedIdentityId = identityRows[0].id;
-        resolvedWorkspaceContainerId = identityRows[0].workspace_id || undefined;
+        resolvedWorkspaceId = identityRows[0].workspace_id || undefined;
       }
     }
 
@@ -568,7 +586,7 @@ If you need to message a user, use send_response with the appropriate channel an
       userId,
       agentId: targetAgentId,
       identityId: resolvedIdentityId,
-      workspaceId: resolvedWorkspaceContainerId || null,
+      workspaceId: resolvedWorkspaceId || null,
     });
 
     const result = await sessionService!.handleMessage(request);

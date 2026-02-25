@@ -57,14 +57,20 @@ apiClient.interceptors.request.use(async (config) => {
 // Response interceptor - transform errors
 apiClient.interceptors.response.use(
   (response: AxiosResponse) => response,
-  (error: AxiosError<{ error?: string }>) => {
+  (error: AxiosError<{ error?: string; detail?: string }>) => {
     if (isInvalidTokenAuthFailure(error)) {
       void handleInvalidTokenLogout();
     }
 
-    const apiError = new Error(
-      error.response?.data?.error || error.message || 'Request failed'
-    ) as ApiError;
+    // In dev mode the API returns a `detail` field with the real error message.
+    // Surface it so dashboard errors are immediately actionable.
+    const serverError = error.response?.data?.error;
+    const serverDetail = error.response?.data?.detail;
+    const displayMessage = serverDetail
+      ? `${serverError}: ${serverDetail}`
+      : serverError || error.message || 'Request failed';
+
+    const apiError = new Error(displayMessage) as ApiError;
     apiError.status = error.response?.status || 500;
     apiError.data = error.response?.data;
     return Promise.reject(apiError);

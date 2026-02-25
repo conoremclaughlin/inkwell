@@ -211,25 +211,25 @@ import {
 } from './activity-stream-handlers';
 
 import {
+  handleCreateWorkspace as handleCreateStudio,
+  handleListWorkspaces as handleListStudios,
+  handleGetWorkspace as handleGetStudio,
+  handleUpdateWorkspace as handleUpdateStudio,
+  handleCloseWorkspace as handleCloseStudio,
+  handleAdoptWorkspace as handleAdoptStudio,
+  workspaceToolDefinitions as studioToolDefinitions,
+} from './workspace-handlers';
+
+import {
   handleCreateWorkspace,
   handleListWorkspaces,
   handleGetWorkspace,
   handleUpdateWorkspace,
-  handleCloseWorkspace,
-  handleAdoptWorkspace,
-  workspaceToolDefinitions,
-} from './workspace-handlers';
-
-import {
-  handleCreateWorkspaceContainer,
-  handleListWorkspaceContainers,
-  handleGetWorkspaceContainer,
-  handleUpdateWorkspaceContainer,
   handleAddWorkspaceMember,
-  createWorkspaceContainerSchema,
-  listWorkspaceContainersSchema,
-  getWorkspaceContainerSchema,
-  updateWorkspaceContainerSchema,
+  createWorkspaceSchema,
+  listWorkspacesSchema,
+  getWorkspaceSchema,
+  updateWorkspaceSchema,
   addWorkspaceMemberSchema,
 } from './workspace-container-handlers';
 
@@ -4148,24 +4148,24 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   );
 
   // =====================================================
-  // WORKSPACE CONTAINER TOOLS (personal/team scope)
+  // WORKSPACE TOOLS (top-level personal/team scope)
   // =====================================================
 
   server.registerTool(
-    'create_workspace_container',
+    'create_workspace',
     {
-      description: `Create a top-level workspace container (personal/team scope). This is distinct from git worktree studios.
+      description: `Create a top-level workspace (personal/team scope). Distinct from git worktree studios.
 
 Use this for Notion/Slack/Linear-style workspace boundaries.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: createWorkspaceContainerSchema,
+      inputSchema: createWorkspaceSchema,
     },
     async (args: Record<string, unknown>) => {
       try {
-        return await handleCreateWorkspaceContainer(args, dataComposer);
+        return await handleCreateWorkspace(args, dataComposer);
       } catch (error) {
-        logger.error('Error in create_workspace_container:', error);
+        logger.error('Error in create_workspace:', error);
         return {
           content: [
             {
@@ -4183,18 +4183,18 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   );
 
   server.registerTool(
-    'list_workspace_containers',
+    'list_workspaces',
     {
-      description: `List top-level workspace containers (personal/team scope). Ensures a default personal workspace exists unless disabled.
+      description: `List top-level workspaces (personal/team scope). Ensures a default personal workspace exists unless disabled.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: listWorkspaceContainersSchema,
+      inputSchema: listWorkspacesSchema,
     },
     async (args: Record<string, unknown>) => {
       try {
-        return await handleListWorkspaceContainers(args, dataComposer);
+        return await handleListWorkspaces(args, dataComposer);
       } catch (error) {
-        logger.error('Error in list_workspace_containers:', error);
+        logger.error('Error in list_workspaces:', error);
         return {
           content: [
             {
@@ -4212,18 +4212,18 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   );
 
   server.registerTool(
-    'get_workspace_container',
+    'get_workspace',
     {
-      description: `Get one workspace container by ID. Optionally include member list.
+      description: `Get one workspace by ID. Optionally include member list.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: getWorkspaceContainerSchema,
+      inputSchema: getWorkspaceSchema,
     },
     async (args: Record<string, unknown>) => {
       try {
-        return await handleGetWorkspaceContainer(args, dataComposer);
+        return await handleGetWorkspace(args, dataComposer);
       } catch (error) {
-        logger.error('Error in get_workspace_container:', error);
+        logger.error('Error in get_workspace:', error);
         return {
           content: [
             {
@@ -4241,18 +4241,18 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   );
 
   server.registerTool(
-    'update_workspace_container',
+    'update_workspace',
     {
-      description: `Update workspace container metadata (name, slug, type, description, archive state).
+      description: `Update workspace metadata (name, slug, type, description, archive state).
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: updateWorkspaceContainerSchema,
+      inputSchema: updateWorkspaceSchema,
     },
     async (args: Record<string, unknown>) => {
       try {
-        return await handleUpdateWorkspaceContainer(args, dataComposer);
+        return await handleUpdateWorkspace(args, dataComposer);
       } catch (error) {
-        logger.error('Error in update_workspace_container:', error);
+        logger.error('Error in update_workspace:', error);
         return {
           content: [
             {
@@ -4272,7 +4272,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'add_workspace_member',
     {
-      description: `Invite/add a collaborator to a workspace container by email.
+      description: `Invite/add a collaborator to a workspace by email.
 Creates a placeholder PCP user if needed, then grants workspace membership.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
@@ -4300,198 +4300,18 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   );
 
   // =====================================================
-  // STUDIO TOOLS (legacy `workspace` naming for git worktree management)
+  // STUDIO TOOLS (git worktree management)
   // =====================================================
-
-  server.registerTool(
-    'create_workspace',
-    {
-      description: `Create a new git worktree workspace for isolated parallel work. Sets up the worktree, installs dependencies, and tracks it in the database.
-
-Branch naming: {agentId}/{type}/{slug} (e.g., wren/feat/session-monitoring)
-Path: {parentDir}/{repoBaseName}--{slug}
-
-User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: workspaceToolDefinitions[0].schema,
-    },
-    async (args: Record<string, unknown>) => {
-      try {
-        return await handleCreateWorkspace(args, dataComposer);
-      } catch (error) {
-        logger.error('Error in create_workspace:', error);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  server.registerTool(
-    'list_workspaces',
-    {
-      description: `List workspaces for the current user. By default excludes cleaned workspaces. Can filter by agent and status.
-
-User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: workspaceToolDefinitions[1].schema,
-    },
-    async (args: Record<string, unknown>) => {
-      try {
-        return await handleListWorkspaces(args, dataComposer);
-      } catch (error) {
-        logger.error('Error in list_workspaces:', error);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  server.registerTool(
-    'get_workspace',
-    {
-      description: `Get full details of a workspace by its ID, branch name, or worktree path.
-
-User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: workspaceToolDefinitions[2].schema,
-    },
-    async (args: Record<string, unknown>) => {
-      try {
-        return await handleGetWorkspace(args, dataComposer);
-      } catch (error) {
-        logger.error('Error in get_workspace:', error);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  server.registerTool(
-    'update_workspace',
-    {
-      description: `Update a workspace status, purpose, or session linkage. Use unlinkSession to detach the current session and set status to idle.
-
-User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: workspaceToolDefinitions[3].schema,
-    },
-    async (args: Record<string, unknown>) => {
-      try {
-        return await handleUpdateWorkspace(args, dataComposer);
-      } catch (error) {
-        logger.error('Error in update_workspace:', error);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  server.registerTool(
-    'close_workspace',
-    {
-      description: `Close a workspace by removing its git worktree, optionally deleting the branch, and marking it as cleaned in the database.
-
-User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: workspaceToolDefinitions[4].schema,
-    },
-    async (args: Record<string, unknown>) => {
-      try {
-        return await handleCloseWorkspace(args, dataComposer);
-      } catch (error) {
-        logger.error('Error in close_workspace:', error);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  server.registerTool(
-    'adopt_workspace',
-    {
-      description: `Adopt an existing workspace by linking a new session to it and setting it to active. Useful when resuming work in a previously created worktree.
-
-User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: workspaceToolDefinitions[5].schema,
-    },
-    async (args: Record<string, unknown>) => {
-      try {
-        return await handleAdoptWorkspace(args, dataComposer);
-      } catch (error) {
-        logger.error('Error in adopt_workspace:', error);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  // Studio-first aliases (preferred naming).
-  // Backward compatibility: legacy workspace tool names remain available above.
 
   server.registerTool(
     'create_studio',
     {
       description: `Create a new git worktree studio for isolated parallel work.`,
-      inputSchema: workspaceToolDefinitions[0].schema,
+      inputSchema: studioToolDefinitions[0].schema,
     },
     async (args: Record<string, unknown>) => {
       try {
-        return await handleCreateWorkspace(args, dataComposer);
+        return await handleCreateStudio(args, dataComposer);
       } catch (error) {
         logger.error('Error in create_studio:', error);
         return {
@@ -4513,12 +4333,12 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'list_studios',
     {
-      description: `List git worktree studios (legacy workspace records).`,
-      inputSchema: workspaceToolDefinitions[1].schema,
+      description: `List git worktree studios for the current user.`,
+      inputSchema: studioToolDefinitions[1].schema,
     },
     async (args: Record<string, unknown>) => {
       try {
-        return await handleListWorkspaces(args, dataComposer);
+        return await handleListStudios(args, dataComposer);
       } catch (error) {
         logger.error('Error in list_studios:', error);
         return {
@@ -4541,11 +4361,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     'get_studio',
     {
       description: `Get one git worktree studio by ID, branch, or path.`,
-      inputSchema: workspaceToolDefinitions[2].schema,
+      inputSchema: studioToolDefinitions[2].schema,
     },
     async (args: Record<string, unknown>) => {
       try {
-        return await handleGetWorkspace(args, dataComposer);
+        return await handleGetStudio(args, dataComposer);
       } catch (error) {
         logger.error('Error in get_studio:', error);
         return {
@@ -4568,11 +4388,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     'update_studio',
     {
       description: `Update a git worktree studio status, purpose, or session link.`,
-      inputSchema: workspaceToolDefinitions[3].schema,
+      inputSchema: studioToolDefinitions[3].schema,
     },
     async (args: Record<string, unknown>) => {
       try {
-        return await handleUpdateWorkspace(args, dataComposer);
+        return await handleUpdateStudio(args, dataComposer);
       } catch (error) {
         logger.error('Error in update_studio:', error);
         return {
@@ -4595,11 +4415,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     'close_studio',
     {
       description: `Close a git worktree studio and optionally clean worktree/branch.`,
-      inputSchema: workspaceToolDefinitions[4].schema,
+      inputSchema: studioToolDefinitions[4].schema,
     },
     async (args: Record<string, unknown>) => {
       try {
-        return await handleCloseWorkspace(args, dataComposer);
+        return await handleCloseStudio(args, dataComposer);
       } catch (error) {
         logger.error('Error in close_studio:', error);
         return {
@@ -4622,11 +4442,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     'adopt_studio',
     {
       description: `Adopt an existing git worktree studio into a new session.`,
-      inputSchema: workspaceToolDefinitions[5].schema,
+      inputSchema: studioToolDefinitions[5].schema,
     },
     async (args: Record<string, unknown>) => {
       try {
-        return await handleAdoptWorkspace(args, dataComposer);
+        return await handleAdoptStudio(args, dataComposer);
       } catch (error) {
         logger.error('Error in adopt_studio:', error);
         return {

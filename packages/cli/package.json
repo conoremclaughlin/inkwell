@@ -10,10 +10,10 @@
   "scripts": {
     "build": "tsc && cp -r src/templates dist/templates",
     "dev": "tsc --watch",
-    "dev:live": "tsc && cp -r src/templates dist/templates && chmod +x dist/cli.js && mkdir -p \"$HOME/.local/bin\" && ln -sf \"$(pwd)/dist/cli.js\" \"$HOME/.local/bin/sb\" && echo '✓ sb linked to '\"$(pwd)/dist/cli.js\" && tsc --watch",
+    "dev:live": "tsc && cp -r src/templates dist/templates && chmod +x dist/cli.js && mkdir -p \"$HOME/.pcp/bin\" \"$HOME/.local/bin\" && ln -sf \"$(pwd)/dist/cli.js\" \"$HOME/.pcp/bin/sb\" && ln -sf \"$HOME/.pcp/bin/sb\" \"$HOME/.local/bin/sb\" && echo \"✓ sb linked: $HOME/.pcp/bin/sb (compat: $HOME/.local/bin/sb)\" && if ! printf '%s' \":$PATH:\" | grep -q \":$HOME/.pcp/bin:\" && ! printf '%s' \":$PATH:\" | grep -q \":$HOME/.local/bin:\"; then echo \"⚠️  PATH warning: neither $HOME/.pcp/bin nor $HOME/.local/bin is in PATH\"; echo \"   Add one of them in your shell profile so 'sb' resolves in new shells.\"; fi && tsc --watch",
     "cli": "tsx src/cli.ts",
-    "install:cli": "chmod +x dist/cli.js && mkdir -p \"$HOME/.local/bin\" && ln -sf \"$(pwd)/dist/cli.js\" \"$HOME/.local/bin/sb\" && echo 'Linked: $HOME/.local/bin/sb → dist/cli.js'",
-    "uninstall:cli": "rm -f \"$HOME/.local/bin/sb\" && echo 'Unlinked: $HOME/.local/bin/sb'",
+    "install:cli": "chmod +x dist/cli.js && mkdir -p \"$HOME/.pcp/bin\" \"$HOME/.local/bin\" && ln -sf \"$(pwd)/dist/cli.js\" \"$HOME/.pcp/bin/sb\" && ln -sf \"$HOME/.pcp/bin/sb\" \"$HOME/.local/bin/sb\" && echo \"Linked: $HOME/.pcp/bin/sb → dist/cli.js (compat: $HOME/.local/bin/sb)\" && if ! printf '%s' \":$PATH:\" | grep -q \":$HOME/.pcp/bin:\" && ! printf '%s' \":$PATH:\" | grep -q \":$HOME/.local/bin:\"; then echo \"⚠️  PATH warning: neither $HOME/.pcp/bin nor $HOME/.local/bin is in PATH\"; echo \"   Add one of them in your shell profile so 'sb' resolves in new shells.\"; fi",
+    "uninstall:cli": "rm -f \"$HOME/.pcp/bin/sb\" \"$HOME/.local/bin/sb\" && echo \"Unlinked: $HOME/.pcp/bin/sb and $HOME/.local/bin/sb\"",
     "test": "vitest run",
     "test:watch": "vitest",
     "clean": "rm -rf dist"
