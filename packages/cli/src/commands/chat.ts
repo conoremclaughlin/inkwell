@@ -69,6 +69,7 @@ interface ChatRuntime {
   toolMode: ToolMode;
   threadKey?: string;
   studioId?: string;
+  userTimezone?: string;
   sessionId?: string;
   maxContextTokens: number;
   pollSeconds: number;
@@ -579,6 +580,27 @@ function formatStartedAt(value?: string): string {
   return new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 }
 
+function formatNow(timezone?: string): string {
+  try {
+    return new Date().toLocaleTimeString([], {
+      hour: 'numeric',
+      minute: '2-digit',
+      second: '2-digit',
+      timeZone: timezone,
+    });
+  } catch {
+    return new Date().toLocaleTimeString([], {
+      hour: 'numeric',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+  }
+}
+
+function chip(label: string, value: string, color: (text: string) => string): string {
+  return `${chalk.dim(`${label}:`)} ${color(value)}`;
+}
+
 function printSessionsSnapshot(sessions: SessionSummary[]): void {
   if (sessions.length === 0) {
     console.log(chalk.dim('No active sessions found.'));
@@ -827,6 +849,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       options.tools === 'off' ? 'off' : options.tools === 'privileged' ? 'privileged' : 'backend',
     threadKey: options.threadKey,
     studioId: identity?.workspaceId,
+    userTimezone: undefined,
     sessionId: options.sessionId?.trim() || undefined,
     maxContextTokens: Number.parseInt(options.maxContextTokens || '12000', 10),
     pollSeconds: Number.parseInt(options.pollSeconds || '20', 10),
@@ -868,6 +891,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       bootstrapResult.reflectionStatus as Record<string, unknown> | undefined
     )?.suggestion;
     const timezone = (bootstrapResult.user as Record<string, unknown> | undefined)?.timezone;
+    if (typeof timezone === 'string' && timezone.trim()) {
+      runtime.userTimezone = timezone;
+    }
     ledger.addEntry(
       'system',
       `Bootstrapped as ${agentId}${timezone ? ` (${String(timezone)})` : ''}${
@@ -967,11 +993,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
       .catch(() => undefined);
   }
 
-  console.log(chalk.bold('\nSB Chat (experimental)\n'));
-  console.log(chalk.dim(`Agent: ${agentId}`));
-  console.log(chalk.dim(`Backend: ${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}`));
+  console.log(chalk.magentaBright('\n✦━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━✦'));
+  console.log(chalk.bold.white('  SB Chat · first-class PCP REPL'));
+  console.log(chalk.magentaBright('✦━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━✦\n'));
+  console.log(
+    [
+      chip('agent', agentId, chalk.cyan),
+      chip('backend', `${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}`, chalk.yellow),
+      chip('inbox auto-run', runtime.autoRunInbox ? 'on' : 'off', runtime.autoRunInbox ? chalk.green : chalk.dim),
+      chip('local time', formatNow(runtime.userTimezone), chalk.magenta),
+    ].join(chalk.dim('  •  '))
+  );
   if (runtime.threadKey) console.log(chalk.dim(`Thread: ${runtime.threadKey}`));
-  console.log(chalk.dim(`Auto-run inbox: ${runtime.autoRunInbox ? 'on' : 'off'}`));
   if (attachedToExistingSession) console.log(chalk.dim('Mode: attached to existing session'));
   if (autoAttachedLatest) console.log(chalk.dim('Mode: auto-attached to latest active session'));
   if (runtime.sessionId) console.log(chalk.dim(`Session: ${runtime.sessionId}`));
@@ -1060,7 +1093,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         messageType: msg.messageType || null,
         relatedSessionId: msg.relatedSessionId || null,
       });
-      console.log(`\n${chalk.cyan(rendered)}\n`);
+      console.log(`\n${chalk.cyan(rendered)} ${chalk.dim(`• ${formatNow(runtime.userTimezone)}`)}\n`);
 
       const eligibleForAutoRun =
         runtime.autoRunInbox &&
@@ -1124,7 +1157,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         sessionId: activity.sessionId || null,
         content: activity.content || null,
       });
-      console.log(`\n${chalk.magenta(rendered)}\n`);
+      console.log(`\n${chalk.magenta(rendered)} ${chalk.dim(`• ${formatNow(runtime.userTimezone)}`)}\n`);
     }
 
     if (force && activities.length === 0) {
@@ -1212,7 +1245,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
     }
 
-    console.log(`\n${chalk.white(responseText)}\n`);
+    console.log(`\n${chalk.white(responseText)} ${chalk.dim(`• ${formatNow(runtime.userTimezone)}`)}\n`);
     if (runResult.usage) {
       console.log(chalk.dim(`↳ ${formatBackendTokenUsage(runResult.usage)}\n`));
     }
