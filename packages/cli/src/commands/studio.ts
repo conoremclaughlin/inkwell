@@ -615,9 +615,6 @@ async function createStudio(
       overrides?.configDirsList ??
       (options.copyConfig ? (options.configDirs || '.claude').split(',').map((s) => s.trim()) : []);
 
-    // Hooks already installed by createStudioInner — check status for display
-    const { result: hooksResult, backend: hooksBackend } = installHooks(wsPath);
-
     spinner.succeed(`Studio created: ${name}`);
     console.log('');
     console.log(chalk.dim('  Path:   ') + wsPath);
@@ -633,16 +630,7 @@ async function createStudio(
       const copySourceRoot = resolveCopySourceRoot(gitRoot, options.copyFrom);
       console.log(chalk.dim('  Source: ') + copySourceRoot);
     }
-    if (hooksResult === 'installed') {
-      console.log(chalk.dim('  Hooks:  ') + `${hooksBackend.name} (installed)`);
-    } else if (hooksResult === 'already-installed') {
-      console.log(chalk.dim('  Hooks:  ') + `${hooksBackend.name} (already installed)`);
-    } else if (hooksResult === 'conflict') {
-      console.log(
-        chalk.yellow('  Hooks:  ') +
-          `skipped — existing non-PCP hooks in ${hooksBackend.configPath}. Run: sb hooks install --force`
-      );
-    }
+    console.log(chalk.dim('  Hooks:  ') + 'installed');
     console.log('');
     console.log(chalk.cyan('To start working:'));
     console.log(chalk.dim(`  cd ${wsPath} && sb`));
@@ -750,6 +738,18 @@ async function createStudioInner(
     throw new Error(`Studio already exists at ${wsPath}`);
   }
 
+  // Validate template before any side effects (worktree creation, file copies)
+  let roleContent: string | null = null;
+  if (options.template) {
+    roleContent = resolveRoleTemplate(options.template);
+    if (!roleContent) {
+      const available = listRoleTemplates();
+      throw new Error(
+        `Unknown template: ${options.template}\n  Available: ${available.join(', ') || '(none)'}`
+      );
+    }
+  }
+
   // Create git worktree
   if (branchExists(branch, gitRoot)) {
     git(`worktree add "${wsPath}" "${branch}"`, gitRoot);
@@ -789,18 +789,6 @@ async function createStudioInner(
     const payload = decodeJwtPayload(auth.access_token);
     if (payload?.identityId) {
       identityId = payload.identityId;
-    }
-  }
-
-  // Role template
-  let roleContent: string | null = null;
-  if (options.template) {
-    roleContent = resolveRoleTemplate(options.template);
-    if (!roleContent) {
-      const available = listRoleTemplates();
-      throw new Error(
-        `Unknown template: ${options.template}\n  Available: ${available.join(', ') || '(none)'}`
-      );
     }
   }
 
