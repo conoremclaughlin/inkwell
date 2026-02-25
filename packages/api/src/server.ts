@@ -43,8 +43,6 @@ import { env } from './config/env';
 
 // Server configuration
 interface ServerConfig {
-  /** Model to use (default: sonnet) */
-  model?: string;
   /** Working directory for Claude Code */
   workingDirectory?: string;
   /** Path to MCP config file */
@@ -100,13 +98,11 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   // Resolve configuration
   const workingDirectory = config.workingDirectory || path.resolve(__dirname, '../../..');
   const mcpConfigPath = config.mcpConfigPath || path.resolve(workingDirectory, '.mcp.json');
-  const model = config.model || env.DEFAULT_MODEL || 'sonnet';
   const agentId = process.env.AGENT_ID || 'myra';
 
   logger.info('Configuration:', {
     workingDirectory,
     mcpConfigPath,
-    model,
     agentId,
     telegramPollingInterval: config.telegramPollingInterval || 1000,
   });
@@ -121,7 +117,6 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   const sessionServiceConfig: Partial<SessionServiceConfig> = {
     defaultWorkingDirectory: workingDirectory,
     mcpConfigPath,
-    defaultModel: model,
     compactionThreshold: config.compactionThreshold || 150000,
     responseHandler: async (responses) => routeResponses(responses),
   };
@@ -772,7 +767,6 @@ process.on('unhandledRejection', (reason) => {
 
 // Start the server
 startServer({
-  model: env.DEFAULT_MODEL || 'sonnet',
   workingDirectory: process.env.PCP_WORKING_DIR || path.resolve(__dirname, '../../..'),
   mcpConfigPath: process.env.MCP_CONFIG_PATH,
 }).catch((error) => {

@@ -118,7 +118,6 @@ describe('SessionService Codex backend integration', () => {
       {
         defaultWorkingDirectory: process.cwd(),
         mcpConfigPath: '',
-        defaultModel: 'sonnet',
       },
       codexRunner
     );
