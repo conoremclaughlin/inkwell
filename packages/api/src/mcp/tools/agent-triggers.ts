@@ -56,9 +56,9 @@ export const triggerAgentSchema = z.object({
     .optional()
     .describe('Optional explicit studio ID for the target agent session'),
   studioHint: z
-    .enum(['main'])
+    .string()
     .optional()
-    .describe('Convenience studio routing hint (e.g., "main" to force shared main studio)'),
+    .describe('Convenience studio routing hint (e.g., "main" for shared main studio, or a studio name)'),
   recipientSessionId: z
     .string()
     .uuid()

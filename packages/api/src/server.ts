@@ -559,7 +559,8 @@ Type: ${payload.triggerType}`;
 ---
 IMPORTANT: This is a system trigger, NOT a user message on Telegram/WhatsApp.
 Check your inbox for the full message using get_inbox.
-If you need to message a user, use send_response with the appropriate channel and conversationId.`;
+If you need to message a user, use send_response with the appropriate channel and conversationId.
+When you complete a task_request, mark it as completed using update_inbox_message(messageId, status: "completed").`;
 
     // 4. Process via SessionService (stateless - looks up session from DB)
     const request: SessionRequest = {

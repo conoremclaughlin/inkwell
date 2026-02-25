@@ -263,6 +263,16 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       accepted: result.accepted,
       error: result.error,
     };
+
+    // Auto-mark as read: if the trigger was accepted, the recipient agent
+    // has been woken up to process this message.
+    if (result.accepted) {
+      await supabase
+        .from('agent_inbox')
+        .update({ status: 'read', read_at: new Date().toISOString() })
+        .eq('id', message.id)
+        .eq('status', 'unread'); // Only transition unread → read
+    }
   }
 
   return {

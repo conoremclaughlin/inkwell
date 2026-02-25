@@ -66,6 +66,15 @@ function createMockSupabase(
 
   const insertReturn = overrides.insertReturn || { data: defaultMessage, error: null };
 
+  const updateChainable = {
+    eq: vi.fn().mockReturnThis(),
+    mockResolvedValue: undefined as unknown,
+  };
+  // Make the last .eq() resolve
+  updateChainable.eq = vi.fn().mockReturnValue({
+    eq: vi.fn().mockResolvedValue({ data: null, error: null }),
+  });
+
   const chainable = {
     insert: vi.fn().mockReturnValue({
       select: vi.fn().mockReturnValue({
@@ -80,6 +89,7 @@ function createMockSupabase(
         .fn()
         .mockResolvedValue(overrides.selectReturn || { data: [defaultMessage], error: null }),
     }),
+    update: vi.fn().mockReturnValue(updateChainable),
   };
 
   // For count query
