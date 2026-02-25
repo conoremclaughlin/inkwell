@@ -474,9 +474,9 @@ describe('artifact comment + identity UUID flows', () => {
             data: [
               {
                 id: '00000000-0000-0000-0000-000000000001',
-                first_name: 'Conor',
-                username: 'conor',
-                email: 'conor@example.com',
+                first_name: 'Alice',
+                username: 'alice',
+                email: 'alice@example.com',
               },
             ],
             error: null,
@@ -837,9 +837,9 @@ describe('artifact comment + identity UUID flows', () => {
             data: [
               {
                 id: '00000000-0000-0000-0000-000000000001',
-                first_name: 'Conor',
-                username: 'conor',
-                email: 'conor@example.com',
+                first_name: 'Alice',
+                username: 'alice',
+                email: 'alice@example.com',
               },
             ],
             error: null,
