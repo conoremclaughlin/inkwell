@@ -34,14 +34,6 @@ interface RoutingIdentity {
   backend: string | null;
 }
 
-interface RoutingStudio {
-  id: string;
-  name: string;
-  branch: string | null;
-  status: string;
-  agentId: string | null;
-}
-
 interface RoutingRoute {
   id: string;
   identityId: string;
@@ -52,7 +44,7 @@ interface RoutingRoute {
   platform: string;
   platformAccountId: string | null;
   chatId: string | null;
-  studioId: string | null;
+  studioHint: string | null;
   isActive: boolean;
   metadata: Record<string, unknown>;
   createdAt: string;
@@ -71,7 +63,6 @@ interface RoutingResponse {
     unassignedReminderCount: number;
   };
   identities: RoutingIdentity[];
-  studios: RoutingStudio[];
   routes: RoutingRoute[];
 }
 
@@ -156,12 +147,6 @@ export default function RoutingPage() {
 
   const routes = data?.routes || [];
   const identities = data?.identities || [];
-  const studios = data?.studios || [];
-  const studioMap = useMemo(() => {
-    const m = new Map<string, RoutingStudio>();
-    for (const s of studios) m.set(s.id, s);
-    return m;
-  }, [studios]);
   const summary = data?.summary || {
     totalRoutes: 0, activeRoutes: 0, agentsWithRoutes: 0, platformsCovered: 0, unassignedReminderCount: 0,
   };
@@ -416,10 +401,10 @@ export default function RoutingPage() {
                           <span className="text-sm text-gray-500 truncate">
                             {formatScopeLabel(route.platformAccountId, route.chatId)}
                           </span>
-                          {route.studioId && studioMap.get(route.studioId) && (
+                          {route.studioHint && (
                             <span className="flex items-center gap-1 text-[11px] text-gray-400">
                               <GitBranch className="h-3 w-3" />
-                              {studioMap.get(route.studioId)!.name}
+                              {route.studioHint === 'main' ? 'Main' : route.studioHint}
                             </span>
                           )}
                         </div>

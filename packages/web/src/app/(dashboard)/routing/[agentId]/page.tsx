@@ -11,14 +11,6 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 
-interface Studio {
-  id: string;
-  name: string;
-  branch: string | null;
-  status: string;
-  agentId: string | null;
-}
-
 interface AgentRoute {
   id: string;
   identityId: string;
@@ -29,7 +21,7 @@ interface AgentRoute {
   platform: string;
   platformAccountId: string | null;
   chatId: string | null;
-  studioId: string | null;
+  studioHint: string | null;
   isActive: boolean;
   metadata: Record<string, unknown>;
   createdAt: string;
@@ -64,7 +56,6 @@ interface AgentRoutingResponse {
     backend: string | null;
     updatedAt: string;
   };
-  studios: Studio[];
   routes: AgentRoute[];
   reminders: AgentReminder[];
 }
@@ -73,11 +64,16 @@ interface RouteFormState {
   platform: string;
   platformAccountId: string;
   chatId: string;
-  studioId: string;
+  studioHint: string;
   isActive: boolean;
 }
 
 const PLATFORM_OPTIONS = ['telegram', 'whatsapp', 'discord', 'slack', 'email'];
+
+const STUDIO_HINT_OPTIONS: { value: string; label: string }[] = [
+  { value: '', label: 'Auto (nearest session)' },
+  { value: 'main', label: 'Main' },
+];
 
 function formatPlatform(value: string): string {
   if (!value) return 'Unknown';
@@ -89,11 +85,10 @@ function formatTime(value: string | null): string {
   return new Date(value).toLocaleString();
 }
 
-function studioLabel(studios: Studio[], studioId: string | null): string {
-  if (!studioId) return 'Auto (nearest session)';
-  const studio = studios.find((s) => s.id === studioId);
-  if (!studio) return 'Unknown studio';
-  return studio.name + (studio.branch ? ` (${studio.branch})` : '');
+function studioHintLabel(hint: string | null): string {
+  if (!hint) return 'Auto (nearest session)';
+  if (hint === 'main') return 'Main';
+  return hint;
 }
 
 function initialFormFromRoute(route: AgentRoute): RouteFormState {
@@ -101,7 +96,7 @@ function initialFormFromRoute(route: AgentRoute): RouteFormState {
     platform: route.platform,
     platformAccountId: route.platformAccountId || '',
     chatId: route.chatId || '',
-    studioId: route.studioId || '',
+    studioHint: route.studioHint || '',
     isActive: route.isActive,
   };
 }
@@ -119,13 +114,11 @@ export default function AgentRoutingPage() {
     }
   );
 
-  const studios = data?.studios ?? [];
-
   const [newRoute, setNewRoute] = useState<RouteFormState>({
     platform: 'telegram',
     platformAccountId: '',
     chatId: '',
-    studioId: '',
+    studioHint: 'main',
     isActive: true,
   });
   const [editingRouteId, setEditingRouteId] = useState<string | null>(null);
@@ -133,7 +126,7 @@ export default function AgentRoutingPage() {
     platform: 'telegram',
     platformAccountId: '',
     chatId: '',
-    studioId: '',
+    studioHint: '',
     isActive: true,
   });
 
@@ -154,7 +147,7 @@ export default function AgentRoutingPage() {
           platform: 'telegram',
           platformAccountId: '',
           chatId: '',
-          studioId: '',
+          studioHint: 'main',
           isActive: true,
         });
       },
@@ -242,7 +235,7 @@ export default function AgentRoutingPage() {
                 platform: newRoute.platform,
                 platformAccountId: newRoute.platformAccountId || null,
                 chatId: newRoute.chatId || null,
-                studioId: newRoute.studioId || null,
+                studioHint: newRoute.studioHint || null,
                 isActive: newRoute.isActive,
               });
             }}
@@ -271,18 +264,17 @@ export default function AgentRoutingPage() {
                 <label className="text-sm font-medium">Studio</label>
                 <select
                   className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                  value={newRoute.studioId}
+                  value={newRoute.studioHint}
                   onChange={(event) =>
                     setNewRoute((previous) => ({
                       ...previous,
-                      studioId: event.target.value,
+                      studioHint: event.target.value,
                     }))
                   }
                 >
-                  <option value="">Auto (nearest session)</option>
-                  {studios.map((studio) => (
-                    <option key={studio.id} value={studio.id}>
-                      {studio.name}{studio.branch ? ` (${studio.branch})` : ''}
+                  {STUDIO_HINT_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
                     </option>
                   ))}
                 </select>
@@ -387,7 +379,7 @@ export default function AgentRoutingPage() {
                         <div className="text-gray-500">Studio</div>
                         <div className="flex items-center gap-1 text-xs">
                           <GitBranch className="h-3 w-3 text-gray-400" />
-                          {studioLabel(studios, route.studioId)}
+                          {studioHintLabel(route.studioHint)}
                         </div>
                       </div>
                     </div>
@@ -403,7 +395,7 @@ export default function AgentRoutingPage() {
                               platform: editForm.platform,
                               platformAccountId: editForm.platformAccountId || null,
                               chatId: editForm.chatId || null,
-                              studioId: editForm.studioId || null,
+                              studioHint: editForm.studioHint || null,
                               isActive: editForm.isActive,
                             },
                           });
@@ -429,18 +421,17 @@ export default function AgentRoutingPage() {
                           </select>
                           <select
                             className={selectClassName}
-                            value={editForm.studioId}
+                            value={editForm.studioHint}
                             onChange={(event) =>
                               setEditForm((previous) => ({
                                 ...previous,
-                                studioId: event.target.value,
+                                studioHint: event.target.value,
                               }))
                             }
                           >
-                            <option value="">Auto (nearest session)</option>
-                            {studios.map((studio) => (
-                              <option key={studio.id} value={studio.id}>
-                                {studio.name}{studio.branch ? ` (${studio.branch})` : ''}
+                            {STUDIO_HINT_OPTIONS.map((opt) => (
+                              <option key={opt.value} value={opt.value}>
+                                {opt.label}
                               </option>
                             ))}
                           </select>
