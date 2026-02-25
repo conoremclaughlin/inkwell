@@ -372,7 +372,13 @@ async function awakenCommand(options: { backend: string; verbose: boolean }): Pr
     console.log(
       chalk.dim("If they didn't call choose_name() during the session, you can save manually:")
     );
-    console.log(chalk.dim(`  sb identity save --agent <chosen-name> --backend ${backendName}`));
+    console.log(chalk.dim(`  sb identity save --agent <chosen-name> --backend ${backendName}\n`));
+
+    console.log(chalk.cyan('Set up role-based studios for your new SB:'));
+    console.log(chalk.dim('  sb studio setup <agent-name>'));
+    console.log(
+      chalk.dim('  Creates review, build, and product studios with pre-configured ROLE.md files.\n')
+    );
 
     process.exit(code || 0);
   });
