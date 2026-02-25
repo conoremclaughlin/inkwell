@@ -22,46 +22,24 @@ describe('isBackendInteractiveSubcommand', () => {
     ).toBe(true);
   });
 
-  it('matches codex resume at end (list mode after other args)', () => {
-    expect(isBackendInteractiveSubcommand('codex', ['something', 'resume'])).toBe(true);
-  });
-
-  it('does not match when next token is natural language', () => {
-    expect(isBackendInteractiveSubcommand('codex', ['resume', 'this', 'bug'])).toBe(false);
-    expect(isBackendInteractiveSubcommand('codex', ['resume', 'working', 'on', 'it'])).toBe(false);
-  });
-
   it('does not match non-codex backends', () => {
-    expect(isBackendInteractiveSubcommand('claude', ['resume', '019c44fd-abc'])).toBe(false);
-    expect(isBackendInteractiveSubcommand('gemini', ['resume', '019c44fd-abc'])).toBe(false);
-  });
-
-  it('does not match prompt text starting with resume on default backend', () => {
-    expect(isBackendInteractiveSubcommand('claude', ['resume', 'this', 'bug'])).toBe(false);
+    expect(isBackendInteractiveSubcommand('claude', ['resume', 'abc123'])).toBe(false);
+    expect(isBackendInteractiveSubcommand('gemini', ['resume', 'abc123'])).toBe(false);
   });
 
   it('does not match empty prompt parts', () => {
     expect(isBackendInteractiveSubcommand('codex', [])).toBe(false);
   });
-
-  it('matches short hex session ids', () => {
-    expect(isBackendInteractiveSubcommand('codex', ['resume', 'ab12cd34'])).toBe(true);
-  });
-
-  it('does not match regular words after resume', () => {
-    expect(isBackendInteractiveSubcommand('codex', ['resume', 'please'])).toBe(false);
-    expect(isBackendInteractiveSubcommand('codex', ['resume', 'the'])).toBe(false);
-  });
 });
 
 describe('extractArgs', () => {
   it('parses prompt parts as positional args', () => {
-    const result = extractArgs(['resume', 'this', 'bug']);
-    expect(result.promptParts).toEqual(['resume', 'this', 'bug']);
-    expect(result.prompt).toBe('resume this bug');
+    const result = extractArgs(['hello', 'world']);
+    expect(result.promptParts).toEqual(['hello', 'world']);
+    expect(result.prompt).toBe('hello world');
   });
 
-  it('separates sb flags from prompt', () => {
+  it('separates sb flags from positional args', () => {
     const result = extractArgs(['-a', 'lumen', '-b', 'codex', 'resume', '019c-abc']);
     expect(result.sbOptions.agent).toBe('lumen');
     expect(result.sbOptions.backend).toBe('codex');

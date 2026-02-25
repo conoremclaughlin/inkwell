@@ -72,32 +72,17 @@ interface ParsedArgs {
  * (e.g. --resume abc123) so we do this ourselves for the root command.
  */
 /**
- * Detect whether positional args contain a backend-specific interactive
- * subcommand (e.g. `codex resume [id]`) rather than a user prompt.
- * Only Codex uses positional subcommands — other backends use flags
- * (--resume, --session-id) which are already handled as passthrough args.
+ * Detect whether positional args contain a backend subcommand that
+ * requires interactive stdio (e.g. `codex resume [id]`).
  *
- * Scans all positions (not just first) and checks the following token:
- * - absent → interactive (list mode, e.g. `codex resume`)
- * - looks like a session ID (hex/dash pattern) → interactive
- * - looks like natural language → prompt (e.g. `resume this bug`)
+ * These subcommands are always passed through to the backend as-is.
+ * sb does not use positional args as prompts — prompts go via flags
+ * or piped stdin.
  */
 export function isBackendInteractiveSubcommand(backend: string, promptParts: string[]): boolean {
   if (backend !== 'codex' || promptParts.length === 0) return false;
   const CODEX_INTERACTIVE_SUBCOMMANDS = ['resume'];
-
-  for (let i = 0; i < promptParts.length; i++) {
-    if (!CODEX_INTERACTIVE_SUBCOMMANDS.includes(promptParts[i])) continue;
-
-    const nextToken = promptParts[i + 1];
-    // No following token → subcommand in list/interactive mode
-    if (!nextToken) return true;
-    // Following token looks like a session ID (hex+dashes, e.g. UUIDv7)
-    if (/^[0-9a-f][-0-9a-f]{7,}$/i.test(nextToken)) return true;
-    // Otherwise it's natural language — not a subcommand
-  }
-
-  return false;
+  return promptParts.some((part) => CODEX_INTERACTIVE_SUBCOMMANDS.includes(part));
 }
 
 export function extractArgs(argv: string[]): ParsedArgs {
