@@ -54,7 +54,7 @@ const mockListTrustedUsers = vi.fn();
 vi.mock('../data/composer', () => ({
   getDataComposer: vi.fn(async () => ({
     repositories: {
-      workspaceContainers: {
+      workspaces: {
         findById: mockFindById,
         findRawById: mockFindRawById,
         ensurePersonalWorkspace: mockEnsurePersonalWorkspace,

@@ -111,7 +111,7 @@ export function Sidebar() {
   const accountMenuRef = useRef<HTMLDivElement | null>(null);
 
   const { data: workspaceData, isLoading: workspacesLoading } = useApiQuery<WorkspaceListResponse>(
-    ['workspace-containers'],
+    ['workspaces'],
     '/api/admin/workspaces',
     {
       retry: 1,
@@ -128,7 +128,8 @@ export function Sidebar() {
   }, [selectedWorkspaceId, workspaceData?.currentWorkspaceId]);
 
   const workspaces = workspaceData?.workspaces || [];
-  const selectedWorkspace = workspaces.find((workspace) => workspace.id === resolvedWorkspaceId) || null;
+  const selectedWorkspace =
+    workspaces.find((workspace) => workspace.id === resolvedWorkspaceId) || null;
   const userEmail = authMeData?.user?.email ?? '';
   const userInitial = userEmail ? userEmail.charAt(0).toUpperCase() : '';
   const workspaceName = selectedWorkspace?.name ?? '';
@@ -166,7 +167,7 @@ export function Sidebar() {
       setNewWorkspaceName('');
       setNewWorkspaceDescription('');
       setWorkspaceError(null);
-      queryClient.invalidateQueries({ queryKey: ['workspace-containers'] });
+      queryClient.invalidateQueries({ queryKey: ['workspaces'] });
       queryClient.invalidateQueries({ queryKey: ['workspace-members', createdWorkspaceId] });
       router.refresh();
     },
@@ -294,9 +295,7 @@ export function Sidebar() {
             <span className="flex h-7 w-7 items-center justify-center rounded bg-gray-600 text-xs font-semibold">
               {userInitial}
             </span>
-            <span className="truncate text-sm font-medium">
-              {workspaceTriggerLabel}
-            </span>
+            <span className="truncate text-sm font-medium">{workspaceTriggerLabel}</span>
           </span>
           <ChevronDown className="h-4 w-4 shrink-0" />
         </button>
@@ -312,7 +311,9 @@ export function Sidebar() {
             </div>
 
             <div className="mt-3 space-y-1 rounded-md border border-gray-200 bg-gray-50 p-2">
-              <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Workspaces</p>
+              <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+                Workspaces
+              </p>
               {workspacesLoading && <p className="text-xs text-gray-500">Loading workspaces...</p>}
               {!workspacesLoading && workspaces.length === 0 && (
                 <p className="text-xs text-gray-500">No workspaces yet</p>
@@ -372,160 +373,162 @@ export function Sidebar() {
       </div>
       {isMounted && (
         <Dialog open={workspaceManagerOpen} onOpenChange={setWorkspaceManagerOpen}>
-            <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-xl">
-              <DialogHeader>
-                <DialogTitle>Workspace Studio</DialogTitle>
-                <DialogDescription>
-                  Create workspaces, add collaborators, and organize teams.
-                </DialogDescription>
-              </DialogHeader>
+          <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-xl">
+            <DialogHeader>
+              <DialogTitle>Workspace Studio</DialogTitle>
+              <DialogDescription>
+                Create workspaces, add collaborators, and organize teams.
+              </DialogDescription>
+            </DialogHeader>
 
-              <Tabs defaultValue="create" className="w-full">
-                <TabsList className="grid w-full grid-cols-2">
-                  <TabsTrigger value="create">
-                    <Plus className="mr-1 h-4 w-4" />
-                    Create
-                  </TabsTrigger>
-                  <TabsTrigger value="invite">
-                    <UserPlus className="mr-1 h-4 w-4" />
-                    Collaborators
-                  </TabsTrigger>
-                </TabsList>
+            <Tabs defaultValue="create" className="w-full">
+              <TabsList className="grid w-full grid-cols-2">
+                <TabsTrigger value="create">
+                  <Plus className="mr-1 h-4 w-4" />
+                  Create
+                </TabsTrigger>
+                <TabsTrigger value="invite">
+                  <UserPlus className="mr-1 h-4 w-4" />
+                  Collaborators
+                </TabsTrigger>
+              </TabsList>
 
-                <TabsContent value="create" className="space-y-3 pt-2">
+              <TabsContent value="create" className="space-y-3 pt-2">
+                <div className="space-y-1">
+                  <label className="text-sm font-medium text-gray-700">Workspace name</label>
+                  <Input
+                    placeholder="e.g., PCP Team"
+                    value={newWorkspaceName}
+                    onChange={(event) => setNewWorkspaceName(event.target.value)}
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-1">
-                    <label className="text-sm font-medium text-gray-700">Workspace name</label>
-                    <Input
-                      placeholder="e.g., PCP Team"
-                      value={newWorkspaceName}
-                      onChange={(event) => setNewWorkspaceName(event.target.value)}
-                    />
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="space-y-1">
-                      <label className="text-sm font-medium text-gray-700">Type</label>
-                      <select
-                        value={newWorkspaceType}
-                        onChange={(event) =>
-                          setNewWorkspaceType(event.target.value as 'personal' | 'team')
-                        }
-                        className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-                      >
-                        <option value="team">Team</option>
-                        <option value="personal">Personal</option>
-                      </select>
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-sm font-medium text-gray-700">Description</label>
-                      <Input
-                        placeholder="Optional"
-                        value={newWorkspaceDescription}
-                        onChange={(event) => setNewWorkspaceDescription(event.target.value)}
-                      />
-                    </div>
-                  </div>
-
-                  <Button
-                    onClick={handleCreateWorkspace}
-                    disabled={createWorkspaceMutation.isPending}
-                    className="w-full"
-                  >
-                    {createWorkspaceMutation.isPending ? 'Creating...' : 'Create workspace'}
-                  </Button>
-                </TabsContent>
-
-                <TabsContent value="invite" className="space-y-3 pt-2">
-                  <div className="space-y-1">
-                    <label className="text-sm font-medium text-gray-700">Workspace</label>
+                    <label className="text-sm font-medium text-gray-700">Type</label>
                     <select
-                      value={inviteTargetWorkspaceId}
-                      onChange={(event) => setInviteWorkspaceId(event.target.value)}
+                      value={newWorkspaceType}
+                      onChange={(event) =>
+                        setNewWorkspaceType(event.target.value as 'personal' | 'team')
+                      }
                       className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
                     >
-                      {workspaces.map((workspace) => (
-                        <option key={workspace.id} value={workspace.id}>
-                          {workspace.name} ({workspace.role})
-                        </option>
-                      ))}
+                      <option value="team">Team</option>
+                      <option value="personal">Personal</option>
                     </select>
                   </div>
-
-                  <div className="grid grid-cols-3 gap-3">
-                    <div className="col-span-2 space-y-1">
-                      <label className="text-sm font-medium text-gray-700">Collaborator email</label>
-                      <Input
-                        placeholder="co@example.com"
-                        value={inviteEmail}
-                        onChange={(event) => setInviteEmail(event.target.value)}
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-sm font-medium text-gray-700">Role</label>
-                      <select
-                        value={inviteRole}
-                        onChange={(event) =>
-                          setInviteRole(event.target.value as 'owner' | 'admin' | 'member' | 'viewer')
-                        }
-                        className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-                      >
-                        <option value="member">member</option>
-                        <option value="admin">admin</option>
-                        <option value="viewer">viewer</option>
-                        <option value="owner">owner</option>
-                      </select>
-                    </div>
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium text-gray-700">Description</label>
+                    <Input
+                      placeholder="Optional"
+                      value={newWorkspaceDescription}
+                      onChange={(event) => setNewWorkspaceDescription(event.target.value)}
+                    />
                   </div>
+                </div>
 
-                  <Button
-                    onClick={handleInviteWorkspaceMember}
-                    disabled={inviteWorkspaceMemberMutation.isPending || !workspaceMembersData?.canManage}
-                    className="w-full"
+                <Button
+                  onClick={handleCreateWorkspace}
+                  disabled={createWorkspaceMutation.isPending}
+                  className="w-full"
+                >
+                  {createWorkspaceMutation.isPending ? 'Creating...' : 'Create workspace'}
+                </Button>
+              </TabsContent>
+
+              <TabsContent value="invite" className="space-y-3 pt-2">
+                <div className="space-y-1">
+                  <label className="text-sm font-medium text-gray-700">Workspace</label>
+                  <select
+                    value={inviteTargetWorkspaceId}
+                    onChange={(event) => setInviteWorkspaceId(event.target.value)}
+                    className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
                   >
-                    {inviteWorkspaceMemberMutation.isPending ? 'Inviting...' : 'Invite collaborator'}
-                  </Button>
+                    {workspaces.map((workspace) => (
+                      <option key={workspace.id} value={workspace.id}>
+                        {workspace.name} ({workspace.role})
+                      </option>
+                    ))}
+                  </select>
+                </div>
 
-                  <div className="rounded-md border p-3">
-                    <p className="mb-2 text-sm font-semibold text-gray-700">Current collaborators</p>
-                    {workspaceMembersLoading && (
-                      <p className="text-sm text-gray-500">Loading collaborators...</p>
-                    )}
-                    {!workspaceMembersLoading && workspaceMembersData?.members?.length === 0 && (
-                      <p className="text-sm text-gray-500">No collaborators yet.</p>
-                    )}
-                    {!workspaceMembersLoading &&
-                      workspaceMembersData?.members?.map((member) => (
-                        <div
-                          key={member.id}
-                          className="flex items-center justify-between border-t py-2 text-sm first:border-t-0"
-                        >
-                          <div>
-                            <p className="font-medium text-gray-900">
-                              {member.user?.firstName ||
-                                member.user?.username ||
-                                member.user?.email ||
-                                member.userId}
-                            </p>
-                            <p className="text-xs text-gray-500">
-                              {member.user?.email || member.userId}
-                              {member.user?.lastLoginAt ? ' · joined' : ' · invited'}
-                            </p>
-                          </div>
-                          <span className="rounded-full bg-gray-100 px-2 py-1 text-xs text-gray-700">
-                            {member.role}
-                          </span>
-                        </div>
-                      ))}
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="col-span-2 space-y-1">
+                    <label className="text-sm font-medium text-gray-700">Collaborator email</label>
+                    <Input
+                      placeholder="co@example.com"
+                      value={inviteEmail}
+                      onChange={(event) => setInviteEmail(event.target.value)}
+                    />
                   </div>
-                </TabsContent>
-              </Tabs>
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium text-gray-700">Role</label>
+                    <select
+                      value={inviteRole}
+                      onChange={(event) =>
+                        setInviteRole(event.target.value as 'owner' | 'admin' | 'member' | 'viewer')
+                      }
+                      className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                    >
+                      <option value="member">member</option>
+                      <option value="admin">admin</option>
+                      <option value="viewer">viewer</option>
+                      <option value="owner">owner</option>
+                    </select>
+                  </div>
+                </div>
 
-              {workspaceError && (
-                <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-                  {workspaceError}
-                </p>
-              )}
-            </DialogContent>
+                <Button
+                  onClick={handleInviteWorkspaceMember}
+                  disabled={
+                    inviteWorkspaceMemberMutation.isPending || !workspaceMembersData?.canManage
+                  }
+                  className="w-full"
+                >
+                  {inviteWorkspaceMemberMutation.isPending ? 'Inviting...' : 'Invite collaborator'}
+                </Button>
+
+                <div className="rounded-md border p-3">
+                  <p className="mb-2 text-sm font-semibold text-gray-700">Current collaborators</p>
+                  {workspaceMembersLoading && (
+                    <p className="text-sm text-gray-500">Loading collaborators...</p>
+                  )}
+                  {!workspaceMembersLoading && workspaceMembersData?.members?.length === 0 && (
+                    <p className="text-sm text-gray-500">No collaborators yet.</p>
+                  )}
+                  {!workspaceMembersLoading &&
+                    workspaceMembersData?.members?.map((member) => (
+                      <div
+                        key={member.id}
+                        className="flex items-center justify-between border-t py-2 text-sm first:border-t-0"
+                      >
+                        <div>
+                          <p className="font-medium text-gray-900">
+                            {member.user?.firstName ||
+                              member.user?.username ||
+                              member.user?.email ||
+                              member.userId}
+                          </p>
+                          <p className="text-xs text-gray-500">
+                            {member.user?.email || member.userId}
+                            {member.user?.lastLoginAt ? ' · joined' : ' · invited'}
+                          </p>
+                        </div>
+                        <span className="rounded-full bg-gray-100 px-2 py-1 text-xs text-gray-700">
+                          {member.role}
+                        </span>
+                      </div>
+                    ))}
+                </div>
+              </TabsContent>
+            </Tabs>
+
+            {workspaceError && (
+              <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                {workspaceError}
+              </p>
+            )}
+          </DialogContent>
         </Dialog>
       )}
       <nav className="flex flex-1 flex-col">

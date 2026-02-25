@@ -13,14 +13,30 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { getAuthorizationService } from '../services/authorization';
 import { getOAuthService } from '../services/oauth';
 import { logger } from '../utils/logger';
-import { env } from '../config/env';
+import { env, isDevelopment } from '../config/env';
 import { runWithRequestContext } from '../utils/request-context';
 import { getDataComposer } from '../data/composer';
+
+/**
+ * Build a JSON error response. In development mode, includes the real error
+ * message and stack trace so issues are immediately visible in the browser
+ * Network tab / dashboard UI instead of requiring server log access.
+ */
+function errorJson(label: string, error: unknown): Record<string, unknown> {
+  const base: Record<string, unknown> = { error: label };
+  if (isDevelopment()) {
+    base.detail = error instanceof Error ? error.message : String(error);
+    if (error instanceof Error && error.stack) {
+      base.stack = error.stack.split('\n').slice(0, 8);
+    }
+  }
+  return base;
+}
 import crypto from 'crypto';
 import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
-import type { WorkspaceMemberRole } from '../data/repositories/workspace-containers.repository';
+import type { WorkspaceMemberRole } from '../data/repositories/workspaces.repository';
 import { slugifyWorkspaceName } from '../utils/workspace-slug';
 import {
   signPcpAccessToken,
@@ -546,7 +562,7 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
 
     // --- Workspace resolution (all tiers, 1 DB query) ---
     const dataComposer = await getDataComposer();
-    const workspaceRepo = dataComposer.repositories.workspaceContainers;
+    const workspaceRepo = dataComposer.repositories.workspaces;
     const requestedWorkspaceId = req.header('x-pcp-workspace-id')?.trim();
 
     // For trusted-user resolution we need telegram/whatsapp IDs.
@@ -685,7 +701,7 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     );
   } catch (error) {
     logger.error('Admin auth error:', error);
-    res.status(500).json({ error: 'Authentication error' });
+    res.status(500).json(errorJson('Authentication error', error));
   }
 }
 
@@ -733,18 +749,18 @@ router.post('/auth/logout', async (req: Request, res: Response) => {
 router.use(adminAuthMiddleware);
 
 // =============================================================================
-// Workspace Containers
+// Workspaces
 // =============================================================================
 
 /**
  * GET /api/admin/workspaces
- * List workspace containers available to the authenticated user.
+ * List workspaces available to the authenticated user.
  */
 router.get('/workspaces', async (req: Request, res: Response) => {
   try {
     const authReq = req as AdminAuthRequest;
     const dataComposer = await getDataComposer();
-    const workspaceRepo = dataComposer.repositories.workspaceContainers;
+    const workspaceRepo = dataComposer.repositories.workspaces;
     const workspaces = await workspaceRepo.listMembershipsByUser(authReq.pcpUserId, {
       includeArchived: false,
     });
@@ -772,20 +788,20 @@ router.get('/workspaces', async (req: Request, res: Response) => {
       })),
     });
   } catch (error) {
-    logger.error('Failed to list workspace containers:', error);
-    res.status(500).json({ error: 'Failed to list workspace containers' });
+    logger.error('Failed to list workspaces:', error);
+    res.status(500).json(errorJson('Failed to list workspaces', error));
   }
 });
 
 /**
  * POST /api/admin/workspaces
- * Create a new workspace container and make the caller owner.
+ * Create a new workspace and make the caller owner.
  */
 router.post('/workspaces', async (req: Request, res: Response) => {
   try {
     const authReq = req as AdminAuthRequest;
     const dataComposer = await getDataComposer();
-    const workspaceRepo = dataComposer.repositories.workspaceContainers;
+    const workspaceRepo = dataComposer.repositories.workspaces;
 
     const rawName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
     if (!rawName) {
@@ -829,13 +845,13 @@ router.post('/workspaces', async (req: Request, res: Response) => {
       },
     });
   } catch (error) {
-    logger.error('Failed to create workspace container:', error);
+    logger.error('Failed to create workspace:', error);
     const message = error instanceof Error ? error.message : 'Unknown error';
     if (message.toLowerCase().includes('duplicate')) {
       res.status(409).json({ error: 'A workspace with that slug already exists for this owner' });
       return;
     }
-    res.status(500).json({ error: 'Failed to create workspace container' });
+    res.status(500).json(errorJson('Failed to create workspace', error));
   }
 });
 
@@ -847,7 +863,7 @@ router.get('/workspaces/:workspaceId/members', async (req: Request, res: Respons
   try {
     const authReq = req as AdminAuthRequest;
     const dataComposer = await getDataComposer();
-    const workspaceRepo = dataComposer.repositories.workspaceContainers;
+    const workspaceRepo = dataComposer.repositories.workspaces;
     const workspaceId = req.params.workspaceId;
 
     const workspace = await workspaceRepo.findById(workspaceId, authReq.pcpUserId);
@@ -877,7 +893,7 @@ router.get('/workspaces/:workspaceId/members', async (req: Request, res: Respons
     });
   } catch (error) {
     logger.error('Failed to list workspace members:', error);
-    res.status(500).json({ error: 'Failed to list workspace members' });
+    res.status(500).json(errorJson('Failed to list workspace members', error));
   }
 });
 
@@ -889,7 +905,7 @@ router.post('/workspaces/:workspaceId/members', async (req: Request, res: Respon
   try {
     const authReq = req as AdminAuthRequest;
     const dataComposer = await getDataComposer();
-    const workspaceRepo = dataComposer.repositories.workspaceContainers;
+    const workspaceRepo = dataComposer.repositories.workspaces;
     const usersRepo = dataComposer.repositories.users;
     const workspaceId = req.params.workspaceId;
 
@@ -954,7 +970,7 @@ router.post('/workspaces/:workspaceId/members', async (req: Request, res: Respon
     });
   } catch (error) {
     logger.error('Failed to add workspace member:', error);
-    res.status(500).json({ error: 'Failed to add workspace member' });
+    res.status(500).json(errorJson('Failed to add workspace member', error));
   }
 });
 
@@ -979,7 +995,7 @@ router.get('/trusted-users', async (req: Request, res: Response) => {
 
     if (error) {
       logger.error('Failed to list trusted users:', error);
-      res.status(500).json({ error: 'Failed to list trusted users' });
+      res.status(500).json(errorJson('Failed to list trusted users', error));
       return;
     }
 
@@ -994,7 +1010,7 @@ router.get('/trusted-users', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to list trusted users:', error);
-    res.status(500).json({ error: 'Failed to list trusted users' });
+    res.status(500).json(errorJson('Failed to list trusted users', error));
   }
 });
 
@@ -1036,7 +1052,7 @@ router.post('/trusted-users', async (req: Request, res: Response) => {
     res.json({ success: true });
   } catch (error) {
     logger.error('Failed to add trusted user:', error);
-    res.status(500).json({ error: 'Failed to add trusted user' });
+    res.status(500).json(errorJson('Failed to add trusted user', error));
   }
 });
 
@@ -1071,14 +1087,14 @@ router.delete('/trusted-users/:id', async (req: Request, res: Response) => {
       .eq('workspace_id', authReq.pcpWorkspaceId);
 
     if (error) {
-      res.status(500).json({ error: 'Failed to delete user' });
+      res.status(500).json(errorJson('Failed to delete user', error));
       return;
     }
 
     res.json({ success: true });
   } catch (error) {
     logger.error('Failed to delete trusted user:', error);
-    res.status(500).json({ error: 'Failed to delete trusted user' });
+    res.status(500).json(errorJson('Failed to delete trusted user', error));
   }
 });
 
@@ -1102,7 +1118,7 @@ router.get('/groups', async (req: Request, res: Response) => {
       .order('authorized_at', { ascending: false });
 
     if (error) {
-      res.status(500).json({ error: 'Failed to list groups' });
+      res.status(500).json(errorJson('Failed to list groups', error));
       return;
     }
 
@@ -1119,7 +1135,7 @@ router.get('/groups', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to list groups:', error);
-    res.status(500).json({ error: 'Failed to list groups' });
+    res.status(500).json(errorJson('Failed to list groups', error));
   }
 });
 
@@ -1145,14 +1161,14 @@ router.post('/groups/:id/revoke', async (req: Request, res: Response) => {
       .eq('workspace_id', authReq.pcpWorkspaceId);
 
     if (error) {
-      res.status(500).json({ error: 'Failed to revoke group' });
+      res.status(500).json(errorJson('Failed to revoke group', error));
       return;
     }
 
     res.json({ success: true });
   } catch (error) {
     logger.error('Failed to revoke group:', error);
-    res.status(500).json({ error: 'Failed to revoke group' });
+    res.status(500).json(errorJson('Failed to revoke group', error));
   }
 });
 
@@ -1177,7 +1193,7 @@ router.get('/challenge-codes', async (req: Request, res: Response) => {
       .limit(50);
 
     if (error) {
-      res.status(500).json({ error: 'Failed to list codes' });
+      res.status(500).json(errorJson('Failed to list codes', error));
       return;
     }
 
@@ -1194,7 +1210,7 @@ router.get('/challenge-codes', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to list challenge codes:', error);
-    res.status(500).json({ error: 'Failed to list codes' });
+    res.status(500).json(errorJson('Failed to list codes', error));
   }
 });
 
@@ -1237,7 +1253,7 @@ router.post('/challenge-codes', async (req: Request, res: Response) => {
       .single();
 
     if (error) {
-      res.status(500).json({ error: 'Failed to generate code' });
+      res.status(500).json(errorJson('Failed to generate code', error));
       return;
     }
 
@@ -1247,7 +1263,7 @@ router.post('/challenge-codes', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to generate challenge code:', error);
-    res.status(500).json({ error: 'Failed to generate code' });
+    res.status(500).json(errorJson('Failed to generate code', error));
   }
 });
 
@@ -1272,7 +1288,7 @@ router.get('/whatsapp/status', async (_req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to get WhatsApp status:', error);
-    res.status(500).json({ error: 'Failed to get status' });
+    res.status(500).json(errorJson('Failed to get status', error));
   }
 });
 
@@ -1343,7 +1359,7 @@ router.post('/whatsapp/logout', async (_req: Request, res: Response) => {
     res.json({ success: true });
   } catch (error) {
     logger.error('Failed to logout WhatsApp:', error);
-    res.status(500).json({ error: 'Failed to logout' });
+    res.status(500).json(errorJson('Failed to logout', error));
   }
 });
 
@@ -1383,7 +1399,7 @@ router.post('/heartbeat', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Heartbeat processing failed:', error);
-    res.status(500).json({ error: 'Heartbeat processing failed' });
+    res.status(500).json(errorJson('Heartbeat processing failed', error));
   }
 });
 
@@ -1432,7 +1448,7 @@ router.get('/routing', async (req: Request, res: Response) => {
 
     if (routesError) {
       logger.error('Failed to list channel routes:', routesError);
-      res.status(500).json({ error: 'Failed to list channel routes' });
+      res.status(500).json(errorJson('Failed to list channel routes', routesError));
       return;
     }
 
@@ -1447,7 +1463,7 @@ router.get('/routing', async (req: Request, res: Response) => {
 
     if (identitiesError) {
       logger.error('Failed to list identities for routing:', identitiesError);
-      res.status(500).json({ error: 'Failed to list identities' });
+      res.status(500).json(errorJson('Failed to list identities', identitiesError));
       return;
     }
 
@@ -1523,7 +1539,7 @@ router.get('/routing', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to list routing data:', error);
-    res.status(500).json({ error: 'Failed to list routing data' });
+    res.status(500).json(errorJson('Failed to list routing data', error));
   }
 });
 
@@ -1583,7 +1599,7 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
 
     if (routesError) {
       logger.error('Failed to list routes for agent:', routesError);
-      res.status(500).json({ error: 'Failed to list routes for agent' });
+      res.status(500).json(errorJson('Failed to list routes for agent', routesError));
       return;
     }
 
@@ -1612,7 +1628,7 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
 
     if (remindersError) {
       logger.error('Failed to list reminders for route detail:', remindersError);
-      res.status(500).json({ error: 'Failed to list reminders for route detail' });
+      res.status(500).json(errorJson('Failed to list reminders for route detail', remindersError));
       return;
     }
 
@@ -1665,7 +1681,7 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to load routing agent detail:', error);
-    res.status(500).json({ error: 'Failed to load routing agent detail' });
+    res.status(500).json(errorJson('Failed to load routing agent detail', error));
   }
 });
 
@@ -1751,7 +1767,7 @@ router.post('/routing/routes', async (req: Request, res: Response) => {
       }
 
       logger.error('Failed to create channel route:', insertError);
-      res.status(500).json({ error: 'Failed to create channel route' });
+      res.status(500).json(errorJson('Failed to create channel route', insertError));
       return;
     }
 
@@ -1761,7 +1777,7 @@ router.post('/routing/routes', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to create channel route:', error);
-    res.status(500).json({ error: 'Failed to create channel route' });
+    res.status(500).json(errorJson('Failed to create channel route', error));
   }
 });
 
@@ -1897,7 +1913,7 @@ router.patch('/routing/routes/:routeId', async (req: Request, res: Response) => 
       }
 
       logger.error('Failed to update channel route:', updateError);
-      res.status(500).json({ error: 'Failed to update channel route' });
+      res.status(500).json(errorJson('Failed to update channel route', updateError));
       return;
     }
 
@@ -1907,7 +1923,7 @@ router.patch('/routing/routes/:routeId', async (req: Request, res: Response) => 
     });
   } catch (error) {
     logger.error('Failed to update channel route:', error);
-    res.status(500).json({ error: 'Failed to update channel route' });
+    res.status(500).json(errorJson('Failed to update channel route', error));
   }
 });
 
@@ -1949,14 +1965,14 @@ router.delete('/routing/routes/:routeId', async (req: Request, res: Response) =>
 
     if (deleteError) {
       logger.error('Failed to delete channel route:', deleteError);
-      res.status(500).json({ error: 'Failed to delete channel route' });
+      res.status(500).json(errorJson('Failed to delete channel route', deleteError));
       return;
     }
 
     res.json({ success: true });
   } catch (error) {
     logger.error('Failed to delete channel route:', error);
-    res.status(500).json({ error: 'Failed to delete channel route' });
+    res.status(500).json(errorJson('Failed to delete channel route', error));
   }
 });
 
@@ -1977,7 +1993,7 @@ router.get('/reminders', async (req: Request, res: Response) => {
       .limit(100);
 
     if (error) {
-      res.status(500).json({ error: 'Failed to list reminders' });
+      res.status(500).json(errorJson('Failed to list reminders', error));
       return;
     }
 
@@ -2003,7 +2019,7 @@ router.get('/reminders', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to list reminders:', error);
-    res.status(500).json({ error: 'Failed to list reminders' });
+    res.status(500).json(errorJson('Failed to list reminders', error));
   }
 });
 
@@ -2029,7 +2045,7 @@ router.get('/user-identity', async (req: Request, res: Response) => {
 
     if (error && error.code !== 'PGRST116') {
       logger.error('Failed to get user identity:', error);
-      res.status(500).json({ error: 'Failed to get user identity' });
+      res.status(500).json(errorJson('Failed to get user identity', error));
       return;
     }
 
@@ -2051,7 +2067,7 @@ router.get('/user-identity', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to get user identity:', error);
-    res.status(500).json({ error: 'Failed to get user identity' });
+    res.status(500).json(errorJson('Failed to get user identity', error));
   }
 });
 
@@ -2088,7 +2104,7 @@ router.get('/user-identity/history', async (req: Request, res: Response) => {
 
     if (error) {
       logger.error('Failed to get user identity history:', error);
-      res.status(500).json({ error: 'Failed to get history' });
+      res.status(500).json(errorJson('Failed to get history', error));
       return;
     }
 
@@ -2105,7 +2121,7 @@ router.get('/user-identity/history', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to get user identity history:', error);
-    res.status(500).json({ error: 'Failed to get user identity history' });
+    res.status(500).json(errorJson('Failed to get user identity history', error));
   }
 });
 
@@ -2131,7 +2147,7 @@ router.get('/individuals', async (req: Request, res: Response) => {
 
     if (error) {
       logger.error('Failed to list individuals:', error);
-      res.status(500).json({ error: 'Failed to list individuals' });
+      res.status(500).json(errorJson('Failed to list individuals', error));
       return;
     }
 
@@ -2157,7 +2173,7 @@ router.get('/individuals', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to list individuals:', error);
-    res.status(500).json({ error: 'Failed to list individuals' });
+    res.status(500).json(errorJson('Failed to list individuals', error));
   }
 });
 
@@ -2196,7 +2212,7 @@ router.get('/individuals/:agentId/history', async (req: Request, res: Response) 
 
     if (error) {
       logger.error('Failed to get identity history:', error);
-      res.status(500).json({ error: 'Failed to get history' });
+      res.status(500).json(errorJson('Failed to get history', error));
       return;
     }
 
@@ -2221,7 +2237,7 @@ router.get('/individuals/:agentId/history', async (req: Request, res: Response) 
     });
   } catch (error) {
     logger.error('Failed to get identity history:', error);
-    res.status(500).json({ error: 'Failed to get history' });
+    res.status(500).json(errorJson('Failed to get history', error));
   }
 });
 
@@ -2374,7 +2390,7 @@ router.get('/individuals/:agentId/memories/timeline', async (req: Request, res: 
     });
   } catch (error) {
     logger.error('Failed to get memory timeline:', error);
-    res.status(500).json({ error: 'Failed to get memory timeline' });
+    res.status(500).json(errorJson('Failed to get memory timeline', error));
   }
 });
 
@@ -2400,7 +2416,7 @@ router.get(
 
       if (error) {
         logger.error('Failed to get memory history:', error);
-        res.status(500).json({ error: 'Failed to get memory history' });
+        res.status(500).json(errorJson('Failed to get memory history', error));
         return;
       }
 
@@ -2421,7 +2437,7 @@ router.get(
       });
     } catch (error) {
       logger.error('Failed to get memory history:', error);
-      res.status(500).json({ error: 'Failed to get memory history' });
+      res.status(500).json(errorJson('Failed to get memory history', error));
     }
   }
 );
@@ -2484,7 +2500,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
     if (receivedResult.error || sentResult.error) {
       const error = receivedResult.error || sentResult.error;
       logger.error('Failed to fetch inbox:', error);
-      res.status(500).json({ error: 'Failed to fetch inbox' });
+      res.status(500).json(errorJson('Failed to fetch inbox', error));
       return;
     }
 
@@ -2657,7 +2673,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
     });
   } catch (error) {
     logger.error('Failed to get inbox:', error);
-    res.status(500).json({ error: 'Failed to get inbox' });
+    res.status(500).json(errorJson('Failed to get inbox', error));
   }
 });
 
@@ -2715,7 +2731,7 @@ router.get('/connected-accounts', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to list connected accounts:', error);
-    res.status(500).json({ error: 'Failed to list connected accounts' });
+    res.status(500).json(errorJson('Failed to list connected accounts', error));
   }
 });
 
@@ -2765,7 +2781,7 @@ router.get('/oauth/:provider/authorize', async (req: Request, res: Response) => 
     res.json({ authUrl });
   } catch (error) {
     logger.error('Failed to start OAuth flow:', error);
-    res.status(500).json({ error: 'Failed to start OAuth flow' });
+    res.status(500).json(errorJson('Failed to start OAuth flow', error));
   }
 });
 
@@ -2891,7 +2907,7 @@ router.get('/oauth/:provider/required-scopes', async (req: Request, res: Respons
     res.json({ provider, requiredScopes });
   } catch (error) {
     logger.error('Failed to get required scopes:', error);
-    res.status(500).json({ error: 'Failed to get required scopes' });
+    res.status(500).json(errorJson('Failed to get required scopes', error));
   }
 });
 
@@ -2980,7 +2996,7 @@ router.post('/oauth/:provider/upgrade-scopes', async (req: Request, res: Respons
     });
   } catch (error) {
     logger.error('Failed to start scope upgrade:', error);
-    res.status(500).json({ error: 'Failed to start scope upgrade' });
+    res.status(500).json(errorJson('Failed to start scope upgrade', error));
   }
 });
 
@@ -3006,7 +3022,7 @@ router.get('/artifacts', async (req: Request, res: Response) => {
 
     if (error) {
       logger.error('Failed to list artifacts:', error);
-      res.status(500).json({ error: 'Failed to list artifacts' });
+      res.status(500).json(errorJson('Failed to list artifacts', error));
       return;
     }
 
@@ -3025,7 +3041,7 @@ router.get('/artifacts', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to list artifacts:', error);
-    res.status(500).json({ error: 'Failed to list artifacts' });
+    res.status(500).json(errorJson('Failed to list artifacts', error));
   }
 });
 
@@ -3072,7 +3088,7 @@ router.get('/artifacts/:id', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to get artifact:', error);
-    res.status(500).json({ error: 'Failed to get artifact' });
+    res.status(500).json(errorJson('Failed to get artifact', error));
   }
 });
 
@@ -3112,7 +3128,7 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
 
     if (error) {
       logger.error('Failed to list artifact comments:', error);
-      res.status(500).json({ error: 'Failed to list comments' });
+      res.status(500).json(errorJson('Failed to list comments', error));
       return;
     }
 
@@ -3141,7 +3157,7 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
 
       if (identitiesError) {
         logger.error('Failed to resolve artifact comment identities:', identitiesError);
-        res.status(500).json({ error: 'Failed to resolve comment identities' });
+        res.status(500).json(errorJson('Failed to resolve comment identities', identitiesError));
         return;
       }
 
@@ -3158,7 +3174,7 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
 
       if (commentUsersError) {
         logger.error('Failed to resolve artifact comment users:', commentUsersError);
-        res.status(500).json({ error: 'Failed to resolve comment users' });
+        res.status(500).json(errorJson('Failed to resolve comment users', commentUsersError));
         return;
       }
 
@@ -3209,7 +3225,7 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to list artifact comments:', error);
-    res.status(500).json({ error: 'Failed to list comments' });
+    res.status(500).json(errorJson('Failed to list comments', error));
   }
 });
 
@@ -3305,7 +3321,7 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
 
     if (error || !comment) {
       logger.error('Failed to create artifact comment:', error);
-      res.status(500).json({ error: 'Failed to create comment' });
+      res.status(500).json(errorJson('Failed to create comment', error));
       return;
     }
 
@@ -3347,7 +3363,7 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to create artifact comment:', error);
-    res.status(500).json({ error: 'Failed to create comment' });
+    res.status(500).json(errorJson('Failed to create comment', error));
   }
 });
 
@@ -3385,7 +3401,7 @@ router.get('/artifacts/:id/history', async (req: Request, res: Response) => {
 
     if (error) {
       logger.error('Failed to get artifact history:', error);
-      res.status(500).json({ error: 'Failed to get history' });
+      res.status(500).json(errorJson('Failed to get history', error));
       return;
     }
 
@@ -3405,7 +3421,7 @@ router.get('/artifacts/:id/history', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to get artifact history:', error);
-    res.status(500).json({ error: 'Failed to get history' });
+    res.status(500).json(errorJson('Failed to get history', error));
   }
 });
 
@@ -3428,7 +3444,7 @@ router.delete('/connected-accounts/:id', async (req: Request, res: Response) => 
     res.json({ success: true });
   } catch (error) {
     logger.error('Failed to disconnect account:', error);
-    res.status(500).json({ error: 'Failed to disconnect account' });
+    res.status(500).json(errorJson('Failed to disconnect account', error));
   }
 });
 
@@ -3464,7 +3480,7 @@ router.get('/sessions', async (req: Request, res: Response) => {
 
     if (sessionsError) {
       logger.error('Failed to list sessions:', sessionsError);
-      res.status(500).json({ error: 'Failed to list sessions' });
+      res.status(500).json(errorJson('Failed to list sessions', sessionsError));
       return;
     }
 
@@ -3665,7 +3681,7 @@ router.get('/sessions', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to list sessions:', error);
-    res.status(500).json({ error: 'Failed to list sessions' });
+    res.status(500).json(errorJson('Failed to list sessions', error));
   }
 });
 
@@ -3747,7 +3763,7 @@ router.get('/sessions/:id/logs', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error('Failed to get session logs:', error);
-    res.status(500).json({ error: 'Failed to get session logs' });
+    res.status(500).json(errorJson('Failed to get session logs', error));
   }
 });
 
@@ -3780,7 +3796,7 @@ router.get('/skills', async (req: Request, res: Response) => {
     res.json(result);
   } catch (error) {
     logger.error('Failed to list skills:', error);
-    res.status(500).json({ error: 'Failed to list skills' });
+    res.status(500).json(errorJson('Failed to list skills', error));
   }
 });
 
@@ -3802,7 +3818,7 @@ router.get('/skills/:name', async (req: Request, res: Response) => {
     res.json(skill);
   } catch (error) {
     logger.error('Failed to get skill:', error);
-    res.status(500).json({ error: 'Failed to get skill' });
+    res.status(500).json(errorJson('Failed to get skill', error));
   }
 });
 
@@ -3817,7 +3833,7 @@ router.post('/skills/refresh', async (_req: Request, res: Response) => {
     res.json(result);
   } catch (error) {
     logger.error('Failed to refresh skills:', error);
-    res.status(500).json({ error: 'Failed to refresh skills' });
+    res.status(500).json(errorJson('Failed to refresh skills', error));
   }
 });
 
@@ -3832,7 +3848,7 @@ router.get('/skills/paths', async (_req: Request, res: Response) => {
     res.json({ paths });
   } catch (error) {
     logger.error('Failed to get skill paths:', error);
-    res.status(500).json({ error: 'Failed to get skill paths' });
+    res.status(500).json(errorJson('Failed to get skill paths', error));
   }
 });
 
@@ -3866,7 +3882,7 @@ router.get('/skills/registry', async (req: Request, res: Response) => {
     res.json(result);
   } catch (error) {
     logger.error('Failed to browse skills registry:', error);
-    res.status(500).json({ error: 'Failed to browse skills registry' });
+    res.status(500).json(errorJson('Failed to browse skills registry', error));
   }
 });
 
@@ -3891,7 +3907,7 @@ router.get('/skills/registry/:idOrName', async (req: Request, res: Response) => 
     res.json(skill);
   } catch (error) {
     logger.error('Failed to get registry skill:', error);
-    res.status(500).json({ error: 'Failed to get registry skill' });
+    res.status(500).json(errorJson('Failed to get registry skill', error));
   }
 });
 
@@ -3927,7 +3943,7 @@ router.post('/skills/install', async (req: Request, res: Response) => {
     res.json(result);
   } catch (error) {
     logger.error('Failed to install skill:', error);
-    res.status(500).json({ error: 'Failed to install skill' });
+    res.status(500).json(errorJson('Failed to install skill', error));
   }
 });
 
@@ -3952,7 +3968,7 @@ router.delete('/skills/install/:skillId', async (req: Request, res: Response) =>
     res.json(result);
   } catch (error) {
     logger.error('Failed to uninstall skill:', error);
-    res.status(500).json({ error: 'Failed to uninstall skill' });
+    res.status(500).json(errorJson('Failed to uninstall skill', error));
   }
 });
 
@@ -3994,7 +4010,7 @@ router.patch('/skills/install/:installationId', async (req: Request, res: Respon
     res.json({ success: true });
   } catch (error) {
     logger.error('Failed to update skill installation:', error);
-    res.status(500).json({ error: 'Failed to update skill installation' });
+    res.status(500).json(errorJson('Failed to update skill installation', error));
   }
 });
 
@@ -4018,7 +4034,7 @@ router.get('/skills/installed', async (req: Request, res: Response) => {
     res.json(result);
   } catch (error) {
     logger.error('Failed to list installed skills:', error);
-    res.status(500).json({ error: 'Failed to list installed skills' });
+    res.status(500).json(errorJson('Failed to list installed skills', error));
   }
 });
 
@@ -4079,7 +4095,7 @@ router.post('/skills/publish', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to publish skill:', error);
     const message = error instanceof Error ? error.message : 'Failed to publish skill';
-    res.status(500).json({ error: message });
+    res.status(500).json(errorJson(message, error));
   }
 });
 
@@ -4129,7 +4145,7 @@ router.patch('/skills/manage/:skillId', async (req: Request, res: Response) => {
     logger.error('Failed to update skill:', error);
     const message = error instanceof Error ? error.message : 'Failed to update skill';
     const status = message.includes('Unauthorized') || message.includes('only modify') ? 403 : 500;
-    res.status(status).json({ error: message });
+    res.status(status).json(errorJson(message, error));
   }
 });
 
@@ -4153,7 +4169,7 @@ router.delete('/skills/manage/:skillId', async (req: Request, res: Response) => 
     logger.error('Failed to delete skill:', error);
     const message = error instanceof Error ? error.message : 'Failed to delete skill';
     const status = message.includes('Unauthorized') || message.includes('only modify') ? 403 : 500;
-    res.status(status).json({ error: message });
+    res.status(status).json(errorJson(message, error));
   }
 });
 
@@ -4181,7 +4197,7 @@ router.post('/skills/manage/:skillId/deprecate', async (req: Request, res: Respo
   } catch (error) {
     logger.error('Failed to deprecate skill:', error);
     const errorMessage = error instanceof Error ? error.message : 'Failed to deprecate skill';
-    res.status(500).json({ error: errorMessage });
+    res.status(500).json(errorJson(errorMessage, error));
   }
 });
 
@@ -4216,7 +4232,7 @@ router.post('/skills/manage/:skillId/fork', async (req: Request, res: Response) 
   } catch (error) {
     logger.error('Failed to fork skill:', error);
     const message = error instanceof Error ? error.message : 'Failed to fork skill';
-    res.status(500).json({ error: message });
+    res.status(500).json(errorJson(message, error));
   }
 });
 

@@ -1,24 +1,24 @@
 /**
- * Workspace Containers Repository
+ * Workspaces Repository
  *
- * Product-level workspace containers (personal/team), distinct from git worktree studios.
+ * Product-level workspaces (personal/team), distinct from git worktree studios.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../supabase/types';
 
-type WorkspaceContainersTable = Database['public']['Tables']['workspace_containers'];
+type WorkspacesTable = Database['public']['Tables']['workspaces'];
 type WorkspaceMembersTable = Database['public']['Tables']['workspace_members'];
 
-export type WorkspaceContainerType = 'personal' | 'team';
+export type WorkspaceType = 'personal' | 'team';
 export type WorkspaceMemberRole = 'owner' | 'admin' | 'member' | 'viewer';
 
-export interface WorkspaceContainer {
+export interface Workspace {
   id: string;
   userId: string;
   name: string;
   slug: string;
-  type: WorkspaceContainerType;
+  type: WorkspaceType;
   description: string | null;
   metadata: Json;
   createdAt: string;
@@ -46,39 +46,39 @@ export interface WorkspaceMemberWithUser extends WorkspaceMember {
   user: WorkspaceMemberUser | null;
 }
 
-export interface WorkspaceContainerMembership extends WorkspaceContainer {
+export interface WorkspaceMembership extends Workspace {
   role: WorkspaceMemberRole;
   membershipCreatedAt: string;
 }
 
-export interface CreateWorkspaceContainerInput {
+export interface CreateWorkspaceInput {
   userId: string;
   name: string;
   slug: string;
-  type?: WorkspaceContainerType;
+  type?: WorkspaceType;
   description?: string;
   metadata?: Json;
 }
 
-export interface UpdateWorkspaceContainerInput {
+export interface UpdateWorkspaceInput {
   name?: string;
   slug?: string;
-  type?: WorkspaceContainerType;
+  type?: WorkspaceType;
   description?: string | null;
   metadata?: Json;
   archivedAt?: string | null;
 }
 
-export class WorkspaceContainersRepository {
+export class WorkspacesRepository {
   constructor(private client: SupabaseClient<Database>) {}
 
-  private mapContainerRow(row: Record<string, unknown>): WorkspaceContainer {
+  private mapContainerRow(row: Record<string, unknown>): Workspace {
     return {
       id: row.id as string,
       userId: row.user_id as string,
       name: row.name as string,
       slug: row.slug as string,
-      type: row.type as WorkspaceContainerType,
+      type: row.type as WorkspaceType,
       description: (row.description as string) || null,
       metadata: (row.metadata as Json) || {},
       createdAt: row.created_at as string,
@@ -97,15 +97,11 @@ export class WorkspaceContainersRepository {
     };
   }
 
-  async findRawById(id: string): Promise<WorkspaceContainer | null> {
-    const { data, error } = await this.client
-      .from('workspace_containers')
-      .select('*')
-      .eq('id', id)
-      .single();
+  async findRawById(id: string): Promise<Workspace | null> {
+    const { data, error } = await this.client.from('workspaces').select('*').eq('id', id).single();
 
     if (error && error.code !== 'PGRST116') {
-      throw new Error(`Failed to find workspace container: ${error.message}`);
+      throw new Error(`Failed to find workspace: ${error.message}`);
     }
 
     return data ? this.mapContainerRow(data as Record<string, unknown>) : null;
@@ -136,8 +132,8 @@ export class WorkspaceContainersRepository {
     return role === 'owner' || role === 'admin';
   }
 
-  async create(input: CreateWorkspaceContainerInput): Promise<WorkspaceContainer> {
-    const insertData: WorkspaceContainersTable['Insert'] = {
+  async create(input: CreateWorkspaceInput): Promise<Workspace> {
+    const insertData: WorkspacesTable['Insert'] = {
       user_id: input.userId,
       name: input.name,
       slug: input.slug,
@@ -147,19 +143,19 @@ export class WorkspaceContainersRepository {
     };
 
     const { data, error } = await this.client
-      .from('workspace_containers')
+      .from('workspaces')
       .insert(insertData)
       .select()
       .single();
 
     if (error) {
-      throw new Error(`Failed to create workspace container: ${error.message}`);
+      throw new Error(`Failed to create workspace: ${error.message}`);
     }
 
     return this.mapContainerRow(data as Record<string, unknown>);
   }
 
-  async findById(id: string, userId: string): Promise<WorkspaceContainer | null> {
+  async findById(id: string, userId: string): Promise<Workspace | null> {
     const membership = await this.findMembership(id, userId);
     if (!membership) {
       return null;
@@ -171,10 +167,10 @@ export class WorkspaceContainersRepository {
   async listMembershipsByUser(
     userId: string,
     opts?: {
-      type?: WorkspaceContainerType;
+      type?: WorkspaceType;
       includeArchived?: boolean;
     }
-  ): Promise<WorkspaceContainerMembership[]> {
+  ): Promise<WorkspaceMembership[]> {
     const { data: membershipRows, error: membershipError } = await this.client
       .from('workspace_members')
       .select('*')
@@ -184,14 +180,18 @@ export class WorkspaceContainersRepository {
       throw new Error(`Failed to list workspace memberships: ${membershipError.message}`);
     }
 
-    const memberships = (membershipRows || []).map((row) => this.mapMemberRow(row as Record<string, unknown>));
+    const memberships = (membershipRows || []).map((row) =>
+      this.mapMemberRow(row as Record<string, unknown>)
+    );
     if (memberships.length === 0) {
       return [];
     }
 
-    const workspaceIds = Array.from(new Set(memberships.map((membership) => membership.workspaceId)));
+    const workspaceIds = Array.from(
+      new Set(memberships.map((membership) => membership.workspaceId))
+    );
     let query = this.client
-      .from('workspace_containers')
+      .from('workspaces')
       .select('*')
       .in('id', workspaceIds)
       .order('updated_at', { ascending: false });
@@ -206,10 +206,10 @@ export class WorkspaceContainersRepository {
 
     const { data: workspaceRows, error: workspaceError } = await query;
     if (workspaceError) {
-      throw new Error(`Failed to list workspace containers: ${workspaceError.message}`);
+      throw new Error(`Failed to list workspaces: ${workspaceError.message}`);
     }
 
-    const workspaceById = new Map<string, WorkspaceContainer>();
+    const workspaceById = new Map<string, Workspace>();
     for (const row of workspaceRows || []) {
       const workspace = this.mapContainerRow(row as Record<string, unknown>);
       workspaceById.set(workspace.id, workspace);
@@ -220,7 +220,7 @@ export class WorkspaceContainersRepository {
       membershipByWorkspaceId.set(membership.workspaceId, membership);
     }
 
-    const results: WorkspaceContainerMembership[] = [];
+    const results: WorkspaceMembership[] = [];
     for (const workspace of workspaceById.values()) {
       const membership = membershipByWorkspaceId.get(workspace.id);
       if (!membership) continue;
@@ -237,10 +237,10 @@ export class WorkspaceContainersRepository {
   async listByUser(
     userId: string,
     opts?: {
-      type?: WorkspaceContainerType;
+      type?: WorkspaceType;
       includeArchived?: boolean;
     }
-  ): Promise<WorkspaceContainer[]> {
+  ): Promise<Workspace[]> {
     const memberships = await this.listMembershipsByUser(userId, opts);
     return memberships.map((membership) => ({
       id: membership.id,
@@ -256,12 +256,8 @@ export class WorkspaceContainersRepository {
     }));
   }
 
-  async update(
-    id: string,
-    userId: string,
-    input: UpdateWorkspaceContainerInput
-  ): Promise<WorkspaceContainer> {
-    const updateData: WorkspaceContainersTable['Update'] = {};
+  async update(id: string, userId: string, input: UpdateWorkspaceInput): Promise<Workspace> {
+    const updateData: WorkspacesTable['Update'] = {};
 
     if (input.name !== undefined) updateData.name = input.name;
     if (input.slug !== undefined) updateData.slug = input.slug;
@@ -271,7 +267,7 @@ export class WorkspaceContainersRepository {
     if (input.archivedAt !== undefined) updateData.archived_at = input.archivedAt;
 
     const { data, error } = await this.client
-      .from('workspace_containers')
+      .from('workspaces')
       .update(updateData)
       .eq('id', id)
       .eq('user_id', userId)
@@ -279,15 +275,15 @@ export class WorkspaceContainersRepository {
       .single();
 
     if (error) {
-      throw new Error(`Failed to update workspace container: ${error.message}`);
+      throw new Error(`Failed to update workspace: ${error.message}`);
     }
 
     return this.mapContainerRow(data as Record<string, unknown>);
   }
 
-  async ensurePersonalWorkspace(userId: string): Promise<WorkspaceContainer> {
+  async ensurePersonalWorkspace(userId: string): Promise<Workspace> {
     const { data: existing, error: existingError } = await this.client
-      .from('workspace_containers')
+      .from('workspaces')
       .select('*')
       .eq('user_id', userId)
       .eq('slug', 'personal')

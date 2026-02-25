@@ -44,7 +44,7 @@ export const chooseNameSchema = userIdentifierBaseSchema.extend({
 });
 
 export const saveIdentitySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
   agentId: z
     .string()
     .describe('Unique identifier for the AI being (e.g., "wren", "benson", "myra")'),
@@ -70,7 +70,7 @@ export const saveIdentitySchema = userIdentifierBaseSchema.extend({
 });
 
 export const getIdentitySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
   agentId: z.string().describe('Agent identifier to look up'),
   file: z
     .enum(['heartbeat', 'soul', 'values', 'identity'])
@@ -79,17 +79,17 @@ export const getIdentitySchema = userIdentifierBaseSchema.extend({
 });
 
 export const listIdentitiesSchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
 });
 
 export const getIdentityHistorySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
   agentId: z.string().describe('Agent identifier to get history for'),
   limit: z.number().min(1).max(50).optional().describe('Max history entries (default: 10)'),
 });
 
 export const restoreIdentitySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
   agentId: z.string().describe('Agent identifier to restore'),
   version: z.number().describe('Version number to restore to'),
 });
@@ -662,7 +662,7 @@ export async function handleRestoreIdentity(args: unknown, dataComposer: DataCom
 // =====================================================
 
 export const meetFamilySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
 });
 
 export async function handleMeetFamily(args: unknown, dataComposer: DataComposer) {

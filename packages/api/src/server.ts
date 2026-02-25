@@ -234,7 +234,10 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     // For external channels (telegram/whatsapp), ensure the conversation is released
     // and auto-route the text response if no explicit send_response was called
     const isExternalChannel =
-      channel === 'telegram' || channel === 'whatsapp' || channel === 'discord' || channel === 'slack';
+      channel === 'telegram' ||
+      channel === 'whatsapp' ||
+      channel === 'discord' ||
+      channel === 'slack';
     if (isExternalChannel && channelGateway) {
       // Check if send_response was called via MCP (tracked in response-handlers)
       const hadExplicitResponse = hasExplicitResponse(channel, conversationId);
@@ -474,7 +477,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     // 2. Resolve and verify target identity for this user
     // Prefer recipient_identity_id from inbox; fallback to user+agent_id with disambiguation.
     let resolvedIdentityId = recipientIdentityId;
-    let resolvedWorkspaceContainerId: string | undefined;
+    let resolvedWorkspaceId: string | undefined;
     const metadataWorkspaceId =
       payload.metadata &&
       typeof payload.metadata.workspaceId === 'string' &&
@@ -503,7 +506,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         );
       }
 
-      resolvedWorkspaceContainerId = identityRow.workspace_id || undefined;
+      resolvedWorkspaceId = identityRow.workspace_id || undefined;
     } else {
       let identityQuery = dataComposer!
         .getClient()
@@ -539,7 +542,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         );
       } else {
         resolvedIdentityId = identityRows[0].id;
-        resolvedWorkspaceContainerId = identityRows[0].workspace_id || undefined;
+        resolvedWorkspaceId = identityRows[0].workspace_id || undefined;
       }
     }
 
@@ -583,7 +586,7 @@ If you need to message a user, use send_response with the appropriate channel an
       userId,
       agentId: targetAgentId,
       identityId: resolvedIdentityId,
-      workspaceId: resolvedWorkspaceContainerId || null,
+      workspaceId: resolvedWorkspaceId || null,
     });
 
     const result = await sessionService!.handleMessage(request);

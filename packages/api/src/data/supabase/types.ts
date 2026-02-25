@@ -189,7 +189,7 @@ export type Database = {
             foreignKeyName: 'agent_identities_workspace_id_fkey';
             columns: ['workspace_id'];
             isOneToOne: false;
-            referencedRelation: 'workspace_containers';
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -270,7 +270,7 @@ export type Database = {
             foreignKeyName: 'agent_identity_history_workspace_id_fkey';
             columns: ['workspace_id'];
             isOneToOne: false;
-            referencedRelation: 'workspace_containers';
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -531,7 +531,7 @@ export type Database = {
             foreignKeyName: 'artifact_comments_workspace_id_fkey';
             columns: ['workspace_id'];
             isOneToOne: false;
-            referencedRelation: 'workspace_containers';
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -602,7 +602,7 @@ export type Database = {
             foreignKeyName: 'artifact_history_workspace_id_fkey';
             columns: ['workspace_id'];
             isOneToOne: false;
-            referencedRelation: 'workspace_containers';
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -681,7 +681,7 @@ export type Database = {
             foreignKeyName: 'artifacts_workspace_id_fkey';
             columns: ['workspace_id'];
             isOneToOne: false;
-            referencedRelation: 'workspace_containers';
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -807,7 +807,7 @@ export type Database = {
             foreignKeyName: 'authorized_groups_workspace_id_fkey';
             columns: ['workspace_id'];
             isOneToOne: false;
-            referencedRelation: 'workspace_containers';
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -891,7 +891,7 @@ export type Database = {
             foreignKeyName: 'connected_accounts_workspace_id_fkey';
             columns: ['workspace_id'];
             isOneToOne: false;
-            referencedRelation: 'workspace_containers';
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -1142,7 +1142,7 @@ export type Database = {
             foreignKeyName: 'group_challenge_codes_workspace_id_fkey';
             columns: ['workspace_id'];
             isOneToOne: false;
-            referencedRelation: 'workspace_containers';
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -2510,7 +2510,7 @@ export type Database = {
             foreignKeyName: 'trusted_users_workspace_id_fkey';
             columns: ['workspace_id'];
             isOneToOne: false;
-            referencedRelation: 'workspace_containers';
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -2561,7 +2561,7 @@ export type Database = {
             foreignKeyName: 'user_identity_workspace_id_fkey';
             columns: ['workspace_id'];
             isOneToOne: false;
-            referencedRelation: 'workspace_containers';
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -2618,7 +2618,7 @@ export type Database = {
             foreignKeyName: 'user_identity_history_workspace_id_fkey';
             columns: ['workspace_id'];
             isOneToOne: false;
-            referencedRelation: 'workspace_containers';
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -2735,7 +2735,7 @@ export type Database = {
         };
         Relationships: [];
       };
-      workspace_containers: {
+      workspaces: {
         Row: {
           archived_at: string | null;
           created_at: string | null;
@@ -2774,7 +2774,7 @@ export type Database = {
         };
         Relationships: [
           {
-            foreignKeyName: 'workspace_containers_user_id_fkey';
+            foreignKeyName: 'workspaces_user_id_fkey';
             columns: ['user_id'];
             isOneToOne: false;
             referencedRelation: 'users';
@@ -2816,7 +2816,7 @@ export type Database = {
             foreignKeyName: 'workspace_members_workspace_id_fkey';
             columns: ['workspace_id'];
             isOneToOne: false;
-            referencedRelation: 'workspace_containers';
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];

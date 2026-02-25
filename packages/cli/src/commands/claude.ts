@@ -193,18 +193,16 @@ function parseSessionIdFromJsonLine(line: string): string | undefined {
   }
 }
 
-async function persistBackendSessionLink(
-  options: {
-    pcpSessionId?: string;
-    backendSessionId?: string;
-    backend: string;
-    agentId: string;
-    runtimeLinkId?: string;
-    studioId?: string;
-    identityId?: string;
-    email?: string;
-  }
-): Promise<void> {
+async function persistBackendSessionLink(options: {
+  pcpSessionId?: string;
+  backendSessionId?: string;
+  backend: string;
+  agentId: string;
+  runtimeLinkId?: string;
+  studioId?: string;
+  identityId?: string;
+  email?: string;
+}): Promise<void> {
   if (!options.pcpSessionId || !options.backendSessionId) return;
 
   upsertRuntimeSession(process.cwd(), {
@@ -373,7 +371,9 @@ export async function runClaude(
   const agentId = resolveAgentId(options.agent, options.backend);
   if (!agentId) {
     console.error(chalk.red('No agent identity configured.'));
-    console.error(chalk.dim('Run `sb init` to set up PCP in this repo, or `sb awaken` to create a new SB.'));
+    console.error(
+      chalk.dim('Run `sb init` to set up PCP in this repo, or `sb awaken` to create a new SB.')
+    );
     console.error(chalk.dim('Or pass `-a <agent>` to specify one directly.'));
     process.exit(1);
   }
@@ -398,7 +398,9 @@ export async function runClaude(
       ...(identityId ? { identityId } : {}),
       ...(studioId ? { studioId } : {}),
       runtimeLinkId,
-      ...(sessionContext.backendSessionId ? { backendSessionId: sessionContext.backendSessionId } : {}),
+      ...(sessionContext.backendSessionId
+        ? { backendSessionId: sessionContext.backendSessionId }
+        : {}),
       updatedAt: new Date().toISOString(),
     });
   }
@@ -496,13 +498,15 @@ export async function runClaudeInteractive(
   const agentId = resolveAgentId(options.agent, options.backend);
   if (!agentId) {
     console.error(chalk.red('No agent identity configured.'));
-    console.error(chalk.dim('Run `sb init` to set up PCP in this repo, or `sb awaken` to create a new SB.'));
+    console.error(
+      chalk.dim('Run `sb init` to set up PCP in this repo, or `sb awaken` to create a new SB.')
+    );
     console.error(chalk.dim('Or pass `-a <agent>` to specify one directly.'));
     process.exit(1);
   }
   const adapter = getBackend(options.backend);
   const sessionContext = options.session
-    ? await ensurePcpSessionContext(agentId, options.backend, passthroughArgs, [], options.verbose)
+    ? await ensurePcpSessionContext(agentId, options.backend, passthroughArgs, options.verbose, [])
     : {};
   const runtimeLinkId = options.session ? randomUUID() : undefined;
   const { studioId, identityId } = getIdentityContextFromIdentityJson(process.cwd());
@@ -515,7 +519,9 @@ export async function runClaudeInteractive(
       ...(identityId ? { identityId } : {}),
       ...(studioId ? { studioId } : {}),
       runtimeLinkId,
-      ...(sessionContext.backendSessionId ? { backendSessionId: sessionContext.backendSessionId } : {}),
+      ...(sessionContext.backendSessionId
+        ? { backendSessionId: sessionContext.backendSessionId }
+        : {}),
       updatedAt: new Date().toISOString(),
     });
   }

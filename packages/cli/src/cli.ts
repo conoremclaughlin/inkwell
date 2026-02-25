@@ -71,7 +71,21 @@ interface ParsedArgs {
  * and the prompt. Commander can't reliably handle unknown flags with values
  * (e.g. --resume abc123) so we do this ourselves for the root command.
  */
-function extractArgs(argv: string[]): ParsedArgs {
+/**
+ * Detect whether positional args contain a backend subcommand that
+ * requires interactive stdio (e.g. `codex resume [id]`).
+ *
+ * These subcommands are always passed through to the backend as-is.
+ * sb does not use positional args as prompts — prompts go via flags
+ * or piped stdin.
+ */
+export function isBackendInteractiveSubcommand(backend: string, promptParts: string[]): boolean {
+  if (backend !== 'codex' || promptParts.length === 0) return false;
+  const CODEX_INTERACTIVE_SUBCOMMANDS = ['resume'];
+  return promptParts.some((part) => CODEX_INTERACTIVE_SUBCOMMANDS.includes(part));
+}
+
+export function extractArgs(argv: string[]): ParsedArgs {
   const sbOptions: ParsedArgs['sbOptions'] = {
     agent: undefined,
     backend: undefined,
@@ -150,7 +164,15 @@ program
     // Resolve backend from identity.json if not explicitly set
     const resolvedOptions = { ...sbOptions, backend: resolveBackend(sbOptions.backend) };
 
-    if (!prompt && !passthroughArgs.length && !process.stdin.isTTY) {
+    const isInteractiveSubcommand = isBackendInteractiveSubcommand(
+      resolvedOptions.backend,
+      promptParts
+    );
+
+    if (isInteractiveSubcommand) {
+      // Move positional args to passthrough so the backend receives them as subcommand args
+      await runClaudeInteractive(resolvedOptions, [...passthroughArgs, ...promptParts]);
+    } else if (!prompt && !passthroughArgs.length && !process.stdin.isTTY) {
       // Piped stdin — read it as the prompt
       let stdinData = '';
       process.stdin.setEncoding('utf8');

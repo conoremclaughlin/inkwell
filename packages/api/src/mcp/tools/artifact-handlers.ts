@@ -21,7 +21,7 @@ import type { Database, Json } from '../../data/supabase/types';
 // ============== Schemas ==============
 
 const workspaceScopedUserIdentifierSchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
 });
 
 const createArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
