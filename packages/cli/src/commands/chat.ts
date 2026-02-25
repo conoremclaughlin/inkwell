@@ -36,6 +36,7 @@ type ChatOptions = {
   backend?: string;
   model?: string;
   threadKey?: string;
+  new?: boolean;
   attach?: string | boolean;
   attachLatest?: string | boolean;
   sessionId?: string;
@@ -109,6 +110,8 @@ const LEDGER_COMPACT_CHARS = 420;
 const AUTO_TRIM_KEEP_RECENT_ENTRIES = 6;
 const DEFAULT_TRIM_TARGET_PCT = 70;
 const CTRL_C_EXIT_WINDOW_MS = 1500;
+const WAITING_VERB_ROTATE_MS = 30_000;
+const WAITING_FRAME_INTERVAL_MS = 850;
 const WAITING_VERBS = [
   'Cooking',
   'Contextifying',
@@ -284,18 +287,23 @@ function startWaitingIndicator(backend: string): (doneMessage?: string) => void 
   const startedAt = Date.now();
   const useAnimatedLine = Boolean(process.stdout.isTTY);
   let tick = 0;
+  let previousWidth = 0;
 
   const render = () => {
     const seconds = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
-    const verb = pickWaitingVerb(tick);
+    const verbTick = Math.floor((Date.now() - startedAt) / WAITING_VERB_ROTATE_MS);
+    const verb = pickWaitingVerb(verbTick);
     const frame = WAITING_FRAMES[tick % WAITING_FRAMES.length] || '✦';
-    const msg = `${frame} ${verb} — waiting for ${backend} (${seconds}s)`;
+    const dots = '.'.repeat((tick % 3) + 1);
+    const msg = `${frame} ${verb}${dots} waiting for ${backend} (${seconds}s)`;
 
     if (useAnimatedLine) {
       const palette = [chalk.cyan, chalk.magenta, chalk.yellow, chalk.green] as const;
       const tint = palette[tick % palette.length] || chalk.cyan;
-      process.stdout.write(`\r${tint(msg)}`);
-    } else if (tick === 0 || tick % 4 === 0) {
+      const pad = previousWidth > msg.length ? ' '.repeat(previousWidth - msg.length) : '';
+      process.stdout.write(`\r${tint(msg)}${pad}`);
+      previousWidth = msg.length;
+    } else if (tick === 0 || tick % 6 === 0) {
       console.log(chalk.dim(`… ${verb} — waiting for ${backend} (${seconds}s)`));
     }
 
@@ -303,14 +311,13 @@ function startWaitingIndicator(backend: string): (doneMessage?: string) => void 
   };
 
   render();
-  const timer = setInterval(render, useAnimatedLine ? 220 : 1000);
+  const timer = setInterval(render, useAnimatedLine ? WAITING_FRAME_INTERVAL_MS : 3000);
 
   return (doneMessage?: string) => {
     clearInterval(timer);
     if (useAnimatedLine) {
-      process.stdout.write('\r');
-      if (typeof process.stdout.clearLine === 'function') process.stdout.clearLine(0);
-      if (typeof process.stdout.cursorTo === 'function') process.stdout.cursorTo(0);
+      const clear = previousWidth > 0 ? ' '.repeat(previousWidth) : '';
+      process.stdout.write(`\r${clear}\r`);
     }
     if (doneMessage) {
       console.log(chalk.dim(doneMessage));
@@ -739,6 +746,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const agentId: string = resolvedAgentId;
   const pcp = new PcpClient();
   const identity = readIdentityJson(process.cwd());
+  let autoAttachedLatest = false;
 
   const runtime: ChatRuntime = {
     backend: options.backend || 'claude',
@@ -770,6 +778,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let activitySince = new Date(Date.now() - 5 * 60 * 1000).toISOString();
   let lastBackendUsage: BackendTokenUsage | undefined;
   let lastDelegation: DelegationState | undefined;
+  let forceQuitAfterTurn = false;
 
   const bootstrapResult = (await pcp
     .callTool('bootstrap', { agentId })
@@ -814,6 +823,27 @@ export async function runChat(options: ChatOptions): Promise<void> {
     runtime.sessionId = selected.id;
     if (!runtime.threadKey && selected.threadKey) {
       runtime.threadKey = selected.threadKey;
+    }
+  }
+
+  if (
+    !runtime.sessionId &&
+    !options.new &&
+    !options.attach &&
+    !options.attachLatest &&
+    !runtime.threadKey
+  ) {
+    const sessionsResult = (await pcp
+      .callTool('list_sessions', { agentId, status: 'active', limit: 30 })
+      .catch(() => null)) as Record<string, unknown> | null;
+    const sessions = extractSessionSummaries(sessionsResult);
+    const selected = pickLatestSession(sessions);
+    if (selected) {
+      runtime.sessionId = selected.id;
+      if (!runtime.threadKey && selected.threadKey) {
+        runtime.threadKey = selected.threadKey;
+      }
+      autoAttachedLatest = true;
     }
   }
 
@@ -865,6 +895,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   console.log(chalk.dim(`Backend: ${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}`));
   if (runtime.threadKey) console.log(chalk.dim(`Thread: ${runtime.threadKey}`));
   if (attachedToExistingSession) console.log(chalk.dim('Mode: attached to existing session'));
+  if (autoAttachedLatest) console.log(chalk.dim('Mode: auto-attached to latest active session'));
   if (runtime.sessionId) console.log(chalk.dim(`Session: ${runtime.sessionId}`));
   console.log(chalk.dim(`Transcript: ${runtime.transcriptPath}`));
   console.log(chalk.dim('Type /help for commands.\n'));
@@ -896,7 +927,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const note = `Trimmed ${trim.removedEntries.length} entries (~${trim.removedTokens} tok) to ${targetPercent}% budget (${reason}).`;
     console.log(chalk.yellow(note));
     appendTranscript(runtime.transcriptPath, {
-      type: 'context_auto_trim',
+      type: 'context_trim',
       reason,
       targetPercent,
       removedCount: trim.removedEntries.length,
@@ -1033,6 +1064,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const prompt = buildPromptEnvelope(agentId, runtime, ledger, raw);
     const turnStartedAt = Date.now();
     const stopWaiting = startWaitingIndicator(runtime.backend);
+    let turnCtrlCAt = 0;
+    const onSigintDuringTurn = () => {
+      const now = Date.now();
+      if (turnCtrlCAt > 0 && now - turnCtrlCAt <= CTRL_C_EXIT_WINDOW_MS) {
+        forceQuitAfterTurn = true;
+        console.log(chalk.yellow('\nWill exit after current backend turn completes.\n'));
+        return;
+      }
+      turnCtrlCAt = now;
+      console.log(chalk.dim('\nBackend turn in progress. Press Ctrl+C again to exit after this turn.\n'));
+    };
+    process.on('SIGINT', onSigintDuringTurn);
     const runResult = await runBackendTurn({
       backend: runtime.backend,
       agentId,
@@ -1041,9 +1084,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
       verbose: runtime.verbose,
       // When tools are off, do not pass through backend tool passthrough flags.
       passthroughArgs: toolPolicy.canUseBackendTools() ? [] : ['--allowedTools', ''],
-    }).finally(() =>
-      stopWaiting(`✓ ${runtime.backend} responded in ${Math.round((Date.now() - turnStartedAt) / 1000)}s`)
-    );
+    }).finally(() => {
+      process.off('SIGINT', onSigintDuringTurn);
+      stopWaiting(`✓ ${runtime.backend} responded in ${Math.round((Date.now() - turnStartedAt) / 1000)}s`);
+    });
 
     let responseText = runResult.stdout.trim();
     if (!responseText && runResult.stderr.trim()) {
@@ -1894,6 +1938,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       continue;
     }
     await runUserTurn(raw);
+    if (forceQuitAfterTurn) {
+      keepRunning = false;
+    }
   }
 
   rl.close();
@@ -1911,6 +1958,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     summary,
   });
 
+  if (runtime.sessionId) {
+    console.log(chalk.dim(`Reattach: sb chat -a ${agentId} --attach ${runtime.sessionId}`));
+  }
   console.log(chalk.dim('\nChat ended.\n'));
 }
 
@@ -1923,6 +1973,7 @@ export function registerChatCommand(program: Command): void {
       .option('-b, --backend <name>', 'Backend: claude, codex, gemini', 'claude')
       .option('-m, --model <model>', 'Model override for backend')
       .option('--thread-key <key>', 'Thread key for PCP session routing')
+      .option('--new', 'Always start a new session (disable auto-attach to latest)')
       .option('--attach [query]', 'Attach to an active session for this SB (optional query filter)')
       .option(
         '--attach-latest [query]',

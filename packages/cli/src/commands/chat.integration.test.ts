@@ -293,6 +293,51 @@ describe('runChat integration', () => {
     expect(sessionStatusLine).toContain('Thread: pr:2');
   });
 
+  it('auto-attaches latest active session by default when no --new/--attach is provided', async () => {
+    testState.callToolImpl.mockImplementation(async (tool: string) => {
+      switch (tool) {
+        case 'bootstrap':
+          return { user: { timezone: 'America/Los_Angeles' } };
+        case 'list_sessions':
+          return {
+            sessions: [
+              {
+                id: 'sess-old',
+                agentId: 'lumen',
+                status: 'active',
+                threadKey: 'pr:9',
+                startedAt: '2026-02-18T18:00:00.000Z',
+              },
+              {
+                id: 'sess-latest',
+                agentId: 'lumen',
+                status: 'active',
+                threadKey: 'pr:10',
+                startedAt: '2026-02-18T19:00:00.000Z',
+              },
+            ],
+          };
+        case 'get_inbox':
+          return { messages: [] };
+        default:
+          return { success: true };
+      }
+    });
+
+    testState.inputs = ['/quit'];
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      pollSeconds: '999',
+    });
+
+    expect(testState.pcpCalls.some((call) => call.tool === 'start_session')).toBe(false);
+    const sessionStatusLine = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    expect(sessionStatusLine).toContain('Mode: auto-attached to latest active session');
+    expect(sessionStatusLine).toContain('Session: sess-latest');
+    expect(sessionStatusLine).toContain('Thread: pr:10');
+  });
+
   it('supports gated /pcp tool execution with inline approval', async () => {
     testState.inputs = ['/pcp send_to_inbox {"recipientAgentId":"wren"}', 'y', '/quit'];
 
