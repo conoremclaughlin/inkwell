@@ -179,6 +179,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     }
 
     // If mention didn't match, try channel_routes specificity cascade
+    let routeStudioId: string | null = null;
     if (routedAgentId === agentId) {
       const route = await resolveRouteAgentId(
         dataComposer!.getClient(),
@@ -189,11 +190,13 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       );
       if (route) {
         routedAgentId = route.agentId;
+        routeStudioId = route.studioId;
         logger.debug(`[Route] Resolved agent from channel_routes`, {
           platform: channel,
           agentId: route.agentId,
           identityId: route.identityId,
           routeId: route.routeId,
+          studioId: route.studioId,
         });
       } else {
         logger.warn(
@@ -220,6 +223,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         chatType: metadata?.chatType,
         media: metadata?.media,
         triggerType: 'message',
+        ...(routeStudioId ? { studioId: routeStudioId } : {}),
       },
     };
 

@@ -4,12 +4,20 @@ import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { useMutation } from '@tanstack/react-query';
-import { ArrowLeft, Bell, Save, Trash2, Plus } from 'lucide-react';
+import { ArrowLeft, Bell, Save, Trash2, Plus, GitBranch } from 'lucide-react';
 import { apiDelete, apiPatch, useApiPost, useApiQuery, useQueryClient } from '@/lib/api';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
+
+interface Studio {
+  id: string;
+  name: string;
+  branch: string | null;
+  status: string;
+  agentId: string | null;
+}
 
 interface AgentRoute {
   id: string;
@@ -21,6 +29,7 @@ interface AgentRoute {
   platform: string;
   platformAccountId: string | null;
   chatId: string | null;
+  studioId: string | null;
   isActive: boolean;
   metadata: Record<string, unknown>;
   createdAt: string;
@@ -55,6 +64,7 @@ interface AgentRoutingResponse {
     backend: string | null;
     updatedAt: string;
   };
+  studios: Studio[];
   routes: AgentRoute[];
   reminders: AgentReminder[];
 }
@@ -63,6 +73,7 @@ interface RouteFormState {
   platform: string;
   platformAccountId: string;
   chatId: string;
+  studioId: string;
   isActive: boolean;
 }
 
@@ -74,8 +85,15 @@ function formatPlatform(value: string): string {
 }
 
 function formatTime(value: string | null): string {
-  if (!value) return '—';
+  if (!value) return '\u2014';
   return new Date(value).toLocaleString();
+}
+
+function studioLabel(studios: Studio[], studioId: string | null): string {
+  if (!studioId) return 'Auto (nearest session)';
+  const studio = studios.find((s) => s.id === studioId);
+  if (!studio) return 'Unknown studio';
+  return studio.name + (studio.branch ? ` (${studio.branch})` : '');
 }
 
 function initialFormFromRoute(route: AgentRoute): RouteFormState {
@@ -83,6 +101,7 @@ function initialFormFromRoute(route: AgentRoute): RouteFormState {
     platform: route.platform,
     platformAccountId: route.platformAccountId || '',
     chatId: route.chatId || '',
+    studioId: route.studioId || '',
     isActive: route.isActive,
   };
 }
@@ -100,10 +119,13 @@ export default function AgentRoutingPage() {
     }
   );
 
+  const studios = data?.studios ?? [];
+
   const [newRoute, setNewRoute] = useState<RouteFormState>({
     platform: 'telegram',
     platformAccountId: '',
     chatId: '',
+    studioId: '',
     isActive: true,
   });
   const [editingRouteId, setEditingRouteId] = useState<string | null>(null);
@@ -111,6 +133,7 @@ export default function AgentRoutingPage() {
     platform: 'telegram',
     platformAccountId: '',
     chatId: '',
+    studioId: '',
     isActive: true,
   });
 
@@ -131,6 +154,7 @@ export default function AgentRoutingPage() {
           platform: 'telegram',
           platformAccountId: '',
           chatId: '',
+          studioId: '',
           isActive: true,
         });
       },
@@ -160,6 +184,9 @@ export default function AgentRoutingPage() {
     updateRouteMutation.error?.message ||
     deleteRouteMutation.error?.message;
 
+  const selectClassName =
+    'flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm';
+
   return (
     <div>
       <div className="flex items-center justify-between gap-4">
@@ -187,7 +214,7 @@ export default function AgentRoutingPage() {
       {data && !data.heartbeatProcessingEnabled && (
         <div className="mt-4 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
           Heartbeat/reminder processing is disabled on this server instance. Routing edits still
-          persist, but reminder execution won’t run here.
+          persist, but reminder execution won't run here.
         </div>
       )}
 
@@ -215,11 +242,12 @@ export default function AgentRoutingPage() {
                 platform: newRoute.platform,
                 platformAccountId: newRoute.platformAccountId || null,
                 chatId: newRoute.chatId || null,
+                studioId: newRoute.studioId || null,
                 isActive: newRoute.isActive,
               });
             }}
           >
-            <div className="grid gap-4 md:grid-cols-3">
+            <div className="grid gap-4 md:grid-cols-2">
               <div className="space-y-2">
                 <label className="text-sm font-medium">Platform</label>
                 <select
@@ -239,6 +267,28 @@ export default function AgentRoutingPage() {
                   ))}
                 </select>
               </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Studio</label>
+                <select
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  value={newRoute.studioId}
+                  onChange={(event) =>
+                    setNewRoute((previous) => ({
+                      ...previous,
+                      studioId: event.target.value,
+                    }))
+                  }
+                >
+                  <option value="">Auto (nearest session)</option>
+                  {studios.map((studio) => (
+                    <option key={studio.id} value={studio.id}>
+                      {studio.name}{studio.branch ? ` (${studio.branch})` : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="grid gap-4 md:grid-cols-2">
               <div className="space-y-2">
                 <label className="text-sm font-medium">Platform account</label>
                 <Input
@@ -324,14 +374,21 @@ export default function AgentRoutingPage() {
                       </div>
                     </div>
 
-                    <div className="mt-3 grid gap-3 md:grid-cols-2 text-sm">
+                    <div className="mt-3 grid gap-3 md:grid-cols-3 text-sm">
                       <div>
                         <div className="text-gray-500">Account</div>
-                        <div className="font-mono text-xs">{route.platformAccountId || 'Any account'}</div>
+                        <div className="font-mono text-xs">{route.platformAccountId || 'All accounts'}</div>
                       </div>
                       <div>
                         <div className="text-gray-500">Chat</div>
-                        <div className="font-mono text-xs">{route.chatId || 'Any chat'}</div>
+                        <div className="font-mono text-xs">{route.chatId || 'All chats'}</div>
+                      </div>
+                      <div>
+                        <div className="text-gray-500">Studio</div>
+                        <div className="flex items-center gap-1 text-xs">
+                          <GitBranch className="h-3 w-3 text-gray-400" />
+                          {studioLabel(studios, route.studioId)}
+                        </div>
                       </div>
                     </div>
 
@@ -346,15 +403,16 @@ export default function AgentRoutingPage() {
                               platform: editForm.platform,
                               platformAccountId: editForm.platformAccountId || null,
                               chatId: editForm.chatId || null,
+                              studioId: editForm.studioId || null,
                               isActive: editForm.isActive,
                             },
                           });
                           setEditingRouteId(null);
                         }}
                       >
-                        <div className="grid gap-3 md:grid-cols-3">
+                        <div className="grid gap-3 md:grid-cols-2">
                           <select
-                            className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                            className={selectClassName}
                             value={editForm.platform}
                             onChange={(event) =>
                               setEditForm((previous) => ({
@@ -369,6 +427,25 @@ export default function AgentRoutingPage() {
                               </option>
                             ))}
                           </select>
+                          <select
+                            className={selectClassName}
+                            value={editForm.studioId}
+                            onChange={(event) =>
+                              setEditForm((previous) => ({
+                                ...previous,
+                                studioId: event.target.value,
+                              }))
+                            }
+                          >
+                            <option value="">Auto (nearest session)</option>
+                            {studios.map((studio) => (
+                              <option key={studio.id} value={studio.id}>
+                                {studio.name}{studio.branch ? ` (${studio.branch})` : ''}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <div className="grid gap-3 md:grid-cols-2">
                           <Input
                             placeholder="Platform account"
                             value={editForm.platformAccountId}
@@ -483,7 +560,7 @@ export default function AgentRoutingPage() {
                       <div className="font-medium text-gray-900">{reminder.title}</div>
                       <div className="text-xs text-gray-500 mt-1">
                         {formatPlatform(reminder.deliveryChannel)}
-                        {reminder.deliveryTarget ? ` → ${reminder.deliveryTarget}` : ''}
+                        {reminder.deliveryTarget ? ` \u2192 ${reminder.deliveryTarget}` : ''}
                       </div>
                     </div>
                     <Badge variant="outline">{reminder.status}</Badge>
