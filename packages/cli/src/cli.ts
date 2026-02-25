@@ -71,7 +71,19 @@ interface ParsedArgs {
  * and the prompt. Commander can't reliably handle unknown flags with values
  * (e.g. --resume abc123) so we do this ourselves for the root command.
  */
-function extractArgs(argv: string[]): ParsedArgs {
+/**
+ * Detect whether positional args represent a backend-specific interactive
+ * subcommand (e.g. `codex resume [id]`) rather than a user prompt.
+ * Only Codex uses positional subcommands — other backends use flags
+ * (--resume, --session-id) which are already handled as passthrough args.
+ */
+export function isBackendInteractiveSubcommand(backend: string, promptParts: string[]): boolean {
+  if (backend !== 'codex' || promptParts.length === 0) return false;
+  const CODEX_INTERACTIVE_SUBCOMMANDS = ['resume'];
+  return CODEX_INTERACTIVE_SUBCOMMANDS.includes(promptParts[0]);
+}
+
+export function extractArgs(argv: string[]): ParsedArgs {
   const sbOptions: ParsedArgs['sbOptions'] = {
     agent: undefined,
     backend: undefined,
@@ -150,11 +162,10 @@ program
     // Resolve backend from identity.json if not explicitly set
     const resolvedOptions = { ...sbOptions, backend: resolveBackend(sbOptions.backend) };
 
-    // Backend subcommands that require interactive stdio (e.g. `codex resume <id>`)
-    // must be routed through runClaudeInteractive, not runClaude (which pipes stdout).
-    const INTERACTIVE_SUBCOMMANDS = ['resume'];
-    const isInteractiveSubcommand =
-      promptParts.length > 0 && INTERACTIVE_SUBCOMMANDS.includes(promptParts[0]);
+    const isInteractiveSubcommand = isBackendInteractiveSubcommand(
+      resolvedOptions.backend,
+      promptParts
+    );
 
     if (isInteractiveSubcommand) {
       // Move positional args to passthrough so the backend receives them as subcommand args
