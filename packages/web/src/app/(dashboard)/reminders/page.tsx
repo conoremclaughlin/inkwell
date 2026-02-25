@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { useApiQuery } from '@/lib/api';
 import clsx from 'clsx';
+import { getAgentGradient } from '@/lib/utils';
 
 // ─── Types ───
 
@@ -72,21 +73,7 @@ const channelConfig: Record<string, { icon: typeof Send; label: string }> = {
   push: { icon: Bell, label: 'Push' },
 };
 
-const INITIAL_COLORS = [
-  'from-violet-500 to-purple-600',
-  'from-sky-500 to-blue-600',
-  'from-emerald-500 to-teal-600',
-  'from-amber-500 to-orange-600',
-  'from-rose-500 to-pink-600',
-];
-
 // ─── Helpers ───
-
-function getColorForAgent(name: string): string {
-  let hash = 0;
-  for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
-  return INITIAL_COLORS[Math.abs(hash) % INITIAL_COLORS.length];
-}
 
 function formatCron(cron: string | null): string {
   if (!cron) return 'One-time';
@@ -201,7 +188,7 @@ function ReminderCard({ reminder }: { reminder: Reminder }) {
 
 function SBSection({ group, statusFilter }: { group: SBReminderGroup; statusFilter: StatusFilter }) {
   const [collapsed, setCollapsed] = useState(group.activeCount === 0);
-  const gradient = getColorForAgent(group.agentName);
+  const gradient = getAgentGradient(group.agentId || '__unassigned__');
 
   const filtered = statusFilter === 'all'
     ? group.reminders

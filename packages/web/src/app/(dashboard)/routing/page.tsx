@@ -21,6 +21,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import clsx from 'clsx';
+import { getAgentGradient } from '@/lib/utils';
 
 // ─── Types ───
 
@@ -108,21 +109,6 @@ function formatScopeLabel(platformAccountId: string | null, chatId: string | nul
 
 function getInitial(name: string): string {
   return name.charAt(0).toUpperCase();
-}
-
-const INITIAL_COLORS = [
-  'from-violet-500 to-purple-600',
-  'from-sky-500 to-blue-600',
-  'from-emerald-500 to-teal-600',
-  'from-amber-500 to-orange-600',
-  'from-rose-500 to-pink-600',
-  'from-cyan-500 to-teal-600',
-];
-
-function getColorForAgent(name: string): string {
-  let hash = 0;
-  for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
-  return INITIAL_COLORS[Math.abs(hash) % INITIAL_COLORS.length];
 }
 
 // ─── Component ───
@@ -349,7 +335,7 @@ export default function RoutingPage() {
           </Card>
         ) : (
           sbGroups.map((group) => {
-            const gradient = getColorForAgent(group.agentName);
+            const gradient = getAgentGradient(group.agentId);
             return (
               <Card key={group.agentId} className="overflow-hidden">
                 {/* SB Header */}
