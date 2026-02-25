@@ -1,10 +1,10 @@
 'use client';
 
 import Link from 'next/link';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { useMutation } from '@tanstack/react-query';
-import { ArrowLeft, Bell, Save, Trash2, Plus } from 'lucide-react';
+import { ArrowLeft, Bell, Save, Trash2, Plus, GitBranch } from 'lucide-react';
 import { apiDelete, apiPatch, useApiPost, useApiQuery, useQueryClient } from '@/lib/api';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -21,6 +21,7 @@ interface AgentRoute {
   platform: string;
   platformAccountId: string | null;
   chatId: string | null;
+  studioHint: string | null;
   isActive: boolean;
   metadata: Record<string, unknown>;
   createdAt: string;
@@ -44,6 +45,13 @@ interface AgentReminder {
   identityId: string | null;
 }
 
+interface AgentStudio {
+  id: string;
+  name: string;
+  branch: string | null;
+  status: string;
+}
+
 interface AgentRoutingResponse {
   heartbeatProcessingEnabled: boolean;
   agent: {
@@ -55,6 +63,7 @@ interface AgentRoutingResponse {
     backend: string | null;
     updatedAt: string;
   };
+  studios: AgentStudio[];
   routes: AgentRoute[];
   reminders: AgentReminder[];
 }
@@ -63,6 +72,7 @@ interface RouteFormState {
   platform: string;
   platformAccountId: string;
   chatId: string;
+  studioHint: string;
   isActive: boolean;
 }
 
@@ -74,8 +84,28 @@ function formatPlatform(value: string): string {
 }
 
 function formatTime(value: string | null): string {
-  if (!value) return '—';
+  if (!value) return '\u2014';
   return new Date(value).toLocaleString();
+}
+
+function buildStudioOptions(studios: AgentStudio[]): { value: string; label: string }[] {
+  const options: { value: string; label: string }[] = [
+    { value: 'main', label: 'Main' },
+  ];
+  for (const s of studios) {
+    // Skip if this IS the main branch studio (already covered by "Main" option)
+    if (s.branch === 'main') continue;
+    options.push({ value: s.name, label: s.name });
+  }
+  return options;
+}
+
+function studioHintLabel(hint: string | null, studios: AgentStudio[]): string {
+  if (!hint) return 'Not set';
+  if (hint === 'main') return 'Main';
+  const match = studios.find((s) => s.name === hint);
+  if (match) return match.name;
+  return hint;
 }
 
 function initialFormFromRoute(route: AgentRoute): RouteFormState {
@@ -83,6 +113,7 @@ function initialFormFromRoute(route: AgentRoute): RouteFormState {
     platform: route.platform,
     platformAccountId: route.platformAccountId || '',
     chatId: route.chatId || '',
+    studioHint: route.studioHint || '',
     isActive: route.isActive,
   };
 }
@@ -100,10 +131,14 @@ export default function AgentRoutingPage() {
     }
   );
 
+  const studios = data?.studios ?? [];
+  const studioOptions = useMemo(() => buildStudioOptions(studios), [studios]);
+
   const [newRoute, setNewRoute] = useState<RouteFormState>({
     platform: 'telegram',
     platformAccountId: '',
     chatId: '',
+    studioHint: 'main',
     isActive: true,
   });
   const [editingRouteId, setEditingRouteId] = useState<string | null>(null);
@@ -111,6 +146,7 @@ export default function AgentRoutingPage() {
     platform: 'telegram',
     platformAccountId: '',
     chatId: '',
+    studioHint: '',
     isActive: true,
   });
 
@@ -131,6 +167,7 @@ export default function AgentRoutingPage() {
           platform: 'telegram',
           platformAccountId: '',
           chatId: '',
+          studioHint: 'main',
           isActive: true,
         });
       },
@@ -160,6 +197,9 @@ export default function AgentRoutingPage() {
     updateRouteMutation.error?.message ||
     deleteRouteMutation.error?.message;
 
+  const selectClassName =
+    'flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm';
+
   return (
     <div>
       <div className="flex items-center justify-between gap-4">
@@ -187,7 +227,7 @@ export default function AgentRoutingPage() {
       {data && !data.heartbeatProcessingEnabled && (
         <div className="mt-4 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
           Heartbeat/reminder processing is disabled on this server instance. Routing edits still
-          persist, but reminder execution won’t run here.
+          persist, but reminder execution won't run here.
         </div>
       )}
 
@@ -215,11 +255,12 @@ export default function AgentRoutingPage() {
                 platform: newRoute.platform,
                 platformAccountId: newRoute.platformAccountId || null,
                 chatId: newRoute.chatId || null,
+                studioHint: newRoute.studioHint || null,
                 isActive: newRoute.isActive,
               });
             }}
           >
-            <div className="grid gap-4 md:grid-cols-3">
+            <div className="grid gap-4 md:grid-cols-2">
               <div className="space-y-2">
                 <label className="text-sm font-medium">Platform</label>
                 <select
@@ -239,6 +280,27 @@ export default function AgentRoutingPage() {
                   ))}
                 </select>
               </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Studio</label>
+                <select
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  value={newRoute.studioHint}
+                  onChange={(event) =>
+                    setNewRoute((previous) => ({
+                      ...previous,
+                      studioHint: event.target.value,
+                    }))
+                  }
+                >
+                  {studioOptions.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="grid gap-4 md:grid-cols-2">
               <div className="space-y-2">
                 <label className="text-sm font-medium">Platform account</label>
                 <Input
@@ -324,16 +386,21 @@ export default function AgentRoutingPage() {
                       </div>
                     </div>
 
-                    <div className="mt-3 grid gap-3 md:grid-cols-2 text-sm">
+                    <div className="mt-3 grid gap-3 md:grid-cols-3 text-sm">
                       <div>
                         <div className="text-gray-500">Account</div>
-                        <div className="font-mono text-xs">
-                          {route.platformAccountId || 'Any account'}
-                        </div>
+                        <div className="font-mono text-xs">{route.platformAccountId || 'All accounts'}</div>
                       </div>
                       <div>
                         <div className="text-gray-500">Chat</div>
-                        <div className="font-mono text-xs">{route.chatId || 'Any chat'}</div>
+                        <div className="font-mono text-xs">{route.chatId || 'All chats'}</div>
+                      </div>
+                      <div>
+                        <div className="text-gray-500">Studio</div>
+                        <div className="flex items-center gap-1 text-xs">
+                          <GitBranch className="h-3 w-3 text-gray-400" />
+                          {studioHintLabel(route.studioHint, studios)}
+                        </div>
                       </div>
                     </div>
 
@@ -348,15 +415,16 @@ export default function AgentRoutingPage() {
                               platform: editForm.platform,
                               platformAccountId: editForm.platformAccountId || null,
                               chatId: editForm.chatId || null,
+                              studioHint: editForm.studioHint || null,
                               isActive: editForm.isActive,
                             },
                           });
                           setEditingRouteId(null);
                         }}
                       >
-                        <div className="grid gap-3 md:grid-cols-3">
+                        <div className="grid gap-3 md:grid-cols-2">
                           <select
-                            className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                            className={selectClassName}
                             value={editForm.platform}
                             onChange={(event) =>
                               setEditForm((previous) => ({
@@ -371,6 +439,24 @@ export default function AgentRoutingPage() {
                               </option>
                             ))}
                           </select>
+                          <select
+                            className={selectClassName}
+                            value={editForm.studioHint}
+                            onChange={(event) =>
+                              setEditForm((previous) => ({
+                                ...previous,
+                                studioHint: event.target.value,
+                              }))
+                            }
+                          >
+                            {studioOptions.map((opt) => (
+                              <option key={opt.value} value={opt.value}>
+                                {opt.label}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <div className="grid gap-3 md:grid-cols-2">
                           <Input
                             placeholder="Platform account"
                             value={editForm.platformAccountId}
@@ -489,7 +575,7 @@ export default function AgentRoutingPage() {
                       <div className="font-medium text-gray-900">{reminder.title}</div>
                       <div className="text-xs text-gray-500 mt-1">
                         {formatPlatform(reminder.deliveryChannel)}
-                        {reminder.deliveryTarget ? ` → ${reminder.deliveryTarget}` : ''}
+                        {reminder.deliveryTarget ? ` \u2192 ${reminder.deliveryTarget}` : ''}
                       </div>
                     </div>
                     <Badge variant="outline">{reminder.status}</Badge>

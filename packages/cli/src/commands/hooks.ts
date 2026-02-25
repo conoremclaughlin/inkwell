@@ -220,7 +220,7 @@ export async function callPcpTool(
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    Accept: 'application/json',
+    Accept: 'application/json, text/event-stream',
   };
 
   // Attach CLI auth token so hooks pass OAuth checks on the MCP server
@@ -244,7 +244,27 @@ export async function callPcpTool(
     throw new Error(`PCP call failed (${response.status}): ${await response.text()}`);
   }
 
-  const payload = (await response.json()) as Record<string, unknown>;
+  // The MCP server uses Streamable HTTP transport, which may respond with
+  // text/event-stream (SSE) even for single JSON-RPC responses. Parse
+  // accordingly based on the Content-Type header.
+  const contentType = response.headers.get('content-type') || '';
+  let payload: Record<string, unknown>;
+
+  if (contentType.includes('text/event-stream')) {
+    // Parse SSE: extract the last `data:` line from the stream
+    const text = await response.text();
+    const dataLines = text
+      .split('\n')
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => line.slice(6));
+    const lastData = dataLines[dataLines.length - 1];
+    if (!lastData) {
+      throw new Error('PCP SSE response contained no data lines');
+    }
+    payload = JSON.parse(lastData) as Record<string, unknown>;
+  } else {
+    payload = (await response.json()) as Record<string, unknown>;
+  }
 
   // JSON-RPC error
   if (payload.error) {

@@ -80,6 +80,7 @@ type ChannelRouteRow = {
   platform: string;
   platform_account_id: string | null;
   chat_id: string | null;
+  studio_hint: string | null;
   is_active: boolean;
   metadata: Record<string, unknown> | null;
   created_at: string;
@@ -162,6 +163,7 @@ function toRoutingRoute(
     platform: route.platform,
     platformAccountId: route.platform_account_id,
     chatId: route.chat_id,
+    studioHint: route.studio_hint,
     isActive: route.is_active,
     metadata: route.metadata || {},
     createdAt: route.created_at,
@@ -1428,6 +1430,7 @@ router.get('/routing', async (req: Request, res: Response) => {
         platform,
         platform_account_id,
         chat_id,
+        studio_hint,
         is_active,
         metadata,
         created_at,
@@ -1578,6 +1581,7 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
         platform,
         platform_account_id,
         chat_id,
+        studio_hint,
         is_active,
         metadata,
         created_at,
@@ -1647,6 +1651,15 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
       toRoutingRoute(route, reminderCountByIdentity, nextReminderByIdentity)
     );
 
+    // Fetch studios owned by this agent
+    const { data: studiosData } = await supabase
+      .from('studios')
+      .select('id, name, branch, status')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('agent_id', identity.agent_id)
+      .in('status', ['active', 'idle'])
+      .order('name', { ascending: true });
+
     const heartbeatProcessingEnabled =
       process.env.ENABLE_HEARTBEAT_SERVICE !== 'false' &&
       process.env.ENABLE_HEARTBEATS !== 'false' &&
@@ -1663,6 +1676,12 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
         backend: identity.backend,
         updatedAt: identity.updated_at,
       },
+      studios: (studiosData || []).map((s) => ({
+        id: s.id,
+        name: s.name,
+        branch: s.branch,
+        status: s.status,
+      })),
       routes,
       reminders: (remindersData || []).map((reminder) => ({
         id: reminder.id,
@@ -1701,6 +1720,7 @@ router.post('/routing/routes', async (req: Request, res: Response) => {
     const platform = normalizeNullableText(body.platform)?.toLowerCase();
     const platformAccountId = normalizeNullableText(body.platformAccountId);
     const chatId = normalizeNullableText(body.chatId);
+    const studioHint = normalizeNullableText(body.studioHint);
     const isActive = typeof body.isActive === 'boolean' ? body.isActive : true;
     const metadata = parseRouteMetadata(body.metadata);
 
@@ -1730,6 +1750,7 @@ router.post('/routing/routes', async (req: Request, res: Response) => {
         platform,
         platform_account_id: platformAccountId,
         chat_id: chatId,
+        studio_hint: studioHint,
         is_active: isActive,
         metadata,
       })
@@ -1741,6 +1762,7 @@ router.post('/routing/routes', async (req: Request, res: Response) => {
         platform,
         platform_account_id,
         chat_id,
+        studio_hint,
         is_active,
         metadata,
         created_at,
@@ -1865,6 +1887,10 @@ router.patch('/routing/routes/:routeId', async (req: Request, res: Response) => 
       updates.is_active = body.isActive;
     }
 
+    if ('studioHint' in body) {
+      updates.studio_hint = normalizeNullableText(body.studioHint);
+    }
+
     if ('metadata' in body) {
       updates.metadata = parseRouteMetadata(body.metadata);
     }
@@ -1887,6 +1913,7 @@ router.patch('/routing/routes/:routeId', async (req: Request, res: Response) => 
         platform,
         platform_account_id,
         chat_id,
+        studio_hint,
         is_active,
         metadata,
         created_at,

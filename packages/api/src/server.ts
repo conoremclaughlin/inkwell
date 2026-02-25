@@ -174,6 +174,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     }
 
     // If mention didn't match, try channel_routes specificity cascade
+    let routeStudioHint: string | null = null;
     if (routedAgentId === agentId) {
       const route = await resolveRouteAgentId(
         dataComposer!.getClient(),
@@ -184,11 +185,13 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       );
       if (route) {
         routedAgentId = route.agentId;
+        routeStudioHint = route.studioHint;
         logger.debug(`[Route] Resolved agent from channel_routes`, {
           platform: channel,
           agentId: route.agentId,
           identityId: route.identityId,
           routeId: route.routeId,
+          studioHint: route.studioHint,
         });
       } else {
         logger.warn(
@@ -215,6 +218,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         chatType: metadata?.chatType,
         media: metadata?.media,
         triggerType: 'message',
+        ...(routeStudioHint ? { studioHint: routeStudioHint } : {}),
       },
     };
 
@@ -555,7 +559,8 @@ Type: ${payload.triggerType}`;
 ---
 IMPORTANT: This is a system trigger, NOT a user message on Telegram/WhatsApp.
 Check your inbox for the full message using get_inbox.
-If you need to message a user, use send_response with the appropriate channel and conversationId.`;
+If you need to message a user, use send_response with the appropriate channel and conversationId.
+When you complete a task_request, mark it as completed using update_inbox_message(messageId, status: "completed").`;
 
     // 4. Process via SessionService (stateless - looks up session from DB)
     const request: SessionRequest = {

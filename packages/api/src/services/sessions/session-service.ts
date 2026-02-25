@@ -460,7 +460,7 @@ export class SessionService implements ISessionService {
       parentSessionId?: string;
       threadKey?: string;
       studioId?: string;
-      studioHint?: 'main';
+      studioHint?: string;
       recipientSessionId?: string;
     }
   ): Promise<Session> {
@@ -577,7 +577,7 @@ export class SessionService implements ISessionService {
     options: {
       threadKey?: string;
       explicitStudioId?: string;
-      studioHint?: 'main';
+      studioHint?: string;
       recipientSessionId?: string;
       backend?: string;
     }
@@ -590,9 +590,33 @@ export class SessionService implements ISessionService {
       return undefined;
     }
 
-    // Explicit convenience hint: route directly to user's shared main studio.
-    if (options.studioHint === 'main') {
-      return this.resolveMainStudioId(userId);
+    // Explicit convenience hint: resolve studio by name.
+    // 'main' is a special case resolved by worktree path / branch.
+    // Other hints resolve by matching the studio name for this user + agent.
+    if (options.studioHint) {
+      if (options.studioHint === 'main') {
+        return this.resolveMainStudioId(userId);
+      }
+
+      const { data: namedStudio } = await this.supabase
+        .from('studios')
+        .select('id')
+        .eq('user_id', userId)
+        .eq('agent_id', agentId)
+        .eq('name', options.studioHint)
+        .in('status', ['active', 'idle'])
+        .limit(1)
+        .maybeSingle();
+
+      if (namedStudio?.id) {
+        return namedStudio.id;
+      }
+
+      logger.warn('[StudioResolve] Studio hint did not match any studio, falling through', {
+        userId,
+        agentId,
+        studioHint: options.studioHint,
+      });
     }
 
     // 1) Related session scope (explicit resume continuity)

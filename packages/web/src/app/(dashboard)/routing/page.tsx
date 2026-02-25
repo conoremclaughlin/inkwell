@@ -1,14 +1,30 @@
 'use client';
 
 import Link from 'next/link';
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useMutation } from '@tanstack/react-query';
-import { Route, Plus, BellRing, AlertTriangle } from 'lucide-react';
+import {
+  Route,
+  Plus,
+  BellRing,
+  AlertTriangle,
+  ChevronRight,
+  Globe,
+  MessageCircle,
+  Send,
+  Hash,
+  Mail,
+  GitBranch,
+} from 'lucide-react';
 import { apiPatch, useApiPost, useApiQuery, useQueryClient } from '@/lib/api';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
+import clsx from 'clsx';
+import { getAgentGradient } from '@/lib/utils';
+
+// ─── Types ───
 
 interface RoutingIdentity {
   id: string;
@@ -28,6 +44,7 @@ interface RoutingRoute {
   platform: string;
   platformAccountId: string | null;
   chatId: string | null;
+  studioHint: string | null;
   isActive: boolean;
   metadata: Record<string, unknown>;
   createdAt: string;
@@ -57,17 +74,46 @@ interface CreateRouteInput {
   isActive?: boolean;
 }
 
+interface SBGroup {
+  agentId: string;
+  agentName: string;
+  agentRole: string | null;
+  identityId: string;
+  routes: RoutingRoute[];
+  totalReminders: number;
+  activeRoutes: number;
+}
+
+// ─── Constants ───
+
 const PLATFORM_OPTIONS = ['telegram', 'whatsapp', 'discord', 'slack', 'email'];
 
+const PLATFORM_CONFIG: Record<string, { label: string; color: string; bgColor: string; icon: typeof Send }> = {
+  telegram: { label: 'Telegram', color: 'text-sky-700', bgColor: 'bg-sky-50 border-sky-200', icon: Send },
+  whatsapp: { label: 'WhatsApp', color: 'text-emerald-700', bgColor: 'bg-emerald-50 border-emerald-200', icon: MessageCircle },
+  discord: { label: 'Discord', color: 'text-indigo-700', bgColor: 'bg-indigo-50 border-indigo-200', icon: Hash },
+  slack: { label: 'Slack', color: 'text-purple-700', bgColor: 'bg-purple-50 border-purple-200', icon: MessageCircle },
+  email: { label: 'Email', color: 'text-amber-700', bgColor: 'bg-amber-50 border-amber-200', icon: Mail },
+};
+
+// ─── Helpers ───
+
 function formatPlatform(value: string): string {
-  if (!value) return 'Unknown';
-  return value.charAt(0).toUpperCase() + value.slice(1);
+  return PLATFORM_CONFIG[value]?.label || value.charAt(0).toUpperCase() + value.slice(1);
 }
 
-function formatTimestamp(value: string | null): string {
-  if (!value) return '—';
-  return new Date(value).toLocaleString();
+function formatScopeLabel(platformAccountId: string | null, chatId: string | null): string {
+  if (platformAccountId && chatId) return `${platformAccountId} / ${chatId}`;
+  if (platformAccountId) return `${platformAccountId} (all chats)`;
+  if (chatId) return `All accounts / ${chatId}`;
+  return 'All traffic';
 }
+
+function getInitial(name: string): string {
+  return name.charAt(0).toUpperCase();
+}
+
+// ─── Component ───
 
 export default function RoutingPage() {
   const queryClient = useQueryClient();
@@ -91,13 +137,7 @@ export default function RoutingPage() {
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: ['routing'] });
         setShowCreateForm(false);
-        setNewRoute({
-          identityId: '',
-          platform: 'telegram',
-          platformAccountId: '',
-          chatId: '',
-          isActive: true,
-        });
+        setNewRoute({ identityId: '', platform: 'telegram', platformAccountId: '', chatId: '', isActive: true });
       },
     }
   );
@@ -105,38 +145,58 @@ export default function RoutingPage() {
   const toggleRouteMutation = useMutation({
     mutationFn: ({ routeId, isActive }: { routeId: string; isActive: boolean }) =>
       apiPatch(`/api/admin/routing/routes/${routeId}`, { isActive }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['routing'] });
-    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['routing'] }),
   });
 
   const routes = data?.routes || [];
   const identities = data?.identities || [];
   const summary = data?.summary || {
-    totalRoutes: 0,
-    activeRoutes: 0,
-    agentsWithRoutes: 0,
-    platformsCovered: 0,
-    unassignedReminderCount: 0,
+    totalRoutes: 0, activeRoutes: 0, agentsWithRoutes: 0, platformsCovered: 0, unassignedReminderCount: 0,
   };
+
+  // Group routes by SB
+  const sbGroups = useMemo<SBGroup[]>(() => {
+    const groups = new Map<string, SBGroup>();
+    for (const route of routes) {
+      const key = route.agentId || route.identityId;
+      if (!groups.has(key)) {
+        groups.set(key, {
+          agentId: route.agentId || 'unknown',
+          agentName: route.agentName || route.agentId || 'Unknown agent',
+          agentRole: route.agentRole || null,
+          identityId: route.identityId,
+          routes: [],
+          totalReminders: 0,
+          activeRoutes: 0,
+        });
+      }
+      const group = groups.get(key)!;
+      group.routes.push(route);
+      group.totalReminders += route.activeReminderCount;
+      if (route.isActive) group.activeRoutes++;
+    }
+    return [...groups.values()].sort((a, b) => a.agentName.localeCompare(b.agentName));
+  }, [routes]);
 
   const mutationError = createRouteMutation.error?.message || toggleRouteMutation.error?.message;
 
   return (
-    <div>
+    <div className="max-w-5xl">
+      {/* Header */}
       <div className="flex items-start justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold text-gray-900">Routing</h1>
-          <p className="mt-2 text-gray-600">
-            Control where channel traffic and reminder execution are routed across SBs.
+          <p className="mt-1 text-gray-500">
+            Control where channel traffic and reminders are routed across SBs.
           </p>
         </div>
-        <Button onClick={() => setShowCreateForm((value) => !value)} size="sm">
+        <Button onClick={() => setShowCreateForm((v) => !v)} size="sm" className="shrink-0">
           <Plus className="mr-2 h-4 w-4" />
           Add Route
         </Button>
       </div>
 
+      {/* Heartbeat warning */}
       {data && !data.heartbeatProcessingEnabled && (
         <Card className="mt-6 border-amber-200 bg-amber-50/70">
           <CardContent className="flex items-start gap-3 p-4">
@@ -153,59 +213,40 @@ export default function RoutingPage() {
       )}
 
       {(error || mutationError) && (
-        <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">
+        <div className="mt-4 rounded-lg bg-red-50 border border-red-200 p-4 text-sm text-red-800">
           {error?.message || mutationError}
         </div>
       )}
 
-      <div className="mt-6 grid gap-4 md:grid-cols-5">
-        <Card>
-          <CardContent className="p-4">
-            <div className="text-xs text-gray-500">Total routes</div>
-            <div className="text-2xl font-semibold text-gray-900">{summary.totalRoutes}</div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <div className="text-xs text-gray-500">Active</div>
-            <div className="text-2xl font-semibold text-green-700">{summary.activeRoutes}</div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <div className="text-xs text-gray-500">SBs with routes</div>
-            <div className="text-2xl font-semibold text-gray-900">{summary.agentsWithRoutes}</div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <div className="text-xs text-gray-500">Platforms</div>
-            <div className="text-2xl font-semibold text-gray-900">{summary.platformsCovered}</div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <div className="text-xs text-gray-500">Unassigned reminders</div>
-            <div className="text-2xl font-semibold text-amber-700">
-              {summary.unassignedReminderCount}
-            </div>
-          </CardContent>
-        </Card>
+      {/* Stats — compact row */}
+      <div className="mt-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
+        {[
+          { label: 'Total routes', value: summary.totalRoutes, color: 'text-gray-900' },
+          { label: 'Active', value: summary.activeRoutes, color: 'text-green-700' },
+          { label: 'SBs', value: summary.agentsWithRoutes, color: 'text-gray-900' },
+          { label: 'Platforms', value: summary.platformsCovered, color: 'text-gray-900' },
+        ].map((stat) => (
+          <div key={stat.label} className="rounded-lg border bg-white p-3">
+            <div className="text-xs text-gray-500">{stat.label}</div>
+            <div className={clsx('text-2xl font-semibold', stat.color)}>{stat.value}</div>
+          </div>
+        ))}
       </div>
 
+      {/* Create form */}
       {showCreateForm && (
         <Card className="mt-6">
-          <CardHeader>
-            <CardTitle>Create route</CardTitle>
+          <CardHeader className="pb-4">
+            <CardTitle className="text-lg">Create route</CardTitle>
             <CardDescription>
-              Scope by platform, then optionally account + chat for more specific routing.
+              Assign a platform (and optionally a specific account or chat) to an SB.
             </CardDescription>
           </CardHeader>
           <CardContent>
             <form
               className="space-y-4"
-              onSubmit={(event) => {
-                event.preventDefault();
+              onSubmit={(e) => {
+                e.preventDefault();
                 createRouteMutation.mutate({
                   identityId: newRoute.identityId,
                   platform: newRoute.platform,
@@ -216,20 +257,15 @@ export default function RoutingPage() {
               }}
             >
               <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">SB</label>
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium text-gray-700">SB</label>
                   <select
-                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
                     value={newRoute.identityId}
-                    onChange={(event) =>
-                      setNewRoute((previous) => ({
-                        ...previous,
-                        identityId: event.target.value,
-                      }))
-                    }
+                    onChange={(e) => setNewRoute((p) => ({ ...p, identityId: e.target.value }))}
                     required
                   >
-                    <option value="">Select an SB</option>
+                    <option value="">Select an SB...</option>
                     {identities.map((identity) => (
                       <option key={identity.id} value={identity.id}>
                         {identity.name} ({identity.agentId})
@@ -237,82 +273,53 @@ export default function RoutingPage() {
                     ))}
                   </select>
                 </div>
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">Platform</label>
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium text-gray-700">Platform</label>
                   <select
-                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
                     value={newRoute.platform}
-                    onChange={(event) =>
-                      setNewRoute((previous) => ({
-                        ...previous,
-                        platform: event.target.value,
-                      }))
-                    }
+                    onChange={(e) => setNewRoute((p) => ({ ...p, platform: e.target.value }))}
                     required
                   >
-                    {PLATFORM_OPTIONS.map((platform) => (
-                      <option key={platform} value={platform}>
-                        {formatPlatform(platform)}
-                      </option>
+                    {PLATFORM_OPTIONS.map((p) => (
+                      <option key={p} value={p}>{formatPlatform(p)}</option>
                     ))}
                   </select>
                 </div>
               </div>
-
               <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">Platform account (optional)</label>
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium text-gray-700">Account <span className="text-gray-400 font-normal">(optional)</span></label>
                   <Input
                     placeholder="myra_help_bot or +14155551234"
                     value={newRoute.platformAccountId || ''}
-                    onChange={(event) =>
-                      setNewRoute((previous) => ({
-                        ...previous,
-                        platformAccountId: event.target.value,
-                      }))
-                    }
+                    onChange={(e) => setNewRoute((p) => ({ ...p, platformAccountId: e.target.value }))}
                   />
                 </div>
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">Chat ID (optional)</label>
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium text-gray-700">Chat <span className="text-gray-400 font-normal">(optional)</span></label>
                   <Input
                     placeholder="group_id / thread_id"
                     value={newRoute.chatId || ''}
-                    onChange={(event) =>
-                      setNewRoute((previous) => ({
-                        ...previous,
-                        chatId: event.target.value,
-                      }))
-                    }
+                    onChange={(e) => setNewRoute((p) => ({ ...p, chatId: e.target.value }))}
                   />
                 </div>
               </div>
-
-              <div className="flex items-center justify-between">
-                <label className="flex items-center gap-2 text-sm">
+              <div className="flex items-center justify-between pt-2">
+                <label className="flex items-center gap-2 text-sm text-gray-600">
                   <input
                     type="checkbox"
+                    className="rounded"
                     checked={newRoute.isActive ?? true}
-                    onChange={(event) =>
-                      setNewRoute((previous) => ({
-                        ...previous,
-                        isActive: event.target.checked,
-                      }))
-                    }
+                    onChange={(e) => setNewRoute((p) => ({ ...p, isActive: e.target.checked }))}
                   />
-                  Route active
+                  Active immediately
                 </label>
                 <div className="flex gap-2">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => {
-                      setShowCreateForm(false);
-                    }}
-                  >
+                  <Button type="button" variant="outline" size="sm" onClick={() => setShowCreateForm(false)}>
                     Cancel
                   </Button>
-                  <Button type="submit" disabled={createRouteMutation.isPending}>
+                  <Button type="submit" size="sm" disabled={createRouteMutation.isPending}>
                     {createRouteMutation.isPending ? 'Creating...' : 'Create route'}
                   </Button>
                 </div>
@@ -322,117 +329,138 @@ export default function RoutingPage() {
         </Card>
       )}
 
-      <Card className="mt-6">
-        <CardHeader>
-          <CardTitle>Route matrix</CardTitle>
-          <CardDescription>
-            Specificity cascade: platform + account + chat → platform + account → platform default.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          {isLoading ? (
-            <p className="text-gray-500">Loading...</p>
-          ) : routes.length === 0 ? (
-            <div className="py-10 text-center text-gray-500">
+      {/* SB Groups */}
+      <div className="mt-6 space-y-4">
+        {isLoading ? (
+          <Card>
+            <CardContent className="py-12 text-center text-gray-500">Loading...</CardContent>
+          </Card>
+        ) : sbGroups.length === 0 ? (
+          <Card>
+            <CardContent className="py-12 text-center">
               <Route className="h-10 w-10 mx-auto text-gray-300 mb-3" />
-              No channel routes yet. Add your first route above.
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full">
-                <thead>
-                  <tr className="border-b text-left text-sm text-gray-600">
-                    <th className="pb-3 font-medium">SB</th>
-                    <th className="pb-3 font-medium">Platform</th>
-                    <th className="pb-3 font-medium">Account</th>
-                    <th className="pb-3 font-medium">Chat</th>
-                    <th className="pb-3 font-medium">Reminders</th>
-                    <th className="pb-3 font-medium">Updated</th>
-                    <th className="pb-3 font-medium">Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {routes.map((route) => (
-                    <tr key={route.id} className="border-b align-top">
-                      <td className="py-3">
-                        <div className="flex flex-col gap-1">
-                          <Link
-                            href={route.agentId ? `/routing/${route.agentId}` : '/routing'}
-                            className="font-semibold text-gray-900 hover:underline"
-                          >
-                            {route.agentName || route.agentId || 'Unknown agent'}
-                          </Link>
-                          {route.agentRole && (
-                            <span className="text-xs text-gray-500">{route.agentRole}</span>
+              <p className="text-gray-500">No channel routes yet.</p>
+              <p className="text-sm text-gray-400 mt-1">Add your first route above to start routing traffic to an SB.</p>
+            </CardContent>
+          </Card>
+        ) : (
+          sbGroups.map((group) => {
+            const gradient = getAgentGradient(group.agentId);
+            return (
+              <Card key={group.agentId} className="overflow-hidden">
+                {/* SB Header */}
+                <div className="flex items-center gap-4 px-5 py-4 border-b bg-gray-50/50">
+                  <div className={clsx(
+                    'h-10 w-10 rounded-full bg-gradient-to-br flex items-center justify-center text-white font-semibold text-sm shrink-0',
+                    gradient
+                  )}>
+                    {getInitial(group.agentName)}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <h3 className="font-semibold text-gray-900">{group.agentName}</h3>
+                      <span className="text-xs text-gray-400">@{group.agentId}</span>
+                    </div>
+                    {group.agentRole && (
+                      <p className="text-sm text-gray-500 truncate">{group.agentRole}</p>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-4 shrink-0">
+                    <div className="text-right">
+                      <div className="text-xs text-gray-400">Reminders</div>
+                      <div className="flex items-center gap-1 justify-end">
+                        <BellRing className="h-3.5 w-3.5 text-gray-500" />
+                        <span className="font-medium text-gray-700">{group.totalReminders}</span>
+                      </div>
+                    </div>
+                    <Link
+                      href={`/routing/${group.agentId}`}
+                      className="flex items-center gap-1 text-sm font-medium text-gray-600 hover:text-gray-900 transition-colors"
+                    >
+                      Manage
+                      <ChevronRight className="h-4 w-4" />
+                    </Link>
+                  </div>
+                </div>
+
+                {/* Platform routes */}
+                <div className="divide-y">
+                  {group.routes.map((route) => {
+                    const pConfig = PLATFORM_CONFIG[route.platform];
+                    const PlatformIcon = pConfig?.icon || Globe;
+
+                    return (
+                      <div
+                        key={route.id}
+                        className={clsx(
+                          'flex items-center gap-4 px-5 py-3 transition-colors',
+                          !route.isActive && 'opacity-50'
+                        )}
+                      >
+                        <div className="flex items-center gap-3 flex-1 min-w-0">
+                          <div className={clsx(
+                            'flex items-center gap-2 rounded-md border px-2.5 py-1 text-xs font-medium',
+                            pConfig?.bgColor || 'bg-gray-50 border-gray-200',
+                            pConfig?.color || 'text-gray-700'
+                          )}>
+                            <PlatformIcon className="h-3.5 w-3.5" />
+                            {formatPlatform(route.platform)}
+                          </div>
+                          <span className="text-sm text-gray-500 truncate">
+                            {formatScopeLabel(route.platformAccountId, route.chatId)}
+                          </span>
+                          {route.studioHint && (
+                            <span className="flex items-center gap-1 text-[11px] text-gray-400">
+                              <GitBranch className="h-3 w-3" />
+                              {route.studioHint === 'main' ? 'Main' : route.studioHint}
+                            </span>
                           )}
                         </div>
-                      </td>
-                      <td className="py-3">
-                        <Badge variant="outline">{formatPlatform(route.platform)}</Badge>
-                      </td>
-                      <td className="py-3 font-mono text-xs text-gray-700">
-                        {route.platformAccountId || (
-                          <span className="text-gray-400">Any account</span>
-                        )}
-                      </td>
-                      <td className="py-3 font-mono text-xs text-gray-700">
-                        {route.chatId || <span className="text-gray-400">Any chat</span>}
-                      </td>
-                      <td className="py-3">
-                        <div className="flex flex-col gap-1 text-sm">
-                          <span className="inline-flex items-center gap-1 text-gray-700">
-                            <BellRing className="h-3 w-3" />
-                            {route.activeReminderCount}
-                          </span>
-                          <span className="text-xs text-gray-500">
-                            {route.nextReminderAt
-                              ? `Next: ${formatTimestamp(route.nextReminderAt)}`
-                              : 'No upcoming reminder'}
-                          </span>
-                        </div>
-                      </td>
-                      <td className="py-3 text-xs text-gray-500">
-                        {formatTimestamp(route.updatedAt)}
-                      </td>
-                      <td className="py-3">
-                        <div className="flex flex-wrap items-center gap-2">
+
+                        <div className="flex items-center gap-2 shrink-0">
                           <Badge
-                            className={
+                            className={clsx(
+                              'text-[11px] font-medium border',
                               route.isActive
-                                ? 'bg-green-100 text-green-700 hover:bg-green-100'
-                                : 'bg-gray-100 text-gray-600 hover:bg-gray-100'
-                            }
+                                ? 'bg-green-50 text-green-700 border-green-200 hover:bg-green-50'
+                                : 'bg-gray-50 text-gray-500 border-gray-200 hover:bg-gray-50'
+                            )}
                           >
                             {route.isActive ? 'Active' : 'Inactive'}
                           </Badge>
                           <Button
-                            variant="outline"
+                            variant="ghost"
                             size="sm"
+                            className="h-7 text-xs text-gray-500 hover:text-gray-900"
                             onClick={() =>
-                              toggleRouteMutation.mutate({
-                                routeId: route.id,
-                                isActive: !route.isActive,
-                              })
+                              toggleRouteMutation.mutate({ routeId: route.id, isActive: !route.isActive })
                             }
                             disabled={toggleRouteMutation.isPending}
                           >
                             {route.isActive ? 'Disable' : 'Enable'}
                           </Button>
-                          {route.agentId && (
-                            <Button variant="ghost" size="sm" asChild>
-                              <Link href={`/routing/${route.agentId}`}>Manage</Link>
-                            </Button>
-                          )}
                         </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </CardContent>
-      </Card>
+                      </div>
+                    );
+                  })}
+                </div>
+              </Card>
+            );
+          })
+        )}
+      </div>
+
+      {/* Unassigned reminders callout */}
+      {summary.unassignedReminderCount > 0 && (
+        <div className="mt-4 flex items-center gap-3 rounded-lg border border-amber-200 bg-amber-50/50 px-4 py-3">
+          <AlertTriangle className="h-4 w-4 text-amber-600 shrink-0" />
+          <p className="text-sm text-amber-800">
+            <span className="font-medium">{summary.unassignedReminderCount} reminder{summary.unassignedReminderCount !== 1 ? 's' : ''}</span>{' '}
+            not assigned to any SB.{' '}
+            <Link href="/reminders" className="underline hover:text-amber-900">View reminders</Link>
+          </p>
+        </div>
+      )}
     </div>
   );
 }

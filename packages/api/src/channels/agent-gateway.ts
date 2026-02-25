@@ -32,8 +32,8 @@ export interface AgentTriggerPayload {
   threadKey?: string;
   /** Explicit studio/worktree scope for the target agent */
   studioId?: string;
-  /** Convenience studio routing hint */
-  studioHint?: 'main';
+  /** Convenience studio routing hint (e.g., 'main' or a studio name) */
+  studioHint?: string;
   /** Recipient session to inherit studio scope from */
   recipientSessionId?: string;
   /** Additional metadata */
