@@ -20,6 +20,7 @@ export interface IdentityJson {
   identityId?: string;
   context?: string;
   backend?: string;
+  role?: string;
   studioId?: string;
   studio?: string;
   /** @deprecated Use studioId */
@@ -36,6 +37,22 @@ export function readIdentityJson(cwd: string): IdentityJson | null {
   if (!existsSync(identityPath)) return null;
   try {
     return JSON.parse(readFileSync(identityPath, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read .pcp/ROLE.md from a directory. Returns null if not found.
+ * ROLE.md defines the studio's situational focus — what the agent is doing
+ * in this context (e.g., reviewing, building, product thinking).
+ */
+export function readRoleMd(cwd: string): string | null {
+  const rolePath = join(cwd, '.pcp', 'ROLE.md');
+  if (!existsSync(rolePath)) return null;
+  try {
+    const content = readFileSync(rolePath, 'utf-8').trim();
+    return content || null;
   } catch {
     return null;
   }

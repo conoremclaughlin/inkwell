@@ -43,8 +43,10 @@ export interface SessionServiceConfig {
   defaultWorkingDirectory: string;
   /** Path to MCP config file */
   mcpConfigPath: string;
-  /** Default model to use */
-  defaultModel: string;
+  /** Optional explicit model override for Claude backend */
+  defaultModel?: string;
+  /** Optional explicit model override for Codex backend */
+  defaultCodexModel?: string;
   /** Token threshold for triggering compaction */
   compactionThreshold: number;
   /** Callback to route responses from async operations (compaction, etc.) */
@@ -54,7 +56,6 @@ export interface SessionServiceConfig {
 const DEFAULT_CONFIG: SessionServiceConfig = {
   defaultWorkingDirectory: process.cwd(),
   mcpConfigPath: '',
-  defaultModel: 'sonnet',
   compactionThreshold: 150000, // ~150k tokens
 };
 
@@ -327,10 +328,17 @@ export class SessionService implements ISessionService {
       session.identityId
     );
 
+    // 4. Select runtime backend and model
+    const resolvedBackend = this.resolveRuntimeBackend(
+      session.backend,
+      injectedContext.agent.backend
+    );
+    const runtimeModel =
+      resolvedBackend === 'codex-cli' ? this.config.defaultCodexModel : this.config.defaultModel;
+
     const runnerConfig: ClaudeRunnerConfig = {
       workingDirectory: resolvedWorkingDirectory,
       mcpConfigPath: this.config.mcpConfigPath,
-      model: this.config.defaultModel,
       appendSystemPrompt: buildIdentityPrompt(
         agentId,
         injectedContext.agent.name,
@@ -338,14 +346,11 @@ export class SessionService implements ISessionService {
         injectedContext.user.timezone,
         injectedContext.agent.heartbeat
       ),
+      ...(runtimeModel ? { model: runtimeModel } : {}),
       ...(pcpAccessToken ? { pcpAccessToken } : {}),
     };
 
-    // 4. Select runtime backend and run
-    const resolvedBackend = this.resolveRuntimeBackend(
-      session.backend,
-      injectedContext.agent.backend
-    );
+    // 5. Run with selected backend
     const runner = resolvedBackend === 'codex-cli' ? this.codexRunner : this.claudeRunner;
 
     const result = await runner.run(formattedMessage, {
@@ -354,14 +359,14 @@ export class SessionService implements ISessionService {
       config: runnerConfig,
     });
 
-    // 5. Log tool calls to activity stream (fire-and-forget, don't block response)
+    // 6. Log tool calls to activity stream (fire-and-forget, don't block response)
     if (result.toolCalls && result.toolCalls.length > 0) {
       this.logToolCalls(userId, agentId, session.id, result.toolCalls, request).catch((err) => {
         logger.warn('Failed to log tool calls to activity stream', { error: err });
       });
     }
 
-    // 6. Update session with new Claude session ID, usage, and message count
+    // 7. Update session with new Claude session ID, usage, and message count
     if (result.claudeSessionId !== session.claudeSessionId) {
       await this.repository.update(session.id, {
         claudeSessionId: result.claudeSessionId,
@@ -834,10 +839,15 @@ This session will continue with a fresh context after compaction. Your identity,
         session.identityId
       );
 
+      const runtimeBackend = this.resolveRuntimeBackend(session.backend, context.agent.backend);
+      const runtimeModel =
+        runtimeBackend === 'codex-cli'
+          ? this.config.defaultCodexModel
+          : this.config.defaultModel;
+
       const runnerConfig: ClaudeRunnerConfig = {
         workingDirectory: compactionWorkingDirectory,
         mcpConfigPath: this.config.mcpConfigPath,
-        model: this.config.defaultModel,
         appendSystemPrompt: buildIdentityPrompt(
           session.agentId,
           context.agent.name,
@@ -845,10 +855,10 @@ This session will continue with a fresh context after compaction. Your identity,
           fullContext.user.timezone,
           context.agent.heartbeat
         ),
+        ...(runtimeModel ? { model: runtimeModel } : {}),
         ...(compactionToken ? { pcpAccessToken: compactionToken } : {}),
       };
 
-      const runtimeBackend = this.resolveRuntimeBackend(session.backend, context.agent.backend);
       const runner = runtimeBackend === 'codex-cli' ? this.codexRunner : this.claudeRunner;
 
       // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session

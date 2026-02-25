@@ -27,6 +27,7 @@ export interface Studio {
   baseBranch: string;
   purpose: string | null;
   workType: string | null;
+  roleTemplate: string | null;
   status: StudioStatus;
   metadata: Json;
   createdAt: string;
@@ -46,6 +47,7 @@ export interface CreateStudioInput {
   baseBranch?: string;
   purpose?: string;
   workType?: WorkType;
+  roleTemplate?: string;
   metadata?: Json;
 }
 
@@ -54,6 +56,7 @@ export interface UpdateStudioInput {
   sessionId?: string | null;
   purpose?: string;
   workType?: WorkType;
+  roleTemplate?: string | null;
   metadata?: Json;
   archivedAt?: string;
   cleanedAt?: string;
@@ -74,6 +77,7 @@ export class StudiosRepository {
       baseBranch: row.base_branch as string,
       purpose: (row.purpose as string) || null,
       workType: (row.work_type as string) || null,
+      roleTemplate: (row.role_template as string) || null,
       status: row.status as StudioStatus,
       metadata: (row.metadata as Json) || {},
       createdAt: row.created_at as string,
@@ -99,6 +103,7 @@ export class StudiosRepository {
       base_branch: input.baseBranch || 'main',
       purpose: input.purpose,
       work_type: input.workType,
+      role_template: input.roleTemplate,
       status: 'active',
       metadata: input.metadata || {},
     };
@@ -127,7 +132,11 @@ export class StudiosRepository {
   }
 
   async findByBranch(branch: string): Promise<Studio | null> {
-    const { data, error } = await this.client.from('studios').select('*').eq('branch', branch).single();
+    const { data, error } = await this.client
+      .from('studios')
+      .select('*')
+      .eq('branch', branch)
+      .single();
 
     if (error && error.code !== 'PGRST116') {
       throw new Error(`Failed to find studio by branch: ${error.message}`);
@@ -217,6 +226,7 @@ export class StudiosRepository {
     if (input.sessionId !== undefined) updateData.session_id = input.sessionId;
     if (input.purpose !== undefined) updateData.purpose = input.purpose;
     if (input.workType !== undefined) updateData.work_type = input.workType;
+    if (input.roleTemplate !== undefined) updateData.role_template = input.roleTemplate;
     if (input.metadata !== undefined) updateData.metadata = input.metadata;
     if (input.archivedAt !== undefined) updateData.archived_at = input.archivedAt;
     if (input.cleanedAt !== undefined) updateData.cleaned_at = input.cleanedAt;

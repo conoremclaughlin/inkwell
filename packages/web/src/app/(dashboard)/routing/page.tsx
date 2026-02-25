@@ -126,7 +126,10 @@ export default function RoutingPage() {
     isActive: true,
   });
 
-  const { data, isLoading, error } = useApiQuery<RoutingResponse>(['routing'], '/api/admin/routing');
+  const { data, isLoading, error } = useApiQuery<RoutingResponse>(
+    ['routing'],
+    '/api/admin/routing'
+  );
 
   const createRouteMutation = useApiPost<{ route: RoutingRoute }, CreateRouteInput>(
     '/api/admin/routing/routes',
@@ -195,13 +198,18 @@ export default function RoutingPage() {
 
       {/* Heartbeat warning */}
       {data && !data.heartbeatProcessingEnabled && (
-        <div className="mt-6 flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50/70 p-4">
-          <AlertTriangle className="h-5 w-5 text-amber-600 mt-0.5 shrink-0" />
-          <p className="text-sm text-amber-900">
-            Heartbeat processing is disabled on this server.
-            Reminders won&apos;t fire until enabled.
-          </p>
-        </div>
+        <Card className="mt-6 border-amber-200 bg-amber-50/70">
+          <CardContent className="flex items-start gap-3 p-4">
+            <AlertTriangle className="h-5 w-5 text-amber-600 mt-0.5" />
+            <div className="text-sm text-amber-900">
+              Heartbeat/reminder processing is disabled on this server instance ({' '}
+              <code className="bg-amber-100 px-1 py-0.5 rounded text-xs">
+                ENABLE_HEARTBEAT_SERVICE=false
+              </code>{' '}
+              or related flags). This is ideal for secondary dev servers.
+            </div>
+          </CardContent>
+        </Card>
       )}
 
       {(error || mutationError) && (

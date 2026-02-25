@@ -48,7 +48,7 @@ const navigation = [
   { name: 'Groups', href: '/groups', icon: UsersRound },
   { name: 'Challenge Codes', href: '/challenge-codes', icon: Key },
   { name: 'Individuals', href: '/individuals', icon: Bot },
-  { name: 'Artifacts', href: '/artifacts', icon: FileText },
+  { name: 'Documents', href: '/artifacts', icon: FileText },
   { name: 'Reminders', href: '/reminders', icon: Bell },
   { name: 'Routing', href: '/routing', icon: Route },
   { name: 'Connections', href: '/connected-accounts', icon: Link2 },

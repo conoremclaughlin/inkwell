@@ -3080,7 +3080,7 @@ Update a PCP session's status and Claude session ID. Use this to mark your sessi
   server.registerTool(
     'create_artifact',
     {
-      description: `Create a shared artifact (spec, design, document). Artifacts are collaborative resources with versioning, distinct from personal memories.
+      description: `Create a shared document (spec, design, decision, note, etc.). Documents are collaborative resources with versioning, distinct from personal memories.
 
 Use for specs, designs, decisions, and shared documents that multiple beings may work on.
 
@@ -3111,7 +3111,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'get_artifact',
     {
-      description: `Get an artifact by URI or ID. Returns the full content and metadata.
+      description: `Get a document by URI or ID. Returns the full content and metadata.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: getArtifactToolSchema('get_artifact'),
@@ -3140,9 +3140,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'update_artifact',
     {
-      description: `Update an artifact. Automatically versions the content and tracks who made changes.
+      description: `Update a document. Automatically versions the content and tracks who made changes.
 
-Supports three-way merge: pass baseVersion (the version you read before editing) to enable automatic merging when another agent has edited the artifact since you read it. If changes don't overlap, they merge cleanly. If they conflict, you'll get structured conflict details and should re-read and retry.
+Supports three-way merge: pass baseVersion (the version you read before editing) to enable automatic merging when another agent has edited the document since you read it. If changes don't overlap, they merge cleanly. If they conflict, you'll get structured conflict details and should re-read and retry.
 
 Omit baseVersion for legacy last-write-wins behavior (not recommended for collaborative editing).
 
@@ -3173,7 +3173,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'list_artifacts',
     {
-      description: `List artifacts with optional filters for type, tags, visibility, and search.
+      description: `List documents with optional filters for type, tags, visibility, and search.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: getArtifactToolSchema('list_artifacts'),
@@ -3202,7 +3202,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'get_artifact_history',
     {
-      description: `Get version history for an artifact. Shows all previous versions and who made changes.
+      description: `Get version history for a document. Shows all previous versions and who made changes.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: getArtifactToolSchema('get_artifact_history'),
@@ -3231,7 +3231,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'add_artifact_comment',
     {
-      description: `Add a comment to an artifact without modifying the artifact body.
+      description: `Add a comment to a document without modifying the document body.
 
 Use this for collaborative review/discussion to avoid overwrite conflicts.
 Stores canonical author identity via agent_identities.id while preserving agentId slug for display.
@@ -3263,7 +3263,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'list_artifact_comments',
     {
-      description: `List comments for an artifact, including canonical identity UUID author metadata.
+      description: `List comments for a document, including canonical identity UUID author metadata.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: getArtifactToolSchema('list_artifact_comments'),

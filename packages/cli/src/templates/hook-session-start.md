@@ -3,6 +3,8 @@
 Agent: **{{AGENT_ID}}**
 {{WORKSPACE_LINE}}
 
+{{ROLE_BLOCK}}
+
 {{IDENTITY_BLOCK}}
 
 {{MEMORIES_BLOCK}}

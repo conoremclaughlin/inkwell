@@ -15,6 +15,10 @@ import {
   updateIdentityForStudioRename,
   getCliLinkTargets,
   shouldWarnMissingCliBinPath,
+  resolveRoleTemplate,
+  listRoleTemplates,
+  isValidTemplateName,
+  BUILTIN_ROLE_TEMPLATES,
   type InitResult,
 } from './studio.js';
 
@@ -222,7 +226,9 @@ describe('CLI link path helpers', () => {
 
   it('should warn when PATH includes neither PCP nor compatibility bin dirs', () => {
     const targets = getCliLinkTargets('/tmp/home', 'sb-lumen');
-    expect(shouldWarnMissingCliBinPath(['/usr/bin', '/bin'].join(pathDelimiter), targets)).toBe(true);
+    expect(shouldWarnMissingCliBinPath(['/usr/bin', '/bin'].join(pathDelimiter), targets)).toBe(
+      true
+    );
   });
 });
 
@@ -503,5 +509,93 @@ describe('Studio prefix resolution', () => {
     writeFileSync(join(worktree, '.git'), `gitdir: ${gitDir}\n`);
 
     expect(getStudioPrefix(worktree)).toBe('personal-context-protocol--');
+  });
+});
+
+describe('isValidTemplateName', () => {
+  it('accepts alphanumeric names', () => {
+    expect(isValidTemplateName('reviewer')).toBe(true);
+    expect(isValidTemplateName('builder')).toBe(true);
+    expect(isValidTemplateName('product')).toBe(true);
+    expect(isValidTemplateName('my-template')).toBe(true);
+    expect(isValidTemplateName('my_template')).toBe(true);
+    expect(isValidTemplateName('Template123')).toBe(true);
+  });
+
+  it('rejects path traversal patterns', () => {
+    expect(isValidTemplateName('../etc/passwd')).toBe(false);
+    expect(isValidTemplateName('../../secret')).toBe(false);
+    expect(isValidTemplateName('foo/bar')).toBe(false);
+    expect(isValidTemplateName('foo\\bar')).toBe(false);
+  });
+
+  it('rejects empty and special characters', () => {
+    expect(isValidTemplateName('')).toBe(false);
+    expect(isValidTemplateName(' ')).toBe(false);
+    expect(isValidTemplateName('foo bar')).toBe(false);
+    expect(isValidTemplateName('template.md')).toBe(false);
+  });
+});
+
+describe('resolveRoleTemplate', () => {
+  it('resolves built-in templates', () => {
+    for (const name of BUILTIN_ROLE_TEMPLATES) {
+      const content = resolveRoleTemplate(name);
+      expect(content).toBeTruthy();
+      expect(content!.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('returns null for unknown templates', () => {
+    expect(resolveRoleTemplate('nonexistent-template')).toBeNull();
+  });
+
+  it('returns null for path traversal attempts', () => {
+    expect(resolveRoleTemplate('../../../etc/passwd')).toBeNull();
+    expect(resolveRoleTemplate('foo/bar')).toBeNull();
+  });
+
+  it('returns content starting with expected role header', () => {
+    const reviewer = resolveRoleTemplate('reviewer');
+    expect(reviewer).toContain('review mode');
+
+    const builder = resolveRoleTemplate('builder');
+    expect(builder).toContain('build mode');
+
+    const product = resolveRoleTemplate('product');
+    expect(product).toContain('product thinking mode');
+  });
+});
+
+describe('listRoleTemplates', () => {
+  it('includes all built-in templates', () => {
+    const templates = listRoleTemplates();
+    for (const name of BUILTIN_ROLE_TEMPLATES) {
+      expect(templates).toContain(name);
+    }
+  });
+
+  it('returns a sorted array', () => {
+    const templates = listRoleTemplates();
+    const sorted = [...templates].sort();
+    expect(templates).toEqual(sorted);
+  });
+});
+
+describe('ROLE_BLOCK in session-start template', () => {
+  it('template file includes ROLE_BLOCK placeholder', () => {
+    const templatePath = join(__dirname, '..', 'templates', 'hook-session-start.md');
+    const content = readFileSync(templatePath, 'utf-8');
+    expect(content).toContain('{{ROLE_BLOCK}}');
+  });
+
+  it('ROLE_BLOCK appears after WORKSPACE_LINE and before IDENTITY_BLOCK', () => {
+    const templatePath = join(__dirname, '..', 'templates', 'hook-session-start.md');
+    const content = readFileSync(templatePath, 'utf-8');
+    const roleIdx = content.indexOf('{{ROLE_BLOCK}}');
+    const wsIdx = content.indexOf('{{WORKSPACE_LINE}}');
+    const idIdx = content.indexOf('{{IDENTITY_BLOCK}}');
+    expect(roleIdx).toBeGreaterThan(wsIdx);
+    expect(roleIdx).toBeLessThan(idIdx);
   });
 });

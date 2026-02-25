@@ -3,15 +3,15 @@ import { hasBackendSessionOverride } from './claude.js';
 
 describe('hasBackendSessionOverride', () => {
   it('detects explicit Codex resume subcommand in positional prompt parts', () => {
-    expect(hasBackendSessionOverride('codex', [], ['resume', '019c44fd-68f6-7332-9eda-2dc7c8afcedf'])).toBe(
-      true
-    );
+    expect(
+      hasBackendSessionOverride('codex', [], ['resume', '019c44fd-68f6-7332-9eda-2dc7c8afcedf'])
+    ).toBe(true);
   });
 
   it('detects explicit Codex resume subcommand in passthrough args', () => {
-    expect(hasBackendSessionOverride('codex', ['resume', '019c44fd-68f6-7332-9eda-2dc7c8afcedf'])).toBe(
-      true
-    );
+    expect(
+      hasBackendSessionOverride('codex', ['resume', '019c44fd-68f6-7332-9eda-2dc7c8afcedf'])
+    ).toBe(true);
   });
 
   it('does not treat plain prompt text as resume override', () => {

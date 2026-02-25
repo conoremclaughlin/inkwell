@@ -145,9 +145,6 @@ const envSchema = z.object({
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
   SENTRY_DSN: optionalUrl,
 
-  // Agent Configuration
-  DEFAULT_MODEL: z.string().default('sonnet'),
-
   // Discord Bot
   DISCORD_BOT_TOKEN: optionalString,
   DISCORD_APPLICATION_ID: optionalString,

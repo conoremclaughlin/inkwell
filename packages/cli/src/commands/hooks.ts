@@ -22,7 +22,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 import { homedir } from 'os';
-import { resolveAgentId, readIdentityJson } from '../backends/identity.js';
+import { resolveAgentId, readIdentityJson, readRoleMd } from '../backends/identity.js';
 import { getValidAccessToken } from '../auth/tokens.js';
 import {
   findRuntimeSessionByLinkId,
@@ -334,6 +334,7 @@ function getIdentitySessionContext(cwd: string): {
   studioId?: string;
   identityId?: string;
   studioName?: string;
+  role?: string;
 } {
   const identityPath = join(cwd, '.pcp', 'identity.json');
   if (!existsSync(identityPath)) return {};
@@ -345,11 +346,13 @@ function getIdentitySessionContext(cwd: string): {
       identityId?: string;
       studio?: string;
       workspace?: string;
+      role?: string;
     };
     return {
       studioId: identity.studioId || identity.workspaceId,
       identityId: identity.identityId,
       studioName: identity.studio || identity.workspace,
+      role: identity.role,
     };
   } catch {
     return {};
@@ -383,7 +386,11 @@ async function findPcpSessionByBackendSessionId(
 
     const matched = sessions.find((session) => {
       if (session.endedAt) return false;
-      if (typeof session.backend === 'string' && session.backend && session.backend !== sessionBackend) {
+      if (
+        typeof session.backend === 'string' &&
+        session.backend &&
+        session.backend !== sessionBackend
+      ) {
         return false;
       }
       const backendCandidate =
@@ -1264,7 +1271,7 @@ async function onSessionStartHandler(): Promise<void> {
   const config = getPcpConfig();
   const agentId = resolveAgentId() || 'unknown';
 
-  const { studioId, studioName } = getIdentitySessionContext(cwd);
+  let { studioId, studioName, role } = getIdentitySessionContext(cwd);
   const studioLine = studioName ? `Studio: ${studioName}` : '';
 
   let identityBlock = '';
@@ -1272,6 +1279,15 @@ async function onSessionStartHandler(): Promise<void> {
   let sessionsBlock = '';
   let inboxBlock = '';
   let skillsBlock = '';
+  let roleBlock = '';
+
+  // Load ROLE.md if present in this studio
+  const roleMd = readRoleMd(cwd);
+  if (roleMd) {
+    const identity = readIdentityJson(cwd);
+    const roleName = identity?.role || 'Studio Role';
+    roleBlock = `## ${roleName}\n\n${roleMd}`;
+  }
 
   // Bootstrap
   try {
@@ -1292,6 +1308,44 @@ async function onSessionStartHandler(): Promise<void> {
   } catch {
     identityBlock =
       '*FAILED: Could not reach PCP server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
+  }
+
+  // Auto-register CLI-created studio in the cloud if not yet tracked
+  if (studioName && !studioId) {
+    try {
+      const gitRoot = execSync('git rev-parse --show-toplevel', {
+        cwd,
+        encoding: 'utf-8',
+      }).trim();
+
+      const createArgs: Record<string, unknown> = {
+        email: config?.email,
+        agentId,
+        repoRoot: gitRoot,
+        slug: studioName,
+        skipGitOperations: true,
+      };
+      if (role) createArgs.roleTemplate = role;
+
+      const created = await callPcpTool('create_studio', createArgs);
+      const ws = created.workspace as Record<string, unknown> | undefined;
+      if (ws && typeof ws.id === 'string') {
+        studioId = ws.id;
+        // Persist studioId back to identity.json for future sessions
+        const identityPath = join(cwd, '.pcp', 'identity.json');
+        if (existsSync(identityPath)) {
+          try {
+            const identityData = JSON.parse(readFileSync(identityPath, 'utf-8'));
+            identityData.studioId = studioId;
+            writeFileSync(identityPath, JSON.stringify(identityData, null, 2));
+          } catch {
+            // Non-fatal: studio registered but identity.json update failed
+          }
+        }
+      }
+    } catch {
+      // Non-fatal: studio auto-registration failed (server may be unreachable)
+    }
   }
 
   // Check inbox
@@ -1382,6 +1436,7 @@ async function onSessionStartHandler(): Promise<void> {
   const output = renderTemplate(template, {
     AGENT_ID: agentId,
     WORKSPACE_LINE: studioLine,
+    ROLE_BLOCK: roleBlock,
     IDENTITY_BLOCK: identityBlock,
     MEMORIES_BLOCK: memoriesBlock,
     SESSIONS_BLOCK: sessionsBlock,

@@ -32,6 +32,7 @@
     "ws:create": "yarn ws create",
     "ws:list": "yarn ws list",
     "ws:status": "yarn ws status",
+    "pr:wait-reply": "node scripts/wait-pr-reply.mjs",
     "build": "yarn workspaces run build",
     "build:web": "yarn workspace @personal-context/web build",
     "test": "yarn workspaces run test",

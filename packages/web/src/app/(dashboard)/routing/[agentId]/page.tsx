@@ -501,7 +501,11 @@ export default function AgentRoutingPage() {
                             >
                               Cancel
                             </Button>
-                            <Button type="submit" size="sm" disabled={updateRouteMutation.isPending}>
+                            <Button
+                              type="submit"
+                              size="sm"
+                              disabled={updateRouteMutation.isPending}
+                            >
                               <Save className="mr-2 h-4 w-4" />
                               Save
                             </Button>

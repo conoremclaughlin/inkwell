@@ -378,7 +378,7 @@ export interface IContextBuilder {
 export interface ClaudeRunnerConfig {
   workingDirectory: string;
   mcpConfigPath: string;
-  model: string;
+  model?: string;
   systemPrompt?: string;
   appendSystemPrompt?: string;
   pcpAccessToken?: string;
