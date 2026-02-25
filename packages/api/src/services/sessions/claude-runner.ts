@@ -384,6 +384,7 @@ export class ClaudeRunner implements IClaudeRunner {
           content: (input.content as string) || '',
           format: input.format as 'text' | 'markdown' | 'code' | 'json' | undefined,
           replyToMessageId: input.replyToMessageId as string | undefined,
+          metadata: input.metadata as Record<string, unknown> | undefined,
         };
         responses.push(response);
         logger.debug('Captured send_response call', { response });

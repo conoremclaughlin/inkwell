@@ -67,4 +67,43 @@ describe('AudioTranscriptionService', () => {
       await rm(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('falls back to CLI provider when OpenAI transcription fails', async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'pcp-audio-cli-test-'));
+    const filePath = path.join(tmpDir, 'note.ogg');
+    await writeFile(filePath, Buffer.from('transcript from cli provider'));
+
+    try {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => {
+          return {
+            ok: false,
+            json: async () => ({}),
+          } as unknown as Response;
+        })
+      );
+
+      const svc = new AudioTranscriptionService({
+        enabled: true,
+        apiKey: 'test',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-4o-mini-transcribe',
+        timeoutMs: 5000,
+        maxBytes: 1024 * 1024,
+        maxChars: 1000,
+        providers: ['openai', 'cli'],
+        cliCommand: 'cat {input}',
+      });
+
+      const result = await svc.transcribe({
+        filePath,
+        contentType: 'audio/ogg',
+      });
+
+      expect(result).toBe('transcript from cli provider');
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

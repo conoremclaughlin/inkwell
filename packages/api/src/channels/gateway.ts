@@ -23,6 +23,7 @@ import type { DataComposer } from '../data/composer';
 import { logger } from '../utils/logger';
 import { env } from '../config/env';
 import { InboundMediaPipeline } from './media-pipeline';
+import { TextToSpeechService } from './text-to-speech';
 import telegramifyMarkdown from 'telegramify-markdown';
 
 // Supported messaging channels
@@ -122,6 +123,10 @@ export class ChannelGateway extends EventEmitter {
   // Known agent names for mention detection in group chats
   private knownAgentNames: Set<string> = new Set();
   private mediaPipeline: InboundMediaPipeline = new InboundMediaPipeline();
+  private textToSpeech: TextToSpeechService = TextToSpeechService.fromEnv();
+  private autoVoiceReplyOnAudio = process.env.TELEGRAM_AUTO_VOICE_REPLY === 'true';
+  private includeTextAfterVoiceReply = process.env.TELEGRAM_VOICE_INCLUDE_TEXT !== 'false';
+  private pendingVoiceReplyConversations: Set<string> = new Set();
 
   constructor(config: ChannelGatewayConfig = {}) {
     super();
@@ -507,6 +512,14 @@ export class ChannelGateway extends EventEmitter {
       conversationUserMap.set(conversationId, userId);
     }
 
+    if (
+      channel === 'telegram' &&
+      this.autoVoiceReplyOnAudio &&
+      metadata?.media?.some((attachment) => attachment.type === 'audio')
+    ) {
+      this.pendingVoiceReplyConversations.add(this.getBufferKey(channel, conversationId));
+    }
+
     // Log incoming message to activity stream
     if (this.dataComposer && userId) {
       try {
@@ -541,6 +554,7 @@ export class ChannelGateway extends EventEmitter {
       // Release processing lock so conversation isn't permanently deadlocked
       const key = this.getBufferKey(channel, conversationId);
       this.processingConversations.delete(key);
+      this.pendingVoiceReplyConversations.delete(key);
 
       // Send error response based on channel
       try {
@@ -598,6 +612,15 @@ export class ChannelGateway extends EventEmitter {
         if (!this.telegramListener) {
           throw new Error('Telegram listener not available');
         }
+        if (await this.trySendTelegramVoiceReply(response)) {
+          if (this.includeTextAfterVoiceReply) {
+            await this.sendTelegramMessage(conversationId, content, { format, replyToMessageId });
+          } else {
+            await this.logOutgoingTelegram(conversationId, content);
+          }
+          break;
+        }
+
         await this.sendTelegramMessage(conversationId, content, { format, replyToMessageId });
         break;
 
@@ -808,6 +831,10 @@ export class ChannelGateway extends EventEmitter {
       parseMode,
     });
 
+    await this.logOutgoingTelegram(conversationId, content);
+  }
+
+  private async logOutgoingTelegram(conversationId: string, content: string): Promise<void> {
     // Log outgoing message to activity stream
     const userId = conversationUserMap.get(conversationId);
     if (this.dataComposer && userId) {
@@ -824,6 +851,55 @@ export class ChannelGateway extends EventEmitter {
       } catch (activityError) {
         logger.warn('Failed to log outgoing message to activity stream:', activityError);
       }
+    }
+  }
+
+  private shouldUseVoiceReply(response: AgentResponse): boolean {
+    if (response.channel !== 'telegram') return false;
+
+    const key = this.getBufferKey('telegram', response.conversationId);
+    const metadata = response.metadata as Record<string, unknown> | undefined;
+    const explicitVoiceRequest =
+      metadata?.voiceReply === true ||
+      metadata?.voice === true ||
+      metadata?.outputMode === 'voice' ||
+      metadata?.format === 'voice';
+    if (explicitVoiceRequest) {
+      this.pendingVoiceReplyConversations.delete(key);
+      return true;
+    }
+
+    if (!this.autoVoiceReplyOnAudio) return false;
+    if (!this.pendingVoiceReplyConversations.has(key)) return false;
+    this.pendingVoiceReplyConversations.delete(key);
+    return true;
+  }
+
+  private async trySendTelegramVoiceReply(response: AgentResponse): Promise<boolean> {
+    if (!this.telegramListener) return false;
+    if (!this.textToSpeech.isEnabled()) return false;
+    if (!this.shouldUseVoiceReply(response)) return false;
+
+    const audio = await this.textToSpeech.synthesize({ text: response.content });
+    if (!audio) return false;
+
+    try {
+      await this.telegramListener.sendVoice(response.conversationId, audio.filePath, {
+        replyToMessageId: response.replyToMessageId,
+        contentType: audio.contentType,
+        filename: audio.filename,
+      });
+      return true;
+    } catch (error) {
+      logger.warn('Failed to send Telegram voice reply, falling back to text', {
+        conversationId: response.conversationId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    } finally {
+      await audio.cleanup().catch((cleanupError) => {
+        logger.debug('Failed to clean up synthesized audio file', cleanupError);
+      });
     }
   }
 

@@ -495,6 +495,9 @@ export class CodexRunner implements IClaudeRunner {
                 replyToMessageId: (input as Record<string, unknown>).replyToMessageId as
                   | string
                   | undefined,
+                metadata: (input as Record<string, unknown>).metadata as
+                  | Record<string, unknown>
+                  | undefined,
               });
             }
           }

@@ -982,6 +982,57 @@ export class TelegramListener extends EventEmitter {
   }
 
   /**
+   * Send a voice note to a Telegram chat
+   * conversationId format: "telegram:<chatId>" or just "<chatId>"
+   */
+  async sendVoice(
+    conversationId: string,
+    filePath: string,
+    options?: {
+      replyToMessageId?: string;
+      caption?: string;
+      contentType?: string;
+      filename?: string;
+    }
+  ): Promise<void> {
+    const chatId = conversationId.startsWith('telegram:')
+      ? conversationId.replace('telegram:', '')
+      : conversationId;
+
+    const fs = await import('fs/promises');
+    const pathMod = await import('path');
+    const bytes = await fs.readFile(filePath);
+    const filename = options?.filename || pathMod.basename(filePath) || 'voice.ogg';
+    const contentType = options?.contentType || 'audio/ogg';
+
+    const form = new FormData();
+    form.append('chat_id', chatId);
+    if (options?.replyToMessageId) {
+      form.append('reply_to_message_id', String(parseInt(options.replyToMessageId, 10)));
+    }
+    if (options?.caption) {
+      form.append('caption', options.caption);
+    }
+    form.append('voice', new Blob([new Uint8Array(bytes)], { type: contentType }), filename);
+
+    const url = `${TELEGRAM_API}/bot${this.token}/sendVoice`;
+    const response = await fetch(url, {
+      method: 'POST',
+      body: form,
+    });
+
+    const data = (await response.json()) as TelegramApiResponse<unknown>;
+    if (!data.ok) {
+      throw new Error(`Telegram API error: ${data.description}`);
+    }
+    logger.info(`Sent voice note to Telegram chat ${chatId}`, {
+      filename,
+      contentType,
+      size: bytes.byteLength,
+    });
+  }
+
+  /**
    * Cache a message for context retrieval
    * Messages are stored in memory only, never persisted
    */

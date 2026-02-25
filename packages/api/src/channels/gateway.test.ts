@@ -6,6 +6,9 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 
+const mockTtsIsEnabled = vi.fn(() => false);
+const mockTtsSynthesize = vi.fn();
+
 // Mock the channel listeners before importing gateway
 vi.mock('./telegram-listener', () => ({
   createTelegramListener: vi.fn(() => ({
@@ -13,6 +16,7 @@ vi.mock('./telegram-listener', () => ({
     stop: vi.fn().mockResolvedValue(undefined),
     onMessage: vi.fn(),
     sendMessage: vi.fn().mockResolvedValue(undefined),
+    sendVoice: vi.fn().mockResolvedValue(undefined),
     sendTypingIndicator: vi.fn(),
     on: vi.fn(),
     running: false,
@@ -51,6 +55,15 @@ vi.mock('../config/env', () => ({
   },
 }));
 
+vi.mock('./text-to-speech', () => ({
+  TextToSpeechService: {
+    fromEnv: vi.fn(() => ({
+      isEnabled: mockTtsIsEnabled,
+      synthesize: mockTtsSynthesize,
+    })),
+  },
+}));
+
 // Import after mocks
 import { ChannelGateway, type IncomingMessageHandler } from './gateway.js';
 
@@ -59,6 +72,8 @@ describe('ChannelGateway', () => {
 
   beforeEach(() => {
     vi.useFakeTimers();
+    mockTtsIsEnabled.mockReturnValue(false);
+    mockTtsSynthesize.mockReset();
     gateway = new ChannelGateway({
       enableTelegram: false,
       enableWhatsApp: false,
@@ -393,6 +408,38 @@ describe('ChannelGateway', () => {
           ],
         })
       );
+    });
+  });
+
+  describe('Telegram Voice Replies', () => {
+    it('sends a voice reply when explicitly requested in metadata', async () => {
+      mockTtsIsEnabled.mockReturnValue(true);
+      const cleanup = vi.fn().mockResolvedValue(undefined);
+      mockTtsSynthesize.mockResolvedValue({
+        filePath: '/tmp/reply.ogg',
+        contentType: 'audio/ogg',
+        filename: 'reply.ogg',
+        cleanup,
+      });
+
+      const sendVoice = vi.fn().mockResolvedValue(undefined);
+      const sendMessage = vi.fn().mockResolvedValue(undefined);
+      (gateway as any).telegramListener = {
+        sendVoice,
+        sendMessage,
+      };
+
+      await gateway.sendResponse({
+        channel: 'telegram',
+        conversationId: 'chat123',
+        content: 'Here is your response',
+        metadata: { voiceReply: true },
+      });
+
+      expect(mockTtsSynthesize).toHaveBeenCalledWith({ text: 'Here is your response' });
+      expect(sendVoice).toHaveBeenCalledTimes(1);
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledTimes(1);
     });
   });
 });
