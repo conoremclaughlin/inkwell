@@ -35,6 +35,7 @@ type ChatOptions = {
   agent?: string;
   backend?: string;
   model?: string;
+  toolRouting?: string;
   threadKey?: string;
   autoRun?: boolean;
   new?: boolean;
@@ -67,6 +68,7 @@ interface ChatRuntime {
   model?: string;
   verbose: boolean;
   toolMode: ToolMode;
+  toolRouting: 'backend' | 'local';
   threadKey?: string;
   studioId?: string;
   userTimezone?: string;
@@ -112,6 +114,12 @@ interface McpServerSummary {
   transport?: string;
   url?: string;
   command?: string;
+}
+
+interface LocalToolCall {
+  tool: string;
+  args: Record<string, unknown>;
+  raw: string;
 }
 
 interface SessionTranscriptMetadata {
@@ -396,11 +404,44 @@ function compactForLedger(content: string, maxChars = LEDGER_COMPACT_CHARS): str
   return `${normalized.slice(0, Math.max(1, maxChars - 1))}…`;
 }
 
+function extractLocalToolCalls(responseText: string): LocalToolCall[] {
+  const matches = Array.from(responseText.matchAll(/```pcp-tool\s*([\s\S]*?)```/gi));
+  const calls: LocalToolCall[] = [];
+  for (const match of matches) {
+    const payload = (match[1] || '').trim();
+    if (!payload) continue;
+    try {
+      const parsed = JSON.parse(payload) as Record<string, unknown>;
+      const tool = typeof parsed.tool === 'string' ? parsed.tool.trim() : '';
+      if (!tool) continue;
+      const args =
+        parsed.args && typeof parsed.args === 'object' && !Array.isArray(parsed.args)
+          ? (parsed.args as Record<string, unknown>)
+          : {};
+      calls.push({ tool, args, raw: match[0] || '' });
+    } catch {
+      continue;
+    }
+  }
+  return calls;
+}
+
+function stripLocalToolBlocks(responseText: string): string {
+  return responseText.replace(/```pcp-tool[\s\S]*?```/gi, '').trim();
+}
+
 function isAbortError(error: unknown): boolean {
   if (!error || typeof error !== 'object') return false;
   const code = (error as { code?: string }).code;
   const name = (error as { name?: string }).name;
   return code === 'ABORT_ERR' || name === 'AbortError';
+}
+
+function isReadlineClosedError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const code = (error as { code?: string }).code;
+  const message = (error as { message?: string }).message;
+  return code === 'ERR_USE_AFTER_CLOSE' || Boolean(message?.toLowerCase().includes('readline was closed'));
 }
 
 function pickWaitingVerb(tick: number): string {
@@ -432,7 +473,7 @@ function startWaitingIndicator(
       process.stdout.write(`\r${tint(msg)}${pad}`);
       previousWidth = msg.length;
     } else if (tick === 0 || tick % 2 === 0) {
-      console.log(chalk.dim(`${frame} ${verb} · waiting for ${backend} (${seconds}s)`));
+      console.log(chalk.dim(`status> ${frame} ${verb} · waiting for ${backend} (${seconds}s)`));
     }
 
     tick += 1;
@@ -967,11 +1008,15 @@ function buildPromptEnvelope(
     'Answer in plain text. Be concise but complete.',
     `Current backend: ${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}.`,
     `Tool mode: ${runtime.toolMode}.`,
+    `Tool routing: ${runtime.toolRouting}.`,
     runtime.toolMode === 'off'
       ? 'Do not call backend-native tools. Provide reasoning and instructions only.'
       : '',
     runtime.toolMode === 'privileged'
       ? 'Backend-native tools are enabled and external actions are allowed when needed.'
+      : '',
+    runtime.toolRouting === 'local'
+      ? 'Backend-native tool calling is disabled for this run. If you need PCP tool access, emit fenced blocks in this exact format: ```pcp-tool {"tool":"tool_name","args":{}} ``` and continue with your plain-text answer.'
       : '',
     runtime.activeSkills.length > 0
       ? `Active skills: ${runtime.activeSkills.map((skill) => skill.name).join(', ')}`
@@ -1017,6 +1062,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     verbose: options.verbose ?? false,
     toolMode:
       options.tools === 'off' ? 'off' : options.tools === 'privileged' ? 'privileged' : 'backend',
+    toolRouting: options.toolRouting === 'local' ? 'local' : 'backend',
     threadKey: options.threadKey,
     studioId: identity?.workspaceId,
     userTimezone: undefined,
@@ -1177,6 +1223,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     [
       chip('agent', agentId, chalk.cyan),
       chip('backend', `${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}`, chalk.yellow),
+      chip('routing', runtime.toolRouting, runtime.toolRouting === 'local' ? chalk.magenta : chalk.dim),
       chip('window', `${formatTokenCount(runtime.backendTokenWindow)} tok`, chalk.green),
       chip('inbox auto-run', runtime.autoRunInbox ? 'on' : 'off', runtime.autoRunInbox ? chalk.green : chalk.dim),
       chip('local time', formatNow(runtime.userTimezone), chalk.magenta),
@@ -1395,7 +1442,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
       prompt,
       verbose: runtime.verbose,
       // When tools are off, do not pass through backend tool passthrough flags.
-      passthroughArgs: toolPolicy.canUseBackendTools() ? [] : ['--allowedTools', ''],
+      passthroughArgs:
+        toolPolicy.canUseBackendTools() && runtime.toolRouting === 'backend'
+          ? []
+          : ['--allowedTools', ''],
     }).finally(() => {
       process.off('SIGINT', onSigintDuringTurn);
       stopWaiting(`✓ ${runtime.backend} responded in ${Math.round((Date.now() - turnStartedAt) / 1000)}s`);
@@ -1409,7 +1459,54 @@ export async function runChat(options: ChatOptions): Promise<void> {
       responseText = '(no output)';
     }
 
-    ledger.addEntry('assistant', responseText, runtime.backend);
+    const localToolCalls =
+      runtime.toolRouting === 'local' ? extractLocalToolCalls(responseText).slice(0, 5) : [];
+    for (const toolCall of localToolCalls) {
+      const decision = toolPolicy.canCallPcpTool(toolCall.tool, runtime.sessionId);
+      if (!decision.allowed) {
+        const blocked = `Local tool blocked (${toolCall.tool}): ${decision.reason}`;
+        console.log(chalk.yellow(blocked));
+        appendTranscript(runtime.transcriptPath, {
+          type: 'local_tool_call',
+          tool: toolCall.tool,
+          args: toolCall.args,
+          status: 'blocked',
+          reason: decision.reason,
+        });
+        ledger.addEntry('system', compactForLedger(blocked, 400), 'local-tool');
+        continue;
+      }
+
+      const toolResult = await pcp
+        .callTool(toolCall.tool, toolCall.args)
+        .catch((error) => ({ error: String(error) }));
+      const resultJson = JSON.stringify(toolResult);
+      console.log(chalk.cyan(`🛠 local tool ${toolCall.tool} ${resultJson}`));
+      appendTranscript(runtime.transcriptPath, {
+        type: 'local_tool_call',
+        tool: toolCall.tool,
+        args: toolCall.args,
+        status: 'executed',
+        result: toolResult,
+      });
+      ledger.addEntry(
+        'system',
+        compactForLedger(`local tool ${toolCall.tool} -> ${resultJson}`, 500),
+        'local-tool'
+      );
+    }
+
+    const assistantDisplayText =
+      runtime.toolRouting === 'local'
+        ? (() => {
+            const stripped = stripLocalToolBlocks(responseText);
+            if (stripped) return stripped;
+            if (localToolCalls.length > 0) return '(local tool call emitted; see tool results above)';
+            return responseText;
+          })()
+        : responseText;
+
+    ledger.addEntry('assistant', assistantDisplayText, runtime.backend);
     appendTranscript(runtime.transcriptPath, {
       type: 'assistant',
       backend: runtime.backend,
@@ -1418,8 +1515,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       exitCode: runResult.exitCode,
       durationMs: runResult.durationMs,
       stderr: runResult.stderr || null,
-      content: responseText,
-      approxTokens: estimateTokens(responseText),
+      content: assistantDisplayText,
+      rawContent: responseText,
+      approxTokens: estimateTokens(assistantDisplayText),
       usage: runResult.usage || null,
     });
     lastBackendUsage = runResult.usage;
@@ -1431,7 +1529,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
     }
 
-    console.log(`\n${chalk.white(responseText)} ${chalk.dim(`• ${formatNow(runtime.userTimezone)}`)}\n`);
+    console.log(`\n${chalk.white(assistantDisplayText)} ${chalk.dim(`• ${formatNow(runtime.userTimezone)}`)}\n`);
     if (runResult.usage) {
       console.log(chalk.dim(`↳ ${formatBackendTokenUsage(runResult.usage)}\n`));
     }
@@ -1498,8 +1596,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let lastUsageTotal: number | undefined;
   let lastCtrlCAt = 0;
   let exitAfterTurnNoticeShown = false;
+  let readlineClosed = false;
+  rl.on('close', () => {
+    readlineClosed = true;
+  });
 
   while (keepRunning) {
+    if (readlineClosed) {
+      keepRunning = false;
+      continue;
+    }
     if (forceQuitAfterTurn) {
       if (!exitAfterTurnNoticeShown) {
         console.log(chalk.dim('Exit requested; waiting for active turn to finish...'));
@@ -1530,6 +1636,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
       raw = (await rl.question(chalk.green(promptLabel))).trim();
       lastCtrlCAt = 0;
     } catch (error) {
+      if (isReadlineClosedError(error)) {
+        console.log(chalk.dim('\nReadline closed. Exiting chat gracefully.\n'));
+        keepRunning = false;
+        continue;
+      }
       if (isAbortError(error)) {
         const now = Date.now();
         if (lastCtrlCAt > 0 && now - lastCtrlCAt <= CTRL_C_EXIT_WINDOW_MS) {
@@ -1549,7 +1660,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         [
           '',
           chalk.bold('Quick commands'),
-          chalk.dim('/help  /mcp  /capabilities  /skills  /policy  /usage  /trim  /quit'),
+          chalk.dim('/help  /mcp  /capabilities  /skills  /policy  /usage  /tool-routing  /trim  /quit'),
           '',
         ].join('\n')
       );
@@ -1569,6 +1680,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '/events [now|on|off]       Poll/toggle merged activity stream',
               '/session                   Show active session info',
               '/autorun [on|off]          Toggle inbox auto-run execution',
+              '/tool-routing [backend|local]  Toggle backend tools vs local pcp-tool routing',
               '/backend <name>            Switch backend (claude|codex|gemini)',
               '/model <id>                Set/clear model override',
               '/tools <backend|off|privileged>  Toggle backend-native tools/policy',
@@ -1629,9 +1741,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
         case 'session':
           console.log(
             chalk.dim(
-              `session=${runtime.sessionId || 'none'} backend=${runtime.backend} model=${
+          `session=${runtime.sessionId || 'none'} backend=${runtime.backend} model=${
                 runtime.model || '(default)'
-              } thread=${runtime.threadKey || '(none)'} events=${runtime.eventPolling ? 'on' : 'off'} autorun=${
+              } routing=${runtime.toolRouting} thread=${runtime.threadKey || '(none)'} events=${
+                runtime.eventPolling ? 'on' : 'off'
+              } autorun=${
                 runtime.autoRunInbox ? 'on' : 'off'
               } budget=${formatTokenCount(runtime.maxContextTokens)} window=${formatTokenCount(
                 runtime.backendTokenWindow
@@ -1652,6 +1766,25 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }
           runtime.autoRunInbox = mode === 'on';
           console.log(chalk.green(`Inbox auto-run ${runtime.autoRunInbox ? 'enabled' : 'disabled'}.`));
+          break;
+        }
+        case 'tool-routing': {
+          const mode = (slash.args[0] || '').toLowerCase();
+          if (!mode) {
+            console.log(chalk.dim(`Tool routing is ${runtime.toolRouting}.`));
+            break;
+          }
+          if (!['backend', 'local'].includes(mode)) {
+            console.log(chalk.yellow('Usage: /tool-routing [backend|local]'));
+            break;
+          }
+          runtime.toolRouting = mode as 'backend' | 'local';
+          console.log(chalk.green(`Tool routing set to ${runtime.toolRouting}.`));
+          if (runtime.toolRouting === 'local') {
+            console.log(
+              chalk.dim('Local routing active: backend-native tools disabled; use pcp-tool blocks for local execution.')
+            );
+          }
           break;
         }
         case 'sessions': {
@@ -2383,6 +2516,11 @@ export function registerChatCommand(program: Command): void {
       .option('-a, --agent <id>', 'Agent identity to use')
       .option('-b, --backend <name>', 'Backend: claude, codex, gemini', 'claude')
       .option('-m, --model <model>', 'Model override for backend')
+      .option(
+        '--tool-routing <mode>',
+        'Tool routing mode: backend (native backend tools) or local (pcp-tool blocks handled by sb chat)',
+        'backend'
+      )
       .option('--thread-key <key>', 'Thread key for PCP session routing')
       .option('--new', 'Always start a new session (disable auto-attach to latest)')
       .option('--attach [query]', 'Attach to an active session for this SB (optional query filter)')

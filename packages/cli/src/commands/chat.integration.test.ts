@@ -45,6 +45,11 @@ vi.mock('readline/promises', () => ({
       if (next === undefined) {
         throw new Error('No scripted input left for readline question');
       }
+      if (next === '__CLOSED__') {
+        const err = new Error('readline was closed') as Error & { code?: string };
+        err.code = 'ERR_USE_AFTER_CLOSE';
+        throw err;
+      }
       if (next === '__ABORT__') {
         const err = new Error('Aborted with Ctrl+C') as Error & { code?: string; name?: string };
         err.code = 'ABORT_ERR';
@@ -53,6 +58,7 @@ vi.mock('readline/promises', () => ({
       }
       return next;
     },
+    on: () => undefined,
     close: () => undefined,
   }),
 }));
@@ -691,6 +697,68 @@ describe('runChat integration', () => {
     expect(logText).toContain('Inbox auto-run disabled.');
   });
 
+  it('toggles tool routing via slash command', async () => {
+    testState.inputs = ['/tool-routing local', '/session', '/tool-routing backend', '/quit'];
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      pollSeconds: '999',
+    });
+
+    const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    expect(logText).toContain('Tool routing set to local.');
+    expect(logText).toContain('routing=local');
+    expect(logText).toContain('Tool routing set to backend.');
+  });
+
+  it('executes local pcp-tool blocks when tool routing is local', async () => {
+    testState.runBackendImpl.mockResolvedValue({
+      success: true,
+      stdout:
+        'Running local tool.\n```pcp-tool\n{"tool":"get_inbox","args":{"agentId":"lumen","status":"unread","limit":1}}\n```\nDone.',
+      stderr: '',
+      exitCode: 0,
+      durationMs: 5,
+      command: 'mock',
+    });
+    testState.callToolImpl.mockImplementation(async (tool: string, args?: Record<string, unknown>) => {
+      switch (tool) {
+        case 'bootstrap':
+          return { user: { timezone: 'America/Los_Angeles' } };
+        case 'start_session':
+          return { session: { id: 'sess-1' } };
+        case 'get_inbox':
+          return { messages: [], echo: args || {} };
+        case 'update_session_phase':
+        case 'end_session':
+          return { success: true };
+        default:
+          return { success: true };
+      }
+    });
+
+    testState.inputs = ['run local tool routing', '/quit'];
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      toolRouting: 'local',
+      pollSeconds: '999',
+    });
+
+    const backendRequest = testState.runBackendImpl.mock.calls[0][0] as {
+      prompt: string;
+      passthroughArgs: string[];
+    };
+    expect(backendRequest.passthroughArgs).toEqual(['--allowedTools', '']);
+    expect(backendRequest.prompt).toContain('Tool routing: local.');
+
+    const localToolCall = testState.pcpCalls.find(
+      (call) => call.tool === 'get_inbox' && call.args.limit === 1
+    );
+    expect(localToolCall).toBeTruthy();
+  });
+
   it('exits gracefully on double ctrl+c', async () => {
     testState.inputs = ['__ABORT__', '__ABORT__'];
 
@@ -705,6 +773,21 @@ describe('runChat integration', () => {
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('Press Ctrl+C again to quit');
     expect(logText).toContain('Exiting chat (double Ctrl+C).');
+  });
+
+  it('exits gracefully when readline closes while loop is active', async () => {
+    testState.inputs = ['__CLOSED__'];
+
+    await expect(
+      runChat({
+        agent: 'lumen',
+        backend: 'claude',
+        pollSeconds: '999',
+      })
+    ).resolves.toBeUndefined();
+
+    const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    expect(logText).toContain('Readline closed. Exiting chat gracefully.');
   });
 
   it('requires confirmation before large context ejection and allows cancel', async () => {
