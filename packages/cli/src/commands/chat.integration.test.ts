@@ -712,6 +712,21 @@ describe('runChat integration', () => {
     expect(logText).toContain('Tool routing set to backend.');
   });
 
+  it('toggles ui mode via slash command', async () => {
+    testState.inputs = ['/ui live', '/session', '/ui scroll', '/quit'];
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      pollSeconds: '999',
+    });
+
+    const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    expect(logText).toContain('UI mode set to live.');
+    expect(logText).toContain('ui=live');
+    expect(logText).toContain('UI mode set to scroll.');
+  });
+
   it('executes local pcp-tool blocks when tool routing is local', async () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,

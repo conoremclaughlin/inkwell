@@ -36,6 +36,7 @@ type ChatOptions = {
   backend?: string;
   model?: string;
   toolRouting?: string;
+  ui?: string;
   threadKey?: string;
   autoRun?: boolean;
   new?: boolean;
@@ -69,6 +70,7 @@ interface ChatRuntime {
   verbose: boolean;
   toolMode: ToolMode;
   toolRouting: 'backend' | 'local';
+  uiMode: 'scroll' | 'live';
   threadKey?: string;
   studioId?: string;
   userTimezone?: string;
@@ -128,6 +130,13 @@ interface SessionTranscriptMetadata {
   assistantCount: number;
   inboxCount: number;
   lastMessageAt?: string;
+}
+
+interface StatusLaneState {
+  live: boolean;
+  line: string;
+  promptActive: boolean;
+  dirtyWhilePrompt: boolean;
 }
 
 const LEDGER_COMPACT_CHARS = 420;
@@ -451,10 +460,11 @@ function pickWaitingVerb(tick: number): string {
 
 function startWaitingIndicator(
   backend: string,
-  options?: { inline?: boolean }
+  options?: { inline?: boolean; logger?: (line: string) => void }
 ): (doneMessage?: string) => void {
   const startedAt = Date.now();
   const useAnimatedLine = Boolean(options?.inline && process.stdout.isTTY);
+  const logger = options?.logger || ((line: string) => console.log(line));
   let tick = 0;
   let previousWidth = 0;
 
@@ -473,7 +483,7 @@ function startWaitingIndicator(
       process.stdout.write(`\r${tint(msg)}${pad}`);
       previousWidth = msg.length;
     } else if (tick === 0 || tick % 2 === 0) {
-      console.log(chalk.dim(`status> ${frame} ${verb} · waiting for ${backend} (${seconds}s)`));
+      logger(chalk.dim(`status> ${frame} ${verb} · waiting for ${backend} (${seconds}s)`));
     }
 
     tick += 1;
@@ -489,7 +499,7 @@ function startWaitingIndicator(
       process.stdout.write(`\r${clear}\r`);
     }
     if (doneMessage) {
-      console.log(chalk.dim(doneMessage));
+      logger(chalk.dim(doneMessage));
     }
   };
 }
@@ -710,8 +720,25 @@ function buildContextStatusSummary(params: {
   )}%) ${queue} backend:${params.backend}${window}`;
 }
 
-function printStatusLane(summary: string, timezone?: string): void {
-  console.log(chalk.dim(`status> ${summary} • ${formatNow(timezone)}`));
+function clearStatusLane(state: StatusLaneState): void {
+  if (!state.live) return;
+  if (!state.line) return;
+  output.write('\r\x1b[2K');
+  state.line = '';
+}
+
+function printStatusLane(summary: string, timezone: string | undefined, state: StatusLaneState): void {
+  const rendered = `status> ${summary} • ${formatNow(timezone)}`;
+  if (!state.live) {
+    console.log(chalk.dim(rendered));
+    return;
+  }
+  if (state.promptActive) {
+    state.dirtyWhilePrompt = true;
+    return;
+  }
+  state.line = rendered;
+  output.write(`\r\x1b[2K${chalk.dim(rendered)}`);
 }
 
 function printUsage(
@@ -1087,6 +1114,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     toolMode:
       options.tools === 'off' ? 'off' : options.tools === 'privileged' ? 'privileged' : 'backend',
     toolRouting: options.toolRouting === 'local' ? 'local' : 'backend',
+    uiMode: options.ui === 'live' ? 'live' : 'scroll',
     threadKey: options.threadKey,
     studioId: identity?.workspaceId,
     userTimezone: undefined,
@@ -1107,6 +1135,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
     runtime.toolMode,
     policyPathFromEnv ? { policyPath: policyPathFromEnv } : undefined
   );
+  const statusLaneState: StatusLaneState = {
+    live: runtime.uiMode === 'live' && Boolean(output.isTTY),
+    line: '',
+    promptActive: false,
+    dirtyWhilePrompt: false,
+  };
+  const printLine = (line = '') => {
+    if (statusLaneState.live) {
+      clearStatusLane(statusLaneState);
+    }
+    console.log(line);
+  };
 
   const ledger = new ContextLedger();
   const seenInboxIds = new Set<string>();
@@ -1248,6 +1288,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       chip('agent', agentId, chalk.cyan),
       chip('backend', `${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}`, chalk.yellow),
       chip('routing', runtime.toolRouting, runtime.toolRouting === 'local' ? chalk.magenta : chalk.dim),
+      chip('ui', runtime.uiMode, runtime.uiMode === 'live' ? chalk.cyan : chalk.dim),
       chip('window', `${formatTokenCount(runtime.backendTokenWindow)} tok`, chalk.green),
       chip('inbox auto-run', runtime.autoRunInbox ? 'on' : 'off', runtime.autoRunInbox ? chalk.green : chalk.dim),
       chip('local time', formatNow(runtime.userTimezone), chalk.magenta),
@@ -1349,7 +1390,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         messageType: msg.messageType || null,
         relatedSessionId: msg.relatedSessionId || null,
       });
-      console.log(`\n${chalk.cyan(rendered)} ${chalk.dim(`• ${formatNow(runtime.userTimezone)}`)}\n`);
+      printLine(`\n${chalk.cyan(rendered)} ${chalk.dim(`• ${formatNow(runtime.userTimezone)}`)}\n`);
 
       const eligibleForAutoRun =
         runtime.autoRunInbox &&
@@ -1367,10 +1408,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
 
     if (force && fresh.length === 0) {
-      console.log(chalk.dim('No new inbox messages.'));
+      printLine(chalk.dim('No new inbox messages.'));
     }
     if (autoRuns > 0) {
-      console.log(chalk.green(`Auto-run processed ${autoRuns} inbox message${autoRuns === 1 ? '' : 's'}.`));
+      printLine(chalk.green(`Auto-run processed ${autoRuns} inbox message${autoRuns === 1 ? '' : 's'}.`));
+    }
+    if (statusLaneState.live) {
+      emitStatusLaneIfChanged(true);
     }
     return fresh.length;
   };
@@ -1414,11 +1458,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
         sessionId: activity.sessionId || null,
         content: activity.content || null,
       });
-      console.log(`\n${chalk.magenta(rendered)} ${chalk.dim(`• ${formatNow(runtime.userTimezone)}`)}\n`);
+      printLine(`\n${chalk.magenta(rendered)} ${chalk.dim(`• ${formatNow(runtime.userTimezone)}`)}\n`);
     }
 
     if (force && activities.length === 0) {
-      console.log(chalk.dim('No new activity events.'));
+      printLine(chalk.dim('No new activity events.'));
+    }
+    if (statusLaneState.live) {
+      emitStatusLaneIfChanged(true);
     }
     return activities.length;
   };
@@ -1446,7 +1493,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     const prompt = buildPromptEnvelope(agentId, runtime, ledger, raw);
     const turnStartedAt = Date.now();
-    const stopWaiting = startWaitingIndicator(runtime.backend, { inline: false });
+    const stopWaiting = startWaitingIndicator(runtime.backend, {
+      inline: statusLaneState.live,
+      logger: printLine,
+    });
     let turnCtrlCAt = 0;
     const onSigintDuringTurn = () => {
       const now = Date.now();
@@ -1489,7 +1539,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const decision = toolPolicy.canCallPcpTool(toolCall.tool, runtime.sessionId);
       if (!decision.allowed) {
         const blocked = `Local tool blocked (${toolCall.tool}): ${decision.reason}`;
-        console.log(chalk.yellow(blocked));
+        printLine(chalk.yellow(blocked));
         appendTranscript(runtime.transcriptPath, {
           type: 'local_tool_call',
           tool: toolCall.tool,
@@ -1505,7 +1555,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         .callTool(toolCall.tool, toolCall.args)
         .catch((error) => ({ error: String(error) }));
       const resultJson = JSON.stringify(toolResult);
-      console.log(chalk.cyan(`🛠 local tool ${toolCall.tool} ${resultJson}`));
+      printLine(chalk.cyan(`🛠 local tool ${toolCall.tool} ${resultJson}`));
       appendTranscript(runtime.transcriptPath, {
         type: 'local_tool_call',
         tool: toolCall.tool,
@@ -1547,22 +1597,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
     lastBackendUsage = runResult.usage;
 
     if (!runResult.success) {
-      console.log(chalk.red(`\n[${runtime.backend}] exit=${runResult.exitCode}`));
+      printLine(chalk.red(`\n[${runtime.backend}] exit=${runResult.exitCode}`));
       if (runResult.stderr) {
-        console.log(chalk.dim(runResult.stderr));
+        printLine(chalk.dim(runResult.stderr));
       }
     }
 
-    console.log(`\n${chalk.white(assistantDisplayText)} ${chalk.dim(`• ${formatNow(runtime.userTimezone)}`)}\n`);
+    printLine(`\n${chalk.white(assistantDisplayText)} ${chalk.dim(`• ${formatNow(runtime.userTimezone)}`)}\n`);
     if (runResult.usage) {
-      console.log(chalk.dim(`↳ ${formatBackendTokenUsage(runResult.usage)}\n`));
+      printLine(chalk.dim(`↳ ${formatBackendTokenUsage(runResult.usage)}\n`));
     }
   };
 
   let turnQueue: Promise<void> = Promise.resolve();
   let pendingTurns = 0;
   let lastStatusSummary = '';
-  const emitStatusLaneIfChanged = () => {
+  const emitStatusLaneIfChanged = (force = false) => {
     const summary = buildContextStatusSummary({
       ledger,
       maxContextTokens: runtime.maxContextTokens,
@@ -1570,9 +1620,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
       pendingTurns,
       backend: runtime.backend,
     });
-    if (summary !== lastStatusSummary) {
-      printStatusLane(summary, runtime.userTimezone);
+    if (force || summary !== lastStatusSummary || statusLaneState.dirtyWhilePrompt) {
+      printStatusLane(summary, runtime.userTimezone, statusLaneState);
       lastStatusSummary = summary;
+      statusLaneState.dirtyWhilePrompt = false;
     }
   };
   const enqueueTurn = (raw: string, source: 'user' | 'inbox-auto' = 'user'): Promise<void> => {
@@ -1582,7 +1633,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       try {
         await runUserTurn(raw, source);
       } catch (error) {
-        console.log(chalk.red(`Turn failed: ${String(error)}`));
+        printLine(chalk.red(`Turn failed: ${String(error)}`));
       } finally {
         pendingTurns = Math.max(0, pendingTurns - 1);
         emitStatusLaneIfChanged();
@@ -1666,28 +1717,38 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
     emitStatusLaneIfChanged();
     let raw = '';
+    statusLaneState.promptActive = true;
     try {
       const promptLabel = pendingTurns > 0 ? `${agentId}+${pendingTurns}> ` : `${agentId}> `;
-      raw = (await rl.question(chalk.green(promptLabel))).trim();
+      const renderedPrompt = statusLaneState.live ? `\n${promptLabel}` : promptLabel;
+      raw = (await rl.question(chalk.green(renderedPrompt))).trim();
       lastCtrlCAt = 0;
     } catch (error) {
+      statusLaneState.promptActive = false;
+      if (statusLaneState.dirtyWhilePrompt) {
+        emitStatusLaneIfChanged(true);
+      }
       if (isReadlineClosedError(error)) {
-        console.log(chalk.dim('\nReadline closed. Exiting chat gracefully.\n'));
+        printLine(chalk.dim('\nReadline closed. Exiting chat gracefully.\n'));
         keepRunning = false;
         continue;
       }
       if (isAbortError(error)) {
         const now = Date.now();
         if (lastCtrlCAt > 0 && now - lastCtrlCAt <= CTRL_C_EXIT_WINDOW_MS) {
-          console.log(chalk.yellow('\nExiting chat (double Ctrl+C).\n'));
+          printLine(chalk.yellow('\nExiting chat (double Ctrl+C).\n'));
           keepRunning = false;
           continue;
         }
         lastCtrlCAt = now;
-        console.log(chalk.dim('\nPress Ctrl+C again to quit, or continue typing.\n'));
+        printLine(chalk.dim('\nPress Ctrl+C again to quit, or continue typing.\n'));
         continue;
       }
       throw error;
+    }
+    statusLaneState.promptActive = false;
+    if (statusLaneState.dirtyWhilePrompt) {
+      emitStatusLaneIfChanged(true);
     }
     if (!raw) continue;
     if (raw === '/') {
@@ -1695,7 +1756,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         [
           '',
           chalk.bold('Quick commands'),
-          chalk.dim('/help  /mcp  /capabilities  /skills  /policy  /usage  /tool-routing  /trim  /quit'),
+          chalk.dim('/help  /mcp  /capabilities  /skills  /policy  /usage  /tool-routing  /ui  /trim  /quit'),
           '',
         ].join('\n')
       );
@@ -1716,6 +1777,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '/session                   Show active session info',
               '/autorun [on|off]          Toggle inbox auto-run execution',
               '/tool-routing [backend|local]  Toggle backend tools vs local pcp-tool routing',
+              '/ui [scroll|live]          Set status rendering mode',
               '/backend <name>            Switch backend (claude|codex|gemini)',
               '/model <id>                Set/clear model override',
               '/tools <backend|off|privileged>  Toggle backend-native tools/policy',
@@ -1780,9 +1842,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 runtime.model || '(default)'
               } routing=${runtime.toolRouting} thread=${runtime.threadKey || '(none)'} events=${
                 runtime.eventPolling ? 'on' : 'off'
-              } autorun=${
-                runtime.autoRunInbox ? 'on' : 'off'
-              } budget=${formatTokenCount(runtime.maxContextTokens)} window=${formatTokenCount(
+              } autorun=${runtime.autoRunInbox ? 'on' : 'off'} ui=${runtime.uiMode} budget=${formatTokenCount(
+                runtime.maxContextTokens
+              )} window=${formatTokenCount(
                 runtime.backendTokenWindow
               )} budgetMode=${contextBudgetAuto ? 'auto' : 'manual'}`
             )
@@ -1820,6 +1882,25 @@ export async function runChat(options: ChatOptions): Promise<void> {
               chalk.dim('Local routing active: backend-native tools disabled; use pcp-tool blocks for local execution.')
             );
           }
+          break;
+        }
+        case 'ui': {
+          const mode = (slash.args[0] || '').toLowerCase();
+          if (!mode) {
+            printLine(chalk.dim(`UI mode is ${runtime.uiMode}.`));
+            break;
+          }
+          if (!['scroll', 'live'].includes(mode)) {
+            printLine(chalk.yellow('Usage: /ui [scroll|live]'));
+            break;
+          }
+          runtime.uiMode = mode as 'scroll' | 'live';
+          statusLaneState.live = runtime.uiMode === 'live' && Boolean(output.isTTY);
+          if (!statusLaneState.live) {
+            clearStatusLane(statusLaneState);
+          }
+          printLine(chalk.green(`UI mode set to ${runtime.uiMode}.`));
+          emitStatusLaneIfChanged(true);
           break;
         }
         case 'sessions': {
@@ -2521,7 +2602,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   if (pollTimer) clearInterval(pollTimer);
 
   if (pendingTurns > 0) {
-    console.log(chalk.dim(`Waiting for ${pendingTurns} pending turn(s) to finish...`));
+    printLine(chalk.dim(`Waiting for ${pendingTurns} pending turn(s) to finish...`));
     await turnQueue;
   }
 
@@ -2538,9 +2619,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
   });
 
   if (runtime.sessionId) {
-    console.log(chalk.dim(`Reattach: sb chat -a ${agentId} --attach ${runtime.sessionId}`));
+    printLine(chalk.dim(`Reattach: sb chat -a ${agentId} --attach ${runtime.sessionId}`));
   }
-  console.log(chalk.dim('\nChat ended.\n'));
+  printLine(chalk.dim('\nChat ended.\n'));
 }
 
 export function registerChatCommand(program: Command): void {
@@ -2556,6 +2637,7 @@ export function registerChatCommand(program: Command): void {
         'Tool routing mode: backend (native backend tools) or local (pcp-tool blocks handled by sb chat)',
         'backend'
       )
+      .option('--ui <mode>', 'UI mode: scroll (default) or live status lane rendering', 'scroll')
       .option('--thread-key <key>', 'Thread key for PCP session routing')
       .option('--new', 'Always start a new session (disable auto-attach to latest)')
       .option('--attach [query]', 'Attach to an active session for this SB (optional query filter)')
