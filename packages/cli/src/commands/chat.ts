@@ -1462,46 +1462,51 @@ export async function runChat(options: ChatOptions): Promise<void> {
       .catch((error) => ({ error: String(error) }))) as Record<string, unknown>;
 
     if ((sessionsResult as Record<string, unknown>).error) {
-      throw new Error(`Failed to list sessions for attach: ${String((sessionsResult as { error?: string }).error)}`);
+      const modeLabel = options.attachLatest ? '--attach-latest' : '--attach';
+      console.log(
+        chalk.yellow(
+          `Warning: ${modeLabel} unavailable (${String((sessionsResult as { error?: string }).error)}). Continuing without attach.`
+        )
+      );
+    } else {
+      const sessions = filterSessionsByPolicy(
+        extractSessionSummaries(sessionsResult),
+        runtime,
+        agentId,
+        toolPolicy,
+        'attach'
+      );
+      const selected = options.attachLatest
+        ? pickLatestSession(sessions, query, { studioId: runtime.studioId })
+        : await pickSessionToAttach(sessions, query, {
+            timezone: runtime.userTimezone,
+            studioId: runtime.studioId,
+          });
+      if (!selected) {
+        throw new Error('No matching active session selected for attach.');
+      }
+      attachedSessionSummary = selected;
+      runtime.sessionId = selected.id;
+      if (selected.workspaceId) {
+        runtime.workspaceId = selected.workspaceId;
+      }
+      if (selected.studioId) {
+        runtime.studioId = selected.studioId;
+      }
+      if (!runtime.threadKey && selected.threadKey) {
+        runtime.threadKey = selected.threadKey;
+      }
+      toolPolicy.setContext({
+        agentId,
+        workspaceId: runtime.workspaceId,
+        studioId: runtime.studioId,
+      });
+      const currentScope = toolPolicy.getMutationScope();
+      if (currentScope.scope !== 'global') {
+        toolPolicy.setMutationScope(currentScope.scope);
+      }
+      runtime.toolMode = toolPolicy.getMode();
     }
-
-    const sessions = filterSessionsByPolicy(
-      extractSessionSummaries(sessionsResult),
-      runtime,
-      agentId,
-      toolPolicy,
-      'attach'
-    );
-    const selected = options.attachLatest
-      ? pickLatestSession(sessions, query, { studioId: runtime.studioId })
-      : await pickSessionToAttach(sessions, query, {
-          timezone: runtime.userTimezone,
-          studioId: runtime.studioId,
-        });
-    if (!selected) {
-      throw new Error('No matching active session selected for attach.');
-    }
-    attachedSessionSummary = selected;
-    runtime.sessionId = selected.id;
-    if (selected.workspaceId) {
-      runtime.workspaceId = selected.workspaceId;
-    }
-    if (selected.studioId) {
-      runtime.studioId = selected.studioId;
-    }
-    if (!runtime.threadKey && selected.threadKey) {
-      runtime.threadKey = selected.threadKey;
-    }
-    toolPolicy.setContext({
-      agentId,
-      workspaceId: runtime.workspaceId,
-      studioId: runtime.studioId,
-    });
-    const currentScope = toolPolicy.getMutationScope();
-    if (currentScope.scope !== 'global') {
-      toolPolicy.setMutationScope(currentScope.scope);
-    }
-    runtime.toolMode = toolPolicy.getMode();
   }
 
   if (

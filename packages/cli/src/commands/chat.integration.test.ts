@@ -381,6 +381,40 @@ describe('runChat integration', () => {
     expect(sessionStatusLine).toContain('Thread: pr:2');
   });
 
+  it('falls back gracefully when attach-latest cannot list sessions', async () => {
+    testState.callToolImpl.mockImplementation(async (tool: string) => {
+      switch (tool) {
+        case 'bootstrap':
+          return { user: { timezone: 'America/Los_Angeles' } };
+        case 'list_sessions':
+          throw new Error('TypeError: fetch failed');
+        case 'start_session':
+          return { session: { id: 'sess-fallback' } };
+        case 'get_inbox':
+          return { messages: [] };
+        case 'update_session_phase':
+        case 'end_session':
+          return { success: true };
+        default:
+          return { success: true };
+      }
+    });
+
+    testState.inputs = ['/quit'];
+    await expect(
+      runChat({
+        agent: 'lumen',
+        backend: 'claude',
+        attachLatest: true,
+        pollSeconds: '999',
+      })
+    ).resolves.toBeUndefined();
+
+    const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    expect(logText).toContain('Warning: --attach-latest unavailable');
+    expect(logText).toContain('Session: sess-fallback');
+  });
+
   it('auto-attaches latest active session by default when no --new/--attach is provided', async () => {
     testState.callToolImpl.mockImplementation(async (tool: string) => {
       switch (tool) {
