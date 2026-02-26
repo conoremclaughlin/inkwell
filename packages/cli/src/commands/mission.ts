@@ -323,7 +323,7 @@ function formatTime(iso?: string): string {
 function renderMissionTable(rows: MissionRow[]): string[] {
   const lines: string[] = [];
 
-  lines.push(chalk.dim('agent    active  unread  latest-id  phase/status          thread        backend-id '));
+  lines.push(chalk.dim('SB       active  unread  latest-id  phase/status          thread        backend-id '));
   for (const row of rows) {
     lines.push(
       chalk.dim(
@@ -468,23 +468,30 @@ function activityToFeedEvent(activity: MissionActivity, timezone?: string): Feed
   const actor = activity.agentId || 'system';
   const type = mapActivityToFeedType(activity);
 
+  // Keep feed content compact — terminal width minus icon/agent/time overhead
+  const maxPreview = Math.min(120, (process.stdout.columns || 80) - 25);
+
   let content: string;
   if (activity.type === 'message_in') {
     const from = trigger?.from || 'unknown';
-    const summary = trigger?.summary || compactPreview(activity.content, 200);
-    content = `${from}: ${summary}`;
+    const summary = trigger?.summary || compactPreview(activity.content, maxPreview);
+    content = `from ${from}: ${summary}`;
   } else if (activity.type === 'message_out') {
-    content = `sent → ${activity.platform || 'unknown'}: ${compactPreview(activity.content, 200)}`;
+    content = `→ ${activity.platform || 'unknown'}: ${compactPreview(activity.content, maxPreview)}`;
   } else if (activity.type === 'state_change') {
-    content = compactPreview(activity.content, 200);
+    content = compactPreview(activity.content, maxPreview);
   } else if (activity.type === 'agent_spawn') {
-    content = `spawned agent`;
+    content = 'spawned sub-process';
   } else if (activity.type === 'agent_complete') {
-    content = `agent completed`;
+    content = 'sub-process completed';
   } else {
     const subtype = activity.subtype ? `:${activity.subtype}` : '';
-    content = `${activity.type || 'activity'}${subtype}: ${compactPreview(activity.content, 200)}`;
+    content = `${activity.type || 'activity'}${subtype}: ${compactPreview(activity.content, maxPreview)}`;
   }
+
+  // Only show type detail for non-obvious message types (skip 'message' which is default)
+  const messageType = trigger?.messageType;
+  const showTypeDetail = messageType && messageType !== 'message';
 
   return {
     id: activity.id,
@@ -492,9 +499,7 @@ function activityToFeedEvent(activity: MissionActivity, timezone?: string): Feed
     agent: actor,
     content,
     time: formatHumanTime(activity.createdAt, timezone),
-    detail: activity.type === 'message_in' && trigger?.messageType
-      ? `type: ${trigger.messageType}`
-      : undefined,
+    detail: showTypeDetail ? `type: ${messageType}` : undefined,
   };
 }
 
@@ -558,7 +563,7 @@ async function runInkMission(options: MissionOptions): Promise<void> {
       const totalAgents = agentSummaries.length;
       const totalUnread = agentSummaries.reduce((sum, a) => sum + a.unread, 0);
       mission.setStatus(
-        `${totalAgents} agent${totalAgents !== 1 ? 's' : ''} · ${totalUnread} unread · refreshing every ${intervalSeconds}s`
+        `${totalAgents} SB${totalAgents !== 1 ? 's' : ''} · ${totalUnread} unread · refreshing every ${intervalSeconds}s`
       );
 
       return newCount;

@@ -16,7 +16,7 @@ export interface FeedEvent {
   detail?: string;
 }
 
-// ── Agent summary row ──
+// ── SB summary row ──
 
 export interface AgentSummary {
   agent: string;
@@ -133,7 +133,7 @@ export const MissionApp = React.forwardRef<MissionAppHandle, MissionAppProps>(
           )}
         </Static>
 
-        {/* Fixed dock: agent summary + status */}
+        {/* Fixed dock: SB summary + status */}
         <Separator />
         <Box paddingX={1} flexDirection="column">
           {agents.length > 0 ? (
@@ -147,7 +147,7 @@ export const MissionApp = React.forwardRef<MissionAppHandle, MissionAppProps>(
               </Box>
             ))
           ) : (
-            <Text dimColor>Loading agents...</Text>
+            <Text dimColor>Loading SBs...</Text>
           )}
         </Box>
         <Separator />
