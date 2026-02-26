@@ -74,15 +74,9 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(
 
     const handleSubmit = useCallback(
       (value: string) => {
-        // Check for exit commands
-        if (value === '/quit' || value === '/exit') {
-          onExit();
-          exit();
-          return;
-        }
         onUserInput(value);
       },
-      [onUserInput, onExit, exit]
+      [onUserInput]
     );
 
     // Handle Ctrl+C for double-tap exit

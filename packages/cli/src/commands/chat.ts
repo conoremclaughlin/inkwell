@@ -2617,6 +2617,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         case 'quit':
         case 'exit':
           keepRunning = false;
+          if (inkRepl) inkRepl.requestExit();
           break;
         case 'inbox':
           await pollInbox(true);
