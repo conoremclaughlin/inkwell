@@ -1941,8 +1941,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
           relatedSessionId: msg.relatedSessionId || null,
         });
       }
-      printLine('');
-      printLine(renderCollapsedInbox(oldMessages.length));
+      if (inkRepl) {
+        inkRepl.addMessage('system', `${oldMessages.length} older inbox message(s) collapsed`);
+      } else {
+        printLine('');
+        printLine(renderCollapsedInbox(oldMessages.length));
+      }
     }
     for (const msg of recentMessages) {
       seenInboxIds.add(msg.id);
