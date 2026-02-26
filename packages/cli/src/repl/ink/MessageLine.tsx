@@ -33,10 +33,9 @@ export function MessageLine({
   const meta = [time, trailingMeta].filter(Boolean).join('  ·  ');
 
   return (
-    <Box flexDirection="column">
+    <Box flexDirection="column" paddingLeft={1}>
       {/* Header: label + metadata on one line */}
       <Box>
-        <Text>{'  '}</Text>
         <Text bold color={color}>{displayLabel}</Text>
         {meta ? (
           <>
@@ -45,8 +44,8 @@ export function MessageLine({
           </>
         ) : null}
       </Box>
-      {/* Content: indented, wraps naturally */}
-      <Box paddingLeft={4}>
+      {/* Content: small indent from label, wraps naturally */}
+      <Box paddingLeft={2}>
         <Text color={color} wrap="wrap">{content}</Text>
       </Box>
     </Box>

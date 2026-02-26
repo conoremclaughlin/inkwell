@@ -886,9 +886,9 @@ function buildContextStatusSummary(params: {
   const queue =
     params.pendingTurns > 0 ? `queue:${params.pendingTurns}` : 'queue:idle';
   const breakdown = bootstrapTokens > 0
-    ? `ctx:${transcriptTokens.toLocaleString()}+id:${bootstrapTokens.toLocaleString()}`
+    ? `${transcriptTokens.toLocaleString()} transcript + ${bootstrapTokens.toLocaleString()} identity`
     : `${total.toLocaleString()}`;
-  return `${breakdown}/${params.maxContextTokens.toLocaleString()} (${pct.toFixed(
+  return `${breakdown} / ${params.maxContextTokens.toLocaleString()} (${pct.toFixed(
     1
   )}%) ${queue} backend:${params.backend}`;
 }

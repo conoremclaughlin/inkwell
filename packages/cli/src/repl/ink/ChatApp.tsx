@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { Box, Static, Text, useApp } from 'ink';
 import { StatusBar } from './StatusBar.js';
 import { InfoBar } from './InfoBar.js';
@@ -6,6 +6,23 @@ import { PromptInput } from './PromptInput.js';
 import { Separator } from './Separator.js';
 import { MessageLine, type MessageLineProps } from './MessageLine.js';
 import { formatNow } from '../tui-components.js';
+
+const WAITING_VERBS = [
+  'Thinking',
+  'Pondering',
+  'Reasoning',
+  'Considering',
+  'Composing',
+  'Reflecting',
+  'Contemplating',
+  'Synthesizing',
+  'Connecting dots',
+  'Neurons firing',
+  'Weaving thoughts',
+  'Mulling it over',
+];
+
+const SPINNER_FRAMES = ['✦', '✧', '✦', '✧'];
 
 export interface ChatMessage extends MessageLineProps {
   id: string;
@@ -54,6 +71,35 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(
     const [infoItems, setInfoItems] = useState(initialInfoItems);
     const [ctrlCCount, setCtrlCCount] = useState(0);
     const [ctrlCTimer, setCtrlCTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
+
+    // Animated waiting indicator state
+    const [spinnerFrame, setSpinnerFrame] = useState(0);
+    const [waitingVerb, setWaitingVerb] = useState('');
+    const verbIndexRef = useRef(Math.floor(Math.random() * WAITING_VERBS.length));
+
+    useEffect(() => {
+      if (!waiting) return;
+      // Pick a random starting verb
+      verbIndexRef.current = Math.floor(Math.random() * WAITING_VERBS.length);
+      setWaitingVerb(WAITING_VERBS[verbIndexRef.current]!);
+      setSpinnerFrame(0);
+
+      // Spinner animation: fast (150ms)
+      const spinnerTimer = setInterval(() => {
+        setSpinnerFrame((f) => (f + 1) % SPINNER_FRAMES.length);
+      }, 150);
+
+      // Verb rotation: every 3 seconds
+      const verbTimer = setInterval(() => {
+        verbIndexRef.current = (verbIndexRef.current + 1) % WAITING_VERBS.length;
+        setWaitingVerb(WAITING_VERBS[verbIndexRef.current]!);
+      }, 3000);
+
+      return () => {
+        clearInterval(spinnerTimer);
+        clearInterval(verbTimer);
+      };
+    }, [waiting]);
 
     // Expose handle for external state pushing
     React.useImperativeHandle(ref, () => ({
@@ -118,12 +164,12 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(
           )}
         </Static>
 
-        {/* Waiting indicator */}
+        {/* Animated waiting indicator */}
         {waiting && (
           <Box paddingX={1}>
-            <Text color="cyan">{'✦ '}</Text>
+            <Text color="cyan">{SPINNER_FRAMES[spinnerFrame] + ' '}</Text>
             <Text dimColor>
-              Waiting for {waitingBackend || 'backend'}...
+              {waitingVerb}...
             </Text>
           </Box>
         )}
