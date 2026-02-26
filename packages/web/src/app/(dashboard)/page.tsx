@@ -263,11 +263,6 @@ export default function DashboardPage() {
                               <span className="text-sm font-medium text-gray-700">
                                 {slug || studio.branch}
                               </span>
-                              {slug && slug !== studio.branch && (
-                                <span className="text-xs text-gray-400">
-                                  {studio.branch}
-                                </span>
-                              )}
                             </div>
                             {studio.purpose && (
                               <span className="text-xs text-gray-400 truncate">
