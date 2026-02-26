@@ -987,20 +987,18 @@ function sessionStudioLabel(
   session: Pick<SessionSummary, 'studioId' | 'studioName' | 'workspaceId' | 'workspaceName'>,
   mode: 'short' | 'full' = 'short'
 ): string {
-  const id = session.studioId || session.workspaceId;
   const name = session.studioName || session.workspaceName;
-  if (name && id) {
-    return `${name} (${formatStudioForDisplay(id, mode)})`;
-  }
+  // Prefer name over UUID — UUIDs are noise for humans
   if (name) return name;
+  const id = session.studioId || session.workspaceId;
   return formatStudioForDisplay(id, mode);
 }
 
 function sessionBackendLabel(session: SessionSummary): string {
   const declared = [session.backend, session.model ? `(${session.model})` : ''].filter(Boolean).join(' ');
   if (declared) return declared;
-  if (session.backendSessionId) return session.backendSessionId;
-  if (session.claudeSessionId) return session.claudeSessionId;
+  // Don't show raw session UUIDs — they're not useful to the user
+  if (session.backendSessionId || session.claudeSessionId) return 'claude-code';
   return '-';
 }
 
@@ -1241,15 +1239,21 @@ async function pickSessionToAttach(
     const phase = session.currentPhase || session.status || '-';
     const transcriptMeta = getSessionTranscriptMetadata(session.id);
     const historyMeta = sessionHistoryLabel(transcriptMeta);
-    const lastMeta = `last ${formatTimestampForSessionList(transcriptMeta?.lastMessageAt, options?.timezone)}`;
-    const studio = sessionStudioLabel(session, 'full');
-    const backend = sessionBackendLabel(session);
+    const lastMsg = formatTimestampForSessionList(transcriptMeta?.lastMessageAt, options?.timezone);
+    const studioName = session.studioName || session.workspaceName;
+    const thread = session.threadKey || '';
+
+    // Compact two-line format: number + id + phase on line 1, details on line 2
+    const num = String(i + 1).padStart(2, ' ');
+    const parts = [
+      phase,
+      historyMeta,
+      lastMsg !== '-' ? `last ${lastMsg}` : null,
+      thread ? `thread:${thread}` : null,
+      studioName || null,
+    ].filter(Boolean);
     console.log(
-      chalk.dim(
-        `  ${String(i + 1).padStart(2, ' ')}. ${session.id.slice(0, 8)}  ${
-          session.agentId || '-'
-        }  ${phase}  studio:${studio}  ${session.threadKey || '-'}  ${backend}  ${historyMeta}  ${lastMeta}`
-      )
+      `  ${chalk.white(`${num}.`)} ${chalk.cyan(session.id.slice(0, 8))}  ${chalk.dim(parts.join('  ·  '))}`
     );
   }
   console.log('');

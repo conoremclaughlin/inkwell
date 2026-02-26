@@ -118,36 +118,23 @@ export function isOlderThan24Hours(createdAt?: string): boolean {
 }
 
 /**
- * Format a timestamp for Ink display — human-readable relative for recent,
- * date+time for older.
+ * Format a timestamp for display — clock time for today, date+time for older.
+ * Always uses absolute time (not relative) so it stays meaningful in scrollback.
  *
  * Examples:
- *   "just now", "2m ago", "45m ago", "3h ago", "1:29 AM", "Feb 25, 8:30 PM"
+ *   "1:29 AM", "11:45 PM", "Feb 25, 8:30 PM"
  */
 export function formatHumanTime(value?: string, timezone?: string): string {
   if (!value) return formatNow(timezone);
   const ms = Date.parse(value);
   if (Number.isNaN(ms)) return formatNow(timezone);
 
-  const now = Date.now();
-  const diffMs = now - ms;
-  const diffSec = Math.floor(diffMs / 1000);
-  const diffMin = Math.floor(diffSec / 60);
-  const diffHr = Math.floor(diffMin / 60);
-
-  // Future timestamps or just now
-  if (diffSec < 30) return 'just now';
-  if (diffMin < 1) return `${diffSec}s ago`;
-  if (diffMin < 60) return `${diffMin}m ago`;
-  if (diffHr < 6) return `${diffHr}h ago`;
-
-  // Same day — show time only
   const date = new Date(ms);
-  const today = new Date(now);
+  const now = new Date();
   const sameDay =
-    date.getFullYear() === today.getFullYear() &&
-    date.getMonth() === today.getMonth() &&
-    date.getDate() === today.getDate();
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
 
   try {
     if (sameDay) {
