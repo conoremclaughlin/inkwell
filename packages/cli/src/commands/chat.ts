@@ -90,7 +90,9 @@ interface SessionSummary {
   id: string;
   agentId?: string;
   workspaceId?: string;
+  workspaceName?: string;
   studioId?: string;
+  studioName?: string;
   status?: string;
   currentPhase?: string;
   threadKey?: string;
@@ -674,11 +676,23 @@ function extractSessionSummaries(result: Record<string, unknown> | null | undefi
             : typeof row.workspace_id === 'string'
               ? row.workspace_id
               : undefined,
+        workspaceName:
+          typeof row.workspaceName === 'string'
+            ? row.workspaceName
+            : typeof row.workspace_name === 'string'
+              ? row.workspace_name
+              : undefined,
         studioId:
           typeof row.studioId === 'string'
             ? row.studioId
             : typeof row.studio_id === 'string'
               ? row.studio_id
+              : undefined,
+        studioName:
+          typeof row.studioName === 'string'
+            ? row.studioName
+            : typeof row.studio_name === 'string'
+              ? row.studio_name
               : undefined,
         status: typeof row.status === 'string' ? row.status : undefined,
         currentPhase: typeof row.currentPhase === 'string' ? row.currentPhase : undefined,
@@ -905,9 +919,22 @@ function formatNow(timezone?: string): string {
   }
 }
 
-function formatStudioForDisplay(studioId?: string): string {
+function formatStudioForDisplay(studioId?: string, mode: 'short' | 'full' = 'short'): string {
   if (!studioId) return '-';
-  return studioId.slice(0, 8);
+  return mode === 'short' ? studioId.slice(0, 8) : studioId;
+}
+
+function sessionStudioLabel(
+  session: Pick<SessionSummary, 'studioId' | 'studioName' | 'workspaceId' | 'workspaceName'>,
+  mode: 'short' | 'full' = 'short'
+): string {
+  const id = session.studioId || session.workspaceId;
+  const name = session.studioName || session.workspaceName;
+  if (name && id) {
+    return `${name} (${formatStudioForDisplay(id, mode)})`;
+  }
+  if (name) return name;
+  return formatStudioForDisplay(id, mode);
 }
 
 function sessionBackendLabel(session: SessionSummary): string {
@@ -938,14 +965,16 @@ function printSessionsSnapshot(
 
   console.log(chalk.bold('\nActive sessions'));
   console.log(
-    chalk.dim('id       agent   status/phase            studio    thread        started   backend            history    last-msg')
+    chalk.dim(
+      'id       agent   status/phase            studio            thread        started   backend            history    last-msg'
+    )
   );
   for (const session of sessions) {
     const transcriptMeta = getSessionTranscriptMetadata(session.id);
     const id = session.id.slice(0, 7).padEnd(7);
     const agent = (session.agentId || '-').slice(0, 6).padEnd(6);
     const status = (session.currentPhase || session.status || '-').slice(0, 22).padEnd(22);
-    const studio = formatStudioForDisplay(session.studioId).padEnd(8);
+    const studio = sessionStudioLabel(session, 'short').slice(0, 16).padEnd(16);
     const thread = (session.threadKey || '-').slice(0, 12).padEnd(12);
     const started = formatStartedAt(session.startedAt);
     const backend = sessionBackendLabel(session).slice(0, 18).padEnd(18);
@@ -1154,7 +1183,7 @@ async function pickSessionToAttach(
     const transcriptMeta = getSessionTranscriptMetadata(session.id);
     const historyMeta = sessionHistoryLabel(transcriptMeta);
     const lastMeta = `last ${formatTimestampForSessionList(transcriptMeta?.lastMessageAt, options?.timezone)}`;
-    const studio = formatStudioForDisplay(session.studioId);
+    const studio = sessionStudioLabel(session, 'full');
     const backend = sessionBackendLabel(session);
     console.log(
       chalk.dim(
@@ -1610,7 +1639,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   if (attachedSessionSummary) {
     console.log(
       chalk.dim(
-        `Attached session metadata: studio=${formatStudioForDisplay(attachedSessionSummary.studioId)} backend=${sessionBackendLabel(
+        `Attached session metadata: studio=${sessionStudioLabel(attachedSessionSummary, 'full')} backend=${sessionBackendLabel(
           attachedSessionSummary
         )}`
       )
@@ -2268,7 +2297,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
               `session=${runtime.sessionId || 'none'} backend=${runtime.backend} model=${
                 runtime.model || '(default)'
               } routing=${runtime.toolRouting} thread=${runtime.threadKey || '(none)'} studio=${formatStudioForDisplay(
-                runtime.studioId
+                runtime.studioId,
+                'full'
               )} events=${runtime.eventPolling ? 'on' : 'off'} autorun=${
                 runtime.autoRunInbox ? 'on' : 'off'
               } ui=${runtime.uiMode} budget=${formatTokenCount(

@@ -246,6 +246,8 @@ describe('runChat integration', () => {
                 status: 'active',
                 currentPhase: 'implementing',
                 threadKey: 'pr:61',
+                studioId: 'aaaaaaaa-bbbb-cccc-dddd-111111111111',
+                studioName: 'main',
                 backendSessionId: 'codex-backend-a',
               },
               {
@@ -254,6 +256,8 @@ describe('runChat integration', () => {
                 status: 'active',
                 currentPhase: 'reviewing',
                 threadKey: 'spec:cli-session-hooks',
+                studioId: 'bbbbbbbb-cccc-dddd-eeee-222222222222',
+                studioName: 'review',
                 backendSessionId: 'codex-backend-b',
               },
             ],
@@ -282,6 +286,8 @@ describe('runChat integration', () => {
     expect(sessionStatusLine).toContain('Thread: spec:cli-session-hooks');
     expect(sessionStatusLine).toContain('codex-backend-a');
     expect(sessionStatusLine).toContain('codex-backend-b');
+    expect(sessionStatusLine).toContain('studio:main (aaaaaaaa-bbbb-cccc-dddd-111111111111)');
+    expect(sessionStatusLine).toContain('studio=review (bbbbbbbb-cccc-dddd-eeee-222222222222)');
   });
 
   it('supports attach-latest without prompting', async () => {
