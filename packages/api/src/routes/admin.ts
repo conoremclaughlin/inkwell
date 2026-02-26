@@ -3734,7 +3734,7 @@ router.get('/studios', async (req: Request, res: Response) => {
     const { data: studios } = await supabase
       .from('studios')
       .select(
-        'id, agent_id, branch, base_branch, purpose, work_type, worktree_path, status, updated_at, created_at'
+        'id, agent_id, branch, base_branch, purpose, work_type, worktree_path, slug, status, updated_at, created_at'
       )
       .eq('user_id', authReq.pcpUserId)
       .neq('status', 'cleaned')
@@ -3795,6 +3795,7 @@ router.get('/studios', async (req: Request, res: Response) => {
           purpose: s.purpose,
           workType: s.work_type,
           worktreePath: s.worktree_path,
+          slug: s.slug,
           status: s.status,
           updatedAt: s.updated_at,
         })),

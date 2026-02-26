@@ -26,6 +26,7 @@ interface StudioInfo {
   purpose: string | null;
   workType: string | null;
   worktreePath: string | null;
+  slug: string | null;
   status: string;
   updatedAt: string;
 }
@@ -80,6 +81,17 @@ function getAgentStatusBadge(phase: string | null): {
     return { label: 'Generating', badgeClass: 'bg-blue-100 text-blue-700' };
   if (phase === 'runtime:idle') return { label: 'Idle', badgeClass: 'bg-green-100 text-green-700' };
   return { label: 'Active', badgeClass: 'bg-green-100 text-green-700' };
+}
+
+function getStudioSlug(worktreePath: string | null): string | null {
+  if (!worktreePath) return null;
+  // Worktree folder names follow the pattern: <repo>--<slug>
+  // e.g. /path/to/personal-context-protocol--wren → "wren"
+  // e.g. /path/to/personal-context-protocol--lumen--lumen-alpha → "lumen--lumen-alpha"
+  const folder = worktreePath.split('/').pop() || '';
+  const dashDashIdx = folder.indexOf('--');
+  if (dashDashIdx === -1) return null;
+  return folder.slice(dashDashIdx + 2);
 }
 
 function getStudioStatusColor(status: string): string {
@@ -239,7 +251,9 @@ export default function DashboardPage() {
                     <div className="px-5 py-4 text-sm text-gray-400">No studios</div>
                   ) : (
                     <div className="divide-y">
-                      {agent.studios.map((studio) => (
+                      {agent.studios.map((studio) => {
+                        const slug = studio.slug || getStudioSlug(studio.worktreePath);
+                        return (
                         <div key={studio.id} className="flex items-center gap-4 px-5 py-3">
                           <div className="flex items-center gap-3 flex-1 min-w-0">
                             <div className="flex items-center gap-2">
@@ -247,8 +261,13 @@ export default function DashboardPage() {
                                 className={clsx('h-4 w-4', getStudioStatusColor(studio.status))}
                               />
                               <span className="text-sm font-medium text-gray-700">
-                                {studio.branch}
+                                {slug || studio.branch}
                               </span>
+                              {slug && slug !== studio.branch && (
+                                <span className="text-xs text-gray-400">
+                                  {studio.branch}
+                                </span>
+                              )}
                             </div>
                             {studio.purpose && (
                               <span className="text-xs text-gray-400 truncate">
@@ -279,7 +298,8 @@ export default function DashboardPage() {
                             </span>
                           </div>
                         </div>
-                      ))}
+                      );
+                      })}
                     </div>
                   )}
                 </Card>

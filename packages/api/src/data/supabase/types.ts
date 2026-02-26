@@ -2836,6 +2836,7 @@ export type Database = {
           repo_root: string;
           role_template: string | null;
           session_id: string | null;
+          slug: string | null;
           status: string;
           updated_at: string | null;
           user_id: string;
@@ -2856,6 +2857,7 @@ export type Database = {
           repo_root: string;
           role_template?: string | null;
           session_id?: string | null;
+          slug?: string | null;
           status?: string;
           updated_at?: string | null;
           user_id: string;
@@ -2876,6 +2878,7 @@ export type Database = {
           repo_root?: string;
           role_template?: string | null;
           session_id?: string | null;
+          slug?: string | null;
           status?: string;
           updated_at?: string | null;
           user_id?: string;
