@@ -9,6 +9,8 @@ interface MissionOptions {
   watch?: boolean;
   interval?: string;
   attach?: string;
+  feed?: boolean;
+  feedLimit?: string;
   json?: boolean;
 }
 
@@ -25,7 +27,29 @@ interface MissionRow {
 interface MissionSnapshot {
   rows: MissionRow[];
   sessions: Session[];
+  feed: MissionFeedRow[];
   generatedAt: string;
+}
+
+interface MissionActivity {
+  id: string;
+  type?: string;
+  subtype?: string;
+  agentId?: string;
+  content?: string;
+  sessionId?: string;
+  platform?: string;
+  status?: string;
+  createdAt?: string;
+}
+
+interface MissionFeedRow {
+  id: string;
+  timestamp?: string;
+  type: string;
+  route: string;
+  studio: string;
+  preview: string;
 }
 
 export function resolveAttachCommand(
@@ -107,6 +131,136 @@ export function extractUnreadCount(result: Record<string, unknown>): number {
   return 0;
 }
 
+function extractActivities(result: Record<string, unknown> | null | undefined): MissionActivity[] {
+  if (!result) return [];
+  const candidate =
+    (Array.isArray(result.activities) ? result.activities : undefined) ||
+    (Array.isArray(result.data) ? result.data : undefined) ||
+    [];
+
+  return candidate
+    .map((entry): MissionActivity | undefined => {
+      const row = entry as Record<string, unknown>;
+      const id = row.id;
+      if (typeof id !== 'string') return undefined;
+      return {
+        id,
+        type: typeof row.type === 'string' ? row.type : undefined,
+        subtype: typeof row.subtype === 'string' ? row.subtype : undefined,
+        agentId:
+          typeof row.agentId === 'string'
+            ? row.agentId
+            : typeof row.agent_id === 'string'
+              ? row.agent_id
+              : undefined,
+        content: typeof row.content === 'string' ? row.content : undefined,
+        sessionId:
+          typeof row.sessionId === 'string'
+            ? row.sessionId
+            : typeof row.session_id === 'string'
+              ? row.session_id
+              : undefined,
+        platform: typeof row.platform === 'string' ? row.platform : undefined,
+        status: typeof row.status === 'string' ? row.status : undefined,
+        createdAt:
+          typeof row.createdAt === 'string'
+            ? row.createdAt
+            : typeof row.created_at === 'string'
+              ? row.created_at
+              : undefined,
+      };
+    })
+    .filter((activity): activity is MissionActivity => Boolean(activity));
+}
+
+function compactPreview(value?: string, max = 110): string {
+  const normalized = (value || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return '-';
+  if (normalized.length <= max) return normalized;
+  return `${normalized.slice(0, Math.max(1, max - 1))}…`;
+}
+
+function studioLabelForSession(session?: Session): string {
+  if (!session) return '-';
+  const studioId = session.studioId || session.studio?.id;
+  const worktree = session.studio?.worktreeFolder;
+  if (worktree && studioId) return `${worktree} (${studioId.slice(0, 8)})`;
+  if (worktree) return worktree;
+  if (studioId) return studioId.slice(0, 8);
+  return '-';
+}
+
+function parseTriggerEnvelope(
+  content?: string
+): { from?: string; messageType?: string; summary?: string } | undefined {
+  if (!content) return undefined;
+  const fromMatch = content.match(/^\[TRIGGER from ([^\]]+)\]/im);
+  const typeMatch = content.match(/^Type:\s*(.+)$/im);
+  const summaryMatch = content.match(/^Summary:\s*(.+)$/im);
+  if (!fromMatch && !typeMatch && !summaryMatch) return undefined;
+  return {
+    from: fromMatch?.[1]?.trim(),
+    messageType: typeMatch?.[1]?.trim(),
+    summary: summaryMatch?.[1]?.trim(),
+  };
+}
+
+export function summarizeMissionFeedRows(
+  activities: MissionActivity[],
+  sessions: Session[]
+): MissionFeedRow[] {
+  const sessionsById = new Map(sessions.map((session) => [session.id, session]));
+  return activities
+    .slice()
+    .sort((a, b) => {
+      const ams = a.createdAt ? Date.parse(a.createdAt) : 0;
+      const bms = b.createdAt ? Date.parse(b.createdAt) : 0;
+      return (Number.isNaN(ams) ? 0 : ams) - (Number.isNaN(bms) ? 0 : bms);
+    })
+    .map((activity) => {
+      const trigger = parseTriggerEnvelope(activity.content);
+      const actor = activity.agentId || 'system';
+      const platform = activity.platform || '-';
+      const sessionStudio = studioLabelForSession(
+        activity.sessionId ? sessionsById.get(activity.sessionId) : undefined
+      );
+      const type = activity.subtype ? `${activity.type}:${activity.subtype}` : activity.type || 'activity';
+
+      if (activity.type === 'message_in') {
+        const from = trigger?.from || (platform === 'agent' ? 'agent' : platform);
+        const kind = trigger?.messageType ? `inbox:${trigger.messageType}` : 'inbox';
+        return {
+          id: activity.id,
+          timestamp: activity.createdAt,
+          type: kind,
+          route: `${from} → ${actor}`,
+          studio: sessionStudio,
+          preview: compactPreview(trigger?.summary || activity.content),
+        };
+      }
+
+      if (activity.type === 'message_out') {
+        return {
+          id: activity.id,
+          timestamp: activity.createdAt,
+          type: 'outbound',
+          route: `${actor} → ${platform}`,
+          studio: sessionStudio,
+          preview: compactPreview(activity.content),
+        };
+      }
+
+      return {
+        id: activity.id,
+        timestamp: activity.createdAt,
+        type,
+        route: actor,
+        studio: sessionStudio,
+        preview: compactPreview(activity.content),
+      };
+    });
+}
+
 function newestSession(sessions: Session[]): Session | undefined {
   return sessions
     .slice()
@@ -184,6 +338,28 @@ function renderMissionTable(rows: MissionRow[]): string[] {
   return lines;
 }
 
+function renderMissionFeed(rows: MissionFeedRow[]): string[] {
+  const lines: string[] = [];
+  lines.push(chalk.bold('\nOverview feed\n'));
+  if (rows.length === 0) {
+    lines.push(chalk.dim('  No recent activity.'));
+    return lines;
+  }
+
+  lines.push(chalk.dim('time      type            route                     studio             preview'));
+  for (const row of rows.slice(-20)) {
+    lines.push(
+      chalk.dim(
+        `${pad(formatTime(row.timestamp), 8)}  ${pad(row.type, 14)}  ${pad(row.route, 24)}  ${pad(
+          row.studio,
+          16
+        )}  ${row.preview}`
+      )
+    );
+  }
+  return lines;
+}
+
 async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSnapshot> {
   const pcp = new PcpClient();
   const config = pcp.getConfig();
@@ -223,23 +399,39 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
     }
   }
 
+  let feed: MissionFeedRow[] = [];
+  if (options.feed || options.watch) {
+    const activityResult = (await pcp
+      .callTool('get_activity', {
+        email: config.email,
+        limit: Number.parseInt(options.feedLimit || '40', 10),
+        types: ['message_in', 'message_out', 'state_change', 'tool_call', 'tool_result', 'agent_spawn', 'agent_complete', 'error'],
+      })
+      .catch(() => null)) as Record<string, unknown> | null;
+    feed = summarizeMissionFeedRows(extractActivities(activityResult), sessions);
+  }
+
   return {
     rows: summarizeMissionRows(sessions, unreadByAgent),
     sessions,
+    feed,
     generatedAt: new Date().toISOString(),
   };
 }
 
 function printSnapshot(snapshot: MissionSnapshot): void {
-  console.log(chalk.bold('\nSB Mission Control\n'));
+  console.log(chalk.bold('\nSB Overview\n'));
   console.log(chalk.dim(`Generated: ${formatTime(snapshot.generatedAt)}\n`));
 
   if (snapshot.rows.length === 0) {
     console.log(chalk.dim('No active sessions or unread inbox activity.'));
-    return;
+  } else {
+    for (const line of renderMissionTable(snapshot.rows)) {
+      console.log(line);
+    }
   }
 
-  for (const line of renderMissionTable(snapshot.rows)) {
+  for (const line of renderMissionFeed(snapshot.feed)) {
     console.log(line);
   }
 
@@ -321,14 +513,16 @@ async function runMission(options: MissionOptions): Promise<void> {
   }
 }
 
-export function registerMissionCommand(program: Command): void {
+function registerOverviewLikeCommand(program: Command, name: string, description: string): void {
   program
-    .command('mission')
-    .description('Mission control for multi-SB sessions + unread inbox')
+    .command(name)
+    .description(description)
     .option('-a, --agent <id>', 'Filter to a specific SB/agent')
     .option('-l, --limit <n>', 'Session query limit', '40')
-    .option('-w, --watch', 'Continuously refresh mission control')
+    .option('-w, --watch', 'Continuously refresh overview')
     .option('-i, --interval <seconds>', 'Refresh interval when --watch is enabled', '6')
+    .option('--feed', 'Include recent cross-agent activity feed')
+    .option('--feed-limit <n>', 'Activity rows to fetch for feed rendering', '40')
     .option('--attach <target>', 'Resolve quick attach command for agent or session-id prefix')
     .option('--json', 'Output JSON')
     .action(async (options: MissionOptions) => {
@@ -339,4 +533,9 @@ export function registerMissionCommand(program: Command): void {
         process.exit(1);
       }
     });
+}
+
+export function registerMissionCommand(program: Command): void {
+  registerOverviewLikeCommand(program, 'mission', 'Mission control for multi-SB sessions + unread inbox');
+  registerOverviewLikeCommand(program, 'overview', 'Cross-SB overview with session matrix + activity feed');
 }

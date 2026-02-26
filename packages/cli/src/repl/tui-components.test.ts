@@ -32,4 +32,16 @@ describe('tui-components', () => {
     lane.markPromptRefreshed();
     expect(lane.shouldRefreshAfterPrompt()).toBe(false);
   });
+
+  it('builds a three-line prompt label with status and hint lanes', () => {
+    const lane = new LiveStatusLane(true, 'America/Los_Angeles');
+    lane.setPromptActive(true);
+    lane.renderSummary('context:99/100 queue:idle');
+    lane.setHint('Press Ctrl+C again to quit');
+
+    const prompt = stripAnsi(lane.buildPromptLabel('wren> '));
+    expect(prompt).toContain('status> context:99/100 queue:idle');
+    expect(prompt).toContain('hint> Press Ctrl+C again to quit');
+    expect(prompt).toContain('wren> ');
+  });
 });

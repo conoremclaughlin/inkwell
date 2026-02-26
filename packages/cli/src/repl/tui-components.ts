@@ -37,10 +37,11 @@ function pickWaitingVerb(tick: number): string {
 }
 
 export class LiveStatusLane {
-  private line = '';
   private promptActive = false;
   private dirtyWhilePrompt = false;
   private timezone?: string;
+  private statusLine = 'status> waiting for input';
+  private hintLine = 'hint> ready';
 
   public constructor(
     private live: boolean,
@@ -83,9 +84,7 @@ export class LiveStatusLane {
 
   public clear(): void {
     if (!this.live) return;
-    if (!this.line) return;
     output.write('\r\x1b[2K');
-    this.line = '';
   }
 
   public printLine(line = ''): void {
@@ -97,6 +96,7 @@ export class LiveStatusLane {
 
   public renderSummary(summary: string, force = false): void {
     const rendered = `status> ${summary} • ${formatNow(this.timezone)}`;
+    this.statusLine = rendered;
     if (!this.live) {
       console.log(chalk.dim(rendered));
       return;
@@ -105,13 +105,13 @@ export class LiveStatusLane {
       this.dirtyWhilePrompt = true;
       return;
     }
-    this.line = rendered;
     output.write(`\r\x1b[2K${chalk.dim(rendered)}`);
     this.dirtyWhilePrompt = false;
   }
 
   public renderHint(message: string): void {
     const rendered = `hint> ${message}`;
+    this.hintLine = rendered;
     if (!this.live) {
       console.log(chalk.dim(rendered));
       return;
@@ -120,8 +120,16 @@ export class LiveStatusLane {
       this.dirtyWhilePrompt = true;
       return;
     }
-    this.line = rendered;
     output.write(`\r\x1b[2K${chalk.dim(rendered)}`);
+  }
+
+  public setHint(message: string): void {
+    this.hintLine = `hint> ${message}`;
+  }
+
+  public buildPromptLabel(promptLabel: string): string {
+    if (!this.live) return promptLabel;
+    return `\n${chalk.dim(this.statusLine)}\n${chalk.dim(this.hintLine)}\n${promptLabel}`;
   }
 }
 
@@ -148,17 +156,21 @@ function formatClockTime(value: string, timezone?: string): string {
 
 export function renderResumeHistoryLines(
   entries: Array<{ role: 'user' | 'assistant' | 'inbox'; content: string; ts?: string }>,
-  timezone?: string
+  timezone?: string,
+  labels?: { user?: string; assistant?: string; inbox?: string }
 ): string[] {
+  const userLabel = labels?.user || 'user';
+  const assistantLabel = labels?.assistant || 'assistant';
+  const inboxLabel = labels?.inbox || 'inbox';
   return entries.map((entry) => {
     const ts = entry.ts ? `${formatClockTime(entry.ts, timezone)} ` : '';
     if (entry.role === 'assistant') {
-      return `${chalk.dim('  ⤷')} ${chalk.yellow(`${ts}assistant:`)} ${entry.content}`;
+      return `${chalk.dim('  ⤷')} ${chalk.yellow(`${ts}${assistantLabel}:`)} ${entry.content}`;
     }
     if (entry.role === 'inbox') {
-      return `${chalk.dim('  ⤷')} ${chalk.cyan(`${ts}inbox:`)} ${entry.content}`;
+      return `${chalk.dim('  ⤷')} ${chalk.cyan(`${ts}${inboxLabel}:`)} ${entry.content}`;
     }
-    return `${chalk.dim('  ⤷')} ${chalk.green(`${ts}user:`)} ${entry.content}`;
+    return `${chalk.dim('  ⤷')} ${chalk.green(`${ts}${userLabel}:`)} ${entry.content}`;
   });
 }
 

@@ -231,7 +231,7 @@ describe('runChat integration', () => {
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('History loaded: 2 prior message(s)');
     expect(logText).toContain('Recent history preview:');
-    expect(logText).toContain('assistant: old assistant reply');
+    expect(logText).toContain('lumen: old assistant reply');
   });
 
   it('hydrates ledger context from PCP session context when no local transcript exists', async () => {
@@ -274,8 +274,8 @@ describe('runChat integration', () => {
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('History loaded: 2 prior message(s) (2 ledger entries, source=pcp-session-context)');
-    expect(logText).toContain('user: previous user request');
-    expect(logText).toContain('assistant: previous assistant reply');
+    expect(logText).toContain('you: previous user request');
+    expect(logText).toContain('lumen: previous assistant reply');
   });
 
   it('supports interactive attach picker from active sessions', async () => {

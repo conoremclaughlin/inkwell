@@ -165,7 +165,7 @@ interface SessionContextMessage {
 const LEDGER_COMPACT_CHARS = 420;
 const AUTO_TRIM_KEEP_RECENT_ENTRIES = 6;
 const DEFAULT_TRIM_TARGET_PCT = 70;
-const CTRL_C_EXIT_WINDOW_MS = 1500;
+const CTRL_C_EXIT_WINDOW_MS = 3000;
 const DEFAULT_BACKEND_TOKEN_WINDOW = 1_000_000;
 function resolveBackendTokenWindow(_backend: string, _model?: string): number {
   // Current policy: claude/codex/gemini all default to 1M effective context window.
@@ -1674,7 +1674,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     );
     if (historyHydration.tailPreview.length > 0) {
       console.log(chalk.bold('Recent history preview:'));
-      for (const line of renderResumeHistoryLines(historyHydration.tailPreview, runtime.userTimezone)) {
+      for (const line of renderResumeHistoryLines(historyHydration.tailPreview, runtime.userTimezone, {
+        user: 'you',
+        assistant: agentId,
+        inbox: 'inbox',
+      })) {
         console.log(line);
       }
     }
@@ -2168,7 +2172,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     statusLane.setPromptActive(true);
     try {
       const promptLabel = pendingTurns > 0 ? `${agentId}+${pendingTurns}> ` : `${agentId}> `;
-      const renderedPrompt = statusLane.isLive() ? `\n${promptLabel}` : promptLabel;
+      const renderedPrompt = statusLane.buildPromptLabel(promptLabel);
       raw = (await rl.question(chalk.green(renderedPrompt))).trim();
       lastCtrlCAt = 0;
     } catch (error) {
@@ -2213,6 +2217,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       throw error;
     }
     statusLane.setPromptActive(false);
+    statusLane.setHint('ready');
     if (statusLane.shouldRefreshAfterPrompt()) {
       emitStatusLaneIfChanged(true);
     }

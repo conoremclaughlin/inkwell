@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { extractUnreadCount, resolveAttachCommand, summarizeMissionRows } from './mission.js';
+import {
+  extractUnreadCount,
+  resolveAttachCommand,
+  summarizeMissionFeedRows,
+  summarizeMissionRows,
+} from './mission.js';
 import type { Session } from './session.js';
 
 describe('summarizeMissionRows', () => {
@@ -116,5 +121,47 @@ describe('resolveAttachCommand', () => {
 
   it('returns null when no target matches', () => {
     expect(resolveAttachCommand(sessions, 'missing')).toBeNull();
+  });
+});
+
+describe('summarizeMissionFeedRows', () => {
+  it('derives from/to routing for inbox triggers and attaches studio metadata', () => {
+    const sessions: Session[] = [
+      {
+        id: 'session-1',
+        agentId: 'wren',
+        status: 'active',
+        startedAt: '2026-02-20T10:00:00.000Z',
+        studioId: 'studio-abc12345',
+        studio: { worktreeFolder: 'workspace-wren' },
+      },
+    ];
+
+    const rows = summarizeMissionFeedRows(
+      [
+        {
+          id: 'evt-1',
+          type: 'message_in',
+          agentId: 'wren',
+          sessionId: 'session-1',
+          createdAt: '2026-02-20T10:01:00.000Z',
+          platform: 'agent',
+          content:
+            '[TRIGGER from lumen]\nType: task_request\nSummary: Please review PR #110 DB-backed conversation routing fallback.',
+        },
+      ],
+      sessions
+    );
+
+    expect(rows).toEqual([
+      {
+        id: 'evt-1',
+        timestamp: '2026-02-20T10:01:00.000Z',
+        type: 'inbox:task_request',
+        route: 'lumen → wren',
+        studio: 'workspace-wren (studio-a)',
+        preview: 'Please review PR #110 DB-backed conversation routing fallback.',
+      },
+    ]);
   });
 });
