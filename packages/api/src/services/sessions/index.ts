@@ -18,9 +18,10 @@ export { SessionRepository } from './session-repository.js';
 // Context builder
 export { ContextBuilder, formatInjectedContext } from './context-builder.js';
 
-// Claude runner
+// Backend runners
 export { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 export { CodexRunner } from './codex-runner.js';
+export { GeminiRunner } from './gemini-runner.js';
 
 // Types
 export type {

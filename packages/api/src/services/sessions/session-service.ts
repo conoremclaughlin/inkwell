@@ -31,6 +31,7 @@ import { SessionRepository } from './session-repository.js';
 import { ContextBuilder } from './context-builder.js';
 import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 import { CodexRunner } from './codex-runner.js';
+import { GeminiRunner } from './gemini-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import { resolveIdentityId } from '../../auth/resolve-identity.js';
 import { logger } from '../../utils/logger.js';
@@ -47,6 +48,8 @@ export interface SessionServiceConfig {
   defaultModel?: string;
   /** Optional explicit model override for Codex backend */
   defaultCodexModel?: string;
+  /** Optional explicit model override for Gemini backend */
+  defaultGeminiModel?: string;
   /** Token threshold for triggering compaction */
   compactionThreshold: number;
   /** Callback to route responses from async operations (compaction, etc.) */
@@ -102,6 +105,7 @@ export class SessionService implements ISessionService {
   private contextBuilder: IContextBuilder;
   private claudeRunner: IClaudeRunner;
   private codexRunner: IClaudeRunner;
+  private geminiRunner: IClaudeRunner;
   private activityStream: IActivityStream;
   private config: SessionServiceConfig;
   private supabase: SupabaseClient<Database> | null;
@@ -133,12 +137,14 @@ export class SessionService implements ISessionService {
     activityStream: IActivityStream,
     config: Partial<SessionServiceConfig> = {},
     codexRunner?: IClaudeRunner,
-    supabase?: SupabaseClient<Database>
+    supabase?: SupabaseClient<Database>,
+    geminiRunner?: IClaudeRunner
   ) {
     this.repository = repository;
     this.contextBuilder = contextBuilder;
     this.claudeRunner = claudeRunner;
     this.codexRunner = codexRunner || claudeRunner;
+    this.geminiRunner = geminiRunner || claudeRunner;
     this.activityStream = activityStream;
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.supabase = supabase || null;
@@ -334,7 +340,11 @@ export class SessionService implements ISessionService {
       injectedContext.agent.backend
     );
     const runtimeModel =
-      resolvedBackend === 'codex-cli' ? this.config.defaultCodexModel : this.config.defaultModel;
+      resolvedBackend === 'codex-cli'
+        ? this.config.defaultCodexModel
+        : resolvedBackend === 'gemini'
+          ? this.config.defaultGeminiModel
+          : this.config.defaultModel;
 
     const runnerConfig: ClaudeRunnerConfig = {
       workingDirectory: resolvedWorkingDirectory,
@@ -351,7 +361,12 @@ export class SessionService implements ISessionService {
     };
 
     // 5. Run with selected backend
-    const runner = resolvedBackend === 'codex-cli' ? this.codexRunner : this.claudeRunner;
+    const runner =
+      resolvedBackend === 'codex-cli'
+        ? this.codexRunner
+        : resolvedBackend === 'gemini'
+          ? this.geminiRunner
+          : this.claudeRunner;
 
     const result = await runner.run(formattedMessage, {
       claudeSessionId: session.claudeSessionId || undefined,
@@ -867,7 +882,9 @@ This session will continue with a fresh context after compaction. Your identity,
       const runtimeModel =
         runtimeBackend === 'codex-cli'
           ? this.config.defaultCodexModel
-          : this.config.defaultModel;
+          : runtimeBackend === 'gemini'
+            ? this.config.defaultGeminiModel
+            : this.config.defaultModel;
 
       const runnerConfig: ClaudeRunnerConfig = {
         workingDirectory: compactionWorkingDirectory,
@@ -883,7 +900,12 @@ This session will continue with a fresh context after compaction. Your identity,
         ...(compactionToken ? { pcpAccessToken: compactionToken } : {}),
       };
 
-      const runner = runtimeBackend === 'codex-cli' ? this.codexRunner : this.claudeRunner;
+      const runner =
+        runtimeBackend === 'codex-cli'
+          ? this.codexRunner
+          : runtimeBackend === 'gemini'
+            ? this.geminiRunner
+            : this.claudeRunner;
 
       // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session
       const result = await runner.run(compactionPrompt, {
@@ -920,16 +942,11 @@ This session will continue with a fresh context after compaction. Your identity,
   /**
    * Normalize backend value to runtime backend IDs used by sessions.
    */
-  private normalizeBackend(raw: string | null | undefined): 'claude-code' | 'codex-cli' {
+  private normalizeBackend(raw: string | null | undefined): 'claude-code' | 'codex-cli' | 'gemini' {
     const value = (raw || '').toLowerCase().trim();
     if (value === 'codex' || value === 'codex-cli') return 'codex-cli';
+    if (value === 'gemini' || value === 'gemini-cli') return 'gemini';
     if (value === 'claude' || value === 'claude-code' || value === '') return 'claude-code';
-    if (value === 'gemini') {
-      logger.warn(
-        'Gemini backend configured but not yet supported in SessionService, falling back to claude-code'
-      );
-      return 'claude-code';
-    }
     logger.warn('Unknown backend configured, falling back to claude-code', { raw });
     return 'claude-code';
   }
@@ -940,7 +957,7 @@ This session will continue with a fresh context after compaction. Your identity,
   private async resolveAgentBackend(
     userId: string,
     agentId: string
-  ): Promise<'claude-code' | 'codex-cli'> {
+  ): Promise<'claude-code' | 'codex-cli' | 'gemini'> {
     try {
       const identityBackend = await this.contextBuilder.getAgentBackend(userId, agentId);
       return this.normalizeBackend(identityBackend);
@@ -960,7 +977,7 @@ This session will continue with a fresh context after compaction. Your identity,
   private resolveRuntimeBackend(
     sessionBackend: string | null | undefined,
     identityBackend: string | null | undefined
-  ): 'claude-code' | 'codex-cli' {
+  ): 'claude-code' | 'codex-cli' | 'gemini' {
     if (sessionBackend) return this.normalizeBackend(sessionBackend);
     return this.normalizeBackend(identityBackend);
   }
@@ -1161,6 +1178,7 @@ export function createSessionService(
     new ActivityStreamRepository(supabase),
     config,
     new CodexRunner(),
-    supabase
+    supabase,
+    new GeminiRunner()
   );
 }
