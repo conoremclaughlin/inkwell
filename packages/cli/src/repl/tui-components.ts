@@ -106,9 +106,24 @@ export class LiveStatusLane {
     output.write('\r\x1b[2K');
   }
 
+  public clearPromptDock(): void {
+    if (!this.live || !this.promptActive) return;
+    // Prompt line
+    output.write('\r\x1b[2K');
+    // Hint line
+    output.write('\x1b[1A\r\x1b[2K');
+    // Status line
+    output.write('\x1b[1A\r\x1b[2K');
+    output.write('\r');
+  }
+
   public printLine(line = ''): void {
     if (this.live) {
-      this.clear();
+      if (this.promptActive) {
+        this.clearPromptDock();
+      } else {
+        this.clear();
+      }
     }
     console.log(line);
   }
@@ -124,7 +139,6 @@ export class LiveStatusLane {
       this.dirtyWhilePrompt = true;
       return;
     }
-    output.write(`\r\x1b[2K${chalk.dim(rendered)}`);
     this.dirtyWhilePrompt = false;
   }
 
@@ -139,7 +153,6 @@ export class LiveStatusLane {
       this.dirtyWhilePrompt = true;
       return;
     }
-    output.write(`\r\x1b[2K${chalk.dim(rendered)}`);
   }
 
   public setHint(message: string): void {
@@ -148,7 +161,7 @@ export class LiveStatusLane {
 
   public buildPromptLabel(promptLabel: string): string {
     if (!this.live) return promptLabel;
-    return `\n${chalk.dim(this.hintLine)}\n${promptLabel}`;
+    return `\n${chalk.dim(this.statusLine)}\n${chalk.dim(this.hintLine)}\n${promptLabel}`;
   }
 }
 
