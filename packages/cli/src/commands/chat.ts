@@ -1994,13 +1994,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
         messageType: msg.messageType || null,
         relatedSessionId: msg.relatedSessionId || null,
       });
-      printLine('');
-      printLine(separator());
-      printLine(renderMessageLine('inbox', rendered, {
-        timezone: runtime.userTimezone,
-        ts: msg.createdAt,
-      }));
-      printLine(separator());
+      if (inkRepl) {
+        inkRepl.addMessage('inbox', rendered, { time: msg.createdAt ? formatNow(runtime.userTimezone) : undefined });
+      } else {
+        printLine('');
+        printLine(separator());
+        printLine(renderMessageLine('inbox', rendered, {
+          timezone: runtime.userTimezone,
+          ts: msg.createdAt,
+        }));
+        printLine(separator());
+      }
 
       const eligibleForAutoRun =
         runtime.autoRunInbox &&
@@ -2088,12 +2092,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
         createdAt: activity.createdAt || null,
         content: activity.content || null,
       });
-      printLine('');
-      printLine(renderMessageLine('activity', `${actor} ${type}${preview ? ` — ${preview}` : ''}`, {
-        label: '⚡',
-        timezone: runtime.userTimezone,
-        ts: activity.createdAt,
-      }));
+      if (inkRepl) {
+        inkRepl.addMessage('activity', `${actor} ${type}${preview ? ` — ${preview}` : ''}`, { label: '⚡' });
+      } else {
+        printLine('');
+        printLine(renderMessageLine('activity', `${actor} ${type}${preview ? ` — ${preview}` : ''}`, {
+          label: '⚡',
+          timezone: runtime.userTimezone,
+          ts: activity.createdAt,
+        }));
+      }
     }
 
     if (force && activities.length === 0) {
