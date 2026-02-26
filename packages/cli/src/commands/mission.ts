@@ -2,6 +2,9 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import { PcpClient } from '../lib/pcp-client.js';
 import { renderSessionsByAgent, type Session } from './session.js';
+import { renderInkMission, type InkMission } from '../repl/ink/index.js';
+import type { FeedEvent, FeedEventType, AgentSummary } from '../repl/ink/index.js';
+import { formatHumanTime } from '../repl/tui-components.js';
 
 interface MissionOptions {
   agent?: string;
@@ -447,6 +450,144 @@ function printSnapshot(snapshot: MissionSnapshot): void {
   }
 }
 
+function mapActivityToFeedType(activity: MissionActivity): FeedEventType {
+  switch (activity.type) {
+    case 'message_in': return 'inbox';
+    case 'message_out': return 'activity';
+    case 'state_change': return 'session';
+    case 'tool_call':
+    case 'tool_result': return 'activity';
+    case 'agent_spawn':
+    case 'agent_complete': return 'session';
+    default: return 'activity';
+  }
+}
+
+function activityToFeedEvent(activity: MissionActivity, timezone?: string): FeedEvent {
+  const trigger = parseTriggerEnvelope(activity.content);
+  const actor = activity.agentId || 'system';
+  const type = mapActivityToFeedType(activity);
+
+  let content: string;
+  if (activity.type === 'message_in') {
+    const from = trigger?.from || 'unknown';
+    const summary = trigger?.summary || compactPreview(activity.content, 200);
+    content = `${from}: ${summary}`;
+  } else if (activity.type === 'message_out') {
+    content = `sent → ${activity.platform || 'unknown'}: ${compactPreview(activity.content, 200)}`;
+  } else if (activity.type === 'state_change') {
+    content = compactPreview(activity.content, 200);
+  } else if (activity.type === 'agent_spawn') {
+    content = `spawned agent`;
+  } else if (activity.type === 'agent_complete') {
+    content = `agent completed`;
+  } else {
+    const subtype = activity.subtype ? `:${activity.subtype}` : '';
+    content = `${activity.type || 'activity'}${subtype}: ${compactPreview(activity.content, 200)}`;
+  }
+
+  return {
+    id: activity.id,
+    type,
+    agent: actor,
+    content,
+    time: formatHumanTime(activity.createdAt, timezone),
+    detail: activity.type === 'message_in' && trigger?.messageType
+      ? `type: ${trigger.messageType}`
+      : undefined,
+  };
+}
+
+async function runInkMission(options: MissionOptions): Promise<void> {
+  const pcp = new PcpClient();
+  const config = pcp.getConfig();
+  if (!config.email) {
+    throw new Error('PCP not configured. Run: sb init');
+  }
+
+  const intervalSeconds = Math.max(3, Number.parseInt(options.interval || '6', 10));
+  const seenActivityIds = new Set<string>();
+
+  const mission = renderInkMission({ timezone: undefined });
+
+  mission.addEvent({
+    id: 'init',
+    type: 'system',
+    content: `SB Mission Control — polling every ${intervalSeconds}s`,
+    time: formatHumanTime(undefined, undefined),
+  });
+
+  // Initial load
+  const loadSnapshot = async () => {
+    try {
+      const snapshot = await fetchMissionSnapshot({ ...options, feed: true, feedLimit: options.feedLimit || '40' });
+
+      // Update agent summaries
+      const agentSummaries: AgentSummary[] = snapshot.rows.map((row) => ({
+        agent: row.agent,
+        status: row.latestPhase || 'active',
+        unread: row.unreadInbox,
+        sessions: row.activeSessions,
+        latestThread: row.latestThreadKey,
+      }));
+      mission.setAgents(agentSummaries);
+
+      // Push new feed events
+      const activities = extractActivities(
+        (await pcp
+          .callTool('get_activity', {
+            email: config.email,
+            limit: Number.parseInt(options.feedLimit || '40', 10),
+            types: ['message_in', 'message_out', 'state_change', 'tool_call', 'tool_result', 'agent_spawn', 'agent_complete', 'error'],
+          })
+          .catch(() => null)) as Record<string, unknown> | null
+      ).sort((a, b) => {
+        const ams = a.createdAt ? Date.parse(a.createdAt) : 0;
+        const bms = b.createdAt ? Date.parse(b.createdAt) : 0;
+        return (Number.isNaN(ams) ? 0 : ams) - (Number.isNaN(bms) ? 0 : bms);
+      });
+
+      let newCount = 0;
+      for (const activity of activities) {
+        if (seenActivityIds.has(activity.id)) continue;
+        seenActivityIds.add(activity.id);
+        mission.addEvent(activityToFeedEvent(activity, undefined));
+        newCount++;
+      }
+
+      const totalAgents = agentSummaries.length;
+      const totalUnread = agentSummaries.reduce((sum, a) => sum + a.unread, 0);
+      mission.setStatus(
+        `${totalAgents} agent${totalAgents !== 1 ? 's' : ''} · ${totalUnread} unread · refreshing every ${intervalSeconds}s`
+      );
+
+      return newCount;
+    } catch (err) {
+      mission.addEvent({
+        id: `error-${Date.now()}`,
+        type: 'system',
+        content: `Poll error: ${String(err)}`,
+        time: formatHumanTime(undefined, undefined),
+      });
+      return 0;
+    }
+  };
+
+  // Initial load
+  await loadSnapshot();
+
+  // Poll loop
+  const pollTimer = setInterval(() => {
+    void loadSnapshot();
+  }, intervalSeconds * 1000);
+
+  // Wait for user to exit
+  await mission.waitForExit();
+
+  clearInterval(pollTimer);
+  mission.cleanup();
+}
+
 async function runMission(options: MissionOptions): Promise<void> {
   const intervalSeconds = Math.max(1, Number.parseInt(options.interval || '6', 10));
 
@@ -483,11 +624,18 @@ async function runMission(options: MissionOptions): Promise<void> {
     printSnapshot(snapshot);
   };
 
+  // Use Ink live feed for --watch on TTY
+  if (options.watch && process.stdout.isTTY && !options.json) {
+    await runInkMission(options);
+    return;
+  }
+
   if (!options.watch) {
     await renderOnce();
     return;
   }
 
+  // Legacy clear-screen loop for non-TTY or JSON watch
   const clearScreen = () => {
     process.stdout.write('\x1Bc');
   };
