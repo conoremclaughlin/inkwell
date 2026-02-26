@@ -3713,6 +3713,103 @@ router.get('/sessions', async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /api/admin/studios
+ * List studios grouped by agent, with latest session status per agent.
+ */
+router.get('/studios', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    // 1. Fetch all agent identities for this user
+    const { data: identities } = await supabase
+      .from('agent_identities')
+      .select('id, agent_id, name, role, backend')
+      .eq('user_id', authReq.pcpUserId)
+      .order('name', { ascending: true });
+
+    // 2. Fetch all non-cleaned studios for this user
+    const { data: studios } = await supabase
+      .from('studios')
+      .select(
+        'id, agent_id, name, branch, base_branch, purpose, work_type, worktree_path, status, updated_at, created_at'
+      )
+      .eq('user_id', authReq.pcpUserId)
+      .neq('status', 'cleaned')
+      .order('updated_at', { ascending: false });
+
+    // 3. Fetch latest active session per agent (for status/phase)
+    const agentIds = (identities || []).map((i) => i.agent_id).filter(Boolean);
+    const latestSessionByAgent = new Map<
+      string,
+      { currentPhase: string | null; updatedAt: string }
+    >();
+
+    if (agentIds.length > 0) {
+      const { data: sessions } = await supabase
+        .from('sessions')
+        .select('agent_id, current_phase, updated_at')
+        .eq('user_id', authReq.pcpUserId)
+        .in('agent_id', agentIds)
+        .is('ended_at', null)
+        .order('updated_at', { ascending: false });
+
+      for (const session of sessions || []) {
+        if (!latestSessionByAgent.has(session.agent_id)) {
+          latestSessionByAgent.set(session.agent_id, {
+            currentPhase: session.current_phase,
+            updatedAt: session.updated_at,
+          });
+        }
+      }
+    }
+
+    // 4. Group studios by agent
+    const studiosByAgent = new Map<string, typeof studios>();
+    for (const studio of studios || []) {
+      const key = studio.agent_id || '__unassigned__';
+      if (!studiosByAgent.has(key)) studiosByAgent.set(key, []);
+      studiosByAgent.get(key)!.push(studio);
+    }
+
+    // 5. Build response grouped by agent
+    const agents = (identities || []).map((identity) => {
+      const agentStudios = studiosByAgent.get(identity.agent_id) || [];
+      const latestSession = latestSessionByAgent.get(identity.agent_id);
+
+      return {
+        agentId: identity.agent_id,
+        agentName: identity.name,
+        agentRole: identity.role,
+        backend: identity.backend,
+        identityId: identity.id,
+        latestSession: latestSession
+          ? { currentPhase: latestSession.currentPhase, updatedAt: latestSession.updatedAt }
+          : null,
+        studios: agentStudios.map((s) => ({
+          id: s.id,
+          name: s.name,
+          branch: s.branch,
+          baseBranch: s.base_branch,
+          purpose: s.purpose,
+          workType: s.work_type,
+          worktreePath: s.worktree_path,
+          status: s.status,
+          updatedAt: s.updated_at,
+        })),
+      };
+    });
+
+    res.json({ agents });
+  } catch (error) {
+    logger.error('Failed to list studios:', error);
+    res.status(500).json(errorJson('Failed to list studios', error));
+  }
+});
+
+/**
  * GET /api/admin/sessions/:id/logs
  * Get merged session logs (activity stream + session_logs + optional local transcript fallback)
  */
