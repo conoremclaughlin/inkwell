@@ -139,6 +139,7 @@ export class GeminiRunner implements IClaudeRunner {
       });
 
       let stderr = '';
+      let stdoutRemainder = '';
       const responses: ChannelResponse[] = [];
       const toolCalls: ToolCall[] = [];
       let usage: GeminiUsageStats | undefined;
@@ -193,9 +194,14 @@ export class GeminiRunner implements IClaudeRunner {
         resetIdleTimer();
         const chunk = data.toString();
 
-        // Parse streaming JSON lines
-        const lines = chunk.split('\n').filter((line: string) => line.trim());
+        // Buffer-aware line splitting: a single chunk may contain a partial
+        // JSON line at the end. We carry the remainder over to the next chunk.
+        const combined = `${stdoutRemainder}${chunk}`;
+        const lines = combined.split('\n');
+        stdoutRemainder = lines.pop() ?? '';
+
         for (const line of lines) {
+          if (!line.trim()) continue;
           try {
             const parsed = JSON.parse(line);
             this.handleStreamEvent(parsed, responses);
@@ -277,6 +283,29 @@ export class GeminiRunner implements IClaudeRunner {
         clearTimeout(idleTimer);
         if (settled) return;
         settled = true;
+
+        // Flush any remaining buffered output
+        if (stdoutRemainder.trim()) {
+          try {
+            const parsed = JSON.parse(stdoutRemainder);
+            this.handleStreamEvent(parsed, responses);
+            this.captureToolCall(parsed, toolCalls);
+            if (parsed.usageMetadata || parsed.usage) {
+              const u = parsed.usageMetadata || parsed.usage;
+              usage = {
+                contextTokens: u.totalTokenCount || u.context_tokens || 0,
+                inputTokens: u.promptTokenCount || u.input_tokens || 0,
+                outputTokens: u.candidatesTokenCount || u.output_tokens || 0,
+              };
+            }
+            if (parsed.type === 'result' && parsed.result) {
+              finalTextResponse =
+                typeof parsed.result === 'string' ? parsed.result : JSON.stringify(parsed.result);
+            }
+          } catch {
+            // Non-JSON remainder — ignore
+          }
+        }
 
         if (code !== 0) {
           logger.warn('Gemini CLI exited with non-zero code', { code, stderr });

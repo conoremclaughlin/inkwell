@@ -368,9 +368,15 @@ export class SessionService implements ISessionService {
           ? this.geminiRunner
           : this.claudeRunner;
 
+    // Gemini is stateless: it cannot resume prior sessions, so we always inject
+    // full context on every turn. Claude/Codex only inject on the first turn
+    // (subsequent turns use --resume with the existing session ID).
+    const isStatelessBackend = resolvedBackend === 'gemini';
+    const shouldInjectContext = isStatelessBackend || !session.claudeSessionId;
+
     const result = await runner.run(formattedMessage, {
       claudeSessionId: session.claudeSessionId || undefined,
-      injectedContext: session.claudeSessionId ? undefined : injectedContext,
+      injectedContext: shouldInjectContext ? injectedContext : undefined,
       config: runnerConfig,
     });
 
@@ -402,8 +408,9 @@ export class SessionService implements ISessionService {
         outputTokens: result.usage.outputTokens,
       });
 
-      // 6. Check if compaction is needed
-      if (result.usage.contextTokens >= this.config.compactionThreshold) {
+      // 6. Check if compaction is needed (skip for stateless backends — they don't
+      // accumulate conversation context across turns, so there's nothing to compact)
+      if (!isStatelessBackend && result.usage.contextTokens >= this.config.compactionThreshold) {
         logger.info('Session approaching context limit, triggering compaction', {
           sessionId: session.id,
           contextTokens: result.usage.contextTokens,
