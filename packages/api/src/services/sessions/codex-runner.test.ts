@@ -81,6 +81,7 @@ describe('CodexRunner', () => {
         content: 'hi from codex',
         format: undefined,
         replyToMessageId: undefined,
+        metadata: undefined,
       },
     ]);
     expect(result.usage).toEqual({

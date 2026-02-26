@@ -131,6 +131,7 @@ export interface ChannelResponse {
   content: string;
   format?: 'text' | 'markdown' | 'code' | 'json';
   replyToMessageId?: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface SessionResult {
