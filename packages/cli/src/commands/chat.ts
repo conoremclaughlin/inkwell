@@ -95,6 +95,8 @@ interface SessionSummary {
   currentPhase?: string;
   threadKey?: string;
   startedAt?: string;
+  backend?: string;
+  model?: string;
   backendSessionId?: string;
   claudeSessionId?: string;
 }
@@ -128,11 +130,20 @@ interface LocalToolCall {
 }
 
 interface SessionTranscriptMetadata {
+  transcriptPath: string;
   messageCount: number;
   userCount: number;
   assistantCount: number;
   inboxCount: number;
   lastMessageAt?: string;
+}
+
+interface HistoryHydrationResult {
+  loaded: number;
+  messageCount: number;
+  source: 'repl-transcript' | 'none';
+  transcriptPath?: string;
+  tailPreview: Array<{ role: 'user' | 'assistant' | 'inbox'; content: string; ts?: string }>;
 }
 
 interface StatusLaneState {
@@ -285,16 +296,24 @@ function getSessionTranscriptMetadata(sessionId: string): SessionTranscriptMetad
   }
 
   const messageCount = userCount + assistantCount + inboxCount;
-  return { messageCount, userCount, assistantCount, inboxCount, lastMessageAt };
+  return { transcriptPath: path, messageCount, userCount, assistantCount, inboxCount, lastMessageAt };
 }
 
 function hydrateLedgerFromTranscript(
   ledger: ContextLedger,
   transcriptPath: string
-): { loaded: number; messageCount: number } {
+): { loaded: number; messageCount: number; tailPreview: HistoryHydrationResult['tailPreview'] } {
   const events = readTranscriptEvents(transcriptPath);
   let loaded = 0;
   let messageCount = 0;
+  const preview: HistoryHydrationResult['tailPreview'] = [];
+
+  const pushPreview = (role: 'user' | 'assistant' | 'inbox', content: string, ts?: string) => {
+    preview.push({ role, content: compactForLedger(content, 180), ts });
+    if (preview.length > 6) {
+      preview.shift();
+    }
+  };
 
   for (const event of events) {
     const type = typeof event.type === 'string' ? event.type : '';
@@ -302,6 +321,7 @@ function hydrateLedgerFromTranscript(
       ledger.addEntry('user', event.content, 'repl-history');
       loaded += 1;
       messageCount += 1;
+      pushPreview('user', event.content, typeof event.ts === 'string' ? event.ts : undefined);
       continue;
     }
     if (type === 'assistant' && typeof event.content === 'string') {
@@ -309,12 +329,14 @@ function hydrateLedgerFromTranscript(
       ledger.addEntry('assistant', event.content, source);
       loaded += 1;
       messageCount += 1;
+      pushPreview('assistant', event.content, typeof event.ts === 'string' ? event.ts : undefined);
       continue;
     }
     if (type === 'inbox' && typeof event.rendered === 'string') {
       ledger.addEntry('inbox', compactForLedger(event.rendered), 'pcp-inbox-history');
       loaded += 1;
       messageCount += 1;
+      pushPreview('inbox', event.rendered, typeof event.ts === 'string' ? event.ts : undefined);
       continue;
     }
     if (type === 'activity' && typeof event.content === 'string') {
@@ -329,7 +351,7 @@ function hydrateLedgerFromTranscript(
     }
   }
 
-  return { loaded, messageCount };
+  return { loaded, messageCount, tailPreview: preview };
 }
 
 function printTranscriptLine(rawLine: string): void {
@@ -463,11 +485,18 @@ function pickWaitingVerb(tick: number): string {
 
 function startWaitingIndicator(
   backend: string,
-  options?: { inline?: boolean; logger?: (line: string) => void }
+  options?: {
+    inline?: boolean;
+    logger?: (line: string) => void;
+    promptActive?: () => boolean;
+    renderAbovePrompt?: boolean;
+  }
 ): (doneMessage?: string) => void {
   const startedAt = Date.now();
   const useAnimatedLine = Boolean(options?.inline && process.stdout.isTTY);
   const logger = options?.logger || ((line: string) => console.log(line));
+  const isPromptActive = options?.promptActive || (() => false);
+  const renderAbovePrompt = Boolean(options?.renderAbovePrompt);
   let tick = 0;
   let previousWidth = 0;
 
@@ -483,7 +512,14 @@ function startWaitingIndicator(
       const palette = [chalk.cyan, chalk.magenta, chalk.yellow, chalk.green] as const;
       const tint = palette[tick % palette.length] || chalk.cyan;
       const pad = previousWidth > msg.length ? ' '.repeat(previousWidth - msg.length) : '';
-      process.stdout.write(`\r${tint(msg)}${pad}`);
+      if (renderAbovePrompt && isPromptActive()) {
+        process.stdout.write('\x1b7');
+        process.stdout.write('\x1b[1A');
+        process.stdout.write(`\r\x1b[2K${tint(msg)}${pad}`);
+        process.stdout.write('\x1b8');
+      } else {
+        process.stdout.write(`\r\x1b[2K${tint(msg)}${pad}`);
+      }
       previousWidth = msg.length;
     } else if (tick === 0 || tick % 2 === 0) {
       logger(chalk.dim(`status> ${frame} ${verb} · waiting for ${backend} (${seconds}s)`));
@@ -499,7 +535,14 @@ function startWaitingIndicator(
     clearInterval(timer);
     if (useAnimatedLine) {
       const clear = previousWidth > 0 ? ' '.repeat(previousWidth) : '';
-      process.stdout.write(`\r${clear}\r`);
+      if (renderAbovePrompt && isPromptActive()) {
+        process.stdout.write('\x1b7');
+        process.stdout.write('\x1b[1A');
+        process.stdout.write(`\r\x1b[2K${clear}\r`);
+        process.stdout.write('\x1b8');
+      } else {
+        process.stdout.write(`\r\x1b[2K${clear}\r`);
+      }
     }
     if (doneMessage) {
       logger(chalk.dim(doneMessage));
@@ -641,6 +684,18 @@ function extractSessionSummaries(result: Record<string, unknown> | null | undefi
         currentPhase: typeof row.currentPhase === 'string' ? row.currentPhase : undefined,
         threadKey: typeof row.threadKey === 'string' ? row.threadKey : undefined,
         startedAt: typeof row.startedAt === 'string' ? row.startedAt : undefined,
+        backend:
+          typeof row.backend === 'string'
+            ? row.backend
+            : typeof row.backend_name === 'string'
+              ? row.backend_name
+              : undefined,
+        model:
+          typeof row.model === 'string'
+            ? row.model
+            : typeof row.model_name === 'string'
+              ? row.model_name
+              : undefined,
         backendSessionId:
           typeof row.backendSessionId === 'string'
             ? row.backendSessionId
@@ -850,6 +905,24 @@ function formatNow(timezone?: string): string {
   }
 }
 
+function formatStudioForDisplay(studioId?: string): string {
+  if (!studioId) return '-';
+  return studioId.slice(0, 8);
+}
+
+function sessionBackendLabel(session: SessionSummary): string {
+  const declared = [session.backend, session.model ? `(${session.model})` : ''].filter(Boolean).join(' ');
+  if (declared) return declared;
+  if (session.backendSessionId) return session.backendSessionId;
+  if (session.claudeSessionId) return session.claudeSessionId;
+  return '-';
+}
+
+function sessionHistoryLabel(meta: SessionTranscriptMetadata | null): string {
+  if (!meta) return 'pcp-only';
+  return `repl:${meta.messageCount}`;
+}
+
 function chip(label: string, value: string, color: (text: string) => string): string {
   return `${chalk.dim(`${label}:`)} ${color(value)}`;
 }
@@ -864,23 +937,26 @@ function printSessionsSnapshot(
   }
 
   console.log(chalk.bold('\nActive sessions'));
-  console.log(chalk.dim('id       agent   status/phase            thread        started   backend      msgs  last-msg'));
+  console.log(
+    chalk.dim('id       agent   status/phase            studio    thread        started   backend            history    last-msg')
+  );
   for (const session of sessions) {
     const transcriptMeta = getSessionTranscriptMetadata(session.id);
     const id = session.id.slice(0, 7).padEnd(7);
     const agent = (session.agentId || '-').slice(0, 6).padEnd(6);
     const status = (session.currentPhase || session.status || '-').slice(0, 22).padEnd(22);
+    const studio = formatStudioForDisplay(session.studioId).padEnd(8);
     const thread = (session.threadKey || '-').slice(0, 12).padEnd(12);
     const started = formatStartedAt(session.startedAt);
-    const backend = (session.backendSessionId || session.claudeSessionId || '-').slice(0, 10);
-    const messageCount = `${transcriptMeta?.messageCount ?? 0}`.padStart(4, ' ');
+    const backend = sessionBackendLabel(session).slice(0, 18).padEnd(18);
+    const history = sessionHistoryLabel(transcriptMeta).slice(0, 9).padEnd(9);
     const lastMessage = formatTimestampForSessionList(transcriptMeta?.lastMessageAt, options?.timezone).padEnd(
       8,
       ' '
     );
     console.log(
       chalk.dim(
-        `${id}  ${agent}  ${status}  ${thread}  ${started.padEnd(7)}  ${backend.padEnd(10)}  ${messageCount}  ${lastMessage}`
+        `${id}  ${agent}  ${status}  ${studio}  ${thread}  ${started.padEnd(7)}  ${backend}  ${history}  ${lastMessage}`
       )
     );
   }
@@ -1040,16 +1116,34 @@ function matchesAttachQuery(session: SessionSummary, query?: string): boolean {
   if (!query) return true;
   const haystack = `${session.id} ${session.agentId || ''} ${session.threadKey || ''} ${
     session.currentPhase || session.status || ''
-  } ${session.backendSessionId || session.claudeSessionId || ''}`.toLowerCase();
+  } ${session.backend || ''} ${session.model || ''} ${session.backendSessionId || session.claudeSessionId || ''} ${
+    session.studioId || ''
+  } ${session.workspaceId || ''}`.toLowerCase();
   return haystack.includes(query.toLowerCase());
 }
 
 async function pickSessionToAttach(
   sessions: SessionSummary[],
   query?: string,
-  options?: { timezone?: string }
+  options?: { timezone?: string; studioId?: string }
 ): Promise<SessionSummary | undefined> {
-  const candidates = sessions.filter((session) => matchesAttachQuery(session, query));
+  const candidates = sessions
+    .filter((session) => matchesAttachQuery(session, query))
+    .sort((a, b) => {
+      const aStudioMatch = options?.studioId && a.studioId === options.studioId ? 1 : 0;
+      const bStudioMatch = options?.studioId && b.studioId === options.studioId ? 1 : 0;
+      if (aStudioMatch !== bStudioMatch) return bStudioMatch - aStudioMatch;
+
+      const aMeta = getSessionTranscriptMetadata(a.id);
+      const bMeta = getSessionTranscriptMetadata(b.id);
+      const aHasHistory = (aMeta?.messageCount || 0) > 0 ? 1 : 0;
+      const bHasHistory = (bMeta?.messageCount || 0) > 0 ? 1 : 0;
+      if (aHasHistory !== bHasHistory) return bHasHistory - aHasHistory;
+
+      const ams = a.startedAt ? Date.parse(a.startedAt) : 0;
+      const bms = b.startedAt ? Date.parse(b.startedAt) : 0;
+      return bms - ams;
+    });
   if (candidates.length === 0) return undefined;
   if (candidates.length === 1) return candidates[0];
 
@@ -1058,13 +1152,15 @@ async function pickSessionToAttach(
     const session = candidates[i]!;
     const phase = session.currentPhase || session.status || '-';
     const transcriptMeta = getSessionTranscriptMetadata(session.id);
-    const msgMeta = `${transcriptMeta?.messageCount ?? 0} msgs`;
+    const historyMeta = sessionHistoryLabel(transcriptMeta);
     const lastMeta = `last ${formatTimestampForSessionList(transcriptMeta?.lastMessageAt, options?.timezone)}`;
+    const studio = formatStudioForDisplay(session.studioId);
+    const backend = sessionBackendLabel(session);
     console.log(
       chalk.dim(
         `  ${String(i + 1).padStart(2, ' ')}. ${session.id.slice(0, 8)}  ${
           session.agentId || '-'
-        }  ${phase}  ${session.threadKey || '-'}  ${session.backendSessionId || session.claudeSessionId || '-'}  ${msgMeta}  ${lastMeta}`
+        }  ${phase}  studio:${studio}  ${session.threadKey || '-'}  ${backend}  ${historyMeta}  ${lastMeta}`
       )
     );
   }
@@ -1077,15 +1173,35 @@ async function pickSessionToAttach(
     const index = Number.parseInt(answer, 10);
     if (Number.isNaN(index) || index < 1 || index > candidates.length) return undefined;
     return candidates[index - 1];
+  } catch (error) {
+    if (isAbortError(error) || isReadlineClosedError(error)) {
+      console.log(chalk.dim('\nAttach cancelled.\n'));
+      return undefined;
+    }
+    throw error;
   } finally {
     rl.close();
   }
 }
 
-function pickLatestSession(sessions: SessionSummary[], query?: string): SessionSummary | undefined {
+function pickLatestSession(
+  sessions: SessionSummary[],
+  query?: string,
+  options?: { studioId?: string }
+): SessionSummary | undefined {
   const candidates = sessions.filter((session) => matchesAttachQuery(session, query));
   if (candidates.length === 0) return undefined;
   return candidates.sort((a, b) => {
+    const aStudioMatch = options?.studioId && a.studioId === options.studioId ? 1 : 0;
+    const bStudioMatch = options?.studioId && b.studioId === options.studioId ? 1 : 0;
+    if (aStudioMatch !== bStudioMatch) return bStudioMatch - aStudioMatch;
+
+    const aMeta = getSessionTranscriptMetadata(a.id);
+    const bMeta = getSessionTranscriptMetadata(b.id);
+    const aHasHistory = (aMeta?.messageCount || 0) > 0 ? 1 : 0;
+    const bHasHistory = (bMeta?.messageCount || 0) > 0 ? 1 : 0;
+    if (aHasHistory !== bHasHistory) return bHasHistory - aHasHistory;
+
     const ams = a.startedAt ? Date.parse(a.startedAt) : 0;
     const bms = b.startedAt ? Date.parse(b.startedAt) : 0;
     return bms - ams;
@@ -1289,6 +1405,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
     );
   }
 
+  let attachedSessionSummary: SessionSummary | undefined;
+
   if ((options.attach || options.attachLatest) && !runtime.sessionId) {
     const attachQuery = typeof options.attach === 'string' ? options.attach.trim() : undefined;
     const attachLatestQuery =
@@ -1310,11 +1428,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
       'attach'
     );
     const selected = options.attachLatest
-      ? pickLatestSession(sessions, query)
-      : await pickSessionToAttach(sessions, query, { timezone: runtime.userTimezone });
+      ? pickLatestSession(sessions, query, { studioId: runtime.studioId })
+      : await pickSessionToAttach(sessions, query, {
+          timezone: runtime.userTimezone,
+          studioId: runtime.studioId,
+        });
     if (!selected) {
       throw new Error('No matching active session selected for attach.');
     }
+    attachedSessionSummary = selected;
     runtime.sessionId = selected.id;
     if (selected.workspaceId) {
       runtime.workspaceId = selected.workspaceId;
@@ -1354,8 +1476,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       toolPolicy,
       'attach'
     );
-    const selected = pickLatestSession(sessions);
+    const selected = pickLatestSession(sessions, undefined, { studioId: runtime.studioId });
     if (selected) {
+      attachedSessionSummary = selected;
       runtime.sessionId = selected.id;
       if (selected.workspaceId) {
         runtime.workspaceId = selected.workspaceId;
@@ -1396,14 +1519,48 @@ export async function runChat(options: ChatOptions): Promise<void> {
     runtime.sessionId = extractSessionId(sessionStartResult);
   }
 
+  if (attachedToExistingSession && runtime.sessionId && !attachedSessionSummary) {
+    const sessionsResult = (await pcp
+      .callTool('list_sessions', { agentId, status: 'active', limit: 80 })
+      .catch(() => null)) as Record<string, unknown> | null;
+    attachedSessionSummary = extractSessionSummaries(sessionsResult).find(
+      (session) => session.id === runtime.sessionId
+    );
+    if (attachedSessionSummary) {
+      if (!runtime.workspaceId && attachedSessionSummary.workspaceId) {
+        runtime.workspaceId = attachedSessionSummary.workspaceId;
+      }
+      if (!runtime.studioId && attachedSessionSummary.studioId) {
+        runtime.studioId = attachedSessionSummary.studioId;
+      }
+      if (!runtime.threadKey && attachedSessionSummary.threadKey) {
+        runtime.threadKey = attachedSessionSummary.threadKey;
+      }
+    }
+  }
+
   const existingTranscript =
     runtime.sessionId && attachedToExistingSession
       ? findLatestTranscriptForSession(runtime.sessionId)
       : undefined;
   runtime.transcriptPath = existingTranscript || ensureRuntimeTranscriptPath(runtime.sessionId);
-  let historyHydration: { loaded: number; messageCount: number } | null = null;
+  let historyHydration: HistoryHydrationResult | null = null;
   if (attachedToExistingSession && existingTranscript) {
-    historyHydration = hydrateLedgerFromTranscript(ledger, existingTranscript);
+    const hydrated = hydrateLedgerFromTranscript(ledger, existingTranscript);
+    historyHydration = {
+      loaded: hydrated.loaded,
+      messageCount: hydrated.messageCount,
+      source: 'repl-transcript',
+      transcriptPath: existingTranscript,
+      tailPreview: hydrated.tailPreview,
+    };
+  } else if (attachedToExistingSession) {
+    historyHydration = {
+      loaded: 0,
+      messageCount: 0,
+      source: 'none',
+      tailPreview: [],
+    };
   }
 
   appendTranscript(runtime.transcriptPath, {
@@ -1413,7 +1570,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     model: runtime.model || null,
     threadKey: runtime.threadKey || null,
     sessionId: runtime.sessionId || null,
-    studioId: identity?.workspaceId || null,
+    studioId: runtime.studioId || null,
+    workspaceId: runtime.workspaceId || null,
+    historySource: historyHydration?.source || null,
+    attachedBackend: attachedSessionSummary?.backend || null,
+    attachedModel: attachedSessionSummary?.model || null,
   });
 
   if (runtime.sessionId && !attachedToExistingSession) {
@@ -1434,6 +1595,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     [
       chip('agent', agentId, chalk.cyan),
       chip('backend', `${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}`, chalk.yellow),
+      chip('studio', formatStudioForDisplay(runtime.studioId), chalk.cyan),
       chip('routing', runtime.toolRouting, runtime.toolRouting === 'local' ? chalk.magenta : chalk.dim),
       chip('ui', runtime.uiMode, runtime.uiMode === 'live' ? chalk.cyan : chalk.dim),
       chip('window', `${formatTokenCount(runtime.backendTokenWindow)} tok`, chalk.green),
@@ -1445,12 +1607,30 @@ export async function runChat(options: ChatOptions): Promise<void> {
   if (attachedToExistingSession) console.log(chalk.dim('Mode: attached to existing session'));
   if (autoAttachedLatest) console.log(chalk.dim('Mode: auto-attached to latest active session'));
   if (runtime.sessionId) console.log(chalk.dim(`Session: ${runtime.sessionId}`));
+  if (attachedSessionSummary) {
+    console.log(
+      chalk.dim(
+        `Attached session metadata: studio=${formatStudioForDisplay(attachedSessionSummary.studioId)} backend=${sessionBackendLabel(
+          attachedSessionSummary
+        )}`
+      )
+    );
+  }
   if (historyHydration && historyHydration.messageCount > 0) {
     console.log(
       chalk.dim(
-        `History loaded: ${historyHydration.messageCount} prior message(s) (${historyHydration.loaded} ledger entries)`
+        `History loaded: ${historyHydration.messageCount} prior message(s) (${historyHydration.loaded} ledger entries, source=${historyHydration.source})`
       )
     );
+    if (historyHydration.tailPreview.length > 0) {
+      console.log(chalk.dim('Recent history preview:'));
+      for (const entry of historyHydration.tailPreview) {
+        const ts = entry.ts ? `${formatTimestampForSessionList(entry.ts, runtime.userTimezone)} ` : '';
+        console.log(chalk.dim(`  - ${ts}${entry.role}: ${entry.content}`));
+      }
+    }
+  } else if (historyHydration?.source === 'none') {
+    console.log(chalk.dim('History loaded: none (no local REPL transcript found for this session).'));
   }
   console.log(chalk.dim(`Transcript: ${runtime.transcriptPath}`));
   console.log(chalk.dim('Type /help for commands.\n'));
@@ -1709,6 +1889,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const stopWaiting = startWaitingIndicator(runtime.backend, {
       inline: statusLaneState.live,
       logger: printLine,
+      promptActive: () => statusLaneState.promptActive,
+      renderAbovePrompt: true,
     });
     let turnCtrlCAt = 0;
     const onSigintDuringTurn = () => {
@@ -1892,15 +2074,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
     return;
   }
 
-  const rl = createInterface({ input, output });
+  let readlineClosed = false;
+  const createRl = () => {
+    const iface = createInterface({ input, output });
+    iface.on('close', () => {
+      readlineClosed = true;
+    });
+    return iface;
+  };
+  let rl = createRl();
   let keepRunning = true;
   let lastUsageTotal: number | undefined;
   let lastCtrlCAt = 0;
+  let lastSigintAt = 0;
   let exitAfterTurnNoticeShown = false;
-  let readlineClosed = false;
-  rl.on('close', () => {
-    readlineClosed = true;
-  });
+  const onPromptSigint = () => {
+    lastSigintAt = Date.now();
+  };
+  process.on('SIGINT', onPromptSigint);
 
   while (keepRunning) {
     if (readlineClosed) {
@@ -1938,8 +2129,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
         emitStatusLaneIfChanged(true);
       }
       if (isReadlineClosedError(error)) {
-        printLine(chalk.dim('\nReadline closed. Exiting chat gracefully.\n'));
-        keepRunning = false;
+        const now = Date.now();
+        const looksLikeSigint = now - lastSigintAt <= 750;
+        if (lastCtrlCAt > 0 && now - lastCtrlCAt <= CTRL_C_EXIT_WINDOW_MS) {
+          printLine(chalk.yellow('\nExiting chat (double Ctrl+C).\n'));
+          keepRunning = false;
+          continue;
+        }
+        if (!looksLikeSigint) {
+          printLine(chalk.dim('\nReadline closed. Exiting chat gracefully.\n'));
+          keepRunning = false;
+          continue;
+        }
+        lastCtrlCAt = now;
+        rl = createRl();
+        readlineClosed = false;
+        printLine(chalk.dim('\nPress Ctrl+C again to quit, or continue typing.\n'));
         continue;
       }
       if (isAbortError(error)) {
@@ -1950,6 +2155,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
           continue;
         }
         lastCtrlCAt = now;
+        if (readlineClosed) {
+          rl = createRl();
+          readlineClosed = false;
+        }
         printLine(chalk.dim('\nPress Ctrl+C again to quit, or continue typing.\n'));
         continue;
       }
@@ -2050,19 +2259,28 @@ export async function runChat(options: ChatOptions): Promise<void> {
           break;
         }
         case 'session':
+          {
+            const transcriptMeta = runtime.sessionId
+              ? getSessionTranscriptMetadata(runtime.sessionId)
+              : null;
           console.log(
             chalk.dim(
               `session=${runtime.sessionId || 'none'} backend=${runtime.backend} model=${
                 runtime.model || '(default)'
-              } routing=${runtime.toolRouting} thread=${runtime.threadKey || '(none)'} events=${
-                runtime.eventPolling ? 'on' : 'off'
-              } autorun=${runtime.autoRunInbox ? 'on' : 'off'} ui=${runtime.uiMode} budget=${formatTokenCount(
+              } routing=${runtime.toolRouting} thread=${runtime.threadKey || '(none)'} studio=${formatStudioForDisplay(
+                runtime.studioId
+              )} events=${runtime.eventPolling ? 'on' : 'off'} autorun=${
+                runtime.autoRunInbox ? 'on' : 'off'
+              } ui=${runtime.uiMode} budget=${formatTokenCount(
                 runtime.maxContextTokens
               )} window=${formatTokenCount(
                 runtime.backendTokenWindow
-              )} budgetMode=${contextBudgetAuto ? 'auto' : 'manual'} tools=${toolPolicy.getMode()} scope=${toolPolicy.getMutationScopeLabel()} visibility=${toolPolicy.getSessionVisibility()}`
+              )} budgetMode=${contextBudgetAuto ? 'auto' : 'manual'} tools=${toolPolicy.getMode()} scope=${toolPolicy.getMutationScopeLabel()} visibility=${toolPolicy.getSessionVisibility()} history=${sessionHistoryLabel(
+                transcriptMeta
+              )}`
             )
           );
+          }
           break;
         case 'autorun':
         case 'auto-run': {
@@ -2879,7 +3097,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
     void enqueueTurn(raw);
   }
 
-  rl.close();
+  if (!readlineClosed) {
+    rl.close();
+  }
+  process.off('SIGINT', onPromptSigint);
   if (pollTimer) clearInterval(pollTimer);
 
   if (pendingTurns > 0) {
