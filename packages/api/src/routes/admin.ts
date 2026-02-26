@@ -1383,7 +1383,7 @@ router.post('/heartbeat', async (req: Request, res: Response) => {
     if (!heartbeatEnabled && !forceRun) {
       res.status(503).json({
         error:
-          'Heartbeat processing is disabled on this server. Set ENABLE_HEARTBEAT_SERVICE=true or call with ?force=true for a manual run.',
+          'Heartbeat processing is disabled on this server. Set ENABLE_HEARTBEATS=true or call with ?force=true for a manual run.',
       });
       return;
     }
@@ -2042,12 +2042,12 @@ router.get('/reminders', async (req: Request, res: Response) => {
 });
 
 // =============================================================================
-// User Identity (USER.md, VALUES.md)
+// Shared Documents (User, Values, Process)
 // =============================================================================
 
 /**
  * GET /api/admin/user-identity
- * Get user identity (USER.md, VALUES.md)
+ * Get shared documents (user profile, shared values, process)
  */
 router.get('/user-identity', async (req: Request, res: Response) => {
   try {
@@ -2078,6 +2078,7 @@ router.get('/user-identity', async (req: Request, res: Response) => {
         userId: data.user_id,
         userProfileMd: data.user_profile_md,
         sharedValuesMd: data.shared_values_md,
+        processMd: data.process_md,
         version: data.version,
         createdAt: data.created_at,
         updatedAt: data.updated_at,
@@ -2132,6 +2133,7 @@ router.get('/user-identity/history', async (req: Request, res: Response) => {
         version: h.version,
         userProfileMd: h.user_profile_md,
         sharedValuesMd: h.shared_values_md,
+        processMd: h.process_md,
         changeType: h.change_type,
         createdAt: h.created_at,
         archivedAt: h.archived_at,

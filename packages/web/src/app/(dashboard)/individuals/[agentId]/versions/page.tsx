@@ -244,7 +244,7 @@ export default function VersionExplorerPage() {
 
                   {/* Show all changed files like a git diff */}
                   <div className="space-y-6">
-                    {/* IDENTITY.md */}
+                    {/* Identity profile */}
                     <div
                       className={clsx(
                         'rounded-lg border',
@@ -255,7 +255,7 @@ export default function VersionExplorerPage() {
                     >
                       <div className="flex items-center gap-2 px-4 py-2 border-b bg-white/50 rounded-t-lg">
                         <FileText className="h-4 w-4 text-gray-600" />
-                        <span className="font-mono text-sm font-medium">IDENTITY.md</span>
+                        <span className="text-sm font-medium">Identity profile</span>
                         {identityChanged ? (
                           <Badge variant="outline" className="ml-auto text-xs bg-amber-100">
                             Changed
@@ -278,7 +278,7 @@ export default function VersionExplorerPage() {
                       </div>
                     </div>
 
-                    {/* SOUL.md */}
+                    {/* Constitution */}
                     <div
                       className={clsx(
                         'rounded-lg border',
@@ -289,7 +289,7 @@ export default function VersionExplorerPage() {
                     >
                       <div className="flex items-center gap-2 px-4 py-2 border-b bg-white/50 rounded-t-lg">
                         <Sparkles className="h-4 w-4 text-amber-500" />
-                        <span className="font-mono text-sm font-medium">SOUL.md</span>
+                        <span className="text-sm font-medium">Constitution</span>
                         {soulChanged ? (
                           <Badge variant="outline" className="ml-auto text-xs bg-amber-100">
                             Changed
@@ -312,7 +312,7 @@ export default function VersionExplorerPage() {
                       </div>
                     </div>
 
-                    {/* HEARTBEAT.md */}
+                    {/* Operating guide */}
                     <div
                       className={clsx(
                         'rounded-lg border',
@@ -323,7 +323,7 @@ export default function VersionExplorerPage() {
                     >
                       <div className="flex items-center gap-2 px-4 py-2 border-b bg-white/50 rounded-t-lg">
                         <Zap className="h-4 w-4 text-blue-500" />
-                        <span className="font-mono text-sm font-medium">HEARTBEAT.md</span>
+                        <span className="text-sm font-medium">Operating guide</span>
                         {heartbeatChanged ? (
                           <Badge variant="outline" className="ml-auto text-xs bg-amber-100">
                             Changed

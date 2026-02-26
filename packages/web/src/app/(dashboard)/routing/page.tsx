@@ -204,7 +204,7 @@ export default function RoutingPage() {
             <div className="text-sm text-amber-900">
               Heartbeat/reminder processing is disabled on this server instance ({' '}
               <code className="bg-amber-100 px-1 py-0.5 rounded text-xs">
-                ENABLE_HEARTBEAT_SERVICE=false
+                ENABLE_HEARTBEATS=false
               </code>{' '}
               or related flags). This is ideal for secondary dev servers.
             </div>

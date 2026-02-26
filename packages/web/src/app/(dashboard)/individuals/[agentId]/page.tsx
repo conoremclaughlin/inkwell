@@ -132,12 +132,12 @@ export default function AgentDetailPage() {
         <TabsList className="grid w-full grid-cols-4 lg:w-[600px]">
           <TabsTrigger value="overview">Overview</TabsTrigger>
           <TabsTrigger value="soul" disabled={!identity.hasSoul}>
-            Soul
+            Constitution
           </TabsTrigger>
           <TabsTrigger value="heartbeat" disabled={!identity.hasHeartbeat}>
-            Heartbeat
+            Operating guide
           </TabsTrigger>
-          <TabsTrigger value="raw">Raw Identity</TabsTrigger>
+          <TabsTrigger value="raw">Identity JSON</TabsTrigger>
         </TabsList>
 
         {/* Overview Tab */}
@@ -232,10 +232,10 @@ export default function AgentDetailPage() {
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <Sparkles className="h-5 w-5 text-amber-500" />
-                SOUL.md
+                Constitution
               </CardTitle>
               <CardDescription>
-                The philosophical core. A space to grow into.
+                Narrative principles and worldview (stored in <code>soul.md</code>).
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -254,10 +254,10 @@ export default function AgentDetailPage() {
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <Zap className="h-5 w-5 text-blue-500" />
-                HEARTBEAT.md
+                Operating guide
               </CardTitle>
               <CardDescription>
-                Operational checklist and wake-up protocols.
+                Operational checklist and wake-up protocols (stored in <code>heartbeat.md</code>).
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -276,10 +276,10 @@ export default function AgentDetailPage() {
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <FileText className="h-5 w-5 text-gray-500" />
-                IDENTITY.md (Generated)
+                Identity JSON
               </CardTitle>
               <CardDescription>
-                The structured identity file synced to the filesystem.
+                Structured identity payload used by API/UI.
               </CardDescription>
             </CardHeader>
             <CardContent>

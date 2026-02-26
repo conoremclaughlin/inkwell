@@ -347,9 +347,6 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   const {
     enabled: heartbeatServiceEnabled,
     flags: heartbeatServiceFlags,
-    effectiveHeartbeatServiceFlag,
-    usedLegacyHeartbeatAlias,
-    conflictingHeartbeatServiceFlags,
   } = getHeartbeatProcessingConfig();
   const enableLocalCron =
     process.env.ENABLE_LOCAL_CRON !== undefined
@@ -359,19 +356,8 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
   logger.info('Heartbeat service flags evaluated', {
     heartbeatServiceEnabled,
-    effectiveHeartbeatServiceFlag,
     ...heartbeatServiceFlags,
   });
-  if (usedLegacyHeartbeatAlias) {
-    logger.warn(
-      'ENABLE_HEARTBEATS is deprecated. Prefer ENABLE_HEARTBEAT_SERVICE for heartbeat service control.'
-    );
-  }
-  if (conflictingHeartbeatServiceFlags) {
-    logger.warn(
-      'Both ENABLE_HEARTBEAT_SERVICE and ENABLE_HEARTBEATS are set with different values. Using ENABLE_HEARTBEAT_SERVICE.'
-    );
-  }
 
   /**
    * Deliver reminder via SessionService - same stateless flow as all other messages.
@@ -474,7 +460,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     );
   } else {
     logger.warn(
-      'Heartbeat service disabled via env (ENABLE_HEARTBEAT_SERVICE or ENABLE_REMINDERS set to a false-like value). Scheduled reminders will not be processed on this server.'
+      'Heartbeat service disabled via env (ENABLE_HEARTBEATS or ENABLE_REMINDERS set to a false-like value). Scheduled reminders will not be processed on this server.'
     );
   }
 
