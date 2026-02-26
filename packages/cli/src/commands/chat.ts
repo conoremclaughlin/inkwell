@@ -26,9 +26,12 @@ import { ensurePcpToolAllowed } from '../repl/tool-gate.js';
 import { canActivateSkill, filterSkillsByPolicy } from '../repl/skill-policy.js';
 import {
   formatNow,
+  isOlderThan5Days,
   LiveStatusLane,
-  renderResumeHistoryLines,
+  renderCollapsedInbox,
+  renderMessageLine,
   renderTimedBlock,
+  separator,
   startWaitingIndicator,
 } from '../repl/tui-components.js';
 import {
@@ -92,6 +95,7 @@ interface ChatRuntime {
   autoRunInbox: boolean;
   transcriptPath: string;
   activeSkills: SkillInstruction[];
+  bootstrapContext?: string;
 }
 
 interface SessionSummary {
@@ -1326,14 +1330,74 @@ function renderActiveSkills(skills: SkillInstruction[]): string {
     .join('\n');
 }
 
+/**
+ * Format bootstrap result into a compact identity context string for prompt injection.
+ * This is the primary mechanism for the backend to know who it is, who it's talking to,
+ * and what it cares about.
+ */
+function formatBootstrapContext(result: Record<string, unknown>, agentId: string): string {
+  const sections: string[] = [];
+
+  // Identity files — the core of who the agent is
+  const files = result.identityFiles as Record<string, string> | undefined;
+  if (files) {
+    if (files.values) sections.push(`--- VALUES.md ---\n${files.values.trim()}`);
+    if (files.user) sections.push(`--- USER.md ---\n${files.user.trim()}`);
+    if (files.soul) sections.push(`--- SOUL.md ---\n${files.soul.trim()}`);
+    if (files.self) sections.push(`--- IDENTITY.md ---\n${files.self.trim()}`);
+    if (files.process) sections.push(`--- PROCESS.md ---\n${files.process.trim()}`);
+  }
+
+  // Active projects + focus
+  const ctx = result.activeContext as Record<string, unknown> | undefined;
+  if (ctx) {
+    const focus = ctx.focus as Record<string, string> | undefined;
+    if (focus?.summary) {
+      sections.push(`--- Current Focus ---\n${focus.summary}`);
+    }
+    const projects = ctx.projects as Array<Record<string, unknown>> | undefined;
+    if (projects && projects.length > 0) {
+      const lines = projects.map(
+        (p) => `- ${p.name} (${p.status}): ${p.description}`
+      );
+      sections.push(`--- Active Projects ---\n${lines.join('\n')}`);
+    }
+  }
+
+  // Recent memories (knowledgeSummary is pre-formatted by bootstrap)
+  const memories = result.knowledgeSummary as string | undefined;
+  if (memories) {
+    sections.push(`--- Recent Memories ---\n${memories}`);
+  }
+
+  // Skills
+  const skills = result.skills as Array<Record<string, unknown>> | undefined;
+  if (skills && skills.length > 0) {
+    const eligible = skills.filter((s) => s.eligible);
+    if (eligible.length > 0) {
+      const lines = eligible.map((s) => `- ${s.displayName}: ${s.description}`);
+      sections.push(`--- Available Skills ---\n${lines.join('\n')}`);
+    }
+  }
+
+  if (sections.length === 0) return '';
+  return sections.join('\n\n');
+}
+
 function buildPromptEnvelope(
   agentId: string,
   runtime: ChatRuntime,
   ledger: ContextLedger,
   userMessage: string
 ): string {
+  // Reserve bootstrap context budget (not counted against transcript budget)
+  const bootstrapTokens = runtime.bootstrapContext
+    ? estimateTokens(runtime.bootstrapContext)
+    : 0;
+  const transcriptBudget = Math.max(0, runtime.maxContextTokens - bootstrapTokens);
+
   const transcript = ledger.buildPromptTranscript({
-    maxTokens: runtime.maxContextTokens,
+    maxTokens: transcriptBudget,
     includeSources: true,
   });
 
@@ -1357,6 +1421,10 @@ function buildPromptEnvelope(
       ? `Active skills: ${runtime.activeSkills.map((skill) => skill.name).join(', ')}`
       : '',
     runtime.threadKey ? `Thread key: ${runtime.threadKey}.` : '',
+    // Identity context from bootstrap — always included
+    runtime.bootstrapContext
+      ? `\n=== Identity Context (from PCP bootstrap) ===\n${runtime.bootstrapContext}\n=== End Identity Context ===`
+      : '',
     '',
     'Conversation transcript:',
     transcript || '(empty)',
@@ -1434,6 +1502,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
   }
   runtime.toolMode = toolPolicy.getMode();
   const statusLane = new LiveStatusLane(runtime.uiMode === 'live' && Boolean(output.isTTY), runtime.userTimezone);
+  // Set up the bottom info bar with workspace/git context
+  {
+    const cwd = process.cwd();
+    // Show just the last 2 path components to keep the info bar compact
+    const parts = cwd.replace(process.env.HOME || '', '~').split('/');
+    const shortCwd = parts.length > 2 ? `…/${parts.slice(-2).join('/')}` : parts.join('/');
+    let gitBranch = '';
+    try {
+      const { execSync } = await import('child_process');
+      gitBranch = execSync('git rev-parse --abbrev-ref HEAD', { cwd, encoding: 'utf-8' }).trim();
+    } catch { /* not a git repo */ }
+    statusLane.setInfoItems([
+      '/help',
+      'ctrl+c ×2 quit',
+      shortCwd,
+      gitBranch,
+    ].filter(Boolean));
+  }
   let restorePromptAfterWrite: (() => void) | null = null;
   const printLine = (line = '') => {
     statusLane.printLine(line);
@@ -1470,6 +1556,20 @@ export async function runChat(options: ChatOptions): Promise<void> {
       runtime.userTimezone = timezone;
       statusLane.setTimezone(timezone);
     }
+
+    // Format and inject the full bootstrap context into the prompt envelope.
+    // This is what gives the backend its identity, values, and memories.
+    const ctx = formatBootstrapContext(bootstrapResult, agentId);
+    if (ctx) {
+      runtime.bootstrapContext = ctx;
+      const ctxTokens = estimateTokens(ctx);
+      console.log(
+        chalk.dim(
+          `Identity context loaded: ~${ctxTokens.toLocaleString()} tokens injected into prompt`
+        )
+      );
+    }
+
     ledger.addEntry(
       'system',
       `Bootstrapped as ${agentId}${timezone ? ` (${String(timezone)})` : ''}${
@@ -1685,9 +1785,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
       .catch(() => undefined);
   }
 
-  console.log(chalk.magentaBright('\n✦━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━✦'));
-  console.log(chalk.bold.white('  SB Chat · first-class PCP REPL'));
-  console.log(chalk.magentaBright('✦━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━✦\n'));
+  {
+    const bannerWidth = Math.min(process.stdout.columns || 80, 60);
+    const bar = '━'.repeat(Math.max(0, bannerWidth - 2));
+    console.log(chalk.magentaBright(`\n✦${bar}✦`));
+    console.log(chalk.bold.white('  SB Chat · first-class PCP REPL'));
+    console.log(chalk.magentaBright(`✦${bar}✦\n`));
+  }
   const runtimeStudioLabel = attachedSessionSummary
     ? sessionStudioLabel(attachedSessionSummary, 'short')
     : sessionStudioLabel({ studioId: runtime.studioId, workspaceId: runtime.workspaceId }, 'short');
@@ -1728,12 +1832,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
     );
     if (historyHydration.tailPreview.length > 0) {
       console.log(chalk.bold('Recent history preview:'));
-      for (const line of renderResumeHistoryLines(historyHydration.tailPreview, runtime.userTimezone, {
-        user: 'you',
-        assistant: agentId,
-        inbox: 'inbox',
-      })) {
-        console.log(line);
+      for (const entry of historyHydration.tailPreview) {
+        const role = entry.role === 'user' ? 'user' as const
+          : entry.role === 'assistant' ? 'assistant' as const
+          : 'inbox' as const;
+        const label = entry.role === 'user' ? 'you'
+          : entry.role === 'assistant' ? agentId
+          : 'inbox';
+        console.log(renderMessageLine(role, entry.content, {
+          label,
+          timezone: runtime.userTimezone,
+          ts: entry.ts,
+        }));
       }
     }
   } else if (historyHydration?.source === 'none') {
@@ -1815,7 +1925,34 @@ export async function runChat(options: ChatOptions): Promise<void> {
       )
       .sort((a, b) => safeDateMs(a.createdAt) - safeDateMs(b.createdAt));
     let autoRuns = 0;
-    for (const msg of fresh) {
+    // Partition into old (>5d) and recent messages
+    const oldMessages = fresh.filter((msg) => isOlderThan5Days(msg.createdAt));
+    const recentMessages = fresh.filter((msg) => !isOlderThan5Days(msg.createdAt));
+    // Show collapsed summary for old messages
+    if (oldMessages.length > 0) {
+      for (const msg of oldMessages) {
+        seenInboxIds.add(msg.id);
+        if (!runtime.threadKey && msg.threadKey) {
+          runtime.threadKey = msg.threadKey;
+        }
+        const from = msg.from || 'unknown';
+        const heading = msg.subject ? `${from} — ${msg.subject}` : from;
+        const rendered = `📥 ${heading}: ${msg.content}`.trim();
+        ledger.addEntry('inbox', compactForLedger(rendered), 'pcp-inbox');
+        appendTranscript(runtime.transcriptPath, {
+          type: 'inbox',
+          messageId: msg.id,
+          rendered,
+          createdAt: msg.createdAt || null,
+          delegationToken: msg.delegationToken || null,
+          messageType: msg.messageType || null,
+          relatedSessionId: msg.relatedSessionId || null,
+        });
+      }
+      printLine('');
+      printLine(renderCollapsedInbox(oldMessages.length));
+    }
+    for (const msg of recentMessages) {
       seenInboxIds.add(msg.id);
       if (!runtime.threadKey && msg.threadKey) {
         runtime.threadKey = msg.threadKey;
@@ -1851,7 +1988,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
         messageType: msg.messageType || null,
         relatedSessionId: msg.relatedSessionId || null,
       });
-      printLine(`\n${renderTimedBlock(chalk.cyan(rendered), runtime.userTimezone, msg.createdAt)}\n`);
+      printLine('');
+      printLine(separator());
+      printLine(renderMessageLine('inbox', rendered, {
+        timezone: runtime.userTimezone,
+        ts: msg.createdAt,
+      }));
+      printLine(separator());
 
       const eligibleForAutoRun =
         runtime.autoRunInbox &&
@@ -1939,7 +2082,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
         createdAt: activity.createdAt || null,
         content: activity.content || null,
       });
-      printLine(`\n${renderTimedBlock(chalk.magenta(rendered), runtime.userTimezone, activity.createdAt)}\n`);
+      printLine('');
+      printLine(renderMessageLine('activity', `${actor} ${type}${preview ? ` — ${preview}` : ''}`, {
+        label: '⚡',
+        timezone: runtime.userTimezone,
+        ts: activity.createdAt,
+      }));
     }
 
     if (force && activities.length === 0) {
@@ -1954,6 +2102,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const runUserTurn = async (raw: string, source: 'user' | 'inbox-auto' = 'user') => {
     if (!raw.trim()) return;
     if (source === 'user') {
+      // Echo the user's message in the consistent format
+      printLine(renderMessageLine('user', raw, {
+        label: 'you',
+        timezone: runtime.userTimezone,
+      }));
+      printLine('');
       ledger.addEntry('user', raw, 'repl');
       appendTranscript(runtime.transcriptPath, { type: 'user', content: raw });
     } else {
@@ -2105,12 +2259,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
     }
 
-    printLine(
-      `\n${renderTimedBlock(chalk.white(assistantDisplayText), runtime.userTimezone, undefined, `${turnDurationSeconds}s`)}\n`
-    );
+    printLine('');
+    printLine(renderMessageLine('assistant', assistantDisplayText, {
+      label: agentId,
+      timezone: runtime.userTimezone,
+      trailingMeta: `${turnDurationSeconds}s`,
+    }));
     if (runResult.usage) {
-      printLine(chalk.dim(`↳ ${formatBackendTokenUsage(runResult.usage)}\n`));
+      printLine(chalk.dim(`    ↳ ${formatBackendTokenUsage(runResult.usage)}`));
     }
+    printLine('');
   };
 
   let turnQueue: Promise<void> = Promise.resolve();
@@ -2134,13 +2292,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
     pendingTurns += 1;
     emitStatusLaneIfChanged();
     const run = async () => {
+      statusLane.setTurnActive(true);
       try {
         await runUserTurn(raw, source);
       } catch (error) {
         printLine(chalk.red(`Turn failed: ${String(error)}`));
       } finally {
+        statusLane.setTurnActive(false);
         pendingTurns = Math.max(0, pendingTurns - 1);
         emitStatusLaneIfChanged();
+        // Restore the dock now that the turn is done (if prompt is waiting)
+        restorePromptAfterWrite?.();
       }
     };
     turnQueue = turnQueue.then(run, run);
@@ -2208,6 +2370,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
   process.on('SIGINT', onPromptSigint);
   restorePromptAfterWrite = () => {
     if (!statusLane.isLive() || !statusLane.isPromptActive() || readlineClosed) return;
+    // During a backend turn, don't restore the dock — messages print cleanly
+    // and the dock is redrawn once when the turn completes.
+    if (statusLane.isTurnActive()) return;
     const currentLine = (rl as unknown as { line?: string }).line || '';
     output.write(chalk.green(statusLane.buildPromptLabel(activePromptLabel)));
     if (currentLine) {
@@ -2245,8 +2410,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
       activePromptLabel = promptLabel;
       const renderedPrompt = statusLane.buildPromptLabel(promptLabel);
       raw = (await rl.question(chalk.green(renderedPrompt))).trim();
+      statusLane.clearDockFromScrollback();
       lastCtrlCAt = 0;
     } catch (error) {
+      statusLane.clearDockFromScrollback();
       statusLane.setPromptActive(false);
       if (statusLane.shouldRefreshAfterPrompt()) {
         emitStatusLaneIfChanged(true);
@@ -2315,6 +2482,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '',
               '/help                      Show this help',
               '/quit | /exit              End chat',
+              '/refresh                   Re-bootstrap identity context from PCP',
               '/inbox                     Poll inbox now',
               '/events [now|on|off]       Poll/toggle merged activity stream',
               '/session                   Show active session info',
@@ -2368,6 +2536,29 @@ export async function runChat(options: ChatOptions): Promise<void> {
         case 'inbox':
           await pollInbox(true);
           break;
+        case 'refresh': {
+          console.log(chalk.dim('Refreshing identity context from PCP...'));
+          const refreshResult = (await pcp
+            .callTool('bootstrap', { agentId })
+            .catch((error) => ({ error: String(error) }))) as Record<string, unknown>;
+          if (refreshResult.error) {
+            console.log(chalk.yellow(`Refresh failed: ${String(refreshResult.error)}`));
+          } else {
+            const ctx = formatBootstrapContext(refreshResult, agentId);
+            if (ctx) {
+              runtime.bootstrapContext = ctx;
+              const ctxTokens = estimateTokens(ctx);
+              console.log(
+                chalk.green(
+                  `Identity context refreshed: ~${ctxTokens.toLocaleString()} tokens`
+                )
+              );
+            } else {
+              console.log(chalk.yellow('Bootstrap returned no identity context.'));
+            }
+          }
+          break;
+        }
         case 'events': {
           const mode = slash.args[0];
           if (mode === 'off') {

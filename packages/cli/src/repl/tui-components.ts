@@ -14,6 +14,101 @@ const WAITING_VERBS = [
 ];
 const WAITING_FRAMES = ['✦', '✶', '✷', '✹'];
 
+// ─── Layout primitives ────────────────────────────────────────────
+
+export function stripAnsi(s: string): string {
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/\u001b\[[0-9;]*m/g, '');
+}
+
+/** Full-width dimmed horizontal rule. */
+export function separator(width?: number): string {
+  const w = width || process.stdout.columns || 80;
+  return chalk.dim('─'.repeat(w));
+}
+
+/** Full-width dotted dimmed line (lighter visual break). */
+export function dottedSeparator(width?: number): string {
+  const w = width || process.stdout.columns || 80;
+  return chalk.dim('┄'.repeat(w));
+}
+
+/** Left-aligned text with right-aligned metadata. */
+export function rightAlign(left: string, right: string, width?: number): string {
+  const w = width || process.stdout.columns || 80;
+  const leftLen = stripAnsi(left).length;
+  const rightLen = stripAnsi(right).length;
+  const gap = Math.max(1, w - leftLen - rightLen);
+  return `${left}${' '.repeat(gap)}${right}`;
+}
+
+/** Bottom info bar: dimmed items joined by centered dot. */
+export function infoBar(items: string[]): string {
+  return chalk.dim(items.filter(Boolean).join('  ·  '));
+}
+
+/** Unified message renderer with role-based prefix + right-aligned time. */
+export function renderMessageLine(
+  role: 'user' | 'assistant' | 'inbox' | 'activity' | 'system',
+  content: string,
+  options: {
+    label?: string;
+    timezone?: string;
+    ts?: string;
+    trailingMeta?: string;
+  } = {}
+): string {
+  const clock = options.ts ? formatClock(options.ts, options.timezone) : formatNow(options.timezone);
+  const meta = options.trailingMeta ? `  ·  ${options.trailingMeta}` : '';
+  const timeStr = chalk.dim(`${clock}${meta}`);
+
+  let prefix: string;
+  let colorFn: (s: string) => string;
+  switch (role) {
+    case 'user':
+      prefix = options.label || 'you';
+      colorFn = chalk.green;
+      break;
+    case 'assistant':
+      prefix = options.label || 'assistant';
+      colorFn = chalk.white;
+      break;
+    case 'inbox':
+      prefix = options.label || 'inbox';
+      colorFn = chalk.cyan;
+      break;
+    case 'activity':
+      prefix = options.label || 'activity';
+      colorFn = chalk.magenta;
+      break;
+    default:
+      prefix = options.label || 'system';
+      colorFn = chalk.dim;
+      break;
+  }
+
+  const labelStr = chalk.bold(colorFn(prefix));
+  const text = colorFn(content);
+  const left = `  ${labelStr}  ${text}`;
+  return rightAlign(left, timeStr);
+}
+
+/** Collapsed old inbox placeholder line. */
+export function renderCollapsedInbox(count: number): string {
+  const label = ` ${count} older inbox message${count === 1 ? '' : 's'} (>5d) collapsed `;
+  const w = process.stdout.columns || 80;
+  const side = Math.max(2, Math.floor((w - label.length) / 2));
+  return chalk.dim(`${'┄'.repeat(side)}${label}${'┄'.repeat(side)}`);
+}
+
+/** Check if a timestamp is older than 5 days. */
+export function isOlderThan5Days(createdAt?: string): boolean {
+  if (!createdAt) return false;
+  const ms = Date.parse(createdAt);
+  if (Number.isNaN(ms)) return false;
+  return Date.now() - ms > 5 * 24 * 60 * 60 * 1000;
+}
+
 export function formatNow(timezone?: string): string {
   try {
     return new Date().toLocaleTimeString([], {
@@ -59,9 +154,14 @@ export class LiveStatusLane {
   private promptActive = false;
   private dockVisible = false;
   private dirtyWhilePrompt = false;
+  private turnActive = false;
   private timezone?: string;
-  private statusLine = 'status> waiting for input';
-  private hintLine = 'hint> ready';
+  private statusLine = 'waiting for input';
+  private hintLine = 'ready';
+  private infoItems: string[] = [];
+
+  /** Number of lines the dock occupies (sep + status + sep + prompt + sep + info). */
+  private readonly DOCK_LINES = 6;
 
   public constructor(
     private live: boolean,
@@ -94,6 +194,14 @@ export class LiveStatusLane {
     this.promptActive = active;
   }
 
+  public setTurnActive(active: boolean): void {
+    this.turnActive = active;
+  }
+
+  public isTurnActive(): boolean {
+    return this.turnActive;
+  }
+
   public shouldRefreshAfterPrompt(): boolean {
     return this.dirtyWhilePrompt;
   }
@@ -107,14 +215,17 @@ export class LiveStatusLane {
     output.write('\r\x1b[2K');
   }
 
+  public setInfoItems(items: string[]): void {
+    this.infoItems = items;
+  }
+
   public clearPromptDock(): void {
     if (!this.live || !this.dockVisible) return;
-    // Prompt line
+    // Clear current line + DOCK_LINES-1 lines above it
     output.write('\r\x1b[2K');
-    // Hint line
-    output.write('\x1b[1A\r\x1b[2K');
-    // Status line
-    output.write('\x1b[1A\r\x1b[2K');
+    for (let i = 0; i < this.DOCK_LINES - 1; i++) {
+      output.write('\x1b[1A\r\x1b[2K');
+    }
     output.write('\r');
     this.dockVisible = false;
   }
@@ -131,10 +242,9 @@ export class LiveStatusLane {
   }
 
   public renderSummary(summary: string, force = false): void {
-    const rendered = `status> ${summary} • ${formatNow(this.timezone)}`;
-    this.statusLine = rendered;
+    this.statusLine = summary;
     if (!this.live) {
-      console.log(chalk.dim(rendered));
+      console.log(chalk.dim(`status> ${summary} • ${formatNow(this.timezone)}`));
       return;
     }
     if (this.promptActive && !force) {
@@ -145,10 +255,9 @@ export class LiveStatusLane {
   }
 
   public renderHint(message: string): void {
-    const rendered = `hint> ${message}`;
-    this.hintLine = rendered;
+    this.hintLine = message;
     if (!this.live) {
-      console.log(chalk.dim(rendered));
+      console.log(chalk.dim(`hint> ${message}`));
       return;
     }
     if (this.promptActive) {
@@ -158,13 +267,49 @@ export class LiveStatusLane {
   }
 
   public setHint(message: string): void {
-    this.hintLine = `hint> ${message}`;
+    this.hintLine = message;
+  }
+
+  /**
+   * Clear the dock lines from terminal scrollback AFTER readline has
+   * submitted (Enter or Ctrl+C). At that point the cursor sits one line
+   * below the dock (readline added a newline), so we clear current line
+   * plus DOCK_LINES lines above it.
+   */
+  public clearDockFromScrollback(): void {
+    if (!this.live || !this.dockVisible) return;
+    // Cursor is on empty line below the dock (post-Enter/^C newline).
+    // Clear that line + DOCK_LINES lines above it.
+    output.write('\r\x1b[2K');
+    for (let i = 0; i < this.DOCK_LINES; i++) {
+      output.write('\x1b[1A\r\x1b[2K');
+    }
+    output.write('\r');
+    this.dockVisible = false;
   }
 
   public buildPromptLabel(promptLabel: string): string {
     if (!this.live) return promptLabel;
     this.dockVisible = true;
-    return `\n${chalk.dim(this.statusLine)}\n${chalk.dim(this.hintLine)}\n${promptLabel}`;
+    const w = process.stdout.columns || 80;
+    const sep = chalk.dim('─'.repeat(w));
+    const statusWithTime = rightAlign(
+      chalk.dim(` ${this.statusLine}`),
+      chalk.dim(formatNow(this.timezone))
+    );
+    const info = this.infoItems.length > 0
+      ? ` ${infoBar(this.infoItems)}`
+      : chalk.dim(` ${this.hintLine}`);
+    // Prompt MUST be the last line so readline places the cursor there.
+    // Layout: sep | status | sep | info | sep | prompt
+    return [
+      sep,
+      statusWithTime,
+      sep,
+      info,
+      sep,
+      ` ${promptLabel}`,
+    ].join('\n');
   }
 }
 
