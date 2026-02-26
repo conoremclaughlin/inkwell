@@ -38,6 +38,7 @@ import { setResponseCallback, hasExplicitResponse } from './mcp/tools/response-h
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
 import { resolveRouteAgentId } from './services/routing/resolve-route';
 import { resolveAgentFromMention } from './services/routing/resolve-mention';
+import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
 import { logger } from './utils/logger';
 import { env } from './config/env';
 
@@ -343,15 +344,20 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   // 6. Initialize heartbeat service for scheduled reminders
   // Useful for secondary/local dev servers where we want API/MCP without
   // participating in global reminder delivery.
-  const heartbeatServiceEnabled =
-    process.env.ENABLE_HEARTBEAT_SERVICE !== 'false' &&
-    process.env.ENABLE_HEARTBEATS !== 'false' &&
-    process.env.ENABLE_REMINDERS !== 'false';
+  const {
+    enabled: heartbeatServiceEnabled,
+    flags: heartbeatServiceFlags,
+  } = getHeartbeatProcessingConfig();
   const enableLocalCron =
     process.env.ENABLE_LOCAL_CRON !== undefined
       ? process.env.ENABLE_LOCAL_CRON === 'true'
       : process.env.NODE_ENV !== 'production';
   const heartbeatInterval = process.env.HEARTBEAT_INTERVAL || '*/5 * * * *';
+
+  logger.info('Heartbeat service flags evaluated', {
+    heartbeatServiceEnabled,
+    ...heartbeatServiceFlags,
+  });
 
   /**
    * Deliver reminder via SessionService - same stateless flow as all other messages.

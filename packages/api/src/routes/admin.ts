@@ -14,6 +14,7 @@ import { getAuthorizationService } from '../services/authorization';
 import { getOAuthService } from '../services/oauth';
 import { logger } from '../utils/logger';
 import { env, isDevelopment } from '../config/env';
+import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
 import { runWithRequestContext } from '../utils/request-context';
 import { getDataComposer } from '../data/composer';
 
@@ -1376,10 +1377,7 @@ router.post('/whatsapp/logout', async (_req: Request, res: Response) => {
  */
 router.post('/heartbeat', async (req: Request, res: Response) => {
   try {
-    const heartbeatEnabled =
-      process.env.ENABLE_HEARTBEAT_SERVICE !== 'false' &&
-      process.env.ENABLE_HEARTBEATS !== 'false' &&
-      process.env.ENABLE_REMINDERS !== 'false';
+    const { enabled: heartbeatEnabled } = getHeartbeatProcessingConfig();
     const forceRun = req.query.force === 'true';
 
     if (!heartbeatEnabled && !forceRun) {
@@ -1514,10 +1512,7 @@ router.get('/routing', async (req: Request, res: Response) => {
       toRoutingRoute(route, reminderCountByIdentity, nextReminderByIdentity)
     );
 
-    const heartbeatProcessingEnabled =
-      process.env.ENABLE_HEARTBEAT_SERVICE !== 'false' &&
-      process.env.ENABLE_HEARTBEATS !== 'false' &&
-      process.env.ENABLE_REMINDERS !== 'false';
+    const { enabled: heartbeatProcessingEnabled } = getHeartbeatProcessingConfig();
 
     const uniqueAgents = new Set(routes.map((route) => route.agentId).filter(Boolean));
     const uniquePlatforms = new Set(routes.map((route) => route.platform));
@@ -1659,11 +1654,7 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
       .eq('agent_id', identity.agent_id)
       .in('status', ['active', 'idle'])
       .order('name', { ascending: true });
-
-    const heartbeatProcessingEnabled =
-      process.env.ENABLE_HEARTBEAT_SERVICE !== 'false' &&
-      process.env.ENABLE_HEARTBEATS !== 'false' &&
-      process.env.ENABLE_REMINDERS !== 'false';
+    const { enabled: heartbeatProcessingEnabled } = getHeartbeatProcessingConfig();
 
     res.json({
       heartbeatProcessingEnabled,
