@@ -305,7 +305,7 @@ function hydrateLedgerFromTranscript(
   const preview: HistoryHydrationResult['tailPreview'] = [];
 
   const pushPreview = (role: 'user' | 'assistant' | 'inbox', content: string, ts?: string) => {
-    preview.push({ role, content: compactForLedger(content, 180), ts });
+    preview.push({ role, content: compactForHistoryPreview(role, content), ts });
     if (preview.length > 12) {
       preview.shift();
     }
@@ -432,6 +432,15 @@ function compactForLedger(content: string, maxChars = LEDGER_COMPACT_CHARS): str
   const normalized = content.replace(/\s+/g, ' ').trim();
   if (normalized.length <= maxChars) return normalized;
   return `${normalized.slice(0, Math.max(1, maxChars - 1))}…`;
+}
+
+function compactForHistoryPreview(role: 'user' | 'assistant' | 'inbox', content: string): string {
+  const normalized = content.replace(/\s+/g, ' ').trim();
+  if (role === 'inbox') {
+    return compactForLedger(normalized, 180);
+  }
+  if (normalized.length <= 4000) return normalized;
+  return `${normalized.slice(0, 3999)}…`;
 }
 
 function extractLocalToolCalls(responseText: string): LocalToolCall[] {
@@ -772,7 +781,7 @@ function hydrateLedgerFromSessionContext(
   let messageCount = 0;
   const preview: HistoryHydrationResult['tailPreview'] = [];
   const pushPreview = (role: 'user' | 'assistant' | 'inbox', content: string, ts?: string) => {
-    preview.push({ role, content: compactForLedger(content, 180), ts });
+    preview.push({ role, content: compactForHistoryPreview(role, content), ts });
     if (preview.length > 12) preview.shift();
   };
 
@@ -1806,7 +1815,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       printLine(chalk.green(`Auto-run processed ${autoRuns} inbox message${autoRuns === 1 ? '' : 's'}.`));
     }
     if (statusLane.isLive()) {
-      emitStatusLaneIfChanged(true);
+      emitStatusLaneIfChanged();
     }
     return fresh.length;
   };
@@ -1876,7 +1885,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       printLine(chalk.dim('No new activity events.'));
     }
     if (statusLane.isLive()) {
-      emitStatusLaneIfChanged(true);
+      emitStatusLaneIfChanged();
     }
     return activities.length;
   };
@@ -1936,11 +1945,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const now = Date.now();
       if (turnCtrlCAt > 0 && now - turnCtrlCAt <= CTRL_C_EXIT_WINDOW_MS) {
         forceQuitAfterTurn = true;
-        console.log(chalk.yellow('\nWill exit after current backend turn completes.\n'));
+        statusLane.renderHint('Will exit after current backend turn completes.');
         return;
       }
       turnCtrlCAt = now;
-      console.log(chalk.dim('\nBackend turn in progress. Press Ctrl+C again to exit after this turn.\n'));
+      statusLane.renderHint('Backend turn in progress. Press Ctrl+C again to exit after this turn.');
     };
     process.on('SIGINT', onSigintDuringTurn);
     const runResult = await runBackendTurn({
@@ -2183,7 +2192,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         lastCtrlCAt = now;
         rl = createRl();
         readlineClosed = false;
-        printLine(chalk.dim('\nPress Ctrl+C again to quit, or continue typing.\n'));
+        statusLane.renderHint('Press Ctrl+C again to quit, or continue typing.');
         continue;
       }
       if (isAbortError(error)) {
@@ -2198,7 +2207,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           rl = createRl();
           readlineClosed = false;
         }
-        printLine(chalk.dim('\nPress Ctrl+C again to quit, or continue typing.\n'));
+        statusLane.renderHint('Press Ctrl+C again to quit, or continue typing.');
         continue;
       }
       throw error;

@@ -109,6 +109,20 @@ export class LiveStatusLane {
     output.write(`\r\x1b[2K${chalk.dim(rendered)}`);
     this.dirtyWhilePrompt = false;
   }
+
+  public renderHint(message: string): void {
+    const rendered = `hint> ${message}`;
+    if (!this.live) {
+      console.log(chalk.dim(rendered));
+      return;
+    }
+    if (this.promptActive) {
+      this.dirtyWhilePrompt = true;
+      return;
+    }
+    this.line = rendered;
+    output.write(`\r\x1b[2K${chalk.dim(rendered)}`);
+  }
 }
 
 export function renderTimedBlock(content: string, timezone?: string): string {

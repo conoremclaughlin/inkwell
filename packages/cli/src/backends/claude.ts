@@ -22,6 +22,8 @@ export class ClaudeAdapter implements BackendAdapter {
     // Prompt mode vs interactive
     if (config.prompt) {
       args.push('-p');
+      // Claude expects print prompt immediately after -p/--print.
+      args.push(config.prompt);
     }
 
     // Model (only if explicitly specified)
@@ -48,11 +50,6 @@ export class ClaudeAdapter implements BackendAdapter {
 
     // Passthrough flags
     args.push(...config.passthroughArgs);
-
-    // Prompt as a single string after -p
-    if (config.prompt) {
-      args.push(config.prompt);
-    }
 
     return {
       binary: this.binary,

@@ -28,15 +28,12 @@ export class GeminiAdapter implements BackendAdapter {
     // Interactive is the default (no flag needed)
     if (config.prompt) {
       args.push('-p');
+      // Keep prompt adjacent to -p for strict CLI parsers.
+      args.push(config.prompt);
     }
 
     // Passthrough flags
     args.push(...config.passthroughArgs);
-
-    // Prompt as a single string after -p
-    if (config.prompt) {
-      args.push(config.prompt);
-    }
 
     return {
       binary: this.binary,
