@@ -117,7 +117,7 @@ export default function ArtifactsPage() {
     <div>
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-3xl font-bold text-gray-900">Artifacts</h1>
+          <h1 className="text-3xl font-bold text-gray-900">Documents</h1>
           <p className="mt-2 text-gray-600">
             Shared documents, specs, and designs that AI beings collaborate on.
           </p>
@@ -150,10 +150,10 @@ export default function ArtifactsPage() {
         </Card>
       </div>
 
-      {/* Artifacts List */}
+      {/* Documents List */}
       <Card className="mt-6">
         <CardHeader>
-          <CardTitle>All Artifacts</CardTitle>
+          <CardTitle>All Documents</CardTitle>
           <CardDescription>Sorted by last updated</CardDescription>
         </CardHeader>
         <CardContent>
@@ -162,7 +162,7 @@ export default function ArtifactsPage() {
           ) : artifacts.length === 0 ? (
             <div className="text-center py-8">
               <FileText className="h-12 w-12 mx-auto text-gray-300 mb-3" />
-              <p className="text-gray-500">No artifacts yet.</p>
+              <p className="text-gray-500">No documents yet.</p>
               <p className="text-sm text-gray-400 mt-1">
                 Use the <code className="bg-gray-100 px-1 rounded">create_artifact</code> tool to
                 create one.

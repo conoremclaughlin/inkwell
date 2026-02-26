@@ -5,7 +5,10 @@
  * user settings integration, and status tracking.
  */
 
-import { loadAllSkills, loadSkillByName, getSkillPaths } from './loader';
+import { existsSync, readFileSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
+import { loadAllSkills, loadSkillByName, getSkillPaths, type SkillLoadOptions } from './loader';
 import type {
   LoadedSkill,
   SkillSummary,
@@ -82,10 +85,10 @@ function toDetail(skill: LoadedSkill, userSettings?: UserSkillSettings): SkillDe
  * Skills Service
  */
 export class SkillsService {
-  private userSkillsPath?: string;
+  private loadOptions: SkillLoadOptions;
 
-  constructor(userSkillsPath?: string) {
-    this.userSkillsPath = userSkillsPath;
+  constructor(options?: SkillLoadOptions) {
+    this.loadOptions = options || {};
   }
 
   /**
@@ -97,7 +100,7 @@ export class SkillsService {
       return skillsCache;
     }
 
-    skillsCache = loadAllSkills(this.userSkillsPath);
+    skillsCache = loadAllSkills(this.loadOptions);
     cacheTimestamp = now;
     return skillsCache;
   }
@@ -156,7 +159,7 @@ export class SkillsService {
    * Get skill details by name
    */
   getSkill(name: string): SkillDetail | null {
-    const skill = loadSkillByName(name, this.userSkillsPath);
+    const skill = loadSkillByName(name, this.loadOptions);
     if (!skill) return null;
     return toDetail(skill);
   }
@@ -174,14 +177,14 @@ export class SkillsService {
    * Get skill paths being scanned
    */
   getSkillPaths(): string[] {
-    return getSkillPaths(this.userSkillsPath);
+    return getSkillPaths(this.loadOptions);
   }
 
   /**
    * Check if a specific skill is eligible
    */
   checkSkillEligibility(name: string): { eligible: boolean; message?: string } {
-    const skill = loadSkillByName(name, this.userSkillsPath);
+    const skill = loadSkillByName(name, this.loadOptions);
     if (!skill) {
       return { eligible: false, message: `Skill "${name}" not found` };
     }
@@ -196,11 +199,32 @@ export class SkillsService {
 let serviceInstance: SkillsService | null = null;
 
 /**
- * Get the skills service singleton
+ * Read skills config from ~/.pcp/config.json.
+ * Returns extraDirs if configured under `skills.extraDirs`.
  */
-export function getSkillsService(userSkillsPath?: string): SkillsService {
+function readSkillsConfig(): SkillLoadOptions {
+  const configPath = join(homedir(), '.pcp', 'config.json');
+  if (!existsSync(configPath)) return {};
+
+  try {
+    const config = JSON.parse(readFileSync(configPath, 'utf-8'));
+    const extraDirs = config?.skills?.extraDirs as string[] | undefined;
+    return extraDirs?.length ? { extraDirs } : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Get the skills service singleton.
+ * When no options are provided, reads ~/.pcp/config.json for extraDirs.
+ */
+export function getSkillsService(options?: SkillLoadOptions): SkillsService {
   if (!serviceInstance) {
-    serviceInstance = new SkillsService(userSkillsPath);
+    // Merge caller options with config-file options (caller wins)
+    const configOptions = readSkillsConfig();
+    const merged: SkillLoadOptions = { ...configOptions, ...options };
+    serviceInstance = new SkillsService(merged);
   }
   return serviceInstance;
 }

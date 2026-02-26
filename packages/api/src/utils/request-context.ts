@@ -35,7 +35,7 @@ export interface RequestContextData {
   identityId?: string;
   /** Session ID if in a session */
   sessionId?: string;
-  /** Active product workspace container ID */
+  /** Active product workspace ID */
   workspaceId?: string;
   /** Conversation ID for channel routing */
   conversationId?: string;

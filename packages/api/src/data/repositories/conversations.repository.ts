@@ -29,6 +29,25 @@ export class ConversationsRepository extends BaseRepository {
     }
   }
 
+  async upsertConversationByPlatformId(
+    conversationData: CreateConversationDTO
+  ): Promise<Conversation> {
+    try {
+      const { data, error } = await this.client
+        .from('conversations')
+        .upsert(conversationData, {
+          onConflict: 'platform,platform_conversation_id',
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+      return data;
+    } catch (error) {
+      this.handleError(error, 'upsertConversationByPlatformId');
+    }
+  }
+
   async findConversationById(id: string, userId: string): Promise<Conversation | null> {
     try {
       const { data, error } = await this.client

@@ -2,29 +2,58 @@
 
 Skills extend your AI assistant's capabilities. There are three types:
 
-| Type | Description | Example |
-|------|-------------|---------|
+| Type         | Description                      | Example                          |
+| ------------ | -------------------------------- | -------------------------------- |
 | **mini-app** | Code-based skills with functions | Bill splitting, expense tracking |
-| **cli** | Wrappers for CLI tools | GitHub CLI, AWS CLI |
-| **guide** | Behavioral guides for situations | Group chat etiquette |
+| **cli**      | Wrappers for CLI tools           | GitHub CLI, AWS CLI              |
+| **guide**    | Behavioral guides for situations | Group chat etiquette             |
+
+## Format Compatibility
+
+PCP skills use the [AgentSkills format](https://docs.openclaw.ai/tools/skills) — an open standard adopted by Claude Code, Cursor, VS Code, Gemini, and others. Skills installed via [ClawHub](https://clawhub.com) are compatible with PCP's loader.
 
 ## Skill Locations
 
-Skills are loaded from two locations:
+Skills are loaded from a 4-tier precedence cascade (lowest → highest). When names collide, higher tiers win:
 
-1. **Built-in skills**: `packages/api/src/skills/builtin/`
+1. **Built-in**: `packages/api/src/skills/builtin/`
    - Ships with PCP
    - Updated via PCP releases
 
-2. **User skills**: `~/.pcp/skills/`
+2. **Extra dirs**: configurable paths (default: `~/.openclaw/skills`)
+   - ClawHub interop — `clawdhub install playwright-mcp` just works
+   - Configured in `~/.pcp/config.json` (see below)
+
+3. **Managed**: `~/.pcp/skills/`
    - Your custom skills
    - Downloaded skills from registries
+
+4. **Workspace**: `<cwd>/.pcp/skills/`
+   - Per-worktree / per-SB skills
+   - Highest precedence — overrides everything
+
+> **Note:** The MCP `list_skills` endpoint covers tiers 1–3 (builtin, extra dirs, managed). Workspace skills (tier 4) require knowing the agent's working directory, which the PCP server doesn't have. Instead, workspace skills are picked up by the session start hooks running inside the agent's process and injected into the `{{SKILLS_BLOCK}}`.
+
+### Configuring Extra Directories
+
+Add `skills.extraDirs` to `~/.pcp/config.json`:
+
+```json
+{
+  "skills": {
+    "extraDirs": ["~/.openclaw/skills"]
+  }
+}
+```
+
+This lets ClawHub-installed skills (and any other AgentSkills-compatible sources) be automatically available to PCP.
 
 ## Installing Skills
 
 ### Manual Installation
 
 1. Create the skills directory if it doesn't exist:
+
    ```bash
    mkdir -p ~/.pcp/skills
    ```
@@ -59,17 +88,26 @@ If the skill is a directory package, place it under:
 ~/.pcp/skills/<skill-name>/
 ```
 
-### Future: PCP CLI (coming soon)
+### From ClawHub
+
+If [ClawHub](https://clawhub.com) is installed, skills install directly into `~/.openclaw/skills/` and are automatically available to PCP (via `extraDirs`):
+
+```bash
+clawdhub install playwright-mcp
+clawdhub install playwright-scraper-skill
+```
+
+### Future: SB CLI (coming soon)
 
 ```bash
 # Install from registry
-pcp skill install bill-split
+sb skill install bill-split
 
 # List installed skills
-pcp skill list
+sb skill list
 
 # Update all skills
-pcp skill update
+sb skill update
 ```
 
 ## Creating a Skill
@@ -81,11 +119,11 @@ The simplest format - a markdown file with YAML frontmatter:
 ```markdown
 ---
 name: my-skill
-version: "1.0.0"
+version: '1.0.0'
 displayName: My Skill
 description: What this skill does
-type: guide  # or mini-app, cli
-emoji: "🎯"
+type: guide # or mini-app, cli
+emoji: '🎯'
 category: productivity
 tags:
   - example
@@ -118,9 +156,21 @@ For more complex skills with multiple files:
 ~/.pcp/skills/my-skill/
 ├── manifest.yaml     # Skill metadata (required)
 ├── SKILL.md          # Instructions for AI (optional)
+├── run.js            # Bundled scripts (optional)
 ├── functions.ts      # Code for mini-apps (optional)
 └── README.md         # Human documentation (optional)
 ```
+
+### The `{baseDir}` Placeholder
+
+Skills can reference `{baseDir}` in their SKILL.md content to resolve paths relative to their own directory. This is useful for bundled scripts:
+
+```markdown
+To run the automation:
+`cd {baseDir} && node run.js /tmp/my-script.js`
+```
+
+At load time, `{baseDir}` is replaced with the skill's actual filesystem path (e.g., `~/.pcp/skills/my-skill`).
 
 ## Skill Types
 
@@ -182,7 +232,6 @@ guide:
     - any
   priority: 5
 ---
-
 # Meeting Notes Guide
 
 How to take effective meeting notes...
@@ -236,10 +285,11 @@ install:
 
   - kind: manual
     url: https://example.com/install
-    instructions: "Download and run the installer"
+    instructions: 'Download and run the installer'
 ```
 
 Supported install kinds:
+
 - `brew` - Homebrew (macOS/Linux)
 - `npm` - Node.js packages
 - `pip` - Python packages
@@ -282,11 +332,15 @@ PCP supports cloud-based skill storage and distribution:
 
 ### Loading Order
 
-Default source priority is deterministic:
+Default source priority is deterministic (lowest → highest precedence):
 
-1. **Cloud installations** - User's installed skills from registry
-2. **Local skills** (`~/.pcp/skills/`) - Loaded after cloud
-3. **Deduplication** - Later sources override earlier ones, so local skills take precedence over cloud when names collide
+1. **Built-in** — shipped with PCP
+2. **Cloud installations** — user's installed skills from registry
+3. **Extra dirs** — ClawHub and other configured sources
+4. **Managed** (`~/.pcp/skills/`) — user-installed local skills
+5. **Workspace** (`<cwd>/.pcp/skills/`) — per-worktree overrides
+
+Later sources override earlier ones when names collide.
 
 ### User Installation Flow
 
@@ -345,8 +399,11 @@ supabase db push
 mcp__supabase__apply_migration
 ```
 
-## Future: Skill Registries
+## Future (v2)
 
+- **Public/private visibility** — Cloud registry already has `is_public`. Surface in local config for per-SB access control (public-facing SBs get different skills than private ones).
+- **`sb skills install`** — CLI command to fetch from cloud registry or ClawHub
+- **Backend skill injection** — Inject skill content into `sb`-wrapped sessions (Claude Code, Codex, Gemini)
 - **PCP Hub**: Curated, verified official skills
 - **Community**: User-submitted public skills
 - **Organization**: Private team skill collections

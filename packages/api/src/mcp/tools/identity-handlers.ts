@@ -13,6 +13,7 @@ import type { Json, TablesInsert } from '../../data/supabase/types';
 import { logger } from '../../utils/logger';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
+import { ensureDefaultReminders } from '../../services/heartbeat';
 
 // =====================================================
 // SCHEMAS
@@ -43,7 +44,7 @@ export const chooseNameSchema = userIdentifierBaseSchema.extend({
 });
 
 export const saveIdentitySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
   agentId: z
     .string()
     .describe('Unique identifier for the AI being (e.g., "wren", "benson", "myra")'),
@@ -69,7 +70,7 @@ export const saveIdentitySchema = userIdentifierBaseSchema.extend({
 });
 
 export const getIdentitySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
   agentId: z.string().describe('Agent identifier to look up'),
   file: z
     .enum(['heartbeat', 'soul', 'values', 'identity'])
@@ -78,17 +79,17 @@ export const getIdentitySchema = userIdentifierBaseSchema.extend({
 });
 
 export const listIdentitiesSchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
 });
 
 export const getIdentityHistorySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
   agentId: z.string().describe('Agent identifier to get history for'),
   limit: z.number().min(1).max(50).optional().describe('Max history entries (default: 10)'),
 });
 
 export const restoreIdentitySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
   agentId: z.string().describe('Agent identifier to restore'),
   version: z.number().describe('Version number to restore to'),
 });
@@ -255,6 +256,17 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
   }
 
   logger.info('Identity saved', { agentId, version: data.version });
+
+  // Seed default reminders on first creation only
+  if (data.version === 1) {
+    ensureDefaultReminders({
+      userId: user.id,
+      identityId: data.id,
+      agentId,
+      deliveryChannel: user.telegram_id ? 'telegram' : user.whatsapp_id ? 'whatsapp' : undefined,
+      deliveryTarget: user.telegram_id?.toString() ?? user.whatsapp_id ?? undefined,
+    }).catch(() => {});
+  }
 
   // Optionally sync to file system
   let filePath: string | undefined;
@@ -650,7 +662,7 @@ export async function handleRestoreIdentity(args: unknown, dataComposer: DataCom
 // =====================================================
 
 export const meetFamilySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace container scope'),
+  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
 });
 
 export async function handleMeetFamily(args: unknown, dataComposer: DataComposer) {
@@ -803,6 +815,15 @@ export async function handleChooseName(args: unknown, dataComposer: DataComposer
   }
 
   logger.info('New SB chose their name', { agentId, name: params.name, backend });
+
+  // Seed default reminders (best-effort, non-blocking)
+  ensureDefaultReminders({
+    userId: user.id,
+    identityId: data.id,
+    agentId,
+    deliveryChannel: user.telegram_id ? 'telegram' : user.whatsapp_id ? 'whatsapp' : undefined,
+    deliveryTarget: user.telegram_id?.toString() ?? user.whatsapp_id ?? undefined,
+  }).catch(() => {});
 
   // Sync to file system
   let filePath: string | undefined;

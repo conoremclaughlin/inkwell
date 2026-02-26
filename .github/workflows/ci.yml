@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn
+
+      # Rewrite git+ssh:// to git+https:// so transitive deps
+      # (e.g. libsignal via @whiskeysockets/baileys) clone without SSH keys
+      - run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+
+      - run: yarn install --immutable
+
+      - run: yarn build
+
+      - run: yarn test

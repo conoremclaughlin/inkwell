@@ -44,6 +44,10 @@ const createWorkspaceSchema = userIdentifierBaseSchema.extend({
     .describe('Human-readable description of what this workspace is for'),
   baseBranch: z.string().optional().default('main').describe('Branch to base the new worktree on'),
   sessionId: z.string().uuid().optional().describe('Session ID to link to this workspace'),
+  roleTemplate: z
+    .string()
+    .optional()
+    .describe('Role template name used when creating the studio (e.g., "reviewer", "builder")'),
   skipGitOperations: z
     .boolean()
     .optional()
@@ -76,6 +80,7 @@ const updateWorkspaceSchema = userIdentifierBaseSchema.extend({
   agentId: z.string().describe('Agent ID making the update'),
   status: z.enum(['active', 'idle', 'archived']).optional().describe('New workspace status'),
   purpose: z.string().optional().describe('Updated purpose description'),
+  roleTemplate: z.string().optional().describe('Role template name to set'),
   sessionId: z.string().uuid().optional().describe('Session ID to link'),
   unlinkSession: z
     .boolean()
@@ -145,6 +150,7 @@ export async function handleCreateWorkspace(args: unknown, dataComposer: DataCom
     purpose,
     baseBranch = 'main',
     sessionId,
+    roleTemplate,
     skipGitOperations = false,
   } = parsed;
 
@@ -190,6 +196,7 @@ export async function handleCreateWorkspace(args: unknown, dataComposer: DataCom
       baseBranch,
       purpose,
       workType,
+      roleTemplate,
     });
   } catch (dbError) {
     // If DB insert fails but git succeeded, attempt cleanup
@@ -231,6 +238,7 @@ export async function handleCreateWorkspace(args: unknown, dataComposer: DataCom
       baseBranch: workspace.baseBranch,
       purpose: workspace.purpose,
       workType: workspace.workType,
+      roleTemplate: workspace.roleTemplate,
       status: workspace.status,
       sessionId: workspace.sessionId,
       createdAt: workspace.createdAt,
@@ -276,6 +284,7 @@ export async function handleListWorkspaces(args: unknown, dataComposer: DataComp
       purpose: w.purpose,
       status: w.status,
       workType: w.workType,
+      roleTemplate: w.roleTemplate,
       hasLinkedSession: !!w.sessionId,
       createdAt: w.createdAt,
     })),
@@ -316,6 +325,7 @@ export async function handleGetWorkspace(args: unknown, dataComposer: DataCompos
       baseBranch: workspace.baseBranch,
       purpose: workspace.purpose,
       workType: workspace.workType,
+      roleTemplate: workspace.roleTemplate,
       status: workspace.status,
       sessionId: workspace.sessionId,
       metadata: workspace.metadata,
@@ -331,7 +341,7 @@ export async function handleUpdateWorkspace(args: unknown, dataComposer: DataCom
   const parsed = updateWorkspaceSchema.parse(args);
   await resolveUserOrThrow(parsed, dataComposer);
 
-  const { workspaceId, agentId, status, purpose, sessionId, unlinkSession } = parsed;
+  const { workspaceId, agentId, status, purpose, roleTemplate, sessionId, unlinkSession } = parsed;
   const studiosRepo = dataComposer.repositories.studios;
 
   // Verify workspace exists
@@ -354,6 +364,9 @@ export async function handleUpdateWorkspace(args: unknown, dataComposer: DataCom
     if (purpose !== undefined) {
       updateObj.purpose = purpose;
     }
+    if (roleTemplate !== undefined) {
+      updateObj.roleTemplate = roleTemplate;
+    }
     updated = await studiosRepo.update(workspaceId, updateObj);
   }
 
@@ -369,6 +382,7 @@ export async function handleUpdateWorkspace(args: unknown, dataComposer: DataCom
       worktreeFolder: path.basename(updated.worktreePath),
       worktreePath: updated.worktreePath,
       purpose: updated.purpose,
+      roleTemplate: updated.roleTemplate,
       status: updated.status,
       sessionId: updated.sessionId,
       updatedAt: updated.updatedAt,
@@ -493,6 +507,7 @@ export async function handleAdoptWorkspace(args: unknown, dataComposer: DataComp
       worktreeFolder: path.basename(updated.worktreePath),
       worktreePath: updated.worktreePath,
       purpose: updated.purpose,
+      roleTemplate: updated.roleTemplate,
       status: updated.status,
       sessionId: updated.sessionId,
       updatedAt: updated.updatedAt,

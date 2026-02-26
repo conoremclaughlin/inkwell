@@ -119,9 +119,9 @@ describe('admin artifact comments routes', () => {
             data: [
               {
                 id: '550e8400-e29b-41d4-a716-446655440000',
-                first_name: 'Conor',
-                username: 'conor',
-                email: 'conor@example.com',
+                first_name: 'Alice',
+                username: 'alice',
+                email: 'alice@example.com',
               },
             ],
             error: null,
@@ -184,9 +184,9 @@ describe('admin artifact comments routes', () => {
             {
               data: {
                 id: '550e8400-e29b-41d4-a716-446655440000',
-                first_name: 'Conor',
-                username: 'conor',
-                email: 'conor@example.com',
+                first_name: 'Alice',
+                username: 'alice',
+                email: 'alice@example.com',
               },
               error: null,
             },

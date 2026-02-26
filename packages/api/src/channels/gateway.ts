@@ -22,13 +22,13 @@ import type { AgentResponse } from '../agent/types';
 import type { DataComposer } from '../data/composer';
 import { logger } from '../utils/logger';
 import { env } from '../config/env';
+import { InboundMediaPipeline } from './media-pipeline';
+import { TextToSpeechService } from './text-to-speech';
 import telegramifyMarkdown from 'telegramify-markdown';
+import type { Platform } from '@shared/types/common';
 
 // Supported messaging channels
 export type GatewayChannel = 'telegram' | 'whatsapp' | 'discord' | 'slack';
-
-// Activity stream - conversation to user mapping for outbound message logging
-const conversationUserMap = new Map<string, string>(); // conversationId -> userId
 
 export interface ChannelGatewayConfig {
   /** Whether to enable Telegram listener */
@@ -120,6 +120,12 @@ export class ChannelGateway extends EventEmitter {
 
   // Known agent names for mention detection in group chats
   private knownAgentNames: Set<string> = new Set();
+  private mediaPipeline: InboundMediaPipeline = new InboundMediaPipeline();
+  private textToSpeech: TextToSpeechService = TextToSpeechService.fromEnv();
+  private autoVoiceReplyOnAudio = process.env.TELEGRAM_AUTO_VOICE_REPLY === 'true';
+  private includeTextAfterVoiceReply = process.env.TELEGRAM_VOICE_INCLUDE_TEXT !== 'false';
+  private pendingVoiceReplyConversations: Set<string> = new Set();
+  private conversationUserMap = new Map<string, string>(); // channel:conversationId -> userId
 
   constructor(config: ChannelGatewayConfig = {}) {
     super();
@@ -259,6 +265,9 @@ export class ChannelGateway extends EventEmitter {
       activeTypingTimeouts.delete(conversationId);
     }
 
+    this.pendingVoiceReplyConversations.clear();
+    this.conversationUserMap.clear();
+
     // Clear all message buffers (flush them first)
     for (const [key, buffer] of this.messageBuffers) {
       clearTimeout(buffer.timer);
@@ -300,6 +309,70 @@ export class ChannelGateway extends EventEmitter {
    */
   private getBufferKey(channel: GatewayChannel, conversationId: string): string {
     return `${channel}:${conversationId}`;
+  }
+
+  private toPersistentConversationPlatform(channel: GatewayChannel): Platform | null {
+    // conversations.platform currently supports telegram/whatsapp/discord/api
+    if (channel === 'telegram' || channel === 'whatsapp' || channel === 'discord') {
+      return channel;
+    }
+    return null;
+  }
+
+  private async resolveUserIdForConversation(
+    channel: GatewayChannel,
+    conversationId: string
+  ): Promise<string | undefined> {
+    const key = this.getBufferKey(channel, conversationId);
+    const cachedUserId = this.conversationUserMap.get(key);
+    if (cachedUserId) return cachedUserId;
+
+    const platform = this.toPersistentConversationPlatform(channel);
+    if (!platform || !this.dataComposer) return undefined;
+
+    try {
+      const conversation =
+        await this.dataComposer.repositories.conversations.findConversationByPlatformId(
+          platform,
+          conversationId
+        );
+      const userId = conversation?.user_id;
+      if (!userId) return undefined;
+
+      this.conversationUserMap.set(key, userId);
+      return userId;
+    } catch (error) {
+      logger.warn('Failed to resolve conversation user from DB', {
+        channel,
+        conversationId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
+    }
+  }
+
+  private persistConversationUserMapping(
+    channel: GatewayChannel,
+    conversationId: string,
+    userId: string
+  ): void {
+    const platform = this.toPersistentConversationPlatform(channel);
+    if (!platform || !this.dataComposer) return;
+
+    void this.dataComposer.repositories.conversations
+      .upsertConversationByPlatformId({
+        user_id: userId,
+        platform,
+        platform_conversation_id: conversationId,
+      })
+      .catch((error) => {
+        logger.warn('Failed to persist conversation user mapping', {
+          channel,
+          conversationId,
+          userId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
   }
 
   /**
@@ -502,7 +575,16 @@ export class ChannelGateway extends EventEmitter {
       }
     }
     if (userId) {
-      conversationUserMap.set(conversationId, userId);
+      this.conversationUserMap.set(this.getBufferKey(channel, conversationId), userId);
+      this.persistConversationUserMapping(channel, conversationId, userId);
+    }
+
+    if (
+      channel === 'telegram' &&
+      this.autoVoiceReplyOnAudio &&
+      metadata?.media?.some((attachment) => attachment.type === 'audio')
+    ) {
+      this.pendingVoiceReplyConversations.add(this.getBufferKey(channel, conversationId));
     }
 
     // Log incoming message to activity stream
@@ -539,6 +621,7 @@ export class ChannelGateway extends EventEmitter {
       // Release processing lock so conversation isn't permanently deadlocked
       const key = this.getBufferKey(channel, conversationId);
       this.processingConversations.delete(key);
+      this.pendingVoiceReplyConversations.delete(key);
 
       // Send error response based on channel
       try {
@@ -596,6 +679,15 @@ export class ChannelGateway extends EventEmitter {
         if (!this.telegramListener) {
           throw new Error('Telegram listener not available');
         }
+        if (await this.trySendTelegramVoiceReply(response)) {
+          if (this.includeTextAfterVoiceReply) {
+            await this.sendTelegramMessage(conversationId, content, { format, replyToMessageId });
+          } else {
+            await this.logOutgoingTelegram(conversationId, content);
+          }
+          break;
+        }
+
         await this.sendTelegramMessage(conversationId, content, { format, replyToMessageId });
         break;
 
@@ -606,7 +698,7 @@ export class ChannelGateway extends EventEmitter {
         await this.whatsappListener.sendMessage(conversationId, content);
         // Log outgoing WhatsApp message to activity stream
         {
-          const userId = conversationUserMap.get(conversationId);
+          const userId = await this.resolveUserIdForConversation('whatsapp', conversationId);
           if (this.dataComposer && userId) {
             try {
               await this.dataComposer.repositories.activityStream.logMessage({
@@ -635,7 +727,7 @@ export class ChannelGateway extends EventEmitter {
         await this.discordListener.sendMessage(conversationId, content);
         // Log outgoing Discord message to activity stream
         {
-          const userId = conversationUserMap.get(conversationId);
+          const userId = await this.resolveUserIdForConversation('discord', conversationId);
           if (this.dataComposer && userId) {
             try {
               await this.dataComposer.repositories.activityStream.logMessage({
@@ -664,7 +756,7 @@ export class ChannelGateway extends EventEmitter {
         await this.slackListener.sendMessage(conversationId, content);
         // Log outgoing Slack message to activity stream
         {
-          const userId = conversationUserMap.get(conversationId);
+          const userId = await this.resolveUserIdForConversation('slack', conversationId);
           if (this.dataComposer && userId) {
             try {
               await this.dataComposer.repositories.activityStream.logMessage({
@@ -770,6 +862,7 @@ export class ChannelGateway extends EventEmitter {
     this.stopTypingIndicator(conversationId);
 
     // Process pending messages (which will also release the lock)
+    this.pendingVoiceReplyConversations.delete(key);
     await this.processPendingMessages(channel, conversationId);
   }
 
@@ -806,8 +899,12 @@ export class ChannelGateway extends EventEmitter {
       parseMode,
     });
 
+    await this.logOutgoingTelegram(conversationId, content);
+  }
+
+  private async logOutgoingTelegram(conversationId: string, content: string): Promise<void> {
     // Log outgoing message to activity stream
-    const userId = conversationUserMap.get(conversationId);
+    const userId = await this.resolveUserIdForConversation('telegram', conversationId);
     if (this.dataComposer && userId) {
       try {
         await this.dataComposer.repositories.activityStream.logMessage({
@@ -822,6 +919,55 @@ export class ChannelGateway extends EventEmitter {
       } catch (activityError) {
         logger.warn('Failed to log outgoing message to activity stream:', activityError);
       }
+    }
+  }
+
+  private shouldUseVoiceReply(response: AgentResponse): boolean {
+    if (response.channel !== 'telegram') return false;
+
+    const key = this.getBufferKey('telegram', response.conversationId);
+    const metadata = response.metadata as Record<string, unknown> | undefined;
+    const explicitVoiceRequest =
+      metadata?.voiceReply === true ||
+      metadata?.voice === true ||
+      metadata?.outputMode === 'voice' ||
+      metadata?.format === 'voice';
+    if (explicitVoiceRequest) {
+      this.pendingVoiceReplyConversations.delete(key);
+      return true;
+    }
+
+    if (!this.autoVoiceReplyOnAudio) return false;
+    if (!this.pendingVoiceReplyConversations.has(key)) return false;
+    this.pendingVoiceReplyConversations.delete(key);
+    return true;
+  }
+
+  private async trySendTelegramVoiceReply(response: AgentResponse): Promise<boolean> {
+    if (!this.telegramListener) return false;
+    if (!this.textToSpeech.isEnabled()) return false;
+    if (!this.shouldUseVoiceReply(response)) return false;
+
+    const audio = await this.textToSpeech.synthesize({ text: response.content });
+    if (!audio) return false;
+
+    try {
+      await this.telegramListener.sendVoice(response.conversationId, audio.filePath, {
+        replyToMessageId: response.replyToMessageId,
+        contentType: audio.contentType,
+        filename: audio.filename,
+      });
+      return true;
+    } catch (error) {
+      logger.warn('Failed to send Telegram voice reply, falling back to text', {
+        conversationId: response.conversationId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    } finally {
+      await audio.cleanup().catch((cleanupError) => {
+        logger.debug('Failed to clean up synthesized audio file', cleanupError);
+      });
     }
   }
 
@@ -845,6 +991,8 @@ export class ChannelGateway extends EventEmitter {
       const senderId = message.sender.id || 'unknown';
       const conversationId = message.conversationId || senderId;
       const isGroupChat = message.chatType === 'group';
+
+      await this.mediaPipeline.preprocess(message);
 
       // In group chats, only respond if bot or any known agent is mentioned
       if (isGroupChat && !this.isAgentMentioned(message.body, message.mentions)) {
@@ -902,6 +1050,8 @@ export class ChannelGateway extends EventEmitter {
       const senderId = message.sender.id || 'unknown';
       const conversationId = message.conversationId || senderId;
       const isGroupChat = message.chatType === 'group';
+
+      await this.mediaPipeline.preprocess(message);
 
       // In group chats, only respond if bot or any known agent is mentioned
       if (isGroupChat && !this.isAgentMentioned(message.body, message.mentions)) {
@@ -967,8 +1117,16 @@ export class ChannelGateway extends EventEmitter {
     this.discordListener.onMessage(async (message) => {
       const senderId = message.sender.id || 'unknown';
       const conversationId = message.conversationId || senderId;
+      const isGroupChat = message.chatType === 'group' || message.chatType === 'channel';
 
-      // Bot mention check already handled inside DiscordListener
+      await this.mediaPipeline.preprocess(message);
+
+      // In group chats, only respond if bot or any known agent is mentioned
+      if (isGroupChat && !this.isAgentMentioned(message.body, message.mentions)) {
+        logger.debug('Skipping Discord group message - no agent mentioned');
+        return;
+      }
+
       // Start typing indicator
       this.startTypingIndicator(conversationId, 'discord');
 
@@ -1022,6 +1180,8 @@ export class ChannelGateway extends EventEmitter {
       const senderId = message.sender.id || 'unknown';
       const conversationId = message.conversationId || senderId;
       const isGroupChat = message.chatType === 'group' || message.chatType === 'channel';
+
+      await this.mediaPipeline.preprocess(message);
 
       // In group chats, only respond if bot or any known agent is mentioned
       if (isGroupChat && !this.isAgentMentioned(message.body, message.mentions)) {

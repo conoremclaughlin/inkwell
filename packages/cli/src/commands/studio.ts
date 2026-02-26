@@ -26,8 +26,16 @@ import {
   readdirSync,
   renameSync,
   cpSync,
+  statSync,
 } from 'fs';
-import { join, dirname, basename, parse as parsePath, resolve as resolvePath } from 'path';
+import {
+  join,
+  dirname,
+  basename,
+  parse as parsePath,
+  resolve as resolvePath,
+  delimiter as pathDelimiter,
+} from 'path';
 import { homedir } from 'os';
 import { installHooks } from './hooks.js';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
@@ -38,6 +46,7 @@ interface StudioIdentity {
   identityId?: string;
   context: string;
   backend?: string;
+  role?: string;
   studioId?: string;
   studio: string;
   description: string;
@@ -51,6 +60,14 @@ interface StudioInfo {
   path: string;
   branch: string;
   identity?: StudioIdentity;
+}
+
+interface RenameIdentity {
+  studio?: string;
+  workspace?: string;
+  context?: string;
+  description?: string;
+  [key: string]: unknown;
 }
 
 // ============================================================================
@@ -86,7 +103,7 @@ function resolveCanonicalRepoRoot(gitRoot: string): string {
     if (idx === -1) return gitRoot;
 
     // /path/to/repo/.git/worktrees/name -> /path/to/repo
-    return gitDirPath.slice(0, idx);
+    return resolvePath(gitDirPath.slice(0, idx));
   } catch {
     return gitRoot;
   }
@@ -213,6 +230,19 @@ interface InteractiveResult {
   configDirs: string[];
 }
 
+function isPromptCancelError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const maybe = err as { name?: string; message?: string };
+  const name = maybe.name || '';
+  const message = maybe.message || '';
+
+  return (
+    name === 'ExitPromptError' ||
+    name === 'AbortPromptError' ||
+    /force closed|ctrl\+c|sigint|cancell?ed|aborted/i.test(message)
+  );
+}
+
 /**
  * Run the full interactive studio creation flow when name is omitted and stdin is a TTY.
  * Returns the resolved name, branch, and config dirs to copy.
@@ -260,9 +290,9 @@ async function runInteractiveFlow(agentId: string, gitRoot: string): Promise<Int
  * - .codex/, .gemini/ — if .mcp.json exists in the target, regenerate via syncMcpConfig instead
  * - .pcp/identity.json is always freshly written (never copied)
  */
-function copyConfigDirs(gitRoot: string, wsPath: string, dirs: string[]): void {
+function copyConfigDirs(sourceRoot: string, wsPath: string, dirs: string[]): void {
   for (const dir of dirs) {
-    const source = join(gitRoot, dir);
+    const source = join(sourceRoot, dir);
     const target = join(wsPath, dir);
 
     if (!existsSync(source)) continue;
@@ -276,6 +306,147 @@ function copyConfigDirs(gitRoot: string, wsPath: string, dirs: string[]): void {
     } else {
       cpSync(source, target, { recursive: true });
     }
+  }
+}
+
+function resolveCopySourceRoot(gitRoot: string, copyFrom?: string): string {
+  const canonicalRoot = resolveCanonicalRepoRoot(gitRoot);
+  if (!copyFrom || copyFrom === 'main') {
+    return canonicalRoot;
+  }
+
+  const explicitPath = resolvePath(copyFrom);
+  if (existsSync(explicitPath)) {
+    if (!statSync(explicitPath).isDirectory()) {
+      throw new Error(`--copy-from must point to a directory: ${copyFrom}`);
+    }
+    return explicitPath;
+  }
+
+  const studioPath = getStudioPath(gitRoot, copyFrom);
+  if (existsSync(studioPath)) {
+    return studioPath;
+  }
+
+  throw new Error(`Copy source not found: ${copyFrom}`);
+}
+
+/** Built-in studio role templates. */
+const BUILTIN_ROLE_TEMPLATES = ['reviewer', 'builder', 'product'] as const;
+type BuiltinRoleTemplate = (typeof BUILTIN_ROLE_TEMPLATES)[number];
+
+/**
+ * Validate a template name to prevent path traversal.
+ * Only allows alphanumeric, hyphens, and underscores.
+ */
+function isValidTemplateName(name: string): boolean {
+  return /^[a-zA-Z0-9_-]+$/.test(name);
+}
+
+/**
+ * Resolve a role template ROLE.md by name.
+ * Checks: built-in templates → ~/.pcp/studio-templates/<name>/ROLE.md
+ * Returns the ROLE.md content, or null if not found.
+ */
+function resolveRoleTemplate(templateName: string): string | null {
+  if (!isValidTemplateName(templateName)) return null;
+
+  // Built-in templates (shipped with CLI)
+  const distPath = join(__dirname, '..', 'templates', 'studio-roles', `${templateName}.md`);
+  if (existsSync(distPath)) return readFileSync(distPath, 'utf-8');
+
+  const srcPath = join(
+    __dirname,
+    '..',
+    '..',
+    'src',
+    'templates',
+    'studio-roles',
+    `${templateName}.md`
+  );
+  if (existsSync(srcPath)) return readFileSync(srcPath, 'utf-8');
+
+  // User-defined templates
+  const userPath = join(homedir(), '.pcp', 'studio-templates', templateName, 'ROLE.md');
+  if (existsSync(userPath)) return readFileSync(userPath, 'utf-8');
+
+  return null;
+}
+
+/**
+ * List available role template names (built-in + user-defined).
+ */
+function listRoleTemplates(): string[] {
+  const templates = new Set<string>(BUILTIN_ROLE_TEMPLATES);
+
+  const userTemplatesDir = join(homedir(), '.pcp', 'studio-templates');
+  if (existsSync(userTemplatesDir)) {
+    for (const entry of readdirSync(userTemplatesDir, { withFileTypes: true })) {
+      if (entry.isDirectory() && existsSync(join(userTemplatesDir, entry.name, 'ROLE.md'))) {
+        templates.add(entry.name);
+      }
+    }
+  }
+
+  return Array.from(templates).sort();
+}
+
+/**
+ * Copy .mcp.json and .env.local when missing in the new studio.
+ * These are local bootstrap files and should be present by default.
+ */
+function copyBootstrapFiles(sourceRoot: string, wsPath: string): string[] {
+  if (sourceRoot === wsPath) return [];
+
+  const copied: string[] = [];
+  for (const file of ['.mcp.json', '.env.local']) {
+    const source = join(sourceRoot, file);
+    const target = join(wsPath, file);
+    if (existsSync(source) && !existsSync(target)) {
+      cpSync(source, target);
+      copied.push(file);
+    }
+  }
+  return copied;
+}
+
+function updateIdentityForStudioRename(wsPath: string, from: string, to: string): boolean {
+  const identityPath = join(wsPath, '.pcp', 'identity.json');
+  if (!existsSync(identityPath)) return false;
+
+  try {
+    const identity = JSON.parse(readFileSync(identityPath, 'utf-8')) as RenameIdentity;
+    let changed = false;
+
+    if (identity.studio !== to) {
+      identity.studio = to;
+      changed = true;
+    }
+
+    if (identity.workspace && identity.workspace === from) {
+      identity.workspace = to;
+      changed = true;
+    }
+
+    if (identity.context === `studio-${from}` || identity.context === `workspace-${from}`) {
+      identity.context = `studio-${to}`;
+      changed = true;
+    }
+
+    if (
+      identity.description === `Studio: ${from}` ||
+      identity.description === `Workspace: ${from}`
+    ) {
+      identity.description = `Studio: ${to}`;
+      changed = true;
+    }
+
+    if (changed) {
+      writeFileSync(identityPath, JSON.stringify(identity, null, 2));
+    }
+    return changed;
+  } catch {
+    return false;
   }
 }
 
@@ -421,8 +592,10 @@ async function createStudio(
     purpose?: string;
     branch?: string;
     backend?: string;
+    template?: string;
     copyConfig?: boolean;
     configDirs?: string;
+    copyFrom?: string;
   },
   overrides?: { branch?: string; configDirsList?: string[] }
 ): Promise<void> {
@@ -432,93 +605,32 @@ async function createStudio(
   try {
     const gitRoot = findGitRoot();
     const wsPath = getStudioPath(gitRoot, name);
-    // Priority: overrides (from interactive) > options (from flags) > default
     const branch = overrides?.branch || options.branch || `${agentId}/studio/main`;
 
-    if (existsSync(wsPath)) {
-      spinner.fail(`Studio already exists at ${wsPath}`);
-      process.exit(1);
-    }
+    spinner.text = 'Creating studio...';
+    await createStudioInner(name, options, overrides);
 
-    spinner.text = 'Creating git worktree...';
-    if (branchExists(branch, gitRoot)) {
-      git(`worktree add "${wsPath}" "${branch}"`, gitRoot);
-    } else {
-      git(`worktree add -b "${branch}" "${wsPath}"`, gitRoot);
-    }
-
-    // Determine which config dirs to copy
+    // Read back what was created for display
     const configDirsList =
       overrides?.configDirsList ??
       (options.copyConfig ? (options.configDirs || '.claude').split(',').map((s) => s.trim()) : []);
-
-    if (configDirsList.length > 0) {
-      spinner.text = 'Copying config directories...';
-      copyConfigDirs(gitRoot, wsPath, configDirsList);
-    }
-
-    // Regenerate .codex/.gemini via syncMcpConfig if .mcp.json exists in the new studio
-    if (existsSync(join(wsPath, '.mcp.json'))) {
-      spinner.text = 'Syncing MCP config for backends...';
-      try {
-        const { syncMcpConfig } = await import('./mcp.js');
-        syncMcpConfig(wsPath);
-      } catch {
-        // syncMcpConfig not available or failed — not critical
-      }
-    }
-
-    spinner.text = 'Setting up PCP identity...';
-    const pcpDir = join(wsPath, '.pcp');
-    mkdirSync(pcpDir, { recursive: true });
-
-    // Resolve identityId from auth token if available
-    let identityId: string | undefined;
-    const auth = loadAuth();
-    if (auth && !isTokenExpired(auth)) {
-      const payload = decodeJwtPayload(auth.access_token);
-      if (payload?.identityId) {
-        identityId = payload.identityId;
-      }
-    }
-
-    // Always write fresh identity.json (never copy from source)
-    const identity: StudioIdentity = {
-      agentId,
-      ...(identityId ? { identityId } : {}),
-      context: `studio-${name}`,
-      ...(options.backend ? { backend: options.backend } : {}),
-      studio: name,
-      description: options.purpose || `Studio: ${name}`,
-      branch,
-      createdAt: new Date().toISOString(),
-      createdBy: getCurrentUser(),
-    };
-
-    writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
-
-    // Auto-install PCP hooks
-    spinner.text = 'Installing PCP hooks...';
-    const { result: hooksResult, backend: hooksBackend } = installHooks(wsPath);
 
     spinner.succeed(`Studio created: ${name}`);
     console.log('');
     console.log(chalk.dim('  Path:   ') + wsPath);
     console.log(chalk.dim('  Branch: ') + branch);
-    console.log(chalk.dim('  Agent:  ') + identity.agentId);
+    console.log(chalk.dim('  Agent:  ') + agentId);
+    if (options.template) {
+      console.log(chalk.dim('  Role:   ') + options.template + chalk.dim(' (.pcp/ROLE.md)'));
+    }
     if (configDirsList.length > 0) {
       console.log(chalk.dim('  Config: ') + configDirsList.join(', '));
     }
-    if (hooksResult === 'installed') {
-      console.log(chalk.dim('  Hooks:  ') + `${hooksBackend.name} (installed)`);
-    } else if (hooksResult === 'already-installed') {
-      console.log(chalk.dim('  Hooks:  ') + `${hooksBackend.name} (already installed)`);
-    } else if (hooksResult === 'conflict') {
-      console.log(
-        chalk.yellow('  Hooks:  ') +
-          `skipped — existing non-PCP hooks in ${hooksBackend.configPath}. Run: sb hooks install --force`
-      );
+    if (options.copyFrom) {
+      const copySourceRoot = resolveCopySourceRoot(gitRoot, options.copyFrom);
+      console.log(chalk.dim('  Source: ') + copySourceRoot);
     }
+    console.log(chalk.dim('  Hooks:  ') + 'installed');
     console.log('');
     console.log(chalk.cyan('To start working:'));
     console.log(chalk.dim(`  cd ${wsPath} && sb`));
@@ -527,6 +639,220 @@ async function createStudio(
     console.log(chalk.dim(`  eval $(sb studio cd ${name})`));
   } catch (error) {
     spinner.fail(`Failed to create studio: ${error}`);
+    process.exit(1);
+  }
+}
+
+/** Default studio set for `sb studio setup`. */
+const DEFAULT_STUDIO_SET: Array<{ suffix: string; template: string; purpose: string }> = [
+  { suffix: 'review', template: 'reviewer', purpose: 'Code review and quality assurance' },
+  { suffix: 'build', template: 'builder', purpose: 'Feature development and bug fixes' },
+  { suffix: 'product', template: 'product', purpose: 'Product thinking and spec writing' },
+];
+
+async function setupStudios(
+  agentId: string,
+  options: { backend?: string; copyFrom?: string }
+): Promise<void> {
+  console.log(chalk.bold(`\nSetting up studios for ${chalk.cyan(agentId)}...\n`));
+
+  const gitRoot = findGitRoot();
+  const results: Array<{ name: string; status: 'created' | 'exists' | 'failed'; path: string }> =
+    [];
+
+  for (const studio of DEFAULT_STUDIO_SET) {
+    const name = `${agentId}-${studio.suffix}`;
+    const wsPath = getStudioPath(gitRoot, name);
+
+    if (existsSync(wsPath)) {
+      results.push({ name, status: 'exists', path: wsPath });
+      continue;
+    }
+
+    const spinner = ora(`Creating studio: ${name}`).start();
+    try {
+      await createStudioInner(name, {
+        agent: agentId,
+        purpose: studio.purpose,
+        template: studio.template,
+        backend: options.backend,
+        copyFrom: options.copyFrom,
+      });
+      spinner.succeed(`Created: ${name}`);
+      results.push({ name, status: 'created', path: wsPath });
+    } catch (error) {
+      spinner.fail(`Failed: ${name} — ${error instanceof Error ? error.message : String(error)}`);
+      results.push({ name, status: 'failed', path: wsPath });
+    }
+  }
+
+  console.log('');
+
+  const created = results.filter((r) => r.status === 'created');
+  const existing = results.filter((r) => r.status === 'exists');
+  const failed = results.filter((r) => r.status === 'failed');
+
+  if (created.length > 0) {
+    console.log(chalk.green(`  ${created.length} studio(s) created`));
+  }
+  if (existing.length > 0) {
+    console.log(chalk.dim(`  ${existing.length} studio(s) already existed (skipped)`));
+  }
+  if (failed.length > 0) {
+    console.log(chalk.red(`  ${failed.length} studio(s) failed`));
+  }
+
+  console.log('');
+  console.log(chalk.cyan('Switch between modes:'));
+  for (const r of results.filter((r) => r.status !== 'failed')) {
+    console.log(chalk.dim(`  cd ${r.path}`));
+  }
+  console.log('');
+}
+
+/**
+ * Inner studio creation logic — throws on failure instead of process.exit.
+ * Used by both `createStudio` (interactive) and `setupStudios` (batch).
+ */
+async function createStudioInner(
+  name: string,
+  options: {
+    agent?: string;
+    purpose?: string;
+    branch?: string;
+    backend?: string;
+    template?: string;
+    copyConfig?: boolean;
+    configDirs?: string;
+    copyFrom?: string;
+  },
+  overrides?: { branch?: string; configDirsList?: string[] }
+): Promise<void> {
+  const agentId = options.agent || resolveAgentId() || 'sb';
+  const gitRoot = findGitRoot();
+  const copySourceRoot = resolveCopySourceRoot(gitRoot, options.copyFrom);
+  const wsPath = getStudioPath(gitRoot, name);
+  const branch = overrides?.branch || options.branch || `${agentId}/studio/main`;
+
+  if (existsSync(wsPath)) {
+    throw new Error(`Studio already exists at ${wsPath}`);
+  }
+
+  // Validate template before any side effects (worktree creation, file copies)
+  let roleContent: string | null = null;
+  if (options.template) {
+    roleContent = resolveRoleTemplate(options.template);
+    if (!roleContent) {
+      const available = listRoleTemplates();
+      throw new Error(
+        `Unknown template: ${options.template}\n  Available: ${available.join(', ') || '(none)'}`
+      );
+    }
+  }
+
+  // Create git worktree
+  if (branchExists(branch, gitRoot)) {
+    git(`worktree add "${wsPath}" "${branch}"`, gitRoot);
+  } else {
+    git(`worktree add -b "${branch}" "${wsPath}"`, gitRoot);
+  }
+
+  // Copy bootstrap files
+  copyBootstrapFiles(copySourceRoot, wsPath);
+
+  // Config dirs
+  const configDirsList =
+    overrides?.configDirsList ??
+    (options.copyConfig ? (options.configDirs || '.claude').split(',').map((s) => s.trim()) : []);
+
+  if (configDirsList.length > 0) {
+    copyConfigDirs(copySourceRoot, wsPath, configDirsList);
+  }
+
+  // Sync MCP config
+  if (existsSync(join(wsPath, '.mcp.json'))) {
+    try {
+      const { syncMcpConfig } = await import('./mcp.js');
+      syncMcpConfig(wsPath);
+    } catch {
+      // Not critical
+    }
+  }
+
+  // PCP identity
+  const pcpDir = join(wsPath, '.pcp');
+  mkdirSync(pcpDir, { recursive: true });
+
+  let identityId: string | undefined;
+  const auth = loadAuth();
+  if (auth && !isTokenExpired(auth)) {
+    const payload = decodeJwtPayload(auth.access_token);
+    if (payload?.identityId) {
+      identityId = payload.identityId;
+    }
+  }
+
+  const identity: StudioIdentity = {
+    agentId,
+    ...(identityId ? { identityId } : {}),
+    context: `studio-${name}`,
+    ...(options.backend ? { backend: options.backend } : {}),
+    ...(options.template ? { role: options.template } : {}),
+    studio: name,
+    description: options.purpose || `Studio: ${name}`,
+    branch,
+    createdAt: new Date().toISOString(),
+    createdBy: getCurrentUser(),
+  };
+
+  writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
+
+  if (roleContent) {
+    writeFileSync(join(pcpDir, 'ROLE.md'), roleContent);
+  }
+
+  // Install hooks
+  installHooks(wsPath);
+}
+
+async function renameStudio(from: string, to: string): Promise<void> {
+  const spinner = ora(`Renaming studio: ${from} → ${to}`).start();
+
+  try {
+    const gitRoot = findGitRoot();
+    const fromPath = getStudioPath(gitRoot, from);
+    const toPath = getStudioPath(gitRoot, to);
+
+    if (!existsSync(fromPath)) {
+      spinner.fail(`Studio not found: ${from}`);
+      process.exit(1);
+    }
+
+    if (existsSync(toPath)) {
+      spinner.fail(`Target studio already exists: ${to}`);
+      process.exit(1);
+    }
+
+    git(`worktree move "${fromPath}" "${toPath}"`, gitRoot);
+
+    spinner.text = 'Updating studio identity metadata...';
+    const updatedIdentity = updateIdentityForStudioRename(toPath, from, to);
+
+    // Intentionally keep existing branch name unchanged.
+    // Studio names are path/identity labels; branch naming is an independent concern.
+    const branch = git('branch --show-current', toPath);
+
+    spinner.succeed(`Studio renamed: ${from} → ${to}`);
+    console.log('');
+    console.log(chalk.dim('  Path:   ') + toPath);
+    console.log(chalk.dim('  Branch: ') + branch + chalk.dim(' (unchanged)'));
+    if (updatedIdentity) {
+      console.log(chalk.dim('  Identity updated: ') + chalk.green('.pcp/identity.json'));
+    }
+  } catch (error) {
+    spinner.fail(
+      `Failed to rename studio: ${error instanceof Error ? error.message : String(error)}`
+    );
     process.exit(1);
   }
 }
@@ -736,18 +1062,56 @@ function resolveDefaultCliName(): string {
   return 'sb-dev';
 }
 
+type CliLinkTargets = {
+  primaryBinDir: string;
+  compatBinDir: string;
+  primaryLinkPath: string;
+  compatLinkPath: string;
+};
+
+function getCliLinkTargets(homeDir: string, name: string): CliLinkTargets {
+  const primaryBinDir = join(homeDir, '.pcp', 'bin');
+  const compatBinDir = join(homeDir, '.local', 'bin');
+  return {
+    primaryBinDir,
+    compatBinDir,
+    primaryLinkPath: join(primaryBinDir, name),
+    compatLinkPath: join(compatBinDir, name),
+  };
+}
+
+function shouldWarnMissingCliBinPath(
+  pathValue: string | undefined,
+  targets: CliLinkTargets
+): boolean {
+  const pathEntries = (pathValue || '').split(pathDelimiter);
+  return (
+    !pathEntries.includes(targets.primaryBinDir) && !pathEntries.includes(targets.compatBinDir)
+  );
+}
+
 async function cliLinkCommand(options: { name?: string; unlink?: boolean }): Promise<void> {
-  const binDir = join(homedir(), '.local', 'bin');
   const name = options.name || resolveDefaultCliName();
+  const targets = getCliLinkTargets(homedir(), name);
+  const { primaryBinDir, compatBinDir, primaryLinkPath, compatLinkPath } = targets;
 
   if (options.unlink) {
-    const linkPath = join(binDir, name);
-    if (existsSync(linkPath)) {
+    let removed = false;
+    if (existsSync(primaryLinkPath)) {
       const { unlinkSync } = await import('fs');
-      unlinkSync(linkPath);
-      console.log(chalk.green(`Unlinked: ${linkPath}`));
-    } else {
-      console.log(chalk.dim(`Not found: ${linkPath}`));
+      unlinkSync(primaryLinkPath);
+      console.log(chalk.green(`Unlinked: ${primaryLinkPath}`));
+      removed = true;
+    }
+    if (existsSync(compatLinkPath)) {
+      const { unlinkSync } = await import('fs');
+      unlinkSync(compatLinkPath);
+      console.log(chalk.green(`Unlinked compatibility link: ${compatLinkPath}`));
+      removed = true;
+    }
+    if (!removed) {
+      console.log(chalk.dim(`Not found: ${primaryLinkPath}`));
+      console.log(chalk.dim(`Not found: ${compatLinkPath}`));
     }
     return;
   }
@@ -783,20 +1147,39 @@ async function cliLinkCommand(options: { name?: string; unlink?: boolean }): Pro
     execSync(`chmod +x "${cliJs}"`, { stdio: 'pipe' });
 
     // Create symlink
-    mkdirSync(binDir, { recursive: true });
-    const linkPath = join(binDir, name);
+    mkdirSync(primaryBinDir, { recursive: true });
+    mkdirSync(compatBinDir, { recursive: true });
     const { symlinkSync, unlinkSync } = await import('fs');
 
     // Remove existing symlink if present
-    if (existsSync(linkPath)) {
-      unlinkSync(linkPath);
+    if (existsSync(primaryLinkPath)) {
+      unlinkSync(primaryLinkPath);
     }
-    symlinkSync(cliJs, linkPath);
+    if (existsSync(compatLinkPath)) {
+      unlinkSync(compatLinkPath);
+    }
+    symlinkSync(cliJs, primaryLinkPath);
+    symlinkSync(primaryLinkPath, compatLinkPath);
 
-    spinner.succeed(`Linked: ${linkPath} → ${cliJs}`);
+    spinner.succeed(`Linked: ${primaryLinkPath} → ${cliJs}`);
+    console.log(chalk.dim(`  Compatibility link: ${compatLinkPath} → ${primaryLinkPath}`));
+
+    if (shouldWarnMissingCliBinPath(process.env.PATH, targets)) {
+      console.log(
+        chalk.yellow(
+          `  PATH warning: neither ${primaryBinDir} nor ${compatBinDir} is currently in PATH`
+        )
+      );
+      console.log(
+        chalk.dim(`  Add one of them to your shell profile so '${name}' resolves in new shells.`)
+      );
+    }
+
     console.log('');
     console.log(chalk.dim(`  Test it: ${name} --help`));
-    console.log(chalk.dim(`  Remove:  sb studio cli --unlink${options.name ? ` --name ${name}` : ''}`));
+    console.log(
+      chalk.dim(`  Remove:  sb studio cli --unlink${options.name ? ` --name ${name}` : ''}`)
+    );
   } catch (error) {
     spinner.fail(`Failed: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
@@ -814,6 +1197,14 @@ export {
   getStudioPrefix,
   getStudioPath,
   getWorktreePaths,
+  updateIdentityForStudioRename,
+  resolveCopySourceRoot,
+  resolveRoleTemplate,
+  listRoleTemplates,
+  isValidTemplateName,
+  BUILTIN_ROLE_TEMPLATES,
+  getCliLinkTargets,
+  shouldWarnMissingCliBinPath,
   planInit,
   git,
 };
@@ -836,25 +1227,37 @@ export function registerStudioCommands(program: Command): void {
     .option('-p, --purpose <desc>', 'Description/purpose of the studio')
     .option('-br, --branch <branch>', 'Custom branch name (default: <agentId>/studio/main)')
     .option('-b, --backend <name>', 'Primary backend (claude-code, codex, gemini)')
+    .option('-t, --template <name>', 'Role template (reviewer, builder, product, or custom)')
     .option('--copy-config', 'Copy config directories into the new studio')
     .option(
       '--config-dirs <dirs>',
       'Comma-separated config dirs to copy (default: .claude)',
       '.claude'
     )
+    .option(
+      '--copy-from <source>',
+      'Copy bootstrap files (.mcp.json, .env.local) and config dirs from source studio/path (default: main worktree)'
+    )
     .action(async (name: string | undefined, options) => {
       if (!name && process.stdin.isTTY) {
         // Interactive mode: prompt for all values
         try {
           const gitRoot = findGitRoot();
+          const copySourceRoot = resolveCopySourceRoot(gitRoot, options.copyFrom);
           const agentId = options.agent || resolveAgentId() || 'sb';
-          const result = await runInteractiveFlow(agentId, gitRoot);
+          const result = await runInteractiveFlow(agentId, copySourceRoot);
           return createStudio(result.name, options, {
             branch: result.branch,
             configDirsList: result.configDirs,
           });
-        } catch {
-          // User cancelled or inquirer failed — fall through to default
+        } catch (err) {
+          if (isPromptCancelError(err)) {
+            console.log(chalk.yellow('\nStudio creation canceled.'));
+            process.exit(130);
+          }
+          const message = err instanceof Error ? err.message : String(err);
+          console.error(chalk.red(`Interactive studio creation failed: ${message}`));
+          process.exit(1);
         }
       }
       const resolvedName = name || 'new';
@@ -868,14 +1271,17 @@ export function registerStudioCommands(program: Command): void {
     .description('Remove a studio (keeps branch for PR)')
     .action(removeStudio);
 
-  ws.command('clean <name>')
-    .description('Remove studio and delete branch')
-    .action(cleanStudio);
+  ws.command('clean <name>').description('Remove studio and delete branch').action(cleanStudio);
 
   ws.command('status')
     .alias('st')
     .description('Show git status of all studios')
     .action(statusCommand);
+
+  ws.command('rename <from> <to>')
+    .alias('mv')
+    .description('Rename a studio (moves worktree path and updates identity metadata)')
+    .action(renameStudio);
 
   ws.command('path <name>').description('Output studio path').action(pathCommand);
 
@@ -883,8 +1289,17 @@ export function registerStudioCommands(program: Command): void {
     .description('Output cd command (use with: eval $(sb studio cd <name>))')
     .action(cdCommand);
 
+  ws.command('setup <agentId>')
+    .description('Create a standard set of studios (review, build, product) for an agent')
+    .option('-b, --backend <name>', 'Primary backend (claude-code, codex, gemini)')
+    .option(
+      '--copy-from <source>',
+      'Copy bootstrap files from source studio/path (default: main worktree)'
+    )
+    .action(setupStudios);
+
   ws.command('cli')
-    .description('Build CLI and link as a named binary (default: sb-<agent>)')
+    .description('Build CLI and link as a named binary in ~/.pcp/bin (default: sb-<agent>)')
     .option('-n, --name <name>', 'Binary name (default: sb-<agent> from .pcp/identity.json)')
     .option('--unlink', 'Remove the linked binary instead of creating it')
     .action(cliLinkCommand);

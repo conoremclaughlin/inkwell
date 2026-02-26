@@ -114,7 +114,7 @@ export default function ArtifactVersionsPage() {
       <div className="rounded-md bg-red-50 p-4 text-red-800">
         {error.message}
         <Link href="/artifacts" className="ml-2 underline">
-          Back to Artifacts
+          Back to Documents
         </Link>
       </div>
     );
@@ -123,9 +123,9 @@ export default function ArtifactVersionsPage() {
   if (!artifact) {
     return (
       <div className="rounded-md bg-yellow-50 p-4 text-yellow-800">
-        Artifact not found
+        Document not found
         <Link href="/artifacts" className="ml-2 underline">
-          Back to Artifacts
+          Back to Documents
         </Link>
       </div>
     );

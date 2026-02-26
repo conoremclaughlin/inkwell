@@ -6,6 +6,9 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 
+const mockTtsIsEnabled = vi.fn(() => false);
+const mockTtsSynthesize = vi.fn();
+
 // Mock the channel listeners before importing gateway
 vi.mock('./telegram-listener', () => ({
   createTelegramListener: vi.fn(() => ({
@@ -13,6 +16,7 @@ vi.mock('./telegram-listener', () => ({
     stop: vi.fn().mockResolvedValue(undefined),
     onMessage: vi.fn(),
     sendMessage: vi.fn().mockResolvedValue(undefined),
+    sendVoice: vi.fn().mockResolvedValue(undefined),
     sendTypingIndicator: vi.fn(),
     on: vi.fn(),
     running: false,
@@ -51,6 +55,15 @@ vi.mock('../config/env', () => ({
   },
 }));
 
+vi.mock('./text-to-speech', () => ({
+  TextToSpeechService: {
+    fromEnv: vi.fn(() => ({
+      isEnabled: mockTtsIsEnabled,
+      synthesize: mockTtsSynthesize,
+    })),
+  },
+}));
+
 // Import after mocks
 import { ChannelGateway, type IncomingMessageHandler } from './gateway.js';
 
@@ -59,6 +72,8 @@ describe('ChannelGateway', () => {
 
   beforeEach(() => {
     vi.useFakeTimers();
+    mockTtsIsEnabled.mockReturnValue(false);
+    mockTtsSynthesize.mockReset();
     gateway = new ChannelGateway({
       enableTelegram: false,
       enableWhatsApp: false,
@@ -395,6 +410,47 @@ describe('ChannelGateway', () => {
       );
     });
   });
+
+  describe('Telegram Voice Replies', () => {
+    it('sends a voice reply when explicitly requested in metadata', async () => {
+      mockTtsIsEnabled.mockReturnValue(true);
+      const cleanup = vi.fn().mockResolvedValue(undefined);
+      mockTtsSynthesize.mockResolvedValue({
+        filePath: '/tmp/reply.ogg',
+        contentType: 'audio/ogg',
+        filename: 'reply.ogg',
+        cleanup,
+      });
+
+      const sendVoice = vi.fn().mockResolvedValue(undefined);
+      const sendMessage = vi.fn().mockResolvedValue(undefined);
+      (gateway as any).telegramListener = {
+        sendVoice,
+        sendMessage,
+      };
+
+      await gateway.sendResponse({
+        channel: 'telegram',
+        conversationId: 'chat123',
+        content: 'Here is your response',
+        metadata: { voiceReply: true },
+      });
+
+      expect(mockTtsSynthesize).toHaveBeenCalledWith({ text: 'Here is your response' });
+      expect(sendVoice).toHaveBeenCalledTimes(1);
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledTimes(1);
+    });
+
+    it('cleans pending voice reply flag when conversation is released without a response', async () => {
+      const key = (gateway as any).getBufferKey('telegram', 'chat999');
+      (gateway as any).pendingVoiceReplyConversations.add(key);
+
+      await gateway.releaseConversation('telegram', 'chat999');
+
+      expect((gateway as any).pendingVoiceReplyConversations.has(key)).toBe(false);
+    });
+  });
 });
 
 describe('Gateway Status', () => {
@@ -525,11 +581,15 @@ describe('Activity Stream Integration', () => {
   let mockDataComposer: any;
 
   let mockFindByPlatformId: Mock;
+  let mockFindConversationByPlatformId: Mock;
+  let mockUpsertConversationByPlatformId: Mock;
 
   beforeEach(() => {
     vi.useFakeTimers();
     mockLogMessage = vi.fn().mockResolvedValue({ id: 'activity-123' });
     mockFindByPlatformId = vi.fn().mockResolvedValue(null);
+    mockFindConversationByPlatformId = vi.fn().mockResolvedValue(null);
+    mockUpsertConversationByPlatformId = vi.fn().mockResolvedValue({ id: 'conversation-123' });
     mockDataComposer = {
       repositories: {
         activityStream: {
@@ -537,6 +597,10 @@ describe('Activity Stream Integration', () => {
         },
         users: {
           findByPlatformId: mockFindByPlatformId,
+        },
+        conversations: {
+          findConversationByPlatformId: mockFindConversationByPlatformId,
+          upsertConversationByPlatformId: mockUpsertConversationByPlatformId,
         },
       },
     };
@@ -714,6 +778,22 @@ describe('Activity Stream Integration', () => {
         isDm: true,
       });
     });
+
+    it('should persist conversationId to userId mapping in DB for cache-miss recovery', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined);
+      gateway.setMessageHandler(handler);
+
+      const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
+      await forwardToHandler('telegram', 'chat123', { id: 'sender456' }, 'Hello', {
+        userId: 'user-uuid-123',
+      });
+
+      expect(mockUpsertConversationByPlatformId).toHaveBeenCalledWith({
+        user_id: 'user-uuid-123',
+        platform: 'telegram',
+        platform_conversation_id: 'chat123',
+      });
+    });
   });
 
   describe('Outgoing Messages', () => {
@@ -764,6 +844,30 @@ describe('Activity Stream Integration', () => {
 
       // No incoming message was processed for this chat, so no userId in map
       expect(mockLogMessage).not.toHaveBeenCalled();
+    });
+
+    it('should recover userId from DB when conversationUserMap cache misses', async () => {
+      mockFindConversationByPlatformId.mockResolvedValueOnce({
+        user_id: 'db-user-uuid',
+      });
+
+      (gateway as any).telegramListener = {
+        sendMessage: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const sendTelegramMessage = (gateway as any).sendTelegramMessage.bind(gateway);
+      await sendTelegramMessage('chat-db-fallback', 'Recovered mapping reply');
+
+      expect(mockFindConversationByPlatformId).toHaveBeenCalledWith('telegram', 'chat-db-fallback');
+      expect(mockLogMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: 'db-user-uuid',
+          direction: 'out',
+          content: 'Recovered mapping reply',
+          platform: 'telegram',
+          platformChatId: 'chat-db-fallback',
+        })
+      );
     });
   });
 });

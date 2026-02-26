@@ -10,6 +10,7 @@
 
 import { randomUUID } from 'crypto';
 import { SupabaseClient } from '@supabase/supabase-js';
+import jwt from 'jsonwebtoken';
 import type { Database } from '../../data/supabase/types.js';
 import type {
   Session,
@@ -42,8 +43,10 @@ export interface SessionServiceConfig {
   defaultWorkingDirectory: string;
   /** Path to MCP config file */
   mcpConfigPath: string;
-  /** Default model to use */
-  defaultModel: string;
+  /** Optional explicit model override for Claude backend */
+  defaultModel?: string;
+  /** Optional explicit model override for Codex backend */
+  defaultCodexModel?: string;
   /** Token threshold for triggering compaction */
   compactionThreshold: number;
   /** Callback to route responses from async operations (compaction, etc.) */
@@ -53,7 +56,6 @@ export interface SessionServiceConfig {
 const DEFAULT_CONFIG: SessionServiceConfig = {
   defaultWorkingDirectory: process.cwd(),
   mcpConfigPath: '',
-  defaultModel: 'sonnet',
   compactionThreshold: 150000, // ~150k tokens
 };
 
@@ -318,11 +320,25 @@ export class SessionService implements ISessionService {
       session.studioId
     );
 
-    // 3. Build Claude runner config
+    // 3. Build runner config
+    const pcpAccessToken = this.createRunnerAccessToken(
+      userId,
+      agentId,
+      injectedContext.user.email,
+      session.identityId
+    );
+
+    // 4. Select runtime backend and model
+    const resolvedBackend = this.resolveRuntimeBackend(
+      session.backend,
+      injectedContext.agent.backend
+    );
+    const runtimeModel =
+      resolvedBackend === 'codex-cli' ? this.config.defaultCodexModel : this.config.defaultModel;
+
     const runnerConfig: ClaudeRunnerConfig = {
       workingDirectory: resolvedWorkingDirectory,
       mcpConfigPath: this.config.mcpConfigPath,
-      model: this.config.defaultModel,
       appendSystemPrompt: buildIdentityPrompt(
         agentId,
         injectedContext.agent.name,
@@ -330,13 +346,11 @@ export class SessionService implements ISessionService {
         injectedContext.user.timezone,
         injectedContext.agent.heartbeat
       ),
+      ...(runtimeModel ? { model: runtimeModel } : {}),
+      ...(pcpAccessToken ? { pcpAccessToken } : {}),
     };
 
-    // 4. Select runtime backend and run
-    const resolvedBackend = this.resolveRuntimeBackend(
-      session.backend,
-      injectedContext.agent.backend
-    );
+    // 5. Run with selected backend
     const runner = resolvedBackend === 'codex-cli' ? this.codexRunner : this.claudeRunner;
 
     const result = await runner.run(formattedMessage, {
@@ -345,14 +359,14 @@ export class SessionService implements ISessionService {
       config: runnerConfig,
     });
 
-    // 5. Log tool calls to activity stream (fire-and-forget, don't block response)
+    // 6. Log tool calls to activity stream (fire-and-forget, don't block response)
     if (result.toolCalls && result.toolCalls.length > 0) {
       this.logToolCalls(userId, agentId, session.id, result.toolCalls, request).catch((err) => {
         logger.warn('Failed to log tool calls to activity stream', { error: err });
       });
     }
 
-    // 6. Update session with new Claude session ID, usage, and message count
+    // 7. Update session with new Claude session ID, usage, and message count
     if (result.claudeSessionId !== session.claudeSessionId) {
       await this.repository.update(session.id, {
         claudeSessionId: result.claudeSessionId,
@@ -400,6 +414,43 @@ export class SessionService implements ISessionService {
     };
   }
 
+  private createRunnerAccessToken(
+    userId: string,
+    agentId: string,
+    email?: string,
+    identityId?: string
+  ): string | undefined {
+    if (!email) {
+      logger.warn('Cannot inject PCP access token for backend runner: missing user email', {
+        userId,
+        agentId,
+      });
+      return undefined;
+    }
+
+    const jwtSecret = process.env.JWT_SECRET;
+    if (!jwtSecret) {
+      logger.warn('Cannot inject PCP access token for backend runner: JWT_SECRET missing', {
+        userId,
+        agentId,
+      });
+      return undefined;
+    }
+
+    return jwt.sign(
+      {
+        type: 'mcp_access',
+        sub: userId,
+        email,
+        scope: 'mcp:tools',
+        ...(agentId ? { agentId } : {}),
+        ...(identityId ? { identityId } : {}),
+      },
+      jwtSecret,
+      { expiresIn: 60 * 60 }
+    );
+  }
+
   async getOrCreateSession(
     userId: string,
     agentId: string,
@@ -409,7 +460,7 @@ export class SessionService implements ISessionService {
       parentSessionId?: string;
       threadKey?: string;
       studioId?: string;
-      studioHint?: 'main';
+      studioHint?: string;
       recipientSessionId?: string;
     }
   ): Promise<Session> {
@@ -526,7 +577,7 @@ export class SessionService implements ISessionService {
     options: {
       threadKey?: string;
       explicitStudioId?: string;
-      studioHint?: 'main';
+      studioHint?: string;
       recipientSessionId?: string;
       backend?: string;
     }
@@ -539,9 +590,33 @@ export class SessionService implements ISessionService {
       return undefined;
     }
 
-    // Explicit convenience hint: route directly to user's shared main studio.
-    if (options.studioHint === 'main') {
-      return this.resolveMainStudioId(userId);
+    // Explicit convenience hint: resolve studio by name.
+    // 'main' is a special case resolved by worktree path / branch.
+    // Other hints resolve by matching the studio name for this user + agent.
+    if (options.studioHint) {
+      if (options.studioHint === 'main') {
+        return this.resolveMainStudioId(userId);
+      }
+
+      const { data: namedStudio } = await this.supabase
+        .from('studios')
+        .select('id')
+        .eq('user_id', userId)
+        .eq('agent_id', agentId)
+        .eq('name', options.studioHint)
+        .in('status', ['active', 'idle'])
+        .limit(1)
+        .maybeSingle();
+
+      if (namedStudio?.id) {
+        return namedStudio.id;
+      }
+
+      logger.warn('[StudioResolve] Studio hint did not match any studio, falling through', {
+        userId,
+        agentId,
+        studioHint: options.studioHint,
+      });
     }
 
     // 1) Related session scope (explicit resume continuity)
@@ -781,10 +856,22 @@ This session will continue with a fresh context after compaction. Your identity,
         session.studioId
       );
 
+      const compactionToken = this.createRunnerAccessToken(
+        session.userId,
+        session.agentId,
+        fullContext.user.email,
+        session.identityId
+      );
+
+      const runtimeBackend = this.resolveRuntimeBackend(session.backend, context.agent.backend);
+      const runtimeModel =
+        runtimeBackend === 'codex-cli'
+          ? this.config.defaultCodexModel
+          : this.config.defaultModel;
+
       const runnerConfig: ClaudeRunnerConfig = {
         workingDirectory: compactionWorkingDirectory,
         mcpConfigPath: this.config.mcpConfigPath,
-        model: this.config.defaultModel,
         appendSystemPrompt: buildIdentityPrompt(
           session.agentId,
           context.agent.name,
@@ -792,9 +879,10 @@ This session will continue with a fresh context after compaction. Your identity,
           fullContext.user.timezone,
           context.agent.heartbeat
         ),
+        ...(runtimeModel ? { model: runtimeModel } : {}),
+        ...(compactionToken ? { pcpAccessToken: compactionToken } : {}),
       };
 
-      const runtimeBackend = this.resolveRuntimeBackend(session.backend, context.agent.backend);
       const runner = runtimeBackend === 'codex-cli' ? this.codexRunner : this.claudeRunner;
 
       // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session

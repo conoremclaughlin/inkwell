@@ -173,7 +173,6 @@ describe('SessionService', () => {
       {
         defaultWorkingDirectory: '/test',
         mcpConfigPath: '/test/.mcp.json',
-        defaultModel: 'sonnet',
         compactionThreshold: 150000,
       },
       mockCodexRunner
@@ -465,7 +464,7 @@ describe('SessionService', () => {
       expect(mockRepository.create).toHaveBeenCalledWith(
         expect.objectContaining({
           backend: 'claude-code',
-          model: 'sonnet',
+          model: null, // model is deferred — set when runner reports it, not at creation
           messageCount: 0,
           tokenCount: 0,
         })
@@ -501,6 +500,8 @@ describe('SessionService', () => {
       expect(result.success).toBe(true);
       expect(mockCodexRunner.run).toHaveBeenCalledTimes(1);
       expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+      const codexCallArgs = vi.mocked(mockCodexRunner.run).mock.calls[0][1];
+      expect(codexCallArgs.config).not.toHaveProperty('model');
       expect(mockRepository.update).toHaveBeenCalledWith(
         'codex-session',
         expect.objectContaining({ backend: 'codex-cli' })
@@ -817,7 +818,6 @@ describe('SessionService', () => {
         {
           defaultWorkingDirectory: '/test',
           mcpConfigPath: '/test/.mcp.json',
-          defaultModel: 'sonnet',
           compactionThreshold: 150000,
           responseHandler: mockResponseHandler,
         }
@@ -858,7 +858,6 @@ describe('SessionService', () => {
         {
           defaultWorkingDirectory: '/test',
           mcpConfigPath: '/test/.mcp.json',
-          defaultModel: 'sonnet',
           compactionThreshold: 150000,
           responseHandler: mockResponseHandler,
         }
@@ -1016,7 +1015,6 @@ describe('SessionService', () => {
         {
           defaultWorkingDirectory: '/test',
           mcpConfigPath: '/test/.mcp.json',
-          defaultModel: 'sonnet',
           compactionThreshold: 150000,
         },
         mockCodexRunner
@@ -1063,7 +1061,6 @@ describe('SessionService', () => {
         {
           defaultWorkingDirectory: '/test',
           mcpConfigPath: '/test/.mcp.json',
-          defaultModel: 'sonnet',
           compactionThreshold: 150000,
         },
         mockCodexRunner
@@ -1108,7 +1105,6 @@ describe('SessionService', () => {
         {
           defaultWorkingDirectory: '/test',
           mcpConfigPath: '/test/.mcp.json',
-          defaultModel: 'sonnet',
           compactionThreshold: 150000,
         },
         mockCodexRunner

@@ -27,7 +27,7 @@ function initTestRepo(): void {
   mkdirSync(TEST_REPO);
 
   // Initialize git repo
-  execSync('git init', { cwd: TEST_REPO, stdio: 'pipe' });
+  execSync('git init -b main', { cwd: TEST_REPO, stdio: 'pipe' });
   execSync('git config user.email "test@test.com"', { cwd: TEST_REPO, stdio: 'pipe' });
   execSync('git config user.name "Test User"', { cwd: TEST_REPO, stdio: 'pipe' });
 

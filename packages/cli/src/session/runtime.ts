@@ -8,7 +8,9 @@ export interface RuntimeSessionRecord {
   identityId?: string;
   studioId?: string;
   threadKey?: string;
+  runtimeLinkId?: string;
   backendSessionId?: string;
+  backendSessionIds?: string[];
   startedAt?: string;
   updatedAt: string;
 }
@@ -109,9 +111,41 @@ export function upsertRuntimeSession(
       s.studioId === next.studioId
   );
 
+  const mergeSessionIds = (existing?: RuntimeSessionRecord, incoming?: RuntimeSessionRecord): string[] => {
+    const ids = new Set<string>();
+
+    const add = (value: unknown): void => {
+      if (typeof value === 'string' && value.trim()) ids.add(value.trim());
+    };
+
+    for (const id of existing?.backendSessionIds || []) add(id);
+    add(existing?.backendSessionId);
+
+    for (const id of incoming?.backendSessionIds || []) add(id);
+    add(incoming?.backendSessionId);
+
+    return [...ids];
+  };
+
   if (idx >= 0) {
-    state.sessions[idx] = { ...state.sessions[idx], ...next };
+    const existing = state.sessions[idx];
+    const merged = { ...existing, ...next };
+    const backendSessionIds = mergeSessionIds(existing, next);
+    if (backendSessionIds.length > 0) {
+      merged.backendSessionIds = backendSessionIds;
+      if (!merged.backendSessionId) {
+        merged.backendSessionId = backendSessionIds[backendSessionIds.length - 1];
+      }
+    }
+    state.sessions[idx] = merged;
   } else {
+    const backendSessionIds = mergeSessionIds(undefined, next);
+    if (backendSessionIds.length > 0) {
+      next.backendSessionIds = backendSessionIds;
+      if (!next.backendSessionId) {
+        next.backendSessionId = backendSessionIds[backendSessionIds.length - 1];
+      }
+    }
     state.sessions.push(next);
   }
 
@@ -141,6 +175,22 @@ export function listRuntimeSessions(cwd: string, backend?: string): RuntimeSessi
   const state = readRuntimeState(cwd);
   const sessions = backend ? state.sessions.filter((s) => s.backend === backend) : state.sessions;
   return [...sessions].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+export function findRuntimeSessionByLinkId(
+  cwd: string,
+  runtimeLinkId: string,
+  options?: { backend?: string; agentId?: string; studioId?: string }
+): RuntimeSessionRecord | undefined {
+  if (!runtimeLinkId.trim()) return undefined;
+
+  const sessions = listRuntimeSessions(cwd, options?.backend);
+  return sessions.find(
+    (session) =>
+      session.runtimeLinkId === runtimeLinkId &&
+      (!options?.agentId || session.agentId === options.agentId) &&
+      (!options?.studioId || session.studioId === options.studioId)
+  );
 }
 
 export function getCurrentRuntimeSession(

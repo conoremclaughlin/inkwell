@@ -68,6 +68,7 @@ describe('resolveRouteAgentId', () => {
       agentId: 'myra',
       identityId: 'id-1',
       routeId: 'route-1',
+      studioHint: null,
     });
   });
 

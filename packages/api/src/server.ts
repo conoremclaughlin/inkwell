@@ -38,13 +38,12 @@ import { setResponseCallback, hasExplicitResponse } from './mcp/tools/response-h
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
 import { resolveRouteAgentId } from './services/routing/resolve-route';
 import { resolveAgentFromMention } from './services/routing/resolve-mention';
+import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
 import { logger } from './utils/logger';
 import { env } from './config/env';
 
 // Server configuration
 interface ServerConfig {
-  /** Model to use (default: sonnet) */
-  model?: string;
   /** Working directory for Claude Code */
   workingDirectory?: string;
   /** Path to MCP config file */
@@ -100,13 +99,11 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   // Resolve configuration
   const workingDirectory = config.workingDirectory || path.resolve(__dirname, '../../..');
   const mcpConfigPath = config.mcpConfigPath || path.resolve(workingDirectory, '.mcp.json');
-  const model = config.model || env.DEFAULT_MODEL || 'sonnet';
   const agentId = process.env.AGENT_ID || 'myra';
 
   logger.info('Configuration:', {
     workingDirectory,
     mcpConfigPath,
-    model,
     agentId,
     telegramPollingInterval: config.telegramPollingInterval || 1000,
   });
@@ -121,7 +118,6 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   const sessionServiceConfig: Partial<SessionServiceConfig> = {
     defaultWorkingDirectory: workingDirectory,
     mcpConfigPath,
-    defaultModel: model,
     compactionThreshold: config.compactionThreshold || 150000,
     responseHandler: async (responses) => routeResponses(responses),
   };
@@ -179,6 +175,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     }
 
     // If mention didn't match, try channel_routes specificity cascade
+    let routeStudioHint: string | null = null;
     if (routedAgentId === agentId) {
       const route = await resolveRouteAgentId(
         dataComposer!.getClient(),
@@ -189,11 +186,13 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       );
       if (route) {
         routedAgentId = route.agentId;
+        routeStudioHint = route.studioHint;
         logger.debug(`[Route] Resolved agent from channel_routes`, {
           platform: channel,
           agentId: route.agentId,
           identityId: route.identityId,
           routeId: route.routeId,
+          studioHint: route.studioHint,
         });
       } else {
         logger.warn(
@@ -220,6 +219,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         chatType: metadata?.chatType,
         media: metadata?.media,
         triggerType: 'message',
+        ...(routeStudioHint ? { studioHint: routeStudioHint } : {}),
       },
     };
 
@@ -234,7 +234,10 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     // For external channels (telegram/whatsapp), ensure the conversation is released
     // and auto-route the text response if no explicit send_response was called
     const isExternalChannel =
-      channel === 'telegram' || channel === 'whatsapp' || channel === 'discord' || channel === 'slack';
+      channel === 'telegram' ||
+      channel === 'whatsapp' ||
+      channel === 'discord' ||
+      channel === 'slack';
     if (isExternalChannel && channelGateway) {
       // Check if send_response was called via MCP (tracked in response-handlers)
       const hadExplicitResponse = hasExplicitResponse(channel, conversationId);
@@ -339,8 +342,22 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   }
 
   // 6. Initialize heartbeat service for scheduled reminders
-  const enableLocalCron = process.env.NODE_ENV !== 'production';
+  // Useful for secondary/local dev servers where we want API/MCP without
+  // participating in global reminder delivery.
+  const {
+    enabled: heartbeatServiceEnabled,
+    flags: heartbeatServiceFlags,
+  } = getHeartbeatProcessingConfig();
+  const enableLocalCron =
+    process.env.ENABLE_LOCAL_CRON !== undefined
+      ? process.env.ENABLE_LOCAL_CRON === 'true'
+      : process.env.NODE_ENV !== 'production';
   const heartbeatInterval = process.env.HEARTBEAT_INTERVAL || '*/5 * * * *';
+
+  logger.info('Heartbeat service flags evaluated', {
+    heartbeatServiceEnabled,
+    ...heartbeatServiceFlags,
+  });
 
   /**
    * Deliver reminder via SessionService - same stateless flow as all other messages.
@@ -360,6 +377,28 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       if (identity?.agent_id) {
         reminderAgentId = identity.agent_id;
         logger.debug(`[Heartbeat] Resolved agent from identity_id: ${reminderAgentId}`);
+      }
+    }
+
+    // Resolve studioHint from channel_routes for the delivery channel + target
+    // delivery_target is the chat/conversation ID (e.g., Telegram chat ID)
+    // This enables per-chat routing for multi-user scenarios
+    let reminderStudioHint: string | null = null;
+    if (dataComposer && reminder.delivery_channel) {
+      const route = await resolveRouteAgentId(
+        dataComposer.getClient(),
+        userId,
+        reminder.delivery_channel,
+        undefined, // platformAccountId — not stored on reminders yet
+        reminder.delivery_target || undefined
+      );
+      if (route?.studioHint) {
+        reminderStudioHint = route.studioHint;
+        logger.debug(`[Heartbeat] Resolved studioHint from channel_route`, {
+          studioHint: reminderStudioHint,
+          deliveryChannel: reminder.delivery_channel,
+          deliveryTarget: reminder.delivery_target,
+        });
       }
     }
 
@@ -387,6 +426,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       metadata: {
         triggerType: 'heartbeat',
         chatType: 'direct',
+        ...(reminderStudioHint ? { studioHint: reminderStudioHint } : {}),
       },
     };
 
@@ -405,18 +445,24 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     }
   };
 
-  initHeartbeatService({
-    interval: heartbeatInterval,
-    enableLocalCron,
-    onHeartbeat: async () => {
-      logger.info('Heartbeat tick — processing due reminders');
-      const stats = await processHeartbeat(deliverReminderViaSession);
-      logger.info('Heartbeat complete', stats);
-    },
-  });
-  logger.info(
-    `Heartbeat service started (interval: ${heartbeatInterval}, local cron: ${enableLocalCron})`
-  );
+  if (heartbeatServiceEnabled) {
+    initHeartbeatService({
+      interval: heartbeatInterval,
+      enableLocalCron,
+      onHeartbeat: async () => {
+        logger.info('Heartbeat tick — processing due reminders');
+        const stats = await processHeartbeat(deliverReminderViaSession);
+        logger.info('Heartbeat complete', stats);
+      },
+    });
+    logger.info(
+      `Heartbeat service started (interval: ${heartbeatInterval}, local cron: ${enableLocalCron})`
+    );
+  } else {
+    logger.warn(
+      'Heartbeat service disabled via env (ENABLE_HEARTBEAT_SERVICE/ENABLE_HEARTBEATS/ENABLE_REMINDERS=false). Scheduled reminders will not be processed on this server.'
+    );
+  }
 
   // 7. Register default trigger handler for stateless, database-driven agent routing
   // This handles triggers for ANY agent by looking up config from the database
@@ -459,7 +505,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     // 2. Resolve and verify target identity for this user
     // Prefer recipient_identity_id from inbox; fallback to user+agent_id with disambiguation.
     let resolvedIdentityId = recipientIdentityId;
-    let resolvedWorkspaceContainerId: string | undefined;
+    let resolvedWorkspaceId: string | undefined;
     const metadataWorkspaceId =
       payload.metadata &&
       typeof payload.metadata.workspaceId === 'string' &&
@@ -488,7 +534,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         );
       }
 
-      resolvedWorkspaceContainerId = identityRow.workspace_id || undefined;
+      resolvedWorkspaceId = identityRow.workspace_id || undefined;
     } else {
       let identityQuery = dataComposer!
         .getClient()
@@ -524,7 +570,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         );
       } else {
         resolvedIdentityId = identityRows[0].id;
-        resolvedWorkspaceContainerId = identityRows[0].workspace_id || undefined;
+        resolvedWorkspaceId = identityRows[0].workspace_id || undefined;
       }
     }
 
@@ -542,7 +588,8 @@ Type: ${payload.triggerType}`;
 ---
 IMPORTANT: This is a system trigger, NOT a user message on Telegram/WhatsApp.
 Check your inbox for the full message using get_inbox.
-If you need to message a user, use send_response with the appropriate channel and conversationId.`;
+If you need to message a user, use send_response with the appropriate channel and conversationId.
+When you complete a task_request, mark it as completed using update_inbox_message(messageId, status: "completed").`;
 
     // 4. Process via SessionService (stateless - looks up session from DB)
     const request: SessionRequest = {
@@ -568,7 +615,7 @@ If you need to message a user, use send_response with the appropriate channel an
       userId,
       agentId: targetAgentId,
       identityId: resolvedIdentityId,
-      workspaceId: resolvedWorkspaceContainerId || null,
+      workspaceId: resolvedWorkspaceId || null,
     });
 
     const result = await sessionService!.handleMessage(request);
@@ -754,7 +801,6 @@ process.on('unhandledRejection', (reason) => {
 
 // Start the server
 startServer({
-  model: env.DEFAULT_MODEL || 'sonnet',
   workingDirectory: process.env.PCP_WORKING_DIR || path.resolve(__dirname, '../../..'),
   mcpConfigPath: process.env.MCP_CONFIG_PATH,
 }).catch((error) => {

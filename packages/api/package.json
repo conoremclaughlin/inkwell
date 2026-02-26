@@ -8,7 +8,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "dev:mcp": "tsx watch src/index.ts",
-    "build": "tsc",
+    "build": "tsc; cp -r src/skills/builtin dist/skills/builtin",
     "start": "node dist/index.js",
     "server": "tsx src/server.ts",
     "server:dev": "tsx watch src/server.ts",
@@ -20,7 +20,7 @@
     "test:connection": "tsx src/test-connection.ts",
     "test:channels": "tsx src/test-channels.ts",
     "lint": "eslint src --ext .ts",
-    "type-check": "tsc --noEmit",
+    "type-check": "yarn workspace @personal-context/shared build && tsc --noEmit",
     "clean": "rm -rf dist"
   },
   "dependencies": {

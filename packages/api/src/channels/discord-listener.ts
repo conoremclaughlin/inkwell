@@ -205,11 +205,6 @@ export class DiscordListener extends EventEmitter {
         logger.debug(`Ignoring message from unauthorized guild: ${guildId}`);
         return;
       }
-
-      // In authorized groups, only process if bot is mentioned
-      if (!this.isBotMentioned(msg)) {
-        return;
-      }
     } else {
       // DM: check if user is trusted
       const trustedUser = await this.authService.isUserTrusted('discord', userId);

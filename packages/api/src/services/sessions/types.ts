@@ -115,7 +115,7 @@ export interface SessionRequest {
     // Explicit studio/worktree scope for this request
     studioId?: string;
     // Convenience routing hint (e.g., force main studio without UUID lookup)
-    studioHint?: 'main';
+    studioHint?: string;
     // Recipient session to inherit studio scope from
     recipientSessionId?: string;
     // For task sessions
@@ -131,6 +131,7 @@ export interface ChannelResponse {
   content: string;
   format?: 'text' | 'markdown' | 'code' | 'json';
   replyToMessageId?: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface SessionResult {
@@ -246,7 +247,7 @@ export interface ISessionService {
       parentSessionId?: string;
       threadKey?: string;
       studioId?: string;
-      studioHint?: 'main';
+      studioHint?: string;
       recipientSessionId?: string;
     }
   ): Promise<Session>;
@@ -378,9 +379,10 @@ export interface IContextBuilder {
 export interface ClaudeRunnerConfig {
   workingDirectory: string;
   mcpConfigPath: string;
-  model: string;
+  model?: string;
   systemPrompt?: string;
   appendSystemPrompt?: string;
+  pcpAccessToken?: string;
 }
 
 export interface ClaudeRunnerResult {

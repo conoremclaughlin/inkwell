@@ -171,7 +171,7 @@ export default function ArtifactDetailPage() {
     return (
       <div className="flex items-center justify-center py-12">
         <Loader2 className="h-6 w-6 animate-spin text-gray-400" />
-        <span className="ml-2 text-gray-500">Loading artifact...</span>
+        <span className="ml-2 text-gray-500">Loading document...</span>
       </div>
     );
   }
@@ -181,7 +181,7 @@ export default function ArtifactDetailPage() {
       <div className="rounded-md bg-red-50 p-4 text-red-800">
         {error.message}
         <Link href="/artifacts" className="ml-2 underline">
-          Back to Artifacts
+          Back to Documents
         </Link>
       </div>
     );
@@ -190,9 +190,9 @@ export default function ArtifactDetailPage() {
   if (!artifact) {
     return (
       <div className="rounded-md bg-yellow-50 p-4 text-yellow-800">
-        Artifact not found
+        Document not found
         <Link href="/artifacts" className="ml-2 underline">
-          Back to Artifacts
+          Back to Documents
         </Link>
       </div>
     );
@@ -281,7 +281,7 @@ export default function ArtifactDetailPage() {
             <textarea
               value={commentDraft}
               onChange={(event) => setCommentDraft(event.target.value)}
-              placeholder="Add a comment about this artifact…"
+              placeholder="Add a comment about this document…"
               rows={3}
               className="w-full rounded-md border border-gray-300 p-3 text-sm focus:border-gray-400 focus:outline-none"
             />

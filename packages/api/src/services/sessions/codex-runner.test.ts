@@ -81,6 +81,7 @@ describe('CodexRunner', () => {
         content: 'hi from codex',
         format: undefined,
         replyToMessageId: undefined,
+        metadata: undefined,
       },
     ]);
     expect(result.usage).toEqual({
@@ -121,5 +122,78 @@ describe('CodexRunner', () => {
     expect(args).toContain('--json');
     expect(args).toContain('existing-session-abc');
     expect(args).toContain('resume msg');
+  });
+
+  it('injects PCP_ACCESS_TOKEN into codex subprocess env when provided', async () => {
+    const mockProc = createMockProcess();
+    (spawn as Mock).mockReturnValue(mockProc);
+
+    const runner = new CodexRunner();
+    const runPromise = runner.run('hello', {
+      config: {
+        workingDirectory: process.cwd(),
+        mcpConfigPath: '',
+        model: 'gpt-5-codex',
+        appendSystemPrompt: 'identity override',
+        pcpAccessToken: 'test-pcp-token',
+      },
+    });
+
+    setTimeout(() => {
+      mockProc.stdout.emit('data', Buffer.from(`${JSON.stringify({ result: 'ok' })}\n`));
+      mockProc.emit('close', 0);
+    }, 5);
+
+    await runPromise;
+
+    expect(spawn).toHaveBeenCalledTimes(1);
+    const [, , options] = (spawn as Mock).mock.calls[0] as [
+      string,
+      string[],
+      { env?: Record<string, string> }
+    ];
+    expect(options.env?.PCP_ACCESS_TOKEN).toBe('test-pcp-token');
+  });
+
+  it('includes parsed startup events in diagnostics when codex exits non-zero without stderr', async () => {
+    const mockProc = createMockProcess();
+    (spawn as Mock).mockReturnValue(mockProc);
+
+    const runner = new CodexRunner();
+    const runPromise = runner.run('hello', {
+      config: {
+        workingDirectory: process.cwd(),
+        mcpConfigPath: '',
+        model: 'gpt-5-codex',
+        appendSystemPrompt: 'identity override',
+      },
+    });
+
+    setTimeout(() => {
+      mockProc.stdout.emit(
+        'data',
+        Buffer.from(`${JSON.stringify({ type: 'thread.started', thread_id: 'thread-1' })}\n`)
+      );
+      mockProc.stdout.emit('data', Buffer.from(`${JSON.stringify({ type: 'turn.started' })}\n`));
+      mockProc.stdout.emit(
+        'data',
+        Buffer.from(
+          `${JSON.stringify({
+            type: 'error',
+            message: 'stream disconnected before completion',
+          })}\n`
+        )
+      );
+      mockProc.emit('close', 1, null);
+    }, 5);
+
+    const result = await runPromise;
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('exitCode=1');
+    expect(result.error).toContain('parsedEvents=3');
+    expect(result.error).toContain('thread.started');
+    expect(result.error).toContain('turn.started');
+    expect(result.error).toContain('parsedErrorMessages');
+    expect(result.error).toContain('stream disconnected before completion');
   });
 });

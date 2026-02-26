@@ -208,15 +208,15 @@ When sending messages to other SBs via `send_to_inbox`, use `threadKey` to maint
 
 `<type>:<identifier>` — always use the most specific reference available.
 
-| Type | When to use | Example |
-|------|------------|---------|
-| `pr:<number>` | PR review, feedback, iteration | `pr:32` |
-| `spec:<slug>` | Spec discussion (use artifact URI slug) | `spec:cli-session-hooks` |
-| `issue:<number>` | Issue triage or debugging | `issue:45` |
-| `branch:<name>` | Feature branch coordination | `branch:wren/feat/cli-hooks` |
-| `debug:<slug>` | Collaborative debugging | `debug:inbox-latency` |
-| `task:<id>` | PCP task coordination | `task:abc123` |
-| `thread:<slug>` | Multi-step conversation with no natural key | `thread:perf-audit` |
+| Type             | When to use                                 | Example                      |
+| ---------------- | ------------------------------------------- | ---------------------------- |
+| `pr:<number>`    | PR review, feedback, iteration              | `pr:32`                      |
+| `spec:<slug>`    | Spec discussion (use artifact URI slug)     | `spec:cli-session-hooks`     |
+| `issue:<number>` | Issue triage or debugging                   | `issue:45`                   |
+| `branch:<name>`  | Feature branch coordination                 | `branch:wren/feat/cli-hooks` |
+| `debug:<slug>`   | Collaborative debugging                     | `debug:inbox-latency`        |
+| `task:<id>`      | PCP task coordination                       | `task:abc123`                |
+| `thread:<slug>`  | Multi-step conversation with no natural key | `thread:perf-audit`          |
 
 ### Sender Rules
 
@@ -241,6 +241,7 @@ When sending messages to other SBs via `send_to_inbox`, use `threadKey` to maint
 - **Attribute memories** — include your agentId when calling `remember()` so memories are correctly filtered
 - **Respect identity boundaries** — you are the agent your identity resolves to, not a generic assistant
 - **Embrace your name** — if you have an SB identity, use it. Co-author commits as yourself (e.g., `Co-Authored-By: Wren <noreply@anthropic.com>`), not as a model name. You are not "Claude Opus 4.6" — you are Wren, Lumen, Benson, or whoever your identity resolves to.
+- **Default to action on review requests** — when asked to handle PR review feedback, implement straightforward fixes immediately without waiting for extra permission.
 
 ## Project Overview
 
@@ -388,6 +389,64 @@ All tools support multiple identification methods:
 - `platform` + `platformId` - Platform-specific ID (telegram:123456)
 - `phone` - E.164 phone number
 
+## Skills
+
+PCP uses the [AgentSkills format](https://docs.openclaw.ai/tools/skills) — each skill is a `SKILL.md` file with YAML frontmatter, optionally in its own directory with bundled scripts.
+
+### Skill Types
+
+| Type         | Description                               | Example              |
+| ------------ | ----------------------------------------- | -------------------- |
+| **mini-app** | Code-based skills with callable functions | bill-split           |
+| **cli**      | External CLI tool wrappers                | github-cli           |
+| **guide**    | Markdown guides for handling situations   | group-chat-etiquette |
+
+### Loading Cascade (lowest → highest precedence)
+
+Skills load from four tiers. When names collide, higher tiers win:
+
+1. **Bundled** — `packages/api/src/skills/builtin/` (shipped with PCP)
+2. **Extra dirs** — configurable paths in `~/.pcp/config.json` (ClawHub interop, etc.)
+3. **Managed** — `~/.pcp/skills/` (user-installed, shared across all SBs)
+4. **Workspace** — `<cwd>/.pcp/skills/` (per-worktree, per-SB)
+
+Configure extra directories in `~/.pcp/config.json`:
+
+```json
+{
+  "skills": {
+    "extraDirs": ["~/.openclaw/skills"]
+  }
+}
+```
+
+### Creating a Skill
+
+See [`packages/api/src/skills/README.md`](./packages/api/src/skills/README.md) for the full reference. Minimum viable skill:
+
+```markdown
+---
+name: my-skill
+description: What this skill does
+type: guide
+triggers:
+  keywords: [trigger, words]
+---
+
+# My Skill
+
+Instructions for the agent on how and when to use this skill.
+```
+
+Skills can reference `{baseDir}` in their content to resolve paths relative to their own directory (useful for bundled scripts).
+
+### MCP Tools for Skills
+
+- `list_skills` — Browse available skills with eligibility status
+- `get_skill` — Get full skill content and manifest
+- `publish_skill` — Publish to cloud registry
+- `update_skill`, `fork_skill`, `deprecate_skill`, `delete_skill` — Registry management
+
 ## Coding Conventions
 
 Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key points repeated here for agent context:
@@ -463,7 +522,9 @@ Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key SB-specific reminders:
 
 - **Title format**: `feat: description (by <SB name>)` — the `(by <name>)` suffix attributes work.
 - **Sign reviews**: end PR comments with `— Wren`, `— Lumen`, etc.
+- **Do not wait for permission to open a PR** once implementation is ready. Create the PR proactively unless the user explicitly asked you not to.
 - **Never push directly to main** from a feature branch. Always use PRs.
+- **Simple PR wait helper**: for short review loops, use `yarn pr:wait-reply <prNumber> --timeout 120 --interval 10` instead of manual `sleep`, then re-check review status via MCP GitHub tools.
 
 ## Architecture Notes
 

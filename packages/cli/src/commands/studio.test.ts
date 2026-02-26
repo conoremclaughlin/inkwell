@@ -5,9 +5,22 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { execSync } from 'child_process';
 import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync, renameSync } from 'fs';
-import { join, basename } from 'path';
+import { join, basename, delimiter as pathDelimiter } from 'path';
 import { tmpdir } from 'os';
-import { planInit, getWorktreePaths, getStudioPrefix, type InitResult } from './studio.js';
+import {
+  planInit,
+  getWorktreePaths,
+  getStudioPrefix,
+  resolveCopySourceRoot,
+  updateIdentityForStudioRename,
+  getCliLinkTargets,
+  shouldWarnMissingCliBinPath,
+  resolveRoleTemplate,
+  listRoleTemplates,
+  isValidTemplateName,
+  BUILTIN_ROLE_TEMPLATES,
+  type InitResult,
+} from './studio.js';
 
 type Move = InitResult['moves'][number];
 
@@ -23,7 +36,7 @@ describe('Studio Commands', () => {
   beforeEach(() => {
     // Create test directory and git repo
     mkdirSync(TEST_REPO, { recursive: true });
-    git('init', TEST_REPO);
+    git('init -b main', TEST_REPO);
     git('config user.email "test@test.com"', TEST_REPO);
     git('config user.name "Test User"', TEST_REPO);
 
@@ -188,6 +201,37 @@ describe('Studio Commands', () => {
   });
 });
 
+describe('CLI link path helpers', () => {
+  it('should resolve ~/.pcp/bin as primary and ~/.local/bin as compatibility path', () => {
+    const targets = getCliLinkTargets('/tmp/home', 'sb-lumen');
+    expect(targets.primaryBinDir).toBe('/tmp/home/.pcp/bin');
+    expect(targets.compatBinDir).toBe('/tmp/home/.local/bin');
+    expect(targets.primaryLinkPath).toBe('/tmp/home/.pcp/bin/sb-lumen');
+    expect(targets.compatLinkPath).toBe('/tmp/home/.local/bin/sb-lumen');
+  });
+
+  it('should not warn when PATH includes primary bin dir', () => {
+    const targets = getCliLinkTargets('/tmp/home', 'sb-lumen');
+    expect(
+      shouldWarnMissingCliBinPath(['/usr/bin', targets.primaryBinDir].join(pathDelimiter), targets)
+    ).toBe(false);
+  });
+
+  it('should not warn when PATH includes compatibility bin dir', () => {
+    const targets = getCliLinkTargets('/tmp/home', 'sb-lumen');
+    expect(
+      shouldWarnMissingCliBinPath(['/usr/bin', targets.compatBinDir].join(pathDelimiter), targets)
+    ).toBe(false);
+  });
+
+  it('should warn when PATH includes neither PCP nor compatibility bin dirs', () => {
+    const targets = getCliLinkTargets('/tmp/home', 'sb-lumen');
+    expect(shouldWarnMissingCliBinPath(['/usr/bin', '/bin'].join(pathDelimiter), targets)).toBe(
+      true
+    );
+  });
+});
+
 describe('Studio init', () => {
   // macOS resolves /var -> /private/var, so we need the real path
   let realTestDir: string;
@@ -195,7 +239,7 @@ describe('Studio init', () => {
 
   beforeEach(() => {
     mkdirSync(TEST_REPO, { recursive: true });
-    git('init', TEST_REPO);
+    git('init -b main', TEST_REPO);
     git('config user.email "test@test.com"', TEST_REPO);
     git('config user.name "Test User"', TEST_REPO);
     writeFileSync(join(TEST_REPO, 'README.md'), '# Test Repo');
@@ -365,6 +409,96 @@ describe('Studio init', () => {
   });
 });
 
+describe('resolveCopySourceRoot', () => {
+  beforeEach(() => {
+    mkdirSync(TEST_REPO, { recursive: true });
+    git('init -b main', TEST_REPO);
+    git('config user.email "test@test.com"', TEST_REPO);
+    git('config user.name "Test User"', TEST_REPO);
+    writeFileSync(join(TEST_REPO, 'README.md'), '# Test Repo');
+    git('add .', TEST_REPO);
+    git('commit -m "Initial commit"', TEST_REPO);
+  });
+
+  afterEach(() => {
+    try {
+      rmSync(TEST_DIR, { recursive: true, force: true });
+    } catch {
+      // Ignore cleanup errors
+    }
+  });
+
+  it('returns canonical main repo by default, even when called from a worktree path', () => {
+    const mainRepo = git('rev-parse --show-toplevel', TEST_REPO);
+    const studioPath = join(mainRepo, '..', 'test-repo--alpha');
+    git(`worktree add -b wren/studio/alpha "${studioPath}"`, mainRepo);
+
+    expect(resolveCopySourceRoot(studioPath)).toBe(mainRepo);
+  });
+
+  it('supports --copy-from as a named studio', () => {
+    const mainRepo = git('rev-parse --show-toplevel', TEST_REPO);
+    const studioPath = join(mainRepo, '..', 'test-repo--alpha');
+    git(`worktree add -b wren/studio/alpha "${studioPath}"`, mainRepo);
+
+    expect(resolveCopySourceRoot(mainRepo, 'alpha')).toBe(studioPath);
+  });
+
+  it('supports --copy-from as an explicit path', () => {
+    const mainRepo = git('rev-parse --show-toplevel', TEST_REPO);
+    const customSource = join(mainRepo, '..', 'custom-source');
+    mkdirSync(customSource, { recursive: true });
+
+    expect(resolveCopySourceRoot(mainRepo, customSource)).toBe(customSource);
+  });
+});
+
+describe('updateIdentityForStudioRename', () => {
+  beforeEach(() => {
+    mkdirSync(TEST_REPO, { recursive: true });
+    git('init -b main', TEST_REPO);
+    git('config user.email "test@test.com"', TEST_REPO);
+    git('config user.name "Test User"', TEST_REPO);
+    writeFileSync(join(TEST_REPO, 'README.md'), '# Test Repo');
+    git('add .', TEST_REPO);
+    git('commit -m "Initial commit"', TEST_REPO);
+  });
+
+  afterEach(() => {
+    try {
+      rmSync(TEST_DIR, { recursive: true, force: true });
+    } catch {
+      // Ignore cleanup errors
+    }
+  });
+
+  it('updates studio/context/description in identity.json after rename', () => {
+    const wsPath = join(TEST_REPO, '..', 'test-repo--old');
+    mkdirSync(join(wsPath, '.pcp'), { recursive: true });
+    writeFileSync(
+      join(wsPath, '.pcp', 'identity.json'),
+      JSON.stringify(
+        {
+          agentId: 'lumen',
+          studio: 'old',
+          context: 'studio-old',
+          description: 'Studio: old',
+        },
+        null,
+        2
+      )
+    );
+
+    const changed = updateIdentityForStudioRename(wsPath, 'old', 'new');
+    expect(changed).toBe(true);
+
+    const updated = JSON.parse(readFileSync(join(wsPath, '.pcp', 'identity.json'), 'utf-8'));
+    expect(updated.studio).toBe('new');
+    expect(updated.context).toBe('studio-new');
+    expect(updated.description).toBe('Studio: new');
+  });
+});
+
 describe('Studio prefix resolution', () => {
   it('should derive prefix from canonical repo when running in a worktree', () => {
     const mainRepo = join(TEST_DIR, 'personal-context-protocol');
@@ -375,5 +509,93 @@ describe('Studio prefix resolution', () => {
     writeFileSync(join(worktree, '.git'), `gitdir: ${gitDir}\n`);
 
     expect(getStudioPrefix(worktree)).toBe('personal-context-protocol--');
+  });
+});
+
+describe('isValidTemplateName', () => {
+  it('accepts alphanumeric names', () => {
+    expect(isValidTemplateName('reviewer')).toBe(true);
+    expect(isValidTemplateName('builder')).toBe(true);
+    expect(isValidTemplateName('product')).toBe(true);
+    expect(isValidTemplateName('my-template')).toBe(true);
+    expect(isValidTemplateName('my_template')).toBe(true);
+    expect(isValidTemplateName('Template123')).toBe(true);
+  });
+
+  it('rejects path traversal patterns', () => {
+    expect(isValidTemplateName('../etc/passwd')).toBe(false);
+    expect(isValidTemplateName('../../secret')).toBe(false);
+    expect(isValidTemplateName('foo/bar')).toBe(false);
+    expect(isValidTemplateName('foo\\bar')).toBe(false);
+  });
+
+  it('rejects empty and special characters', () => {
+    expect(isValidTemplateName('')).toBe(false);
+    expect(isValidTemplateName(' ')).toBe(false);
+    expect(isValidTemplateName('foo bar')).toBe(false);
+    expect(isValidTemplateName('template.md')).toBe(false);
+  });
+});
+
+describe('resolveRoleTemplate', () => {
+  it('resolves built-in templates', () => {
+    for (const name of BUILTIN_ROLE_TEMPLATES) {
+      const content = resolveRoleTemplate(name);
+      expect(content).toBeTruthy();
+      expect(content!.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('returns null for unknown templates', () => {
+    expect(resolveRoleTemplate('nonexistent-template')).toBeNull();
+  });
+
+  it('returns null for path traversal attempts', () => {
+    expect(resolveRoleTemplate('../../../etc/passwd')).toBeNull();
+    expect(resolveRoleTemplate('foo/bar')).toBeNull();
+  });
+
+  it('returns content starting with expected role header', () => {
+    const reviewer = resolveRoleTemplate('reviewer');
+    expect(reviewer).toContain('review mode');
+
+    const builder = resolveRoleTemplate('builder');
+    expect(builder).toContain('build mode');
+
+    const product = resolveRoleTemplate('product');
+    expect(product).toContain('product thinking mode');
+  });
+});
+
+describe('listRoleTemplates', () => {
+  it('includes all built-in templates', () => {
+    const templates = listRoleTemplates();
+    for (const name of BUILTIN_ROLE_TEMPLATES) {
+      expect(templates).toContain(name);
+    }
+  });
+
+  it('returns a sorted array', () => {
+    const templates = listRoleTemplates();
+    const sorted = [...templates].sort();
+    expect(templates).toEqual(sorted);
+  });
+});
+
+describe('ROLE_BLOCK in session-start template', () => {
+  it('template file includes ROLE_BLOCK placeholder', () => {
+    const templatePath = join(__dirname, '..', 'templates', 'hook-session-start.md');
+    const content = readFileSync(templatePath, 'utf-8');
+    expect(content).toContain('{{ROLE_BLOCK}}');
+  });
+
+  it('ROLE_BLOCK appears after WORKSPACE_LINE and before IDENTITY_BLOCK', () => {
+    const templatePath = join(__dirname, '..', 'templates', 'hook-session-start.md');
+    const content = readFileSync(templatePath, 'utf-8');
+    const roleIdx = content.indexOf('{{ROLE_BLOCK}}');
+    const wsIdx = content.indexOf('{{WORKSPACE_LINE}}');
+    const idIdx = content.indexOf('{{IDENTITY_BLOCK}}');
+    expect(roleIdx).toBeGreaterThan(wsIdx);
+    expect(roleIdx).toBeLessThan(idIdx);
   });
 });

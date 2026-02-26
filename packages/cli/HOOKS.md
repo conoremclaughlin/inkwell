@@ -29,9 +29,10 @@ PCP hooks bridge coding agents (Claude Code, Codex, Gemini) with PCP's session, 
 2. Calls `bootstrap` with agentId and workspaceId
 3. Calls `get_inbox` for unread messages
 4. Resolves PCP session ID (`PCP_SESSION_ID` env from launcher, or `start_session` fallback)
-5. Stores runtime session state in `.pcp/runtime/sessions.json` (multi-session list + current pointer)
-6. Stores backend session ID in `.pcp/runtime/session-id` (legacy compatibility)
-7. Links backend session ID to PCP session via `update_session_phase(sessionId, backendSessionId)`
+5. Reconciles PCP/backend session linkage when backend session ID is available (prefers existing server-side backend-session match)
+6. Stores runtime session state in `.pcp/runtime/sessions.json` (multi-session list + current pointer + correlation link)
+7. Stores backend session ID in `.pcp/runtime/session-id` (legacy compatibility)
+8. Links backend session ID to PCP session via `update_session_phase(sessionId, backendSessionId)`
 
 **Output:**
 
@@ -117,9 +118,11 @@ Agent: {agentId}
 **What it does:**
 
 1. Marks runtime phase as `runtime:generating` via `update_session_phase(sessionId, phase)`
-2. Checks if inbox was polled within the last 5 minutes — if so, exits silently
-3. Calls `get_inbox` for unread messages
-4. Updates the `last-inbox-check` timestamp in `.pcp/runtime/`
+2. Reconciles backend session ID linkage if the hook payload includes a session ID
+   - short-circuits on local `sessions.json` if linkage is already known
+3. Checks if inbox was polled within the last 5 minutes — if so, exits silently
+4. Calls `get_inbox` for unread messages
+5. Updates the `last-inbox-check` timestamp in `.pcp/runtime/`
 
 **Output (only if messages exist and inbox is stale):**
 
@@ -139,9 +142,11 @@ Agent: {agentId}
 **What it does:**
 
 1. Marks runtime phase as `runtime:idle` via `update_session_phase(sessionId, phase)`
-2. Increments tool call counter in `.pcp/runtime/tool-count`
-3. Every 30 tool calls, outputs a nudge to log session progress
-4. If inbox is stale (>5 minutes), checks for new messages
+2. Reconciles backend session ID linkage if the hook payload includes a session ID
+   - short-circuits on local `sessions.json` if linkage is already known
+3. Increments tool call counter in `.pcp/runtime/tool-count`
+4. Every 30 tool calls, outputs a nudge to log session progress
+5. If inbox is stale (>5 minutes), checks for new messages
 
 **Output (conditional):**
 
@@ -163,9 +168,10 @@ Hooks store ephemeral state in `.pcp/runtime/` (gitignored):
 
 | File               | Purpose                                                                                 |
 | ------------------ | --------------------------------------------------------------------------------------- |
-| `sessions.json`    | Runtime session registry (list of PCP sessions + backend session IDs + current pointer) |
+| `sessions.json`    | Runtime session registry (list of PCP sessions + backend session IDs/history + current pointer + runtimeLinkId correlation token) |
 | `pcp-session-id`   | Current PCP session UUID (legacy convenience file)                                      |
 | `session-id`       | Backend session ID from on-session-start (legacy convenience file)                      |
+| `runtime-link-id`  | Current run correlation token (`PCP_RUNTIME_LINK_ID`) for local reconciliation/debug    |
 | `last-inbox-check` | ISO timestamp of last inbox poll                                                        |
 | `tool-count`       | Cumulative tool call counter for on-stop nudges                                         |
 
