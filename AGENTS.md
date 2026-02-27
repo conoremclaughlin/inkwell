@@ -337,6 +337,10 @@ supabase/migrations/YYYYMMDDHHmmss_short_description.sql
    - MCP tool: `mcp__supabase__generate_typescript_types`
    - Update `packages/api/src/data/supabase/types.ts`
 
+5. **Read `supabase/migrations/README.md` before writing or editing migrations.** It documents migration hygiene and the canonical `updated_at` trigger helper.
+
+6. **Use one canonical `updated_at` trigger function everywhere:** `public.update_updated_at_column()`. Do not introduce alternate function names (e.g., `update_updated_at()`).
+
 ## MCP Tools
 
 The MCP server exposes 60+ tools. Key categories:

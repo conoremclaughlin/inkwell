@@ -27,7 +27,7 @@ CREATE UNIQUE INDEX idx_channel_routes_unique_route
 -- Auto-update updated_at
 CREATE TRIGGER channel_routes_updated_at
   BEFORE UPDATE ON channel_routes
-  FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- RLS: service role + user self-management (matches agent_identities pattern)
 ALTER TABLE channel_routes ENABLE ROW LEVEL SECURITY;
