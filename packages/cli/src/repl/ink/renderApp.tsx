@@ -104,19 +104,31 @@ export function renderInkChat(options: {
     }
   };
 
-  // On resize, Ink's internal handler erases `previousLineCount` lines.
-  // But when the terminal shrinks, old dock content wraps to more visual rows
-  // than Ink tracks, leaving ghost lines. Pre-clear a generous area BEFORE
-  // Ink's handler fires (our listener is registered first), then restore
-  // cursor so Ink re-renders from the correct position.
+  // Resize ghost fix: when the terminal shrinks, old dock content wraps to
+  // more visual rows than Ink's `previousLineCount` tracks. Ink erases the
+  // tracked count but the wrapped overflow lines remain as ghosts. We pre-clear
+  // just enough extra lines to catch the overflow, calculated from the width
+  // ratio. Our listener fires BEFORE Ink's (registered first).
+  const DOCK_LINES = 6; // sep + status + sep + prompt + sep + info
+  let prevWidth = process.stdout.columns || 80;
   const onResize = () => {
-    const clearLines = 20; // Well above max dock height including wraps
+    const newWidth = process.stdout.columns || 80;
+    if (newWidth >= prevWidth) {
+      prevWidth = newWidth;
+      return; // Only shrinking causes ghost overflow
+    }
+    // Each dock line wraps to ceil(prevWidth/newWidth) visual rows.
+    // Ghost count = total visual rows - tracked logical rows.
+    const wrapFactor = Math.ceil(prevWidth / Math.max(1, newWidth));
+    const ghostLines = DOCK_LINES * (wrapFactor - 1);
+    const totalClear = DOCK_LINES + ghostLines;
     let seq = '\x1b7'; // Save cursor position
-    for (let i = 0; i < clearLines; i++) {
+    for (let i = 0; i < totalClear; i++) {
       seq += '\x1b[1A\x1b[2K'; // Move up + clear line
     }
     seq += '\x1b8'; // Restore cursor position
     process.stdout.write(seq);
+    prevWidth = newWidth;
   };
   process.stdout.on('resize', onResize);
 

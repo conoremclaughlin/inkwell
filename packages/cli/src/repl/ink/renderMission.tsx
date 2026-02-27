@@ -32,15 +32,25 @@ export function renderInkMission(options: { timezone?: string }): InkMission {
     }
   };
 
-  // Pre-clear ghost lines on resize (see renderApp.tsx for explanation).
+  // Pre-clear ghost lines on resize (see renderApp.tsx for full explanation).
+  const DOCK_LINES = 8; // Mission dock is taller: agents + sep + status + sep + footer
+  let prevWidth = process.stdout.columns || 80;
   const onResize = () => {
-    const clearLines = 20;
+    const newWidth = process.stdout.columns || 80;
+    if (newWidth >= prevWidth) {
+      prevWidth = newWidth;
+      return;
+    }
+    const wrapFactor = Math.ceil(prevWidth / Math.max(1, newWidth));
+    const ghostLines = DOCK_LINES * (wrapFactor - 1);
+    const totalClear = DOCK_LINES + ghostLines;
     let seq = '\x1b7';
-    for (let i = 0; i < clearLines; i++) {
+    for (let i = 0; i < totalClear; i++) {
       seq += '\x1b[1A\x1b[2K';
     }
     seq += '\x1b8';
     process.stdout.write(seq);
+    prevWidth = newWidth;
   };
   process.stdout.on('resize', onResize);
 
