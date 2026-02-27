@@ -31,6 +31,7 @@ interface MissionSnapshot {
   rows: MissionRow[];
   sessions: Session[];
   feed: MissionFeedRow[];
+  inboxMessages: InboxMessage[];
   generatedAt: string;
 }
 
@@ -47,6 +48,20 @@ interface MissionActivity {
   payload?: Record<string, unknown>;
 }
 
+interface InboxMessage {
+  id: string;
+  subject?: string;
+  content?: string;
+  messageType?: string;
+  priority?: string;
+  status?: string;
+  senderAgentId?: string;
+  threadKey?: string;
+  metadata?: Record<string, unknown>;
+  createdAt?: string;
+  recipientAgentId?: string;
+}
+
 interface MissionFeedRow {
   id: string;
   timestamp?: string;
@@ -54,6 +69,83 @@ interface MissionFeedRow {
   route: string;
   studio: string;
   preview: string;
+}
+
+// ── Inbox extraction ──
+
+function extractInboxMessages(result: Record<string, unknown> | null | undefined): InboxMessage[] {
+  if (!result) return [];
+  const candidate =
+    (Array.isArray(result.messages) ? result.messages : undefined) ||
+    (Array.isArray(result.inbox) ? result.inbox : undefined) ||
+    (Array.isArray(result.data) ? result.data : undefined) ||
+    [];
+
+  return candidate
+    .map((entry): InboxMessage | undefined => {
+      const row = entry as Record<string, unknown>;
+      const id = row.id;
+      if (typeof id !== 'string') return undefined;
+      return {
+        id,
+        subject: typeof row.subject === 'string' ? row.subject : undefined,
+        content: typeof row.content === 'string' ? row.content : undefined,
+        messageType: typeof row.messageType === 'string' ? row.messageType : undefined,
+        priority: typeof row.priority === 'string' ? row.priority : undefined,
+        status: typeof row.status === 'string' ? row.status : undefined,
+        senderAgentId: typeof row.senderAgentId === 'string' ? row.senderAgentId : undefined,
+        threadKey: typeof row.threadKey === 'string' ? row.threadKey : undefined,
+        metadata:
+          row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+            ? (row.metadata as Record<string, unknown>)
+            : undefined,
+        createdAt: typeof row.createdAt === 'string' ? row.createdAt : undefined,
+        recipientAgentId:
+          typeof row.recipientAgentId === 'string' ? row.recipientAgentId : undefined,
+      };
+    })
+    .filter((msg): msg is InboxMessage => Boolean(msg));
+}
+
+function inboxMessageToFeedEvent(msg: InboxMessage, timezone?: string): FeedEvent {
+  const maxPreview = Math.min(120, (process.stdout.columns || 80) - 25);
+  const sender = msg.senderAgentId || 'user';
+  const recipient = msg.recipientAgentId || 'unknown';
+
+  // Build content line
+  const preview = msg.subject || compactPreview(msg.content, maxPreview);
+  const typeTag = msg.messageType && msg.messageType !== 'message' ? `[${msg.messageType}] ` : '';
+  const content = `from ${sender}: ${typeTag}${preview}`;
+
+  // Map messageType to feed event type
+  let type: FeedEventType = 'inbox';
+  if (msg.messageType === 'task_request') type = 'task';
+  if (msg.messageType === 'session_resume') type = 'session';
+
+  // Extract routing metadata from inbox `metadata.pcp.recipient`
+  const pcp = msg.metadata?.pcp as Record<string, unknown> | undefined;
+  const recipientMeta = pcp?.recipient as Record<string, unknown> | undefined;
+  const studioHint =
+    typeof recipientMeta?.studioHint === 'string' ? recipientMeta.studioHint : undefined;
+  const studioId = typeof recipientMeta?.studioId === 'string' ? recipientMeta.studioId : undefined;
+
+  const detailParts: string[] = [];
+  if (msg.messageType && msg.messageType !== 'message') {
+    detailParts.push(`type: ${msg.messageType}`);
+  }
+  if (msg.threadKey) detailParts.push(`thread: ${msg.threadKey}`);
+  const studioLabel = studioHint || (studioId ? studioId.slice(0, 8) : undefined);
+  if (studioLabel) detailParts.push(`studio: ${studioLabel}`);
+  if (msg.priority && msg.priority !== 'normal') detailParts.push(`priority: ${msg.priority}`);
+
+  return {
+    id: `inbox-${msg.id}`,
+    type,
+    agent: recipient,
+    content,
+    time: formatHumanTime(msg.createdAt, timezone),
+    detail: detailParts.length > 0 ? detailParts.join('  ·  ') : undefined,
+  };
 }
 
 export function resolveAttachCommand(
@@ -271,6 +363,32 @@ export function summarizeMissionFeedRows(
     });
 }
 
+function inboxMessageToFeedRow(msg: InboxMessage): MissionFeedRow {
+  const sender = msg.senderAgentId || 'user';
+  const recipient = msg.recipientAgentId || 'unknown';
+
+  const typeTag = msg.messageType
+    ? msg.messageType === 'message'
+      ? 'inbox'
+      : `inbox:${msg.messageType}`
+    : 'inbox';
+
+  const pcp = msg.metadata?.pcp as Record<string, unknown> | undefined;
+  const recipientMeta = pcp?.recipient as Record<string, unknown> | undefined;
+  const studioHint =
+    typeof recipientMeta?.studioHint === 'string' ? recipientMeta.studioHint : undefined;
+  const studioId = typeof recipientMeta?.studioId === 'string' ? recipientMeta.studioId : undefined;
+
+  return {
+    id: `inbox-${msg.id}`,
+    timestamp: msg.createdAt,
+    type: typeTag,
+    route: `${sender} → ${recipient}`,
+    studio: studioHint || (studioId ? studioId.slice(0, 8) : '-'),
+    preview: compactPreview(msg.subject || msg.content),
+  };
+}
+
 function newestSession(sessions: Session[]): Session | undefined {
   return sessions
     .slice()
@@ -396,28 +514,36 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
   }
 
   const unreadByAgent: Record<string, number> = {};
+  const allInboxMessages: InboxMessage[] = [];
+  const fetchAllInbox = options.feed || options.watch;
   for (const agentId of Array.from(allAgents)) {
     try {
       const inboxResult = (await pcp.callTool('get_inbox', {
         email: config.email,
         agentId,
-        status: 'unread',
-        limit: 200,
+        // Fetch all messages for the feed, only unread for the counts-only path
+        status: fetchAllInbox ? 'all' : 'unread',
+        limit: fetchAllInbox ? Number.parseInt(options.feedLimit || '40', 10) : 200,
       })) as Record<string, unknown>;
       unreadByAgent[agentId] = extractUnreadCount(inboxResult);
+      if (fetchAllInbox) {
+        const msgs = extractInboxMessages(inboxResult);
+        for (const m of msgs) m.recipientAgentId = agentId;
+        allInboxMessages.push(...msgs);
+      }
     } catch {
       unreadByAgent[agentId] = 0;
     }
   }
 
   let feed: MissionFeedRow[] = [];
-  if (options.feed || options.watch) {
+  if (fetchAllInbox) {
+    // Activity-sourced rows (non-inbox types)
     const activityResult = (await pcp
       .callTool('get_activity', {
         email: config.email,
         limit: Number.parseInt(options.feedLimit || '40', 10),
         types: [
-          'message_in',
           'message_out',
           'state_change',
           'tool_call',
@@ -428,13 +554,24 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
         ],
       })
       .catch(() => null)) as Record<string, unknown> | null;
-    feed = summarizeMissionFeedRows(extractActivities(activityResult), sessions);
+    const activityFeed = summarizeMissionFeedRows(extractActivities(activityResult), sessions);
+
+    // Inbox-sourced rows
+    const inboxFeed = allInboxMessages.map(inboxMessageToFeedRow);
+
+    // Merge and sort by timestamp
+    feed = [...activityFeed, ...inboxFeed].sort((a, b) => {
+      const ams = a.timestamp ? Date.parse(a.timestamp) : 0;
+      const bms = b.timestamp ? Date.parse(b.timestamp) : 0;
+      return (Number.isNaN(ams) ? 0 : ams) - (Number.isNaN(bms) ? 0 : bms);
+    });
   }
 
   return {
     rows: summarizeMissionRows(sessions, unreadByAgent),
     sessions,
     feed,
+    inboxMessages: allInboxMessages,
     generatedAt: new Date().toISOString(),
   };
 }
@@ -613,14 +750,26 @@ async function runInkMission(options: MissionOptions): Promise<void> {
       }));
       mission.setAgents(agentSummaries);
 
-      // Push new feed events
+      // ── Build feed events from snapshot data ──
+      // Inbox messages are the authoritative source for inbound messages
+      // (they carry threadKey, messageType, and routing metadata natively).
+      // Activities cover non-inbox types (outbound, state changes, etc.).
+
+      // Convert inbox messages to feed events (already fetched by fetchMissionSnapshot)
+      const inboxEvents: Array<{ event: FeedEvent; timestamp: number }> =
+        snapshot.inboxMessages.map((msg) => ({
+          event: inboxMessageToFeedEvent(msg, undefined),
+          timestamp: msg.createdAt ? Date.parse(msg.createdAt) : 0,
+        }));
+
+      // Fetch activities for non-inbox types
+      const feedLimit = Number.parseInt(options.feedLimit || '40', 10);
       const activities = extractActivities(
         (await pcp
           .callTool('get_activity', {
             email: config.email,
-            limit: Number.parseInt(options.feedLimit || '40', 10),
+            limit: feedLimit,
             types: [
-              'message_in',
               'message_out',
               'state_change',
               'tool_call',
@@ -631,15 +780,9 @@ async function runInkMission(options: MissionOptions): Promise<void> {
             ],
           })
           .catch(() => null)) as Record<string, unknown> | null
-      ).sort((a, b) => {
-        const ams = a.createdAt ? Date.parse(a.createdAt) : 0;
-        const bms = b.createdAt ? Date.parse(b.createdAt) : 0;
-        return (Number.isNaN(ams) ? 0 : ams) - (Number.isNaN(bms) ? 0 : bms);
-      });
+      );
 
-      // Build sessions map for feed enrichment.
-      // snapshot.sessions only has active sessions, but activities often belong
-      // to ended sessions. Fetch recent sessions (any status) for the join.
+      // Build sessions map for activity enrichment
       const recentSessionsResult = (await pcp
         .callTool('list_sessions', {
           email: config.email,
@@ -649,14 +792,28 @@ async function runInkMission(options: MissionOptions): Promise<void> {
       const recentSessions = recentSessionsResult ? parseSessions(recentSessionsResult) : [];
       const sessionsById = new Map<string, Session>();
       for (const s of recentSessions) sessionsById.set(s.id, s);
-      // Active sessions override (more current data)
       for (const s of snapshot.sessions) sessionsById.set(s.id, s);
 
+      // Convert activities to feed events
+      const activityEvents: Array<{ event: FeedEvent; timestamp: number }> = activities.map(
+        (a) => ({
+          event: activityToFeedEvent(a, undefined, sessionsById),
+          timestamp: a.createdAt ? Date.parse(a.createdAt) : 0,
+        })
+      );
+
+      // Merge and sort by timestamp
+      const allEvents = [...inboxEvents, ...activityEvents].sort(
+        (a, b) =>
+          (Number.isNaN(a.timestamp) ? 0 : a.timestamp) -
+          (Number.isNaN(b.timestamp) ? 0 : b.timestamp)
+      );
+
       let newCount = 0;
-      for (const activity of activities) {
-        if (seenActivityIds.has(activity.id)) continue;
-        seenActivityIds.add(activity.id);
-        mission.addEvent(activityToFeedEvent(activity, undefined, sessionsById));
+      for (const { event } of allEvents) {
+        if (seenActivityIds.has(event.id)) continue;
+        seenActivityIds.add(event.id);
+        mission.addEvent(event);
         newCount++;
       }
 
