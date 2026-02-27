@@ -171,6 +171,9 @@ export class SessionService implements ISessionService {
             sender: request.sender,
             triggerType: metadata?.triggerType,
             media: metadata?.media,
+            threadKey: metadata?.threadKey,
+            studioId: metadata?.studioId,
+            studioHint: metadata?.studioHint,
           })
         ),
       });
@@ -865,9 +868,7 @@ This session will continue with a fresh context after compaction. Your identity,
 
       const runtimeBackend = this.resolveRuntimeBackend(session.backend, context.agent.backend);
       const runtimeModel =
-        runtimeBackend === 'codex-cli'
-          ? this.config.defaultCodexModel
-          : this.config.defaultModel;
+        runtimeBackend === 'codex-cli' ? this.config.defaultCodexModel : this.config.defaultModel;
 
       const runnerConfig: ClaudeRunnerConfig = {
         workingDirectory: compactionWorkingDirectory,

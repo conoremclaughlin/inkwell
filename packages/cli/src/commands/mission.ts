@@ -44,6 +44,7 @@ interface MissionActivity {
   platform?: string;
   status?: string;
   createdAt?: string;
+  payload?: Record<string, unknown>;
 }
 
 interface MissionFeedRow {
@@ -171,6 +172,10 @@ function extractActivities(result: Record<string, unknown> | null | undefined): 
             : typeof row.created_at === 'string'
               ? row.created_at
               : undefined,
+        payload:
+          row.payload && typeof row.payload === 'object' && !Array.isArray(row.payload)
+            ? (row.payload as Record<string, unknown>)
+            : undefined,
       };
     })
     .filter((activity): activity is MissionActivity => Boolean(activity));
@@ -544,14 +549,21 @@ function activityToFeedEvent(
   }
 
   // Build detail line: message type, threadKey, studio
+  // Sources (in priority order): activity payload (direct from message), then session join
   const messageType = trigger?.messageType;
+  const p = activity.payload;
   const session =
     activity.sessionId && sessionsById ? sessionsById.get(activity.sessionId) : undefined;
+  const threadKey =
+    (typeof p?.threadKey === 'string' ? p.threadKey : undefined) || session?.threadKey;
+  const studioHint = typeof p?.studioHint === 'string' ? p.studioHint : undefined;
+  const studioId = typeof p?.studioId === 'string' ? p.studioId : undefined;
+  const studioLabel = studioHint || studioId?.slice(0, 8) || studioLabelForSession(session);
+
   const detailParts: string[] = [];
   if (messageType && messageType !== 'message') detailParts.push(`type: ${messageType}`);
-  if (session?.threadKey) detailParts.push(`thread: ${session.threadKey}`);
-  const studioLabel = studioLabelForSession(session);
-  if (studioLabel !== '-') detailParts.push(`studio: ${studioLabel}`);
+  if (threadKey) detailParts.push(`thread: ${threadKey}`);
+  if (studioLabel && studioLabel !== '-') detailParts.push(`studio: ${studioLabel}`);
 
   return {
     id: activity.id,
