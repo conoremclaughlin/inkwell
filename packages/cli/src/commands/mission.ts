@@ -463,6 +463,32 @@ function mapActivityToFeedType(activity: MissionActivity): FeedEventType {
   }
 }
 
+/**
+ * Detect system-originated messages and return a clean label + summary.
+ * Heartbeat reminders, scheduled tasks, and other automated triggers
+ * have no sender agent — without this they show as "from unknown".
+ */
+function parseSystemOrigin(
+  activity: MissionActivity
+): { label: string; summary: string } | undefined {
+  const raw = activity.content || '';
+
+  // Heartbeat reminders: [HEARTBEAT REMINDER]\nTitle: <title>\n...
+  if (raw.startsWith('[HEARTBEAT REMINDER]')) {
+    const titleMatch = raw.match(/^Title:\s*(.+)$/m);
+    const title = titleMatch?.[1]?.trim() || 'scheduled reminder';
+    return { label: '⏰ reminder', summary: title };
+  }
+
+  // Agent-channel messages with no trigger envelope are system-initiated
+  if (activity.platform === 'agent' && activity.type === 'message_in') {
+    // Generic system trigger — show a compact preview
+    return { label: 'system', summary: compactPreview(raw, 80) };
+  }
+
+  return undefined;
+}
+
 function activityToFeedEvent(activity: MissionActivity, timezone?: string): FeedEvent {
   const trigger = parseTriggerEnvelope(activity.content);
   const actor = activity.agentId || 'system';
@@ -473,9 +499,15 @@ function activityToFeedEvent(activity: MissionActivity, timezone?: string): Feed
 
   let content: string;
   if (activity.type === 'message_in') {
-    const from = trigger?.from || 'unknown';
-    const summary = trigger?.summary || compactPreview(activity.content, maxPreview);
-    content = `from ${from}: ${summary}`;
+    // Check for system-originated messages (heartbeat, scheduler, etc.)
+    const systemOrigin = !trigger ? parseSystemOrigin(activity) : undefined;
+    if (systemOrigin) {
+      content = `${systemOrigin.label}: ${systemOrigin.summary}`;
+    } else {
+      const from = trigger?.from || 'unknown';
+      const summary = trigger?.summary || compactPreview(activity.content, maxPreview);
+      content = `from ${from}: ${summary}`;
+    }
   } else if (activity.type === 'message_out') {
     content = `→ ${activity.platform || 'unknown'}: ${compactPreview(activity.content, maxPreview)}`;
   } else if (activity.type === 'state_change') {
