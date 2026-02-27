@@ -104,8 +104,24 @@ export function renderInkChat(options: {
     }
   };
 
-  // Mount the Ink app
-  const { unmount, clear } = render(
+  // On resize, Ink's internal handler erases `previousLineCount` lines.
+  // But when the terminal shrinks, old dock content wraps to more visual rows
+  // than Ink tracks, leaving ghost lines. Pre-clear a generous area BEFORE
+  // Ink's handler fires (our listener is registered first), then restore
+  // cursor so Ink re-renders from the correct position.
+  const onResize = () => {
+    const clearLines = 20; // Well above max dock height including wraps
+    let seq = '\x1b7'; // Save cursor position
+    for (let i = 0; i < clearLines; i++) {
+      seq += '\x1b[1A\x1b[2K'; // Move up + clear line
+    }
+    seq += '\x1b8'; // Restore cursor position
+    process.stdout.write(seq);
+  };
+  process.stdout.on('resize', onResize);
+
+  // Mount the Ink app (its internal resize handler registers AFTER ours)
+  const { unmount } = render(
     <ChatApp
       ref={handleRef}
       agentId={options.agentId}
@@ -115,11 +131,6 @@ export function renderInkChat(options: {
       onExit={onExit}
     />
   );
-
-  // Ink v6 internally handles SIGWINCH and re-renders on terminal resize.
-  // Calling clear() externally fights with Ink's own resize logic — it erases
-  // too many lines (including scrollback), causing the dock to drift upward
-  // and eventually duplicate. Let Ink manage resize natively.
 
   // Get the handle (available synchronously after render)
   const getHandle = (): ChatAppHandle => {
@@ -175,6 +186,7 @@ export function renderInkChat(options: {
     },
 
     cleanup: () => {
+      process.stdout.off('resize', onResize);
       unmount();
     },
 

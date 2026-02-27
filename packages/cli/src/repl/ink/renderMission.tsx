@@ -32,12 +32,21 @@ export function renderInkMission(options: { timezone?: string }): InkMission {
     }
   };
 
+  // Pre-clear ghost lines on resize (see renderApp.tsx for explanation).
+  const onResize = () => {
+    const clearLines = 20;
+    let seq = '\x1b7';
+    for (let i = 0; i < clearLines; i++) {
+      seq += '\x1b[1A\x1b[2K';
+    }
+    seq += '\x1b8';
+    process.stdout.write(seq);
+  };
+  process.stdout.on('resize', onResize);
+
   const { unmount } = render(
     <MissionApp ref={handleRef} timezone={options.timezone} onExit={onExit} />
   );
-
-  // Ink v6 handles SIGWINCH and re-renders on resize natively.
-  // External clear() fights with Ink's line tracking and causes drift.
 
   const getHandle = (): MissionAppHandle => {
     if (!handleRef.current) {
@@ -51,6 +60,7 @@ export function renderInkMission(options: { timezone?: string }): InkMission {
     setAgents: (agents) => getHandle().setAgents(agents),
     setStatus: (status) => getHandle().setStatus(status),
     cleanup: () => {
+      process.stdout.off('resize', onResize);
       unmount();
     },
     waitForExit: () => exitPromise,
