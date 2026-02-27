@@ -227,7 +227,9 @@ export function summarizeMissionFeedRows(
       const sessionStudio = studioLabelForSession(
         activity.sessionId ? sessionsById.get(activity.sessionId) : undefined
       );
-      const type = activity.subtype ? `${activity.type}:${activity.subtype}` : activity.type || 'activity';
+      const type = activity.subtype
+        ? `${activity.type}:${activity.subtype}`
+        : activity.type || 'activity';
 
       if (activity.type === 'message_in') {
         const from = trigger?.from || (platform === 'agent' ? 'agent' : platform);
@@ -283,10 +285,7 @@ export function summarizeMissionRows(
     grouped.set(agent, list);
   }
 
-  const allAgents = new Set<string>([
-    ...Array.from(grouped.keys()),
-    ...Object.keys(unreadByAgent),
-  ]);
+  const allAgents = new Set<string>([...Array.from(grouped.keys()), ...Object.keys(unreadByAgent)]);
 
   return Array.from(allAgents)
     .map((agent) => {
@@ -323,7 +322,9 @@ function formatTime(iso?: string): string {
 function renderMissionTable(rows: MissionRow[]): string[] {
   const lines: string[] = [];
 
-  lines.push(chalk.dim('SB       active  unread  latest-id  phase/status          thread        backend-id '));
+  lines.push(
+    chalk.dim('SB       active  unread  latest-id  phase/status          thread        backend-id ')
+  );
   for (const row of rows) {
     lines.push(
       chalk.dim(
@@ -349,7 +350,9 @@ function renderMissionFeed(rows: MissionFeedRow[]): string[] {
     return lines;
   }
 
-  lines.push(chalk.dim('time      type            route                     studio             preview'));
+  lines.push(
+    chalk.dim('time      type            route                     studio             preview')
+  );
   for (const row of rows.slice(-20)) {
     lines.push(
       chalk.dim(
@@ -408,7 +411,16 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
       .callTool('get_activity', {
         email: config.email,
         limit: Number.parseInt(options.feedLimit || '40', 10),
-        types: ['message_in', 'message_out', 'state_change', 'tool_call', 'tool_result', 'agent_spawn', 'agent_complete', 'error'],
+        types: [
+          'message_in',
+          'message_out',
+          'state_change',
+          'tool_call',
+          'tool_result',
+          'agent_spawn',
+          'agent_complete',
+          'error',
+        ],
       })
       .catch(() => null)) as Record<string, unknown> | null;
     feed = summarizeMissionFeedRows(extractActivities(activityResult), sessions);
@@ -452,14 +464,20 @@ function printSnapshot(snapshot: MissionSnapshot): void {
 
 function mapActivityToFeedType(activity: MissionActivity): FeedEventType {
   switch (activity.type) {
-    case 'message_in': return 'inbox';
-    case 'message_out': return 'activity';
-    case 'state_change': return 'session';
+    case 'message_in':
+      return 'inbox';
+    case 'message_out':
+      return 'activity';
+    case 'state_change':
+      return 'session';
     case 'tool_call':
-    case 'tool_result': return 'activity';
+    case 'tool_result':
+      return 'activity';
     case 'agent_spawn':
-    case 'agent_complete': return 'session';
-    default: return 'activity';
+    case 'agent_complete':
+      return 'session';
+    default:
+      return 'activity';
   }
 }
 
@@ -489,7 +507,11 @@ function parseSystemOrigin(
   return undefined;
 }
 
-function activityToFeedEvent(activity: MissionActivity, timezone?: string): FeedEvent {
+function activityToFeedEvent(
+  activity: MissionActivity,
+  timezone?: string,
+  sessionsById?: Map<string, Session>
+): FeedEvent {
   const trigger = parseTriggerEnvelope(activity.content);
   const actor = activity.agentId || 'system';
   const type = mapActivityToFeedType(activity);
@@ -521,9 +543,15 @@ function activityToFeedEvent(activity: MissionActivity, timezone?: string): Feed
     content = `${activity.type || 'activity'}${subtype}: ${compactPreview(activity.content, maxPreview)}`;
   }
 
-  // Only show type detail for non-obvious message types (skip 'message' which is default)
+  // Build detail line: message type, threadKey, studio
   const messageType = trigger?.messageType;
-  const showTypeDetail = messageType && messageType !== 'message';
+  const session =
+    activity.sessionId && sessionsById ? sessionsById.get(activity.sessionId) : undefined;
+  const detailParts: string[] = [];
+  if (messageType && messageType !== 'message') detailParts.push(`type: ${messageType}`);
+  if (session?.threadKey) detailParts.push(`thread: ${session.threadKey}`);
+  const studioLabel = studioLabelForSession(session);
+  if (studioLabel !== '-') detailParts.push(`studio: ${studioLabel}`);
 
   return {
     id: activity.id,
@@ -531,7 +559,7 @@ function activityToFeedEvent(activity: MissionActivity, timezone?: string): Feed
     agent: actor,
     content,
     time: formatHumanTime(activity.createdAt, timezone),
-    detail: showTypeDetail ? `type: ${messageType}` : undefined,
+    detail: detailParts.length > 0 ? detailParts.join('  ·  ') : undefined,
   };
 }
 
@@ -557,7 +585,11 @@ async function runInkMission(options: MissionOptions): Promise<void> {
   // Initial load
   const loadSnapshot = async () => {
     try {
-      const snapshot = await fetchMissionSnapshot({ ...options, feed: true, feedLimit: options.feedLimit || '40' });
+      const snapshot = await fetchMissionSnapshot({
+        ...options,
+        feed: true,
+        feedLimit: options.feedLimit || '40',
+      });
 
       // Update agent summaries
       const agentSummaries: AgentSummary[] = snapshot.rows.map((row) => ({
@@ -575,7 +607,16 @@ async function runInkMission(options: MissionOptions): Promise<void> {
           .callTool('get_activity', {
             email: config.email,
             limit: Number.parseInt(options.feedLimit || '40', 10),
-            types: ['message_in', 'message_out', 'state_change', 'tool_call', 'tool_result', 'agent_spawn', 'agent_complete', 'error'],
+            types: [
+              'message_in',
+              'message_out',
+              'state_change',
+              'tool_call',
+              'tool_result',
+              'agent_spawn',
+              'agent_complete',
+              'error',
+            ],
           })
           .catch(() => null)) as Record<string, unknown> | null
       ).sort((a, b) => {
@@ -584,11 +625,12 @@ async function runInkMission(options: MissionOptions): Promise<void> {
         return (Number.isNaN(ams) ? 0 : ams) - (Number.isNaN(bms) ? 0 : bms);
       });
 
+      const sessionsById = new Map(snapshot.sessions.map((s) => [s.id, s]));
       let newCount = 0;
       for (const activity of activities) {
         if (seenActivityIds.has(activity.id)) continue;
         seenActivityIds.add(activity.id);
-        mission.addEvent(activityToFeedEvent(activity, undefined));
+        mission.addEvent(activityToFeedEvent(activity, undefined, sessionsById));
         newCount++;
       }
 
@@ -721,6 +763,14 @@ function registerOverviewLikeCommand(program: Command, name: string, description
 }
 
 export function registerMissionCommand(program: Command): void {
-  registerOverviewLikeCommand(program, 'mission', 'Mission control for multi-SB sessions + unread inbox');
-  registerOverviewLikeCommand(program, 'overview', 'Cross-SB overview with session matrix + activity feed');
+  registerOverviewLikeCommand(
+    program,
+    'mission',
+    'Mission control for multi-SB sessions + unread inbox'
+  );
+  registerOverviewLikeCommand(
+    program,
+    'overview',
+    'Cross-SB overview with session matrix + activity feed'
+  );
 }
