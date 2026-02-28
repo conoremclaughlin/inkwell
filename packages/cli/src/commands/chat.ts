@@ -23,7 +23,12 @@ import { formatBackendTokenUsage, type BackendTokenUsage } from '../repl/token-u
 import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../repl/skills.js';
 import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
 import { ensurePcpToolAllowed } from '../repl/tool-gate.js';
-import { parsePermissionGrant, applyPermissionGrant, buildPermissionGrantMetadata, type PermissionGrantAction } from '../repl/permission-grant.js';
+import {
+  parsePermissionGrant,
+  applyPermissionGrant,
+  buildPermissionGrantMetadata,
+  type PermissionGrantAction,
+} from '../repl/permission-grant.js';
 import { canActivateSkill, filterSkillsByPolicy } from '../repl/skill-policy.js';
 import {
   formatHumanTime,
@@ -305,7 +310,14 @@ function getSessionTranscriptMetadata(sessionId: string): SessionTranscriptMetad
   }
 
   const messageCount = userCount + assistantCount + inboxCount;
-  return { transcriptPath: path, messageCount, userCount, assistantCount, inboxCount, lastMessageAt };
+  return {
+    transcriptPath: path,
+    messageCount,
+    userCount,
+    assistantCount,
+    inboxCount,
+    lastMessageAt,
+  };
 }
 
 function hydrateLedgerFromTranscript(
@@ -468,11 +480,14 @@ function compactForLedger(content: string, maxChars = LEDGER_COMPACT_CHARS): str
 }
 
 function compactForHistoryPreview(role: 'user' | 'assistant' | 'inbox', content: string): string {
-  const normalized = content.replace(/\s+/g, ' ').trim();
   if (role === 'inbox') {
-    return compactForLedger(normalized, 180);
+    return compactForLedger(content.replace(/\s+/g, ' ').trim(), 180);
   }
-  return normalized;
+  // Preserve newlines but collapse runs of spaces/tabs within lines
+  return content
+    .replace(/[^\S\n]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 function extractLocalToolCalls(responseText: string): LocalToolCall[] {
@@ -512,7 +527,10 @@ function isReadlineClosedError(error: unknown): boolean {
   if (!error || typeof error !== 'object') return false;
   const code = (error as { code?: string }).code;
   const message = (error as { message?: string }).message;
-  return code === 'ERR_USE_AFTER_CLOSE' || Boolean(message?.toLowerCase().includes('readline was closed'));
+  return (
+    code === 'ERR_USE_AFTER_CLOSE' ||
+    Boolean(message?.toLowerCase().includes('readline was closed'))
+  );
 }
 
 function listConfiguredMcpServers(cwd = process.cwd()): McpServerSummary[] {
@@ -579,7 +597,11 @@ function extractInboxMessages(result: Record<string, unknown> | null | undefined
       return {
         id,
         content: String(msg.content || ''),
-        from: msg.senderAgentId ? String(msg.senderAgentId) : msg.from ? String(msg.from) : undefined,
+        from: msg.senderAgentId
+          ? String(msg.senderAgentId)
+          : msg.from
+            ? String(msg.from)
+            : undefined,
         subject: msg.subject ? String(msg.subject) : undefined,
         createdAt:
           typeof msg.createdAt === 'string'
@@ -625,7 +647,9 @@ function extractInboxMessages(result: Record<string, unknown> | null | undefined
     .filter((m): m is InboxMessage => Boolean(m));
 }
 
-function extractSessionSummaries(result: Record<string, unknown> | null | undefined): SessionSummary[] {
+function extractSessionSummaries(
+  result: Record<string, unknown> | null | undefined
+): SessionSummary[] {
   if (!result) return [];
   const candidate =
     (Array.isArray(result.sessions) ? result.sessions : undefined) ||
@@ -654,7 +678,7 @@ function extractSessionSummaries(result: Record<string, unknown> | null | undefi
               ? row.workspace_name
               : typeof studio?.worktreeFolder === 'string'
                 ? studio.worktreeFolder
-              : undefined,
+                : undefined,
         studioId:
           typeof row.studioId === 'string'
             ? row.studioId
@@ -662,7 +686,7 @@ function extractSessionSummaries(result: Record<string, unknown> | null | undefi
               ? row.studio_id
               : typeof studio?.id === 'string'
                 ? studio.id
-              : undefined,
+                : undefined,
         studioName:
           typeof row.studioName === 'string'
             ? row.studioName
@@ -672,7 +696,7 @@ function extractSessionSummaries(result: Record<string, unknown> | null | undefi
                 ? studio.worktreeFolder
                 : typeof studio?.branch === 'string'
                   ? studio.branch
-              : undefined,
+                  : undefined,
         status: typeof row.status === 'string' ? row.status : undefined,
         currentPhase: typeof row.currentPhase === 'string' ? row.currentPhase : undefined,
         threadKey: typeof row.threadKey === 'string' ? row.threadKey : undefined,
@@ -706,7 +730,9 @@ function extractSessionSummaries(result: Record<string, unknown> | null | undefi
     .filter((session): session is SessionSummary => Boolean(session));
 }
 
-function extractActivitySummaries(result: Record<string, unknown> | null | undefined): ActivitySummary[] {
+function extractActivitySummaries(
+  result: Record<string, unknown> | null | undefined
+): ActivitySummary[] {
   if (!result) return [];
   const candidate =
     (Array.isArray(result.activities) ? result.activities : undefined) ||
@@ -793,7 +819,12 @@ function extractSessionContextMessages(
           source,
         };
       }
-      if (type === 'inbox' || type === 'notification' || type === 'task_request' || type === 'session_resume') {
+      if (
+        type === 'inbox' ||
+        type === 'notification' ||
+        type === 'task_request' ||
+        type === 'session_resume'
+      ) {
         return {
           role: 'inbox',
           content,
@@ -847,7 +878,11 @@ function hydrateLedgerFromSessionContext(
       continue;
     }
 
-    ledger.addEntry('system', compactForLedger(message.content, 320), `pcp-history:${message.source}`);
+    ledger.addEntry(
+      'system',
+      compactForLedger(message.content, 320),
+      `pcp-history:${message.source}`
+    );
     loaded += 1;
   }
 
@@ -888,11 +923,11 @@ function buildContextStatusSummary(params: {
   const bootstrapTokens = params.bootstrapTokens || 0;
   const total = transcriptTokens + bootstrapTokens;
   const pct = params.maxContextTokens > 0 ? (total / params.maxContextTokens) * 100 : 0;
-  const queue =
-    params.pendingTurns > 0 ? `queue:${params.pendingTurns}` : 'queue:idle';
-  const breakdown = bootstrapTokens > 0
-    ? `${transcriptTokens.toLocaleString()} transcript + ${bootstrapTokens.toLocaleString()} identity`
-    : `${total.toLocaleString()}`;
+  const queue = params.pendingTurns > 0 ? `queue:${params.pendingTurns}` : 'queue:idle';
+  const breakdown =
+    bootstrapTokens > 0
+      ? `${transcriptTokens.toLocaleString()} transcript + ${bootstrapTokens.toLocaleString()} identity`
+      : `${total.toLocaleString()}`;
   return `${breakdown} / ${params.maxContextTokens.toLocaleString()} (${pct.toFixed(
     1
   )}%) ${queue} backend:${params.backend}`;
@@ -911,9 +946,7 @@ function printUsage(
   const displayPct = Math.min(pct, 100);
   const delta = previousTotal === undefined ? 0 : total - previousTotal;
   const deltaLabel =
-    previousTotal === undefined
-      ? ''
-      : `  ${delta >= 0 ? '+' : ''}${delta.toLocaleString()} tok`;
+    previousTotal === undefined ? '' : `  ${delta >= 0 ? '+' : ''}${delta.toLocaleString()} tok`;
 
   let user = 0;
   let assistant = 0;
@@ -928,7 +961,13 @@ function printUsage(
 
   const bar = buildTokenMeter(displayPct);
   const color =
-    pct >= 95 ? chalk.red : pct >= 80 ? chalk.yellow : pct >= 60 ? chalk.hex('#f59e0b') : chalk.green;
+    pct >= 95
+      ? chalk.red
+      : pct >= 80
+        ? chalk.yellow
+        : pct >= 60
+          ? chalk.hex('#f59e0b')
+          : chalk.green;
   const windowLabel =
     backendTokenWindow && backendTokenWindow !== maxContextTokens
       ? `  backend-window:${backendTokenWindow.toLocaleString()}`
@@ -998,7 +1037,9 @@ function sessionStudioLabel(
 }
 
 function sessionBackendLabel(session: SessionSummary): string {
-  const declared = [session.backend, session.model ? `(${session.model})` : ''].filter(Boolean).join(' ');
+  const declared = [session.backend, session.model ? `(${session.model})` : '']
+    .filter(Boolean)
+    .join(' ');
   if (declared) return declared;
   // Don't show raw session UUIDs — they're not useful to the user
   if (session.backendSessionId || session.claudeSessionId) return 'claude-code';
@@ -1014,10 +1055,7 @@ function chip(label: string, value: string, color: (text: string) => string): st
   return `${chalk.dim(`${label}:`)} ${color(value)}`;
 }
 
-function printSessionsSnapshot(
-  sessions: SessionSummary[],
-  options?: { timezone?: string }
-): void {
+function printSessionsSnapshot(sessions: SessionSummary[], options?: { timezone?: string }): void {
   if (sessions.length === 0) {
     console.log(chalk.dim('No active sessions found.'));
     return;
@@ -1039,10 +1077,10 @@ function printSessionsSnapshot(
     const started = formatStartedAt(session.startedAt);
     const backend = sessionBackendLabel(session).slice(0, 18).padEnd(18);
     const history = sessionHistoryLabel(transcriptMeta).slice(0, 9).padEnd(9);
-    const lastMessage = formatTimestampForSessionList(transcriptMeta?.lastMessageAt, options?.timezone).padEnd(
-      8,
-      ' '
-    );
+    const lastMessage = formatTimestampForSessionList(
+      transcriptMeta?.lastMessageAt,
+      options?.timezone
+    ).padEnd(8, ' ');
     console.log(
       chalk.dim(
         `${id}  ${agent}  ${status}  ${studio}  ${thread}  ${started.padEnd(7)}  ${backend}  ${history}  ${lastMessage}`
@@ -1069,7 +1107,9 @@ function printToolPolicySnapshot(
     console.log(
       chalk.dim(
         `Backend passthrough allowlist (${gate.allowedTools.length}): ${
-          gate.allowedTools.length > 0 ? gate.allowedTools.join(', ') : '(empty; backend tools disabled)'
+          gate.allowedTools.length > 0
+            ? gate.allowedTools.join(', ')
+            : '(empty; backend tools disabled)'
         }`
       )
     );
@@ -1085,12 +1125,16 @@ function printToolPolicySnapshot(
     console.log(chalk.dim('Backend passthrough mode is off (no backend tool calls permitted).'));
   }
   if (gate.mode === 'privileged') {
-    console.log(chalk.dim('Backend passthrough mode is privileged (backend tool allowlist not clamped).'));
+    console.log(
+      chalk.dim('Backend passthrough mode is privileged (backend tool allowlist not clamped).')
+    );
   }
 
   const grants = toolPolicy.listGrants();
   if (grants.length > 0) {
-    console.log(chalk.dim(`Grants: ${grants.map((entry) => `${entry.tool}(${entry.uses})`).join(', ')}`));
+    console.log(
+      chalk.dim(`Grants: ${grants.map((entry) => `${entry.tool}(${entry.uses})`).join(', ')}`)
+    );
   }
   const allow = toolPolicy.listAllowTools();
   if (allow.length > 0) console.log(chalk.dim(`Allow: ${allow.join(', ')}`));
@@ -1109,7 +1153,9 @@ function printToolPolicySnapshot(
   const sessionGrants = toolPolicy.listSessionGrants(sessionId);
   if (sessionGrants.length > 0) {
     console.log(
-      chalk.dim(`Session grants: ${sessionGrants.map((entry) => `${entry.tool}(${entry.uses})`).join(', ')}`)
+      chalk.dim(
+        `Session grants: ${sessionGrants.map((entry) => `${entry.tool}(${entry.uses})`).join(', ')}`
+      )
     );
   }
   const scoped = toolPolicy.listActiveScopeSnapshots();
@@ -1125,11 +1171,16 @@ function printToolPolicySnapshot(
       if (scope.promptTools.length > 0) fragments.push(`prompt=${scope.promptTools.join('|')}`);
       if (scope.allowedSkills.length > 0) fragments.push(`skills=${scope.allowedSkills.join('|')}`);
       if (scope.readPathAllow.length > 0) fragments.push(`read=${scope.readPathAllow.join('|')}`);
-      if (scope.writePathAllow.length > 0) fragments.push(`write=${scope.writePathAllow.join('|')}`);
+      if (scope.writePathAllow.length > 0)
+        fragments.push(`write=${scope.writePathAllow.join('|')}`);
       if (scope.grants.length > 0) {
-        fragments.push(`grants=${scope.grants.map((entry) => `${entry.tool}(${entry.uses})`).join('|')}`);
+        fragments.push(
+          `grants=${scope.grants.map((entry) => `${entry.tool}(${entry.uses})`).join('|')}`
+        );
       }
-      console.log(chalk.dim(`  - ${scope.label}${fragments.length > 0 ? ` :: ${fragments.join('  ')}` : ''}`));
+      console.log(
+        chalk.dim(`  - ${scope.label}${fragments.length > 0 ? ` :: ${fragments.join('  ')}` : ''}`)
+      );
     }
   }
   if (activeSkills.length > 0) {
@@ -1139,13 +1190,21 @@ function printToolPolicySnapshot(
 }
 
 function inboxMessageMatchesSessionScope(runtime: ChatRuntime, message: InboxMessage): boolean {
-  if (runtime.sessionId && message.relatedSessionId && message.relatedSessionId !== runtime.sessionId) {
+  if (
+    runtime.sessionId &&
+    message.relatedSessionId &&
+    message.relatedSessionId !== runtime.sessionId
+  ) {
     return false;
   }
   if (runtime.threadKey && message.threadKey && message.threadKey !== runtime.threadKey) {
     return false;
   }
-  if (runtime.studioId && message.recipientStudioId && message.recipientStudioId !== runtime.studioId) {
+  if (
+    runtime.studioId &&
+    message.recipientStudioId &&
+    message.recipientStudioId !== runtime.studioId
+  ) {
     return false;
   }
   if (runtime.threadKey) {
@@ -1165,24 +1224,25 @@ function filterSessionsByPolicy(
   toolPolicy: ToolPolicyState,
   action: 'list' | 'attach'
 ): SessionSummary[] {
-  return sessions.filter((session) =>
-    toolPolicy.canAccessSession({
-      action,
-      requester: {
-        sessionId: runtime.sessionId,
-        threadKey: runtime.threadKey,
-        studioId: runtime.studioId,
-        workspaceId: runtime.workspaceId,
-        agentId,
-      },
-      target: {
-        sessionId: session.id,
-        threadKey: session.threadKey,
-        studioId: session.studioId,
-        workspaceId: session.workspaceId,
-        agentId: session.agentId,
-      },
-    }).allowed
+  return sessions.filter(
+    (session) =>
+      toolPolicy.canAccessSession({
+        action,
+        requester: {
+          sessionId: runtime.sessionId,
+          threadKey: runtime.threadKey,
+          studioId: runtime.studioId,
+          workspaceId: runtime.workspaceId,
+          agentId,
+        },
+        target: {
+          sessionId: session.id,
+          threadKey: session.threadKey,
+          studioId: session.studioId,
+          workspaceId: session.workspaceId,
+          agentId: session.agentId,
+        },
+      }).allowed
   );
 }
 
@@ -1263,7 +1323,9 @@ async function pickSessionToAttach(
 
   const rl = createInterface({ input, output });
   try {
-    const answer = (await rl.question(chalk.green('Attach which session? [number, Enter=cancel]: '))).trim();
+    const answer = (
+      await rl.question(chalk.green('Attach which session? [number, Enter=cancel]: '))
+    ).trim();
     if (!answer) return undefined;
     const index = Number.parseInt(answer, 10);
     if (Number.isNaN(index) || index < 1 || index > candidates.length) return undefined;
@@ -1314,17 +1376,23 @@ async function promptForToolApproval(
   let answer: string;
   if (inkRepl) {
     // Render a visually distinct permission prompt in Ink
-    inkRepl.addMessage('system', [
-      `🔐 ${tool}`,
-      reason,
-      '',
-      '[y] once · [s] session · [a] always · [d] deny · [n] cancel',
-    ].join('\n'), { label: '🔐 permission' });
+    inkRepl.addMessage(
+      'system',
+      [
+        `🔐 ${tool}`,
+        reason,
+        '',
+        '[y] once · [s] session · [a] always · [d] deny · [n] cancel',
+      ].join('\n'),
+      { label: '🔐 permission' }
+    );
     answer = (await inkRepl.waitForInput()).trim();
   } else if (rl) {
     console.log(chalk.yellow(`🔐 ${tool} — ${reason}`));
     answer = (
-      await rl.question(chalk.yellow(`Allow? [y] once, [s] session, [a] always, [d] deny, [n] cancel: `))
+      await rl.question(
+        chalk.yellow(`Allow? [y] once, [s] session, [a] always, [d] deny, [n] cancel: `)
+      )
     ).trim();
   } else {
     return false;
@@ -1385,9 +1453,7 @@ function formatBootstrapContext(result: Record<string, unknown>, agentId: string
     }
     const projects = ctx.projects as Array<Record<string, unknown>> | undefined;
     if (projects && projects.length > 0) {
-      const lines = projects.map(
-        (p) => `- ${p.name} (${p.status}): ${p.description}`
-      );
+      const lines = projects.map((p) => `- ${p.name} (${p.status}): ${p.description}`);
       sections.push(`--- Active Projects ---\n${lines.join('\n')}`);
     }
   }
@@ -1419,9 +1485,7 @@ function buildPromptEnvelope(
   userMessage: string
 ): string {
   // Reserve bootstrap context budget (not counted against transcript budget)
-  const bootstrapTokens = runtime.bootstrapContext
-    ? estimateTokens(runtime.bootstrapContext)
-    : 0;
+  const bootstrapTokens = runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0;
   const transcriptBudget = Math.max(0, runtime.maxContextTokens - bootstrapTokens);
 
   const transcript = ledger.buildPromptTranscript({
@@ -1456,7 +1520,9 @@ function buildPromptEnvelope(
     '',
     'Conversation transcript:',
     transcript || '(empty)',
-    runtime.activeSkills.length > 0 ? `\nSkill instructions:${renderActiveSkills(runtime.activeSkills)}` : '',
+    runtime.activeSkills.length > 0
+      ? `\nSkill instructions:${renderActiveSkills(runtime.activeSkills)}`
+      : '',
     '',
     'Latest user message:',
     userMessage,
@@ -1539,7 +1605,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
   try {
     const { execSync } = await import('child_process');
     gitBranch = execSync('git rev-parse --abbrev-ref HEAD', { cwd, encoding: 'utf-8' }).trim();
-  } catch { /* not a git repo */ }
+  } catch {
+    /* not a git repo */
+  }
   const initialInfoItems = ['/help', 'ctrl+c ×2 quit', shortCwd, gitBranch].filter(Boolean);
   statusLane.setInfoItems(initialInfoItems);
 
@@ -1570,9 +1638,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let lastDelegation: DelegationState | undefined;
   let forceQuitAfterTurn = false;
   let readyForAutoRun = false;
-  let enqueueAutoRunFromInbox:
-    | ((message: InboxMessage) => Promise<void>)
-    | null = null;
+  let enqueueAutoRunFromInbox: ((message: InboxMessage) => Promise<void>) | null = null;
 
   const bootstrapResult = (await pcp
     .callTool('bootstrap', { agentId })
@@ -1581,9 +1647,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
   if (bootstrapResult.error) {
     console.log(chalk.yellow(`bootstrap unavailable: ${String(bootstrapResult.error)}`));
   } else {
-    const suggestion = (
-      bootstrapResult.reflectionStatus as Record<string, unknown> | undefined
-    )?.suggestion;
+    const suggestion = (bootstrapResult.reflectionStatus as Record<string, unknown> | undefined)
+      ?.suggestion;
     const timezone = (bootstrapResult.user as Record<string, unknown> | undefined)?.timezone;
     if (typeof timezone === 'string' && timezone.trim()) {
       runtime.userTimezone = timezone;
@@ -1827,11 +1892,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
     console.log(chalk.magentaBright(`✦${bar}✦`));
   }
   // Use studio slug/name where available, fall back to short ID
-  const studioSlug = (attachedSessionSummary?.studioName || attachedSessionSummary?.workspaceName)
-    || (identity?.workspaceId ? formatStudioForDisplay(identity.workspaceId, 'short') : undefined);
+  const studioSlug =
+    attachedSessionSummary?.studioName ||
+    attachedSessionSummary?.workspaceName ||
+    (identity?.workspaceId ? formatStudioForDisplay(identity.workspaceId, 'short') : undefined);
   const bannerParts = [
     chip('agent', agentId, chalk.cyan),
-    chip('backend', `${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}`, chalk.yellow),
+    chip(
+      'backend',
+      `${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}`,
+      chalk.yellow
+    ),
     studioSlug ? chip('studio', studioSlug, chalk.cyan) : null,
     chip('window', `${formatTokenCount(runtime.backendTokenWindow)} tok`, chalk.green),
     chip('time', formatNow(runtime.userTimezone), chalk.magenta),
@@ -1839,7 +1910,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
   console.log(bannerParts.join(chalk.dim('  •  ')));
   if (runtime.threadKey) console.log(chalk.dim(`Thread: ${runtime.threadKey}`));
   if (attachedToExistingSession) {
-    console.log(chalk.dim(autoAttachedLatest ? 'Auto-attached to latest session' : 'Attached to existing session'));
+    console.log(
+      chalk.dim(
+        autoAttachedLatest ? 'Auto-attached to latest session' : 'Attached to existing session'
+      )
+    );
   }
   if (historyHydration && historyHydration.messageCount > 0) {
     console.log(chalk.dim(`History: ${historyHydration.messageCount} prior message(s) loaded`));
@@ -1898,24 +1973,25 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const fresh = messages
       .filter((msg) => !seenInboxIds.has(msg.id))
       .filter((msg) => inboxMessageMatchesSessionScope(runtime, msg))
-      .filter((msg) =>
-        toolPolicy.canAccessSession({
-          action: 'inbox',
-          requester: {
-            sessionId: runtime.sessionId,
-            threadKey: runtime.threadKey,
-            studioId: runtime.studioId,
-            workspaceId: runtime.workspaceId,
-            agentId,
-          },
-          target: {
-            sessionId: msg.relatedSessionId,
-            threadKey: msg.threadKey,
-            studioId: msg.recipientStudioId,
-            workspaceId: runtime.workspaceId,
-            agentId,
-          },
-        }).allowed
+      .filter(
+        (msg) =>
+          toolPolicy.canAccessSession({
+            action: 'inbox',
+            requester: {
+              sessionId: runtime.sessionId,
+              threadKey: runtime.threadKey,
+              studioId: runtime.studioId,
+              workspaceId: runtime.workspaceId,
+              agentId,
+            },
+            target: {
+              sessionId: msg.relatedSessionId,
+              threadKey: msg.threadKey,
+              studioId: msg.recipientStudioId,
+              workspaceId: runtime.workspaceId,
+              agentId,
+            },
+          }).allowed
       )
       .sort((a, b) => safeDateMs(a.createdAt) - safeDateMs(b.createdAt));
     let autoRuns = 0;
@@ -1927,7 +2003,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
       seenInboxIds.add(msg.id);
       const grant = parsePermissionGrant(msg.metadata);
       if (!grant) {
-        printLine(chalk.yellow(`Received malformed permission grant from ${msg.from || 'unknown'} — ignoring.`));
+        printLine(
+          chalk.yellow(
+            `Received malformed permission grant from ${msg.from || 'unknown'} — ignoring.`
+          )
+        );
         continue;
       }
       const result = applyPermissionGrant({
@@ -1937,7 +2017,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
       });
       const from = msg.from || 'remote';
       const action = grant.action;
-      const label = action === 'deny' ? '🚫 denied' : action === 'revoke' ? '↩ revoked' : '✅ granted';
+      const label =
+        action === 'deny' ? '🚫 denied' : action === 'revoke' ? '↩ revoked' : '✅ granted';
       if (inkRepl) {
         inkRepl.addMessage('grant', result.summary, {
           label,
@@ -1946,12 +2027,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
         });
       } else {
         printLine('');
-        printLine(renderMessageLine('grant', result.summary, {
-          label,
-          timezone: runtime.userTimezone,
-          ts: msg.createdAt,
-          trailingMeta: `from ${from}`,
-        }));
+        printLine(
+          renderMessageLine('grant', result.summary, {
+            label,
+            timezone: runtime.userTimezone,
+            ts: msg.createdAt,
+            trailingMeta: `from ${from}`,
+          })
+        );
       }
       appendTranscript(runtime.transcriptPath, {
         type: 'permission_grant',
@@ -1999,7 +2082,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const subj = msg.subject ? ` — ${msg.subject}` : '';
           return `${from}${subj}`;
         });
-        inkRepl.addMessage('system', `${oldMessages.length} older message(s): ${summaries.join(', ')}. Use /inbox to expand.`);
+        inkRepl.addMessage(
+          'system',
+          `${oldMessages.length} older message(s): ${summaries.join(', ')}. Use /inbox to expand.`
+        );
       } else {
         printLine('');
         printLine(renderCollapsedInbox(oldMessages.length));
@@ -2051,10 +2137,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       } else {
         printLine('');
         printLine(separator());
-        printLine(renderMessageLine('inbox', rendered, {
-          timezone: runtime.userTimezone,
-          ts: msg.createdAt,
-        }));
+        printLine(
+          renderMessageLine('inbox', rendered, {
+            timezone: runtime.userTimezone,
+            ts: msg.createdAt,
+          })
+        );
         printLine(separator());
       }
 
@@ -2077,7 +2165,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       printLine(chalk.dim('No new inbox messages.'));
     }
     if (autoRuns > 0) {
-      printLine(chalk.green(`Auto-run processed ${autoRuns} inbox message${autoRuns === 1 ? '' : 's'}.`));
+      printLine(
+        chalk.green(`Auto-run processed ${autoRuns} inbox message${autoRuns === 1 ? '' : 's'}.`)
+      );
     }
     emitStatusLaneIfChanged();
     return fresh.length;
@@ -2095,25 +2185,29 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const activities = extractActivitySummaries(activityResult)
       .filter((activity) => !seenActivityIds.has(activity.id))
       // Ignore raw local transcript echoes for this same session; inbox handles human-facing notices.
-      .filter((activity) => !(activity.sessionId && runtime.sessionId && activity.sessionId === runtime.sessionId))
-      .filter((activity) =>
-        toolPolicy.canAccessSession({
-          action: 'events',
-          requester: {
-            sessionId: runtime.sessionId,
-            threadKey: runtime.threadKey,
-            studioId: runtime.studioId,
-            workspaceId: runtime.workspaceId,
-            agentId,
-          },
-          target: {
-            sessionId: activity.sessionId,
-            threadKey: runtime.threadKey,
-            studioId: runtime.studioId,
-            workspaceId: runtime.workspaceId,
-            agentId: activity.agentId,
-          },
-        }).allowed
+      .filter(
+        (activity) =>
+          !(activity.sessionId && runtime.sessionId && activity.sessionId === runtime.sessionId)
+      )
+      .filter(
+        (activity) =>
+          toolPolicy.canAccessSession({
+            action: 'events',
+            requester: {
+              sessionId: runtime.sessionId,
+              threadKey: runtime.threadKey,
+              studioId: runtime.studioId,
+              workspaceId: runtime.workspaceId,
+              agentId,
+            },
+            target: {
+              sessionId: activity.sessionId,
+              threadKey: runtime.threadKey,
+              studioId: runtime.studioId,
+              workspaceId: runtime.workspaceId,
+              agentId: activity.agentId,
+            },
+          }).allowed
       )
       .sort((a, b) => safeDateMs(a.createdAt) - safeDateMs(b.createdAt));
 
@@ -2123,12 +2217,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
         activitySince = activity.createdAt;
       }
 
-      const type = activity.subtype ? `${activity.type}:${activity.subtype}` : activity.type || 'activity';
+      const type = activity.subtype
+        ? `${activity.type}:${activity.subtype}`
+        : activity.type || 'activity';
       const actor = activity.agentId || 'system';
-      const preview = (activity.content || '')
-        .replace(/\\s+/g, ' ')
-        .trim()
-        .slice(0, 200);
+      const preview = (activity.content || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
       const rendered = `⚡ ${actor} ${type}${preview ? ` — ${preview}` : ''}`;
 
       ledger.addEntry('system', compactForLedger(rendered, 320), 'pcp-activity');
@@ -2143,14 +2236,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
         content: activity.content || null,
       });
       if (inkRepl) {
-        inkRepl.addMessage('activity', `${actor} ${type}${preview ? ` — ${preview}` : ''}`, { label: '⚡' });
+        inkRepl.addMessage('activity', `${actor} ${type}${preview ? ` — ${preview}` : ''}`, {
+          label: '⚡',
+        });
       } else {
         printLine('');
-        printLine(renderMessageLine('activity', `${actor} ${type}${preview ? ` — ${preview}` : ''}`, {
-          label: '⚡',
-          timezone: runtime.userTimezone,
-          ts: activity.createdAt,
-        }));
+        printLine(
+          renderMessageLine('activity', `${actor} ${type}${preview ? ` — ${preview}` : ''}`, {
+            label: '⚡',
+            timezone: runtime.userTimezone,
+            ts: activity.createdAt,
+          })
+        );
       }
     }
 
@@ -2168,10 +2265,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       if (inkRepl) {
         inkRepl.addMessage('user', raw, { label: 'you' });
       } else {
-        printLine(renderMessageLine('user', raw, {
-          label: 'you',
-          timezone: runtime.userTimezone,
-        }));
+        printLine(
+          renderMessageLine('user', raw, {
+            label: 'you',
+            timezone: runtime.userTimezone,
+          })
+        );
         printLine('');
       }
       ledger.addEntry('user', raw, 'repl');
@@ -2218,7 +2317,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     // Ink handles waiting via its own component; legacy uses animated indicator
     const stopWaiting = inkRepl
-      ? (() => { /* Ink waiting managed by enqueueTurn via setWaiting */ return () => {}; })()
+      ? (() => {
+          /* Ink waiting managed by enqueueTurn via setWaiting */ return () => {};
+        })()
       : startWaitingIndicator(runtime.backend, {
           statusLane,
           logger: printLine,
@@ -2239,9 +2340,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
       turnCtrlCAt = now;
       if (inkRepl) {
-        inkRepl.printSystem('Backend turn in progress. Press Ctrl+C again to exit after this turn.');
+        inkRepl.printSystem(
+          'Backend turn in progress. Press Ctrl+C again to exit after this turn.'
+        );
       } else {
-        statusLane.renderHint('Backend turn in progress. Press Ctrl+C again to exit after this turn.');
+        statusLane.renderHint(
+          'Backend turn in progress. Press Ctrl+C again to exit after this turn.'
+        );
       }
     };
     process.on('SIGINT', onSigintDuringTurn);
@@ -2308,7 +2413,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
         ? (() => {
             const stripped = stripLocalToolBlocks(responseText);
             if (stripped) return stripped;
-            if (localToolCalls.length > 0) return '(local tool call emitted; see tool results above)';
+            if (localToolCalls.length > 0)
+              return '(local tool call emitted; see tool results above)';
             return responseText;
           })()
         : responseText;
@@ -2345,11 +2451,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
       });
     } else {
       printLine('');
-      printLine(renderMessageLine('assistant', assistantDisplayText, {
-        label: agentId,
-        timezone: runtime.userTimezone,
-        trailingMeta: `${turnDurationSeconds}s`,
-      }));
+      printLine(
+        renderMessageLine('assistant', assistantDisplayText, {
+          label: agentId,
+          timezone: runtime.userTimezone,
+          trailingMeta: `${turnDurationSeconds}s`,
+        })
+      );
       if (runResult.usage) {
         printLine(chalk.dim(`    ↳ ${formatBackendTokenUsage(runResult.usage)}`));
       }
@@ -2421,12 +2529,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
   await pollInbox(false);
   await pollActivity(false);
 
-  pollTimer = setInterval(() => {
-    void pollInbox(false);
-    if (runtime.eventPolling) {
-      void pollActivity(false);
-    }
-  }, Math.max(runtime.pollSeconds, 5) * 1000);
+  pollTimer = setInterval(
+    () => {
+      void pollInbox(false);
+      if (runtime.eventPolling) {
+        void pollActivity(false);
+      }
+    },
+    Math.max(runtime.pollSeconds, 5) * 1000
+  );
   // Status update deferred until after Ink/readline mount below
   if (!useInk) {
     emitStatusLaneIfChanged();
@@ -2488,13 +2599,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // Push prior messages into Ink scrollback so user sees conversation history
     if (historyHydration && historyHydration.tailPreview.length > 0) {
       for (const entry of historyHydration.tailPreview) {
-        const role = entry.role === 'user' ? 'user' as const
-          : entry.role === 'assistant' ? 'assistant' as const
-          : 'inbox' as const;
-        const label = entry.role === 'user' ? 'you'
-          : entry.role === 'assistant' ? agentId
-          : '📬 inbox';
-        inkRepl.addMessage(role, entry.content, { label, time: formatHumanTime(entry.ts, runtime.userTimezone) });
+        const role =
+          entry.role === 'user'
+            ? ('user' as const)
+            : entry.role === 'assistant'
+              ? ('assistant' as const)
+              : ('inbox' as const);
+        const label =
+          entry.role === 'user' ? 'you' : entry.role === 'assistant' ? agentId : '📬 inbox';
+        inkRepl.addMessage(role, entry.content, {
+          label,
+          time: formatHumanTime(entry.ts, runtime.userTimezone),
+        });
       }
     }
   } else {
@@ -2590,7 +2706,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }
           lastCtrlCAt = now;
           rl = createInterface({ input, output });
-          rl.on('close', () => { readlineClosed = true; });
+          rl.on('close', () => {
+            readlineClosed = true;
+          });
           readlineClosed = false;
           statusLane.renderHint('Press Ctrl+C again to quit, or continue typing.');
           continue;
@@ -2605,7 +2723,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           lastCtrlCAt = now;
           if (readlineClosed) {
             rl = createInterface({ input, output });
-            rl.on('close', () => { readlineClosed = true; });
+            rl.on('close', () => {
+              readlineClosed = true;
+            });
             readlineClosed = false;
           }
           statusLane.renderHint('Press Ctrl+C again to quit, or continue typing.');
@@ -2702,8 +2822,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
             const fullResult = (await pcp
               .callTool('get_inbox', { agentId, status: 'unread', limit: 20 })
               .catch(() => null)) as Record<string, unknown> | null;
-            const allInbox = extractInboxMessages(fullResult)
-              .sort((a, b) => safeDateMs(a.createdAt) - safeDateMs(b.createdAt));
+            const allInbox = extractInboxMessages(fullResult).sort(
+              (a, b) => safeDateMs(a.createdAt) - safeDateMs(b.createdAt)
+            );
             if (allInbox.length === 0) {
               inkRepl.printSystem('No unread inbox messages.');
             } else {
@@ -2733,9 +2854,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               runtime.bootstrapContext = ctx;
               const ctxTokens = estimateTokens(ctx);
               console.log(
-                chalk.green(
-                  `Identity context refreshed: ~${ctxTokens.toLocaleString()} tokens`
-                )
+                chalk.green(`Identity context refreshed: ~${ctxTokens.toLocaleString()} tokens`)
               );
             } else {
               console.log(chalk.yellow('Bootstrap returned no identity context.'));
@@ -2763,24 +2882,27 @@ export async function runChat(options: ChatOptions): Promise<void> {
               : null;
             const sessionStudio = attachedSessionSummary
               ? sessionStudioLabel(attachedSessionSummary, 'full')
-              : sessionStudioLabel({ studioId: runtime.studioId, workspaceId: runtime.workspaceId }, 'full');
-          console.log(
-            chalk.dim(
-              `session=${runtime.sessionId || 'none'} backend=${runtime.backend} model=${
-                runtime.model || '(default)'
-              } routing=${runtime.toolRouting} thread=${runtime.threadKey || '(none)'} studio=${sessionStudio} events=${
-                runtime.eventPolling ? 'on' : 'off'
-              } autorun=${
-                runtime.autoRunInbox ? 'on' : 'off'
-              } ui=${runtime.uiMode} budget=${formatTokenCount(
-                runtime.maxContextTokens
-              )} window=${formatTokenCount(
-                runtime.backendTokenWindow
-              )} budgetMode=${contextBudgetAuto ? 'auto' : 'manual'} tools=${toolPolicy.getMode()} scope=${toolPolicy.getMutationScopeLabel()} visibility=${toolPolicy.getSessionVisibility()} history=${sessionHistoryLabel(
-                transcriptMeta
-              )}`
-            )
-          );
+              : sessionStudioLabel(
+                  { studioId: runtime.studioId, workspaceId: runtime.workspaceId },
+                  'full'
+                );
+            console.log(
+              chalk.dim(
+                `session=${runtime.sessionId || 'none'} backend=${runtime.backend} model=${
+                  runtime.model || '(default)'
+                } routing=${runtime.toolRouting} thread=${runtime.threadKey || '(none)'} studio=${sessionStudio} events=${
+                  runtime.eventPolling ? 'on' : 'off'
+                } autorun=${
+                  runtime.autoRunInbox ? 'on' : 'off'
+                } ui=${runtime.uiMode} budget=${formatTokenCount(
+                  runtime.maxContextTokens
+                )} window=${formatTokenCount(
+                  runtime.backendTokenWindow
+                )} budgetMode=${contextBudgetAuto ? 'auto' : 'manual'} tools=${toolPolicy.getMode()} scope=${toolPolicy.getMutationScopeLabel()} visibility=${toolPolicy.getSessionVisibility()} history=${sessionHistoryLabel(
+                  transcriptMeta
+                )}`
+              )
+            );
           }
           break;
         case 'autorun':
@@ -2795,7 +2917,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
             break;
           }
           runtime.autoRunInbox = mode === 'on';
-          console.log(chalk.green(`Inbox auto-run ${runtime.autoRunInbox ? 'enabled' : 'disabled'}.`));
+          console.log(
+            chalk.green(`Inbox auto-run ${runtime.autoRunInbox ? 'enabled' : 'disabled'}.`)
+          );
           break;
         }
         case 'tool-routing': {
@@ -2812,7 +2936,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           console.log(chalk.green(`Tool routing set to ${runtime.toolRouting}.`));
           if (runtime.toolRouting === 'local') {
             console.log(
-              chalk.dim('Local routing active: backend-native tools disabled; use pcp-tool blocks for local execution.')
+              chalk.dim(
+                'Local routing active: backend-native tools disabled; use pcp-tool blocks for local execution.'
+              )
             );
           }
           break;
@@ -2881,7 +3007,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }
           console.log(chalk.green(`Model override: ${runtime.model || '(backend default)'}`));
           console.log(
-            chalk.dim(`Backend window: ${formatTokenCount(runtime.backendTokenWindow)} tok (policy default).`)
+            chalk.dim(
+              `Backend window: ${formatTokenCount(runtime.backendTokenWindow)} tok (policy default).`
+            )
           );
           break;
         }
@@ -2893,7 +3021,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
             console.log(chalk.dim(`Mutation scope: ${toolPolicy.getMutationScopeLabel()}`));
             console.log(chalk.dim(`Session visibility: ${toolPolicy.getSessionVisibility()}`));
             if (grants.length > 0) {
-              console.log(chalk.dim(`Grants: ${grants.map((g) => `${g.tool}(${g.uses})`).join(', ')}`));
+              console.log(
+                chalk.dim(`Grants: ${grants.map((g) => `${g.tool}(${g.uses})`).join(', ')}`)
+              );
             }
             const sessionGrants = toolPolicy.listSessionGrants(runtime.sessionId);
             if (sessionGrants.length > 0) {
@@ -2911,9 +3041,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }
           toolPolicy.setMode(next);
           runtime.toolMode = toolPolicy.getMode();
-          console.log(chalk.green(`Tool mode set in ${toolPolicy.getMutationScopeLabel()} to ${next}.`));
+          console.log(
+            chalk.green(`Tool mode set in ${toolPolicy.getMutationScopeLabel()} to ${next}.`)
+          );
           if (runtime.toolMode !== next) {
-            console.log(chalk.yellow(`Effective mode remains ${runtime.toolMode} due stricter active scope.`));
+            console.log(
+              chalk.yellow(`Effective mode remains ${runtime.toolMode} due stricter active scope.`)
+            );
           }
           break;
         }
@@ -2958,7 +3092,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const targetAgent = slash.args[0];
           const toolSpec = slash.args[1];
           if (!targetAgent || !toolSpec) {
-            console.log(chalk.yellow('Usage: /grant-remote <agent> <toolSpec> [once|session|always|deny|revoke]'));
+            console.log(
+              chalk.yellow(
+                'Usage: /grant-remote <agent> <toolSpec> [once|session|always|deny|revoke]'
+              )
+            );
             break;
           }
           const scopeArg = (slash.args[2] || 'session').toLowerCase();
@@ -2971,7 +3109,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           };
           const action = actionMap[scopeArg];
           if (!action) {
-            console.log(chalk.yellow(`Unknown scope: ${scopeArg}. Use: once, session, always, deny, revoke`));
+            console.log(
+              chalk.yellow(`Unknown scope: ${scopeArg}. Use: once, session, always, deny, revoke`)
+            );
             break;
           }
           const grantResult = await pcp
@@ -2988,7 +3128,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
               }),
             })
             .catch((err: unknown) => {
-              console.log(chalk.red(`Failed to send grant: ${err instanceof Error ? err.message : String(err)}`));
+              console.log(
+                chalk.red(
+                  `Failed to send grant: ${err instanceof Error ? err.message : String(err)}`
+                )
+              );
               return null;
             });
           if (grantResult) {
@@ -3010,7 +3154,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const scopeRaw = (slash.args[0] || '').trim().toLowerCase();
           if (!scopeRaw) {
             console.log(chalk.dim(`Mutation scope: ${toolPolicy.getMutationScopeLabel()}`));
-            console.log(chalk.dim(`Active scopes: ${toolPolicy.listActiveScopeLabels().join(' -> ')}`));
+            console.log(
+              chalk.dim(`Active scopes: ${toolPolicy.listActiveScopeLabels().join(' -> ')}`)
+            );
             break;
           }
           if (!['global', 'workspace', 'agent', 'studio'].includes(scopeRaw)) {
@@ -3031,7 +3177,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const scopeRaw = (slash.args[0] || '').trim().toLowerCase();
           const explicitScope =
             scopeRaw && ['global', 'workspace', 'agent', 'studio'].includes(scopeRaw)
-              ? ({ scope: scopeRaw as ToolPolicyScopeKind, id: slash.args.slice(1).join(' ').trim() || undefined } as const)
+              ? ({
+                  scope: scopeRaw as ToolPolicyScopeKind,
+                  id: slash.args.slice(1).join(' ').trim() || undefined,
+                } as const)
               : undefined;
           if (scopeRaw && !explicitScope) {
             console.log(chalk.yellow('Usage: /policy-reset [global|workspace|agent|studio] [id]'));
@@ -3061,7 +3210,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
             console.log(chalk.bold(`MCP servers (${servers.length})`));
             for (const server of servers) {
               const endpoint = server.url || server.command || '(unknown)';
-              console.log(chalk.dim(`- ${server.name} [${server.transport || 'unknown'}] ${endpoint}`));
+              console.log(
+                chalk.dim(`- ${server.name} [${server.transport || 'unknown'}] ${endpoint}`)
+              );
             }
             console.log('');
             break;
@@ -3078,7 +3229,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
               try {
                 pcpArgs = JSON.parse(rawArgs) as Record<string, unknown>;
               } catch {
-                console.log(chalk.yellow('Invalid JSON args. Example: /mcp call get_inbox {"agentId":"lumen"}'));
+                console.log(
+                  chalk.yellow(
+                    'Invalid JSON args. Example: /mcp call get_inbox {"agentId":"lumen"}'
+                  )
+                );
                 break;
               }
             }
@@ -3093,10 +3248,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
               console.log(chalk.yellow(`Skipped ${tool}`));
               break;
             }
-            const result = await pcp.callTool(tool, pcpArgs).catch((error) => ({ error: String(error) }));
+            const result = await pcp
+              .callTool(tool, pcpArgs)
+              .catch((error) => ({ error: String(error) }));
             const rendered = JSON.stringify(result, null, 2);
             ledger.addEntry('system', compactForLedger(`PCP ${tool} -> ${rendered}`, 500), 'pcp');
-            appendTranscript(runtime.transcriptPath, { type: 'pcp_tool', tool, args: pcpArgs, result });
+            appendTranscript(runtime.transcriptPath, {
+              type: 'pcp_tool',
+              tool,
+              args: pcpArgs,
+              result,
+            });
             console.log(rendered);
             break;
           }
@@ -3112,7 +3274,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           console.log(chalk.bold(`MCP servers (${servers.length})`));
           for (const server of servers) {
             const endpoint = server.url || server.command || '(unknown)';
-            console.log(chalk.dim(`- ${server.name} [${server.transport || 'unknown'}] ${endpoint}`));
+            console.log(
+              chalk.dim(`- ${server.name} [${server.transport || 'unknown'}] ${endpoint}`)
+            );
           }
           console.log('');
           break;
@@ -3137,7 +3301,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
             console.log(chalk.bold(`MCP servers (${servers.length})`));
             for (const server of servers) {
               const endpoint = server.url || server.command || '(unknown)';
-              console.log(chalk.dim(`- ${server.name} [${server.transport || 'unknown'}] ${endpoint}`));
+              console.log(
+                chalk.dim(`- ${server.name} [${server.transport || 'unknown'}] ${endpoint}`)
+              );
             }
           }
 
@@ -3146,7 +3312,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
             console.log(chalk.dim('- none visible under current policy'));
           } else {
             for (const skill of filtered.visible.slice(0, 20)) {
-              const active = runtime.activeSkills.some((entry) => entry.path === skill.path) ? ' *active*' : '';
+              const active = runtime.activeSkills.some((entry) => entry.path === skill.path)
+                ? ' *active*'
+                : '';
               console.log(
                 chalk.dim(`- ${skill.name} [${skill.source}] trust=${skill.trustLevel}${active}`)
               );
@@ -3156,7 +3324,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
             }
           }
           if (filtered.blockedBySkill.length > 0) {
-            console.log(chalk.yellow(`Blocked by skill allowlist: ${filtered.blockedBySkill.length}`));
+            console.log(
+              chalk.yellow(`Blocked by skill allowlist: ${filtered.blockedBySkill.length}`)
+            );
           }
           if (filtered.blockedByPath.length > 0) {
             console.log(chalk.yellow(`Blocked by path policy: ${filtered.blockedByPath.length}`));
@@ -3180,7 +3350,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
             try {
               pcpArgs = JSON.parse(rawArgs) as Record<string, unknown>;
             } catch {
-              console.log(chalk.yellow('Invalid JSON args. Example: /pcp get_inbox {"agentId":"lumen"}'));
+              console.log(
+                chalk.yellow('Invalid JSON args. Example: /pcp get_inbox {"agentId":"lumen"}')
+              );
               break;
             }
           }
@@ -3195,10 +3367,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
             console.log(chalk.yellow(`Skipped ${tool}`));
             break;
           }
-          const result = await pcp.callTool(tool, pcpArgs).catch((error) => ({ error: String(error) }));
+          const result = await pcp
+            .callTool(tool, pcpArgs)
+            .catch((error) => ({ error: String(error) }));
           const rendered = JSON.stringify(result, null, 2);
           ledger.addEntry('system', compactForLedger(`PCP ${tool} -> ${rendered}`, 500), 'pcp');
-          appendTranscript(runtime.transcriptPath, { type: 'pcp_tool', tool, args: pcpArgs, result });
+          appendTranscript(runtime.transcriptPath, {
+            type: 'pcp_tool',
+            tool,
+            args: pcpArgs,
+            result,
+          });
           console.log(rendered);
           break;
         }
@@ -3215,10 +3394,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const blockedByTrust = filtered.blockedByTrust.length;
           console.log(chalk.bold(`Discovered skills (${skills.length})`));
           for (const skill of visible.slice(0, 80)) {
-            const active = runtime.activeSkills.some((entry) => entry.path === skill.path) ? ' *active*' : '';
-            const trust = skill.trustLevel === 'trusted' ? chalk.green(skill.trustLevel) : skill.trustLevel;
-            const provenance = skill.provenance?.registry ? ` registry:${skill.provenance.registry}` : '';
-            console.log(chalk.dim(`- ${skill.name} [${skill.source}] trust=${trust}${provenance}${active}`));
+            const active = runtime.activeSkills.some((entry) => entry.path === skill.path)
+              ? ' *active*'
+              : '';
+            const trust =
+              skill.trustLevel === 'trusted' ? chalk.green(skill.trustLevel) : skill.trustLevel;
+            const provenance = skill.provenance?.registry
+              ? ` registry:${skill.provenance.registry}`
+              : '';
+            console.log(
+              chalk.dim(`- ${skill.name} [${skill.source}] trust=${trust}${provenance}${active}`)
+            );
           }
           if (visible.length > 80) {
             console.log(chalk.dim(`... and ${visible.length - 80} more visible skills`));
@@ -3227,7 +3413,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
             console.log(chalk.yellow(`${blockedByPolicy} skills hidden by skill allowlist policy`));
           }
           if (blockedByPath > 0) {
-            console.log(chalk.yellow(`${blockedByPath} skills hidden by read-path allowlist policy`));
+            console.log(
+              chalk.yellow(`${blockedByPath} skills hidden by read-path allowlist policy`)
+            );
           }
           if (blockedByTrust > 0) {
             console.log(chalk.yellow(`${blockedByTrust} skills hidden by trust policy mode`));
@@ -3344,11 +3532,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const ttlMinutes = Number.parseInt(slash.args[2] || '15', 10);
           const secret = getDelegationSecret();
           if (!secret) {
-            console.log(chalk.yellow('Delegation secret missing. Set PCP_DELEGATION_SECRET (or JWT_SECRET).'));
+            console.log(
+              chalk.yellow('Delegation secret missing. Set PCP_DELEGATION_SECRET (or JWT_SECRET).')
+            );
             break;
           }
           if (!toAgent || !scopeSpec) {
-            console.log(chalk.yellow('Usage: /delegate-create <to-agent> <scope1,scope2> [ttl-minutes]'));
+            console.log(
+              chalk.yellow('Usage: /delegate-create <to-agent> <scope1,scope2> [ttl-minutes]')
+            );
             break;
           }
           const scopes = parseToolScopes(scopeSpec);
@@ -3395,12 +3587,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const target = (slash.args[0] || 'last').trim();
           const token = target === 'last' ? lastDelegation?.token : target;
           if (!token) {
-            console.log(chalk.yellow('No token available. Use /delegate-create first or pass a token.'));
+            console.log(
+              chalk.yellow('No token available. Use /delegate-create first or pass a token.')
+            );
             break;
           }
           const secret = getDelegationSecret();
           if (!secret) {
-            console.log(chalk.yellow('Delegation secret missing. Set PCP_DELEGATION_SECRET (or JWT_SECRET).'));
+            console.log(
+              chalk.yellow('Delegation secret missing. Set PCP_DELEGATION_SECRET (or JWT_SECRET).')
+            );
             break;
           }
           const verified = verifyDelegationToken(token, secret);
@@ -3424,7 +3620,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }
           const secret = getDelegationSecret();
           if (!secret) {
-            console.log(chalk.yellow('Delegation secret missing. Set PCP_DELEGATION_SECRET (or JWT_SECRET).'));
+            console.log(
+              chalk.yellow('Delegation secret missing. Set PCP_DELEGATION_SECRET (or JWT_SECRET).')
+            );
             break;
           }
 
@@ -3454,7 +3652,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
             tool: 'send_to_inbox',
             sessionId: runtime.sessionId,
             prompt: (reason) =>
-              promptForToolApproval(rl, toolPolicy, runtime.sessionId, 'send_to_inbox', reason, inkRepl),
+              promptForToolApproval(
+                rl,
+                toolPolicy,
+                runtime.sessionId,
+                'send_to_inbox',
+                reason,
+                inkRepl
+              ),
           });
           if (!approved) {
             console.log(chalk.yellow('Skipped delegated send_to_inbox (policy blocked).'));
@@ -3542,7 +3747,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
             if (maybeLargeEject) {
               const previewLines = preview.removedEntries
                 .slice(-3)
-                .map((entry) => `- ${entry.role}: ${entry.content.slice(0, 80).replace(/\\s+/g, ' ')}`);
+                .map(
+                  (entry) => `- ${entry.role}: ${entry.content.slice(0, 80).replace(/\\s+/g, ' ')}`
+                );
               console.log(
                 chalk.yellow(
                   `About to eject ${removedCount} entries (~${preview.removedTokens} tok) up to ${preview.bookmark.id}.`
@@ -3601,7 +3808,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
         case 'trim': {
           const targetPctRaw = slash.args[0] || `${DEFAULT_TRIM_TARGET_PCT}`;
           const targetPct = Number.parseInt(targetPctRaw, 10);
-          if (!Number.isFinite(targetPct) || Number.isNaN(targetPct) || targetPct < 10 || targetPct > 95) {
+          if (
+            !Number.isFinite(targetPct) ||
+            Number.isNaN(targetPct) ||
+            targetPct < 10 ||
+            targetPct > 95
+          ) {
             console.log(chalk.yellow('Usage: /trim [targetPercent 10-95]'));
             break;
           }
@@ -3708,7 +3920,10 @@ export function registerChatCommand(program: Command): void {
       .option('--auto-run', 'Automatically execute backend turns for new inbox task messages')
       .option('--message <text>', 'Single-turn message for non-interactive mode')
       .option('--non-interactive', 'Run one turn and exit (requires --message)')
-      .option('--tail-transcript <pathOrSession>', 'Tail transcript output by file path or session id')
+      .option(
+        '--tail-transcript <pathOrSession>',
+        'Tail transcript output by file path or session id'
+      )
       .option('-v, --verbose', 'Verbose backend passthrough output')
       .action((options: ChatOptions) => runChat(options));
 
