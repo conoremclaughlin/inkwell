@@ -18,6 +18,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { resolveAgentId } from '../backends/identity.js';
 import { getCurrentRuntimeSession } from '../session/runtime.js';
+import { callPcpTool } from '../lib/pcp-mcp.js';
 
 interface PcpConfig {
   userId?: string;
@@ -63,21 +64,6 @@ function getPcpConfig(): PcpConfig | null {
   return null;
 }
 
-function getPcpServerUrl(): string {
-  return process.env.PCP_SERVER_URL || 'http://localhost:3001';
-}
-
-async function fetchPcp(path: string, options?: RequestInit): Promise<Response> {
-  const url = `${getPcpServerUrl()}${path}`;
-  return fetch(url, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...options?.headers,
-    },
-  });
-}
-
 // ============================================================================
 // Commands
 // ============================================================================
@@ -106,35 +92,21 @@ async function triggerAgent(
     const currentRuntime = getCurrentRuntimeSession(process.cwd());
     const threadKey = options.threadKey || currentRuntime?.threadKey;
 
-    const inboxResponse = await fetchPcp('/api/mcp/call', {
-      method: 'POST',
-      body: JSON.stringify({
-        tool: 'send_to_inbox',
-        args: {
-          email: config.email,
-          recipientAgentId: agentId,
-          senderAgentId: 'cli',
-          content: options.message || `CLI trigger at ${new Date().toISOString()}`,
-          messageType: 'message',
-          priority: options.priority || 'normal',
-          ...(threadKey ? { threadKey } : {}),
-          ...(options.recipientSessionId ? { recipientSessionId: options.recipientSessionId } : {}),
-          ...(options.studioId ? { recipientStudioId: options.studioId } : {}),
-          ...(options.studioHint ? { recipientStudioHint: options.studioHint } : {}),
-          trigger: true,
-          triggerType: 'message',
-          triggerSummary: options.message || 'CLI trigger',
-        },
-      }),
+    const result = await callPcpTool<TriggerResult>('send_to_inbox', {
+      email: config.email,
+      recipientAgentId: agentId,
+      senderAgentId: 'cli',
+      content: options.message || `CLI trigger at ${new Date().toISOString()}`,
+      messageType: 'message',
+      priority: options.priority || 'normal',
+      ...(threadKey ? { threadKey } : {}),
+      ...(options.recipientSessionId ? { recipientSessionId: options.recipientSessionId } : {}),
+      ...(options.studioId ? { recipientStudioId: options.studioId } : {}),
+      ...(options.studioHint ? { recipientStudioHint: options.studioHint } : {}),
+      trigger: true,
+      triggerType: 'message',
+      triggerSummary: options.message || 'CLI trigger',
     });
-
-    if (!inboxResponse.ok) {
-      const error = await inboxResponse.text();
-      spinner.fail(`Failed to trigger: ${error}`);
-      process.exit(1);
-    }
-
-    const result = (await inboxResponse.json()) as TriggerResult;
     spinner.succeed(`Triggered ${agentId}`);
 
     if (result.trigger?.triggered) {
@@ -160,42 +132,28 @@ async function statusCommand(agentId?: string): Promise<void> {
 
   for (const agent of agents) {
     try {
-      const response = await fetchPcp('/api/mcp/call', {
-        method: 'POST',
-        body: JSON.stringify({
-          tool: 'get_agent_status',
-          args: {
-            email: config.email,
-            agentId: agent,
-          },
-        }),
+      const result = await callPcpTool<AgentStatusResult>('get_agent_status', {
+        email: config.email,
+        agentId: agent,
       });
 
-      if (response.ok) {
-        const result = (await response.json()) as AgentStatusResult;
+      const statusIcon =
+        result.status === 'active'
+          ? chalk.green('●')
+          : result.status === 'recently_active'
+            ? chalk.yellow('●')
+            : chalk.dim('○');
 
-        const statusIcon =
-          result.status === 'active'
-            ? chalk.green('●')
-            : result.status === 'recently_active'
-              ? chalk.yellow('●')
-              : chalk.dim('○');
+      console.log(`  ${statusIcon} ${chalk.cyan(agent)}`);
+      console.log(chalk.dim(`      Status: ${result.status}`));
+      console.log(chalk.dim(`      Inbox:  ${result.inbox?.unreadCount || 0} unread`));
 
-        console.log(`  ${statusIcon} ${chalk.cyan(agent)}`);
-        console.log(chalk.dim(`      Status: ${result.status}`));
-        console.log(chalk.dim(`      Inbox:  ${result.inbox?.unreadCount || 0} unread`));
-
-        if (result.lastSession) {
-          const lastActive = new Date(result.lastSession.endedAt || result.lastSession.startedAt);
-          const ago = formatTimeAgo(lastActive);
-          console.log(chalk.dim(`      Last:   ${ago}`));
-        }
-        console.log('');
-      } else {
-        console.log(`  ${chalk.dim('○')} ${chalk.cyan(agent)}`);
-        console.log(chalk.dim('      Status: unknown'));
-        console.log('');
+      if (result.lastSession) {
+        const lastActive = new Date(result.lastSession.endedAt || result.lastSession.startedAt);
+        const ago = formatTimeAgo(lastActive);
+        console.log(chalk.dim(`      Last:   ${ago}`));
       }
+      console.log('');
     } catch {
       console.log(`  ${chalk.dim('○')} ${chalk.cyan(agent)}`);
       console.log(chalk.dim('      Status: unreachable'));
@@ -218,25 +176,12 @@ async function inboxCommand(agentId?: string): Promise<void> {
   }
 
   try {
-    const response = await fetchPcp('/api/mcp/call', {
-      method: 'POST',
-      body: JSON.stringify({
-        tool: 'get_inbox',
-        args: {
-          email: config.email,
-          agentId: agent,
-          status: 'all',
-          limit: 10,
-        },
-      }),
+    const result = await callPcpTool<InboxResult>('get_inbox', {
+      email: config.email,
+      agentId: agent,
+      status: 'all',
+      limit: 10,
     });
-
-    if (!response.ok) {
-      console.error(chalk.red(`Failed to fetch inbox: ${await response.text()}`));
-      process.exit(1);
-    }
-
-    const result = (await response.json()) as InboxResult;
 
     console.log(chalk.bold(`\nInbox for ${agent}:`));
     console.log(chalk.dim(`  ${result.unreadCount} unread\n`));

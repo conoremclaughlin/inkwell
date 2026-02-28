@@ -11,6 +11,7 @@ import chalk from 'chalk';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { callPcpTool } from '../lib/pcp-mcp.js';
 
 interface PcpConfig {
   userId?: string;
@@ -27,6 +28,30 @@ interface Workspace {
   role?: 'owner' | 'admin' | 'member' | 'viewer';
   description?: string | null;
   archivedAt?: string | null;
+}
+
+interface WorkspaceMember {
+  role?: string;
+  user?: {
+    email?: string | null;
+    firstName?: string | null;
+    username?: string | null;
+    lastLoginAt?: string | null;
+  };
+  userId?: string;
+  userWasCreated?: boolean;
+}
+
+interface AddWorkspaceMemberResult {
+  success?: boolean;
+  error?: string;
+  member?: WorkspaceMember;
+}
+
+interface GetWorkspaceResult {
+  workspace?: {
+    members?: WorkspaceMember[];
+  };
 }
 
 function getConfigPath(): string {
@@ -53,50 +78,6 @@ function savePcpConfig(config: PcpConfig): void {
   writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
 }
 
-function getPcpServerUrl(): string {
-  return process.env.PCP_SERVER_URL || 'http://localhost:3001';
-}
-
-async function fetchPcp(path: string, options?: RequestInit): Promise<Response> {
-  const url = `${getPcpServerUrl()}${path}`;
-  // Intentionally no Authorization header here:
-  // CLI workspace selection currently goes through MCP tool calls (`/api/mcp/call`)
-  // that resolve user context from explicit args (email/userId), matching other sb CLI commands.
-  return fetch(url, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...options?.headers,
-    },
-  });
-}
-
-function unwrapToolResult(payload: unknown): Record<string, unknown> {
-  if (!payload || typeof payload !== 'object') {
-    throw new Error('Invalid response payload');
-  }
-
-  const direct = payload as Record<string, unknown>;
-  if (Array.isArray(direct.workspaces)) {
-    return direct;
-  }
-
-  const mcpText =
-    (direct.result as { content?: Array<{ text?: string }> } | undefined)?.content?.[0]?.text ||
-    (direct.content as Array<{ text?: string }> | undefined)?.[0]?.text;
-
-  if (typeof mcpText === 'string') {
-    try {
-      const parsed = JSON.parse(mcpText) as Record<string, unknown>;
-      return parsed;
-    } catch {
-      // fall through
-    }
-  }
-
-  return direct;
-}
-
 async function listWorkspaces(options: {
   all?: boolean;
   type?: 'personal' | 'team';
@@ -108,26 +89,12 @@ async function listWorkspaces(options: {
     process.exit(1);
   }
 
-  const response = await fetchPcp('/api/mcp/call', {
-    method: 'POST',
-    body: JSON.stringify({
-      tool: 'list_workspaces',
-      args: {
-        email: config.email,
-        includeArchived: options.all === true,
-        type: options.type,
-        ensurePersonal: true,
-      },
-    }),
+  const parsed = await callPcpTool<{ workspaces?: Workspace[] }>('list_workspaces', {
+    email: config.email,
+    includeArchived: options.all === true,
+    type: options.type,
+    ensurePersonal: true,
   });
-
-  if (!response.ok) {
-    console.error(chalk.red(`Failed to list workspaces: ${await response.text()}`));
-    process.exit(1);
-  }
-
-  const raw = (await response.json()) as unknown;
-  const parsed = unwrapToolResult(raw);
   const workspaces = Array.isArray(parsed.workspaces) ? (parsed.workspaces as Workspace[]) : [];
 
   if (options.json) {
@@ -169,25 +136,11 @@ async function useWorkspace(workspaceRef: string): Promise<void> {
     process.exit(1);
   }
 
-  const response = await fetchPcp('/api/mcp/call', {
-    method: 'POST',
-    body: JSON.stringify({
-      tool: 'list_workspaces',
-      args: {
-        email: config.email,
-        includeArchived: false,
-        ensurePersonal: true,
-      },
-    }),
+  const parsed = await callPcpTool<{ workspaces?: Workspace[] }>('list_workspaces', {
+    email: config.email,
+    includeArchived: false,
+    ensurePersonal: true,
   });
-
-  if (!response.ok) {
-    console.error(chalk.red(`Failed to list workspaces: ${await response.text()}`));
-    process.exit(1);
-  }
-
-  const raw = (await response.json()) as unknown;
-  const parsed = unwrapToolResult(raw);
   const workspaces = Array.isArray(parsed.workspaces) ? (parsed.workspaces as Workspace[]) : [];
   const match = workspaces.find((w) => w.id === workspaceRef || w.slug === workspaceRef);
 
@@ -206,24 +159,11 @@ async function useWorkspace(workspaceRef: string): Promise<void> {
 }
 
 async function resolveWorkspaceByRef(workspaceRef: string, config: PcpConfig): Promise<Workspace> {
-  const response = await fetchPcp('/api/mcp/call', {
-    method: 'POST',
-    body: JSON.stringify({
-      tool: 'list_workspaces',
-      args: {
-        email: config.email,
-        includeArchived: false,
-        ensurePersonal: true,
-      },
-    }),
+  const parsed = await callPcpTool<{ workspaces?: Workspace[] }>('list_workspaces', {
+    email: config.email,
+    includeArchived: false,
+    ensurePersonal: true,
   });
-
-  if (!response.ok) {
-    throw new Error(`Failed to list workspaces: ${await response.text()}`);
-  }
-
-  const raw = (await response.json()) as unknown;
-  const parsed = unwrapToolResult(raw);
   const workspaces = Array.isArray(parsed.workspaces) ? (parsed.workspaces as Workspace[]) : [];
   const match = workspaces.find(
     (workspace) => workspace.id === workspaceRef || workspace.slug === workspaceRef
@@ -246,27 +186,13 @@ async function createWorkspace(
     process.exit(1);
   }
 
-  const response = await fetchPcp('/api/mcp/call', {
-    method: 'POST',
-    body: JSON.stringify({
-      tool: 'create_workspace',
-      args: {
-        email: config.email,
-        name,
-        type: options.type || 'team',
-        description: options.description,
-        slug: options.slug,
-      },
-    }),
+  const parsed = await callPcpTool<{ workspace?: Workspace }>('create_workspace', {
+    email: config.email,
+    name,
+    type: options.type || 'team',
+    description: options.description,
+    slug: options.slug,
   });
-
-  if (!response.ok) {
-    console.error(chalk.red(`Failed to create workspace: ${await response.text()}`));
-    process.exit(1);
-  }
-
-  const raw = (await response.json()) as unknown;
-  const parsed = unwrapToolResult(raw);
   const workspace = parsed.workspace as Workspace | undefined;
 
   if (!workspace?.id) {
@@ -307,35 +233,19 @@ async function inviteWorkspaceMember(
     process.exit(1);
   }
 
-  const response = await fetchPcp('/api/mcp/call', {
-    method: 'POST',
-    body: JSON.stringify({
-      tool: 'add_workspace_member',
-      args: {
-        email: config.email,
-        workspaceId: targetWorkspace.id,
-        inviteeEmail,
-        role: options.role || 'member',
-      },
-    }),
+  const parsed = await callPcpTool<AddWorkspaceMemberResult>('add_workspace_member', {
+    email: config.email,
+    workspaceId: targetWorkspace.id,
+    inviteeEmail,
+    role: options.role || 'member',
   });
-
-  if (!response.ok) {
-    console.error(chalk.red(`Failed to invite member: ${await response.text()}`));
-    process.exit(1);
-  }
-
-  const raw = (await response.json()) as unknown;
-  const parsed = unwrapToolResult(raw);
 
   if (parsed.success === false) {
     console.error(chalk.red(`Failed to invite member: ${String(parsed.error || 'unknown error')}`));
     process.exit(1);
   }
 
-  const member = parsed.member as
-    | { role?: string; user?: { email?: string | null }; userWasCreated?: boolean }
-    | undefined;
+  const member = parsed.member;
   console.log(
     chalk.green(
       `Added ${member?.user?.email || inviteeEmail} to ${targetWorkspace.name} as ${member?.role || options.role || 'member'}`
@@ -371,37 +281,12 @@ async function listWorkspaceMembers(workspaceRef?: string): Promise<void> {
     process.exit(1);
   }
 
-  const response = await fetchPcp('/api/mcp/call', {
-    method: 'POST',
-    body: JSON.stringify({
-      tool: 'get_workspace',
-      args: {
-        email: config.email,
-        workspaceId: targetWorkspace.id,
-        includeMembers: true,
-      },
-    }),
+  const parsed = await callPcpTool<GetWorkspaceResult>('get_workspace', {
+    email: config.email,
+    workspaceId: targetWorkspace.id,
+    includeMembers: true,
   });
-
-  if (!response.ok) {
-    console.error(chalk.red(`Failed to list workspace members: ${await response.text()}`));
-    process.exit(1);
-  }
-
-  const raw = (await response.json()) as unknown;
-  const parsed = unwrapToolResult(raw);
-  const members = Array.isArray((parsed.workspace as { members?: unknown[] } | undefined)?.members)
-    ? ((parsed.workspace as { members?: unknown[] }).members as Array<{
-        role?: string;
-        user?: {
-          email?: string | null;
-          firstName?: string | null;
-          username?: string | null;
-          lastLoginAt?: string | null;
-        };
-        userId?: string;
-      }>)
-    : [];
+  const members = Array.isArray(parsed.workspace?.members) ? parsed.workspace.members : [];
 
   console.log(chalk.bold(`\nMembers — ${targetWorkspace.name}\n`));
   if (members.length === 0) {

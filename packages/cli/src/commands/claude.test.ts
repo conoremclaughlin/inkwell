@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
+  extractClaudeHistorySessionsForProject,
   filterPcpSessionsForContext,
   filterUntrackedLocalClaudeSessions,
   hasBackendSessionOverride,
+  sanitizeBackendExecutionArgs,
+  shouldAutoResumeRuntimeSession,
 } from './claude.js';
 
 describe('hasBackendSessionOverride', () => {
@@ -96,6 +99,29 @@ describe('filterPcpSessionsForContext', () => {
 
     expect(filtered.map((session) => session.id)).toEqual(['codex-1']);
   });
+
+  it('path-scopes codex sessions when workingDir data is available', () => {
+    const filtered = filterPcpSessionsForContext(
+      [
+        {
+          id: 'codex-a',
+          startedAt: '2026-02-28T00:00:00.000Z',
+          backend: 'codex',
+          workingDir: '/tmp/project-a',
+        },
+        {
+          id: 'codex-b',
+          startedAt: '2026-02-28T00:00:00.000Z',
+          backend: 'codex',
+          workingDir: '/tmp/project-b',
+        },
+      ],
+      'codex',
+      '/tmp/project-a'
+    );
+
+    expect(filtered.map((session) => session.id)).toEqual(['codex-a']);
+  });
 });
 
 describe('filterUntrackedLocalClaudeSessions', () => {
@@ -123,5 +149,90 @@ describe('filterUntrackedLocalClaudeSessions', () => {
     ]);
 
     expect(filtered.map((session) => session.sessionId)).toEqual(['claude-2']);
+  });
+});
+
+describe('sanitizeBackendExecutionArgs', () => {
+  it('redacts claude system prompt and one-shot prompt text', () => {
+    const sanitized = sanitizeBackendExecutionArgs(
+      [
+        '-p',
+        '--append-system-prompt',
+        'identity text',
+        '--mcp-config',
+        '/tmp/.mcp.json',
+        'fix this bug',
+      ],
+      'claude'
+    );
+    expect(sanitized).toEqual([
+      '-p',
+      '--append-system-prompt',
+      '<redacted-system-prompt>',
+      '--mcp-config',
+      '/tmp/.mcp.json',
+      '<redacted-prompt>',
+    ]);
+  });
+
+  it('redacts trailing codex prompt parts when present', () => {
+    const sanitized = sanitizeBackendExecutionArgs(
+      [
+        '--config',
+        'model_instructions_file=/tmp/identity.md',
+        '--model',
+        'o3',
+        'please',
+        'summarize',
+      ],
+      'codex',
+      ['please', 'summarize']
+    );
+
+    expect(sanitized).toEqual([
+      '--config',
+      'model_instructions_file=/tmp/identity.md',
+      '--model',
+      'o3',
+      '<redacted-prompt-part>',
+      '<redacted-prompt-part>',
+    ]);
+  });
+});
+
+describe('shouldAutoResumeRuntimeSession', () => {
+  it('auto-resumes only for non-tty execution when runtime has a PCP session', () => {
+    expect(shouldAutoResumeRuntimeSession({ pcpSessionId: 'pcp-1' }, false)).toBe(true);
+    expect(shouldAutoResumeRuntimeSession({ pcpSessionId: 'pcp-1' }, true)).toBe(false);
+    expect(shouldAutoResumeRuntimeSession(undefined, false)).toBe(false);
+    expect(shouldAutoResumeRuntimeSession({ backendSessionId: 'b-1' }, false)).toBe(false);
+  });
+});
+
+describe('extractClaudeHistorySessionsForProject', () => {
+  it('parses local claude sessions from history.jsonl for the current project path', () => {
+    const jsonl = [
+      JSON.stringify({
+        sessionId: 'sess-clearpol-1',
+        project: '/Users/conormclaughlin/ws/clearpol-ai',
+        timestamp: 1772254853007,
+        display: 'Hi Wren',
+      }),
+      JSON.stringify({
+        sessionId: 'sess-other',
+        project: '/Users/conormclaughlin/ws/another-repo',
+        timestamp: 1772254853007,
+      }),
+    ].join('\n');
+
+    const parsed = extractClaudeHistorySessionsForProject(
+      jsonl,
+      '/Users/conormclaughlin/ws/clearpol-ai'
+    );
+
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].sessionId).toBe('sess-clearpol-1');
+    expect(parsed[0].backend).toBe('claude');
+    expect(parsed[0].firstPrompt).toBe('Hi Wren');
   });
 });

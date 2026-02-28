@@ -21,6 +21,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir, tmpdir } from 'os';
 import { getBackend, BACKEND_NAMES } from '../backends/index.js';
+import { callPcpTool } from '../lib/pcp-mcp.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -85,10 +86,6 @@ function getPcpConfig(): PcpConfig | null {
   return null;
 }
 
-function getPcpServerUrl(): string {
-  return process.env.PCP_SERVER_URL || 'http://localhost:3001';
-}
-
 /**
  * Fetch shared values and sibling identities from PCP cloud.
  * Returns null if the server is unreachable.
@@ -98,23 +95,16 @@ async function fetchFromCloud(config: PcpConfig): Promise<{
   siblings: BootstrapIdentity[];
 } | null> {
   try {
-    const url = `${getPcpServerUrl()}/api/mcp/call`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        tool: 'bootstrap',
-        args: {
-          email: config.email,
-          agentId: 'awakening', // temporary identity for bootstrap
-        },
-      }),
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (!response.ok) return null;
-
-    const result = (await response.json()) as BootstrapResponse;
+    const result = await callPcpTool<BootstrapResponse>(
+      'bootstrap',
+      {
+        email: config.email,
+        agentId: 'awakening', // temporary identity for bootstrap
+      },
+      {
+        timeoutMs: 5000,
+      }
+    );
 
     // Extract shared values from identity files
     const sharedValues = result.identityFiles?.values || '';

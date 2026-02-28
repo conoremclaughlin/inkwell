@@ -15,6 +15,7 @@ import chalk from 'chalk';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { callPcpTool } from '../lib/pcp-mcp.js';
 
 interface PcpConfig {
   userId?: string;
@@ -52,21 +53,6 @@ function getPcpConfig(): PcpConfig | null {
   return null;
 }
 
-function getPcpServerUrl(): string {
-  return process.env.PCP_SERVER_URL || 'http://localhost:3001';
-}
-
-async function fetchPcp(path: string, options?: RequestInit): Promise<Response> {
-  const url = `${getPcpServerUrl()}${path}`;
-  return fetch(url, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...options?.headers,
-    },
-  });
-}
-
 // ============================================================================
 // Commands
 // ============================================================================
@@ -79,24 +65,11 @@ async function listCommand(options: { agent?: string; limit?: string }): Promise
   }
 
   try {
-    const response = await fetchPcp('/api/mcp/call', {
-      method: 'POST',
-      body: JSON.stringify({
-        tool: 'list_sessions',
-        args: {
-          email: config.email,
-          agentId: options.agent,
-          limit: parseInt(options.limit || '10', 10),
-        },
-      }),
+    const result = await callPcpTool<SessionListResult>('list_sessions', {
+      email: config.email,
+      agentId: options.agent,
+      limit: parseInt(options.limit || '10', 10),
     });
-
-    if (!response.ok) {
-      console.error(chalk.red(`Failed to list sessions: ${await response.text()}`));
-      process.exit(1);
-    }
-
-    const result = (await response.json()) as SessionListResult;
 
     console.log(chalk.bold('\nRecent Sessions:\n'));
 
@@ -146,23 +119,10 @@ async function showCommand(sessionId: string): Promise<void> {
   }
 
   try {
-    const response = await fetchPcp('/api/mcp/call', {
-      method: 'POST',
-      body: JSON.stringify({
-        tool: 'get_session',
-        args: {
-          email: config.email,
-          sessionId,
-        },
-      }),
+    const session = await callPcpTool<Session>('get_session', {
+      email: config.email,
+      sessionId,
     });
-
-    if (!response.ok) {
-      console.error(chalk.red(`Failed to get session: ${await response.text()}`));
-      process.exit(1);
-    }
-
-    const session = (await response.json()) as Session;
 
     console.log(chalk.bold(`\nSession: ${session.id}\n`));
     console.log(chalk.dim('  Agent:    ') + (session.agentId || 'unknown'));
@@ -209,23 +169,10 @@ async function resumeCommand(sessionId: string): Promise<void> {
 
   // Get session to find Claude session ID
   try {
-    const response = await fetchPcp('/api/mcp/call', {
-      method: 'POST',
-      body: JSON.stringify({
-        tool: 'get_session',
-        args: {
-          email: config.email,
-          sessionId,
-        },
-      }),
+    const session = await callPcpTool<Session>('get_session', {
+      email: config.email,
+      sessionId,
     });
-
-    if (!response.ok) {
-      console.error(chalk.red(`Failed to get session: ${await response.text()}`));
-      process.exit(1);
-    }
-
-    const session = (await response.json()) as Session;
 
     if (!session.claudeSessionId) {
       console.error(chalk.red('Session has no Claude session ID to resume'));
@@ -257,22 +204,10 @@ async function endCommand(sessionId?: string): Promise<void> {
   }
 
   try {
-    const response = await fetchPcp('/api/mcp/call', {
-      method: 'POST',
-      body: JSON.stringify({
-        tool: 'end_session',
-        args: {
-          email: config.email,
-          sessionId,
-        },
-      }),
+    await callPcpTool('end_session', {
+      email: config.email,
+      sessionId,
     });
-
-    if (!response.ok) {
-      console.error(chalk.red(`Failed to end session: ${await response.text()}`));
-      process.exit(1);
-    }
-
     console.log(chalk.green(`Session ${sessionId.substring(0, 8)} ended`));
   } catch (error) {
     console.error(chalk.red(`Failed to end session: ${error}`));
