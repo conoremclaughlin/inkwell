@@ -4,9 +4,14 @@
  * Covers three-way merge/CAS behavior plus comment + identity UUID flows.
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DataComposer } from '../../data/composer';
 import { createTableAwareSupabaseMock } from '../../test/table-aware-supabase-mock';
+import {
+  clearSessionContext,
+  runWithRequestContext,
+  setSessionContext,
+} from '../../utils/request-context';
 import {
   handleAddArtifactComment,
   handleCreateArtifact,
@@ -34,6 +39,10 @@ vi.mock('../../utils/logger', () => ({
     debug: vi.fn(),
   },
 }));
+
+afterEach(() => {
+  clearSessionContext();
+});
 
 function createMockSupabase(
   overrides: {
@@ -65,6 +74,12 @@ function createMockSupabase(
         select: vi.fn().mockReturnValue({
           eq: vi.fn().mockReturnValue({
             eq: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                maybeSingle: vi.fn().mockResolvedValue({
+                  data: null,
+                  error: null,
+                }),
+              }),
               maybeSingle: vi.fn().mockResolvedValue({
                 data: null,
                 error: null,
@@ -79,6 +94,12 @@ function createMockSupabase(
         select: vi.fn().mockReturnValue({
           eq: vi.fn().mockReturnValue({
             eq: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                single: vi.fn().mockResolvedValue({
+                  data: artifact,
+                  error: artifact ? null : { message: 'Not found' },
+                }),
+              }),
               single: vi.fn().mockResolvedValue({
                 data: artifact,
                 error: artifact ? null : { message: 'Not found' },
@@ -142,6 +163,10 @@ function createMockDataComposer(supabase: { from: ReturnType<typeof vi.fn> }) {
 describe('handleUpdateArtifact', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    setSessionContext({
+      userId: '00000000-0000-0000-0000-000000000001',
+      workspaceId: '11111111-1111-1111-1111-111111111111',
+    });
   });
 
   describe('without baseVersion (backward compatible)', () => {
@@ -409,6 +434,10 @@ describe('handleUpdateArtifact', () => {
 describe('artifact comment + identity UUID flows', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    setSessionContext({
+      userId: '00000000-0000-0000-0000-000000000001',
+      workspaceId: '11111111-1111-1111-1111-111111111111',
+    });
   });
 
   it('handleGetArtifact includes comments when includeComments=true', async () => {
@@ -555,6 +584,12 @@ describe('artifact comment + identity UUID flows', () => {
     const supabase = createTableAwareSupabaseMock({
       agent_identities: [
         {
+          then: {
+            data: [{ workspace_id: '11111111-1111-1111-1111-111111111111' }],
+            error: null,
+          },
+        },
+        {
           maybeSingle: [
             {
               data: { id: 'identity-1', agent_id: 'lumen', name: 'Lumen', backend: 'codex' },
@@ -622,7 +657,15 @@ describe('artifact comment + identity UUID flows', () => {
 
   it('handleCreateArtifact keeps slug behavior when identity row is missing', async () => {
     const supabase = createTableAwareSupabaseMock({
-      agent_identities: [{ maybeSingle: [{ data: null, error: null }] }],
+      agent_identities: [
+        {
+          then: {
+            data: [],
+            error: null,
+          },
+        },
+        { maybeSingle: [{ data: null, error: null }] },
+      ],
       artifacts: [
         { maybeSingle: [{ data: null, error: null }] },
         {
@@ -680,6 +723,359 @@ describe('artifact comment + identity UUID flows', () => {
     });
   });
 
+  it('handleCreateArtifact uses workspaceId from session context when args omit workspaceId', async () => {
+    setSessionContext({
+      userId: '00000000-0000-0000-0000-000000000001',
+      workspaceId: '22222222-2222-2222-2222-222222222222',
+    });
+
+    const supabase = createTableAwareSupabaseMock({
+      agent_identities: [{ maybeSingle: [{ data: null, error: null }] }],
+      artifacts: [
+        { maybeSingle: [{ data: null, error: null }] },
+        {
+          single: [
+            {
+              data: {
+                id: 'artifact-ctx-1',
+                uri: 'pcp://specs/context-workspace',
+                title: 'Context scoped spec',
+                artifact_type: 'spec',
+                version: 1,
+                created_at: '2026-02-28T00:00:00Z',
+              },
+              error: null,
+            },
+          ],
+        },
+      ],
+      artifact_history: [{ then: { data: null, error: null } }],
+    });
+
+    const result = await handleCreateArtifact(
+      {
+        userId: '00000000-0000-0000-0000-000000000001',
+        uri: 'pcp://specs/context-workspace',
+        title: 'Context scoped spec',
+        content: '# Context Workspace',
+        artifactType: 'spec',
+      },
+      createMockDataComposer(supabase)
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+
+    const artifactInsertBuilder = supabase.calls.find(
+      (c) =>
+        c.table === 'artifacts' &&
+        (c.builder.insert as ReturnType<typeof vi.fn>).mock.calls.length > 0
+    )?.builder;
+    const historyInsertBuilder = supabase.calls.find(
+      (c) => c.table === 'artifact_history'
+    )?.builder;
+
+    expect(
+      (artifactInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    ).toMatchObject({
+      workspace_id: '22222222-2222-2222-2222-222222222222',
+    });
+    expect(
+      (historyInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    ).toMatchObject({
+      workspace_id: '22222222-2222-2222-2222-222222222222',
+    });
+  });
+
+  it('handleCreateArtifact prioritizes header workspace over explicit workspace arg', async () => {
+    const supabase = createTableAwareSupabaseMock({
+      artifacts: [
+        { maybeSingle: [{ data: null, error: null }] },
+        {
+          single: [
+            {
+              data: {
+                id: 'artifact-header-1',
+                uri: 'pcp://specs/header-workspace',
+                title: 'Header scoped spec',
+                artifact_type: 'spec',
+                version: 1,
+                created_at: '2026-02-28T00:00:00Z',
+              },
+              error: null,
+            },
+          ],
+        },
+      ],
+      artifact_history: [{ then: { data: null, error: null } }],
+    });
+
+    await runWithRequestContext(
+      {
+        userId: '00000000-0000-0000-0000-000000000001',
+        workspaceId: '33333333-3333-3333-3333-333333333333',
+        workspaceSource: 'header',
+      },
+      async () => {
+        const result = await handleCreateArtifact(
+          {
+            userId: '00000000-0000-0000-0000-000000000001',
+            workspaceId: '44444444-4444-4444-4444-444444444444',
+            uri: 'pcp://specs/header-workspace',
+            title: 'Header scoped spec',
+            content: '# Header Workspace',
+            artifactType: 'spec',
+          },
+          createMockDataComposer(supabase)
+        );
+
+        const parsed = JSON.parse(result.content[0].text);
+        expect(parsed.success).toBe(true);
+      }
+    );
+
+    const artifactInsertBuilder = supabase.calls.find(
+      (c) =>
+        c.table === 'artifacts' &&
+        (c.builder.insert as ReturnType<typeof vi.fn>).mock.calls.length > 0
+    )?.builder;
+    const historyInsertBuilder = supabase.calls.find(
+      (c) => c.table === 'artifact_history'
+    )?.builder;
+
+    expect(
+      (artifactInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    ).toMatchObject({
+      workspace_id: '33333333-3333-3333-3333-333333333333',
+    });
+    expect(
+      (historyInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    ).toMatchObject({
+      workspace_id: '33333333-3333-3333-3333-333333333333',
+    });
+  });
+
+  it('handleCreateArtifact treats header workspace as first-class, ahead of agent-derived scope', async () => {
+    const supabase = createTableAwareSupabaseMock({
+      // Single identity lookup for resolveIdentityForAgent. If deriveWorkspaceIdFromAgent
+      // runs unexpectedly, this queue will underflow and fail the test.
+      agent_identities: [{ maybeSingle: [{ data: null, error: null }] }],
+      artifacts: [
+        { maybeSingle: [{ data: null, error: null }] },
+        {
+          single: [
+            {
+              data: {
+                id: 'artifact-header-first-1',
+                uri: 'pcp://specs/header-first',
+                title: 'Header first',
+                artifact_type: 'spec',
+                version: 1,
+                created_at: '2026-02-28T00:00:00Z',
+              },
+              error: null,
+            },
+          ],
+        },
+      ],
+      artifact_history: [{ then: { data: null, error: null } }],
+    });
+
+    await runWithRequestContext(
+      {
+        userId: '00000000-0000-0000-0000-000000000001',
+        workspaceId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        workspaceSource: 'header',
+      },
+      async () => {
+        const result = await handleCreateArtifact(
+          {
+            userId: '00000000-0000-0000-0000-000000000001',
+            uri: 'pcp://specs/header-first',
+            title: 'Header first',
+            content: '# Header first',
+            artifactType: 'spec',
+            agentId: 'lumen',
+          },
+          createMockDataComposer(supabase)
+        );
+
+        const parsed = JSON.parse(result.content[0].text);
+        expect(parsed.success).toBe(true);
+      }
+    );
+
+    const artifactInsertBuilder = supabase.calls.find(
+      (c) =>
+        c.table === 'artifacts' &&
+        (c.builder.insert as ReturnType<typeof vi.fn>).mock.calls.length > 0
+    )?.builder;
+    expect(
+      (artifactInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    ).toMatchObject({
+      workspace_id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+    });
+  });
+
+  it('handleCreateArtifact prefers agent-derived workspace over non-header request context fallback', async () => {
+    const supabase = createTableAwareSupabaseMock({
+      agent_identities: [
+        {
+          then: {
+            data: [{ workspace_id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' }],
+            error: null,
+          },
+        },
+        {
+          maybeSingle: [
+            {
+              data: { id: 'identity-derive-2', agent_id: 'lumen', name: 'Lumen', backend: 'codex' },
+              error: null,
+            },
+          ],
+        },
+      ],
+      artifacts: [
+        { maybeSingle: [{ data: null, error: null }] },
+        {
+          single: [
+            {
+              data: {
+                id: 'artifact-derived-over-default-1',
+                uri: 'pcp://specs/derived-over-default',
+                title: 'Derived over default',
+                artifact_type: 'spec',
+                version: 1,
+                created_at: '2026-02-28T00:00:00Z',
+              },
+              error: null,
+            },
+          ],
+        },
+      ],
+      artifact_history: [{ then: { data: null, error: null } }],
+    });
+
+    await runWithRequestContext(
+      {
+        userId: '00000000-0000-0000-0000-000000000001',
+        workspaceId: 'cccccccc-cccc-cccc-cccc-cccccccccccc',
+        workspaceSource: 'default',
+      },
+      async () => {
+        const result = await handleCreateArtifact(
+          {
+            userId: '00000000-0000-0000-0000-000000000001',
+            uri: 'pcp://specs/derived-over-default',
+            title: 'Derived over default',
+            content: '# Derived over default',
+            artifactType: 'spec',
+            agentId: 'lumen',
+          },
+          createMockDataComposer(supabase)
+        );
+
+        const parsed = JSON.parse(result.content[0].text);
+        expect(parsed.success).toBe(true);
+      }
+    );
+
+    const artifactInsertBuilder = supabase.calls.find(
+      (c) =>
+        c.table === 'artifacts' &&
+        (c.builder.insert as ReturnType<typeof vi.fn>).mock.calls.length > 0
+    )?.builder;
+    expect(
+      (artifactInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    ).toMatchObject({
+      workspace_id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+      created_by_identity_id: 'identity-derive-2',
+    });
+  });
+
+  it('handleCreateArtifact derives workspace from agent identity when workspace is omitted', async () => {
+    const supabase = createTableAwareSupabaseMock({
+      agent_identities: [
+        {
+          then: {
+            data: [{ workspace_id: '55555555-5555-5555-5555-555555555555' }],
+            error: null,
+          },
+        },
+        {
+          maybeSingle: [
+            {
+              data: { id: 'identity-derive-1', agent_id: 'lumen', name: 'Lumen', backend: 'codex' },
+              error: null,
+            },
+          ],
+        },
+      ],
+      artifacts: [
+        { maybeSingle: [{ data: null, error: null }] },
+        {
+          single: [
+            {
+              data: {
+                id: 'artifact-derived-1',
+                uri: 'pcp://specs/derived-workspace',
+                title: 'Derived workspace spec',
+                artifact_type: 'spec',
+                version: 1,
+                created_at: '2026-02-28T00:00:00Z',
+              },
+              error: null,
+            },
+          ],
+        },
+      ],
+      artifact_history: [{ then: { data: null, error: null } }],
+    });
+
+    const result = await handleCreateArtifact(
+      {
+        userId: '00000000-0000-0000-0000-000000000001',
+        uri: 'pcp://specs/derived-workspace',
+        title: 'Derived workspace spec',
+        content: '# Derived Workspace',
+        artifactType: 'spec',
+        agentId: 'lumen',
+      },
+      createMockDataComposer(supabase)
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+
+    const artifactInsertBuilder = supabase.calls.find(
+      (c) =>
+        c.table === 'artifacts' &&
+        (c.builder.insert as ReturnType<typeof vi.fn>).mock.calls.length > 0
+    )?.builder;
+    expect(
+      (artifactInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    ).toMatchObject({
+      workspace_id: '55555555-5555-5555-5555-555555555555',
+      created_by_identity_id: 'identity-derive-1',
+    });
+  });
+
+  it('handleCreateArtifact rejects writes when workspace scope cannot be resolved', async () => {
+    clearSessionContext();
+    await expect(
+      handleCreateArtifact(
+        {
+          userId: '00000000-0000-0000-0000-000000000001',
+          uri: 'pcp://specs/no-workspace',
+          title: 'No workspace',
+          content: '# Missing workspace scope',
+          artifactType: 'spec',
+        },
+        createMockDataComposer({ from: vi.fn() })
+      )
+    ).rejects.toThrow('Artifact write requires workspace scope');
+  });
+
   it('handleAddArtifactComment resolves identity UUID and returns identity metadata', async () => {
     const supabase = createTableAwareSupabaseMock({
       artifacts: [
@@ -693,6 +1089,12 @@ describe('artifact comment + identity UUID flows', () => {
         },
       ],
       agent_identities: [
+        {
+          then: {
+            data: [{ workspace_id: '11111111-1111-1111-1111-111111111111' }],
+            error: null,
+          },
+        },
         {
           maybeSingle: [
             {

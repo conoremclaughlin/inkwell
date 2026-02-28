@@ -17,6 +17,8 @@ import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/use
 import { logger } from '../../utils/logger';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import type { Database, Json } from '../../data/supabase/types';
+import { mergeWithContext } from '../../utils/request-context';
+import { resolveWorkspaceScopeForWrite } from '../../utils/workspace-scope';
 
 // ============== Schemas ==============
 
@@ -116,7 +118,57 @@ const listArtifactCommentsSchema = workspaceScopedUserIdentifierSchema.extend({
 
 function withWorkspaceFilter<T>(query: T, workspaceId?: string): T {
   if (!workspaceId) return query;
-  return (query as { eq: (column: string, value: string) => T }).eq('workspace_id', workspaceId);
+  const queryWithEq = query as { eq?: (column: string, value: string) => T };
+  if (typeof queryWithEq.eq !== 'function') return query;
+  return queryWithEq.eq('workspace_id', workspaceId);
+}
+
+function parseWithContext<T extends z.ZodTypeAny>(schema: T, args: unknown): z.infer<T> {
+  const merged = mergeWithContext((args ?? {}) as Record<string, unknown>);
+  return schema.parse(merged);
+}
+
+function toArgsRecord(args: unknown): Record<string, unknown> {
+  if (!args || typeof args !== 'object') return {};
+  return args as Record<string, unknown>;
+}
+
+async function deriveWorkspaceIdFromAgent(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  agentId: string
+): Promise<string | null> {
+  const { data, error } = await supabase
+    .from('agent_identities')
+    .select('workspace_id')
+    .eq('user_id', userId)
+    .eq('agent_id', agentId);
+
+  if (error) {
+    logger.warn('Failed to derive workspace from agent identity', {
+      userId,
+      agentId,
+      error: error.message,
+    });
+    return null;
+  }
+
+  const workspaceIds = Array.from(
+    new Set(
+      (data || [])
+        .map((row) => row.workspace_id)
+        .filter((workspaceId): workspaceId is string => typeof workspaceId === 'string')
+    )
+  );
+
+  if (workspaceIds.length === 1) return workspaceIds[0];
+  if (workspaceIds.length > 1) {
+    throw new Error(
+      `Workspace is ambiguous for agent "${agentId}". Provide workspaceId or X-PCP-Workspace-Id.`
+    );
+  }
+
+  return null;
 }
 
 async function resolveIdentityForAgent(
@@ -203,7 +255,8 @@ function resolveArtifactForUser(
 
 export async function handleCreateArtifact(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
-  const parsed = createArtifactSchema.parse(args);
+  const rawArgs = toArgsRecord(args);
+  const parsed = parseWithContext(createArtifactSchema, args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const {
@@ -218,10 +271,23 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
     workspaceId,
   } = parsed;
   const agentId = getEffectiveAgentId(parsed.agentId);
+  const workspaceResolution = await resolveWorkspaceScopeForWrite({
+    rawArgs,
+    explicitWorkspaceId: workspaceId,
+    agentId,
+    deriveWorkspaceIdFromAgent: (candidateAgentId) =>
+      deriveWorkspaceIdFromAgent(supabase, resolved.user.id, candidateAgentId),
+  });
+  if (!workspaceResolution) {
+    throw new Error(
+      'Artifact write requires workspace scope. Provide X-PCP-Workspace-Id, workspaceId, or a workspace-scoped agent identity.'
+    );
+  }
+  const workspaceScope = workspaceResolution.workspaceId;
   const authorIdentity = await resolveIdentityForAgent(
     supabase,
     resolved.user.id,
-    workspaceId,
+    workspaceScope,
     agentId
   );
 
@@ -231,7 +297,7 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
     .select('id')
     .eq('user_id', resolved.user.id)
     .eq('uri', uri);
-  existingQuery = withWorkspaceFilter(existingQuery, workspaceId);
+  existingQuery = withWorkspaceFilter(existingQuery, workspaceScope);
   const { data: existing } = await existingQuery.maybeSingle();
 
   if (existing) {
@@ -243,7 +309,7 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
     .insert({
       uri,
       user_id: resolved.user.id,
-      ...(workspaceId ? { workspace_id: workspaceId } : {}),
+      workspace_id: workspaceScope,
       created_by_identity_id: authorIdentity?.id || null,
       title,
       content,
@@ -265,7 +331,7 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
   // Create initial history entry
   await supabase.from('artifact_history').insert({
     artifact_id: artifact.id,
-    ...(workspaceId ? { workspace_id: workspaceId } : {}),
+    workspace_id: workspaceScope,
     version: 1,
     title,
     content,
@@ -300,7 +366,7 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
 
 export async function handleGetArtifact(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
-  const parsed = getArtifactSchema.parse(args);
+  const parsed = parseWithContext(getArtifactSchema, args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const { uri, artifactId, includeComments = false, commentLimit = 50, workspaceId } = parsed;
@@ -480,7 +546,8 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
 
 export async function handleUpdateArtifact(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
-  const parsed = updateArtifactSchema.parse(args);
+  const rawArgs = toArgsRecord(args);
+  const parsed = parseWithContext(updateArtifactSchema, args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const {
@@ -495,15 +562,28 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     workspaceId,
   } = parsed;
   const agentId = getEffectiveAgentId(parsed.agentId);
+  const workspaceResolution = await resolveWorkspaceScopeForWrite({
+    rawArgs,
+    explicitWorkspaceId: workspaceId,
+    agentId,
+    deriveWorkspaceIdFromAgent: (candidateAgentId) =>
+      deriveWorkspaceIdFromAgent(supabase, resolved.user.id, candidateAgentId),
+  });
+  if (!workspaceResolution) {
+    throw new Error(
+      'Artifact write requires workspace scope. Provide X-PCP-Workspace-Id, workspaceId, or a workspace-scoped agent identity.'
+    );
+  }
+  const workspaceScope = workspaceResolution.workspaceId;
   const editorIdentity = await resolveIdentityForAgent(
     supabase,
     resolved.user.id,
-    workspaceId,
+    workspaceScope,
     agentId
   );
 
   // First, get the current artifact
-  const query = resolveArtifactForUser(supabase, resolved.user.id, workspaceId, {
+  const query = resolveArtifactForUser(supabase, resolved.user.id, workspaceScope, {
     uri,
     artifactId,
   });
@@ -542,7 +622,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
       .select('content')
       .eq('artifact_id', current.id)
       .eq('version', baseVersion);
-    baseHistoryQuery = withWorkspaceFilter(baseHistoryQuery, workspaceId);
+    baseHistoryQuery = withWorkspaceFilter(baseHistoryQuery, workspaceScope);
     const { data: baseHistory, error: historyError } = await baseHistoryQuery.single();
 
     if (historyError || !baseHistory?.content) {
@@ -646,7 +726,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     .update(updates)
     .eq('id', current.id)
     .eq('version', expectedVersion);
-  updateQuery = withWorkspaceFilter(updateQuery, workspaceId);
+  updateQuery = withWorkspaceFilter(updateQuery, workspaceScope);
   const { data: updated, error: updateError } = await updateQuery.select().maybeSingle();
 
   if (updateError) {
@@ -685,7 +765,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
 
   await supabase.from('artifact_history').insert({
     artifact_id: current.id,
-    ...(workspaceId ? { workspace_id: workspaceId } : {}),
+    workspace_id: workspaceScope,
     version: newVersion,
     title: updated.title,
     content: updated.content,
@@ -727,7 +807,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
 
 export async function handleListArtifacts(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
-  const parsed = listArtifactsSchema.parse(args);
+  const parsed = parseWithContext(listArtifactsSchema, args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const { artifactType, tags, visibility, search, limit = 20, workspaceId } = parsed;
@@ -784,7 +864,7 @@ export async function handleListArtifacts(args: unknown, dataComposer: DataCompo
 
 export async function handleGetArtifactHistory(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
-  const parsed = getArtifactHistorySchema.parse(args);
+  const parsed = parseWithContext(getArtifactHistorySchema, args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const { uri, artifactId, limit = 10, workspaceId } = parsed;
@@ -837,7 +917,8 @@ export async function handleGetArtifactHistory(args: unknown, dataComposer: Data
 
 export async function handleAddArtifactComment(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
-  const parsed = addArtifactCommentSchema.parse(args);
+  const rawArgs = toArgsRecord(args);
+  const parsed = parseWithContext(addArtifactCommentSchema, args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const { uri, artifactId, content, agentId, parentCommentId, metadata = {}, workspaceId } = parsed;
@@ -846,10 +927,25 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
     throw new Error('Comment content cannot be empty');
   }
 
+  const effectiveAgentId = getEffectiveAgentId(agentId);
+  const workspaceResolution = await resolveWorkspaceScopeForWrite({
+    rawArgs,
+    explicitWorkspaceId: workspaceId,
+    agentId: effectiveAgentId,
+    deriveWorkspaceIdFromAgent: (candidateAgentId) =>
+      deriveWorkspaceIdFromAgent(supabase, resolved.user.id, candidateAgentId),
+  });
+  if (!workspaceResolution) {
+    throw new Error(
+      'Artifact write requires workspace scope. Provide X-PCP-Workspace-Id, workspaceId, or a workspace-scoped agent identity.'
+    );
+  }
+  const workspaceScope = workspaceResolution.workspaceId;
+
   const { data: artifact, error: artifactError } = await resolveArtifactForUser(
     supabase,
     resolved.user.id,
-    workspaceId,
+    workspaceScope,
     { uri, artifactId }
   ).single();
 
@@ -864,7 +960,7 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
       .eq('id', parentCommentId)
       .eq('artifact_id', artifact.id)
       .eq('user_id', resolved.user.id);
-    parentQuery = withWorkspaceFilter(parentQuery, workspaceId);
+    parentQuery = withWorkspaceFilter(parentQuery, workspaceScope);
     const { data: parent, error: parentError } = await parentQuery.maybeSingle();
 
     if (parentError || !parent) {
@@ -875,8 +971,8 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
   const authorIdentity = await resolveIdentityForAgent(
     supabase,
     resolved.user.id,
-    workspaceId,
-    agentId
+    workspaceScope,
+    effectiveAgentId
   );
 
   const { data: created, error: createError } = await supabase
@@ -885,7 +981,7 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
       artifact_id: artifact.id,
       user_id: resolved.user.id,
       created_by_user_id: resolved.user.id,
-      ...(workspaceId ? { workspace_id: workspaceId } : {}),
+      workspace_id: workspaceScope,
       created_by_identity_id: authorIdentity?.id || null,
       parent_comment_id: parentCommentId || null,
       content: trimmed,
@@ -901,7 +997,7 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
   logger.info('Artifact comment added', {
     artifactId: artifact.id,
     commentId: created.id,
-    agentId: agentId || null,
+    agentId: effectiveAgentId || null,
     identityId: authorIdentity?.id || null,
   });
 
@@ -946,7 +1042,7 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
 
 export async function handleListArtifactComments(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
-  const parsed = listArtifactCommentsSchema.parse(args);
+  const parsed = parseWithContext(listArtifactCommentsSchema, args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const { uri, artifactId, limit = 100, workspaceId } = parsed;

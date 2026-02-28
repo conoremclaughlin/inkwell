@@ -31,6 +31,7 @@ import {
   type IncomingMessageHandler,
 } from '../channels/gateway';
 import { runWithRequestContext } from '../utils/request-context';
+import { resolveWorkspaceContextForRequest } from '../utils/workspace-scope';
 import { PcpAuthProvider } from './auth/pcp-auth-provider';
 
 export { setWhatsAppListener, getAgentGateway };
@@ -78,6 +79,77 @@ export class MCPServer {
     this.server = this.createMcpServerInstance();
 
     logger.info('MCP Server initialized');
+  }
+
+  private async deriveWorkspaceIdFromAgent(
+    userId: string,
+    agentId: string
+  ): Promise<string | null> {
+    const { data, error } = await this.dataComposer
+      .getClient()
+      .from('agent_identities')
+      .select('workspace_id')
+      .eq('user_id', userId)
+      .eq('agent_id', agentId);
+
+    if (error) {
+      logger.warn('Failed to derive workspace from agent identity in MCP request context', {
+        userId,
+        agentId,
+        error: error.message,
+      });
+      return null;
+    }
+
+    const workspaceIds = Array.from(
+      new Set(
+        (data || [])
+          .map((row) => row.workspace_id)
+          .filter((workspaceId): workspaceId is string => typeof workspaceId === 'string')
+      )
+    );
+
+    if (workspaceIds.length === 1) return workspaceIds[0];
+
+    if (workspaceIds.length > 1) {
+      logger.warn('Ambiguous workspace mapping for agent identity in MCP request context', {
+        userId,
+        agentId,
+        workspaceCount: workspaceIds.length,
+      });
+    }
+
+    return null;
+  }
+
+  private async resolveWorkspaceContextForMcpRequest(
+    req: express.Request,
+    userData: { userId: string; email: string; agentId?: string; identityId?: string }
+  ): Promise<{ workspaceId?: string; workspaceSource?: 'header' | 'derived' }> {
+    const requestedWorkspaceId = req.header('x-pcp-workspace-id')?.trim();
+
+    const resolution = await resolveWorkspaceContextForRequest({
+      requestedWorkspaceId,
+      validateRequestedWorkspaceId: requestedWorkspaceId
+        ? async (workspaceId: string) => {
+            const workspace = await this.dataComposer.repositories.workspaces.findById(
+              workspaceId,
+              userData.userId
+            );
+            return !!workspace;
+          }
+        : undefined,
+      deriveWorkspaceIdFromAgent: userData.agentId
+        ? () => this.deriveWorkspaceIdFromAgent(userData.userId, userData.agentId!)
+        : undefined,
+    });
+
+    if (!resolution) return {};
+
+    return {
+      workspaceId: resolution.workspaceId,
+      workspaceSource: resolution.source,
+    };
   }
 
   /**
@@ -202,6 +274,24 @@ export class MCPServer {
           }
         : {};
 
+      if (userData) {
+        try {
+          Object.assign(ctx, await this.resolveWorkspaceContextForMcpRequest(req, userData));
+        } catch (error) {
+          logger.warn('Rejected MCP request due to invalid workspace scope', {
+            userId: userData.userId,
+            agentId: userData.agentId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          res.status(403).json({
+            jsonrpc: '2.0',
+            error: { code: -32003, message: 'Workspace not found or not accessible.' },
+            id: null,
+          });
+          return;
+        }
+      }
+
       await runWithRequestContext(ctx, async () => {
         let transport: StreamableHTTPServerTransport | undefined;
         let mcpServer: ReturnType<typeof this.createMcpServerInstance> | undefined;
@@ -239,11 +329,14 @@ export class MCPServer {
     // This stateless endpoint does not expose a standalone SSE stream.
     // Streamable HTTP clients may probe GET /mcp; return explicit 405 per spec.
     app.get('/mcp', (_req, res) => {
-      res.status(405).set('Allow', 'POST, DELETE').json({
-        jsonrpc: '2.0',
-        error: { code: -32000, message: 'Method not allowed.' },
-        id: null,
-      });
+      res
+        .status(405)
+        .set('Allow', 'POST, DELETE')
+        .json({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Method not allowed.' },
+          id: null,
+        });
     });
 
     // DELETE /mcp - No-op in stateless mode (no sessions to terminate)

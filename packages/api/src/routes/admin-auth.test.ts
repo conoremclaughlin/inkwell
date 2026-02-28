@@ -322,6 +322,7 @@ describe('adminAuthMiddleware', () => {
         userId: 'user-ctx',
         email: 'ctx@example.com',
         workspaceId: 'workspace-1',
+        workspaceSource: 'default',
       });
     });
 

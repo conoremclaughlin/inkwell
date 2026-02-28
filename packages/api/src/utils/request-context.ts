@@ -37,6 +37,8 @@ export interface RequestContextData {
   sessionId?: string;
   /** Active product workspace ID */
   workspaceId?: string;
+  /** How workspace scope was determined for this request/session */
+  workspaceSource?: 'header' | 'default' | 'derived' | 'session';
   /** Conversation ID for channel routing */
   conversationId?: string;
   /** Request timestamp */
@@ -70,6 +72,10 @@ export function runWithRequestContext<T>(
  * Persists until cleared or replaced.
  */
 export function setSessionContext(context: Omit<RequestContextData, 'timestamp'> | null): void {
+  if (context?.workspaceId && !context.workspaceSource) {
+    sessionContext = { ...context, workspaceSource: 'session' };
+    return;
+  }
   sessionContext = context;
 }
 
