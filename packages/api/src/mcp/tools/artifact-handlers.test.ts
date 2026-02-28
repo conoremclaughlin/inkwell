@@ -428,6 +428,21 @@ describe('handleUpdateArtifact', () => {
       expect(parsed.success).toBe(true);
       expect(parsed.mergePerformed).toBeFalsy();
     });
+
+    it('should reject update writes when workspace scope cannot be resolved', async () => {
+      clearSessionContext();
+
+      await expect(
+        handleUpdateArtifact(
+          {
+            userId: '00000000-0000-0000-0000-000000000001',
+            uri: 'pcp://test/doc',
+            content: 'Updated content',
+          },
+          createMockDataComposer({ from: vi.fn() })
+        )
+      ).rejects.toThrow('Artifact write requires workspace scope');
+    });
   });
 });
 
@@ -1176,6 +1191,21 @@ describe('artifact comment + identity UUID flows', () => {
         createMockDataComposer(supabase)
       )
     ).rejects.toThrow('Parent comment not found');
+  });
+
+  it('handleAddArtifactComment rejects writes when workspace scope cannot be resolved', async () => {
+    clearSessionContext();
+
+    await expect(
+      handleAddArtifactComment(
+        {
+          userId: '00000000-0000-0000-0000-000000000001',
+          artifactId: '11111111-1111-1111-1111-111111111111',
+          content: 'Missing scope',
+        },
+        createMockDataComposer({ from: vi.fn() })
+      )
+    ).rejects.toThrow('Artifact write requires workspace scope');
   });
 
   it('handleListArtifactComments enriches comments with identity details', async () => {

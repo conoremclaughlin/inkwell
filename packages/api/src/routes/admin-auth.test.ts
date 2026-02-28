@@ -644,6 +644,28 @@ describe('adminAuthMiddleware', () => {
       expect((req as any).pcpWorkspaceRole).toBe('member');
     });
 
+    it('should set request context workspaceSource=header when x-pcp-workspace-id is used', async () => {
+      mockFindById.mockResolvedValue({ id: 'requested-ws' });
+
+      const req = createMockReq({
+        header: vi.fn((name: string) => {
+          if (name === 'x-pcp-workspace-id') return 'requested-ws';
+          return undefined;
+        }),
+      });
+      const res = createMockRes();
+      const next = vi.fn();
+
+      await middleware(req, res, next);
+
+      expect(next).toHaveBeenCalled();
+      expect(capturedRunContext).toMatchObject({
+        userId: 'user-ws',
+        workspaceId: 'requested-ws',
+        workspaceSource: 'header',
+      });
+    });
+
     it('should return 404 when requested workspace does not exist', async () => {
       mockFindById.mockResolvedValue(null);
       mockFindRawById.mockResolvedValue(null);
