@@ -4,6 +4,7 @@ import {
   filterPcpSessionsForContext,
   filterUntrackedLocalClaudeSessions,
   hasBackendSessionOverride,
+  resolveBackendSessionIdForResume,
   sanitizeBackendExecutionArgs,
   shouldAutoResumeRuntimeSession,
 } from './claude.js';
@@ -209,6 +210,53 @@ describe('shouldAutoResumeRuntimeSession', () => {
   });
 });
 
+describe('resolveBackendSessionIdForResume', () => {
+  it('keeps selected local backend session id when provided', () => {
+    expect(
+      resolveBackendSessionIdForResume({
+        backend: 'claude',
+        chosen: {
+          id: 'pcp-1',
+          startedAt: '2026-02-28T00:00:00.000Z',
+          backend: 'claude',
+          backendSessionId: 'stale-id',
+        },
+        selectedLocalBackendSessionId: 'local-id',
+        localBackendSessionIds: new Set(['local-id']),
+      })
+    ).toEqual({ backendSessionId: 'local-id' });
+  });
+
+  it('drops stale tracked backend id when local project sessions are known and do not match', () => {
+    expect(
+      resolveBackendSessionIdForResume({
+        backend: 'claude',
+        chosen: {
+          id: 'pcp-1',
+          startedAt: '2026-02-28T00:00:00.000Z',
+          backend: 'claude',
+          backendSessionId: 'stale-id',
+        },
+        localBackendSessionIds: new Set(['local-a', 'local-b']),
+      })
+    ).toEqual({ staleTrackedBackendSessionId: 'stale-id' });
+  });
+
+  it('keeps tracked backend id when it matches local project sessions', () => {
+    expect(
+      resolveBackendSessionIdForResume({
+        backend: 'claude',
+        chosen: {
+          id: 'pcp-1',
+          startedAt: '2026-02-28T00:00:00.000Z',
+          backend: 'claude',
+          backendSessionId: 'local-a',
+        },
+        localBackendSessionIds: new Set(['local-a', 'local-b']),
+      })
+    ).toEqual({ backendSessionId: 'local-a' });
+  });
+});
 describe('extractClaudeHistorySessionsForProject', () => {
   it('parses local claude sessions from history.jsonl for the current project path', () => {
     const jsonl = [

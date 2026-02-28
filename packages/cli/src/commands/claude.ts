@@ -276,6 +276,32 @@ export function filterPcpSessionsForContext(
   return pathScoped.length > 0 ? pathScoped : backendMatched;
 }
 
+export function resolveBackendSessionIdForResume(options: {
+  backend: string;
+  chosen?: PcpSessionSummary;
+  selectedLocalBackendSessionId?: string;
+  localBackendSessionIds: Set<string>;
+}): { backendSessionId?: string; staleTrackedBackendSessionId?: string } {
+  const { backend, chosen, selectedLocalBackendSessionId, localBackendSessionIds } = options;
+
+  if (selectedLocalBackendSessionId) {
+    return { backendSessionId: selectedLocalBackendSessionId };
+  }
+
+  if (!chosen || (chosen.backend && chosen.backend !== backend)) {
+    return {};
+  }
+
+  const candidate = chosen.backendSessionId || chosen.claudeSessionId || undefined;
+  if (!candidate) return {};
+
+  if (localBackendSessionIds.size > 0 && !localBackendSessionIds.has(candidate)) {
+    return { staleTrackedBackendSessionId: candidate };
+  }
+
+  return { backendSessionId: candidate };
+}
+
 export function getClaudeLocalSessionsForProject(
   cwd = process.cwd(),
   limit = 20
@@ -950,11 +976,21 @@ async function ensurePcpSessionContext(
 
   if (!chosen?.id) return {};
 
-  const backendSessionId =
-    selectedLocalBackendSessionId ||
-    (!chosen.backend || chosen.backend === backend
-      ? chosen.backendSessionId || chosen.claudeSessionId || undefined
-      : undefined);
+  const { backendSessionId, staleTrackedBackendSessionId } = resolveBackendSessionIdForResume({
+    backend,
+    chosen,
+    selectedLocalBackendSessionId,
+    localBackendSessionIds,
+  });
+
+  if (staleTrackedBackendSessionId && process.stdin.isTTY) {
+    const backendLabel = backend[0].toUpperCase() + backend.slice(1);
+    console.log(
+      chalk.yellow(
+        `\nLinked ${backendLabel} session ${staleTrackedBackendSessionId.slice(0, 8)} is unavailable for this project; starting backend fresh.`
+      )
+    );
+  }
 
   upsertRuntimeSession(cwd, {
     pcpSessionId: chosen.id,
