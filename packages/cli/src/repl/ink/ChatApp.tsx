@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useRef } from 'react';
+import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { Box, Static, Text, useApp } from 'ink';
 import { StatusBar } from './StatusBar.js';
 import { InfoBar } from './InfoBar.js';
@@ -61,127 +61,142 @@ export interface ChatAppHandle {
  *   ─────────── separator
  *   info bar
  */
-export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(
-  function ChatApp({ agentId, timezone, infoItems: initialInfoItems, onUserInput, onExit }, ref) {
-    const { exit } = useApp();
-    const [messages, setMessages] = useState<ChatMessage[]>([]);
-    const [statusSummary, setStatusSummary] = useState('waiting for input');
-    const [waiting, setWaiting] = useState(false);
-    const [waitingBackend, setWaitingBackend] = useState('');
-    const [infoItems, setInfoItems] = useState(initialInfoItems);
-    const [ctrlCCount, setCtrlCCount] = useState(0);
-    const [ctrlCTimer, setCtrlCTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
+export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function ChatApp(
+  { agentId, timezone, infoItems: initialInfoItems, onUserInput, onExit },
+  ref
+) {
+  const { exit } = useApp();
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [statusSummary, setStatusSummary] = useState('waiting for input');
+  const [waiting, setWaiting] = useState(false);
+  const [waitingBackend, setWaitingBackend] = useState('');
+  const [infoItems, setInfoItems] = useState(initialInfoItems);
+  const [ctrlCCount, setCtrlCCount] = useState(0);
+  const [ctrlCTimer, setCtrlCTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
 
-    // Animated waiting indicator state
-    const [spinnerFrame, setSpinnerFrame] = useState(0);
-    const [waitingVerb, setWaitingVerb] = useState('');
-    const verbIndexRef = useRef(Math.floor(Math.random() * WAITING_VERBS.length));
+  // Animated waiting indicator state
+  const [spinnerFrame, setSpinnerFrame] = useState(0);
+  const [waitingVerb, setWaitingVerb] = useState('');
+  const verbIndexRef = useRef(Math.floor(Math.random() * WAITING_VERBS.length));
 
-    useEffect(() => {
-      if (!waiting) return;
-      // Pick a random starting verb
-      verbIndexRef.current = Math.floor(Math.random() * WAITING_VERBS.length);
+  useEffect(() => {
+    if (!waiting) return;
+    // Pick a random starting verb
+    verbIndexRef.current = Math.floor(Math.random() * WAITING_VERBS.length);
+    setWaitingVerb(WAITING_VERBS[verbIndexRef.current]!);
+    setSpinnerFrame(0);
+
+    // Spinner animation: fast (150ms)
+    const spinnerTimer = setInterval(() => {
+      setSpinnerFrame((f) => (f + 1) % SPINNER_FRAMES.length);
+    }, 150);
+
+    // Verb rotation: every 3 seconds
+    const verbTimer = setInterval(() => {
+      verbIndexRef.current = (verbIndexRef.current + 1) % WAITING_VERBS.length;
       setWaitingVerb(WAITING_VERBS[verbIndexRef.current]!);
-      setSpinnerFrame(0);
+    }, 3000);
 
-      // Spinner animation: fast (150ms)
-      const spinnerTimer = setInterval(() => {
-        setSpinnerFrame((f) => (f + 1) % SPINNER_FRAMES.length);
-      }, 150);
+    return () => {
+      clearInterval(spinnerTimer);
+      clearInterval(verbTimer);
+    };
+  }, [waiting]);
 
-      // Verb rotation: every 3 seconds
-      const verbTimer = setInterval(() => {
-        verbIndexRef.current = (verbIndexRef.current + 1) % WAITING_VERBS.length;
-        setWaitingVerb(WAITING_VERBS[verbIndexRef.current]!);
-      }, 3000);
+  // Expose handle for external state pushing
+  React.useImperativeHandle(ref, () => ({
+    addMessage: (msg: ChatMessage) => {
+      setMessages((prev) => [...prev, msg]);
+    },
+    setStatusSummary: (summary: string) => {
+      setStatusSummary(summary);
+    },
+    setWaiting: (w: boolean, backend?: string) => {
+      setWaiting(w);
+      if (backend) setWaitingBackend(backend);
+    },
+    setInfoItems: (items: string[]) => {
+      setInfoItems(items);
+    },
+  }));
 
-      return () => {
-        clearInterval(spinnerTimer);
-        clearInterval(verbTimer);
-      };
-    }, [waiting]);
+  const handleSubmit = useCallback(
+    (value: string) => {
+      onUserInput(value);
+    },
+    [onUserInput]
+  );
 
-    // Expose handle for external state pushing
-    React.useImperativeHandle(ref, () => ({
-      addMessage: (msg: ChatMessage) => {
-        setMessages((prev) => [...prev, msg]);
-      },
-      setStatusSummary: (summary: string) => {
-        setStatusSummary(summary);
-      },
-      setWaiting: (w: boolean, backend?: string) => {
-        setWaiting(w);
-        if (backend) setWaitingBackend(backend);
-      },
-      setInfoItems: (items: string[]) => {
-        setInfoItems(items);
-      },
-    }));
+  // Handle Ctrl+C for double-tap exit
+  useEffect(() => {
+    const handler = () => {
+      if (ctrlCCount >= 1) {
+        onExit();
+        exit();
+        return;
+      }
+      setCtrlCCount(1);
+      const timer = setTimeout(() => setCtrlCCount(0), 1500);
+      setCtrlCTimer(timer);
+    };
+    process.on('SIGINT', handler);
+    return () => {
+      process.off('SIGINT', handler);
+      if (ctrlCTimer) clearTimeout(ctrlCTimer);
+    };
+  }, [ctrlCCount, ctrlCTimer, onExit, exit]);
 
-    const handleSubmit = useCallback(
-      (value: string) => {
-        onUserInput(value);
-      },
-      [onUserInput]
-    );
+  const now = formatNow(timezone);
+  const promptLabel = '> ';
 
-    // Handle Ctrl+C for double-tap exit
-    useEffect(() => {
-      const handler = () => {
-        if (ctrlCCount >= 1) {
-          onExit();
-          exit();
-          return;
-        }
-        setCtrlCCount(1);
-        const timer = setTimeout(() => setCtrlCCount(0), 1500);
-        setCtrlCTimer(timer);
-      };
-      process.on('SIGINT', handler);
-      return () => {
-        process.off('SIGINT', handler);
-        if (ctrlCTimer) clearTimeout(ctrlCTimer);
-      };
-    }, [ctrlCCount, ctrlCTimer, onExit, exit]);
+  // IMPORTANT: Ink's reconciler only sets isStaticDirty (which triggers
+  // onImmediateRender for <Static> content) when the static box node
+  // receives a commitUpdate — NOT when children are added/removed.
+  // Without this, new static items go through the throttled onRender path,
+  // which can fire AFTER useLayoutEffect removes the children, causing
+  // messages to be lost or the dock to ghost-duplicate.
+  //
+  // By changing the style prop when messages.length changes, we force
+  // commitUpdate on the ink-box internal_static node → isStaticDirty = true
+  // → onImmediateRender fires synchronously before children are cleared.
+  const staticStyle = useMemo(
+    () => ({ flexDirection: 'column' as const }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [messages.length]
+  );
 
-    const now = formatNow(timezone);
-    const promptLabel = '> ';
-
-    return (
-      <Box flexDirection="column">
-        {/* Messages scroll into scrollback — <Static> renders once and commits */}
-        <Static items={messages}>
-          {(msg) => (
-            <MessageLine
-              key={msg.id}
-              id={msg.id}
-              role={msg.role}
-              content={msg.content}
-              label={msg.label}
-              time={msg.time}
-              trailingMeta={msg.trailingMeta}
-            />
-          )}
-        </Static>
-
-        {/* Animated waiting indicator */}
-        {waiting && (
-          <Box paddingX={1}>
-            <Text color="cyan">{SPINNER_FRAMES[spinnerFrame] + ' '}</Text>
-            <Text dimColor>
-              {waitingVerb}...
-            </Text>
-          </Box>
+  return (
+    <Box flexDirection="column">
+      {/* Messages scroll into scrollback — <Static> renders once and commits */}
+      <Static items={messages} style={staticStyle}>
+        {(msg) => (
+          <MessageLine
+            key={msg.id}
+            id={msg.id}
+            role={msg.role}
+            content={msg.content}
+            label={msg.label}
+            time={msg.time}
+            trailingMeta={msg.trailingMeta}
+          />
         )}
+      </Static>
 
-        {/* Fixed dock: status | prompt | info */}
-        <Separator />
-        <StatusBar summary={statusSummary} time={now} />
-        <Separator />
-        <PromptInput label={promptLabel} onSubmit={handleSubmit} isActive={!waiting} />
-        <Separator />
-        <InfoBar items={infoItems} />
-      </Box>
-    );
-  }
-);
+      {/* Animated waiting indicator */}
+      {waiting && (
+        <Box paddingX={1}>
+          <Text color="cyan">{SPINNER_FRAMES[spinnerFrame] + ' '}</Text>
+          <Text dimColor>{waitingVerb}...</Text>
+        </Box>
+      )}
+
+      {/* Fixed dock: status | prompt | info */}
+      <Separator />
+      <StatusBar summary={statusSummary} time={now} />
+      <Separator />
+      <PromptInput label={promptLabel} onSubmit={handleSubmit} isActive={!waiting} />
+      <Separator />
+      <InfoBar items={infoItems} />
+    </Box>
+  );
+});
