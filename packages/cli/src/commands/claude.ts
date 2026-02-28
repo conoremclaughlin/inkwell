@@ -310,6 +310,7 @@ export function resolveCapturedBackendSessionIdFromRuntime(options: {
   runtimeLinkId?: string;
   agentId?: string;
   studioId?: string;
+  knownLocalSessionIds?: Set<string>;
   fallbackBackendSessionId?: string;
 }): string | undefined {
   const {
@@ -319,6 +320,7 @@ export function resolveCapturedBackendSessionIdFromRuntime(options: {
     runtimeLinkId,
     agentId,
     studioId,
+    knownLocalSessionIds,
     fallbackBackendSessionId,
   } = options;
 
@@ -354,6 +356,14 @@ export function resolveCapturedBackendSessionIdFromRuntime(options: {
   ) {
     const currentSessionId = resolveFromRecord(current);
     if (currentSessionId) return currentSessionId;
+  }
+
+  if (knownLocalSessionIds && knownLocalSessionIds.size > 0) {
+    const postRunLocalSessions = getBackendLocalSessionsForProject(backend, cwd, 50);
+    const newLocalSession = postRunLocalSessions.find(
+      (session) => !knownLocalSessionIds.has(session.sessionId)
+    );
+    if (newLocalSession?.sessionId) return newLocalSession.sessionId;
   }
 
   return resolveFromRecord(scopedRecords[0]) || fallbackBackendSessionId;
@@ -1182,6 +1192,13 @@ export async function runClaude(
   };
   const executionStartedAt = Date.now();
   const backendStartActivityId = await logBackendExecutionStart(executionContext);
+  const knownLocalSessionIds = options.session
+    ? new Set(
+        getBackendLocalSessionsForProject(options.backend, process.cwd(), 50).map(
+          (session) => session.sessionId
+        )
+      )
+    : undefined;
   let capturedBackendSessionId = sessionContext.backendSessionId;
   let stdoutLineBuffer = '';
   let cleanedUp = false;
@@ -1238,6 +1255,17 @@ export async function runClaude(
     if (stdoutLineBuffer.trim()) {
       const parsedSessionId = parseSessionIdFromJsonLine(stdoutLineBuffer.trim());
       if (parsedSessionId) capturedBackendSessionId = parsedSessionId;
+    }
+    if (!capturedBackendSessionId) {
+      capturedBackendSessionId = resolveCapturedBackendSessionIdFromRuntime({
+        backend: options.backend,
+        pcpSessionId: sessionContext.pcpSessionId,
+        runtimeLinkId,
+        agentId,
+        studioId,
+        knownLocalSessionIds,
+        fallbackBackendSessionId: capturedBackendSessionId,
+      });
     }
 
     await persistBackendSessionLink({
@@ -1344,6 +1372,13 @@ export async function runClaudeInteractive(
   };
   const executionStartedAt = Date.now();
   const backendStartActivityId = await logBackendExecutionStart(executionContext);
+  const knownLocalSessionIds = options.session
+    ? new Set(
+        getBackendLocalSessionsForProject(options.backend, process.cwd(), 50).map(
+          (session) => session.sessionId
+        )
+      )
+    : undefined;
   let capturedBackendSessionId = sessionContext.backendSessionId;
   let cleanedUp = false;
   let finalizedExecution = false;
@@ -1383,6 +1418,7 @@ export async function runClaudeInteractive(
       runtimeLinkId,
       agentId,
       studioId,
+      knownLocalSessionIds,
       fallbackBackendSessionId: capturedBackendSessionId,
     });
     await persistBackendSessionLink({

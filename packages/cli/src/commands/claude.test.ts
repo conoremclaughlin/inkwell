@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 import {
   extractClaudeHistorySessionsForProject,
   filterPcpSessionsForContext,
@@ -267,6 +270,60 @@ describe('resolveCapturedBackendSessionIdFromRuntime', () => {
         fallbackBackendSessionId: 'fallback-id',
       })
     ).toBe('fallback-id');
+  });
+
+  it('falls back to new local backend session for the project when runtime linkage is missing', () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'sb-claude-runtime-'));
+    const tempHome = join(tempRoot, 'home');
+    const tempRepo = join(tempRoot, 'repo');
+    mkdirSync(tempHome, { recursive: true });
+    mkdirSync(tempRepo, { recursive: true });
+
+    const projectKeyDir = join(tempHome, '.claude', 'projects', 'clearpol-ai');
+    mkdirSync(projectKeyDir, { recursive: true });
+
+    const oldHome = process.env.HOME;
+    process.env.HOME = tempHome;
+
+    try {
+      writeFileSync(
+        join(projectKeyDir, 'sessions-index.json'),
+        JSON.stringify(
+          {
+            entries: [
+              {
+                sessionId: 'old-local-session',
+                projectPath: tempRepo,
+                modified: '2026-02-28T09:00:00.000Z',
+              },
+              {
+                sessionId: 'new-local-session',
+                projectPath: tempRepo,
+                modified: '2026-02-28T10:00:00.000Z',
+              },
+            ],
+          },
+          null,
+          2
+        )
+      );
+
+      const resolved = resolveCapturedBackendSessionIdFromRuntime({
+        cwd: tempRepo,
+        backend: 'claude',
+        pcpSessionId: 'pcp-session-1',
+        knownLocalSessionIds: new Set(['old-local-session']),
+      });
+
+      expect(resolved).toBe('new-local-session');
+    } finally {
+      if (oldHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = oldHome;
+      }
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 });
 
