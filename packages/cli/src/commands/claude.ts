@@ -62,10 +62,10 @@ function getSessionBackendId(session: PcpSessionSummary): string | undefined {
   return session.backendSessionId || session.claudeSessionId || undefined;
 }
 
-export function filterUntrackedLocalClaudeSessions(
-  localSessions: BackendLocalSessionSummary[],
+export function filterUntrackedLocalClaudeSessions<T extends { sessionId: string }>(
+  localSessions: T[],
   activePcpSessions: PcpSessionSummary[]
-): BackendLocalSessionSummary[] {
+): T[] {
   const trackedSessionIds = new Set(
     activePcpSessions
       .map((session) => getSessionBackendId(session))
@@ -676,8 +676,7 @@ async function ensurePcpSessionContext(
       const preview = localSession.firstPrompt
         ? ` — ${truncateText(localSession.firstPrompt)}`
         : '';
-      const backendLabel =
-        localSession.backend[0].toUpperCase() + localSession.backend.slice(1);
+      const backendLabel = localSession.backend[0].toUpperCase() + localSession.backend.slice(1);
       choices.push({
         name:
           localSession.backend === 'claude'
