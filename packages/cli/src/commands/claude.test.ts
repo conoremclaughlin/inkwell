@@ -96,6 +96,29 @@ describe('filterPcpSessionsForContext', () => {
 
     expect(filtered.map((session) => session.id)).toEqual(['codex-1']);
   });
+
+  it('path-scopes codex sessions when workingDir data is available', () => {
+    const filtered = filterPcpSessionsForContext(
+      [
+        {
+          id: 'codex-a',
+          startedAt: '2026-02-28T00:00:00.000Z',
+          backend: 'codex',
+          workingDir: '/tmp/project-a',
+        },
+        {
+          id: 'codex-b',
+          startedAt: '2026-02-28T00:00:00.000Z',
+          backend: 'codex',
+          workingDir: '/tmp/project-b',
+        },
+      ],
+      'codex',
+      '/tmp/project-a'
+    );
+
+    expect(filtered.map((session) => session.id)).toEqual(['codex-a']);
+  });
 });
 
 describe('filterUntrackedLocalClaudeSessions', () => {

@@ -30,6 +30,11 @@ export class GeminiAdapter implements BackendAdapter {
       args.push('-p');
     }
 
+    // Resume a specific backend-native Gemini session when available.
+    if (config.backendSessionId) {
+      args.push('--resume', config.backendSessionId);
+    }
+
     // Passthrough flags
     args.push(...config.passthroughArgs);
 

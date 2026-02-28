@@ -27,6 +27,11 @@ export class CodexAdapter implements BackendAdapter {
       args.push('--model', config.model);
     }
 
+    // Resume a specific backend-native Codex session when available.
+    if (config.backendSessionId) {
+      args.push('resume', config.backendSessionId);
+    }
+
     // Passthrough flags
     args.push(...config.passthroughArgs);
 
