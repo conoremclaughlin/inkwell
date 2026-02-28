@@ -100,6 +100,21 @@ export function shouldAutoResumeRuntimeSession(
   existing: { pcpSessionId?: string; backendSessionId?: string } | undefined,
   isTty: boolean
 ): boolean {
+  // CRITICAL UX NOTE:
+  // - Interactive users (TTY=true) MUST see the session picker so they can explicitly choose
+  //   between:
+  //     1) starting a new session,
+  //     2) resuming a tracked PCP session, or
+  //     3) resuming a backend-local session.
+  // - Non-interactive contexts (TTY=false), like scripts/piped invocations, cannot render the
+  //   picker safely. Only in that case do we allow implicit runtime auto-resume.
+  //
+  // Regressions here are high-impact because they make session behavior feel "mysterious":
+  // users see an unexpected resume with no chance to choose.
+  //
+  // If you modify this function, manually verify both:
+  //   sb -a <agent> -b <backend>          # TTY: picker appears
+  //   echo "prompt" | sb -a <agent> ...   # non-TTY: no picker, deterministic auto behavior
   return Boolean(existing?.pcpSessionId && !isTty);
 }
 
