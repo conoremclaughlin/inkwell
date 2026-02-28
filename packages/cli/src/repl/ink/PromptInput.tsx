@@ -5,6 +5,8 @@ interface PromptInputProps {
   label: string;
   onSubmit: (value: string) => void;
   isActive?: boolean;
+  /** Scroll callback for page up/down from within the prompt. */
+  onScroll?: (direction: 'up' | 'down') => void;
 }
 
 /** Find the position of the previous word boundary (start of current/previous word). */
@@ -35,6 +37,7 @@ export function PromptInput({
   label,
   onSubmit,
   isActive = true,
+  onScroll,
 }: PromptInputProps): React.ReactElement {
   const [value, setValue] = useState('');
   const [cursor, setCursor] = useState(0);
@@ -125,6 +128,16 @@ export function PromptInput({
 
     if (key.rightArrow) {
       setCursor((prev) => Math.min(value.length, prev + 1));
+      return;
+    }
+
+    // Shift+Up/Down: scroll messages (page up/down)
+    if (key.shift && key.upArrow) {
+      onScroll?.('up');
+      return;
+    }
+    if (key.shift && key.downArrow) {
+      onScroll?.('down');
       return;
     }
 

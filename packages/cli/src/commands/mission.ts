@@ -15,6 +15,7 @@ interface MissionOptions {
   feed?: boolean;
   feedLimit?: string;
   json?: boolean;
+  fullscreen?: boolean;
 }
 
 interface MissionRow {
@@ -722,7 +723,7 @@ async function runInkMission(options: MissionOptions): Promise<void> {
   const intervalSeconds = Math.max(3, Number.parseInt(options.interval || '6', 10));
   const seenActivityIds = new Set<string>();
 
-  const mission = renderInkMission({ timezone: undefined });
+  const mission = renderInkMission({ timezone: undefined, fullscreen: !!options.fullscreen });
 
   mission.addEvent({
     id: 'init',
@@ -935,6 +936,7 @@ function registerOverviewLikeCommand(program: Command, name: string, description
     .option('--feed-limit <n>', 'Activity rows to fetch for feed rendering', '40')
     .option('--attach <target>', 'Resolve quick attach command for agent or session-id prefix')
     .option('--json', 'Output JSON')
+    .option('--fullscreen', 'Fullscreen alternate buffer mode (app-controlled scrolling)')
     .action(async (options: MissionOptions) => {
       try {
         await runMission(options);

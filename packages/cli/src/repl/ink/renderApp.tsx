@@ -78,9 +78,11 @@ export function renderInkChat(options: {
   agentId: string;
   timezone?: string;
   infoItems: string[];
+  fullscreen?: boolean;
 }): InkRepl {
   const handleRef =
     React.createRef<ChatAppHandle>() as React.MutableRefObject<ChatAppHandle | null>;
+  const fullscreen = !!options.fullscreen;
 
   // Pending input promise — resolved when user submits a line
   let pendingInput: ReturnType<typeof deferred<string>> | null = null;
@@ -104,19 +106,21 @@ export function renderInkChat(options: {
     }
   };
 
-  // incrementalRendering: line-by-line diffing instead of full erase+rewrite.
-  // Since all content is dynamic (no <Static>), this ensures keystrokes in the
-  // prompt only rewrite the prompt line — not every message above it.
+  // <Static> handles scroll protection: completed messages go to terminal scrollback,
+  // only the dock (~6 lines) is dynamic. Cursor movement is bounded to dock height.
+  // incrementalRendering: line-by-line diffing for the dynamic portion.
+  // alternateBuffer (--fullscreen): optional app-controlled viewport.
   const { unmount } = render(
     <ChatApp
       ref={handleRef}
       agentId={options.agentId}
       timezone={options.timezone}
       infoItems={options.infoItems}
+      fullscreen={fullscreen}
       onUserInput={onUserInput}
       onExit={onExit}
     />,
-    { incrementalRendering: true }
+    { alternateBuffer: fullscreen, incrementalRendering: true }
   );
 
   // Get the handle (available synchronously after render)

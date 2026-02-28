@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
-import { Box, Text, useApp } from 'ink';
+import { Box, Static, Text, useApp, useStdout } from 'ink';
 import { StatusBar } from './StatusBar.js';
 import { InfoBar } from './InfoBar.js';
 import { PromptInput } from './PromptInput.js';
@@ -32,6 +32,7 @@ export interface ChatAppProps {
   agentId: string;
   timezone?: string;
   infoItems: string[];
+  fullscreen?: boolean;
   /** Called when the user submits a message from the prompt. */
   onUserInput: (raw: string) => void;
   /** Called when the user requests exit (double Ctrl+C). */
@@ -40,7 +41,6 @@ export interface ChatAppProps {
 
 /**
  * External handle for pushing state into the ChatApp from outside React.
- * The chat command orchestrator calls these to push messages, update status, etc.
  */
 export interface ChatAppHandle {
   addMessage: (msg: ChatMessage) => void;
@@ -52,23 +52,13 @@ export interface ChatAppHandle {
 /**
  * Root Ink component for the SB Chat REPL.
  *
- * All content is rendered dynamically (no <Static>). Ink erases and redraws
- * the entire output on every state change, which means:
- *   - No ghost dock duplication (single erase-rewrite pipeline)
- *   - Resize just re-renders everything at the new width
- *   - Terminal scrollback works naturally as content exceeds viewport
- *
- * Layout:
- *   messages (all dynamic)
- *   ─────────── separator
- *   status bar                          timestamp
- *   ─────────── separator
- *   prompt> _
- *   ─────────── separator
- *   info bar
+ * Uses <Static> for completed messages (written once to terminal scrollback).
+ * Only the dock (status | prompt | info) is dynamic (~6 lines).
+ * On terminal resize, the Static remount key increments to force a full
+ * re-render of all static content at the new width.
  */
 export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function ChatApp(
-  { agentId, timezone, infoItems: initialInfoItems, onUserInput, onExit },
+  { agentId, timezone, infoItems: initialInfoItems, fullscreen = false, onUserInput, onExit },
   ref
 ) {
   const { exit } = useApp();
@@ -80,8 +70,27 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
   const [ctrlCCount, setCtrlCCount] = useState(0);
   const [ctrlCTimer, setCtrlCTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
 
-  // Waiting indicator state — verb rotates every 3s, no fast spinner
-  // (fast animation causes scroll snapback because each re-render resets viewport)
+  // Remount key — incremented on resize to force <Static> to re-render all items
+  const [remountKey, setRemountKey] = useState(0);
+
+  // Terminal resize tracking
+  const { stdout } = useStdout();
+  useEffect(() => {
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+    const onResize = () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        setRemountKey((k) => k + 1);
+      }, 150);
+    };
+    stdout?.on('resize', onResize);
+    return () => {
+      stdout?.off('resize', onResize);
+      if (debounceTimer) clearTimeout(debounceTimer);
+    };
+  }, [stdout]);
+
+  // Waiting indicator state — verb rotates every 3s
   const [waitingVerb, setWaitingVerb] = useState('');
   const verbIndexRef = useRef(Math.floor(Math.random() * WAITING_VERBS.length));
 
@@ -146,20 +155,23 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
 
   return (
     <Box flexDirection="column">
-      {/* Messages — rendered as regular dynamic children */}
-      {messages.map((msg) => (
-        <MessageLine
-          key={msg.id}
-          id={msg.id}
-          role={msg.role}
-          content={msg.content}
-          label={msg.label}
-          time={msg.time}
-          trailingMeta={msg.trailingMeta}
-        />
-      ))}
+      {/* Messages — written once to terminal scrollback via <Static>.
+          key={remountKey} forces full re-render on terminal resize. */}
+      <Static key={remountKey} items={messages}>
+        {(msg) => (
+          <MessageLine
+            key={msg.id}
+            id={msg.id}
+            role={msg.role}
+            content={msg.content}
+            label={msg.label}
+            time={msg.time}
+            trailingMeta={msg.trailingMeta}
+          />
+        )}
+      </Static>
 
-      {/* Waiting indicator — static char, rotating verb every 3s */}
+      {/* Dynamic tail: waiting indicator + dock */}
       {waiting && (
         <Box paddingX={1}>
           <Text color="cyan">{SPINNER_CHAR + ' '}</Text>
@@ -167,7 +179,6 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
         </Box>
       )}
 
-      {/* Dock: status | prompt | info */}
       <Separator />
       <StatusBar summary={statusSummary} time={now} />
       <Separator />

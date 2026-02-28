@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Box, Text, useApp, useStdout } from 'ink';
+import { Box, Static, Text, useApp, useStdout } from 'ink';
 import { Separator } from './Separator.js';
 import { formatNow } from '../tui-components.js';
 
@@ -30,6 +30,7 @@ export interface AgentSummary {
 
 export interface MissionAppProps {
   timezone?: string;
+  fullscreen?: boolean;
   onExit: () => void;
 }
 
@@ -59,9 +60,60 @@ const TYPE_ICONS: Record<FeedEventType, string> = {
   system: '•',
 };
 
-/** Live mission control feed — renders events as scrollback with agent summary dock. */
+/**
+ * Single feed event rendered as a proper React component for <Static>.
+ * Uses Box/Text layout so Ink handles wrapping at the current terminal width.
+ */
+const FeedEventLine = React.memo(function FeedEventLine({
+  type,
+  agent,
+  content,
+  time,
+  detail,
+}: Omit<FeedEvent, 'id'>) {
+  const color = TYPE_COLORS[type] || 'gray';
+  const icon = TYPE_ICONS[type] || '•';
+
+  return (
+    <Box flexDirection="column" paddingLeft={1} marginTop={type !== 'system' ? 1 : 0}>
+      {/* Header: icon + agent + time */}
+      <Box>
+        <Text color={color}>{icon} </Text>
+        {agent ? (
+          <>
+            <Text bold color={color}>
+              {agent}
+            </Text>
+            <Text>{'  '}</Text>
+          </>
+        ) : null}
+        <Text dimColor>{time}</Text>
+      </Box>
+      {/* Content */}
+      <Box paddingLeft={agent ? 4 : 2}>
+        <Text wrap="wrap">{content}</Text>
+      </Box>
+      {/* Optional detail */}
+      {detail ? (
+        <Box paddingLeft={agent ? 4 : 2}>
+          <Text dimColor wrap="wrap">
+            {detail}
+          </Text>
+        </Box>
+      ) : null}
+    </Box>
+  );
+});
+
+/**
+ * Live mission control feed.
+ *
+ * Uses <Static> for all events (written once to terminal scrollback).
+ * Only the dock (agent summary + status + info) is dynamic.
+ * This bounds cursor movement to the dock height, preventing scroll snapback.
+ */
 export const MissionApp = React.forwardRef<MissionAppHandle, MissionAppProps>(function MissionApp(
-  { timezone, onExit },
+  { timezone, fullscreen = false, onExit },
   ref
 ) {
   const { exit } = useApp();
@@ -83,6 +135,26 @@ export const MissionApp = React.forwardRef<MissionAppHandle, MissionAppProps>(fu
     },
   }));
 
+  // Terminal dimensions + remount key for <Static> resize re-render
+  const { stdout } = useStdout();
+  const [cols, setCols] = useState(stdout?.columns || 80);
+  const [remountKey, setRemountKey] = useState(0);
+  useEffect(() => {
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+    const onResize = () => {
+      setCols(stdout?.columns || 80);
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        setRemountKey((k) => k + 1);
+      }, 150);
+    };
+    stdout?.on('resize', onResize);
+    return () => {
+      stdout?.off('resize', onResize);
+      if (debounceTimer) clearTimeout(debounceTimer);
+    };
+  }, [stdout]);
+
   // Double Ctrl+C to exit
   useEffect(() => {
     const handler = () => {
@@ -102,18 +174,9 @@ export const MissionApp = React.forwardRef<MissionAppHandle, MissionAppProps>(fu
   }, [ctrlCCount, onExit, exit]);
 
   const now = formatNow(timezone);
-  const { stdout } = useStdout();
-  const [cols, setCols] = useState(stdout?.columns || 80);
-  useEffect(() => {
-    const onResize = () => setCols(stdout?.columns || 80);
-    stdout?.on('resize', onResize);
-    return () => {
-      stdout?.off('resize', onResize);
-    };
-  }, [stdout]);
 
-  // Truncate helper — guarantee single visual line per dock row
-  const pad = 2; // paddingX={1} on each side
+  // Truncate helpers
+  const pad = 2;
   const truncLine = (text: string) => {
     const max = cols - pad;
     return text.length > max ? text.slice(0, Math.max(1, max - 1)) + '…' : text;
@@ -128,35 +191,22 @@ export const MissionApp = React.forwardRef<MissionAppHandle, MissionAppProps>(fu
 
   return (
     <Box flexDirection="column">
-      {/* Feed events — rendered as regular dynamic children */}
-      {events.map((event) => (
-        <Box key={event.id} paddingLeft={1} marginTop={event.type === 'system' ? 0 : 1}>
-          <Text color={TYPE_COLORS[event.type] || 'gray'}>{TYPE_ICONS[event.type] || '•'} </Text>
-          <Box flexDirection="column" flexShrink={1}>
-            <Box>
-              {event.agent && (
-                <Text bold color={TYPE_COLORS[event.type] || 'gray'}>
-                  {event.agent}
-                </Text>
-              )}
-              {event.agent && <Text>{'  '}</Text>}
-              <Text dimColor>{event.time}</Text>
-            </Box>
-            <Box paddingLeft={event.agent ? 2 : 0}>
-              <Text wrap="wrap">{event.content}</Text>
-            </Box>
-            {event.detail && (
-              <Box paddingLeft={event.agent ? 2 : 0}>
-                <Text dimColor wrap="wrap">
-                  {event.detail}
-                </Text>
-              </Box>
-            )}
-          </Box>
-        </Box>
-      ))}
+      {/* Events — written once to terminal scrollback via <Static>.
+          key={remountKey} forces full re-render on terminal resize. */}
+      <Static key={remountKey} items={events}>
+        {(event) => (
+          <FeedEventLine
+            key={event.id}
+            type={event.type}
+            agent={event.agent}
+            content={event.content}
+            time={event.time}
+            detail={event.detail}
+          />
+        )}
+      </Static>
 
-      {/* Fixed dock: SB summary + status */}
+      {/* Dynamic dock only */}
       <Separator />
       <Box paddingX={1} flexDirection="column">
         {agents.length > 0 ? (

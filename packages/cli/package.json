@@ -24,7 +24,7 @@
     "@personal-context/shared": "workspace:*",
     "chalk": "^5.3.0",
     "commander": "^12.1.0",
-    "ink": "^6.8.0",
+    "ink": "npm:@jrichman/ink@6.4.11",
     "ora": "^8.0.1",
     "react": "^19.2.4"
   },

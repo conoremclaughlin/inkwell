@@ -69,6 +69,7 @@ type ChatOptions = {
   nonInteractive?: boolean;
   tailTranscript?: string;
   verbose?: boolean;
+  fullscreen?: boolean;
 };
 
 interface InboxMessage {
@@ -2582,6 +2583,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       agentId,
       timezone: runtime.userTimezone,
       infoItems: initialInfoItems,
+      fullscreen: !!options.fullscreen,
     });
     // Initial status update — ChatApp starts with 'waiting for input'
     // so push the real context budget summary immediately
@@ -3925,6 +3927,7 @@ export function registerChatCommand(program: Command): void {
         'Tail transcript output by file path or session id'
       )
       .option('-v, --verbose', 'Verbose backend passthrough output')
+      .option('--fullscreen', 'Fullscreen alternate buffer mode (app-controlled scrolling)')
       .action((options: ChatOptions) => runChat(options));
 
   register('chat', 'Start first-class PCP REPL (experimental)');

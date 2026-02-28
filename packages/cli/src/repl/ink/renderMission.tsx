@@ -16,9 +16,10 @@ export interface InkMission {
   waitForExit: () => Promise<void>;
 }
 
-export function renderInkMission(options: { timezone?: string }): InkMission {
+export function renderInkMission(options: { timezone?: string; fullscreen?: boolean }): InkMission {
   const handleRef =
     React.createRef<MissionAppHandle>() as React.MutableRefObject<MissionAppHandle | null>;
+  const fullscreen = !!options.fullscreen;
 
   let exitResolve: (() => void) | null = null;
   const exitPromise = new Promise<void>((resolve) => {
@@ -32,10 +33,16 @@ export function renderInkMission(options: { timezone?: string }): InkMission {
     }
   };
 
-  // incrementalRendering: line-by-line diffing instead of full erase+rewrite.
+  // alternateBuffer (--fullscreen): app-controlled viewport, eliminates scroll snapback.
+  // incrementalRendering: line-by-line diffing — always on for better performance.
   const { unmount } = render(
-    <MissionApp ref={handleRef} timezone={options.timezone} onExit={onExit} />,
-    { incrementalRendering: true }
+    <MissionApp
+      ref={handleRef}
+      timezone={options.timezone}
+      fullscreen={fullscreen}
+      onExit={onExit}
+    />,
+    { alternateBuffer: fullscreen, incrementalRendering: true }
   );
 
   const getHandle = (): MissionAppHandle => {
