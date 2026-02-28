@@ -4,6 +4,7 @@ import {
   filterUntrackedLocalClaudeSessions,
   hasBackendSessionOverride,
   sanitizeBackendExecutionArgs,
+  shouldAutoResumeRuntimeSession,
 } from './claude.js';
 
 describe('hasBackendSessionOverride', () => {
@@ -195,5 +196,14 @@ describe('sanitizeBackendExecutionArgs', () => {
       '<redacted-prompt-part>',
       '<redacted-prompt-part>',
     ]);
+  });
+});
+
+describe('shouldAutoResumeRuntimeSession', () => {
+  it('auto-resumes only for non-tty execution when runtime has a PCP session', () => {
+    expect(shouldAutoResumeRuntimeSession({ pcpSessionId: 'pcp-1' }, false)).toBe(true);
+    expect(shouldAutoResumeRuntimeSession({ pcpSessionId: 'pcp-1' }, true)).toBe(false);
+    expect(shouldAutoResumeRuntimeSession(undefined, false)).toBe(false);
+    expect(shouldAutoResumeRuntimeSession({ backendSessionId: 'b-1' }, false)).toBe(false);
   });
 });

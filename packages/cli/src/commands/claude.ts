@@ -96,6 +96,13 @@ export function filterUntrackedLocalClaudeSessions<T extends { sessionId: string
   return localSessions.filter((session) => !trackedSessionIds.has(session.sessionId));
 }
 
+export function shouldAutoResumeRuntimeSession(
+  existing: { pcpSessionId?: string; backendSessionId?: string } | undefined,
+  isTty: boolean
+): boolean {
+  return Boolean(existing?.pcpSessionId && !isTty);
+}
+
 function isPromptCancelError(err: unknown): boolean {
   if (!err || typeof err !== 'object') return false;
   const maybe = err as { name?: string; message?: string };
@@ -748,7 +755,7 @@ async function ensurePcpSessionContext(
 
   // Fast path: runtime already knows current session for this backend.
   const existing = getCurrentRuntimeSession(cwd, backend);
-  if (existing?.pcpSessionId) {
+  if (existing?.pcpSessionId && shouldAutoResumeRuntimeSession(existing, process.stdin.isTTY)) {
     return {
       pcpSessionId: existing.pcpSessionId,
       backendSessionId: existing.backendSessionId,
