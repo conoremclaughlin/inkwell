@@ -10,6 +10,26 @@
 import { createIdentityPromptFile } from './identity.js';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
 
+const CODEX_TOP_LEVEL_COMMANDS = new Set([
+  'exec',
+  'review',
+  'login',
+  'logout',
+  'mcp',
+  'mcp-server',
+  'app-server',
+  'app',
+  'completion',
+  'sandbox',
+  'debug',
+  'apply',
+  'resume',
+  'fork',
+  'cloud',
+  'features',
+  'help',
+]);
+
 export class CodexAdapter implements BackendAdapter {
   readonly name = 'codex';
   readonly binary = 'codex';
@@ -25,6 +45,15 @@ export class CodexAdapter implements BackendAdapter {
     // Model (only if explicitly specified by user)
     if (config.model) {
       args.push('--model', config.model);
+    }
+
+    const firstPromptToken = config.promptParts[0]?.toLowerCase();
+    const hasExplicitCommand = firstPromptToken
+      ? CODEX_TOP_LEVEL_COMMANDS.has(firstPromptToken)
+      : false;
+
+    if (config.backendSessionId && !hasExplicitCommand) {
+      args.push('resume', config.backendSessionId);
     }
 
     // Passthrough flags

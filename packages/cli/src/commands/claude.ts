@@ -5,7 +5,7 @@
  * passthrough flags, and session tracking.
  */
 
-import { spawn } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import chalk from 'chalk';
 import { randomUUID } from 'crypto';
 import { existsSync, readFileSync, readdirSync, realpathSync } from 'fs';
@@ -55,6 +55,28 @@ interface ClaudeLocalSessionSummary {
   firstPrompt?: string;
   messageCount?: number;
   gitBranch?: string;
+}
+
+interface CodexLocalSessionSummary {
+  sessionId: string;
+  cwd: string;
+  modified: string;
+  title?: string;
+}
+
+interface GeminiLocalSessionSummary {
+  sessionId: string;
+  projectKey: string;
+  modified: string;
+  summary?: string;
+  firstUserMessage?: string;
+}
+
+interface LocalBackendSessionChoice {
+  sessionId: string;
+  backendLabel: 'Claude' | 'Codex' | 'Gemini';
+  modified: string;
+  preview?: string;
 }
 
 function isPromptCancelError(err: unknown): boolean {
@@ -136,7 +158,7 @@ export function filterPcpSessionsForContext(
   sessions: PcpSessionSummary[],
   backend: string,
   cwd = process.cwd(),
-  localClaudeSessionIds: Set<string> = new Set()
+  localBackendSessionIds: Set<string> = new Set()
 ): PcpSessionSummary[] {
   const normalizedCwd = normalizePath(cwd);
 
@@ -145,17 +167,43 @@ export function filterPcpSessionsForContext(
     return session.backend === backend;
   });
 
-  if (backend !== 'claude' || !normalizedCwd) {
+  if (!normalizedCwd) {
     return backendMatched;
   }
 
+  const hasWorkingDirCoverage = backendMatched.some(
+    (session) => !!normalizePath(session.workingDir)
+  );
+  const canPathScope =
+    backend === 'claude' || localBackendSessionIds.size > 0 || hasWorkingDirCoverage;
+  if (!canPathScope) return backendMatched;
+
   return backendMatched.filter((session) => {
     const localMatchedId = session.backendSessionId || session.claudeSessionId;
-    if (localMatchedId && localClaudeSessionIds.has(localMatchedId)) return true;
+    if (localMatchedId && localBackendSessionIds.has(localMatchedId)) return true;
 
     const normalizedWorkingDir = normalizePath(session.workingDir);
     return !!normalizedWorkingDir && normalizedWorkingDir === normalizedCwd;
   });
+}
+
+function toUnixTimestampIso(value: number | string | null | undefined): string | null {
+  if (value === null || value === undefined) return null;
+
+  const numeric = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(numeric)) return null;
+
+  const milliseconds = numeric < 1_000_000_000_000 ? numeric * 1000 : numeric;
+  const date = new Date(milliseconds);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString();
+}
+
+function sanitizePreview(text: string | undefined, maxLength = 100): string | undefined {
+  if (!text) return undefined;
+  const singleLine = text.replace(/\s+/g, ' ').trim();
+  if (!singleLine) return undefined;
+  return singleLine.length <= maxLength ? singleLine : `${singleLine.slice(0, maxLength - 1)}…`;
 }
 
 export function getClaudeLocalSessionsForProject(
@@ -217,6 +265,180 @@ export function getClaudeLocalSessionsForProject(
   return Array.from(dedupedBySessionId.values())
     .sort((a, b) => new Date(b.modified).getTime() - new Date(a.modified).getTime())
     .slice(0, limit);
+}
+
+export function getCodexLocalSessionsForProject(
+  cwd = process.cwd(),
+  limit = 20
+): CodexLocalSessionSummary[] {
+  const codexStateDb = join(homedir(), '.codex', 'state_5.sqlite');
+  if (!existsSync(codexStateDb)) return [];
+
+  const normalizedCwd = normalizePath(cwd);
+  if (!normalizedCwd) return [];
+
+  const sql =
+    'SELECT id as sessionId, cwd, updated_at, title FROM threads WHERE archived = 0 ORDER BY updated_at DESC LIMIT 500;';
+
+  let rows: Array<{
+    sessionId?: string;
+    cwd?: string;
+    updated_at?: number | string;
+    title?: string;
+  }> = [];
+
+  try {
+    const stdout = execFileSync('sqlite3', ['-json', codexStateDb, sql], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    rows = JSON.parse(stdout) as typeof rows;
+  } catch {
+    return [];
+  }
+
+  const results: CodexLocalSessionSummary[] = [];
+  for (const row of rows) {
+    if (!row.sessionId || !row.cwd) continue;
+    const normalizedRowCwd = normalizePath(row.cwd);
+    if (!normalizedRowCwd || normalizedRowCwd !== normalizedCwd) continue;
+    const modified = toUnixTimestampIso(row.updated_at);
+    if (!modified) continue;
+
+    results.push({
+      sessionId: row.sessionId,
+      cwd: row.cwd,
+      modified,
+      title: row.title,
+    });
+  }
+
+  return results.slice(0, limit);
+}
+
+function extractGeminiFirstUserMessage(messages: unknown): string | undefined {
+  if (!Array.isArray(messages)) return undefined;
+
+  for (const message of messages) {
+    if (!message || typeof message !== 'object') continue;
+    const record = message as { type?: unknown; content?: unknown };
+    if (record.type !== 'user') continue;
+    if (typeof record.content === 'string') {
+      return sanitizePreview(record.content);
+    }
+  }
+
+  return undefined;
+}
+
+export function getGeminiLocalSessionsForProject(
+  cwd = process.cwd(),
+  limit = 20
+): GeminiLocalSessionSummary[] {
+  const geminiHistoryDir = join(homedir(), '.gemini', 'history');
+  const geminiTmpDir = join(homedir(), '.gemini', 'tmp');
+  if (!existsSync(geminiHistoryDir) || !existsSync(geminiTmpDir)) return [];
+
+  const normalizedCwd = normalizePath(cwd);
+  if (!normalizedCwd) return [];
+
+  const matchingProjectKeys: string[] = [];
+  for (const entry of readdirSync(geminiHistoryDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const projectRootPath = join(geminiHistoryDir, entry.name, '.project_root');
+    if (!existsSync(projectRootPath)) continue;
+
+    try {
+      const projectRoot = readFileSync(projectRootPath, 'utf-8').trim();
+      const normalizedProjectRoot = normalizePath(projectRoot);
+      if (normalizedProjectRoot && normalizedProjectRoot === normalizedCwd) {
+        matchingProjectKeys.push(entry.name);
+      }
+    } catch {
+      // Ignore malformed project root references.
+    }
+  }
+
+  const results: GeminiLocalSessionSummary[] = [];
+
+  for (const projectKey of matchingProjectKeys) {
+    const chatsDir = join(geminiTmpDir, projectKey, 'chats');
+    if (!existsSync(chatsDir)) continue;
+
+    for (const entry of readdirSync(chatsDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.startsWith('session-') || !entry.name.endsWith('.json')) {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(readFileSync(join(chatsDir, entry.name), 'utf-8')) as {
+          sessionId?: string;
+          lastUpdated?: string;
+          summary?: string;
+          messages?: unknown;
+        };
+
+        if (!parsed.sessionId || !parsed.lastUpdated) continue;
+
+        results.push({
+          sessionId: parsed.sessionId,
+          projectKey,
+          modified: parsed.lastUpdated,
+          summary: sanitizePreview(parsed.summary),
+          firstUserMessage: extractGeminiFirstUserMessage(parsed.messages),
+        });
+      } catch {
+        // Ignore malformed session files.
+      }
+    }
+  }
+
+  const dedupedBySessionId = new Map<string, GeminiLocalSessionSummary>();
+  for (const session of results) {
+    const existing = dedupedBySessionId.get(session.sessionId);
+    if (!existing || new Date(session.modified).getTime() > new Date(existing.modified).getTime()) {
+      dedupedBySessionId.set(session.sessionId, session);
+    }
+  }
+
+  return Array.from(dedupedBySessionId.values())
+    .sort((a, b) => new Date(b.modified).getTime() - new Date(a.modified).getTime())
+    .slice(0, limit);
+}
+
+function getLocalBackendSessionsForProject(
+  backend: string,
+  cwd = process.cwd(),
+  limit = 20
+): LocalBackendSessionChoice[] {
+  if (backend === 'claude') {
+    return getClaudeLocalSessionsForProject(cwd, limit).map((session) => ({
+      sessionId: session.sessionId,
+      backendLabel: 'Claude',
+      modified: session.modified,
+      preview: sanitizePreview(session.firstPrompt),
+    }));
+  }
+
+  if (backend === 'codex') {
+    return getCodexLocalSessionsForProject(cwd, limit).map((session) => ({
+      sessionId: session.sessionId,
+      backendLabel: 'Codex',
+      modified: session.modified,
+      preview: sanitizePreview(session.title),
+    }));
+  }
+
+  if (backend === 'gemini') {
+    return getGeminiLocalSessionsForProject(cwd, limit).map((session) => ({
+      sessionId: session.sessionId,
+      backendLabel: 'Gemini',
+      modified: session.modified,
+      preview: session.summary || session.firstUserMessage,
+    }));
+  }
+
+  return [];
 }
 
 function printPcpUnavailableWarning(reason: string, cwd = process.cwd()): void {
@@ -376,8 +598,8 @@ async function ensurePcpSessionContext(
   const email = config?.email;
   const cwd = process.cwd();
   const { studioId, identityId } = getIdentityContextFromIdentityJson(cwd);
-  const localClaudeSessions = backend === 'claude' ? getClaudeLocalSessionsForProject(cwd, 20) : [];
-  const localClaudeSessionIds = new Set(localClaudeSessions.map((session) => session.sessionId));
+  const localBackendSessions = getLocalBackendSessionsForProject(backend, cwd, 20);
+  const localBackendSessionIds = new Set(localBackendSessions.map((session) => session.sessionId));
   const sessionChoiceByValue = new Map<string, string>();
 
   // Fast path: runtime already knows current session for this backend.
@@ -409,7 +631,7 @@ async function ensurePcpSessionContext(
         (listed.sessions || []).filter((s) => !s.endedAt),
         backend,
         cwd,
-        localClaudeSessionIds
+        localBackendSessionIds
       );
     } catch (err) {
       pcpAvailable = false;
@@ -460,16 +682,14 @@ async function ensurePcpSessionContext(
       sessionChoiceByValue.set(value, session.id);
     }
 
-    if (backend === 'claude') {
-      for (const localSession of localClaudeSessions) {
-        const value = `__claude__:${localSession.sessionId}`;
-        const preview = localSession.firstPrompt ? ` — ${localSession.firstPrompt}` : '';
-        choices.push({
-          name: `Resume Claude ${localSession.sessionId.slice(0, 8)} (${new Date(localSession.modified).toLocaleString()})${preview}`,
-          value,
-        });
-        sessionChoiceByValue.set(value, localSession.sessionId);
-      }
+    for (const localSession of localBackendSessions) {
+      const value = `__local__:${localSession.sessionId}`;
+      const preview = localSession.preview ? ` — ${localSession.preview}` : '';
+      choices.push({
+        name: `Resume ${localSession.backendLabel} ${localSession.sessionId.slice(0, 8)} (${new Date(localSession.modified).toLocaleString()})${preview}`,
+        value,
+      });
+      sessionChoiceByValue.set(value, localSession.sessionId);
     }
 
     try {
@@ -483,7 +703,7 @@ async function ensurePcpSessionContext(
       } else if (selection.startsWith('__pcp__:')) {
         const sessionId = sessionChoiceByValue.get(selection);
         chosen = activeSessions.find((session) => session.id === sessionId);
-      } else if (selection.startsWith('__claude__:')) {
+      } else if (selection.startsWith('__local__:')) {
         selectedLocalBackendSessionId = sessionChoiceByValue.get(selection);
         if (selectedLocalBackendSessionId && pcpAvailable) {
           chosen = await startNewPcpSession();

@@ -30,6 +30,10 @@ export class GeminiAdapter implements BackendAdapter {
       args.push('-p');
     }
 
+    if (config.backendSessionId) {
+      args.push('--resume', config.backendSessionId);
+    }
+
     // Passthrough flags
     args.push(...config.passthroughArgs);
 

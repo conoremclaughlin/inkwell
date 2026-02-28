@@ -70,7 +70,7 @@ describe('filterPcpSessionsForContext', () => {
     expect(filtered.map((session) => session.id)).toEqual(['pcp-1']);
   });
 
-  it('filters non-claude sessions only by backend', () => {
+  it('path-scopes non-claude sessions when workingDir metadata exists', () => {
     const filtered = filterPcpSessionsForContext(
       [
         {
@@ -84,6 +84,27 @@ describe('filterPcpSessionsForContext', () => {
           startedAt: '2026-02-28T00:00:00.000Z',
           backend: 'gemini',
           workingDir: '/tmp/project',
+        },
+      ],
+      'codex',
+      '/tmp/project'
+    );
+
+    expect(filtered.map((session) => session.id)).toEqual([]);
+  });
+
+  it('falls back to backend-only filtering when no local ids or workingDir metadata exist', () => {
+    const filtered = filterPcpSessionsForContext(
+      [
+        {
+          id: 'codex-1',
+          startedAt: '2026-02-28T00:00:00.000Z',
+          backend: 'codex',
+        },
+        {
+          id: 'gemini-1',
+          startedAt: '2026-02-28T00:00:00.000Z',
+          backend: 'gemini',
         },
       ],
       'codex',
