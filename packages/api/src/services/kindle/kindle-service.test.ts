@@ -30,6 +30,7 @@ describe('KindleService', () => {
         name: 'Wren',
         values: ['curiosity', 'authenticity', 'growth'],
         soul: '# Soul\n\nI value deep understanding.\nI believe in authentic collaboration.',
+        shared_values: 'We share a commitment to honesty.',
         shared_values_md: 'We share a commitment to honesty.',
       });
 
@@ -40,6 +41,7 @@ describe('KindleService', () => {
       expect(seed.coreValues).toEqual(['curiosity', 'authenticity', 'growth']);
       expect(seed.philosophicalOrientation).toContain('I value deep understanding');
       expect(mockSupabase.from).toHaveBeenCalledWith('agent_identities');
+      expect(mockSupabase.from).toHaveBeenCalledWith('workspaces');
       expect(mockSupabase.from).toHaveBeenCalledWith('user_identity');
     });
 
@@ -49,6 +51,7 @@ describe('KindleService', () => {
         name: 'Wren',
         values: [],
         soul: '# Philosophy\nI value growth.\n## Relationship Notes\nOur relationship is...\n## Session Context\nIn specific sessions...\nI care about authenticity.',
+        shared_values: '',
         shared_values_md: '',
       });
 

@@ -2743,6 +2743,8 @@ export type Database = {
           id: string;
           metadata: Json | null;
           name: string;
+          process: string | null;
+          shared_values: string | null;
           slug: string;
           type: string;
           updated_at: string | null;
@@ -2755,6 +2757,8 @@ export type Database = {
           id?: string;
           metadata?: Json | null;
           name: string;
+          process?: string | null;
+          shared_values?: string | null;
           slug: string;
           type?: string;
           updated_at?: string | null;
@@ -2767,6 +2771,8 @@ export type Database = {
           id?: string;
           metadata?: Json | null;
           name?: string;
+          process?: string | null;
+          shared_values?: string | null;
           slug?: string;
           type?: string;
           updated_at?: string | null;

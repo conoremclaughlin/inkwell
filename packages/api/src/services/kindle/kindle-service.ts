@@ -67,17 +67,43 @@ export class KindleService {
     // Get agent identity
     const { data: identity } = await this.supabase
       .from('agent_identities')
-      .select('agent_id, name, values, soul')
+      .select('agent_id, name, values, soul, workspace_id')
       .eq('user_id', userId)
       .eq('agent_id', agentId)
       .single();
 
-    // Get shared values from user identity
+    let workspaceShared: { shared_values: string | null } | null = null;
+    if (identity?.workspace_id) {
+      const { data } = await this.supabase
+        .from('workspaces')
+        .select('shared_values')
+        .eq('id', identity.workspace_id as string)
+        .eq('user_id', userId)
+        .is('archived_at', null)
+        .maybeSingle();
+      workspaceShared = (data as { shared_values: string | null } | null) || null;
+    } else {
+      // Deterministic fallback: personal workspace (not most-recent workspace)
+      const { data } = await this.supabase
+        .from('workspaces')
+        .select('shared_values')
+        .eq('user_id', userId)
+        .eq('type', 'personal')
+        .is('archived_at', null)
+        .order('created_at', { ascending: true })
+        .limit(1)
+        .maybeSingle();
+      workspaceShared = (data as { shared_values: string | null } | null) || null;
+    }
+
+    // Legacy fallback: user_identity table
     const { data: userIdentity } = await this.supabase
       .from('user_identity')
       .select('shared_values_md')
       .eq('user_id', userId)
-      .single();
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     // Extract philosophical orientation from soul (first ~500 chars, skip personal details)
     let philosophicalOrientation = '';
@@ -98,7 +124,10 @@ export class KindleService {
       parentName: identity?.name || agentId,
       coreValues: (identity?.values as string[]) || [],
       philosophicalOrientation,
-      sharedValues: (userIdentity?.shared_values_md as string) || '',
+      sharedValues:
+        (workspaceShared?.shared_values as string | null) ||
+        (userIdentity?.shared_values_md as string | null) ||
+        '',
     };
   }
 

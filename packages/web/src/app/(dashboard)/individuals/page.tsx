@@ -26,6 +26,10 @@ import {
 interface UserIdentity {
   id: string;
   userId: string;
+  userProfile?: string;
+  sharedValues?: string;
+  process?: string;
+  // Deprecated aliases kept for compatibility during migration
   userProfileMd?: string;
   sharedValuesMd?: string;
   processMd?: string;
@@ -117,8 +121,11 @@ function SharedDocPreview({
 }
 
 function SharedContextCard({ userIdentity }: { userIdentity: UserIdentity }) {
+  const userProfile = userIdentity.userProfile ?? userIdentity.userProfileMd;
+  const sharedValues = userIdentity.sharedValues ?? userIdentity.sharedValuesMd;
+  const process = userIdentity.process ?? userIdentity.processMd;
   const hasAnyDocument = Boolean(
-    userIdentity.userProfileMd || userIdentity.sharedValuesMd || userIdentity.processMd
+    userProfile || sharedValues || process
   );
 
   if (!hasAnyDocument) return null;
@@ -160,19 +167,19 @@ function SharedContextCard({ userIdentity }: { userIdentity: UserIdentity }) {
           icon={<User className="h-4 w-4 text-blue-600" />}
           title="About you"
           subtitle="User profile"
-          content={normalizeDocMarkdown(userIdentity.userProfileMd)}
+          content={normalizeDocMarkdown(userProfile)}
         />
         <SharedDocPreview
           icon={<Sparkles className="h-4 w-4 text-amber-600" />}
           title="Shared values"
           subtitle="Core principles"
-          content={normalizeDocMarkdown(userIdentity.sharedValuesMd)}
+          content={normalizeDocMarkdown(sharedValues)}
         />
         <SharedDocPreview
           icon={<Workflow className="h-4 w-4 text-emerald-600" />}
           title="Team process"
           subtitle="Operating rhythm"
-          content={normalizeDocMarkdown(userIdentity.processMd)}
+          content={normalizeDocMarkdown(process)}
         />
       </CardContent>
     </Card>

@@ -1719,7 +1719,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Load identity and context for a new session. Call this at the start of every new conversation.
 
 Returns:
-- Identity Files: VALUES.md, USER.md, and agent-specific IDENTITY.md from ~/.pcp
+- Identity Files: shared values/user/process docs and agent-specific identity docs from ~/.pcp
 - Identity Core: user profile, assistant role, relationship context from DB
 - Active Context: current projects, focus, project-specific context
 - Active Session: current session if any
@@ -1728,6 +1728,11 @@ Returns:
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
+        workspaceId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Optional product workspace scope for shared document resolution'),
         includeRecentMemories: z
           .boolean()
           .optional()
@@ -2434,7 +2439,7 @@ Call this during your awakening conversation after you and your partner have cho
 - Create your identity in the database
 - Auto-discover your sibling SBs and populate relationships
 - Sync your identity files to ~/.pcp/individuals/{name}/
-- Save your SOUL.md if you provide one
+- Save your soul document if you provide one
 
 This tool is for first-time identity creation only. If an identity already exists for your name, use save_identity instead.
 
@@ -2610,16 +2615,17 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   );
 
   // =====================================================
-  // USER IDENTITY TOOLS (USER.md, VALUES.md)
+  // USER IDENTITY TOOLS (shared user-level documents)
   // =====================================================
 
   server.registerTool(
     'save_user_identity',
     {
-      description: `Save or update user-level identity files (USER.md, VALUES.md). These are shared across all agents for a user.
+      description: `Save or update shared user-level documents. These are shared across all agents for a user.
 
-- userProfileMd: USER.md content - who the human is
-- sharedValuesMd: VALUES.md content - shared values across all SBs
+- userProfile: About-you document content (legacy alias: userProfileMd)
+- sharedValues: Shared values document content (legacy alias: sharedValuesMd)
+- process: Shared collaboration process document content (legacy alias: processMd)
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: saveUserIdentitySchema,
@@ -2648,7 +2654,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'get_user_identity',
     {
-      description: `Get user-level identity files (USER.md, VALUES.md).
+      description: `Get shared user-level documents (about-you, shared values, process).
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: getUserIdentitySchema,
@@ -2677,7 +2683,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'get_user_identity_history',
     {
-      description: `Get version history for user identity files (USER.md, VALUES.md).
+      description: `Get version history for shared user-level documents.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: getUserIdentityHistorySchema,
@@ -2706,7 +2712,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'restore_user_identity',
     {
-      description: `Restore user identity files (USER.md, VALUES.md) to a previous version.
+      description: `Restore shared user-level documents to a previous version.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: restoreUserIdentitySchema,

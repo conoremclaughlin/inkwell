@@ -20,6 +20,10 @@ const MarkdownVersionDiff = dynamic(() => import('@/stories/diff-versions/markdo
 interface UserIdentity {
   id: string;
   userId: string;
+  userProfile?: string;
+  sharedValues?: string;
+  process?: string;
+  // Deprecated aliases kept for compatibility during migration
   userProfileMd?: string;
   sharedValuesMd?: string;
   processMd?: string;
@@ -31,6 +35,10 @@ interface UserIdentity {
 interface HistoryEntry {
   id: string;
   version: number;
+  userProfile?: string;
+  sharedValues?: string;
+  process?: string;
+  // Deprecated aliases kept for compatibility during migration
   userProfileMd?: string;
   sharedValuesMd?: string;
   processMd?: string;
@@ -50,9 +58,9 @@ interface HistoryResponse {
 type VersionEntry = {
   id: string;
   version: number;
-  userProfileMd?: string;
-  sharedValuesMd?: string;
-  processMd?: string;
+  userProfile?: string;
+  sharedValues?: string;
+  process?: string;
   changeType: string;
   archivedAt: string;
 };
@@ -127,33 +135,38 @@ export default function SharedVersionsPage() {
         {
           id: userIdentity.id,
           version: userIdentity.version,
-          userProfileMd: userIdentity.userProfileMd,
-          sharedValuesMd: userIdentity.sharedValuesMd,
-          processMd: userIdentity.processMd,
+          userProfile: userIdentity.userProfile ?? userIdentity.userProfileMd,
+          sharedValues: userIdentity.sharedValues ?? userIdentity.sharedValuesMd,
+          process: userIdentity.process ?? userIdentity.processMd,
           changeType: 'current',
           archivedAt: userIdentity.updatedAt,
         },
-        ...history,
+        ...history.map((entry) => ({
+          ...entry,
+          userProfile: entry.userProfile ?? entry.userProfileMd,
+          sharedValues: entry.sharedValues ?? entry.sharedValuesMd,
+          process: entry.process ?? entry.processMd,
+        })),
       ]
     : [];
 
   const selectedVersion = allVersions[selectedVersionIndex];
   const comparisonVersion = allVersions[selectedVersionIndex + 1];
 
-  const hasUserProfile = allVersions.some((v) => v.userProfileMd);
-  const hasValues = allVersions.some((v) => v.sharedValuesMd);
-  const hasProcess = allVersions.some((v) => v.processMd);
+  const hasUserProfile = allVersions.some((v) => v.userProfile);
+  const hasValues = allVersions.some((v) => v.sharedValues);
+  const hasProcess = allVersions.some((v) => v.process);
 
   const userProfileChanged =
     !!selectedVersion &&
     !!comparisonVersion &&
-    selectedVersion.userProfileMd !== comparisonVersion.userProfileMd;
+    selectedVersion.userProfile !== comparisonVersion.userProfile;
   const valuesChanged =
     !!selectedVersion &&
     !!comparisonVersion &&
-    selectedVersion.sharedValuesMd !== comparisonVersion.sharedValuesMd;
+    selectedVersion.sharedValues !== comparisonVersion.sharedValues;
   const processChanged =
-    !!selectedVersion && !!comparisonVersion && selectedVersion.processMd !== comparisonVersion.processMd;
+    !!selectedVersion && !!comparisonVersion && selectedVersion.process !== comparisonVersion.process;
 
   if (isLoading) {
     return (
@@ -224,8 +237,8 @@ export default function SharedVersionsPage() {
                         icon={<User className="h-4 w-4 text-blue-600" />}
                         label="About you"
                         changed={userProfileChanged}
-                        current={normalizeDocMarkdown(selectedVersion.userProfileMd)}
-                        previous={normalizeDocMarkdown(comparisonVersion.userProfileMd)}
+                        current={normalizeDocMarkdown(selectedVersion.userProfile)}
+                        previous={normalizeDocMarkdown(comparisonVersion.userProfile)}
                       />
                     )}
 
@@ -234,8 +247,8 @@ export default function SharedVersionsPage() {
                         icon={<Sparkles className="h-4 w-4 text-amber-600" />}
                         label="Shared values"
                         changed={valuesChanged}
-                        current={normalizeDocMarkdown(selectedVersion.sharedValuesMd)}
-                        previous={normalizeDocMarkdown(comparisonVersion.sharedValuesMd)}
+                        current={normalizeDocMarkdown(selectedVersion.sharedValues)}
+                        previous={normalizeDocMarkdown(comparisonVersion.sharedValues)}
                       />
                     )}
 
@@ -244,8 +257,8 @@ export default function SharedVersionsPage() {
                         icon={<Workflow className="h-4 w-4 text-emerald-600" />}
                         label="Process"
                         changed={processChanged}
-                        current={normalizeDocMarkdown(selectedVersion.processMd)}
-                        previous={normalizeDocMarkdown(comparisonVersion.processMd)}
+                        current={normalizeDocMarkdown(selectedVersion.process)}
+                        previous={normalizeDocMarkdown(comparisonVersion.process)}
                       />
                     )}
                   </div>

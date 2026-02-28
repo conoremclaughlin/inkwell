@@ -1604,46 +1604,6 @@ BEGIN
 END;
 $function$;
 
-CREATE OR REPLACE FUNCTION public.update_agent_sessions_updated_at()
- RETURNS trigger
- LANGUAGE plpgsql
-AS $function$
-BEGIN
-  NEW.updated_at = NOW();
-  RETURN NEW;
-END;
-$function$;
-
-CREATE OR REPLACE FUNCTION public.update_connected_accounts_timestamp()
- RETURNS trigger
- LANGUAGE plpgsql
-AS $function$
-BEGIN
-  NEW.updated_at = NOW();
-  RETURN NEW;
-END;
-$function$;
-
-CREATE OR REPLACE FUNCTION public.update_contacts_updated_at()
- RETURNS trigger
- LANGUAGE plpgsql
-AS $function$
-BEGIN
-  NEW.updated_at = NOW();
-  RETURN NEW;
-END;
-$function$;
-
-CREATE OR REPLACE FUNCTION public.update_project_tasks_updated_at()
- RETURNS trigger
- LANGUAGE plpgsql
-AS $function$
-BEGIN
-  NEW.updated_at = NOW();
-  RETURN NEW;
-END;
-$function$;
-
 CREATE OR REPLACE FUNCTION public.update_updated_at_column()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -1668,16 +1628,16 @@ CREATE TRIGGER update_agent_identities_updated_at BEFORE UPDATE ON agent_identit
 FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TRIGGER trigger_agent_sessions_updated_at BEFORE UPDATE ON agent_sessions
-FOR EACH ROW EXECUTE FUNCTION update_agent_sessions_updated_at();
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TRIGGER artifact_version_trigger BEFORE UPDATE ON artifacts
 FOR EACH ROW EXECUTE FUNCTION archive_artifact_version();
 
 CREATE TRIGGER update_connected_accounts_updated_at BEFORE UPDATE ON connected_accounts
-FOR EACH ROW EXECUTE FUNCTION update_connected_accounts_timestamp();
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TRIGGER contacts_updated_at BEFORE UPDATE ON contacts
-FOR EACH ROW EXECUTE FUNCTION update_contacts_updated_at();
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TRIGGER context_update_archive BEFORE UPDATE ON context_summaries
 FOR EACH ROW EXECUTE FUNCTION archive_context_on_update();
@@ -1710,7 +1670,7 @@ CREATE TRIGGER trigger_project_task_completed BEFORE UPDATE ON project_tasks
 FOR EACH ROW EXECUTE FUNCTION set_project_task_completed_at();
 
 CREATE TRIGGER trigger_project_tasks_updated_at BEFORE UPDATE ON project_tasks
-FOR EACH ROW EXECUTE FUNCTION update_project_tasks_updated_at();
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TRIGGER update_projects_updated_at BEFORE UPDATE ON projects
 FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();

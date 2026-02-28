@@ -435,7 +435,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
       expect(res._status).toBe(200);
     });
 
-    it('should include processMd when identity exists', async () => {
+    it('should include alias and legacy shared doc fields when identity exists', async () => {
       const handler = findRouteHandler('get', '/user-identity');
       expect(handler).not.toBeNull();
 
@@ -454,6 +454,9 @@ describe('admin endpoint handlers (no-500 regression)', () => {
             },
           ]);
         }
+        if (table === 'workspaces') {
+          return createQueryChain([{ shared_values: '# VALUES (workspace)', process: '# PROCESS (workspace)' }]);
+        }
         return createQueryChain([]);
       });
 
@@ -462,12 +465,18 @@ describe('admin endpoint handlers (no-500 regression)', () => {
       await handler!(req, res);
 
       expect(res._status).toBe(200);
-      expect((res._json as any).userIdentity.processMd).toBe('# PROCESS');
+      const payload = (res._json as any).userIdentity;
+      expect(payload.userProfile).toBe('# USER');
+      expect(payload.sharedValues).toBe('# VALUES (workspace)');
+      expect(payload.process).toBe('# PROCESS (workspace)');
+      expect(payload.userProfileMd).toBe('# USER');
+      expect(payload.sharedValuesMd).toBe('# VALUES (workspace)');
+      expect(payload.processMd).toBe('# PROCESS (workspace)');
     });
   });
 
   describe('GET /user-identity/history', () => {
-    it('should include processMd in history entries', async () => {
+    it('should include alias and legacy fields in history entries', async () => {
       const handler = findRouteHandler('get', '/user-identity/history');
       expect(handler).not.toBeNull();
 
@@ -497,7 +506,13 @@ describe('admin endpoint handlers (no-500 regression)', () => {
       await handler!(req, res);
 
       expect(res._status).toBe(200);
-      expect((res._json as any).history[0].processMd).toBe('# PROCESS');
+      const entry = (res._json as any).history[0];
+      expect(entry.userProfile).toBe('# USER');
+      expect(entry.sharedValues).toBe('# VALUES');
+      expect(entry.process).toBe('# PROCESS');
+      expect(entry.userProfileMd).toBe('# USER');
+      expect(entry.sharedValuesMd).toBe('# VALUES');
+      expect(entry.processMd).toBe('# PROCESS');
     });
   });
 

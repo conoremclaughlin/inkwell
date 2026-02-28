@@ -15,6 +15,10 @@ import { normalizeDocMarkdown } from '@/lib/markdown/normalize-doc';
 interface UserIdentity {
   id: string;
   userId: string;
+  userProfile?: string;
+  sharedValues?: string;
+  process?: string;
+  // Deprecated aliases kept for compatibility during migration
   userProfileMd?: string;
   sharedValuesMd?: string;
   processMd?: string;
@@ -67,6 +71,9 @@ export default function SharedDocumentsPage() {
   );
 
   const userIdentity = data?.userIdentity;
+  const userProfile = userIdentity?.userProfile ?? userIdentity?.userProfileMd;
+  const sharedValues = userIdentity?.sharedValues ?? userIdentity?.sharedValuesMd;
+  const process = userIdentity?.process ?? userIdentity?.processMd;
 
   if (isLoading) {
     return (
@@ -138,7 +145,7 @@ export default function SharedDocumentsPage() {
             title="About you"
             subtitle="User profile"
             icon={<User className="h-5 w-5 text-blue-600" />}
-            content={normalizeDocMarkdown(userIdentity.userProfileMd)}
+            content={normalizeDocMarkdown(userProfile)}
           />
         </TabsContent>
 
@@ -147,7 +154,7 @@ export default function SharedDocumentsPage() {
             title="Shared values"
             subtitle="Cross-agent principles"
             icon={<Sparkles className="h-5 w-5 text-amber-600" />}
-            content={normalizeDocMarkdown(userIdentity.sharedValuesMd)}
+            content={normalizeDocMarkdown(sharedValues)}
           />
         </TabsContent>
 
@@ -156,7 +163,7 @@ export default function SharedDocumentsPage() {
             title="Collaboration process"
             subtitle="How we operate"
             icon={<Workflow className="h-5 w-5 text-emerald-600" />}
-            content={normalizeDocMarkdown(userIdentity.processMd)}
+            content={normalizeDocMarkdown(process)}
           />
         </TabsContent>
       </Tabs>

@@ -2072,13 +2072,34 @@ router.get('/user-identity', async (req: Request, res: Response) => {
       return;
     }
 
+    const { data: workspaceDocs, error: workspaceError } = await supabase
+      .from('workspaces')
+      .select('shared_values, process')
+      .eq('id', authReq.pcpWorkspaceId)
+      .eq('user_id', authReq.pcpUserId)
+      .single();
+
+    if (workspaceError && workspaceError.code !== 'PGRST116') {
+      logger.error('Failed to get workspace shared docs:', workspaceError);
+      res.status(500).json(errorJson('Failed to get user identity', workspaceError));
+      return;
+    }
+
+    const userProfile = data.user_profile_md;
+    const sharedValues = (workspaceDocs?.shared_values as string | null) ?? data.shared_values_md;
+    const process = (workspaceDocs?.process as string | null) ?? data.process_md;
+
     res.json({
       userIdentity: {
         id: data.id,
         userId: data.user_id,
-        userProfileMd: data.user_profile_md,
-        sharedValuesMd: data.shared_values_md,
-        processMd: data.process_md,
+        userProfile,
+        sharedValues,
+        process,
+        // Deprecated aliases kept for compatibility
+        userProfileMd: userProfile,
+        sharedValuesMd: sharedValues,
+        processMd: process,
         version: data.version,
         createdAt: data.created_at,
         updatedAt: data.updated_at,
@@ -2131,6 +2152,10 @@ router.get('/user-identity/history', async (req: Request, res: Response) => {
       history: (data || []).map((h) => ({
         id: h.id,
         version: h.version,
+        userProfile: h.user_profile_md,
+        sharedValues: h.shared_values_md,
+        process: h.process_md,
+        // Deprecated aliases kept for compatibility
         userProfileMd: h.user_profile_md,
         sharedValuesMd: h.shared_values_md,
         processMd: h.process_md,

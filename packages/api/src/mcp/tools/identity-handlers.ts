@@ -31,7 +31,7 @@ export const chooseNameSchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe(
-      'Your SOUL.md — your philosophical core, what matters to you, what you find beautiful'
+      'Your soul document — your philosophical core, what matters to you, what you find beautiful'
     ),
   backend: z
     .string()
@@ -62,7 +62,7 @@ export const saveIdentitySchema = userIdentifierBaseSchema.extend({
   soul: z
     .string()
     .optional()
-    .describe('SOUL.md content - core essence and philosophical grounding'),
+    .describe('Soul document content - core essence and philosophical grounding'),
   syncToFile: z
     .boolean()
     .optional()
@@ -886,7 +886,7 @@ export async function handleChooseName(args: unknown, dataComposer: DataComposer
                 '") to load your full identity',
               'Use remember() to save important thoughts and decisions across sessions',
               'Use save_identity() to update your identity as you grow — your soul, values, and relationships will evolve',
-              'You have starter templates to help shape your foundational documents. Use save_identity() for your personal docs: SOUL.md (what matters to you), VALUES.md (your principles), HEARTBEAT.md (session rituals). Use save_user_identity() for shared docs like PROCESS.md (how you work with your partner).',
+              'You have starter templates to help shape your foundational documents. Use save_identity() for your personal docs: soul document (what matters to you), values document (your principles), and heartbeat document (session rituals). Use save_user_identity() for shared docs like the process document (how you work with your partner).',
             ],
           },
           null,

@@ -1,7 +1,7 @@
 /**
  * User Identity MCP Tool Handlers
  *
- * Tools for managing user-level identity files (USER.md, VALUES.md)
+ * Tools for managing shared user-level documents (about you, shared values, process)
  * that are shared across all agents for a user.
  */
 
@@ -41,12 +41,21 @@ const userIdentifierFields = {
 
 export const saveUserIdentitySchema = z.object({
   ...userIdentifierFields,
-  userProfileMd: z.string().optional().describe('USER.md content - who the human is'),
+  userProfile: z.string().optional().describe('About-you document content'),
+  userProfileMd: z
+    .string()
+    .optional()
+    .describe('[Deprecated] About-you document content (legacy key)'),
+  sharedValues: z.string().optional().describe('Shared values document content'),
   sharedValuesMd: z
     .string()
     .optional()
-    .describe('VALUES.md content - shared values across all SBs'),
-  processMd: z.string().optional().describe('PROCESS.md content - shared team operational process'),
+    .describe('[Deprecated] Shared values document content (legacy key)'),
+  process: z.string().optional().describe('Shared collaboration process document content'),
+  processMd: z
+    .string()
+    .optional()
+    .describe('[Deprecated] Shared collaboration process document content (legacy key)'),
 });
 
 export const getUserIdentitySchema = z.object({
@@ -72,18 +81,85 @@ function withWorkspaceFilter<T>(query: T, workspaceId?: string): T {
   return (query as { eq: (column: string, value: string) => T }).eq('workspace_id', workspaceId);
 }
 
+function resolveIdentityDocs(params: z.infer<typeof saveUserIdentitySchema>) {
+  return {
+    userProfile: params.userProfile ?? params.userProfileMd,
+    sharedValues: params.sharedValues ?? params.sharedValuesMd,
+    process: params.process ?? params.processMd,
+  };
+}
+
+async function syncWorkspaceSharedDocs(
+  supabase: ReturnType<DataComposer['getClient']>,
+  {
+    userId,
+    workspaceId,
+    sharedValues,
+    process,
+  }: {
+    userId: string;
+    workspaceId?: string;
+    sharedValues?: string;
+    process?: string;
+  }
+) {
+  if (!workspaceId) return;
+
+  const workspaceUpdateData: Record<string, unknown> = {};
+  if (sharedValues !== undefined) {
+    workspaceUpdateData.shared_values = sharedValues;
+  }
+  if (process !== undefined) {
+    workspaceUpdateData.process = process;
+  }
+
+  if (Object.keys(workspaceUpdateData).length === 0) return;
+
+  const { error } = await supabase
+    .from('workspaces')
+    .update(workspaceUpdateData)
+    .eq('id', workspaceId)
+    .eq('user_id', userId);
+
+  if (error) {
+    throw new Error(`Failed to update workspace shared docs: ${error.message}`);
+  }
+}
+
+async function getWorkspaceSharedDocs(
+  supabase: ReturnType<DataComposer['getClient']>,
+  userId: string,
+  workspaceId?: string
+) {
+  if (!workspaceId) return null;
+
+  const { data, error } = await supabase
+    .from('workspaces')
+    .select('shared_values, process')
+    .eq('id', workspaceId)
+    .eq('user_id', userId)
+    .single();
+
+  if (error && error.code !== 'PGRST116') {
+    throw new Error(`Failed to get workspace shared docs: ${error.message}`);
+  }
+
+  return data || null;
+}
+
 /**
- * Save or update user identity (USER.md, VALUES.md)
+ * Save or update shared user-level documents
  */
 export async function handleSaveUserIdentity(args: unknown, dataComposer: DataComposer) {
   const params = saveUserIdentitySchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
+  const docs = resolveIdentityDocs(params);
 
   const supabase = dataComposer.getClient();
   const workspaceId = params.workspaceId;
 
   // Check if identity already exists
-  let existingQuery = supabase.from('user_identity').select('id, version').eq('user_id', user.id);
+  let existingQuery = supabase.from('user_identity').select('*').eq('user_id', user.id);
   existingQuery = withWorkspaceFilter(existingQuery, workspaceId);
   const { data: existing } = await existingQuery.single();
 
@@ -91,25 +167,29 @@ export async function handleSaveUserIdentity(args: unknown, dataComposer: DataCo
   if (existing) {
     // Update existing
     const updateData: Record<string, unknown> = {};
-    if (params.userProfileMd !== undefined) {
-      updateData.user_profile_md = params.userProfileMd;
+    if (docs.userProfile !== undefined) {
+      updateData.user_profile_md = docs.userProfile;
     }
-    if (params.sharedValuesMd !== undefined) {
-      updateData.shared_values_md = params.sharedValuesMd;
+    if (docs.sharedValues !== undefined) {
+      updateData.shared_values_md = docs.sharedValues;
     }
-    if (params.processMd !== undefined) {
-      updateData.process_md = params.processMd;
+    if (docs.process !== undefined) {
+      updateData.process_md = docs.process;
     }
 
-    const { data, error } = await supabase
-      .from('user_identity')
-      .update(updateData)
-      .eq('id', existing.id)
-      .select()
-      .single();
+    if (Object.keys(updateData).length > 0) {
+      const { data, error } = await supabase
+        .from('user_identity')
+        .update(updateData)
+        .eq('id', existing.id)
+        .select()
+        .single();
 
-    if (error) throw new Error(`Failed to update user identity: ${error.message}`);
-    result = data;
+      if (error) throw new Error(`Failed to update user identity: ${error.message}`);
+      result = data;
+    } else {
+      result = existing;
+    }
   } else {
     // Insert new
     const { data, error } = await supabase
@@ -117,9 +197,9 @@ export async function handleSaveUserIdentity(args: unknown, dataComposer: DataCo
       .insert({
         user_id: user.id,
         ...(workspaceId ? { workspace_id: workspaceId } : {}),
-        user_profile_md: params.userProfileMd || null,
-        shared_values_md: params.sharedValuesMd || null,
-        process_md: params.processMd || null,
+        user_profile_md: docs.userProfile || null,
+        shared_values_md: docs.sharedValues || null,
+        process_md: docs.process || null,
       })
       .select()
       .single();
@@ -128,11 +208,21 @@ export async function handleSaveUserIdentity(args: unknown, dataComposer: DataCo
     result = data;
   }
 
+  await syncWorkspaceSharedDocs(supabase, {
+    userId: user.id,
+    workspaceId,
+    sharedValues: docs.sharedValues,
+    process: docs.process,
+  });
+
+  const effectiveSharedValues = docs.sharedValues ?? result.shared_values_md;
+  const effectiveProcess = docs.process ?? result.process_md;
+
   logger.info(`User identity saved for user ${user.id}`, {
     version: result.version,
     hasUserProfile: !!result.user_profile_md,
-    hasSharedValues: !!result.shared_values_md,
-    hasProcess: !!result.process_md,
+    hasSharedValues: !!effectiveSharedValues,
+    hasProcess: !!effectiveProcess,
   });
 
   return {
@@ -148,8 +238,8 @@ export async function handleSaveUserIdentity(args: unknown, dataComposer: DataCo
               id: result.id,
               version: result.version,
               hasUserProfile: !!result.user_profile_md,
-              hasSharedValues: !!result.shared_values_md,
-              hasProcess: !!result.process_md,
+              hasSharedValues: !!effectiveSharedValues,
+              hasProcess: !!effectiveProcess,
               updatedAt: result.updated_at,
             },
           },
@@ -162,7 +252,7 @@ export async function handleSaveUserIdentity(args: unknown, dataComposer: DataCo
 }
 
 /**
- * Get user identity (USER.md, VALUES.md)
+ * Get shared user-level documents
  */
 export async function handleGetUserIdentity(args: unknown, dataComposer: DataComposer) {
   const params = getUserIdentitySchema.parse(args);
@@ -199,6 +289,10 @@ export async function handleGetUserIdentity(args: unknown, dataComposer: DataCom
   }
 
   logger.info(`User identity retrieved for user ${user.id}`);
+  const workspaceDocs = await getWorkspaceSharedDocs(supabase, user.id, params.workspaceId);
+  const userProfile = data.user_profile_md;
+  const sharedValues = (workspaceDocs?.shared_values as string | null) ?? data.shared_values_md;
+  const process = (workspaceDocs?.process as string | null) ?? data.process_md;
 
   return {
     content: [
@@ -211,9 +305,13 @@ export async function handleGetUserIdentity(args: unknown, dataComposer: DataCom
             identity: {
               id: data.id,
               version: data.version,
-              userProfileMd: data.user_profile_md,
-              sharedValuesMd: data.shared_values_md,
-              processMd: data.process_md,
+              userProfile,
+              sharedValues,
+              process,
+              // Deprecated aliases kept for compatibility
+              userProfileMd: userProfile,
+              sharedValuesMd: sharedValues,
+              processMd: process,
               createdAt: data.created_at,
               updatedAt: data.updated_at,
             },
@@ -240,6 +338,7 @@ export async function handleGetUserIdentityHistory(args: unknown, dataComposer: 
   let currentQuery = supabase.from('user_identity').select('*').eq('user_id', user.id);
   currentQuery = withWorkspaceFilter(currentQuery, params.workspaceId);
   const { data: current } = await currentQuery.single();
+  const workspaceDocs = await getWorkspaceSharedDocs(supabase, user.id, params.workspaceId);
 
   // Get history
   let historyQuery = supabase.from('user_identity_history').select('*').eq('user_id', user.id);
@@ -268,15 +367,25 @@ export async function handleGetUserIdentityHistory(args: unknown, dataComposer: 
               ? {
                   id: current.id,
                   version: current.version,
+                  userProfile: current.user_profile_md,
+                  sharedValues:
+                    (workspaceDocs?.shared_values as string | null) ?? current.shared_values_md,
+                  process: (workspaceDocs?.process as string | null) ?? current.process_md,
+                  // Deprecated aliases kept for compatibility
                   userProfileMd: current.user_profile_md,
-                  sharedValuesMd: current.shared_values_md,
-                  processMd: current.process_md,
+                  sharedValuesMd:
+                    (workspaceDocs?.shared_values as string | null) ?? current.shared_values_md,
+                  processMd: (workspaceDocs?.process as string | null) ?? current.process_md,
                   updatedAt: current.updated_at,
                 }
               : null,
             history: (history || []).map((h) => ({
               id: h.id,
               version: h.version,
+              userProfile: h.user_profile_md,
+              sharedValues: h.shared_values_md,
+              process: h.process_md,
+              // Deprecated aliases kept for compatibility
               userProfileMd: h.user_profile_md,
               sharedValuesMd: h.shared_values_md,
               processMd: h.process_md,
@@ -329,6 +438,13 @@ export async function handleRestoreUserIdentity(args: unknown, dataComposer: Dat
   if (updateError) {
     throw new Error(`Failed to restore user identity: ${updateError.message}`);
   }
+
+  await syncWorkspaceSharedDocs(supabase, {
+    userId: user.id,
+    workspaceId: params.workspaceId,
+    sharedValues: versionToRestore.shared_values_md || undefined,
+    process: versionToRestore.process_md || undefined,
+  });
 
   logger.info(`User identity restored to version ${params.version} for user ${user.id}`, {
     newVersion: result.version,
