@@ -184,7 +184,7 @@ const AUTO_TRIM_KEEP_RECENT_ENTRIES = 6;
 const DEFAULT_TRIM_TARGET_PCT = 70;
 const CTRL_C_EXIT_WINDOW_MS = 3000;
 const DEFAULT_BACKEND_TOKEN_WINDOW = 1_000_000;
-const HISTORY_PREVIEW_MAX = 36;
+const HISTORY_PREVIEW_MAX = 200;
 function resolveBackendTokenWindow(_backend: string, _model?: string): number {
   // Current policy: claude/codex/gemini all default to 1M effective context window.
   return DEFAULT_BACKEND_TOKEN_WINDOW;
