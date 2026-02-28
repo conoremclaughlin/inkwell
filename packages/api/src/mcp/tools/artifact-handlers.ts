@@ -138,6 +138,9 @@ async function deriveWorkspaceIdFromAgent(
   userId: string,
   agentId: string
 ): Promise<string | null> {
+  // TODO(lumen): Deduplicate with MCPServer.deriveWorkspaceIdFromAgent in
+  // server.ts via a shared helper; keep strict throw-on-ambiguous behavior
+  // here for write-path safety.
   const { data, error } = await supabase
     .from('agent_identities')
     .select('workspace_id')

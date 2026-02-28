@@ -85,6 +85,8 @@ export class MCPServer {
     userId: string,
     agentId: string
   ): Promise<string | null> {
+    // TODO(lumen): Deduplicate this with the artifact-handler variant in a
+    // shared helper that can choose ambiguous-workspace behavior (warn/throw).
     const { data, error } = await this.dataComposer
       .getClient()
       .from('agent_identities')
