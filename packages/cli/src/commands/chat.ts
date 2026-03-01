@@ -2364,6 +2364,32 @@ export async function runChat(options: ChatOptions): Promise<void> {
       stopWaiting();
     });
 
+    // Log backend CLI turn completion to activity stream
+    if (runtime.sessionId) {
+      const turnStatus = runResult.success ? 'completed' : 'failed';
+      const turnContent = runResult.success
+        ? `Backend turn completed (${runtime.backend}, ${turnDurationSeconds}s)`
+        : `Backend turn failed (${runtime.backend}, exit ${runResult.exitCode})`;
+      pcp
+        .callTool('log_activity', {
+          agentId,
+          type: runResult.success ? 'agent_complete' : 'error',
+          subtype: `backend_cli:${runtime.backend}`,
+          content: turnContent,
+          sessionId: runtime.sessionId,
+          status: turnStatus,
+          payload: {
+            backend: runtime.backend,
+            exitCode: runResult.exitCode,
+            durationMs: turnDurationSeconds * 1000,
+            studioId: runtime.studioId,
+            ...(runResult.success ? {} : { stderr: runResult.stderr.slice(0, 500) }),
+            ...(runResult.usage ? { usage: runResult.usage } : {}),
+          },
+        })
+        .catch(() => undefined);
+    }
+
     let responseText = runResult.stdout.trim();
     if (!responseText && runResult.stderr.trim()) {
       responseText = runResult.stderr.trim();

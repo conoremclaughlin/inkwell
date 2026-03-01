@@ -274,6 +274,15 @@ function extractActivities(result: Record<string, unknown> | null | undefined): 
     .filter((activity): activity is MissionActivity => Boolean(activity));
 }
 
+/** Parse "project--slug" worktree folder into "project / slug" display format. */
+function formatWorktreeLabel(folder: string): string {
+  const dashIdx = folder.indexOf('--');
+  if (dashIdx > 0) {
+    return `${folder.slice(0, dashIdx)} / ${folder.slice(dashIdx + 2)}`;
+  }
+  return folder;
+}
+
 function compactPreview(value?: string, max = 110): string {
   const normalized = (value || '').replace(/\s+/g, ' ').trim();
   if (!normalized) return '-';
@@ -285,8 +294,16 @@ function studioLabelForSession(session?: Session): string {
   if (!session) return '-';
   const studioId = session.studioId || session.studio?.id;
   const worktree = session.studio?.worktreeFolder;
-  if (worktree && studioId) return `${worktree} (${studioId.slice(0, 8)})`;
-  if (worktree) return worktree;
+  if (worktree) {
+    // Parse "project--slug" into "project / slug" display format
+    const dashIdx = worktree.indexOf('--');
+    if (dashIdx > 0) {
+      const project = worktree.slice(0, dashIdx);
+      const slug = worktree.slice(dashIdx + 2);
+      return `${project} / ${slug}`;
+    }
+    return worktree;
+  }
   if (studioId) return studioId.slice(0, 8);
   return '-';
 }
@@ -696,7 +713,9 @@ function activityToFeedEvent(
     (typeof p?.threadKey === 'string' ? p.threadKey : undefined) || session?.threadKey;
   const studioHint = typeof p?.studioHint === 'string' ? p.studioHint : undefined;
   const studioId = typeof p?.studioId === 'string' ? p.studioId : undefined;
-  const studioLabel = studioHint || studioId?.slice(0, 8) || studioLabelForSession(session);
+  const rawLabel = studioHint || studioLabelForSession(session);
+  const studioLabel =
+    rawLabel && rawLabel !== '-' ? formatWorktreeLabel(rawLabel) : studioId?.slice(0, 8) || '-';
 
   const detailParts: string[] = [];
   if (messageType && messageType !== 'message') detailParts.push(`type: ${messageType}`);

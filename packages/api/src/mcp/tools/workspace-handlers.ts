@@ -14,6 +14,28 @@ import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
 
+// ============== Helpers ==============
+
+/**
+ * Resolve the main git worktree root from any path (worktree or main repo).
+ * If the given path is a linked worktree, returns the main worktree root.
+ * Falls back to the original path if git fails or isn't available.
+ */
+function resolveMainWorktree(dir: string): string {
+  try {
+    const output = execSync('git worktree list --porcelain', {
+      cwd: dir,
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    // First entry in `git worktree list` is always the main worktree
+    const match = output.match(/^worktree\s+(.+)$/m);
+    return match ? match[1] : dir;
+  } catch {
+    return dir;
+  }
+}
+
 // ============== Constants ==============
 
 const WORK_TYPE_ABBREV: Record<string, string> = {
@@ -154,10 +176,13 @@ export async function handleCreateWorkspace(args: unknown, dataComposer: DataCom
     skipGitOperations = false,
   } = parsed;
 
-  // Derive branch name and worktree path
+  // Resolve to the main worktree root (handles case where repoRoot is a linked worktree)
+  const mainRoot = resolveMainWorktree(repoRoot);
+
+  // Derive branch name and worktree path (sibling of the main repo root)
   const abbrev = WORK_TYPE_ABBREV[workType] || 'other';
   const branch = `${agentId}/${abbrev}/${slug}`;
-  const worktreePath = path.join(path.dirname(repoRoot), `${path.basename(repoRoot)}--${slug}`);
+  const worktreePath = path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
 
   // Perform git operations if not skipped
   if (!skipGitOperations) {
@@ -190,7 +215,7 @@ export async function handleCreateWorkspace(args: unknown, dataComposer: DataCom
       userId: resolved.user.id,
       agentId,
       sessionId,
-      repoRoot,
+      repoRoot: mainRoot,
       worktreePath,
       branch,
       baseBranch,
