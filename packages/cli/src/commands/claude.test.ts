@@ -333,43 +333,27 @@ describe('resolveCapturedBackendSessionIdFromRuntime', () => {
     mkdirSync(tempHome, { recursive: true });
     mkdirSync(tempRepo, { recursive: true });
 
-    const projectKeyDir = join(tempHome, '.claude', 'projects', 'clearpol-ai');
+    const projectDirName = tempRepo.replace(/[\\/]/g, '-');
+    const projectKeyDir = join(tempHome, '.claude', 'projects', projectDirName);
     mkdirSync(projectKeyDir, { recursive: true });
 
     const oldHome = process.env.HOME;
     process.env.HOME = tempHome;
 
     try {
-      writeFileSync(
-        join(projectKeyDir, 'sessions-index.json'),
-        JSON.stringify(
-          {
-            entries: [
-              {
-                sessionId: 'old-local-session',
-                projectPath: tempRepo,
-                modified: '2026-02-28T09:00:00.000Z',
-              },
-              {
-                sessionId: 'new-local-session',
-                projectPath: tempRepo,
-                modified: '2026-02-28T10:00:00.000Z',
-              },
-            ],
-          },
-          null,
-          2
-        )
-      );
+      const oldSessionId = '11111111-1111-4111-8111-111111111111';
+      const newSessionId = '22222222-2222-4222-8222-222222222222';
+      writeFileSync(join(projectKeyDir, `${oldSessionId}.jsonl`), '');
+      writeFileSync(join(projectKeyDir, `${newSessionId}.jsonl`), '');
 
       const resolved = resolveCapturedBackendSessionIdFromRuntime({
         cwd: tempRepo,
         backend: 'claude',
         pcpSessionId: 'pcp-session-1',
-        knownLocalSessionIds: new Set(['old-local-session']),
+        knownLocalSessionIds: new Set([oldSessionId]),
       });
 
-      expect(resolved).toBe('new-local-session');
+      expect(resolved).toBe(newSessionId);
     } finally {
       if (oldHome === undefined) {
         delete process.env.HOME;

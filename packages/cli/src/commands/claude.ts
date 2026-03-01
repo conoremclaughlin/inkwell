@@ -8,7 +8,7 @@
 import { spawn, spawnSync } from 'child_process';
 import chalk from 'chalk';
 import { randomUUID } from 'crypto';
-import { existsSync, readFileSync, readdirSync, realpathSync } from 'fs';
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'fs';
 import { join, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
 import { getBackend, resolveAgentId } from '../backends/index.js';
@@ -425,41 +425,34 @@ export function getClaudeLocalSessionsForProject(
   if (!normalizedCwd) return [];
 
   const results: BackendLocalSessionSummary[] = [];
+  const normalizedDirName = normalizedCwd.replace(/[\\/]/g, '-');
+  const projectDirCandidates = new Set<string>([
+    join(claudeProjectsDir, normalizedDirName),
+    join(claudeProjectsDir, cwd.replace(/[\\/]/g, '-')),
+  ]);
 
-  for (const entry of readdirSync(claudeProjectsDir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    const indexPath = join(claudeProjectsDir, entry.name, 'sessions-index.json');
-    if (!existsSync(indexPath)) continue;
+  const sessionFileIdRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-    try {
-      const parsed = JSON.parse(readFileSync(indexPath, 'utf-8')) as {
-        entries?: Array<{
-          sessionId?: string;
-          projectPath?: string;
-          modified?: string;
-          firstPrompt?: string;
-          messageCount?: number;
-          gitBranch?: string;
-        }>;
-      };
+  for (const projectDir of projectDirCandidates) {
+    if (!existsSync(projectDir)) continue;
 
-      for (const item of parsed.entries || []) {
-        if (!item.sessionId || !item.projectPath || !item.modified) continue;
-        const normalizedProjectPath = normalizePath(item.projectPath);
-        if (!normalizedProjectPath || normalizedProjectPath !== normalizedCwd) continue;
+    for (const entry of readdirSync(projectDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+      const sessionId = entry.name.slice(0, -'.jsonl'.length);
+      if (!sessionFileIdRegex.test(sessionId)) continue;
 
+      const filePath = join(projectDir, entry.name);
+      try {
+        const stats = statSync(filePath);
         results.push({
           backend: 'claude',
-          sessionId: item.sessionId,
-          projectPath: item.projectPath,
-          modified: item.modified,
-          firstPrompt: item.firstPrompt,
-          messageCount: item.messageCount,
-          gitBranch: item.gitBranch,
+          sessionId,
+          projectPath: normalizedCwd,
+          modified: stats.mtime.toISOString(),
         });
+      } catch {
+        // Ignore unreadable file stats.
       }
-    } catch {
-      // Ignore malformed local index files and continue.
     }
   }
 
@@ -495,21 +488,21 @@ export function getKnownClaudeSessionIds(limitPerProject = 500): Set<string> {
   const sessionIds = new Set<string>();
   const claudeProjectsDir = join(homedir(), '.claude', 'projects');
 
+  const sessionFileIdRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
   if (existsSync(claudeProjectsDir)) {
     for (const entry of readdirSync(claudeProjectsDir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
-      const indexPath = join(claudeProjectsDir, entry.name, 'sessions-index.json');
-      if (!existsSync(indexPath)) continue;
-
-      try {
-        const parsed = JSON.parse(readFileSync(indexPath, 'utf-8')) as {
-          entries?: Array<{ sessionId?: string }>;
-        };
-        for (const item of (parsed.entries || []).slice(0, limitPerProject)) {
-          if (item.sessionId?.trim()) sessionIds.add(item.sessionId.trim());
-        }
-      } catch {
-        // Ignore malformed local index files and continue.
+      let seenForProject = 0;
+      for (const file of readdirSync(join(claudeProjectsDir, entry.name), {
+        withFileTypes: true,
+      })) {
+        if (!file.isFile() || !file.name.endsWith('.jsonl')) continue;
+        const sessionId = file.name.slice(0, -'.jsonl'.length);
+        if (!sessionFileIdRegex.test(sessionId)) continue;
+        sessionIds.add(sessionId);
+        seenForProject += 1;
+        if (seenForProject >= limitPerProject) break;
       }
     }
   }
