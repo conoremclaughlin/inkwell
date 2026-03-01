@@ -9,6 +9,7 @@ import {
   hasBackendSessionOverride,
   resolveCapturedBackendSessionIdFromRuntime,
   resolveBackendSessionIdForResume,
+  resolveBackendSessionSeedId,
   sanitizeBackendExecutionArgs,
   shouldAutoResumeRuntimeSession,
 } from './claude.js';
@@ -259,6 +260,41 @@ describe('resolveBackendSessionIdForResume', () => {
         localBackendSessionIds: new Set(['local-a', 'local-b']),
       })
     ).toEqual({ backendSessionId: 'local-a' });
+  });
+});
+
+describe('resolveBackendSessionSeedId', () => {
+  it('seeds claude on first run when pcp session is newly created', () => {
+    expect(
+      resolveBackendSessionSeedId({
+        backend: 'claude',
+        chosenSessionId: 'pcp-new-1',
+        createdNewPcpSession: true,
+      })
+    ).toBe('pcp-new-1');
+  });
+
+  it('seeds claude when tracked backend id is stale on existing pcp session', () => {
+    expect(
+      resolveBackendSessionSeedId({
+        backend: 'claude',
+        chosenSessionId: 'pcp-existing-1',
+        createdNewPcpSession: false,
+        staleTrackedBackendSessionId: 'stale-backend-id',
+      })
+    ).toBe('pcp-existing-1');
+  });
+
+  it('does not seed when backend-native session id is already known', () => {
+    expect(
+      resolveBackendSessionSeedId({
+        backend: 'claude',
+        chosenSessionId: 'pcp-existing-1',
+        backendSessionId: 'claude-123',
+        createdNewPcpSession: false,
+        staleTrackedBackendSessionId: 'stale-backend-id',
+      })
+    ).toBeUndefined();
   });
 });
 

@@ -303,6 +303,36 @@ export function resolveBackendSessionIdForResume(options: {
   return { backendSessionId: candidate };
 }
 
+export function resolveBackendSessionSeedId(options: {
+  backend: string;
+  chosenSessionId?: string;
+  backendSessionId?: string;
+  createdNewPcpSession: boolean;
+  staleTrackedBackendSessionId?: string;
+}): string | undefined {
+  const {
+    backend,
+    chosenSessionId,
+    backendSessionId,
+    createdNewPcpSession,
+    staleTrackedBackendSessionId,
+  } = options;
+
+  if (backend !== 'claude') return undefined;
+  if (!chosenSessionId) return undefined;
+  if (backendSessionId) return undefined;
+
+  // Seed Claude session ID when:
+  // 1) this invocation created the PCP session (first run), or
+  // 2) the previously tracked backend-native ID is stale and we are effectively
+  //    re-seeding from a fresh backend launch.
+  if (createdNewPcpSession || staleTrackedBackendSessionId) {
+    return chosenSessionId;
+  }
+
+  return undefined;
+}
+
 export function resolveCapturedBackendSessionIdFromRuntime(options: {
   cwd?: string;
   backend: string;
@@ -1053,8 +1083,13 @@ async function ensurePcpSessionContext(
     selectedLocalBackendSessionId,
     localBackendSessionIds,
   });
-  const backendSessionSeedId =
-    backend === 'claude' && !backendSessionId && createdNewPcpSession ? chosen.id : undefined;
+  const backendSessionSeedId = resolveBackendSessionSeedId({
+    backend,
+    chosenSessionId: chosen.id,
+    backendSessionId,
+    createdNewPcpSession,
+    staleTrackedBackendSessionId,
+  });
 
   if (staleTrackedBackendSessionId && process.stdin.isTTY) {
     const backendLabel = backend[0].toUpperCase() + backend.slice(1);
