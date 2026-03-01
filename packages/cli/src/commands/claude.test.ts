@@ -244,7 +244,11 @@ describe('resolveBackendSessionIdForResume', () => {
         },
         localBackendSessionIds: new Set(['local-a', 'local-b']),
       })
-    ).toEqual({ staleTrackedBackendSessionId: 'stale-id' });
+    ).toEqual({
+      backendSessionId: 'pcp-1',
+      staleTrackedBackendSessionId: 'stale-id',
+      fallbackMode: 'resume_pcp_session_id',
+    });
   });
 
   it('keeps tracked backend id when it matches local project sessions', () => {
@@ -274,15 +278,14 @@ describe('resolveBackendSessionSeedId', () => {
     ).toBe('pcp-new-1');
   });
 
-  it('seeds claude when tracked backend id is stale on existing pcp session', () => {
+  it('does not seed claude for stale existing sessions (uses resume fallback instead)', () => {
     expect(
       resolveBackendSessionSeedId({
         backend: 'claude',
         chosenSessionId: 'pcp-existing-1',
         createdNewPcpSession: false,
-        staleTrackedBackendSessionId: 'stale-backend-id',
       })
-    ).toBe('pcp-existing-1');
+    ).toBeUndefined();
   });
 
   it('does not seed when backend-native session id is already known', () => {
@@ -292,7 +295,6 @@ describe('resolveBackendSessionSeedId', () => {
         chosenSessionId: 'pcp-existing-1',
         backendSessionId: 'claude-123',
         createdNewPcpSession: false,
-        staleTrackedBackendSessionId: 'stale-backend-id',
       })
     ).toBeUndefined();
   });

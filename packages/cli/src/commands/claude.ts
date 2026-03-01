@@ -282,7 +282,11 @@ export function resolveBackendSessionIdForResume(options: {
   chosen?: PcpSessionSummary;
   selectedLocalBackendSessionId?: string;
   localBackendSessionIds: Set<string>;
-}): { backendSessionId?: string; staleTrackedBackendSessionId?: string } {
+}): {
+  backendSessionId?: string;
+  staleTrackedBackendSessionId?: string;
+  fallbackMode?: 'resume_pcp_session_id';
+} {
   const { backend, chosen, selectedLocalBackendSessionId, localBackendSessionIds } = options;
 
   if (selectedLocalBackendSessionId) {
@@ -297,6 +301,13 @@ export function resolveBackendSessionIdForResume(options: {
   if (!candidate) return {};
 
   if (localBackendSessionIds.size > 0 && !localBackendSessionIds.has(candidate)) {
+    if (backend === 'claude' && chosen.id) {
+      return {
+        backendSessionId: chosen.id,
+        staleTrackedBackendSessionId: candidate,
+        fallbackMode: 'resume_pcp_session_id',
+      };
+    }
     return { staleTrackedBackendSessionId: candidate };
   }
 
@@ -308,25 +319,15 @@ export function resolveBackendSessionSeedId(options: {
   chosenSessionId?: string;
   backendSessionId?: string;
   createdNewPcpSession: boolean;
-  staleTrackedBackendSessionId?: string;
 }): string | undefined {
-  const {
-    backend,
-    chosenSessionId,
-    backendSessionId,
-    createdNewPcpSession,
-    staleTrackedBackendSessionId,
-  } = options;
+  const { backend, chosenSessionId, backendSessionId, createdNewPcpSession } = options;
 
   if (backend !== 'claude') return undefined;
   if (!chosenSessionId) return undefined;
   if (backendSessionId) return undefined;
 
-  // Seed Claude session ID when:
-  // 1) this invocation created the PCP session (first run), or
-  // 2) the previously tracked backend-native ID is stale and we are effectively
-  //    re-seeding from a fresh backend launch.
-  if (createdNewPcpSession || staleTrackedBackendSessionId) {
+  // Seed Claude session ID only on first run when PCP session is created now.
+  if (createdNewPcpSession) {
     return chosenSessionId;
   }
 
@@ -1077,27 +1078,35 @@ async function ensurePcpSessionContext(
 
   if (!chosen?.id) return {};
 
-  const { backendSessionId, staleTrackedBackendSessionId } = resolveBackendSessionIdForResume({
-    backend,
-    chosen,
-    selectedLocalBackendSessionId,
-    localBackendSessionIds,
-  });
+  const { backendSessionId, staleTrackedBackendSessionId, fallbackMode } =
+    resolveBackendSessionIdForResume({
+      backend,
+      chosen,
+      selectedLocalBackendSessionId,
+      localBackendSessionIds,
+    });
   const backendSessionSeedId = resolveBackendSessionSeedId({
     backend,
     chosenSessionId: chosen.id,
     backendSessionId,
     createdNewPcpSession,
-    staleTrackedBackendSessionId,
   });
 
   if (staleTrackedBackendSessionId && process.stdin.isTTY) {
-    const backendLabel = backend[0].toUpperCase() + backend.slice(1);
-    console.log(
-      chalk.yellow(
-        `\nLinked ${backendLabel} session ${staleTrackedBackendSessionId.slice(0, 8)} is unavailable for this project; starting backend fresh.`
-      )
-    );
+    if (fallbackMode === 'resume_pcp_session_id' && chosen.id) {
+      console.log(
+        chalk.yellow(
+          `\nLinked Claude session ${staleTrackedBackendSessionId.slice(0, 8)} is unavailable for this project; retrying with PCP-linked Claude session ${chosen.id.slice(0, 8)}.`
+        )
+      );
+    } else {
+      const backendLabel = backend[0].toUpperCase() + backend.slice(1);
+      console.log(
+        chalk.yellow(
+          `\nLinked ${backendLabel} session ${staleTrackedBackendSessionId.slice(0, 8)} is unavailable for this project; starting backend fresh.`
+        )
+      );
+    }
   }
 
   upsertRuntimeSession(cwd, {
