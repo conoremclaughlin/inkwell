@@ -19,7 +19,7 @@ Most tools require identifying a user. You can use ANY ONE of these methods:
 
 ## Core Capabilities
 - **Memory**: remember, recall, forget - Long-term memory with semantic search
-- **Sessions**: start_session, log_session, end_session - Track conversation sessions
+- **Sessions**: update_session_phase, get_session, list_sessions - Track and inspect session state
 - **Bootstrap**: bootstrap - Initialize agent with user context, identity, and recent memories
 - **Gmail**: list_emails, get_email, send_email, modify_emails - Full Gmail integration
 - **Calendar**: list_calendars, list_calendar_events - Google Calendar access

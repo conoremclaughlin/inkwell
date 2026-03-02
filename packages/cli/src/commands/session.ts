@@ -291,10 +291,14 @@ async function endCommand(sessionId?: string): Promise<void> {
   }
 
   try {
-    await callPcpTool('end_session', {
-      email: config.email,
-      sessionId,
-    });
+    await callPcpTool(
+      'end_session',
+      {
+        email: config.email,
+        sessionId,
+      },
+      { callerProfile: 'runtime' }
+    );
     console.log(chalk.green(`Session ${sessionId.substring(0, 8)} ended`));
   } catch (error) {
     console.error(chalk.red(`Failed to end session: ${error}`));

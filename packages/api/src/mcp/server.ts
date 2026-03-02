@@ -158,7 +158,7 @@ export class MCPServer {
    * Create a new McpServer instance with all tools registered.
    * Each HTTP client session gets its own instance.
    */
-  private createMcpServerInstance(): McpServer {
+  private createMcpServerInstance(callerProfile: 'agent' | 'runtime' = 'runtime'): McpServer {
     const server = new McpServer({
       name: MCP_SERVER_NAME,
       version: MCP_SERVER_VERSION,
@@ -166,7 +166,9 @@ export class MCPServer {
     });
 
     // Register all tools on this server instance
-    registerAllTools(server, this.dataComposer);
+    registerAllTools(server, this.dataComposer, {
+      includeInternalLifecycleTools: callerProfile === 'runtime',
+    });
     registerMiniAppTools(server, this.miniApps);
 
     // Error handling
@@ -275,6 +277,10 @@ export class MCPServer {
             identityId: userData.identityId,
           }
         : {};
+      const callerProfileHeader = req.header('x-pcp-caller-profile')?.trim().toLowerCase();
+      const callerProfile: 'agent' | 'runtime' =
+        callerProfileHeader === 'runtime' ? 'runtime' : 'agent';
+      Object.assign(ctx, { callerProfile });
 
       if (userData) {
         try {
@@ -302,7 +308,7 @@ export class MCPServer {
           transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: undefined,
           });
-          mcpServer = this.createMcpServerInstance();
+          mcpServer = this.createMcpServerInstance(callerProfile);
 
           await mcpServer.connect(transport);
           await transport.handleRequest(req, res);
