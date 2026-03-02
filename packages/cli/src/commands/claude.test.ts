@@ -1,10 +1,17 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 import {
   extractClaudeHistorySessionsForProject,
   filterPcpSessionsForContext,
   filterUntrackedLocalClaudeSessions,
   hasBackendSessionOverride,
+  resolveCapturedBackendSessionIdFromRuntime,
+  resolveBackendSessionIdForResume,
+  resolveBackendSessionSeedId,
   sanitizeBackendExecutionArgs,
+  shouldRetryWithFreshBackendSession,
   shouldAutoResumeRuntimeSession,
 } from './claude.js';
 
@@ -75,6 +82,25 @@ describe('filterPcpSessionsForContext', () => {
     );
 
     expect(filtered.map((session) => session.id)).toEqual(['pcp-1']);
+  });
+
+  it('strictly excludes claude sessions outside current project when no local match exists', () => {
+    const filtered = filterPcpSessionsForContext(
+      [
+        {
+          id: 'pcp-1',
+          startedAt: '2026-02-28T00:00:00.000Z',
+          backend: 'claude',
+          backendSessionId: 'remote-session-id',
+          workingDir: '/tmp/another-project',
+        },
+      ],
+      'claude',
+      '/tmp/current-project',
+      new Set()
+    );
+
+    expect(filtered).toEqual([]);
   });
 
   it('filters non-claude sessions only by backend', () => {
@@ -206,6 +232,187 @@ describe('shouldAutoResumeRuntimeSession', () => {
     expect(shouldAutoResumeRuntimeSession({ pcpSessionId: 'pcp-1' }, true)).toBe(false);
     expect(shouldAutoResumeRuntimeSession(undefined, false)).toBe(false);
     expect(shouldAutoResumeRuntimeSession({ backendSessionId: 'b-1' }, false)).toBe(false);
+  });
+});
+
+describe('shouldRetryWithFreshBackendSession', () => {
+  it('retries claude when resume fails with no conversation found', () => {
+    expect(
+      shouldRetryWithFreshBackendSession({
+        backend: 'claude',
+        attemptedBackendSessionId: 'abc123',
+        stderrText: 'No conversation found with session ID: abc123',
+      })
+    ).toBe(true);
+  });
+
+  it('retries claude when session id is already in use', () => {
+    expect(
+      shouldRetryWithFreshBackendSession({
+        backend: 'claude',
+        attemptedBackendSessionId: 'abc123',
+        stderrText: 'Error: Session ID abc123 is already in use.',
+      })
+    ).toBe(true);
+  });
+
+  it('does not retry when no backend session id was attempted', () => {
+    expect(
+      shouldRetryWithFreshBackendSession({
+        backend: 'claude',
+        stderrText: 'No conversation found with session ID: abc123',
+      })
+    ).toBe(false);
+  });
+});
+
+describe('resolveBackendSessionIdForResume', () => {
+  it('keeps selected local backend session id when provided', () => {
+    expect(
+      resolveBackendSessionIdForResume({
+        backend: 'claude',
+        chosen: {
+          id: 'pcp-1',
+          startedAt: '2026-02-28T00:00:00.000Z',
+          backend: 'claude',
+          backendSessionId: 'stale-id',
+        },
+        selectedLocalBackendSessionId: 'local-id',
+        localBackendSessionIds: new Set(['local-id']),
+      })
+    ).toEqual({ backendSessionId: 'local-id' });
+  });
+
+  it('drops stale tracked backend id when local project sessions are known and do not match', () => {
+    expect(
+      resolveBackendSessionIdForResume({
+        backend: 'claude',
+        chosen: {
+          id: 'pcp-1',
+          startedAt: '2026-02-28T00:00:00.000Z',
+          backend: 'claude',
+          backendSessionId: 'stale-id',
+        },
+        localBackendSessionIds: new Set(['local-a', 'local-b']),
+      })
+    ).toEqual({
+      backendSessionId: 'pcp-1',
+      staleTrackedBackendSessionId: 'stale-id',
+      fallbackMode: 'resume_pcp_session_id',
+    });
+  });
+
+  it('does not classify session as stale when it exists in global backend index', () => {
+    expect(
+      resolveBackendSessionIdForResume({
+        backend: 'claude',
+        chosen: {
+          id: 'pcp-1',
+          startedAt: '2026-02-28T00:00:00.000Z',
+          backend: 'claude',
+          backendSessionId: 'known-global-id',
+        },
+        localBackendSessionIds: new Set(['local-a', 'local-b']),
+        knownBackendSessionIds: new Set(['known-global-id', 'local-a']),
+      })
+    ).toEqual({ backendSessionId: 'known-global-id' });
+  });
+
+  it('keeps tracked backend id when it matches local project sessions', () => {
+    expect(
+      resolveBackendSessionIdForResume({
+        backend: 'claude',
+        chosen: {
+          id: 'pcp-1',
+          startedAt: '2026-02-28T00:00:00.000Z',
+          backend: 'claude',
+          backendSessionId: 'local-a',
+        },
+        localBackendSessionIds: new Set(['local-a', 'local-b']),
+      })
+    ).toEqual({ backendSessionId: 'local-a' });
+  });
+});
+
+describe('resolveBackendSessionSeedId', () => {
+  it('seeds claude on first run when pcp session is newly created', () => {
+    expect(
+      resolveBackendSessionSeedId({
+        backend: 'claude',
+        chosenSessionId: 'pcp-new-1',
+        createdNewPcpSession: true,
+      })
+    ).toBe('pcp-new-1');
+  });
+
+  it('does not seed claude for stale existing sessions (uses resume fallback instead)', () => {
+    expect(
+      resolveBackendSessionSeedId({
+        backend: 'claude',
+        chosenSessionId: 'pcp-existing-1',
+        createdNewPcpSession: false,
+      })
+    ).toBeUndefined();
+  });
+
+  it('does not seed when backend-native session id is already known', () => {
+    expect(
+      resolveBackendSessionSeedId({
+        backend: 'claude',
+        chosenSessionId: 'pcp-existing-1',
+        backendSessionId: 'claude-123',
+        createdNewPcpSession: false,
+      })
+    ).toBeUndefined();
+  });
+});
+
+describe('resolveCapturedBackendSessionIdFromRuntime', () => {
+  it('returns fallback when no pcp session id is present', () => {
+    expect(
+      resolveCapturedBackendSessionIdFromRuntime({
+        backend: 'claude',
+        fallbackBackendSessionId: 'fallback-id',
+      })
+    ).toBe('fallback-id');
+  });
+
+  it('falls back to new local backend session for the project when runtime linkage is missing', () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'sb-claude-runtime-'));
+    const tempHome = join(tempRoot, 'home');
+    const tempRepo = join(tempRoot, 'repo');
+    mkdirSync(tempHome, { recursive: true });
+    mkdirSync(tempRepo, { recursive: true });
+
+    const projectDirName = tempRepo.replace(/[\\/]/g, '-');
+    const projectKeyDir = join(tempHome, '.claude', 'projects', projectDirName);
+    mkdirSync(projectKeyDir, { recursive: true });
+
+    const oldHome = process.env.HOME;
+    process.env.HOME = tempHome;
+
+    try {
+      const oldSessionId = '11111111-1111-4111-8111-111111111111';
+      const newSessionId = '22222222-2222-4222-8222-222222222222';
+      writeFileSync(join(projectKeyDir, `${oldSessionId}.jsonl`), '');
+      writeFileSync(join(projectKeyDir, `${newSessionId}.jsonl`), '');
+
+      const resolved = resolveCapturedBackendSessionIdFromRuntime({
+        cwd: tempRepo,
+        backend: 'claude',
+        pcpSessionId: 'pcp-session-1',
+        knownLocalSessionIds: new Set([oldSessionId]),
+      });
+
+      expect(resolved).toBe(newSessionId);
+    } finally {
+      if (oldHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = oldHome;
+      }
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 });
 

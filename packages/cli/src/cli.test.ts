@@ -51,4 +51,10 @@ describe('extractArgs', () => {
     expect(result.passthroughArgs).toEqual(['--resume', 'abc123']);
     expect(result.promptParts).toEqual(['do', 'stuff']);
   });
+
+  it('parses session candidate debug flags', () => {
+    const result = extractArgs(['--session-candidates', '--session-choice', 'pcp:e03f522a']);
+    expect(result.sbOptions.sessionCandidates).toBe(true);
+    expect(result.sbOptions.sessionChoice).toBe('pcp:e03f522a');
+  });
 });

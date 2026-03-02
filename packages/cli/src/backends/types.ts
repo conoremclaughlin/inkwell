@@ -13,6 +13,7 @@ export interface BackendConfig {
   passthroughArgs: string[];
   pcpSessionId?: string;
   backendSessionId?: string;
+  backendSessionSeedId?: string;
 }
 
 export interface PreparedBackend {

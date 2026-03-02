@@ -8,7 +8,7 @@
 import { spawn, spawnSync } from 'child_process';
 import chalk from 'chalk';
 import { randomUUID } from 'crypto';
-import { existsSync, readFileSync, readdirSync, realpathSync } from 'fs';
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'fs';
 import { join, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
 import { getBackend, resolveAgentId } from '../backends/index.js';
@@ -16,6 +16,7 @@ import { getValidAccessToken } from '../auth/tokens.js';
 import { callPcpTool, getPcpServerUrl } from '../lib/pcp-mcp.js';
 import {
   getCurrentRuntimeSession,
+  listRuntimeSessions,
   setCurrentRuntimeSession,
   upsertRuntimeSession,
 } from '../session/runtime.js';
@@ -26,6 +27,8 @@ export interface SbOptions {
   session: boolean;
   verbose: boolean;
   backend: string;
+  sessionCandidates?: boolean;
+  sessionChoice?: string;
 }
 
 interface PcpConfig {
@@ -273,7 +276,148 @@ export function filterPcpSessionsForContext(
     return !!normalizedWorkingDir && normalizedWorkingDir === normalizedCwd;
   });
 
+  if (backend === 'claude') {
+    return pathScoped;
+  }
+
   return pathScoped.length > 0 ? pathScoped : backendMatched;
+}
+
+export function resolveBackendSessionIdForResume(options: {
+  backend: string;
+  chosen?: PcpSessionSummary;
+  selectedLocalBackendSessionId?: string;
+  localBackendSessionIds: Set<string>;
+  knownBackendSessionIds?: Set<string>;
+}): {
+  backendSessionId?: string;
+  staleTrackedBackendSessionId?: string;
+  fallbackMode?: 'resume_pcp_session_id';
+} {
+  const {
+    backend,
+    chosen,
+    selectedLocalBackendSessionId,
+    localBackendSessionIds,
+    knownBackendSessionIds,
+  } = options;
+
+  if (selectedLocalBackendSessionId) {
+    return { backendSessionId: selectedLocalBackendSessionId };
+  }
+
+  if (!chosen || (chosen.backend && chosen.backend !== backend)) {
+    return {};
+  }
+
+  const candidate = chosen.backendSessionId || chosen.claudeSessionId || undefined;
+  if (!candidate) return {};
+
+  if (localBackendSessionIds.size > 0 && !localBackendSessionIds.has(candidate)) {
+    // Local project indexes can be incomplete (history truncation, worktree sharing,
+    // path drift). If we can still find the session in the broader backend-local index,
+    // prefer resume and avoid false stale classification.
+    if (knownBackendSessionIds?.has(candidate)) {
+      return { backendSessionId: candidate };
+    }
+
+    if (backend === 'claude' && chosen.id) {
+      return {
+        backendSessionId: chosen.id,
+        staleTrackedBackendSessionId: candidate,
+        fallbackMode: 'resume_pcp_session_id',
+      };
+    }
+    return { staleTrackedBackendSessionId: candidate };
+  }
+
+  return { backendSessionId: candidate };
+}
+
+export function resolveBackendSessionSeedId(options: {
+  backend: string;
+  chosenSessionId?: string;
+  backendSessionId?: string;
+  createdNewPcpSession: boolean;
+}): string | undefined {
+  const { backend, chosenSessionId, backendSessionId, createdNewPcpSession } = options;
+
+  if (backend !== 'claude') return undefined;
+  if (!chosenSessionId) return undefined;
+  if (backendSessionId) return undefined;
+
+  // Seed Claude session ID only on first run when PCP session is created now.
+  if (createdNewPcpSession) {
+    return chosenSessionId;
+  }
+
+  return undefined;
+}
+
+export function resolveCapturedBackendSessionIdFromRuntime(options: {
+  cwd?: string;
+  backend: string;
+  pcpSessionId?: string;
+  runtimeLinkId?: string;
+  agentId?: string;
+  studioId?: string;
+  knownLocalSessionIds?: Set<string>;
+  fallbackBackendSessionId?: string;
+}): string | undefined {
+  const {
+    cwd = process.cwd(),
+    backend,
+    pcpSessionId,
+    runtimeLinkId,
+    agentId,
+    studioId,
+    knownLocalSessionIds,
+    fallbackBackendSessionId,
+  } = options;
+
+  const resolveFromRecord = (
+    record?: { backendSessionId?: string; backendSessionIds?: string[] } | null
+  ): string | undefined => {
+    if (!record) return undefined;
+    if (record.backendSessionId) return record.backendSessionId;
+    const last = record.backendSessionIds?.at(-1);
+    return typeof last === 'string' && last.trim() ? last : undefined;
+  };
+
+  if (!pcpSessionId) return fallbackBackendSessionId;
+
+  const scopedRecords = listRuntimeSessions(cwd, backend).filter(
+    (record) =>
+      record.pcpSessionId === pcpSessionId &&
+      (!agentId || record.agentId === agentId) &&
+      (!studioId || record.studioId === studioId)
+  );
+
+  if (runtimeLinkId) {
+    const byRuntimeLink = scopedRecords.find((record) => record.runtimeLinkId === runtimeLinkId);
+    const linked = resolveFromRecord(byRuntimeLink);
+    if (linked) return linked;
+  }
+
+  const current = getCurrentRuntimeSession(cwd, backend);
+  if (
+    current?.pcpSessionId === pcpSessionId &&
+    (!agentId || current.agentId === agentId) &&
+    (!studioId || current.studioId === studioId)
+  ) {
+    const currentSessionId = resolveFromRecord(current);
+    if (currentSessionId) return currentSessionId;
+  }
+
+  if (knownLocalSessionIds && knownLocalSessionIds.size > 0) {
+    const postRunLocalSessions = getBackendLocalSessionsForProject(backend, cwd, 50);
+    const newLocalSession = postRunLocalSessions.find(
+      (session) => !knownLocalSessionIds.has(session.sessionId)
+    );
+    if (newLocalSession?.sessionId) return newLocalSession.sessionId;
+  }
+
+  return resolveFromRecord(scopedRecords[0]) || fallbackBackendSessionId;
 }
 
 export function getClaudeLocalSessionsForProject(
@@ -287,41 +431,34 @@ export function getClaudeLocalSessionsForProject(
   if (!normalizedCwd) return [];
 
   const results: BackendLocalSessionSummary[] = [];
+  const normalizedDirName = normalizedCwd.replace(/[\\/]/g, '-');
+  const projectDirCandidates = new Set<string>([
+    join(claudeProjectsDir, normalizedDirName),
+    join(claudeProjectsDir, cwd.replace(/[\\/]/g, '-')),
+  ]);
 
-  for (const entry of readdirSync(claudeProjectsDir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    const indexPath = join(claudeProjectsDir, entry.name, 'sessions-index.json');
-    if (!existsSync(indexPath)) continue;
+  const sessionFileIdRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-    try {
-      const parsed = JSON.parse(readFileSync(indexPath, 'utf-8')) as {
-        entries?: Array<{
-          sessionId?: string;
-          projectPath?: string;
-          modified?: string;
-          firstPrompt?: string;
-          messageCount?: number;
-          gitBranch?: string;
-        }>;
-      };
+  for (const projectDir of projectDirCandidates) {
+    if (!existsSync(projectDir)) continue;
 
-      for (const item of parsed.entries || []) {
-        if (!item.sessionId || !item.projectPath || !item.modified) continue;
-        const normalizedProjectPath = normalizePath(item.projectPath);
-        if (!normalizedProjectPath || normalizedProjectPath !== normalizedCwd) continue;
+    for (const entry of readdirSync(projectDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+      const sessionId = entry.name.slice(0, -'.jsonl'.length);
+      if (!sessionFileIdRegex.test(sessionId)) continue;
 
+      const filePath = join(projectDir, entry.name);
+      try {
+        const stats = statSync(filePath);
         results.push({
           backend: 'claude',
-          sessionId: item.sessionId,
-          projectPath: item.projectPath,
-          modified: item.modified,
-          firstPrompt: item.firstPrompt,
-          messageCount: item.messageCount,
-          gitBranch: item.gitBranch,
+          sessionId,
+          projectPath: normalizedCwd,
+          modified: stats.mtime.toISOString(),
         });
+      } catch {
+        // Ignore unreadable file stats.
       }
-    } catch {
-      // Ignore malformed local index files and continue.
     }
   }
 
@@ -351,6 +488,50 @@ export function getClaudeLocalSessionsForProject(
   return Array.from(dedupedBySessionId.values())
     .sort((a, b) => new Date(b.modified).getTime() - new Date(a.modified).getTime())
     .slice(0, limit);
+}
+
+export function getKnownClaudeSessionIds(limitPerProject = 500): Set<string> {
+  const sessionIds = new Set<string>();
+  const claudeProjectsDir = join(homedir(), '.claude', 'projects');
+
+  const sessionFileIdRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  if (existsSync(claudeProjectsDir)) {
+    for (const entry of readdirSync(claudeProjectsDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      let seenForProject = 0;
+      for (const file of readdirSync(join(claudeProjectsDir, entry.name), {
+        withFileTypes: true,
+      })) {
+        if (!file.isFile() || !file.name.endsWith('.jsonl')) continue;
+        const sessionId = file.name.slice(0, -'.jsonl'.length);
+        if (!sessionFileIdRegex.test(sessionId)) continue;
+        sessionIds.add(sessionId);
+        seenForProject += 1;
+        if (seenForProject >= limitPerProject) break;
+      }
+    }
+  }
+
+  const historyPath = join(homedir(), '.claude', 'history.jsonl');
+  if (existsSync(historyPath)) {
+    try {
+      for (const line of readFileSync(historyPath, 'utf-8').split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const parsed = JSON.parse(trimmed) as { sessionId?: string };
+          if (parsed.sessionId?.trim()) sessionIds.add(parsed.sessionId.trim());
+        } catch {
+          // Ignore malformed history lines.
+        }
+      }
+    } catch {
+      // Ignore unreadable history file.
+    }
+  }
+
+  return sessionIds;
 }
 
 export function extractClaudeHistorySessionsForProject(
@@ -755,6 +936,22 @@ function parseSessionIdFromJsonLine(line: string): string | undefined {
   }
 }
 
+export function shouldRetryWithFreshBackendSession(options: {
+  backend: string;
+  attemptedBackendSessionId?: string;
+  stderrText?: string;
+}): boolean {
+  const { backend, attemptedBackendSessionId, stderrText = '' } = options;
+  if (backend !== 'claude') return false;
+  if (!attemptedBackendSessionId) return false;
+
+  const lowered = stderrText.toLowerCase();
+  return (
+    lowered.includes('no conversation found with session id') ||
+    (lowered.includes('session id') && lowered.includes('already in use'))
+  );
+}
+
 async function persistBackendSessionLink(options: {
   pcpSessionId?: string;
   backendSessionId?: string;
@@ -797,8 +994,9 @@ async function ensurePcpSessionContext(
   backend: string,
   passthroughArgs: string[],
   verbose: boolean,
-  promptParts: string[] = []
-): Promise<{ pcpSessionId?: string; backendSessionId?: string }> {
+  promptParts: string[] = [],
+  options: { listCandidates?: boolean; selectionOverride?: string } = {}
+): Promise<{ pcpSessionId?: string; backendSessionId?: string; backendSessionSeedId?: string }> {
   if (hasBackendSessionOverride(backend, passthroughArgs, promptParts)) return {};
 
   const config = getPcpConfig();
@@ -807,6 +1005,8 @@ async function ensurePcpSessionContext(
   const { studioId, identityId } = getIdentityContextFromIdentityJson(cwd);
   const localBackendSessions = getBackendLocalSessionsForProject(backend, cwd, 20);
   const localBackendSessionIds = new Set(localBackendSessions.map((session) => session.sessionId));
+  const knownBackendSessionIds =
+    backend === 'claude' ? getKnownClaudeSessionIds() : localBackendSessionIds;
   const sessionChoiceByValue = new Map<string, string>();
 
   // Fast path: runtime already knows current session for this backend.
@@ -857,6 +1057,23 @@ async function ensurePcpSessionContext(
 
   let chosen: PcpSessionSummary | undefined;
   let selectedLocalBackendSessionId: string | undefined;
+  let createdNewPcpSession = false;
+
+  const normalizedSelectionOverride = options.selectionOverride?.trim();
+  const pcpSelection = (selection: string): string | undefined => {
+    const value = selection.replace(/^__pcp__:/, '').replace(/^pcp:/, '');
+    const found = activeSessions.find(
+      (session) => session.id === value || session.id.startsWith(value)
+    );
+    return found?.id;
+  };
+  const localSelection = (selection: string): string | undefined => {
+    const value = selection.replace(/^__local__:/, '').replace(/^local:/, '');
+    const found = untrackedLocalBackendSessions.find(
+      (session) => session.sessionId === value || session.sessionId.startsWith(value)
+    );
+    return found?.sessionId;
+  };
 
   const startNewPcpSession = async (): Promise<PcpSessionSummary | undefined> => {
     if (!pcpAvailable || !email) return undefined;
@@ -877,7 +1094,54 @@ async function ensurePcpSessionContext(
     }
   };
 
-  if (process.stdin.isTTY) {
+  if (options.listCandidates) {
+    console.log(chalk.bold(`\nSession candidates for ${agentId}/${backend}:`));
+    console.log(chalk.dim('  new'));
+    for (const session of activeSessions) {
+      const linkedBackendSessionId =
+        backend === 'claude' ? getSessionBackendId(session) : undefined;
+      console.log(
+        chalk.dim(
+          `  pcp:${session.id}${session.threadKey ? ` (${session.threadKey})` : ''}${session.currentPhase ? ` — ${session.currentPhase}` : ''}${linkedBackendSessionId ? ` · tracks ${linkedBackendSessionId}` : ''}`
+        )
+      );
+    }
+    for (const localSession of untrackedLocalBackendSessions) {
+      console.log(
+        chalk.dim(
+          `  local:${localSession.sessionId}${localSession.firstPrompt ? ` — ${truncateText(localSession.firstPrompt)}` : ''}`
+        )
+      );
+    }
+    console.log('');
+    if (!normalizedSelectionOverride) {
+      process.exit(0);
+    }
+  }
+
+  if (normalizedSelectionOverride) {
+    const selection = normalizedSelectionOverride.toLowerCase();
+    if (selection === 'new' || selection === '__new__') {
+      chosen = await startNewPcpSession();
+      createdNewPcpSession = Boolean(chosen?.id);
+    } else if (selection.startsWith('pcp:') || selection.startsWith('__pcp__:')) {
+      const matchedSessionId = pcpSelection(selection);
+      chosen = activeSessions.find((session) => session.id === matchedSessionId);
+    } else if (selection.startsWith('local:') || selection.startsWith('__local__:')) {
+      selectedLocalBackendSessionId = localSelection(selection);
+      if (selectedLocalBackendSessionId && pcpAvailable) {
+        chosen = await startNewPcpSession();
+        createdNewPcpSession = Boolean(chosen?.id);
+      }
+    } else {
+      console.error(
+        chalk.red(
+          `Unknown session choice "${options.selectionOverride}". Use "new", "pcp:<id>", or "local:<id>".`
+        )
+      );
+      process.exit(1);
+    }
+  } else if (process.stdin.isTTY) {
     const choices: Array<{ name: string; value: string }> = [
       {
         name: pcpAvailable ? 'Start new session' : 'Start new backend session',
@@ -920,6 +1184,7 @@ async function ensurePcpSessionContext(
       });
       if (selection === '__new__') {
         chosen = await startNewPcpSession();
+        createdNewPcpSession = Boolean(chosen?.id);
       } else if (selection.startsWith('__pcp__:')) {
         const sessionId = sessionChoiceByValue.get(selection);
         chosen = activeSessions.find((session) => session.id === sessionId);
@@ -927,6 +1192,7 @@ async function ensurePcpSessionContext(
         selectedLocalBackendSessionId = sessionChoiceByValue.get(selection);
         if (selectedLocalBackendSessionId && pcpAvailable) {
           chosen = await startNewPcpSession();
+          createdNewPcpSession = Boolean(chosen?.id);
         }
       }
     } catch (err) {
@@ -940,6 +1206,7 @@ async function ensurePcpSessionContext(
 
   if (!chosen && !selectedLocalBackendSessionId && pcpAvailable) {
     chosen = await startNewPcpSession();
+    createdNewPcpSession = Boolean(chosen?.id);
   }
 
   if (!chosen?.id && !selectedLocalBackendSessionId) return {};
@@ -950,11 +1217,37 @@ async function ensurePcpSessionContext(
 
   if (!chosen?.id) return {};
 
-  const backendSessionId =
-    selectedLocalBackendSessionId ||
-    (!chosen.backend || chosen.backend === backend
-      ? chosen.backendSessionId || chosen.claudeSessionId || undefined
-      : undefined);
+  const { backendSessionId, staleTrackedBackendSessionId, fallbackMode } =
+    resolveBackendSessionIdForResume({
+      backend,
+      chosen,
+      selectedLocalBackendSessionId,
+      localBackendSessionIds,
+      knownBackendSessionIds,
+    });
+  const backendSessionSeedId = resolveBackendSessionSeedId({
+    backend,
+    chosenSessionId: chosen.id,
+    backendSessionId,
+    createdNewPcpSession,
+  });
+
+  if (staleTrackedBackendSessionId && process.stdin.isTTY) {
+    if (fallbackMode === 'resume_pcp_session_id' && chosen.id) {
+      console.log(
+        chalk.yellow(
+          `\nLinked Claude session ${staleTrackedBackendSessionId.slice(0, 8)} is unavailable for this project; retrying with PCP-linked Claude session ${chosen.id.slice(0, 8)}.`
+        )
+      );
+    } else {
+      const backendLabel = backend[0].toUpperCase() + backend.slice(1);
+      console.log(
+        chalk.yellow(
+          `\nLinked ${backendLabel} session ${staleTrackedBackendSessionId.slice(0, 8)} is unavailable for this project; starting backend fresh.`
+        )
+      );
+    }
+  }
 
   upsertRuntimeSession(cwd, {
     pcpSessionId: chosen.id,
@@ -996,6 +1289,7 @@ async function ensurePcpSessionContext(
   return {
     pcpSessionId: chosen.id,
     backendSessionId,
+    ...(backendSessionSeedId ? { backendSessionSeedId } : {}),
   };
 }
 
@@ -1024,7 +1318,11 @@ export async function runClaude(
         options.backend,
         passthroughArgs,
         options.verbose,
-        promptParts
+        promptParts,
+        {
+          listCandidates: options.sessionCandidates,
+          selectionOverride: options.sessionChoice,
+        }
       )
     : {};
   const runtimeLinkId = options.session ? randomUUID() : undefined;
@@ -1089,6 +1387,13 @@ export async function runClaude(
   };
   const executionStartedAt = Date.now();
   const backendStartActivityId = await logBackendExecutionStart(executionContext);
+  const knownLocalSessionIds = options.session
+    ? new Set(
+        getBackendLocalSessionsForProject(options.backend, process.cwd(), 50).map(
+          (session) => session.sessionId
+        )
+      )
+    : undefined;
   let capturedBackendSessionId = sessionContext.backendSessionId;
   let stdoutLineBuffer = '';
   let cleanedUp = false;
@@ -1146,6 +1451,17 @@ export async function runClaude(
       const parsedSessionId = parseSessionIdFromJsonLine(stdoutLineBuffer.trim());
       if (parsedSessionId) capturedBackendSessionId = parsedSessionId;
     }
+    if (!capturedBackendSessionId) {
+      capturedBackendSessionId = resolveCapturedBackendSessionIdFromRuntime({
+        backend: options.backend,
+        pcpSessionId: sessionContext.pcpSessionId,
+        runtimeLinkId,
+        agentId,
+        studioId,
+        knownLocalSessionIds,
+        fallbackBackendSessionId: capturedBackendSessionId,
+      });
+    }
 
     await persistBackendSessionLink({
       pcpSessionId: sessionContext.pcpSessionId,
@@ -1190,7 +1506,17 @@ export async function runClaudeInteractive(
   }
   const adapter = getBackend(options.backend);
   const sessionContext = options.session
-    ? await ensurePcpSessionContext(agentId, options.backend, passthroughArgs, options.verbose, [])
+    ? await ensurePcpSessionContext(
+        agentId,
+        options.backend,
+        passthroughArgs,
+        options.verbose,
+        [],
+        {
+          listCandidates: options.sessionCandidates,
+          selectionOverride: options.sessionChoice,
+        }
+      )
     : {};
   const runtimeLinkId = options.session ? randomUUID() : undefined;
   const { studioId, identityId } = getIdentityContextFromIdentityJson(process.cwd());
@@ -1219,77 +1545,146 @@ export async function runClaudeInteractive(
     }
   }
 
-  const prepared = adapter.prepare({
-    agentId,
-    model: options.model,
-    promptParts: [],
-    passthroughArgs,
-    ...sessionContext,
-  });
-
   const authEnv = await resolvePcpAuthEnv(options.verbose);
-
-  if (options.verbose) {
-    console.log(chalk.dim(`Running: ${prepared.binary} ${prepared.args.join(' ')}`));
-  }
-
   const pcpConfig = getPcpConfig();
-  const executionContext: BackendExecutionLogContext = {
-    pcpConfig,
-    agentId,
-    backend: options.backend,
-    binary: prepared.binary,
-    args: prepared.args,
-    pcpSessionId: sessionContext.pcpSessionId,
-    backendSessionId: sessionContext.backendSessionId,
-    studioId,
-    runtimeLinkId,
-    cwd: process.cwd(),
-    mode: 'interactive',
-    retryAttempt: 1,
-    maxAttempts: 1,
-  };
-  const executionStartedAt = Date.now();
-  const backendStartActivityId = await logBackendExecutionStart(executionContext);
-  let cleanedUp = false;
-  let finalizedExecution = false;
-  const ensureCleanup = (): void => {
-    if (cleanedUp) return;
-    cleanedUp = true;
-    prepared.cleanup();
-  };
-  const finalizeExecution = async (exitCode: number | null, error?: string): Promise<void> => {
-    if (finalizedExecution) return;
-    finalizedExecution = true;
-    await logBackendExecutionResult({
-      context: executionContext,
-      parentActivityId: backendStartActivityId,
-      exitCode,
-      durationMs: Date.now() - executionStartedAt,
-      error,
-      backendSessionId: sessionContext.backendSessionId,
+  const knownLocalSessionIds = options.session
+    ? new Set(
+        getBackendLocalSessionsForProject(options.backend, process.cwd(), 50).map(
+          (session) => session.sessionId
+        )
+      )
+    : undefined;
+  const maxAttempts = sessionContext.backendSessionId ? 2 : 1;
+  let attempt = 1;
+  let attemptBackendSessionId = sessionContext.backendSessionId;
+  let attemptBackendSessionSeedId = sessionContext.backendSessionSeedId;
+  let finalCapturedBackendSessionId = sessionContext.backendSessionId;
+
+  const runAttempt = async (): Promise<{ code: number | null; stderrText: string }> => {
+    const prepared = adapter.prepare({
+      agentId,
+      model: options.model,
+      promptParts: [],
+      passthroughArgs,
+      ...sessionContext,
+      ...(attemptBackendSessionId ? { backendSessionId: attemptBackendSessionId } : {}),
+      ...(attemptBackendSessionSeedId ? { backendSessionSeedId: attemptBackendSessionSeedId } : {}),
+    });
+
+    if (options.verbose) {
+      console.log(chalk.dim(`Running: ${prepared.binary} ${prepared.args.join(' ')}`));
+    }
+
+    const executionContext: BackendExecutionLogContext = {
+      pcpConfig,
+      agentId,
+      backend: options.backend,
+      binary: prepared.binary,
+      args: prepared.args,
+      pcpSessionId: sessionContext.pcpSessionId,
+      backendSessionId: attemptBackendSessionId,
+      studioId,
+      runtimeLinkId,
+      cwd: process.cwd(),
+      mode: 'interactive',
+      retryAttempt: attempt,
+      maxAttempts,
+    };
+    const executionStartedAt = Date.now();
+    const backendStartActivityId = await logBackendExecutionStart(executionContext);
+
+    return await new Promise<{ code: number | null; stderrText: string }>((resolve) => {
+      let stderrText = '';
+
+      const child = spawn(prepared.binary, prepared.args, {
+        stdio: ['inherit', 'inherit', 'pipe'],
+        env: {
+          ...process.env,
+          ...authEnv,
+          ...prepared.env,
+          ...(runtimeLinkId ? { PCP_RUNTIME_LINK_ID: runtimeLinkId } : {}),
+        },
+      });
+
+      child.stderr?.on('data', (chunk) => {
+        const text = chunk.toString();
+        stderrText += text;
+        process.stderr.write(chunk);
+      });
+
+      child.on('close', async (code) => {
+        prepared.cleanup();
+        finalCapturedBackendSessionId = resolveCapturedBackendSessionIdFromRuntime({
+          backend: options.backend,
+          pcpSessionId: sessionContext.pcpSessionId,
+          runtimeLinkId,
+          agentId,
+          studioId,
+          knownLocalSessionIds,
+          fallbackBackendSessionId: finalCapturedBackendSessionId,
+        });
+
+        await logBackendExecutionResult({
+          context: executionContext,
+          parentActivityId: backendStartActivityId,
+          exitCode: code ?? null,
+          durationMs: Date.now() - executionStartedAt,
+          backendSessionId: finalCapturedBackendSessionId,
+        });
+        resolve({ code: code ?? null, stderrText });
+      });
+
+      child.on('error', async (err) => {
+        prepared.cleanup();
+        const errorText = err.message || 'spawn failed';
+        await logBackendExecutionResult({
+          context: executionContext,
+          parentActivityId: backendStartActivityId,
+          exitCode: null,
+          durationMs: Date.now() - executionStartedAt,
+          error: errorText,
+          backendSessionId: finalCapturedBackendSessionId,
+        });
+        resolve({ code: 1, stderrText: `${stderrText}\n${errorText}`.trim() });
+      });
     });
   };
 
-  const child = spawn(prepared.binary, prepared.args, {
-    stdio: 'inherit',
-    env: {
-      ...process.env,
-      ...authEnv,
-      ...prepared.env,
-      ...(runtimeLinkId ? { PCP_RUNTIME_LINK_ID: runtimeLinkId } : {}),
-    },
-  });
+  while (true) {
+    const { code, stderrText } = await runAttempt();
+    const shouldRetry =
+      attempt < maxAttempts &&
+      shouldRetryWithFreshBackendSession({
+        backend: options.backend,
+        attemptedBackendSessionId: attemptBackendSessionId,
+        stderrText,
+      });
 
-  child.on('close', async (code) => {
-    ensureCleanup();
-    await finalizeExecution(code ?? null);
+    if (shouldRetry) {
+      if (attemptBackendSessionId) {
+        console.log(
+          chalk.yellow(
+            `\nLinked Claude session ${attemptBackendSessionId.slice(0, 8)} failed to resume; retrying once with a fresh backend session.`
+          )
+        );
+      }
+      attempt += 1;
+      attemptBackendSessionId = undefined;
+      attemptBackendSessionSeedId = undefined;
+      continue;
+    }
+
+    await persistBackendSessionLink({
+      pcpSessionId: sessionContext.pcpSessionId,
+      backendSessionId: finalCapturedBackendSessionId,
+      backend: options.backend,
+      agentId,
+      runtimeLinkId,
+      studioId,
+      identityId,
+      email: pcpConfig?.email,
+    });
+
     process.exit(code || 0);
-  });
-
-  child.on('error', async (err) => {
-    ensureCleanup();
-    await finalizeExecution(null, err.message || 'spawn failed');
-    process.exit(1);
-  });
+  }
 }
