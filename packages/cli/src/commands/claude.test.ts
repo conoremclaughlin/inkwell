@@ -380,6 +380,21 @@ describe('resolveBackendSessionIdForResume', () => {
     ).toEqual({ staleTrackedBackendSessionId: 'known-global-id' });
   });
 
+  it('for claude, trusts canonical pcp-matched backend id even when local scans miss it', () => {
+    expect(
+      resolveBackendSessionIdForResume({
+        backend: 'claude',
+        chosen: {
+          id: 'c72051cc-5abd-4403-84cb-a0852ae86a30',
+          startedAt: '2026-02-28T00:00:00.000Z',
+          backend: 'claude',
+          backendSessionId: 'c72051cc-5abd-4403-84cb-a0852ae86a30',
+        },
+        localBackendSessionIds: new Set(['recent-a', 'recent-b']),
+      })
+    ).toEqual({ backendSessionId: 'c72051cc-5abd-4403-84cb-a0852ae86a30' });
+  });
+
   it('keeps tracked backend id when it matches local project sessions', () => {
     expect(
       resolveBackendSessionIdForResume({

@@ -313,6 +313,13 @@ export function resolveBackendSessionIdForResume(options: {
   const candidate = chosen.backendSessionId || chosen.claudeSessionId || undefined;
   if (!candidate) return {};
 
+  // If backendSessionId already matches the PCP session id, treat it as canonical
+  // and try resume directly even when local file discovery can't currently see it.
+  // Claude can legitimately resume this id while local project scans miss it.
+  if (backend === 'claude' && candidate === chosen.id) {
+    return { backendSessionId: candidate };
+  }
+
   if (localBackendSessionIds.size > 0 && !localBackendSessionIds.has(candidate)) {
     // For Claude, session IDs are path-scoped by project. If an ID is not present in
     // current-project local sessions, treat it as stale even if it exists elsewhere.
@@ -1036,8 +1043,12 @@ async function ensurePcpSessionContext(
   const email = config?.email;
   const cwd = process.cwd();
   const { studioId, identityId } = getIdentityContextFromIdentityJson(cwd);
-  const localBackendSessions = getBackendLocalSessionsForProject(backend, cwd, 20);
-  const localBackendSessionIds = new Set(localBackendSessions.map((session) => session.sessionId));
+  const localScanLimit = backend === 'claude' ? 500 : 100;
+  const localBackendSessionsAll = getBackendLocalSessionsForProject(backend, cwd, localScanLimit);
+  const localBackendSessions = localBackendSessionsAll.slice(0, 20);
+  const localBackendSessionIds = new Set(
+    localBackendSessionsAll.map((session) => session.sessionId)
+  );
   const knownBackendSessionIds =
     backend === 'claude' ? getKnownClaudeSessionIds() : localBackendSessionIds;
   sbDebugLog('claude', 'ensure_context_start', {
@@ -1048,6 +1059,7 @@ async function ensurePcpSessionContext(
       id: session.sessionId,
       modified: session.modified,
     })),
+    localBackendSessionsScanned: localBackendSessionsAll.length,
     localCount: localBackendSessionIds.size,
     knownCount: knownBackendSessionIds.size,
     listCandidates: Boolean(options.listCandidates),
