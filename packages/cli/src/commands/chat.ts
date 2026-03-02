@@ -24,6 +24,7 @@ import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../
 import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
 import { ensurePcpToolAllowed } from '../repl/tool-gate.js';
 import { executeToolCalls, type ToolCallResult } from '../repl/tool-call-executor.js';
+import { applyProfile, formatProfileList, isValidProfileId } from '../repl/tool-profiles.js';
 import {
   parsePermissionGrant,
   applyPermissionGrant,
@@ -66,6 +67,7 @@ type ChatOptions = {
   maxContextTokens?: string;
   pollSeconds?: string;
   tools?: string;
+  profile?: string;
   message?: string;
   nonInteractive?: boolean;
   tailTranscript?: string;
@@ -1597,6 +1599,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
     toolPolicy.setMutationScope('agent');
   }
   runtime.toolMode = toolPolicy.getMode();
+
+  // Apply --profile flag if provided
+  if (options.profile) {
+    if (isValidProfileId(options.profile)) {
+      const profileResult = applyProfile(toolPolicy, options.profile);
+      if (profileResult.success) {
+        runtime.toolMode = toolPolicy.getMode();
+        console.log(chalk.green(profileResult.message));
+      }
+    } else {
+      console.log(
+        chalk.yellow(
+          `Unknown profile: ${options.profile}. Valid: minimal, safe, collaborative, full`
+        )
+      );
+    }
+  }
+
   const useInk = runtime.uiMode === 'live' && Boolean(output.isTTY);
   const statusLane = new LiveStatusLane(!useInk && Boolean(output.isTTY), runtime.userTimezone);
   // Build the info items used by both Ink and legacy dock
@@ -2790,7 +2810,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           '',
           chalk.bold('Quick commands'),
           chalk.dim(
-            '/help  /mcp  /capabilities  /skills  /policy  /policy-scope  /usage  /tool-routing  /ui  /trim  /quit'
+            '/help  /mcp  /capabilities  /skills  /profile  /policy  /policy-scope  /usage  /tool-routing  /ui  /trim  /quit'
           ),
           '',
         ].join('\n')
@@ -2836,6 +2856,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '/skill-allow <pattern>      Persistently allow skill(s) via pattern',
               '/path-allow-read <glob>      Persistently allow local reads for matching paths',
               '/path-allow-write <glob>     Persistently allow local writes for matching paths',
+              '/profile [name]             Apply security profile (minimal/safe/collaborative/full)',
               '/policy-reset [global|workspace|agent|studio] [id]  Reset policy scope to defaults',
               '/delegate-create <to> <scopes> [ttlMin]  Mint delegation token',
               '/delegate-show               Show last minted delegation token payload',
@@ -3237,6 +3258,28 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }
           runtime.toolMode = toolPolicy.getMode();
           console.log(chalk.green(result.message));
+          break;
+        }
+        case 'profile': {
+          const profileArg = (slash.args[0] || '').trim().toLowerCase();
+          if (!profileArg) {
+            console.log(chalk.bold('Tool Profiles'));
+            console.log(formatProfileList());
+            console.log(chalk.dim('\nUsage: /profile <minimal|safe|collaborative|full>'));
+            break;
+          }
+          if (!isValidProfileId(profileArg)) {
+            console.log(chalk.yellow(`Unknown profile: ${profileArg}`));
+            console.log(formatProfileList());
+            break;
+          }
+          const profileResult = applyProfile(toolPolicy, profileArg);
+          if (profileResult.success) {
+            runtime.toolMode = toolPolicy.getMode();
+            console.log(chalk.green(profileResult.message));
+          } else {
+            console.log(chalk.yellow(profileResult.message));
+          }
           break;
         }
         case 'policy': {
@@ -3961,6 +4004,7 @@ export function registerChatCommand(program: Command): void {
       )
       .option('--poll-seconds <n>', 'Inbox polling interval seconds', '20')
       .option('--tools <mode>', 'Tool mode: backend|off|privileged', 'backend')
+      .option('--profile <name>', 'Apply security profile: minimal|safe|collaborative|full')
       .option('--auto-run', 'Automatically execute backend turns for new inbox task messages')
       .option('--message <text>', 'Single-turn message for non-interactive mode')
       .option('--non-interactive', 'Run one turn and exit (requires --message)')
