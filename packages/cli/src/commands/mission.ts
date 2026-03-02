@@ -600,7 +600,15 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
       .callTool('get_activity', {
         email: config.email,
         limit: Number.parseInt(options.feedLimit || '40', 10),
-        types: ['message_out', 'state_change', 'agent_spawn', 'agent_complete', 'error'],
+        types: [
+          'message_out',
+          'state_change',
+          'tool_call',
+          'tool_result',
+          'agent_spawn',
+          'agent_complete',
+          'error',
+        ],
       })
       .catch(() => null)) as Record<string, unknown> | null;
     const activityFeed = summarizeMissionFeedRows(extractActivities(activityResult), sessions);
@@ -661,6 +669,9 @@ function mapActivityToFeedType(activity: MissionActivity): FeedEventType {
       return 'activity';
     case 'state_change':
       return 'session';
+    case 'tool_call':
+    case 'tool_result':
+      return 'activity';
     case 'agent_spawn':
     case 'agent_complete':
       return 'session';
@@ -730,6 +741,33 @@ export function activityToFeedEvent(
     content = `→ ${activity.platform || 'unknown'}: ${compactPreview(activity.content, maxPreview)}`;
   } else if (activity.type === 'state_change') {
     content = compactPreview(activity.content, maxPreview);
+  } else if (activity.type === 'tool_call' || activity.type === 'tool_result') {
+    const ap = activity.payload;
+    const isBackendCli = activity.subtype?.startsWith('backend_cli:');
+    if (isBackendCli) {
+      // Backend CLI spawn/result — render like agent_spawn/complete with trigger metadata
+      const backend =
+        (typeof ap?.backend === 'string' ? ap.backend : null) ||
+        backendFromSubtype(activity.subtype);
+      const source = typeof ap?.triggerSource === 'string' ? ap.triggerSource : null;
+      const callThread = typeof ap?.threadKey === 'string' ? ap.threadKey : null;
+      const durationMs = typeof ap?.durationMs === 'number' ? ap.durationMs : null;
+      const error = typeof ap?.error === 'string' ? ap.error : null;
+      const parts: string[] = [];
+      if (backend) parts.push(backend);
+      if (durationMs != null) parts.push(`${Math.round(durationMs / 1000)}s`);
+      if (source) parts.push(`via ${source}`);
+      if (callThread) parts.push(callThread);
+      if (activity.type === 'tool_result' && activity.status === 'failed' && error) {
+        content = parts.length > 0 ? `failed (${parts.join(', ')}): ${error}` : `failed: ${error}`;
+      } else {
+        const verb = activity.type === 'tool_call' ? 'spawned' : 'completed';
+        content = parts.length > 0 ? `${verb} (${parts.join(', ')})` : `${verb} backend`;
+      }
+    } else {
+      // Individual PCP tool call — content is already "toolName(params)"
+      content = compactPreview(activity.content, maxPreview);
+    }
   } else if (activity.type === 'agent_spawn') {
     const ap = activity.payload;
     const backend =
@@ -861,7 +899,15 @@ async function runInkMission(options: MissionOptions): Promise<void> {
           .callTool('get_activity', {
             email: config.email,
             limit: feedLimit,
-            types: ['message_out', 'state_change', 'agent_spawn', 'agent_complete', 'error'],
+            types: [
+              'message_out',
+              'state_change',
+              'tool_call',
+              'tool_result',
+              'agent_spawn',
+              'agent_complete',
+              'error',
+            ],
           })
           .catch(() => null)) as Record<string, unknown> | null
       );

@@ -664,3 +664,91 @@ describe('activityToFeedEvent subtype fallback', () => {
     expect(event.content).toBe('spawned (claude-code, via heartbeat)');
   });
 });
+
+// ── tool_call / tool_result rendering ──
+
+describe('activityToFeedEvent tool_call/tool_result', () => {
+  const activity = (overrides: Partial<MissionActivity>): MissionActivity => ({
+    id: 'test-tc',
+    createdAt: '2026-03-02T20:00:00.000Z',
+    ...overrides,
+  });
+
+  it('renders backend_cli tool_call with trigger metadata', () => {
+    const event = activityToFeedEvent(
+      activity({
+        type: 'tool_call',
+        agentId: 'myra',
+        subtype: 'backend_cli:claude-code',
+        content: 'Spawned backend CLI (claude)',
+        payload: {
+          backend: 'claude-code',
+          triggerSource: 'heartbeat',
+          threadKey: 'pr:130',
+        },
+      })
+    );
+    expect(event.content).toBe('spawned (claude-code, via heartbeat, pr:130)');
+    expect(event.type).toBe('activity');
+  });
+
+  it('renders backend_cli tool_result with duration', () => {
+    const event = activityToFeedEvent(
+      activity({
+        type: 'tool_result',
+        agentId: 'lumen',
+        subtype: 'backend_cli:codex',
+        status: 'completed',
+        content: 'Backend CLI finished (codex)',
+        payload: {
+          backend: 'codex',
+          durationMs: 45000,
+          triggerSource: 'agent',
+        },
+      })
+    );
+    expect(event.content).toBe('completed (codex, 45s, via agent)');
+  });
+
+  it('renders backend_cli tool_result failure with error', () => {
+    const event = activityToFeedEvent(
+      activity({
+        type: 'tool_result',
+        agentId: 'wren',
+        subtype: 'backend_cli:claude',
+        status: 'failed',
+        content: 'Backend CLI failed (claude)',
+        payload: {
+          backend: 'claude',
+          error: 'exit code 1',
+        },
+      })
+    );
+    expect(event.content).toBe('failed (claude): exit code 1');
+  });
+
+  it('falls back to subtype for backend_cli tool_call without payload', () => {
+    const event = activityToFeedEvent(
+      activity({
+        type: 'tool_call',
+        agentId: 'myra',
+        subtype: 'backend_cli:claude-code',
+        content: 'Spawned backend CLI (claude)',
+      })
+    );
+    expect(event.content).toBe('spawned (claude-code)');
+  });
+
+  it('renders individual PCP tool calls compactly', () => {
+    const event = activityToFeedEvent(
+      activity({
+        type: 'tool_call',
+        agentId: 'myra',
+        subtype: 'log_session',
+        content: 'log_session(email, sessionId, content, salience)',
+      })
+    );
+    expect(event.content).toBe('log_session(email, sessionId, content, salience)');
+    expect(event.type).toBe('activity');
+  });
+});
