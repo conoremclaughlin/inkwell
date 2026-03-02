@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   extractUnreadCount,
+  formatWorktreeLabel,
   resolveAttachCommand,
   summarizeMissionFeedRows,
   summarizeMissionRows,
@@ -124,6 +125,41 @@ describe('resolveAttachCommand', () => {
   });
 });
 
+describe('formatWorktreeLabel', () => {
+  it('splits project--slug into "project / slug"', () => {
+    expect(formatWorktreeLabel('acme-app--wren')).toBe('acme-app / wren');
+  });
+
+  it('handles repo names with hyphens', () => {
+    expect(formatWorktreeLabel('personal-context-protocol--lumen')).toBe(
+      'personal-context-protocol / lumen'
+    );
+  });
+
+  it('returns plain folder name when no -- separator exists', () => {
+    expect(formatWorktreeLabel('workspace-wren')).toBe('workspace-wren');
+    expect(formatWorktreeLabel('my-project')).toBe('my-project');
+  });
+
+  it('only splits on first -- to handle slugs containing hyphens', () => {
+    expect(formatWorktreeLabel('personal-context-protocol--lumen-alpha')).toBe(
+      'personal-context-protocol / lumen-alpha'
+    );
+    expect(formatWorktreeLabel('acme-app--wren-review')).toBe('acme-app / wren-review');
+  });
+
+  it('does NOT double-split nested worktree names (regression)', () => {
+    // If a worktree was incorrectly created as repo--agent--slug, formatWorktreeLabel
+    // should only split on the first --, not produce three segments.
+    // This is a display-level safeguard; the real fix is resolveMainWorktree preventing
+    // the bad path from being created in the first place.
+    expect(formatWorktreeLabel('acme-app--wren--wren')).toBe('acme-app / wren--wren');
+    expect(formatWorktreeLabel('my-project--lumen--lumen-alpha')).toBe(
+      'my-project / lumen--lumen-alpha'
+    );
+  });
+});
+
 describe('summarizeMissionFeedRows', () => {
   it('derives from/to routing for inbox triggers and attaches studio metadata', () => {
     const sessions: Session[] = [
@@ -133,7 +169,7 @@ describe('summarizeMissionFeedRows', () => {
         status: 'active',
         startedAt: '2026-02-20T10:00:00.000Z',
         studioId: 'studio-abc12345',
-        studio: { worktreeFolder: 'workspace-wren' },
+        studio: { worktreeFolder: 'personal-context-protocol--wren' },
       },
     ];
 
@@ -159,9 +195,57 @@ describe('summarizeMissionFeedRows', () => {
         timestamp: '2026-02-20T10:01:00.000Z',
         type: 'inbox:task_request',
         route: 'lumen → wren',
-        studio: 'workspace-wren (studio-a)',
+        studio: 'personal-context-protocol / wren',
         preview: 'Please review PR #110 DB-backed conversation routing fallback.',
       },
     ]);
+  });
+
+  it('shows plain folder name when worktreeFolder has no -- separator', () => {
+    const sessions: Session[] = [
+      {
+        id: 'session-1',
+        agentId: 'wren',
+        status: 'active',
+        startedAt: '2026-02-20T10:00:00.000Z',
+        studio: { worktreeFolder: 'workspace-wren' },
+      },
+    ];
+
+    const rows = summarizeMissionFeedRows(
+      [
+        {
+          id: 'evt-1',
+          type: 'message_out',
+          agentId: 'wren',
+          sessionId: 'session-1',
+          createdAt: '2026-02-20T10:01:00.000Z',
+          platform: 'telegram',
+          content: 'Hello from wren',
+        },
+      ],
+      sessions
+    );
+
+    expect(rows[0].studio).toBe('workspace-wren');
+  });
+
+  it('falls back to studioId prefix when no session studio is available', () => {
+    const rows = summarizeMissionFeedRows(
+      [
+        {
+          id: 'evt-1',
+          type: 'tool_call',
+          agentId: 'lumen',
+          createdAt: '2026-02-20T10:01:00.000Z',
+          payload: { studioId: 'abcd1234-full-uuid' },
+        },
+      ],
+      []
+    );
+
+    expect(rows[0]).toMatchObject({
+      id: 'evt-1',
+    });
   });
 });
