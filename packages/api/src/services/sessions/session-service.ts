@@ -314,7 +314,7 @@ export class SessionService implements ISessionService {
    * This is the core message processing logic, separated from locking.
    */
   private async processMessage(request: SessionRequest, session: Session): Promise<SessionResult> {
-    const { userId, agentId } = request;
+    const { userId, agentId, metadata } = request;
 
     // 1. Build context for the agent
     const injectedContext = await this.contextBuilder.buildContext(userId, agentId, session);
@@ -371,6 +371,28 @@ export class SessionService implements ISessionService {
           ? this.geminiRunner
           : this.claudeRunner;
 
+    // 5a. Log backend spawn to activity stream (fire-and-forget)
+    const triggerSource = metadata?.triggerType as string | undefined;
+    this.activityStream
+      .logActivity({
+        userId,
+        agentId,
+        type: 'agent_spawn',
+        subtype: `backend_cli:${resolvedBackend}`,
+        content: `Backend turn started (${resolvedBackend})`,
+        sessionId: session.id,
+        payload: {
+          backend: resolvedBackend,
+          studioId: session.studioId,
+          ...(triggerSource ? { triggerSource } : {}),
+          ...(request.sender?.id ? { triggeredBy: request.sender.id } : {}),
+          ...(metadata?.threadKey ? { threadKey: metadata.threadKey } : {}),
+        } as unknown as Json,
+      })
+      .catch((err) => {
+        logger.warn('Failed to log backend spawn activity', { error: err });
+      });
+
     const turnStartMs = Date.now();
     const result = await runner.run(formattedMessage, {
       claudeSessionId: session.claudeSessionId || undefined,
@@ -394,6 +416,9 @@ export class SessionService implements ISessionService {
           backend: resolvedBackend,
           durationMs: turnDurationMs,
           studioId: session.studioId,
+          ...(triggerSource ? { triggerSource } : {}),
+          ...(request.sender?.id ? { triggeredBy: request.sender.id } : {}),
+          ...(metadata?.threadKey ? { threadKey: metadata.threadKey } : {}),
           ...(result.error ? { error: result.error.slice(0, 500) } : {}),
           ...(result.usage ? { usage: result.usage } : {}),
         } as unknown as Json,

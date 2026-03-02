@@ -686,9 +686,24 @@ function activityToFeedEvent(
   } else if (activity.type === 'state_change') {
     content = compactPreview(activity.content, maxPreview);
   } else if (activity.type === 'agent_spawn') {
-    content = 'spawned sub-process';
+    const ap = activity.payload;
+    const backend = typeof ap?.backend === 'string' ? ap.backend : null;
+    const triggeredBy = typeof ap?.triggeredBy === 'string' ? ap.triggeredBy : null;
+    const source = typeof ap?.triggerSource === 'string' ? ap.triggerSource : null;
+    const parts: string[] = [];
+    if (backend) parts.push(backend);
+    if (source === 'agent' && triggeredBy) parts.push(`via ${triggeredBy}`);
+    else if (source) parts.push(`via ${source}`);
+    content = parts.length > 0 ? `spawned (${parts.join(', ')})` : 'spawned sub-process';
   } else if (activity.type === 'agent_complete') {
-    content = 'sub-process completed';
+    const ap = activity.payload;
+    const backend = typeof ap?.backend === 'string' ? ap.backend : null;
+    const durationMs = typeof ap?.durationMs === 'number' ? ap.durationMs : null;
+    const durationLabel = durationMs != null ? `${Math.round(durationMs / 1000)}s` : null;
+    const parts: string[] = [];
+    if (backend) parts.push(backend);
+    if (durationLabel) parts.push(durationLabel);
+    content = parts.length > 0 ? `completed (${parts.join(', ')})` : 'sub-process completed';
   } else {
     const subtype = activity.subtype ? `:${activity.subtype}` : '';
     content = `${activity.type || 'activity'}${subtype}: ${compactPreview(activity.content, maxPreview)}`;

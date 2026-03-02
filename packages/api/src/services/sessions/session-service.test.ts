@@ -643,7 +643,11 @@ describe('SessionService', () => {
       // Give fire-and-forget a tick to execute
       await new Promise((r) => setTimeout(r, 10));
 
-      expect(mockActivityStream.logActivity).toHaveBeenCalledTimes(2);
+      // agent_spawn + agent_complete + 2 tool_call = 4
+      expect(mockActivityStream.logActivity).toHaveBeenCalledTimes(4);
+      expect(mockActivityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'agent_spawn' })
+      );
       expect(mockActivityStream.logActivity).toHaveBeenCalledWith(
         expect.objectContaining({
           type: 'tool_call',
@@ -672,7 +676,14 @@ describe('SessionService', () => {
 
       await new Promise((r) => setTimeout(r, 10));
 
-      expect(mockActivityStream.logActivity).not.toHaveBeenCalled();
+      // agent_spawn + agent_complete only (no tool calls)
+      expect(mockActivityStream.logActivity).toHaveBeenCalledTimes(2);
+      expect(mockActivityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'agent_spawn' })
+      );
+      expect(mockActivityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'agent_complete' })
+      );
     });
 
     it('should truncate large tool call inputs', async () => {
