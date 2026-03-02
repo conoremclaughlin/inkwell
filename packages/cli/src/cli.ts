@@ -52,8 +52,7 @@ const SB_FLAGS: Record<string, { hasValue: boolean; key: string }> = {
   '--backend': { hasValue: true, key: 'backend' },
   '-m': { hasValue: true, key: 'model' },
   '--model': { hasValue: true, key: 'model' },
-  '-v': { hasValue: false, key: 'verbose' },
-  '--verbose': { hasValue: false, key: 'verbose' },
+  '--sb-verbose': { hasValue: false, key: 'verbose' },
   '--no-session': { hasValue: false, key: 'noSession' },
   '--session-candidates': { hasValue: false, key: 'sessionCandidates' },
   '--session-choice': { hasValue: true, key: 'sessionChoice' },
@@ -176,7 +175,7 @@ program
   )
   .option('--session-choice <choice>', 'Force session selection (new | pcp:<id> | local:<id>)')
   .option('--sb-debug', 'Enable SB debug logging to ~/.pcp/sb-debug.log')
-  .option('-v, --verbose', 'Verbose output')
+  .option('--sb-verbose', 'Verbose SB output')
   .argument('[prompt...]', 'Prompt to send (omit for interactive)')
   .action(async () => {
     // We parse argv ourselves for clean passthrough — Commander's parsed

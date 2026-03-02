@@ -57,4 +57,16 @@ describe('extractArgs', () => {
     expect(result.sbOptions.sessionCandidates).toBe(true);
     expect(result.sbOptions.sessionChoice).toBe('pcp:e03f522a');
   });
+
+  it('parses sb-specific verbose flag', () => {
+    const result = extractArgs(['--sb-verbose', 'hello']);
+    expect(result.sbOptions.verbose).toBe(true);
+    expect(result.promptParts).toEqual(['hello']);
+  });
+
+  it('forwards -v to backend passthrough', () => {
+    const result = extractArgs(['-v', '--resume', 'abc123']);
+    expect(result.sbOptions.verbose).toBe(false);
+    expect(result.passthroughArgs).toEqual(['-v', '--resume', 'abc123']);
+  });
 });

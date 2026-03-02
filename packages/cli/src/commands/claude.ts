@@ -63,6 +63,41 @@ interface BackendLocalSessionSummary {
   gitBranch?: string;
 }
 
+function toEpochMs(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+export function resolveAdoptableLocalBackendSessionId(options: {
+  backend: string;
+  backendSessionId?: string;
+  selectedLocalBackendSessionId?: string;
+  chosen?: PcpSessionSummary;
+  localSessions: BackendLocalSessionSummary[];
+}): string | undefined {
+  const { backend, backendSessionId, selectedLocalBackendSessionId, chosen, localSessions } =
+    options;
+  if (backend === 'claude') return undefined;
+  if (backendSessionId || selectedLocalBackendSessionId) return undefined;
+  if (!chosen?.id || localSessions.length === 0) return undefined;
+  if (localSessions.length === 1) return localSessions[0].sessionId;
+
+  const startedAtMs = toEpochMs(chosen.startedAt);
+  if (!startedAtMs) return undefined;
+
+  // For Codex/Gemini orphan repair: if exactly one untracked local session is
+  // close to the PCP session start time, adopt it as the backend linkage.
+  const REPAIR_WINDOW_MS = 15 * 60 * 1000;
+  const nearby = localSessions.filter((session) => {
+    const modifiedMs = toEpochMs(session.modified);
+    if (modifiedMs === undefined) return false;
+    return Math.abs(modifiedMs - startedAtMs) <= REPAIR_WINDOW_MS;
+  });
+
+  return nearby.length === 1 ? nearby[0].sessionId : undefined;
+}
+
 interface ClaudeHistoryLine {
   display?: string;
   timestamp?: number;
@@ -116,6 +151,13 @@ export function filterUntrackedLocalClaudeSessions<T extends { sessionId: string
   );
 
   return localSessions.filter((session) => !trackedSessionIds.has(session.sessionId));
+}
+
+export function filterUntrackedLocalBackendSessions<T extends { sessionId: string }>(
+  localSessions: T[],
+  activePcpSessions: PcpSessionSummary[]
+): T[] {
+  return filterUntrackedLocalClaudeSessions(localSessions, activePcpSessions);
 }
 
 export function shouldAutoResumeRuntimeSession(
@@ -932,6 +974,59 @@ function printPcpUnavailableWarning(reason: string, cwd = process.cwd()): void {
   console.log(chalk.dim('    sb status'));
 }
 
+function hasPcpHookCommand(value: unknown): boolean {
+  if (typeof value === 'string') {
+    return value.includes('sb hooks ') || value.includes('commands/hooks.js');
+  }
+  if (Array.isArray(value)) {
+    return value.some((entry) => hasPcpHookCommand(entry));
+  }
+  if (value && typeof value === 'object') {
+    return Object.values(value).some((entry) => hasPcpHookCommand(entry));
+  }
+  return false;
+}
+
+function getHookHealthForBackend(
+  backend: string,
+  cwd = process.cwd()
+): { installed: boolean; configPath: string } {
+  if (backend === 'codex') {
+    const configPath = join(cwd, '.codex', 'config.toml');
+    if (!existsSync(configPath)) return { installed: false, configPath: '.codex/config.toml' };
+    const content = readFileSync(configPath, 'utf-8');
+    const installed =
+      /session_start\s*=\s*".*sb hooks on-session-start"/.test(content) &&
+      /session_end\s*=\s*".*sb hooks on-stop"/.test(content) &&
+      /user_prompt\s*=\s*".*sb hooks on-prompt"/.test(content);
+    return { installed, configPath: '.codex/config.toml' };
+  }
+
+  if (backend === 'gemini') {
+    const configPath = join(cwd, '.gemini', 'settings.json');
+    if (!existsSync(configPath)) return { installed: false, configPath: '.gemini/settings.json' };
+    try {
+      const parsed = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
+      return { installed: hasPcpHookCommand(parsed.hooks), configPath: '.gemini/settings.json' };
+    } catch {
+      return { installed: false, configPath: '.gemini/settings.json' };
+    }
+  }
+
+  const configPath = join(cwd, '.claude', 'settings.local.json');
+  if (!existsSync(configPath))
+    return { installed: false, configPath: '.claude/settings.local.json' };
+  try {
+    const parsed = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
+    return {
+      installed: hasPcpHookCommand(parsed.hooks),
+      configPath: '.claude/settings.local.json',
+    };
+  } catch {
+    return { installed: false, configPath: '.claude/settings.local.json' };
+  }
+}
+
 export function hasBackendSessionOverride(
   backend: string,
   passthroughArgs: string[],
@@ -1213,10 +1308,22 @@ async function ensurePcpSessionContext(
     printPcpUnavailableWarning(pcpUnavailableReason || 'unknown error', cwd);
   }
 
-  const untrackedLocalBackendSessions =
-    backend === 'claude'
-      ? filterUntrackedLocalClaudeSessions(localBackendSessions, activeSessions)
-      : localBackendSessions;
+  if (process.stdin.isTTY || options.listCandidates) {
+    const hooks = getHookHealthForBackend(backend, cwd);
+    if (!hooks.installed) {
+      console.log(
+        chalk.yellow(
+          `\n⚠ PCP hooks not installed for ${backend} (${hooks.configPath}). Session mapping may be unreliable.`
+        )
+      );
+      console.log(chalk.dim(`  Run: sb hooks install -b ${backend}`));
+    }
+  }
+
+  const untrackedLocalBackendSessions = filterUntrackedLocalBackendSessions(
+    localBackendSessions,
+    activeSessions
+  );
 
   let chosen: PcpSessionSummary | undefined;
   let selectedLocalBackendSessionId: string | undefined;
@@ -1314,10 +1421,10 @@ async function ensurePcpSessionContext(
 
     for (const session of activeSessions) {
       const value = `__pcp__:${session.id}`;
-      const linkedBackendSessionId =
-        backend === 'claude' ? getSessionBackendId(session) : undefined;
+      const linkedBackendSessionId = getSessionBackendId(session);
+      const backendLabel = backend[0].toUpperCase() + backend.slice(1);
       choices.push({
-        name: `Resume PCP ${session.id.slice(0, 8)}${session.threadKey ? ` (${session.threadKey})` : ''}${session.currentPhase ? ` — ${session.currentPhase}` : ''}${linkedBackendSessionId ? ` · tracks Claude ${linkedBackendSessionId.slice(0, 8)}` : ''}`,
+        name: `Resume PCP ${session.id.slice(0, 8)}${session.threadKey ? ` (${session.threadKey})` : ''}${session.currentPhase ? ` — ${session.currentPhase}` : ''}${linkedBackendSessionId ? ` · tracks ${backendLabel} ${linkedBackendSessionId.slice(0, 8)}` : ''}`,
         value,
       });
       sessionChoiceByValue.set(value, session.id);
@@ -1388,10 +1495,18 @@ async function ensurePcpSessionContext(
       localBackendSessionIds,
       knownBackendSessionIds,
     });
+  const adoptedLocalBackendSessionId = resolveAdoptableLocalBackendSessionId({
+    backend,
+    backendSessionId,
+    selectedLocalBackendSessionId,
+    chosen,
+    localSessions: untrackedLocalBackendSessions,
+  });
+  const effectiveBackendSessionId = backendSessionId || adoptedLocalBackendSessionId;
   const backendSessionSeedId = resolveBackendSessionSeedId({
     backend,
     chosenSessionId: chosen.id,
-    backendSessionId,
+    backendSessionId: effectiveBackendSessionId,
     createdNewPcpSession,
   });
 
@@ -1419,7 +1534,7 @@ async function ensurePcpSessionContext(
     ...(identityId ? { identityId } : {}),
     ...(studioId ? { studioId } : {}),
     ...(chosen.threadKey ? { threadKey: chosen.threadKey } : {}),
-    ...(backendSessionId ? { backendSessionId } : {}),
+    ...(effectiveBackendSessionId ? { backendSessionId: effectiveBackendSessionId } : {}),
     startedAt: chosen.startedAt,
   });
   setCurrentRuntimeSession(cwd, chosen.id, backend, {
@@ -1430,8 +1545,8 @@ async function ensurePcpSessionContext(
 
   if (verbose) {
     console.log(chalk.dim(`PCP session: ${chosen.id}`));
-    if (backendSessionId) {
-      console.log(chalk.dim(`Backend session: ${backendSessionId}`));
+    if (effectiveBackendSessionId) {
+      console.log(chalk.dim(`Backend session: ${effectiveBackendSessionId}`));
     }
   }
 
@@ -1441,6 +1556,7 @@ async function ensurePcpSessionContext(
         email,
         agentId,
         sessionId: chosen.id,
+        ...(effectiveBackendSessionId ? { backendSessionId: effectiveBackendSessionId } : {}),
         status: 'active',
         workingDir: cwd,
       });
@@ -1451,7 +1567,7 @@ async function ensurePcpSessionContext(
 
   return {
     pcpSessionId: chosen.id,
-    backendSessionId,
+    backendSessionId: effectiveBackendSessionId,
     ...(backendSessionSeedId ? { backendSessionSeedId } : {}),
   };
 }

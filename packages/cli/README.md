@@ -184,7 +184,7 @@ echo "explain this" | sb        # Pipe input as prompt
 | `-a, --agent <id>`     | Agent identity           | from `.pcp/identity.json`              |
 | `-b, --backend <name>` | AI backend               | from `.pcp/identity.json`, or `claude` |
 | `--no-session`         | Disable session tracking | enabled                                |
-| `-v, --verbose`        | Show debug output        | off                                    |
+| `--sb-verbose`         | Show SB verbose output   | off                                    |
 
 Any flag not listed above is forwarded to the backend.
 
@@ -333,6 +333,7 @@ sb mission --attach lumen      # Print attach command for latest lumen session
 sb mission --attach b85490f5   # Resolve attach command from session ID prefix
 sb mission --json              # Machine-readable output
 ```
+
 ### First-Class REPL (`sb chat`) (experimental)
 
 `sb chat` is the native PCP REPL where PCP controls session lifecycle and context instead of relying solely on backend CLI compaction behavior.
@@ -391,10 +392,10 @@ Inside REPL:
 
 ## Environment Variables
 
-| Variable         | Description             | Default                    |
-| ---------------- | ----------------------- | -------------------------- |
-| `PCP_SERVER_URL` | PCP server URL          | `http://localhost:3001`    |
-| `AGENT_ID`       | Override agent identity | (from identity resolution) |
+| Variable               | Description                                   | Default                            |
+| ---------------------- | --------------------------------------------- | ---------------------------------- |
+| `PCP_SERVER_URL`       | PCP server URL                                | `http://localhost:3001`            |
+| `AGENT_ID`             | Override agent identity                       | (from identity resolution)         |
 | `PCP_TOOL_POLICY_PATH` | Override persisted REPL tool-policy JSON path | `~/.pcp/security/tool-policy.json` |
 
 ## Development

@@ -254,18 +254,40 @@ describe('installHooks: Codex', () => {
     expect(existsSync(configPath)).toBe(true);
 
     const content = readFileSync(configPath, 'utf-8');
-    expect(content).toContain('# pcp-managed');
+    expect(content).toContain('# pcp-managed:hooks:start');
     expect(content).toContain('[hooks]');
     expect(content).toMatch(/session_start = ".*sb hooks on-session-start"/);
     expect(content).toMatch(/session_end = ".*sb hooks on-stop"/);
     expect(content).toMatch(/user_prompt = ".*sb hooks on-prompt"/);
-    expect(content).toContain('# end pcp-managed');
+    expect(content).toContain('# pcp-managed:hooks:end');
   });
 
-  it('should return already-installed when PCP marker exists', () => {
+  it('should return already-installed when PCP hooks are already present', () => {
     installHooks(TEST_DIR, { backend: 'codex' });
     const { result } = installHooks(TEST_DIR, { backend: 'codex' });
     expect(result).toBe('already-installed');
+  });
+
+  it('does not confuse MCP managed markers with hook installation', () => {
+    const configDir = join(TEST_DIR, '.codex');
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      join(configDir, 'config.toml'),
+      [
+        '# pcp-managed:start mcp_servers',
+        '[mcp_servers.pcp]',
+        'url = "http://localhost:3001/mcp"',
+        '# pcp-managed:end mcp_servers',
+        '',
+      ].join('\n')
+    );
+
+    const { result } = installHooks(TEST_DIR, { backend: 'codex' });
+    expect(result).toBe('installed');
+
+    const content = readFileSync(join(configDir, 'config.toml'), 'utf-8');
+    expect(content).toContain('# pcp-managed:start mcp_servers');
+    expect(content).toContain('# pcp-managed:hooks:start');
   });
 
   it('should return conflict when non-PCP [hooks] exists', () => {
@@ -289,7 +311,7 @@ describe('installHooks: Codex', () => {
 
     const content = readFileSync(join(configDir, 'config.toml'), 'utf-8');
     expect(content).toContain('[mcp_servers.pcp]');
-    expect(content).toContain('# pcp-managed');
+    expect(content).toContain('# pcp-managed:hooks:start');
   });
 
   it('should replace PCP section on re-install with force', () => {
@@ -301,8 +323,8 @@ describe('installHooks: Codex', () => {
 
     // Should have exactly one start marker and one end marker (no duplicates)
     const content = readFileSync(join(TEST_DIR, '.codex', 'config.toml'), 'utf-8');
-    const startMarkers = content.match(/# pcp-managed\n/g);
-    const endMarkers = content.match(/# end pcp-managed/g);
+    const startMarkers = content.match(/# pcp-managed:hooks:start/g);
+    const endMarkers = content.match(/# pcp-managed:hooks:end/g);
     expect(startMarkers).toHaveLength(1);
     expect(endMarkers).toHaveLength(1);
     expect(content).toMatch(/session_start = ".*sb hooks on-session-start"/);

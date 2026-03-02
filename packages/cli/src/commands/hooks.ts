@@ -758,8 +758,14 @@ function buildSkillsBlock(skills: Array<Record<string, unknown>> | undefined): s
 // Install / Uninstall / Status
 // ============================================================================
 
-/** Marker used to identify PCP-managed hook entries */
+/** Marker used to identify PCP-managed hook entries (JSON backends) */
 const PCP_MARKER = 'pcp-managed';
+/** Marker used to identify PCP-managed Codex hook block (TOML) */
+const CODEX_HOOKS_START_MARKER = '# pcp-managed:hooks:start';
+const CODEX_HOOKS_END_MARKER = '# pcp-managed:hooks:end';
+// Back-compat with earlier Codex hook marker format.
+const CODEX_LEGACY_HOOKS_START_MARKER = '# pcp-managed';
+const CODEX_LEGACY_HOOKS_END_MARKER = '# end pcp-managed';
 
 /**
  * Resolve absolute path to the `sb` CLI binary from the main worktree's
@@ -783,6 +789,15 @@ function isPcpHookCommand(cmd: string | undefined): boolean {
 }
 
 type InstallResult = 'installed' | 'already-installed' | 'conflict';
+
+function hasCodexPcpHooks(content: string): boolean {
+  if (!content.trim()) return false;
+  return (
+    /session_start\s*=\s*".*sb hooks on-session-start"/.test(content) &&
+    /session_end\s*=\s*".*sb hooks on-stop"/.test(content) &&
+    /user_prompt\s*=\s*".*sb hooks on-prompt"/.test(content)
+  );
+}
 
 function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
   return {
@@ -976,11 +991,11 @@ function installCodex(cwd: string, force: boolean): InstallResult {
     existingContent = readFileSync(configPath, 'utf-8');
   }
 
-  if (existingContent.includes(PCP_MARKER) && !force) {
+  if (hasCodexPcpHooks(existingContent) && !force) {
     return 'already-installed';
   }
 
-  if (existingContent.includes('[hooks]') && !existingContent.includes(PCP_MARKER) && !force) {
+  if (existingContent.includes('[hooks]') && !hasCodexPcpHooks(existingContent) && !force) {
     return 'conflict';
   }
 
@@ -990,12 +1005,12 @@ function installCodex(cwd: string, force: boolean): InstallResult {
   const sbPath = resolveSbBinaryPath(cwd);
   const pcpSection = [
     '',
-    `# ${PCP_MARKER}`,
+    CODEX_HOOKS_START_MARKER,
     '[hooks]',
     `session_start = "${sbPath} hooks on-session-start"`,
     `session_end = "${sbPath} hooks on-stop"`,
     `user_prompt = "${sbPath} hooks on-prompt"`,
-    `# end ${PCP_MARKER}`,
+    CODEX_HOOKS_END_MARKER,
     '',
   ].join('\n');
 
@@ -1004,18 +1019,22 @@ function installCodex(cwd: string, force: boolean): InstallResult {
 }
 
 function removePcpTomlSection(content: string): string {
-  const startMarker = `# ${PCP_MARKER}`;
-  const endMarker = `# end ${PCP_MARKER}`;
+  const markerPairs = [
+    [CODEX_HOOKS_START_MARKER, CODEX_HOOKS_END_MARKER],
+    [CODEX_LEGACY_HOOKS_START_MARKER, CODEX_LEGACY_HOOKS_END_MARKER],
+  ] as const;
 
-  const startIdx = content.indexOf(startMarker);
-  if (startIdx === -1) return content;
+  for (const [startMarker, endMarker] of markerPairs) {
+    const startIdx = content.indexOf(startMarker);
+    if (startIdx === -1) continue;
+    const endIdx = content.indexOf(endMarker);
+    if (endIdx === -1) continue;
+    const before = content.substring(0, startIdx);
+    const after = content.substring(endIdx + endMarker.length);
+    return before + after;
+  }
 
-  const endIdx = content.indexOf(endMarker);
-  if (endIdx === -1) return content;
-
-  const before = content.substring(0, startIdx);
-  const after = content.substring(endIdx + endMarker.length);
-  return before + after;
+  return content;
 }
 
 /**
@@ -1145,8 +1164,9 @@ function uninstallFromDir(targetDir: string, backendName?: string): boolean {
     }
     case 'codex': {
       const content = readFileSync(configPath, 'utf-8');
-      if (!content.includes('pcp-managed')) return false;
+      if (!hasCodexPcpHooks(content)) return false;
       const cleaned = removePcpTomlSection(content);
+      if (cleaned === content) return false;
       writeFileSync(configPath, cleaned);
       break;
     }
@@ -1247,7 +1267,7 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
     }
     case 'codex': {
       const content = readFileSync(configPath, 'utf-8');
-      if (content.includes(PCP_MARKER)) {
+      if (hasCodexPcpHooks(content)) {
         hasHooks = true;
         console.log(chalk.green('\n  PCP hooks installed (TOML)'));
         if (content.includes('session_start'))
