@@ -10,6 +10,7 @@ import {
   resolveCapturedBackendSessionIdFromRuntime,
   resolveBackendSessionIdForResume,
   resolveBackendSessionSeedId,
+  resolveClaudeStaleBackendSessionRecovery,
   sanitizeBackendExecutionArgs,
   shouldRetryWithFreshBackendSession,
   shouldAutoResumeRuntimeSession,
@@ -283,7 +284,7 @@ describe('resolveBackendSessionIdForResume', () => {
     ).toEqual({ backendSessionId: 'local-id' });
   });
 
-  it('drops stale tracked backend id when local project sessions are known and do not match', () => {
+  it('flags stale tracked backend id when local project sessions are known and do not match', () => {
     expect(
       resolveBackendSessionIdForResume({
         backend: 'claude',
@@ -296,9 +297,7 @@ describe('resolveBackendSessionIdForResume', () => {
         localBackendSessionIds: new Set(['local-a', 'local-b']),
       })
     ).toEqual({
-      backendSessionId: 'pcp-1',
       staleTrackedBackendSessionId: 'stale-id',
-      fallbackMode: 'resume_pcp_session_id',
     });
   });
 
@@ -364,6 +363,32 @@ describe('resolveBackendSessionSeedId', () => {
         createdNewPcpSession: false,
       })
     ).toBeUndefined();
+  });
+});
+
+describe('resolveClaudeStaleBackendSessionRecovery', () => {
+  it('resumes orphaned PCP session id when it exists locally', () => {
+    expect(
+      resolveClaudeStaleBackendSessionRecovery({
+        pcpSessionId: 'pcp-123',
+        localBackendSessionIds: new Set(['pcp-123', 'other']),
+      })
+    ).toEqual({
+      backendSessionId: 'pcp-123',
+      recoveryMode: 'resume_orphaned_pcp_id',
+    });
+  });
+
+  it('seeds with PCP session id when orphan does not exist locally', () => {
+    expect(
+      resolveClaudeStaleBackendSessionRecovery({
+        pcpSessionId: 'pcp-123',
+        localBackendSessionIds: new Set(['local-a']),
+      })
+    ).toEqual({
+      backendSessionSeedId: 'pcp-123',
+      recoveryMode: 'seed_with_pcp_id',
+    });
   });
 });
 

@@ -292,7 +292,6 @@ export function resolveBackendSessionIdForResume(options: {
 }): {
   backendSessionId?: string;
   staleTrackedBackendSessionId?: string;
-  fallbackMode?: 'resume_pcp_session_id';
 } {
   const {
     backend,
@@ -321,17 +320,37 @@ export function resolveBackendSessionIdForResume(options: {
       return { backendSessionId: candidate };
     }
 
-    if (backend === 'claude' && chosen.id) {
-      return {
-        backendSessionId: chosen.id,
-        staleTrackedBackendSessionId: candidate,
-        fallbackMode: 'resume_pcp_session_id',
-      };
-    }
     return { staleTrackedBackendSessionId: candidate };
   }
 
   return { backendSessionId: candidate };
+}
+
+export function resolveClaudeStaleBackendSessionRecovery(options: {
+  pcpSessionId?: string;
+  localBackendSessionIds: Set<string>;
+}): {
+  backendSessionId?: string;
+  backendSessionSeedId?: string;
+  recoveryMode?: 'resume_orphaned_pcp_id' | 'seed_with_pcp_id';
+} {
+  const { pcpSessionId, localBackendSessionIds } = options;
+  if (!pcpSessionId) return {};
+
+  // If this PCP session ID already exists as a local Claude session, treat it as an
+  // orphaned backend mapping and repair by resuming it directly.
+  if (localBackendSessionIds.has(pcpSessionId)) {
+    return {
+      backendSessionId: pcpSessionId,
+      recoveryMode: 'resume_orphaned_pcp_id',
+    };
+  }
+
+  // Otherwise, create a fresh Claude session deterministically seeded to the PCP ID.
+  return {
+    backendSessionSeedId: pcpSessionId,
+    recoveryMode: 'seed_with_pcp_id',
+  };
 }
 
 export function resolveBackendSessionSeedId(options: {
@@ -936,6 +955,18 @@ function parseSessionIdFromJsonLine(line: string): string | undefined {
   }
 }
 
+function parseClaudeSessionIdFromOutputLine(line: string): string | undefined {
+  const fromJson = parseSessionIdFromJsonLine(line);
+  if (fromJson) return fromJson;
+
+  const resumeMatch = line.match(
+    /\bclaude\s+--resume\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i
+  );
+  if (resumeMatch?.[1]) return resumeMatch[1];
+
+  return undefined;
+}
+
 export function shouldRetryWithFreshBackendSession(options: {
   backend: string;
   attemptedBackendSessionId?: string;
@@ -1217,7 +1248,7 @@ async function ensurePcpSessionContext(
 
   if (!chosen?.id) return {};
 
-  const { backendSessionId, staleTrackedBackendSessionId, fallbackMode } =
+  const { backendSessionId: resolvedBackendSessionId, staleTrackedBackendSessionId } =
     resolveBackendSessionIdForResume({
       backend,
       chosen,
@@ -1225,18 +1256,36 @@ async function ensurePcpSessionContext(
       localBackendSessionIds,
       knownBackendSessionIds,
     });
-  const backendSessionSeedId = resolveBackendSessionSeedId({
+  let backendSessionId = resolvedBackendSessionId;
+  let backendSessionSeedId = resolveBackendSessionSeedId({
     backend,
     chosenSessionId: chosen.id,
     backendSessionId,
     createdNewPcpSession,
   });
+  let staleRecoveryMode: 'resume_orphaned_pcp_id' | 'seed_with_pcp_id' | undefined;
+
+  if (backend === 'claude' && staleTrackedBackendSessionId) {
+    const recovery = resolveClaudeStaleBackendSessionRecovery({
+      pcpSessionId: chosen.id,
+      localBackendSessionIds,
+    });
+    backendSessionId = recovery.backendSessionId;
+    backendSessionSeedId = recovery.backendSessionSeedId;
+    staleRecoveryMode = recovery.recoveryMode;
+  }
 
   if (staleTrackedBackendSessionId && process.stdin.isTTY) {
-    if (fallbackMode === 'resume_pcp_session_id' && chosen.id) {
+    if (staleRecoveryMode === 'resume_orphaned_pcp_id' && chosen.id) {
       console.log(
         chalk.yellow(
-          `\nLinked Claude session ${staleTrackedBackendSessionId.slice(0, 8)} is unavailable for this project; retrying with PCP-linked Claude session ${chosen.id.slice(0, 8)}.`
+          `\nLinked Claude session ${staleTrackedBackendSessionId.slice(0, 8)} is unavailable for this project; repairing mapping by resuming orphaned Claude session ${chosen.id.slice(0, 8)}.`
+        )
+      );
+    } else if (staleRecoveryMode === 'seed_with_pcp_id' && chosen.id) {
+      console.log(
+        chalk.yellow(
+          `\nLinked Claude session ${staleTrackedBackendSessionId.slice(0, 8)} is unavailable for this project; creating a fresh Claude session seeded to PCP ${chosen.id.slice(0, 8)}.`
         )
       );
     } else {
@@ -1396,6 +1445,7 @@ export async function runClaude(
     : undefined;
   let capturedBackendSessionId = sessionContext.backendSessionId;
   let stdoutLineBuffer = '';
+  let stderrText = '';
   let cleanedUp = false;
   let finalizedExecution = false;
   const ensureCleanup = (): void => {
@@ -1421,7 +1471,7 @@ export async function runClaude(
     stdoutLineBuffer = lines.pop() || '';
 
     for (const line of lines) {
-      const parsedSessionId = parseSessionIdFromJsonLine(line.trim());
+      const parsedSessionId = parseClaudeSessionIdFromOutputLine(line.trim());
       if (parsedSessionId) capturedBackendSessionId = parsedSessionId;
     }
   };
@@ -1442,13 +1492,14 @@ export async function runClaude(
   });
 
   child.stderr?.on('data', (chunk) => {
+    stderrText += chunk.toString();
     process.stderr.write(chunk);
   });
 
   child.on('close', async (code) => {
     ensureCleanup();
     if (stdoutLineBuffer.trim()) {
-      const parsedSessionId = parseSessionIdFromJsonLine(stdoutLineBuffer.trim());
+      const parsedSessionId = parseClaudeSessionIdFromOutputLine(stdoutLineBuffer.trim());
       if (parsedSessionId) capturedBackendSessionId = parsedSessionId;
     }
     if (!capturedBackendSessionId) {
@@ -1463,16 +1514,28 @@ export async function runClaude(
       });
     }
 
-    await persistBackendSessionLink({
-      pcpSessionId: sessionContext.pcpSessionId,
-      backendSessionId: capturedBackendSessionId,
-      backend: options.backend,
-      agentId,
-      runtimeLinkId,
-      studioId,
-      identityId,
-      email: pcpConfig?.email,
-    });
+    const isRecoverableResumeError =
+      options.backend === 'claude' &&
+      (shouldRetryWithFreshBackendSession({
+        backend: options.backend,
+        attemptedBackendSessionId: sessionContext.backendSessionId,
+        stderrText,
+      }) ||
+        (Boolean(sessionContext.backendSessionSeedId) &&
+          stderrText.toLowerCase().includes('session id') &&
+          stderrText.toLowerCase().includes('already in use')));
+    if (!isRecoverableResumeError) {
+      await persistBackendSessionLink({
+        pcpSessionId: sessionContext.pcpSessionId,
+        backendSessionId: capturedBackendSessionId,
+        backend: options.backend,
+        agentId,
+        runtimeLinkId,
+        studioId,
+        identityId,
+        email: pcpConfig?.email,
+      });
+    }
     await finalizeExecution(code ?? null);
 
     if (code !== 0) process.exit(code || 1);
@@ -1554,7 +1617,12 @@ export async function runClaudeInteractive(
         )
       )
     : undefined;
-  const maxAttempts = sessionContext.backendSessionId ? 2 : 1;
+  const maxAttempts =
+    options.backend === 'claude' &&
+    Boolean(sessionContext.pcpSessionId) &&
+    Boolean(sessionContext.backendSessionId || sessionContext.backendSessionSeedId)
+      ? 2
+      : 1;
   let attempt = 1;
   let attemptBackendSessionId = sessionContext.backendSessionId;
   let attemptBackendSessionSeedId = sessionContext.backendSessionSeedId;
@@ -1652,38 +1720,91 @@ export async function runClaudeInteractive(
 
   while (true) {
     const { code, stderrText } = await runAttempt();
-    const shouldRetry =
+    const shouldRetryResumeFailure =
       attempt < maxAttempts &&
       shouldRetryWithFreshBackendSession({
         backend: options.backend,
         attemptedBackendSessionId: attemptBackendSessionId,
         stderrText,
       });
+    const shouldRetrySeedConflict =
+      attempt < maxAttempts &&
+      options.backend === 'claude' &&
+      Boolean(attemptBackendSessionSeedId) &&
+      stderrText.toLowerCase().includes('session id') &&
+      stderrText.toLowerCase().includes('already in use');
+    const shouldRetry = shouldRetryResumeFailure || shouldRetrySeedConflict;
 
     if (shouldRetry) {
+      const latestLocalBackendSessionIds = new Set(
+        getBackendLocalSessionsForProject(options.backend, process.cwd(), 200).map(
+          (session) => session.sessionId
+        )
+      );
+      const staleRecovery = resolveClaudeStaleBackendSessionRecovery({
+        pcpSessionId: sessionContext.pcpSessionId,
+        localBackendSessionIds: latestLocalBackendSessionIds,
+      });
+
       if (attemptBackendSessionId) {
+        if (
+          staleRecovery.recoveryMode === 'resume_orphaned_pcp_id' &&
+          staleRecovery.backendSessionId
+        ) {
+          console.log(
+            chalk.yellow(
+              `\nLinked Claude session ${attemptBackendSessionId.slice(0, 8)} failed to resume; retrying once with orphaned Claude session ${staleRecovery.backendSessionId.slice(0, 8)}.`
+            )
+          );
+        } else {
+          console.log(
+            chalk.yellow(
+              `\nLinked Claude session ${attemptBackendSessionId.slice(0, 8)} failed to resume; retrying once with a freshly seeded Claude session.`
+            )
+          );
+        }
+      } else if (attemptBackendSessionSeedId && sessionContext.pcpSessionId) {
         console.log(
           chalk.yellow(
-            `\nLinked Claude session ${attemptBackendSessionId.slice(0, 8)} failed to resume; retrying once with a fresh backend session.`
+            `\nSeeded Claude session ${attemptBackendSessionSeedId.slice(0, 8)} already exists; retrying once by resuming PCP-linked session ${sessionContext.pcpSessionId.slice(0, 8)}.`
           )
         );
       }
+
       attempt += 1;
-      attemptBackendSessionId = undefined;
-      attemptBackendSessionSeedId = undefined;
+      if (attemptBackendSessionSeedId && sessionContext.pcpSessionId && shouldRetrySeedConflict) {
+        attemptBackendSessionId = sessionContext.pcpSessionId;
+        attemptBackendSessionSeedId = undefined;
+      } else {
+        attemptBackendSessionId = staleRecovery.backendSessionId;
+        attemptBackendSessionSeedId = staleRecovery.backendSessionSeedId;
+      }
       continue;
     }
 
-    await persistBackendSessionLink({
-      pcpSessionId: sessionContext.pcpSessionId,
-      backendSessionId: finalCapturedBackendSessionId,
-      backend: options.backend,
-      agentId,
-      runtimeLinkId,
-      studioId,
-      identityId,
-      email: pcpConfig?.email,
-    });
+    const isTerminalRecoverableResumeError =
+      options.backend === 'claude' &&
+      (shouldRetryWithFreshBackendSession({
+        backend: options.backend,
+        attemptedBackendSessionId: attemptBackendSessionId,
+        stderrText,
+      }) ||
+        (Boolean(attemptBackendSessionSeedId) &&
+          stderrText.toLowerCase().includes('session id') &&
+          stderrText.toLowerCase().includes('already in use')));
+
+    if (!isTerminalRecoverableResumeError) {
+      await persistBackendSessionLink({
+        pcpSessionId: sessionContext.pcpSessionId,
+        backendSessionId: finalCapturedBackendSessionId,
+        backend: options.backend,
+        agentId,
+        runtimeLinkId,
+        studioId,
+        identityId,
+        email: pcpConfig?.email,
+      });
+    }
 
     process.exit(code || 0);
   }
