@@ -25,6 +25,7 @@ import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-ap
 import { ensurePcpToolAllowed } from '../repl/tool-gate.js';
 import { executeToolCalls, type ToolCallResult } from '../repl/tool-call-executor.js';
 import { applyProfile, formatProfileList, isValidProfileId } from '../repl/tool-profiles.js';
+import { ApprovalRequestManager } from '../repl/approval-request.js';
 import {
   parsePermissionGrant,
   applyPermissionGrant,
@@ -107,6 +108,7 @@ interface ChatRuntime {
   showSessionsWatch: boolean;
   eventPolling: boolean;
   autoRunInbox: boolean;
+  awayMode: boolean;
   transcriptPath: string;
   activeSkills: SkillInstruction[];
   bootstrapContext?: string;
@@ -1578,9 +1580,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     showSessionsWatch: false,
     eventPolling: true,
     autoRunInbox: options.autoRun ?? false,
+    awayMode: false,
     transcriptPath: ensureRuntimeTranscriptPath(),
     activeSkills: [],
   };
+  const approvalManager = new ApprovalRequestManager();
   const policyPathFromEnv = process.env.PCP_TOOL_POLICY_PATH?.trim();
   const toolPolicy = new ToolPolicyState(
     runtime.toolMode,
@@ -2037,6 +2041,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
         grant,
         sessionId: runtime.sessionId,
       });
+
+      // Resolve pending approval requests if this grant matches
+      if (grant.requestId && approvalManager.hasPending(grant.requestId)) {
+        const decision = grant.action === 'deny' ? 'denied' : 'approved';
+        approvalManager.resolve(grant.requestId, decision, msg.from);
+      } else {
+        // Try matching by tool name for grants without explicit requestId
+        for (const tool of grant.tools) {
+          const pending = approvalManager.findPendingForTool(tool);
+          if (pending) {
+            const decision = grant.action === 'deny' ? 'denied' : 'approved';
+            approvalManager.resolve(pending.id, decision, msg.from);
+          }
+        }
+      }
+
       const from = msg.from || 'remote';
       const action = grant.action;
       const label =
@@ -2426,8 +2446,45 @@ export async function runChat(options: ChatOptions): Promise<void> {
         policy: toolPolicy,
         callTool: (tool, args) => pcp.callTool(tool, args),
         sessionId: runtime.sessionId,
-        promptForApproval: (tool, reason) =>
-          promptForToolApproval(rl, toolPolicy, runtime.sessionId, tool, reason, inkRepl),
+        promptForApproval: async (tool, reason) => {
+          if (!runtime.awayMode) {
+            return promptForToolApproval(rl, toolPolicy, runtime.sessionId, tool, reason, inkRepl);
+          }
+          // Remote approval: register request, send to inbox, wait for resolution
+          const { request, promise } = approvalManager.register(tool, {}, reason);
+          printLine(
+            chalk.yellow(`⏳ Awaiting remote approval for ${tool} (${request.id.slice(0, 8)}…)`)
+          );
+          try {
+            await pcp.callTool('send_to_inbox', {
+              agentId: agentId,
+              content: `🔐 Tool approval needed: **${tool}**\n\nReason: ${reason}\n\nReply with a permission_grant to approve or deny.\nRequest ID: ${request.id}`,
+              messageType: 'notification',
+              metadata: { approvalRequestId: request.id, tool },
+            });
+          } catch {
+            printLine(
+              chalk.yellow('Failed to send remote approval request — falling back to local prompt')
+            );
+            approvalManager.expire(request.id);
+            return promptForToolApproval(rl, toolPolicy, runtime.sessionId, tool, reason, inkRepl);
+          }
+          const response = await promise;
+          if (response.decision === 'approved') {
+            printLine(
+              chalk.green(
+                `✅ Remote approval granted for ${tool}${response.resolvedBy ? ` by ${response.resolvedBy}` : ''}`
+              )
+            );
+            return true;
+          } else if (response.decision === 'timeout') {
+            printLine(chalk.yellow(`⏰ Remote approval timed out for ${tool}`));
+            return false;
+          } else {
+            printLine(chalk.yellow(`🚫 Remote approval denied for ${tool}`));
+            return false;
+          }
+        },
         onResult: (result: ToolCallResult) => {
           if (result.status === 'blocked' || result.status === 'denied') {
             const msg = `Local tool ${result.status} (${result.tool}): ${result.reason}`;
@@ -2810,7 +2867,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           '',
           chalk.bold('Quick commands'),
           chalk.dim(
-            '/help  /mcp  /capabilities  /skills  /profile  /policy  /policy-scope  /usage  /tool-routing  /ui  /trim  /quit'
+            '/help  /mcp  /capabilities  /skills  /profile  /policy  /away  /tool-routing  /ui  /trim  /quit'
           ),
           '',
         ].join('\n')
@@ -2833,6 +2890,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '/events [now|on|off]       Poll/toggle merged activity stream',
               '/session                   Show active session info',
               '/autorun [on|off]          Toggle inbox auto-run execution',
+              '/away [on|off]             Toggle remote approval mode (approvals via inbox)',
               '/tool-routing [backend|local]  Toggle backend tools vs local pcp-tool routing',
               '/ui [scroll|live]          Set status rendering mode',
               '/backend <name>            Switch backend (claude|codex|gemini)',
@@ -2985,6 +3043,35 @@ export async function runChat(options: ChatOptions): Promise<void> {
           console.log(
             chalk.green(`Inbox auto-run ${runtime.autoRunInbox ? 'enabled' : 'disabled'}.`)
           );
+          break;
+        }
+        case 'away': {
+          const mode = (slash.args[0] || '').toLowerCase();
+          if (!mode) {
+            console.log(chalk.dim(`Away mode is ${runtime.awayMode ? 'on' : 'off'}.`));
+            if (approvalManager.size > 0) {
+              console.log(chalk.dim(`  ${approvalManager.size} pending approval request(s)`));
+            }
+            break;
+          }
+          if (!['on', 'off'].includes(mode)) {
+            console.log(chalk.yellow('Usage: /away [on|off]'));
+            break;
+          }
+          runtime.awayMode = mode === 'on';
+          if (runtime.awayMode) {
+            console.log(
+              chalk.green(
+                'Away mode enabled — tool approvals will be sent to your inbox for remote approval.'
+              )
+            );
+          } else {
+            console.log(chalk.green('Away mode disabled — tool approvals will prompt locally.'));
+            if (approvalManager.size > 0) {
+              approvalManager.cancelAll();
+              console.log(chalk.dim('Cancelled pending remote approval requests.'));
+            }
+          }
           break;
         }
         case 'tool-routing': {
@@ -3957,6 +4044,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     console.log(chalk.dim(`Waiting for ${pendingTurns} pending turn(s) to finish...`));
     await turnQueue;
   }
+
+  // Cancel any pending remote approval requests
+  approvalManager.cancelAll();
 
   const summary = summarizeForSessionEnd(ledger);
   if (runtime.sessionId && !attachedToExistingSession) {

@@ -8,6 +8,8 @@ export interface PermissionGrantPayload {
   tools: string[];
   uses?: number;
   reason?: string;
+  /** Links this grant to a specific approval request */
+  requestId?: string;
 }
 
 const VALID_ACTIONS = new Set<string>(['allow', 'deny', 'grant', 'grant-session', 'revoke']);
@@ -26,13 +28,19 @@ export function parsePermissionGrant(metadata: unknown): PermissionGrantPayload 
   const payload = grant as Record<string, unknown>;
 
   // Validate action
-  const action = String(payload.action || '').trim().toLowerCase();
+  const action = String(payload.action || '')
+    .trim()
+    .toLowerCase();
   if (!VALID_ACTIONS.has(action)) return null;
 
   // Validate tools — must be a non-empty string array
   if (!Array.isArray(payload.tools) || payload.tools.length === 0) return null;
   const tools = payload.tools
-    .map((t) => String(t || '').trim().toLowerCase())
+    .map((t) =>
+      String(t || '')
+        .trim()
+        .toLowerCase()
+    )
     .filter(Boolean);
   if (tools.length === 0) return null;
 
@@ -46,6 +54,9 @@ export function parsePermissionGrant(metadata: unknown): PermissionGrantPayload 
   }
   if (typeof payload.reason === 'string' && payload.reason.trim()) {
     result.reason = payload.reason.trim();
+  }
+  if (typeof payload.requestId === 'string' && payload.requestId.trim()) {
+    result.requestId = payload.requestId.trim();
   }
 
   return result;
@@ -120,6 +131,8 @@ export function applyPermissionGrant(params: {
 /**
  * Build a structured permission grant metadata payload for sending via inbox.
  */
-export function buildPermissionGrantMetadata(grant: PermissionGrantPayload): Record<string, unknown> {
+export function buildPermissionGrantMetadata(
+  grant: PermissionGrantPayload
+): Record<string, unknown> {
   return { permissionGrant: grant };
 }
