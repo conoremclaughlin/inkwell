@@ -1,3 +1,3 @@
 // Common types used across packages
-export * from './common';
-export * from './api';
+export * from './common.js';
+export * from './api.js';

@@ -1,4 +1,4 @@
-import { Pagination } from './common';
+import { Pagination } from './common.js';
 
 // API Response types
 
