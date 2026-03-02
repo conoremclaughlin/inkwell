@@ -1329,6 +1329,7 @@ async function ensurePcpSessionContext(
         sessionId: chosen.id,
         status: 'active',
         workingDir: cwd,
+        ...(backendSessionId ? { backendSessionId } : {}),
       });
     } catch {
       // Best-effort only.

@@ -267,6 +267,7 @@ writeFileSync(process.env.FAKE_CLAUDE_ARGS_PATH, JSON.stringify(process.argv.sli
       backendSessionId: 'stale-backend-id',
       workingDir: repoDir,
     };
+    const pcpToolCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
 
     vi.stubGlobal(
       'fetch',
@@ -276,6 +277,8 @@ writeFileSync(process.env.FAKE_CLAUDE_ARGS_PATH, JSON.stringify(process.argv.sli
           params?: { name?: string; arguments?: Record<string, unknown> };
         };
         const toolName = body.params?.name || '';
+        const toolArgs = body.params?.arguments || {};
+        pcpToolCalls.push({ name: toolName, args: toolArgs });
 
         let payload: Record<string, unknown> = { success: true };
         if (toolName === 'list_sessions') {
@@ -358,6 +361,14 @@ writeFileSync(process.env.FAKE_CLAUDE_ARGS_PATH, JSON.stringify(process.argv.sli
       expect(resumeFlagIndex).toBeGreaterThanOrEqual(0);
       expect(secondArgs[resumeFlagIndex + 1]).toBe(pcpSessionId);
       expect(secondArgs).not.toContain('--session-id');
+
+      const phaseUpdatesWithOrphanRepair = pcpToolCalls
+        .filter((call) => call.name === 'update_session_phase')
+        .some(
+          (call) =>
+            call.args.sessionId === pcpSessionId && call.args.backendSessionId === pcpSessionId
+        );
+      expect(phaseUpdatesWithOrphanRepair).toBe(true);
     } finally {
       process.chdir(oldCwd);
 
