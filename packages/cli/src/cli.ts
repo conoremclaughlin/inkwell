@@ -33,6 +33,7 @@ import { registerMissionCommand } from './commands/mission.js';
 import { registerStatusCommand } from './commands/status.js';
 import { runClaude, runClaudeInteractive } from './commands/claude.js';
 import { resolveBackend } from './backends/index.js';
+import { initSbDebug, sbDebugLog } from './lib/sb-debug.js';
 
 const VERSION = '0.3.0';
 
@@ -56,6 +57,7 @@ const SB_FLAGS: Record<string, { hasValue: boolean; key: string }> = {
   '--no-session': { hasValue: false, key: 'noSession' },
   '--session-candidates': { hasValue: false, key: 'sessionCandidates' },
   '--session-choice': { hasValue: true, key: 'sessionChoice' },
+  '--sb-debug': { hasValue: false, key: 'sbDebug' },
 };
 
 interface ParsedArgs {
@@ -67,6 +69,7 @@ interface ParsedArgs {
     verbose: boolean;
     sessionCandidates: boolean;
     sessionChoice: string | undefined;
+    sbDebug: boolean;
   };
   passthroughArgs: string[];
   promptParts: string[];
@@ -101,6 +104,7 @@ export function extractArgs(argv: string[]): ParsedArgs {
     verbose: false,
     sessionCandidates: false,
     sessionChoice: undefined,
+    sbDebug: false,
   };
   const passthroughArgs: string[] = [];
   const promptParts: string[] = [];
@@ -122,6 +126,7 @@ export function extractArgs(argv: string[]): ParsedArgs {
         if (flag.key === 'noSession') sbOptions.session = false;
         else if (flag.key === 'verbose') sbOptions.verbose = true;
         else if (flag.key === 'sessionCandidates') sbOptions.sessionCandidates = true;
+        else if (flag.key === 'sbDebug') sbOptions.sbDebug = true;
       }
     } else if (arg === '--') {
       // Explicit passthrough boundary — everything after goes to claude
@@ -170,6 +175,7 @@ program
     'List session candidates and exit (or combine with --session-choice)'
   )
   .option('--session-choice <choice>', 'Force session selection (new | pcp:<id> | local:<id>)')
+  .option('--sb-debug', 'Enable SB debug logging to ~/.pcp/sb-debug.log')
   .option('-v, --verbose', 'Verbose output')
   .argument('[prompt...]', 'Prompt to send (omit for interactive)')
   .action(async () => {
@@ -179,6 +185,23 @@ program
 
     // Resolve backend from identity.json if not explicitly set
     const resolvedOptions = { ...sbOptions, backend: resolveBackend(sbOptions.backend) };
+    const debugFile = initSbDebug({
+      enabled: resolvedOptions.sbDebug,
+      context: {
+        argv: process.argv.slice(2),
+        backend: resolvedOptions.backend,
+        agent: resolvedOptions.agent || null,
+      },
+    });
+    if (resolvedOptions.sbDebug) {
+      console.log(chalk.dim(`SB debug log: ${debugFile}`));
+    }
+    sbDebugLog('sb', 'parsed_args', {
+      sbOptions: resolvedOptions,
+      passthroughArgs,
+      promptParts,
+      hasPrompt: Boolean(prompt),
+    });
 
     const isInteractiveSubcommand = isBackendInteractiveSubcommand(
       resolvedOptions.backend,
@@ -186,6 +209,10 @@ program
     );
 
     if (isInteractiveSubcommand) {
+      sbDebugLog('sb', 'run_interactive_subcommand', {
+        backend: resolvedOptions.backend,
+        passthroughArgs: [...passthroughArgs, ...promptParts],
+      });
       // Move positional args to passthrough so the backend receives them as subcommand args
       await runClaudeInteractive(resolvedOptions, [...passthroughArgs, ...promptParts]);
     } else if (!prompt && !passthroughArgs.length && !process.stdin.isTTY) {
@@ -195,13 +222,25 @@ program
       for await (const chunk of process.stdin) {
         stdinData += chunk;
       }
+      sbDebugLog('sb', 'run_prompt_from_stdin', {
+        backend: resolvedOptions.backend,
+        stdinChars: stdinData.length,
+      });
       await runClaude(stdinData.trim(), [stdinData.trim()], resolvedOptions, passthroughArgs);
     } else if (prompt) {
       // Prompt mode (one-shot)
+      sbDebugLog('sb', 'run_prompt_mode', {
+        backend: resolvedOptions.backend,
+        promptPartsCount: promptParts.length,
+      });
       await runClaude(prompt, promptParts, resolvedOptions, passthroughArgs);
     } else {
       // No prompt — launch interactive session
       // Passthrough args (like --resume) still forwarded
+      sbDebugLog('sb', 'run_interactive_mode', {
+        backend: resolvedOptions.backend,
+        passthroughArgs,
+      });
       await runClaudeInteractive(resolvedOptions, passthroughArgs);
     }
   });
