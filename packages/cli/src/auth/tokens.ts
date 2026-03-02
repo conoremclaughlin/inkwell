@@ -157,6 +157,11 @@ export async function refreshAccessToken(serverUrl: string, auth: StoredAuth): P
 // ============================================================================
 
 export async function getValidAccessToken(serverUrl: string): Promise<string | null> {
+  const envToken = process.env.PCP_ACCESS_TOKEN?.trim();
+  if (envToken) {
+    return envToken;
+  }
+
   const auth = loadAuth();
   if (!auth) return null;
 
