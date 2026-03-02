@@ -25,7 +25,7 @@ import { env } from '../config/env';
 import { InboundMediaPipeline } from './media-pipeline';
 import { TextToSpeechService } from './text-to-speech';
 import telegramifyMarkdown from 'telegramify-markdown';
-import type { Platform } from '@shared/types/common';
+import type { Platform } from '../types/shared';
 
 // Supported messaging channels
 export type GatewayChannel = 'telegram' | 'whatsapp' | 'discord' | 'slack';

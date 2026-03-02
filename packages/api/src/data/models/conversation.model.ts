@@ -1,5 +1,5 @@
 import type { Database } from '../supabase/types';
-import type { Platform, MessageType } from '@shared/types/common';
+import type { Platform, MessageType } from '../../types/shared';
 
 export type Conversation = Database['public']['Tables']['conversations']['Row'];
 export type ConversationInsert = Database['public']['Tables']['conversations']['Insert'];

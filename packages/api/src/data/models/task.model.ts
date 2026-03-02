@@ -1,5 +1,5 @@
 import type { Database } from '../supabase/types';
-import type { TaskStatus, TaskPriority } from '@shared/types/common';
+import type { TaskStatus, TaskPriority } from '../../types/shared';
 
 export type Task = Database['public']['Tables']['tasks']['Row'];
 export type TaskInsert = Database['public']['Tables']['tasks']['Insert'];
