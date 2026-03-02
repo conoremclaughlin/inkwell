@@ -26,7 +26,10 @@ export function renderInkMission(options: { timezone?: string; fullscreen?: bool
     exitResolve = resolve;
   });
 
+  let unmounted = false;
+
   const onExit = () => {
+    unmounted = true;
     if (exitResolve) {
       exitResolve();
       exitResolve = null;
@@ -45,18 +48,18 @@ export function renderInkMission(options: { timezone?: string; fullscreen?: bool
     { alternateBuffer: fullscreen, incrementalRendering: true }
   );
 
-  const getHandle = (): MissionAppHandle => {
-    if (!handleRef.current) {
-      throw new Error('MissionApp handle not available');
-    }
-    return handleRef.current;
-  };
-
   return {
-    addEvent: (event) => getHandle().addEvent(event),
-    setAgents: (agents) => getHandle().setAgents(agents),
-    setStatus: (status) => getHandle().setStatus(status),
+    addEvent: (event) => {
+      if (!unmounted && handleRef.current) handleRef.current.addEvent(event);
+    },
+    setAgents: (agents) => {
+      if (!unmounted && handleRef.current) handleRef.current.setAgents(agents);
+    },
+    setStatus: (status) => {
+      if (!unmounted && handleRef.current) handleRef.current.setStatus(status);
+    },
     cleanup: () => {
+      unmounted = true;
       unmount();
     },
     waitForExit: () => exitPromise,
