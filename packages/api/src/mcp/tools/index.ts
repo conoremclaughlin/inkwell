@@ -211,13 +211,13 @@ import {
 } from './activity-stream-handlers';
 
 import {
-  handleCreateWorkspace as handleCreateStudio,
-  handleListWorkspaces as handleListStudios,
-  handleGetWorkspace as handleGetStudio,
-  handleUpdateWorkspace as handleUpdateStudio,
-  handleCloseWorkspace as handleCloseStudio,
-  handleAdoptWorkspace as handleAdoptStudio,
-  workspaceToolDefinitions as studioToolDefinitions,
+  handleCreateStudio,
+  handleListStudios,
+  handleGetStudio,
+  handleUpdateStudio,
+  handleCloseStudio,
+  handleAdoptStudio,
+  studioToolDefinitions,
 } from './workspace-handlers';
 
 import {

@@ -1,7 +1,7 @@
 /**
- * Workspace Handlers
+ * Studio Handlers
  *
- * MCP tools for managing git worktree workspaces. Enables agents to create
+ * MCP tools for managing git worktree studios. Enables agents to create
  * isolated worktrees for parallel work, track their lifecycle, and link
  * them to sessions for context continuity.
  */
@@ -49,23 +49,20 @@ const WORK_TYPE_ABBREV: Record<string, string> = {
 
 // ============== Schemas ==============
 
-const createWorkspaceSchema = userIdentifierBaseSchema.extend({
-  agentId: z.string().describe('Agent ID creating the workspace (e.g., "wren")'),
+const createStudioSchema = userIdentifierBaseSchema.extend({
+  agentId: z.string().describe('Agent ID creating the studio (e.g., "wren")'),
   repoRoot: z.string().describe('Absolute path to the main repository root'),
   slug: z
     .string()
-    .describe('Short slug for the workspace (used in branch name and worktree directory)'),
+    .describe('Short slug for the studio (used in branch name and worktree directory)'),
   workType: z
     .enum(['feature', 'bugfix', 'refactor', 'chore', 'experiment', 'other'])
     .optional()
     .default('feature')
-    .describe('Type of work being done in this workspace'),
-  purpose: z
-    .string()
-    .optional()
-    .describe('Human-readable description of what this workspace is for'),
+    .describe('Type of work being done in this studio'),
+  purpose: z.string().optional().describe('Human-readable description of what this studio is for'),
   baseBranch: z.string().optional().default('main').describe('Branch to base the new worktree on'),
-  sessionId: z.string().uuid().optional().describe('Session ID to link to this workspace'),
+  sessionId: z.string().uuid().optional().describe('Session ID to link to this studio'),
   roleTemplate: z
     .string()
     .optional()
@@ -77,13 +74,13 @@ const createWorkspaceSchema = userIdentifierBaseSchema.extend({
     .describe('If true, skip git worktree creation (useful when worktree already exists)'),
 });
 
-const listWorkspacesSchema = userIdentifierBaseSchema.extend({
+const listStudiosSchema = userIdentifierBaseSchema.extend({
   agentId: z.string().optional().describe('Filter by agent ID'),
   status: z
     .enum(['active', 'idle', 'archived', 'cleaned', 'all'])
     .optional()
     .default('all')
-    .describe('Filter by workspace status'),
+    .describe('Filter by studio status'),
   includeAll: z
     .boolean()
     .optional()
@@ -91,16 +88,16 @@ const listWorkspacesSchema = userIdentifierBaseSchema.extend({
     .describe('If true, include all statuses including cleaned'),
 });
 
-const getWorkspaceSchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Workspace UUID'),
+const getStudioSchema = userIdentifierBaseSchema.extend({
+  studioId: z.string().uuid().optional().describe('Studio UUID'),
   branch: z.string().optional().describe('Branch name to look up'),
   path: z.string().optional().describe('Worktree path to look up'),
 });
 
-const updateWorkspaceSchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().describe('Workspace UUID to update'),
+const updateStudioSchema = userIdentifierBaseSchema.extend({
+  studioId: z.string().uuid().describe('Studio UUID to update'),
   agentId: z.string().describe('Agent ID making the update'),
-  status: z.enum(['active', 'idle', 'archived']).optional().describe('New workspace status'),
+  status: z.enum(['active', 'idle', 'archived']).optional().describe('New studio status'),
   purpose: z.string().optional().describe('Updated purpose description'),
   roleTemplate: z.string().optional().describe('Role template name to set'),
   worktreePath: z.string().optional().describe('Updated worktree path (after rename/move)'),
@@ -112,9 +109,9 @@ const updateWorkspaceSchema = userIdentifierBaseSchema.extend({
     .describe('If true, unlink the current session and set status to idle'),
 });
 
-const closeWorkspaceSchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().describe('Workspace UUID to close'),
-  agentId: z.string().describe('Agent ID closing the workspace'),
+const closeStudioSchema = userIdentifierBaseSchema.extend({
+  studioId: z.string().uuid().describe('Studio UUID to close'),
+  agentId: z.string().describe('Agent ID closing the studio'),
   removeWorktree: z
     .boolean()
     .optional()
@@ -127,12 +124,12 @@ const closeWorkspaceSchema = userIdentifierBaseSchema.extend({
     .describe('If true, delete the associated git branch'),
 });
 
-const adoptWorkspaceSchema = userIdentifierBaseSchema.extend({
-  agentId: z.string().describe('Agent ID adopting the workspace'),
-  sessionId: z.string().uuid().describe('Session ID to link to the workspace'),
-  workspaceId: z.string().uuid().optional().describe('Workspace UUID to adopt'),
-  branch: z.string().optional().describe('Branch name to look up the workspace'),
-  worktreePath: z.string().optional().describe('Worktree path to look up the workspace'),
+const adoptStudioSchema = userIdentifierBaseSchema.extend({
+  agentId: z.string().describe('Agent ID adopting the studio'),
+  sessionId: z.string().uuid().describe('Session ID to link to the studio'),
+  studioId: z.string().uuid().optional().describe('Studio UUID to adopt'),
+  branch: z.string().optional().describe('Branch name to look up the studio'),
+  worktreePath: z.string().optional().describe('Worktree path to look up the studio'),
 });
 
 // ============== Helpers ==============
@@ -162,8 +159,8 @@ function errorResponse(error: string) {
 
 // ============== Handlers ==============
 
-export async function handleCreateWorkspace(args: unknown, dataComposer: DataComposer) {
-  const parsed = createWorkspaceSchema.parse(args);
+export async function handleCreateStudio(args: unknown, dataComposer: DataComposer) {
+  const parsed = createStudioSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const {
@@ -210,10 +207,10 @@ export async function handleCreateWorkspace(args: unknown, dataComposer: DataCom
     }
   }
 
-  // Insert workspace record into the database
-  let workspace;
+  // Insert studio record into the database
+  let studio;
   try {
-    workspace = await dataComposer.repositories.studios.create({
+    studio = await dataComposer.repositories.studios.create({
       userId: resolved.user.id,
       agentId,
       sessionId,
@@ -242,52 +239,52 @@ export async function handleCreateWorkspace(args: unknown, dataComposer: DataCom
       }
     }
     const errorMessage = dbError instanceof Error ? dbError.message : String(dbError);
-    return errorResponse(`Failed to save workspace record: ${errorMessage}`);
+    return errorResponse(`Failed to save studio record: ${errorMessage}`);
   }
 
-  logger.info('Workspace created', {
-    workspaceId: workspace.id,
+  logger.info('Studio created', {
+    studioId: studio.id,
     branch,
     worktreePath,
     agentId,
   });
 
   return successResponse({
-    message: `Workspace created at ${worktreePath}`,
-    workspace: {
-      id: workspace.id,
-      studioId: workspace.id,
-      agentId: workspace.agentId,
-      branch: workspace.branch,
-      worktreeFolder: path.basename(workspace.worktreePath),
-      worktreePath: workspace.worktreePath,
-      repoRoot: workspace.repoRoot,
-      baseBranch: workspace.baseBranch,
-      purpose: workspace.purpose,
-      workType: workspace.workType,
-      roleTemplate: workspace.roleTemplate,
-      status: workspace.status,
-      sessionId: workspace.sessionId,
-      createdAt: workspace.createdAt,
+    message: `Studio created at ${worktreePath}`,
+    studio: {
+      id: studio.id,
+      studioId: studio.id,
+      agentId: studio.agentId,
+      branch: studio.branch,
+      worktreeFolder: path.basename(studio.worktreePath),
+      worktreePath: studio.worktreePath,
+      repoRoot: studio.repoRoot,
+      baseBranch: studio.baseBranch,
+      purpose: studio.purpose,
+      workType: studio.workType,
+      roleTemplate: studio.roleTemplate,
+      status: studio.status,
+      sessionId: studio.sessionId,
+      createdAt: studio.createdAt,
     },
   });
 }
 
-export async function handleListWorkspaces(args: unknown, dataComposer: DataComposer) {
-  const parsed = listWorkspacesSchema.parse(args);
+export async function handleListStudios(args: unknown, dataComposer: DataComposer) {
+  const parsed = listStudiosSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const { agentId, status = 'all', includeAll = false } = parsed;
   const studiosRepo = dataComposer.repositories.studios;
 
-  let workspaces;
+  let studios;
   if (status !== 'all') {
-    workspaces = await studiosRepo.listByUser(resolved.user.id, {
+    studios = await studiosRepo.listByUser(resolved.user.id, {
       status: status as 'active' | 'idle' | 'archived' | 'cleaned',
       agentId: agentId || undefined,
     });
   } else if (includeAll) {
-    workspaces = await studiosRepo.listByUser(resolved.user.id, {
+    studios = await studiosRepo.listByUser(resolved.user.id, {
       agentId: agentId || undefined,
     });
   } else {
@@ -295,12 +292,12 @@ export async function handleListWorkspaces(args: unknown, dataComposer: DataComp
     const all = await studiosRepo.listByUser(resolved.user.id, {
       agentId: agentId || undefined,
     });
-    workspaces = all.filter((w) => w.status !== 'cleaned');
+    studios = all.filter((w) => w.status !== 'cleaned');
   }
 
   return successResponse({
-    count: workspaces.length,
-    workspaces: workspaces.map((w) => ({
+    count: studios.length,
+    studios: studios.map((w) => ({
       id: w.id,
       studioId: w.id,
       agentId: w.agentId,
@@ -318,58 +315,58 @@ export async function handleListWorkspaces(args: unknown, dataComposer: DataComp
   });
 }
 
-export async function handleGetWorkspace(args: unknown, dataComposer: DataComposer) {
-  const parsed = getWorkspaceSchema.parse(args);
+export async function handleGetStudio(args: unknown, dataComposer: DataComposer) {
+  const parsed = getStudioSchema.parse(args);
   await resolveUserOrThrow(parsed, dataComposer);
 
   const studiosRepo = dataComposer.repositories.studios;
-  let workspace = null;
+  let studio = null;
 
-  // Try identifiers in order: workspaceId, branch, path
-  if (parsed.workspaceId) {
-    workspace = await studiosRepo.findById(parsed.workspaceId);
+  // Try identifiers in order: studioId, branch, path
+  if (parsed.studioId) {
+    studio = await studiosRepo.findById(parsed.studioId);
   } else if (parsed.branch) {
-    workspace = await studiosRepo.findByBranch(parsed.branch);
+    studio = await studiosRepo.findByBranch(parsed.branch);
   } else if (parsed.path) {
-    workspace = await studiosRepo.findByPath(parsed.path);
+    studio = await studiosRepo.findByPath(parsed.path);
   } else {
-    return errorResponse('Must provide at least one of: workspaceId, branch, or path');
+    return errorResponse('Must provide at least one of: studioId, branch, or path');
   }
 
-  if (!workspace) {
-    return errorResponse('Workspace not found');
+  if (!studio) {
+    return errorResponse('Studio not found');
   }
 
   return successResponse({
-    workspace: {
-      id: workspace.id,
-      studioId: workspace.id,
-      agentId: workspace.agentId,
-      branch: workspace.branch,
-      worktreeFolder: path.basename(workspace.worktreePath),
-      worktreePath: workspace.worktreePath,
-      repoRoot: workspace.repoRoot,
-      baseBranch: workspace.baseBranch,
-      purpose: workspace.purpose,
-      workType: workspace.workType,
-      roleTemplate: workspace.roleTemplate,
-      status: workspace.status,
-      sessionId: workspace.sessionId,
-      metadata: workspace.metadata,
-      createdAt: workspace.createdAt,
-      updatedAt: workspace.updatedAt,
-      archivedAt: workspace.archivedAt,
-      cleanedAt: workspace.cleanedAt,
+    studio: {
+      id: studio.id,
+      studioId: studio.id,
+      agentId: studio.agentId,
+      branch: studio.branch,
+      worktreeFolder: path.basename(studio.worktreePath),
+      worktreePath: studio.worktreePath,
+      repoRoot: studio.repoRoot,
+      baseBranch: studio.baseBranch,
+      purpose: studio.purpose,
+      workType: studio.workType,
+      roleTemplate: studio.roleTemplate,
+      status: studio.status,
+      sessionId: studio.sessionId,
+      metadata: studio.metadata,
+      createdAt: studio.createdAt,
+      updatedAt: studio.updatedAt,
+      archivedAt: studio.archivedAt,
+      cleanedAt: studio.cleanedAt,
     },
   });
 }
 
-export async function handleUpdateWorkspace(args: unknown, dataComposer: DataComposer) {
-  const parsed = updateWorkspaceSchema.parse(args);
+export async function handleUpdateStudio(args: unknown, dataComposer: DataComposer) {
+  const parsed = updateStudioSchema.parse(args);
   await resolveUserOrThrow(parsed, dataComposer);
 
   const {
-    workspaceId,
+    studioId,
     agentId,
     status,
     purpose,
@@ -381,18 +378,18 @@ export async function handleUpdateWorkspace(args: unknown, dataComposer: DataCom
   } = parsed;
   const studiosRepo = dataComposer.repositories.studios;
 
-  // Verify workspace exists
-  const existing = await studiosRepo.findById(workspaceId);
+  // Verify studio exists
+  const existing = await studiosRepo.findById(studioId);
   if (!existing) {
-    return errorResponse(`Workspace not found: ${workspaceId}`);
+    return errorResponse(`Studio not found: ${studioId}`);
   }
 
   let updated;
 
   if (unlinkSession) {
-    updated = await studiosRepo.unlinkSession(workspaceId);
+    updated = await studiosRepo.unlinkSession(studioId);
   } else if (sessionId) {
-    updated = await studiosRepo.linkSession(workspaceId, sessionId);
+    updated = await studiosRepo.linkSession(studioId, sessionId);
   } else {
     const updateObj: Record<string, unknown> = {};
     if (status !== undefined) {
@@ -410,14 +407,14 @@ export async function handleUpdateWorkspace(args: unknown, dataComposer: DataCom
     if (slug !== undefined) {
       updateObj.slug = slug;
     }
-    updated = await studiosRepo.update(workspaceId, updateObj);
+    updated = await studiosRepo.update(studioId, updateObj);
   }
 
-  logger.info('Workspace updated', { workspaceId, agentId, status: updated.status });
+  logger.info('Studio updated', { studioId, agentId, status: updated.status });
 
   return successResponse({
-    message: 'Workspace updated',
-    workspace: {
+    message: 'Studio updated',
+    studio: {
       id: updated.id,
       studioId: updated.id,
       agentId: updated.agentId,
@@ -433,17 +430,17 @@ export async function handleUpdateWorkspace(args: unknown, dataComposer: DataCom
   });
 }
 
-export async function handleCloseWorkspace(args: unknown, dataComposer: DataComposer) {
-  const parsed = closeWorkspaceSchema.parse(args);
+export async function handleCloseStudio(args: unknown, dataComposer: DataComposer) {
+  const parsed = closeStudioSchema.parse(args);
   await resolveUserOrThrow(parsed, dataComposer);
 
-  const { workspaceId, agentId, removeWorktree = true, deleteBranch = false } = parsed;
+  const { studioId, agentId, removeWorktree = true, deleteBranch = false } = parsed;
   const studiosRepo = dataComposer.repositories.studios;
 
-  // Verify workspace exists
-  const workspace = await studiosRepo.findById(workspaceId);
-  if (!workspace) {
-    return errorResponse(`Workspace not found: ${workspaceId}`);
+  // Verify studio exists
+  const studio = await studiosRepo.findById(studioId);
+  if (!studio) {
+    return errorResponse(`Studio not found: ${studioId}`);
   }
 
   const cleanupResults: { worktreeRemoved: boolean; branchDeleted: boolean; errors: string[] } = {
@@ -455,8 +452,8 @@ export async function handleCloseWorkspace(args: unknown, dataComposer: DataComp
   // Remove the git worktree
   if (removeWorktree) {
     try {
-      execSync(`git worktree remove ${workspace.worktreePath}`, {
-        cwd: workspace.repoRoot,
+      execSync(`git worktree remove ${studio.worktreePath}`, {
+        cwd: studio.repoRoot,
         stdio: 'pipe',
       });
       cleanupResults.worktreeRemoved = true;
@@ -464,7 +461,7 @@ export async function handleCloseWorkspace(args: unknown, dataComposer: DataComp
       const errorMessage =
         worktreeError instanceof Error ? worktreeError.message : String(worktreeError);
       logger.warn('Failed to remove worktree (may already be gone)', {
-        worktreePath: workspace.worktreePath,
+        worktreePath: studio.worktreePath,
         error: errorMessage,
       });
       cleanupResults.errors.push(`Worktree removal: ${errorMessage}`);
@@ -474,15 +471,15 @@ export async function handleCloseWorkspace(args: unknown, dataComposer: DataComp
   // Delete the branch
   if (deleteBranch) {
     try {
-      execSync(`git branch -d ${workspace.branch}`, {
-        cwd: workspace.repoRoot,
+      execSync(`git branch -d ${studio.branch}`, {
+        cwd: studio.repoRoot,
         stdio: 'pipe',
       });
       cleanupResults.branchDeleted = true;
     } catch (branchError) {
       const errorMessage = branchError instanceof Error ? branchError.message : String(branchError);
       logger.warn('Failed to delete branch', {
-        branch: workspace.branch,
+        branch: studio.branch,
         error: errorMessage,
       });
       cleanupResults.errors.push(`Branch deletion: ${errorMessage}`);
@@ -490,59 +487,59 @@ export async function handleCloseWorkspace(args: unknown, dataComposer: DataComp
   }
 
   // Mark as cleaned in the database
-  const updated = await studiosRepo.markCleaned(workspaceId);
+  const updated = await studiosRepo.markCleaned(studioId);
 
-  logger.info('Workspace closed', {
-    workspaceId,
+  logger.info('Studio closed', {
+    studioId,
     agentId,
     worktreeRemoved: cleanupResults.worktreeRemoved,
     branchDeleted: cleanupResults.branchDeleted,
   });
 
   return successResponse({
-    message: 'Workspace closed and marked as cleaned',
-    workspaceId: updated.id,
+    message: 'Studio closed and marked as cleaned',
+    studioId: updated.id,
     status: updated.status,
     cleanedAt: updated.cleanedAt,
     cleanup: cleanupResults,
   });
 }
 
-export async function handleAdoptWorkspace(args: unknown, dataComposer: DataComposer) {
-  const parsed = adoptWorkspaceSchema.parse(args);
+export async function handleAdoptStudio(args: unknown, dataComposer: DataComposer) {
+  const parsed = adoptStudioSchema.parse(args);
   await resolveUserOrThrow(parsed, dataComposer);
 
   const { agentId, sessionId } = parsed;
   const studiosRepo = dataComposer.repositories.studios;
 
-  // Find workspace by ID, branch, or path
-  let workspace = null;
-  if (parsed.workspaceId) {
-    workspace = await studiosRepo.findById(parsed.workspaceId);
+  // Find studio by ID, branch, or path
+  let studio = null;
+  if (parsed.studioId) {
+    studio = await studiosRepo.findById(parsed.studioId);
   } else if (parsed.branch) {
-    workspace = await studiosRepo.findByBranch(parsed.branch);
+    studio = await studiosRepo.findByBranch(parsed.branch);
   } else if (parsed.worktreePath) {
-    workspace = await studiosRepo.findByPath(parsed.worktreePath);
+    studio = await studiosRepo.findByPath(parsed.worktreePath);
   } else {
-    return errorResponse('Must provide at least one of: workspaceId, branch, or worktreePath');
+    return errorResponse('Must provide at least one of: studioId, branch, or worktreePath');
   }
 
-  if (!workspace) {
-    return errorResponse('Workspace not found');
+  if (!studio) {
+    return errorResponse('Studio not found');
   }
 
   // Link session and set to active
-  const updated = await studiosRepo.linkSession(workspace.id, sessionId);
+  const updated = await studiosRepo.linkSession(studio.id, sessionId);
 
-  logger.info('Workspace adopted', {
-    workspaceId: updated.id,
+  logger.info('Studio adopted', {
+    studioId: updated.id,
     agentId,
     sessionId,
   });
 
   return successResponse({
-    message: `Workspace adopted by ${agentId} and linked to session ${sessionId}`,
-    workspace: {
+    message: `Studio adopted by ${agentId} and linked to session ${sessionId}`,
+    studio: {
       id: updated.id,
       studioId: updated.id,
       agentId: updated.agentId,
@@ -560,46 +557,46 @@ export async function handleAdoptWorkspace(args: unknown, dataComposer: DataComp
 
 // ============== Tool Registration ==============
 
-export const workspaceToolDefinitions = [
+export const studioToolDefinitions = [
   {
-    name: 'create_workspace',
+    name: 'create_studio',
     description:
-      'Create a new git worktree workspace for isolated parallel work. Sets up the worktree, installs dependencies, and tracks it in the database.',
-    schema: createWorkspaceSchema,
-    handler: handleCreateWorkspace,
+      'Create a new git worktree studio for isolated parallel work. Sets up the worktree, installs dependencies, and tracks it in the database.',
+    schema: createStudioSchema,
+    handler: handleCreateStudio,
   },
   {
-    name: 'list_workspaces',
+    name: 'list_studios',
     description:
-      'List workspaces for the current user. By default excludes cleaned workspaces unless includeAll is true. Can filter by agent and status.',
-    schema: listWorkspacesSchema,
-    handler: handleListWorkspaces,
+      'List studios for the current user. By default excludes cleaned studios unless includeAll is true. Can filter by agent and status.',
+    schema: listStudiosSchema,
+    handler: handleListStudios,
   },
   {
-    name: 'get_workspace',
-    description: 'Get full details of a workspace by its ID, branch name, or worktree path.',
-    schema: getWorkspaceSchema,
-    handler: handleGetWorkspace,
+    name: 'get_studio',
+    description: 'Get full details of a studio by its ID, branch name, or worktree path.',
+    schema: getStudioSchema,
+    handler: handleGetStudio,
   },
   {
-    name: 'update_workspace',
+    name: 'update_studio',
     description:
-      'Update a workspace status, purpose, or session linkage. Use unlinkSession to detach the current session and set status to idle.',
-    schema: updateWorkspaceSchema,
-    handler: handleUpdateWorkspace,
+      'Update a studio status, purpose, or session linkage. Use unlinkSession to detach the current session and set status to idle.',
+    schema: updateStudioSchema,
+    handler: handleUpdateStudio,
   },
   {
-    name: 'close_workspace',
+    name: 'close_studio',
     description:
-      'Close a workspace by removing its git worktree, optionally deleting the branch, and marking it as cleaned in the database.',
-    schema: closeWorkspaceSchema,
-    handler: handleCloseWorkspace,
+      'Close a studio by removing its git worktree, optionally deleting the branch, and marking it as cleaned in the database.',
+    schema: closeStudioSchema,
+    handler: handleCloseStudio,
   },
   {
-    name: 'adopt_workspace',
+    name: 'adopt_studio',
     description:
-      'Adopt an existing workspace by linking a new session to it and setting it to active. Useful when resuming work in a previously created worktree.',
-    schema: adoptWorkspaceSchema,
-    handler: handleAdoptWorkspace,
+      'Adopt an existing studio by linking a new session to it and setting it to active. Useful when resuming work in a previously created worktree.',
+    schema: adoptStudioSchema,
+    handler: handleAdoptStudio,
   },
 ];

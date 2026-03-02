@@ -14,7 +14,7 @@ import type {
 import type { Json } from '../../data/supabase/types';
 import { slugifyWorkspaceName } from '../../utils/workspace-slug';
 
-const workspaceContainerTypeSchema = z.enum(['personal', 'team']);
+const workspaceTypeSchema = z.enum(['personal', 'team']);
 const workspaceMemberRoleSchema = z.enum(['owner', 'admin', 'member', 'viewer']);
 
 export const createWorkspaceSchema = userIdentifierBaseSchema.extend({
@@ -24,7 +24,7 @@ export const createWorkspaceSchema = userIdentifierBaseSchema.extend({
     .min(1)
     .optional()
     .describe('Stable workspace slug (generated from name when omitted)'),
-  type: workspaceContainerTypeSchema
+  type: workspaceTypeSchema
     .optional()
     .default('personal')
     .describe('Workspace type: personal or team'),
@@ -33,7 +33,7 @@ export const createWorkspaceSchema = userIdentifierBaseSchema.extend({
 });
 
 export const listWorkspacesSchema = userIdentifierBaseSchema.extend({
-  type: workspaceContainerTypeSchema.optional().describe('Optional type filter'),
+  type: workspaceTypeSchema.optional().describe('Optional type filter'),
   includeArchived: z.boolean().optional().default(false).describe('Include archived workspaces'),
   ensurePersonal: z
     .boolean()
@@ -51,7 +51,7 @@ export const updateWorkspaceSchema = userIdentifierBaseSchema.extend({
   workspaceId: z.string().uuid().describe('Workspace UUID'),
   name: z.string().min(1).optional(),
   slug: z.string().min(1).optional(),
-  type: workspaceContainerTypeSchema.optional(),
+  type: workspaceTypeSchema.optional(),
   description: z.string().nullable().optional(),
   metadata: z.record(z.unknown()).optional(),
   archived: z.boolean().optional().describe('Set true to archive, false to unarchive'),

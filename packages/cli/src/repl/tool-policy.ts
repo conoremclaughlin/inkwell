@@ -140,10 +140,8 @@ export const DEFAULT_SAFE_PCP_TOOLS = new Set<string>([
   'list_tasks',
   'list_projects',
   'list_reminders',
-  'list_workspace_containers',
   'list_workspaces',
   'list_studios',
-  'get_workspace_container',
   'get_workspace',
   'get_studio',
   'get_timezone',
@@ -154,7 +152,13 @@ export const TOOL_GROUPS: ToolGroupMap = {
   'group:pcp-safe': Array.from(DEFAULT_SAFE_PCP_TOOLS),
   'group:pcp-comms': ['send_to_inbox', 'trigger_agent', 'send_response'],
   'group:pcp-memory': ['remember', 'recall', 'forget', 'update_memory', 'restore_memory'],
-  'group:pcp-session': ['start_session', 'update_session_phase', 'get_session', 'list_sessions', 'end_session'],
+  'group:pcp-session': [
+    'start_session',
+    'update_session_phase',
+    'get_session',
+    'list_sessions',
+    'end_session',
+  ],
 };
 
 const MODE_RANK: Record<ToolMode, number> = {
@@ -218,13 +222,7 @@ function isExactToolToken(token: string): boolean {
 
 function normalizeStringArray(values: string[] | undefined): string[] {
   if (!Array.isArray(values)) return [];
-  return Array.from(
-    new Set(
-      values
-        .map((value) => String(value || '').trim())
-        .filter(Boolean)
-    )
-  );
+  return Array.from(new Set(values.map((value) => String(value || '').trim()).filter(Boolean)));
 }
 
 function cloneContext(context: ToolPolicyContext): ToolPolicyContext {
@@ -243,8 +241,7 @@ function modeFromRank(rank: number): ToolMode {
 
 function isValidSessionVisibility(value: string | undefined): value is SessionVisibility {
   return Boolean(
-    value &&
-      ['self', 'thread', 'studio', 'workspace', 'agent', 'all'].includes(value)
+    value && ['self', 'thread', 'studio', 'workspace', 'agent', 'all'].includes(value)
   );
 }
 
@@ -274,16 +271,16 @@ function addPathSpec(target: string[], raw: string): string[] {
 function hasAnyRules(rule: ToolPolicyRulesState): boolean {
   return Boolean(
     rule.mode ||
-      rule.skillTrustMode ||
-      rule.sessionVisibility ||
-      rule.allowTools.size ||
-      rule.denyTools.size ||
-      rule.promptTools.size ||
-      rule.grants.size ||
-      rule.readPathAllow.length ||
-      rule.writePathAllow.length ||
-      rule.allowedSkills.size ||
-      rule.safeTools.size
+    rule.skillTrustMode ||
+    rule.sessionVisibility ||
+    rule.allowTools.size ||
+    rule.denyTools.size ||
+    rule.promptTools.size ||
+    rule.grants.size ||
+    rule.readPathAllow.length ||
+    rule.writePathAllow.length ||
+    rule.allowedSkills.size ||
+    rule.safeTools.size
   );
 }
 
@@ -333,7 +330,9 @@ export class ToolPolicyState {
     }
   }
 
-  private getScopeMap(scope: Exclude<ToolPolicyScopeKind, 'global'>): Map<string, ToolPolicyRulesState> {
+  private getScopeMap(
+    scope: Exclude<ToolPolicyScopeKind, 'global'>
+  ): Map<string, ToolPolicyRulesState> {
     if (scope === 'workspace') return this.workspaceRules;
     if (scope === 'agent') return this.agentRules;
     return this.studioRules;
@@ -358,7 +357,10 @@ export class ToolPolicyState {
     return { scope, id: resolved };
   }
 
-  private getRulesForScope(scope: ToolPolicyScopeRef, create = false): ToolPolicyRulesState | undefined {
+  private getRulesForScope(
+    scope: ToolPolicyScopeRef,
+    create = false
+  ): ToolPolicyRulesState | undefined {
     if (scope.scope === 'global') {
       return this.globalRules;
     }
@@ -396,10 +398,15 @@ export class ToolPolicyState {
         const rules = this.getRulesForScope(ref, false);
         return rules ? { ref, rules } : undefined;
       })
-      .filter((entry): entry is { ref: ToolPolicyScopeRef; rules: ToolPolicyRulesState } => Boolean(entry));
+      .filter((entry): entry is { ref: ToolPolicyScopeRef; rules: ToolPolicyRulesState } =>
+        Boolean(entry)
+      );
   }
 
-  private applyPersistedRules(target: ToolPolicyRulesState, data: PersistedToolPolicyRules | undefined): void {
+  private applyPersistedRules(
+    target: ToolPolicyRulesState,
+    data: PersistedToolPolicyRules | undefined
+  ): void {
     if (!data) return;
 
     if (data.mode === 'backend' || data.mode === 'off' || data.mode === 'privileged') {
@@ -440,7 +447,9 @@ export class ToolPolicyState {
     };
   }
 
-  private serializeScopedMap(map: Map<string, ToolPolicyRulesState>): Record<string, PersistedToolPolicyRules> {
+  private serializeScopedMap(
+    map: Map<string, ToolPolicyRulesState>
+  ): Record<string, PersistedToolPolicyRules> {
     const output: Record<string, PersistedToolPolicyRules> = {};
     for (const [id, rules] of map.entries()) {
       if (!hasAnyRules(rules)) continue;
@@ -576,7 +585,11 @@ export class ToolPolicyState {
     return undefined;
   }
 
-  private consumeScopedGrant(tool: string): { consumed: boolean; remaining: number; scopeLabel?: string } {
+  private consumeScopedGrant(tool: string): {
+    consumed: boolean;
+    remaining: number;
+    scopeLabel?: string;
+  } {
     const activeScopes = this.getActiveScopeRules().reverse();
     for (const { ref, rules } of activeScopes) {
       const current = rules.grants.get(tool) || 0;
@@ -660,7 +673,9 @@ export class ToolPolicyState {
       );
     }
     if (visibility === 'studio') {
-      return Boolean(requester.studioId && target.studioId && requester.studioId === target.studioId);
+      return Boolean(
+        requester.studioId && target.studioId && requester.studioId === target.studioId
+      );
     }
     if (visibility === 'thread') {
       if (requester.threadKey && target.threadKey) {
@@ -672,7 +687,9 @@ export class ToolPolicyState {
       return false;
     }
     // self
-    return Boolean(requester.sessionId && target.sessionId && requester.sessionId === target.sessionId);
+    return Boolean(
+      requester.sessionId && target.sessionId && requester.sessionId === target.sessionId
+    );
   }
 
   public setContext(context: ToolPolicyContext): void {
@@ -745,7 +762,10 @@ export class ToolPolicyState {
           allowedSkills: Array.from(rules.allowedSkills).sort(),
         } satisfies ToolPolicyScopeSnapshot;
       })
-      .filter((snapshot, index) => index === 0 || hasAnyRules(this.getRulesForScope(snapshot.scope, false) || createRules()));
+      .filter(
+        (snapshot, index) =>
+          index === 0 || hasAnyRules(this.getRulesForScope(snapshot.scope, false) || createRules())
+      );
   }
 
   public getMode(): ToolMode {
@@ -808,7 +828,11 @@ export class ToolPolicyState {
         includeDefaultSafeTools: true,
       });
       this.saveToDisk();
-      return { success: true, message: 'Reset global policy scope to defaults.', scope: { ...target } };
+      return {
+        success: true,
+        message: 'Reset global policy scope to defaults.',
+        scope: { ...target },
+      };
     }
 
     if (!target.id) {
@@ -818,7 +842,11 @@ export class ToolPolicyState {
     const map = this.getScopeMap(target.scope);
     map.delete(target.id);
     this.saveToDisk();
-    return { success: true, message: `Reset ${normalizeScopeLabel(target)} policy scope.`, scope: { ...target } };
+    return {
+      success: true,
+      message: `Reset ${normalizeScopeLabel(target)} policy scope.`,
+      scope: { ...target },
+    };
   }
 
   public isSkillTrustAllowed(level: 'trusted' | 'local' | 'untrusted'): boolean {
