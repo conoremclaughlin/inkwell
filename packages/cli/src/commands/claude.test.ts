@@ -84,6 +84,25 @@ describe('filterPcpSessionsForContext', () => {
     expect(filtered.map((session) => session.id)).toEqual(['pcp-1']);
   });
 
+  it('strictly excludes claude sessions outside current project when no local match exists', () => {
+    const filtered = filterPcpSessionsForContext(
+      [
+        {
+          id: 'pcp-1',
+          startedAt: '2026-02-28T00:00:00.000Z',
+          backend: 'claude',
+          backendSessionId: 'remote-session-id',
+          workingDir: '/tmp/another-project',
+        },
+      ],
+      'claude',
+      '/tmp/current-project',
+      new Set()
+    );
+
+    expect(filtered).toEqual([]);
+  });
+
   it('filters non-claude sessions only by backend', () => {
     const filtered = filterPcpSessionsForContext(
       [

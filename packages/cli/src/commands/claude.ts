@@ -27,6 +27,8 @@ export interface SbOptions {
   session: boolean;
   verbose: boolean;
   backend: string;
+  sessionCandidates?: boolean;
+  sessionChoice?: string;
 }
 
 interface PcpConfig {
@@ -273,6 +275,10 @@ export function filterPcpSessionsForContext(
     const normalizedWorkingDir = normalizePath(session.workingDir);
     return !!normalizedWorkingDir && normalizedWorkingDir === normalizedCwd;
   });
+
+  if (backend === 'claude') {
+    return pathScoped;
+  }
 
   return pathScoped.length > 0 ? pathScoped : backendMatched;
 }
@@ -988,7 +994,8 @@ async function ensurePcpSessionContext(
   backend: string,
   passthroughArgs: string[],
   verbose: boolean,
-  promptParts: string[] = []
+  promptParts: string[] = [],
+  options: { listCandidates?: boolean; selectionOverride?: string } = {}
 ): Promise<{ pcpSessionId?: string; backendSessionId?: string; backendSessionSeedId?: string }> {
   if (hasBackendSessionOverride(backend, passthroughArgs, promptParts)) return {};
 
@@ -1052,6 +1059,22 @@ async function ensurePcpSessionContext(
   let selectedLocalBackendSessionId: string | undefined;
   let createdNewPcpSession = false;
 
+  const normalizedSelectionOverride = options.selectionOverride?.trim();
+  const pcpSelection = (selection: string): string | undefined => {
+    const value = selection.replace(/^__pcp__:/, '').replace(/^pcp:/, '');
+    const found = activeSessions.find(
+      (session) => session.id === value || session.id.startsWith(value)
+    );
+    return found?.id;
+  };
+  const localSelection = (selection: string): string | undefined => {
+    const value = selection.replace(/^__local__:/, '').replace(/^local:/, '');
+    const found = untrackedLocalBackendSessions.find(
+      (session) => session.sessionId === value || session.sessionId.startsWith(value)
+    );
+    return found?.sessionId;
+  };
+
   const startNewPcpSession = async (): Promise<PcpSessionSummary | undefined> => {
     if (!pcpAvailable || !email) return undefined;
 
@@ -1071,7 +1094,54 @@ async function ensurePcpSessionContext(
     }
   };
 
-  if (process.stdin.isTTY) {
+  if (options.listCandidates) {
+    console.log(chalk.bold(`\nSession candidates for ${agentId}/${backend}:`));
+    console.log(chalk.dim('  new'));
+    for (const session of activeSessions) {
+      const linkedBackendSessionId =
+        backend === 'claude' ? getSessionBackendId(session) : undefined;
+      console.log(
+        chalk.dim(
+          `  pcp:${session.id}${session.threadKey ? ` (${session.threadKey})` : ''}${session.currentPhase ? ` — ${session.currentPhase}` : ''}${linkedBackendSessionId ? ` · tracks ${linkedBackendSessionId}` : ''}`
+        )
+      );
+    }
+    for (const localSession of untrackedLocalBackendSessions) {
+      console.log(
+        chalk.dim(
+          `  local:${localSession.sessionId}${localSession.firstPrompt ? ` — ${truncateText(localSession.firstPrompt)}` : ''}`
+        )
+      );
+    }
+    console.log('');
+    if (!normalizedSelectionOverride) {
+      process.exit(0);
+    }
+  }
+
+  if (normalizedSelectionOverride) {
+    const selection = normalizedSelectionOverride.toLowerCase();
+    if (selection === 'new' || selection === '__new__') {
+      chosen = await startNewPcpSession();
+      createdNewPcpSession = Boolean(chosen?.id);
+    } else if (selection.startsWith('pcp:') || selection.startsWith('__pcp__:')) {
+      const matchedSessionId = pcpSelection(selection);
+      chosen = activeSessions.find((session) => session.id === matchedSessionId);
+    } else if (selection.startsWith('local:') || selection.startsWith('__local__:')) {
+      selectedLocalBackendSessionId = localSelection(selection);
+      if (selectedLocalBackendSessionId && pcpAvailable) {
+        chosen = await startNewPcpSession();
+        createdNewPcpSession = Boolean(chosen?.id);
+      }
+    } else {
+      console.error(
+        chalk.red(
+          `Unknown session choice "${options.selectionOverride}". Use "new", "pcp:<id>", or "local:<id>".`
+        )
+      );
+      process.exit(1);
+    }
+  } else if (process.stdin.isTTY) {
     const choices: Array<{ name: string; value: string }> = [
       {
         name: pcpAvailable ? 'Start new session' : 'Start new backend session',
@@ -1248,7 +1318,11 @@ export async function runClaude(
         options.backend,
         passthroughArgs,
         options.verbose,
-        promptParts
+        promptParts,
+        {
+          listCandidates: options.sessionCandidates,
+          selectionOverride: options.sessionChoice,
+        }
       )
     : {};
   const runtimeLinkId = options.session ? randomUUID() : undefined;
@@ -1432,7 +1506,17 @@ export async function runClaudeInteractive(
   }
   const adapter = getBackend(options.backend);
   const sessionContext = options.session
-    ? await ensurePcpSessionContext(agentId, options.backend, passthroughArgs, options.verbose, [])
+    ? await ensurePcpSessionContext(
+        agentId,
+        options.backend,
+        passthroughArgs,
+        options.verbose,
+        [],
+        {
+          listCandidates: options.sessionCandidates,
+          selectionOverride: options.sessionChoice,
+        }
+      )
     : {};
   const runtimeLinkId = options.session ? randomUUID() : undefined;
   const { studioId, identityId } = getIdentityContextFromIdentityJson(process.cwd());
