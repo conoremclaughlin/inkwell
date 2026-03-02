@@ -75,15 +75,22 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
 });
 
 const getInboxSchema = userIdentifierBaseSchema.extend({
-  agentId: z.string().describe('Agent ID to get inbox for'),
+  agentId: z
+    .string()
+    .optional()
+    .describe(
+      'Agent ID to get inbox for. Omit to get inbox across ALL agents (useful for unified timelines).'
+    ),
   status: z
     .enum(['unread', 'read', 'acknowledged', 'completed', 'all'])
     .optional()
     .default('unread')
     .describe('Filter by status'),
   priority: z.enum(['low', 'normal', 'high', 'urgent']).optional().describe('Filter by priority'),
-  messageType: z.enum(['message', 'task_request', 'session_resume', 'notification', 'permission_grant']).optional(),
-  limit: z.number().min(1).max(100).optional().default(20).describe('Max messages'),
+  messageType: z
+    .enum(['message', 'task_request', 'session_resume', 'notification', 'permission_grant'])
+    .optional(),
+  limit: z.number().min(1).max(200).optional().default(20).describe('Max messages'),
 });
 
 const updateInboxMessageSchema = userIdentifierBaseSchema.extend({
@@ -316,18 +323,22 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const { status = 'unread', priority, messageType, limit = 20 } = parsed;
-  // Enforce identity: pinned agents can only read their own inbox
-  const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
+  // Enforce identity: pinned agents can only read their own inbox.
+  // When agentId is omitted, return inbox across ALL agents (unified timeline).
+  const agentId = parsed.agentId
+    ? (getEffectiveAgentId(parsed.agentId) ?? parsed.agentId)
+    : undefined;
 
   let query = supabase
     .from('agent_inbox')
     .select('*')
     .eq('recipient_user_id', resolved.user.id)
-    .eq('recipient_agent_id', agentId)
-    .order('priority', { ascending: false }) // urgent first
     .order('created_at', { ascending: false })
     .limit(limit);
 
+  if (agentId) {
+    query = query.eq('recipient_agent_id', agentId);
+  }
   if (status !== 'all') {
     query = query.eq('status', status);
   }
@@ -348,12 +359,15 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   }
 
   // Count unread for context
-  const { count: unreadCount } = await supabase
+  let unreadQuery = supabase
     .from('agent_inbox')
     .select('*', { count: 'exact', head: true })
     .eq('recipient_user_id', resolved.user.id)
-    .eq('recipient_agent_id', agentId)
     .eq('status', 'unread');
+  if (agentId) {
+    unreadQuery = unreadQuery.eq('recipient_agent_id', agentId);
+  }
+  const { count: unreadCount } = await unreadQuery;
 
   return {
     content: [
@@ -361,7 +375,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         type: 'text' as const,
         text: JSON.stringify({
           success: true,
-          agentId,
+          ...(agentId ? { agentId } : { allAgents: true }),
           unreadCount: unreadCount || 0,
           count: messages?.length || 0,
           messages: (messages || []).map((m) => ({
@@ -372,6 +386,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
             priority: m.priority,
             status: m.status,
             senderAgentId: m.sender_agent_id,
+            recipientAgentId: m.recipient_agent_id,
             threadKey: m.thread_key || null,
             recipientSessionId: m.recipient_session_id,
             relatedArtifactUri: m.related_artifact_uri,
@@ -549,7 +564,8 @@ export const inboxToolDefinitions = [
   },
   {
     name: 'get_inbox',
-    description: "Get messages from an agent's inbox. Returns unread messages by default.",
+    description:
+      "Get messages from an agent's inbox. Returns unread messages by default. Omit agentId to get inbox across ALL agents in one query (useful for unified timelines like mission control). Sorted by created_at descending.",
     schema: getInboxSchema,
     handler: handleGetInbox,
   },

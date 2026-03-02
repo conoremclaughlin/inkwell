@@ -525,22 +525,36 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
   const unreadByAgent: Record<string, number> = {};
   const allInboxMessages: InboxMessage[] = [];
   const fetchAllInbox = options.feed || options.watch;
-  for (const agentId of Array.from(allAgents)) {
-    try {
-      const inboxResult = (await pcp.callTool('get_inbox', {
-        email: config.email,
-        agentId,
-        // Fetch all messages for the feed, only unread for the counts-only path
-        status: fetchAllInbox ? 'all' : 'unread',
-        limit: fetchAllInbox ? Number.parseInt(options.feedLimit || '40', 10) : 200,
-      })) as Record<string, unknown>;
-      unreadByAgent[agentId] = extractUnreadCount(inboxResult);
-      if (fetchAllInbox) {
-        const msgs = extractInboxMessages(inboxResult);
-        for (const m of msgs) m.recipientAgentId = agentId;
-        allInboxMessages.push(...msgs);
+
+  // Single query for all agents — chronological timeline, no per-agent loop
+  try {
+    const inboxResult = (await pcp.callTool('get_inbox', {
+      email: config.email,
+      // Omit agentId to get inbox across all agents
+      ...(options.agent ? { agentId: options.agent } : {}),
+      status: fetchAllInbox ? 'all' : 'unread',
+      limit: fetchAllInbox ? Number.parseInt(options.feedLimit || '40', 10) : 200,
+    })) as Record<string, unknown>;
+
+    const msgs = extractInboxMessages(inboxResult);
+
+    // Build per-agent unread counts from the messages
+    for (const m of msgs) {
+      const agent = m.recipientAgentId || 'unknown';
+      if (m.status === 'unread') {
+        unreadByAgent[agent] = (unreadByAgent[agent] || 0) + 1;
       }
-    } catch {
+    }
+    // Ensure all known agents have an entry
+    for (const agentId of Array.from(allAgents)) {
+      if (!(agentId in unreadByAgent)) unreadByAgent[agentId] = 0;
+    }
+
+    if (fetchAllInbox) {
+      allInboxMessages.push(...msgs);
+    }
+  } catch {
+    for (const agentId of Array.from(allAgents)) {
       unreadByAgent[agentId] = 0;
     }
   }
