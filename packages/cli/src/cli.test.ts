@@ -57,4 +57,11 @@ describe('extractArgs', () => {
     expect(result.sbOptions.sessionCandidates).toBe(true);
     expect(result.sbOptions.sessionChoice).toBe('pcp:e03f522a');
   });
+
+  it('parses sb debug flag without passing through to backend', () => {
+    const result = extractArgs(['--sb-debug', '-a', 'wren', 'hello']);
+    expect(result.sbOptions.sbDebug).toBe(true);
+    expect(result.passthroughArgs).toEqual([]);
+    expect(result.promptParts).toEqual(['hello']);
+  });
 });

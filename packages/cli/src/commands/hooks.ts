@@ -24,6 +24,7 @@ import { execSync } from 'child_process';
 import { homedir } from 'os';
 import { resolveAgentId, readIdentityJson, readRoleMd } from '../backends/identity.js';
 import { getValidAccessToken } from '../auth/tokens.js';
+import { sbDebugLog } from '../lib/sb-debug.js';
 import {
   findRuntimeSessionByLinkId,
   getCurrentRuntimeSession,
@@ -163,7 +164,10 @@ function listWorktreePaths(cwd: string): string[] {
 
 async function readStdin(): Promise<Record<string, unknown>> {
   // If stdin is a TTY (interactive), return empty object
-  if (process.stdin.isTTY) return {};
+  if (process.stdin.isTTY) {
+    sbDebugLog('hooks', 'stdin_tty', { hasStdin: false });
+    return {};
+  }
 
   return new Promise((resolve) => {
     let data = '';
@@ -173,12 +177,19 @@ async function readStdin(): Promise<Record<string, unknown>> {
     });
     process.stdin.on('end', () => {
       if (!data.trim()) {
+        sbDebugLog('hooks', 'stdin_empty', { byteLength: data.length });
         resolve({});
         return;
       }
       try {
-        resolve(JSON.parse(data) as Record<string, unknown>);
+        const parsed = JSON.parse(data) as Record<string, unknown>;
+        sbDebugLog('hooks', 'stdin_parsed', {
+          byteLength: data.length,
+          keys: Object.keys(parsed),
+        });
+        resolve(parsed);
       } catch {
+        sbDebugLog('hooks', 'stdin_parse_failed', { byteLength: data.length });
         resolve({});
       }
     });
@@ -217,6 +228,11 @@ export async function callPcpTool(
 ): Promise<Record<string, unknown>> {
   const serverUrl = getPcpServerUrl();
   const url = `${serverUrl}/mcp`;
+  sbDebugLog('hooks', 'pcp_call_start', {
+    tool,
+    serverUrl,
+    argKeys: Object.keys(args),
+  });
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -241,7 +257,13 @@ export async function callPcpTool(
   });
 
   if (!response.ok) {
-    throw new Error(`PCP call failed (${response.status}): ${await response.text()}`);
+    const body = await response.text();
+    sbDebugLog('hooks', 'pcp_call_http_error', {
+      tool,
+      status: response.status,
+      bodySnippet: body.slice(0, 300),
+    });
+    throw new Error(`PCP call failed (${response.status}): ${body}`);
   }
 
   // The MCP server uses Streamable HTTP transport, which may respond with
@@ -259,6 +281,7 @@ export async function callPcpTool(
       .map((line) => line.slice(6));
     const lastData = dataLines[dataLines.length - 1];
     if (!lastData) {
+      sbDebugLog('hooks', 'pcp_call_sse_empty', { tool });
       throw new Error('PCP SSE response contained no data lines');
     }
     payload = JSON.parse(lastData) as Record<string, unknown>;
@@ -269,6 +292,11 @@ export async function callPcpTool(
   // JSON-RPC error
   if (payload.error) {
     const err = payload.error as { message?: string; code?: number };
+    sbDebugLog('hooks', 'pcp_call_rpc_error', {
+      tool,
+      code: err.code ?? null,
+      message: err.message ?? null,
+    });
     throw new Error(`PCP tool error (${err.code}): ${err.message}`);
   }
 
@@ -278,12 +306,28 @@ export async function callPcpTool(
 
   if (typeof mcpText === 'string') {
     try {
-      return JSON.parse(mcpText) as Record<string, unknown>;
+      const parsed = JSON.parse(mcpText) as Record<string, unknown>;
+      sbDebugLog('hooks', 'pcp_call_success', {
+        tool,
+        mode: 'json-content',
+        resultKeys: Object.keys(parsed),
+      });
+      return parsed;
     } catch {
+      sbDebugLog('hooks', 'pcp_call_success', {
+        tool,
+        mode: 'text-content',
+      });
       return { text: mcpText };
     }
   }
 
+  sbDebugLog('hooks', 'pcp_call_success', {
+    tool,
+    mode: 'raw-result',
+    resultKeys:
+      result && typeof result === 'object' ? Object.keys(result as Record<string, unknown>) : [],
+  });
   return (result as Record<string, unknown>) ?? payload;
 }
 
@@ -452,6 +496,18 @@ async function reconcileBackendSignal(
 
   let pcpSessionId = options?.initialPcpSessionId || resolveActivePcpSessionId(cwd);
   let threadKey = options?.initialThreadKey;
+  sbDebugLog('hooks', 'reconcile_start', {
+    cwd,
+    agentId,
+    sessionBackend,
+    runtimeLinkId: runtimeLinkId || null,
+    studioId: studioId || null,
+    identityId: identityId || null,
+    initialPcpSessionId: options?.initialPcpSessionId || null,
+    resolvedPcpSessionId: pcpSessionId || null,
+    backendSessionId: backendSessionId || null,
+    stdinKeys: Object.keys(stdin),
+  });
 
   if (!pcpSessionId && runtimeLinkId) {
     const linked = findRuntimeSessionByLinkId(cwd, runtimeLinkId, {
@@ -507,6 +563,11 @@ async function reconcileBackendSignal(
     if (matched.pcpSessionId) {
       pcpSessionId = matched.pcpSessionId;
       threadKey = matched.threadKey || threadKey;
+      sbDebugLog('hooks', 'reconcile_server_match', {
+        backendSessionId,
+        pcpSessionId,
+        threadKey: threadKey || null,
+      });
     }
   }
 
@@ -515,6 +576,10 @@ async function reconcileBackendSignal(
   }
 
   if (!pcpSessionId) {
+    sbDebugLog('hooks', 'reconcile_no_session', {
+      backendSessionId: backendSessionId || null,
+      threadKey: threadKey || null,
+    });
     return {
       ...(backendSessionId ? { backendSessionId } : {}),
       ...(threadKey ? { threadKey } : {}),
@@ -539,6 +604,13 @@ async function reconcileBackendSignal(
     ...(identityId ? { identityId } : {}),
     ...(studioId ? { studioId } : {}),
   });
+  sbDebugLog('hooks', 'reconcile_complete', {
+    pcpSessionId,
+    backendSessionId: backendSessionId || null,
+    threadKey: threadKey || null,
+    runtimeLinkId: runtimeLinkId || null,
+    sessionBackend,
+  });
 
   return {
     pcpSessionId,
@@ -554,7 +626,13 @@ async function updateRuntimeGenerationState(
   phase: string
 ): Promise<void> {
   const sessionId = resolveActivePcpSessionId(cwd);
-  if (!sessionId) return;
+  if (!sessionId) {
+    sbDebugLog('hooks', 'update_runtime_phase_skip', {
+      phase,
+      reason: 'no_active_pcp_session',
+    });
+    return;
+  }
 
   try {
     await callPcpTool('update_session_phase', {
@@ -565,7 +643,15 @@ async function updateRuntimeGenerationState(
       status: 'active',
       workingDir: cwd,
     });
+    sbDebugLog('hooks', 'update_runtime_phase_success', {
+      phase,
+      sessionId,
+    });
   } catch {
+    sbDebugLog('hooks', 'update_runtime_phase_error', {
+      phase,
+      sessionId,
+    });
     // Non-fatal; hook execution should not fail due to transient session sync issues.
   }
 }
@@ -1249,11 +1335,14 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
 // ============================================================================
 
 async function preCompactHandler(): Promise<void> {
+  sbDebugLog('hooks', 'handler_start', { handler: 'pre-compact' });
   await readStdin(); // consume stdin but we don't need it
   process.stdout.write(loadTemplate('hook-pre-compact'));
+  sbDebugLog('hooks', 'handler_complete', { handler: 'pre-compact' });
 }
 
 async function postCompactHandler(): Promise<void> {
+  sbDebugLog('hooks', 'handler_start', { handler: 'post-compact' });
   await readStdin();
 
   const cwd = process.cwd();
@@ -1313,9 +1402,14 @@ async function postCompactHandler(): Promise<void> {
   });
 
   process.stdout.write(output);
+  sbDebugLog('hooks', 'handler_complete', {
+    handler: 'post-compact',
+    outputLength: output.length,
+  });
 }
 
 async function onSessionStartHandler(): Promise<void> {
+  sbDebugLog('hooks', 'handler_start', { handler: 'on-session-start' });
   const stdin = await readStdin();
 
   const cwd = process.cwd();
@@ -1479,7 +1573,14 @@ async function onSessionStartHandler(): Promise<void> {
       };
       if (backendSessionId) updateArgs.backendSessionId = backendSessionId;
       await callPcpTool('update_session_phase', updateArgs);
+      sbDebugLog('hooks', 'startup_phase_set', {
+        pcpSessionId,
+        backendSessionId: backendSessionId || null,
+      });
     } catch {
+      sbDebugLog('hooks', 'startup_phase_set_failed', {
+        pcpSessionId,
+      });
       // Non-fatal; startup should continue even if linkage fails.
     }
   }
@@ -1497,9 +1598,16 @@ async function onSessionStartHandler(): Promise<void> {
   });
 
   process.stdout.write(output);
+  sbDebugLog('hooks', 'handler_complete', {
+    handler: 'on-session-start',
+    pcpSessionId: pcpSessionId || null,
+    backendSessionId: backendSessionId || null,
+    outputLength: output.length,
+  });
 }
 
 async function onPromptHandler(): Promise<void> {
+  sbDebugLog('hooks', 'handler_start', { handler: 'on-prompt' });
   const stdin = await readStdin();
 
   const cwd = process.cwd();
@@ -1519,6 +1627,10 @@ async function onPromptHandler(): Promise<void> {
     const elapsed = Date.now() - lastCheckTime;
     if (elapsed < staleThresholdMs) {
       // Fast path: inbox was checked recently, output nothing
+      sbDebugLog('hooks', 'on_prompt_skip_inbox', {
+        reason: 'fresh_cache',
+        elapsedMs: elapsed,
+      });
       return;
     }
   }
@@ -1537,12 +1649,19 @@ async function onPromptHandler(): Promise<void> {
     if (inboxTag) {
       process.stdout.write(inboxTag);
     }
+    sbDebugLog('hooks', 'on_prompt_inbox_polled', {
+      hasMessages: Boolean(messages?.length),
+      messageCount: messages?.length || 0,
+    });
   } catch {
+    sbDebugLog('hooks', 'on_prompt_inbox_failed');
     // Silent failure — don't interrupt the user's prompt
   }
+  sbDebugLog('hooks', 'handler_complete', { handler: 'on-prompt' });
 }
 
 async function onStopHandler(): Promise<void> {
+  sbDebugLog('hooks', 'handler_start', { handler: 'on-stop' });
   const stdin = await readStdin();
 
   const cwd = process.cwd();
@@ -1593,6 +1712,10 @@ async function onStopHandler(): Promise<void> {
   if (parts.length > 0) {
     process.stdout.write(parts.join('\n\n'));
   }
+  sbDebugLog('hooks', 'handler_complete', {
+    handler: 'on-stop',
+    outputParts: parts.length,
+  });
 }
 
 // ============================================================================

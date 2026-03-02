@@ -1,4 +1,5 @@
 import { getValidAccessToken } from '../auth/tokens.js';
+import { sbDebugLog } from './sb-debug.js';
 
 let jsonRpcId = 1;
 
@@ -13,6 +14,12 @@ export async function callPcpTool<T = Record<string, unknown>>(
 ): Promise<T> {
   const serverUrl = getPcpServerUrl();
   const url = `${serverUrl}/mcp`;
+  sbDebugLog('pcp-mcp', 'call_start', {
+    tool,
+    serverUrl,
+    timeoutMs: options?.timeoutMs ?? null,
+    argKeys: Object.keys(args),
+  });
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -37,7 +44,13 @@ export async function callPcpTool<T = Record<string, unknown>>(
   });
 
   if (!response.ok) {
-    throw new Error(`PCP call failed (${response.status}): ${await response.text()}`);
+    const body = await response.text();
+    sbDebugLog('pcp-mcp', 'call_http_error', {
+      tool,
+      status: response.status,
+      bodySnippet: body.slice(0, 300),
+    });
+    throw new Error(`PCP call failed (${response.status}): ${body}`);
   }
 
   const contentType = response.headers.get('content-type') || '';
@@ -51,6 +64,7 @@ export async function callPcpTool<T = Record<string, unknown>>(
       .map((line) => line.slice(6));
     const lastData = dataLines[dataLines.length - 1];
     if (!lastData) {
+      sbDebugLog('pcp-mcp', 'call_sse_empty', { tool });
       throw new Error('PCP SSE response contained no data lines');
     }
     payload = JSON.parse(lastData) as Record<string, unknown>;
@@ -60,6 +74,11 @@ export async function callPcpTool<T = Record<string, unknown>>(
 
   if (payload.error) {
     const err = payload.error as { message?: string; code?: number };
+    sbDebugLog('pcp-mcp', 'call_rpc_error', {
+      tool,
+      code: err.code ?? null,
+      message: err.message ?? null,
+    });
     throw new Error(`PCP tool error (${err.code}): ${err.message}`);
   }
 
@@ -68,11 +87,24 @@ export async function callPcpTool<T = Record<string, unknown>>(
 
   if (typeof mcpText === 'string') {
     try {
-      return JSON.parse(mcpText) as T;
+      const parsed = JSON.parse(mcpText) as T;
+      sbDebugLog('pcp-mcp', 'call_success', {
+        tool,
+        mode: 'json-content',
+      });
+      return parsed;
     } catch {
+      sbDebugLog('pcp-mcp', 'call_success', {
+        tool,
+        mode: 'text-content',
+      });
       return { text: mcpText } as unknown as T;
     }
   }
 
+  sbDebugLog('pcp-mcp', 'call_success', {
+    tool,
+    mode: 'raw-result',
+  });
   return (result as unknown as T) ?? (payload as unknown as T);
 }

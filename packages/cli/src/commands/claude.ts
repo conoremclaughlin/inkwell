@@ -14,6 +14,7 @@ import { homedir } from 'os';
 import { getBackend, resolveAgentId } from '../backends/index.js';
 import { getValidAccessToken } from '../auth/tokens.js';
 import { callPcpTool, getPcpServerUrl } from '../lib/pcp-mcp.js';
+import { sbDebugLog } from '../lib/sb-debug.js';
 import {
   getCurrentRuntimeSession,
   listRuntimeSessions,
@@ -1078,11 +1079,29 @@ async function ensurePcpSessionContext(
   const localBackendSessionIds = new Set(localBackendSessions.map((session) => session.sessionId));
   const knownBackendSessionIds =
     backend === 'claude' ? getKnownClaudeSessionIds() : localBackendSessionIds;
+  sbDebugLog('claude', 'ensure_context_start', {
+    backend,
+    agentId,
+    cwd,
+    localBackendSessions: localBackendSessions.map((session) => ({
+      id: session.sessionId,
+      modified: session.modified,
+    })),
+    localCount: localBackendSessionIds.size,
+    knownCount: knownBackendSessionIds.size,
+    listCandidates: Boolean(options.listCandidates),
+    selectionOverride: options.selectionOverride || null,
+  });
   const sessionChoiceByValue = new Map<string, string>();
 
   // Fast path: runtime already knows current session for this backend.
   const existing = getCurrentRuntimeSession(cwd, backend);
   if (existing?.pcpSessionId && shouldAutoResumeRuntimeSession(existing, process.stdin.isTTY)) {
+    sbDebugLog('claude', 'runtime_fast_path_candidate', {
+      backend,
+      existing,
+      isTty: process.stdin.isTTY,
+    });
     if (backend === 'claude' && existing.backendSessionId) {
       const existingResume = resolveBackendSessionIdForResume({
         backend,
@@ -1101,6 +1120,12 @@ async function ensurePcpSessionContext(
         const recovery = resolveClaudeStaleBackendSessionRecovery({
           pcpSessionId: existing.pcpSessionId,
           localBackendSessionIds,
+        });
+        sbDebugLog('claude', 'runtime_fast_path_stale_recovery', {
+          backend,
+          pcpSessionId: existing.pcpSessionId,
+          staleTrackedBackendSessionId: existingResume.staleTrackedBackendSessionId,
+          recovery,
         });
 
         const recoveredBackendSessionId =
@@ -1142,6 +1167,11 @@ async function ensurePcpSessionContext(
       }
     }
 
+    sbDebugLog('claude', 'runtime_fast_path_reuse', {
+      backend,
+      pcpSessionId: existing.pcpSessionId,
+      backendSessionId: existing.backendSessionId || null,
+    });
     return {
       pcpSessionId: existing.pcpSessionId,
       backendSessionId: existing.backendSessionId,
@@ -1170,9 +1200,25 @@ async function ensurePcpSessionContext(
         cwd,
         localBackendSessionIds
       );
+      sbDebugLog('claude', 'active_sessions_loaded', {
+        backend,
+        listedCount: (listed.sessions || []).length,
+        filteredCount: activeSessions.length,
+        filtered: activeSessions.map((session) => ({
+          id: session.id,
+          backend: session.backend || null,
+          backendSessionId: session.backendSessionId || session.claudeSessionId || null,
+          workingDir: session.workingDir || null,
+          phase: session.currentPhase || null,
+        })),
+      });
     } catch (err) {
       pcpAvailable = false;
       pcpUnavailableReason = err instanceof Error ? err.message : 'request failed';
+      sbDebugLog('claude', 'active_sessions_load_failed', {
+        backend,
+        reason: pcpUnavailableReason,
+      });
     }
   }
 
@@ -1372,6 +1418,14 @@ async function ensurePcpSessionContext(
     backendSessionId = recovery.backendSessionId;
     backendSessionSeedId = recovery.backendSessionSeedId;
     staleRecoveryMode = recovery.recoveryMode;
+    sbDebugLog('claude', 'stale_recovery_selected', {
+      backend,
+      pcpSessionId: chosen.id,
+      staleTrackedBackendSessionId,
+      staleRecoveryMode: staleRecoveryMode || null,
+      recoveredBackendSessionId: backendSessionId || null,
+      recoveredSeedId: backendSessionSeedId || null,
+    });
   }
 
   if (staleTrackedBackendSessionId && process.stdin.isTTY) {
@@ -1419,6 +1473,13 @@ async function ensurePcpSessionContext(
       console.log(chalk.dim(`Backend session: ${backendSessionId}`));
     }
   }
+  sbDebugLog('claude', 'ensure_context_result', {
+    backend,
+    pcpSessionId: chosen.id,
+    backendSessionId: backendSessionId || null,
+    backendSessionSeedId: backendSessionSeedId || null,
+    createdNewPcpSession,
+  });
 
   if (email) {
     try {
@@ -1516,6 +1577,15 @@ export async function runClaude(
   if (options.verbose) {
     console.log(chalk.dim(`Running: ${prepared.binary} ${prepared.args.join(' ')}`));
   }
+  sbDebugLog('claude', 'prompt_spawn_prepare', {
+    backend: options.backend,
+    mode: 'prompt',
+    pcpSessionId: sessionContext.pcpSessionId || null,
+    backendSessionId: sessionContext.backendSessionId || null,
+    backendSessionSeedId: sessionContext.backendSessionSeedId || null,
+    binary: prepared.binary,
+    args: sanitizeBackendExecutionArgs(prepared.args, options.backend, promptParts),
+  });
 
   const pcpConfig = getPcpConfig();
   const executionContext: BackendExecutionLogContext = {
@@ -1613,6 +1683,14 @@ export async function runClaude(
         fallbackBackendSessionId: capturedBackendSessionId,
       });
     }
+    sbDebugLog('claude', 'prompt_spawn_close', {
+      backend: options.backend,
+      mode: 'prompt',
+      code: code ?? null,
+      pcpSessionId: sessionContext.pcpSessionId || null,
+      capturedBackendSessionId: capturedBackendSessionId || null,
+      stderrSnippet: stderrText.slice(-4000),
+    });
 
     const isRecoverableResumeError =
       options.backend === 'claude' &&
@@ -1643,6 +1721,12 @@ export async function runClaude(
 
   child.on('error', async (err) => {
     ensureCleanup();
+    sbDebugLog('claude', 'prompt_spawn_error', {
+      backend: options.backend,
+      mode: 'prompt',
+      pcpSessionId: sessionContext.pcpSessionId || null,
+      error: err.message || 'spawn failed',
+    });
     await finalizeExecution(null, err.message || 'spawn failed');
     process.exit(1);
   });
@@ -1742,6 +1826,16 @@ export async function runClaudeInteractive(
     if (options.verbose) {
       console.log(chalk.dim(`Running: ${prepared.binary} ${prepared.args.join(' ')}`));
     }
+    sbDebugLog('claude', 'interactive_attempt_start', {
+      backend: options.backend,
+      attempt,
+      maxAttempts,
+      pcpSessionId: sessionContext.pcpSessionId || null,
+      backendSessionId: attemptBackendSessionId || null,
+      backendSessionSeedId: attemptBackendSessionSeedId || null,
+      binary: prepared.binary,
+      args: sanitizeBackendExecutionArgs(prepared.args, options.backend),
+    });
 
     const executionContext: BackendExecutionLogContext = {
       pcpConfig,
@@ -1791,6 +1885,17 @@ export async function runClaudeInteractive(
           knownLocalSessionIds,
           fallbackBackendSessionId: attemptBackendSessionId || finalCapturedBackendSessionId,
         });
+        sbDebugLog('claude', 'interactive_attempt_close', {
+          backend: options.backend,
+          attempt,
+          maxAttempts,
+          code: code ?? null,
+          pcpSessionId: sessionContext.pcpSessionId || null,
+          attemptBackendSessionId: attemptBackendSessionId || null,
+          attemptBackendSessionSeedId: attemptBackendSessionSeedId || null,
+          finalCapturedBackendSessionId: finalCapturedBackendSessionId || null,
+          stderrSnippet: stderrText.slice(-4000),
+        });
 
         await logBackendExecutionResult({
           context: executionContext,
@@ -1805,6 +1910,15 @@ export async function runClaudeInteractive(
       child.on('error', async (err) => {
         prepared.cleanup();
         const errorText = err.message || 'spawn failed';
+        sbDebugLog('claude', 'interactive_attempt_error', {
+          backend: options.backend,
+          attempt,
+          maxAttempts,
+          pcpSessionId: sessionContext.pcpSessionId || null,
+          attemptBackendSessionId: attemptBackendSessionId || null,
+          attemptBackendSessionSeedId: attemptBackendSessionSeedId || null,
+          error: errorText,
+        });
         await logBackendExecutionResult({
           context: executionContext,
           parentActivityId: backendStartActivityId,
@@ -1843,6 +1957,20 @@ export async function runClaudeInteractive(
       stderrText.toLowerCase().includes('already in use');
     const shouldRetry =
       shouldRetryResumeFailure || shouldRetrySeedConflict || isRecoverableNonzeroExit;
+    sbDebugLog('claude', 'interactive_retry_decision', {
+      backend: options.backend,
+      attempt,
+      maxAttempts,
+      code,
+      shouldRetryResumeFailure,
+      shouldRetrySeedConflict,
+      isRecoverableNonzeroExit,
+      shouldRetry,
+      attemptBackendSessionId: attemptBackendSessionId || null,
+      attemptBackendSessionSeedId: attemptBackendSessionSeedId || null,
+      pcpSessionId: sessionContext.pcpSessionId || null,
+      stderrSnippet: stderrText.slice(-4000),
+    });
 
     if (shouldRetry) {
       const latestLocalBackendSessionIds = new Set(
@@ -1890,6 +2018,12 @@ export async function runClaudeInteractive(
       }
 
       if (sessionContext.pcpSessionId && attemptBackendSessionId) {
+        sbDebugLog('claude', 'interactive_retry_mapping_update', {
+          backend: options.backend,
+          pcpSessionId: sessionContext.pcpSessionId,
+          repairedBackendSessionId: attemptBackendSessionId,
+          attempt,
+        });
         upsertRuntimeSession(process.cwd(), {
           pcpSessionId: sessionContext.pcpSessionId,
           backend: options.backend,
@@ -1930,6 +2064,12 @@ export async function runClaudeInteractive(
           stderrText.toLowerCase().includes('already in use')));
 
     if (!isTerminalRecoverableResumeError) {
+      sbDebugLog('claude', 'interactive_persist_final_mapping', {
+        backend: options.backend,
+        pcpSessionId: sessionContext.pcpSessionId || null,
+        finalCapturedBackendSessionId: finalCapturedBackendSessionId || null,
+        attempt,
+      });
       await persistBackendSessionLink({
         pcpSessionId: sessionContext.pcpSessionId,
         backendSessionId: finalCapturedBackendSessionId,
@@ -1941,6 +2081,13 @@ export async function runClaudeInteractive(
         email: pcpConfig?.email,
       });
     }
+    sbDebugLog('claude', 'interactive_exit', {
+      backend: options.backend,
+      code: code || 0,
+      pcpSessionId: sessionContext.pcpSessionId || null,
+      finalCapturedBackendSessionId: finalCapturedBackendSessionId || null,
+      isTerminalRecoverableResumeError,
+    });
 
     process.exit(code || 0);
   }
