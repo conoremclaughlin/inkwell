@@ -76,6 +76,7 @@ vi.mock('@supabase/supabase-js', () => ({
 
 import { MCPServer } from './server';
 import { env } from '../config/env';
+import { registerAllTools } from './tools';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -99,11 +100,13 @@ function makeToolsListRequest(id: number) {
 /** POST to the MCP endpoint. */
 async function mcpPost(
   baseUrl: string,
-  body: unknown
+  body: unknown,
+  extraHeaders: Record<string, string> = {}
 ): Promise<{ status: number; headers: Headers; body: string }> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     Accept: 'application/json, text/event-stream',
+    ...extraHeaders,
   };
   const res = await fetch(`${baseUrl}/mcp`, {
     method: 'POST',
@@ -239,6 +242,34 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     // A separate tools/list request (new transport) should also work
     const listRes = await mcpPost(baseUrl, makeToolsListRequest(2));
     expect(listRes.status).toBe(200);
+  });
+
+  it('registers agent-facing MCP catalog without internal lifecycle tools by default', async () => {
+    if (serverUnavailableError) return;
+    const registerAllToolsMock = vi.mocked(registerAllTools);
+    const priorCalls = registerAllToolsMock.mock.calls.length;
+
+    const res = await mcpPost(baseUrl, makeToolsListRequest(21));
+    expect(res.status).toBe(200);
+
+    const newCalls = registerAllToolsMock.mock.calls.slice(priorCalls);
+    const lastCall = newCalls[newCalls.length - 1];
+    expect(lastCall?.[2]).toEqual({ includeInternalLifecycleTools: false });
+  });
+
+  it('registers runtime MCP catalog with internal lifecycle tools when caller profile is runtime', async () => {
+    if (serverUnavailableError) return;
+    const registerAllToolsMock = vi.mocked(registerAllTools);
+    const priorCalls = registerAllToolsMock.mock.calls.length;
+
+    const res = await mcpPost(baseUrl, makeToolsListRequest(22), {
+      'x-pcp-caller-profile': 'runtime',
+    });
+    expect(res.status).toBe(200);
+
+    const newCalls = registerAllToolsMock.mock.calls.slice(priorCalls);
+    const lastCall = newCalls[newCalls.length - 1];
+    expect(lastCall?.[2]).toEqual({ includeInternalLifecycleTools: true });
   });
 
   it('should handle multiple concurrent requests independently', async () => {

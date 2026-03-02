@@ -295,7 +295,7 @@ describe('DiscordListener', () => {
     });
   });
 
-  describe('message handling - bot mention in groups', () => {
+  describe('message handling - authorized group messages', () => {
     let messageHandler: Function;
     let callback: ReturnType<typeof vi.fn>;
 
@@ -306,7 +306,7 @@ describe('DiscordListener', () => {
       messageHandler = eventHandlers.get('messageCreate')!;
     });
 
-    it('should ignore authorized group messages without bot mention', async () => {
+    it('should pass authorized group messages through even without bot mention', async () => {
       mockAuthService.isGroupAuthorized.mockResolvedValue({ id: '1', status: 'active' });
 
       const msg = createMockMessage({
@@ -318,7 +318,13 @@ describe('DiscordListener', () => {
       });
       await messageHandler(msg);
 
-      expect(callback).not.toHaveBeenCalled();
+      expect(callback).toHaveBeenCalledTimes(1);
+      const inbound = callback.mock.calls[0][0];
+      expect(inbound.body).toBe('hello everyone');
+      expect(inbound.mentions).toEqual({
+        users: [],
+        botMentioned: false,
+      });
     });
 
     it('should process authorized group messages with direct @mention', async () => {

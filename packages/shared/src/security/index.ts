@@ -1,2 +1,2 @@
-export * from './tool-policy-core';
-export * from './delegation-token';
+export * from './tool-policy-core.js';
+export * from './delegation-token.js';

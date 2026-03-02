@@ -272,7 +272,16 @@ const userIdentifierFields = {
     .describe('Platform-specific user ID — only needed for platform-based user lookup'),
 };
 
-export function registerAllTools(server: McpServer, dataComposer: DataComposer): void {
+export interface RegisterToolOptions {
+  includeInternalLifecycleTools?: boolean;
+}
+
+export function registerAllTools(
+  server: McpServer,
+  dataComposer: DataComposer,
+  options?: RegisterToolOptions
+): void {
+  const includeInternalLifecycleTools = options?.includeInternalLifecycleTools ?? true;
   // ---------------------------------------------------------------------------
   // Timing diagnostics — wraps every tool handler to log execution time.
   // Calls exceeding SLOW_TOOL_THRESHOLD_MS are logged at warn level.
@@ -1229,11 +1238,12 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   // SESSION TOOLS (for tracking AI sessions)
   // =====================================================
 
-  // Register start_session tool
-  server.registerTool(
-    'start_session',
-    {
-      description: `Start a new AI session. Sessions track work done across a conversation and can be logged to.
+  if (includeInternalLifecycleTools) {
+    // Register start_session tool
+    server.registerTool(
+      'start_session',
+      {
+        description: `Start a new AI session. Sessions track work done across a conversation and can be logged to.
 
 Session matching priority:
 1. threadKey — if provided, returns an existing active session with the same agent+threadKey (enables cross-trigger session continuity, e.g., "pr:32").
@@ -1245,183 +1255,184 @@ workspaceId is accepted as a deprecated alias for studioId.
 When forceNew=true, start_session always creates a new session (skips active-session reuse). You can optionally provide sessionId to set a client-generated canonical UUID.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        agentId: z
-          .string()
-          .optional()
-          .describe('Agent identifier (e.g., "claude-code", "telegram-myra")'),
-        sessionId: z
-          .string()
-          .uuid()
-          .optional()
-          .describe(
-            'Optional PCP session UUID to use when creating a new session (typically with forceNew=true).'
-          ),
-        studioId: z
-          .string()
-          .uuid()
-          .optional()
-          .describe(
-            'Studio ID to scope this session to. Allows multiple active sessions per agent (one per studio). Read from .pcp/identity.json.'
-          ),
-        workspaceId: z
-          .string()
-          .uuid()
-          .optional()
-          .describe('[Deprecated] Workspace ID alias for studioId.'),
-        threadKey: z
-          .string()
-          .optional()
-          .describe(
-            'Thread key for session routing (e.g., "pr:32"). If an active session with this threadKey exists for the same agent, it is returned instead of creating a new one.'
-          ),
-        backend: z
-          .string()
-          .optional()
-          .describe('Backend runtime (e.g., "claude-code", "codex", "gemini")'),
-        model: z
-          .string()
-          .optional()
-          .describe('Model identifier (e.g., "opus-4-6", "sonnet", "o3")'),
-        metadata: z.record(z.unknown()).optional().describe('Session metadata'),
-        forceNew: z
-          .boolean()
-          .optional()
-          .describe('If true, create a new session even if an active one exists for this scope.'),
+        inputSchema: {
+          ...userIdentifierFields,
+          agentId: z
+            .string()
+            .optional()
+            .describe('Agent identifier (e.g., "claude-code", "telegram-myra")'),
+          sessionId: z
+            .string()
+            .uuid()
+            .optional()
+            .describe(
+              'Optional PCP session UUID to use when creating a new session (typically with forceNew=true).'
+            ),
+          studioId: z
+            .string()
+            .uuid()
+            .optional()
+            .describe(
+              'Studio ID to scope this session to. Allows multiple active sessions per agent (one per studio). Read from .pcp/identity.json.'
+            ),
+          workspaceId: z
+            .string()
+            .uuid()
+            .optional()
+            .describe('[Deprecated] Workspace ID alias for studioId.'),
+          threadKey: z
+            .string()
+            .optional()
+            .describe(
+              'Thread key for session routing (e.g., "pr:32"). If an active session with this threadKey exists for the same agent, it is returned instead of creating a new one.'
+            ),
+          backend: z
+            .string()
+            .optional()
+            .describe('Backend runtime (e.g., "claude-code", "codex", "gemini")'),
+          model: z
+            .string()
+            .optional()
+            .describe('Model identifier (e.g., "opus-4-6", "sonnet", "o3")'),
+          metadata: z.record(z.unknown()).optional().describe('Session metadata'),
+          forceNew: z
+            .boolean()
+            .optional()
+            .describe('If true, create a new session even if an active one exists for this scope.'),
+        },
       },
-    },
-    async (args) => {
-      try {
-        return await handleStartSession(args, dataComposer);
-      } catch (error) {
-        logger.error('Error in start_session:', error);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              }),
-            },
-          ],
-          isError: true,
-        };
+      async (args) => {
+        try {
+          return await handleStartSession(args, dataComposer);
+        } catch (error) {
+          logger.error('Error in start_session:', error);
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  success: false,
+                  error: error instanceof Error ? error.message : 'Unknown error',
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
       }
-    }
-  );
+    );
 
-  // Register log_session tool
-  server.registerTool(
-    'log_session',
-    {
-      description: `[DEPRECATED] Add an entry to the current session log. Prefer update_session_phase for work status and remember for important decisions/events.
+    // Register log_session tool
+    server.registerTool(
+      'log_session',
+      {
+        description: `[DEPRECATED] Add an entry to the current session log. Prefer update_session_phase for work status and remember for important decisions/events.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        sessionId: z
-          .string()
-          .uuid()
-          .optional()
-          .describe('Session ID (uses active session if not provided)'),
-        agentId: z
-          .string()
-          .optional()
-          .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
-        studioId: z
-          .string()
-          .uuid()
-          .optional()
-          .describe('Studio ID for session resolution when sessionId not provided'),
-        workspaceId: z
-          .string()
-          .uuid()
-          .optional()
-          .describe('[Deprecated] Workspace ID alias for studioId.'),
-        content: z.string().describe('Log entry content'),
-        salience: z
-          .enum(['low', 'medium', 'high', 'critical'])
-          .optional()
-          .describe('Importance (default: medium)'),
+        inputSchema: {
+          ...userIdentifierFields,
+          sessionId: z
+            .string()
+            .uuid()
+            .optional()
+            .describe('Session ID (uses active session if not provided)'),
+          agentId: z
+            .string()
+            .optional()
+            .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
+          studioId: z
+            .string()
+            .uuid()
+            .optional()
+            .describe('Studio ID for session resolution when sessionId not provided'),
+          workspaceId: z
+            .string()
+            .uuid()
+            .optional()
+            .describe('[Deprecated] Workspace ID alias for studioId.'),
+          content: z.string().describe('Log entry content'),
+          salience: z
+            .enum(['low', 'medium', 'high', 'critical'])
+            .optional()
+            .describe('Importance (default: medium)'),
+        },
       },
-    },
-    async (args) => {
-      try {
-        return await handleLogSession(args, dataComposer);
-      } catch (error) {
-        logger.error('Error in log_session:', error);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              }),
-            },
-          ],
-          isError: true,
-        };
+      async (args) => {
+        try {
+          return await handleLogSession(args, dataComposer);
+        } catch (error) {
+          logger.error('Error in log_session:', error);
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  success: false,
+                  error: error instanceof Error ? error.message : 'Unknown error',
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
       }
-    }
-  );
+    );
 
-  // Register end_session tool
-  server.registerTool(
-    'end_session',
-    {
-      description: `End a session with an optional summary. The summary is automatically saved as a high-salience memory.
+    // Register end_session tool
+    server.registerTool(
+      'end_session',
+      {
+        description: `End a session with an optional summary. The summary is automatically saved as a high-salience memory.
 
 Session resolution: sessionId (explicit) > agentId+studioId (scoped) > most recent active (fallback).
 workspaceId is accepted as a deprecated alias.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        sessionId: z
-          .string()
-          .uuid()
-          .optional()
-          .describe('Session ID (uses active session if not provided)'),
-        agentId: z
-          .string()
-          .optional()
-          .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
-        studioId: z
-          .string()
-          .uuid()
-          .optional()
-          .describe('Studio ID for session resolution when sessionId not provided'),
-        workspaceId: z
-          .string()
-          .uuid()
-          .optional()
-          .describe('[Deprecated] Workspace ID alias for studioId.'),
-        summary: z.string().optional().describe('End-of-session summary (saved as memory)'),
+        inputSchema: {
+          ...userIdentifierFields,
+          sessionId: z
+            .string()
+            .uuid()
+            .optional()
+            .describe('Session ID (uses active session if not provided)'),
+          agentId: z
+            .string()
+            .optional()
+            .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
+          studioId: z
+            .string()
+            .uuid()
+            .optional()
+            .describe('Studio ID for session resolution when sessionId not provided'),
+          workspaceId: z
+            .string()
+            .uuid()
+            .optional()
+            .describe('[Deprecated] Workspace ID alias for studioId.'),
+          summary: z.string().optional().describe('End-of-session summary (saved as memory)'),
+        },
       },
-    },
-    async (args) => {
-      try {
-        return await handleEndSession(args, dataComposer);
-      } catch (error) {
-        logger.error('Error in end_session:', error);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              }),
-            },
-          ],
-          isError: true,
-        };
+      async (args) => {
+        try {
+          return await handleEndSession(args, dataComposer);
+        } catch (error) {
+          logger.error('Error in end_session:', error);
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  success: false,
+                  error: error instanceof Error ? error.message : 'Unknown error',
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
       }
-    }
-  );
+    );
+  }
 
   // Register get_session tool
   server.registerTool(

@@ -9,7 +9,7 @@ export function getPcpServerUrl(): string {
 export async function callPcpTool<T = Record<string, unknown>>(
   tool: string,
   args: Record<string, unknown>,
-  options?: { timeoutMs?: number }
+  options?: { timeoutMs?: number; callerProfile?: 'agent' | 'runtime' }
 ): Promise<T> {
   const serverUrl = getPcpServerUrl();
   const url = `${serverUrl}/mcp`;
@@ -22,6 +22,9 @@ export async function callPcpTool<T = Record<string, unknown>>(
   const token = await getValidAccessToken(serverUrl);
   if (token) {
     headers.Authorization = `Bearer ${token}`;
+  }
+  if (options?.callerProfile) {
+    headers['x-pcp-caller-profile'] = options.callerProfile;
   }
 
   const response = await fetch(url, {

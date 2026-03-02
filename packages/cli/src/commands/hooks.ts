@@ -222,6 +222,7 @@ export async function callPcpTool(
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     Accept: 'application/json, text/event-stream',
+    'x-pcp-caller-profile': 'runtime',
   };
 
   // Attach CLI auth token so hooks pass OAuth checks on the MCP server
