@@ -23,6 +23,7 @@ import { formatBackendTokenUsage, type BackendTokenUsage } from '../repl/token-u
 import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../repl/skills.js';
 import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
 import { ensurePcpToolAllowed } from '../repl/tool-gate.js';
+import { executeToolCalls, type ToolCallResult } from '../repl/tool-call-executor.js';
 import {
   parsePermissionGrant,
   applyPermissionGrant,
@@ -2400,39 +2401,54 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     const localToolCalls =
       runtime.toolRouting === 'local' ? extractLocalToolCalls(responseText).slice(0, 5) : [];
-    for (const toolCall of localToolCalls) {
-      const decision = toolPolicy.canCallPcpTool(toolCall.tool, runtime.sessionId);
-      if (!decision.allowed) {
-        const blocked = `Local tool blocked (${toolCall.tool}): ${decision.reason}`;
-        printLine(chalk.yellow(blocked));
-        appendTranscript(runtime.transcriptPath, {
-          type: 'local_tool_call',
-          tool: toolCall.tool,
-          args: toolCall.args,
-          status: 'blocked',
-          reason: decision.reason,
-        });
-        ledger.addEntry('system', compactForLedger(blocked, 400), 'local-tool');
-        continue;
-      }
-
-      const toolResult = await pcp
-        .callTool(toolCall.tool, toolCall.args)
-        .catch((error) => ({ error: String(error) }));
-      const resultJson = JSON.stringify(toolResult);
-      printLine(chalk.cyan(`🛠 local tool ${toolCall.tool} ${resultJson}`));
-      appendTranscript(runtime.transcriptPath, {
-        type: 'local_tool_call',
-        tool: toolCall.tool,
-        args: toolCall.args,
-        status: 'executed',
-        result: toolResult,
+    if (localToolCalls.length > 0) {
+      await executeToolCalls(localToolCalls, {
+        policy: toolPolicy,
+        callTool: (tool, args) => pcp.callTool(tool, args),
+        sessionId: runtime.sessionId,
+        promptForApproval: (tool, reason) =>
+          promptForToolApproval(rl, toolPolicy, runtime.sessionId, tool, reason, inkRepl),
+        onResult: (result: ToolCallResult) => {
+          if (result.status === 'blocked' || result.status === 'denied') {
+            const msg = `Local tool ${result.status} (${result.tool}): ${result.reason}`;
+            printLine(chalk.yellow(msg));
+            appendTranscript(runtime.transcriptPath, {
+              type: 'local_tool_call',
+              tool: result.tool,
+              args: result.args,
+              status: result.status,
+              reason: result.reason,
+            });
+            ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
+          } else if (result.status === 'executed' || result.status === 'approved') {
+            const resultJson = JSON.stringify(result.result);
+            printLine(chalk.cyan(`🛠 local tool ${result.tool} ${resultJson}`));
+            appendTranscript(runtime.transcriptPath, {
+              type: 'local_tool_call',
+              tool: result.tool,
+              args: result.args,
+              status: result.status,
+              result: result.result,
+            });
+            ledger.addEntry(
+              'system',
+              compactForLedger(`local tool ${result.tool} -> ${resultJson}`, 500),
+              'local-tool'
+            );
+          } else if (result.status === 'error') {
+            const msg = `Local tool error (${result.tool}): ${result.error}`;
+            printLine(chalk.red(msg));
+            appendTranscript(runtime.transcriptPath, {
+              type: 'local_tool_call',
+              tool: result.tool,
+              args: result.args,
+              status: 'error',
+              error: result.error,
+            });
+            ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
+          }
+        },
       });
-      ledger.addEntry(
-        'system',
-        compactForLedger(`local tool ${toolCall.tool} -> ${resultJson}`, 500),
-        'local-tool'
-      );
     }
 
     const assistantDisplayText =
