@@ -118,6 +118,13 @@ export function filterUntrackedLocalClaudeSessions<T extends { sessionId: string
   return localSessions.filter((session) => !trackedSessionIds.has(session.sessionId));
 }
 
+export function filterUntrackedLocalBackendSessions<T extends { sessionId: string }>(
+  localSessions: T[],
+  activePcpSessions: PcpSessionSummary[]
+): T[] {
+  return filterUntrackedLocalClaudeSessions(localSessions, activePcpSessions);
+}
+
 export function shouldAutoResumeRuntimeSession(
   existing: { pcpSessionId?: string; backendSessionId?: string } | undefined,
   isTty: boolean
@@ -1213,10 +1220,10 @@ async function ensurePcpSessionContext(
     printPcpUnavailableWarning(pcpUnavailableReason || 'unknown error', cwd);
   }
 
-  const untrackedLocalBackendSessions =
-    backend === 'claude'
-      ? filterUntrackedLocalClaudeSessions(localBackendSessions, activeSessions)
-      : localBackendSessions;
+  const untrackedLocalBackendSessions = filterUntrackedLocalBackendSessions(
+    localBackendSessions,
+    activeSessions
+  );
 
   let chosen: PcpSessionSummary | undefined;
   let selectedLocalBackendSessionId: string | undefined;
@@ -1314,10 +1321,10 @@ async function ensurePcpSessionContext(
 
     for (const session of activeSessions) {
       const value = `__pcp__:${session.id}`;
-      const linkedBackendSessionId =
-        backend === 'claude' ? getSessionBackendId(session) : undefined;
+      const linkedBackendSessionId = getSessionBackendId(session);
+      const backendLabel = backend[0].toUpperCase() + backend.slice(1);
       choices.push({
-        name: `Resume PCP ${session.id.slice(0, 8)}${session.threadKey ? ` (${session.threadKey})` : ''}${session.currentPhase ? ` — ${session.currentPhase}` : ''}${linkedBackendSessionId ? ` · tracks Claude ${linkedBackendSessionId.slice(0, 8)}` : ''}`,
+        name: `Resume PCP ${session.id.slice(0, 8)}${session.threadKey ? ` (${session.threadKey})` : ''}${session.currentPhase ? ` — ${session.currentPhase}` : ''}${linkedBackendSessionId ? ` · tracks ${backendLabel} ${linkedBackendSessionId.slice(0, 8)}` : ''}`,
         value,
       });
       sessionChoiceByValue.set(value, session.id);

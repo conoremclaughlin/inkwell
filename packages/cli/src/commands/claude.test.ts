@@ -4,6 +4,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import {
   extractClaudeHistorySessionsForProject,
+  filterUntrackedLocalBackendSessions,
   filterPcpSessionsForContext,
   filterUntrackedLocalClaudeSessions,
   getCodexLocalSessionsForProject,
@@ -176,6 +177,34 @@ describe('filterUntrackedLocalClaudeSessions', () => {
     ]);
 
     expect(filtered.map((session) => session.sessionId)).toEqual(['claude-2']);
+  });
+});
+
+describe('filterUntrackedLocalBackendSessions', () => {
+  it('excludes local codex sessions already represented by PCP sessions', () => {
+    const local = [
+      {
+        sessionId: 'codex-1',
+        projectPath: '/tmp/project',
+        modified: '2026-02-28T00:00:00.000Z',
+      },
+      {
+        sessionId: 'codex-2',
+        projectPath: '/tmp/project',
+        modified: '2026-02-28T00:00:00.000Z',
+      },
+    ];
+
+    const filtered = filterUntrackedLocalBackendSessions(local, [
+      {
+        id: 'pcp-1',
+        startedAt: '2026-02-28T00:00:00.000Z',
+        backend: 'codex',
+        backendSessionId: 'codex-1',
+      },
+    ]);
+
+    expect(filtered.map((session) => session.sessionId)).toEqual(['codex-2']);
   });
 });
 
