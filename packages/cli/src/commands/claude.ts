@@ -316,6 +316,11 @@ export function resolveBackendSessionIdForResume(options: {
   // If backendSessionId already matches the PCP session id, treat it as canonical
   // and try resume directly even when local file discovery can't currently see it.
   // Claude can legitimately resume this id while local project scans miss it.
+  //
+  // Why this exists:
+  // We observed "false stale" loops where a valid canonical id (pcpSessionId) was
+  // present server-side but not found in the most recent local JSONL scan window.
+  // Marking that as stale forced reseed/resume churn.
   if (backend === 'claude' && candidate === chosen.id) {
     return { backendSessionId: candidate };
   }
@@ -940,6 +945,16 @@ function isUuidSessionId(value: string): boolean {
 }
 
 export function parseClaudeSessionIdFromOutputLine(line: string): string | undefined {
+  // IMPORTANT:
+  // Claude emits many UUID-like values in JSON event output. Those are often
+  // transient event/session envelope IDs, NOT resumable conversation IDs.
+  //
+  // Poisoning bug we hit:
+  // - we captured JSON session_id values
+  // - persisted them as backendSessionId
+  // - next launch attempted --resume <transient-id> and failed
+  //
+  // To avoid this, only accept IDs from explicit "claude --resume <uuid>" lines.
   const resumeMatch = line.match(
     /\bclaude\s+--resume\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i
   );

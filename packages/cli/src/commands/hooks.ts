@@ -662,6 +662,14 @@ export function extractBackendSessionId(
 ): string | undefined {
   // Claude hook payload session_id values are not stable conversation IDs.
   // They can rotate on each run and poison backendSessionId mapping.
+  //
+  // Real-world failure we observed:
+  // 1) fallback repair correctly set backendSessionId to a resumable id
+  // 2) later hook events emitted a new transient UUID
+  // 3) hook reconciliation overwrote backendSessionId with that transient id
+  // 4) next launch failed on --resume <transient-id>
+  //
+  // Therefore hooks MUST NOT source Claude backendSessionId from stdin payloads.
   // For Claude, backendSessionId should be captured by sb launch path from
   // explicit "claude --resume <id>" output, not hook stdin fields.
   if (sessionBackend === 'claude') {
