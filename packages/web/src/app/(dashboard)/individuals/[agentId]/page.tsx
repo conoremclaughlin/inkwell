@@ -121,8 +121,7 @@ export default function AgentDetailPage() {
           </Button>
           <Button variant="outline" size="sm" asChild>
             <Link href={`/individuals/${agentId}/versions`}>
-              <History className="mr-2 h-4 w-4" />
-              v{identity.version} History
+              <History className="mr-2 h-4 w-4" />v{identity.version} History
             </Link>
           </Button>
         </div>
@@ -216,7 +215,10 @@ export default function AgentDetailPage() {
               <CardContent>
                 <div className="grid gap-4 sm:grid-cols-2">
                   {Object.entries(identity.relationships).map(([relAgent, desc]) => (
-                    <div key={relAgent} className="p-3 bg-gray-50 rounded-lg border border-gray-100">
+                    <div
+                      key={relAgent}
+                      className="p-3 bg-gray-50 rounded-lg border border-gray-100"
+                    >
                       <div className="font-semibold text-gray-900 mb-1 capitalize">{relAgent}</div>
                       <div className="text-sm text-gray-600">{desc}</div>
                     </div>
@@ -279,9 +281,7 @@ export default function AgentDetailPage() {
                 <FileText className="h-5 w-5 text-gray-500" />
                 Identity JSON
               </CardTitle>
-              <CardDescription>
-                Structured identity payload used by API/UI.
-              </CardDescription>
+              <CardDescription>Structured identity payload used by API/UI.</CardDescription>
             </CardHeader>
             <CardContent>
               <pre className="bg-gray-900 text-gray-100 p-4 rounded-md overflow-x-auto text-sm font-mono">

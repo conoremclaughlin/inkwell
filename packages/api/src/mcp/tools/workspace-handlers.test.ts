@@ -8,7 +8,7 @@ import {
   handleUpdateWorkspace,
   handleAddWorkspaceMember,
   addWorkspaceMemberSchema,
-} from './workspace-container-handlers';
+} from './workspace-handlers';
 
 vi.mock('../../services/user-resolver', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../services/user-resolver')>();

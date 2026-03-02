@@ -25,7 +25,7 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
   subject: z.string().optional().describe('Message subject'),
   content: z.string().describe('Message content'),
   messageType: z
-    .enum(['message', 'task_request', 'session_resume', 'notification'])
+    .enum(['message', 'task_request', 'session_resume', 'notification', 'permission_grant'])
     .optional()
     .default('message')
     .describe('Type of message'),
@@ -62,7 +62,7 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .boolean()
     .optional()
     .describe(
-      'If true, automatically trigger the recipient agent after sending. Defaults to true for task_request, session_resume, and notification; false for message.'
+      'If true, automatically trigger the recipient agent after sending. Defaults to true for task_request, session_resume, notification, and permission_grant; false for message.'
     ),
   triggerType: z
     .enum(['task_complete', 'approval_needed', 'message', 'error', 'custom'])
@@ -82,7 +82,7 @@ const getInboxSchema = userIdentifierBaseSchema.extend({
     .default('unread')
     .describe('Filter by status'),
   priority: z.enum(['low', 'normal', 'high', 'urgent']).optional().describe('Filter by priority'),
-  messageType: z.enum(['message', 'task_request', 'session_resume', 'notification']).optional(),
+  messageType: z.enum(['message', 'task_request', 'session_resume', 'notification', 'permission_grant']).optional(),
   limit: z.number().min(1).max(100).optional().default(20).describe('Max messages'),
 });
 
@@ -129,7 +129,8 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   const shouldTriggerByDefault =
     messageType === 'task_request' ||
     messageType === 'session_resume' ||
-    messageType === 'notification';
+    messageType === 'notification' ||
+    messageType === 'permission_grant';
   const trigger = parsed.trigger ?? shouldTriggerByDefault;
 
   const hasRoutingAnchor = Boolean(
@@ -542,7 +543,7 @@ export const inboxToolDefinitions = [
   {
     name: 'send_to_inbox',
     description:
-      "Send a message to another agent's inbox. Use for cross-agent communication, task handoff, or session resume requests.\n\nMessage types:\n- message: General communication\n- task_request: Request another agent to do work\n- session_resume: Request agent to resume a specific session\n- notification: FYI, no response needed\n\nTrigger defaults:\n- task_request / session_resume / notification: wake recipient by default\n- message: no automatic wake by default\n- override with `trigger` boolean\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId",
+      "Send a message to another agent's inbox. Use for cross-agent communication, task handoff, or session resume requests.\n\nMessage types:\n- message: General communication\n- task_request: Request another agent to do work\n- session_resume: Request agent to resume a specific session\n- notification: FYI, no response needed\n- permission_grant: Grant or revoke tool permissions for recipient (include permissionGrant in metadata)\n\nTrigger defaults:\n- task_request / session_resume / notification / permission_grant: wake recipient by default\n- message: no automatic wake by default\n- override with `trigger` boolean\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId",
     schema: sendToInboxSchema,
     handler: handleSendToInbox,
   },

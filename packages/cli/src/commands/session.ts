@@ -22,18 +22,28 @@ interface PcpConfig {
   email?: string;
 }
 
-interface Session {
+export interface Session {
   id: string;
   agentId?: string;
   status: string;
+  currentPhase?: string;
+  threadKey?: string;
   startedAt: string;
   endedAt?: string;
   summary?: string;
+  backendSessionId?: string;
   claudeSessionId?: string;
+  studioId?: string;
+  studio?: {
+    id?: string;
+    worktreePath?: string;
+    worktreeFolder?: string;
+    branch?: string;
+  } | null;
   logs?: Array<{ salience: string; content: string }>;
 }
 
-interface SessionListResult {
+export interface SessionListResult {
   sessions: Session[];
 }
 
@@ -57,7 +67,101 @@ function getPcpConfig(): PcpConfig | null {
 // Commands
 // ============================================================================
 
-async function listCommand(options: { agent?: string; limit?: string }): Promise<void> {
+function formatStatus(session: Session): string {
+  return session.currentPhase || session.status || 'unknown';
+}
+
+function formatSessionLine(session: Session): string[] {
+  const statusIcon =
+    session.status === 'active'
+      ? chalk.green('●')
+      : session.status === 'completed'
+        ? chalk.dim('○')
+        : chalk.yellow('◐');
+
+  const startedAt = new Date(session.startedAt);
+  const duration = session.endedAt
+    ? formatDuration(new Date(session.endedAt).getTime() - startedAt.getTime())
+    : 'ongoing';
+  const thread = session.threadKey || '-';
+  const phase = formatStatus(session);
+
+  const lines = [
+    `  ${statusIcon} ${chalk.cyan(session.id.substring(0, 8))} ${chalk.dim(`(${phase})`)}`,
+    chalk.dim(`      Started: ${formatDate(startedAt)}  Duration: ${duration}`),
+    chalk.dim(`      Thread:  ${thread}`),
+    chalk.dim(`      Attach:  sb chat -a ${session.agentId || 'wren'} --attach ${session.id}`),
+  ];
+
+  if (session.summary) {
+    const summary =
+      session.summary.length > 80 ? session.summary.substring(0, 80) + '...' : session.summary;
+    lines.push(chalk.dim(`      Summary: ${summary}`));
+  }
+
+  if (session.studioId) {
+    const studioLabel = session.studio?.worktreeFolder
+      ? `${session.studioId} (${session.studio.worktreeFolder})`
+      : session.studioId;
+    lines.push(chalk.dim(`      Studio:  ${studioLabel}`));
+    if (session.studio?.worktreePath) {
+      lines.push(chalk.dim(`      Path:    ${session.studio.worktreePath}`));
+    }
+    if (session.studio?.branch) {
+      lines.push(chalk.dim(`      Branch:  ${session.studio.branch}`));
+    }
+  }
+
+  if (session.backendSessionId || session.claudeSessionId) {
+    lines.push(chalk.dim(`      Backend: ${session.backendSessionId || session.claudeSessionId}`));
+  }
+
+  return lines;
+}
+
+export function renderSessionsByAgent(sessions: Session[], flat = false): string[] {
+  if (sessions.length === 0) {
+    return [chalk.dim('  No sessions found')];
+  }
+
+  if (flat) {
+    const lines: string[] = [];
+    for (const session of sessions) {
+      lines.push(...formatSessionLine(session), '');
+    }
+    return lines;
+  }
+
+  const grouped = new Map<string, Session[]>();
+  for (const session of sessions) {
+    const key = session.agentId || 'unknown';
+    const list = grouped.get(key) || [];
+    list.push(session);
+    grouped.set(key, list);
+  }
+
+  const lines: string[] = [];
+  const agents = Array.from(grouped.keys()).sort((a, b) => a.localeCompare(b));
+  for (const agent of agents) {
+    const list = grouped.get(agent)!;
+    const activeCount = list.filter((entry) => entry.status === 'active').length;
+    lines.push(
+      chalk.bold(`${agent}`) +
+        chalk.dim(` (${list.length} session${list.length === 1 ? '' : 's'}, ${activeCount} active)`)
+    );
+    for (const session of list) {
+      lines.push(...formatSessionLine(session), '');
+    }
+  }
+
+  return lines;
+}
+
+async function listCommand(options: {
+  agent?: string;
+  limit?: string;
+  flat?: boolean;
+}): Promise<void> {
   const config = getPcpConfig();
   if (!config?.email) {
     console.error(chalk.red('PCP not configured. Run: sb init'));
@@ -72,38 +176,8 @@ async function listCommand(options: { agent?: string; limit?: string }): Promise
     });
 
     console.log(chalk.bold('\nRecent Sessions:\n'));
-
-    if (!result.sessions || result.sessions.length === 0) {
-      console.log(chalk.dim('  No sessions found'));
-      return;
-    }
-
-    for (const session of result.sessions) {
-      const statusIcon =
-        session.status === 'active'
-          ? chalk.green('●')
-          : session.status === 'completed'
-            ? chalk.dim('○')
-            : chalk.yellow('◐');
-
-      const agent = session.agentId || 'unknown';
-      const startedAt = new Date(session.startedAt);
-      const duration = session.endedAt
-        ? formatDuration(new Date(session.endedAt).getTime() - startedAt.getTime())
-        : 'ongoing';
-
-      console.log(
-        `  ${statusIcon} ${chalk.cyan(session.id.substring(0, 8))} ${chalk.dim(`(${agent})`)}`
-      );
-      console.log(chalk.dim(`      Started: ${formatDate(startedAt)}`));
-      console.log(chalk.dim(`      Duration: ${duration}`));
-
-      if (session.summary) {
-        const summary =
-          session.summary.length > 60 ? session.summary.substring(0, 60) + '...' : session.summary;
-        console.log(chalk.dim(`      Summary: ${summary}`));
-      }
-      console.log('');
+    for (const line of renderSessionsByAgent(result.sessions || [], options.flat)) {
+      console.log(line);
     }
   } catch (error) {
     console.error(chalk.red(`Failed to list sessions: ${error}`));
@@ -135,6 +209,19 @@ async function showCommand(sessionId: string): Promise<void> {
 
     if (session.claudeSessionId) {
       console.log(chalk.dim('  Claude:   ') + session.claudeSessionId);
+    }
+
+    if (session.studioId) {
+      const studioLabel = session.studio?.worktreeFolder
+        ? `${session.studioId} (${session.studio.worktreeFolder})`
+        : session.studioId;
+      console.log(chalk.dim('  Studio:   ') + studioLabel);
+      if (session.studio?.worktreePath) {
+        console.log(chalk.dim('  Path:     ') + session.studio.worktreePath);
+      }
+      if (session.studio?.branch) {
+        console.log(chalk.dim('  Branch:   ') + session.studio.branch);
+      }
     }
 
     if (session.summary) {
@@ -251,6 +338,7 @@ export function registerSessionCommands(program: Command): void {
     .description('List recent sessions')
     .option('-a, --agent <id>', 'Filter by agent')
     .option('-l, --limit <n>', 'Number of sessions', '10')
+    .option('--flat', 'Show flat list without SB grouping')
     .action(listCommand);
 
   session.command('show <id>').description('Show session details').action(showCommand);

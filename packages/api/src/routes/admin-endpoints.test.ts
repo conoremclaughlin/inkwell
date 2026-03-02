@@ -455,7 +455,9 @@ describe('admin endpoint handlers (no-500 regression)', () => {
           ]);
         }
         if (table === 'workspaces') {
-          return createQueryChain([{ shared_values: '# VALUES (workspace)', process: '# PROCESS (workspace)' }]);
+          return createQueryChain([
+            { shared_values: '# VALUES (workspace)', process: '# PROCESS (workspace)' },
+          ]);
         }
         return createQueryChain([]);
       });

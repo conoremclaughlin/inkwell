@@ -126,15 +126,24 @@ export default function SharedDocumentsPage() {
 
       <Tabs defaultValue="user" className="w-full">
         <TabsList className="grid h-auto w-full grid-cols-3 gap-2 bg-transparent p-0">
-          <TabsTrigger value="user" className="border bg-white data-[state=active]:border-blue-300 data-[state=active]:bg-blue-50">
+          <TabsTrigger
+            value="user"
+            className="border bg-white data-[state=active]:border-blue-300 data-[state=active]:bg-blue-50"
+          >
             <User className="mr-2 h-4 w-4" />
             About you
           </TabsTrigger>
-          <TabsTrigger value="values" className="border bg-white data-[state=active]:border-amber-300 data-[state=active]:bg-amber-50">
+          <TabsTrigger
+            value="values"
+            className="border bg-white data-[state=active]:border-amber-300 data-[state=active]:bg-amber-50"
+          >
             <Sparkles className="mr-2 h-4 w-4" />
             Shared values
           </TabsTrigger>
-          <TabsTrigger value="process" className="border bg-white data-[state=active]:border-emerald-300 data-[state=active]:bg-emerald-50">
+          <TabsTrigger
+            value="process"
+            className="border bg-white data-[state=active]:border-emerald-300 data-[state=active]:bg-emerald-50"
+          >
             <Workflow className="mr-2 h-4 w-4" />
             Process
           </TabsTrigger>

@@ -321,6 +321,7 @@ export async function handleGetActivity(args: unknown, dataComposer: DataCompose
               platform: a.platform,
               contactId: a.contactId,
               sessionId: a.sessionId,
+              payload: a.payload ?? undefined,
               status: a.status,
               createdAt: a.createdAt.toISOString(),
               completedAt: a.completedAt?.toISOString(),

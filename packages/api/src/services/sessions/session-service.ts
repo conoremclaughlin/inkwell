@@ -177,6 +177,9 @@ export class SessionService implements ISessionService {
             sender: request.sender,
             triggerType: metadata?.triggerType,
             media: metadata?.media,
+            threadKey: metadata?.threadKey,
+            studioId: metadata?.studioId,
+            studioHint: metadata?.studioHint,
           })
         ),
       });
@@ -311,7 +314,7 @@ export class SessionService implements ISessionService {
    * This is the core message processing logic, separated from locking.
    */
   private async processMessage(request: SessionRequest, session: Session): Promise<SessionResult> {
-    const { userId, agentId } = request;
+    const { userId, agentId, metadata } = request;
 
     // 1. Build context for the agent
     const injectedContext = await this.contextBuilder.buildContext(userId, agentId, session);
@@ -368,11 +371,61 @@ export class SessionService implements ISessionService {
           ? this.geminiRunner
           : this.claudeRunner;
 
+    // 5a. Log backend spawn to activity stream (fire-and-forget)
+    const triggerSource = metadata?.triggerType as string | undefined;
+    this.activityStream
+      .logActivity({
+        userId,
+        agentId,
+        type: 'agent_spawn',
+        subtype: `backend_cli:${resolvedBackend}`,
+        content: `Backend turn started (${resolvedBackend})`,
+        sessionId: session.id,
+        payload: {
+          backend: resolvedBackend,
+          studioId: session.studioId,
+          ...(triggerSource ? { triggerSource } : {}),
+          ...(request.sender?.id ? { triggeredBy: request.sender.id } : {}),
+          ...(metadata?.threadKey ? { threadKey: metadata.threadKey } : {}),
+        } as unknown as Json,
+      })
+      .catch((err) => {
+        logger.warn('Failed to log backend spawn activity', { error: err });
+      });
+
+    const turnStartMs = Date.now();
     const result = await runner.run(formattedMessage, {
       claudeSessionId: session.claudeSessionId || undefined,
       injectedContext: session.claudeSessionId ? undefined : injectedContext,
       config: runnerConfig,
     });
+    const turnDurationMs = Date.now() - turnStartMs;
+
+    // 5b. Log backend CLI completion to activity stream (fire-and-forget)
+    this.activityStream
+      .logActivity({
+        userId,
+        agentId,
+        type: result.success ? 'agent_complete' : 'error',
+        subtype: `backend_cli:${resolvedBackend}`,
+        content: result.success
+          ? `Backend turn completed (${resolvedBackend}, ${Math.round(turnDurationMs / 1000)}s)`
+          : `Backend turn failed (${resolvedBackend}): ${result.error?.slice(0, 200) || 'unknown error'}`,
+        sessionId: session.id,
+        payload: {
+          backend: resolvedBackend,
+          durationMs: turnDurationMs,
+          studioId: session.studioId,
+          ...(triggerSource ? { triggerSource } : {}),
+          ...(request.sender?.id ? { triggeredBy: request.sender.id } : {}),
+          ...(metadata?.threadKey ? { threadKey: metadata.threadKey } : {}),
+          ...(result.error ? { error: result.error.slice(0, 500) } : {}),
+          ...(result.usage ? { usage: result.usage } : {}),
+        } as unknown as Json,
+      })
+      .catch((err) => {
+        logger.warn('Failed to log backend turn activity', { error: err });
+      });
 
     // 6. Log tool calls to activity stream (fire-and-forget, don't block response)
     if (result.toolCalls && result.toolCalls.length > 0) {

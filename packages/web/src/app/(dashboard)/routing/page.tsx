@@ -88,12 +88,40 @@ interface SBGroup {
 
 const PLATFORM_OPTIONS = ['telegram', 'whatsapp', 'discord', 'slack', 'email'];
 
-const PLATFORM_CONFIG: Record<string, { label: string; color: string; bgColor: string; icon: typeof Send }> = {
-  telegram: { label: 'Telegram', color: 'text-sky-700', bgColor: 'bg-sky-50 border-sky-200', icon: Send },
-  whatsapp: { label: 'WhatsApp', color: 'text-emerald-700', bgColor: 'bg-emerald-50 border-emerald-200', icon: MessageCircle },
-  discord: { label: 'Discord', color: 'text-indigo-700', bgColor: 'bg-indigo-50 border-indigo-200', icon: Hash },
-  slack: { label: 'Slack', color: 'text-purple-700', bgColor: 'bg-purple-50 border-purple-200', icon: MessageCircle },
-  email: { label: 'Email', color: 'text-amber-700', bgColor: 'bg-amber-50 border-amber-200', icon: Mail },
+const PLATFORM_CONFIG: Record<
+  string,
+  { label: string; color: string; bgColor: string; icon: typeof Send }
+> = {
+  telegram: {
+    label: 'Telegram',
+    color: 'text-sky-700',
+    bgColor: 'bg-sky-50 border-sky-200',
+    icon: Send,
+  },
+  whatsapp: {
+    label: 'WhatsApp',
+    color: 'text-emerald-700',
+    bgColor: 'bg-emerald-50 border-emerald-200',
+    icon: MessageCircle,
+  },
+  discord: {
+    label: 'Discord',
+    color: 'text-indigo-700',
+    bgColor: 'bg-indigo-50 border-indigo-200',
+    icon: Hash,
+  },
+  slack: {
+    label: 'Slack',
+    color: 'text-purple-700',
+    bgColor: 'bg-purple-50 border-purple-200',
+    icon: MessageCircle,
+  },
+  email: {
+    label: 'Email',
+    color: 'text-amber-700',
+    bgColor: 'bg-amber-50 border-amber-200',
+    icon: Mail,
+  },
 };
 
 // ─── Helpers ───
@@ -137,7 +165,13 @@ export default function RoutingPage() {
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: ['routing'] });
         setShowCreateForm(false);
-        setNewRoute({ identityId: '', platform: 'telegram', platformAccountId: '', chatId: '', isActive: true });
+        setNewRoute({
+          identityId: '',
+          platform: 'telegram',
+          platformAccountId: '',
+          chatId: '',
+          isActive: true,
+        });
       },
     }
   );
@@ -151,7 +185,11 @@ export default function RoutingPage() {
   const routes = data?.routes || [];
   const identities = data?.identities || [];
   const summary = data?.summary || {
-    totalRoutes: 0, activeRoutes: 0, agentsWithRoutes: 0, platformsCovered: 0, unassignedReminderCount: 0,
+    totalRoutes: 0,
+    activeRoutes: 0,
+    agentsWithRoutes: 0,
+    platformsCovered: 0,
+    unassignedReminderCount: 0,
   };
 
   // Group routes by SB
@@ -282,22 +320,30 @@ export default function RoutingPage() {
                     required
                   >
                     {PLATFORM_OPTIONS.map((p) => (
-                      <option key={p} value={p}>{formatPlatform(p)}</option>
+                      <option key={p} value={p}>
+                        {formatPlatform(p)}
+                      </option>
                     ))}
                   </select>
                 </div>
               </div>
               <div className="grid gap-4 md:grid-cols-2">
                 <div className="space-y-1.5">
-                  <label className="text-sm font-medium text-gray-700">Account <span className="text-gray-400 font-normal">(optional)</span></label>
+                  <label className="text-sm font-medium text-gray-700">
+                    Account <span className="text-gray-400 font-normal">(optional)</span>
+                  </label>
                   <Input
                     placeholder="myra_help_bot or +14155551234"
                     value={newRoute.platformAccountId || ''}
-                    onChange={(e) => setNewRoute((p) => ({ ...p, platformAccountId: e.target.value }))}
+                    onChange={(e) =>
+                      setNewRoute((p) => ({ ...p, platformAccountId: e.target.value }))
+                    }
                   />
                 </div>
                 <div className="space-y-1.5">
-                  <label className="text-sm font-medium text-gray-700">Chat <span className="text-gray-400 font-normal">(optional)</span></label>
+                  <label className="text-sm font-medium text-gray-700">
+                    Chat <span className="text-gray-400 font-normal">(optional)</span>
+                  </label>
                   <Input
                     placeholder="group_id / thread_id"
                     value={newRoute.chatId || ''}
@@ -316,7 +362,12 @@ export default function RoutingPage() {
                   Active immediately
                 </label>
                 <div className="flex gap-2">
-                  <Button type="button" variant="outline" size="sm" onClick={() => setShowCreateForm(false)}>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setShowCreateForm(false)}
+                  >
                     Cancel
                   </Button>
                   <Button type="submit" size="sm" disabled={createRouteMutation.isPending}>
@@ -340,7 +391,9 @@ export default function RoutingPage() {
             <CardContent className="py-12 text-center">
               <Route className="h-10 w-10 mx-auto text-gray-300 mb-3" />
               <p className="text-gray-500">No channel routes yet.</p>
-              <p className="text-sm text-gray-400 mt-1">Add your first route above to start routing traffic to an SB.</p>
+              <p className="text-sm text-gray-400 mt-1">
+                Add your first route above to start routing traffic to an SB.
+              </p>
             </CardContent>
           </Card>
         ) : (
@@ -350,10 +403,12 @@ export default function RoutingPage() {
               <Card key={group.agentId} className="overflow-hidden">
                 {/* SB Header */}
                 <div className="flex items-center gap-4 px-5 py-4 border-b bg-gray-50/50">
-                  <div className={clsx(
-                    'h-10 w-10 rounded-full bg-gradient-to-br flex items-center justify-center text-white font-semibold text-sm shrink-0',
-                    gradient
-                  )}>
+                  <div
+                    className={clsx(
+                      'h-10 w-10 rounded-full bg-gradient-to-br flex items-center justify-center text-white font-semibold text-sm shrink-0',
+                      gradient
+                    )}
+                  >
                     {getInitial(group.agentName)}
                   </div>
                   <div className="flex-1 min-w-0">
@@ -398,11 +453,13 @@ export default function RoutingPage() {
                         )}
                       >
                         <div className="flex items-center gap-3 flex-1 min-w-0">
-                          <div className={clsx(
-                            'flex items-center gap-2 rounded-md border px-2.5 py-1 text-xs font-medium',
-                            pConfig?.bgColor || 'bg-gray-50 border-gray-200',
-                            pConfig?.color || 'text-gray-700'
-                          )}>
+                          <div
+                            className={clsx(
+                              'flex items-center gap-2 rounded-md border px-2.5 py-1 text-xs font-medium',
+                              pConfig?.bgColor || 'bg-gray-50 border-gray-200',
+                              pConfig?.color || 'text-gray-700'
+                            )}
+                          >
                             <PlatformIcon className="h-3.5 w-3.5" />
                             {formatPlatform(route.platform)}
                           </div>
@@ -433,7 +490,10 @@ export default function RoutingPage() {
                             size="sm"
                             className="h-7 text-xs text-gray-500 hover:text-gray-900"
                             onClick={() =>
-                              toggleRouteMutation.mutate({ routeId: route.id, isActive: !route.isActive })
+                              toggleRouteMutation.mutate({
+                                routeId: route.id,
+                                isActive: !route.isActive,
+                              })
                             }
                             disabled={toggleRouteMutation.isPending}
                           >
@@ -455,9 +515,14 @@ export default function RoutingPage() {
         <div className="mt-4 flex items-center gap-3 rounded-lg border border-amber-200 bg-amber-50/50 px-4 py-3">
           <AlertTriangle className="h-4 w-4 text-amber-600 shrink-0" />
           <p className="text-sm text-amber-800">
-            <span className="font-medium">{summary.unassignedReminderCount} reminder{summary.unassignedReminderCount !== 1 ? 's' : ''}</span>{' '}
+            <span className="font-medium">
+              {summary.unassignedReminderCount} reminder
+              {summary.unassignedReminderCount !== 1 ? 's' : ''}
+            </span>{' '}
             not assigned to any SB.{' '}
-            <Link href="/reminders" className="underline hover:text-amber-900">View reminders</Link>
+            <Link href="/reminders" className="underline hover:text-amber-900">
+              View reminders
+            </Link>
           </p>
         </div>
       )}

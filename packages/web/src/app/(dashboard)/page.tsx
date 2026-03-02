@@ -269,46 +269,46 @@ export default function DashboardPage() {
                       {agent.studios.map((studio) => {
                         const slug = studio.slug || getStudioSlug(studio.worktreePath);
                         return (
-                        <div key={studio.id} className="flex items-center gap-4 px-5 py-3">
-                          <div className="flex items-center gap-3 flex-1 min-w-0">
-                            <div className="flex items-center gap-2">
-                              <GitBranch
-                                className={clsx('h-4 w-4', getStudioStatusColor(studio.status))}
-                              />
-                              <span className="text-sm font-medium text-gray-700">
-                                {slug || studio.branch}
+                          <div key={studio.id} className="flex items-center gap-4 px-5 py-3">
+                            <div className="flex items-center gap-3 flex-1 min-w-0">
+                              <div className="flex items-center gap-2">
+                                <GitBranch
+                                  className={clsx('h-4 w-4', getStudioStatusColor(studio.status))}
+                                />
+                                <span className="text-sm font-medium text-gray-700">
+                                  {slug || studio.branch}
+                                </span>
+                              </div>
+                              {studio.purpose && (
+                                <span className="text-xs text-gray-400 truncate">
+                                  {studio.purpose}
+                                </span>
+                              )}
+                              {studio.workType && (
+                                <Badge className="text-[10px] bg-gray-100 text-gray-500 border-gray-200">
+                                  {studio.workType}
+                                </Badge>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-3 shrink-0">
+                              <Badge
+                                className={clsx(
+                                  'text-[11px] font-medium border',
+                                  studio.status === 'active'
+                                    ? 'bg-green-50 text-green-700 border-green-200 hover:bg-green-50'
+                                    : studio.status === 'idle'
+                                      ? 'bg-gray-50 text-gray-500 border-gray-200 hover:bg-gray-50'
+                                      : 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-50'
+                                )}
+                              >
+                                {studio.status}
+                              </Badge>
+                              <span className="text-xs text-gray-400">
+                                {formatRelativeTime(studio.updatedAt)}
                               </span>
                             </div>
-                            {studio.purpose && (
-                              <span className="text-xs text-gray-400 truncate">
-                                {studio.purpose}
-                              </span>
-                            )}
-                            {studio.workType && (
-                              <Badge className="text-[10px] bg-gray-100 text-gray-500 border-gray-200">
-                                {studio.workType}
-                              </Badge>
-                            )}
                           </div>
-                          <div className="flex items-center gap-3 shrink-0">
-                            <Badge
-                              className={clsx(
-                                'text-[11px] font-medium border',
-                                studio.status === 'active'
-                                  ? 'bg-green-50 text-green-700 border-green-200 hover:bg-green-50'
-                                  : studio.status === 'idle'
-                                    ? 'bg-gray-50 text-gray-500 border-gray-200 hover:bg-gray-50'
-                                    : 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-50'
-                              )}
-                            >
-                              {studio.status}
-                            </Badge>
-                            <span className="text-xs text-gray-400">
-                              {formatRelativeTime(studio.updatedAt)}
-                            </span>
-                          </div>
-                        </div>
-                      );
+                        );
                       })}
                     </div>
                   )}

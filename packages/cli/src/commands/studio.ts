@@ -866,7 +866,9 @@ async function renameStudio(from: string, to: string): Promise<void> {
         });
       } catch {
         // Non-fatal: local rename succeeded, cloud sync can be retried
-        console.log(chalk.yellow('\n  Note: Cloud sync failed — slug will update on next session start'));
+        console.log(
+          chalk.yellow('\n  Note: Cloud sync failed — slug will update on next session start')
+        );
       }
     }
 

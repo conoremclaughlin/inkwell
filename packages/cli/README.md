@@ -192,6 +192,12 @@ Any flag not listed above is forwarded to the backend.
 
 ```bash
 sb init                         # Set up PCP in current repo
+sb doctor                       # Check linked studio CLI binary health
+sb doctor --fix                 # Prompt to relink current studio binary
+sb mission                      # Mission control (sessions + unread inbox by SB)
+sb mission --watch              # Live-refresh mission dashboard
+sb chat                         # First-class PCP REPL (experimental)
+sb chat -b codex                # REPL using Codex backend
 sb hooks install --all          # Install hooks across all worktrees
 sb studio create feat-auth      # Create a studio (git worktree)
 sb agent status                 # Check agent status
@@ -282,10 +288,14 @@ Hooks are installed to **local-only** config by default (e.g., `.claude/settings
 
 ```bash
 sb session list                 # Recent sessions
+sb session list --flat          # Flat list (default groups by SB/agent)
 sb session show <id>            # Session details
 sb session resume <id>          # Resume a session
 sb session end [id]             # End a session
 ```
+
+`sb session list` now prints grouped SB sections with attach hints:
+`sb chat -a <agent> --session-id <id>`.
 
 ### Workspaces (`sb workspace`)
 
@@ -313,12 +323,79 @@ Options for `invite`:
 
 - `--role <role>` — Role: `owner`, `admin`, `member`, or `viewer` (default: member)
 
+### Mission Control (`sb mission`)
+
+```bash
+sb mission                     # Snapshot of active sessions + unread inbox by SB
+sb mission --watch             # Live refresh dashboard
+sb mission -a lumen            # Filter to one SB
+sb mission --attach lumen      # Print attach command for latest lumen session
+sb mission --attach b85490f5   # Resolve attach command from session ID prefix
+sb mission --json              # Machine-readable output
+```
+### First-Class REPL (`sb chat`) (experimental)
+
+`sb chat` is the native PCP REPL where PCP controls session lifecycle and context instead of relying solely on backend CLI compaction behavior.
+
+```bash
+sb chat                          # Start REPL (default backend: claude)
+sb alpha                         # Alias for sb chat
+sb chat -b codex                 # Use codex backend
+sb chat -b gemini                # Use gemini backend
+sb chat --thread-key pr:123      # Bind to collaborative thread
+sb chat --attach                 # Pick an active session for this SB and attach
+sb chat --attach pr:61           # Pick from active sessions filtered by query
+sb chat --attach-latest          # Auto-attach newest active session for this SB
+sb chat --attach-latest pr:61    # Auto-attach newest active session matching query
+sb chat --session-id <pcp-id>    # Attach to an existing PCP session
+sb chat --non-interactive --message "run heartbeat pass"
+sb chat --tail-transcript <session-or-path>  # Stream transcript output
+sb chat --max-context-tokens 16000
+sb chat --poll-seconds 10
+sb chat --tools off              # Disable backend-native tool usage
+sb chat --tools privileged       # Allow broad tool execution
+```
+
+When a blocked `/pcp` tool is attempted, REPL prompts inline to allow once, allow for the active PCP session, allow always (persisted), or deny always.
+
+Inside REPL:
+
+- `/inbox` force inbox refresh
+- `/events [now|on|off]` poll or toggle merged PCP activity stream during chat
+- `/sessions [watch|off]` show active sessions (id + SB + status + thread)
+- `/bookmark [label]` create a context bookmark
+- `/eject <bookmark|last>` eject context up to bookmark (and persist a `remember` checkpoint)
+- `/backend <claude|codex|gemini>` switch backend
+- `/model <id>` set/clear model override
+- `/tools <backend|off|privileged>` adjust tool policy mode
+- `/grant <tool> [uses]` scoped grant for blocked PCP tool calls
+- `/grant-session <tool>` allow a blocked PCP tool for the current PCP session only
+- `/allow <tool>` persistently allow a PCP tool
+- `/deny <tool>` persistently deny a PCP tool
+- `/policy` inspect active policy and storage path
+- `/skills` list discovered local skills from .codex/.pcp/.claude/.gemini roots
+- `/skill-trust <all|trusted-only>` set trust policy mode for skill activation
+- `/skill-allow <pattern>` add skill pattern to persistent skill allowlist
+- `/path-allow-read <glob>` add a persistent local read allowlist pattern for skills/context files
+- `/path-allow-write <glob>` add a persistent local write allowlist pattern
+- `/delegate-create <to> <scopes> [ttl-min]` mint an SB delegation token
+- `/delegate-show` show last minted delegation token payload
+- `/delegate-verify <token|last>` verify delegation token locally
+- `/delegate-send <to> <scopes> <message>` send inbox task with delegation token metadata
+- `/skill-use <name>` activate a discovered skill and inject SKILL.md guidance into prompt context
+- `/skill-clear [name]` clear active skills
+- `/pcp <tool> [jsonArgs]` invoke PCP tools directly from REPL
+- `/usage` show visual context token meter (budget %, delta since last turn, per-role breakdown + backend usage when available)
+- `/session` show session/thread routing info
+- `/quit` end REPL and close PCP session
+
 ## Environment Variables
 
 | Variable         | Description             | Default                    |
 | ---------------- | ----------------------- | -------------------------- |
 | `PCP_SERVER_URL` | PCP server URL          | `http://localhost:3001`    |
 | `AGENT_ID`       | Override agent identity | (from identity resolution) |
+| `PCP_TOOL_POLICY_PATH` | Override persisted REPL tool-policy JSON path | `~/.pcp/security/tool-policy.json` |
 
 ## Development
 

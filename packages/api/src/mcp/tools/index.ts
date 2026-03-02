@@ -211,14 +211,14 @@ import {
 } from './activity-stream-handlers';
 
 import {
-  handleCreateWorkspace as handleCreateStudio,
-  handleListWorkspaces as handleListStudios,
-  handleGetWorkspace as handleGetStudio,
-  handleUpdateWorkspace as handleUpdateStudio,
-  handleCloseWorkspace as handleCloseStudio,
-  handleAdoptWorkspace as handleAdoptStudio,
-  workspaceToolDefinitions as studioToolDefinitions,
-} from './workspace-handlers';
+  handleCreateStudio,
+  handleListStudios,
+  handleGetStudio,
+  handleUpdateStudio,
+  handleCloseStudio,
+  handleAdoptStudio,
+  studioToolDefinitions,
+} from './studio-handlers';
 
 import {
   handleCreateWorkspace,
@@ -231,7 +231,7 @@ import {
   getWorkspaceSchema,
   updateWorkspaceSchema,
   addWorkspaceMemberSchema,
-} from './workspace-container-handlers';
+} from './workspace-handlers';
 
 import { handleCreateKindleToken, createKindleTokenSchema } from './kindle-handlers';
 
@@ -3307,9 +3307,10 @@ Message types:
 - task_request: Request another agent to do work
 - session_resume: Request agent to resume a specific session
 - notification: FYI, no response needed
+- permission_grant: Grant or revoke tool permissions (include permissionGrant in metadata)
 
 Trigger defaults:
-- task_request / session_resume / notification: trigger recipient wake-up by default
+- task_request / session_resume / notification / permission_grant: trigger recipient wake-up by default
 - message: does not trigger by default
 - Any default can be overridden with the \`trigger\` boolean flag
 

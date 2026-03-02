@@ -122,7 +122,10 @@ export default function SharedVersionsPage() {
     data: historyData,
     isLoading: historyLoading,
     error: historyError,
-  } = useApiQuery<HistoryResponse>(['user-identity', 'history'], '/api/admin/user-identity/history');
+  } = useApiQuery<HistoryResponse>(
+    ['user-identity', 'history'],
+    '/api/admin/user-identity/history'
+  );
 
   const userIdentity = userIdentityData?.userIdentity ?? null;
   const history = historyData?.history ?? [];
@@ -166,7 +169,9 @@ export default function SharedVersionsPage() {
     !!comparisonVersion &&
     selectedVersion.sharedValues !== comparisonVersion.sharedValues;
   const processChanged =
-    !!selectedVersion && !!comparisonVersion && selectedVersion.process !== comparisonVersion.process;
+    !!selectedVersion &&
+    !!comparisonVersion &&
+    selectedVersion.process !== comparisonVersion.process;
 
   if (isLoading) {
     return (
@@ -266,7 +271,9 @@ export default function SharedVersionsPage() {
               ) : (
                 <div className="py-8 text-center text-gray-500">
                   <p className="font-medium">Original version</p>
-                  <p className="mt-1 text-sm">This is the first version, so there is nothing to diff yet.</p>
+                  <p className="mt-1 text-sm">
+                    This is the first version, so there is nothing to diff yet.
+                  </p>
                 </div>
               )}
             </CardContent>
