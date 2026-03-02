@@ -8,12 +8,13 @@
 import { spawn, spawnSync } from 'child_process';
 import chalk from 'chalk';
 import { randomUUID } from 'crypto';
-import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'fs';
+import { type Dirent, existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'fs';
 import { join, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
 import { getBackend, resolveAgentId } from '../backends/index.js';
 import { getValidAccessToken } from '../auth/tokens.js';
 import { callPcpTool, getPcpServerUrl } from '../lib/pcp-mcp.js';
+import { sbDebugLog } from '../lib/sb-debug.js';
 import {
   getCurrentRuntimeSession,
   listRuntimeSessions,
@@ -67,6 +68,16 @@ interface ClaudeHistoryLine {
   timestamp?: number;
   project?: string;
   sessionId?: string;
+}
+
+interface CodexSessionMetaLine {
+  timestamp?: string;
+  type?: string;
+  payload?: {
+    id?: string;
+    cwd?: string;
+    timestamp?: string;
+  };
 }
 
 interface BackendExecutionLogContext {
@@ -574,11 +585,28 @@ export function getCodexLocalSessionsForProject(
   cwd = process.cwd(),
   limit = 20
 ): BackendLocalSessionSummary[] {
+  const fallbackToJsonl = (reason: string): BackendLocalSessionSummary[] => {
+    const fallback = getCodexLocalSessionsFromJsonl(cwd, limit);
+    sbDebugLog('backend', 'codex_local_sessions_fallback_jsonl', {
+      cwd,
+      reason,
+      returnedSessions: fallback.length,
+      sessionIds: fallback.map((session) => session.sessionId),
+    });
+    return fallback;
+  };
+
   const codexStateDbPath = join(homedir(), '.codex', 'state_5.sqlite');
-  if (!existsSync(codexStateDbPath)) return [];
+  if (!existsSync(codexStateDbPath)) {
+    sbDebugLog('backend', 'codex_local_sessions_missing_db', { cwd, codexStateDbPath });
+    return fallbackToJsonl('missing_state_db');
+  }
 
   const normalizedCwd = normalizePath(cwd);
-  if (!normalizedCwd) return [];
+  if (!normalizedCwd) {
+    sbDebugLog('backend', 'codex_local_sessions_unresolved_cwd', { cwd });
+    return [];
+  }
 
   const query = `
 SELECT id, cwd, updated_at,
@@ -591,7 +619,16 @@ LIMIT 200;
 `;
 
   const result = spawnSync('sqlite3', ['-tabs', codexStateDbPath, query], { encoding: 'utf-8' });
-  if (result.error || result.status !== 0 || !result.stdout) return [];
+  if (result.error || result.status !== 0 || !result.stdout) {
+    sbDebugLog('backend', 'codex_local_sessions_query_failed', {
+      cwd: normalizedCwd,
+      codexStateDbPath,
+      status: result.status ?? null,
+      error: result.error?.message || null,
+      stderr: result.stderr?.toString()?.slice(-1000) || null,
+    });
+    return fallbackToJsonl('sqlite_query_failed');
+  }
 
   const sessions: BackendLocalSessionSummary[] = [];
   const lines = result.stdout.split('\n').map((line) => line.trim());
@@ -618,12 +655,121 @@ LIMIT 200;
     });
   }
 
-  return sessions.slice(0, limit);
+  const scoped = sessions.slice(0, limit);
+  sbDebugLog('backend', 'codex_local_sessions_loaded', {
+    cwd: normalizedCwd,
+    totalScopedSessions: sessions.length,
+    returnedSessions: scoped.length,
+    sessionIds: scoped.map((session) => session.sessionId),
+  });
+  return scoped.length > 0 ? scoped : fallbackToJsonl('sqlite_query_empty');
+}
+
+function getCodexLocalSessionsFromJsonl(
+  cwd = process.cwd(),
+  limit = 20
+): BackendLocalSessionSummary[] {
+  const codexSessionsDir = join(homedir(), '.codex', 'sessions');
+  if (!existsSync(codexSessionsDir)) return [];
+
+  const normalizedCwd = normalizePath(cwd);
+  if (!normalizedCwd) return [];
+
+  const sessionFiles: Array<{ path: string; modified: string }> = [];
+  const stack: string[] = [codexSessionsDir];
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    if (!dir) continue;
+
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+      try {
+        const stats = statSync(fullPath);
+        sessionFiles.push({ path: fullPath, modified: stats.mtime.toISOString() });
+      } catch {
+        // Ignore unreadable files.
+      }
+    }
+  }
+
+  const maxFilesToInspect = Math.max(limit * 25, 250);
+  const sortedFiles = sessionFiles
+    .sort((a, b) => new Date(b.modified).getTime() - new Date(a.modified).getTime())
+    .slice(0, maxFilesToInspect);
+
+  const sessions: BackendLocalSessionSummary[] = [];
+  for (const sessionFile of sortedFiles) {
+    let content: string;
+    try {
+      content = readFileSync(sessionFile.path, 'utf-8');
+    } catch {
+      continue;
+    }
+
+    let matched: BackendLocalSessionSummary | undefined;
+    const lines = content.split('\n');
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      let parsed: CodexSessionMetaLine;
+      try {
+        parsed = JSON.parse(trimmed) as CodexSessionMetaLine;
+      } catch {
+        continue;
+      }
+
+      if (parsed.type !== 'session_meta') continue;
+      const sessionId = parsed.payload?.id?.trim();
+      const sessionCwd = parsed.payload?.cwd?.trim();
+      if (!sessionId || !sessionCwd) break;
+
+      const normalizedSessionCwd = normalizePath(sessionCwd);
+      if (!normalizedSessionCwd || normalizedSessionCwd !== normalizedCwd) break;
+
+      matched = {
+        backend: 'codex',
+        sessionId,
+        projectPath: sessionCwd,
+        modified: parsed.payload?.timestamp || parsed.timestamp || sessionFile.modified,
+      };
+      break;
+    }
+
+    if (matched) sessions.push(matched);
+  }
+
+  const deduped = new Map<string, BackendLocalSessionSummary>();
+  for (const session of sessions) {
+    const existing = deduped.get(session.sessionId);
+    if (!existing || new Date(session.modified).getTime() > new Date(existing.modified).getTime()) {
+      deduped.set(session.sessionId, session);
+    }
+  }
+
+  return Array.from(deduped.values())
+    .sort((a, b) => new Date(b.modified).getTime() - new Date(a.modified).getTime())
+    .slice(0, limit);
 }
 
 function getGeminiProjectKeysForCwd(cwd = process.cwd()): string[] {
   const normalizedCwd = normalizePath(cwd);
-  if (!normalizedCwd) return [];
+  if (!normalizedCwd) {
+    sbDebugLog('backend', 'gemini_project_keys_unresolved_cwd', { cwd });
+    return [];
+  }
 
   const keys = new Set<string>();
 
@@ -661,7 +807,13 @@ function getGeminiProjectKeysForCwd(cwd = process.cwd()): string[] {
     }
   }
 
-  return Array.from(keys);
+  const resolved = Array.from(keys);
+  sbDebugLog('backend', 'gemini_project_keys_loaded', {
+    cwd: normalizedCwd,
+    keyCount: resolved.length,
+    keys: resolved,
+  });
+  return resolved;
 }
 
 function getGeminiSessionsForProjectKey(projectKey: string): BackendLocalSessionSummary[] {
@@ -719,7 +871,10 @@ export function getGeminiLocalSessionsForProject(
   limit = 20
 ): BackendLocalSessionSummary[] {
   const projectKeys = getGeminiProjectKeysForCwd(cwd);
-  if (projectKeys.length === 0) return [];
+  if (projectKeys.length === 0) {
+    sbDebugLog('backend', 'gemini_local_sessions_no_project_keys', { cwd });
+    return [];
+  }
 
   const sessions = projectKeys.flatMap((projectKey) => getGeminiSessionsForProjectKey(projectKey));
   const deduped = new Map<string, BackendLocalSessionSummary>();
@@ -730,9 +885,17 @@ export function getGeminiLocalSessionsForProject(
     }
   }
 
-  return Array.from(deduped.values())
+  const sorted = Array.from(deduped.values())
     .sort((a, b) => new Date(b.modified).getTime() - new Date(a.modified).getTime())
     .slice(0, limit);
+  sbDebugLog('backend', 'gemini_local_sessions_loaded', {
+    cwd,
+    projectKeyCount: projectKeys.length,
+    dedupedCount: deduped.size,
+    returnedSessions: sorted.length,
+    sessionIds: sorted.map((session) => session.sessionId),
+  });
+  return sorted;
 }
 
 export function getBackendLocalSessionsForProject(

@@ -6,6 +6,7 @@ import {
   extractClaudeHistorySessionsForProject,
   filterPcpSessionsForContext,
   filterUntrackedLocalClaudeSessions,
+  getCodexLocalSessionsForProject,
   hasBackendSessionOverride,
   resolveCapturedBackendSessionIdFromRuntime,
   resolveBackendSessionIdForResume,
@@ -441,5 +442,54 @@ describe('extractClaudeHistorySessionsForProject', () => {
     expect(parsed[0].sessionId).toBe('sess-clearpol-1');
     expect(parsed[0].backend).toBe('claude');
     expect(parsed[0].firstPrompt).toBe('Hi Wren');
+  });
+});
+
+describe('getCodexLocalSessionsForProject', () => {
+  it('falls back to codex session jsonl files when sqlite db is unavailable', () => {
+    const tempHome = mkdtempSync(join(tmpdir(), 'codex-jsonl-fallback-'));
+    const projectPath = join(tempHome, 'repo');
+    mkdirSync(projectPath, { recursive: true });
+
+    const codexSessionsDir = join(tempHome, '.codex', 'sessions', '2026', '03', '02');
+    mkdirSync(codexSessionsDir, { recursive: true });
+
+    const matchingSessionId = '019a23ac-e563-7d53-8bf0-5a948546bf29';
+    const nonMatchingSessionId = '019a23b9-b211-7972-b007-012a8bc1d6f2';
+    writeFileSync(
+      join(codexSessionsDir, `rollout-2026-03-02T11-44-41-${matchingSessionId}.jsonl`),
+      `${JSON.stringify({
+        timestamp: '2026-03-02T11:44:41.000Z',
+        type: 'session_meta',
+        payload: {
+          id: matchingSessionId,
+          cwd: projectPath,
+          timestamp: '2026-03-02T11:44:41.000Z',
+        },
+      })}\n`
+    );
+    writeFileSync(
+      join(codexSessionsDir, `rollout-2026-03-02T11-44-41-${nonMatchingSessionId}.jsonl`),
+      `${JSON.stringify({
+        timestamp: '2026-03-02T11:44:41.000Z',
+        type: 'session_meta',
+        payload: {
+          id: nonMatchingSessionId,
+          cwd: join(tempHome, 'other-repo'),
+          timestamp: '2026-03-02T11:44:41.000Z',
+        },
+      })}\n`
+    );
+
+    const originalHome = process.env.HOME;
+    process.env.HOME = tempHome;
+
+    try {
+      const sessions = getCodexLocalSessionsForProject(projectPath, 10);
+      expect(sessions.map((session) => session.sessionId)).toEqual([matchingSessionId]);
+    } finally {
+      process.env.HOME = originalHome;
+      rmSync(tempHome, { recursive: true, force: true });
+    }
   });
 });

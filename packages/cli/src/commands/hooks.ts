@@ -31,6 +31,7 @@ import {
   setCurrentRuntimeSession,
   upsertRuntimeSession,
 } from '../session/runtime.js';
+import { sbDebugLog } from '../lib/sb-debug.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -439,7 +440,7 @@ async function reconcileBackendSignal(
 ): Promise<{ pcpSessionId?: string; threadKey?: string; backendSessionId?: string }> {
   const detectedBackend = detectBackend(cwd);
   const sessionBackend = normalizeSessionBackend(detectedBackend.name);
-  const backendSessionId = extractBackendSessionId(stdin);
+  const backendSessionId = extractBackendSessionId(stdin, sessionBackend);
   const runtimeLinkId = getRuntimeLinkId();
   if (runtimeLinkId) {
     writeRuntimeFile(cwd, 'runtime-link-id', runtimeLinkId);
@@ -566,22 +567,67 @@ async function updateRuntimeGenerationState(
   }
 }
 
-function extractBackendSessionId(stdin: Record<string, unknown>): string | undefined {
-  const candidates: unknown[] = [
-    stdin.session_id,
-    stdin.sessionId,
-    (stdin.session as Record<string, unknown> | undefined)?.id,
-    (stdin.session as Record<string, unknown> | undefined)?.session_id,
-    (stdin.data as Record<string, unknown> | undefined)?.session_id,
-    (stdin.data as Record<string, unknown> | undefined)?.sessionId,
+export function extractBackendSessionId(
+  stdin: Record<string, unknown>,
+  sessionBackend?: string
+): string | undefined {
+  // Claude hook payload session_id values are not stable conversation IDs.
+  // They can rotate on each run and poison backendSessionId mapping.
+  //
+  // Real-world failure we observed:
+  // 1) fallback repair correctly set backendSessionId to a resumable id
+  // 2) later hook events emitted a new transient UUID
+  // 3) hook reconciliation overwrote backendSessionId with that transient id
+  // 4) next launch failed on --resume <transient-id>
+  //
+  // Therefore hooks MUST NOT source Claude backendSessionId from stdin payloads.
+  // For Claude, backendSessionId should be captured by sb launch path from
+  // explicit "claude --resume <id>" output, not hook stdin fields.
+  if (sessionBackend === 'claude') {
+    sbDebugLog('hooks', 'backend_session_extract_skip', {
+      sessionBackend,
+      reason: 'claude_transient_ids_blocked',
+    });
+    return undefined;
+  }
+
+  const candidates: Array<{ source: string; value: unknown }> = [
+    { source: 'stdin.session_id', value: stdin.session_id },
+    { source: 'stdin.sessionId', value: stdin.sessionId },
+    {
+      source: 'stdin.session.id',
+      value: (stdin.session as Record<string, unknown> | undefined)?.id,
+    },
+    {
+      source: 'stdin.session.session_id',
+      value: (stdin.session as Record<string, unknown> | undefined)?.session_id,
+    },
+    {
+      source: 'stdin.data.session_id',
+      value: (stdin.data as Record<string, unknown> | undefined)?.session_id,
+    },
+    {
+      source: 'stdin.data.sessionId',
+      value: (stdin.data as Record<string, unknown> | undefined)?.sessionId,
+    },
   ];
 
   for (const candidate of candidates) {
-    if (typeof candidate === 'string' && candidate.trim()) {
-      return candidate.trim();
+    if (typeof candidate.value === 'string' && candidate.value.trim()) {
+      const normalized = candidate.value.trim();
+      sbDebugLog('hooks', 'backend_session_extract_success', {
+        sessionBackend: sessionBackend || 'unknown',
+        source: candidate.source,
+        backendSessionId: normalized,
+      });
+      return normalized;
     }
   }
 
+  sbDebugLog('hooks', 'backend_session_extract_none', {
+    sessionBackend: sessionBackend || 'unknown',
+    stdinKeys: Object.keys(stdin),
+  });
   return undefined;
 }
 
