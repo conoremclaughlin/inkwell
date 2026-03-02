@@ -171,7 +171,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CLAUDE_SESSION_ID || '
     process.env.PATH = `${binDir}:${oldPath || ''}`;
     process.env.PCP_SERVER_URL = 'http://pcp.test.local';
     process.env.FAKE_CLAUDE_ARGS_PATH = fakeClaudeArgsPath;
-    process.env.FAKE_CLAUDE_SESSION_ID = 'claude-session-int-1';
+    process.env.FAKE_CLAUDE_SESSION_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
     process.chdir(repoDir);
 
     try {
@@ -204,11 +204,11 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CLAUDE_SESSION_ID || '
       const persistedBackendSessionId =
         runtimeState.sessions[0]?.backendSessionId ||
         (await waitForRuntimeBackendSessionId(runtimePath, 5_000));
-      expect(persistedBackendSessionId).toBe('claude-session-int-1');
+      expect(persistedBackendSessionId).toBe('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
 
       const phaseUpdatesWithBackendId = pcpToolCalls
         .filter((call) => call.name === 'update_session_phase')
-        .some((call) => call.args.backendSessionId === 'claude-session-int-1');
+        .some((call) => call.args.backendSessionId === 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
       expect(phaseUpdatesWithBackendId).toBe(true);
     } finally {
       process.chdir(oldCwd);

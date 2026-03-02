@@ -954,6 +954,10 @@ function extractBackendSessionIdFromEvent(event: Record<string, unknown>): strin
   return undefined;
 }
 
+function isUuidSessionId(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.trim());
+}
+
 function parseSessionIdFromJsonLine(line: string): string | undefined {
   try {
     const parsed = JSON.parse(line) as Record<string, unknown>;
@@ -965,7 +969,7 @@ function parseSessionIdFromJsonLine(line: string): string | undefined {
 
 function parseClaudeSessionIdFromOutputLine(line: string): string | undefined {
   const fromJson = parseSessionIdFromJsonLine(line);
-  if (fromJson) return fromJson;
+  if (fromJson && isUuidSessionId(fromJson)) return fromJson;
 
   const resumeMatch = line.match(
     /\bclaude\s+--resume\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i

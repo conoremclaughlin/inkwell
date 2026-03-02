@@ -325,6 +325,10 @@ function normalizeSessionBackend(backendName: string): string {
   return backendName === 'claude-code' ? 'claude' : backendName;
 }
 
+function isUuidSessionId(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.trim());
+}
+
 function resolveActivePcpSessionId(cwd: string): string | undefined {
   const detectedBackend = detectBackend(cwd);
   const sessionBackend = normalizeSessionBackend(detectedBackend.name);
@@ -439,7 +443,7 @@ async function reconcileBackendSignal(
 ): Promise<{ pcpSessionId?: string; threadKey?: string; backendSessionId?: string }> {
   const detectedBackend = detectBackend(cwd);
   const sessionBackend = normalizeSessionBackend(detectedBackend.name);
-  const backendSessionId = extractBackendSessionId(stdin);
+  const backendSessionId = extractBackendSessionId(stdin, sessionBackend);
   const runtimeLinkId = getRuntimeLinkId();
   if (runtimeLinkId) {
     writeRuntimeFile(cwd, 'runtime-link-id', runtimeLinkId);
@@ -566,7 +570,10 @@ async function updateRuntimeGenerationState(
   }
 }
 
-function extractBackendSessionId(stdin: Record<string, unknown>): string | undefined {
+function extractBackendSessionId(
+  stdin: Record<string, unknown>,
+  sessionBackend?: string
+): string | undefined {
   const candidates: unknown[] = [
     stdin.session_id,
     stdin.sessionId,
@@ -578,7 +585,11 @@ function extractBackendSessionId(stdin: Record<string, unknown>): string | undef
 
   for (const candidate of candidates) {
     if (typeof candidate === 'string' && candidate.trim()) {
-      return candidate.trim();
+      const normalized = candidate.trim();
+      if (sessionBackend === 'claude' && !isUuidSessionId(normalized)) {
+        continue;
+      }
+      return normalized;
     }
   }
 
