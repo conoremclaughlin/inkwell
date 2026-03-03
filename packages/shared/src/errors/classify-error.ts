@@ -42,7 +42,9 @@ const RULES: Array<{
       /\b503\b/.test(errorText) ||
       /overloaded_error/i.test(errorText) ||
       /\b529\b/.test(errorText) ||
-      /\boverloaded\b/i.test(errorText),
+      /\boverloaded\b/i.test(errorText) ||
+      /\bno capacity\b/i.test(errorText) ||
+      /\bcapacity available\b/i.test(errorText),
   },
   {
     category: 'quota',

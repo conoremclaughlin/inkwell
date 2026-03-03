@@ -35,6 +35,17 @@ describe('classifyError', () => {
     expect(r.category).toBe('capacity');
   });
 
+  it('Gemini 429 "No capacity available" → capacity (not quota)', () => {
+    const r = classifyError({
+      errorText:
+        'Attempt 1 failed with status 429. Retrying with backoff... GaxiosError: No capacity available for model gemini-3-pro-preview',
+      backend: 'gemini',
+      exitCode: 1,
+    });
+    expect(r.category).toBe('capacity');
+    expect(r.retryable).toBe(true);
+  });
+
   // ── quota ─────────────────────────────────────────────────────
   it('TerminalQuotaError → quota', () => {
     const r = classifyError({
