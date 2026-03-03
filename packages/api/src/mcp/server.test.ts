@@ -308,6 +308,9 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
 
     const body = await res.json();
     expect(body.status).toBe('healthy');
+    expect(body.build).toBeDefined();
+    expect(typeof body.build.appVersion).toBe('string');
+    expect(typeof body.build.updateAvailable).toBe('boolean');
     expect(body.checks.mcp.details.mode).toBe('stateless');
     expect(body.checks.mcp.details.toolsVersion).toBeDefined();
   });

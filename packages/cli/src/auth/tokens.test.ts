@@ -11,6 +11,7 @@ import {
   generatePkce,
   decodeJwtPayload,
   isTokenExpired,
+  getValidAccessToken,
   loadAuth,
   saveAuth,
   clearAuth,
@@ -202,6 +203,45 @@ describe('loadAuth / saveAuth / clearAuth', () => {
 
   it('clearAuth is safe when no file exists', () => {
     expect(() => clearAuth()).not.toThrow();
+  });
+});
+
+describe('getValidAccessToken', () => {
+  let origHome: string | undefined;
+  let tempHome: string;
+  let origEnvToken: string | undefined;
+
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    origEnvToken = process.env.PCP_ACCESS_TOKEN;
+    tempHome = join(tmpdir(), `pcp-token-test-${Date.now()}`);
+    mkdirSync(tempHome, { recursive: true });
+    process.env.HOME = tempHome;
+  });
+
+  afterEach(() => {
+    process.env.HOME = origHome;
+    if (origEnvToken === undefined) delete process.env.PCP_ACCESS_TOKEN;
+    else process.env.PCP_ACCESS_TOKEN = origEnvToken;
+    rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  it('prefers PCP_ACCESS_TOKEN from environment when present', async () => {
+    process.env.PCP_ACCESS_TOKEN = 'env-token';
+    const token = await getValidAccessToken('http://localhost:3001');
+    expect(token).toBe('env-token');
+  });
+
+  it('returns env token even when auth.json is absent', async () => {
+    process.env.PCP_ACCESS_TOKEN = 'env-only-token';
+    const token = await getValidAccessToken('http://localhost:3001');
+    expect(token).toBe('env-only-token');
+  });
+
+  it('can skip env token lookup when allowEnvToken=false', async () => {
+    process.env.PCP_ACCESS_TOKEN = 'env-only-token';
+    const token = await getValidAccessToken('http://localhost:3001', { allowEnvToken: false });
+    expect(token).toBeNull();
   });
 });
 

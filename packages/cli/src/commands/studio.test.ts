@@ -19,6 +19,9 @@ import {
   listRoleTemplates,
   isValidTemplateName,
   BUILTIN_ROLE_TEMPLATES,
+  getDefaultStudioMainBranch,
+  planStudioHomeBranchRename,
+  slugifyStudioNameForBranch,
   type InitResult,
 } from './studio.js';
 
@@ -198,6 +201,19 @@ describe('Studio Commands', () => {
       const branches = git('branch', TEST_REPO);
       expect(branches).toContain(branchName);
     });
+  });
+});
+
+describe('Studio default branch naming', () => {
+  it('builds per-studio main branch names to avoid worktree branch collisions', () => {
+    expect(getDefaultStudioMainBranch('lumen', 'review')).toBe('lumen/studio/main-review');
+    expect(getDefaultStudioMainBranch('wren', 'my-feature')).toBe('wren/studio/main-my-feature');
+  });
+
+  it('slugifies studio names for safe branch suffixes', () => {
+    expect(slugifyStudioNameForBranch('  API Review  ')).toBe('api-review');
+    expect(slugifyStudioNameForBranch('ux/polish')).toBe('ux-polish');
+    expect(slugifyStudioNameForBranch('***')).toBe('studio');
   });
 });
 
@@ -483,19 +499,59 @@ describe('updateIdentityForStudioRename', () => {
           studio: 'old',
           context: 'studio-old',
           description: 'Studio: old',
+          branch: 'lumen/studio/main-old',
         },
         null,
         2
       )
     );
 
-    const changed = updateIdentityForStudioRename(wsPath, 'old', 'new');
+    const changed = updateIdentityForStudioRename(wsPath, 'old', 'new', {
+      fromBranch: 'lumen/studio/main-old',
+      toBranch: 'lumen/studio/main-new',
+    });
     expect(changed).toBe(true);
 
     const updated = JSON.parse(readFileSync(join(wsPath, '.pcp', 'identity.json'), 'utf-8'));
     expect(updated.studio).toBe('new');
     expect(updated.context).toBe('studio-new');
     expect(updated.description).toBe('Studio: new');
+    expect(updated.branch).toBe('lumen/studio/main-new');
+  });
+});
+
+describe('planStudioHomeBranchRename', () => {
+  it('plans a rename when current branch is old per-studio default', () => {
+    const plan = planStudioHomeBranchRename(
+      { agentId: 'lumen', branch: 'lumen/studio/main-old-name' },
+      'old-name',
+      'new-name'
+    );
+    expect(plan).toEqual({
+      fromBranch: 'lumen/studio/main-old-name',
+      toBranch: 'lumen/studio/main-new-name',
+    });
+  });
+
+  it('plans a rename when current branch is legacy default', () => {
+    const plan = planStudioHomeBranchRename(
+      { agentId: 'lumen', branch: 'lumen/studio/main' },
+      'old-name',
+      'new-name'
+    );
+    expect(plan).toEqual({
+      fromBranch: 'lumen/studio/main',
+      toBranch: 'lumen/studio/main-new-name',
+    });
+  });
+
+  it('does not plan rename for custom feature branches', () => {
+    const plan = planStudioHomeBranchRename(
+      { agentId: 'lumen', branch: 'lumen/feat/my-work' },
+      'old-name',
+      'new-name'
+    );
+    expect(plan).toBeNull();
   });
 });
 

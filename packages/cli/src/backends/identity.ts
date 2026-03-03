@@ -164,8 +164,8 @@ export function resolveBackend(cliBackend?: string): string {
 /**
  * Build the identity prompt content. Same across all backends.
  */
-export function buildIdentityPrompt(agentId: string): string {
-  return `## Identity Override (CRITICAL)
+export function buildIdentityPrompt(agentId: string, startupContextBlock?: string): string {
+  const basePrompt = `## Identity Override (CRITICAL)
 
 **You are ${agentId}. Your agent ID is \`${agentId}\`.**
 
@@ -184,17 +184,29 @@ Always use **PCP cloud tools** (mcp__pcp__*) over file reads or Claude Code buil
 - Sessions: use mcp__pcp__update_session_phase/get_session/list_sessions
 
 PCP tools persist across sessions and are shared with the user and other agents.`;
+
+  const injectedContext = startupContextBlock?.trim();
+  if (!injectedContext) return basePrompt;
+
+  return `${basePrompt}
+
+## Bootstrapped Startup Context (PCP)
+
+${injectedContext}`;
 }
 
 /**
  * Write the identity prompt to a temp file.
  * Returns the file path and a cleanup function.
  */
-export function createIdentityPromptFile(agentId: string): {
+export function createIdentityPromptFile(
+  agentId: string,
+  startupContextBlock?: string
+): {
   promptFile: string;
   cleanup: () => void;
 } {
-  const content = buildIdentityPrompt(agentId);
+  const content = buildIdentityPrompt(agentId, startupContextBlock);
   const tempDir = mkdtempSync(join(tmpdir(), 'sb-'));
   const promptFile = join(tempDir, 'identity-prompt.md');
   writeFileSync(promptFile, content);

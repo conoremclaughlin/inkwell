@@ -33,8 +33,19 @@ function getHookConfigPath(backend: StatusBackend): string {
 }
 
 function hasPcpHookCommand(value: unknown): boolean {
+  const signatures = [
+    'hooks on-session-start',
+    'hooks on-stop',
+    'hooks on-prompt',
+    'hooks pre-compact',
+    'hooks post-compact',
+  ];
   if (typeof value === 'string') {
-    return value.includes('sb hooks ') || value.includes('commands/hooks.js');
+    return (
+      value.includes('sb hooks ') ||
+      signatures.some((signature) => value.includes(signature)) ||
+      value.includes('commands/hooks.js')
+    );
   }
   if (Array.isArray(value)) {
     return value.some((entry) => hasPcpHookCommand(entry));
@@ -45,7 +56,10 @@ function hasPcpHookCommand(value: unknown): boolean {
   return false;
 }
 
-function getHooksInstalled(cwd: string, backend: StatusBackend): {
+function getHooksInstalled(
+  cwd: string,
+  backend: StatusBackend
+): {
   installed: boolean;
   configExists: boolean;
   parseError: boolean;
@@ -58,8 +72,7 @@ function getHooksInstalled(cwd: string, backend: StatusBackend): {
   if (backend === 'codex') {
     const content = readFileSync(configPath, 'utf-8');
     return {
-      installed:
-        content.includes('sb hooks on-session-start') || content.includes('sb hooks on-stop'),
+      installed: content.includes('hooks on-session-start') || content.includes('hooks on-stop'),
       configExists: true,
       parseError: false,
     };
@@ -131,7 +144,11 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
   console.log('');
 
   if (!auth || expired || !hooks.installed) {
-    console.log(chalk.yellow('  Attention: auth + hooks should both be healthy for reliable trigger/session behavior.'));
+    console.log(
+      chalk.yellow(
+        '  Attention: auth + hooks should both be healthy for reliable trigger/session behavior.'
+      )
+    );
     console.log('');
   }
 }

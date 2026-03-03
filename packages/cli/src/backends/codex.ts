@@ -15,7 +15,10 @@ export class CodexAdapter implements BackendAdapter {
   readonly binary = 'codex';
 
   prepare(config: BackendConfig): PreparedBackend {
-    const { promptFile, cleanup } = createIdentityPromptFile(config.agentId);
+    const { promptFile, cleanup } = createIdentityPromptFile(
+      config.agentId,
+      config.startupContextBlock
+    );
 
     const args: string[] = [];
 

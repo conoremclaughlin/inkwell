@@ -1,5 +1,9 @@
-import { expandPolicySpecs } from '@personal-context/shared';
-import { ToolPolicyState, TOOL_GROUPS, type ToolPolicyScopeRef } from './tool-policy.js';
+import {
+  ToolPolicyState,
+  TOOL_GROUPS,
+  expandPolicySpecs,
+  type ToolPolicyScopeRef,
+} from './tool-policy.js';
 
 export type PermissionGrantAction = 'allow' | 'deny' | 'grant' | 'grant-session' | 'revoke';
 

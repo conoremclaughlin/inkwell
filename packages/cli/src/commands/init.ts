@@ -96,7 +96,11 @@ function ensureMcpJson(cwd: string): InitStepResult {
             mcpServers: { ...servers, pcp: updatedPcp },
           };
           writeFileSync(mcpPath, JSON.stringify(updated, null, 2) + '\n');
-          return { label: '.mcp.json', status: 'updated', detail: 'added auth header to pcp entry' };
+          return {
+            label: '.mcp.json',
+            status: 'updated',
+            detail: 'added auth header to pcp entry',
+          };
         }
         return { label: '.mcp.json', status: 'exists', detail: 'pcp server configured' };
       }
@@ -125,17 +129,38 @@ function ensureMcpJson(cwd: string): InitStepResult {
   return { label: '.mcp.json', status: 'created', detail: `pcp → ${serverUrl}/mcp` };
 }
 
-function runInstallHooks(cwd: string, force?: boolean): InitStepResult {
-  const { result, backend } = installHooks(cwd, { force });
+function runInstallHooks(cwd: string, force?: boolean): InitStepResult[] {
+  const targets = ['claude-code', 'codex', 'gemini'] as const;
+  const results: InitStepResult[] = [];
 
-  switch (result) {
-    case 'installed':
-      return { label: 'hooks', status: 'created', detail: `${backend.name} (${backend.configPath})` };
-    case 'already-installed':
-      return { label: 'hooks', status: 'exists', detail: `${backend.name}` };
-    case 'conflict':
-      return { label: 'hooks', status: 'skipped', detail: 'existing non-PCP hooks (use sb hooks install --force)' };
+  for (const backend of targets) {
+    const { result, backend: resolvedBackend } = installHooks(cwd, { force, backend });
+    switch (result) {
+      case 'installed':
+        results.push({
+          label: `hooks (${resolvedBackend.name})`,
+          status: 'created',
+          detail: resolvedBackend.configPath,
+        });
+        break;
+      case 'already-installed':
+        results.push({
+          label: `hooks (${resolvedBackend.name})`,
+          status: 'exists',
+          detail: resolvedBackend.configPath,
+        });
+        break;
+      case 'conflict':
+        results.push({
+          label: `hooks (${resolvedBackend.name})`,
+          status: 'skipped',
+          detail: 'existing non-PCP hooks (use sb hooks install --force)',
+        });
+        break;
+    }
   }
+
+  return results;
 }
 
 function syncBackendConfigs(cwd: string): InitStepResult {
@@ -180,7 +205,7 @@ async function initCommand(options: { force?: boolean }): Promise<void> {
   const steps: InitStepResult[] = [
     ensurePcpDir(cwd),
     ensureMcpJson(cwd),
-    runInstallHooks(cwd, options.force),
+    ...runInstallHooks(cwd, options.force),
     syncBackendConfigs(cwd),
   ];
 

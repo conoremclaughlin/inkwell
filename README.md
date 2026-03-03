@@ -86,30 +86,27 @@ yarn dev
 
 1. Install Supabase CLI and Docker:
    - Supabase CLI install docs: https://supabase.com/docs/guides/cli/getting-started
-2. Start local Supabase from this repo root:
+2. Run one command from repo root to start local Supabase, reset DB, and update `.env.local`:
 
 ```bash
-supabase start
+yarn supabase:local:setup
 ```
 
-3. Reset/apply migrations + seed data:
+This helper:
 
-```bash
-supabase db reset
-```
+- starts local Supabase (Docker required)
+- applies migrations + seed (`supabase db reset --local`)
+- reads local env values from `supabase status -o env`
+- writes them into `.env.local`
 
-4. Print local env values:
+If `.env.local` already has `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`, or `JWT_SECRET`, the helper **won't overwrite** them. It logs a warning and writes local references instead:
 
-```bash
-supabase status -o env
-```
+- `LOCAL_SUPABASE_URL`
+- `LOCAL_SUPABASE_PUBLISHABLE_KEY`
+- `LOCAL_SUPABASE_SECRET_KEY`
+- `LOCAL_JWT_SECRET`
 
-5. Map local values into `.env.local`:
-   - `API_URL` → `SUPABASE_URL`
-   - `ANON_KEY` → `SUPABASE_PUBLISHABLE_KEY`
-   - `SERVICE_ROLE_KEY` → `SUPABASE_SECRET_KEY`
-
-6. Start PCP:
+3. Start PCP:
 
 ```bash
 yarn dev
@@ -184,9 +181,13 @@ See [AGENTS.md](./AGENTS.md) for onboarding instructions.
 
 ```bash
 yarn dev                   # Start all services (pm2)
+yarn dev:direct            # Start API+web directly (no pm2, dev mode)
+yarn prod:refresh          # Install + build latest code after pull
+yarn prod:direct           # Run API+web directly in production mode (no pm2)
 yarn build                 # Build all packages
 yarn type-check            # Type check all packages
 yarn test                  # Unit tests (all workspaces)
+yarn supabase:local:setup  # Start/reset local Supabase and sync env values into .env.local
 yarn test:integration:db:local  # DB integration suite against isolated local Supabase
 yarn test:integration:runtime    # Runtime/CLI integration suite
 yarn logs:pcp              # View PCP server logs
@@ -195,6 +196,25 @@ yarn pm2 restart pcp       # Restart PCP server
 ```
 
 `yarn test:integration:db:local` spins up an **isolated, temporary local Supabase stack** with dedicated ports, applies migrations + seed, runs integration tests, then tears it down. This avoids accidental use of remote `.env.local` credentials and keeps integration runs sandboxed from any online dev server.
+
+## Low-power runtime mode (no PM2)
+
+If PM2/watcher overhead is undesirable on laptops, run PCP directly:
+
+```bash
+# 1) After pulling latest changes
+yarn prod:refresh
+
+# 2) Start in direct production mode (no PM2)
+yarn prod:direct
+```
+
+Notes:
+
+- `yarn prod:direct` does **not rebuild** on start; it uses existing build artifacts.
+- To run API only (no dashboard process): `PCP_RUN_WEB=false yarn prod:direct`
+- After `git pull`, run `yarn prod:refresh` and restart your direct/PM2 process.
+- The dashboard and `sb` CLI will warn when the running server is behind local HEAD and needs a restart.
 
 ## Contributing
 

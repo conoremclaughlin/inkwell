@@ -25,3 +25,20 @@ Messages with the same threadKey are routed to the same session on the recipient
 - `task_request`, `session_resume`, and `notification` trigger the recipient by default
 - `message` does not trigger by default — use `trigger: true` if the message is time-sensitive
 - Avoid triggering agents for low-priority or non-urgent messages during quiet hours
+
+## Studio Branch Conventions
+
+Studios are git worktrees, and **a single branch can only be checked out in one worktree at a time**.
+
+- Each studio should use its own home branch: `<agentId>/studio/main-<studio-slug>`
+- Treat that branch as a **return point**, not a feature branch
+- Keep it fast-forwarded from `main` (`origin/main`)
+- Do **not** commit work directly on this branch
+
+Recommended flow:
+
+1. Enter studio on its home branch
+2. Fast-forward from `main`
+3. Create a feature branch for actual work
+4. Merge feature branch
+5. Return the studio home branch to a clean, fast-forward-only state
