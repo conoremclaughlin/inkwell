@@ -12,6 +12,7 @@ import { type Dirent, existsSync, readFileSync, readdirSync, realpathSync, statS
 import { join, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
 import { getBackend, resolveAgentId } from '../backends/index.js';
+import { classifyError } from '@personal-context/shared';
 import { getValidAccessToken } from '../auth/tokens.js';
 import { callPcpTool, getPcpServerUrl } from '../lib/pcp-mcp.js';
 import { sbDebugLog } from '../lib/sb-debug.js';
@@ -1272,24 +1273,42 @@ async function logBackendExecutionResult(options: {
         status === 'completed'
           ? `Backend CLI finished (${options.context.binary})`
           : `Backend CLI failed (${options.context.binary})`,
-      payload: {
-        kind: 'backend_cli_execution',
-        phase: 'result',
-        backend: options.context.backend,
-        binary: options.context.binary,
-        cwd: options.context.cwd,
-        studioId: options.context.studioId || null,
-        pcpSessionId: options.context.pcpSessionId || null,
-        backendSessionId: options.backendSessionId || null,
-        retryAttempt: options.context.retryAttempt,
-        maxAttempts: options.context.maxAttempts,
-        retries: Math.max(options.context.retryAttempt - 1, 0),
-        exitCode: options.exitCode,
-        durationMs: options.durationMs,
-        error: options.error || null,
-        ...(options.context.threadKey ? { threadKey: options.context.threadKey } : {}),
-        ...(options.context.triggerSource ? { triggerSource: options.context.triggerSource } : {}),
-      },
+      payload: (() => {
+        const base = {
+          kind: 'backend_cli_execution' as const,
+          phase: 'result' as const,
+          backend: options.context.backend,
+          binary: options.context.binary,
+          cwd: options.context.cwd,
+          studioId: options.context.studioId || null,
+          pcpSessionId: options.context.pcpSessionId || null,
+          backendSessionId: options.backendSessionId || null,
+          retryAttempt: options.context.retryAttempt,
+          maxAttempts: options.context.maxAttempts,
+          retries: Math.max(options.context.retryAttempt - 1, 0),
+          exitCode: options.exitCode,
+          durationMs: options.durationMs,
+          error: options.error || null,
+          ...(options.context.threadKey ? { threadKey: options.context.threadKey } : {}),
+          ...(options.context.triggerSource
+            ? { triggerSource: options.context.triggerSource }
+            : {}),
+        };
+        if (options.error) {
+          const ec = classifyError({
+            errorText: options.error,
+            backend: options.context.backend,
+            exitCode: options.exitCode,
+          });
+          return {
+            ...base,
+            errorCategory: ec.category,
+            errorSummary: ec.summary,
+            retryable: ec.retryable,
+          };
+        }
+        return base;
+      })(),
     });
   } catch {
     // Best-effort telemetry only.

@@ -39,6 +39,7 @@ import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gate
 import { resolveRouteAgentId } from './services/routing/resolve-route';
 import { resolveAgentFromMention } from './services/routing/resolve-mention';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
+import { classifyError } from '@personal-context/shared';
 import { logger } from './utils/logger';
 import { env } from './config/env';
 
@@ -631,6 +632,110 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     logger.info(`[Trigger] Successfully processed trigger for ${targetAgentId}`);
   });
   logger.info('Default agent trigger handler registered (stateless, database-driven)');
+
+  // 7b. Listen for trigger failures — restore inbox message + notify sender
+  agentGateway.on(
+    'trigger:error',
+    async ({
+      triggerId,
+      payload,
+      error,
+    }: {
+      triggerId: string;
+      payload: AgentTriggerPayload;
+      error: unknown;
+    }) => {
+      const errorText = error instanceof Error ? error.message : String(error);
+      const classification = classifyError({ errorText });
+
+      logger.warn('[TriggerFailure] Processing failure notification', {
+        triggerId,
+        from: payload.fromAgentId,
+        to: payload.toAgentId,
+        category: classification.category,
+        retryable: classification.retryable,
+        inboxMessageId: payload.inboxMessageId,
+      });
+
+      const client = dataComposer?.getClient();
+      if (!client) return;
+
+      // 1. Restore inbox message to unread (only if it was read — don't touch other states)
+      if (payload.inboxMessageId) {
+        const { error: restoreErr } = await client
+          .from('agent_inbox')
+          .update({ status: 'unread', read_at: null })
+          .eq('id', payload.inboxMessageId)
+          .eq('status', 'read');
+
+        if (restoreErr) {
+          logger.warn('[TriggerFailure] Failed to restore inbox message', {
+            inboxMessageId: payload.inboxMessageId,
+            error: restoreErr.message,
+          });
+        } else {
+          logger.info('[TriggerFailure] Restored inbox message to unread', {
+            inboxMessageId: payload.inboxMessageId,
+          });
+        }
+      }
+
+      // 2. Notify sender agent (if there is one) — skip if no sender to avoid loops
+      if (!payload.fromAgentId) return;
+
+      // Look up the userId from the original inbox message (needed for sender inbox insert)
+      let recipientUserId: string | undefined;
+      if (payload.inboxMessageId) {
+        const { data: origMsg } = await client
+          .from('agent_inbox')
+          .select('recipient_user_id')
+          .eq('id', payload.inboxMessageId)
+          .single();
+        recipientUserId = origMsg?.recipient_user_id;
+      }
+
+      if (!recipientUserId) {
+        logger.warn('[TriggerFailure] Cannot notify sender — no userId from inbox message');
+        return;
+      }
+
+      const categoryLabel =
+        classification.category !== 'unknown' ? ` (${classification.category})` : '';
+      const notificationContent = `Trigger to ${payload.toAgentId} failed${categoryLabel}: ${classification.summary}`;
+
+      const { error: insertErr } = await client.from('agent_inbox').insert({
+        recipient_user_id: recipientUserId,
+        recipient_agent_id: payload.fromAgentId,
+        sender_agent_id: payload.toAgentId,
+        subject: `Trigger failed: ${payload.toAgentId}`,
+        content: notificationContent,
+        message_type: 'notification',
+        priority: 'high',
+        thread_key: payload.threadKey || null,
+        metadata: {
+          triggerFailure: true,
+          triggerId,
+          errorCategory: classification.category,
+          errorSummary: classification.summary,
+          retryable: classification.retryable,
+          originalInboxMessageId: payload.inboxMessageId || null,
+        },
+        // No trigger — avoid infinite failure loops
+      });
+
+      if (insertErr) {
+        logger.error('[TriggerFailure] Failed to send failure notification to sender', {
+          sender: payload.fromAgentId,
+          error: insertErr.message,
+        });
+      } else {
+        logger.info('[TriggerFailure] Sent failure notification to sender', {
+          sender: payload.fromAgentId,
+          category: classification.category,
+        });
+      }
+    }
+  );
 
   // 8. Print status
   printStatus();

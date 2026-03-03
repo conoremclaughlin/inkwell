@@ -6,12 +6,8 @@ export default defineConfig({
     include: [
       'packages/api/src/**/*.test.ts',
       'packages/cli/src/**/*.test.ts',
+      'packages/shared/src/**/*.test.ts',
     ],
-    exclude: [
-      'node_modules',
-      'dist',
-      'packages/clawdbot/**',
-      '**/*.integration.test.ts',
-    ],
+    exclude: ['node_modules', 'dist', 'packages/clawdbot/**', '**/*.integration.test.ts'],
   },
 });

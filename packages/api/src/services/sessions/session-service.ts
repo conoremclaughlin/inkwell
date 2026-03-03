@@ -34,6 +34,7 @@ import { CodexRunner } from './codex-runner.js';
 import { GeminiRunner } from './gemini-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import { resolveIdentityId } from '../../auth/resolve-identity.js';
+import { classifyError } from '@personal-context/shared';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -402,6 +403,11 @@ export class SessionService implements ISessionService {
     const turnDurationMs = Date.now() - turnStartMs;
 
     // 5b. Log backend CLI completion to activity stream (fire-and-forget)
+    const errorClassification =
+      !result.success && result.error
+        ? classifyError({ errorText: result.error, backend: resolvedBackend })
+        : null;
+
     this.activityStream
       .logActivity({
         userId,
@@ -410,7 +416,7 @@ export class SessionService implements ISessionService {
         subtype: `backend_cli:${resolvedBackend}`,
         content: result.success
           ? `Backend turn completed (${resolvedBackend}, ${Math.round(turnDurationMs / 1000)}s)`
-          : `Backend turn failed (${resolvedBackend}): ${result.error?.slice(0, 200) || 'unknown error'}`,
+          : `Backend turn failed (${resolvedBackend}): ${result.error?.slice(0, 500) || 'unknown error'}`,
         sessionId: session.id,
         payload: {
           backend: resolvedBackend,
@@ -419,7 +425,14 @@ export class SessionService implements ISessionService {
           ...(triggerSource ? { triggerSource } : {}),
           ...(request.sender?.id ? { triggeredBy: request.sender.id } : {}),
           ...(metadata?.threadKey ? { threadKey: metadata.threadKey } : {}),
-          ...(result.error ? { error: result.error.slice(0, 500) } : {}),
+          ...(result.error ? { error: result.error.slice(0, 2000) } : {}),
+          ...(errorClassification
+            ? {
+                errorCategory: errorClassification.category,
+                errorSummary: errorClassification.summary,
+                retryable: errorClassification.retryable,
+              }
+            : {}),
           ...(result.usage ? { usage: result.usage } : {}),
         } as unknown as Json,
       })

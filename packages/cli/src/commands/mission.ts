@@ -802,9 +802,16 @@ export function activityToFeedEvent(
     const ap = activity.payload;
     const backend =
       (typeof ap?.backend === 'string' ? ap.backend : null) || backendFromSubtype(activity.subtype);
+    const errorCategory = typeof ap?.errorCategory === 'string' ? ap.errorCategory : null;
     const errorDetail =
       typeof ap?.error === 'string' ? ap.error : activity.content || 'unknown error';
-    const label = backend ? `failed (${backend})` : 'error';
+    const label = backend
+      ? errorCategory
+        ? `failed (${backend}, ${errorCategory})`
+        : `failed (${backend})`
+      : errorCategory
+        ? `failed (${errorCategory})`
+        : 'error';
     content = `${label}: ${errorDetail}`;
   } else {
     const subtype = activity.subtype ? `:${activity.subtype}` : '';

@@ -47,6 +47,7 @@ import {
 } from '../repl/tui-components.js';
 import { renderInkChat, InkExitSignal, type InkRepl } from '../repl/ink/index.js';
 import {
+  classifyError,
   decodeDelegationToken,
   mintDelegationToken,
   verifyDelegationToken,
@@ -2411,6 +2412,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const turnContent = runResult.success
         ? `Backend turn completed (${runtime.backend}, ${turnDurationSeconds}s)`
         : `Backend turn failed (${runtime.backend}, exit ${runResult.exitCode})`;
+      const cliErrorClassification = !runResult.success
+        ? classifyError({
+            errorText: runResult.stderr,
+            backend: runtime.backend,
+            exitCode: runResult.exitCode,
+          })
+        : null;
+
       pcp
         .callTool('log_activity', {
           agentId,
@@ -2424,7 +2433,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
             exitCode: runResult.exitCode,
             durationMs: turnDurationSeconds * 1000,
             studioId: runtime.studioId,
-            ...(runResult.success ? {} : { stderr: runResult.stderr.slice(0, 500) }),
+            ...(runResult.success ? {} : { stderr: runResult.stderr.slice(0, 2000) }),
+            ...(cliErrorClassification
+              ? {
+                  errorCategory: cliErrorClassification.category,
+                  errorSummary: cliErrorClassification.summary,
+                  retryable: cliErrorClassification.retryable,
+                }
+              : {}),
             ...(runResult.usage ? { usage: runResult.usage } : {}),
           },
         })

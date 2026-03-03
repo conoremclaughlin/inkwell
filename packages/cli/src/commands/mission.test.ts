@@ -357,6 +357,51 @@ describe('activityToFeedEvent', () => {
       const event = activityToFeedEvent(activity({ type: 'error', agentId: 'wren' }));
       expect(event.content).toBe('error: unknown error');
     });
+
+    it('shows errorCategory tag when present', () => {
+      const event = activityToFeedEvent(
+        activity({
+          type: 'error',
+          agentId: 'aster',
+          payload: {
+            backend: 'gemini',
+            error: 'We are currently experiencing high demand',
+            errorCategory: 'capacity',
+          },
+        })
+      );
+      expect(event.content).toBe(
+        'failed (gemini, capacity): We are currently experiencing high demand'
+      );
+    });
+
+    it('renders without errorCategory when absent', () => {
+      const event = activityToFeedEvent(
+        activity({
+          type: 'error',
+          agentId: 'wren',
+          payload: {
+            backend: 'claude',
+            error: 'something went wrong',
+          },
+        })
+      );
+      expect(event.content).toBe('failed (claude): something went wrong');
+    });
+
+    it('shows only errorCategory when no backend', () => {
+      const event = activityToFeedEvent(
+        activity({
+          type: 'error',
+          agentId: 'lumen',
+          payload: {
+            error: 'authentication_error: invalid API key',
+            errorCategory: 'auth',
+          },
+        })
+      );
+      expect(event.content).toBe('failed (auth): authentication_error: invalid API key');
+    });
   });
 
   describe('studio detail line', () => {

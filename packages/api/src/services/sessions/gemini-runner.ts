@@ -155,6 +155,7 @@ export class GeminiRunner implements IClaudeRunner {
       const toolCalls: ToolCall[] = [];
       let usage: GeminiUsageStats | undefined;
       let finalTextResponse: string | undefined;
+      let capturedStreamError: string | undefined;
       let resolvedSessionId: string | undefined;
       let settled = false;
       let lastActivityAt = Date.now();
@@ -242,6 +243,13 @@ export class GeminiRunner implements IClaudeRunner {
                 typeof parsed.result === 'string' ? parsed.result : JSON.stringify(parsed.result);
             }
 
+            // Capture structured errors from Gemini stream-json
+            if (parsed.type === 'result' && parsed.status === 'error' && parsed.error) {
+              const errType = parsed.error.type || 'Error';
+              const errMsg = parsed.error.message || 'Unknown error';
+              capturedStreamError = `[${errType}] ${errMsg}`;
+            }
+
             // Gemini stream-json may emit text content differently
             if (parsed.type === 'assistant' && parsed.message?.content) {
               const content = parsed.message.content as Array<{ type: string; text?: string }>;
@@ -321,15 +329,24 @@ export class GeminiRunner implements IClaudeRunner {
               finalTextResponse =
                 typeof parsed.result === 'string' ? parsed.result : JSON.stringify(parsed.result);
             }
+            if (parsed.type === 'result' && parsed.status === 'error' && parsed.error) {
+              const errType = parsed.error.type || 'Error';
+              const errMsg = parsed.error.message || 'Unknown error';
+              capturedStreamError = `[${errType}] ${errMsg}`;
+            }
           } catch {
             // Non-JSON remainder — ignore
           }
         }
 
         if (code !== 0) {
-          logger.warn('Gemini CLI exited with non-zero code', { code, stderr });
+          logger.warn('Gemini CLI exited with non-zero code', {
+            code,
+            stderr,
+            capturedStreamError,
+          });
           if (responses.length === 0 && !finalTextResponse) {
-            reject(new Error(`Gemini exited with code ${code}: ${stderr}`));
+            reject(new Error(`Gemini exited with code ${code}: ${capturedStreamError || stderr}`));
             return;
           }
         }
