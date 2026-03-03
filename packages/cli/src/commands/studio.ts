@@ -67,6 +67,9 @@ interface StudioInfo {
 }
 
 interface RenameIdentity {
+  agentId?: string;
+  branch?: string;
+  studioId?: string;
   studio?: string;
   workspace?: string;
   context?: string;
@@ -245,6 +248,10 @@ function slugifyStudioNameForBranch(name: string): string {
 
 function getDefaultStudioMainBranch(agentId: string, studioName: string): string {
   return `${agentId}/studio/main-${slugifyStudioNameForBranch(studioName)}`;
+}
+
+function getLegacyDefaultStudioMainBranch(agentId: string): string {
+  return `${agentId}/studio/main`;
 }
 
 function isPromptCancelError(err: unknown): boolean {
@@ -427,7 +434,38 @@ function copyBootstrapFiles(sourceRoot: string, wsPath: string): string[] {
   return copied;
 }
 
-function updateIdentityForStudioRename(wsPath: string, from: string, to: string): boolean {
+interface StudioBranchRenamePlan {
+  fromBranch: string;
+  toBranch: string;
+}
+
+function planStudioHomeBranchRename(
+  identity: Pick<RenameIdentity, 'agentId' | 'branch'> | null | undefined,
+  from: string,
+  to: string
+): StudioBranchRenamePlan | null {
+  if (!identity) return null;
+  if (!identity.agentId || !identity.branch) return null;
+
+  const oldDefault = getDefaultStudioMainBranch(identity.agentId, from);
+  const oldLegacyDefault = getLegacyDefaultStudioMainBranch(identity.agentId);
+
+  if (identity.branch !== oldDefault && identity.branch !== oldLegacyDefault) {
+    return null;
+  }
+
+  const nextDefault = getDefaultStudioMainBranch(identity.agentId, to);
+  if (identity.branch === nextDefault) return null;
+
+  return { fromBranch: identity.branch, toBranch: nextDefault };
+}
+
+function updateIdentityForStudioRename(
+  wsPath: string,
+  from: string,
+  to: string,
+  branchRename?: StudioBranchRenamePlan
+): boolean {
   const identityPath = join(wsPath, '.pcp', 'identity.json');
   if (!existsSync(identityPath)) return false;
 
@@ -455,6 +493,15 @@ function updateIdentityForStudioRename(wsPath: string, from: string, to: string)
       identity.description === `Workspace: ${from}`
     ) {
       identity.description = `Studio: ${to}`;
+      changed = true;
+    }
+
+    if (
+      branchRename &&
+      identity.branch === branchRename.fromBranch &&
+      identity.branch !== branchRename.toBranch
+    ) {
+      identity.branch = branchRename.toBranch;
       changed = true;
     }
 
@@ -850,13 +897,15 @@ async function renameStudio(from: string, to: string): Promise<void> {
       process.exit(1);
     }
 
-    // Read studioId before moving (for DB update)
+    // Read studio metadata before moving (for DB + rename planning)
     let studioId: string | undefined;
+    let branchRenamePlan: StudioBranchRenamePlan | null = null;
     try {
       const identityPath = join(fromPath, '.pcp', 'identity.json');
       if (existsSync(identityPath)) {
-        const identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
+        const identity = JSON.parse(readFileSync(identityPath, 'utf-8')) as RenameIdentity;
         studioId = identity.studioId;
+        branchRenamePlan = planStudioHomeBranchRename(identity, from, to);
       }
     } catch {
       // Non-fatal
@@ -864,8 +913,28 @@ async function renameStudio(from: string, to: string): Promise<void> {
 
     git(`worktree move "${fromPath}" "${toPath}"`, gitRoot);
 
+    let branchRenamed = false;
+    if (branchRenamePlan) {
+      if (branchExists(branchRenamePlan.toBranch, gitRoot)) {
+        console.log(
+          chalk.yellow(
+            `\n  Note: did not rename default branch because target exists: ${branchRenamePlan.toBranch}`
+          )
+        );
+      } else {
+        spinner.text = 'Renaming default studio home branch...';
+        git(`branch -m "${branchRenamePlan.fromBranch}" "${branchRenamePlan.toBranch}"`, toPath);
+        branchRenamed = true;
+      }
+    }
+
     spinner.text = 'Updating studio identity metadata...';
-    const updatedIdentity = updateIdentityForStudioRename(toPath, from, to);
+    const updatedIdentity = updateIdentityForStudioRename(
+      toPath,
+      from,
+      to,
+      branchRenamed ? (branchRenamePlan ?? undefined) : undefined
+    );
 
     // Update the cloud record if we have a studioId
     if (studioId) {
@@ -885,14 +954,16 @@ async function renameStudio(from: string, to: string): Promise<void> {
       }
     }
 
-    // Intentionally keep existing branch name unchanged.
-    // Studio names are path/identity labels; branch naming is an independent concern.
     const branch = git('branch --show-current', toPath);
 
     spinner.succeed(`Studio renamed: ${from} → ${to}`);
     console.log('');
     console.log(chalk.dim('  Path:   ') + toPath);
-    console.log(chalk.dim('  Branch: ') + branch + chalk.dim(' (unchanged)'));
+    console.log(
+      chalk.dim('  Branch: ') +
+        branch +
+        (branchRenamed ? chalk.dim(' (renamed default home branch)') : chalk.dim(' (unchanged)'))
+    );
     if (updatedIdentity) {
       console.log(chalk.dim('  Identity updated: ') + chalk.green('.pcp/identity.json'));
     }
@@ -1251,6 +1322,7 @@ export {
   isValidTemplateName,
   BUILTIN_ROLE_TEMPLATES,
   getDefaultStudioMainBranch,
+  planStudioHomeBranchRename,
   slugifyStudioNameForBranch,
   getCliLinkTargets,
   shouldWarnMissingCliBinPath,
