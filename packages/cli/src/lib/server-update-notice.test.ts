@@ -31,7 +31,7 @@ describe('maybeWarnServerUpdate', () => {
       }),
     }) as unknown as typeof fetch;
 
-    const { maybeWarnServerUpdate } = await import('./server-update-notice');
+    const { maybeWarnServerUpdate } = await import('./server-update-notice.js');
     await maybeWarnServerUpdate();
 
     expect(logSpy).toHaveBeenCalled();
@@ -47,7 +47,7 @@ describe('maybeWarnServerUpdate', () => {
       }),
     }) as unknown as typeof fetch;
 
-    const { maybeWarnServerUpdate } = await import('./server-update-notice');
+    const { maybeWarnServerUpdate } = await import('./server-update-notice.js');
     await maybeWarnServerUpdate();
 
     expect(logSpy).not.toHaveBeenCalled();
