@@ -627,6 +627,58 @@ export function resolveCapturedBackendSessionIdFromRuntime(options: {
   return resolveFromRecord(scopedRecords[0]) || fallbackBackendSessionId;
 }
 
+export function extractSessionFromStartSessionResponse(
+  payload: unknown
+): PcpSessionSummary | undefined {
+  if (!payload || typeof payload !== 'object') return undefined;
+  const record = payload as Record<string, unknown>;
+
+  const nested = record.session;
+  if (nested && typeof nested === 'object') {
+    const nestedSession = nested as Record<string, unknown>;
+    if (typeof nestedSession.id === 'string' && typeof nestedSession.startedAt === 'string') {
+      return nestedSession as unknown as PcpSessionSummary;
+    }
+  }
+
+  if (typeof record.id === 'string' && typeof record.startedAt === 'string') {
+    return record as unknown as PcpSessionSummary;
+  }
+
+  if (typeof record.text === 'string') {
+    try {
+      const parsed = JSON.parse(record.text) as unknown;
+      return extractSessionFromStartSessionResponse(parsed);
+    } catch {
+      return undefined;
+    }
+  }
+
+  return undefined;
+}
+
+export function resolveStartedSessionFromList(options: {
+  beforeSessionIds: Set<string>;
+  requestedSessionId?: string;
+  listedSessions: PcpSessionSummary[];
+}): PcpSessionSummary | undefined {
+  const { beforeSessionIds, requestedSessionId, listedSessions } = options;
+
+  if (requestedSessionId) {
+    const exact = listedSessions.find((session) => session.id === requestedSessionId);
+    if (exact) return exact;
+  }
+
+  const created = listedSessions
+    .filter((session) => !beforeSessionIds.has(session.id))
+    .sort((a, b) => {
+      const aMs = toEpochMs(a.startedAt) ?? 0;
+      const bMs = toEpochMs(b.startedAt) ?? 0;
+      return bMs - aMs;
+    });
+  return created[0];
+}
+
 export function getClaudeLocalSessionsForProject(
   cwd = process.cwd(),
   limit = 20
@@ -1558,6 +1610,7 @@ async function ensurePcpSessionContext(
     localBackendSessions,
     activeSessions
   );
+  const existingSessionIds = new Set(activeSessions.map((session) => session.id));
 
   let chosen: PcpSessionSummary | undefined;
   let selectedLocalBackendSessionId: string | undefined;
@@ -1582,6 +1635,56 @@ async function ensurePcpSessionContext(
   const startNewPcpSession = async (): Promise<PcpSessionSummary | undefined> => {
     if (!pcpAvailable || !email) return undefined;
 
+    const resolveCreatedSessionFromList = async (
+      requestedSessionId: string | undefined,
+      mode: 'with_session_id' | 'legacy_without_session_id'
+    ): Promise<PcpSessionSummary | undefined> => {
+      try {
+        const listed = await callPcpTool<ListSessionsResult>(
+          'list_sessions',
+          {
+            email,
+            agentId,
+            ...(studioId ? { studioId } : {}),
+            limit: 20,
+          },
+          { callerProfile: 'runtime' }
+        );
+        const listedActive = filterPcpSessionsForContext(
+          (listed.sessions || []).filter((session) => !session.endedAt),
+          backend,
+          cwd,
+          localBackendSessionIds
+        );
+        const resolved = resolveStartedSessionFromList({
+          beforeSessionIds: existingSessionIds,
+          requestedSessionId,
+          listedSessions: listedActive,
+        });
+        sbDebugLog('sb', 'pcp_start_session_resolve_from_list', {
+          backend,
+          agentId,
+          studioId: studioId || null,
+          mode,
+          requestedSessionId: requestedSessionId || null,
+          resolvedSessionId: resolved?.id || null,
+          listedCount: listedActive.length,
+        });
+        if (resolved) activeSessions = listedActive;
+        return resolved;
+      } catch (error) {
+        sbDebugLog('sb', 'pcp_start_session_resolve_from_list_failed', {
+          backend,
+          agentId,
+          studioId: studioId || null,
+          mode,
+          requestedSessionId: requestedSessionId || null,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return undefined;
+      }
+    };
+
     const newSessionId = randomUUID();
     try {
       const started = await callPcpTool<{ session?: PcpSessionSummary }>('start_session', {
@@ -1592,15 +1695,19 @@ async function ensurePcpSessionContext(
         forceNew: true,
         sessionId: newSessionId,
       });
+      const directSession = extractSessionFromStartSessionResponse(started);
+      const resolvedSession =
+        directSession || (await resolveCreatedSessionFromList(newSessionId, 'with_session_id'));
       sbDebugLog('sb', 'pcp_start_session_success', {
         backend,
         agentId,
         studioId: studioId || null,
         requestedSessionId: newSessionId,
-        returnedSessionId: started.session?.id || null,
+        returnedSessionId: resolvedSession?.id || null,
         mode: 'with_session_id',
       });
-      return started.session;
+      if (resolvedSession) return resolvedSession;
+      throw new Error('start_session returned no session payload');
     } catch (errorWithSessionId) {
       // Backward compatibility: older PCP servers may reject the newer `sessionId`
       // parameter. Retry once without it so "start new session" still creates a
@@ -1624,15 +1731,19 @@ async function ensurePcpSessionContext(
           backend,
           forceNew: true,
         });
+        const directSession = extractSessionFromStartSessionResponse(startedLegacy);
+        const resolvedSession =
+          directSession ||
+          (await resolveCreatedSessionFromList(undefined, 'legacy_without_session_id'));
         sbDebugLog('sb', 'pcp_start_session_success', {
           backend,
           agentId,
           studioId: studioId || null,
           requestedSessionId: newSessionId,
-          returnedSessionId: startedLegacy.session?.id || null,
+          returnedSessionId: resolvedSession?.id || null,
           mode: 'legacy_without_session_id',
         });
-        return startedLegacy.session;
+        return resolvedSession;
       } catch (legacyError) {
         sbDebugLog('sb', 'pcp_start_session_failed', {
           backend,

@@ -4,6 +4,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import {
   extractClaudeHistorySessionsForProject,
+  extractSessionFromStartSessionResponse,
   filterUntrackedLocalBackendSessions,
   filterPcpSessionsForContext,
   filterUntrackedLocalClaudeSessions,
@@ -13,6 +14,7 @@ import {
   resolveAdoptableLocalBackendSessionId,
   resolveBackendSessionIdForResume,
   resolveBackendSessionSeedId,
+  resolveStartedSessionFromList,
   sanitizeBackendExecutionArgs,
   shouldRetryWithFreshBackendSession,
   shouldAutoResumeRuntimeSession,
@@ -644,5 +646,98 @@ describe('getCodexLocalSessionsForProject', () => {
       process.env.HOME = originalHome;
       rmSync(tempHome, { recursive: true, force: true });
     }
+  });
+});
+
+describe('extractSessionFromStartSessionResponse', () => {
+  it('extracts nested session payload', () => {
+    expect(
+      extractSessionFromStartSessionResponse({
+        session: {
+          id: 'pcp-1',
+          startedAt: '2026-03-03T00:00:00.000Z',
+          backend: 'codex',
+        },
+      })
+    ).toMatchObject({ id: 'pcp-1', backend: 'codex' });
+  });
+
+  it('extracts top-level session payload', () => {
+    expect(
+      extractSessionFromStartSessionResponse({
+        id: 'pcp-2',
+        startedAt: '2026-03-03T00:00:00.000Z',
+        backend: 'codex',
+      })
+    ).toMatchObject({ id: 'pcp-2', backend: 'codex' });
+  });
+
+  it('returns undefined for payloads without session objects', () => {
+    expect(
+      extractSessionFromStartSessionResponse({ success: true, message: 'ok' })
+    ).toBeUndefined();
+  });
+});
+
+describe('resolveStartedSessionFromList', () => {
+  it('prefers requested session id when present', () => {
+    const resolved = resolveStartedSessionFromList({
+      beforeSessionIds: new Set(['pcp-old']),
+      requestedSessionId: 'pcp-new',
+      listedSessions: [
+        {
+          id: 'pcp-old',
+          startedAt: '2026-03-03T00:00:00.000Z',
+          backend: 'codex',
+        },
+        {
+          id: 'pcp-new',
+          startedAt: '2026-03-03T00:01:00.000Z',
+          backend: 'codex',
+        },
+      ],
+    });
+
+    expect(resolved?.id).toBe('pcp-new');
+  });
+
+  it('falls back to the newest newly created session', () => {
+    const resolved = resolveStartedSessionFromList({
+      beforeSessionIds: new Set(['pcp-old']),
+      listedSessions: [
+        {
+          id: 'pcp-old',
+          startedAt: '2026-03-03T00:00:00.000Z',
+          backend: 'codex',
+        },
+        {
+          id: 'pcp-new-a',
+          startedAt: '2026-03-03T00:01:00.000Z',
+          backend: 'codex',
+        },
+        {
+          id: 'pcp-new-b',
+          startedAt: '2026-03-03T00:02:00.000Z',
+          backend: 'codex',
+        },
+      ],
+    });
+
+    expect(resolved?.id).toBe('pcp-new-b');
+  });
+
+  it('returns undefined when no new session can be inferred', () => {
+    const resolved = resolveStartedSessionFromList({
+      beforeSessionIds: new Set(['pcp-old']),
+      listedSessions: [
+        {
+          id: 'pcp-old',
+          startedAt: '2026-03-03T00:00:00.000Z',
+          backend: 'codex',
+        },
+      ],
+    });
+
+    expect(resolved).toBeUndefined();
   });
 });
