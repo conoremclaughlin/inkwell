@@ -22,6 +22,11 @@ const nextConfig: NextConfig = {
         source: '/api/kindle/:path*',
         destination: `${apiUrl}/api/kindle/:path*`,
       },
+      // System health/version info (used for restart-required banners)
+      {
+        source: '/api/system/health',
+        destination: `${apiUrl}/health`,
+      },
     ];
   },
 };

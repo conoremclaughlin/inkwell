@@ -32,6 +32,7 @@ import {
 } from '../channels/gateway';
 import { runWithRequestContext } from '../utils/request-context';
 import { resolveWorkspaceContextForRequest } from '../utils/workspace-scope';
+import { getRuntimeBuildInfo } from '../utils/runtime-build-info';
 import { PcpAuthProvider } from './auth/pcp-auth-provider';
 
 export { setWhatsAppListener, getAgentGateway };
@@ -421,6 +422,7 @@ export class MCPServer {
         timestamp: new Date().toISOString(),
         uptime: process.uptime(),
         latencyMs: Date.now() - startTime,
+        build: getRuntimeBuildInfo(),
         checks,
       });
     });

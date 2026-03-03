@@ -177,6 +177,9 @@ See [AGENTS.md](./AGENTS.md) for onboarding instructions.
 
 ```bash
 yarn dev                   # Start all services (pm2)
+yarn dev:direct            # Start API+web directly (no pm2, dev mode)
+yarn prod:refresh          # Install + build latest code after pull
+yarn prod:direct           # Run API+web directly in production mode (no pm2)
 yarn build                 # Build all packages
 yarn type-check            # Type check all packages
 yarn test                  # Unit tests (all workspaces)
@@ -189,6 +192,25 @@ yarn pm2 restart pcp       # Restart PCP server
 ```
 
 `yarn test:integration:db:local` spins up an **isolated, temporary local Supabase stack** with dedicated ports, applies migrations + seed, runs integration tests, then tears it down. This avoids accidental use of remote `.env.local` credentials and keeps integration runs sandboxed from any online dev server.
+
+## Low-power runtime mode (no PM2)
+
+If PM2/watcher overhead is undesirable on laptops, run PCP directly:
+
+```bash
+# 1) After pulling latest changes
+yarn prod:refresh
+
+# 2) Start in direct production mode (no PM2)
+yarn prod:direct
+```
+
+Notes:
+
+- `yarn prod:direct` does **not rebuild** on start; it uses existing build artifacts.
+- To run API only (no dashboard process): `PCP_RUN_WEB=false yarn prod:direct`
+- After `git pull`, run `yarn prod:refresh` and restart your direct/PM2 process.
+- The dashboard and `sb` CLI will warn when the running server is behind local HEAD and needs a restart.
 
 ## Contributing
 

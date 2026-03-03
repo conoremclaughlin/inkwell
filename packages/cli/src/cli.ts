@@ -34,6 +34,7 @@ import { registerStatusCommand } from './commands/status.js';
 import { runClaude, runClaudeInteractive } from './commands/claude.js';
 import { resolveBackend } from './backends/index.js';
 import { initSbDebug, sbDebugLog } from './lib/sb-debug.js';
+import { maybeWarnServerUpdate } from './lib/server-update-notice.js';
 
 const VERSION = '0.3.0';
 
@@ -195,6 +196,7 @@ program
     if (resolvedOptions.sbDebug) {
       console.log(chalk.dim(`SB debug log: ${debugFile}`));
     }
+    await maybeWarnServerUpdate();
     sbDebugLog('sb', 'parsed_args', {
       sbOptions: resolvedOptions,
       passthroughArgs,
