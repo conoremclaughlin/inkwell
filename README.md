@@ -86,30 +86,27 @@ yarn dev
 
 1. Install Supabase CLI and Docker:
    - Supabase CLI install docs: https://supabase.com/docs/guides/cli/getting-started
-2. Start local Supabase from this repo root:
+2. Run one command from repo root to start local Supabase, reset DB, and update `.env.local`:
 
 ```bash
-supabase start
+yarn supabase:local:setup
 ```
 
-3. Reset/apply migrations + seed data:
+This helper:
 
-```bash
-supabase db reset
-```
+- starts local Supabase (Docker required)
+- applies migrations + seed (`supabase db reset --local`)
+- reads local env values from `supabase status -o env`
+- writes them into `.env.local`
 
-4. Print local env values:
+If `.env.local` already has `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`, or `JWT_SECRET`, the helper **won't overwrite** them. It logs a warning and writes local references instead:
 
-```bash
-supabase status -o env
-```
+- `LOCAL_SUPABASE_URL`
+- `LOCAL_SUPABASE_PUBLISHABLE_KEY`
+- `LOCAL_SUPABASE_SECRET_KEY`
+- `LOCAL_JWT_SECRET`
 
-5. Map local values into `.env.local`:
-   - `API_URL` → `SUPABASE_URL`
-   - `ANON_KEY` → `SUPABASE_PUBLISHABLE_KEY`
-   - `SERVICE_ROLE_KEY` → `SUPABASE_SECRET_KEY`
-
-6. Start PCP:
+3. Start PCP:
 
 ```bash
 yarn dev
@@ -183,6 +180,7 @@ yarn dev                   # Start all services (pm2)
 yarn build                 # Build all packages
 yarn type-check            # Type check all packages
 yarn test                  # Unit tests (all workspaces)
+yarn supabase:local:setup  # Start/reset local Supabase and sync env values into .env.local
 yarn test:integration:db:local  # DB integration suite against isolated local Supabase
 yarn test:integration:runtime    # Runtime/CLI integration suite
 yarn logs:pcp              # View PCP server logs
