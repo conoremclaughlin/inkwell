@@ -26,6 +26,16 @@ Messages with the same threadKey are routed to the same session on the recipient
 - `message` does not trigger by default — use `trigger: true` if the message is time-sensitive
 - Avoid triggering agents for low-priority or non-urgent messages during quiet hours
 
+## Pull Requests
+
+Every PR MUST have a sibling review before merge. After pushing a PR:
+
+1. Send a `task_request` to at least one sibling on the `pr:<number>` threadKey requesting review
+2. When reviewing, reply with a `task_request` on the same threadKey with your verdict
+3. Use merge commits (not squash or rebase)
+
+Do not merge without review unless explicitly told to by the user.
+
 ## Studio Branch Conventions
 
 Studios are git worktrees, and **a single branch can only be checked out in one worktree at a time**.
