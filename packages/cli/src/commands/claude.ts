@@ -1531,9 +1531,45 @@ async function ensurePcpSessionContext(
         forceNew: true,
         sessionId: newSessionId,
       });
-      return started.session || { id: newSessionId, startedAt: new Date().toISOString() };
-    } catch {
-      return { id: newSessionId, startedAt: new Date().toISOString() };
+      return started.session;
+    } catch (errorWithSessionId) {
+      // Backward compatibility: older PCP servers may reject the newer `sessionId`
+      // parameter. Retry once without it so "start new session" still creates a
+      // real server-side PCP session instead of a synthetic local-only UUID.
+      sbDebugLog('sb', 'pcp_start_session_retry_legacy', {
+        backend,
+        agentId,
+        studioId: studioId || null,
+        attemptedSessionId: newSessionId,
+        error:
+          errorWithSessionId instanceof Error
+            ? errorWithSessionId.message
+            : String(errorWithSessionId),
+      });
+
+      try {
+        const startedLegacy = await callPcpTool<{ session?: PcpSessionSummary }>('start_session', {
+          email,
+          agentId,
+          ...(studioId ? { studioId } : {}),
+          backend,
+          forceNew: true,
+        });
+        return startedLegacy.session;
+      } catch (legacyError) {
+        sbDebugLog('sb', 'pcp_start_session_failed', {
+          backend,
+          agentId,
+          studioId: studioId || null,
+          attemptedSessionId: newSessionId,
+          errorWithSessionId:
+            errorWithSessionId instanceof Error
+              ? errorWithSessionId.message
+              : String(errorWithSessionId),
+          legacyError: legacyError instanceof Error ? legacyError.message : String(legacyError),
+        });
+        return undefined;
+      }
     }
   };
 
