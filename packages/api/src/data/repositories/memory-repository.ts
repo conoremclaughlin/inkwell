@@ -401,6 +401,7 @@ export class MemoryRepository {
       .from('sessions')
       .update({
         ended_at: new Date().toISOString(),
+        lifecycle: 'completed',
         summary,
       })
       .eq('id', sessionId)
@@ -423,6 +424,7 @@ export class MemoryRepository {
     sessionId: string,
     updates: {
       currentPhase?: string | null;
+      lifecycle?: string;
       status?: string;
       backendSessionId?: string;
       context?: string;
@@ -434,6 +436,9 @@ export class MemoryRepository {
 
     if (updates.currentPhase !== undefined) {
       dbUpdates.current_phase = updates.currentPhase;
+    }
+    if (updates.lifecycle !== undefined) {
+      dbUpdates.lifecycle = updates.lifecycle;
     }
     if (updates.status !== undefined) {
       dbUpdates.status = updates.status;
@@ -499,6 +504,7 @@ export class MemoryRepository {
       .select('*')
       .eq('user_id', userId)
       .is('ended_at', null)
+      .not('lifecycle', 'in', '("completed","failed")')
       .order('started_at', { ascending: false })
       .limit(1);
 
@@ -542,6 +548,7 @@ export class MemoryRepository {
       .eq('agent_id', agentId)
       .eq('thread_key', threadKey)
       .is('ended_at', null)
+      .not('lifecycle', 'in', '("completed","failed")')
       .order('started_at', { ascending: false })
       .limit(1);
 
@@ -574,6 +581,7 @@ export class MemoryRepository {
       .select('*')
       .eq('user_id', userId)
       .is('ended_at', null)
+      .not('lifecycle', 'in', '("completed","failed")')
       .order('started_at', { ascending: false });
 
     if (agentId) {
@@ -933,6 +941,7 @@ export class MemoryRepository {
       studioId,
       workspaceId: studioId,
       threadKey: row.thread_key || undefined,
+      lifecycle: (row.lifecycle as Session['lifecycle']) || undefined,
       status: row.status || undefined,
       currentPhase: row.current_phase || undefined,
       backend: row.backend || undefined,

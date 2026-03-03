@@ -7,7 +7,13 @@
 
 import { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../../data/supabase/types.js';
-import type { Session, SessionStatus, SessionType, ISessionRepository } from './types.js';
+import type {
+  Session,
+  SessionLifecycle,
+  SessionStatus,
+  SessionType,
+  ISessionRepository,
+} from './types.js';
 import { logger } from '../../utils/logger.js';
 
 type DbSession = Database['public']['Tables']['sessions']['Row'];
@@ -34,6 +40,7 @@ function mapDbToSession(row: DbSession): Session {
     claudeSessionId: row.claude_session_id,
 
     type: (metadata.type as SessionType) || 'primary',
+    lifecycle: (row.lifecycle as SessionLifecycle) || 'idle',
     status: (row.status as SessionStatus) || 'active',
 
     taskDescription: metadata.taskDescription as string | undefined,
@@ -81,6 +88,7 @@ function mapSessionToDb(
     agent_id: session.agentId,
     identity_id: session.identityId || null,
     claude_session_id: session.claudeSessionId,
+    lifecycle: session.lifecycle,
     status: session.status,
     ended_at: session.endedAt?.toISOString() || null,
     message_count: session.messageCount,
@@ -133,6 +141,7 @@ export class SessionRepository implements ISessionRepository {
       .eq('user_id', userId)
       .eq('agent_id', agentId)
       .is('ended_at', null)
+      .not('lifecycle', 'in', '("completed","failed")')
       .order('started_at', { ascending: false })
       .limit(1);
 
@@ -182,6 +191,7 @@ export class SessionRepository implements ISessionRepository {
       .eq('agent_id', agentId)
       .eq('thread_key', threadKey)
       .is('ended_at', null)
+      .not('lifecycle', 'in', '("completed","failed")')
       .order('started_at', { ascending: false })
       .limit(1);
 
@@ -278,6 +288,10 @@ export class SessionRepository implements ISessionRepository {
 
     if (updates.claudeSessionId !== undefined) {
       dbUpdates.claude_session_id = updates.claudeSessionId;
+    }
+
+    if (updates.lifecycle !== undefined) {
+      dbUpdates.lifecycle = updates.lifecycle;
     }
 
     if (updates.status !== undefined) {

@@ -2070,6 +2070,7 @@ export type Database = {
           ended_at: string | null;
           id: string;
           identity_id: string | null;
+          lifecycle: string | null;
           message_count: number | null;
           metadata: Json | null;
           model: string | null;
@@ -2095,6 +2096,7 @@ export type Database = {
           ended_at?: string | null;
           id?: string;
           identity_id?: string | null;
+          lifecycle?: string | null;
           message_count?: number | null;
           metadata?: Json | null;
           model?: string | null;
@@ -2120,6 +2122,7 @@ export type Database = {
           ended_at?: string | null;
           id?: string;
           identity_id?: string | null;
+          lifecycle?: string | null;
           message_count?: number | null;
           metadata?: Json | null;
           model?: string | null;
