@@ -126,6 +126,8 @@ interface BackendExecutionLogContext {
   backendSessionId?: string;
   studioId?: string;
   runtimeLinkId?: string;
+  threadKey?: string;
+  triggerSource?: string;
   cwd: string;
   mode: 'prompt' | 'interactive';
   retryAttempt: number;
@@ -1101,6 +1103,8 @@ async function logBackendExecutionStart(
         backendSessionId: context.backendSessionId || null,
         retryAttempt: context.retryAttempt,
         maxAttempts: context.maxAttempts,
+        ...(context.threadKey ? { threadKey: context.threadKey } : {}),
+        ...(context.triggerSource ? { triggerSource: context.triggerSource } : {}),
       },
     });
 
@@ -1151,6 +1155,8 @@ async function logBackendExecutionResult(options: {
         exitCode: options.exitCode,
         durationMs: options.durationMs,
         error: options.error || null,
+        ...(options.context.threadKey ? { threadKey: options.context.threadKey } : {}),
+        ...(options.context.triggerSource ? { triggerSource: options.context.triggerSource } : {}),
       },
     });
   } catch {
@@ -1254,7 +1260,12 @@ async function ensurePcpSessionContext(
   verbose: boolean,
   promptParts: string[] = [],
   options: { listCandidates?: boolean; selectionOverride?: string } = {}
-): Promise<{ pcpSessionId?: string; backendSessionId?: string; backendSessionSeedId?: string }> {
+): Promise<{
+  pcpSessionId?: string;
+  backendSessionId?: string;
+  backendSessionSeedId?: string;
+  threadKey?: string;
+}> {
   if (hasBackendSessionOverride(backend, passthroughArgs, promptParts)) return {};
 
   const config = getPcpConfig();
@@ -1569,6 +1580,7 @@ async function ensurePcpSessionContext(
     pcpSessionId: chosen.id,
     backendSessionId: effectiveBackendSessionId,
     ...(backendSessionSeedId ? { backendSessionSeedId } : {}),
+    ...(chosen.threadKey ? { threadKey: chosen.threadKey } : {}),
   };
 }
 
@@ -1659,6 +1671,7 @@ export async function runClaude(
     backendSessionId: sessionContext.backendSessionId,
     studioId,
     runtimeLinkId,
+    threadKey: sessionContext.threadKey,
     cwd: process.cwd(),
     mode: 'prompt',
     retryAttempt: 1,
@@ -1864,6 +1877,7 @@ export async function runClaudeInteractive(
       backendSessionId: attemptBackendSessionId,
       studioId,
       runtimeLinkId,
+      threadKey: sessionContext.threadKey,
       cwd: process.cwd(),
       mode: 'interactive',
       retryAttempt: attempt,

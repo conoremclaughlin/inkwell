@@ -40,6 +40,7 @@ export interface Session {
     worktreeFolder?: string;
     branch?: string;
   } | null;
+  workingDir?: string;
   logs?: Array<{ salience: string; content: string }>;
 }
 

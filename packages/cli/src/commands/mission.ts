@@ -36,7 +36,7 @@ interface MissionSnapshot {
   generatedAt: string;
 }
 
-interface MissionActivity {
+export interface MissionActivity {
   id: string;
   type?: string;
   subtype?: string;
@@ -49,7 +49,7 @@ interface MissionActivity {
   payload?: Record<string, unknown>;
 }
 
-interface InboxMessage {
+export interface InboxMessage {
   id: string;
   subject?: string;
   content?: string;
@@ -74,7 +74,9 @@ interface MissionFeedRow {
 
 // ── Inbox extraction ──
 
-function extractInboxMessages(result: Record<string, unknown> | null | undefined): InboxMessage[] {
+export function extractInboxMessages(
+  result: Record<string, unknown> | null | undefined
+): InboxMessage[] {
   if (!result) return [];
   const candidate =
     (Array.isArray(result.messages) ? result.messages : undefined) ||
@@ -108,7 +110,7 @@ function extractInboxMessages(result: Record<string, unknown> | null | undefined
     .filter((msg): msg is InboxMessage => Boolean(msg));
 }
 
-function inboxMessageToFeedEvent(msg: InboxMessage, timezone?: string): FeedEvent {
+export function inboxMessageToFeedEvent(msg: InboxMessage, timezone?: string): FeedEvent {
   const maxPreview = Math.min(120, (process.stdout.columns || 80) - 25);
   const sender = msg.senderAgentId || 'user';
   const recipient = msg.recipientAgentId || 'unknown';
@@ -290,12 +292,22 @@ function compactPreview(value?: string, max = 110): string {
   return `${normalized.slice(0, Math.max(1, max - 1))}…`;
 }
 
-function studioLabelForSession(session?: Session): string {
+export function repoNameFromPath(dir?: string): string | null {
+  if (!dir) return null;
+  // Extract the last path component as the repo name
+  const name = dir.replace(/\/+$/, '').split('/').pop();
+  return name || null;
+}
+
+export function studioLabelForSession(session?: Session): string {
   if (!session) return '-';
   const studioId = session.studioId || session.studio?.id;
   const worktree = session.studio?.worktreeFolder;
   if (worktree) return formatWorktreeLabel(worktree);
   if (studioId) return studioId.slice(0, 8);
+  // Fallback: extract repo name from workingDir
+  const repo = repoNameFromPath(session.workingDir);
+  if (repo) return repo;
   return '-';
 }
 
@@ -525,23 +537,59 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
   const unreadByAgent: Record<string, number> = {};
   const allInboxMessages: InboxMessage[] = [];
   const fetchAllInbox = options.feed || options.watch;
-  for (const agentId of Array.from(allAgents)) {
+
+  // Try single query for all agents (requires server support for optional agentId).
+  // Falls back to per-agent loop if the server rejects the agentId-less request.
+  let inboxFetched = false;
+  if (!options.agent) {
     try {
       const inboxResult = (await pcp.callTool('get_inbox', {
         email: config.email,
-        agentId,
-        // Fetch all messages for the feed, only unread for the counts-only path
         status: fetchAllInbox ? 'all' : 'unread',
         limit: fetchAllInbox ? Number.parseInt(options.feedLimit || '40', 10) : 200,
       })) as Record<string, unknown>;
-      unreadByAgent[agentId] = extractUnreadCount(inboxResult);
-      if (fetchAllInbox) {
-        const msgs = extractInboxMessages(inboxResult);
-        for (const m of msgs) m.recipientAgentId = agentId;
-        allInboxMessages.push(...msgs);
+
+      const msgs = extractInboxMessages(inboxResult);
+      if (msgs.length > 0 || inboxResult.allAgents === true) {
+        inboxFetched = true;
+        for (const m of msgs) {
+          const agent = m.recipientAgentId || 'unknown';
+          if (m.status === 'unread') {
+            unreadByAgent[agent] = (unreadByAgent[agent] || 0) + 1;
+          }
+        }
+        for (const agentId of Array.from(allAgents)) {
+          if (!(agentId in unreadByAgent)) unreadByAgent[agentId] = 0;
+        }
+        if (fetchAllInbox) {
+          allInboxMessages.push(...msgs);
+        }
       }
     } catch {
-      unreadByAgent[agentId] = 0;
+      // Server doesn't support agentId-less query yet — fall through to per-agent
+    }
+  }
+
+  // Per-agent fallback (or when --agent filter is specified)
+  if (!inboxFetched) {
+    const agentsToQuery = options.agent ? [options.agent] : Array.from(allAgents);
+    for (const agentId of agentsToQuery) {
+      try {
+        const inboxResult = (await pcp.callTool('get_inbox', {
+          email: config.email,
+          agentId,
+          status: fetchAllInbox ? 'all' : 'unread',
+          limit: fetchAllInbox ? Number.parseInt(options.feedLimit || '40', 10) : 200,
+        })) as Record<string, unknown>;
+        unreadByAgent[agentId] = extractUnreadCount(inboxResult);
+        if (fetchAllInbox) {
+          const msgs = extractInboxMessages(inboxResult);
+          for (const m of msgs) m.recipientAgentId = agentId;
+          allInboxMessages.push(...msgs);
+        }
+      } catch {
+        unreadByAgent[agentId] = 0;
+      }
     }
   }
 
@@ -632,6 +680,14 @@ function mapActivityToFeedType(activity: MissionActivity): FeedEventType {
   }
 }
 
+/** Extract backend name from subtype like "backend_cli:claude-code" → "claude-code" */
+export function backendFromSubtype(subtype?: string): string | null {
+  if (!subtype) return null;
+  const prefix = 'backend_cli:';
+  if (subtype.startsWith(prefix)) return subtype.slice(prefix.length);
+  return null;
+}
+
 /**
  * Detect system-originated messages and return a clean label + summary.
  * Heartbeat reminders, scheduled tasks, and other automated triggers
@@ -658,7 +714,7 @@ function parseSystemOrigin(
   return undefined;
 }
 
-function activityToFeedEvent(
+export function activityToFeedEvent(
   activity: MissionActivity,
   timezone?: string,
   sessionsById?: Map<string, Session>
@@ -685,25 +741,71 @@ function activityToFeedEvent(
     content = `→ ${activity.platform || 'unknown'}: ${compactPreview(activity.content, maxPreview)}`;
   } else if (activity.type === 'state_change') {
     content = compactPreview(activity.content, maxPreview);
+  } else if (activity.type === 'tool_call' || activity.type === 'tool_result') {
+    const ap = activity.payload;
+    const isBackendCli = activity.subtype?.startsWith('backend_cli:');
+    if (isBackendCli) {
+      // Backend CLI spawn/result — render like agent_spawn/complete with trigger metadata
+      const backend =
+        (typeof ap?.backend === 'string' ? ap.backend : null) ||
+        backendFromSubtype(activity.subtype);
+      const source = typeof ap?.triggerSource === 'string' ? ap.triggerSource : null;
+      const callThread = typeof ap?.threadKey === 'string' ? ap.threadKey : null;
+      const durationMs = typeof ap?.durationMs === 'number' ? ap.durationMs : null;
+      const error = typeof ap?.error === 'string' ? ap.error : null;
+      const parts: string[] = [];
+      if (backend) parts.push(backend);
+      if (durationMs != null) parts.push(`${Math.round(durationMs / 1000)}s`);
+      if (source) parts.push(`via ${source}`);
+      if (callThread) parts.push(callThread);
+      if (activity.type === 'tool_result' && activity.status === 'failed' && error) {
+        content = parts.length > 0 ? `failed (${parts.join(', ')}): ${error}` : `failed: ${error}`;
+      } else {
+        const verb = activity.type === 'tool_call' ? 'spawned' : 'completed';
+        content = parts.length > 0 ? `${verb} (${parts.join(', ')})` : `${verb} backend`;
+      }
+    } else {
+      // Individual PCP tool call — content is already "toolName(params)"
+      content = compactPreview(activity.content, maxPreview);
+    }
   } else if (activity.type === 'agent_spawn') {
     const ap = activity.payload;
-    const backend = typeof ap?.backend === 'string' ? ap.backend : null;
+    const backend =
+      (typeof ap?.backend === 'string' ? ap.backend : null) || backendFromSubtype(activity.subtype);
     const triggeredBy = typeof ap?.triggeredBy === 'string' ? ap.triggeredBy : null;
     const source = typeof ap?.triggerSource === 'string' ? ap.triggerSource : null;
+    const spawnThread = typeof ap?.threadKey === 'string' ? ap.threadKey : null;
     const parts: string[] = [];
     if (backend) parts.push(backend);
     if (source === 'agent' && triggeredBy) parts.push(`via ${triggeredBy}`);
     else if (source) parts.push(`via ${source}`);
+    if (spawnThread) parts.push(spawnThread);
     content = parts.length > 0 ? `spawned (${parts.join(', ')})` : 'spawned sub-process';
   } else if (activity.type === 'agent_complete') {
     const ap = activity.payload;
-    const backend = typeof ap?.backend === 'string' ? ap.backend : null;
+    const backend =
+      (typeof ap?.backend === 'string' ? ap.backend : null) || backendFromSubtype(activity.subtype);
     const durationMs = typeof ap?.durationMs === 'number' ? ap.durationMs : null;
     const durationLabel = durationMs != null ? `${Math.round(durationMs / 1000)}s` : null;
+    const triggeredBy = typeof ap?.triggeredBy === 'string' ? ap.triggeredBy : null;
+    const source = typeof ap?.triggerSource === 'string' ? ap.triggerSource : null;
+    const completeThread = typeof ap?.threadKey === 'string' ? ap.threadKey : null;
     const parts: string[] = [];
     if (backend) parts.push(backend);
     if (durationLabel) parts.push(durationLabel);
+    if (source === 'agent' && triggeredBy) parts.push(`via ${triggeredBy}`);
+    else if (source) parts.push(`via ${source}`);
+    if (completeThread) parts.push(completeThread);
     content = parts.length > 0 ? `completed (${parts.join(', ')})` : 'sub-process completed';
+  } else if (activity.type === 'error') {
+    // Show full error reason — mission control exists for this visibility
+    const ap = activity.payload;
+    const backend =
+      (typeof ap?.backend === 'string' ? ap.backend : null) || backendFromSubtype(activity.subtype);
+    const errorDetail =
+      typeof ap?.error === 'string' ? ap.error : activity.content || 'unknown error';
+    const label = backend ? `failed (${backend})` : 'error';
+    content = `${label}: ${errorDetail}`;
   } else {
     const subtype = activity.subtype ? `:${activity.subtype}` : '';
     content = `${activity.type || 'activity'}${subtype}: ${compactPreview(activity.content, maxPreview)}`;

@@ -23,6 +23,9 @@ import { formatBackendTokenUsage, type BackendTokenUsage } from '../repl/token-u
 import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../repl/skills.js';
 import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
 import { ensurePcpToolAllowed } from '../repl/tool-gate.js';
+import { executeToolCalls, type ToolCallResult } from '../repl/tool-call-executor.js';
+import { applyProfile, formatProfileList, isValidProfileId } from '../repl/tool-profiles.js';
+import { ApprovalRequestManager } from '../repl/approval-request.js';
 import {
   parsePermissionGrant,
   applyPermissionGrant,
@@ -65,6 +68,7 @@ type ChatOptions = {
   maxContextTokens?: string;
   pollSeconds?: string;
   tools?: string;
+  profile?: string;
   message?: string;
   nonInteractive?: boolean;
   tailTranscript?: string;
@@ -104,6 +108,7 @@ interface ChatRuntime {
   showSessionsWatch: boolean;
   eventPolling: boolean;
   autoRunInbox: boolean;
+  awayMode: boolean;
   transcriptPath: string;
   activeSkills: SkillInstruction[];
   bootstrapContext?: string;
@@ -1575,9 +1580,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     showSessionsWatch: false,
     eventPolling: true,
     autoRunInbox: options.autoRun ?? false,
+    awayMode: false,
     transcriptPath: ensureRuntimeTranscriptPath(),
     activeSkills: [],
   };
+  const approvalManager = new ApprovalRequestManager();
   const policyPathFromEnv = process.env.PCP_TOOL_POLICY_PATH?.trim();
   const toolPolicy = new ToolPolicyState(
     runtime.toolMode,
@@ -1596,6 +1603,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
     toolPolicy.setMutationScope('agent');
   }
   runtime.toolMode = toolPolicy.getMode();
+
+  // Apply --profile flag if provided
+  if (options.profile) {
+    if (isValidProfileId(options.profile)) {
+      const profileResult = applyProfile(toolPolicy, options.profile);
+      if (profileResult.success) {
+        runtime.toolMode = toolPolicy.getMode();
+        console.log(chalk.green(profileResult.message));
+      }
+    } else {
+      console.log(
+        chalk.yellow(
+          `Unknown profile: ${options.profile}. Valid: minimal, safe, collaborative, full`
+        )
+      );
+    }
+  }
+
   const useInk = runtime.uiMode === 'live' && Boolean(output.isTTY);
   const statusLane = new LiveStatusLane(!useInk && Boolean(output.isTTY), runtime.userTimezone);
   // Build the info items used by both Ink and legacy dock
@@ -2016,6 +2041,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
         grant,
         sessionId: runtime.sessionId,
       });
+
+      // Resolve pending approval requests if this grant matches
+      if (grant.requestId && approvalManager.hasPending(grant.requestId)) {
+        const decision = grant.action === 'deny' ? 'denied' : 'approved';
+        approvalManager.resolve(grant.requestId, decision, msg.from);
+      } else {
+        // Try matching by tool name for grants without explicit requestId
+        for (const tool of grant.tools) {
+          const pending = approvalManager.findPendingForTool(tool);
+          if (pending) {
+            const decision = grant.action === 'deny' ? 'denied' : 'approved';
+            approvalManager.resolve(pending.id, decision, msg.from);
+          }
+        }
+      }
+
       const from = msg.from || 'remote';
       const action = grant.action;
       const label =
@@ -2400,39 +2441,94 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     const localToolCalls =
       runtime.toolRouting === 'local' ? extractLocalToolCalls(responseText).slice(0, 5) : [];
-    for (const toolCall of localToolCalls) {
-      const decision = toolPolicy.canCallPcpTool(toolCall.tool, runtime.sessionId);
-      if (!decision.allowed) {
-        const blocked = `Local tool blocked (${toolCall.tool}): ${decision.reason}`;
-        printLine(chalk.yellow(blocked));
-        appendTranscript(runtime.transcriptPath, {
-          type: 'local_tool_call',
-          tool: toolCall.tool,
-          args: toolCall.args,
-          status: 'blocked',
-          reason: decision.reason,
-        });
-        ledger.addEntry('system', compactForLedger(blocked, 400), 'local-tool');
-        continue;
-      }
-
-      const toolResult = await pcp
-        .callTool(toolCall.tool, toolCall.args)
-        .catch((error) => ({ error: String(error) }));
-      const resultJson = JSON.stringify(toolResult);
-      printLine(chalk.cyan(`🛠 local tool ${toolCall.tool} ${resultJson}`));
-      appendTranscript(runtime.transcriptPath, {
-        type: 'local_tool_call',
-        tool: toolCall.tool,
-        args: toolCall.args,
-        status: 'executed',
-        result: toolResult,
+    if (localToolCalls.length > 0) {
+      await executeToolCalls(localToolCalls, {
+        policy: toolPolicy,
+        callTool: (tool, args) => pcp.callTool(tool, args),
+        sessionId: runtime.sessionId,
+        promptForApproval: async (tool, reason) => {
+          if (!runtime.awayMode) {
+            return promptForToolApproval(rl, toolPolicy, runtime.sessionId, tool, reason, inkRepl);
+          }
+          // Remote approval: register request, send to inbox, wait for resolution
+          const { request, promise } = approvalManager.register(tool, {}, reason);
+          printLine(
+            chalk.yellow(`⏳ Awaiting remote approval for ${tool} (${request.id.slice(0, 8)}…)`)
+          );
+          try {
+            await pcp.callTool('send_to_inbox', {
+              recipientAgentId: agentId,
+              senderAgentId: agentId,
+              content: `🔐 Tool approval needed: **${tool}**\n\nReason: ${reason}\n\nReply with a permission_grant to approve or deny.\nRequest ID: ${request.id}`,
+              messageType: 'notification',
+              metadata: { approvalRequestId: request.id, tool },
+              ...(runtime.threadKey ? { threadKey: runtime.threadKey } : {}),
+              trigger: false,
+            });
+          } catch {
+            printLine(
+              chalk.yellow('Failed to send remote approval request — falling back to local prompt')
+            );
+            approvalManager.expire(request.id);
+            return promptForToolApproval(rl, toolPolicy, runtime.sessionId, tool, reason, inkRepl);
+          }
+          const response = await promise;
+          if (response.decision === 'approved') {
+            printLine(
+              chalk.green(
+                `✅ Remote approval granted for ${tool}${response.resolvedBy ? ` by ${response.resolvedBy}` : ''}`
+              )
+            );
+            return true;
+          } else if (response.decision === 'timeout') {
+            printLine(chalk.yellow(`⏰ Remote approval timed out for ${tool}`));
+            return false;
+          } else {
+            printLine(chalk.yellow(`🚫 Remote approval denied for ${tool}`));
+            return false;
+          }
+        },
+        onResult: (result: ToolCallResult) => {
+          if (result.status === 'blocked' || result.status === 'denied') {
+            const msg = `Local tool ${result.status} (${result.tool}): ${result.reason}`;
+            printLine(chalk.yellow(msg));
+            appendTranscript(runtime.transcriptPath, {
+              type: 'local_tool_call',
+              tool: result.tool,
+              args: result.args,
+              status: result.status,
+              reason: result.reason,
+            });
+            ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
+          } else if (result.status === 'executed' || result.status === 'approved') {
+            const resultJson = JSON.stringify(result.result);
+            printLine(chalk.cyan(`🛠 local tool ${result.tool} ${resultJson}`));
+            appendTranscript(runtime.transcriptPath, {
+              type: 'local_tool_call',
+              tool: result.tool,
+              args: result.args,
+              status: result.status,
+              result: result.result,
+            });
+            ledger.addEntry(
+              'system',
+              compactForLedger(`local tool ${result.tool} -> ${resultJson}`, 500),
+              'local-tool'
+            );
+          } else if (result.status === 'error') {
+            const msg = `Local tool error (${result.tool}): ${result.error}`;
+            printLine(chalk.red(msg));
+            appendTranscript(runtime.transcriptPath, {
+              type: 'local_tool_call',
+              tool: result.tool,
+              args: result.args,
+              status: 'error',
+              error: result.error,
+            });
+            ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
+          }
+        },
       });
-      ledger.addEntry(
-        'system',
-        compactForLedger(`local tool ${toolCall.tool} -> ${resultJson}`, 500),
-        'local-tool'
-      );
     }
 
     const assistantDisplayText =
@@ -2774,7 +2870,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           '',
           chalk.bold('Quick commands'),
           chalk.dim(
-            '/help  /mcp  /capabilities  /skills  /policy  /policy-scope  /usage  /tool-routing  /ui  /trim  /quit'
+            '/help  /mcp  /capabilities  /skills  /profile  /policy  /away  /tool-routing  /ui  /trim  /quit'
           ),
           '',
         ].join('\n')
@@ -2797,6 +2893,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '/events [now|on|off]       Poll/toggle merged activity stream',
               '/session                   Show active session info',
               '/autorun [on|off]          Toggle inbox auto-run execution',
+              '/away [on|off]             Toggle remote approval mode (approvals via inbox)',
               '/tool-routing [backend|local]  Toggle backend tools vs local pcp-tool routing',
               '/ui [scroll|live]          Set status rendering mode',
               '/backend <name>            Switch backend (claude|codex|gemini)',
@@ -2820,6 +2917,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '/skill-allow <pattern>      Persistently allow skill(s) via pattern',
               '/path-allow-read <glob>      Persistently allow local reads for matching paths',
               '/path-allow-write <glob>     Persistently allow local writes for matching paths',
+              '/profile [name]             Apply security profile (minimal/safe/collaborative/full)',
               '/policy-reset [global|workspace|agent|studio] [id]  Reset policy scope to defaults',
               '/delegate-create <to> <scopes> [ttlMin]  Mint delegation token',
               '/delegate-show               Show last minted delegation token payload',
@@ -2948,6 +3046,35 @@ export async function runChat(options: ChatOptions): Promise<void> {
           console.log(
             chalk.green(`Inbox auto-run ${runtime.autoRunInbox ? 'enabled' : 'disabled'}.`)
           );
+          break;
+        }
+        case 'away': {
+          const mode = (slash.args[0] || '').toLowerCase();
+          if (!mode) {
+            console.log(chalk.dim(`Away mode is ${runtime.awayMode ? 'on' : 'off'}.`));
+            if (approvalManager.size > 0) {
+              console.log(chalk.dim(`  ${approvalManager.size} pending approval request(s)`));
+            }
+            break;
+          }
+          if (!['on', 'off'].includes(mode)) {
+            console.log(chalk.yellow('Usage: /away [on|off]'));
+            break;
+          }
+          runtime.awayMode = mode === 'on';
+          if (runtime.awayMode) {
+            console.log(
+              chalk.green(
+                'Away mode enabled — tool approvals will be sent to your inbox for remote approval.'
+              )
+            );
+          } else {
+            console.log(chalk.green('Away mode disabled — tool approvals will prompt locally.'));
+            if (approvalManager.size > 0) {
+              approvalManager.cancelAll();
+              console.log(chalk.dim('Cancelled pending remote approval requests.'));
+            }
+          }
           break;
         }
         case 'tool-routing': {
@@ -3221,6 +3348,28 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }
           runtime.toolMode = toolPolicy.getMode();
           console.log(chalk.green(result.message));
+          break;
+        }
+        case 'profile': {
+          const profileArg = (slash.args[0] || '').trim().toLowerCase();
+          if (!profileArg) {
+            console.log(chalk.bold('Tool Profiles'));
+            console.log(formatProfileList());
+            console.log(chalk.dim('\nUsage: /profile <minimal|safe|collaborative|full>'));
+            break;
+          }
+          if (!isValidProfileId(profileArg)) {
+            console.log(chalk.yellow(`Unknown profile: ${profileArg}`));
+            console.log(formatProfileList());
+            break;
+          }
+          const profileResult = applyProfile(toolPolicy, profileArg);
+          if (profileResult.success) {
+            runtime.toolMode = toolPolicy.getMode();
+            console.log(chalk.green(profileResult.message));
+          } else {
+            console.log(chalk.yellow(profileResult.message));
+          }
           break;
         }
         case 'policy': {
@@ -3899,6 +4048,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     await turnQueue;
   }
 
+  // Cancel any pending remote approval requests
+  approvalManager.cancelAll();
+
   const summary = summarizeForSessionEnd(ledger);
   if (runtime.sessionId && !attachedToExistingSession) {
     await pcp
@@ -3945,6 +4097,7 @@ export function registerChatCommand(program: Command): void {
       )
       .option('--poll-seconds <n>', 'Inbox polling interval seconds', '20')
       .option('--tools <mode>', 'Tool mode: backend|off|privileged', 'backend')
+      .option('--profile <name>', 'Apply security profile: minimal|safe|collaborative|full')
       .option('--auto-run', 'Automatically execute backend turns for new inbox task messages')
       .option('--message <text>', 'Single-turn message for non-interactive mode')
       .option('--non-interactive', 'Run one turn and exit (requires --message)')
