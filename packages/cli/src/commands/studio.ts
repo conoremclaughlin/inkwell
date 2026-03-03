@@ -234,6 +234,19 @@ interface InteractiveResult {
   configDirs: string[];
 }
 
+function slugifyStudioNameForBranch(name: string): string {
+  const normalized = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return normalized || 'studio';
+}
+
+function getDefaultStudioMainBranch(agentId: string, studioName: string): string {
+  return `${agentId}/studio/main-${slugifyStudioNameForBranch(studioName)}`;
+}
+
 function isPromptCancelError(err: unknown): boolean {
   if (!err || typeof err !== 'object') return false;
   const maybe = err as { name?: string; message?: string };
@@ -261,7 +274,7 @@ async function runInteractiveFlow(agentId: string, gitRoot: string): Promise<Int
   });
 
   // Step 2: Branch name (derived, editable)
-  const defaultBranch = `${agentId}/studio/main`;
+  const defaultBranch = getDefaultStudioMainBranch(agentId, name);
   const branch = await input({
     message: 'Branch name',
     default: defaultBranch,
@@ -609,7 +622,7 @@ async function createStudio(
   try {
     const gitRoot = findGitRoot();
     const wsPath = getStudioPath(gitRoot, name);
-    const branch = overrides?.branch || options.branch || `${agentId}/studio/main`;
+    const branch = overrides?.branch || options.branch || getDefaultStudioMainBranch(agentId, name);
 
     spinner.text = 'Creating studio...';
     await createStudioInner(name, options, overrides);
@@ -736,7 +749,7 @@ async function createStudioInner(
   const gitRoot = findGitRoot();
   const copySourceRoot = resolveCopySourceRoot(gitRoot, options.copyFrom);
   const wsPath = getStudioPath(gitRoot, name);
-  const branch = overrides?.branch || options.branch || `${agentId}/studio/main`;
+  const branch = overrides?.branch || options.branch || getDefaultStudioMainBranch(agentId, name);
 
   if (existsSync(wsPath)) {
     throw new Error(`Studio already exists at ${wsPath}`);
@@ -1237,6 +1250,8 @@ export {
   listRoleTemplates,
   isValidTemplateName,
   BUILTIN_ROLE_TEMPLATES,
+  getDefaultStudioMainBranch,
+  slugifyStudioNameForBranch,
   getCliLinkTargets,
   shouldWarnMissingCliBinPath,
   planInit,
@@ -1260,7 +1275,10 @@ export function registerStudioCommands(program: Command): void {
     .description('Create a new studio with git worktree')
     .option('-a, --agent <agent>', 'Agent ID for this studio')
     .option('-p, --purpose <desc>', 'Description/purpose of the studio')
-    .option('-br, --branch <branch>', 'Custom branch name (default: <agentId>/studio/main)')
+    .option(
+      '-br, --branch <branch>',
+      'Custom branch name (default: <agentId>/studio/main-<studio-name>)'
+    )
     .option('-b, --backend <name>', 'Primary backend (claude-code, codex, gemini)')
     .option('-t, --template <name>', 'Role template (reviewer, builder, product, or custom)')
     .option('--copy-config', 'Copy config directories into the new studio')
