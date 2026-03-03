@@ -621,6 +621,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
       .mockResolvedValueOnce('env-token')
       .mockResolvedValueOnce('fallback-token');
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const firstResponseTextSpy = vi.fn().mockResolvedValue('unauthorized');
 
     fetchSpy = vi
       .fn()
@@ -628,7 +629,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
         ok: false,
         status: 401,
         headers: new Headers({ 'content-type': 'application/json' }),
-        text: async () => 'unauthorized',
+        text: firstResponseTextSpy,
       })
       .mockResolvedValueOnce(mockJsonResponse(TOOL_RESULT_PAYLOAD));
     vi.stubGlobal('fetch', fetchSpy);
@@ -647,6 +648,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
           (options as { allowEnvToken?: boolean } | undefined)?.allowEnvToken === false
       )
     ).toBe(true);
+    expect(firstResponseTextSpy).toHaveBeenCalledTimes(1);
     expect(consoleSpy).toHaveBeenCalled();
   });
 

@@ -250,6 +250,14 @@ export async function callPcpTool(
 
   // If an injected env token is stale/invalid, retry once using local auth fallback.
   if (response.status === 401 && hasInjectedEnvToken) {
+    // Drain first response body before retrying so the underlying HTTP client
+    // can cleanly release the stream (avoids occasional undici body warnings).
+    try {
+      await response.text();
+    } catch {
+      // Best-effort: failure to read the body should not block retry.
+    }
+
     sbDebugLog('hooks', 'mcp_auth_retry_without_env_token', {
       tool,
       status: 401,
