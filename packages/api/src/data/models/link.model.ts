@@ -1,5 +1,5 @@
 import type { Database } from '../supabase/types';
-import type { Platform } from '@shared/types/common';
+import type { Platform } from '../../types/shared';
 
 export type Link = Database['public']['Tables']['links']['Row'];
 export type LinkInsert = Database['public']['Tables']['links']['Insert'];

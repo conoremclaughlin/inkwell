@@ -14,7 +14,7 @@ import type {
   ChannelPlatform,
   ExtractedContext,
 } from './types';
-import type { Platform } from '@shared/types/common';
+import type { Platform } from '../types/shared';
 
 export class ChannelAdapter {
   private dataComposer: DataComposer;

@@ -1,5 +1,5 @@
 import type { Database } from '../supabase/types';
-import type { ReminderStatus, RecurrenceConfig, Platform } from '@shared/types/common';
+import type { ReminderStatus, RecurrenceConfig, Platform } from '../../types/shared';
 
 export type Reminder = Database['public']['Tables']['reminders']['Row'];
 export type ReminderInsert = Database['public']['Tables']['reminders']['Insert'];

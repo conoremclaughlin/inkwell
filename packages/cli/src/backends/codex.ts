@@ -31,6 +31,10 @@ export class CodexAdapter implements BackendAdapter {
     if (config.backendSessionId) {
       args.push('resume', config.backendSessionId);
     }
+    // NOTE:
+    // Codex does not currently expose a reliable "set session id on first run"
+    // equivalent to Claude's --session-id seeding flow, so we only pass resume
+    // when a backend-native id is already known.
 
     // Passthrough flags
     args.push(...config.passthroughArgs);

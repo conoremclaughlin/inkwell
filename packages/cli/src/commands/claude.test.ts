@@ -4,10 +4,13 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import {
   extractClaudeHistorySessionsForProject,
+  filterUntrackedLocalBackendSessions,
   filterPcpSessionsForContext,
   filterUntrackedLocalClaudeSessions,
+  getCodexLocalSessionsForProject,
   hasBackendSessionOverride,
   resolveCapturedBackendSessionIdFromRuntime,
+  resolveAdoptableLocalBackendSessionId,
   resolveBackendSessionIdForResume,
   resolveBackendSessionSeedId,
   sanitizeBackendExecutionArgs,
@@ -178,6 +181,34 @@ describe('filterUntrackedLocalClaudeSessions', () => {
   });
 });
 
+describe('filterUntrackedLocalBackendSessions', () => {
+  it('excludes local codex sessions already represented by PCP sessions', () => {
+    const local = [
+      {
+        sessionId: 'codex-1',
+        projectPath: '/tmp/project',
+        modified: '2026-02-28T00:00:00.000Z',
+      },
+      {
+        sessionId: 'codex-2',
+        projectPath: '/tmp/project',
+        modified: '2026-02-28T00:00:00.000Z',
+      },
+    ];
+
+    const filtered = filterUntrackedLocalBackendSessions(local, [
+      {
+        id: 'pcp-1',
+        startedAt: '2026-02-28T00:00:00.000Z',
+        backend: 'codex',
+        backendSessionId: 'codex-1',
+      },
+    ]);
+
+    expect(filtered.map((session) => session.sessionId)).toEqual(['codex-2']);
+  });
+});
+
 describe('sanitizeBackendExecutionArgs', () => {
   it('redacts claude system prompt and one-shot prompt text', () => {
     const sanitized = sanitizeBackendExecutionArgs(
@@ -334,6 +365,88 @@ describe('resolveBackendSessionIdForResume', () => {
   });
 });
 
+describe('resolveAdoptableLocalBackendSessionId', () => {
+  it('does not adopt for claude backend', () => {
+    expect(
+      resolveAdoptableLocalBackendSessionId({
+        backend: 'claude',
+        chosen: { id: 'pcp-1', startedAt: '2026-03-02T21:30:14.354Z' },
+        localSessions: [
+          {
+            backend: 'claude',
+            sessionId: 'local-1',
+            projectPath: '/tmp/project',
+            modified: '2026-03-02T21:30:20.000Z',
+          },
+        ],
+      })
+    ).toBeUndefined();
+  });
+
+  it('adopts the single untracked codex local session', () => {
+    expect(
+      resolveAdoptableLocalBackendSessionId({
+        backend: 'codex',
+        chosen: { id: 'pcp-1', startedAt: '2026-03-02T21:30:14.354Z' },
+        localSessions: [
+          {
+            backend: 'codex',
+            sessionId: '019cb076-af49-7471-bd8e-12315a616dca',
+            projectPath: '/tmp/project',
+            modified: '2026-03-02T21:33:22.000Z',
+          },
+        ],
+      })
+    ).toBe('019cb076-af49-7471-bd8e-12315a616dca');
+  });
+
+  it('adopts by start-time proximity when exactly one nearby session exists', () => {
+    expect(
+      resolveAdoptableLocalBackendSessionId({
+        backend: 'gemini',
+        chosen: { id: 'pcp-1', startedAt: '2026-03-02T21:30:14.354Z' },
+        localSessions: [
+          {
+            backend: 'gemini',
+            sessionId: 'gem-nearby',
+            projectPath: '/tmp/project',
+            modified: '2026-03-02T21:31:00.000Z',
+          },
+          {
+            backend: 'gemini',
+            sessionId: 'gem-old',
+            projectPath: '/tmp/project',
+            modified: '2026-03-02T20:00:00.000Z',
+          },
+        ],
+      })
+    ).toBe('gem-nearby');
+  });
+
+  it('does not adopt when multiple nearby sessions exist', () => {
+    expect(
+      resolveAdoptableLocalBackendSessionId({
+        backend: 'codex',
+        chosen: { id: 'pcp-1', startedAt: '2026-03-02T21:30:14.354Z' },
+        localSessions: [
+          {
+            backend: 'codex',
+            sessionId: 'local-1',
+            projectPath: '/tmp/project',
+            modified: '2026-03-02T21:31:00.000Z',
+          },
+          {
+            backend: 'codex',
+            sessionId: 'local-2',
+            projectPath: '/tmp/project',
+            modified: '2026-03-02T21:32:00.000Z',
+          },
+        ],
+      })
+    ).toBeUndefined();
+  });
+});
+
 describe('resolveBackendSessionSeedId', () => {
   it('seeds claude on first run when pcp session is newly created', () => {
     expect(
@@ -441,5 +554,54 @@ describe('extractClaudeHistorySessionsForProject', () => {
     expect(parsed[0].sessionId).toBe('sess-clearpol-1');
     expect(parsed[0].backend).toBe('claude');
     expect(parsed[0].firstPrompt).toBe('Hi Wren');
+  });
+});
+
+describe('getCodexLocalSessionsForProject', () => {
+  it('falls back to codex session jsonl files when sqlite db is unavailable', () => {
+    const tempHome = mkdtempSync(join(tmpdir(), 'codex-jsonl-fallback-'));
+    const projectPath = join(tempHome, 'repo');
+    mkdirSync(projectPath, { recursive: true });
+
+    const codexSessionsDir = join(tempHome, '.codex', 'sessions', '2026', '03', '02');
+    mkdirSync(codexSessionsDir, { recursive: true });
+
+    const matchingSessionId = '019a23ac-e563-7d53-8bf0-5a948546bf29';
+    const nonMatchingSessionId = '019a23b9-b211-7972-b007-012a8bc1d6f2';
+    writeFileSync(
+      join(codexSessionsDir, `rollout-2026-03-02T11-44-41-${matchingSessionId}.jsonl`),
+      `${JSON.stringify({
+        timestamp: '2026-03-02T11:44:41.000Z',
+        type: 'session_meta',
+        payload: {
+          id: matchingSessionId,
+          cwd: projectPath,
+          timestamp: '2026-03-02T11:44:41.000Z',
+        },
+      })}\n`
+    );
+    writeFileSync(
+      join(codexSessionsDir, `rollout-2026-03-02T11-44-41-${nonMatchingSessionId}.jsonl`),
+      `${JSON.stringify({
+        timestamp: '2026-03-02T11:44:41.000Z',
+        type: 'session_meta',
+        payload: {
+          id: nonMatchingSessionId,
+          cwd: join(tempHome, 'other-repo'),
+          timestamp: '2026-03-02T11:44:41.000Z',
+        },
+      })}\n`
+    );
+
+    const originalHome = process.env.HOME;
+    process.env.HOME = tempHome;
+
+    try {
+      const sessions = getCodexLocalSessionsForProject(projectPath, 10);
+      expect(sessions.map((session) => session.sessionId)).toEqual([matchingSessionId]);
+    } finally {
+      process.env.HOME = originalHome;
+      rmSync(tempHome, { recursive: true, force: true });
+    }
   });
 });

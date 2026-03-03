@@ -43,6 +43,8 @@ export interface RequestContextData {
   conversationId?: string;
   /** Request timestamp */
   timestamp: Date;
+  /** Caller profile for MCP access control */
+  callerProfile?: 'agent' | 'runtime';
 }
 
 const asyncLocalStorage = new AsyncLocalStorage<RequestContextData>();

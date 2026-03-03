@@ -31,6 +31,7 @@ import {
   setCurrentRuntimeSession,
   upsertRuntimeSession,
 } from '../session/runtime.js';
+import { sbDebugLog } from '../lib/sb-debug.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -221,6 +222,7 @@ export async function callPcpTool(
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     Accept: 'application/json, text/event-stream',
+    'x-pcp-caller-profile': 'runtime',
   };
 
   // Attach CLI auth token so hooks pass OAuth checks on the MCP server
@@ -439,7 +441,7 @@ async function reconcileBackendSignal(
 ): Promise<{ pcpSessionId?: string; threadKey?: string; backendSessionId?: string }> {
   const detectedBackend = detectBackend(cwd);
   const sessionBackend = normalizeSessionBackend(detectedBackend.name);
-  const backendSessionId = extractBackendSessionId(stdin);
+  const backendSessionId = extractBackendSessionId(stdin, sessionBackend);
   const runtimeLinkId = getRuntimeLinkId();
   if (runtimeLinkId) {
     writeRuntimeFile(cwd, 'runtime-link-id', runtimeLinkId);
@@ -566,22 +568,67 @@ async function updateRuntimeGenerationState(
   }
 }
 
-function extractBackendSessionId(stdin: Record<string, unknown>): string | undefined {
-  const candidates: unknown[] = [
-    stdin.session_id,
-    stdin.sessionId,
-    (stdin.session as Record<string, unknown> | undefined)?.id,
-    (stdin.session as Record<string, unknown> | undefined)?.session_id,
-    (stdin.data as Record<string, unknown> | undefined)?.session_id,
-    (stdin.data as Record<string, unknown> | undefined)?.sessionId,
+export function extractBackendSessionId(
+  stdin: Record<string, unknown>,
+  sessionBackend?: string
+): string | undefined {
+  // Claude hook payload session_id values are not stable conversation IDs.
+  // They can rotate on each run and poison backendSessionId mapping.
+  //
+  // Real-world failure we observed:
+  // 1) fallback repair correctly set backendSessionId to a resumable id
+  // 2) later hook events emitted a new transient UUID
+  // 3) hook reconciliation overwrote backendSessionId with that transient id
+  // 4) next launch failed on --resume <transient-id>
+  //
+  // Therefore hooks MUST NOT source Claude backendSessionId from stdin payloads.
+  // For Claude, backendSessionId should be captured by sb launch path from
+  // explicit "claude --resume <id>" output, not hook stdin fields.
+  if (sessionBackend === 'claude') {
+    sbDebugLog('hooks', 'backend_session_extract_skip', {
+      sessionBackend,
+      reason: 'claude_transient_ids_blocked',
+    });
+    return undefined;
+  }
+
+  const candidates: Array<{ source: string; value: unknown }> = [
+    { source: 'stdin.session_id', value: stdin.session_id },
+    { source: 'stdin.sessionId', value: stdin.sessionId },
+    {
+      source: 'stdin.session.id',
+      value: (stdin.session as Record<string, unknown> | undefined)?.id,
+    },
+    {
+      source: 'stdin.session.session_id',
+      value: (stdin.session as Record<string, unknown> | undefined)?.session_id,
+    },
+    {
+      source: 'stdin.data.session_id',
+      value: (stdin.data as Record<string, unknown> | undefined)?.session_id,
+    },
+    {
+      source: 'stdin.data.sessionId',
+      value: (stdin.data as Record<string, unknown> | undefined)?.sessionId,
+    },
   ];
 
   for (const candidate of candidates) {
-    if (typeof candidate === 'string' && candidate.trim()) {
-      return candidate.trim();
+    if (typeof candidate.value === 'string' && candidate.value.trim()) {
+      const normalized = candidate.value.trim();
+      sbDebugLog('hooks', 'backend_session_extract_success', {
+        sessionBackend: sessionBackend || 'unknown',
+        source: candidate.source,
+        backendSessionId: normalized,
+      });
+      return normalized;
     }
   }
 
+  sbDebugLog('hooks', 'backend_session_extract_none', {
+    sessionBackend: sessionBackend || 'unknown',
+    stdinKeys: Object.keys(stdin),
+  });
   return undefined;
 }
 
@@ -711,8 +758,14 @@ function buildSkillsBlock(skills: Array<Record<string, unknown>> | undefined): s
 // Install / Uninstall / Status
 // ============================================================================
 
-/** Marker used to identify PCP-managed hook entries */
+/** Marker used to identify PCP-managed hook entries (JSON backends) */
 const PCP_MARKER = 'pcp-managed';
+/** Marker used to identify PCP-managed Codex hook block (TOML) */
+const CODEX_HOOKS_START_MARKER = '# pcp-managed:hooks:start';
+const CODEX_HOOKS_END_MARKER = '# pcp-managed:hooks:end';
+// Back-compat with earlier Codex hook marker format.
+const CODEX_LEGACY_HOOKS_START_MARKER = '# pcp-managed';
+const CODEX_LEGACY_HOOKS_END_MARKER = '# end pcp-managed';
 
 /**
  * Resolve absolute path to the `sb` CLI binary from the main worktree's
@@ -736,6 +789,15 @@ function isPcpHookCommand(cmd: string | undefined): boolean {
 }
 
 type InstallResult = 'installed' | 'already-installed' | 'conflict';
+
+function hasCodexPcpHooks(content: string): boolean {
+  if (!content.trim()) return false;
+  return (
+    /session_start\s*=\s*".*sb hooks on-session-start"/.test(content) &&
+    /session_end\s*=\s*".*sb hooks on-stop"/.test(content) &&
+    /user_prompt\s*=\s*".*sb hooks on-prompt"/.test(content)
+  );
+}
 
 function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
   return {
@@ -929,11 +991,11 @@ function installCodex(cwd: string, force: boolean): InstallResult {
     existingContent = readFileSync(configPath, 'utf-8');
   }
 
-  if (existingContent.includes(PCP_MARKER) && !force) {
+  if (hasCodexPcpHooks(existingContent) && !force) {
     return 'already-installed';
   }
 
-  if (existingContent.includes('[hooks]') && !existingContent.includes(PCP_MARKER) && !force) {
+  if (existingContent.includes('[hooks]') && !hasCodexPcpHooks(existingContent) && !force) {
     return 'conflict';
   }
 
@@ -943,12 +1005,12 @@ function installCodex(cwd: string, force: boolean): InstallResult {
   const sbPath = resolveSbBinaryPath(cwd);
   const pcpSection = [
     '',
-    `# ${PCP_MARKER}`,
+    CODEX_HOOKS_START_MARKER,
     '[hooks]',
     `session_start = "${sbPath} hooks on-session-start"`,
     `session_end = "${sbPath} hooks on-stop"`,
     `user_prompt = "${sbPath} hooks on-prompt"`,
-    `# end ${PCP_MARKER}`,
+    CODEX_HOOKS_END_MARKER,
     '',
   ].join('\n');
 
@@ -957,18 +1019,22 @@ function installCodex(cwd: string, force: boolean): InstallResult {
 }
 
 function removePcpTomlSection(content: string): string {
-  const startMarker = `# ${PCP_MARKER}`;
-  const endMarker = `# end ${PCP_MARKER}`;
+  const markerPairs = [
+    [CODEX_HOOKS_START_MARKER, CODEX_HOOKS_END_MARKER],
+    [CODEX_LEGACY_HOOKS_START_MARKER, CODEX_LEGACY_HOOKS_END_MARKER],
+  ] as const;
 
-  const startIdx = content.indexOf(startMarker);
-  if (startIdx === -1) return content;
+  for (const [startMarker, endMarker] of markerPairs) {
+    const startIdx = content.indexOf(startMarker);
+    if (startIdx === -1) continue;
+    const endIdx = content.indexOf(endMarker);
+    if (endIdx === -1) continue;
+    const before = content.substring(0, startIdx);
+    const after = content.substring(endIdx + endMarker.length);
+    return before + after;
+  }
 
-  const endIdx = content.indexOf(endMarker);
-  if (endIdx === -1) return content;
-
-  const before = content.substring(0, startIdx);
-  const after = content.substring(endIdx + endMarker.length);
-  return before + after;
+  return content;
 }
 
 /**
@@ -1098,8 +1164,9 @@ function uninstallFromDir(targetDir: string, backendName?: string): boolean {
     }
     case 'codex': {
       const content = readFileSync(configPath, 'utf-8');
-      if (!content.includes('pcp-managed')) return false;
+      if (!hasCodexPcpHooks(content)) return false;
       const cleaned = removePcpTomlSection(content);
+      if (cleaned === content) return false;
       writeFileSync(configPath, cleaned);
       break;
     }
@@ -1200,7 +1267,7 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
     }
     case 'codex': {
       const content = readFileSync(configPath, 'utf-8');
-      if (content.includes(PCP_MARKER)) {
+      if (hasCodexPcpHooks(content)) {
         hasHooks = true;
         console.log(chalk.green('\n  PCP hooks installed (TOML)'));
         if (content.includes('session_start'))

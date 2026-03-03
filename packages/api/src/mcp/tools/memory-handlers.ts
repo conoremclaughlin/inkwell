@@ -25,6 +25,18 @@ async function safeReadFile(filePath: string): Promise<string | null> {
   }
 }
 
+// Bundled conventions template (fallback when ~/.pcp/shared/CONVENTIONS.md doesn't exist)
+const BUNDLED_CONVENTIONS_PATH = path.resolve(
+  __dirname,
+  '..',
+  '..',
+  '..',
+  '..',
+  'templates',
+  'starters',
+  'conventions.md'
+);
+
 // Enums for validation
 const memorySourceSchema = z.enum([
   'conversation',
@@ -1556,6 +1568,11 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     };
   }
 
+  // Conventions: shared across all agents, loaded from user override or bundled template
+  const conventionsContent = await safeReadFile(
+    path.join(basePath, 'shared', 'CONVENTIONS.md')
+  ).then((content) => content ?? safeReadFile(BUNDLED_CONVENTIONS_PATH));
+
   // Fetch all context in parallel (including timezone and skills)
   const cloudSkillsService = getCloudSkillsService(dataComposer.getClient());
 
@@ -1881,6 +1898,10 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 
             // Reflection status - prompt for periodic self-reflection
             reflectionStatus,
+
+            // PCP conventions — messaging best practices, loaded from
+            // ~/.pcp/shared/CONVENTIONS.md or bundled template fallback
+            conventions: conventionsContent || null,
 
             // User's installed skills (local + cloud merged)
             // Use these to understand what capabilities are available

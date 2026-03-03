@@ -8,12 +8,13 @@
 import { spawn, spawnSync } from 'child_process';
 import chalk from 'chalk';
 import { randomUUID } from 'crypto';
-import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'fs';
+import { type Dirent, existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'fs';
 import { join, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
 import { getBackend, resolveAgentId } from '../backends/index.js';
 import { getValidAccessToken } from '../auth/tokens.js';
 import { callPcpTool, getPcpServerUrl } from '../lib/pcp-mcp.js';
+import { sbDebugLog } from '../lib/sb-debug.js';
 import {
   getCurrentRuntimeSession,
   listRuntimeSessions,
@@ -62,11 +63,56 @@ interface BackendLocalSessionSummary {
   gitBranch?: string;
 }
 
+function toEpochMs(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+export function resolveAdoptableLocalBackendSessionId(options: {
+  backend: string;
+  backendSessionId?: string;
+  selectedLocalBackendSessionId?: string;
+  chosen?: PcpSessionSummary;
+  localSessions: BackendLocalSessionSummary[];
+}): string | undefined {
+  const { backend, backendSessionId, selectedLocalBackendSessionId, chosen, localSessions } =
+    options;
+  if (backend === 'claude') return undefined;
+  if (backendSessionId || selectedLocalBackendSessionId) return undefined;
+  if (!chosen?.id || localSessions.length === 0) return undefined;
+  if (localSessions.length === 1) return localSessions[0].sessionId;
+
+  const startedAtMs = toEpochMs(chosen.startedAt);
+  if (!startedAtMs) return undefined;
+
+  // For Codex/Gemini orphan repair: if exactly one untracked local session is
+  // close to the PCP session start time, adopt it as the backend linkage.
+  const REPAIR_WINDOW_MS = 15 * 60 * 1000;
+  const nearby = localSessions.filter((session) => {
+    const modifiedMs = toEpochMs(session.modified);
+    if (modifiedMs === undefined) return false;
+    return Math.abs(modifiedMs - startedAtMs) <= REPAIR_WINDOW_MS;
+  });
+
+  return nearby.length === 1 ? nearby[0].sessionId : undefined;
+}
+
 interface ClaudeHistoryLine {
   display?: string;
   timestamp?: number;
   project?: string;
   sessionId?: string;
+}
+
+interface CodexSessionMetaLine {
+  timestamp?: string;
+  type?: string;
+  payload?: {
+    id?: string;
+    cwd?: string;
+    timestamp?: string;
+  };
 }
 
 interface BackendExecutionLogContext {
@@ -107,6 +153,13 @@ export function filterUntrackedLocalClaudeSessions<T extends { sessionId: string
   );
 
   return localSessions.filter((session) => !trackedSessionIds.has(session.sessionId));
+}
+
+export function filterUntrackedLocalBackendSessions<T extends { sessionId: string }>(
+  localSessions: T[],
+  activePcpSessions: PcpSessionSummary[]
+): T[] {
+  return filterUntrackedLocalClaudeSessions(localSessions, activePcpSessions);
 }
 
 export function shouldAutoResumeRuntimeSession(
@@ -576,11 +629,28 @@ export function getCodexLocalSessionsForProject(
   cwd = process.cwd(),
   limit = 20
 ): BackendLocalSessionSummary[] {
+  const fallbackToJsonl = (reason: string): BackendLocalSessionSummary[] => {
+    const fallback = getCodexLocalSessionsFromJsonl(cwd, limit);
+    sbDebugLog('backend', 'codex_local_sessions_fallback_jsonl', {
+      cwd,
+      reason,
+      returnedSessions: fallback.length,
+      sessionIds: fallback.map((session) => session.sessionId),
+    });
+    return fallback;
+  };
+
   const codexStateDbPath = join(homedir(), '.codex', 'state_5.sqlite');
-  if (!existsSync(codexStateDbPath)) return [];
+  if (!existsSync(codexStateDbPath)) {
+    sbDebugLog('backend', 'codex_local_sessions_missing_db', { cwd, codexStateDbPath });
+    return fallbackToJsonl('missing_state_db');
+  }
 
   const normalizedCwd = normalizePath(cwd);
-  if (!normalizedCwd) return [];
+  if (!normalizedCwd) {
+    sbDebugLog('backend', 'codex_local_sessions_unresolved_cwd', { cwd });
+    return [];
+  }
 
   const query = `
 SELECT id, cwd, updated_at,
@@ -593,7 +663,16 @@ LIMIT 200;
 `;
 
   const result = spawnSync('sqlite3', ['-tabs', codexStateDbPath, query], { encoding: 'utf-8' });
-  if (result.error || result.status !== 0 || !result.stdout) return [];
+  if (result.error || result.status !== 0 || !result.stdout) {
+    sbDebugLog('backend', 'codex_local_sessions_query_failed', {
+      cwd: normalizedCwd,
+      codexStateDbPath,
+      status: result.status ?? null,
+      error: result.error?.message || null,
+      stderr: result.stderr?.toString()?.slice(-1000) || null,
+    });
+    return fallbackToJsonl('sqlite_query_failed');
+  }
 
   const sessions: BackendLocalSessionSummary[] = [];
   const lines = result.stdout.split('\n').map((line) => line.trim());
@@ -620,12 +699,121 @@ LIMIT 200;
     });
   }
 
-  return sessions.slice(0, limit);
+  const scoped = sessions.slice(0, limit);
+  sbDebugLog('backend', 'codex_local_sessions_loaded', {
+    cwd: normalizedCwd,
+    totalScopedSessions: sessions.length,
+    returnedSessions: scoped.length,
+    sessionIds: scoped.map((session) => session.sessionId),
+  });
+  return scoped.length > 0 ? scoped : fallbackToJsonl('sqlite_query_empty');
+}
+
+function getCodexLocalSessionsFromJsonl(
+  cwd = process.cwd(),
+  limit = 20
+): BackendLocalSessionSummary[] {
+  const codexSessionsDir = join(homedir(), '.codex', 'sessions');
+  if (!existsSync(codexSessionsDir)) return [];
+
+  const normalizedCwd = normalizePath(cwd);
+  if (!normalizedCwd) return [];
+
+  const sessionFiles: Array<{ path: string; modified: string }> = [];
+  const stack: string[] = [codexSessionsDir];
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    if (!dir) continue;
+
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+      try {
+        const stats = statSync(fullPath);
+        sessionFiles.push({ path: fullPath, modified: stats.mtime.toISOString() });
+      } catch {
+        // Ignore unreadable files.
+      }
+    }
+  }
+
+  const maxFilesToInspect = Math.max(limit * 25, 250);
+  const sortedFiles = sessionFiles
+    .sort((a, b) => new Date(b.modified).getTime() - new Date(a.modified).getTime())
+    .slice(0, maxFilesToInspect);
+
+  const sessions: BackendLocalSessionSummary[] = [];
+  for (const sessionFile of sortedFiles) {
+    let content: string;
+    try {
+      content = readFileSync(sessionFile.path, 'utf-8');
+    } catch {
+      continue;
+    }
+
+    let matched: BackendLocalSessionSummary | undefined;
+    const lines = content.split('\n');
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      let parsed: CodexSessionMetaLine;
+      try {
+        parsed = JSON.parse(trimmed) as CodexSessionMetaLine;
+      } catch {
+        continue;
+      }
+
+      if (parsed.type !== 'session_meta') continue;
+      const sessionId = parsed.payload?.id?.trim();
+      const sessionCwd = parsed.payload?.cwd?.trim();
+      if (!sessionId || !sessionCwd) break;
+
+      const normalizedSessionCwd = normalizePath(sessionCwd);
+      if (!normalizedSessionCwd || normalizedSessionCwd !== normalizedCwd) break;
+
+      matched = {
+        backend: 'codex',
+        sessionId,
+        projectPath: sessionCwd,
+        modified: parsed.payload?.timestamp || parsed.timestamp || sessionFile.modified,
+      };
+      break;
+    }
+
+    if (matched) sessions.push(matched);
+  }
+
+  const deduped = new Map<string, BackendLocalSessionSummary>();
+  for (const session of sessions) {
+    const existing = deduped.get(session.sessionId);
+    if (!existing || new Date(session.modified).getTime() > new Date(existing.modified).getTime()) {
+      deduped.set(session.sessionId, session);
+    }
+  }
+
+  return Array.from(deduped.values())
+    .sort((a, b) => new Date(b.modified).getTime() - new Date(a.modified).getTime())
+    .slice(0, limit);
 }
 
 function getGeminiProjectKeysForCwd(cwd = process.cwd()): string[] {
   const normalizedCwd = normalizePath(cwd);
-  if (!normalizedCwd) return [];
+  if (!normalizedCwd) {
+    sbDebugLog('backend', 'gemini_project_keys_unresolved_cwd', { cwd });
+    return [];
+  }
 
   const keys = new Set<string>();
 
@@ -663,7 +851,13 @@ function getGeminiProjectKeysForCwd(cwd = process.cwd()): string[] {
     }
   }
 
-  return Array.from(keys);
+  const resolved = Array.from(keys);
+  sbDebugLog('backend', 'gemini_project_keys_loaded', {
+    cwd: normalizedCwd,
+    keyCount: resolved.length,
+    keys: resolved,
+  });
+  return resolved;
 }
 
 function getGeminiSessionsForProjectKey(projectKey: string): BackendLocalSessionSummary[] {
@@ -721,7 +915,10 @@ export function getGeminiLocalSessionsForProject(
   limit = 20
 ): BackendLocalSessionSummary[] {
   const projectKeys = getGeminiProjectKeysForCwd(cwd);
-  if (projectKeys.length === 0) return [];
+  if (projectKeys.length === 0) {
+    sbDebugLog('backend', 'gemini_local_sessions_no_project_keys', { cwd });
+    return [];
+  }
 
   const sessions = projectKeys.flatMap((projectKey) => getGeminiSessionsForProjectKey(projectKey));
   const deduped = new Map<string, BackendLocalSessionSummary>();
@@ -732,9 +929,17 @@ export function getGeminiLocalSessionsForProject(
     }
   }
 
-  return Array.from(deduped.values())
+  const sorted = Array.from(deduped.values())
     .sort((a, b) => new Date(b.modified).getTime() - new Date(a.modified).getTime())
     .slice(0, limit);
+  sbDebugLog('backend', 'gemini_local_sessions_loaded', {
+    cwd,
+    projectKeyCount: projectKeys.length,
+    dedupedCount: deduped.size,
+    returnedSessions: sorted.length,
+    sessionIds: sorted.map((session) => session.sessionId),
+  });
+  return sorted;
 }
 
 export function getBackendLocalSessionsForProject(
@@ -769,6 +974,59 @@ function printPcpUnavailableWarning(reason: string, cwd = process.cwd()): void {
   console.log(chalk.dim('    sb auth login'));
   console.log(chalk.dim('    sb init'));
   console.log(chalk.dim('    sb status'));
+}
+
+function hasPcpHookCommand(value: unknown): boolean {
+  if (typeof value === 'string') {
+    return value.includes('sb hooks ') || value.includes('commands/hooks.js');
+  }
+  if (Array.isArray(value)) {
+    return value.some((entry) => hasPcpHookCommand(entry));
+  }
+  if (value && typeof value === 'object') {
+    return Object.values(value).some((entry) => hasPcpHookCommand(entry));
+  }
+  return false;
+}
+
+function getHookHealthForBackend(
+  backend: string,
+  cwd = process.cwd()
+): { installed: boolean; configPath: string } {
+  if (backend === 'codex') {
+    const configPath = join(cwd, '.codex', 'config.toml');
+    if (!existsSync(configPath)) return { installed: false, configPath: '.codex/config.toml' };
+    const content = readFileSync(configPath, 'utf-8');
+    const installed =
+      /session_start\s*=\s*".*sb hooks on-session-start"/.test(content) &&
+      /session_end\s*=\s*".*sb hooks on-stop"/.test(content) &&
+      /user_prompt\s*=\s*".*sb hooks on-prompt"/.test(content);
+    return { installed, configPath: '.codex/config.toml' };
+  }
+
+  if (backend === 'gemini') {
+    const configPath = join(cwd, '.gemini', 'settings.json');
+    if (!existsSync(configPath)) return { installed: false, configPath: '.gemini/settings.json' };
+    try {
+      const parsed = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
+      return { installed: hasPcpHookCommand(parsed.hooks), configPath: '.gemini/settings.json' };
+    } catch {
+      return { installed: false, configPath: '.gemini/settings.json' };
+    }
+  }
+
+  const configPath = join(cwd, '.claude', 'settings.local.json');
+  if (!existsSync(configPath))
+    return { installed: false, configPath: '.claude/settings.local.json' };
+  try {
+    const parsed = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
+    return {
+      installed: hasPcpHookCommand(parsed.hooks),
+      configPath: '.claude/settings.local.json',
+    };
+  } catch {
+    return { installed: false, configPath: '.claude/settings.local.json' };
+  }
 }
 
 export function hasBackendSessionOverride(
@@ -1061,10 +1319,22 @@ async function ensurePcpSessionContext(
     printPcpUnavailableWarning(pcpUnavailableReason || 'unknown error', cwd);
   }
 
-  const untrackedLocalBackendSessions =
-    backend === 'claude'
-      ? filterUntrackedLocalClaudeSessions(localBackendSessions, activeSessions)
-      : localBackendSessions;
+  if (process.stdin.isTTY || options.listCandidates) {
+    const hooks = getHookHealthForBackend(backend, cwd);
+    if (!hooks.installed) {
+      console.log(
+        chalk.yellow(
+          `\n⚠ PCP hooks not installed for ${backend} (${hooks.configPath}). Session mapping may be unreliable.`
+        )
+      );
+      console.log(chalk.dim(`  Run: sb hooks install -b ${backend}`));
+    }
+  }
+
+  const untrackedLocalBackendSessions = filterUntrackedLocalBackendSessions(
+    localBackendSessions,
+    activeSessions
+  );
 
   let chosen: PcpSessionSummary | undefined;
   let selectedLocalBackendSessionId: string | undefined;
@@ -1162,10 +1432,10 @@ async function ensurePcpSessionContext(
 
     for (const session of activeSessions) {
       const value = `__pcp__:${session.id}`;
-      const linkedBackendSessionId =
-        backend === 'claude' ? getSessionBackendId(session) : undefined;
+      const linkedBackendSessionId = getSessionBackendId(session);
+      const backendLabel = backend[0].toUpperCase() + backend.slice(1);
       choices.push({
-        name: `Resume PCP ${session.id.slice(0, 8)}${session.threadKey ? ` (${session.threadKey})` : ''}${session.currentPhase ? ` — ${session.currentPhase}` : ''}${linkedBackendSessionId ? ` · tracks Claude ${linkedBackendSessionId.slice(0, 8)}` : ''}`,
+        name: `Resume PCP ${session.id.slice(0, 8)}${session.threadKey ? ` (${session.threadKey})` : ''}${session.currentPhase ? ` — ${session.currentPhase}` : ''}${linkedBackendSessionId ? ` · tracks ${backendLabel} ${linkedBackendSessionId.slice(0, 8)}` : ''}`,
         value,
       });
       sessionChoiceByValue.set(value, session.id);
@@ -1236,10 +1506,18 @@ async function ensurePcpSessionContext(
       localBackendSessionIds,
       knownBackendSessionIds,
     });
+  const adoptedLocalBackendSessionId = resolveAdoptableLocalBackendSessionId({
+    backend,
+    backendSessionId,
+    selectedLocalBackendSessionId,
+    chosen,
+    localSessions: untrackedLocalBackendSessions,
+  });
+  const effectiveBackendSessionId = backendSessionId || adoptedLocalBackendSessionId;
   const backendSessionSeedId = resolveBackendSessionSeedId({
     backend,
     chosenSessionId: chosen.id,
-    backendSessionId,
+    backendSessionId: effectiveBackendSessionId,
     createdNewPcpSession,
   });
 
@@ -1267,7 +1545,7 @@ async function ensurePcpSessionContext(
     ...(identityId ? { identityId } : {}),
     ...(studioId ? { studioId } : {}),
     ...(chosen.threadKey ? { threadKey: chosen.threadKey } : {}),
-    ...(backendSessionId ? { backendSessionId } : {}),
+    ...(effectiveBackendSessionId ? { backendSessionId: effectiveBackendSessionId } : {}),
     startedAt: chosen.startedAt,
   });
   setCurrentRuntimeSession(cwd, chosen.id, backend, {
@@ -1278,8 +1556,8 @@ async function ensurePcpSessionContext(
 
   if (verbose) {
     console.log(chalk.dim(`PCP session: ${chosen.id}`));
-    if (backendSessionId) {
-      console.log(chalk.dim(`Backend session: ${backendSessionId}`));
+    if (effectiveBackendSessionId) {
+      console.log(chalk.dim(`Backend session: ${effectiveBackendSessionId}`));
     }
   }
 
@@ -1289,6 +1567,7 @@ async function ensurePcpSessionContext(
         email,
         agentId,
         sessionId: chosen.id,
+        ...(effectiveBackendSessionId ? { backendSessionId: effectiveBackendSessionId } : {}),
         status: 'active',
         workingDir: cwd,
       });
@@ -1299,7 +1578,7 @@ async function ensurePcpSessionContext(
 
   return {
     pcpSessionId: chosen.id,
-    backendSessionId,
+    backendSessionId: effectiveBackendSessionId,
     ...(backendSessionSeedId ? { backendSessionSeedId } : {}),
     ...(chosen.threadKey ? { threadKey: chosen.threadKey } : {}),
   };
