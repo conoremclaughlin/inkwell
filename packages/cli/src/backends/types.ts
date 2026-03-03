@@ -11,6 +11,7 @@ export interface BackendConfig {
   prompt?: string; // undefined = interactive mode
   promptParts: string[]; // raw positional args (preserves shell word boundaries)
   passthroughArgs: string[];
+  startupContextBlock?: string; // optional injected startup context for backends that support it
   pcpSessionId?: string;
   backendSessionId?: string;
   backendSessionSeedId?: string;

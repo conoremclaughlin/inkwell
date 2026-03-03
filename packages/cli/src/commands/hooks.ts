@@ -22,6 +22,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 import { homedir } from 'os';
+import { createHash } from 'crypto';
 import { resolveAgentId, readIdentityJson, readRoleMd } from '../backends/identity.js';
 import { getValidAccessToken } from '../auth/tokens.js';
 import {
@@ -1807,6 +1808,21 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     SESSIONS_BLOCK: sessionsBlock,
     SKILLS_BLOCK: skillsBlock,
     INBOX_BLOCK: inboxBlock,
+  });
+
+  sbDebugLog('hooks', 'on_session_start_output_emitted', {
+    backend: detectedBackend.name,
+    backendSessionId: backendSessionId || null,
+    pcpSessionId: pcpSessionId || null,
+    threadKey: pcpThreadKey || null,
+    outputBytes: Buffer.byteLength(output, 'utf-8'),
+    outputSha256: createHash('sha256').update(output, 'utf-8').digest('hex'),
+    hasRoleBlock: roleBlock.trim().length > 0,
+    hasIdentityBlock: identityBlock.trim().length > 0,
+    hasMemoriesBlock: memoriesBlock.trim().length > 0,
+    hasSessionsBlock: sessionsBlock.trim().length > 0,
+    hasSkillsBlock: skillsBlock.trim().length > 0,
+    hasInboxBlock: inboxBlock.trim().length > 0,
   });
 
   process.stdout.write(output);
