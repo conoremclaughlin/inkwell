@@ -38,6 +38,11 @@ vi.mock('../repl/skills.js', () => ({
     testState.loadSkillInstructionImpl(skill, maxChars),
 }));
 
+vi.mock('../repl/ink/index.js', () => ({
+  renderInkChat: async () => null,
+  InkExitSignal: class InkExitSignal extends Error {},
+}));
+
 vi.mock('readline/promises', () => ({
   createInterface: () => ({
     question: async () => {
@@ -174,7 +179,10 @@ describe('runChat integration', () => {
     });
 
     expect(testState.runBackendImpl).toHaveBeenCalledTimes(1);
-    const backendRequest = testState.runBackendImpl.mock.calls[0][0] as { prompt: string; backend: string };
+    const backendRequest = testState.runBackendImpl.mock.calls[0][0] as {
+      prompt: string;
+      backend: string;
+    };
     expect(backendRequest.backend).toBe('gemini');
     expect(backendRequest.prompt).toContain('Latest user message:\nheartbeat pulse');
     // Newly created session in non-interactive mode should be ended.
@@ -196,7 +204,9 @@ describe('runChat integration', () => {
     expect(testState.pcpCalls.some((call) => call.tool === 'end_session')).toBe(false);
 
     const transcriptDir = join(testCwd, '.pcp', 'runtime', 'repl');
-    const transcriptFiles = readdirSync(transcriptDir).filter((entry) => entry.includes('sess-attach-1'));
+    const transcriptFiles = readdirSync(transcriptDir).filter((entry) =>
+      entry.includes('sess-attach-1')
+    );
     expect(transcriptFiles.length).toBeGreaterThan(0);
     const transcript = readFileSync(join(transcriptDir, transcriptFiles[0]!), 'utf-8');
     expect(transcript).toContain('"type":"session_attach"');
@@ -210,8 +220,16 @@ describe('runChat integration', () => {
     writeFileSync(
       transcriptPath,
       [
-        JSON.stringify({ ts: '2026-02-25T07:00:00.000Z', type: 'user', content: 'old user message' }),
-        JSON.stringify({ ts: '2026-02-25T07:00:01.000Z', type: 'assistant', content: 'old assistant reply' }),
+        JSON.stringify({
+          ts: '2026-02-25T07:00:00.000Z',
+          type: 'user',
+          content: 'old user message',
+        }),
+        JSON.stringify({
+          ts: '2026-02-25T07:00:01.000Z',
+          type: 'assistant',
+          content: 'old assistant reply',
+        }),
       ].join('\n') + '\n'
     );
 
@@ -326,6 +344,83 @@ describe('runChat integration', () => {
     const sessionStatusLine = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(sessionStatusLine).toContain('sess-b222');
     expect(sessionStatusLine).toContain('Thread: spec:cli-session-hooks');
+  });
+
+  it('renders latest transcript message previews in attach picker', async () => {
+    testState.callToolImpl.mockImplementation(async (tool: string) => {
+      switch (tool) {
+        case 'bootstrap':
+          return { user: { timezone: 'America/Los_Angeles' } };
+        case 'list_sessions':
+          return {
+            sessions: [
+              {
+                id: 'sess-a111',
+                agentId: 'lumen',
+                status: 'active',
+                currentPhase: 'implementing',
+                threadKey: 'pr:61',
+                studioId: 'aaaaaaaa-bbbb-cccc-dddd-111111111111',
+                studioName: 'main',
+                startedAt: '2026-03-03T18:00:00.000Z',
+              },
+              {
+                id: 'sess-b222',
+                agentId: 'lumen',
+                status: 'active',
+                currentPhase: 'reviewing',
+                threadKey: 'spec:cli-session-hooks',
+                studioId: 'bbbbbbbb-cccc-dddd-eeee-222222222222',
+                studioName: 'review',
+                startedAt: '2026-03-03T19:00:00.000Z',
+              },
+            ],
+          };
+        case 'get_inbox':
+          return { messages: [] };
+        default:
+          return { success: true };
+      }
+    });
+
+    const replDir = join(testCwd, '.pcp', 'runtime', 'repl');
+    mkdirSync(replDir, { recursive: true });
+    writeFileSync(
+      join(replDir, 'sess-a111-1111111111111.jsonl'),
+      [
+        JSON.stringify({
+          ts: '2026-03-03T18:01:00.000Z',
+          type: 'user',
+          content: 'Testing attach previews with the latest message from me',
+        }),
+      ].join('\n') + '\n'
+    );
+    writeFileSync(
+      join(replDir, 'sess-b222-2222222222222.jsonl'),
+      [
+        JSON.stringify({
+          ts: '2026-03-03T19:02:00.000Z',
+          type: 'assistant',
+          content: 'Latest assistant response appears as a preview in the picker',
+        }),
+      ].join('\n') + '\n'
+    );
+
+    testState.inputs = ['1', '/quit'];
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      attach: true,
+      pollSeconds: '999',
+    });
+
+    const sessionStatusLine = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    expect(sessionStatusLine).toContain(
+      '↳ you: Testing attach previews with the latest message from me'
+    );
+    expect(sessionStatusLine).toContain(
+      '↳ lumen: Latest assistant response appears as a preview in the picker'
+    );
   });
 
   it('supports attach-latest without prompting', async () => {
@@ -576,7 +671,9 @@ describe('runChat integration', () => {
       const logText = stripAnsi(logSpy.mock.calls.slice(before).flat().join('\n'));
       expect(logText, `visibility=${row.visibility}`).toContain(row.expectedSession);
       if (row.expectsAutoAttach) {
-        expect(logText, `visibility=${row.visibility}`).toContain('Auto-attached to latest session');
+        expect(logText, `visibility=${row.visibility}`).toContain(
+          'Auto-attached to latest session'
+        );
       } else {
         expect(logText, `visibility=${row.visibility}`).not.toContain(
           'Auto-attached to latest session'
@@ -919,7 +1016,9 @@ describe('runChat integration', () => {
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('Skill trust mode set to trusted-only');
     expect(logText).toContain('1 skills hidden by trust policy mode');
-    expect(logText).toContain('Skill blocked by trust policy (local); set /skill-trust all to allow.');
+    expect(logText).toContain(
+      'Skill blocked by trust policy (local); set /skill-trust all to allow.'
+    );
   });
 
   it('renders backend token usage when available', async () => {
@@ -948,7 +1047,9 @@ describe('runChat integration', () => {
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('claude usage (json): in 1,200 · out 400 · total 1,600');
-    expect(logText).toContain('Last backend usage: claude usage (json): in 1,200 · out 400 · total 1,600');
+    expect(logText).toContain(
+      'Last backend usage: claude usage (json): in 1,200 · out 400 · total 1,600'
+    );
   });
 
   it('shows capabilities snapshot including MCP servers and policy', async () => {
@@ -1073,7 +1174,9 @@ describe('runChat integration', () => {
     expect(logText).toContain('Mutation scope set to global.');
     expect(logText).toContain('Persistently allowed send_to_inbox');
     expect(logText).toContain('Mutation scope: global');
-    expect(logText).toContain('Active scopes: global -> workspace:studio-test -> agent:lumen -> studio:studio-test');
+    expect(logText).toContain(
+      'Active scopes: global -> workspace:studio-test -> agent:lumen -> studio:studio-test'
+    );
   });
 
   it('supports /session-visibility and /policy-reset controls', async () => {
@@ -1099,7 +1202,12 @@ describe('runChat integration', () => {
   });
 
   it('passes effective backend allowlist to backend runner in backend routing mode', async () => {
-    testState.inputs = ['/policy-scope global', '/allow send_to_inbox', 'run backend allowlist', '/quit'];
+    testState.inputs = [
+      '/policy-scope global',
+      '/allow send_to_inbox',
+      'run backend allowlist',
+      '/quit',
+    ];
 
     await runChat({
       agent: 'lumen',
@@ -1141,21 +1249,23 @@ describe('runChat integration', () => {
       durationMs: 5,
       command: 'mock',
     });
-    testState.callToolImpl.mockImplementation(async (tool: string, args?: Record<string, unknown>) => {
-      switch (tool) {
-        case 'bootstrap':
-          return { user: { timezone: 'America/Los_Angeles' } };
-        case 'start_session':
-          return { session: { id: 'sess-1' } };
-        case 'get_inbox':
-          return { messages: [], echo: args || {} };
-        case 'update_session_phase':
-        case 'end_session':
-          return { success: true };
-        default:
-          return { success: true };
+    testState.callToolImpl.mockImplementation(
+      async (tool: string, args?: Record<string, unknown>) => {
+        switch (tool) {
+          case 'bootstrap':
+            return { user: { timezone: 'America/Los_Angeles' } };
+          case 'start_session':
+            return { session: { id: 'sess-1' } };
+          case 'get_inbox':
+            return { messages: [], echo: args || {} };
+          case 'update_session_phase':
+          case 'end_session':
+            return { success: true };
+          default:
+            return { success: true };
+        }
       }
-    });
+    );
 
     testState.inputs = ['run local tool routing', '/quit'];
     await runChat({

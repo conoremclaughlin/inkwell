@@ -167,6 +167,8 @@ interface SessionTranscriptMetadata {
   assistantCount: number;
   inboxCount: number;
   lastMessageAt?: string;
+  lastMessageRole?: 'user' | 'assistant' | 'inbox';
+  lastMessagePreview?: string;
 }
 
 interface HistoryHydrationResult {
@@ -297,22 +299,59 @@ function getSessionTranscriptMetadata(sessionId: string): SessionTranscriptMetad
   let assistantCount = 0;
   let inboxCount = 0;
   let lastMessageAt: string | undefined;
+  let lastMessageRole: SessionTranscriptMetadata['lastMessageRole'];
+  let lastMessagePreview: string | undefined;
+
+  const compactSessionMessagePreview = (raw: string): string => {
+    const singleLine = raw.replace(/\s+/g, ' ').trim();
+    if (!singleLine) return '';
+    const maxChars = 120;
+    if (singleLine.length <= maxChars) return singleLine;
+    return `${singleLine.slice(0, Math.max(1, maxChars - 1))}…`;
+  };
+
+  const recordLastMessage = (
+    role: 'user' | 'assistant' | 'inbox',
+    content: string | undefined,
+    ts?: string
+  ) => {
+    if (ts) lastMessageAt = ts;
+    lastMessageRole = role;
+    const compacted = content ? compactSessionMessagePreview(content) : '';
+    lastMessagePreview = compacted || undefined;
+  };
 
   for (const event of events) {
     const type = typeof event.type === 'string' ? event.type : '';
     if (type === 'user') {
       userCount += 1;
-      if (typeof event.ts === 'string') lastMessageAt = event.ts;
+      recordLastMessage(
+        'user',
+        typeof event.content === 'string' ? event.content : undefined,
+        typeof event.ts === 'string' ? event.ts : undefined
+      );
       continue;
     }
     if (type === 'assistant') {
       assistantCount += 1;
-      if (typeof event.ts === 'string') lastMessageAt = event.ts;
+      recordLastMessage(
+        'assistant',
+        typeof event.content === 'string' ? event.content : undefined,
+        typeof event.ts === 'string' ? event.ts : undefined
+      );
       continue;
     }
     if (type === 'inbox') {
       inboxCount += 1;
-      if (typeof event.ts === 'string') lastMessageAt = event.ts;
+      recordLastMessage(
+        'inbox',
+        typeof event.rendered === 'string'
+          ? event.rendered
+          : typeof event.content === 'string'
+            ? event.content
+            : undefined,
+        typeof event.ts === 'string' ? event.ts : undefined
+      );
     }
   }
 
@@ -324,6 +363,8 @@ function getSessionTranscriptMetadata(sessionId: string): SessionTranscriptMetad
     assistantCount,
     inboxCount,
     lastMessageAt,
+    lastMessageRole,
+    lastMessagePreview,
   };
 }
 
@@ -1058,6 +1099,20 @@ function sessionHistoryLabel(meta: SessionTranscriptMetadata | null): string {
   return `${meta.messageCount} msgs`;
 }
 
+function sessionLatestMessagePreview(
+  session: Pick<SessionSummary, 'agentId'>,
+  meta: SessionTranscriptMetadata | null
+): string | null {
+  if (!meta?.lastMessagePreview) return null;
+  const speaker =
+    meta.lastMessageRole === 'assistant'
+      ? session.agentId || 'assistant'
+      : meta.lastMessageRole === 'inbox'
+        ? 'inbox'
+        : 'you';
+  return `${speaker}: ${meta.lastMessagePreview}`;
+}
+
 function chip(label: string, value: string, color: (text: string) => string): string {
   return `${chalk.dim(`${label}:`)} ${color(value)}`;
 }
@@ -1310,6 +1365,7 @@ async function pickSessionToAttach(
     const transcriptMeta = getSessionTranscriptMetadata(session.id);
     const historyMeta = sessionHistoryLabel(transcriptMeta);
     const lastMsg = formatTimestampForSessionList(transcriptMeta?.lastMessageAt, options?.timezone);
+    const preview = sessionLatestMessagePreview(session, transcriptMeta);
     const studioName = session.studioName || session.workspaceName;
     const thread = session.threadKey || '';
 
@@ -1325,6 +1381,9 @@ async function pickSessionToAttach(
     console.log(
       `  ${chalk.white(`${num}.`)} ${chalk.cyan(session.id.slice(0, 8))}  ${chalk.dim(parts.join('  ·  '))}`
     );
+    if (preview) {
+      console.log(chalk.dim(`      ↳ ${preview}`));
+    }
   }
   console.log('');
 
