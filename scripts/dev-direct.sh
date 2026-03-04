@@ -66,7 +66,7 @@ echo "  API_URL=${API_URL}"
   ENABLE_TELEGRAM="${ENABLE_TELEGRAM}" \
   ENABLE_WHATSAPP="${ENABLE_WHATSAPP:-false}" \
   ENABLE_DISCORD="${ENABLE_DISCORD:-false}" \
-  yarn --cwd "${ROOT_DIR}" workspace @personal-context/api server
+  yarn --cwd "${ROOT_DIR}" workspace @personal-context/api server:dev
 ) &
 API_PID=$!
 
