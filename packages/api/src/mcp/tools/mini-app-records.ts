@@ -1117,5 +1117,5 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
     }
   );
 
-  logger.info('Mini-app record tools registered');
+  logger.debug('Mini-app record tools registered');
 }

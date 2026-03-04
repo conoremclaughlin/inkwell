@@ -176,7 +176,7 @@ export function registerMiniAppTools(
         }
       );
 
-      logger.info(`Registered tool: ${toolName}`);
+      logger.debug(`Registered tool: ${toolName}`);
     }
   }
 }
