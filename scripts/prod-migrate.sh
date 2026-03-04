@@ -11,9 +11,18 @@ if ! command -v supabase >/dev/null 2>&1; then
 fi
 
 echo "[prod-migrate] Checking linked migration status..."
-if node "${ROOT_DIR}/scripts/migration-status.mjs" --workdir "${ROOT_DIR}" >/dev/null 2>&1; then
+set +e
+node "${ROOT_DIR}/scripts/migration-status.mjs" --workdir "${ROOT_DIR}"
+status_code=$?
+set -e
+
+if [[ "${status_code}" -eq 0 ]]; then
   echo "[prod-migrate] No pending linked migrations."
   exit 0
+fi
+
+if [[ "${status_code}" -ne 10 ]]; then
+  echo "[prod-migrate] Migration status check returned ${status_code}; proceeding with best-effort apply."
 fi
 
 echo "[prod-migrate] Applying linked migrations (supabase db push)..."

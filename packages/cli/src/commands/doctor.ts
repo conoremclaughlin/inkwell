@@ -238,6 +238,19 @@ function parseMigrationStatus(raw: string): MigrationStatusResult | null {
   }
 }
 
+function formatPendingMigrationCheck(parsed: MigrationStatusResult): DoctorCheck {
+  const pendingCount = parsed.pendingCount || parsed.pending?.length || 0;
+  const pendingList = (parsed.pending || []).slice(0, 5).join(', ');
+  return {
+    name: 'Linked migrations',
+    status: 'warn',
+    detail:
+      `${pendingCount} pending linked migration(s).` +
+      `${pendingList ? `\n      pending: ${pendingList}` : ''}\n` +
+      `      run: yarn prod:migrate (or one-shot: yarn prod:up)`,
+  };
+}
+
 function buildMigrationHealthCheck(
   fsOps: Pick<DoctorFs, 'existsSync'> = defaultFs
 ): DoctorCheck | null {
@@ -266,15 +279,7 @@ function buildMigrationHealthCheck(
         : '';
     const parsed = parseMigrationStatus(stdout);
     if (parsed?.state === 'pending') {
-      const pendingList = (parsed.pending || []).slice(0, 5).join(', ');
-      return {
-        name: 'Linked migrations',
-        status: 'warn',
-        detail:
-          `${parsed.pendingCount || parsed.pending?.length || 0} pending linked migration(s).` +
-          `${pendingList ? `\n      pending: ${pendingList}` : ''}\n` +
-          `      run: yarn prod:migrate (or one-shot: yarn prod:up)`,
-      };
+      return formatPendingMigrationCheck(parsed);
     }
 
     const reason = parsed?.reason || String(error);
@@ -295,15 +300,7 @@ function buildMigrationHealthCheck(
   }
 
   if (parsed.state === 'pending') {
-    const pendingList = (parsed.pending || []).slice(0, 5).join(', ');
-    return {
-      name: 'Linked migrations',
-      status: 'warn',
-      detail:
-        `${parsed.pendingCount || parsed.pending?.length || 0} pending linked migration(s).` +
-        `${pendingList ? `\n      pending: ${pendingList}` : ''}\n` +
-        `      run: yarn prod:migrate (or one-shot: yarn prod:up)`,
-    };
+    return formatPendingMigrationCheck(parsed);
   }
 
   if (parsed.state === 'clean') {
