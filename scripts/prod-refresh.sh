@@ -11,7 +11,8 @@ echo "[prod-refresh] Building all packages..."
 yarn build
 
 echo "[prod-refresh] ✅ Build complete."
-echo "[prod-refresh] Restart your running server process to pick up the latest code."
-echo "[prod-refresh] - PM2 mode: yarn restart"
-echo "[prod-refresh] - Direct mode: stop/re-run yarn prod:direct"
-
+echo "[prod-refresh] Next steps:"
+echo "[prod-refresh] - Apply linked DB migrations: yarn prod:migrate"
+echo "[prod-refresh] - Start direct mode: yarn prod:direct"
+echo "[prod-refresh] - One-shot all-in-one flow: yarn prod:up"
+echo "[prod-refresh] - PM2 mode restart: yarn restart"
