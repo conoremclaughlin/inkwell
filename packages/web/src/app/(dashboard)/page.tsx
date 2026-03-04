@@ -2,16 +2,7 @@
 
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import {
-  MessageSquare,
-  Users,
-  UsersRound,
-  Key,
-  GitBranch,
-  ArrowRight,
-  Monitor,
-  FolderGit2,
-} from 'lucide-react';
+import { MessageSquare, GitBranch, ArrowRight, Monitor, FolderGit2 } from 'lucide-react';
 import Link from 'next/link';
 import { useApiQuery } from '@/lib/api';
 import clsx from 'clsx';
@@ -149,22 +140,10 @@ const quickLinks = [
     icon: MessageSquare,
   },
   {
-    name: 'Trusted Users',
-    description: 'Add or remove trusted users',
-    href: '/trusted-users',
-    icon: Users,
-  },
-  {
-    name: 'Groups',
-    description: 'View and manage authorized groups',
-    href: '/groups',
-    icon: UsersRound,
-  },
-  {
-    name: 'Challenge Codes',
-    description: 'Generate group authorization codes',
-    href: '/challenge-codes',
-    icon: Key,
+    name: 'Messaging',
+    description: 'Manage trusted users, groups & codes',
+    href: '/messaging',
+    icon: MessageSquare,
   },
 ];
 
@@ -324,7 +303,7 @@ export default function DashboardPage() {
       </div>
 
       {/* Quick Links */}
-      <div className="mt-8 grid gap-6 sm:grid-cols-2 lg:grid-cols-5">
+      <div className="mt-8 grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
         {quickLinks.map((item) => (
           <Link key={item.name} href={item.href}>
             <Card className="hover:shadow-lg transition-shadow cursor-pointer h-full">
