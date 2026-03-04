@@ -14,6 +14,7 @@
     "prod:refresh": "./scripts/prod-refresh.sh",
     "prod:migrate": "./scripts/prod-migrate.sh",
     "prod:up": "./scripts/prod-up.sh",
+    "prod": "yarn prod:up",
     "dev:mcp": "yarn workspace @personal-context/api dev:mcp",
     "dev:myra:deprecated": "echo 'DEPRECATED: Myra is now triggered via heartbeat reminders through the PCP server. Use yarn dev instead.'",
     "dev:web": "yarn workspace @personal-context/web dev",

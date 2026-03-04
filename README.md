@@ -185,6 +185,7 @@ yarn dev:direct            # Start API+web directly (no pm2, dev mode)
 yarn prod:refresh          # Install + build latest code after pull
 yarn prod:migrate          # Apply pending linked Supabase migrations
 yarn prod:direct           # Run API+web directly in production mode (no pm2)
+yarn prod                  # Alias for prod:up (fast path)
 yarn prod:up               # One-shot: refresh build + migrate + start direct prod
 yarn build                 # Build all packages
 yarn type-check            # Type check all packages
@@ -214,7 +215,8 @@ yarn prod:migrate
 yarn prod:direct
 
 # Or one-shot:
-yarn prod:up
+yarn prod
+# (same as: yarn prod:up)
 ```
 
 Notes:
