@@ -371,7 +371,7 @@ describe('handleSendToInbox - threadKey', () => {
     );
   });
 
-  it('should not trigger by default for message type', async () => {
+  it('should trigger by default for message type (all types trigger by default)', async () => {
     const { getAgentGateway } = await import('../../channels/agent-gateway.js');
     const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
 
@@ -390,8 +390,12 @@ describe('handleSendToInbox - threadKey', () => {
     );
 
     const parsed = JSON.parse(result.content[0].text);
-    expect(parsed.trigger.triggered).toBe(false);
-    expect(mockGateway.dispatchTrigger).not.toHaveBeenCalled();
+    expect(parsed.trigger.triggered).toBe(true);
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toAgentId: 'lumen',
+      })
+    );
   });
 
   it('should deliver actionable handoff without anchor and return routing hint', async () => {

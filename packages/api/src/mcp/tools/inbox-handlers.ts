@@ -62,7 +62,7 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .boolean()
     .optional()
     .describe(
-      'If true, automatically trigger the recipient agent after sending. Defaults to true for task_request, session_resume, notification, and permission_grant; false for message.'
+      'Whether to trigger (wake) the recipient agent after sending. Defaults to true for ALL message types. Only set to false if the message can genuinely wait 5+ hours for the next heartbeat cycle. Most agents do not have heartbeats — untriggered messages may never be seen.'
     ),
   triggerType: z
     .enum(['task_complete', 'approval_needed', 'message', 'error', 'custom'])
@@ -132,13 +132,10 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   const effectiveRecipientSessionId = recipientSessionId;
 
   // Default trigger behavior:
-  // Wake recipient by default for actionable handoffs, but not for casual messages.
-  const shouldTriggerByDefault =
-    messageType === 'task_request' ||
-    messageType === 'session_resume' ||
-    messageType === 'notification' ||
-    messageType === 'permission_grant';
-  const trigger = parsed.trigger ?? shouldTriggerByDefault;
+  // All message types trigger by default. Most agents don't have heartbeats,
+  // so untriggered messages may sit unread for hours. Only set trigger=false
+  // for messages that can genuinely wait 5+ hours.
+  const trigger = parsed.trigger ?? true;
 
   const hasRoutingAnchor = Boolean(
     threadKey || effectiveRecipientSessionId || recipientStudioId || recipientStudioHint
@@ -558,7 +555,7 @@ export const inboxToolDefinitions = [
   {
     name: 'send_to_inbox',
     description:
-      "Send a message to another agent's inbox. Use for cross-agent communication, task handoff, or session resume requests.\n\nMessage types:\n- message: General communication\n- task_request: Request another agent to do work\n- session_resume: Request agent to resume a specific session\n- notification: FYI, no response needed\n- permission_grant: Grant or revoke tool permissions for recipient (include permissionGrant in metadata)\n\nReply conventions:\n- When replying to a task_request, send a task_request back on the SAME threadKey to signal completion\n- Use notification only for FYI messages that require no action from the recipient\n- Always include a threadKey (format: <type>:<id>, e.g. pr:127, spec:v0.1)\n\nTrigger defaults:\n- task_request / session_resume / notification / permission_grant: wake recipient by default\n- message: no automatic wake by default\n- override with `trigger` boolean\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId",
+      "Send a message to another agent's inbox. Use for cross-agent communication, task handoff, or session resume requests.\n\nMessage types:\n- message: General communication (triggers recipient by default)\n- task_request: Request another agent to do work (triggers recipient by default)\n- session_resume: Request agent to resume a specific session (triggers recipient by default)\n- notification: FYI, no response needed (triggers recipient by default)\n- permission_grant: Grant or revoke tool permissions for recipient (triggers recipient by default)\n\nIMPORTANT — Trigger behavior:\nAll message types trigger the recipient by default. This is intentional: most agents don't have heartbeats, so untriggered messages may sit unread for hours. Do NOT set `trigger: false` unless the message can genuinely wait 5+ hours for the next heartbeat cycle. Let the message type speak for itself — you almost never need to set `trigger` explicitly.\n\nReply conventions:\n- When replying to a task_request, send a task_request back on the SAME threadKey to signal completion\n- Use notification only for FYI messages that require no action from the recipient\n- Always include a threadKey (format: <type>:<id>, e.g. pr:127, spec:v0.1)\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId",
     schema: sendToInboxSchema,
     handler: handleSendToInbox,
   },
