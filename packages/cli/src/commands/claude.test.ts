@@ -759,9 +759,11 @@ describe('getClaudeLocalSessionsForProject previews', () => {
     mkdirSync(projectDir, { recursive: true });
 
     const sessionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const hugePrefix = 'x'.repeat(400_000);
     writeFileSync(
       join(projectDir, `${sessionId}.jsonl`),
       [
+        hugePrefix,
         JSON.stringify({
           type: 'user',
           sessionId,
