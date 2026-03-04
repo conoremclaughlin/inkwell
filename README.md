@@ -182,6 +182,10 @@ See [AGENTS.md](./AGENTS.md) for onboarding instructions.
 ```bash
 yarn dev                   # Start all services (pm2)
 yarn dev:direct            # Start API+web directly (no pm2, dev mode)
+yarn local:status          # Show local migration status explicitly
+yarn linked:status         # Show linked (remote) migration status explicitly
+yarn local:migrate         # Apply local migrations explicitly
+yarn linked:migrate        # Apply linked (remote) migrations explicitly
 yarn prod:refresh          # Install + build latest code after pull
 yarn prod:migrate          # Apply pending migrations (auto local/linked via .env.local SUPABASE_URL)
 yarn prod:direct           # Run API+web directly in production mode (no pm2)
@@ -226,6 +230,9 @@ Notes:
   - `local` when `SUPABASE_URL` (or `LOCAL_SUPABASE_URL`) points to localhost/127.0.0.1/::1
   - otherwise `linked`
   - source precedence: process env → `.env.local` → `.env`
+- You can override auto mode explicitly:
+  - `yarn local:status` / `yarn local:migrate`
+  - `yarn linked:status` / `yarn linked:migrate`
 - `yarn prod:direct` now warns if migrations appear pending for the resolved target.
 - `yarn dev` / `yarn dev:direct` also run the same migration-status warning check before starting.
 - To run API only (no dashboard process): `PCP_RUN_WEB=false yarn prod:direct`
