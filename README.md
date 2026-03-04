@@ -227,6 +227,7 @@ Notes:
 
 - `yarn prod:direct` does **not rebuild** on start; it uses existing build artifacts.
 - `yarn prod:migrate` / `migration-status` auto-select target:
+  - explicit override: `PCP_MIGRATION_TARGET=local|linked`
   - `local` when `SUPABASE_URL` (or `LOCAL_SUPABASE_URL`) points to localhost/127.0.0.1/::1
   - otherwise `linked`
   - source precedence: process env → `.env.local` → `.env`

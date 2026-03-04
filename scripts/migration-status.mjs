@@ -99,6 +99,11 @@ function isLocalSupabaseUrl(value) {
 function resolveTarget(args) {
   if (args.target === 'local' || args.target === 'linked') return args.target;
 
+  const override = String(process.env.PCP_MIGRATION_TARGET || '')
+    .trim()
+    .toLowerCase();
+  if (override === 'local' || override === 'linked') return override;
+
   const envLocal = parseEnvFile(resolvePath(args.workdir, '.env.local'));
   const envFallback = parseEnvFile(resolvePath(args.workdir, '.env'));
 
