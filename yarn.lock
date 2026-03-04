@@ -2118,6 +2118,12 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@personal-context/spec@workspace:packages/spec":
+  version: 0.0.0-use.local
+  resolution: "@personal-context/spec@workspace:packages/spec"
+  languageName: unknown
+  linkType: soft
+
 "@personal-context/templates@workspace:packages/templates":
   version: 0.0.0-use.local
   resolution: "@personal-context/templates@workspace:packages/templates"

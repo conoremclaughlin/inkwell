@@ -120,7 +120,37 @@ export async function callPcpTool<T = Record<string, unknown>>(
     throw new Error(`PCP tool error (${err.code}): ${err.message}`);
   }
 
-  const result = payload.result as { content?: Array<{ text?: string }> } | undefined;
+  const result = payload.result as
+    | { content?: Array<{ text?: string }>; isError?: boolean }
+    | undefined;
+  if (result?.isError) {
+    const rawText = result.content
+      ?.map((entry) => (typeof entry?.text === 'string' ? entry.text : ''))
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+
+    let message = rawText || 'Unknown MCP tool error';
+    if (rawText) {
+      try {
+        const parsed = JSON.parse(rawText) as { error?: string; message?: string };
+        if (typeof parsed.error === 'string' && parsed.error.trim()) {
+          message = parsed.error.trim();
+        } else if (typeof parsed.message === 'string' && parsed.message.trim()) {
+          message = parsed.message.trim();
+        }
+      } catch {
+        // Keep raw text message.
+      }
+    }
+
+    sbDebugLog('pcp-mcp', 'call_result_error', {
+      tool,
+      message,
+    });
+    throw new Error(`PCP tool error: ${message}`);
+  }
+
   const mcpText = result?.content?.[0]?.text;
 
   if (typeof mcpText === 'string') {

@@ -312,7 +312,33 @@ export async function callPcpTool(
   }
 
   // Unwrap JSON-RPC result → MCP tool response → content text
-  const result = payload.result as { content?: Array<{ text?: string }> } | undefined;
+  const result = payload.result as
+    | { content?: Array<{ text?: string }>; isError?: boolean }
+    | undefined;
+  if (result?.isError) {
+    const rawText = result.content
+      ?.map((entry) => (typeof entry?.text === 'string' ? entry.text : ''))
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+
+    let message = rawText || 'Unknown MCP tool error';
+    if (rawText) {
+      try {
+        const parsed = JSON.parse(rawText) as { error?: string; message?: string };
+        if (typeof parsed.error === 'string' && parsed.error.trim()) {
+          message = parsed.error.trim();
+        } else if (typeof parsed.message === 'string' && parsed.message.trim()) {
+          message = parsed.message.trim();
+        }
+      } catch {
+        // Keep raw text as best-effort error.
+      }
+    }
+
+    throw new Error(`PCP tool error: ${message}`);
+  }
+
   const mcpText = result?.content?.[0]?.text;
 
   if (typeof mcpText === 'string') {

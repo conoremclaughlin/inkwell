@@ -179,14 +179,18 @@ echo "explain this" | sb        # Pipe input as prompt
 
 ### SB Options
 
-| Flag                   | Description              | Default                                |
-| ---------------------- | ------------------------ | -------------------------------------- |
-| `-a, --agent <id>`     | Agent identity           | from `.pcp/identity.json`              |
-| `-b, --backend <name>` | AI backend               | from `.pcp/identity.json`, or `claude` |
-| `--no-session`         | Disable session tracking | enabled                                |
-| `--sb-verbose`         | Show SB verbose output   | off                                    |
+| Flag                        | Description                                              | Default                                |
+| --------------------------- | -------------------------------------------------------- | -------------------------------------- |
+| `-a, --agent <id>`          | Agent identity                                           | from `.pcp/identity.json`              |
+| `-b, --backend <name>`      | AI backend                                               | from `.pcp/identity.json`, or `claude` |
+| `--no-session`              | Disable session tracking                                 | enabled                                |
+| `--sb-verbose`              | Show SB verbose output                                   | off                                    |
+| `--session-candidates`      | Print picker candidates and exit                         | off                                    |
+| `--session-candidates-json` | Print picker candidates as JSON and exit (testing/debug) | off                                    |
 
 Any flag not listed above is forwarded to the backend.
+
+Testing and regression workflows for session-candidate resolution live in [`packages/cli/TESTS.md`](./TESTS.md).
 
 ### Quick reference
 

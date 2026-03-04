@@ -58,6 +58,11 @@ describe('extractArgs', () => {
     expect(result.sbOptions.sessionChoice).toBe('pcp:e03f522a');
   });
 
+  it('parses JSON session candidate flag', () => {
+    const result = extractArgs(['--session-candidates-json']);
+    expect(result.sbOptions.sessionCandidatesJson).toBe(true);
+  });
+
   it('parses sb-specific verbose flag', () => {
     const result = extractArgs(['--sb-verbose', 'hello']);
     expect(result.sbOptions.verbose).toBe(true);

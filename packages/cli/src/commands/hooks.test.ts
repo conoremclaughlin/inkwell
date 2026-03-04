@@ -588,6 +588,24 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     );
   });
 
+  it('should throw on MCP tool-level isError responses', async () => {
+    fetchSpy = vi.fn().mockResolvedValue(
+      mockJsonResponse({
+        jsonrpc: '2.0',
+        result: {
+          isError: true,
+          content: [{ text: '{"success":false,"error":"start_session unavailable"}' }],
+        },
+        id: 1,
+      })
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await expect(callPcpTool('start_session', { agentId: 'wren' })).rejects.toThrow(
+      'PCP tool error: start_session unavailable'
+    );
+  });
+
   it('should handle content-type with charset suffix', async () => {
     fetchSpy = vi.fn().mockResolvedValue({
       ok: true,

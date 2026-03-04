@@ -30,6 +30,7 @@ export interface SbOptions {
   verbose: boolean;
   backend: string;
   sessionCandidates?: boolean;
+  sessionCandidatesJson?: boolean;
   sessionChoice?: string;
 }
 
@@ -48,6 +49,7 @@ interface PcpSessionSummary {
   studioId?: string | null;
   threadKey?: string | null;
   currentPhase?: string | null;
+  status?: string | null;
   startedAt: string;
   endedAt?: string | null;
   backend?: string | null;
@@ -167,6 +169,27 @@ type LogActivityResult = {
 
 function getSessionBackendId(session: PcpSessionSummary): string | undefined {
   return session.backendSessionId || session.claudeSessionId || undefined;
+}
+
+function normalizeSessionBackendName(backend: string | null | undefined): string {
+  if (!backend) return '';
+  const normalized = backend.trim().toLowerCase();
+  if (normalized === 'claude-code') return 'claude';
+  if (normalized === 'codex-cli') return 'codex';
+  if (normalized === 'gemini-cli') return 'gemini';
+  return normalized;
+}
+
+function isSessionResumable(session: PcpSessionSummary): boolean {
+  if (session.endedAt) return false;
+
+  const phase = (session.currentPhase || '').trim().toLowerCase();
+  if (phase === 'complete' || phase.startsWith('complete:')) return false;
+
+  const status = (session.status || '').trim().toLowerCase();
+  if (status === 'completed') return false;
+
+  return true;
 }
 
 export function filterUntrackedLocalClaudeSessions<T extends { sessionId: string }>(
@@ -658,10 +681,13 @@ export function filterPcpSessionsForContext(
   localBackendSessionIds: Set<string> = new Set()
 ): PcpSessionSummary[] {
   const normalizedCwd = normalizePath(cwd);
+  const normalizedBackend = normalizeSessionBackendName(backend);
+  const nowMs = Date.now();
+  const AMBIGUOUS_SESSION_WINDOW_MS = 6 * 60 * 60 * 1000;
 
   const backendMatched = sessions.filter((session) => {
     if (!session.backend) return true;
-    return session.backend === backend;
+    return normalizeSessionBackendName(session.backend) === normalizedBackend;
   });
 
   if (!normalizedCwd) {
@@ -688,12 +714,17 @@ export function filterPcpSessionsForContext(
     // PCP sessions (before hooks/close persist workingDir/backendSessionId) are
     // not accidentally hidden behind older mapped sessions.
     if (backend !== 'claude' && !normalizedWorkingDir && !localMatchedId) {
-      ambiguous.push(session);
+      const startedAtMs = toEpochMs(session.startedAt);
+      const isFresh =
+        startedAtMs !== undefined && Number.isFinite(startedAtMs)
+          ? nowMs - startedAtMs <= AMBIGUOUS_SESSION_WINDOW_MS
+          : false;
+      if (isFresh) ambiguous.push(session);
     }
   }
 
   if (backend === 'claude') return pathScoped;
-  if (pathScoped.length === 0) return backendMatched;
+  if (pathScoped.length === 0 && ambiguous.length === 0) return [];
 
   const deduped = new Map<string, PcpSessionSummary>();
   for (const session of [...pathScoped, ...ambiguous]) {
@@ -720,12 +751,16 @@ export function resolveBackendSessionIdForResume(options: {
     localBackendSessionIds,
     knownBackendSessionIds,
   } = options;
+  const normalizedBackend = normalizeSessionBackendName(backend);
 
   if (selectedLocalBackendSessionId) {
     return { backendSessionId: selectedLocalBackendSessionId };
   }
 
-  if (!chosen || (chosen.backend && chosen.backend !== backend)) {
+  if (
+    !chosen ||
+    (chosen.backend && normalizeSessionBackendName(chosen.backend) !== normalizedBackend)
+  ) {
     return {};
   }
 
@@ -920,6 +955,16 @@ export function getClaudeLocalSessionsForProject(
 
       const filePath = join(projectDir, entry.name);
       try {
+        // Claude may create per-session jsonl files that only contain
+        // file-history snapshots and no resumable conversation stream.
+        // Those "poison" files look like valid session IDs by filename but fail
+        // with `No conversation found with session ID` when resumed.
+        // Require explicit sessionId evidence in file contents before surfacing
+        // as a local resumable candidate.
+        if (!isLikelyClaudeResumableSessionFile(filePath, sessionId)) {
+          continue;
+        }
+
         const stats = statSync(filePath);
         results.push({
           backend: 'claude',
@@ -962,6 +1007,38 @@ export function getClaudeLocalSessionsForProject(
     .slice(0, limit);
 }
 
+function isLikelyClaudeResumableSessionFile(filePath: string, sessionId: string): boolean {
+  let content: string;
+  try {
+    content = readFileSync(filePath, 'utf-8');
+  } catch {
+    return false;
+  }
+
+  const lines = content.split('\n').slice(0, 30);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+
+    const fromSessionId =
+      typeof parsed.sessionId === 'string' ? parsed.sessionId.trim() : undefined;
+    const fromLegacySessionId =
+      typeof parsed.session_id === 'string' ? parsed.session_id.trim() : undefined;
+
+    if (fromSessionId === sessionId || fromLegacySessionId === sessionId) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 export function getKnownClaudeSessionIds(limitPerProject = 500): Set<string> {
   const sessionIds = new Set<string>();
   const claudeProjectsDir = join(homedir(), '.claude', 'projects');
@@ -978,6 +1055,8 @@ export function getKnownClaudeSessionIds(limitPerProject = 500): Set<string> {
         if (!file.isFile() || !file.name.endsWith('.jsonl')) continue;
         const sessionId = file.name.slice(0, -'.jsonl'.length);
         if (!sessionFileIdRegex.test(sessionId)) continue;
+        const filePath = join(claudeProjectsDir, entry.name, file.name);
+        if (!isLikelyClaudeResumableSessionFile(filePath, sessionId)) continue;
         sessionIds.add(sessionId);
         seenForProject += 1;
         if (seenForProject >= limitPerProject) break;
@@ -1739,7 +1818,11 @@ async function ensurePcpSessionContext(
   passthroughArgs: string[],
   verbose: boolean,
   promptParts: string[] = [],
-  options: { listCandidates?: boolean; selectionOverride?: string } = {}
+  options: {
+    listCandidates?: boolean;
+    listCandidatesJson?: boolean;
+    selectionOverride?: string;
+  } = {}
 ): Promise<{
   pcpSessionId?: string;
   backendSessionId?: string;
@@ -1807,11 +1890,18 @@ async function ensurePcpSessionContext(
         limit: 20,
       });
       activeSessions = filterPcpSessionsForContext(
-        (listed.sessions || []).filter((s) => !s.endedAt),
+        (listed.sessions || []).filter((s) => isSessionResumable(s)),
         backend,
         cwd,
         localBackendSessionIds
       );
+      if (backend === 'claude') {
+        activeSessions = activeSessions.filter((session) => {
+          const linkedBackendSessionId = getSessionBackendId(session);
+          if (!linkedBackendSessionId) return true;
+          return knownBackendSessionIds.has(linkedBackendSessionId);
+        });
+      }
       sbDebugLog('claude', 'active_sessions_loaded', {
         backend,
         agentId,
@@ -1903,15 +1993,23 @@ async function ensurePcpSessionContext(
           { callerProfile: 'runtime' }
         );
         const listedActive = filterPcpSessionsForContext(
-          (listed.sessions || []).filter((session) => !session.endedAt),
+          (listed.sessions || []).filter((session) => isSessionResumable(session)),
           backend,
           cwd,
           localBackendSessionIds
         );
+        const scopedActive =
+          backend === 'claude'
+            ? listedActive.filter((session) => {
+                const linkedBackendSessionId = getSessionBackendId(session);
+                if (!linkedBackendSessionId) return true;
+                return knownBackendSessionIds.has(linkedBackendSessionId);
+              })
+            : listedActive;
         const resolved = resolveStartedSessionFromList({
           beforeSessionIds: existingSessionIds,
           requestedSessionId,
-          listedSessions: listedActive,
+          listedSessions: scopedActive,
         });
         sbDebugLog('sb', 'pcp_start_session_resolve_from_list', {
           backend,
@@ -1920,9 +2018,9 @@ async function ensurePcpSessionContext(
           mode,
           requestedSessionId: requestedSessionId || null,
           resolvedSessionId: resolved?.id || null,
-          listedCount: listedActive.length,
+          listedCount: scopedActive.length,
         });
-        if (resolved) activeSessions = listedActive;
+        if (resolved) activeSessions = scopedActive;
         return resolved;
       } catch (error) {
         sbDebugLog('sb', 'pcp_start_session_resolve_from_list_failed', {
@@ -1939,14 +2037,18 @@ async function ensurePcpSessionContext(
 
     const newSessionId = randomUUID();
     try {
-      const started = await callPcpTool<{ session?: PcpSessionSummary }>('start_session', {
-        email,
-        agentId,
-        ...(studioId ? { studioId } : {}),
-        backend,
-        forceNew: true,
-        sessionId: newSessionId,
-      });
+      const started = await callPcpTool<{ session?: PcpSessionSummary }>(
+        'start_session',
+        {
+          email,
+          agentId,
+          ...(studioId ? { studioId } : {}),
+          backend,
+          forceNew: true,
+          sessionId: newSessionId,
+        },
+        { callerProfile: 'runtime' }
+      );
       const directSession = extractSessionFromStartSessionResponse(started);
       const resolvedSession =
         directSession || (await resolveCreatedSessionFromList(newSessionId, 'with_session_id'));
@@ -1976,13 +2078,17 @@ async function ensurePcpSessionContext(
       });
 
       try {
-        const startedLegacy = await callPcpTool<{ session?: PcpSessionSummary }>('start_session', {
-          email,
-          agentId,
-          ...(studioId ? { studioId } : {}),
-          backend,
-          forceNew: true,
-        });
+        const startedLegacy = await callPcpTool<{ session?: PcpSessionSummary }>(
+          'start_session',
+          {
+            email,
+            agentId,
+            ...(studioId ? { studioId } : {}),
+            backend,
+            forceNew: true,
+          },
+          { callerProfile: 'runtime' }
+        );
         const directSession = extractSessionFromStartSessionResponse(startedLegacy);
         const resolvedSession =
           directSession ||
@@ -2013,31 +2119,79 @@ async function ensurePcpSessionContext(
     }
   };
 
-  if (options.listCandidates) {
-    console.log(chalk.bold(`\nSession candidates for ${agentId}/${backend}:`));
-    console.log(chalk.dim('  new'));
-    for (const session of activeSessions) {
-      const linkedBackendSessionId =
-        backend === 'claude' ? getSessionBackendId(session) : undefined;
-      const preview = pcpPreviewBySessionId.get(session.id);
+  const localBySessionId = new Map(
+    localBackendSessions.map((session) => [session.sessionId, session])
+  );
+  if (options.listCandidates || options.listCandidatesJson) {
+    const pcpCandidates = activeSessions.map((session) => {
+      const linkedBackendSessionId = getSessionBackendId(session);
+      const linkedLocalSession = linkedBackendSessionId
+        ? localBySessionId.get(linkedBackendSessionId)
+        : undefined;
+      return {
+        type: 'pcp' as const,
+        id: session.id,
+        threadKey: session.threadKey || null,
+        phase: session.currentPhase || null,
+        backendSessionId: linkedBackendSessionId || null,
+        linkedLocalModified:
+          linkedLocalSession?.latestPromptAt || linkedLocalSession?.modified || null,
+        linkedLocalPreview:
+          linkedLocalSession?.latestPrompt || linkedLocalSession?.firstPrompt || null,
+        pcpPreview: pcpPreviewBySessionId.get(session.id) || null,
+      };
+    });
+    const localCandidates = untrackedLocalBackendSessions.map((session) => ({
+      type: 'local' as const,
+      id: session.sessionId,
+      modified: session.latestPromptAt || session.modified,
+      preview:
+        withAgentPreviewSpeaker(session.latestPrompt || session.firstPrompt, agentId) || null,
+      gitBranch: session.gitBranch || null,
+    }));
+
+    if (options.listCandidatesJson) {
       console.log(
-        chalk.dim(
-          `  pcp:${session.id}${session.threadKey ? ` (${session.threadKey})` : ''}${session.currentPhase ? ` — ${session.currentPhase}` : ''}${linkedBackendSessionId ? ` · tracks ${linkedBackendSessionId}` : ''}${preview ? ` — ${preview}` : ''}`
+        JSON.stringify(
+          {
+            backend,
+            agentId,
+            cwd,
+            pcpAvailable,
+            pcpUnavailableReason: pcpUnavailableReason || null,
+            candidates: [{ type: 'new' as const }, ...pcpCandidates, ...localCandidates],
+          },
+          null,
+          2
         )
       );
+    } else {
+      console.log(chalk.bold(`\nSession candidates for ${agentId}/${backend}:`));
+      console.log(chalk.dim('  new'));
+      for (const session of pcpCandidates) {
+        const backendLabel = backend[0].toUpperCase() + backend.slice(1);
+        const linkedPreview = session.linkedLocalPreview
+          ? ` — ${truncateText(session.linkedLocalPreview)}`
+          : '';
+        const linkedWhen = session.linkedLocalModified
+          ? ` (${new Date(session.linkedLocalModified).toLocaleString()})`
+          : '';
+        const pcpPreview = session.pcpPreview ? ` — ${truncateText(session.pcpPreview, 120)}` : '';
+        console.log(
+          chalk.dim(
+            `  pcp:${session.id}${session.threadKey ? ` (${session.threadKey})` : ''}${session.phase ? ` — ${session.phase}` : ''}${session.backendSessionId ? ` · tracks ${backendLabel} ${session.backendSessionId.slice(0, 8)}` : ''}${linkedWhen}${linkedPreview}${pcpPreview}`
+          )
+        );
+      }
+      for (const localSession of localCandidates) {
+        console.log(
+          chalk.dim(
+            `  local:${localSession.id}${localSession.preview ? ` — ${truncateText(localSession.preview)}` : ''}`
+          )
+        );
+      }
+      console.log('');
     }
-    for (const localSession of untrackedLocalBackendSessions) {
-      const previewText = withAgentPreviewSpeaker(
-        localSession.latestPrompt || localSession.firstPrompt,
-        agentId
-      );
-      console.log(
-        chalk.dim(
-          `  local:${localSession.sessionId}${previewText ? ` — ${truncateText(previewText)}` : ''}`
-        )
-      );
-    }
-    console.log('');
     if (!normalizedSelectionOverride) {
       process.exit(0);
     }
@@ -2076,10 +2230,19 @@ async function ensurePcpSessionContext(
     for (const session of activeSessions) {
       const value = `__pcp__:${session.id}`;
       const linkedBackendSessionId = getSessionBackendId(session);
+      const linkedLocalSession = linkedBackendSessionId
+        ? localBySessionId.get(linkedBackendSessionId)
+        : undefined;
+      const linkedPreview = linkedLocalSession?.firstPrompt
+        ? ` — ${truncateText(linkedLocalSession.firstPrompt)}`
+        : '';
+      const linkedWhen = linkedLocalSession?.modified
+        ? ` (${new Date(linkedLocalSession.modified).toLocaleString()})`
+        : '';
       const backendLabel = backend[0].toUpperCase() + backend.slice(1);
       const preview = pcpPreviewBySessionId.get(session.id);
       choices.push({
-        name: `Resume PCP ${session.id.slice(0, 8)}${session.threadKey ? ` (${session.threadKey})` : ''}${session.currentPhase ? ` — ${session.currentPhase}` : ''}${linkedBackendSessionId ? ` · tracks ${backendLabel} ${linkedBackendSessionId.slice(0, 8)}` : ''}${preview ? ` — ${truncateText(preview, 120)}` : ''}`,
+        name: `Resume PCP ${session.id.slice(0, 8)}${session.threadKey ? ` (${session.threadKey})` : ''}${session.currentPhase ? ` — ${session.currentPhase}` : ''}${linkedBackendSessionId ? ` · tracks ${backendLabel} ${linkedBackendSessionId.slice(0, 8)}` : ''}${linkedWhen}${linkedPreview}${preview ? ` — ${truncateText(preview, 120)}` : ''}`,
         value,
       });
       sessionChoiceByValue.set(value, session.id);
@@ -2282,7 +2445,8 @@ export async function runClaude(
         options.verbose,
         promptParts,
         {
-          listCandidates: options.sessionCandidates,
+          listCandidates: options.sessionCandidates || options.sessionCandidatesJson,
+          listCandidatesJson: options.sessionCandidatesJson,
           selectionOverride: options.sessionChoice,
         }
       )
@@ -2485,7 +2649,8 @@ export async function runClaudeInteractive(
         options.verbose,
         [],
         {
-          listCandidates: options.sessionCandidates,
+          listCandidates: options.sessionCandidates || options.sessionCandidatesJson,
+          listCandidatesJson: options.sessionCandidatesJson,
           selectionOverride: options.sessionChoice,
         }
       )
