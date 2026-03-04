@@ -70,7 +70,16 @@ function resolveCliRoot(fsOps: Pick<DoctorFs, 'existsSync' | 'readFileSync'>): s
 }
 
 function resolveDefaultCliName(fsOps: Pick<DoctorFs, 'existsSync' | 'readFileSync'>): string {
-  const fromEnv = process.env.AGENT_ID?.trim();
+  const invokedCandidates = [process.argv[1], process.env._]
+    .map((value) => basename(String(value || '')).trim())
+    .filter(Boolean);
+  for (const candidate of invokedCandidates) {
+    if (/^sb(?:-[a-z0-9][a-z0-9_-]*)?$/i.test(candidate)) {
+      return candidate.toLowerCase();
+    }
+  }
+
+  const fromEnv = process.env.AGENT_ID?.trim().toLowerCase();
   if (fromEnv) return `sb-${fromEnv}`;
 
   const cwd = process.cwd();
@@ -86,24 +95,7 @@ function resolveDefaultCliName(fsOps: Pick<DoctorFs, 'existsSync' | 'readFileSyn
   const dirName = basename(cwd);
   const match = dirName.match(/--(.+)$/);
   if (match) return `sb-${match[1]}`;
-
-  try {
-    const branch = execSync('git rev-parse --abbrev-ref HEAD', {
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-    const prefixMatch = branch.match(/^([a-z0-9_-]+)\//i);
-    if (prefixMatch?.[1]) {
-      const candidate = prefixMatch[1].toLowerCase();
-      if (!['main', 'master', 'develop', 'release'].includes(candidate)) {
-        return `sb-${candidate}`;
-      }
-    }
-  } catch {
-    // fall through
-  }
-
-  return 'sb-dev';
+  return 'sb';
 }
 
 export function analyzeCliLink(
@@ -127,10 +119,11 @@ export function analyzeCliLink(
   }
 
   if (!fsOps.existsSync(linkPath)) {
+    const fixCmd = buildFixCommand(binaryName);
     checks.push({
       name: 'Linked binary',
       status: 'fail',
-      detail: `Missing ${linkPath} (run: sb studio cli${options.name ? ` --name ${binaryName}` : ''})`,
+      detail: `Missing ${linkPath} (run: ${fixCmd})`,
     });
     return { binaryName, linkPath, expectedTarget, checks };
   }
@@ -220,6 +213,7 @@ function iconForStatus(status: CheckStatus): string {
 }
 
 function buildFixCommand(binaryName: string): string {
+  if (binaryName === 'sb') return 'sb studio cli';
   return `sb studio cli --name ${binaryName}`;
 }
 
