@@ -1425,10 +1425,7 @@ export function hasBackendSessionOverride(
     Boolean(promptParts[1]) &&
     !promptParts[1]?.startsWith('-');
   const isCodexResumePassthrough =
-    backend === 'codex' &&
-    passthroughArgs[0]?.toLowerCase() === 'resume' &&
-    Boolean(passthroughArgs[1]) &&
-    !passthroughArgs[1]?.startsWith('-');
+    backend === 'codex' && passthroughArgs[0]?.toLowerCase() === 'resume';
 
   if (isCodexResumePrompt || isCodexResumePassthrough) return true;
 
