@@ -4598,5 +4598,5 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     }
   );
 
-  logger.info('All MCP tools registered (timing diagnostics enabled)');
+  logger.debug('All MCP tools registered (timing diagnostics enabled)');
 }
