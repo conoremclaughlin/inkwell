@@ -7,7 +7,6 @@ import { Badge } from '@/components/ui/badge';
 import {
   Activity,
   AlertTriangle,
-  Pause,
   CircleDot,
   Monitor,
   GitBranch,
@@ -34,6 +33,7 @@ interface Session {
   agentId: string;
   agentName: string;
   agentRole: string | null;
+  lifecycle: string | null;
   status: string;
   currentPhase: string | null;
   summary: string | null;
@@ -79,19 +79,12 @@ function isBlocked(session: Session): boolean {
   return session.currentPhase?.startsWith('blocked') ?? false;
 }
 
-function isGenerating(session: Session): boolean {
-  return session.currentPhase === 'runtime:generating';
-}
-
-function isRuntimeIdle(session: Session): boolean {
-  return session.currentPhase === 'runtime:idle';
-}
-
-function formatPhaseLabel(phase: string | null): string | null {
-  if (!phase) return null;
-  if (!phase.startsWith('runtime:')) return phase;
-  const runtimeState = phase.replace('runtime:', '');
-  return `Runtime: ${runtimeState}`;
+function getLifecycle(session: Session): string {
+  // Prefer lifecycle column; fall back to old runtime:* phase for backward compat
+  if (session.lifecycle) return session.lifecycle;
+  if (session.currentPhase === 'runtime:generating') return 'running';
+  if (session.currentPhase === 'runtime:idle') return 'idle';
+  return 'idle';
 }
 
 function getSessionState(session: Session): {
@@ -109,25 +102,36 @@ function getSessionState(session: Session): {
     };
   }
 
-  if (session.status === 'paused') {
+  const lifecycle = getLifecycle(session);
+
+  if (lifecycle === 'failed') {
     return {
-      label: 'Paused',
-      cardClass: 'border-gray-200',
-      badgeClass: 'bg-gray-100 text-gray-600',
-      phaseClass: 'text-gray-600',
+      label: 'Failed',
+      cardClass: 'border-red-200 bg-red-50/50',
+      badgeClass: 'bg-red-100 text-red-700',
+      phaseClass: 'text-red-600',
     };
   }
 
-  if (isGenerating(session)) {
+  if (lifecycle === 'running') {
     return {
-      label: 'Generating',
+      label: 'Running',
       cardClass: 'border-blue-200 bg-blue-50/50',
       badgeClass: 'bg-blue-100 text-blue-700',
       phaseClass: 'font-medium text-blue-700',
     };
   }
 
-  if (isRuntimeIdle(session)) {
+  if (lifecycle === 'completed') {
+    return {
+      label: 'Completed',
+      cardClass: 'border-gray-200',
+      badgeClass: 'bg-gray-100 text-gray-600',
+      phaseClass: 'text-gray-600',
+    };
+  }
+
+  if (lifecycle === 'idle') {
     return {
       label: 'Idle',
       cardClass: 'border-green-200 bg-green-50/50',
@@ -136,17 +140,8 @@ function getSessionState(session: Session): {
     };
   }
 
-  if (session.status === 'active') {
-    return {
-      label: 'Active',
-      cardClass: 'border-green-200 bg-green-50/50',
-      badgeClass: 'bg-green-100 text-green-700',
-      phaseClass: 'text-gray-600',
-    };
-  }
-
   return {
-    label: session.status,
+    label: lifecycle,
     cardClass: 'border-gray-200',
     badgeClass: 'bg-gray-100 text-gray-600',
     phaseClass: 'text-gray-600',
@@ -156,7 +151,7 @@ function getSessionState(session: Session): {
 function SessionCard({ session }: { session: Session }) {
   const [expanded, setExpanded] = useState(false);
   const state = getSessionState(session);
-  const phaseLabel = formatPhaseLabel(session.currentPhase);
+  const phaseLabel = session.currentPhase;
 
   return (
     <div className={clsx('rounded-lg border p-4', state.cardClass)}>
@@ -344,8 +339,9 @@ export default function SessionsPage() {
 
   const stats = data?.stats ?? { active: 0, blocked: 0, paused: 0, total: 0 };
   const sessions = data?.sessions ?? [];
-  const generatingCount = sessions.filter((session) => isGenerating(session)).length;
-  const idleCount = sessions.filter((session) => isRuntimeIdle(session)).length;
+  const runningCount = sessions.filter((s) => getLifecycle(s) === 'running').length;
+  const idleCount = sessions.filter((s) => getLifecycle(s) === 'idle').length;
+  const failedCount = sessions.filter((s) => getLifecycle(s) === 'failed').length;
 
   return (
     <div>
@@ -365,15 +361,15 @@ export default function SessionsPage() {
         <Card>
           <CardContent className="p-4 text-center">
             <Activity className="h-5 w-5 mx-auto text-blue-600 mb-1" />
-            <div className="text-2xl font-bold text-blue-600">{generatingCount}</div>
-            <div className="text-xs text-gray-500">Generating</div>
+            <div className="text-2xl font-bold text-blue-600">{runningCount}</div>
+            <div className="text-xs text-gray-500">Running</div>
           </CardContent>
         </Card>
         <Card>
           <CardContent className="p-4 text-center">
             <CircleDot className="h-5 w-5 mx-auto text-green-600 mb-1" />
             <div className="text-2xl font-bold text-green-600">{idleCount}</div>
-            <div className="text-xs text-gray-500">Runtime Idle</div>
+            <div className="text-xs text-gray-500">Idle</div>
           </CardContent>
         </Card>
         <Card>
@@ -385,9 +381,9 @@ export default function SessionsPage() {
         </Card>
         <Card>
           <CardContent className="p-4 text-center">
-            <Pause className="h-5 w-5 mx-auto text-gray-500 mb-1" />
-            <div className="text-2xl font-bold text-gray-500">{stats.paused}</div>
-            <div className="text-xs text-gray-500">Paused</div>
+            <AlertTriangle className="h-5 w-5 mx-auto text-red-500 mb-1" />
+            <div className="text-2xl font-bold text-red-500">{failedCount}</div>
+            <div className="text-xs text-gray-500">Failed</div>
           </CardContent>
         </Card>
         <Card>

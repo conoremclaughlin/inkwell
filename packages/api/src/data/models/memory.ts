@@ -81,6 +81,8 @@ export type SessionPhase =
   | 'complete'
   | string;
 
+export type SessionLifecycle = 'running' | 'idle' | 'completed' | 'failed';
+
 export interface Session {
   id: string;
   userId: string;
@@ -91,6 +93,9 @@ export interface Session {
    */
   workspaceId?: string;
   threadKey?: string;
+  /** Runtime lifecycle state: running, idle, completed, failed */
+  lifecycle?: SessionLifecycle;
+  /** @deprecated Use lifecycle. Kept for backward compat. */
   status?: string;
   currentPhase?: string;
   backend?: string;
@@ -177,6 +182,7 @@ export interface SessionRow {
   studio_id: string | null;
   workspace_id: string | null;
   thread_key: string | null;
+  lifecycle?: string | null;
   status?: string | null;
   current_phase: string | null;
   backend?: string | null;

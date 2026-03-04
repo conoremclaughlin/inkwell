@@ -40,6 +40,9 @@ export interface MediaAttachment {
  */
 export type SessionType = 'primary' | 'task';
 
+export type SessionLifecycle = 'running' | 'idle' | 'completed' | 'failed';
+
+/** @deprecated Use SessionLifecycle */
 export type SessionStatus = 'active' | 'paused' | 'completed' | 'failed';
 
 export interface Session {
@@ -52,6 +55,9 @@ export interface Session {
   claudeSessionId: string | null;
 
   type: SessionType;
+  /** Runtime lifecycle: running, idle, completed, failed */
+  lifecycle: SessionLifecycle;
+  /** @deprecated Use lifecycle */
   status: SessionStatus;
 
   // For task sessions

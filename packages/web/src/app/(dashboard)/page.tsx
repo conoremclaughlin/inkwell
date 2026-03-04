@@ -32,6 +32,7 @@ interface StudioInfo {
 }
 
 interface AgentLatestSession {
+  lifecycle: string | null;
   currentPhase: string | null;
   status: string | null;
   updatedAt: string;
@@ -72,26 +73,29 @@ function getInitial(name: string): string {
 }
 
 function getAgentStatusBadge(
-  phase: string | null,
-  sessionStatus: string | null
+  lifecycle: string | null,
+  phase: string | null
 ): {
   label: string;
   badgeClass: string;
 } {
-  // Phase takes priority when present
-  if (phase) {
-    if (phase.startsWith('blocked'))
-      return { label: 'Blocked', badgeClass: 'bg-amber-100 text-amber-700' };
-    if (phase === 'runtime:generating')
-      return { label: 'Generating', badgeClass: 'bg-blue-100 text-blue-700' };
-    if (phase === 'runtime:idle')
-      return { label: 'Idle', badgeClass: 'bg-green-100 text-green-700' };
-    return { label: 'Active', badgeClass: 'bg-green-100 text-green-700' };
-  }
-  // Fall back to session status when phase is null
-  if (sessionStatus === 'active' || sessionStatus === 'resumable')
-    return { label: 'Active', badgeClass: 'bg-green-100 text-green-700' };
-  if (sessionStatus) return { label: 'Active', badgeClass: 'bg-green-100 text-green-700' };
+  // Phase-level overrides (blocked is a phase concern)
+  if (phase?.startsWith('blocked'))
+    return { label: 'Blocked', badgeClass: 'bg-amber-100 text-amber-700' };
+
+  // Lifecycle takes priority for runtime state
+  if (lifecycle === 'running') return { label: 'Running', badgeClass: 'bg-blue-100 text-blue-700' };
+  if (lifecycle === 'failed') return { label: 'Failed', badgeClass: 'bg-red-100 text-red-700' };
+  if (lifecycle === 'completed')
+    return { label: 'Completed', badgeClass: 'bg-gray-100 text-gray-600' };
+  if (lifecycle === 'idle') return { label: 'Idle', badgeClass: 'bg-green-100 text-green-700' };
+
+  // Backward compat: check old runtime:* phase values
+  if (phase === 'runtime:generating')
+    return { label: 'Running', badgeClass: 'bg-blue-100 text-blue-700' };
+  if (phase === 'runtime:idle') return { label: 'Idle', badgeClass: 'bg-green-100 text-green-700' };
+  if (phase) return { label: 'Idle', badgeClass: 'bg-green-100 text-green-700' };
+
   return { label: 'Offline', badgeClass: 'bg-gray-100 text-gray-500' };
 }
 
@@ -212,8 +216,8 @@ export default function DashboardPage() {
             {agents.map((agent) => {
               const gradient = getAgentGradient(agent.agentId);
               const status = getAgentStatusBadge(
-                agent.latestSession?.currentPhase ?? null,
-                agent.latestSession?.status ?? null
+                agent.latestSession?.lifecycle ?? null,
+                agent.latestSession?.currentPhase ?? null
               );
               const backendLabel = formatBackend(agent.backend);
 

@@ -445,7 +445,7 @@ export const updateSessionPhaseSchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe(
-      'Work phase. Core phases: investigating, implementing, reviewing, paused, complete. Use blocked:<reason> or waiting:<reason> for transitions that auto-create memories.'
+      'Work phase (agent-set). Core phases: investigating, implementing, reviewing, paused, complete. Use blocked:<reason> or waiting:<reason> for transitions that auto-create memories. Do NOT use runtime: prefix — use lifecycle instead.'
     ),
   note: z
     .string()
@@ -463,10 +463,18 @@ export const updateSessionPhaseSchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe('Backend session ID for resumption (e.g., Claude Code session ID, Codex session ID)'),
+  lifecycle: z
+    .enum(['running', 'idle', 'completed', 'failed'])
+    .optional()
+    .describe(
+      'Runtime lifecycle state (managed by hooks). running=generating, idle=waiting for input, completed=session done, failed=backend crashed.'
+    ),
   status: z
     .enum(['active', 'paused', 'resumable', 'completed'])
     .optional()
-    .describe('Session status'),
+    .describe(
+      '[Deprecated] Use lifecycle. Kept for backward compat — ignored when lifecycle is set.'
+    ),
   context: z.string().optional().describe('Brief context of current work state'),
   workingDir: z.string().optional().describe('Working directory'),
 });
@@ -1008,6 +1016,7 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
               agentId: session.agentId,
               studioId: session.studioId,
               workspaceId: session.workspaceId,
+              lifecycle: session.lifecycle || null,
               currentPhase: session.currentPhase || null,
               status: session.status || null,
               backend: session.backend || null,
@@ -1078,6 +1087,7 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
               agentId: session.agentId,
               studioId: session.studioId,
               workspaceId: session.workspaceId,
+              lifecycle: session.lifecycle || null,
               currentPhase: session.currentPhase || null,
               startedAt: session.startedAt.toISOString(),
               endedAt: session.endedAt?.toISOString(),
@@ -1144,6 +1154,7 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
                     };
                   })()
                 : null,
+              lifecycle: s.lifecycle || null,
               currentPhase: s.currentPhase || null,
               status: s.status || null,
               backend: s.backend || null,
@@ -1185,6 +1196,7 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
   // Require at least one field to update
   if (
     !params.phase &&
+    !params.lifecycle &&
     !params.backendSessionId &&
     !params.status &&
     !params.context &&
@@ -1198,7 +1210,7 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
             {
               success: false,
               error:
-                'At least one field must be provided (phase, backendSessionId, status, context, workingDir).',
+                'At least one field must be provided (phase, lifecycle, backendSessionId, status, context, workingDir).',
             },
             null,
             2
@@ -1236,14 +1248,38 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
   // Build update object
   const updates: {
     currentPhase?: string | null;
+    lifecycle?: string;
     status?: string;
     backendSessionId?: string;
     context?: string;
     workingDir?: string;
   } = {};
 
+  // Map runtime: prefix phases to lifecycle (backward compat for old callers)
   if (params.phase !== undefined) {
-    updates.currentPhase = params.phase;
+    if (params.phase === 'runtime:generating') {
+      updates.lifecycle = 'running';
+      // Don't set currentPhase — runtime state is lifecycle, not phase
+    } else if (params.phase === 'runtime:idle') {
+      updates.lifecycle = 'idle';
+      // Don't set currentPhase — runtime state is lifecycle, not phase
+    } else {
+      updates.currentPhase = params.phase;
+    }
+  }
+
+  // New lifecycle param takes precedence
+  if (params.lifecycle !== undefined) {
+    updates.lifecycle = params.lifecycle;
+  }
+
+  // Backward compat: map old status to lifecycle when lifecycle not explicitly set
+  if (params.status !== undefined && updates.lifecycle === undefined) {
+    if (params.status === 'completed') {
+      updates.lifecycle = 'completed';
+    }
+    // status='active' → no-op (was always a no-op)
+    // status='paused'/'resumable' → no lifecycle mapping (phase concern)
   }
   if (params.status !== undefined) {
     updates.status = params.status;
@@ -1273,6 +1309,7 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
 
   const messageParts: string[] = [];
   if (params.phase) messageParts.push(`phase → ${params.phase}`);
+  if (updates.lifecycle) messageParts.push(`lifecycle → ${updates.lifecycle}`);
   if (params.status) messageParts.push(`status → ${params.status}`);
   if (params.backendSessionId) messageParts.push('backendSessionId set');
   if (params.context) messageParts.push('context updated');
@@ -1287,6 +1324,7 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
       agentId: updated.agentId,
       studioId: updated.studioId,
       workspaceId: updated.workspaceId,
+      lifecycle: updated.lifecycle || null,
       currentPhase: updated.currentPhase || null,
     },
   };
@@ -1870,6 +1908,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
               studioId: s.studioId || null,
               workspaceId: s.workspaceId || null,
               threadKey: s.threadKey || null,
+              lifecycle: s.lifecycle || null,
               currentPhase: s.currentPhase || null,
               startedAt: s.startedAt.toISOString(),
             })),

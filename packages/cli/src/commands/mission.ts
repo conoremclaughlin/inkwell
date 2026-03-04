@@ -24,6 +24,7 @@ interface MissionRow {
   unreadInbox: number;
   latestSessionId?: string;
   latestThreadKey?: string;
+  latestLifecycle?: string;
   latestPhase?: string;
   latestBackendSessionId?: string;
 }
@@ -441,7 +442,8 @@ export function summarizeMissionRows(
         unreadInbox: unreadByAgent[agent] || 0,
         latestSessionId: latest?.id,
         latestThreadKey: latest?.threadKey,
-        latestPhase: latest?.currentPhase || latest?.status,
+        latestLifecycle: latest?.lifecycle || 'idle',
+        latestPhase: latest?.currentPhase || undefined,
         latestBackendSessionId: latest?.backendSessionId || latest?.claudeSessionId,
       } satisfies MissionRow;
     })
@@ -467,7 +469,9 @@ function renderMissionTable(rows: MissionRow[]): string[] {
   const lines: string[] = [];
 
   lines.push(
-    chalk.dim('SB       active  unread  latest-id  phase/status          thread        backend-id ')
+    chalk.dim(
+      'SB       active  unread  latest-id  lifecycle   phase                 thread        backend-id '
+    )
   );
   for (const row of rows) {
     lines.push(
@@ -475,7 +479,7 @@ function renderMissionTable(rows: MissionRow[]): string[] {
         `${pad(row.agent, 8)} ${pad(String(row.activeSessions), 6)} ${pad(String(row.unreadInbox), 6)} ${pad(
           row.latestSessionId?.slice(0, 8) || '-',
           9
-        )} ${pad(row.latestPhase || '-', 20)} ${pad(row.latestThreadKey || '-', 12)} ${pad(
+        )} ${pad(row.latestLifecycle || 'idle', 10)} ${pad(row.latestPhase || '-', 20)} ${pad(row.latestThreadKey || '-', 12)} ${pad(
           row.latestBackendSessionId || '-',
           10
         )}`
@@ -880,7 +884,8 @@ async function runInkMission(options: MissionOptions): Promise<void> {
       // Update agent summaries
       const agentSummaries: AgentSummary[] = snapshot.rows.map((row) => ({
         agent: row.agent,
-        status: row.latestPhase || 'active',
+        status: row.latestLifecycle || 'idle',
+        phase: row.latestPhase,
         unread: row.unreadInbox,
         sessions: row.activeSessions,
         latestThread: row.latestThreadKey,

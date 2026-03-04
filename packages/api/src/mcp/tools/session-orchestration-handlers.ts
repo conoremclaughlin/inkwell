@@ -14,10 +14,14 @@ import { z } from 'zod';
 // Schema for get_resumable_sessions
 export const getResumableSessionsSchema = {
   agentId: z.string().optional().describe('Filter by agent (e.g., "wren", "myra")'),
+  lifecycle: z
+    .enum(['idle', 'running', 'completed', 'failed'])
+    .optional()
+    .describe('Filter by lifecycle state'),
   status: z
     .enum(['active', 'paused', 'resumable'])
     .optional()
-    .describe('Filter by status (default: resumable)'),
+    .describe('[Deprecated] Filter by status (default: resumable)'),
 };
 
 // Schema for update_session_status
@@ -33,6 +37,7 @@ interface ResumableSession {
   sessionId: string;
   agentId: string;
   claudeSessionId: string | null;
+  lifecycle: string;
   status: string;
   currentPhase: string | null;
   workingDir: string | null;
@@ -46,7 +51,7 @@ interface ResumableSession {
  * Get sessions that can be resumed by another agent
  */
 export async function handleGetResumableSessions(
-  args: { agentId?: string; status?: string },
+  args: { agentId?: string; lifecycle?: string; status?: string },
   _dataComposer: DataComposer
 ): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
   try {
@@ -54,10 +59,14 @@ export async function handleGetResumableSessions(
 
     let query = supabase.from('sessions').select('*').is('ended_at', null); // Only active/resumable sessions
 
-    // Filter by status (default to 'resumable')
-    const status = args.status || 'resumable';
-    if (status) {
-      query = query.eq('status', status);
+    // Filter by lifecycle if provided, otherwise fall back to status for backward compat
+    if (args.lifecycle) {
+      query = query.eq('lifecycle', args.lifecycle);
+    } else {
+      const status = args.status || 'resumable';
+      if (status) {
+        query = query.eq('status', status);
+      }
     }
 
     // Filter by agent if specified
@@ -83,6 +92,7 @@ export async function handleGetResumableSessions(
       sessionId: s.id,
       agentId: s.agent_id,
       claudeSessionId: s.claude_session_id,
+      lifecycle: s.lifecycle || 'idle',
       status: s.status || 'active',
       currentPhase: s.current_phase || null,
       workingDir: s.working_dir,
@@ -150,6 +160,9 @@ export async function handleUpdateSessionStatus(
     }
     if (args.status !== undefined) {
       updates.status = args.status;
+      // Map status to lifecycle for dual-write
+      if (args.status === 'completed') updates.lifecycle = 'completed';
+      else if (args.status === 'active') updates.lifecycle = 'idle';
     }
     if (args.workingDir !== undefined) {
       updates.working_dir = args.workingDir;

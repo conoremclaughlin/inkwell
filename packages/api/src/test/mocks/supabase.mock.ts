@@ -30,6 +30,7 @@ export function createMockSupabaseClient() {
     'neq',
     'in',
     'is',
+    'not',
     'or',
     'and',
     'gt',

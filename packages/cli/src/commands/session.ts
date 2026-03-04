@@ -25,6 +25,7 @@ interface PcpConfig {
 export interface Session {
   id: string;
   agentId?: string;
+  lifecycle?: string;
   status: string;
   currentPhase?: string;
   threadKey?: string;
