@@ -34,6 +34,9 @@ describe('hasBackendSessionOverride', () => {
   it('does not treat plain prompt text as resume override', () => {
     expect(hasBackendSessionOverride('codex', [], ['resume this bug'])).toBe(false);
     expect(hasBackendSessionOverride('codex', [], ['resume'])).toBe(false);
+  });
+
+  it('treats codex resume passthrough args as override', () => {
     expect(hasBackendSessionOverride('codex', ['resume'])).toBe(true);
     expect(hasBackendSessionOverride('codex', ['resume', '--latest'])).toBe(true);
   });
