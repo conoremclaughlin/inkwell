@@ -23,6 +23,7 @@ interface StudioInfo {
   id: string;
   branch: string;
   baseBranch: string | null;
+  repoRoot: string | null;
   purpose: string | null;
   workType: string | null;
   worktreePath: string | null;
@@ -108,6 +109,20 @@ function getStudioSlug(worktreePath: string | null): string | null {
   const dashDashIdx = folder.indexOf('--');
   if (dashDashIdx === -1) return null;
   return folder.slice(dashDashIdx + 2);
+}
+
+function getRepoName(repoRoot: string | null, worktreePath: string | null): string | null {
+  if (repoRoot) {
+    const normalized = repoRoot.replace(/\/+$/, '');
+    const parts = normalized.split('/');
+    return parts[parts.length - 1] || normalized;
+  }
+
+  // Fallback: infer from worktree folder "<repo>--<slug>"
+  const folder = worktreePath?.split('/').pop() || '';
+  const dashDashIdx = folder.indexOf('--');
+  if (dashDashIdx === -1) return null;
+  return folder.slice(0, dashDashIdx) || null;
 }
 
 function getStudioStatusColor(status: string): string {
@@ -272,6 +287,7 @@ export default function DashboardPage() {
                     <div className="divide-y">
                       {agent.studios.map((studio) => {
                         const slug = studio.slug || getStudioSlug(studio.worktreePath);
+                        const repoName = getRepoName(studio.repoRoot, studio.worktreePath);
                         return (
                           <div key={studio.id} className="flex items-center gap-4 px-5 py-3">
                             <div className="flex items-center gap-3 flex-1 min-w-0">
@@ -283,6 +299,14 @@ export default function DashboardPage() {
                                   {slug || studio.branch}
                                 </span>
                               </div>
+                              {repoName && (
+                                <span
+                                  className="text-xs text-gray-400"
+                                  title={studio.repoRoot || undefined}
+                                >
+                                  {repoName}
+                                </span>
+                              )}
                               {studio.purpose && (
                                 <span className="text-xs text-gray-400 truncate">
                                   {studio.purpose}

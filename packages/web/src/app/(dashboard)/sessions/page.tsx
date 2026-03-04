@@ -22,6 +22,7 @@ interface SessionWorkspace {
   id: string;
   branch: string | null;
   baseBranch: string | null;
+  repoRoot: string | null;
   purpose: string | null;
   workType: string | null;
   status: string;
@@ -148,10 +149,18 @@ function getSessionState(session: Session): {
   };
 }
 
+function getRepoName(repoRoot: string | null): string | null {
+  if (!repoRoot) return null;
+  const normalized = repoRoot.replace(/\/+$/, '');
+  const parts = normalized.split('/');
+  return parts[parts.length - 1] || normalized;
+}
+
 function SessionCard({ session }: { session: Session }) {
   const [expanded, setExpanded] = useState(false);
   const state = getSessionState(session);
   const phaseLabel = session.currentPhase;
+  const repoName = getRepoName(session.workspace?.repoRoot || null);
 
   return (
     <div className={clsx('rounded-lg border p-4', state.cardClass)}>
@@ -184,6 +193,15 @@ function SessionCard({ session }: { session: Session }) {
                 <GitBranch className="h-3 w-3" />
                 {session.workspace.branch || 'no branch'}
               </span>
+              {repoName && (
+                <span
+                  className="flex items-center gap-1"
+                  title={session.workspace?.repoRoot || undefined}
+                >
+                  <FolderGit2 className="h-3 w-3" />
+                  {repoName}
+                </span>
+              )}
               {session.workspace.purpose && (
                 <span className="truncate max-w-xs">{session.workspace.purpose}</span>
               )}
@@ -306,6 +324,12 @@ function SessionCard({ session }: { session: Session }) {
                     <div>
                       <span className="text-gray-400">Base: </span>
                       <code className="font-mono">{session.workspace.baseBranch}</code>
+                    </div>
+                  )}
+                  {session.workspace.repoRoot && (
+                    <div className="sm:col-span-2">
+                      <span className="text-gray-400">Repo root: </span>
+                      <code className="font-mono break-all">{session.workspace.repoRoot}</code>
                     </div>
                   )}
                   {session.workspace.purpose && (
