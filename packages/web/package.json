@@ -2,6 +2,7 @@
   "name": "@personal-context/web",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "description": "PCP Admin Dashboard - Manage WhatsApp, trusted users, and groups",
   "scripts": {
     "dev": "next dev -p 3002",

@@ -1,16 +1,9 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import { createInterface } from 'readline/promises';
 import { stdin as input, stdout as output } from 'process';
-import {
-  existsSync,
-  lstatSync,
-  readFileSync,
-  readlinkSync,
-  realpathSync,
-  statSync,
-} from 'fs';
+import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from 'fs';
 import { basename, dirname, join, parse as parsePath, resolve } from 'path';
 import { homedir } from 'os';
 
@@ -48,6 +41,15 @@ const defaultFs: DoctorFs = {
   readFileSync,
 };
 
+type MigrationStatusResult = {
+  target?: 'linked' | 'local';
+  state?: 'clean' | 'pending' | 'unknown';
+  reason?: string | null;
+  pendingCount?: number;
+  pending?: string[];
+};
+const MIGRATION_CHECK_NAME = 'Migrations';
+
 function resolveCliRoot(fsOps: Pick<DoctorFs, 'existsSync' | 'readFileSync'>): string {
   let dir = process.cwd();
   const { root } = parsePath(dir);
@@ -70,6 +72,18 @@ function resolveCliRoot(fsOps: Pick<DoctorFs, 'existsSync' | 'readFileSync'>): s
 }
 
 function resolveDefaultCliName(fsOps: Pick<DoctorFs, 'existsSync' | 'readFileSync'>): string {
+  const invokedCandidates = [process.argv[1], process.env._]
+    .map((value) => basename(String(value || '')).trim())
+    .filter(Boolean);
+  for (const candidate of invokedCandidates) {
+    if (/^sb(?:-[a-z0-9][a-z0-9_-]*)?$/i.test(candidate)) {
+      return candidate.toLowerCase();
+    }
+  }
+
+  const fromEnv = process.env.AGENT_ID?.trim().toLowerCase();
+  if (fromEnv) return `sb-${fromEnv}`;
+
   const cwd = process.cwd();
   const identityPath = join(cwd, '.pcp', 'identity.json');
   if (fsOps.existsSync(identityPath)) {
@@ -83,7 +97,7 @@ function resolveDefaultCliName(fsOps: Pick<DoctorFs, 'existsSync' | 'readFileSyn
   const dirName = basename(cwd);
   const match = dirName.match(/--(.+)$/);
   if (match) return `sb-${match[1]}`;
-  return 'sb-dev';
+  return 'sb';
 }
 
 export function analyzeCliLink(
@@ -107,10 +121,11 @@ export function analyzeCliLink(
   }
 
   if (!fsOps.existsSync(linkPath)) {
+    const fixCmd = buildFixCommand(binaryName);
     checks.push({
       name: 'Linked binary',
       status: 'fail',
-      detail: `Missing ${linkPath} (run: sb studio cli${options.name ? ` --name ${binaryName}` : ''})`,
+      detail: `Missing ${linkPath} (run: ${fixCmd})`,
     });
     return { binaryName, linkPath, expectedTarget, checks };
   }
@@ -155,7 +170,9 @@ export function analyzeCliLink(
     checks.push({
       name: 'Executable bit',
       status: executable ? 'ok' : 'warn',
-      detail: executable ? 'Target is executable.' : 'Target is not executable (chmod +x may be needed).',
+      detail: executable
+        ? 'Target is executable.'
+        : 'Target is not executable (chmod +x may be needed).',
     });
   } catch {
     checks.push({
@@ -198,11 +215,123 @@ function iconForStatus(status: CheckStatus): string {
 }
 
 function buildFixCommand(binaryName: string): string {
+  if (binaryName === 'sb') return 'sb studio cli';
   return `sb studio cli --name ${binaryName}`;
 }
 
-async function doctorCommand(options: { name?: string; json?: boolean; fix?: boolean }): Promise<void> {
+function resolveRepoRoot(fsOps: Pick<DoctorFs, 'existsSync'>): string | undefined {
+  let dir = process.cwd();
+  const { root } = parsePath(dir);
+  while (true) {
+    if (fsOps.existsSync(join(dir, 'supabase', 'config.toml'))) return dir;
+    if (dir === root) break;
+    dir = dirname(dir);
+  }
+  return undefined;
+}
+
+function parseMigrationStatus(raw: string): MigrationStatusResult | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed) as MigrationStatusResult;
+  } catch {
+    return null;
+  }
+}
+
+function formatPendingMigrationCheck(parsed: MigrationStatusResult): DoctorCheck {
+  const pendingCount = parsed.pendingCount || parsed.pending?.length || 0;
+  const pendingList = (parsed.pending || []).slice(0, 5).join(', ');
+  const scope = parsed.target === 'local' ? 'local' : 'linked';
+  return {
+    name: MIGRATION_CHECK_NAME,
+    status: 'warn',
+    detail:
+      `${pendingCount} pending ${scope} migration(s).` +
+      `${pendingList ? `\n      pending: ${pendingList}` : ''}\n` +
+      `      run: yarn prod:migrate (or one-shot: yarn prod:up)`,
+  };
+}
+
+function buildMigrationHealthCheck(
+  fsOps: Pick<DoctorFs, 'existsSync'> = defaultFs
+): DoctorCheck | null {
+  const repoRoot = resolveRepoRoot(fsOps);
+  if (!repoRoot) return null;
+
+  const scriptPath = join(repoRoot, 'scripts', 'migration-status.mjs');
+  if (!fsOps.existsSync(scriptPath)) {
+    return {
+      name: MIGRATION_CHECK_NAME,
+      status: 'warn',
+      detail: `Missing scripts/migration-status.mjs at ${scriptPath}`,
+    };
+  }
+
+  let raw = '';
+  try {
+    raw = execFileSync('node', [scriptPath, '--json', '--workdir', repoRoot], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+  } catch (error) {
+    const stdout =
+      error && typeof error === 'object' && 'stdout' in error
+        ? String((error as { stdout?: string }).stdout || '')
+        : '';
+    const parsed = parseMigrationStatus(stdout);
+    if (parsed?.state === 'pending') {
+      return formatPendingMigrationCheck(parsed);
+    }
+
+    const reason = parsed?.reason || String(error);
+    return {
+      name: MIGRATION_CHECK_NAME,
+      status: 'warn',
+      detail: `Unable to determine linked migration status.\n      ${reason}`,
+    };
+  }
+
+  const parsed = parseMigrationStatus(raw);
+  if (!parsed) {
+    return {
+      name: MIGRATION_CHECK_NAME,
+      status: 'warn',
+      detail: 'Unable to parse migration status output.',
+    };
+  }
+
+  if (parsed.state === 'pending') {
+    return formatPendingMigrationCheck(parsed);
+  }
+
+  if (parsed.state === 'clean') {
+    const scope = parsed.target === 'local' ? 'local' : 'linked';
+    return {
+      name: MIGRATION_CHECK_NAME,
+      status: 'ok',
+      detail: `No pending ${scope} migrations.`,
+    };
+  }
+
+  return {
+    name: MIGRATION_CHECK_NAME,
+    status: 'warn',
+    detail: parsed.reason || 'Unable to determine linked migration status.',
+  };
+}
+
+async function doctorCommand(options: {
+  name?: string;
+  json?: boolean;
+  fix?: boolean;
+}): Promise<void> {
   const result = analyzeCliLink({ name: options.name });
+  const migrationCheck = buildMigrationHealthCheck();
+  if (migrationCheck) {
+    result.checks.push(migrationCheck);
+  }
 
   if (options.json) {
     console.log(JSON.stringify(result, null, 2));
@@ -268,7 +397,9 @@ async function doctorCommand(options: { name?: string; json?: boolean; fix?: boo
         rl.close();
       }
     } else {
-      console.log(chalk.dim('\nTip: run sb doctor --fix to confirm and apply from this directory.'));
+      console.log(
+        chalk.dim('\nTip: run sb doctor --fix to confirm and apply from this directory.')
+      );
     }
     console.log('');
   }

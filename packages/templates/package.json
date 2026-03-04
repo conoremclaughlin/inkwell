@@ -2,5 +2,6 @@
   "name": "@personal-context/templates",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "description": "Shared identity templates for PCP — awakening prompts and document starters"
 }

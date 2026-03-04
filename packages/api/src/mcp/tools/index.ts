@@ -32,7 +32,6 @@ import {
   handleForget,
   handleUpdateMemory,
   handleStartSession,
-  handleLogSession,
   handleEndSession,
   handleGetSession,
   handleListSessions,
@@ -1306,62 +1305,6 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           return await handleStartSession(args, dataComposer);
         } catch (error) {
           logger.error('Error in start_session:', error);
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: JSON.stringify({
-                  success: false,
-                  error: error instanceof Error ? error.message : 'Unknown error',
-                }),
-              },
-            ],
-            isError: true,
-          };
-        }
-      }
-    );
-
-    // Register log_session tool
-    server.registerTool(
-      'log_session',
-      {
-        description: `[DEPRECATED] Add an entry to the current session log. Prefer update_session_phase for work status and remember for important decisions/events.
-
-User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-        inputSchema: {
-          ...userIdentifierFields,
-          sessionId: z
-            .string()
-            .uuid()
-            .optional()
-            .describe('Session ID (uses active session if not provided)'),
-          agentId: z
-            .string()
-            .optional()
-            .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
-          studioId: z
-            .string()
-            .uuid()
-            .optional()
-            .describe('Studio ID for session resolution when sessionId not provided'),
-          workspaceId: z
-            .string()
-            .uuid()
-            .optional()
-            .describe('[Deprecated] Workspace ID alias for studioId.'),
-          content: z.string().describe('Log entry content'),
-          salience: z
-            .enum(['low', 'medium', 'high', 'critical'])
-            .optional()
-            .describe('Importance (default: medium)'),
-        },
-      },
-      async (args) => {
-        try {
-          return await handleLogSession(args, dataComposer);
-        } catch (error) {
-          logger.error('Error in log_session:', error);
           return {
             content: [
               {
@@ -3320,10 +3263,8 @@ Message types:
 - notification: FYI, no response needed
 - permission_grant: Grant or revoke tool permissions (include permissionGrant in metadata)
 
-Trigger defaults:
-- task_request / session_resume / notification / permission_grant: trigger recipient wake-up by default
-- message: does not trigger by default
-- Any default can be overridden with the \`trigger\` boolean flag
+Trigger behavior:
+All message types trigger the recipient by default. Most agents don't have heartbeats, so untriggered messages may sit unread for hours. Only set trigger=false if the message can genuinely wait 5+ hours.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: inboxToolDefinitions[0].schema,
@@ -3447,13 +3388,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'trigger_agent',
     {
-      description: `Trigger another agent to wake up immediately. Use this after sending to an agent's inbox to avoid waiting for their polling interval.
-
-Pattern:
-1. send_to_inbox(toAgentId: "myra", content: "Task completed", ...)
-2. trigger_agent(toAgentId: "myra", fromAgentId: "wren", triggerType: "task_complete")
-
-This is the "doorbell" - the inbox is the "mailbox". Use both together for reliable async communication.`,
+      description: `Trigger another agent to wake up immediately. Note: send_to_inbox already triggers the recipient by default, so you rarely need this tool separately. Use this only for bare triggers without an inbox message (e.g., pinging an agent to check their inbox or resume work).`,
       inputSchema: triggerAgentSchema,
     },
     async (args) => {

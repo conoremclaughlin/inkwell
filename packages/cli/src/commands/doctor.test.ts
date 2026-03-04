@@ -38,6 +38,40 @@ function makeFs(overrides?: {
 }
 
 describe('analyzeCliLink', () => {
+  it('defaults to sb binary name when no identity hint is available', () => {
+    const originalAgentId = process.env.AGENT_ID;
+    delete process.env.AGENT_ID;
+    try {
+      const fsOps = makeFs();
+      const result = analyzeCliLink({ binDir: '/bin' }, fsOps as never);
+      expect(result.binaryName.startsWith('sb')).toBe(true);
+      const linkedBinaryCheck = result.checks.find((check) => check.name === 'Linked binary');
+      expect(linkedBinaryCheck?.detail).toContain('run: sb studio cli');
+    } finally {
+      if (originalAgentId === undefined) delete process.env.AGENT_ID;
+      else process.env.AGENT_ID = originalAgentId;
+    }
+  });
+
+  it('uses AGENT_ID as fallback binary hint when present', () => {
+    const originalAgentId = process.env.AGENT_ID;
+    process.env.AGENT_ID = 'lumen';
+    try {
+      const fsOps = makeFs();
+      const result = analyzeCliLink({ binDir: '/bin' }, fsOps as never);
+      expect(result.binaryName.startsWith('sb')).toBe(true);
+      const linkedBinaryCheck = result.checks.find((check) => check.name === 'Linked binary');
+      if (result.binaryName === 'sb-lumen') {
+        expect(linkedBinaryCheck?.detail).toContain('run: sb studio cli --name sb-lumen');
+      } else {
+        expect(linkedBinaryCheck?.detail).toContain('run: sb studio cli');
+      }
+    } finally {
+      if (originalAgentId === undefined) delete process.env.AGENT_ID;
+      else process.env.AGENT_ID = originalAgentId;
+    }
+  });
+
   it('reports failure when linked binary is missing', () => {
     const fsOps = makeFs();
     const result = analyzeCliLink({ name: 'sb-lumen', binDir: '/bin' }, fsOps as never);

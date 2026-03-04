@@ -123,8 +123,12 @@ Useful Supabase docs:
 ```
 personal-context-protocol/
 ├── packages/
-│   ├── api/              # PCP server (MCP tools, services, data layer)
-│   └── cli/              # SB CLI (sb command)
+│   ├── api/              # PCP server (MCP tools, services, data layer) [FSL-1.1-MIT]
+│   ├── cli/              # SB CLI (sb command)
+│   ├── shared/           # Shared types and utilities
+│   ├── spec/             # PCP Protocol Specification
+│   ├── templates/        # Identity templates and conventions
+│   └── web/              # Admin dashboard
 ├── stories/              # Feature specs and design docs
 │   └── cli/              # CLI-related stories
 ├── supabase/
@@ -179,7 +183,10 @@ See [AGENTS.md](./AGENTS.md) for onboarding instructions.
 yarn dev                   # Start all services (pm2)
 yarn dev:direct            # Start API+web directly (no pm2, dev mode)
 yarn prod:refresh          # Install + build latest code after pull
+yarn prod:migrate          # Apply pending migrations (auto local/linked via .env.local SUPABASE_URL)
 yarn prod:direct           # Run API+web directly in production mode (no pm2)
+yarn prod                  # Alias for prod:up (fast path)
+yarn prod:up               # One-shot: refresh build + migrate + start direct prod
 yarn build                 # Build all packages
 yarn type-check            # Type check all packages
 yarn test                  # Unit tests (all workspaces)
@@ -201,16 +208,30 @@ If PM2/watcher overhead is undesirable on laptops, run PCP directly:
 # 1) After pulling latest changes
 yarn prod:refresh
 
-# 2) Start in direct production mode (no PM2)
+# 2) Apply pending migrations (auto local/linked)
+yarn prod:migrate
+
+# 3) Start in direct production mode (no PM2)
 yarn prod:direct
+
+# Or one-shot:
+yarn prod
+# (same as: yarn prod:up)
 ```
 
 Notes:
 
 - `yarn prod:direct` does **not rebuild** on start; it uses existing build artifacts.
+- `yarn prod:migrate` / `migration-status` auto-select target:
+  - `local` when `SUPABASE_URL` (or `LOCAL_SUPABASE_URL`) points to localhost/127.0.0.1/::1
+  - otherwise `linked`
+  - source precedence: process env → `.env.local` → `.env`
+- `yarn prod:direct` now warns if migrations appear pending for the resolved target.
+- `yarn dev` / `yarn dev:direct` also run the same migration-status warning check before starting.
 - To run API only (no dashboard process): `PCP_RUN_WEB=false yarn prod:direct`
 - After `git pull`, run `yarn prod:refresh` and restart your direct/PM2 process.
 - The dashboard and `sb` CLI will warn when the running server is behind local HEAD and needs a restart.
+- `sb doctor` includes a migration status check (local or linked) and points to `yarn prod:migrate` / `yarn prod:up` when pending.
 
 ## Contributing
 
@@ -218,4 +239,6 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for git conventions, coding style, PR p
 
 ## License
 
-MIT
+MIT — matching [MCP](https://github.com/modelcontextprotocol) and [OpenClaw](https://github.com/openclaw).
+
+The PCP server (`packages/api`) is licensed under [FSL-1.1-MIT](./packages/api/LICENSE) (Functional Source License) — source-available with a competing-use restriction, converting to MIT after 2 years. All other packages are [MIT](./LICENSE).

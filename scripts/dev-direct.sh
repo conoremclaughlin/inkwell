@@ -37,6 +37,12 @@ load_env_file "${ROOT_DIR}/.env"
 # shellcheck disable=SC1090
 source "${PRESERVED_ENV_FILE}"
 
+if command -v supabase >/dev/null 2>&1; then
+  node "${ROOT_DIR}/scripts/migration-status.mjs" --workdir "${ROOT_DIR}" --warn-only || true
+else
+  echo "[migrations] ⚠ Supabase CLI not found; cannot check linked migration status."
+fi
+
 # Run API + web directly (no PM2), useful for parallel worktrees.
 BASE_PORT="${PCP_PORT_BASE:-3001}"
 WEB_PORT="${WEB_PORT:-$((BASE_PORT + 1))}"

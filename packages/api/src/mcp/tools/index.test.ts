@@ -18,7 +18,6 @@ describe('registerAllTools lifecycle visibility', () => {
     });
 
     expect(server.registeredTools).not.toContain('start_session');
-    expect(server.registeredTools).not.toContain('log_session');
     expect(server.registeredTools).not.toContain('end_session');
     expect(server.registeredTools).toContain('update_session_phase');
   });
@@ -31,8 +30,8 @@ describe('registerAllTools lifecycle visibility', () => {
     });
 
     expect(server.registeredTools).toContain('start_session');
-    expect(server.registeredTools).toContain('log_session');
     expect(server.registeredTools).toContain('end_session');
+    expect(server.registeredTools).not.toContain('log_session');
     expect(server.registeredTools).toContain('update_session_phase');
   });
 });

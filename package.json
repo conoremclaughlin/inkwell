@@ -7,11 +7,14 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "pm2 start ecosystem.config.cjs",
-    "dev:isolated": "PM2_HOME=.pm2 pm2 start ecosystem.config.cjs",
+    "dev": "./scripts/dev.sh",
+    "dev:isolated": "PM2_HOME=.pm2 ./scripts/dev.sh",
     "dev:direct": "./scripts/dev-direct.sh",
     "prod:direct": "./scripts/prod-direct.sh",
     "prod:refresh": "./scripts/prod-refresh.sh",
+    "prod:migrate": "./scripts/prod-migrate.sh",
+    "prod:up": "./scripts/prod-up.sh",
+    "prod": "yarn prod:up",
     "dev:mcp": "yarn workspace @personal-context/api dev:mcp",
     "dev:myra:deprecated": "echo 'DEPRECATED: Myra is now triggered via heartbeat reminders through the PCP server. Use yarn dev instead.'",
     "dev:web": "yarn workspace @personal-context/web dev",

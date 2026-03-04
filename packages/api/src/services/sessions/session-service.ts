@@ -394,13 +394,29 @@ export class SessionService implements ISessionService {
         logger.warn('Failed to log backend spawn activity', { error: err });
       });
 
+    // Mark session as running before backend turn
+    await this.repository.update(session.id, { lifecycle: 'running' });
+
+    let result;
+    let turnDurationMs: number;
     const turnStartMs = Date.now();
-    const result = await runner.run(formattedMessage, {
-      claudeSessionId: session.claudeSessionId || undefined,
-      injectedContext: session.claudeSessionId ? undefined : injectedContext,
-      config: runnerConfig,
-    });
-    const turnDurationMs = Date.now() - turnStartMs;
+    try {
+      result = await runner.run(formattedMessage, {
+        claudeSessionId: session.claudeSessionId || undefined,
+        injectedContext: session.claudeSessionId ? undefined : injectedContext,
+        config: runnerConfig,
+      });
+      turnDurationMs = Date.now() - turnStartMs;
+    } catch (runnerError) {
+      // Runner threw (spawn failure, capacity error, etc.) — mark session as failed
+      await this.repository.update(session.id, { lifecycle: 'failed' }).catch((e) => {
+        logger.warn('Failed to set lifecycle=failed after runner crash', {
+          sessionId: session.id,
+          error: e,
+        });
+      });
+      throw runnerError;
+    }
 
     // 5b. Log backend CLI completion to activity stream (fire-and-forget)
     const errorClassification =
@@ -447,17 +463,21 @@ export class SessionService implements ISessionService {
       });
     }
 
-    // 7. Update session with new Claude session ID, usage, and message count
+    // 7. Update session with new Claude session ID, usage, message count, and lifecycle
+    // idle (not completed) after success — session stays reusable. completed only via end_session.
+    const postRunLifecycle = result.success ? 'idle' : 'failed';
     if (result.claudeSessionId !== session.claudeSessionId) {
       await this.repository.update(session.id, {
         claudeSessionId: result.claudeSessionId,
         messageCount: session.messageCount + 1,
         backend: resolvedBackend,
+        lifecycle: postRunLifecycle as Session['lifecycle'],
       });
     } else {
       await this.repository.update(session.id, {
         messageCount: session.messageCount + 1,
         backend: resolvedBackend,
+        lifecycle: postRunLifecycle as Session['lifecycle'],
       });
     }
 
@@ -623,6 +643,7 @@ export class SessionService implements ISessionService {
       identityId,
       claudeSessionId: null,
       type,
+      lifecycle: 'idle',
       status: 'active',
       taskDescription: options?.taskDescription,
       parentSessionId: options?.parentSessionId,
@@ -676,7 +697,14 @@ export class SessionService implements ISessionService {
     // Other hints resolve by matching the studio name for this user + agent.
     if (options.studioHint) {
       if (options.studioHint === 'main') {
-        return this.resolveMainStudioId(userId);
+        const mainId = await this.resolveMainStudioId(userId);
+        if (mainId) return mainId;
+        // studioHint was explicit — don't silently fall through to unrelated studios
+        logger.warn('[StudioResolve] studioHint=main but no main studio found, skipping fallback', {
+          userId,
+          agentId,
+        });
+        return undefined;
       }
 
       const { data: namedStudio } = await this.supabase
@@ -693,11 +721,13 @@ export class SessionService implements ISessionService {
         return namedStudio.id;
       }
 
-      logger.warn('[StudioResolve] Studio hint did not match any studio, falling through', {
+      // studioHint was explicit — don't silently fall through to unrelated studios
+      logger.warn('[StudioResolve] Studio hint did not match any studio, skipping fallback', {
         userId,
         agentId,
         studioHint: options.studioHint,
       });
+      return undefined;
     }
 
     // 1) Related session scope (explicit resume continuity)
@@ -807,6 +837,7 @@ export class SessionService implements ISessionService {
   private async resolveMainStudioId(userId: string): Promise<string | undefined> {
     if (!this.supabase) return undefined;
 
+    // 1. Exact match: studio whose worktree_path is the server's default working directory
     const { data: mainStudioByPath } = await this.supabase
       .from('studios')
       .select('id')
@@ -820,6 +851,7 @@ export class SessionService implements ISessionService {
       return mainStudioByPath.id;
     }
 
+    // 2. Branch match: any studio on the 'main' branch
     const { data: mainStudioByBranch } = await this.supabase
       .from('studios')
       .select('id, updated_at')

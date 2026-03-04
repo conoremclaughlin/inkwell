@@ -2,6 +2,7 @@
   "name": "@personal-context/api",
   "version": "1.0.0",
   "private": true,
+  "license": "SEE LICENSE IN LICENSE",
   "description": "Personal context protocol API server with MCP, Telegram bot, and REST API",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
