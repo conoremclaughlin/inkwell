@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync } from 'child_process';
 import { resolve as resolvePath } from 'path';
+import { existsSync, readFileSync } from 'fs';
 
 function parseArgs(argv) {
   const args = {
@@ -8,6 +9,8 @@ function parseArgs(argv) {
     json: false,
     warnOnly: false,
     quiet: false,
+    target: 'auto',
+    printTarget: false,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -29,9 +32,85 @@ function parseArgs(argv) {
       i += 1;
       continue;
     }
+    if (token === '--target') {
+      const next = String(argv[i + 1] || '').trim().toLowerCase();
+      if (next === 'linked' || next === 'local' || next === 'auto') {
+        args.target = next;
+        i += 1;
+      }
+      continue;
+    }
+    if (token === '--linked') {
+      args.target = 'linked';
+      continue;
+    }
+    if (token === '--local') {
+      args.target = 'local';
+      continue;
+    }
+    if (token === '--print-target') {
+      args.printTarget = true;
+      continue;
+    }
   }
 
   return args;
+}
+
+function parseEnvFile(filePath) {
+  if (!existsSync(filePath)) return {};
+  try {
+    const raw = readFileSync(filePath, 'utf-8');
+    const out = {};
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+
+      const candidate = trimmed.startsWith('export ') ? trimmed.slice(7).trim() : trimmed;
+      const eqIndex = candidate.indexOf('=');
+      if (eqIndex <= 0) continue;
+      const key = candidate.slice(0, eqIndex).trim();
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+      let value = candidate.slice(eqIndex + 1).trim();
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      out[key] = value;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function isLocalSupabaseUrl(value) {
+  if (!value) return false;
+  try {
+    const { hostname } = new URL(value);
+    return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+  } catch {
+    return false;
+  }
+}
+
+function resolveTarget(args) {
+  if (args.target === 'local' || args.target === 'linked') return args.target;
+
+  const envLocal = parseEnvFile(resolvePath(args.workdir, '.env.local'));
+  const envFallback = parseEnvFile(resolvePath(args.workdir, '.env'));
+
+  const supabaseUrl =
+    process.env.SUPABASE_URL ||
+    process.env.LOCAL_SUPABASE_URL ||
+    envLocal.SUPABASE_URL ||
+    envLocal.LOCAL_SUPABASE_URL ||
+    envFallback.SUPABASE_URL ||
+    envFallback.LOCAL_SUPABASE_URL;
+
+  return isLocalSupabaseUrl(supabaseUrl) ? 'local' : 'linked';
 }
 
 function boolLike(value) {
@@ -125,14 +204,18 @@ function classifyPending(rows) {
 }
 
 function printHuman(result) {
+  const scope = result.target === 'local' ? 'local' : 'linked';
+  if (result.target) {
+    console.log(`[migrations] Target: ${result.target}`);
+  }
   if (result.state === 'clean') {
-    console.log('[migrations] ✅ No pending linked migrations.');
+    console.log(`[migrations] ✅ No pending ${scope} migrations.`);
     return;
   }
 
   if (result.state === 'pending') {
     console.log(
-      `[migrations] ⚠ ${result.pendingCount} pending linked migration${
+      `[migrations] ⚠ ${result.pendingCount} pending ${scope} migration${
         result.pendingCount === 1 ? '' : 's'
       }.`
     );
@@ -148,7 +231,14 @@ function printHuman(result) {
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
-  const commandArgs = ['migration', 'list', '--linked', '--workdir', args.workdir, '-o', 'json'];
+  const target = resolveTarget(args);
+  if (args.printTarget) {
+    console.log(target);
+    process.exit(0);
+    return;
+  }
+
+  const commandArgs = ['migration', 'list', `--${target}`, '--workdir', args.workdir, '-o', 'json'];
 
   let raw;
   try {
@@ -161,6 +251,7 @@ function main() {
     const stdout = error && typeof error === 'object' ? String(error.stdout || '').trim() : '';
     const detail = stderr || stdout || (error instanceof Error ? error.message : String(error));
     const result = {
+      target,
       state: 'unknown',
       reason: detail || 'supabase migration list failed',
       pendingCount: 0,
@@ -177,6 +268,7 @@ function main() {
     parsed = JSON.parse(raw);
   } catch (error) {
     const result = {
+      target,
       state: 'unknown',
       reason: `Could not parse Supabase migration JSON output: ${
         error instanceof Error ? error.message : String(error)
@@ -195,12 +287,14 @@ function main() {
   const result =
     pendingRows.length > 0
       ? {
+          target,
           state: 'pending',
           reason: null,
           pendingCount: pendingRows.length,
           pending: pendingRows.map(rowLabel),
         }
       : {
+          target,
           state: 'clean',
           reason: null,
           pendingCount: 0,
