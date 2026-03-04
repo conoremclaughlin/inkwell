@@ -784,23 +784,7 @@ export class SessionService implements ISessionService {
       }
     }
 
-    // 3) Agent default studio (derived from recent sessions, then studio records)
-    const { data: recentAgentStudioSession } = await this.supabase
-      .from('sessions')
-      .select('studio_id, workspace_id, updated_at')
-      .eq('user_id', userId)
-      .eq('agent_id', agentId)
-      .or('studio_id.not.is.null,workspace_id.not.is.null')
-      .order('updated_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    const recentAgentStudio =
-      recentAgentStudioSession?.studio_id || recentAgentStudioSession?.workspace_id || undefined;
-    if (recentAgentStudio) {
-      return recentAgentStudio;
-    }
-
+    // 3) Agent's own studio (authoritative — from studios table, not session history)
     const { data: agentStudio } = await this.supabase
       .from('studios')
       .select('id, updated_at')
@@ -814,6 +798,10 @@ export class SessionService implements ISessionService {
     if (agentStudio?.id) {
       return agentStudio.id;
     }
+
+    // NOTE: We intentionally skip "most recent session's studio" as a fallback.
+    // It creates feedback loops: if an agent is misrouted once, all future sessions
+    // inherit the bad studio. The studios table is the authoritative source.
 
     // 4) Shared per-user main studio fallback
     const mainStudioId = await this.resolveMainStudioId(userId);
