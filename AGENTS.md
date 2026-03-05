@@ -458,6 +458,7 @@ Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key points repeated here for ag
 - Strict TypeScript, avoid `any`. Use Zod for runtime validation.
 - One class/module per file. Co-locate tests (`*.test.ts`).
 - **Upsert safety**: never set optional fields to `null` just because they weren't provided. Use `undefined` checks to distinguish "not provided" from "explicitly cleared". When adding new columns, also update archive/history triggers, history response mappings, and restore handlers.
+- **NEVER block the event loop.** The API server is a single-threaded Node.js process handling concurrent requests. Use async alternatives (`execFile` + `promisify`, `fs/promises`, etc.) instead of sync calls (`execSync`, `readFileSync`, `writeFileSync`). The only acceptable exception is during one-time server startup before the HTTP listener opens. Blocking calls in request handlers, tool handlers, or message processing will stall all other concurrent work.
 
 ## Environment Variables
 
