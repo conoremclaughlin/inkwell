@@ -3868,6 +3868,10 @@ router.get('/sessions', async (req: Request, res: Response) => {
       stats,
       sessions: sessionRows.map((s) => {
         const identity = s.agent_id ? identitiesByAgentId.get(s.agent_id) : null;
+        const studio =
+          studiosById.get(s.studio_id || s.workspace_id || '') ||
+          workspacesBySessionId.get(s.id) ||
+          null;
         return {
           id: s.id,
           backendSessionId: s.backend_session_id || s.claude_session_id || null,
@@ -3886,14 +3890,10 @@ router.get('/sessions', async (req: Request, res: Response) => {
           updatedAt: s.updated_at,
           endedAt: s.ended_at,
           preview: previewsBySessionId.get(s.id) || [],
-          workspace:
-            studiosById.get(s.studio_id || s.workspace_id || '') ||
-            workspacesBySessionId.get(s.id) ||
-            null,
-          studio:
-            studiosById.get(s.studio_id || s.workspace_id || '') ||
-            workspacesBySessionId.get(s.id) ||
-            null,
+          // NOTE: `workspace` previously represented studio/worktree scope.
+          // Keep a single canonical `studio` field to avoid conflating it with
+          // top-level organizational workspaces.
+          studio,
         };
       }),
     });

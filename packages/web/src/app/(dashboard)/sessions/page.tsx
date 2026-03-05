@@ -45,7 +45,7 @@ interface Session {
   startedAt: string;
   updatedAt: string;
   endedAt: string | null;
-  workspace: SessionWorkspace | null;
+  studio: SessionWorkspace | null;
   preview: Array<{
     id: string;
     source: 'activity_stream' | 'session_logs' | 'local_transcript';
@@ -203,18 +203,18 @@ function SessionCard({ session }: { session: Session }) {
           )}
 
           {/* Workspace info */}
-          {session.workspace && (
+          {session.studio && (
             <div className="flex items-center gap-3 mt-2 text-xs text-gray-500">
               <span className="flex items-center gap-1">
                 <GitBranch className="h-3 w-3" />
-                {session.workspace.branch || 'no branch'}
+                {session.studio.branch || 'no branch'}
               </span>
-              {session.workspace.purpose && (
-                <span className="truncate max-w-xs">{session.workspace.purpose}</span>
+              {session.studio.purpose && (
+                <span className="truncate max-w-xs">{session.studio.purpose}</span>
               )}
-              {session.workspace.workType && (
+              {session.studio.workType && (
                 <Badge variant="outline" className="text-xs">
-                  {session.workspace.workType}
+                  {session.studio.workType}
                 </Badge>
               )}
             </div>
@@ -306,7 +306,7 @@ function SessionCard({ session }: { session: Session }) {
             </div>
 
             {/* Studio details */}
-            {session.workspace && (
+            {session.studio && (
               <div>
                 <div className="flex items-center gap-1.5 font-medium text-gray-700 mb-1.5">
                   <FolderGit2 className="h-3.5 w-3.5" />
@@ -315,34 +315,34 @@ function SessionCard({ session }: { session: Session }) {
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 text-gray-500">
                   <div>
                     <span className="text-gray-400">ID: </span>
-                    <code className="font-mono select-all">{session.workspace.id}</code>
+                    <code className="font-mono select-all">{session.studio.id}</code>
                   </div>
                   <div>
                     <span className="text-gray-400">Status: </span>
-                    <span>{session.workspace.status}</span>
+                    <span>{session.studio.status}</span>
                   </div>
-                  {session.workspace.branch && (
+                  {session.studio.branch && (
                     <div>
                       <span className="text-gray-400">Branch: </span>
-                      <code className="font-mono">{session.workspace.branch}</code>
+                      <code className="font-mono">{session.studio.branch}</code>
                     </div>
                   )}
-                  {session.workspace.baseBranch && (
+                  {session.studio.baseBranch && (
                     <div>
                       <span className="text-gray-400">Base: </span>
-                      <code className="font-mono">{session.workspace.baseBranch}</code>
+                      <code className="font-mono">{session.studio.baseBranch}</code>
                     </div>
                   )}
-                  {session.workspace.purpose && (
+                  {session.studio.purpose && (
                     <div className="sm:col-span-2">
                       <span className="text-gray-400">Purpose: </span>
-                      <span>{session.workspace.purpose}</span>
+                      <span>{session.studio.purpose}</span>
                     </div>
                   )}
-                  {session.workspace.workType && (
+                  {session.studio.workType && (
                     <div>
                       <span className="text-gray-400">Type: </span>
-                      <span>{session.workspace.workType}</span>
+                      <span>{session.studio.workType}</span>
                     </div>
                   )}
                 </div>
