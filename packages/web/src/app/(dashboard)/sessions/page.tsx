@@ -22,6 +22,7 @@ interface SessionWorkspace {
   id: string;
   branch: string | null;
   baseBranch: string | null;
+  repoRoot: string | null;
   purpose: string | null;
   workType: string | null;
   status: string;
@@ -186,6 +187,7 @@ function SessionCard({ session }: { session: Session }) {
   const [expanded, setExpanded] = useState(false);
   const state = getSessionState(session);
   const phaseLabel = session.currentPhase;
+  const repoName = session.studio?.repoName;
 
   return (
     <div className={clsx('rounded-lg border p-4', state.cardClass)}>
@@ -214,10 +216,13 @@ function SessionCard({ session }: { session: Session }) {
           {/* Workspace info */}
           {session.studio && (
             <div className="flex items-center gap-3 mt-2 text-xs text-gray-500">
-              {session.studio.repoName && (
-                <span className="flex items-center gap-1">
+              {repoName && (
+                <span
+                  className="flex items-center gap-1"
+                  title={session.studio.repoRoot || undefined}
+                >
                   <FolderGit2 className="h-3 w-3" />
-                  {session.studio.repoName}
+                  {repoName}
                 </span>
               )}
               <span className="flex items-center gap-1">
@@ -358,6 +363,12 @@ function SessionCard({ session }: { session: Session }) {
                     <div>
                       <span className="text-gray-400">Base: </span>
                       <code className="font-mono">{session.studio.baseBranch}</code>
+                    </div>
+                  )}
+                  {session.studio.repoRoot && (
+                    <div className="sm:col-span-2">
+                      <span className="text-gray-400">Repo root: </span>
+                      <code className="font-mono break-all">{session.studio.repoRoot}</code>
                     </div>
                   )}
                   {session.studio.purpose && (

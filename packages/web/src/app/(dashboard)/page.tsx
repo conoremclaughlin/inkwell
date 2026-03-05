@@ -6,7 +6,7 @@ import { MessageSquare, GitBranch, ArrowRight, Monitor, FolderGit2 } from 'lucid
 import Link from 'next/link';
 import { useApiQuery } from '@/lib/api';
 import clsx from 'clsx';
-import { getAgentGradient } from '@/lib/utils';
+import { deriveRepoName, deriveStudioSlugFromWorktreePath, getAgentGradient } from '@/lib/utils';
 
 // ─── Types ───
 
@@ -14,6 +14,7 @@ interface StudioInfo {
   id: string;
   branch: string;
   baseBranch: string | null;
+  repoRoot: string | null;
   purpose: string | null;
   workType: string | null;
   worktreePath: string | null;
@@ -69,7 +70,7 @@ function getAgentStatusBadge(
 ): {
   label: string;
   badgeClass: string;
-} {
+} | null {
   // Phase-level overrides (blocked is a phase concern)
   if (phase?.startsWith('blocked'))
     return { label: 'Blocked', badgeClass: 'bg-amber-100 text-amber-700' };
@@ -84,21 +85,10 @@ function getAgentStatusBadge(
   // Backward compat: check old runtime:* phase values
   if (phase === 'runtime:generating')
     return { label: 'Running', badgeClass: 'bg-blue-100 text-blue-700' };
-  if (phase === 'runtime:idle') return { label: 'Idle', badgeClass: 'bg-green-100 text-green-700' };
-  if (phase) return { label: 'Idle', badgeClass: 'bg-green-100 text-green-700' };
+  if (phase === 'runtime:idle') return null;
+  if (phase) return null;
 
-  return { label: 'Offline', badgeClass: 'bg-gray-100 text-gray-500' };
-}
-
-function getStudioSlug(worktreePath: string | null): string | null {
-  if (!worktreePath) return null;
-  // Worktree folder names follow the pattern: <repo>--<slug>
-  // e.g. /path/to/personal-context-protocol--wren → "wren"
-  // e.g. /path/to/personal-context-protocol--lumen--lumen-alpha → "lumen--lumen-alpha"
-  const folder = worktreePath.split('/').pop() || '';
-  const dashDashIdx = folder.indexOf('--');
-  if (dashDashIdx === -1) return null;
-  return folder.slice(dashDashIdx + 2);
+  return null;
 }
 
 function getStudioStatusColor(status: string): string {
@@ -216,9 +206,11 @@ export default function DashboardPage() {
                       <div className="flex items-center gap-2">
                         <h3 className="font-semibold text-gray-900">{agent.agentName}</h3>
                         <span className="text-xs text-gray-400">@{agent.agentId}</span>
-                        <Badge className={clsx('text-[11px]', status.badgeClass)}>
-                          {status.label}
-                        </Badge>
+                        {status && (
+                          <Badge className={clsx('text-[11px]', status.badgeClass)}>
+                            {status.label}
+                          </Badge>
+                        )}
                       </div>
                       <div className="flex items-center gap-2 mt-0.5">
                         {agent.agentRole && (
@@ -250,7 +242,9 @@ export default function DashboardPage() {
                   ) : (
                     <div className="divide-y">
                       {agent.studios.map((studio) => {
-                        const slug = studio.slug || getStudioSlug(studio.worktreePath);
+                        const slug =
+                          studio.slug || deriveStudioSlugFromWorktreePath(studio.worktreePath);
+                        const repoName = deriveRepoName(studio.repoRoot, studio.worktreePath);
                         return (
                           <div key={studio.id} className="flex items-center gap-4 px-5 py-3">
                             <div className="flex items-center gap-3 flex-1 min-w-0">
@@ -262,6 +256,14 @@ export default function DashboardPage() {
                                   {slug || studio.branch}
                                 </span>
                               </div>
+                              {repoName && (
+                                <span
+                                  className="text-xs text-gray-400"
+                                  title={studio.repoRoot || undefined}
+                                >
+                                  {repoName}
+                                </span>
+                              )}
                               {studio.purpose && (
                                 <span className="text-xs text-gray-400 truncate">
                                   {studio.purpose}
@@ -274,18 +276,18 @@ export default function DashboardPage() {
                               )}
                             </div>
                             <div className="flex items-center gap-3 shrink-0">
-                              <Badge
-                                className={clsx(
-                                  'text-[11px] font-medium border',
-                                  studio.status === 'active'
-                                    ? 'bg-green-50 text-green-700 border-green-200 hover:bg-green-50'
-                                    : studio.status === 'idle'
+                              {studio.status !== 'active' && (
+                                <Badge
+                                  className={clsx(
+                                    'text-[11px] font-medium border',
+                                    studio.status === 'idle'
                                       ? 'bg-gray-50 text-gray-500 border-gray-200 hover:bg-gray-50'
                                       : 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-50'
-                                )}
-                              >
-                                {studio.status}
-                              </Badge>
+                                  )}
+                                >
+                                  {studio.status}
+                                </Badge>
+                              )}
                               <span className="text-xs text-gray-400">
                                 {formatRelativeTime(studio.updatedAt)}
                               </span>

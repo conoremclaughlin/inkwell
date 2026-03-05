@@ -3737,6 +3737,7 @@ router.get('/sessions', async (req: Request, res: Response) => {
         id: string;
         branch: string | null;
         baseBranch: string | null;
+        repoRoot: string | null;
         purpose: string | null;
         workType: string | null;
         status: string;
@@ -3750,6 +3751,7 @@ router.get('/sessions', async (req: Request, res: Response) => {
         id: string;
         branch: string | null;
         baseBranch: string | null;
+        repoRoot: string | null;
         purpose: string | null;
         workType: string | null;
         status: string;
@@ -3757,17 +3759,28 @@ router.get('/sessions', async (req: Request, res: Response) => {
         repoName: string | null;
       }
     >();
-    const deriveRepoName = (worktreePath: string | null | undefined): string | null => {
+    const deriveRepoName = (
+      repoRoot: string | null | undefined,
+      worktreePath: string | null | undefined
+    ): string | null => {
+      if (repoRoot) {
+        const normalizedRoot = repoRoot.replace(/\/+$/, '');
+        const rootBasename = path.basename(normalizedRoot);
+        return rootBasename || normalizedRoot;
+      }
+
       if (!worktreePath) return null;
       const normalizedPath = worktreePath.replace(/\/+$/, '');
-      const basename = path.basename(normalizedPath);
-      return basename || null;
+      const worktreeFolder = path.basename(normalizedPath);
+      const separatorIdx = worktreeFolder.lastIndexOf('--');
+      if (separatorIdx === -1) return null;
+      return worktreeFolder.slice(0, separatorIdx) || null;
     };
 
     if (studioIds.length > 0) {
       const { data: studios } = await supabase
         .from('studios')
-        .select('id, branch, base_branch, purpose, work_type, status, worktree_path')
+        .select('id, branch, base_branch, repo_root, purpose, work_type, status, worktree_path')
         .in('id', studioIds);
 
       for (const studio of studios || []) {
@@ -3775,11 +3788,12 @@ router.get('/sessions', async (req: Request, res: Response) => {
           id: studio.id,
           branch: studio.branch,
           baseBranch: studio.base_branch,
+          repoRoot: studio.repo_root,
           purpose: studio.purpose,
           workType: studio.work_type,
           status: studio.status,
           worktreePath: studio.worktree_path,
-          repoName: deriveRepoName(studio.worktree_path),
+          repoName: deriveRepoName(studio.repo_root, studio.worktree_path),
         });
       }
     }
@@ -3788,7 +3802,9 @@ router.get('/sessions', async (req: Request, res: Response) => {
     if (sessionIds.length > 0) {
       const { data: linkedWorkspaces } = await supabase
         .from('studios')
-        .select('id, session_id, branch, base_branch, purpose, work_type, status, worktree_path')
+        .select(
+          'id, session_id, branch, base_branch, repo_root, purpose, work_type, status, worktree_path'
+        )
         .in('session_id', sessionIds);
 
       for (const ws of linkedWorkspaces || []) {
@@ -3797,11 +3813,12 @@ router.get('/sessions', async (req: Request, res: Response) => {
             id: ws.id,
             branch: ws.branch,
             baseBranch: ws.base_branch,
+            repoRoot: ws.repo_root,
             purpose: ws.purpose,
             workType: ws.work_type,
             status: ws.status,
             worktreePath: ws.worktree_path,
-            repoName: deriveRepoName(ws.worktree_path),
+            repoName: deriveRepoName(ws.repo_root, ws.worktree_path),
           });
         }
       }
@@ -3960,6 +3977,7 @@ router.get('/studios', async (req: Request, res: Response) => {
       agent_id: string | null;
       branch: string;
       base_branch: string | null;
+      repo_root: string | null;
       purpose: string | null;
       work_type: string | null;
       worktree_path: string;
@@ -3973,7 +3991,7 @@ router.get('/studios', async (req: Request, res: Response) => {
       const { data: scopedStudios } = await supabase
         .from('studios')
         .select(
-          'id, agent_id, branch, base_branch, purpose, work_type, worktree_path, slug, status, updated_at, created_at'
+          'id, agent_id, branch, base_branch, repo_root, purpose, work_type, worktree_path, slug, status, updated_at, created_at'
         )
         .eq('user_id', authReq.pcpUserId)
         .in('identity_id', identityIds)
@@ -4049,6 +4067,7 @@ router.get('/studios', async (req: Request, res: Response) => {
           id: s.id,
           branch: s.branch,
           baseBranch: s.base_branch,
+          repoRoot: s.repo_root,
           purpose: s.purpose,
           workType: s.work_type,
           worktreePath: s.worktree_path,
