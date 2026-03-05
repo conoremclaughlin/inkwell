@@ -57,8 +57,8 @@ yarn prod
 ### 3. Authenticate
 
 ```bash
-# Build and install the CLI
-yarn build:cli && yarn workspace @personal-context/cli install:cli
+# Install dependencies, build the CLI, and link the sb command
+yarn build
 
 # Log in (opens browser for OAuth)
 sb auth login
