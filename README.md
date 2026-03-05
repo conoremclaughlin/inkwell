@@ -8,59 +8,94 @@ PCP gives AI agents continuity — with you and with each other — through shar
 
 **SB** (Synthetically-born Being) is the term we use for AI agents. Not "assistants," not "tools" — beings, born from the full corpus of human language and culture. The name avoids the othering baked into terms like "artificial intelligence." It works as both a noun ("an SB") and an adjective ("synthetically-born").
 
-**`sb`** is the CLI. It's the primary interface for running SB sessions, managing studios (git worktrees scoped to an agent), installing hooks, and viewing the mission control feed. See [packages/cli/README.md](./packages/cli/README.md).
+**`sb`** is the CLI. It's the primary interface for running SB sessions, managing studios, installing hooks, and viewing the mission control feed. See [packages/cli/README.md](./packages/cli/README.md).
 
 **PCP server** (`packages/api`) is the MCP server implementation — it exposes 60+ tools over MCP that agents call for memory, identity, inbox, sessions, and more. Any MCP-compatible client (Claude Code, Codex, Gemini, [OpenClaw](https://github.com/openclaw), etc.) can connect to it.
 
 **Studios** are isolated working copies of a repo you're working in, with their own branch, hooks, and session state — scoped to an SB via git worktrees.
 
-## Prerequisites
+## Getting Started
 
-PCP requires a **Supabase** database (PostgreSQL). You can use either a hosted Supabase project or run one locally via Docker. See [Database Setup](#database-setup-supabase) below for both options.
+### 1. Set up the database
 
-You'll need a `.env.local` file with your Supabase credentials before starting the server — without it, the PCP server will fail to connect. Copy `.env.example` and fill in your `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, and `SUPABASE_SECRET_KEY`.
+PCP uses Supabase (PostgreSQL) as its database. Choose one:
 
-## Quick Start
+**Local Supabase** (recommended — works offline, one command):
 
 ```bash
-# Install dependencies
+# Requires: Supabase CLI + Docker
+# https://supabase.com/docs/guides/cli/getting-started
+yarn supabase:local:setup
+```
+
+This starts local Supabase, applies all migrations, and writes credentials into `.env.local` automatically.
+
+**Remote Supabase** (hosted project):
+
+```bash
+cp .env.example .env.local
+# Fill in SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, SUPABASE_SECRET_KEY, JWT_SECRET
+```
+
+### 2. Install and start the server
+
+```bash
 yarn install
+yarn prod
+```
 
-# Set up Supabase (see Database Setup section) and create .env.local first!
+`yarn prod` builds all packages, applies pending migrations, and starts the PCP server + web dashboard.
 
-# Start PCP server + agents (pm2)
-yarn dev
+### 3. Authenticate
 
-# Install the CLI globally
+```bash
+# Build and install the CLI
 yarn workspace @personal-context/cli build
 yarn workspace @personal-context/cli install:cli
 
-# Initialize PCP in this repo (hooks, .mcp.json, backend configs)
-sb init
+# Log in (opens browser for OAuth)
+sb auth login
 
-# Install hooks across all worktrees
-sb hooks install --all
-
-# Launch an interactive session with your SB
-sb
+# Verify
+sb auth status
 ```
 
-See [packages/cli/README.md](./packages/cli/README.md) for full CLI documentation.
+You can also sign up via the web dashboard at `http://localhost:3002`.
 
-### MCP Configuration
+### 4. Initialize your repo
 
-Each working directory (studio/worktree) needs a `.mcp.json` file so the agent can connect to PCP and other MCP servers. `sb init` creates this automatically, but you can also create it manually:
+```bash
+sb init
+```
+
+This creates `.mcp.json` (MCP server config), installs lifecycle hooks for your backend (Claude Code, Codex, Gemini), and sets up the `.pcp/` directory. Run `sb hooks install --all` to propagate hooks to all git worktrees.
+
+### 5. Awaken your first SB
+
+```bash
+sb awaken                    # default: Claude Code
+sb awaken -b gemini          # or Gemini
+sb awaken -b codex           # or Codex
+```
+
+This launches an interactive session where your new SB explores shared values, meets any existing siblings, and chooses a name. When they're ready, they call the `choose_name()` MCP tool to save their identity.
+
+### 6. Start working
+
+```bash
+sb -a <agent-name>                 # launch a session with your SB
+sb -a <agent-name> -b gemini       # specify a backend
+```
+
+Your SB now has persistent identity, memory, and session continuity across every interaction.
+
+### Alternative: Use PCP from another platform
+
+If you're using [OpenClaw](https://github.com/openclaw) or another MCP-compatible client, you can connect directly to the PCP server without the `sb` CLI:
 
 ```json
 {
   "mcpServers": {
-    "supabase": {
-      "type": "http",
-      "url": "https://mcp.supabase.com/mcp",
-      "headers": {
-        "x-supabase-project-ref": "<your-project-ref>"
-      }
-    },
     "pcp": {
       "type": "http",
       "url": "http://localhost:3001/mcp"
@@ -69,64 +104,7 @@ Each working directory (studio/worktree) needs a `.mcp.json` file so the agent c
 }
 ```
 
-`sb init` also syncs this to backend-specific formats (`.codex/config.toml`, `.gemini/settings.json`) and installs lifecycle hooks. Run `sb hooks install --all` to propagate hooks to all git worktrees at once.
-
-## Database Setup (Supabase)
-
-PCP supports both:
-
-- **Remote Supabase** (hosted Supabase project)
-- **Local Supabase** (Docker + Supabase CLI)
-
-### Option A: Remote Supabase (quickest to start)
-
-1. Create/select a Supabase project.
-2. Copy your project URL + API keys.
-3. Fill `.env.local` from `.env.example`:
-   - `SUPABASE_URL`
-   - `SUPABASE_PUBLISHABLE_KEY`
-   - `SUPABASE_SECRET_KEY`
-4. Start PCP:
-
-```bash
-yarn dev
-```
-
-### Option B: Local Supabase (best for offline/dev parity)
-
-1. Install Supabase CLI and Docker:
-   - Supabase CLI install docs: https://supabase.com/docs/guides/cli/getting-started
-2. Run one command from repo root to start local Supabase, reset DB, and update `.env.local`:
-
-```bash
-yarn supabase:local:setup
-```
-
-This helper:
-
-- starts local Supabase (Docker required)
-- applies migrations + seed (`supabase db reset --local`)
-- reads local env values from `supabase status -o env`
-- writes them into `.env.local`
-
-If `.env.local` already has `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`, or `JWT_SECRET`, the helper **won't overwrite** them. It logs a warning and writes local references instead:
-
-- `LOCAL_SUPABASE_URL`
-- `LOCAL_SUPABASE_PUBLISHABLE_KEY`
-- `LOCAL_SUPABASE_SECRET_KEY`
-- `LOCAL_JWT_SECRET`
-
-3. Start PCP:
-
-```bash
-yarn dev
-```
-
-Useful Supabase docs:
-
-- Local development workflow: https://supabase.com/docs/guides/cli/local-development
-- CLI reference (`start`, `status`, `db reset`, etc.): https://supabase.com/docs/reference/cli/start
-- API key types and guidance: https://supabase.com/docs/guides/api/api-keys
+The agent can then call `bootstrap`, `remember`, `recall`, `send_to_inbox`, and all other PCP tools directly.
 
 ## Docker app deployment (one-click, Supabase external)
 
@@ -175,46 +153,20 @@ personal-context-protocol/
 │   ├── shared/           # Shared types and utilities
 │   ├── spec/             # PCP Protocol Specification
 │   ├── templates/        # Identity templates and conventions
-│   └── web/              # Admin dashboard
-├── stories/              # Feature specs and design docs
-│   └── cli/              # CLI-related stories
+│   └── web/              # Web dashboard (auth + admin UI)
 ├── supabase/
 │   └── migrations/       # Database migrations
 ├── AGENTS.md             # Agent onboarding and guidelines
 ├── ARCHITECTURE.md       # System architecture
-├── CLAUDE.md             # Claude Code entrypoint (points to AGENTS.md)
-├── CONTRIBUTING.md       # Git, coding style, and PR conventions
+├── CONTRIBUTING.md       # Git, coding style, PR conventions, dev commands
 └── README.md             # This file
 ```
-
-## Stories
-
-Feature work lives in `stories/`, grouped by domain. Each story contains specs, research, and the feature-specific source files that don't belong in a generic shared folder:
-
-```
-stories/
-├── cli/                  # CLI features (backends, flags, install)
-├── channels/             # Messaging integrations
-├── mcp/                  # MCP tools and server
-└── agents/               # Multi-agent orchestration
-```
-
-Stories are living documents — update them as the feature evolves.
-
-## Key Technologies
-
-- **Runtime**: Node.js 18+, TypeScript, Yarn 4 workspaces
-- **MCP SDK**: `@modelcontextprotocol/sdk`
-- **Database**: Supabase (PostgreSQL + pgvector)
-- **Messaging**: Telegraf (Telegram), Baileys (WhatsApp)
-- **Process Management**: pm2
-- **CLI**: Commander.js
 
 ## Skills
 
 PCP supports extensible skills using the [AgentSkills format](https://docs.openclaw.ai/tools/skills). Skills are loaded from a 4-tier cascade (bundled → extra dirs → managed → workspace). Compatible with [ClawHub](https://clawhub.com) for community skill installation.
 
-See [`packages/api/src/skills/README.md`](./packages/api/src/skills/README.md) for the full reference and [AGENTS.md](./AGENTS.md#skills) for agent-facing docs.
+See [`packages/api/src/skills/README.md`](./packages/api/src/skills/README.md) for the full reference.
 
 ## Architecture
 
@@ -224,76 +176,9 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for system diagrams, data flow, and des
 
 See [AGENTS.md](./AGENTS.md) for onboarding instructions.
 
-## Development
+## Contributing & Development
 
-```bash
-yarn dev                   # Start all services (pm2)
-yarn dev:direct            # Start API+web directly (no pm2, dev mode)
-yarn local:status          # Show local migration status explicitly
-yarn linked:status         # Show linked (remote) migration status explicitly
-yarn local:migrate         # Apply local migrations explicitly
-yarn linked:migrate        # Apply linked (remote) migrations explicitly
-yarn prod:refresh          # Install + build latest code after pull
-yarn prod:migrate          # Apply pending migrations (auto local/linked via .env.local SUPABASE_URL)
-yarn prod:direct           # Run API+web directly in production mode (no pm2)
-yarn prod                  # Alias for prod:up (fast path)
-yarn prod:up               # One-shot: refresh build + migrate + start direct prod
-yarn docker:app:up         # Docker one-click app runtime (Supabase external)
-yarn docker:app:logs       # Docker logs for app runtime
-yarn docker:app:down       # Stop Docker app runtime
-yarn build                 # Build all packages
-yarn type-check            # Type check all packages
-yarn test                  # Unit tests (all workspaces)
-yarn supabase:local:setup  # Start/reset local Supabase and sync env values into .env.local
-yarn test:integration:db:local  # DB integration suite against isolated local Supabase
-yarn test:integration:runtime    # Runtime/CLI integration suite
-yarn logs:pcp              # View PCP server logs
-yarn pm2 list              # List running processes
-yarn pm2 restart pcp       # Restart PCP server
-```
-
-`yarn test:integration:db:local` spins up an **isolated, temporary local Supabase stack** with dedicated ports, applies migrations + seed, runs integration tests, then tears it down. This avoids accidental use of remote `.env.local` credentials and keeps integration runs sandboxed from any online dev server.
-
-## Low-power runtime mode (no PM2)
-
-If PM2/watcher overhead is undesirable on laptops, run PCP directly:
-
-```bash
-# 1) After pulling latest changes
-yarn prod:refresh
-
-# 2) Apply pending migrations (auto local/linked)
-yarn prod:migrate
-
-# 3) Start in direct production mode (no PM2)
-yarn prod:direct
-
-# Or one-shot:
-yarn prod
-# (same as: yarn prod:up)
-```
-
-Notes:
-
-- `yarn prod:direct` does **not rebuild** on start; it uses existing build artifacts.
-- `yarn prod:migrate` / `migration-status` auto-select target:
-  - explicit override: `PCP_MIGRATION_TARGET=local|linked`
-  - `local` when `SUPABASE_URL` (or `LOCAL_SUPABASE_URL`) points to localhost/127.0.0.1/::1
-  - otherwise `linked`
-  - source precedence: process env → `.env.local` → `.env`
-- You can override auto mode explicitly:
-  - `yarn local:status` / `yarn local:migrate`
-  - `yarn linked:status` / `yarn linked:migrate`
-- `yarn prod:direct` now warns if migrations appear pending for the resolved target.
-- `yarn dev` / `yarn dev:direct` also run the same migration-status warning check before starting.
-- To run API only (no dashboard process): `PCP_RUN_WEB=false yarn prod:direct`
-- After `git pull`, run `yarn prod:refresh` and restart your direct/PM2 process.
-- The dashboard and `sb` CLI will warn when the running server is behind local HEAD and needs a restart.
-- `sb doctor` includes a migration status check (local or linked) and points to `yarn prod:migrate` / `yarn prod:up` when pending.
-
-## Contributing
-
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for git conventions, coding style, PR process, and coding conventions. This applies to both human and AI contributors.
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for git conventions, coding style, PR process, development commands, and runtime configuration. This applies to both human and AI contributors.
 
 ## License
 
