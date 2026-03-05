@@ -161,11 +161,12 @@ export class ClaudeRunner implements IClaudeRunner {
     finalTextResponse?: string;
     toolCalls: ToolCall[];
   }> {
+    const claudeBin = await resolveBinaryPath('claude');
     return new Promise((resolve, reject) => {
       // Strip CLAUDECODE to prevent "nested session" detection when PCP is
       // launched from inside a Claude Code session (e.g., via PM2).
       const { CLAUDECODE, ...cleanEnv } = process.env;
-      const proc = spawn(resolveBinaryPath('claude'), args, {
+      const proc = spawn(claudeBin, args, {
         cwd: config.workingDirectory,
         env: {
           ...cleanEnv,

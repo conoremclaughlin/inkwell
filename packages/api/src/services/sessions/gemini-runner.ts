@@ -136,10 +136,11 @@ export class GeminiRunner implements IClaudeRunner {
     toolCalls: ToolCall[];
     sessionId?: string;
   }> {
+    const geminiBin = await resolveBinaryPath('gemini');
     return new Promise((resolve, reject) => {
       // Strip CLAUDECODE to prevent env leaking into subprocess
       const { CLAUDECODE, ...cleanEnv } = process.env;
-      const proc = spawn(resolveBinaryPath('gemini'), args, {
+      const proc = spawn(geminiBin, args, {
         cwd: config.workingDirectory,
         env: {
           ...cleanEnv,
