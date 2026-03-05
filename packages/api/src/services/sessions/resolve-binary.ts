@@ -12,6 +12,7 @@
  */
 
 import { execFile } from 'child_process';
+import { dirname } from 'path';
 import { promisify } from 'util';
 import { logger } from '../../utils/logger.js';
 
@@ -64,4 +65,20 @@ export async function resolveBinaryPath(binary: string): Promise<string> {
     `Could not resolve ${binary} in PATH or zsh login shell. Spawn will likely fail with ENOENT.`
   );
   return binary;
+}
+
+/**
+ * Build a PATH string for child process env that includes the resolved
+ * binary's directory. This ensures shebang scripts (`#!/usr/bin/env node`)
+ * can find the interpreter even when the server's own PATH doesn't include it.
+ */
+export function buildSpawnPath(resolvedBinaryPath: string): string {
+  const binDir = dirname(resolvedBinaryPath);
+  const currentPath = process.env.PATH || '';
+
+  if (currentPath.split(':').includes(binDir)) {
+    return currentPath;
+  }
+
+  return `${binDir}:${currentPath}`;
 }

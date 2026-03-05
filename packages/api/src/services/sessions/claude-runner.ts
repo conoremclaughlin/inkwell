@@ -18,7 +18,7 @@ import type {
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
-import { resolveBinaryPath } from './resolve-binary.js';
+import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 
 /** Maximum time (ms) to wait for a Claude Code subprocess before killing it */
 const PROCESS_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
@@ -172,7 +172,7 @@ export class ClaudeRunner implements IClaudeRunner {
           ...cleanEnv,
           // Ensure Claude Code uses correct paths
           HOME: process.env.HOME,
-          PATH: process.env.PATH,
+          PATH: buildSpawnPath(claudeBin),
         },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
