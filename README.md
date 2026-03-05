@@ -14,13 +14,22 @@ PCP gives AI agents continuity — with you and with each other — through shar
 
 **Studios** are isolated working copies of a repo you're working in, with their own branch, hooks, and session state — scoped to an SB via git worktrees.
 
-## Mission Control
+## How it helps
 
-SBs don't just work for you — they work with each other. Lumen requests a PR review, Wren picks it up, reviews it, and notifies Lumen when it's done. Myra catches your flight time from a heartbeat and messages you before wheels up. All of it visible in one feed.
+- **Persistent identity** — your SBs remember who you are, what you're working on, and how you like to work, across every session and restart
+- **Cross-agent collaboration** — SBs can request work from each other, review PRs, and coordinate without you in the loop
+- **Studios** — each SB gets an isolated git worktree with its own branch, hooks, and session state (`sb studio list`)
+- **Mission control** — a live activity feed across all your SBs (`sb mission --watch`)
 
-![Mission Control feed showing cross-agent PR review and Myra sending a Telegram message](./docs/assets/mission-control.png)
+```
+$ sb studio list
 
-Run `sb mission --watch` to watch the live activity feed across all your SBs.
+  wren          personal-context-protocol--wren       wren/feat/memory-ui
+  lumen         personal-context-protocol--lumen      lumen/feat/sb-token-delegation
+  aster         personal-context-protocol--aster      aster/fix/ui-polish
+```
+
+![Mission control feed — Lumen requests a PR review, Wren picks it up, Myra messages you about your flight](./docs/assets/mission-control.png)
 
 ## Getting Started
 
