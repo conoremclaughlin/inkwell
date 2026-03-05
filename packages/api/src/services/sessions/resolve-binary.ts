@@ -1,0 +1,71 @@
+/**
+ * Binary Path Resolution
+ *
+ * Resolves CLI binary paths (claude, codex) with fallback to zsh login shell.
+ * Node's spawn() only searches the current process PATH, which may be a
+ * stripped-down bash PATH missing user-installed tools (nvm, homebrew, etc.).
+ *
+ * Resolution order:
+ *   1. Check current process PATH via `which`
+ *   2. Fall back to `zsh -ilc 'which <binary>'` to pick up login shell paths
+ *   3. Cache resolved paths for the process lifetime
+ */
+
+import { execSync } from 'child_process';
+import { logger } from '../../utils/logger.js';
+
+const resolvedPaths = new Map<string, string | null>();
+
+/**
+ * Resolve a binary name to its full path, with zsh login shell fallback.
+ * Returns the binary name unchanged if resolution fails (spawn will produce
+ * a clear ENOENT error).
+ */
+export function resolveBinaryPath(binary: string): string {
+  const cached = resolvedPaths.get(binary);
+  if (cached !== undefined) {
+    return cached ?? binary;
+  }
+
+  // 1. Try current process PATH
+  try {
+    const path = execSync(`which ${binary}`, {
+      encoding: 'utf-8',
+      timeout: 3000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    if (path) {
+      resolvedPaths.set(binary, path);
+      logger.debug(`Resolved ${binary} from PATH: ${path}`);
+      return path;
+    }
+  } catch {
+    // Not found in current PATH
+  }
+
+  // 2. Fall back to zsh login shell (picks up nvm, homebrew, etc.)
+  try {
+    const path = execSync(`zsh -ilc 'which ${binary}'`, {
+      encoding: 'utf-8',
+      timeout: 5000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    // zsh -il may print extra lines (nvm "Now using..." etc.) — take the last non-empty line
+    const lines = path.split('\n').filter((l) => l.trim() && l.startsWith('/'));
+    const resolved = lines[lines.length - 1];
+    if (resolved) {
+      resolvedPaths.set(binary, resolved);
+      logger.info(`Resolved ${binary} via zsh login shell: ${resolved}`);
+      return resolved;
+    }
+  } catch {
+    // zsh fallback also failed
+  }
+
+  // 3. Not found anywhere — cache the miss and warn
+  resolvedPaths.set(binary, null);
+  logger.warn(
+    `Could not resolve ${binary} in PATH or zsh login shell. Spawn will likely fail with ENOENT.`
+  );
+  return binary;
+}
