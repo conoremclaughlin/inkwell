@@ -3759,11 +3759,22 @@ router.get('/sessions', async (req: Request, res: Response) => {
         repoName: string | null;
       }
     >();
-    const deriveRepoName = (worktreePath: string | null | undefined): string | null => {
+    const deriveRepoName = (
+      repoRoot: string | null | undefined,
+      worktreePath: string | null | undefined
+    ): string | null => {
+      if (repoRoot) {
+        const normalizedRoot = repoRoot.replace(/\/+$/, '');
+        const rootBasename = path.basename(normalizedRoot);
+        return rootBasename || normalizedRoot;
+      }
+
       if (!worktreePath) return null;
       const normalizedPath = worktreePath.replace(/\/+$/, '');
-      const basename = path.basename(normalizedPath);
-      return basename || null;
+      const worktreeFolder = path.basename(normalizedPath);
+      const separatorIdx = worktreeFolder.lastIndexOf('--');
+      if (separatorIdx === -1) return null;
+      return worktreeFolder.slice(0, separatorIdx) || null;
     };
 
     if (studioIds.length > 0) {
@@ -3782,7 +3793,7 @@ router.get('/sessions', async (req: Request, res: Response) => {
           workType: studio.work_type,
           status: studio.status,
           worktreePath: studio.worktree_path,
-          repoName: deriveRepoName(studio.worktree_path),
+          repoName: deriveRepoName(studio.repo_root, studio.worktree_path),
         });
       }
     }
@@ -3807,7 +3818,7 @@ router.get('/sessions', async (req: Request, res: Response) => {
             workType: ws.work_type,
             status: ws.status,
             worktreePath: ws.worktree_path,
-            repoName: deriveRepoName(ws.worktree_path),
+            repoName: deriveRepoName(ws.repo_root, ws.worktree_path),
           });
         }
       }

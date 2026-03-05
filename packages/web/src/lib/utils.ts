@@ -27,3 +27,35 @@ export function getAgentGradient(agentId: string): string {
   }
   return SB_GRADIENTS[Math.abs(hash) % SB_GRADIENTS.length];
 }
+
+/**
+ * Parse studio slug from worktree folder convention: "<repo>--<slug>".
+ * Uses the last "--" so repo names containing "--" still resolve correctly.
+ */
+export function deriveStudioSlugFromWorktreePath(worktreePath: string | null): string | null {
+  if (!worktreePath) return null;
+  const folder = worktreePath.split('/').pop() || '';
+  const separatorIdx = folder.lastIndexOf('--');
+  if (separatorIdx === -1) return null;
+  return folder.slice(separatorIdx + 2) || null;
+}
+
+/**
+ * Derive repo display name from repoRoot with worktree fallback.
+ * Fallback also supports repo names containing "--" via lastIndexOf.
+ */
+export function deriveRepoName(
+  repoRoot: string | null,
+  worktreePath?: string | null
+): string | null {
+  if (repoRoot) {
+    const normalized = repoRoot.replace(/\/+$/, '');
+    const parts = normalized.split('/');
+    return parts[parts.length - 1] || normalized;
+  }
+
+  const folder = worktreePath?.split('/').pop() || '';
+  const separatorIdx = folder.lastIndexOf('--');
+  if (separatorIdx === -1) return null;
+  return folder.slice(0, separatorIdx) || null;
+}
