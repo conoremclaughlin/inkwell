@@ -157,6 +157,8 @@ yarn docker:app:down   # stop container
 Notes:
 
 - If Supabase runs on your host machine, use `host.docker.internal` in `SUPABASE_URL` (not `localhost`).
+- `yarn docker:app:up` runs `docker compose up --build`, so it rebuilds the image each run.
+  For faster local iteration without rebuild: `docker compose --env-file .env.docker -f docker-compose.app.yml up`
 - `scripts/docker-app-up.sh` auto-selects env file in this order:
   1. `PCP_DOCKER_ENV_FILE`
   2. `.env.docker`
