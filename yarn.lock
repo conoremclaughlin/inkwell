@@ -5883,13 +5883,6 @@ __metadata:
   languageName: node
   linkType: hard
 
-"curve25519-js@npm:^0.0.4":
-  version: 0.0.4
-  resolution: "curve25519-js@npm:0.0.4"
-  checksum: 10/7ad740ca5a31452f27c875562f93e858a423c7b6587c8a893593fc1edf5bab8e0aae96abe8d315eedafbf0ca7dac543baefe3af183dd09cb8fb72772ddd6d6e2
-  languageName: node
-  linkType: hard
-
 "data-uri-to-buffer@npm:^4.0.0":
   version: 4.0.1
   resolution: "data-uri-to-buffer@npm:4.0.1"
@@ -8942,13 +8935,12 @@ __metadata:
   languageName: node
   linkType: hard
 
-"libsignal@git+https://github.com/whiskeysockets/libsignal-node.git":
+"libsignal@npm:2.0.1":
   version: 2.0.1
-  resolution: "libsignal@git+ssh://git@github.com/whiskeysockets/libsignal-node.git#commit=1c30d7d7e76a3b0aa120b04dc6a26f5a12dccf67"
+  resolution: "libsignal@npm:2.0.1"
   dependencies:
-    curve25519-js: "npm:^0.0.4"
     protobufjs: "npm:6.8.8"
-  checksum: 10/754165c38bf65deb41e02ceeb4c95c67242ef683d3e83c231aeff36d31b5bc93833a2af6dacc0212c74b1da0df889e9caeef04e3402e092e5fd4dcaefe537ad4
+  checksum: 10/a566d7eda44a8f9648be356e1b2b323169bbb58d3e813c45bab75d6a6a61232dd78ca8ac43cdad90008181d3428d940d21adfcb22580c6ddc48aa02a58aaeff1
   languageName: node
   linkType: hard
 
