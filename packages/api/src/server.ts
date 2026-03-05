@@ -41,6 +41,7 @@ import { resolveAgentFromMention } from './services/routing/resolve-mention';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
 import { classifyError } from '@personal-context/shared';
 import { logger } from './utils/logger';
+import { getUserFromContext } from './utils/request-context';
 import { env } from './config/env';
 
 // Server configuration
@@ -476,9 +477,23 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       studioHint: payload.studioHint,
     });
 
-    // 1. Resolve userId (+ identity hint) from inbox message (required for stateless processing)
+    // 1. Resolve userId (+ identity hint) from inbox message or auth context.
+    //
+    // SECURITY: userId determines whose agent config is loaded and which agent
+    // gets spawned. It must come from a trusted source — never from caller-supplied
+    // tool args. Two trusted sources:
+    //   a) The inbox message's recipient_user_id (set server-side at send time)
+    //   b) The caller's OAuth token via getUserFromContext()
+    //
+    // When both are available, we verify they match. A mismatch means someone is
+    // trying to trigger another user's agent via a known inbox message ID — this
+    // is blocked and logged as a security warning.
     let userId: string | undefined;
     let recipientIdentityId: string | undefined;
+
+    const authUser = getUserFromContext();
+    const authUserId = authUser?.userId;
+
     if (payload.inboxMessageId) {
       const { data: inboxMsg, error: inboxError } = await dataComposer!
         .getClient()
@@ -492,13 +507,40 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
           error: inboxError.message,
         });
       }
+
+      // SECURITY: verify the inbox message belongs to the authenticated user.
+      // Prevents cross-user triggers via guessed/leaked inbox message IDs.
+      if (inboxMsg?.recipient_user_id && authUserId && inboxMsg.recipient_user_id !== authUserId) {
+        logger.warn(
+          '[Trigger] SECURITY: inbox message recipient does not match authenticated user',
+          {
+            inboxMessageId: payload.inboxMessageId,
+            inboxRecipientUserId: inboxMsg.recipient_user_id,
+            authUserId,
+            targetAgentId,
+            fromAgentId: payload.fromAgentId,
+          }
+        );
+        throw new Error('Trigger denied: inbox message does not belong to authenticated user');
+      }
+
       userId = inboxMsg?.recipient_user_id;
       recipientIdentityId = inboxMsg?.recipient_identity_id || undefined;
     }
 
+    // Fall back to authenticated user from OAuth context (trigger_agent called directly)
+    if (!userId) {
+      userId = authUserId;
+      if (userId) {
+        logger.info(`[Trigger] Resolved userId from auth context for ${targetAgentId}`);
+      }
+    }
+
     if (!userId) {
       logger.error(`[Trigger] Cannot process - no userId found for agent ${targetAgentId}`);
-      throw new Error('Cannot process trigger without userId (inbox message required)');
+      throw new Error(
+        'Cannot process trigger without userId (no inbox message and no auth context)'
+      );
     }
 
     // 2. Resolve and verify target identity for this user
