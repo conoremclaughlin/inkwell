@@ -39,6 +39,11 @@ export class CodexAdapter implements BackendAdapter {
     // equivalent to Claude's --session-id seeding flow, so we only pass resume
     // when a backend-native id is already known.
 
+    // Auto-approve: skip all permission prompts and sandbox restrictions
+    if (config.dangerous) {
+      args.push('--dangerously-bypass-approvals-and-sandbox');
+    }
+
     // Passthrough flags
     args.push(...config.passthroughArgs);
 

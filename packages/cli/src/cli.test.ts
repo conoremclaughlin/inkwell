@@ -69,6 +69,17 @@ describe('extractArgs', () => {
     expect(result.promptParts).toEqual(['hello']);
   });
 
+  it('parses --dangerous flag', () => {
+    const result = extractArgs(['--dangerous', 'hello']);
+    expect(result.sbOptions.dangerous).toBe(true);
+    expect(result.promptParts).toEqual(['hello']);
+  });
+
+  it('defaults dangerous to false', () => {
+    const result = extractArgs(['hello']);
+    expect(result.sbOptions.dangerous).toBe(false);
+  });
+
   it('forwards -v to backend passthrough', () => {
     const result = extractArgs(['-v', '--resume', 'abc123']);
     expect(result.sbOptions.verbose).toBe(false);

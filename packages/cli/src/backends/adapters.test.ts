@@ -92,6 +92,90 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
+  it('maps --dangerous to claude --dangerously-skip-permissions', () => {
+    const adapter = new ClaudeAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'wren',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+      dangerous: true,
+    });
+
+    expect(prepared.args).toContain('--dangerously-skip-permissions');
+  });
+
+  it('maps --dangerous to codex --dangerously-bypass-approvals-and-sandbox', () => {
+    const adapter = new CodexAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'lumen',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+      dangerous: true,
+    });
+
+    try {
+      expect(prepared.args).toContain('--dangerously-bypass-approvals-and-sandbox');
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('maps --dangerous to gemini --yolo', () => {
+    const adapter = new GeminiAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'aster',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+      dangerous: true,
+    });
+
+    try {
+      expect(prepared.args).toContain('--yolo');
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('does not add auto-approve flags when dangerous is false', () => {
+    const claude = new ClaudeAdapter();
+    const claudePrep = claude.prepare({
+      agentId: 'wren',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+    });
+    expect(claudePrep.args).not.toContain('--dangerously-skip-permissions');
+
+    const codex = new CodexAdapter();
+    const codexPrep = codex.prepare({
+      agentId: 'lumen',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+    });
+    try {
+      expect(codexPrep.args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
+    } finally {
+      codexPrep.cleanup();
+    }
+
+    const gemini = new GeminiAdapter();
+    const geminiPrep = gemini.prepare({
+      agentId: 'aster',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+    });
+    try {
+      expect(geminiPrep.args).not.toContain('--yolo');
+    } finally {
+      geminiPrep.cleanup();
+    }
+  });
+
   it('passes backendSessionId through gemini --resume flag', () => {
     const adapter = new GeminiAdapter();
     const prepared = adapter.prepare({

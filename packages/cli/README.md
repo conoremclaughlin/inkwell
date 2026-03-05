@@ -179,14 +179,15 @@ echo "explain this" | sb        # Pipe input as prompt
 
 ### SB Options
 
-| Flag                        | Description                                              | Default                                |
-| --------------------------- | -------------------------------------------------------- | -------------------------------------- |
-| `-a, --agent <id>`          | Agent identity                                           | from `.pcp/identity.json`              |
-| `-b, --backend <name>`      | AI backend                                               | from `.pcp/identity.json`, or `claude` |
-| `--no-session`              | Disable session tracking                                 | enabled                                |
-| `--sb-verbose`              | Show SB verbose output                                   | off                                    |
-| `--session-candidates`      | Print picker candidates and exit                         | off                                    |
-| `--session-candidates-json` | Print picker candidates as JSON and exit (testing/debug) | off                                    |
+| Flag                        | Description                                                | Default                                |
+| --------------------------- | ---------------------------------------------------------- | -------------------------------------- |
+| `-a, --agent <id>`          | Agent identity                                             | from `.pcp/identity.json`              |
+| `-b, --backend <name>`      | AI backend                                                 | from `.pcp/identity.json`, or `claude` |
+| `--no-session`              | Disable session tracking                                   | enabled                                |
+| `--sb-verbose`              | Show SB verbose output                                     | off                                    |
+| `--session-candidates`      | Print picker candidates and exit                           | off                                    |
+| `--session-candidates-json` | Print picker candidates as JSON and exit (testing/debug)   | off                                    |
+| `--dangerous`               | Skip all permission prompts (maps to backend auto-approve) | off                                    |
 
 Any flag not listed above is forwarded to the backend.
 
@@ -326,6 +327,24 @@ Options for `create`:
 Options for `invite`:
 
 - `--role <role>` — Role: `owner`, `admin`, `member`, or `viewer` (default: member)
+
+### Permissions (`sb permissions`)
+
+Manages Claude Code permission rules — allow-all with a deny list for destructive commands. Claude-only; Codex and Gemini lack per-command deny support.
+
+```bash
+sb permissions auto          # Write allow-all + deny-dangerous rules to .claude/settings.local.json
+sb permissions auto --dry-run  # Preview what would be written
+sb permissions show          # Show current allow/deny rules
+sb permissions reset         # Remove all rules (Claude will prompt for everything)
+```
+
+**`sb permissions auto`** sets:
+
+- **Allow**: `Bash(*)`, `Edit(*)`, `Write(*)`, `Read(*)`, `WebFetch(*)`, MCP tools — no prompts for normal dev work
+- **Deny**: `rm -rf`, `git push --force`, `git reset --hard`, `git clean -f` — always blocked
+
+> ⚠️ **`--dangerous` bypasses deny rules entirely.** It maps to each backend's native full-autonomy flag and ignores any configured allow/deny rules. Use it when you explicitly want zero guardrails for a session.
 
 ### Mission Control (`sb mission`)
 

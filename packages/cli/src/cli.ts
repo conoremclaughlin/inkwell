@@ -31,6 +31,7 @@ import { registerChatCommand } from './commands/chat.js';
 import { registerDoctorCommand } from './commands/doctor.js';
 import { registerMissionCommand } from './commands/mission.js';
 import { registerStatusCommand } from './commands/status.js';
+import { registerPermissionsCommands } from './commands/permissions.js';
 import { runClaude, runClaudeInteractive } from './commands/claude.js';
 import { resolveBackend } from './backends/index.js';
 import { initSbDebug, sbDebugLog } from './lib/sb-debug.js';
@@ -59,6 +60,7 @@ const SB_FLAGS: Record<string, { hasValue: boolean; key: string }> = {
   '--session-candidates-json': { hasValue: false, key: 'sessionCandidatesJson' },
   '--session-choice': { hasValue: true, key: 'sessionChoice' },
   '--sb-debug': { hasValue: false, key: 'sbDebug' },
+  '--dangerous': { hasValue: false, key: 'dangerous' },
 };
 
 interface ParsedArgs {
@@ -72,6 +74,7 @@ interface ParsedArgs {
     sessionCandidatesJson: boolean;
     sessionChoice: string | undefined;
     sbDebug: boolean;
+    dangerous: boolean;
   };
   passthroughArgs: string[];
   promptParts: string[];
@@ -108,6 +111,7 @@ export function extractArgs(argv: string[]): ParsedArgs {
     sessionCandidatesJson: false,
     sessionChoice: undefined,
     sbDebug: false,
+    dangerous: false,
   };
   const passthroughArgs: string[] = [];
   const promptParts: string[] = [];
@@ -131,6 +135,7 @@ export function extractArgs(argv: string[]): ParsedArgs {
         else if (flag.key === 'sessionCandidates') sbOptions.sessionCandidates = true;
         else if (flag.key === 'sessionCandidatesJson') sbOptions.sessionCandidatesJson = true;
         else if (flag.key === 'sbDebug') sbOptions.sbDebug = true;
+        else if (flag.key === 'dangerous') sbOptions.dangerous = true;
       }
     } else if (arg === '--') {
       // Explicit passthrough boundary — everything after goes to claude
@@ -182,6 +187,7 @@ program
   .option('--session-choice <choice>', 'Force session selection (new | pcp:<id> | local:<id>)')
   .option('--sb-debug', 'Enable SB debug logging to ~/.pcp/sb-debug.log')
   .option('--sb-verbose', 'Verbose SB output')
+  .option('--dangerous', 'Skip all permission prompts (maps to backend-native auto-approve)')
   .argument('[prompt...]', 'Prompt to send (omit for interactive)')
   .action(async () => {
     // We parse argv ourselves for clean passthrough — Commander's parsed
@@ -200,6 +206,14 @@ program
     });
     if (resolvedOptions.sbDebug) {
       console.log(chalk.dim(`SB debug log: ${debugFile}`));
+    }
+    if (resolvedOptions.dangerous) {
+      console.log(
+        chalk.bgYellow.black(' DANGEROUS ') +
+          chalk.yellow(
+            ' All permission prompts will be skipped. The backend can execute any tool without confirmation.'
+          )
+      );
     }
     await maybeWarnServerUpdate();
     sbDebugLog('sb', 'parsed_args', {
@@ -265,6 +279,7 @@ registerChatCommand(program);
 registerDoctorCommand(program);
 registerMissionCommand(program);
 registerStatusCommand(program);
+registerPermissionsCommands(program);
 
 // ============================================================================
 // Subcommand detection

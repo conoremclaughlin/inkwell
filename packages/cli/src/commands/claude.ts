@@ -42,6 +42,7 @@ export interface SbOptions {
   sessionCandidates?: boolean;
   sessionCandidatesJson?: boolean;
   sessionChoice?: string;
+  dangerous?: boolean;
 }
 
 interface PcpConfig {
@@ -2619,6 +2620,7 @@ export async function runClaude(
     passthroughArgs,
     ...(startupContextBlock ? { startupContextBlock } : {}),
     ...sessionContext,
+    ...(options.dangerous ? { dangerous: true } : {}),
   });
 
   if (options.verbose) {
@@ -2836,6 +2838,7 @@ export async function runClaudeInteractive(
       ...sessionContext,
       ...(attemptBackendSessionId ? { backendSessionId: attemptBackendSessionId } : {}),
       ...(attemptBackendSessionSeedId ? { backendSessionSeedId: attemptBackendSessionSeedId } : {}),
+      ...(options.dangerous ? { dangerous: true } : {}),
     });
 
     if (options.verbose) {

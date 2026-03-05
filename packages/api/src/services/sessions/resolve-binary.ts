@@ -12,7 +12,7 @@
  */
 
 import { execFile } from 'child_process';
-import { dirname } from 'path';
+import { delimiter, dirname, isAbsolute } from 'path';
 import { promisify } from 'util';
 import { logger } from '../../utils/logger.js';
 
@@ -73,12 +73,20 @@ export async function resolveBinaryPath(binary: string): Promise<string> {
  * can find the interpreter even when the server's own PATH doesn't include it.
  */
 export function buildSpawnPath(resolvedBinaryPath: string): string {
-  const binDir = dirname(resolvedBinaryPath);
   const currentPath = process.env.PATH || '';
 
-  if (currentPath.split(':').includes(binDir)) {
+  // If resolution failed and we got a bare name (e.g. "codex"), dirname
+  // returns "." which would inject CWD into the child PATH — skip it.
+  if (!isAbsolute(resolvedBinaryPath)) {
     return currentPath;
   }
 
-  return `${binDir}:${currentPath}`;
+  const binDir = dirname(resolvedBinaryPath);
+  const parts = currentPath.split(delimiter).filter(Boolean);
+
+  if (parts.includes(binDir)) {
+    return currentPath;
+  }
+
+  return parts.length ? `${binDir}${delimiter}${currentPath}` : binDir;
 }
