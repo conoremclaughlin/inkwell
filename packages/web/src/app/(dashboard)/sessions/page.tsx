@@ -35,6 +35,7 @@ interface Session {
   agentId: string;
   agentName: string;
   agentRole: string | null;
+  lifecycle: string | null;
   status: string;
   currentPhase: string | null;
   summary: string | null;
@@ -87,19 +88,12 @@ function isBlocked(session: Session): boolean {
   return session.currentPhase?.startsWith('blocked') ?? false;
 }
 
-function isGenerating(session: Session): boolean {
-  return session.currentPhase === 'runtime:generating';
-}
-
-function isRuntimeIdle(session: Session): boolean {
-  return session.currentPhase === 'runtime:idle';
-}
-
-function formatPhaseLabel(phase: string | null): string | null {
-  if (!phase) return null;
-  if (!phase.startsWith('runtime:')) return phase;
-  const runtimeState = phase.replace('runtime:', '');
-  return `Runtime: ${runtimeState}`;
+function getLifecycle(session: Session): string {
+  // Prefer lifecycle column; fall back to old runtime:* phase for backward compat
+  if (session.lifecycle) return session.lifecycle;
+  if (session.currentPhase === 'runtime:generating') return 'running';
+  if (session.currentPhase === 'runtime:idle') return 'idle';
+  return 'idle';
 }
 
 function getSessionState(session: Session): {
@@ -119,6 +113,17 @@ function getSessionState(session: Session): {
     };
   }
 
+  const lifecycle = getLifecycle(session);
+
+  if (lifecycle === 'failed') {
+    return {
+      label: 'Failed',
+      cardClass: 'border-red-200 bg-red-50/50',
+      badgeClass: 'bg-red-100 text-red-700',
+      phaseClass: 'text-red-600',
+    };
+  }
+
   if (normalizedStatus === 'paused') {
     return {
       label: 'Paused',
@@ -128,16 +133,26 @@ function getSessionState(session: Session): {
     };
   }
 
-  if (isGenerating(session)) {
+  if (lifecycle === 'running') {
+    const isGenerating = session.currentPhase === 'runtime:generating';
     return {
-      label: 'Generating',
+      label: isGenerating ? 'Generating' : 'Running',
       cardClass: 'border-blue-200 bg-blue-50/50',
       badgeClass: 'bg-blue-100 text-blue-700',
       phaseClass: 'font-medium text-blue-700',
     };
   }
 
-  if (isRuntimeIdle(session)) {
+  if (lifecycle === 'completed') {
+    return {
+      label: 'Completed',
+      cardClass: 'border-gray-200',
+      badgeClass: 'bg-gray-100 text-gray-600',
+      phaseClass: 'text-gray-600',
+    };
+  }
+
+  if (lifecycle === 'idle') {
     return {
       label: 'Idle',
       cardClass: 'border-green-200 bg-green-50/50',
@@ -146,25 +161,11 @@ function getSessionState(session: Session): {
     };
   }
 
-  if (normalizedStatus === 'resumable') {
-    return {
-      label: 'Resumable',
-      cardClass: 'border-violet-200 bg-violet-50/50',
-      badgeClass: 'bg-violet-100 text-violet-700',
-      phaseClass: 'text-violet-700',
-    };
-  }
-
-  if (normalizedStatus === 'idle') {
-    return {
-      label: 'Idle',
-      cardClass: 'border-green-200 bg-green-50/50',
-      badgeClass: 'bg-green-100 text-green-700',
-      phaseClass: 'text-green-700',
-    };
-  }
-
-  if (normalizedStatus === 'active' || normalizedStatus === 'running') {
+  if (
+    normalizedStatus === 'resumable' ||
+    normalizedStatus === 'active' ||
+    normalizedStatus === 'running'
+  ) {
     return {
       label: 'Running',
       cardClass: 'border-green-200 bg-green-50/50',
@@ -174,7 +175,7 @@ function getSessionState(session: Session): {
   }
 
   return {
-    label: session.status || 'unknown',
+    label: lifecycle || session.status || 'unknown',
     cardClass: 'border-gray-200',
     badgeClass: 'bg-gray-100 text-gray-600',
     phaseClass: 'text-gray-600',
@@ -184,7 +185,7 @@ function getSessionState(session: Session): {
 function SessionCard({ session }: { session: Session }) {
   const [expanded, setExpanded] = useState(false);
   const state = getSessionState(session);
-  const phaseLabel = formatPhaseLabel(session.currentPhase);
+  const phaseLabel = session.currentPhase;
 
   return (
     <div className={clsx('rounded-lg border p-4', state.cardClass)}>

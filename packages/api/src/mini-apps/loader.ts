@@ -43,6 +43,10 @@ export interface LoadedMiniApp {
 
 const MINI_APPS_DIR = join(__dirname);
 
+// Mini-apps hidden from tool registration (code preserved, just not loaded).
+// Remove entries here to re-enable.
+const HIDDEN_MINI_APPS = new Set(['bill-split']);
+
 /**
  * Load all mini-apps from the mini-apps directory
  */
@@ -54,6 +58,7 @@ export function loadMiniApps(): Map<string, LoadedMiniApp> {
 
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
+      if (HIDDEN_MINI_APPS.has(entry.name)) continue;
 
       const appDir = join(MINI_APPS_DIR, entry.name);
       const manifestPath = join(appDir, 'manifest.json');
@@ -176,7 +181,7 @@ export function registerMiniAppTools(
         }
       );
 
-      logger.info(`Registered tool: ${toolName}`);
+      logger.debug(`Registered tool: ${toolName}`);
     }
   }
 }

@@ -312,7 +312,33 @@ export async function callPcpTool(
   }
 
   // Unwrap JSON-RPC result → MCP tool response → content text
-  const result = payload.result as { content?: Array<{ text?: string }> } | undefined;
+  const result = payload.result as
+    | { content?: Array<{ text?: string }>; isError?: boolean }
+    | undefined;
+  if (result?.isError) {
+    const rawText = result.content
+      ?.map((entry) => (typeof entry?.text === 'string' ? entry.text : ''))
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+
+    let message = rawText || 'Unknown MCP tool error';
+    if (rawText) {
+      try {
+        const parsed = JSON.parse(rawText) as { error?: string; message?: string };
+        if (typeof parsed.error === 'string' && parsed.error.trim()) {
+          message = parsed.error.trim();
+        } else if (typeof parsed.message === 'string' && parsed.message.trim()) {
+          message = parsed.message.trim();
+        }
+      } catch {
+        // Keep raw text as best-effort error.
+      }
+    }
+
+    throw new Error(`PCP tool error: ${message}`);
+  }
+
   const mcpText = result?.content?.[0]?.text;
 
   if (typeof mcpText === 'string') {
@@ -636,7 +662,7 @@ async function updateRuntimeGenerationState(
   cwd: string,
   config: PcpConfig | null,
   agentId: string,
-  phase: string
+  lifecycle: 'running' | 'idle'
 ): Promise<void> {
   const sessionId = resolveActivePcpSessionId(cwd);
   if (!sessionId) return;
@@ -646,8 +672,7 @@ async function updateRuntimeGenerationState(
       email: config?.email,
       agentId,
       sessionId,
-      phase,
-      status: 'active',
+      lifecycle,
       workingDir: cwd,
     });
   } catch {
@@ -1779,16 +1804,14 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   pcpThreadKey = reconciled.threadKey || pcpThreadKey;
   const backendSessionId = reconciled.backendSessionId;
 
-  // Keep an explicit runtime phase for dashboard "generating vs idle" visualization.
-  // Startup phase should always settle to idle.
+  // Set lifecycle to idle on startup (ready for user input).
   if (pcpSessionId) {
     try {
       const updateArgs: Record<string, unknown> = {
         email: config?.email,
         agentId,
         sessionId: pcpSessionId,
-        phase: 'runtime:idle',
-        status: 'active',
+        lifecycle: 'idle',
         workingDir: cwd,
       };
       if (backendSessionId) updateArgs.backendSessionId = backendSessionId;
@@ -1849,7 +1872,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   });
 
   // Mark session as actively generating at prompt start.
-  await updateRuntimeGenerationState(cwd, config, agentId, 'runtime:generating');
+  await updateRuntimeGenerationState(cwd, config, agentId, 'running');
 
   // Check if inbox check is stale (> 5 minutes)
   const lastCheck = readRuntimeFile(cwd, 'last-inbox-check');
@@ -1905,7 +1928,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
   });
 
   // Mark session as idle after each completed backend turn.
-  await updateRuntimeGenerationState(cwd, config, agentId, 'runtime:idle');
+  await updateRuntimeGenerationState(cwd, config, agentId, 'idle');
 
   // Increment tool call counter
   const countStr = readRuntimeFile(cwd, 'tool-count');

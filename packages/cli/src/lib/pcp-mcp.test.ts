@@ -99,4 +99,40 @@ describe('pcp-mcp callPcpTool', () => {
       Accept: 'application/json, text/event-stream',
     });
   });
+
+  it('throws when MCP tool response is marked as isError', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(
+      mockJsonResponse({
+        jsonrpc: '2.0',
+        result: {
+          isError: true,
+          content: [{ text: '{"success":false,"error":"start_session unavailable"}' }],
+        },
+        id: 1,
+      })
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await expect(callPcpTool('start_session', { forceNew: true })).rejects.toThrow(
+      'PCP tool error: start_session unavailable'
+    );
+  });
+
+  it('sets caller profile header when provided', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(
+      mockJsonResponse({
+        jsonrpc: '2.0',
+        result: { content: [{ text: '{"ok":true}' }] },
+        id: 1,
+      })
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await callPcpTool('start_session', { forceNew: true }, { callerProfile: 'runtime' });
+
+    const [, options] = fetchSpy.mock.calls[0];
+    expect(options.headers).toMatchObject({
+      'x-pcp-caller-profile': 'runtime',
+    });
+  });
 });

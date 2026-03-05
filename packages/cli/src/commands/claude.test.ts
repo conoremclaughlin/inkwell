@@ -4,15 +4,19 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import {
   extractClaudeHistorySessionsForProject,
+  extractSessionFromStartSessionResponse,
   filterUntrackedLocalBackendSessions,
   filterPcpSessionsForContext,
   filterUntrackedLocalClaudeSessions,
+  getClaudeLocalSessionsForProject,
+  getKnownClaudeSessionIds,
   getCodexLocalSessionsForProject,
   hasBackendSessionOverride,
   resolveCapturedBackendSessionIdFromRuntime,
   resolveAdoptableLocalBackendSessionId,
   resolveBackendSessionIdForResume,
   resolveBackendSessionSeedId,
+  resolveStartedSessionFromList,
   sanitizeBackendExecutionArgs,
   shouldRetryWithFreshBackendSession,
   shouldAutoResumeRuntimeSession,
@@ -34,8 +38,11 @@ describe('hasBackendSessionOverride', () => {
   it('does not treat plain prompt text as resume override', () => {
     expect(hasBackendSessionOverride('codex', [], ['resume this bug'])).toBe(false);
     expect(hasBackendSessionOverride('codex', [], ['resume'])).toBe(false);
-    expect(hasBackendSessionOverride('codex', ['resume'])).toBe(false);
-    expect(hasBackendSessionOverride('codex', ['resume', '--latest'])).toBe(false);
+  });
+
+  it('treats codex resume passthrough args as override', () => {
+    expect(hasBackendSessionOverride('codex', ['resume'])).toBe(true);
+    expect(hasBackendSessionOverride('codex', ['resume', '--latest'])).toBe(true);
   });
 
   it('still respects flag-based resume overrides', () => {
@@ -106,7 +113,7 @@ describe('filterPcpSessionsForContext', () => {
     expect(filtered).toEqual([]);
   });
 
-  it('filters non-claude sessions only by backend', () => {
+  it('path-scopes non-claude sessions and excludes other repos', () => {
     const filtered = filterPcpSessionsForContext(
       [
         {
@@ -126,7 +133,24 @@ describe('filterPcpSessionsForContext', () => {
       '/tmp/project'
     );
 
-    expect(filtered.map((session) => session.id)).toEqual(['codex-1']);
+    expect(filtered.map((session) => session.id)).toEqual([]);
+  });
+
+  it('treats codex backend aliases as equivalent during filtering', () => {
+    const filtered = filterPcpSessionsForContext(
+      [
+        {
+          id: 'codex-legacy-label',
+          startedAt: '2026-02-28T00:00:00.000Z',
+          backend: 'codex-cli',
+          workingDir: '/tmp/project-a',
+        },
+      ],
+      'codex',
+      '/tmp/project-a'
+    );
+
+    expect(filtered.map((session) => session.id)).toEqual(['codex-legacy-label']);
   });
 
   it('path-scopes codex sessions when workingDir data is available', () => {
@@ -150,6 +174,29 @@ describe('filterPcpSessionsForContext', () => {
     );
 
     expect(filtered.map((session) => session.id)).toEqual(['codex-a']);
+  });
+
+  it('keeps path-ambiguous codex sessions visible alongside path-scoped matches', () => {
+    const nowIso = new Date().toISOString();
+    const filtered = filterPcpSessionsForContext(
+      [
+        {
+          id: 'codex-a',
+          startedAt: nowIso,
+          backend: 'codex',
+          workingDir: '/tmp/project-a',
+        },
+        {
+          id: 'codex-unknown',
+          startedAt: nowIso,
+          backend: 'codex',
+        },
+      ],
+      'codex',
+      '/tmp/project-a'
+    );
+
+    expect(filtered.map((session) => session.id)).toEqual(['codex-a', 'codex-unknown']);
   });
 });
 
@@ -178,6 +225,100 @@ describe('filterUntrackedLocalClaudeSessions', () => {
     ]);
 
     expect(filtered.map((session) => session.sessionId)).toEqual(['claude-2']);
+  });
+});
+
+describe('getClaudeLocalSessionsForProject', () => {
+  it('excludes non-resumable snapshot-only jsonl files', () => {
+    const root = mkdtempSync(join(tmpdir(), 'sb-claude-local-'));
+    const homeDir = join(root, 'home');
+    const projectDir = join(root, 'project');
+    mkdirSync(homeDir, { recursive: true });
+    mkdirSync(projectDir, { recursive: true });
+
+    const projectKey = projectDir.replace(/[\\/]/g, '-');
+    const claudeProjectDir = join(homeDir, '.claude', 'projects', projectKey);
+    mkdirSync(claudeProjectDir, { recursive: true });
+
+    const validSessionId = '11111111-1111-4111-8111-111111111111';
+    const poisonSessionId = '22222222-2222-4222-8222-222222222222';
+
+    writeFileSync(
+      join(claudeProjectDir, `${validSessionId}.jsonl`),
+      JSON.stringify({
+        type: 'progress',
+        sessionId: validSessionId,
+        timestamp: '2026-03-04T00:00:00.000Z',
+      }) + '\n'
+    );
+
+    writeFileSync(
+      join(claudeProjectDir, `${poisonSessionId}.jsonl`),
+      JSON.stringify({
+        type: 'file-history-snapshot',
+        messageId: 'abc',
+        snapshot: {
+          messageId: 'abc',
+          trackedFileBackups: {},
+          timestamp: '2026-03-04T00:00:00.000Z',
+        },
+      }) + '\n'
+    );
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = homeDir;
+
+    try {
+      const sessions = getClaudeLocalSessionsForProject(projectDir, 20);
+      expect(sessions.map((session) => session.sessionId)).toContain(validSessionId);
+      expect(sessions.map((session) => session.sessionId)).not.toContain(poisonSessionId);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('getKnownClaudeSessionIds', () => {
+  it('excludes snapshot-only session files from known resumable ids', () => {
+    const root = mkdtempSync(join(tmpdir(), 'sb-claude-known-'));
+    const homeDir = join(root, 'home');
+    mkdirSync(homeDir, { recursive: true });
+
+    const projectDir = join(homeDir, '.claude', 'projects', '-tmp-project');
+    mkdirSync(projectDir, { recursive: true });
+
+    const validSessionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const snapshotOnlySessionId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+
+    writeFileSync(
+      join(projectDir, `${validSessionId}.jsonl`),
+      JSON.stringify({
+        type: 'progress',
+        sessionId: validSessionId,
+        timestamp: '2026-03-04T00:00:00.000Z',
+      }) + '\n'
+    );
+    writeFileSync(
+      join(projectDir, `${snapshotOnlySessionId}.jsonl`),
+      JSON.stringify({
+        type: 'file-history-snapshot',
+        messageId: 'abc',
+      }) + '\n'
+    );
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = homeDir;
+    try {
+      const known = getKnownClaudeSessionIds();
+      expect(known.has(validSessionId)).toBe(true);
+      expect(known.has(snapshotOnlySessionId)).toBe(false);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -363,6 +504,21 @@ describe('resolveBackendSessionIdForResume', () => {
       })
     ).toEqual({ backendSessionId: 'local-a' });
   });
+
+  it('accepts backend aliases when validating chosen session backend', () => {
+    expect(
+      resolveBackendSessionIdForResume({
+        backend: 'codex',
+        chosen: {
+          id: 'pcp-codex',
+          startedAt: '2026-02-28T00:00:00.000Z',
+          backend: 'codex-cli',
+          backendSessionId: 'codex-local-a',
+        },
+        localBackendSessionIds: new Set(['codex-local-a']),
+      })
+    ).toEqual({ backendSessionId: 'codex-local-a' });
+  });
 });
 
 describe('resolveAdoptableLocalBackendSessionId', () => {
@@ -387,6 +543,7 @@ describe('resolveAdoptableLocalBackendSessionId', () => {
     expect(
       resolveAdoptableLocalBackendSessionId({
         backend: 'codex',
+        createdNewPcpSession: false,
         chosen: { id: 'pcp-1', startedAt: '2026-03-02T21:30:14.354Z' },
         localSessions: [
           {
@@ -398,6 +555,24 @@ describe('resolveAdoptableLocalBackendSessionId', () => {
         ],
       })
     ).toBe('019cb076-af49-7471-bd8e-12315a616dca');
+  });
+
+  it('does not auto-adopt local codex sessions for newly created PCP sessions', () => {
+    expect(
+      resolveAdoptableLocalBackendSessionId({
+        backend: 'codex',
+        createdNewPcpSession: true,
+        chosen: { id: 'pcp-1', startedAt: '2026-03-02T21:30:14.354Z' },
+        localSessions: [
+          {
+            backend: 'codex',
+            sessionId: '019cb076-af49-7471-bd8e-12315a616dca',
+            projectPath: '/tmp/project',
+            modified: '2026-03-02T21:33:22.000Z',
+          },
+        ],
+      })
+    ).toBeUndefined();
   });
 
   it('adopts by start-time proximity when exactly one nearby session exists', () => {
@@ -507,8 +682,22 @@ describe('resolveCapturedBackendSessionIdFromRuntime', () => {
     try {
       const oldSessionId = '11111111-1111-4111-8111-111111111111';
       const newSessionId = '22222222-2222-4222-8222-222222222222';
-      writeFileSync(join(projectKeyDir, `${oldSessionId}.jsonl`), '');
-      writeFileSync(join(projectKeyDir, `${newSessionId}.jsonl`), '');
+      writeFileSync(
+        join(projectKeyDir, `${oldSessionId}.jsonl`),
+        JSON.stringify({
+          type: 'progress',
+          sessionId: oldSessionId,
+          timestamp: '2026-03-04T00:00:00.000Z',
+        }) + '\n'
+      );
+      writeFileSync(
+        join(projectKeyDir, `${newSessionId}.jsonl`),
+        JSON.stringify({
+          type: 'progress',
+          sessionId: newSessionId,
+          timestamp: '2026-03-04T00:01:00.000Z',
+        }) + '\n'
+      );
 
       const resolved = resolveCapturedBackendSessionIdFromRuntime({
         cwd: tempRepo,
@@ -554,6 +743,62 @@ describe('extractClaudeHistorySessionsForProject', () => {
     expect(parsed[0].sessionId).toBe('sess-clearpol-1');
     expect(parsed[0].backend).toBe('claude');
     expect(parsed[0].firstPrompt).toBe('Hi Wren');
+  });
+});
+
+describe('getClaudeLocalSessionsForProject previews', () => {
+  it('extracts latest assistant preview from claude project jsonl', () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'sb-claude-preview-'));
+    const tempHome = join(tempRoot, 'home');
+    const projectPath = join(tempRoot, 'repo');
+    mkdirSync(tempHome, { recursive: true });
+    mkdirSync(projectPath, { recursive: true });
+
+    const projectDirName = projectPath.replace(/[\\/]/g, '-');
+    const projectDir = join(tempHome, '.claude', 'projects', projectDirName);
+    mkdirSync(projectDir, { recursive: true });
+
+    const sessionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const hugePrefix = 'x'.repeat(400_000);
+    writeFileSync(
+      join(projectDir, `${sessionId}.jsonl`),
+      [
+        hugePrefix,
+        JSON.stringify({
+          type: 'user',
+          sessionId,
+          timestamp: '2026-03-04T08:00:00.000Z',
+          message: { role: 'user', content: 'Hello Wren' },
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          sessionId,
+          timestamp: '2026-03-04T08:00:05.000Z',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Hi Conor — latest assistant reply' }],
+          },
+        }),
+      ].join('\n') + '\n'
+    );
+
+    const originalHome = process.env.HOME;
+    process.env.HOME = tempHome;
+
+    try {
+      const sessions = getClaudeLocalSessionsForProject(projectPath, 10);
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0]?.sessionId).toBe(sessionId);
+      expect(sessions[0]?.latestPrompt).toBe('assistant: Hi Conor — latest assistant reply');
+      expect(sessions[0]?.latestPromptAt).toBe('2026-03-04T08:00:05.000Z');
+    } finally {
+      if (originalHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = originalHome;
+      }
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 });
 
@@ -616,5 +861,98 @@ describe('getCodexLocalSessionsForProject', () => {
       process.env.HOME = originalHome;
       rmSync(tempHome, { recursive: true, force: true });
     }
+  });
+});
+
+describe('extractSessionFromStartSessionResponse', () => {
+  it('extracts nested session payload', () => {
+    expect(
+      extractSessionFromStartSessionResponse({
+        session: {
+          id: 'pcp-1',
+          startedAt: '2026-03-03T00:00:00.000Z',
+          backend: 'codex',
+        },
+      })
+    ).toMatchObject({ id: 'pcp-1', backend: 'codex' });
+  });
+
+  it('extracts top-level session payload', () => {
+    expect(
+      extractSessionFromStartSessionResponse({
+        id: 'pcp-2',
+        startedAt: '2026-03-03T00:00:00.000Z',
+        backend: 'codex',
+      })
+    ).toMatchObject({ id: 'pcp-2', backend: 'codex' });
+  });
+
+  it('returns undefined for payloads without session objects', () => {
+    expect(
+      extractSessionFromStartSessionResponse({ success: true, message: 'ok' })
+    ).toBeUndefined();
+  });
+});
+
+describe('resolveStartedSessionFromList', () => {
+  it('prefers requested session id when present', () => {
+    const resolved = resolveStartedSessionFromList({
+      beforeSessionIds: new Set(['pcp-old']),
+      requestedSessionId: 'pcp-new',
+      listedSessions: [
+        {
+          id: 'pcp-old',
+          startedAt: '2026-03-03T00:00:00.000Z',
+          backend: 'codex',
+        },
+        {
+          id: 'pcp-new',
+          startedAt: '2026-03-03T00:01:00.000Z',
+          backend: 'codex',
+        },
+      ],
+    });
+
+    expect(resolved?.id).toBe('pcp-new');
+  });
+
+  it('falls back to the newest newly created session', () => {
+    const resolved = resolveStartedSessionFromList({
+      beforeSessionIds: new Set(['pcp-old']),
+      listedSessions: [
+        {
+          id: 'pcp-old',
+          startedAt: '2026-03-03T00:00:00.000Z',
+          backend: 'codex',
+        },
+        {
+          id: 'pcp-new-a',
+          startedAt: '2026-03-03T00:01:00.000Z',
+          backend: 'codex',
+        },
+        {
+          id: 'pcp-new-b',
+          startedAt: '2026-03-03T00:02:00.000Z',
+          backend: 'codex',
+        },
+      ],
+    });
+
+    expect(resolved?.id).toBe('pcp-new-b');
+  });
+
+  it('returns undefined when no new session can be inferred', () => {
+    const resolved = resolveStartedSessionFromList({
+      beforeSessionIds: new Set(['pcp-old']),
+      listedSessions: [
+        {
+          id: 'pcp-old',
+          startedAt: '2026-03-03T00:00:00.000Z',
+          backend: 'codex',
+        },
+      ],
+    });
+
+    expect(resolved).toBeUndefined();
   });
 });

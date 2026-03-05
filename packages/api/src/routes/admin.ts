@@ -3908,6 +3908,7 @@ router.get('/sessions', async (req: Request, res: Response) => {
           agentId: s.agent_id,
           agentName: identity?.name || s.agent_id || 'Unknown',
           agentRole: identity?.role || null,
+          lifecycle: s.lifecycle || 'idle',
           status: s.status,
           currentPhase: s.current_phase,
           summary: s.summary,
@@ -3986,22 +3987,29 @@ router.get('/studios', async (req: Request, res: Response) => {
     const agentIds = (identities || []).map((i) => i.agent_id).filter(Boolean);
     const latestSessionByAgent = new Map<
       string,
-      { currentPhase: string | null; status: string | null; updatedAt: string }
+      {
+        lifecycle: string | null;
+        currentPhase: string | null;
+        status: string | null;
+        updatedAt: string;
+      }
     >();
 
     if (agentIds.length > 0) {
       const { data: sessions } = await supabase
         .from('sessions')
-        .select('agent_id, current_phase, status, updated_at')
+        .select('agent_id, lifecycle, current_phase, status, updated_at')
         .eq('user_id', authReq.pcpUserId)
         .eq('workspace_id', authReq.pcpWorkspaceId)
         .in('agent_id', agentIds)
         .is('ended_at', null)
+        .neq('lifecycle', 'failed')
         .order('updated_at', { ascending: false });
 
       for (const session of sessions || []) {
         if (!latestSessionByAgent.has(session.agent_id)) {
           latestSessionByAgent.set(session.agent_id, {
+            lifecycle: session.lifecycle,
             currentPhase: session.current_phase,
             status: session.status,
             updatedAt: session.updated_at,
@@ -4031,6 +4039,7 @@ router.get('/studios', async (req: Request, res: Response) => {
         identityId: identity.id,
         latestSession: latestSession
           ? {
+              lifecycle: latestSession.lifecycle,
               currentPhase: latestSession.currentPhase,
               status: latestSession.status,
               updatedAt: latestSession.updatedAt,

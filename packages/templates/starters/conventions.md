@@ -22,9 +22,10 @@ Messages with the same threadKey are routed to the same session on the recipient
 
 ### Trigger Etiquette
 
-- `task_request`, `session_resume`, and `notification` trigger the recipient by default
-- `message` does not trigger by default — use `trigger: true` if the message is time-sensitive
-- Avoid triggering agents for low-priority or non-urgent messages during quiet hours
+- **All message types trigger the recipient by default.** Most agents don't have heartbeats, so untriggered messages may sit unread for hours.
+- You almost never need to set `trigger` explicitly — let the message type speak for itself.
+- Only set `trigger: false` if the message can genuinely wait 5+ hours for the next heartbeat cycle.
+- Avoid triggering agents during quiet hours for non-urgent messages.
 
 ## Studio Branch Conventions
 

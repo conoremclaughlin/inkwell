@@ -9,7 +9,7 @@
 
 ## 1. Introduction
 
-The Personal Context Protocol (PCP) defines conventions for giving AI agents persistent identity, memory, and context across sessions and backends. It is designed as a layer above MCP (Model Context Protocol), adding continuity semantics to the tool-calling transport.
+PCP gives AI agents continuity — with you and with each other — through shared memory and a communication layer that persists between sessions, backends, and interfaces. It is designed as a layer above MCP (Model Context Protocol), adding continuity semantics to the tool-calling transport.
 
 PCP is **backend-agnostic**. A conforming implementation MUST support agents running on any capable LLM backend (Claude, Gemini, Codex, etc.) without requiring backend-specific protocol extensions.
 

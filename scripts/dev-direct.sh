@@ -47,14 +47,16 @@ fi
 BASE_PORT="${PCP_PORT_BASE:-3001}"
 WEB_PORT="${WEB_PORT:-$((BASE_PORT + 1))}"
 MYRA_PORT="${MYRA_HTTP_PORT:-$((BASE_PORT + 2))}"
-ENABLE_TELEGRAM="${ENABLE_TELEGRAM:-false}"
+# Default: unset → server.ts auto-enables if TELEGRAM_BOT_TOKEN is present.
+# Set ENABLE_TELEGRAM=false explicitly to force-disable.
+ENABLE_TELEGRAM="${ENABLE_TELEGRAM:-}"
 API_URL="${API_URL:-http://localhost:${BASE_PORT}}"
 
 echo "Starting direct dev mode"
 echo "  PCP_PORT_BASE=${BASE_PORT}"
 echo "  WEB_PORT=${WEB_PORT}"
 echo "  MYRA_HTTP_PORT=${MYRA_PORT}"
-echo "  ENABLE_TELEGRAM=${ENABLE_TELEGRAM}"
+echo "  ENABLE_TELEGRAM=${ENABLE_TELEGRAM:-<auto>}"
 echo "  ENABLE_HEARTBEATS=${ENABLE_HEARTBEATS:-<unset>}"
 echo "  ENABLE_REMINDERS=${ENABLE_REMINDERS:-<unset>}"
 echo "  API_URL=${API_URL}"
@@ -66,7 +68,7 @@ echo "  API_URL=${API_URL}"
   ENABLE_TELEGRAM="${ENABLE_TELEGRAM}" \
   ENABLE_WHATSAPP="${ENABLE_WHATSAPP:-false}" \
   ENABLE_DISCORD="${ENABLE_DISCORD:-false}" \
-  yarn --cwd "${ROOT_DIR}" workspace @personal-context/api server
+  yarn --cwd "${ROOT_DIR}" workspace @personal-context/api server:dev
 ) &
 API_PID=$!
 

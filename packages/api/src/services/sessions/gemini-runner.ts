@@ -26,6 +26,7 @@ import type {
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
+import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 
 /** Maximum time (ms) to wait for a Gemini CLI subprocess before killing it */
 const PROCESS_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
@@ -135,15 +136,16 @@ export class GeminiRunner implements IClaudeRunner {
     toolCalls: ToolCall[];
     sessionId?: string;
   }> {
+    const geminiBin = await resolveBinaryPath('gemini');
     return new Promise((resolve, reject) => {
       // Strip CLAUDECODE to prevent env leaking into subprocess
       const { CLAUDECODE, ...cleanEnv } = process.env;
-      const proc = spawn('gemini', args, {
+      const proc = spawn(geminiBin, args, {
         cwd: config.workingDirectory,
         env: {
           ...cleanEnv,
           HOME: process.env.HOME,
-          PATH: process.env.PATH,
+          PATH: buildSpawnPath(geminiBin),
           ...(config.pcpAccessToken ? { PCP_ACCESS_TOKEN: config.pcpAccessToken } : {}),
         },
         stdio: ['ignore', 'pipe', 'pipe'],

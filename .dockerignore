@@ -1,0 +1,14 @@
+.git
+.github
+.pcp
+.vscode
+.codex
+node_modules
+packages/*/node_modules
+packages/web/.next
+packages/*/dist
+.env.local
+.env.docker
+*.log
+tmp
+coverage

@@ -2,10 +2,8 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import type { LucideIcon } from 'lucide-react';
 import {
-  Users,
-  UsersRound,
-  Key,
   LogOut,
   Home,
   Bot,
@@ -21,6 +19,7 @@ import {
   Settings,
   Activity,
   Route,
+  MessageSquare,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useRouter } from 'next/navigation';
@@ -39,18 +38,39 @@ import {
 } from '@/components/ui/dialog';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 
-const navigation = [
-  { name: 'Dashboard', href: '/', icon: Home },
-  { name: 'Sessions', href: '/sessions', icon: Activity },
-  { name: 'Trusted Users', href: '/trusted-users', icon: Users },
-  { name: 'Groups', href: '/groups', icon: UsersRound },
-  { name: 'Challenge Codes', href: '/challenge-codes', icon: Key },
-  { name: 'Individuals', href: '/individuals', icon: Bot },
-  { name: 'Documents', href: '/artifacts', icon: FileText },
-  { name: 'Reminders', href: '/reminders', icon: Bell },
-  { name: 'Routing', href: '/routing', icon: Route },
-  { name: 'Connections', href: '/connected-accounts', icon: Link2 },
-  { name: 'Skills', href: '/skills', icon: Puzzle },
+interface NavItem {
+  name: string;
+  href: string;
+  icon: LucideIcon;
+}
+
+interface NavGroup {
+  label?: string;
+  items: NavItem[];
+}
+
+const mainNav: NavGroup[] = [
+  {
+    items: [{ name: 'Dashboard', href: '/', icon: Home }],
+  },
+  {
+    label: 'Team',
+    items: [
+      { name: 'Individuals', href: '/individuals', icon: Bot },
+      { name: 'Documents', href: '/artifacts', icon: FileText },
+      { name: 'Messaging', href: '/messaging', icon: MessageSquare },
+      { name: 'Skills', href: '/skills', icon: Puzzle },
+    ],
+  },
+  {
+    label: 'Platform',
+    items: [
+      { name: 'Reminders', href: '/reminders', icon: Bell },
+      { name: 'Connections', href: '/connected-accounts', icon: Link2 },
+      { name: 'Routing', href: '/routing', icon: Route },
+      { name: 'Sessions', href: '/sessions', icon: Activity },
+    ],
+  },
 ];
 
 interface WorkspaceOption {
@@ -291,40 +311,90 @@ export function Sidebar() {
     });
   };
 
+  const isLinkActive = (href: string) =>
+    href === '/' ? pathname === '/' : pathname === href || pathname.startsWith(href + '/');
+
+  const renderNavItem = (item: NavItem) => {
+    const active = isLinkActive(item.href);
+    return (
+      <li key={item.name}>
+        <Link
+          href={item.href}
+          className={cn(
+            'group relative flex items-center gap-x-3 rounded-lg px-3 py-2 text-[13px] font-medium transition-all duration-150',
+            active
+              ? 'bg-white/[0.08] text-white'
+              : 'text-gray-400 hover:bg-white/[0.04] hover:text-gray-200'
+          )}
+        >
+          {active && (
+            <span className="absolute left-0 top-1/2 h-4 w-[3px] -translate-y-1/2 rounded-r-full bg-blue-400" />
+          )}
+          <item.icon
+            className={cn(
+              'h-[18px] w-[18px] shrink-0 transition-colors duration-150',
+              active ? 'text-blue-400' : 'text-gray-500 group-hover:text-gray-400'
+            )}
+            strokeWidth={1.75}
+          />
+          {item.name}
+        </Link>
+      </li>
+    );
+  };
+
   return (
-    <div className="flex h-full w-64 flex-col bg-gray-900">
-      <div className="relative border-b border-gray-800 px-4 py-3" ref={accountMenuRef}>
-        <span className="text-lg font-bold text-white">PCP Admin</span>
+    <div className="flex h-full w-64 flex-col border-r border-white/[0.06] bg-[#0f1117]">
+      {/* Workspace switcher */}
+      <div className="relative px-3 pb-2 pt-4" ref={accountMenuRef}>
         <button
           onClick={() => setAccountMenuOpen((open) => !open)}
-          className="mt-3 flex w-full items-center justify-between rounded-md border border-gray-700 bg-gray-800 px-3 py-2 text-gray-100 hover:bg-gray-700"
+          className={cn(
+            'flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 transition-colors duration-150',
+            accountMenuOpen ? 'bg-white/[0.08]' : 'hover:bg-white/[0.04]'
+          )}
         >
-          <span className="flex min-w-0 items-center gap-2">
-            <span className="flex h-7 w-7 items-center justify-center rounded bg-gray-600 text-xs font-semibold">
-              {userInitial}
-            </span>
-            <span className="truncate text-sm font-medium">{workspaceTriggerLabel}</span>
+          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-gradient-to-br from-blue-500 to-violet-600 text-[11px] font-bold text-white shadow-sm shadow-blue-500/20">
+            {userInitial || 'P'}
           </span>
-          <ChevronDown className="h-4 w-4 shrink-0" />
+          <span className="min-w-0 flex-1 overflow-hidden text-left">
+            <span className="block truncate text-[13px] font-semibold text-gray-100 leading-tight">
+              {workspaceTriggerLabel}
+            </span>
+            {userEmail && (
+              <span className="block truncate text-[11px] text-gray-500 leading-tight">
+                {userEmail}
+              </span>
+            )}
+          </span>
+          <ChevronDown
+            className={cn(
+              'ml-auto h-3.5 w-3.5 shrink-0 text-gray-500 transition-transform duration-200',
+              accountMenuOpen && 'rotate-180'
+            )}
+          />
         </button>
 
         {accountMenuOpen && (
-          <div className="absolute left-4 right-4 top-full z-30 mt-2 rounded-xl border border-gray-200 bg-white p-3 shadow-2xl">
-            <div className="rounded-md border border-gray-200 bg-gray-50 p-2">
-              <p className="truncate text-sm font-semibold text-gray-900">{workspaceTitleLabel}</p>
-              <p className="mt-1 truncate text-xs text-gray-500">{userEmail || '\u00A0'}</p>
-              <p className="truncate text-xs text-gray-500">
-                {selectedWorkspaceRole ? `Role: ${selectedWorkspaceRole}` : '\u00A0'}
+          <div className="absolute left-3 right-3 top-full z-30 mt-1 overflow-hidden rounded-xl border border-gray-200 bg-white shadow-2xl shadow-black/20">
+            {/* Current workspace info */}
+            <div className="border-b border-gray-100 px-3 py-2.5">
+              <p className="truncate text-[13px] font-semibold text-gray-900">
+                {workspaceTitleLabel}
+              </p>
+              <p className="mt-0.5 truncate text-[11px] text-gray-500">
+                {selectedWorkspaceRole ? `Role: ${selectedWorkspaceRole}` : userEmail || '\u00A0'}
               </p>
             </div>
 
-            <div className="mt-3 space-y-1 rounded-md border border-gray-200 bg-gray-50 p-2">
-              <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+            {/* Workspace list */}
+            <div className="max-h-48 overflow-y-auto px-1.5 py-1.5">
+              <p className="px-2 pb-1 pt-0.5 text-[10px] font-semibold uppercase tracking-wider text-gray-400">
                 Workspaces
               </p>
-              {workspacesLoading && <p className="text-xs text-gray-500">Loading workspaces...</p>}
+              {workspacesLoading && <p className="px-2 py-1 text-xs text-gray-400">Loading...</p>}
               {!workspacesLoading && workspaces.length === 0 && (
-                <p className="text-xs text-gray-500">No workspaces yet</p>
+                <p className="px-2 py-1 text-xs text-gray-400">No workspaces yet</p>
               )}
               {workspaces.map((workspace) => {
                 const isSelected = workspace.id === resolvedWorkspaceId;
@@ -335,50 +405,56 @@ export function Sidebar() {
                       handleWorkspaceChange(workspace.id);
                       setAccountMenuOpen(false);
                     }}
-                    className="flex w-full items-center justify-between rounded px-2 py-1 text-left text-sm text-gray-700 hover:bg-gray-100"
+                    className={cn(
+                      'flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-[13px] transition-colors',
+                      isSelected
+                        ? 'bg-gray-100 font-medium text-gray-900'
+                        : 'text-gray-600 hover:bg-gray-50'
+                    )}
                   >
-                    <span className="truncate">
-                      {workspace.name}{' '}
-                      <span className="text-xs text-gray-500">({workspace.role || 'member'})</span>
-                    </span>
-                    {isSelected && <Check className="h-4 w-4 text-gray-700" />}
+                    <span className="truncate">{workspace.name}</span>
+                    {isSelected && <Check className="h-3.5 w-3.5 text-blue-500" />}
                   </button>
                 );
               })}
             </div>
 
-            <div className="mt-3 grid grid-cols-2 gap-2">
+            {/* Actions */}
+            <div className="border-t border-gray-100 px-1.5 py-1.5">
               <button
                 onClick={() => {
                   setWorkspaceManagerOpen(true);
                   setAccountMenuOpen(false);
                 }}
-                className="rounded border border-gray-300 px-2 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-[13px] text-gray-600 hover:bg-gray-50"
               >
-                <span className="inline-flex items-center gap-1">
-                  <Building2 className="h-4 w-4" />
-                  Manage
-                </span>
+                <Building2 className="h-3.5 w-3.5" />
+                Manage workspaces
               </button>
               <button
                 disabled
-                className="flex items-center justify-center gap-1 rounded border border-gray-200 px-2 py-2 text-sm font-medium text-gray-400"
+                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-[13px] text-gray-300"
               >
-                <Settings className="h-4 w-4" />
+                <Settings className="h-3.5 w-3.5" />
                 Settings
               </button>
             </div>
 
-            <button
-              onClick={() => signOut()}
-              className="mt-3 flex w-full items-center justify-center gap-2 rounded bg-gray-900 px-3 py-2 text-sm font-medium text-white hover:bg-gray-800"
-            >
-              <LogOut className="h-4 w-4" />
-              Log out
-            </button>
+            {/* Sign out */}
+            <div className="border-t border-gray-100 px-1.5 py-1.5">
+              <button
+                onClick={() => signOut()}
+                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-[13px] text-red-500 hover:bg-red-50"
+              >
+                <LogOut className="h-3.5 w-3.5" />
+                Sign out
+              </button>
+            </div>
           </div>
         )}
       </div>
+
+      {/* Workspace manager dialog */}
       {isMounted && (
         <Dialog open={workspaceManagerOpen} onOpenChange={setWorkspaceManagerOpen}>
           <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-xl">
@@ -544,36 +620,20 @@ export function Sidebar() {
           </DialogContent>
         </Dialog>
       )}
-      <nav className="flex flex-1 flex-col">
-        <ul className="flex flex-1 flex-col gap-y-1 px-3">
-          {navigation.map((item) => {
-            const isActive = pathname === item.href;
-            return (
-              <li key={item.name}>
-                <Link
-                  href={item.href}
-                  className={cn(
-                    'group flex gap-x-3 rounded-md p-3 text-sm font-semibold leading-6',
-                    isActive
-                      ? 'bg-gray-800 text-white'
-                      : 'text-gray-400 hover:bg-gray-800 hover:text-white'
-                  )}
-                >
-                  <item.icon className="h-6 w-6 shrink-0" />
-                  {item.name}
-                </Link>
-              </li>
-            );
-          })}
-        </ul>
-        <div className="px-3 pb-4">
-          <button
-            onClick={() => signOut()}
-            className="group flex w-full gap-x-3 rounded-md p-3 text-sm font-semibold leading-6 text-gray-400 hover:bg-gray-800 hover:text-white"
-          >
-            <LogOut className="h-6 w-6 shrink-0" />
-            Sign out
-          </button>
+
+      {/* Navigation */}
+      <nav className="flex flex-1 flex-col overflow-y-auto px-3 pt-2">
+        <div className="flex flex-1 flex-col gap-y-5">
+          {mainNav.map((group, groupIdx) => (
+            <div key={groupIdx}>
+              {group.label && (
+                <p className="mb-1.5 px-3 text-[10px] font-semibold uppercase tracking-wider text-gray-500">
+                  {group.label}
+                </p>
+              )}
+              <ul className="space-y-0.5">{group.items.map(renderNavItem)}</ul>
+            </div>
+          ))}
         </div>
       </nav>
     </div>

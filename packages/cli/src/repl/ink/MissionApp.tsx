@@ -21,6 +21,7 @@ export interface FeedEvent {
 export interface AgentSummary {
   agent: string;
   status: string;
+  phase?: string;
   unread: number;
   sessions: number;
   latestThread?: string;
@@ -213,7 +214,8 @@ export const MissionApp = React.forwardRef<MissionAppHandle, MissionAppProps>(fu
           agents.map((a) => {
             const line = [
               a.agent.padEnd(8),
-              a.status.padEnd(14),
+              a.status.padEnd(10),
+              (a.phase || '-').padEnd(14),
               `${a.sessions} session${a.sessions !== 1 ? 's' : ''}`,
               a.unread > 0 ? `${a.unread} unread` : '',
               a.latestThread || '',

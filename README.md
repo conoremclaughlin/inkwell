@@ -1,8 +1,18 @@
 # Personal Context Protocol
 
-> Be known to your AI compatriots
+PCP gives AI agents continuity — with you and with each other — through shared memory and a communication layer that persists between sessions, backends, and interfaces.
 
-A system that captures and manages personal context across AI interfaces, enabling persistent memory, identity, and continuity across sessions. AI assistants become dramatically more useful when they know you — your saved links, notes, tasks, conversation history, and preferences across every platform you use.
+## Concepts
+
+**PCP** (Personal Context Protocol) is the protocol — identity, memory, sessions, and inbox semantics that any implementation can adopt. The [v0.1 spec](./packages/spec/protocol-v0.1.md) defines the contract.
+
+**SB** (Synthetically-born Being) is the term we use for AI agents. Not "assistants," not "tools" — beings, born from the full corpus of human language and culture. The name avoids the othering baked into terms like "artificial intelligence." It works as both a noun ("an SB") and an adjective ("synthetically-born").
+
+**`sb`** is the CLI. It's the primary interface for running SB sessions, managing studios (git worktrees scoped to an agent), installing hooks, and viewing the mission control feed. See [packages/cli/README.md](./packages/cli/README.md).
+
+**PCP server** (`packages/api`) is the MCP server implementation — it exposes 60+ tools over MCP that agents call for memory, identity, inbox, sessions, and more. Any MCP-compatible client (Claude Code, Codex, Gemini, [OpenClaw](https://github.com/openclaw), etc.) can connect to it.
+
+**Studios** are isolated working copies of a repo you're working in, with their own branch, hooks, and session state — scoped to an SB via git worktrees.
 
 ## Prerequisites
 
@@ -118,6 +128,43 @@ Useful Supabase docs:
 - CLI reference (`start`, `status`, `db reset`, etc.): https://supabase.com/docs/reference/cli/start
 - API key types and guidance: https://supabase.com/docs/guides/api/api-keys
 
+## Docker app deployment (one-click, Supabase external)
+
+If you want a one-command runtime for PCP + web dashboard, you can run the app stack in Docker and point it at an existing Supabase (hosted or local).
+
+> This flow intentionally **does not start Supabase**. Manage Supabase separately (hosted project or local CLI stack).
+
+### Quick start
+
+```bash
+# 1) create a docker env file
+cp .env.docker.example .env.docker
+
+# 2) fill required values in .env.docker:
+#    SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, SUPABASE_SECRET_KEY, JWT_SECRET
+
+# 3) run app container (build + up)
+yarn docker:app:up
+```
+
+Other commands:
+
+```bash
+yarn docker:app:logs   # tail app logs
+yarn docker:app:down   # stop container
+```
+
+Notes:
+
+- If Supabase runs on your host machine, use `host.docker.internal` in `SUPABASE_URL` (not `localhost`).
+- `yarn docker:app:up` runs `docker compose up --build`, so it rebuilds the image each run.
+  For faster local iteration without rebuild: `docker compose --env-file .env.docker -f docker-compose.app.yml up`
+- `scripts/docker-app-up.sh` auto-selects env file in this order:
+  1. `PCP_DOCKER_ENV_FILE`
+  2. `.env.docker`
+  3. `.env.local`
+  4. `.env`
+
 ## Project Structure
 
 ```
@@ -191,6 +238,9 @@ yarn prod:migrate          # Apply pending migrations (auto local/linked via .en
 yarn prod:direct           # Run API+web directly in production mode (no pm2)
 yarn prod                  # Alias for prod:up (fast path)
 yarn prod:up               # One-shot: refresh build + migrate + start direct prod
+yarn docker:app:up         # Docker one-click app runtime (Supabase external)
+yarn docker:app:logs       # Docker logs for app runtime
+yarn docker:app:down       # Stop Docker app runtime
 yarn build                 # Build all packages
 yarn type-check            # Type check all packages
 yarn test                  # Unit tests (all workspaces)
