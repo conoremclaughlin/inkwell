@@ -128,6 +128,41 @@ Useful Supabase docs:
 - CLI reference (`start`, `status`, `db reset`, etc.): https://supabase.com/docs/reference/cli/start
 - API key types and guidance: https://supabase.com/docs/guides/api/api-keys
 
+## Docker app deployment (one-click, Supabase external)
+
+If you want a one-command runtime for PCP + web dashboard, you can run the app stack in Docker and point it at an existing Supabase (hosted or local).
+
+> This flow intentionally **does not start Supabase**. Manage Supabase separately (hosted project or local CLI stack).
+
+### Quick start
+
+```bash
+# 1) create a docker env file
+cp .env.docker.example .env.docker
+
+# 2) fill required values in .env.docker:
+#    SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, SUPABASE_SECRET_KEY, JWT_SECRET
+
+# 3) run app container (build + up)
+yarn docker:app:up
+```
+
+Other commands:
+
+```bash
+yarn docker:app:logs   # tail app logs
+yarn docker:app:down   # stop container
+```
+
+Notes:
+
+- If Supabase runs on your host machine, use `host.docker.internal` in `SUPABASE_URL` (not `localhost`).
+- `scripts/docker-app-up.sh` auto-selects env file in this order:
+  1. `PCP_DOCKER_ENV_FILE`
+  2. `.env.docker`
+  3. `.env.local`
+  4. `.env`
+
 ## Project Structure
 
 ```
@@ -201,6 +236,9 @@ yarn prod:migrate          # Apply pending migrations (auto local/linked via .en
 yarn prod:direct           # Run API+web directly in production mode (no pm2)
 yarn prod                  # Alias for prod:up (fast path)
 yarn prod:up               # One-shot: refresh build + migrate + start direct prod
+yarn docker:app:up         # Docker one-click app runtime (Supabase external)
+yarn docker:app:logs       # Docker logs for app runtime
+yarn docker:app:down       # Stop Docker app runtime
 yarn build                 # Build all packages
 yarn type-check            # Type check all packages
 yarn test                  # Unit tests (all workspaces)
