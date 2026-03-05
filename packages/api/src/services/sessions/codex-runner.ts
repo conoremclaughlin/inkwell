@@ -135,10 +135,11 @@ export class CodexRunner implements IClaudeRunner {
     toolCalls: ToolCall[];
     sessionId?: string;
   }> {
+    const codexBin = await resolveBinaryPath('codex');
     return new Promise((resolve, reject) => {
       // Strip CLAUDECODE to prevent env leaking into subprocess
       const { CLAUDECODE, ...cleanEnv } = process.env;
-      const proc = spawn(resolveBinaryPath('codex'), args, {
+      const proc = spawn(codexBin, args, {
         cwd: config.workingDirectory,
         env: {
           ...cleanEnv,

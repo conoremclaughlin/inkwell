@@ -11,8 +11,11 @@
  *   3. Cache resolved paths for the process lifetime
  */
 
-import { execSync } from 'child_process';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { logger } from '../../utils/logger.js';
+
+const execFileAsync = promisify(execFile);
 
 const resolvedPaths = new Map<string, string | null>();
 
@@ -21,7 +24,7 @@ const resolvedPaths = new Map<string, string | null>();
  * Returns the binary name unchanged if resolution fails (spawn will produce
  * a clear ENOENT error).
  */
-export function resolveBinaryPath(binary: string): string {
+export async function resolveBinaryPath(binary: string): Promise<string> {
   const cached = resolvedPaths.get(binary);
   if (cached !== undefined) {
     return cached ?? binary;
@@ -29,11 +32,8 @@ export function resolveBinaryPath(binary: string): string {
 
   // 1. Try current process PATH
   try {
-    const path = execSync(`which ${binary}`, {
-      encoding: 'utf-8',
-      timeout: 3000,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
+    const { stdout } = await execFileAsync('which', [binary], { timeout: 3000 });
+    const path = stdout.trim();
     if (path) {
       resolvedPaths.set(binary, path);
       logger.debug(`Resolved ${binary} from PATH: ${path}`);
@@ -45,13 +45,9 @@ export function resolveBinaryPath(binary: string): string {
 
   // 2. Fall back to zsh login shell (picks up nvm, homebrew, etc.)
   try {
-    const path = execSync(`zsh -ilc 'which ${binary}'`, {
-      encoding: 'utf-8',
-      timeout: 5000,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-    // zsh -il may print extra lines (nvm "Now using..." etc.) — take the last non-empty line
-    const lines = path.split('\n').filter((l) => l.trim() && l.startsWith('/'));
+    const { stdout } = await execFileAsync('zsh', ['-ilc', `which ${binary}`], { timeout: 5000 });
+    // zsh -il may print extra lines (nvm "Now using..." etc.) — take the last absolute path
+    const lines = stdout.split('\n').filter((l) => l.trim() && l.startsWith('/'));
     const resolved = lines[lines.length - 1];
     if (resolved) {
       resolvedPaths.set(binary, resolved);
