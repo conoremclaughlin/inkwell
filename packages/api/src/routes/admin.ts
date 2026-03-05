@@ -3621,50 +3621,109 @@ router.get('/sessions', async (req: Request, res: Response) => {
     const authReq = req as AdminAuthRequest;
     const includeCompleted = req.query.includeCompleted === 'true';
 
-    // 1. Fetch sessions for the user
-    let sessionsQuery = supabase
-      .from('sessions')
-      .select('*')
+    // 1. Resolve identities in the active top-level workspace.
+    const { data: scopedIdentities, error: scopedIdentitiesError } = await supabase
+      .from('agent_identities')
+      .select('id, agent_id, name, role')
       .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
-      .order('updated_at', { ascending: false })
-      .limit(100);
+      .eq('workspace_id', authReq.pcpWorkspaceId);
 
-    if (!includeCompleted) {
-      sessionsQuery = sessionsQuery.is('ended_at', null).neq('lifecycle', 'failed');
-    }
-
-    const { data: sessions, error: sessionsError } = await sessionsQuery;
-
-    if (sessionsError) {
-      logger.error('Failed to list sessions:', sessionsError);
-      res.status(500).json(errorJson('Failed to list sessions', sessionsError));
+    if (scopedIdentitiesError) {
+      logger.error('Failed to resolve workspace identities for sessions:', scopedIdentitiesError);
+      res.status(500).json(errorJson('Failed to list sessions', scopedIdentitiesError));
       return;
     }
 
-    const sessionRows = sessions || [];
+    const scopedIdentityRows = scopedIdentities || [];
+    const scopedIdentityIds = scopedIdentityRows.map((i) => i.id).filter(Boolean);
+    const scopedAgentIds = [
+      ...new Set(
+        scopedIdentityRows.map((i) => i.agent_id).filter((id): id is string => Boolean(id))
+      ),
+    ];
 
-    // 2. Batch-fetch agent identities for unique agent_ids
-    const uniqueAgentIds = [...new Set(sessionRows.map((s) => s.agent_id).filter(Boolean))];
     const identitiesByAgentId = new Map<string, { name: string; role: string | null }>();
-
-    if (uniqueAgentIds.length > 0) {
-      // Look up identities by user_id (not workspace container) so names resolve
-      // for sessions across all containers. agent_id is typically unique per user.
-      const { data: identities } = await supabase
-        .from('agent_identities')
-        .select('agent_id, name, role')
-        .eq('user_id', authReq.pcpUserId)
-        .eq('workspace_id', authReq.pcpWorkspaceId)
-        .in('agent_id', uniqueAgentIds);
-
-      for (const identity of identities || []) {
-        identitiesByAgentId.set(identity.agent_id, {
-          name: identity.name,
-          role: identity.role,
-        });
-      }
+    for (const identity of scopedIdentityRows) {
+      identitiesByAgentId.set(identity.agent_id, {
+        name: identity.name,
+        role: identity.role,
+      });
     }
+
+    if (scopedIdentityRows.length === 0) {
+      // Active workspace has no agent identities yet, so there are no
+      // sessions to display in this scope.
+      res.json({
+        stats: { running: 0, generating: 0, idle: 0, blocked: 0, paused: 0, total: 0 },
+        sessions: [],
+      });
+      return;
+    }
+
+    // 2. Fetch sessions scoped to identities in the active top-level workspace.
+    // Sessions store studio/worktree scope in studio_id/workspace_id, so we scope
+    // via identity_id (with legacy agent_id fallback), not by sessions.workspace_id.
+    let identitySessionsQuery = supabase
+      .from('sessions')
+      .select('*')
+      .eq('user_id', authReq.pcpUserId)
+      .in('identity_id', scopedIdentityIds)
+      .order('updated_at', { ascending: false })
+      .limit(200);
+
+    if (!includeCompleted) {
+      // Include NULL status rows as non-terminal; only exclude explicit terminal states.
+      identitySessionsQuery = identitySessionsQuery.or(
+        'status.is.null,status.not.in.(completed,failed,archived)'
+      );
+    }
+
+    const { data: identityScopedSessions, error: identityScopedSessionsError } =
+      await identitySessionsQuery;
+
+    if (identityScopedSessionsError) {
+      logger.error('Failed to list identity-scoped sessions:', identityScopedSessionsError);
+      res.status(500).json(errorJson('Failed to list sessions', identityScopedSessionsError));
+      return;
+    }
+
+    type SessionRow = NonNullable<typeof identityScopedSessions>[number];
+    let legacySessions: SessionRow[] = [];
+    if (scopedAgentIds.length > 0) {
+      let legacyQuery = supabase
+        .from('sessions')
+        .select('*')
+        .eq('user_id', authReq.pcpUserId)
+        .is('identity_id', null)
+        .in('agent_id', scopedAgentIds)
+        .order('updated_at', { ascending: false })
+        .limit(200);
+
+      if (!includeCompleted) {
+        // Include NULL status rows as non-terminal; only exclude explicit terminal states.
+        legacyQuery = legacyQuery.or('status.is.null,status.not.in.(completed,failed,archived)');
+      }
+
+      const { data: legacyRows, error: legacyError } = await legacyQuery;
+      if (legacyError) {
+        logger.error('Failed to list legacy sessions:', legacyError);
+        res.status(500).json(errorJson('Failed to list sessions', legacyError));
+        return;
+      }
+      legacySessions = legacyRows || [];
+    }
+
+    const dedupedSessionsById = new Map<string, SessionRow>();
+    for (const row of [...(identityScopedSessions || []), ...legacySessions]) {
+      dedupedSessionsById.set(row.id, row);
+    }
+
+    // We intentionally over-fetch each query (200) and then trim to 100 after
+    // merge+dedupe so the mixed identity/legacy result set still surfaces the
+    // most recently updated sessions overall.
+    const sessionRows = [...dedupedSessionsById.values()]
+      .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())
+      .slice(0, 100);
 
     // 3. Batch-fetch studios linked to these sessions (studio_id preferred, session_id fallback)
     const sessionIds = sessionRows.map((s) => s.id);
@@ -3681,6 +3740,8 @@ router.get('/sessions', async (req: Request, res: Response) => {
         purpose: string | null;
         workType: string | null;
         status: string;
+        worktreePath: string | null;
+        repoName: string | null;
       }
     >();
     const workspacesBySessionId = new Map<
@@ -3692,13 +3753,21 @@ router.get('/sessions', async (req: Request, res: Response) => {
         purpose: string | null;
         workType: string | null;
         status: string;
+        worktreePath: string | null;
+        repoName: string | null;
       }
     >();
+    const deriveRepoName = (worktreePath: string | null | undefined): string | null => {
+      if (!worktreePath) return null;
+      const normalizedPath = worktreePath.replace(/\/+$/, '');
+      const basename = path.basename(normalizedPath);
+      return basename || null;
+    };
 
     if (studioIds.length > 0) {
       const { data: studios } = await supabase
         .from('studios')
-        .select('id, branch, base_branch, purpose, work_type, status')
+        .select('id, branch, base_branch, purpose, work_type, status, worktree_path')
         .in('id', studioIds);
 
       for (const studio of studios || []) {
@@ -3709,6 +3778,8 @@ router.get('/sessions', async (req: Request, res: Response) => {
           purpose: studio.purpose,
           workType: studio.work_type,
           status: studio.status,
+          worktreePath: studio.worktree_path,
+          repoName: deriveRepoName(studio.worktree_path),
         });
       }
     }
@@ -3717,7 +3788,7 @@ router.get('/sessions', async (req: Request, res: Response) => {
     if (sessionIds.length > 0) {
       const { data: linkedWorkspaces } = await supabase
         .from('studios')
-        .select('id, session_id, branch, base_branch, purpose, work_type, status')
+        .select('id, session_id, branch, base_branch, purpose, work_type, status, worktree_path')
         .in('session_id', sessionIds);
 
       for (const ws of linkedWorkspaces || []) {
@@ -3729,6 +3800,8 @@ router.get('/sessions', async (req: Request, res: Response) => {
             purpose: ws.purpose,
             workType: ws.work_type,
             status: ws.status,
+            worktreePath: ws.worktree_path,
+            repoName: deriveRepoName(ws.worktree_path),
           });
         }
       }
@@ -3800,13 +3873,22 @@ router.get('/sessions', async (req: Request, res: Response) => {
 
     // 5. Compute stats
     const stats = {
-      active: sessionRows.filter(
-        (s) =>
-          (s.lifecycle === 'idle' ||
-            s.lifecycle === 'running' ||
-            (!s.lifecycle && s.status === 'active')) &&
-          !s.current_phase?.startsWith('blocked')
-      ).length,
+      running: sessionRows.filter((s) => {
+        const normalizedStatus = String(s.status || '').toLowerCase();
+        const currentPhase = s.current_phase || '';
+        if (
+          ['completed', 'failed', 'archived', 'paused', 'resumable', 'idle'].includes(
+            normalizedStatus
+          )
+        ) {
+          return false;
+        }
+        if (currentPhase.startsWith('blocked')) return false;
+        if (currentPhase === 'runtime:generating' || currentPhase === 'runtime:idle') return false;
+        return true;
+      }).length,
+      generating: sessionRows.filter((s) => s.current_phase === 'runtime:generating').length,
+      idle: sessionRows.filter((s) => s.current_phase === 'runtime:idle').length,
       blocked: sessionRows.filter((s) => s.current_phase?.startsWith('blocked')).length,
       paused: sessionRows.filter((s) => s.status === 'paused').length,
       total: sessionRows.length,
@@ -3816,6 +3898,10 @@ router.get('/sessions', async (req: Request, res: Response) => {
       stats,
       sessions: sessionRows.map((s) => {
         const identity = s.agent_id ? identitiesByAgentId.get(s.agent_id) : null;
+        const studio =
+          studiosById.get(s.studio_id || s.workspace_id || '') ||
+          workspacesBySessionId.get(s.id) ||
+          null;
         return {
           id: s.id,
           backendSessionId: s.backend_session_id || s.claude_session_id || null,
@@ -3835,11 +3921,10 @@ router.get('/sessions', async (req: Request, res: Response) => {
           updatedAt: s.updated_at,
           endedAt: s.ended_at,
           preview: previewsBySessionId.get(s.id) || [],
-          workspace: workspacesBySessionId.get(s.id) || null,
-          studio:
-            studiosById.get(s.studio_id || s.workspace_id || '') ||
-            workspacesBySessionId.get(s.id) ||
-            null,
+          // NOTE: `workspace` previously represented studio/worktree scope.
+          // Keep a single canonical `studio` field to avoid conflating it with
+          // top-level organizational workspaces.
+          studio,
         };
       }),
     });
@@ -4004,17 +4089,50 @@ router.get('/sessions/:id/logs', async (req: Request, res: Response) => {
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
+    const { data: scopedIdentities, error: scopedIdentityError } = await supabase
+      .from('agent_identities')
+      .select('id, agent_id')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId);
+
+    if (scopedIdentityError) {
+      logger.error('Failed to resolve workspace identities for session logs:', scopedIdentityError);
+      res.status(500).json(errorJson('Failed to get session logs', scopedIdentityError));
+      return;
+    }
+
+    const scopedIdentityIds = (scopedIdentities || []).map((i) => i.id);
+    const scopedAgentIds = new Set(
+      (scopedIdentities || [])
+        .map((i) => i.agent_id)
+        .filter((agentId): agentId is string => Boolean(agentId))
+    );
+
+    if (scopedIdentityIds.length === 0) {
+      logger.warn('Session log lookup denied: no identities in active workspace scope', {
+        userId: authReq.pcpUserId,
+        workspaceId: authReq.pcpWorkspaceId,
+        sessionId,
+      });
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
     const { data: session, error: sessionError } = await supabase
       .from('sessions')
       .select(
-        'id, agent_id, status, current_phase, started_at, updated_at, ended_at, backend, backend_session_id, claude_session_id'
+        'id, identity_id, agent_id, status, current_phase, started_at, updated_at, ended_at, backend, backend_session_id, claude_session_id'
       )
       .eq('id', sessionId)
       .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId)
       .single();
 
-    if (sessionError || !session) {
+    const sessionInWorkspace =
+      session &&
+      ((session.identity_id && scopedIdentityIds.includes(session.identity_id)) ||
+        (!session.identity_id && session.agent_id && scopedAgentIds.has(session.agent_id)));
+
+    if (sessionError || !session || !sessionInWorkspace) {
       res.status(404).json({ error: 'Session not found' });
       return;
     }

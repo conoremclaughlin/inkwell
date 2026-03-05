@@ -25,6 +25,8 @@ interface SessionWorkspace {
   purpose: string | null;
   workType: string | null;
   status: string;
+  repoName: string | null;
+  worktreePath: string | null;
 }
 
 interface Session {
@@ -45,7 +47,7 @@ interface Session {
   startedAt: string;
   updatedAt: string;
   endedAt: string | null;
-  workspace: SessionWorkspace | null;
+  studio: SessionWorkspace | null;
   preview: Array<{
     id: string;
     source: 'activity_stream' | 'session_logs' | 'local_transcript';
@@ -57,7 +59,14 @@ interface Session {
 }
 
 interface SessionsResponse {
-  stats: { active: number; blocked: number; paused: number; total: number };
+  stats: {
+    running: number;
+    generating: number;
+    idle: number;
+    blocked: number;
+    paused: number;
+    total: number;
+  };
   sessions: Session[];
 }
 
@@ -93,6 +102,8 @@ function getSessionState(session: Session): {
   badgeClass: string;
   phaseClass: string;
 } {
+  const normalizedStatus = String(session.status || '').toLowerCase();
+
   if (isBlocked(session)) {
     return {
       label: 'Blocked',
@@ -113,9 +124,19 @@ function getSessionState(session: Session): {
     };
   }
 
-  if (lifecycle === 'running') {
+  if (normalizedStatus === 'paused') {
     return {
-      label: 'Running',
+      label: 'Paused',
+      cardClass: 'border-gray-200',
+      badgeClass: 'bg-gray-100 text-gray-600',
+      phaseClass: 'text-gray-600',
+    };
+  }
+
+  if (lifecycle === 'running') {
+    const isGenerating = session.currentPhase === 'runtime:generating';
+    return {
+      label: isGenerating ? 'Generating' : 'Running',
       cardClass: 'border-blue-200 bg-blue-50/50',
       badgeClass: 'bg-blue-100 text-blue-700',
       phaseClass: 'font-medium text-blue-700',
@@ -140,8 +161,21 @@ function getSessionState(session: Session): {
     };
   }
 
+  if (
+    normalizedStatus === 'resumable' ||
+    normalizedStatus === 'active' ||
+    normalizedStatus === 'running'
+  ) {
+    return {
+      label: 'Running',
+      cardClass: 'border-green-200 bg-green-50/50',
+      badgeClass: 'bg-green-100 text-green-700',
+      phaseClass: 'text-gray-600',
+    };
+  }
+
   return {
-    label: lifecycle,
+    label: lifecycle || session.status || 'unknown',
     cardClass: 'border-gray-200',
     badgeClass: 'bg-gray-100 text-gray-600',
     phaseClass: 'text-gray-600',
@@ -178,18 +212,24 @@ function SessionCard({ session }: { session: Session }) {
           )}
 
           {/* Workspace info */}
-          {session.workspace && (
+          {session.studio && (
             <div className="flex items-center gap-3 mt-2 text-xs text-gray-500">
+              {session.studio.repoName && (
+                <span className="flex items-center gap-1">
+                  <FolderGit2 className="h-3 w-3" />
+                  {session.studio.repoName}
+                </span>
+              )}
               <span className="flex items-center gap-1">
                 <GitBranch className="h-3 w-3" />
-                {session.workspace.branch || 'no branch'}
+                {session.studio.branch || 'no branch'}
               </span>
-              {session.workspace.purpose && (
-                <span className="truncate max-w-xs">{session.workspace.purpose}</span>
+              {session.studio.purpose && (
+                <span className="truncate max-w-xs">{session.studio.purpose}</span>
               )}
-              {session.workspace.workType && (
+              {session.studio.workType && (
                 <Badge variant="outline" className="text-xs">
-                  {session.workspace.workType}
+                  {session.studio.workType}
                 </Badge>
               )}
             </div>
@@ -281,7 +321,7 @@ function SessionCard({ session }: { session: Session }) {
             </div>
 
             {/* Studio details */}
-            {session.workspace && (
+            {session.studio && (
               <div>
                 <div className="flex items-center gap-1.5 font-medium text-gray-700 mb-1.5">
                   <FolderGit2 className="h-3.5 w-3.5" />
@@ -290,34 +330,46 @@ function SessionCard({ session }: { session: Session }) {
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 text-gray-500">
                   <div>
                     <span className="text-gray-400">ID: </span>
-                    <code className="font-mono select-all">{session.workspace.id}</code>
+                    <code className="font-mono select-all">{session.studio.id}</code>
                   </div>
                   <div>
                     <span className="text-gray-400">Status: </span>
-                    <span>{session.workspace.status}</span>
+                    <span>{session.studio.status}</span>
                   </div>
-                  {session.workspace.branch && (
+                  {session.studio.repoName && (
+                    <div>
+                      <span className="text-gray-400">Repo: </span>
+                      <code className="font-mono">{session.studio.repoName}</code>
+                    </div>
+                  )}
+                  {session.studio.branch && (
                     <div>
                       <span className="text-gray-400">Branch: </span>
-                      <code className="font-mono">{session.workspace.branch}</code>
+                      <code className="font-mono">{session.studio.branch}</code>
                     </div>
                   )}
-                  {session.workspace.baseBranch && (
+                  {session.studio.worktreePath && (
+                    <div className="sm:col-span-2">
+                      <span className="text-gray-400">Path: </span>
+                      <code className="font-mono break-all">{session.studio.worktreePath}</code>
+                    </div>
+                  )}
+                  {session.studio.baseBranch && (
                     <div>
                       <span className="text-gray-400">Base: </span>
-                      <code className="font-mono">{session.workspace.baseBranch}</code>
+                      <code className="font-mono">{session.studio.baseBranch}</code>
                     </div>
                   )}
-                  {session.workspace.purpose && (
+                  {session.studio.purpose && (
                     <div className="sm:col-span-2">
                       <span className="text-gray-400">Purpose: </span>
-                      <span>{session.workspace.purpose}</span>
+                      <span>{session.studio.purpose}</span>
                     </div>
                   )}
-                  {session.workspace.workType && (
+                  {session.studio.workType && (
                     <div>
                       <span className="text-gray-400">Type: </span>
-                      <span>{session.workspace.workType}</span>
+                      <span>{session.studio.workType}</span>
                     </div>
                   )}
                 </div>
@@ -337,11 +389,15 @@ export default function SessionsPage() {
     { refetchInterval: 30000 }
   );
 
-  const stats = data?.stats ?? { active: 0, blocked: 0, paused: 0, total: 0 };
+  const stats = data?.stats ?? {
+    running: 0,
+    generating: 0,
+    idle: 0,
+    blocked: 0,
+    paused: 0,
+    total: 0,
+  };
   const sessions = data?.sessions ?? [];
-  const runningCount = sessions.filter((s) => getLifecycle(s) === 'running').length;
-  const idleCount = sessions.filter((s) => getLifecycle(s) === 'idle').length;
-  const failedCount = sessions.filter((s) => getLifecycle(s) === 'failed').length;
 
   return (
     <div>
@@ -360,16 +416,23 @@ export default function SessionsPage() {
       <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mt-6">
         <Card>
           <CardContent className="p-4 text-center">
-            <Activity className="h-5 w-5 mx-auto text-blue-600 mb-1" />
-            <div className="text-2xl font-bold text-blue-600">{runningCount}</div>
+            <Activity className="h-5 w-5 mx-auto text-green-700 mb-1" />
+            <div className="text-2xl font-bold text-green-700">{stats.running}</div>
             <div className="text-xs text-gray-500">Running</div>
           </CardContent>
         </Card>
         <Card>
           <CardContent className="p-4 text-center">
+            <Activity className="h-5 w-5 mx-auto text-blue-600 mb-1" />
+            <div className="text-2xl font-bold text-blue-600">{stats.generating}</div>
+            <div className="text-xs text-gray-500">Generating</div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4 text-center">
             <CircleDot className="h-5 w-5 mx-auto text-green-600 mb-1" />
-            <div className="text-2xl font-bold text-green-600">{idleCount}</div>
-            <div className="text-xs text-gray-500">Idle</div>
+            <div className="text-2xl font-bold text-green-600">{stats.idle}</div>
+            <div className="text-xs text-gray-500">Runtime Idle</div>
           </CardContent>
         </Card>
         <Card>
@@ -377,13 +440,6 @@ export default function SessionsPage() {
             <AlertTriangle className="h-5 w-5 mx-auto text-amber-600 mb-1" />
             <div className="text-2xl font-bold text-amber-600">{stats.blocked}</div>
             <div className="text-xs text-gray-500">Blocked</div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4 text-center">
-            <AlertTriangle className="h-5 w-5 mx-auto text-red-500 mb-1" />
-            <div className="text-2xl font-bold text-red-500">{failedCount}</div>
-            <div className="text-xs text-gray-500">Failed</div>
           </CardContent>
         </Card>
         <Card>

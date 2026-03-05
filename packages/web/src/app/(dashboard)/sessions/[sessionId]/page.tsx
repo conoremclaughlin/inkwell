@@ -70,12 +70,19 @@ function sessionStatusBadge(
   status: string,
   phase: string | null
 ): { label: string; className: string } {
+  const normalizedStatus = String(status || '').toLowerCase();
   if (isBlocked(phase)) return { label: 'Blocked', className: 'bg-amber-100 text-amber-700' };
-  if (status === 'paused') return { label: 'Paused', className: 'bg-gray-100 text-gray-600' };
+  if (normalizedStatus === 'paused')
+    return { label: 'Paused', className: 'bg-gray-100 text-gray-600' };
   if (isGenerating(phase)) return { label: 'Generating', className: 'bg-blue-100 text-blue-700' };
   if (isRuntimeIdle(phase)) return { label: 'Idle', className: 'bg-green-100 text-green-700' };
-  if (status === 'active') return { label: 'Active', className: 'bg-green-100 text-green-700' };
-  return { label: status, className: 'bg-gray-100 text-gray-600' };
+  if (normalizedStatus === 'resumable')
+    return { label: 'Resumable', className: 'bg-violet-100 text-violet-700' };
+  if (normalizedStatus === 'idle')
+    return { label: 'Idle', className: 'bg-green-100 text-green-700' };
+  if (normalizedStatus === 'active' || normalizedStatus === 'running')
+    return { label: 'Running', className: 'bg-green-100 text-green-700' };
+  return { label: status || 'unknown', className: 'bg-gray-100 text-gray-600' };
 }
 
 function formatPhaseLabel(phase: string | null): string | null {
