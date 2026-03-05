@@ -24,7 +24,7 @@ import { execSync } from 'child_process';
 import { homedir } from 'os';
 import { createHash } from 'crypto';
 import { resolveAgentId, readIdentityJson, readRoleMd } from '../backends/identity.js';
-import { getValidAccessToken } from '../auth/tokens.js';
+import { getValidAccessToken, getValidDelegatedAccessToken } from '../auth/tokens.js';
 import {
   findRuntimeSessionByLinkId,
   getCurrentRuntimeSession,
@@ -227,11 +227,16 @@ export async function callPcpTool(
   const serverUrl = getPcpServerUrl();
   const url = `${serverUrl}/mcp`;
   const hasInjectedEnvToken = Boolean(process.env.PCP_ACCESS_TOKEN?.trim());
+  const delegatedAgentId =
+    typeof args.agentId === 'string' && args.agentId.trim().length > 0
+      ? args.agentId.trim().toLowerCase()
+      : null;
 
   const baseHeaders: Record<string, string> = {
     'Content-Type': 'application/json',
     Accept: 'application/json, text/event-stream',
     'x-pcp-caller-profile': 'runtime',
+    ...(delegatedAgentId ? { 'x-pcp-agent-id': delegatedAgentId } : {}),
   };
 
   const callOnce = async (token: string | null): Promise<Response> => {
@@ -254,7 +259,17 @@ export async function callPcpTool(
 
   // Attach CLI auth token so hooks pass OAuth checks on the MCP server.
   // Prefer runtime-injected env token, then local auth file.
-  let response = await callOnce(await getValidAccessToken(serverUrl));
+  const resolveHookToken = async (options?: {
+    allowEnvToken?: boolean;
+  }): Promise<string | null> => {
+    if (delegatedAgentId) {
+      const delegatedToken = getValidDelegatedAccessToken(delegatedAgentId);
+      if (delegatedToken) return delegatedToken;
+    }
+    return getValidAccessToken(serverUrl, options);
+  };
+
+  let response = await callOnce(await resolveHookToken());
 
   // If an injected env token is stale/invalid, retry once using local auth fallback.
   if (response.status === 401 && hasInjectedEnvToken) {
@@ -276,7 +291,7 @@ export async function callPcpTool(
         '⚠ PCP hook auth token was rejected; retrying with local ~/.pcp/auth.json token fallback.'
       )
     );
-    response = await callOnce(await getValidAccessToken(serverUrl, { allowEnvToken: false }));
+    response = await callOnce(await resolveHookToken({ allowEnvToken: false }));
   }
 
   if (!response.ok) {

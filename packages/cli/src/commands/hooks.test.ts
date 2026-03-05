@@ -379,6 +379,7 @@ describe('installHooks: detection priority', () => {
 
 vi.mock('../auth/tokens.js', () => ({
   getValidAccessToken: vi.fn(),
+  getValidDelegatedAccessToken: vi.fn(),
   loadAuth: vi.fn(),
   isTokenExpired: vi.fn(),
   decodeJwtPayload: vi.fn(),
@@ -387,6 +388,7 @@ vi.mock('../auth/tokens.js', () => ({
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import * as tokensMod from '../auth/tokens.js';
 const mockedGetValidAccessToken = vi.mocked(tokensMod.getValidAccessToken);
+const mockedGetValidDelegatedAccessToken = vi.mocked(tokensMod.getValidDelegatedAccessToken);
 
 // ============================================================================
 // Helpers for mock fetch responses
@@ -428,6 +430,10 @@ describe('callPcpTool: auth header', () => {
   beforeEach(() => {
     fetchSpy = vi.fn().mockResolvedValue(mockJsonResponse(TOOL_RESULT_PAYLOAD));
     vi.stubGlobal('fetch', fetchSpy);
+    mockedGetValidAccessToken.mockReset();
+    mockedGetValidAccessToken.mockResolvedValue('token');
+    mockedGetValidDelegatedAccessToken.mockReset();
+    mockedGetValidDelegatedAccessToken.mockReturnValue(null);
   });
 
   afterEach(() => {
@@ -443,6 +449,19 @@ describe('callPcpTool: auth header', () => {
     expect(fetchSpy).toHaveBeenCalledOnce();
     const [, options] = fetchSpy.mock.calls[0];
     expect(options.headers).toHaveProperty('Authorization', 'Bearer test-jwt-token');
+  });
+
+  it('should prefer delegated token and include x-pcp-agent-id header when available', async () => {
+    mockedGetValidDelegatedAccessToken.mockReturnValue('delegated-jwt-token');
+    mockedGetValidAccessToken.mockResolvedValue('fallback-token');
+
+    await callPcpTool('bootstrap', { agentId: 'wren' });
+
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    const [, options] = fetchSpy.mock.calls[0];
+    expect(options.headers).toHaveProperty('Authorization', 'Bearer delegated-jwt-token');
+    expect(options.headers).toHaveProperty('x-pcp-agent-id', 'wren');
+    expect(mockedGetValidAccessToken).not.toHaveBeenCalled();
   });
 
   it('should omit Authorization header when no token is available', async () => {

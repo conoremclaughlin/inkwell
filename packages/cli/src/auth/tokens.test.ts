@@ -12,8 +12,12 @@ import {
   decodeJwtPayload,
   isTokenExpired,
   getValidAccessToken,
+  getValidDelegatedAccessToken,
   loadAuth,
   saveAuth,
+  loadDelegatedAuth,
+  saveDelegatedAuth,
+  clearDelegatedAuth,
   clearAuth,
   updateConfigEmail,
   type StoredAuth,
@@ -203,6 +207,71 @@ describe('loadAuth / saveAuth / clearAuth', () => {
 
   it('clearAuth is safe when no file exists', () => {
     expect(() => clearAuth()).not.toThrow();
+  });
+});
+
+describe('delegated auth storage', () => {
+  let origHome: string | undefined;
+  let tempHome: string;
+
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    tempHome = join(tmpdir(), `pcp-delegated-auth-test-${Date.now()}`);
+    mkdirSync(tempHome, { recursive: true });
+    process.env.HOME = tempHome;
+  });
+
+  afterEach(() => {
+    process.env.HOME = origHome;
+    rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  it('round-trips delegated token data', () => {
+    saveDelegatedAuth('wren', {
+      access_token: 'delegated-token',
+      expires_in: 3600,
+      issued_at: Date.now(),
+      agent_id: 'wren',
+      identity_id: 'identity-123',
+      scope: 'mcp:tools',
+    });
+
+    const loaded = loadDelegatedAuth('wren');
+    expect(loaded).not.toBeNull();
+    expect(loaded!.access_token).toBe('delegated-token');
+    expect(loaded!.agent_id).toBe('wren');
+    expect(loaded!.identity_id).toBe('identity-123');
+  });
+
+  it('returns delegated token only when not expired', () => {
+    saveDelegatedAuth('lumen', {
+      access_token: 'fresh-delegated-token',
+      expires_in: 3600,
+      issued_at: Date.now(),
+      agent_id: 'lumen',
+    });
+    expect(getValidDelegatedAccessToken('lumen')).toBe('fresh-delegated-token');
+
+    saveDelegatedAuth('lumen', {
+      access_token: 'stale-delegated-token',
+      expires_in: 60,
+      issued_at: Date.now() - 2 * 60 * 1000,
+      agent_id: 'lumen',
+    });
+    expect(getValidDelegatedAccessToken('lumen')).toBeNull();
+  });
+
+  it('clears delegated auth safely', () => {
+    saveDelegatedAuth('aster', {
+      access_token: 'token',
+      expires_in: 3600,
+      issued_at: Date.now(),
+      agent_id: 'aster',
+    });
+    expect(loadDelegatedAuth('aster')).not.toBeNull();
+    clearDelegatedAuth('aster');
+    expect(loadDelegatedAuth('aster')).toBeNull();
+    expect(() => clearDelegatedAuth('aster')).not.toThrow();
   });
 });
 
