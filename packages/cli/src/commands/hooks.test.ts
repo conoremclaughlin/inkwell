@@ -505,6 +505,9 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
   let fetchSpy: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
+    mockedGetValidDelegatedAccessToken.mockReset();
+    mockedGetValidDelegatedAccessToken.mockReturnValue(null);
+    mockedGetValidAccessToken.mockReset();
     mockedGetValidAccessToken.mockResolvedValue('token');
   });
 
@@ -687,6 +690,60 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     ).toBe(true);
     expect(firstResponseTextSpy).toHaveBeenCalledTimes(1);
     expect(consoleSpy).toHaveBeenCalled();
+  });
+
+  it('retries with base token and skips delegated token after delegated 401', async () => {
+    process.env.PCP_ACCESS_TOKEN = 'env-token';
+    mockedGetValidDelegatedAccessToken.mockReturnValue('delegated-token');
+    mockedGetValidAccessToken.mockResolvedValueOnce('fallback-token');
+
+    fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        headers: new Headers({ 'content-type': 'application/json' }),
+        text: async () => 'delegated unauthorized',
+      })
+      .mockResolvedValueOnce(mockJsonResponse(TOOL_RESULT_PAYLOAD));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const result = await callPcpTool('bootstrap', { agentId: 'wren' });
+    expect(result).toEqual({ success: true });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+    const [, firstOptions] = fetchSpy.mock.calls[0];
+    const [, secondOptions] = fetchSpy.mock.calls[1];
+    expect(firstOptions.headers).toHaveProperty('Authorization', 'Bearer delegated-token');
+    expect(secondOptions.headers).toHaveProperty('Authorization', 'Bearer fallback-token');
+
+    expect(mockedGetValidDelegatedAccessToken).toHaveBeenCalledTimes(1);
+    expect(
+      mockedGetValidAccessToken.mock.calls.some(
+        ([, options]) =>
+          (options as { allowEnvToken?: boolean } | undefined)?.allowEnvToken === false
+      )
+    ).toBe(true);
+  });
+
+  it('retries delegated 401 even without injected env token', async () => {
+    mockedGetValidDelegatedAccessToken.mockReturnValue('delegated-token');
+    mockedGetValidAccessToken.mockResolvedValueOnce('file-token');
+
+    fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        headers: new Headers({ 'content-type': 'application/json' }),
+        text: async () => 'delegated unauthorized',
+      })
+      .mockResolvedValueOnce(mockJsonResponse(TOOL_RESULT_PAYLOAD));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const result = await callPcpTool('bootstrap', { agentId: 'wren' });
+    expect(result).toEqual({ success: true });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 
   it('does not retry on 401 when no env token is injected', async () => {
