@@ -7,7 +7,7 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "node scripts/preflight.mjs && concurrently -k -n api,web -c blue,magenta \"yarn workspace @personal-context/api server:dev\" \"yarn workspace @personal-context/web dev\"",
+    "dev": "node scripts/preflight.mjs && bash ./scripts/dev-concurrently.sh",
     "dev:api": "yarn workspace @personal-context/api server:dev",
     "dev:web": "yarn workspace @personal-context/web dev",
     "dev:mcp": "yarn workspace @personal-context/api dev:mcp",

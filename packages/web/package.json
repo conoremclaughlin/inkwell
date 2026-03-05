@@ -5,9 +5,9 @@
   "license": "MIT",
   "description": "PCP Admin Dashboard - Manage WhatsApp, trusted users, and groups",
   "scripts": {
-    "dev": "next dev -p 3002",
+    "dev": "BASE_PORT=${PCP_PORT_BASE:-3001}; WEB_PORT=${WEB_PORT:-$((BASE_PORT + 1))}; next dev -p $WEB_PORT",
     "build": "next build",
-    "start": "next start -p 3002",
+    "start": "BASE_PORT=${PCP_PORT_BASE:-3001}; WEB_PORT=${WEB_PORT:-$((BASE_PORT + 1))}; next start -p $WEB_PORT",
     "lint": "next lint",
     "type-check": "tsc --noEmit",
     "test": "vitest run",
