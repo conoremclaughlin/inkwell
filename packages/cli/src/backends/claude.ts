@@ -47,6 +47,11 @@ export class ClaudeAdapter implements BackendAdapter {
       args.push('--mcp-config', mcpConfig);
     }
 
+    // Auto-approve: skip all permission prompts
+    if (config.dangerous) {
+      args.push('--dangerously-skip-permissions');
+    }
+
     // Passthrough flags
     args.push(...config.passthroughArgs);
 

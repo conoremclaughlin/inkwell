@@ -37,6 +37,11 @@ export class GeminiAdapter implements BackendAdapter {
       args.push('--resume', config.backendSessionId);
     }
 
+    // Auto-approve: skip all permission prompts
+    if (config.dangerous) {
+      args.push('--yolo');
+    }
+
     // Passthrough flags
     args.push(...config.passthroughArgs);
 
