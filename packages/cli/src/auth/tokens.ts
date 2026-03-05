@@ -22,6 +22,20 @@ export interface StoredAuth {
   issued_at: number; // Date.now() at storage time
 }
 
+export interface StoredDelegatedAuth {
+  access_token: string;
+  expires_in: number; // seconds from issuance
+  issued_at: number; // Date.now() at storage time
+  scope?: string;
+  agent_id: string;
+  identity_id?: string;
+}
+
+type ExpiringToken = {
+  expires_in: number;
+  issued_at: number;
+};
+
 export interface JwtPayload {
   type: string;
   sub: string; // userId
@@ -45,6 +59,21 @@ function authFilePath(): string {
 
 function configFilePath(): string {
   return join(homedir(), '.pcp', 'config.json');
+}
+
+function delegatedAuthDirPath(): string {
+  return join(homedir(), '.pcp', 'auth', 'agents');
+}
+
+function sanitizeAgentId(agentId: string): string {
+  return agentId
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, '_');
+}
+
+function delegatedAuthFilePath(agentId: string): string {
+  return join(delegatedAuthDirPath(), `${sanitizeAgentId(agentId)}.json`);
 }
 
 // ============================================================================
@@ -86,6 +115,37 @@ export function clearAuth(): void {
   }
 }
 
+export function loadDelegatedAuth(agentId: string): StoredDelegatedAuth | null {
+  const path = delegatedAuthFilePath(agentId);
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+export function saveDelegatedAuth(agentId: string, auth: StoredDelegatedAuth): void {
+  const dir = delegatedAuthDirPath();
+  mkdirSync(dir, { recursive: true });
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    // Best-effort only; some environments may not support chmod.
+  }
+
+  const path = delegatedAuthFilePath(agentId);
+  writeFileSync(path, JSON.stringify(auth, null, 2) + '\n');
+  chmodSync(path, 0o600);
+}
+
+export function clearDelegatedAuth(agentId: string): void {
+  const path = delegatedAuthFilePath(agentId);
+  if (existsSync(path)) {
+    unlinkSync(path);
+  }
+}
+
 // ============================================================================
 // JWT Decode (no verification — server-issued, trusted locally)
 // ============================================================================
@@ -105,7 +165,7 @@ export function decodeJwtPayload(token: string): JwtPayload | null {
 // Token Expiry
 // ============================================================================
 
-export function isTokenExpired(auth: StoredAuth, bufferSeconds = 300): boolean {
+export function isTokenExpired(auth: ExpiringToken, bufferSeconds = 300): boolean {
   const expiresAtMs = auth.issued_at + auth.expires_in * 1000;
   return Date.now() + bufferSeconds * 1000 >= expiresAtMs;
 }
@@ -185,6 +245,16 @@ export async function getValidAccessToken(
     clearAuth();
     return null;
   }
+}
+
+export function getValidDelegatedAccessToken(
+  agentId: string,
+  options?: { bufferSeconds?: number }
+): string | null {
+  const auth = loadDelegatedAuth(agentId);
+  if (!auth) return null;
+  if (isTokenExpired(auth, options?.bufferSeconds ?? 300)) return null;
+  return auth.access_token;
 }
 
 // ============================================================================

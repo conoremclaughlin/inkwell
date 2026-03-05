@@ -24,7 +24,7 @@ import { execSync } from 'child_process';
 import { homedir } from 'os';
 import { createHash } from 'crypto';
 import { resolveAgentId, readIdentityJson, readRoleMd } from '../backends/identity.js';
-import { getValidAccessToken } from '../auth/tokens.js';
+import { getValidAccessToken, getValidDelegatedAccessToken } from '../auth/tokens.js';
 import {
   findRuntimeSessionByLinkId,
   getCurrentRuntimeSession,
@@ -227,11 +227,18 @@ export async function callPcpTool(
   const serverUrl = getPcpServerUrl();
   const url = `${serverUrl}/mcp`;
   const hasInjectedEnvToken = Boolean(process.env.PCP_ACCESS_TOKEN?.trim());
+  const delegatedAgentId =
+    typeof args.agentId === 'string' && args.agentId.trim().length > 0
+      ? args.agentId.trim().toLowerCase()
+      : null;
 
   const baseHeaders: Record<string, string> = {
     'Content-Type': 'application/json',
     Accept: 'application/json, text/event-stream',
     'x-pcp-caller-profile': 'runtime',
+    // Forward-looking runtime identity signal for stricter server-side enforcement.
+    // Today, effective agent identity is still sourced from JWT claims.
+    ...(delegatedAgentId ? { 'x-pcp-agent-id': delegatedAgentId } : {}),
   };
 
   const callOnce = async (token: string | null): Promise<Response> => {
@@ -254,10 +261,27 @@ export async function callPcpTool(
 
   // Attach CLI auth token so hooks pass OAuth checks on the MCP server.
   // Prefer runtime-injected env token, then local auth file.
-  let response = await callOnce(await getValidAccessToken(serverUrl));
+  let usedDelegatedTokenOnFirstAttempt = false;
+  const resolveHookToken = async (options?: {
+    allowEnvToken?: boolean;
+    skipDelegated?: boolean;
+  }): Promise<{ token: string | null; source: 'delegated' | 'base' }> => {
+    if (delegatedAgentId && !options?.skipDelegated) {
+      const delegatedToken = getValidDelegatedAccessToken(delegatedAgentId);
+      if (delegatedToken) {
+        return { token: delegatedToken, source: 'delegated' };
+      }
+    }
+    return { token: await getValidAccessToken(serverUrl, options), source: 'base' };
+  };
 
-  // If an injected env token is stale/invalid, retry once using local auth fallback.
-  if (response.status === 401 && hasInjectedEnvToken) {
+  const firstToken = await resolveHookToken();
+  usedDelegatedTokenOnFirstAttempt = firstToken.source === 'delegated';
+  let response = await callOnce(firstToken.token);
+
+  // Retry once if a runtime token was injected OR if we attempted a delegated token.
+  // This allows fallback to local auth token when the first credential is rejected.
+  if (response.status === 401 && (hasInjectedEnvToken || usedDelegatedTokenOnFirstAttempt)) {
     // Drain first response body before retrying so the underlying HTTP client
     // can cleanly release the stream (avoids occasional undici body warnings).
     try {
@@ -269,14 +293,21 @@ export async function callPcpTool(
     sbDebugLog('hooks', 'mcp_auth_retry_without_env_token', {
       tool,
       status: 401,
-      reason: 'env_token_rejected',
+      reason: usedDelegatedTokenOnFirstAttempt ? 'delegated_token_rejected' : 'env_token_rejected',
+      skipDelegatedOnRetry: usedDelegatedTokenOnFirstAttempt,
     });
-    console.error(
-      chalk.yellow(
-        '⚠ PCP hook auth token was rejected; retrying with local ~/.pcp/auth.json token fallback.'
-      )
-    );
-    response = await callOnce(await getValidAccessToken(serverUrl, { allowEnvToken: false }));
+    if (hasInjectedEnvToken) {
+      console.error(
+        chalk.yellow(
+          '⚠ PCP hook auth token was rejected; retrying with local ~/.pcp/auth.json token fallback.'
+        )
+      );
+    }
+    const retryToken = await resolveHookToken({
+      allowEnvToken: false,
+      skipDelegated: usedDelegatedTokenOnFirstAttempt,
+    });
+    response = await callOnce(retryToken.token);
   }
 
   if (!response.ok) {

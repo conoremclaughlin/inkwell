@@ -22,6 +22,8 @@ import {
   clearAuth,
   decodeJwtPayload,
   isTokenExpired,
+  getValidAccessToken,
+  saveDelegatedAuth,
   updateConfigEmail,
   CLIENT_ID,
 } from '../auth/tokens.js';
@@ -268,11 +270,15 @@ async function statusCommand(): Promise<void> {
 
   if (expired) {
     console.log(`  ${chalk.bold('Token:')}   ${chalk.yellow('expired')}`);
-    console.log(chalk.dim('\n  Token will refresh automatically on next sb launch, or run: sb auth login'));
+    console.log(
+      chalk.dim('\n  Token will refresh automatically on next sb launch, or run: sb auth login')
+    );
   } else {
     const expiresAtMs = auth.issued_at + auth.expires_in * 1000;
     const daysLeft = Math.floor((expiresAtMs - Date.now()) / (1000 * 60 * 60 * 24));
-    console.log(`  ${chalk.bold('Token:')}   ${chalk.green('valid')} ${chalk.dim(`(expires in ${daysLeft}d)`)}`);
+    console.log(
+      `  ${chalk.bold('Token:')}   ${chalk.green('valid')} ${chalk.dim(`(expires in ${daysLeft}d)`)}`
+    );
   }
   console.log('');
 }
@@ -292,6 +298,69 @@ async function logoutCommand(): Promise<void> {
   console.log(chalk.green('Logged out. Tokens cleared.'));
 }
 
+async function delegateCommand(options: { agent: string }): Promise<void> {
+  const serverUrl = getPcpServerUrl();
+  const agentId = options.agent?.trim().toLowerCase();
+  if (!agentId) {
+    console.log(chalk.red('Missing --agent <agentId>'));
+    process.exitCode = 1;
+    return;
+  }
+
+  const baseToken = await getValidAccessToken(serverUrl);
+  if (!baseToken) {
+    console.log(chalk.yellow('Not authenticated. Run: sb auth login'));
+    process.exitCode = 1;
+    return;
+  }
+
+  const response = await fetch(`${serverUrl}/token/delegate`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${baseToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ agentId }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    console.log(chalk.red(`Delegation failed (${response.status}): ${text}`));
+    process.exitCode = 1;
+    return;
+  }
+
+  const payload = (await response.json()) as {
+    access_token?: string;
+    expires_in?: number;
+    scope?: string;
+    delegated_agent_id?: string;
+    identity_id?: string;
+  };
+
+  if (!payload.access_token || typeof payload.expires_in !== 'number') {
+    console.log(chalk.red('Delegation response missing access token payload.'));
+    process.exitCode = 1;
+    return;
+  }
+
+  saveDelegatedAuth(agentId, {
+    access_token: payload.access_token,
+    expires_in: payload.expires_in,
+    issued_at: Date.now(),
+    scope: payload.scope,
+    agent_id: payload.delegated_agent_id || agentId,
+    identity_id: payload.identity_id,
+  });
+
+  const expiresAt = new Date(Date.now() + payload.expires_in * 1000);
+  console.log(
+    chalk.green(
+      `Delegated token saved for ${agentId} (expires ${expiresAt.toLocaleString('en-US')}).`
+    )
+  );
+}
+
 // ============================================================================
 // Register
 // ============================================================================
@@ -307,8 +376,11 @@ export function registerAuthCommands(program: Command): void {
 
   auth.command('status').description('Show current authentication status').action(statusCommand);
 
+  auth.command('logout').description('Clear stored authentication tokens').action(logoutCommand);
+
   auth
-    .command('logout')
-    .description('Clear stored authentication tokens')
-    .action(logoutCommand);
+    .command('delegate')
+    .description('Mint and store an SB-scoped delegated MCP token')
+    .requiredOption('-a, --agent <agentId>', 'SB agentId (e.g. wren, lumen, aster)')
+    .action(delegateCommand);
 }

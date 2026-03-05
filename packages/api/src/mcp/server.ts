@@ -34,6 +34,7 @@ import { runWithRequestContext } from '../utils/request-context';
 import { resolveWorkspaceContextForRequest } from '../utils/workspace-scope';
 import { getRuntimeBuildInfo } from '../utils/runtime-build-info';
 import { PcpAuthProvider } from './auth/pcp-auth-provider';
+import { signPcpAccessToken } from '../auth/pcp-tokens';
 
 export { setWhatsAppListener, getAgentGateway };
 
@@ -45,6 +46,8 @@ export interface MCPServerConfig {
   /** Getter for the session service (for chat routes) */
   getSessionService?: () => import('../services/sessions/session-service').SessionService | null;
 }
+
+const DELEGATED_ACCESS_TOKEN_LIFETIME_SECONDS = 60 * 60; // 1 hour
 
 export class MCPServer {
   /** Primary server instance (used for stdio transport only) */
@@ -574,6 +577,79 @@ export class MCPServer {
           error_description: `Grant type '${grant_type}' is not supported`,
         });
       }
+    });
+
+    // Delegated token endpoint — mint short-lived agent-bound MCP access tokens.
+    app.post('/token/delegate', express.json(), async (req, res) => {
+      const authHeader = req.header('authorization');
+      const userData = await this.authProvider.verifyAccessToken(authHeader);
+      if (!userData) {
+        res.status(401).json({
+          error: 'invalid_token',
+          error_description: 'Missing or invalid bearer token',
+        });
+        return;
+      }
+
+      const requestedAgentId =
+        typeof req.body?.agentId === 'string' ? req.body.agentId.trim().toLowerCase() : '';
+      if (!requestedAgentId) {
+        res.status(400).json({
+          error: 'invalid_request',
+          error_description: 'Missing required field: agentId',
+        });
+        return;
+      }
+
+      const { data: identity, error: identityError } = await this.dataComposer
+        .getClient()
+        .from('agent_identities')
+        .select('id, agent_id')
+        .eq('user_id', userData.userId)
+        .eq('agent_id', requestedAgentId)
+        .maybeSingle();
+
+      if (identityError) {
+        logger.error('Failed to resolve agent identity for delegated token', {
+          userId: userData.userId,
+          requestedAgentId,
+          error: identityError.message,
+        });
+        res.status(500).json({
+          error: 'server_error',
+          error_description: 'Failed to resolve requested agent identity',
+        });
+        return;
+      }
+
+      if (!identity) {
+        res.status(403).json({
+          error: 'forbidden',
+          error_description: 'Agent identity not found for this user',
+        });
+        return;
+      }
+
+      const accessToken = signPcpAccessToken(
+        {
+          type: 'mcp_access',
+          sub: userData.userId,
+          email: userData.email,
+          scope: 'mcp:tools',
+          agentId: identity.agent_id,
+          identityId: identity.id,
+        },
+        DELEGATED_ACCESS_TOKEN_LIFETIME_SECONDS
+      );
+
+      res.json({
+        access_token: accessToken,
+        token_type: 'Bearer',
+        expires_in: DELEGATED_ACCESS_TOKEN_LIFETIME_SECONDS,
+        scope: 'mcp:tools',
+        delegated_agent_id: identity.agent_id,
+        identity_id: identity.id,
+      });
     });
 
     // OAuth Authorization Server Metadata (RFC 8414)

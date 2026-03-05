@@ -574,6 +574,25 @@ Implementations SHOULD support user-defined delivery windows (quiet hours) that 
 
 The quiet hours mechanism is implementation-defined. Implementations SHOULD store user timezone and delivery preferences as part of the user profile.
 
+### 8.10 Delegated SB Access Tokens
+
+When a human principal authenticates via OAuth, implementations MAY issue **delegated short-lived SB tokens** derived from the parent user token.
+
+If delegated tokens are used, implementations MUST:
+
+- Bind each delegated token to exactly one SB identity (`agentId`, and ideally canonical `identityId`)
+- Keep delegated tokens short-lived (recommended: 15-60 minutes)
+- Validate that the requested SB belongs to the authenticated user before minting
+- Preserve user-level ownership (`sub` remains the user principal) while enforcing SB-level scope
+
+Implementations SHOULD:
+
+- Store delegated tokens in a secure local location with strict file permissions (e.g., `0600`)
+- Prefer delegated SB tokens for runtime hook flows, with parent token fallback only when needed
+- Include explicit runtime identity signaling (for example, agent-bound headers) so servers can audit effective actor identity
+
+This model supports least-privilege SB execution in multi-agent environments while preserving a single user trust root.
+
 ---
 
 ## 9. Relationship to MCP

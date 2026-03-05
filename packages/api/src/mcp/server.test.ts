@@ -5,7 +5,10 @@
  * tools) and validates stateless request handling via fetch.
  */
 
-import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from 'vitest';
+import { verifyPcpAccessToken } from '../auth/pcp-tokens';
+
+const mockVerifyAccessToken = vi.fn();
 
 // ---------------------------------------------------------------------------
 // Mocks — must be declared before importing the module under test
@@ -19,6 +22,7 @@ vi.mock('../config/env', () => ({
     SUPABASE_URL: 'http://localhost:54321',
     SUPABASE_SECRET_KEY: 'test-key',
     SUPABASE_ANON_KEY: 'test-anon-key',
+    JWT_SECRET: 'test-jwt-secret',
   },
 }));
 
@@ -42,6 +46,18 @@ vi.mock('../mini-apps', () => ({
   registerMiniAppTools: vi.fn(),
   getMiniAppsInfo: vi.fn(() => []),
 }));
+
+vi.mock('./auth/pcp-auth-provider', () => {
+  class MockPcpAuthProvider {
+    verifyAccessToken = mockVerifyAccessToken;
+    createPendingAuth = vi.fn(() => 'pending-id');
+    handleAuthCallback = vi.fn(async () => ({ error: 'invalid_request' }));
+    exchangeAuthorizationCode = vi.fn(async () => ({ error: 'invalid_grant' }));
+    exchangeRefreshToken = vi.fn(async () => ({ error: 'invalid_grant' }));
+    cleanupExpiredDatabaseTokens = vi.fn();
+  }
+  return { PcpAuthProvider: MockPcpAuthProvider };
+});
 
 vi.mock('../routes/admin', () => {
   const { Router } = require('express');
@@ -142,16 +158,39 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
   let server: MCPServer;
   let baseUrl: string;
   let serverUnavailableError: Error | null = null;
+  let delegatedIdentity: { id: string; agent_id: string } | null = null;
 
   // Minimal DataComposer stub
   const mockDataComposer = {
     getClient: () => ({
-      from: () => ({
-        select: () => ({
-          limit: () => ({ error: null }),
-          eq: () => ({ single: () => ({ data: null, error: null }) }),
-        }),
-      }),
+      from: (table: string) => {
+        if (table === 'agent_identities') {
+          const filters: Record<string, string> = {};
+          const query = {
+            select: () => query,
+            eq: (field: string, value: string) => {
+              filters[field] = value;
+              return query;
+            },
+            maybeSingle: async () => {
+              const matches =
+                delegatedIdentity &&
+                filters.user_id === 'user-123' &&
+                filters.agent_id === delegatedIdentity.agent_id;
+              return { data: matches ? delegatedIdentity : null, error: null };
+            },
+            single: async () => ({ data: null, error: null }),
+            limit: () => ({ error: null }),
+          };
+          return query;
+        }
+        return {
+          select: () => ({
+            limit: () => ({ error: null }),
+            eq: () => ({ single: async () => ({ data: null, error: null }) }),
+          }),
+        };
+      },
     }),
   } as any;
 
@@ -182,8 +221,13 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
   });
 
   afterAll(async () => {
-    if (serverUnavailableError) return;
+    if (serverUnavailableError || !server) return;
     await server.shutdown();
+  });
+
+  beforeEach(() => {
+    mockVerifyAccessToken.mockReset();
+    delegatedIdentity = null;
   });
 
   // =========================================================================
@@ -313,5 +357,60 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     expect(typeof body.build.updateAvailable).toBe('boolean');
     expect(body.checks.mcp.details.mode).toBe('stateless');
     expect(body.checks.mcp.details.toolsVersion).toBeDefined();
+  });
+
+  // =========================================================================
+  // Delegated token endpoint
+  // =========================================================================
+
+  it('issues a delegated agent-bound token', async () => {
+    if (serverUnavailableError) return;
+    mockVerifyAccessToken.mockResolvedValue({ userId: 'user-123', email: 'user@example.com' });
+    delegatedIdentity = { id: 'identity-abc', agent_id: 'wren' };
+
+    const res = await fetch(`${baseUrl}/token/delegate`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer valid', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentId: 'wren' }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.delegated_agent_id).toBe('wren');
+    expect(body.identity_id).toBe('identity-abc');
+    expect(body.expires_in).toBe(3600);
+
+    const token = body.access_token as string;
+    const payload = verifyPcpAccessToken(token, 'mcp_access');
+    expect(payload?.sub).toBe('user-123');
+    expect(payload?.agentId).toBe('wren');
+    expect(payload?.identityId).toBe('identity-abc');
+  });
+
+  it('rejects delegated token requests without valid auth', async () => {
+    if (serverUnavailableError) return;
+    mockVerifyAccessToken.mockResolvedValue(null);
+
+    const res = await fetch(`${baseUrl}/token/delegate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentId: 'wren' }),
+    });
+
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects delegated token requests for unknown agent identity', async () => {
+    if (serverUnavailableError) return;
+    mockVerifyAccessToken.mockResolvedValue({ userId: 'user-123', email: 'user@example.com' });
+    delegatedIdentity = null;
+
+    const res = await fetch(`${baseUrl}/token/delegate`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer valid', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentId: 'aster' }),
+    });
+
+    expect(res.status).toBe(403);
   });
 });
