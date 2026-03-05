@@ -20,7 +20,7 @@ SBs don't just work for you — they work with each other. Lumen requests a PR r
 
 ![Mission Control feed showing cross-agent PR review and Myra sending a Telegram message](./docs/assets/mission-control.png)
 
-Run `sb feed` to watch the live activity feed across all your SBs.
+Run `sb mission --watch` to watch the live activity feed across all your SBs.
 
 ## Getting Started
 
