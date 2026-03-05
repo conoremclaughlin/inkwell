@@ -18,6 +18,7 @@ import type {
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
+import { resolveBinaryPath } from './resolve-binary.js';
 
 /** Maximum time (ms) to wait for a Claude Code subprocess before killing it */
 const PROCESS_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
@@ -164,7 +165,7 @@ export class ClaudeRunner implements IClaudeRunner {
       // Strip CLAUDECODE to prevent "nested session" detection when PCP is
       // launched from inside a Claude Code session (e.g., via PM2).
       const { CLAUDECODE, ...cleanEnv } = process.env;
-      const proc = spawn('claude', args, {
+      const proc = spawn(resolveBinaryPath('claude'), args, {
         cwd: config.workingDirectory,
         env: {
           ...cleanEnv,

@@ -21,6 +21,7 @@ import type {
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
+import { resolveBinaryPath } from './resolve-binary.js';
 
 const PROCESS_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const DIAGNOSTIC_MAX_CHARS = 4000;
@@ -137,7 +138,7 @@ export class CodexRunner implements IClaudeRunner {
     return new Promise((resolve, reject) => {
       // Strip CLAUDECODE to prevent env leaking into subprocess
       const { CLAUDECODE, ...cleanEnv } = process.env;
-      const proc = spawn('codex', args, {
+      const proc = spawn(resolveBinaryPath('codex'), args, {
         cwd: config.workingDirectory,
         env: {
           ...cleanEnv,
