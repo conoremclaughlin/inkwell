@@ -168,3 +168,68 @@ npx prettier --write "path/to/file"
 - Only set a field to `null` when the caller explicitly passes `null` (or an empty string that should clear the field).
 - For handlers that accept partial updates, fetch the existing record first and merge provided fields over it.
 - When adding new columns to a table, also update: (1) archive/history triggers, (2) history response mappings, (3) restore handlers.
+
+## Development Commands
+
+```bash
+yarn dev                   # Start all services (pm2)
+yarn dev:direct            # Start API+web directly (no pm2, auto-restarts on code changes)
+yarn prod                  # One-shot: build + migrate + start (alias for prod:up)
+yarn prod:refresh          # Install + build latest code after pull
+yarn prod:migrate          # Apply pending migrations (auto-detects local vs remote)
+yarn prod:direct           # Run API+web directly in production mode (no pm2)
+yarn build                 # Build all packages
+yarn type-check            # Type check all packages
+yarn test                  # Unit tests (all workspaces)
+yarn supabase:local:setup  # Start/reset local Supabase and sync env values into .env.local
+yarn local:status          # Show local migration status
+yarn linked:status         # Show linked (remote) migration status
+yarn local:migrate         # Apply local migrations
+yarn linked:migrate        # Apply linked (remote) migrations
+yarn test:integration:db:local   # DB integration suite against isolated local Supabase
+yarn test:integration:runtime    # Runtime/CLI integration suite
+yarn logs:pcp              # View PCP server logs (structured JSON)
+yarn pm2 list              # List running processes
+yarn pm2 restart pcp       # Restart PCP server
+```
+
+### Migration target auto-detection
+
+`yarn prod:migrate` and `migration-status` auto-select the target:
+
+- Explicit override: `PCP_MIGRATION_TARGET=local|linked`
+- `local` when `SUPABASE_URL` points to localhost/127.0.0.1/::1
+- Otherwise `linked` (remote)
+- Source precedence: process env → `.env.local` → `.env`
+
+### Low-power runtime (no PM2)
+
+If PM2/watcher overhead is undesirable, run PCP directly:
+
+```bash
+yarn prod                  # One-shot: build + migrate + start
+# Or step by step:
+yarn prod:refresh          # Build
+yarn prod:migrate          # Migrate
+yarn prod:direct           # Start (no rebuild, uses existing artifacts)
+```
+
+Notes:
+
+- `yarn dev` / `yarn dev:direct` run migration-status warnings on startup.
+- To run API only (no dashboard): `PCP_RUN_WEB=false yarn prod:direct`
+- After `git pull`, run `yarn prod:refresh` and restart your process.
+- `sb doctor` checks migration status and points to `yarn prod:migrate` when pending.
+
+### Integration tests
+
+`yarn test:integration:db:local` spins up an **isolated, temporary local Supabase stack** with dedicated ports, applies migrations + seed, runs integration tests, then tears it down. This avoids accidental use of remote credentials.
+
+## Key Technologies
+
+- **Runtime**: Node.js 18+, TypeScript, Yarn 4 workspaces
+- **MCP SDK**: `@modelcontextprotocol/sdk`
+- **Database**: Supabase (PostgreSQL + pgvector)
+- **Messaging**: Telegraf (Telegram), Baileys (WhatsApp)
+- **Process Management**: pm2
+- **CLI**: Commander.js, Ink (React for CLI)
