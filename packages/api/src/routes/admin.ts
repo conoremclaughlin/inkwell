@@ -3651,8 +3651,10 @@ router.get('/sessions', async (req: Request, res: Response) => {
     }
 
     if (scopedIdentityRows.length === 0) {
+      // Active workspace has no agent identities yet, so there are no
+      // sessions to display in this scope.
       res.json({
-        stats: { active: 0, blocked: 0, paused: 0, total: 0 },
+        stats: { running: 0, generating: 0, idle: 0, blocked: 0, paused: 0, total: 0 },
         sessions: [],
       });
       return;
@@ -3670,10 +3672,9 @@ router.get('/sessions', async (req: Request, res: Response) => {
       .limit(200);
 
     if (!includeCompleted) {
-      identitySessionsQuery = identitySessionsQuery.not(
-        'status',
-        'in',
-        '(completed,failed,archived)'
+      // Include NULL status rows as non-terminal; only exclude explicit terminal states.
+      identitySessionsQuery = identitySessionsQuery.or(
+        'status.is.null,status.not.in.(completed,failed,archived)'
       );
     }
 
@@ -3699,7 +3700,8 @@ router.get('/sessions', async (req: Request, res: Response) => {
         .limit(200);
 
       if (!includeCompleted) {
-        legacyQuery = legacyQuery.not('status', 'in', '(completed,failed,archived)');
+        // Include NULL status rows as non-terminal; only exclude explicit terminal states.
+        legacyQuery = legacyQuery.or('status.is.null,status.not.in.(completed,failed,archived)');
       }
 
       const { data: legacyRows, error: legacyError } = await legacyQuery;
@@ -3716,6 +3718,9 @@ router.get('/sessions', async (req: Request, res: Response) => {
       dedupedSessionsById.set(row.id, row);
     }
 
+    // We intentionally over-fetch each query (200) and then trim to 100 after
+    // merge+dedupe so the mixed identity/legacy result set still surfaces the
+    // most recently updated sessions overall.
     const sessionRows = [...dedupedSessionsById.values()]
       .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())
       .slice(0, 100);
@@ -3735,6 +3740,8 @@ router.get('/sessions', async (req: Request, res: Response) => {
         purpose: string | null;
         workType: string | null;
         status: string;
+        worktreePath: string | null;
+        repoName: string | null;
       }
     >();
     const workspacesBySessionId = new Map<
@@ -3746,13 +3753,21 @@ router.get('/sessions', async (req: Request, res: Response) => {
         purpose: string | null;
         workType: string | null;
         status: string;
+        worktreePath: string | null;
+        repoName: string | null;
       }
     >();
+    const deriveRepoName = (worktreePath: string | null | undefined): string | null => {
+      if (!worktreePath) return null;
+      const normalizedPath = worktreePath.replace(/\/+$/, '');
+      const basename = path.basename(normalizedPath);
+      return basename || null;
+    };
 
     if (studioIds.length > 0) {
       const { data: studios } = await supabase
         .from('studios')
-        .select('id, branch, base_branch, purpose, work_type, status')
+        .select('id, branch, base_branch, purpose, work_type, status, worktree_path')
         .in('id', studioIds);
 
       for (const studio of studios || []) {
@@ -3763,6 +3778,8 @@ router.get('/sessions', async (req: Request, res: Response) => {
           purpose: studio.purpose,
           workType: studio.work_type,
           status: studio.status,
+          worktreePath: studio.worktree_path,
+          repoName: deriveRepoName(studio.worktree_path),
         });
       }
     }
@@ -3771,7 +3788,7 @@ router.get('/sessions', async (req: Request, res: Response) => {
     if (sessionIds.length > 0) {
       const { data: linkedWorkspaces } = await supabase
         .from('studios')
-        .select('id, session_id, branch, base_branch, purpose, work_type, status')
+        .select('id, session_id, branch, base_branch, purpose, work_type, status, worktree_path')
         .in('session_id', sessionIds);
 
       for (const ws of linkedWorkspaces || []) {
@@ -3783,6 +3800,8 @@ router.get('/sessions', async (req: Request, res: Response) => {
             purpose: ws.purpose,
             workType: ws.work_type,
             status: ws.status,
+            worktreePath: ws.worktree_path,
+            repoName: deriveRepoName(ws.worktree_path),
           });
         }
       }
@@ -3854,11 +3873,22 @@ router.get('/sessions', async (req: Request, res: Response) => {
 
     // 5. Compute stats
     const stats = {
-      active: sessionRows.filter(
-        (s) =>
-          !['completed', 'failed', 'archived', 'paused'].includes(String(s.status || '')) &&
-          !s.current_phase?.startsWith('blocked')
-      ).length,
+      running: sessionRows.filter((s) => {
+        const normalizedStatus = String(s.status || '').toLowerCase();
+        const currentPhase = s.current_phase || '';
+        if (
+          ['completed', 'failed', 'archived', 'paused', 'resumable', 'idle'].includes(
+            normalizedStatus
+          )
+        ) {
+          return false;
+        }
+        if (currentPhase.startsWith('blocked')) return false;
+        if (currentPhase === 'runtime:generating' || currentPhase === 'runtime:idle') return false;
+        return true;
+      }).length,
+      generating: sessionRows.filter((s) => s.current_phase === 'runtime:generating').length,
+      idle: sessionRows.filter((s) => s.current_phase === 'runtime:idle').length,
       blocked: sessionRows.filter((s) => s.current_phase?.startsWith('blocked')).length,
       paused: sessionRows.filter((s) => s.status === 'paused').length,
       total: sessionRows.length,
@@ -4068,6 +4098,16 @@ router.get('/sessions/:id/logs', async (req: Request, res: Response) => {
         .map((i) => i.agent_id)
         .filter((agentId): agentId is string => Boolean(agentId))
     );
+
+    if (scopedIdentityIds.length === 0) {
+      logger.warn('Session log lookup denied: no identities in active workspace scope', {
+        userId: authReq.pcpUserId,
+        workspaceId: authReq.pcpWorkspaceId,
+        sessionId,
+      });
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
 
     const { data: session, error: sessionError } = await supabase
       .from('sessions')

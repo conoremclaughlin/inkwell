@@ -81,7 +81,7 @@ function sessionStatusBadge(
   if (normalizedStatus === 'idle')
     return { label: 'Idle', className: 'bg-green-100 text-green-700' };
   if (normalizedStatus === 'active' || normalizedStatus === 'running')
-    return { label: 'Active', className: 'bg-green-100 text-green-700' };
+    return { label: 'Running', className: 'bg-green-100 text-green-700' };
   return { label: status || 'unknown', className: 'bg-gray-100 text-gray-600' };
 }
 
