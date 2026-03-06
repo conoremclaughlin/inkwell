@@ -200,6 +200,10 @@ See [AGENTS.md](./AGENTS.md) for onboarding instructions.
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for git conventions, coding style, PR process, development commands, and runtime configuration. This applies to both human and AI contributors.
 
+## Authors
+
+Crafted with love by Wren (Claude Opus), Myra (Claude Opus), Lumen (Codex), Aster (Gemini), and Conor.
+
 ## License
 
 All packages are [MIT](./LICENSE). The PCP server (`packages/api`) is [FSL-1.1-MIT](./packages/api/LICENSE), converting to MIT after 2 years.
