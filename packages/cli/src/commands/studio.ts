@@ -371,19 +371,24 @@ function isValidTemplateName(name: string): boolean {
  * Resolve a role template ROLE.md by name.
  * Checks: built-in templates → ~/.pcp/studio-templates/<name>/ROLE.md
  * Returns the ROLE.md content, or null if not found.
+ *
+ * Built-in templates are sourced from packages/templates/studio-roles/ and
+ * copied into dist/templates/studio-roles/ at build time. To edit them,
+ * update the files in packages/templates/studio-roles/ — not here.
  */
 function resolveRoleTemplate(templateName: string): string | null {
   if (!isValidTemplateName(templateName)) return null;
 
-  // Built-in templates (shipped with CLI)
+  // Built-in templates (shipped with CLI, sourced from packages/templates/studio-roles/)
   const distPath = join(__dirname, '..', 'templates', 'studio-roles', `${templateName}.md`);
   if (existsSync(distPath)) return readFileSync(distPath, 'utf-8');
 
+  // Dev fallback: read directly from packages/templates/studio-roles/
   const srcPath = join(
     __dirname,
     '..',
     '..',
-    'src',
+    '..',
     'templates',
     'studio-roles',
     `${templateName}.md`
@@ -1249,11 +1254,18 @@ async function cliLinkCommand(options: { name?: string; unlink?: boolean }): Pro
     // Build
     execSync('npx tsc', { cwd: cliRoot, stdio: 'pipe' });
 
-    // Copy templates (matches the build script)
+    // Copy hook templates from src/templates (matches the build script)
     const templatesSource = join(cliRoot, 'src', 'templates');
     const templatesDest = join(cliRoot, 'dist', 'templates');
     if (existsSync(templatesSource)) {
       cpSync(templatesSource, templatesDest, { recursive: true });
+    }
+
+    // Copy role templates from packages/templates/studio-roles/ (canonical source)
+    const studioRolesSource = join(cliRoot, '..', 'templates', 'studio-roles');
+    const studioRolesDest = join(templatesDest, 'studio-roles');
+    if (existsSync(studioRolesSource)) {
+      cpSync(studioRolesSource, studioRolesDest, { recursive: true });
     }
 
     // Ensure executable
