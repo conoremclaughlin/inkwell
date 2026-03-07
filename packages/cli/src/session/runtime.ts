@@ -8,6 +8,7 @@ export interface RuntimeSessionRecord {
   identityId?: string;
   studioId?: string;
   threadKey?: string;
+  gitBranch?: string;
   runtimeLinkId?: string;
   backendSessionId?: string;
   backendSessionIds?: string[];
@@ -111,7 +112,10 @@ export function upsertRuntimeSession(
       s.studioId === next.studioId
   );
 
-  const mergeSessionIds = (existing?: RuntimeSessionRecord, incoming?: RuntimeSessionRecord): string[] => {
+  const mergeSessionIds = (
+    existing?: RuntimeSessionRecord,
+    incoming?: RuntimeSessionRecord
+  ): string[] => {
     const ids = new Set<string>();
 
     const add = (value: unknown): void => {

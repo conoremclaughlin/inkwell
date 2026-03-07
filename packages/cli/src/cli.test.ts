@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { extractArgs, isBackendInteractiveSubcommand } from './cli.js';
+import {
+  buildInteractiveSubcommandArgs,
+  extractArgs,
+  isBackendInteractiveSubcommand,
+} from './cli.js';
 
 describe('isBackendInteractiveSubcommand', () => {
   it('matches codex resume with session id', () => {
@@ -12,14 +16,8 @@ describe('isBackendInteractiveSubcommand', () => {
     expect(isBackendInteractiveSubcommand('codex', ['resume'])).toBe(true);
   });
 
-  it('matches codex resume behind other positional args', () => {
-    expect(
-      isBackendInteractiveSubcommand('codex', [
-        'mcp',
-        'resume',
-        '019c44fd-68f6-7332-9eda-2dc7c8afcedf',
-      ])
-    ).toBe(true);
+  it('does not match codex resume when it is not the first positional token', () => {
+    expect(isBackendInteractiveSubcommand('codex', ['mcp', 'resume'])).toBe(false);
   });
 
   it('does not match non-codex backends', () => {
@@ -29,6 +27,16 @@ describe('isBackendInteractiveSubcommand', () => {
 
   it('does not match empty prompt parts', () => {
     expect(isBackendInteractiveSubcommand('codex', [])).toBe(false);
+  });
+});
+
+describe('buildInteractiveSubcommandArgs', () => {
+  it('keeps positional subcommand tokens before passthrough flags', () => {
+    expect(buildInteractiveSubcommandArgs(['--full-auto'], ['resume', '019c91d2'])).toEqual([
+      'resume',
+      '019c91d2',
+      '--full-auto',
+    ]);
   });
 });
 

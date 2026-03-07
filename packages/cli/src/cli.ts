@@ -96,8 +96,18 @@ interface ParsedArgs {
  */
 export function isBackendInteractiveSubcommand(backend: string, promptParts: string[]): boolean {
   if (backend !== 'codex' || promptParts.length === 0) return false;
-  const CODEX_INTERACTIVE_SUBCOMMANDS = ['resume'];
-  return promptParts.some((part) => CODEX_INTERACTIVE_SUBCOMMANDS.includes(part));
+  return promptParts[0]?.toLowerCase() === 'resume';
+}
+
+/**
+ * For interactive backend subcommands, positional tokens are the actual subcommand
+ * invocation and must stay first (e.g. `codex resume <id> --full-auto`).
+ */
+export function buildInteractiveSubcommandArgs(
+  passthroughArgs: string[],
+  promptParts: string[]
+): string[] {
+  return [...promptParts, ...passthroughArgs];
 }
 
 export function extractArgs(argv: string[]): ParsedArgs {
@@ -229,12 +239,13 @@ program
     );
 
     if (isInteractiveSubcommand) {
+      const interactiveArgs = buildInteractiveSubcommandArgs(passthroughArgs, promptParts);
       sbDebugLog('sb', 'run_interactive_subcommand', {
         backend: resolvedOptions.backend,
-        passthroughArgs: [...passthroughArgs, ...promptParts],
+        passthroughArgs: interactiveArgs,
       });
       // Move positional args to passthrough so the backend receives them as subcommand args
-      await runClaudeInteractive(resolvedOptions, [...passthroughArgs, ...promptParts]);
+      await runClaudeInteractive(resolvedOptions, interactiveArgs);
     } else if (!prompt && !passthroughArgs.length && !process.stdin.isTTY) {
       // Piped stdin — read it as the prompt
       let stdinData = '';
