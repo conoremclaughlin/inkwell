@@ -32,6 +32,7 @@ export interface DueReminder {
   next_run_at: string;
   run_count: number;
   max_runs: number | null;
+  studio_hint: string | null;
 }
 
 interface HeartbeatConfig {
@@ -317,6 +318,7 @@ export async function createReminder(params: {
   runAt?: Date;
   maxRuns?: number;
   identityId?: string;
+  studioHint?: string;
   metadata?: Json;
 }): Promise<{ id: string } | null> {
   if (!supabase) {
@@ -344,6 +346,7 @@ export async function createReminder(params: {
       next_run_at: nextRunAt.toISOString(),
       max_runs: params.maxRuns || null,
       identity_id: params.identityId || null,
+      studio_hint: params.studioHint || null,
       metadata: params.metadata ?? {},
     })
     .select('id')

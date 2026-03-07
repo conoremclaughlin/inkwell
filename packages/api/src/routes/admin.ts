@@ -1458,7 +1458,7 @@ router.get('/routing', async (req: Request, res: Response) => {
 
     const { data: identitiesData, error: identitiesError } = await supabase
       .from('agent_identities')
-      .select('id, agent_id, name, role, backend')
+      .select('id, agent_id, name, role, backend, studio_hint')
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
       .order('agent_id', { ascending: true });
@@ -1533,6 +1533,7 @@ router.get('/routing', async (req: Request, res: Response) => {
         name: identity.name,
         role: identity.role,
         backend: identity.backend,
+        studioHint: identity.studio_hint || 'home',
       })),
       routes,
     });
@@ -1996,6 +1997,57 @@ router.delete('/routing/routes/:routeId', async (req: Request, res: Response) =>
 });
 
 /**
+ * PATCH /api/admin/routing/identities/:identityId
+ * Update an agent identity's studio_hint (home studio).
+ */
+router.patch('/routing/identities/:identityId', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const { identityId } = req.params;
+    const { studioHint } = req.body;
+
+    if (typeof studioHint !== 'string' || !studioHint.trim()) {
+      res.status(400).json({ error: 'studioHint is required (non-empty string)' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    // Verify identity belongs to user + workspace
+    const { data: identity, error: fetchError } = await supabase
+      .from('agent_identities')
+      .select('id, agent_id')
+      .eq('id', identityId)
+      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .single();
+
+    if (fetchError || !identity) {
+      res.status(404).json({ error: 'Identity not found' });
+      return;
+    }
+
+    const { error: updateError } = await supabase
+      .from('agent_identities')
+      .update({ studio_hint: studioHint.trim() })
+      .eq('id', identityId);
+
+    if (updateError) {
+      logger.error('Failed to update identity studio_hint:', updateError);
+      res.status(500).json(errorJson('Failed to update identity', updateError));
+      return;
+    }
+
+    res.json({ success: true, identityId, studioHint: studioHint.trim() });
+  } catch (error) {
+    logger.error('Failed to update identity studio_hint:', error);
+    res.status(500).json(errorJson('Failed to update identity', error));
+  }
+});
+
+/**
  * GET /api/admin/reminders
  * List reminders for the active user (admin view)
  */
@@ -2032,6 +2084,7 @@ router.get('/reminders', async (req: Request, res: Response) => {
         status: r.status,
         runCount: r.run_count,
         maxRuns: r.max_runs,
+        studioHint: r.studio_hint ?? null,
         agentId: r.agent_identities?.agent_id ?? null,
         agentName: r.agent_identities?.name ?? null,
         createdAt: r.created_at,
