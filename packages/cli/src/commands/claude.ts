@@ -143,15 +143,46 @@ function getPickerLabelMaxWidth(): number {
   return Math.max(72, Math.min(140, columns - 12));
 }
 
+interface PickerMetaLineInput {
+  source: string;
+  id: string;
+  state: string;
+  branch: string;
+  age: string;
+}
+
+function buildPickerMetaLine(input: PickerMetaLineInput): string {
+  const maxWidth = getPickerLabelMaxWidth();
+  const sourceWidth = 10;
+  const idWidth = 9;
+  const ageWidth = 8;
+  const separator = '  ';
+  const fixed = sourceWidth + idWidth + ageWidth + separator.length * 4;
+  const flexible = Math.max(34, maxWidth - fixed);
+  let stateWidth = Math.max(18, Math.floor(flexible * 0.62));
+  let branchWidth = Math.max(12, flexible - stateWidth);
+  if (stateWidth + branchWidth > flexible) {
+    branchWidth = Math.max(12, flexible - stateWidth);
+  }
+  if (stateWidth + branchWidth > flexible) {
+    stateWidth = Math.max(18, flexible - branchWidth);
+  }
+
+  return [
+    padSessionCandidateCell(input.source, sourceWidth),
+    padSessionCandidateCell(input.id, idWidth),
+    padSessionCandidateCell(input.state, stateWidth),
+    padSessionCandidateCell(input.branch, branchWidth),
+    padSessionCandidateCell(input.age, ageWidth),
+  ].join(separator);
+}
+
 export function buildSessionPickerLabel(options: {
-  primary: string;
-  details?: Array<string | null | undefined>;
+  metaLine: string;
   preview?: string | null;
 }): string {
   const maxWidth = getPickerLabelMaxWidth();
-  const detailText = (options.details || []).filter(Boolean).join(' | ');
-  const base = detailText ? `${options.primary} | ${detailText}` : options.primary;
-  const firstLine = truncateText(base, maxWidth);
+  const firstLine = truncateText(options.metaLine, maxWidth);
   if (!options.preview) return firstLine;
 
   const previewWidth = Math.max(36, maxWidth - 4);
@@ -2542,17 +2573,20 @@ async function ensurePcpSessionContext(
       const preview = pcpPreviewBySessionId.get(session.id);
       const phaseLabel = getSessionPhaseLabel(session);
       const pickerPreview = linkedPreviewText || preview || session.context || undefined;
+      const stateTokens = [
+        phaseLabel || 'runtime:active',
+        session.threadKey ? `thread ${truncateText(session.threadKey, 20)}` : null,
+        linkedBackendSessionId ? `${backendLabel} ${linkedBackendSessionId.slice(0, 8)}` : null,
+      ].filter(Boolean) as string[];
       choices.push({
         name: buildSessionPickerLabel({
-          primary: `PCP ${session.id.slice(0, 8)}`,
-          details: [
-            session.threadKey ? `thread ${truncateText(session.threadKey, 24)}` : null,
-            phaseLabel || null,
-            linkedBackendSessionId
-              ? `tracks ${backendLabel} ${linkedBackendSessionId.slice(0, 8)}`
-              : null,
-            formatRelativeCandidateTime(linkedAt || session.startedAt),
-          ],
+          metaLine: buildPickerMetaLine({
+            source: 'PCP',
+            id: session.id.slice(0, 8),
+            state: stateTokens.join(' · '),
+            branch: linkedLocalSession?.gitBranch || '-',
+            age: formatRelativeCandidateTime(linkedAt || session.startedAt),
+          }),
           preview: pickerPreview,
         }),
         value,
@@ -2571,15 +2605,15 @@ async function ensurePcpSessionContext(
       const linkedPcpSession = pcpSessionByBackendSessionId.get(localSession.sessionId);
       choices.push({
         name: buildSessionPickerLabel({
-          primary:
-            localSession.backend === 'claude'
-              ? `Claude local ${localSession.sessionId.slice(0, 8)}`
-              : `${backendLabel} local ${localSession.sessionId.slice(0, 8)}`,
-          details: [
-            linkedPcpSession ? `linked pcp:${linkedPcpSession.id.slice(0, 8)}` : null,
-            localSession.gitBranch ? `branch ${truncateText(localSession.gitBranch, 22)}` : null,
-            formatRelativeCandidateTime(previewAt),
-          ],
+          metaLine: buildPickerMetaLine({
+            source: `${backendLabel} local`,
+            id: localSession.sessionId.slice(0, 8),
+            state: linkedPcpSession
+              ? `linked pcp:${linkedPcpSession.id.slice(0, 8)}`
+              : 'local-only',
+            branch: localSession.gitBranch || '-',
+            age: formatRelativeCandidateTime(previewAt),
+          }),
           preview: previewText,
         }),
         value,

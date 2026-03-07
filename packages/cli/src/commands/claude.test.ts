@@ -90,15 +90,14 @@ describe('renderSessionCandidatesTable', () => {
 describe('buildSessionPickerLabel', () => {
   it('renders two lines when preview is present', () => {
     const label = buildSessionPickerLabel({
-      primary: 'PCP c4ec2f5e',
-      details: ['runtime:idle', '2m ago'],
+      metaLine: 'PCP        c4ec2f5e   runtime:idle         main         2m ago',
       preview: 'lumen: latest assistant message preview here',
     });
 
     expect(label).toContain('\n');
     expect(label).toContain('↳');
-    expect(label).toContain('PCP c4ec2f5e');
-    expect(label).toContain('|');
+    expect(label).toContain('PCP');
+    expect(label).toContain('c4ec2f5e');
   });
 });
 
