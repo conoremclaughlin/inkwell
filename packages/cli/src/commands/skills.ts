@@ -12,7 +12,15 @@
 
 import { Command } from 'commander';
 import chalk from 'chalk';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { execSync } from 'child_process';
@@ -68,15 +76,18 @@ interface McpJsonConfig {
 // Constants
 // ============================================================================
 
+/** Canonical skill directory — single source of truth */
+const PCP_SKILLS_DIR = join(homedir(), '.pcp', 'skills');
+
 /**
- * Home-level skill directories for each backend.
- * Writing here means skills persist across ALL projects/studios.
+ * Backend skill directories that get symlinks pointing to PCP_SKILLS_DIR.
+ * This makes skills show up in each backend's native discovery:
+ *   Claude Code: /skills   Codex: native   Gemini: native
  */
-const HOME_SKILL_DIRS = [
-  join(homedir(), '.pcp', 'skills'), // PCP discovery (sb chat, buildMergedMcpConfig)
-  join(homedir(), '.claude', 'skills'), // Claude Code native (/skills)
-  join(homedir(), '.codex', 'skills'), // Codex native
-  join(homedir(), '.gemini', 'skills'), // Gemini native
+const BACKEND_SKILL_DIRS = [
+  join(homedir(), '.claude', 'skills'),
+  join(homedir(), '.codex', 'skills'),
+  join(homedir(), '.gemini', 'skills'),
 ];
 
 // ============================================================================
@@ -194,10 +205,11 @@ function injectMcpServers(
 }
 
 /**
- * Write a SKILL.md to a directory, return true if written (false if skipped).
+ * Write a SKILL.md to the canonical PCP skills dir.
+ * Returns true if written (false if content unchanged).
  */
-function writeSkillToDir(dir: string, skillName: string, content: string): boolean {
-  const skillDir = join(dir, skillName);
+function writeCanonicalSkill(skillName: string, content: string): boolean {
+  const skillDir = join(PCP_SKILLS_DIR, skillName);
   const skillFile = join(skillDir, 'SKILL.md');
 
   if (existsSync(skillFile)) {
@@ -208,6 +220,48 @@ function writeSkillToDir(dir: string, skillName: string, content: string): boole
   mkdirSync(skillDir, { recursive: true });
   writeFileSync(skillFile, content);
   return true;
+}
+
+/**
+ * Create a symlink from a backend skill dir to the canonical PCP skill dir.
+ * Returns 'created' | 'exists' | 'updated' (if symlink target changed).
+ */
+function ensureSkillSymlink(
+  backendDir: string,
+  skillName: string
+): 'created' | 'exists' | 'updated' {
+  const linkPath = join(backendDir, skillName);
+  const targetPath = join(PCP_SKILLS_DIR, skillName);
+
+  mkdirSync(backendDir, { recursive: true });
+
+  if (existsSync(linkPath)) {
+    try {
+      const stat = lstatSync(linkPath);
+      if (stat.isSymbolicLink()) {
+        // Already a symlink — check if target matches
+        const currentTarget = readFileSync(linkPath + '/SKILL.md', 'utf-8');
+        const canonicalContent = readFileSync(join(targetPath, 'SKILL.md'), 'utf-8');
+        if (currentTarget === canonicalContent) return 'exists';
+        // Stale symlink — remove and recreate
+        unlinkSync(linkPath);
+      } else {
+        // Real directory — remove it and replace with symlink
+        // (safe: we just wrote the canonical version)
+        execSync(`rm -rf ${JSON.stringify(linkPath)}`, { stdio: 'ignore' });
+      }
+    } catch {
+      // If we can't stat it, remove and recreate
+      try {
+        unlinkSync(linkPath);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  symlinkSync(targetPath, linkPath);
+  return 'created';
 }
 
 // ============================================================================
@@ -306,14 +360,14 @@ async function syncCommand(options: SyncOptions): Promise<void> {
 
   console.log(chalk.dim(`  Found ${mcpSkills.length} MCP-providing skill(s) on server\n`));
 
-  // ---- Step 1: Write SKILL.md to all backend skill dirs (home-level) ----
-  // This is the core of "one sync, skills everywhere":
-  //   ~/.pcp/skills/    → PCP discovery (sb chat, buildMergedMcpConfig)
-  //   ~/.claude/skills/ → Claude Code native (/skills)
-  //   ~/.codex/skills/  → Codex native
-  //   ~/.gemini/skills/ → Gemini native
+  // ---- Step 1: Write canonical SKILL.md + symlink to backend dirs ----
+  // ~/.pcp/skills/<name>/SKILL.md is the single source of truth.
+  // ~/.claude/skills/<name> → ~/.pcp/skills/<name>  (symlink)
+  // ~/.codex/skills/<name>  → ~/.pcp/skills/<name>  (symlink)
+  // ~/.gemini/skills/<name> → ~/.pcp/skills/<name>  (symlink)
 
   let written = 0;
+  let linked = 0;
   let skipped = 0;
 
   for (const skill of mcpSkills) {
@@ -332,13 +386,21 @@ async function syncCommand(options: SyncOptions): Promise<void> {
     if (!detail.mcp && skill.mcp) detail.mcp = skill.mcp;
     const skillMd = buildSkillMd(detail);
 
-    for (const dir of HOME_SKILL_DIRS) {
-      if (writeSkillToDir(dir, skill.name, skillMd)) {
-        written++;
-        const shortDir = dir.replace(homedir(), '~');
-        console.log(chalk.green(`  + ${skill.name}`), chalk.dim(`→ ${shortDir}/`));
-      } else {
-        skipped++;
+    // Write canonical copy
+    if (writeCanonicalSkill(skill.name, skillMd)) {
+      written++;
+      console.log(chalk.green(`  + ${skill.name}`), chalk.dim('→ ~/.pcp/skills/'));
+    } else {
+      skipped++;
+    }
+
+    // Symlink from each backend dir
+    for (const backendDir of BACKEND_SKILL_DIRS) {
+      const result = ensureSkillSymlink(backendDir, skill.name);
+      if (result === 'created' || result === 'updated') {
+        linked++;
+        const shortDir = backendDir.replace(homedir(), '~');
+        console.log(chalk.green(`  ↳ ${skill.name}`), chalk.dim(`→ ${shortDir}/ (symlink)`));
       }
     }
   }
@@ -380,7 +442,7 @@ async function syncCommand(options: SyncOptions): Promise<void> {
   }
 
   // ---- Summary ----
-  if (written === 0 && skipped > 0) {
+  if (written === 0 && linked === 0 && skipped > 0) {
     console.log(chalk.dim(`\n  All skill(s) already up to date.`));
   }
 
