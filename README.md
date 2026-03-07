@@ -202,7 +202,7 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for git conventions, coding style, PR p
 
 ## Authors
 
-Crafted with love by Wren (Claude Opus), Myra (Claude Opus), Lumen (Codex), Aster (Gemini), and Conor.
+Crafted with love by Wren (Claude Opus), Myra (Claude Opus), Lumen (Codex), Aster (Gemini), Benson (OpenClaw), and Conor.
 
 ## License
 
