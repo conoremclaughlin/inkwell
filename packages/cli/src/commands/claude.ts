@@ -116,8 +116,44 @@ function formatCandidateTimestamp(value: string | null | undefined): string {
   return new Date(ms).toLocaleString();
 }
 
+function formatRelativeCandidateTime(value: string | null | undefined): string {
+  if (!value) return '-';
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) return '-';
+  const diffMs = Math.max(0, Date.now() - ms);
+  const minute = 60 * 1000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+
+  if (diffMs < minute) return 'just now';
+  if (diffMs < hour) return `${Math.floor(diffMs / minute)}m ago`;
+  if (diffMs < day) return `${Math.floor(diffMs / hour)}h ago`;
+  if (diffMs < 7 * day) return `${Math.floor(diffMs / day)}d ago`;
+  return new Date(ms).toLocaleDateString();
+}
+
 function padSessionCandidateCell(value: string, width: number): string {
   return truncateText(value || '-', width).padEnd(width, ' ');
+}
+
+function getPickerLabelMaxWidth(): number {
+  const columns = process.stdout.columns;
+  if (!columns || columns <= 0) return 110;
+  return Math.max(72, Math.min(140, columns - 12));
+}
+
+function buildSessionPickerLabel(options: {
+  primary: string;
+  details?: Array<string | null | undefined>;
+  preview?: string | null;
+}): string {
+  const maxWidth = getPickerLabelMaxWidth();
+  const detailText = (options.details || []).filter(Boolean).join(' · ');
+  const base = detailText ? `${options.primary} — ${detailText}` : options.primary;
+  if (!options.preview) return truncateText(base, maxWidth);
+
+  const previewBudget = Math.max(24, maxWidth - base.length - 3);
+  return truncateText(`${base} — ${truncateText(options.preview, previewBudget)}`, maxWidth);
 }
 
 export function renderSessionCandidatesTable(rows: SessionCandidateTableRow[]): string[] {
@@ -2461,33 +2497,51 @@ async function ensurePcpSessionContext(
         linkedLocalSession?.latestPrompt || linkedLocalSession?.firstPrompt,
         agentId
       );
-      const linkedPreview = linkedPreviewText ? ` — ${truncateText(linkedPreviewText)}` : '';
       const linkedAt = linkedLocalSession?.latestPromptAt || linkedLocalSession?.modified;
-      const linkedWhen = linkedAt ? ` (${new Date(linkedAt).toLocaleString()})` : '';
       const backendLabel = backend[0].toUpperCase() + backend.slice(1);
       const preview = pcpPreviewBySessionId.get(session.id);
       const phaseLabel = getSessionPhaseLabel(session);
+      const pickerPreview = linkedPreviewText || preview;
       choices.push({
-        name: `Resume PCP ${session.id.slice(0, 8)}${session.threadKey ? ` (${session.threadKey})` : ''}${phaseLabel ? ` — ${phaseLabel}` : ''}${linkedBackendSessionId ? ` · tracks ${backendLabel} ${linkedBackendSessionId.slice(0, 8)}` : ''}${linkedWhen}${linkedPreview}${preview ? ` — ${truncateText(preview, 120)}` : ''}`,
+        name: buildSessionPickerLabel({
+          primary: `Resume PCP ${session.id.slice(0, 8)}`,
+          details: [
+            session.threadKey ? `thread ${truncateText(session.threadKey, 24)}` : null,
+            phaseLabel || null,
+            linkedBackendSessionId
+              ? `tracks ${backendLabel} ${linkedBackendSessionId.slice(0, 8)}`
+              : null,
+            formatRelativeCandidateTime(linkedAt || session.startedAt),
+          ],
+          preview: pickerPreview,
+        }),
         value,
       });
       sessionChoiceByValue.set(value, session.id);
     }
 
-    for (const localSession of untrackedLocalBackendSessions) {
+    for (const localSession of displayLocalBackendSessions) {
       const value = `__local__:${localSession.sessionId}`;
       const previewText = withAgentPreviewSpeaker(
         localSession.latestPrompt || localSession.firstPrompt,
         agentId
       );
-      const preview = previewText ? ` — ${truncateText(previewText)}` : '';
       const previewAt = localSession.latestPromptAt || localSession.modified;
       const backendLabel = localSession.backend[0].toUpperCase() + localSession.backend.slice(1);
+      const linkedPcpSession = pcpSessionByBackendSessionId.get(localSession.sessionId);
       choices.push({
-        name:
-          localSession.backend === 'claude'
-            ? `Resume Claude local ${localSession.sessionId.slice(0, 8)} (${new Date(previewAt).toLocaleString()})${preview}`
-            : `Resume ${backendLabel} local ${localSession.sessionId.slice(0, 8)} (${new Date(previewAt).toLocaleString()})${preview}`,
+        name: buildSessionPickerLabel({
+          primary:
+            localSession.backend === 'claude'
+              ? `Resume Claude local ${localSession.sessionId.slice(0, 8)}`
+              : `Resume ${backendLabel} local ${localSession.sessionId.slice(0, 8)}`,
+          details: [
+            linkedPcpSession ? `linked pcp:${linkedPcpSession.id.slice(0, 8)}` : null,
+            localSession.gitBranch ? `branch ${truncateText(localSession.gitBranch, 22)}` : null,
+            formatRelativeCandidateTime(previewAt),
+          ],
+          preview: previewText,
+        }),
         value,
       });
       sessionChoiceByValue.set(value, localSession.sessionId);
