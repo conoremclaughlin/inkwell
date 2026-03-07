@@ -1874,8 +1874,11 @@ export function hasBackendSessionOverride(
   const lowered = passthroughArgs.map((arg) => arg.toLowerCase());
   const has = (flag: string) => lowered.includes(flag.toLowerCase());
   const isCodexResumePrompt = backend === 'codex' && promptParts[0]?.toLowerCase() === 'resume';
+  const codexResumeIndex = passthroughArgs.findIndex((arg) => arg.toLowerCase() === 'resume');
   const isCodexResumePassthrough =
-    backend === 'codex' && passthroughArgs[0]?.toLowerCase() === 'resume';
+    backend === 'codex' &&
+    codexResumeIndex >= 0 &&
+    passthroughArgs.slice(0, codexResumeIndex).every((arg) => arg.startsWith('-'));
 
   if (isCodexResumePrompt || isCodexResumePassthrough) return true;
 
@@ -2615,6 +2618,11 @@ async function ensurePcpSessionContext(
       const preview = pcpPreviewBySessionId.get(session.id);
       const phaseLabel = getSessionPhaseLabel(session);
       const pickerPreview = linkedPreviewText || preview || session.context || undefined;
+      const branchLabel =
+        linkedLocalSession?.gitBranch ||
+        runtimeBranchByPcpSessionId.get(session.id) ||
+        session.studio?.branch ||
+        '-';
       const stateTokens = [
         phaseLabel || 'runtime:active',
         session.threadKey ? `thread ${truncateText(session.threadKey, 20)}` : null,
@@ -2627,13 +2635,9 @@ async function ensurePcpSessionContext(
             id: session.id.slice(0, 8),
             when: formatPickerTimestamp(linkedAt || session.startedAt),
             state: stateTokens.join(' · '),
-            branch:
-              linkedLocalSession?.gitBranch ||
-              runtimeBranchByPcpSessionId.get(session.id) ||
-              session.studio?.branch ||
-              '-',
+            branch: pickerPreview || branchLabel,
           }),
-          preview: pickerPreview,
+          preview: branchLabel !== '-' ? `branch ${branchLabel}` : undefined,
         }),
         value,
       });
@@ -2652,15 +2656,13 @@ async function ensurePcpSessionContext(
       choices.push({
         name: buildSessionPickerLabel({
           metaLine: buildPickerMetaLine({
-            source: `${backendLabel} local`,
+            source: backendLabel,
             id: localSession.sessionId.slice(0, 8),
             when: formatPickerTimestamp(previewAt),
-            state: linkedPcpSession
-              ? `linked pcp:${linkedPcpSession.id.slice(0, 8)}`
-              : 'local-only',
-            branch: localSession.gitBranch || '-',
+            state: linkedPcpSession ? `linked pcp:${linkedPcpSession.id.slice(0, 8)}` : 'local',
+            branch: previewText || localSession.gitBranch || '-',
           }),
-          preview: previewText,
+          preview: localSession.gitBranch ? `branch ${localSession.gitBranch}` : undefined,
         }),
         value,
       });

@@ -49,6 +49,8 @@ describe('hasBackendSessionOverride', () => {
   it('treats codex resume passthrough args as override', () => {
     expect(hasBackendSessionOverride('codex', ['resume'])).toBe(true);
     expect(hasBackendSessionOverride('codex', ['resume', '--latest'])).toBe(true);
+    expect(hasBackendSessionOverride('codex', ['--full-auto', 'resume', '019c1234'])).toBe(true);
+    expect(hasBackendSessionOverride('codex', ['foo', 'resume'])).toBe(false);
   });
 
   it('still respects flag-based resume overrides', () => {
