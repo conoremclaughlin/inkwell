@@ -58,6 +58,7 @@ interface BootstrapContextResult {
 interface PcpSessionSummary {
   id: string;
   studioId?: string | null;
+  studio?: { branch?: string | null } | null;
   threadKey?: string | null;
   context?: string | null;
   currentPhase?: string | null;
@@ -117,20 +118,30 @@ function formatCandidateTimestamp(value: string | null | undefined): string {
   return new Date(ms).toLocaleString();
 }
 
-function formatRelativeCandidateTime(value: string | null | undefined): string {
+function formatPickerTimestamp(value: string | null | undefined): string {
   if (!value) return '-';
   const ms = Date.parse(value);
   if (!Number.isFinite(ms)) return '-';
-  const diffMs = Math.max(0, Date.now() - ms);
-  const minute = 60 * 1000;
-  const hour = 60 * minute;
-  const day = 24 * hour;
+  return new Date(ms).toLocaleString([], {
+    month: 'numeric',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+}
 
-  if (diffMs < minute) return 'just now';
-  if (diffMs < hour) return `${Math.floor(diffMs / minute)}m ago`;
-  if (diffMs < day) return `${Math.floor(diffMs / hour)}h ago`;
-  if (diffMs < 7 * day) return `${Math.floor(diffMs / day)}d ago`;
-  return new Date(ms).toLocaleDateString();
+function getCurrentGitBranch(cwd = process.cwd()): string | undefined {
+  try {
+    const result = spawnSync('git', ['-C', cwd, 'rev-parse', '--abbrev-ref', 'HEAD'], {
+      encoding: 'utf-8',
+    });
+    if (result.status !== 0) return undefined;
+    const value = result.stdout.trim();
+    if (!value || value === 'HEAD') return undefined;
+    return value;
+  } catch {
+    return undefined;
+  }
 }
 
 function padSessionCandidateCell(value: string, width: number): string {
@@ -152,18 +163,18 @@ function getPickerLabelMaxWidth(): number {
 interface PickerMetaLineInput {
   source: string;
   id: string;
+  when: string;
   state: string;
   branch: string;
-  age: string;
 }
 
 function buildPickerMetaLine(input: PickerMetaLineInput): string {
   const maxWidth = getPickerLabelMaxWidth();
   const sourceWidth = 12;
   const idWidth = 9;
-  const ageWidth = 8;
+  const whenWidth = 16;
   const separator = '  ';
-  const fixed = sourceWidth + idWidth + ageWidth + separator.length * 4;
+  const fixed = sourceWidth + idWidth + whenWidth + separator.length * 4;
   const flexible = Math.max(34, maxWidth - fixed);
   let stateWidth = Math.max(16, Math.floor(flexible * 0.45));
   let branchWidth = Math.max(12, flexible - stateWidth);
@@ -177,9 +188,9 @@ function buildPickerMetaLine(input: PickerMetaLineInput): string {
   return [
     padSessionCandidateCell(input.source, sourceWidth),
     padSessionCandidateCell(input.id, idWidth),
+    padSessionCandidateCell(input.when, whenWidth),
     padSessionCandidateCell(input.state, stateWidth),
     padSessionCandidateCell(input.branch, branchWidth),
-    padSessionCandidateCell(input.age, ageWidth),
   ].join(separator);
 }
 
@@ -2061,6 +2072,7 @@ async function persistBackendSessionLink(options: {
   email?: string;
 }): Promise<void> {
   if (!options.pcpSessionId || !options.backendSessionId) return;
+  const gitBranch = getCurrentGitBranch(process.cwd());
 
   upsertRuntimeSession(process.cwd(), {
     pcpSessionId: options.pcpSessionId,
@@ -2070,6 +2082,7 @@ async function persistBackendSessionLink(options: {
     ...(options.studioId ? { studioId: options.studioId } : {}),
     ...(options.runtimeLinkId ? { runtimeLinkId: options.runtimeLinkId } : {}),
     backendSessionId: options.backendSessionId,
+    ...(gitBranch ? { gitBranch } : {}),
     updatedAt: new Date().toISOString(),
   });
 
@@ -2110,6 +2123,7 @@ async function ensurePcpSessionContext(
   const email = config?.email;
   const cwd = process.cwd();
   const { studioId, identityId } = getIdentityContextFromIdentityJson(cwd);
+  const currentGitBranch = getCurrentGitBranch(cwd);
   const localSessionLimit = options.listCandidates || options.listCandidatesJson ? 120 : 40;
   const pcpSessionLimit = options.listCandidates || options.listCandidatesJson ? 80 : 40;
   const localBackendSessions = getBackendLocalSessionsForProject(backend, cwd, localSessionLimit);
@@ -2409,6 +2423,11 @@ async function ensurePcpSessionContext(
   const localBySessionId = new Map(
     localBackendSessions.map((session) => [session.sessionId, session])
   );
+  const runtimeBranchByPcpSessionId = new Map(
+    listRuntimeSessions(cwd, backend)
+      .filter((session) => Boolean(session.gitBranch))
+      .map((session) => [session.pcpSessionId, session.gitBranch as string])
+  );
   if (options.listCandidates || options.listCandidatesJson) {
     const pcpCandidates = activeSessions.map((session) => {
       const linkedBackendSessionId = getSessionBackendId(session);
@@ -2589,9 +2608,13 @@ async function ensurePcpSessionContext(
           metaLine: buildPickerMetaLine({
             source: 'PCP',
             id: session.id.slice(0, 8),
+            when: formatPickerTimestamp(linkedAt || session.startedAt),
             state: stateTokens.join(' · '),
-            branch: linkedLocalSession?.gitBranch || '-',
-            age: formatRelativeCandidateTime(linkedAt || session.startedAt),
+            branch:
+              linkedLocalSession?.gitBranch ||
+              runtimeBranchByPcpSessionId.get(session.id) ||
+              session.studio?.branch ||
+              '-',
           }),
           preview: pickerPreview,
         }),
@@ -2614,11 +2637,11 @@ async function ensurePcpSessionContext(
           metaLine: buildPickerMetaLine({
             source: `${backendLabel} local`,
             id: localSession.sessionId.slice(0, 8),
+            when: formatPickerTimestamp(previewAt),
             state: linkedPcpSession
               ? `linked pcp:${linkedPcpSession.id.slice(0, 8)}`
               : 'local-only',
             branch: localSession.gitBranch || '-',
-            age: formatRelativeCandidateTime(previewAt),
           }),
           preview: previewText,
         }),
@@ -2736,6 +2759,7 @@ async function ensurePcpSessionContext(
     ...(studioId ? { studioId } : {}),
     ...(chosen.threadKey ? { threadKey: chosen.threadKey } : {}),
     ...(effectiveBackendSessionId ? { backendSessionId: effectiveBackendSessionId } : {}),
+    ...(currentGitBranch ? { gitBranch: currentGitBranch } : {}),
     startedAt: chosen.startedAt,
   });
   setCurrentRuntimeSession(cwd, chosen.id, backend, {
@@ -2819,6 +2843,7 @@ export async function runClaude(
       )
     : {};
   const runtimeLinkId = options.session ? randomUUID() : undefined;
+  const currentGitBranch = getCurrentGitBranch(process.cwd());
   const { studioId, identityId } = getIdentityContextFromIdentityJson(process.cwd());
 
   if (sessionContext.pcpSessionId && runtimeLinkId) {
@@ -2832,6 +2857,7 @@ export async function runClaude(
       ...(sessionContext.backendSessionId
         ? { backendSessionId: sessionContext.backendSessionId }
         : {}),
+      ...(currentGitBranch ? { gitBranch: currentGitBranch } : {}),
       updatedAt: new Date().toISOString(),
     });
   }
@@ -3024,6 +3050,7 @@ export async function runClaudeInteractive(
       )
     : {};
   const runtimeLinkId = options.session ? randomUUID() : undefined;
+  const currentGitBranch = getCurrentGitBranch(process.cwd());
   const { studioId, identityId } = getIdentityContextFromIdentityJson(process.cwd());
 
   if (sessionContext.pcpSessionId && runtimeLinkId) {
@@ -3037,6 +3064,7 @@ export async function runClaudeInteractive(
       ...(sessionContext.backendSessionId
         ? { backendSessionId: sessionContext.backendSessionId }
         : {}),
+      ...(currentGitBranch ? { gitBranch: currentGitBranch } : {}),
       updatedAt: new Date().toISOString(),
     });
   }
