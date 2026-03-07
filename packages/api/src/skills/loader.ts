@@ -153,6 +153,8 @@ function frontmatterToManifest(
     guide: frontmatter.guide as SkillManifest['guide'],
 
     entry: frontmatter.entry as string,
+
+    mcp: frontmatter.mcp as SkillManifest['mcp'],
   };
 }
 

@@ -144,6 +144,14 @@ export interface SkillManifest {
 
   /** Entry point file (SKILL.md for documentation) */
   entry?: string;
+
+  /** MCP server provided by this skill (stdio transport) */
+  mcp?: {
+    name: string;
+    command: string;
+    args: string[];
+    env?: Record<string, string>;
+  };
 }
 
 // ============================================================================
@@ -235,6 +243,7 @@ export interface SkillSummary {
   functionCount?: number;
   capabilities?: SkillManifest['capabilities'];
   eligibility: EligibilityResult;
+  mcp?: SkillManifest['mcp'];
 }
 
 export interface SkillDetail extends SkillSummary {

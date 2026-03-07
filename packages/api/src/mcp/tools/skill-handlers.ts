@@ -103,6 +103,7 @@ export async function handleListSkills(
         triggers: s.triggers,
         functionCount: s.functionCount,
         capabilities: s.capabilities,
+        ...(s.mcp ? { mcp: s.mcp } : {}),
       };
 
       // Include full content for guides when requested (for hook injection)
@@ -166,6 +167,7 @@ export async function handleGetSkill(
             content: matchDetail.skillContent || 'No skill documentation available.',
             functions: matchDetail.manifest.functions,
             triggers: matchDetail.manifest.triggers,
+            ...(matchDetail.manifest.mcp ? { mcp: matchDetail.manifest.mcp } : {}),
           });
         }
       }
@@ -191,6 +193,7 @@ export async function handleGetSkill(
       content: detail.skillContent || 'No skill documentation available.',
       functions: detail.manifest.functions,
       triggers: detail.manifest.triggers,
+      ...(detail.manifest.mcp ? { mcp: detail.manifest.mcp } : {}),
     });
   } catch (error) {
     logger.error('Error in get_skill:', error);

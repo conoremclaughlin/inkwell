@@ -16,6 +16,7 @@ import { homedir } from 'os';
 import { installHooks } from './hooks.js';
 import { syncMcpConfig } from './mcp.js';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
+import { callPcpTool } from '../lib/pcp-mcp.js';
 
 // ============================================================================
 // Helpers
@@ -226,6 +227,25 @@ async function initCommand(options: { force?: boolean }): Promise<void> {
             : chalk.yellow(step.status);
     const detail = step.detail ? chalk.dim(` (${step.detail})`) : '';
     console.log(`  ${icon} ${step.label}: ${statusText}${detail}`);
+  }
+
+  // Async step: sync MCP-providing skills from PCP server (best-effort)
+  try {
+    const result = await callPcpTool<{
+      success: boolean;
+      skills: Array<{ name: string; mcp?: { name: string; command: string; args: string[] } }>;
+    }>('list_skills', {});
+    if (result.success && result.skills) {
+      const mcpSkills = result.skills.filter((s) => s.mcp);
+      if (mcpSkills.length > 0) {
+        console.log(
+          chalk.dim(`\n  ${mcpSkills.length} MCP-providing skill(s) available on server.`)
+        );
+        console.log(chalk.dim('  Run `sb skills sync` to install them locally.'));
+      }
+    }
+  } catch {
+    // Server not reachable — skip skill hint
   }
 
   console.log(chalk.dim('\nDone.'));

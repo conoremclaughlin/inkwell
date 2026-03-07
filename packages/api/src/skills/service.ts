@@ -66,6 +66,7 @@ function toSummary(skill: LoadedSkill, userSettings?: UserSkillSettings): SkillS
     functionCount: skill.manifest.functions?.length,
     capabilities: skill.manifest.capabilities,
     eligibility: skill.eligibility,
+    ...(skill.manifest.mcp ? { mcp: skill.manifest.mcp } : {}),
   };
 }
 

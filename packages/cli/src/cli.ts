@@ -32,6 +32,7 @@ import { registerDoctorCommand } from './commands/doctor.js';
 import { registerMissionCommand } from './commands/mission.js';
 import { registerStatusCommand } from './commands/status.js';
 import { registerPermissionsCommands } from './commands/permissions.js';
+import { registerSkillsCommands } from './commands/skills.js';
 import { runClaude, runClaudeInteractive } from './commands/claude.js';
 import { resolveBackend } from './backends/index.js';
 import { initSbDebug, sbDebugLog } from './lib/sb-debug.js';
@@ -280,6 +281,7 @@ registerDoctorCommand(program);
 registerMissionCommand(program);
 registerStatusCommand(program);
 registerPermissionsCommands(program);
+registerSkillsCommands(program);
 
 // ============================================================================
 // Subcommand detection
