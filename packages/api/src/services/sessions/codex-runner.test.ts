@@ -28,6 +28,10 @@ vi.mock('child_process', async (importOriginal) => {
   };
 });
 
+vi.mock('fs/promises', () => ({
+  access: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock('../../utils/logger.js', () => ({
   logger: {
     info: vi.fn(),

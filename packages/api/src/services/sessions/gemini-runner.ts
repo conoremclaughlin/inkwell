@@ -28,8 +28,10 @@ import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 
-/** Maximum time (ms) to wait for a Gemini CLI subprocess before killing it */
-const PROCESS_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+/** Maximum time (ms) to wait for a Gemini CLI subprocess before killing it.
+ *  Override with GEMINI_PROCESS_TIMEOUT_MS env var. */
+const PROCESS_TIMEOUT_MS =
+  parseInt(process.env.GEMINI_PROCESS_TIMEOUT_MS || '', 10) || 15 * 60 * 1000; // 15 minutes
 
 /** Idle timeout: no output for this long = stuck */
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
@@ -221,8 +223,9 @@ export class GeminiRunner implements IClaudeRunner {
           if (!line.trim()) continue;
           try {
             const parsed = JSON.parse(line);
-            this.handleStreamEvent(parsed, responses);
-            this.captureToolCall(parsed, toolCalls);
+            const extracted = this.extractToolData(parsed);
+            responses.push(...extracted.responses);
+            toolCalls.push(...extracted.toolCalls);
 
             // Capture session_id from init event (Gemini emits this on every session)
             if (parsed.type === 'init' && typeof parsed.session_id === 'string') {
@@ -317,8 +320,9 @@ export class GeminiRunner implements IClaudeRunner {
         if (stdoutRemainder.trim()) {
           try {
             const parsed = JSON.parse(stdoutRemainder);
-            this.handleStreamEvent(parsed, responses);
-            this.captureToolCall(parsed, toolCalls);
+            const extracted = this.extractToolData(parsed);
+            responses.push(...extracted.responses);
+            toolCalls.push(...extracted.toolCalls);
             if (parsed.usageMetadata || parsed.usage) {
               const u = parsed.usageMetadata || parsed.usage;
               usage = {
@@ -379,43 +383,81 @@ export class GeminiRunner implements IClaudeRunner {
   }
 
   /**
-   * Capture tool_use events for activity stream logging.
+   * Extract tool calls and send_response calls from a streaming event.
+   *
+   * Uses BFS to find tool call data anywhere in the event structure,
+   * matching the robust approach used by CodexRunner. Gemini's stream-json
+   * format may nest tool info in various structures (functionCall, toolCall,
+   * parts arrays, etc.) — BFS handles all of them.
    */
-  private captureToolCall(event: Record<string, unknown>, toolCalls: ToolCall[]): void {
-    // Handle both Claude-style and Gemini-style tool call events
-    if (event.type === 'tool_use' || event.type === 'toolCall') {
-      toolCalls.push({
-        toolUseId: (event.id as string) || (event.toolCallId as string) || '',
-        toolName: (event.name as string) || (event.toolName as string) || '',
-        input:
-          (event.input as Record<string, unknown>) || (event.args as Record<string, unknown>) || {},
-      });
+  private extractToolData(event: Record<string, unknown>): {
+    responses: ChannelResponse[];
+    toolCalls: ToolCall[];
+  } {
+    const responses: ChannelResponse[] = [];
+    const toolCalls: ToolCall[] = [];
+    const queue: unknown[] = [event];
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (!current || typeof current !== 'object') continue;
+      const obj = current as Record<string, unknown>;
+
+      // Look for a "name" field indicating a tool/function call
+      const name = obj.name;
+      if (typeof name === 'string' && name.length > 0) {
+        const rawInput = obj.input ?? obj.args ?? obj.arguments ?? {};
+        const input = this.normalizeInput(rawInput);
+
+        if (input && typeof input === 'object') {
+          toolCalls.push({
+            toolUseId:
+              typeof obj.id === 'string'
+                ? obj.id
+                : typeof obj.toolCallId === 'string'
+                  ? obj.toolCallId
+                  : '',
+            toolName: name,
+            input: input as Record<string, unknown>,
+          });
+
+          if (name === 'mcp__pcp__send_response') {
+            const typedInput = input as Record<string, unknown>;
+            const channel = (typedInput.channel as ChannelType) || 'telegram';
+            const conversationId = typedInput.conversationId as string | undefined;
+            const content = typedInput.content as string | undefined;
+            if (channel && conversationId && content) {
+              responses.push({
+                channel,
+                conversationId,
+                content,
+                format: typedInput.format as 'text' | 'markdown' | 'code' | 'json' | undefined,
+                replyToMessageId: typedInput.replyToMessageId as string | undefined,
+                metadata: typedInput.metadata as Record<string, unknown> | undefined,
+              });
+              logger.debug('Captured send_response call from Gemini', { channel, conversationId });
+            }
+          }
+        }
+      }
+
+      for (const value of Object.values(obj)) {
+        if (value && typeof value === 'object') queue.push(value);
+      }
     }
+
+    return { responses, toolCalls };
   }
 
-  /**
-   * Handle a streaming JSON event — capture send_response tool calls.
-   */
-  private handleStreamEvent(event: Record<string, unknown>, responses: ChannelResponse[]): void {
-    // Look for send_response tool calls (same MCP tool as Claude/Codex)
-    const toolName = (event.name as string) || (event.toolName as string);
-    const isToolUse = event.type === 'tool_use' || event.type === 'toolCall';
-
-    if (isToolUse && toolName === 'mcp__pcp__send_response') {
-      const input =
-        (event.input as Record<string, unknown>) || (event.args as Record<string, unknown>) || {};
-      const channel = (input.channel as ChannelType) || 'telegram';
-      const response: ChannelResponse = {
-        channel,
-        conversationId: (input.conversationId as string) || '',
-        content: (input.content as string) || '',
-        format: input.format as 'text' | 'markdown' | 'code' | 'json' | undefined,
-        replyToMessageId: input.replyToMessageId as string | undefined,
-        metadata: input.metadata as Record<string, unknown> | undefined,
-      };
-      responses.push(response);
-      logger.debug('Captured send_response call from Gemini', { response });
+  private normalizeInput(raw: unknown): unknown {
+    if (typeof raw === 'string') {
+      try {
+        return JSON.parse(raw);
+      } catch {
+        return {};
+      }
     }
+    return raw;
   }
 
   /**
