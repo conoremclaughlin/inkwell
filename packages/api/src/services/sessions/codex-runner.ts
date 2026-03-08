@@ -23,7 +23,7 @@ import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 
-const PROCESS_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+const PROCESS_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 const DIAGNOSTIC_MAX_CHARS = 4000;
 const DIAGNOSTIC_MAX_LINES = 20;
 
