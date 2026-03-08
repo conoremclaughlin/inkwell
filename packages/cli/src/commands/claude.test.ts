@@ -8,10 +8,12 @@ import {
   filterUntrackedLocalBackendSessions,
   filterPcpSessionsForContext,
   filterUntrackedLocalClaudeSessions,
+  buildSessionPickerLabel,
   getClaudeLocalSessionsForProject,
   getKnownClaudeSessionIds,
   getCodexLocalSessionsForProject,
   hasBackendSessionOverride,
+  renderSessionCandidatesTable,
   resolveCapturedBackendSessionIdFromRuntime,
   resolveAdoptableLocalBackendSessionId,
   resolveBackendSessionIdForResume,
@@ -37,18 +39,78 @@ describe('hasBackendSessionOverride', () => {
 
   it('does not treat plain prompt text as resume override', () => {
     expect(hasBackendSessionOverride('codex', [], ['resume this bug'])).toBe(false);
-    expect(hasBackendSessionOverride('codex', [], ['resume'])).toBe(false);
+    expect(hasBackendSessionOverride('codex', [], ['summarize', 'resume'])).toBe(false);
+  });
+
+  it('treats codex resume prompt without explicit session id as override', () => {
+    expect(hasBackendSessionOverride('codex', [], ['resume'])).toBe(true);
   });
 
   it('treats codex resume passthrough args as override', () => {
     expect(hasBackendSessionOverride('codex', ['resume'])).toBe(true);
     expect(hasBackendSessionOverride('codex', ['resume', '--latest'])).toBe(true);
+    expect(hasBackendSessionOverride('codex', ['--full-auto', 'resume', '019c1234'])).toBe(true);
+    expect(hasBackendSessionOverride('codex', ['foo', 'resume'])).toBe(false);
   });
 
   it('still respects flag-based resume overrides', () => {
     expect(hasBackendSessionOverride('codex', ['--resume', 'abc123'])).toBe(true);
     expect(hasBackendSessionOverride('claude', ['--resume', 'abc123'])).toBe(true);
     expect(hasBackendSessionOverride('gemini', ['--session-id', 'abc123'])).toBe(true);
+  });
+
+  it('treats backend resume flags as overrides even without explicit ids', () => {
+    expect(hasBackendSessionOverride('claude', ['--resume'])).toBe(true);
+    expect(hasBackendSessionOverride('claude', ['-r'])).toBe(true);
+    expect(hasBackendSessionOverride('gemini', ['--resume'])).toBe(true);
+    expect(hasBackendSessionOverride('gemini', ['-r'])).toBe(true);
+  });
+});
+
+describe('renderSessionCandidatesTable', () => {
+  it('renders headers and aligned rows with truncation', () => {
+    const lines = renderSessionCandidatesTable([
+      {
+        type: 'new',
+        choice: 'new',
+        updated: '-',
+        phase: '-',
+        thread: '-',
+        link: '-',
+        preview: 'Start new session',
+      },
+      {
+        type: 'pcp',
+        choice: 'pcp:12345678',
+        updated: '3/7/2026, 1:23:45 PM',
+        phase: 'runtime:idle',
+        thread: 'pr:182',
+        link: 'Claude 48650142',
+        preview:
+          'lumen: Resumed ✅ Quick checkpoint: Open PRs #149, #147, #126 and more detail that should be truncated in the table row output.',
+      },
+    ]);
+
+    expect(lines[0]).toContain('TYPE');
+    expect(lines[0]).toContain('CHOICE');
+    expect(lines[0]).toContain('PREVIEW');
+    expect(lines[2]).toContain('new');
+    expect(lines[3]).toContain('pcp:12345678');
+    expect(lines[3].length).toBe(lines[2].length);
+  });
+});
+
+describe('buildSessionPickerLabel', () => {
+  it('renders two lines when preview is present', () => {
+    const label = buildSessionPickerLabel({
+      metaLine: 'PCP        c4ec2f5e   runtime:idle         main         2m ago',
+      preview: 'lumen: latest assistant message preview here',
+    });
+
+    expect(label).toContain('\n');
+    expect(label).toContain('↳');
+    expect(label).toContain('PCP');
+    expect(label).toContain('c4ec2f5e');
   });
 });
 
@@ -703,10 +765,64 @@ describe('resolveCapturedBackendSessionIdFromRuntime', () => {
         cwd: tempRepo,
         backend: 'claude',
         pcpSessionId: 'pcp-session-1',
-        knownLocalSessionIds: new Set([oldSessionId]),
+        knownLocalSessionSnapshot: new Map([[oldSessionId, '2026-03-04T00:00:00.000Z']]),
       });
 
       expect(resolved).toBe(newSessionId);
+    } finally {
+      if (oldHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = oldHome;
+      }
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to modified existing local backend session when no new local id appears', () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'sb-claude-runtime-'));
+    const tempHome = join(tempRoot, 'home');
+    const tempRepo = join(tempRoot, 'repo');
+    mkdirSync(tempHome, { recursive: true });
+    mkdirSync(tempRepo, { recursive: true });
+
+    const projectDirName = tempRepo.replace(/[\\/]/g, '-');
+    const projectKeyDir = join(tempHome, '.claude', 'projects', projectDirName);
+    mkdirSync(projectKeyDir, { recursive: true });
+
+    const oldHome = process.env.HOME;
+    process.env.HOME = tempHome;
+
+    try {
+      const existingSessionId = '33333333-3333-4333-8333-333333333333';
+      const sessionPath = join(projectKeyDir, `${existingSessionId}.jsonl`);
+      writeFileSync(
+        sessionPath,
+        JSON.stringify({
+          type: 'progress',
+          sessionId: existingSessionId,
+          timestamp: '2026-03-04T00:00:00.000Z',
+        }) + '\n'
+      );
+
+      const beforeModified = '2000-01-01T00:00:00.000Z';
+      writeFileSync(
+        sessionPath,
+        JSON.stringify({
+          type: 'progress',
+          sessionId: existingSessionId,
+          timestamp: '2026-03-04T00:02:00.000Z',
+        }) + '\n'
+      );
+
+      const resolved = resolveCapturedBackendSessionIdFromRuntime({
+        cwd: tempRepo,
+        backend: 'claude',
+        pcpSessionId: 'pcp-session-1',
+        knownLocalSessionSnapshot: new Map([[existingSessionId, beforeModified]]),
+      });
+
+      expect(resolved).toBe(existingSessionId);
     } finally {
       if (oldHome === undefined) {
         delete process.env.HOME;

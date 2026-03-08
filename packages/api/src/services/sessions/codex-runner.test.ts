@@ -1,8 +1,35 @@
 import { describe, it, expect, vi, beforeEach, type Mock } from 'vitest';
 import { EventEmitter } from 'events';
 
-vi.mock('child_process', () => ({
-  spawn: vi.fn(),
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('child_process')>();
+  return {
+    ...actual,
+    spawn: vi.fn(),
+    execFile: vi.fn(
+      (
+        file: string,
+        args: string[] | undefined,
+        options: unknown,
+        callback?: (error: Error | null, stdout: string, stderr: string) => void
+      ) => {
+        const cb =
+          typeof options === 'function'
+            ? (options as (error: Error | null, stdout: string, stderr: string) => void)
+            : callback;
+        if (typeof cb !== 'function') return;
+        if (file === 'which' || file === 'zsh') {
+          cb(null, '/usr/bin/codex\n', '');
+          return;
+        }
+        cb(new Error(`mock execFile unsupported for ${file}`), '', '');
+      }
+    ),
+  };
+});
+
+vi.mock('fs/promises', () => ({
+  access: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('./resolve-binary.js', () => ({
