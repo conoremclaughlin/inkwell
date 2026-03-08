@@ -5,6 +5,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { resolveIdentityId } from '../../auth/resolve-identity';
 import { logger } from '../../utils/logger';
+import { EmbeddingRouter } from '../../services/embeddings/router';
 import type {
   Memory,
   MemoryCreateInput,
@@ -22,7 +23,11 @@ import type {
 } from '../models/memory';
 
 export class MemoryRepository {
-  constructor(private supabase: SupabaseClient) {}
+  private embeddingRouter: EmbeddingRouter;
+
+  constructor(private supabase: SupabaseClient) {
+    this.embeddingRouter = new EmbeddingRouter();
+  }
 
   // ==================== MEMORIES ====================
 
@@ -64,7 +69,11 @@ export class MemoryRepository {
       throw new Error(`Failed to create memory: ${error.message}`);
     }
 
-    return this.rowToMemory(data);
+    const memory = this.rowToMemory(data);
+
+    await this.tryEmbedMemory(memory, input);
+
+    return memory;
   }
 
   /**
@@ -75,6 +84,16 @@ export class MemoryRepository {
     query?: string,
     options: MemorySearchOptions = {}
   ): Promise<Memory[]> {
+    const limit = options.limit || 20;
+    const offset = options.offset || 0;
+
+    if (query) {
+      const semanticResults = await this.trySemanticRecall(userId, query, options, limit, offset);
+      if (semanticResults && semanticResults.length > 0) {
+        return semanticResults;
+      }
+    }
+
     let queryBuilder = this.supabase
       .from('memories')
       .select('*')
@@ -119,8 +138,6 @@ export class MemoryRepository {
     }
 
     // Pagination
-    const limit = options.limit || 20;
-    const offset = options.offset || 0;
     queryBuilder = queryBuilder.range(offset, offset + limit - 1);
 
     const { data, error } = await queryBuilder;
@@ -131,6 +148,92 @@ export class MemoryRepository {
     }
 
     return (data || []).map(this.rowToMemory);
+  }
+
+  private async trySemanticRecall(
+    userId: string,
+    query: string,
+    options: MemorySearchOptions,
+    limit: number,
+    offset: number
+  ): Promise<Memory[] | null> {
+    const queryEmbedding = await this.embeddingRouter.embedQuery(query);
+    if (!queryEmbedding) return null;
+
+    const config = this.embeddingRouter.getRuntimeConfig();
+    const matchCount = Math.max(
+      limit,
+      (offset + limit) * Math.max(1, config.matchCountMultiplier || 1)
+    );
+
+    const { data, error } = await (this.supabase as any).rpc('match_memories', {
+      query_embedding: queryEmbedding.vector,
+      match_threshold: config.queryThreshold,
+      match_count: matchCount,
+      p_user_id: userId,
+      p_source: options.source ?? null,
+      p_salience: options.salience ?? null,
+      p_topics: options.topics && options.topics.length > 0 ? options.topics : null,
+      p_agent_id: options.agentId ?? null,
+      p_include_shared: options.includeShared !== false,
+      p_include_expired: options.includeExpired === true,
+    });
+
+    if (error) {
+      logger.warn('Semantic memory recall failed, falling back to text recall', {
+        error: error.message,
+      });
+      return null;
+    }
+
+    const rows = (data || []) as MemoryRow[];
+    const pagedRows = rows.slice(offset, offset + limit);
+    return pagedRows.map(this.rowToMemory);
+  }
+
+  private async tryEmbedMemory(memory: Memory, input: MemoryCreateInput): Promise<void> {
+    if (!this.embeddingRouter.isEnabled()) return;
+
+    const sourceText = [input.summary, input.content].filter(Boolean).join('\n\n').trim();
+    if (!sourceText) return;
+
+    const embedding = await this.embeddingRouter.embedDocument(sourceText);
+    if (!embedding) return;
+
+    const { error } = await this.supabase
+      .from('memories')
+      .update({
+        embedding: embedding.vector,
+        metadata: {
+          ...(memory.metadata || {}),
+          embedding: {
+            provider: embedding.provider,
+            model: embedding.model,
+            dimensions: embedding.dimensions,
+            updatedAt: new Date().toISOString(),
+          },
+        },
+      })
+      .eq('id', memory.id)
+      .eq('user_id', memory.userId);
+
+    if (error) {
+      logger.warn('Failed to persist memory embedding', {
+        memoryId: memory.id,
+        error: error.message,
+      });
+      return;
+    }
+
+    memory.embedding = embedding.vector;
+    memory.metadata = {
+      ...(memory.metadata || {}),
+      embedding: {
+        provider: embedding.provider,
+        model: embedding.model,
+        dimensions: embedding.dimensions,
+      },
+    };
   }
 
   /**
