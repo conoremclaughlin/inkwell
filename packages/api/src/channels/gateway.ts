@@ -698,7 +698,12 @@ export class ChannelGateway extends EventEmitter {
           const mediaResult = await this.sendMediaAttachments('telegram', conversationId, media, {
             replyToMessageId,
           });
-          // Log media metadata to activity stream
+          if (mediaResult.failed > 0 && mediaResult.sent === 0) {
+            throw new Error(
+              `All media attachments failed to send: ${mediaResult.errors.join('; ')}`
+            );
+          }
+          // Log media metadata to activity stream (only if at least one sent)
           await this.logOutgoingTelegram(
             conversationId,
             content
@@ -706,11 +711,7 @@ export class ChannelGateway extends EventEmitter {
               : `[${media.length} media attachment(s)]`,
             media
           );
-          if (mediaResult.failed > 0 && mediaResult.sent === 0) {
-            throw new Error(
-              `All media attachments failed to send: ${mediaResult.errors.join('; ')}`
-            );
-          } else if (mediaResult.failed > 0) {
+          if (mediaResult.failed > 0) {
             logger.warn(
               `${mediaResult.failed}/${media.length} media attachments failed on telegram`,
               { errors: mediaResult.errors }
