@@ -15,6 +15,12 @@ import {
 import { isAbsolute, join } from 'path';
 import { readIdentityJson, resolveAgentId } from '../backends/identity.js';
 import { PcpClient } from '../lib/pcp-client.js';
+import { initSbDebug, sbDebugLog } from '../lib/sb-debug.js';
+import {
+  getBackendAuthStatus,
+  runBackendInteractiveLogin,
+  type BackendAuthBackend,
+} from '../lib/backend-auth.js';
 import { runBackendTurn } from '../repl/backend-runner.js';
 import { ContextLedger, estimateTokens } from '../repl/context-ledger.js';
 import { parseSlashCommand } from '../repl/slash.js';
@@ -72,8 +78,10 @@ type ChatOptions = {
   profile?: string;
   message?: string;
   nonInteractive?: boolean;
+  backendTimeoutSeconds?: string;
   tailTranscript?: string;
   sbStrictTools?: boolean;
+  sbDebug?: boolean;
   verbose?: boolean;
   fullscreen?: boolean;
 };
@@ -115,6 +123,7 @@ interface ChatRuntime {
   activeSkills: SkillInstruction[];
   bootstrapContext?: string;
   strictTools: boolean;
+  backendTurnTimeoutMs?: number;
 }
 
 interface SessionSummary {
@@ -142,6 +151,90 @@ interface ActivitySummary {
   agentId?: string;
   sessionId?: string;
   createdAt?: string;
+}
+
+function isBackendAuthBackend(value: string): value is BackendAuthBackend {
+  return value === 'claude' || value === 'codex' || value === 'gemini';
+}
+
+async function ensureBackendAuthReady(
+  backend: string,
+  mode: { nonInteractive: boolean; hasMessage: boolean; verbose: boolean }
+): Promise<void> {
+  if (process.env.SB_SKIP_BACKEND_AUTH_CHECK === '1' || process.env.VITEST) {
+    return;
+  }
+  if (!isBackendAuthBackend(backend)) return;
+
+  const status = await getBackendAuthStatus(backend);
+  sbDebugLog('chat', 'backend_auth_status', {
+    backend,
+    authenticated: status.authenticated,
+    detail: status.detail,
+    canInteractiveLogin: status.canInteractiveLogin,
+    loginCommand: status.loginCommand || null,
+    mode,
+  });
+  if (status.authenticated) {
+    if (mode.verbose) {
+      console.log(chalk.dim(`Backend auth: ${backend} (${status.detail})`));
+    }
+    return;
+  }
+
+  const guidance = `Backend ${backend} is not authenticated (${status.detail}).`;
+  const loginHint =
+    status.loginCommand ||
+    (backend === 'gemini' ? 'Start `gemini` once and complete login in the Gemini CLI' : null);
+
+  if (mode.nonInteractive || mode.hasMessage) {
+    sbDebugLog('chat', 'backend_auth_required_non_interactive', {
+      backend,
+      detail: status.detail,
+      loginCommand: loginHint || null,
+      mode,
+    });
+    throw new Error(
+      `${guidance}${loginHint ? `\nRun: ${loginHint}` : '\nAuthenticate backend CLI and retry.'}`
+    );
+  }
+
+  console.log(chalk.yellow(`⚠ ${guidance}`));
+  if (!status.canInteractiveLogin || !status.loginCommand) {
+    if (loginHint) console.log(chalk.dim(`  Run: ${loginHint}`));
+    return;
+  }
+  if (!input.isTTY || !output.isTTY) {
+    console.log(chalk.dim(`  Run: ${status.loginCommand}`));
+    return;
+  }
+
+  const prompt = createInterface({ input, output });
+  try {
+    const answer = (
+      await prompt.question(chalk.cyan(`Run ${status.loginCommand} now? [Y/n] `))
+    ).trim();
+    if (answer && !['y', 'yes'].includes(answer.toLowerCase())) {
+      console.log(chalk.dim(`  Skipping login. Run manually: ${status.loginCommand}`));
+      return;
+    }
+  } finally {
+    prompt.close();
+  }
+
+  const exitCode = await runBackendInteractiveLogin(backend);
+  if (exitCode !== 0) {
+    throw new Error(
+      `Backend ${backend} login exited with code ${exitCode}. Run \`${status.loginCommand}\` and retry.`
+    );
+  }
+  const recheck = await getBackendAuthStatus(backend);
+  if (!recheck.authenticated) {
+    throw new Error(
+      `Backend ${backend} still appears unauthenticated (${recheck.detail}). Run \`${status.loginCommand}\` and retry.`
+    );
+  }
+  console.log(chalk.green(`✓ Backend ${backend} authenticated (${recheck.detail})`));
 }
 
 type BackendToolGateSnapshot = {
@@ -182,15 +275,29 @@ function buildBackendToolPassthrough(
     if (toolRouting === 'local' && strictTools) {
       return {
         passthroughArgs: [
+          // Keep Codex execution deterministic in one-shot mode.
+          // NOTE: for Codex `exec`, these are subcommand options and therefore
+          // must be placed after `exec` (adapter handles ordering).
+          '--color',
+          'never',
           '--sandbox',
           'read-only',
-          '--ask-for-approval',
-          'never',
+          '--skip-git-repo-check',
+          '--config',
+          'features.apps=false',
+          '--config',
+          'mcp_servers.pcp.enabled=false',
+          '--config',
+          'mcp_servers.next-devtools.enabled=false',
+          '--config',
+          'mcp_servers.github.enabled=false',
+          '--config',
+          'mcp_servers.supabase.enabled=false',
           '--config',
           'mcp_servers={}',
         ],
         warning:
-          'Codex strict-tools mode enabled: forcing read-only sandbox, no approval prompts, and disabling backend MCP servers.',
+          'Codex strict-tools mode enabled: forcing read-only sandbox, no color UI, and disabling known backend MCP servers.',
       };
     }
     if (shouldDisableBackendTools || gate.mode === 'backend') {
@@ -1665,6 +1772,16 @@ function buildPromptEnvelope(
 }
 
 export async function runChat(options: ChatOptions): Promise<void> {
+  const debugFile = initSbDebug({
+    enabled: options.sbDebug,
+    context: {
+      command: 'chat',
+      argv: process.argv.slice(2),
+      backend: options.backend,
+      agent: options.agent,
+    },
+  });
+
   if (options.tailTranscript) {
     await tailTranscript(options.tailTranscript);
     return;
@@ -1685,6 +1802,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
     options.maxContextTokens || String(initialBackendTokenWindow),
     10
   );
+  const parsedBackendTimeoutSeconds =
+    options.backendTimeoutSeconds !== undefined
+      ? Number.parseInt(options.backendTimeoutSeconds, 10)
+      : Number.NaN;
+  const backendTurnTimeoutMs =
+    Number.isFinite(parsedBackendTimeoutSeconds) && parsedBackendTimeoutSeconds > 0
+      ? parsedBackendTimeoutSeconds * 1000
+      : options.nonInteractive
+        ? 120_000
+        : undefined;
 
   const runtime: ChatRuntime = {
     backend: initialBackend,
@@ -1711,7 +1838,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
     transcriptPath: ensureRuntimeTranscriptPath(),
     activeSkills: [],
     strictTools: options.sbStrictTools ?? false,
+    backendTurnTimeoutMs,
   };
+  await ensureBackendAuthReady(runtime.backend, {
+    nonInteractive: Boolean(options.nonInteractive),
+    hasMessage: Boolean(options.message?.trim()),
+    verbose: runtime.verbose,
+  });
   const approvalManager = new ApprovalRequestManager();
   const policyPathFromEnv = process.env.PCP_TOOL_POLICY_PATH?.trim();
   const toolPolicy = new ToolPolicyState(
@@ -2486,6 +2619,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (passthroughPlan.warning && runtime.verbose) {
       printLine(chalk.yellow(passthroughPlan.warning));
     }
+    sbDebugLog(
+      'chat',
+      'backend_turn_start',
+      {
+        backend: runtime.backend,
+        sessionId: runtime.sessionId || null,
+        toolRouting: runtime.toolRouting,
+        toolMode: backendGate.mode,
+        passthroughArgs,
+        timeoutMs: runtime.backendTurnTimeoutMs ?? null,
+      },
+      debugFile ? { force: true, file: debugFile } : undefined
+    );
 
     // Ink handles waiting via its own component; legacy uses animated indicator
     const stopWaiting = inkRepl
@@ -2529,11 +2675,26 @@ export async function runChat(options: ChatOptions): Promise<void> {
       prompt,
       verbose: runtime.verbose,
       passthroughArgs,
+      timeoutMs: runtime.backendTurnTimeoutMs,
     }).finally(() => {
       process.off('SIGINT', onSigintDuringTurn);
       turnDurationSeconds = Math.max(0, Math.round((Date.now() - turnStartedAt) / 1000));
       stopWaiting();
     });
+    sbDebugLog(
+      'chat',
+      'backend_turn_result',
+      {
+        backend: runtime.backend,
+        sessionId: runtime.sessionId || null,
+        success: runResult.success,
+        exitCode: runResult.exitCode,
+        durationMs: runResult.durationMs,
+        command: runResult.command,
+        stderrPreview: runResult.stderr.slice(0, 500),
+      },
+      debugFile ? { force: true, file: debugFile } : undefined
+    );
 
     // Log backend CLI turn completion to activity stream
     if (runtime.sessionId) {
@@ -4247,6 +4408,11 @@ export function registerChatCommand(program: Command): void {
       .option('--auto-run', 'Automatically execute backend turns for new inbox task messages')
       .option('--message <text>', 'Single-turn message for non-interactive mode')
       .option('--non-interactive', 'Run one turn and exit (requires --message)')
+      .option(
+        '--backend-timeout-seconds <n>',
+        'Backend turn timeout in seconds (default: 120 for --non-interactive, otherwise 1200)'
+      )
+      .option('--sb-debug', 'Enable sb debug logging for chat runtime')
       .option(
         '--sb-strict-tools',
         'Harden backend-native tooling (Codex: disable MCP servers + force read-only sandbox in local routing)'

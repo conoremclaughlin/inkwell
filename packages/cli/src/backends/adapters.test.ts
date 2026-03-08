@@ -67,6 +67,30 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
+  it('places codex passthrough args after exec subcommand', () => {
+    const adapter = new CodexAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'lumen',
+      model: undefined,
+      promptParts: ['exec', 'do work'],
+      passthroughArgs: ['--sandbox', 'read-only', '--skip-git-repo-check'],
+    });
+
+    try {
+      const execIndex = prepared.args.indexOf('exec');
+      expect(execIndex).toBeGreaterThanOrEqual(0);
+      expect(prepared.args.slice(execIndex, execIndex + 5)).toEqual([
+        'exec',
+        '--sandbox',
+        'read-only',
+        '--skip-git-repo-check',
+        'do work',
+      ]);
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
   it('injects startup context into codex model instructions file when provided', () => {
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({

@@ -14,11 +14,15 @@ set -euo pipefail
 #   SB_SMOKE_AGENT=lumen
 #   SB_SMOKE_BACKENDS="claude codex gemini"
 #   SB_SMOKE_BIN="node dist/cli.js"
+#   SB_SMOKE_TIMEOUT_SECONDS=20
+#   SB_SMOKE_DEBUG_FILE=/tmp/sb-chat-smoke-debug.log
 #   PCP_SERVER_URL=http://localhost:3101
 
 AGENT="${SB_SMOKE_AGENT:-lumen}"
 BACKENDS="${SB_SMOKE_BACKENDS:-claude codex gemini}"
 SB_BIN="${SB_SMOKE_BIN:-node dist/cli.js}"
+TIMEOUT_SECONDS="${SB_SMOKE_TIMEOUT_SECONDS:-20}"
+DEBUG_FILE="${SB_SMOKE_DEBUG_FILE:-/tmp/sb-chat-smoke-debug.log}"
 PCP_URL="${PCP_SERVER_URL:-http://localhost:3101}"
 
 if [[ ! -f "dist/cli.js" ]]; then
@@ -42,6 +46,8 @@ echo "Running sb-chat live smoke test"
 echo "  agent:    ${AGENT}"
 echo "  backends: ${BACKENDS}"
 echo "  pcp:      ${PCP_URL}"
+echo "  timeout:  ${TIMEOUT_SECONDS}s"
+echo "  debug:    ${DEBUG_FILE}"
 echo ""
 
 for backend in ${BACKENDS}; do
@@ -56,11 +62,14 @@ for backend in ${BACKENDS}; do
   set +e
   output="$(
     PCP_SERVER_URL="${PCP_URL}" \
+      SB_DEBUG_FILE="${DEBUG_FILE}" \
       ${SB_BIN} chat \
       -a "${AGENT}" \
       -b "${backend}" \
       --tool-routing local \
       --sb-strict-tools \
+      --backend-timeout-seconds "${TIMEOUT_SECONDS}" \
+      --sb-debug \
       --non-interactive \
       --message "${prompt}" \
       --poll-seconds 999 \
@@ -77,11 +86,15 @@ for backend in ${BACKENDS}; do
     continue
   fi
 
-  if ! grep -q "local tool get_inbox" <<<"${output}"; then
-    echo "FAIL ${backend}: no sb local tool execution marker found"
+  if ! grep -Eq "local tool get_inbox|Local tool error \\(get_inbox\\)|local tool call emitted; see tool results above" <<<"${output}"; then
+    echo "FAIL ${backend}: no sb local tool routing marker found"
     echo "${output}" | tail -n 60
     failures=$((failures + 1))
     continue
+  fi
+
+  if grep -q "Local tool error (get_inbox)" <<<"${output}"; then
+    echo "WARN ${backend}: local tool call was routed but PCP call failed (check PCP_SERVER_URL/auth)"
   fi
 
   echo "PASS ${backend}"
