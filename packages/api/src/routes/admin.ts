@@ -3322,7 +3322,7 @@ router.patch('/artifacts/:id/permissions', async (req: Request, res: Response) =
         ? normalizeArtifactEditors(requestedEditorsRaw)
         : current.collaborators || [];
 
-    const nextEditors = normalizedMode === 'workspace' ? [] : normalizedEditors;
+    const nextEditors = normalizedEditors;
     if (normalizedMode === 'editors' && nextEditors.length === 0) {
       res.status(400).json({ error: 'editMode "editors" requires at least one editor' });
       return;
@@ -3387,23 +3387,26 @@ router.patch('/artifacts/permissions', async (req: Request, res: Response) => {
           ? body.collaborators
           : undefined;
     const normalizedEditors = normalizeArtifactEditors(requestedEditorsRaw);
-    const nextEditors = editMode === 'workspace' ? [] : normalizedEditors;
-
-    if (editMode === 'editors' && nextEditors.length === 0) {
-      res.status(400).json({ error: 'editMode "editors" requires at least one editor' });
-      return;
-    }
 
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
     const authReq = req as AdminAuthRequest;
 
+    const updates: { edit_mode: ArtifactEditMode; collaborators?: string[]; updated_at: string } = {
+      edit_mode: editMode,
+      updated_at: new Date().toISOString(),
+    };
+
+    if (editMode === 'editors') {
+      if (normalizedEditors.length === 0) {
+        res.status(400).json({ error: 'editMode "editors" requires at least one editor' });
+        return;
+      }
+      updates.collaborators = normalizedEditors;
+    }
+
     const { data: updatedRows, error } = await supabase
       .from('artifacts')
-      .update({
-        edit_mode: editMode,
-        collaborators: nextEditors,
-        updated_at: new Date().toISOString(),
-      })
+      .update(updates)
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
       .select('id');
@@ -3418,7 +3421,7 @@ router.patch('/artifacts/permissions', async (req: Request, res: Response) => {
       success: true,
       updatedCount: updatedRows?.length || 0,
       editMode,
-      editors: nextEditors,
+      editors: editMode === 'editors' ? normalizedEditors : undefined,
     });
   } catch (error) {
     logger.error('Failed to bulk update artifact permissions:', error);

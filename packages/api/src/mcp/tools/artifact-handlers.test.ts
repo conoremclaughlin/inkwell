@@ -488,7 +488,40 @@ describe('handleUpdateArtifact', () => {
           },
           dataComposer
         )
-      ).rejects.toThrow('editMode "editors" requires at least one editor agent ID');
+      ).rejects.toThrow('editMode "editors" requires at least one editor');
+    });
+
+    it('preserves existing editor list when switching to workspace mode', async () => {
+      const { supabase, updatedArtifact } = createMockSupabase({
+        artifact: {
+          id: 'artifact-1',
+          uri: 'pcp://test/doc',
+          title: 'Test Doc',
+          content: 'Original content',
+          version: 3,
+          metadata: {},
+          edit_mode: 'editors',
+          collaborators: ['identity-wren', 'identity-lumen'],
+          created_by_identity_id: null,
+          created_at: '2026-01-01',
+          updated_at: '2026-01-01',
+        },
+      });
+      const dataComposer = createMockDataComposer(supabase);
+
+      const result = await handleUpdateArtifact(
+        {
+          userId: '00000000-0000-0000-0000-000000000001',
+          uri: 'pcp://test/doc',
+          editMode: 'workspace',
+          agentId: 'identity-wren',
+        },
+        dataComposer
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(true);
+      expect(updatedArtifact.collaborators).toEqual(['identity-wren', 'identity-lumen']);
     });
 
     it('should not trigger merge for metadata-only updates even with baseVersion', async () => {
@@ -791,7 +824,7 @@ describe('artifact comment + identity UUID flows', () => {
         },
         createMockDataComposer(supabase)
       )
-    ).rejects.toThrow('editMode "editors" requires at least one editor agent ID');
+    ).rejects.toThrow('editMode "editors" requires at least one editor');
   });
 
   it('handleCreateArtifact keeps slug behavior when identity row is missing', async () => {

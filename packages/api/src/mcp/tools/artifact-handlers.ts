@@ -41,8 +41,8 @@ const createArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
     .optional()
     .default('workspace')
     .describe('Edit permission mode: workspace (all workspace agents) or editors list only'),
-  editors: z.array(z.string()).optional().describe('Editor agent IDs when editMode is editors'),
-  collaborators: z.array(z.string()).optional().describe('Agent IDs who can edit'),
+  editors: z.array(z.string()).optional().describe('Editor IDs when editMode is editors'),
+  collaborators: z.array(z.string()).optional().describe('Backward-compatible alias for editors'),
   visibility: z
     .enum(['private', 'shared', 'public'])
     .optional()
@@ -83,8 +83,8 @@ const updateArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
     ),
   agentId: z.string().optional().describe('Agent making the update'),
   editMode: z.enum(['workspace', 'editors']).optional().describe('Updated edit permission mode'),
-  editors: z.array(z.string()).optional().describe('Updated editor agent IDs'),
-  collaborators: z.array(z.string()).optional().describe('Updated collaborator list'),
+  editors: z.array(z.string()).optional().describe('Updated editor IDs'),
+  collaborators: z.array(z.string()).optional().describe('Backward-compatible alias for editors'),
   tags: z.array(z.string()).optional().describe('Updated tags'),
   changeSummary: z.string().optional().describe('Summary of changes'),
 });
@@ -298,9 +298,9 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
   } = parsed;
   const normalizedEditors = normalizeEditorAgentIds(editors ?? collaborators);
   if (editMode === 'editors' && normalizedEditors.length === 0) {
-    throw new Error('editMode "editors" requires at least one editor agent ID');
+    throw new Error('editMode "editors" requires at least one editor');
   }
-  const effectiveEditors = editMode === 'editors' ? normalizedEditors : [];
+  const effectiveEditors = normalizedEditors;
   const agentId = getEffectiveAgentId(parsed.agentId);
   const workspaceResolution = await resolveWorkspaceScopeForWrite({
     rawArgs,
@@ -636,8 +636,12 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
   if (agentId) {
     const currentEditMode = normalizeEditMode(current.edit_mode);
     const currentEditors = current.collaborators || [];
+    const editorIdentityId = editorIdentity?.id || null;
     const isCreator = editorIdentity && current.created_by_identity_id === editorIdentity.id;
-    const hasEditorAccess = currentEditMode === 'workspace' || currentEditors.includes(agentId);
+    const hasEditorAccess =
+      currentEditMode === 'workspace' ||
+      (!!editorIdentityId && currentEditors.includes(editorIdentityId)) ||
+      currentEditors.includes(agentId);
 
     if (!isCreator && !hasEditorAccess) {
       throw new Error(`Agent ${agentId} does not have permission to edit this artifact`);
@@ -760,12 +764,8 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
       ? requestedEditors
       : current.collaborators || [];
 
-  if (nextEditMode === 'workspace') {
-    nextEditors = [];
-  }
-
   if (nextEditMode === 'editors' && nextEditors.length === 0) {
-    throw new Error('editMode "editors" requires at least one editor agent ID');
+    throw new Error('editMode "editors" requires at least one editor');
   }
 
   if (title !== undefined) updates.title = title;

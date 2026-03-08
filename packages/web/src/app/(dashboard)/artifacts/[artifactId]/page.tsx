@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { Card, CardContent } from '@/components/ui/card';
@@ -23,6 +23,10 @@ import { apiPatch, useApiPost, useApiQuery, useQueryClient } from '@/lib/api';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import clsx from 'clsx';
+import {
+  ObjectPermissionsEditor,
+  type PermissionIdentityOption,
+} from '@/components/permissions/object-permissions-editor';
 
 interface Artifact {
   id: string;
@@ -79,6 +83,16 @@ interface ArtifactComment {
 interface ArtifactCommentsResponse {
   artifactId: string;
   comments: ArtifactComment[];
+}
+
+interface IndividualIdentity {
+  id: string;
+  agentId: string;
+  name: string;
+}
+
+interface IndividualsResponse {
+  individuals: IndividualIdentity[];
 }
 
 const typeConfig = {
@@ -138,7 +152,7 @@ export default function ArtifactDetailPage() {
   const [permissionEditMode, setPermissionEditMode] = useState<'workspace' | 'editors'>(
     'workspace'
   );
-  const [permissionEditorsInput, setPermissionEditorsInput] = useState('');
+  const [permissionEditorIdentityIds, setPermissionEditorIdentityIds] = useState<string[]>([]);
   const [isSavingPermissions, setIsSavingPermissions] = useState(false);
   const [permissionError, setPermissionError] = useState<string | null>(null);
   const [permissionSuccess, setPermissionSuccess] = useState<string | null>(null);
@@ -159,6 +173,10 @@ export default function ArtifactDetailPage() {
     ['artifact-comments', artifactId],
     `/api/admin/artifacts/${artifactId}/comments`
   );
+  const { data: identitiesData } = useApiQuery<IndividualsResponse>(
+    ['individual-identities'],
+    '/api/admin/individuals'
+  );
 
   const addCommentMutation = useApiPost<
     { comment: ArtifactComment },
@@ -175,12 +193,43 @@ export default function ArtifactDetailPage() {
 
   const artifact = artifactData?.artifact ?? null;
   const comments = commentsData?.comments ?? [];
+  const identityOptions: PermissionIdentityOption[] = useMemo(
+    () =>
+      identitiesData?.individuals.map((identity) => ({
+        id: identity.id,
+        name: identity.name,
+      })) ?? [],
+    [identitiesData?.individuals]
+  );
+  const identityNameById = useMemo(
+    () => new Map(identityOptions.map((identity) => [identity.id, identity.name] as const)),
+    [identityOptions]
+  );
+  const identityIdByAgentId = useMemo(
+    () =>
+      new Map(
+        (identitiesData?.individuals ?? []).map(
+          (identity) => [identity.agentId, identity.id] as const
+        )
+      ),
+    [identitiesData?.individuals]
+  );
 
   useEffect(() => {
     if (!artifact) return;
+    const normalizedEditorIds = Array.from(
+      new Set(
+        (artifact.editors || [])
+          .map((value) => value.trim())
+          .filter((value) => value.length > 0)
+          .map((value) =>
+            identityNameById.get(value) ? value : identityIdByAgentId.get(value) || value
+          )
+      )
+    );
     setPermissionEditMode(artifact.editMode || 'workspace');
-    setPermissionEditorsInput((artifact.editors || []).join(', '));
-  }, [artifact]);
+    setPermissionEditorIdentityIds(normalizedEditorIds);
+  }, [artifact, identityNameById, identityIdByAgentId]);
 
   if (isLoading) {
     return (
@@ -229,29 +278,16 @@ export default function ArtifactDetailPage() {
     });
   };
 
-  const parseEditors = (raw: string): string[] =>
-    Array.from(
-      new Set(
-        raw
-          .split(',')
-          .map((item) => item.trim())
-          .filter((item) => item.length > 0)
-      )
-    );
-
   const handleSavePermissions = async () => {
     setPermissionError(null);
     setPermissionSuccess(null);
     setIsSavingPermissions(true);
 
     try {
-      const editors = parseEditors(permissionEditorsInput);
-      const payload =
-        permissionEditMode === 'editors'
-          ? { editMode: permissionEditMode, editors }
-          : { editMode: permissionEditMode };
-
-      await apiPatch(`/api/admin/artifacts/${artifactId}/permissions`, payload);
+      await apiPatch(`/api/admin/artifacts/${artifactId}/permissions`, {
+        editMode: permissionEditMode,
+        editors: permissionEditorIdentityIds,
+      });
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['artifacts', artifactId] }),
         queryClient.invalidateQueries({ queryKey: ['artifacts'] }),
@@ -322,48 +358,21 @@ export default function ArtifactDetailPage() {
 
       <Card className="mt-6">
         <CardContent className="p-6 space-y-4">
-          <div>
-            <h2 className="text-lg font-semibold text-gray-900">Edit permissions</h2>
-            <p className="text-sm text-gray-500">
-              Control who can update this document via MCP or dashboard actions.
-            </p>
-          </div>
-
-          <div className="grid gap-3 md:grid-cols-[220px_1fr_auto] md:items-end">
-            <div>
-              <label className="mb-1 block text-sm font-medium text-gray-700">Edit mode</label>
-              <select
-                value={permissionEditMode}
-                onChange={(event) =>
-                  setPermissionEditMode(event.target.value as 'workspace' | 'editors')
-                }
-                className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-              >
-                <option value="workspace">Workspace editors</option>
-                <option value="editors">Specific editor list</option>
-              </select>
-            </div>
-
-            <div>
-              <label className="mb-1 block text-sm font-medium text-gray-700">
-                Editors (comma-separated)
-              </label>
-              <input
-                value={permissionEditorsInput}
-                onChange={(event) => setPermissionEditorsInput(event.target.value)}
-                disabled={permissionEditMode !== 'editors'}
-                placeholder="wren, lumen, myra"
-                className="h-10 w-full rounded-md border border-gray-300 px-3 text-sm focus:border-gray-400 focus:outline-none disabled:bg-gray-100 disabled:text-gray-400"
-              />
-            </div>
-
-            <Button onClick={handleSavePermissions} disabled={isSavingPermissions}>
-              {isSavingPermissions ? 'Saving…' : 'Save'}
-            </Button>
-          </div>
-
-          {permissionError && <p className="text-sm text-red-700">{permissionError}</p>}
-          {permissionSuccess && <p className="text-sm text-green-700">{permissionSuccess}</p>}
+          <ObjectPermissionsEditor
+            title="Edit permissions"
+            description="Control who can update this document. “Anyone” mode keeps stored editor selections so you can switch back safely."
+            mode={permissionEditMode}
+            onModeChange={setPermissionEditMode}
+            editorIdentityIds={permissionEditorIdentityIds}
+            onEditorIdentityIdsChange={setPermissionEditorIdentityIds}
+            identities={identityOptions}
+            actionLabel="Save"
+            pendingActionLabel="Saving…"
+            onAction={handleSavePermissions}
+            isActionPending={isSavingPermissions}
+            error={permissionError}
+            success={permissionSuccess}
+          />
         </CardContent>
       </Card>
 
@@ -452,7 +461,18 @@ export default function ArtifactDetailPage() {
             {artifact.editMode === 'workspace' ? 'workspace editors' : 'specific editor list'}
           </span>
           {artifact.editMode === 'editors' && artifact.editors && artifact.editors.length > 0 && (
-            <span>Editors: {artifact.editors.join(', ')}</span>
+            <span>
+              Editors:{' '}
+              {artifact.editors
+                .map((identityId) => {
+                  const identityName = identityNameById.get(identityId);
+                  if (identityName) return identityName;
+                  const remappedId = identityIdByAgentId.get(identityId);
+                  const remappedIdentityName = remappedId ? identityNameById.get(remappedId) : null;
+                  return remappedIdentityName || identityId;
+                })
+                .join(', ')}
+            </span>
           )}
         </div>
         <div className="flex items-center gap-4">

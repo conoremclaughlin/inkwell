@@ -1,10 +1,8 @@
 'use client';
 
 import Link from 'next/link';
-import { useState } from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
 import {
   FileText,
   BookOpen,
@@ -16,7 +14,7 @@ import {
   Lock,
   History,
 } from 'lucide-react';
-import { apiPatch, useApiQuery, useQueryClient } from '@/lib/api';
+import { useApiQuery } from '@/lib/api';
 import clsx from 'clsx';
 
 interface Artifact {
@@ -100,55 +98,12 @@ function formatRelativeTime(date: string): string {
 }
 
 export default function ArtifactsPage() {
-  const queryClient = useQueryClient();
-  const [bulkEditMode, setBulkEditMode] = useState<'workspace' | 'editors'>('workspace');
-  const [bulkEditorsInput, setBulkEditorsInput] = useState('');
-  const [isBulkUpdating, setIsBulkUpdating] = useState(false);
-  const [bulkError, setBulkError] = useState<string | null>(null);
-  const [bulkSuccess, setBulkSuccess] = useState<string | null>(null);
-
   const { data, isLoading, error } = useApiQuery<ArtifactsResponse>(
     ['artifacts'],
     '/api/admin/artifacts'
   );
 
   const artifacts = data?.artifacts ?? [];
-
-  const parseEditorInput = (raw: string): string[] =>
-    Array.from(
-      new Set(
-        raw
-          .split(',')
-          .map((item) => item.trim())
-          .filter((item) => item.length > 0)
-      )
-    );
-
-  const handleBulkPermissionUpdate = async () => {
-    setBulkError(null);
-    setBulkSuccess(null);
-    setIsBulkUpdating(true);
-
-    try {
-      const editors = parseEditorInput(bulkEditorsInput);
-      const payload =
-        bulkEditMode === 'editors'
-          ? { editMode: bulkEditMode, editors }
-          : { editMode: bulkEditMode };
-
-      const response = await apiPatch<{ updatedCount: number }>(
-        '/api/admin/artifacts/permissions',
-        payload
-      );
-      setBulkSuccess(`Updated ${response.updatedCount} document permissions.`);
-      await queryClient.invalidateQueries({ queryKey: ['artifacts'] });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to update permissions';
-      setBulkError(message);
-    } finally {
-      setIsBulkUpdating(false);
-    }
-  };
 
   // Stats by type
   const stats = {
@@ -172,50 +127,6 @@ export default function ArtifactsPage() {
       </div>
 
       {error && <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">{error.message}</div>}
-
-      <Card className="mt-6">
-        <CardHeader>
-          <CardTitle>Document edit permissions</CardTitle>
-          <CardDescription>
-            Apply a workspace-wide edit policy to all current documents.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="grid gap-3 md:grid-cols-[220px_1fr_auto] md:items-end">
-            <div>
-              <label className="mb-1 block text-sm font-medium text-gray-700">Edit mode</label>
-              <select
-                value={bulkEditMode}
-                onChange={(event) => setBulkEditMode(event.target.value as 'workspace' | 'editors')}
-                className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-              >
-                <option value="workspace">Workspace editors (recommended)</option>
-                <option value="editors">Specific editor list</option>
-              </select>
-            </div>
-
-            <div>
-              <label className="mb-1 block text-sm font-medium text-gray-700">
-                Editors (comma-separated)
-              </label>
-              <input
-                value={bulkEditorsInput}
-                onChange={(event) => setBulkEditorsInput(event.target.value)}
-                disabled={bulkEditMode !== 'editors'}
-                placeholder="wren, lumen, myra"
-                className="h-10 w-full rounded-md border border-gray-300 px-3 text-sm focus:border-gray-400 focus:outline-none disabled:bg-gray-100 disabled:text-gray-400"
-              />
-            </div>
-
-            <Button onClick={handleBulkPermissionUpdate} disabled={isBulkUpdating}>
-              {isBulkUpdating ? 'Applying…' : 'Apply to all'}
-            </Button>
-          </div>
-
-          {bulkError && <p className="text-sm text-red-700">{bulkError}</p>}
-          {bulkSuccess && <p className="text-sm text-green-700">{bulkSuccess}</p>}
-        </CardContent>
-      </Card>
 
       {/* Stats */}
       <div className="grid grid-cols-6 gap-4 mt-6">

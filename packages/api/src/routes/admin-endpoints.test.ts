@@ -761,6 +761,36 @@ describe('admin endpoint handlers (no-500 regression)', () => {
       expect((res._json as any).success).toBe(true);
       expect((res._json as any).artifact.editMode).toBe('workspace');
     });
+
+    it('preserves stored editor identities when switching to workspace mode', async () => {
+      const artifactsChain = createQueryChain([
+        {
+          id: 'artifact-1',
+          edit_mode: 'editors',
+          collaborators: ['identity-wren', 'identity-lumen'],
+          updated_at: '2026-03-07T05:00:00.000Z',
+        },
+      ]);
+
+      mockSupabaseFrom.mockImplementation((table: string) => {
+        if (table === 'artifacts') return artifactsChain;
+        return createQueryChain([]);
+      });
+
+      const handler = findRouteHandler('patch', '/artifacts/:id/permissions');
+      const req = createAuthenticatedReq({
+        params: { id: 'artifact-1' },
+        body: { editMode: 'workspace' },
+      });
+      const res = createMockRes();
+      await handler!(req, res);
+
+      expect(res._status).toBe(200);
+      expect((artifactsChain.update as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
+        edit_mode: 'workspace',
+        collaborators: ['identity-wren', 'identity-lumen'],
+      });
+    });
   });
 
   describe('PATCH /artifacts/permissions', () => {
@@ -784,6 +814,24 @@ describe('admin endpoint handlers (no-500 regression)', () => {
       expect(res._status).toBe(200);
       expect((res._json as any).success).toBe(true);
       expect((res._json as any).updatedCount).toBe(2);
+    });
+
+    it('does not clear collaborator lists when applying workspace mode in bulk', async () => {
+      const artifactsChain = createQueryChain([{ id: 'artifact-1' }, { id: 'artifact-2' }]);
+      mockSupabaseFrom.mockImplementation((table: string) => {
+        if (table === 'artifacts') return artifactsChain;
+        return createQueryChain([]);
+      });
+
+      const handler = findRouteHandler('patch', '/artifacts/permissions');
+      const req = createAuthenticatedReq({ body: { editMode: 'workspace' } });
+      const res = createMockRes();
+      await handler!(req, res);
+
+      expect(res._status).toBe(200);
+      const updatePayload = (artifactsChain.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(updatePayload).toMatchObject({ edit_mode: 'workspace' });
+      expect(updatePayload).not.toHaveProperty('collaborators');
     });
   });
 
