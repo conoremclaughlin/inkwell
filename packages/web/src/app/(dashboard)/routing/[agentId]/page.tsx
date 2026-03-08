@@ -186,7 +186,7 @@ export default function AgentRoutingPage() {
     platform: 'telegram',
     platformAccountId: '',
     chatId: '',
-    studioHint: 'main',
+    studioHint: '',
     isActive: true,
   });
   const [editingRouteId, setEditingRouteId] = useState<string | null>(null);
@@ -215,7 +215,7 @@ export default function AgentRoutingPage() {
           platform: 'telegram',
           platformAccountId: '',
           chatId: '',
-          studioHint: 'main',
+          studioHint: '',
           isActive: true,
         });
       },
