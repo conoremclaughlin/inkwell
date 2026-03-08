@@ -127,6 +127,8 @@ export async function handleSendResponse(
     logger.info(`send_response called for channel: ${args.channel}`, {
       conversationId: args.conversationId,
       contentLength: args.content.length,
+      mediaCount: args.media?.length || 0,
+      mediaPaths: args.media?.map((m) => m.path || m.url || 'none'),
     });
 
     // Build the response object
@@ -185,6 +187,7 @@ export async function handleSendResponse(
       channel: args.channel,
       conversationId: args.conversationId,
       contentLength: args.content.length,
+      mediaRequested: args.media?.length || 0,
     });
   } catch (error) {
     logger.error('Error in send_response:', error);

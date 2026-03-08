@@ -1,28 +1,21 @@
 /**
  * PM2 Ecosystem Configuration
  *
- * ⚠️  DEPRECATED for local development — use `yarn dev` instead.
- * `yarn dev` uses tsx --watch for hot reload and avoids PM2's issues with
- * env caching, stale ports, and build staleness.
+ * Two modes:
  *
- * This file is retained for production/CI use cases only.
+ * 1. `yarn pm2:dev` — Wraps `yarn dev` in PM2 for centralized logging.
+ *    Same hot-reload behavior, but logs go to `pm2 logs` instead of a terminal.
+ *    Uses the single "pcp-dev" process that runs both API + web via concurrently.
  *
- * This manages the PCP server processes:
- * 1. pcp     - Full PCP Server (MCP + ChannelGateway + SessionHost)
- * 2. web     - Next.js admin dashboard
+ * 2. `yarn pm2:start` — Legacy per-process mode (separate pcp + web processes).
+ *    No hot reload. Useful for production-like setups.
  *
- * The 'pcp' process runs server.ts which integrates:
- * - MCP Server (tools, admin API)
- * - ChannelGateway (Telegram/WhatsApp listeners)
- * - SessionHost (Claude Code backend)
- * - Heartbeat service for scheduled reminders
- * - Agent gateway for inter-agent triggers
- *
- * If you must use PM2 locally:
- *   pm2 start ecosystem.config.cjs    # Start all processes
- *   pm2 restart pcp                   # Restart PCP server
- *   pm2 logs                          # View all logs
- *   pm2 delete all && pm2 start ...   # Full reset (avoids env caching)
+ * Commands:
+ *   pm2 start ecosystem.config.cjs --only pcp-dev   # Mode 1
+ *   pm2 start ecosystem.config.cjs --only pcp,web   # Mode 2
+ *   pm2 logs                                         # View all logs
+ *   pm2 logs pcp-dev                                 # View dev logs only
+ *   pm2 delete all && pm2 start ...                  # Full reset (avoids env caching)
  */
 
 const path = require('path');
@@ -30,7 +23,7 @@ const path = require('path');
 const rootDir = __dirname;
 const apiDir = path.join(rootDir, 'packages/api');
 const webDir = path.join(rootDir, 'packages/web');
-const basePort = Number(process.env.PCP_PORT_BASE || 3001); // MCP-first base
+const basePort = Number(process.env.PCP_PORT_BASE || 3001);
 const apiPort = Number(process.env.PORT || basePort - 1);
 const mcpPort = Number(process.env.MCP_HTTP_PORT || basePort);
 const webPort = Number(process.env.WEB_PORT || basePort + 1);
@@ -42,14 +35,28 @@ const nextBin = path.join(rootDir, 'node_modules/.bin/next');
 
 module.exports = {
   apps: [
+    // ─── Mode 1: Wrap `yarn dev` for centralized logging ───
     {
-      // Full PCP Server: MCP + ChannelGateway + SessionService
-      // Using SessionService for stateless, horizontally-scalable architecture
+      name: 'pcp-dev',
+      cwd: rootDir,
+      script: 'yarn',
+      args: 'dev',
+      watch: false, // yarn dev handles its own file watching
+      env: {
+        NODE_ENV: 'development',
+        CLAUDECODE: '', // Prevent nested-session detection when spawning Claude Code
+      },
+      max_restarts: 5,
+      restart_delay: 2000,
+    },
+
+    // ─── Mode 2: Legacy per-process mode ───
+    {
       name: 'pcp',
       cwd: apiDir,
       script: tsxBin,
       args: 'src/server.ts',
-      watch: false,  // Disable watch - restart manually with: pm2 restart pcp
+      watch: false,
       env: {
         NODE_ENV: 'development',
         MCP_TRANSPORT: 'http',
@@ -58,8 +65,8 @@ module.exports = {
         MYRA_HTTP_PORT: String(myraPort),
         ENABLE_WHATSAPP: 'true',
         ENABLE_DISCORD: 'false',
-        AGENT_ID: 'myra',  // Identity for the Claude Code backend
-        CLAUDECODE: '',     // Prevent nested-session detection when spawning Claude Code
+        AGENT_ID: 'myra',
+        CLAUDECODE: '',
       },
       max_restarts: 10,
       restart_delay: 1000,

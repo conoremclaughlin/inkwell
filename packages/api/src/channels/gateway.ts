@@ -1026,12 +1026,20 @@ export class ChannelGateway extends EventEmitter {
    * Routes each attachment to the appropriate channel-specific method.
    * Supports both local file paths and remote URLs.
    */
+  /**
+   * Send media attachments to a channel.
+   * Returns { sent, failed } counts so callers can report accurate status.
+   */
   private async sendMediaAttachments(
     channel: GatewayChannel,
     conversationId: string,
     media: OutboundMedia[],
     options?: { replyToMessageId?: string }
-  ): Promise<void> {
+  ): Promise<{ sent: number; failed: number; errors: string[] }> {
+    let sent = 0;
+    let failed = 0;
+    const errors: string[] = [];
+
     for (const attachment of media) {
       let filePath = attachment.path;
       let tempCleanup: (() => Promise<void>) | null = null;
@@ -1043,16 +1051,19 @@ export class ChannelGateway extends EventEmitter {
           filePath = temp.path;
           tempCleanup = temp.cleanup;
         } catch (error) {
-          logger.error(`Failed to download media URL: ${attachment.url}`, error);
+          const msg = `Failed to download media URL: ${attachment.url}`;
+          logger.error(msg, error);
+          errors.push(msg);
+          failed++;
           continue;
         }
       }
 
       if (!filePath) {
-        logger.warn('Media attachment missing both path and url, skipping', {
-          channel,
-          attachment,
-        });
+        const msg = `Media attachment missing both path and url (type: ${attachment.type})`;
+        logger.warn(msg, { channel, attachment });
+        errors.push(msg);
+        failed++;
         continue;
       }
 
@@ -1111,12 +1122,19 @@ export class ChannelGateway extends EventEmitter {
             break;
         }
 
+        sent++;
         logger.info(`Sent ${attachment.type} to ${channel}:${conversationId}`, {
-          filename: attachment.filename,
+          filename: attachment.filename || filePath,
           source: tempCleanup ? 'url' : 'path',
         });
       } catch (error) {
-        logger.error(`Failed to send ${attachment.type} to ${channel}:${conversationId}`, error);
+        const msg = error instanceof Error ? error.message : String(error);
+        logger.error(`Failed to send ${attachment.type} to ${channel}:${conversationId}`, {
+          error: msg,
+          filePath,
+        });
+        errors.push(`${attachment.type}: ${msg}`);
+        failed++;
       } finally {
         // Clean up temp file if we downloaded from URL
         if (tempCleanup) {
@@ -1124,6 +1142,8 @@ export class ChannelGateway extends EventEmitter {
         }
       }
     }
+
+    return { sent, failed, errors };
   }
 
   private async trySendTelegramVoiceReply(response: AgentResponse): Promise<boolean> {
