@@ -82,6 +82,7 @@ interface BackendLocalSessionSummary {
   sessionId: string;
   projectPath: string;
   modified: string;
+  fileSizeBytes?: number;
   firstPrompt?: string;
   latestPrompt?: string;
   latestPromptAt?: string;
@@ -123,6 +124,20 @@ function formatCandidateTimestamp(value: string | null | undefined): string {
   const ms = Date.parse(value);
   if (!Number.isFinite(ms)) return '-';
   return new Date(ms).toLocaleString();
+}
+
+function formatFileSize(bytes: number | undefined): string | undefined {
+  if (bytes === undefined || !Number.isFinite(bytes) || bytes < 0) return undefined;
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let size = bytes / 1024;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  const decimals = size >= 10 ? 1 : 2;
+  return `${size.toFixed(decimals)} ${units[unitIndex]}`;
 }
 
 function formatPickerTimestamp(value: string | null | undefined): string {
@@ -1232,6 +1247,20 @@ export function getClaudeLocalSessionsForProject(
   if (!normalizedCwd) return [];
 
   const results: BackendLocalSessionSummary[] = [];
+  const historyPath = join(homedir(), '.claude', 'history.jsonl');
+  let historySessions: BackendLocalSessionSummary[] = [];
+  let historySessionIds = new Set<string>();
+  if (existsSync(historyPath)) {
+    try {
+      historySessions = extractClaudeHistorySessionsForProject(
+        readFileSync(historyPath, 'utf-8'),
+        normalizedCwd
+      );
+      historySessionIds = new Set(historySessions.map((session) => session.sessionId));
+    } catch {
+      // Ignore unreadable history file.
+    }
+  }
   const normalizedDirName = normalizedCwd.replace(/[\\/]/g, '-');
   const projectDirCandidates = new Set<string>([
     join(claudeProjectsDir, normalizedDirName),
@@ -1256,7 +1285,10 @@ export function getClaudeLocalSessionsForProject(
         // with `No conversation found with session ID` when resumed.
         // Require explicit sessionId evidence in file contents before surfacing
         // as a local resumable candidate.
-        if (!isLikelyClaudeResumableSessionFile(filePath, sessionId)) {
+        if (
+          !isLikelyClaudeResumableSessionFile(filePath, sessionId) &&
+          !historySessionIds.has(sessionId)
+        ) {
           continue;
         }
 
@@ -1274,11 +1306,17 @@ export function getClaudeLocalSessionsForProject(
           // Best-effort preview extraction only.
         }
 
+        if (!latestPrompt) {
+          const size = formatFileSize(stats.size);
+          if (size) latestPrompt = `(session) · ${size}`;
+        }
+
         results.push({
           backend: 'claude',
           sessionId,
           projectPath: normalizedCwd,
           modified: stats.mtime.toISOString(),
+          fileSizeBytes: stats.size,
           latestPrompt,
           latestPromptAt,
           transcriptPath: filePath,
@@ -1291,18 +1329,7 @@ export function getClaudeLocalSessionsForProject(
 
   // Fallback path: some Claude installations persist session linkage in history.jsonl
   // even when per-project sessions-index files are missing/out-of-date.
-  const historyPath = join(homedir(), '.claude', 'history.jsonl');
-  if (existsSync(historyPath)) {
-    try {
-      const historySessions = extractClaudeHistorySessionsForProject(
-        readFileSync(historyPath, 'utf-8'),
-        normalizedCwd
-      );
-      results.push(...historySessions);
-    } catch {
-      // Ignore unreadable history file.
-    }
-  }
+  results.push(...historySessions);
 
   const dedupedBySessionId = new Map<string, BackendLocalSessionSummary>();
   for (const session of results) {
@@ -1502,8 +1529,10 @@ LIMIT 200;
     let latestPrompt: string | undefined;
     let latestPromptAt: string | undefined;
     const transcriptPath = rolloutPath?.trim() || undefined;
+    let fileSizeBytes: number | undefined;
     if (transcriptPath && existsSync(transcriptPath)) {
       try {
+        fileSizeBytes = statSync(transcriptPath).size;
         const transcript = readFileSync(transcriptPath, 'utf-8');
         const preview = extractLatestPreviewFromCodexRolloutJsonl(transcript);
         if (preview) {
@@ -1515,11 +1544,17 @@ LIMIT 200;
       }
     }
 
+    if (!latestPrompt) {
+      const size = formatFileSize(fileSizeBytes);
+      if (size) latestPrompt = `(session) · ${size}`;
+    }
+
     sessions.push({
       backend: 'codex',
       sessionId,
       projectPath: sessionCwd,
       modified,
+      fileSizeBytes,
       firstPrompt: firstPrompt?.trim(),
       latestPrompt,
       latestPromptAt,
@@ -1620,8 +1655,19 @@ function getCodexLocalSessionsFromJsonl(
         modified: parsed.payload?.timestamp || parsed.timestamp || sessionFile.modified,
         latestPrompt: latestPreview ? formatSessionPreviewText(latestPreview) : undefined,
         latestPromptAt: latestPreview?.ts,
+        fileSizeBytes: (() => {
+          try {
+            return statSync(sessionFile.path).size;
+          } catch {
+            return undefined;
+          }
+        })(),
         transcriptPath: sessionFile.path,
       };
+      if (!matched.latestPrompt) {
+        const size = formatFileSize(matched.fileSizeBytes);
+        if (size) matched.latestPrompt = `(session) · ${size}`;
+      }
       break;
     }
 
@@ -1720,6 +1766,13 @@ function getGeminiSessionsForProjectKey(projectKey: string): BackendLocalSession
       if (!parsed.sessionId) continue;
       const modified = parsed.lastUpdated || parsed.startTime;
       if (!modified) continue;
+      const fileSizeBytes = (() => {
+        try {
+          return statSync(sessionPath).size;
+        } catch {
+          return undefined;
+        }
+      })();
 
       const firstUserMessage = (parsed.messages || []).find((message) => message.type === 'user');
       const latestMessage = [...(parsed.messages || [])]
@@ -1737,14 +1790,21 @@ function getGeminiSessionsForProjectKey(projectKey: string): BackendLocalSession
               content: latestMessage.content,
             })
           : undefined;
+      const latestPromptWithFallback =
+        latestPrompt ||
+        (() => {
+          const size = formatFileSize(fileSizeBytes);
+          return size ? `(session) · ${size}` : undefined;
+        })();
 
       sessions.push({
         backend: 'gemini',
         sessionId: parsed.sessionId,
         projectPath,
         modified,
+        fileSizeBytes,
         firstPrompt,
-        latestPrompt,
+        latestPrompt: latestPromptWithFallback,
         transcriptPath: sessionPath,
       });
     } catch {
@@ -2284,10 +2344,7 @@ async function ensurePcpSessionContext(
     if (!backendSessionId || pcpSessionByBackendSessionId.has(backendSessionId)) continue;
     pcpSessionByBackendSessionId.set(backendSessionId, session);
   }
-  const displayLocalBackendSessions =
-    options.listCandidates || options.listCandidatesJson
-      ? localBackendSessions
-      : untrackedLocalBackendSessions;
+  const displayLocalBackendSessions = localBackendSessions;
   const existingSessionIds = new Set(activeSessions.map((session) => session.id));
   const pcpPreviewBySessionId = new Map<string, string>();
   for (const session of activeSessions) {
