@@ -21,7 +21,7 @@ import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 
 /** Maximum time (ms) to wait for a Claude Code subprocess before killing it */
-const PROCESS_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+const PROCESS_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 
 /**
  * Parse usage stats from Claude Code stream output.
