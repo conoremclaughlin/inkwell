@@ -389,6 +389,7 @@ export class ClaudeRunner implements IClaudeRunner {
           format: input.format as 'text' | 'markdown' | 'code' | 'json' | undefined,
           replyToMessageId: input.replyToMessageId as string | undefined,
           metadata: input.metadata as Record<string, unknown> | undefined,
+          media: input.media as ChannelResponse['media'],
         };
         responses.push(response);
         logger.debug('Captured send_response call', { response });

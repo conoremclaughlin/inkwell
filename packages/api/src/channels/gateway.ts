@@ -748,17 +748,35 @@ export class ChannelGateway extends EventEmitter {
         }
         // Log outgoing WhatsApp message to activity stream
         {
+          const logContent =
+            media && media.length > 0 && mediaResult
+              ? content
+                ? `${content} [+${media.length} media] sent=${mediaResult.sent} failed=${mediaResult.failed}`
+                : `[${media.length} media] sent=${mediaResult.sent} failed=${mediaResult.failed}`
+              : content;
           const userId = await this.resolveUserIdForConversation('whatsapp', conversationId);
           if (this.dataComposer && userId) {
             try {
+              const payload: Record<string, unknown> = {};
+              if (media && media.length > 0) {
+                payload.mediaCount = media.length;
+                payload.media = media.map((m) => ({
+                  type: m.type,
+                  path: m.path || null,
+                  url: m.url || null,
+                  filename: m.filename || null,
+                  contentType: m.contentType || null,
+                }));
+              }
               await this.dataComposer.repositories.activityStream.logMessage({
                 userId,
                 agentId: 'myra',
                 direction: 'out',
-                content,
+                content: logContent,
                 platform: 'whatsapp',
                 platformChatId: conversationId,
                 isDm: true,
+                payload: Object.keys(payload).length > 0 ? payload : undefined,
               });
             } catch (activityError) {
               logger.warn(
@@ -792,17 +810,35 @@ export class ChannelGateway extends EventEmitter {
         }
         // Log outgoing Discord message to activity stream
         {
+          const logContent =
+            media && media.length > 0 && mediaResult
+              ? content
+                ? `${content} [+${media.length} media] sent=${mediaResult.sent} failed=${mediaResult.failed}`
+                : `[${media.length} media] sent=${mediaResult.sent} failed=${mediaResult.failed}`
+              : content;
           const userId = await this.resolveUserIdForConversation('discord', conversationId);
           if (this.dataComposer && userId) {
             try {
+              const payload: Record<string, unknown> = {};
+              if (media && media.length > 0) {
+                payload.mediaCount = media.length;
+                payload.media = media.map((m) => ({
+                  type: m.type,
+                  path: m.path || null,
+                  url: m.url || null,
+                  filename: m.filename || null,
+                  contentType: m.contentType || null,
+                }));
+              }
               await this.dataComposer.repositories.activityStream.logMessage({
                 userId,
                 agentId: 'benson',
                 direction: 'out',
-                content,
+                content: logContent,
                 platform: 'discord',
                 platformChatId: conversationId,
                 isDm: true,
+                payload: Object.keys(payload).length > 0 ? payload : undefined,
               });
             } catch (activityError) {
               logger.warn(
@@ -818,20 +854,49 @@ export class ChannelGateway extends EventEmitter {
         if (!this.slackListener) {
           throw new Error('Slack listener not available');
         }
-        await this.slackListener.sendMessage(conversationId, content);
+        if (content) {
+          await this.slackListener.sendMessage(conversationId, content);
+        }
+        if (media && media.length > 0) {
+          // Slack file uploads not yet implemented — count as failures
+          mediaResult = {
+            sent: 0,
+            failed: media.length,
+            errors: ['Slack media sending not yet implemented'],
+          };
+          logger.warn('Slack media sending not yet implemented', { mediaCount: media.length });
+        }
         // Log outgoing Slack message to activity stream
         {
+          const logContent =
+            media && media.length > 0 && mediaResult
+              ? content
+                ? `${content} [+${media.length} media] sent=${mediaResult.sent} failed=${mediaResult.failed}`
+                : `[${media.length} media] sent=${mediaResult.sent} failed=${mediaResult.failed}`
+              : content;
           const userId = await this.resolveUserIdForConversation('slack', conversationId);
           if (this.dataComposer && userId) {
             try {
+              const payload: Record<string, unknown> = {};
+              if (media && media.length > 0) {
+                payload.mediaCount = media.length;
+                payload.media = media.map((m) => ({
+                  type: m.type,
+                  path: m.path || null,
+                  url: m.url || null,
+                  filename: m.filename || null,
+                  contentType: m.contentType || null,
+                }));
+              }
               await this.dataComposer.repositories.activityStream.logMessage({
                 userId,
-                agentId: 'slack', // Will be resolved by routing
+                agentId: 'slack',
                 direction: 'out',
-                content,
+                content: logContent,
                 platform: 'slack',
                 platformChatId: conversationId,
                 isDm: true,
+                payload: Object.keys(payload).length > 0 ? payload : undefined,
               });
             } catch (activityError) {
               logger.warn(

@@ -503,6 +503,7 @@ export class CodexRunner implements IClaudeRunner {
                 metadata: (input as Record<string, unknown>).metadata as
                   | Record<string, unknown>
                   | undefined,
+                media: (input as Record<string, unknown>).media as ChannelResponse['media'],
               });
             }
           }

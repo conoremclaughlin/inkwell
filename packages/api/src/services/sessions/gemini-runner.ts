@@ -434,6 +434,7 @@ export class GeminiRunner implements IClaudeRunner {
                 format: typedInput.format as 'text' | 'markdown' | 'code' | 'json' | undefined,
                 replyToMessageId: typedInput.replyToMessageId as string | undefined,
                 metadata: typedInput.metadata as Record<string, unknown> | undefined,
+                media: typedInput.media as ChannelResponse['media'],
               });
               logger.debug('Captured send_response call from Gemini', { channel, conversationId });
             }
