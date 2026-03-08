@@ -166,6 +166,12 @@ function findRouteHandler(
   return handler?.handle ?? null;
 }
 
+function findRouteIndex(method: 'get' | 'post' | 'put' | 'delete' | 'patch', path: string): number {
+  return (router as any).stack.findIndex(
+    (entry: any) => entry.route?.path === path && entry.route?.methods?.[method]
+  );
+}
+
 /** Create a mock request with auth context already set (as if middleware passed) */
 function createAuthenticatedReq(overrides: Record<string, unknown> = {}): Request {
   return {
@@ -794,6 +800,15 @@ describe('admin endpoint handlers (no-500 regression)', () => {
   });
 
   describe('PATCH /artifacts/permissions', () => {
+    it('registers bulk route before per-artifact route to avoid path shadowing', () => {
+      const bulkRouteIndex = findRouteIndex('patch', '/artifacts/permissions');
+      const singleRouteIndex = findRouteIndex('patch', '/artifacts/:id/permissions');
+
+      expect(bulkRouteIndex).toBeGreaterThanOrEqual(0);
+      expect(singleRouteIndex).toBeGreaterThanOrEqual(0);
+      expect(bulkRouteIndex).toBeLessThan(singleRouteIndex);
+    });
+
     it('should bulk update permissions in the active workspace', async () => {
       mockSupabaseFrom.mockImplementation((table: string) => {
         if (table === 'artifacts') {

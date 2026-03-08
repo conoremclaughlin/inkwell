@@ -231,6 +231,12 @@ export default function ArtifactDetailPage() {
     setPermissionEditorIdentityIds(normalizedEditorIds);
   }, [artifact, identityNameById, identityIdByAgentId]);
 
+  useEffect(() => {
+    if (!permissionSuccess) return;
+    const timeout = window.setTimeout(() => setPermissionSuccess(null), 3000);
+    return () => window.clearTimeout(timeout);
+  }, [permissionSuccess]);
+
   if (isLoading) {
     return (
       <div className="flex items-center justify-center py-12">
