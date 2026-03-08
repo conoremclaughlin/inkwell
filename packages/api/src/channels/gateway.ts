@@ -696,6 +696,14 @@ export class ChannelGateway extends EventEmitter {
             await this.sendTelegramMessage(conversationId, content, { format, replyToMessageId });
           }
           await this.sendMediaAttachments('telegram', conversationId, media, { replyToMessageId });
+          // Log media metadata to activity stream
+          await this.logOutgoingTelegram(
+            conversationId,
+            content
+              ? `[+${media.length} media attachment(s)]`
+              : `[${media.length} media attachment(s)]`,
+            media
+          );
         }
         break;
 
@@ -920,11 +928,26 @@ export class ChannelGateway extends EventEmitter {
     await this.logOutgoingTelegram(conversationId, content);
   }
 
-  private async logOutgoingTelegram(conversationId: string, content: string): Promise<void> {
+  private async logOutgoingTelegram(
+    conversationId: string,
+    content: string,
+    media?: OutboundMedia[]
+  ): Promise<void> {
     // Log outgoing message to activity stream
     const userId = await this.resolveUserIdForConversation('telegram', conversationId);
     if (this.dataComposer && userId) {
       try {
+        const payload: Record<string, unknown> = {};
+        if (media && media.length > 0) {
+          payload.mediaCount = media.length;
+          payload.media = media.map((m) => ({
+            type: m.type,
+            path: m.path || null,
+            url: m.url || null,
+            filename: m.filename || null,
+            contentType: m.contentType || null,
+          }));
+        }
         await this.dataComposer.repositories.activityStream.logMessage({
           userId,
           agentId: 'myra',
@@ -933,6 +956,7 @@ export class ChannelGateway extends EventEmitter {
           platform: 'telegram',
           platformChatId: conversationId,
           isDm: true, // Will be corrected by context
+          payload: Object.keys(payload).length > 0 ? payload : undefined,
         });
       } catch (activityError) {
         logger.warn('Failed to log outgoing message to activity stream:', activityError);
