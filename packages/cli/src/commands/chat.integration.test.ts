@@ -1308,6 +1308,33 @@ describe('runChat integration', () => {
     expect(backendRequest.passthroughArgs).toEqual([]);
   });
 
+  it('applies strict codex hardening args in local routing when --sb-strict-tools is set', async () => {
+    testState.inputs = ['codex strict local turn', '/quit'];
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'codex',
+      toolRouting: 'local',
+      sbStrictTools: true,
+      pollSeconds: '999',
+    });
+
+    expect(testState.runBackendImpl).toHaveBeenCalledTimes(1);
+    const backendRequest = testState.runBackendImpl.mock.calls[0][0] as {
+      passthroughArgs: string[];
+      prompt: string;
+    };
+    expect(backendRequest.passthroughArgs).toEqual([
+      '--sandbox',
+      'read-only',
+      '--ask-for-approval',
+      'never',
+      '--config',
+      'mcp_servers={}',
+    ]);
+    expect(backendRequest.prompt).toContain('Strict tools mode: ON.');
+  });
+
   it('handles non-interactive local tool blocks without readline crashes', async () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,

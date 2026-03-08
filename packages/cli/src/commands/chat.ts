@@ -73,6 +73,7 @@ type ChatOptions = {
   message?: string;
   nonInteractive?: boolean;
   tailTranscript?: string;
+  sbStrictTools?: boolean;
   verbose?: boolean;
   fullscreen?: boolean;
 };
@@ -113,6 +114,7 @@ interface ChatRuntime {
   transcriptPath: string;
   activeSkills: SkillInstruction[];
   bootstrapContext?: string;
+  strictTools: boolean;
 }
 
 interface SessionSummary {
@@ -151,7 +153,8 @@ type BackendToolGateSnapshot = {
 function buildBackendToolPassthrough(
   backend: string,
   toolRouting: 'backend' | 'local',
-  gate: BackendToolGateSnapshot
+  gate: BackendToolGateSnapshot,
+  strictTools: boolean
 ): { passthroughArgs: string[]; warning?: string } {
   const shouldDisableBackendTools = toolRouting !== 'backend' || gate.mode === 'off';
 
@@ -175,14 +178,30 @@ function buildBackendToolPassthrough(
     return { passthroughArgs: ['--allowed-tools', gate.allowedTools.join(',')] };
   }
 
-  if (backend === 'codex' && (shouldDisableBackendTools || gate.mode === 'backend')) {
-    return {
-      passthroughArgs: [],
-      warning:
-        toolRouting === 'local'
-          ? 'Codex CLI has no allowlist passthrough flag; relying on sb local-tool routing prompt guard.'
-          : 'Codex CLI has no allowlist passthrough flag; backend tool gating is not enforced by CLI flags.',
-    };
+  if (backend === 'codex') {
+    if (toolRouting === 'local' && strictTools) {
+      return {
+        passthroughArgs: [
+          '--sandbox',
+          'read-only',
+          '--ask-for-approval',
+          'never',
+          '--config',
+          'mcp_servers={}',
+        ],
+        warning:
+          'Codex strict-tools mode enabled: forcing read-only sandbox, no approval prompts, and disabling backend MCP servers.',
+      };
+    }
+    if (shouldDisableBackendTools || gate.mode === 'backend') {
+      return {
+        passthroughArgs: [],
+        warning:
+          toolRouting === 'local'
+            ? 'Codex CLI has no allowlist passthrough flag; relying on sb local-tool routing prompt guard.'
+            : 'Codex CLI has no allowlist passthrough flag; backend tool gating is not enforced by CLI flags.',
+      };
+    }
   }
 
   return { passthroughArgs: [] };
@@ -1621,6 +1640,7 @@ function buildPromptEnvelope(
     `Current backend: ${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}.`,
     `Tool mode: ${runtime.toolMode}.`,
     `Tool routing: ${runtime.toolRouting}.`,
+    runtime.strictTools ? 'Strict tools mode: ON.' : '',
     toolInstruction,
     runtime.activeSkills.length > 0
       ? `Active skills: ${runtime.activeSkills.map((skill) => skill.name).join(', ')}`
@@ -1690,6 +1710,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     awayMode: false,
     transcriptPath: ensureRuntimeTranscriptPath(),
     activeSkills: [],
+    strictTools: options.sbStrictTools ?? false,
   };
   const approvalManager = new ApprovalRequestManager();
   const policyPathFromEnv = process.env.PCP_TOOL_POLICY_PATH?.trim();
@@ -2446,7 +2467,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const passthroughPlan = buildBackendToolPassthrough(
       runtime.backend,
       runtime.toolRouting,
-      backendGate
+      backendGate,
+      runtime.strictTools
     );
     const passthroughArgs = passthroughPlan.passthroughArgs;
 
@@ -4225,6 +4247,10 @@ export function registerChatCommand(program: Command): void {
       .option('--auto-run', 'Automatically execute backend turns for new inbox task messages')
       .option('--message <text>', 'Single-turn message for non-interactive mode')
       .option('--non-interactive', 'Run one turn and exit (requires --message)')
+      .option(
+        '--sb-strict-tools',
+        'Harden backend-native tooling (Codex: disable MCP servers + force read-only sandbox in local routing)'
+      )
       .option(
         '--tail-transcript <pathOrSession>',
         'Tail transcript output by file path or session id'
