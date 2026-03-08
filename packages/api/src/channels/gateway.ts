@@ -17,7 +17,11 @@ import { createTelegramListener, TelegramListener } from './telegram-listener';
 import { createWhatsAppListener, WhatsAppListener } from './whatsapp-listener';
 import { createDiscordListener, DiscordListener } from './discord-listener';
 import { createSlackListener, SlackListener } from './slack-listener';
-import { setResponseCallback, type ResponseCallback } from '../mcp/tools/response-handlers';
+import {
+  setResponseCallback,
+  type ResponseCallback,
+  type ResponseResult,
+} from '../mcp/tools/response-handlers';
 import type { AgentResponse, OutboundMedia } from '../agent/types';
 import type { DataComposer } from '../data/composer';
 import { logger } from '../utils/logger';
@@ -658,7 +662,7 @@ export class ChannelGateway extends EventEmitter {
    */
   private registerResponseCallback(): void {
     const callback: ResponseCallback = async (response: AgentResponse) => {
-      await this.sendResponse(response);
+      return await this.sendResponse(response);
     };
     setResponseCallback(callback);
     logger.info('ChannelGateway registered response callback');
@@ -668,11 +672,14 @@ export class ChannelGateway extends EventEmitter {
    * Send a response to a channel
    * Called by the response callback or directly
    */
-  async sendResponse(response: AgentResponse): Promise<void> {
+  async sendResponse(response: AgentResponse): Promise<ResponseResult | void> {
     const { channel, conversationId, content, format, replyToMessageId, media } = response;
 
     // Stop typing indicator when sending response
     this.stopTypingIndicator(conversationId);
+
+    // Track media results across channels for caller visibility
+    let mediaResult: { sent: number; failed: number; errors: string[] } | undefined;
 
     switch (channel) {
       case 'telegram':
@@ -695,7 +702,7 @@ export class ChannelGateway extends EventEmitter {
           if (content) {
             await this.sendTelegramMessage(conversationId, content, { format, replyToMessageId });
           }
-          const mediaResult = await this.sendMediaAttachments('telegram', conversationId, media, {
+          mediaResult = await this.sendMediaAttachments('telegram', conversationId, media, {
             replyToMessageId,
           });
           // Always log media attempts to activity stream (success or failure) for debugging
@@ -727,7 +734,7 @@ export class ChannelGateway extends EventEmitter {
           await this.whatsappListener.sendMessage(conversationId, content);
         }
         if (media && media.length > 0) {
-          const mediaResult = await this.sendMediaAttachments('whatsapp', conversationId, media);
+          mediaResult = await this.sendMediaAttachments('whatsapp', conversationId, media);
           if (mediaResult.failed > 0 && mediaResult.sent === 0) {
             throw new Error(
               `All media attachments failed to send: ${mediaResult.errors.join('; ')}`
@@ -771,7 +778,7 @@ export class ChannelGateway extends EventEmitter {
           await this.discordListener.sendMessage(conversationId, content);
         }
         if (media && media.length > 0) {
-          const mediaResult = await this.sendMediaAttachments('discord', conversationId, media);
+          mediaResult = await this.sendMediaAttachments('discord', conversationId, media);
           if (mediaResult.failed > 0 && mediaResult.sent === 0) {
             throw new Error(
               `All media attachments failed to send: ${mediaResult.errors.join('; ')}`
@@ -845,6 +852,15 @@ export class ChannelGateway extends EventEmitter {
 
     // Check for pending messages that arrived while processing
     await this.processPendingMessages(channel as GatewayChannel, conversationId);
+
+    // Return media delivery results so callers (send_response) can report them
+    if (mediaResult) {
+      return {
+        mediaSent: mediaResult.sent,
+        mediaFailed: mediaResult.failed,
+        mediaErrors: mediaResult.errors.length > 0 ? mediaResult.errors : undefined,
+      };
+    }
   }
 
   /**

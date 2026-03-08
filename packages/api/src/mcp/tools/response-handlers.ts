@@ -10,8 +10,15 @@ import type { DataComposer } from '../../data/composer';
 import type { ChannelType, AgentResponse, ResponseFormat, OutboundMedia } from '../../agent/types';
 import { logger } from '../../utils/logger';
 
+// Response result returned by the callback (optional — void is still accepted)
+export interface ResponseResult {
+  mediaSent?: number;
+  mediaFailed?: number;
+  mediaErrors?: string[];
+}
+
 // Response handler callback type
-export type ResponseCallback = (response: AgentResponse) => Promise<void>;
+export type ResponseCallback = (response: AgentResponse) => Promise<ResponseResult | void>;
 
 // Global response callback - set by the session host
 let globalResponseCallback: ResponseCallback | null = null;
@@ -146,8 +153,9 @@ export async function handleSendResponse(
     markExplicitResponse(args.channel, args.conversationId);
 
     // Try local callback first (when running in same process as session host)
+    let callbackResult: ResponseResult | void = undefined;
     if (globalResponseCallback) {
-      await globalResponseCallback(response);
+      callbackResult = await globalResponseCallback(response);
       logger.info(`Response sent to ${args.channel}:${args.conversationId} via local callback`);
     } else {
       // Fallback: route through Myra's HTTP endpoint for external channels
@@ -182,13 +190,22 @@ export async function handleSendResponse(
       }
     }
 
-    return mcpResponse({
+    const result: Record<string, unknown> = {
       success: true,
       channel: args.channel,
       conversationId: args.conversationId,
       contentLength: args.content.length,
       mediaRequested: args.media?.length || 0,
-    });
+    };
+
+    // Surface media delivery counters from the gateway if available
+    if (callbackResult) {
+      if (callbackResult.mediaSent !== undefined) result.mediaSent = callbackResult.mediaSent;
+      if (callbackResult.mediaFailed !== undefined) result.mediaFailed = callbackResult.mediaFailed;
+      if (callbackResult.mediaErrors?.length) result.mediaErrors = callbackResult.mediaErrors;
+    }
+
+    return mcpResponse(result);
   } catch (error) {
     logger.error('Error in send_response:', error);
     return mcpResponse(
