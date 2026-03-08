@@ -962,8 +962,45 @@ export class ChannelGateway extends EventEmitter {
   }
 
   /**
+   * Download a URL to a temporary file. Returns the path and a cleanup function.
+   */
+  private async downloadToTempFile(
+    url: string,
+    filename?: string
+  ): Promise<{ path: string; cleanup: () => Promise<void> }> {
+    const fs = await import('fs/promises');
+    const pathMod = await import('path');
+    const os = await import('os');
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to download ${url}: ${response.status}`);
+    }
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const tmpDir = pathMod.join(os.tmpdir(), 'pcp-media');
+    await fs.mkdir(tmpDir, { recursive: true });
+
+    const safeName = (filename || `media_${Date.now()}`).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const tmpPath = pathMod.join(tmpDir, safeName);
+    await fs.writeFile(tmpPath, buffer);
+
+    return {
+      path: tmpPath,
+      cleanup: async () => {
+        try {
+          await fs.unlink(tmpPath);
+        } catch {
+          // Best-effort cleanup
+        }
+      },
+    };
+  }
+
+  /**
    * Send media attachments to a channel.
    * Routes each attachment to the appropriate channel-specific method.
+   * Supports both local file paths and remote URLs.
    */
   private async sendMediaAttachments(
     channel: GatewayChannel,
@@ -972,9 +1009,26 @@ export class ChannelGateway extends EventEmitter {
     options?: { replyToMessageId?: string }
   ): Promise<void> {
     for (const attachment of media) {
-      const filePath = attachment.path;
+      let filePath = attachment.path;
+      let tempCleanup: (() => Promise<void>) | null = null;
+
+      // If no local path but URL is provided, download to temp file
+      if (!filePath && attachment.url) {
+        try {
+          const temp = await this.downloadToTempFile(attachment.url, attachment.filename);
+          filePath = temp.path;
+          tempCleanup = temp.cleanup;
+        } catch (error) {
+          logger.error(`Failed to download media URL: ${attachment.url}`, error);
+          continue;
+        }
+      }
+
       if (!filePath) {
-        logger.warn('Media attachment missing file path, skipping', { channel, attachment });
+        logger.warn('Media attachment missing both path and url, skipping', {
+          channel,
+          attachment,
+        });
         continue;
       }
 
@@ -1035,9 +1089,15 @@ export class ChannelGateway extends EventEmitter {
 
         logger.info(`Sent ${attachment.type} to ${channel}:${conversationId}`, {
           filename: attachment.filename,
+          source: tempCleanup ? 'url' : 'path',
         });
       } catch (error) {
         logger.error(`Failed to send ${attachment.type} to ${channel}:${conversationId}`, error);
+      } finally {
+        // Clean up temp file if we downloaded from URL
+        if (tempCleanup) {
+          await tempCleanup();
+        }
       }
     }
   }
