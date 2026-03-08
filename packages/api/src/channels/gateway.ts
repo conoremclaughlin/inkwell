@@ -695,7 +695,9 @@ export class ChannelGateway extends EventEmitter {
           if (content) {
             await this.sendTelegramMessage(conversationId, content, { format, replyToMessageId });
           }
-          await this.sendMediaAttachments('telegram', conversationId, media, { replyToMessageId });
+          const mediaResult = await this.sendMediaAttachments('telegram', conversationId, media, {
+            replyToMessageId,
+          });
           // Log media metadata to activity stream
           await this.logOutgoingTelegram(
             conversationId,
@@ -704,6 +706,16 @@ export class ChannelGateway extends EventEmitter {
               : `[${media.length} media attachment(s)]`,
             media
           );
+          if (mediaResult.failed > 0 && mediaResult.sent === 0) {
+            throw new Error(
+              `All media attachments failed to send: ${mediaResult.errors.join('; ')}`
+            );
+          } else if (mediaResult.failed > 0) {
+            logger.warn(
+              `${mediaResult.failed}/${media.length} media attachments failed on telegram`,
+              { errors: mediaResult.errors }
+            );
+          }
         }
         break;
 
@@ -715,7 +727,17 @@ export class ChannelGateway extends EventEmitter {
           await this.whatsappListener.sendMessage(conversationId, content);
         }
         if (media && media.length > 0) {
-          await this.sendMediaAttachments('whatsapp', conversationId, media);
+          const mediaResult = await this.sendMediaAttachments('whatsapp', conversationId, media);
+          if (mediaResult.failed > 0 && mediaResult.sent === 0) {
+            throw new Error(
+              `All media attachments failed to send: ${mediaResult.errors.join('; ')}`
+            );
+          } else if (mediaResult.failed > 0) {
+            logger.warn(
+              `${mediaResult.failed}/${media.length} media attachments failed on whatsapp`,
+              { errors: mediaResult.errors }
+            );
+          }
         }
         // Log outgoing WhatsApp message to activity stream
         {
@@ -749,7 +771,17 @@ export class ChannelGateway extends EventEmitter {
           await this.discordListener.sendMessage(conversationId, content);
         }
         if (media && media.length > 0) {
-          await this.sendMediaAttachments('discord', conversationId, media);
+          const mediaResult = await this.sendMediaAttachments('discord', conversationId, media);
+          if (mediaResult.failed > 0 && mediaResult.sent === 0) {
+            throw new Error(
+              `All media attachments failed to send: ${mediaResult.errors.join('; ')}`
+            );
+          } else if (mediaResult.failed > 0) {
+            logger.warn(
+              `${mediaResult.failed}/${media.length} media attachments failed on discord`,
+              { errors: mediaResult.errors }
+            );
+          }
         }
         // Log outgoing Discord message to activity stream
         {
@@ -1075,9 +1107,17 @@ export class ChannelGateway extends EventEmitter {
           replyToMessageId: options?.replyToMessageId,
         };
 
+        let didSend = false;
+
         switch (channel) {
           case 'telegram':
-            if (!this.telegramListener) break;
+            if (!this.telegramListener) {
+              const msg = 'Telegram listener not available for media send';
+              logger.warn(msg);
+              errors.push(msg);
+              failed++;
+              continue;
+            }
             switch (attachment.type) {
               case 'image':
                 await this.telegramListener.sendPhoto(conversationId, filePath, mediaOpts);
@@ -1092,10 +1132,17 @@ export class ChannelGateway extends EventEmitter {
                 await this.telegramListener.sendDocument(conversationId, filePath, mediaOpts);
                 break;
             }
+            didSend = true;
             break;
 
           case 'whatsapp':
-            if (!this.whatsappListener) break;
+            if (!this.whatsappListener) {
+              const msg = 'WhatsApp listener not available for media send';
+              logger.warn(msg);
+              errors.push(msg);
+              failed++;
+              continue;
+            }
             switch (attachment.type) {
               case 'image':
                 await this.whatsappListener.sendImage(conversationId, filePath, mediaOpts);
@@ -1108,25 +1155,38 @@ export class ChannelGateway extends EventEmitter {
                 await this.whatsappListener.sendDocument(conversationId, filePath, mediaOpts);
                 break;
             }
+            didSend = true;
             break;
 
           case 'discord':
-            if (!this.discordListener) break;
+            if (!this.discordListener) {
+              const msg = 'Discord listener not available for media send';
+              logger.warn(msg);
+              errors.push(msg);
+              failed++;
+              continue;
+            }
             // Discord uses a unified file attachment API for all types
             await this.discordListener.sendFile(conversationId, filePath, mediaOpts);
+            didSend = true;
             break;
 
-          case 'slack':
-            // Slack file uploads can be added later
-            logger.warn('Slack media sending not yet implemented');
-            break;
+          case 'slack': {
+            const msg = 'Slack media sending not yet implemented';
+            logger.warn(msg);
+            errors.push(msg);
+            failed++;
+            continue;
+          }
         }
 
-        sent++;
-        logger.info(`Sent ${attachment.type} to ${channel}:${conversationId}`, {
-          filename: attachment.filename || filePath,
-          source: tempCleanup ? 'url' : 'path',
-        });
+        if (didSend) {
+          sent++;
+          logger.info(`Sent ${attachment.type} to ${channel}:${conversationId}`, {
+            filename: attachment.filename || filePath,
+            source: tempCleanup ? 'url' : 'path',
+          });
+        }
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         logger.error(`Failed to send ${attachment.type} to ${channel}:${conversationId}`, {
