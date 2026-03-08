@@ -24,11 +24,14 @@ export interface BackendRunResult {
 
 export async function runBackendTurn(request: BackendRunRequest): Promise<BackendRunResult> {
   const adapter = getBackend(request.backend);
+  // Codex requires `exec` for one-shot/non-interactive turns.
+  // Plain `codex <prompt>` enters interactive mode and can fail in non-TTY flows.
+  const promptParts = request.backend === 'codex' ? ['exec', request.prompt] : [request.prompt];
   const prepared = adapter.prepare({
     agentId: request.agentId,
     model: request.model,
     prompt: request.prompt,
-    promptParts: [request.prompt],
+    promptParts,
     passthroughArgs: request.passthroughArgs || [],
   });
 

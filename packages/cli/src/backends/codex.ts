@@ -44,13 +44,26 @@ export class CodexAdapter implements BackendAdapter {
       args.push('--dangerously-bypass-approvals-and-sandbox');
     }
 
-    // Passthrough flags
-    args.push(...config.passthroughArgs);
-
     // Positional args spread individually so subcommands work
     // e.g. "sb -b codex mcp login supabase" → codex ... mcp login supabase
-    if (config.promptParts.length > 0) {
-      args.push(...config.promptParts);
+    //
+    // Codex has subcommand-scoped flags (notably for `exec`) such as:
+    //   --skip-git-repo-check, --color, --json
+    // Those must come AFTER `exec`, not before it.
+    //
+    // Preserve general behavior for non-exec prompt parts, but when promptParts
+    // starts with `exec`, place passthrough args immediately after `exec`.
+    const promptParts = config.promptParts || [];
+    if (promptParts.length > 0 && promptParts[0]?.toLowerCase() === 'exec') {
+      args.push(promptParts[0]);
+      args.push(...config.passthroughArgs);
+      args.push(...promptParts.slice(1));
+    } else {
+      // Passthrough flags
+      args.push(...config.passthroughArgs);
+      if (promptParts.length > 0) {
+        args.push(...promptParts);
+      }
     }
 
     return {

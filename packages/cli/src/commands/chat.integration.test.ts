@@ -1417,10 +1417,21 @@ describe('runChat integration', () => {
       prompt: string;
     };
     expect(backendRequest.passthroughArgs).toEqual([
+      '--color',
+      'never',
       '--sandbox',
       'read-only',
-      '--ask-for-approval',
-      'never',
+      '--skip-git-repo-check',
+      '--config',
+      'features.apps=false',
+      '--config',
+      'mcp_servers.pcp.enabled=false',
+      '--config',
+      'mcp_servers.next-devtools.enabled=false',
+      '--config',
+      'mcp_servers.github.enabled=false',
+      '--config',
+      'mcp_servers.supabase.enabled=false',
       '--config',
       'mcp_servers={}',
     ]);
@@ -1454,6 +1465,39 @@ describe('runChat integration', () => {
     expect(testState.pcpCalls.some((call) => call.tool === 'send_to_inbox')).toBe(false);
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('Local tool denied (send_to_inbox)');
+  });
+
+  it('applies default backend timeout for non-interactive turns', async () => {
+    await runChat({
+      agent: 'lumen',
+      backend: 'codex',
+      nonInteractive: true,
+      message: 'one shot timeout default',
+      pollSeconds: '999',
+    });
+
+    expect(testState.runBackendImpl).toHaveBeenCalledTimes(1);
+    const backendRequest = testState.runBackendImpl.mock.calls[0][0] as {
+      timeoutMs?: number;
+    };
+    expect(backendRequest.timeoutMs).toBe(120_000);
+  });
+
+  it('applies explicit --backend-timeout-seconds override', async () => {
+    await runChat({
+      agent: 'lumen',
+      backend: 'codex',
+      nonInteractive: true,
+      message: 'one shot timeout override',
+      backendTimeoutSeconds: '7',
+      pollSeconds: '999',
+    });
+
+    expect(testState.runBackendImpl).toHaveBeenCalledTimes(1);
+    const backendRequest = testState.runBackendImpl.mock.calls[0][0] as {
+      timeoutMs?: number;
+    };
+    expect(backendRequest.timeoutMs).toBe(7_000);
   });
 
   it('exits gracefully on double ctrl+c', async () => {
