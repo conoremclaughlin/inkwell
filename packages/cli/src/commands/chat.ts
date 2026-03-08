@@ -142,6 +142,52 @@ interface ActivitySummary {
   createdAt?: string;
 }
 
+type BackendToolGateSnapshot = {
+  mode: ToolMode;
+  allowedTools: string[];
+  unresolvedPatterns: string[];
+};
+
+function buildBackendToolPassthrough(
+  backend: string,
+  toolRouting: 'backend' | 'local',
+  gate: BackendToolGateSnapshot
+): { passthroughArgs: string[]; warning?: string } {
+  const shouldDisableBackendTools = toolRouting !== 'backend' || gate.mode === 'off';
+
+  if (backend === 'claude') {
+    if (shouldDisableBackendTools) {
+      return { passthroughArgs: ['--allowedTools', ''] };
+    }
+    if (gate.mode === 'privileged') {
+      return { passthroughArgs: [] };
+    }
+    return { passthroughArgs: ['--allowedTools', gate.allowedTools.join(',')] };
+  }
+
+  if (backend === 'gemini') {
+    if (shouldDisableBackendTools) {
+      return { passthroughArgs: ['--allowed-tools', ''] };
+    }
+    if (gate.mode === 'privileged') {
+      return { passthroughArgs: [] };
+    }
+    return { passthroughArgs: ['--allowed-tools', gate.allowedTools.join(',')] };
+  }
+
+  if (backend === 'codex' && (shouldDisableBackendTools || gate.mode === 'backend')) {
+    return {
+      passthroughArgs: [],
+      warning:
+        toolRouting === 'local'
+          ? 'Codex CLI has no allowlist passthrough flag; relying on sb local-tool routing prompt guard.'
+          : 'Codex CLI has no allowlist passthrough flag; backend tool gating is not enforced by CLI flags.',
+    };
+  }
+
+  return { passthroughArgs: [] };
+}
+
 interface DelegationState {
   token: string;
   payload: DelegationTokenPayload;
@@ -1559,6 +1605,15 @@ function buildPromptEnvelope(
     includeSources: true,
   });
 
+  const toolInstruction =
+    runtime.toolRouting === 'local'
+      ? 'Backend-native tool calling is disabled for this run. If you need PCP tool access, emit fenced blocks in this exact format: ```pcp-tool {"tool":"tool_name","args":{}} ``` and continue with your plain-text answer.'
+      : runtime.toolMode === 'off'
+        ? 'Do not call backend-native tools. Provide reasoning and instructions only.'
+        : runtime.toolMode === 'privileged'
+          ? 'Backend-native tools are enabled and external actions are allowed when needed.'
+          : '';
+
   return [
     `You are ${agentId}.`,
     'You are running inside sb chat (first-class PCP REPL).',
@@ -1566,15 +1621,7 @@ function buildPromptEnvelope(
     `Current backend: ${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}.`,
     `Tool mode: ${runtime.toolMode}.`,
     `Tool routing: ${runtime.toolRouting}.`,
-    runtime.toolMode === 'off'
-      ? 'Do not call backend-native tools. Provide reasoning and instructions only.'
-      : '',
-    runtime.toolMode === 'privileged'
-      ? 'Backend-native tools are enabled and external actions are allowed when needed.'
-      : '',
-    runtime.toolRouting === 'local'
-      ? 'Backend-native tool calling is disabled for this run. If you need PCP tool access, emit fenced blocks in this exact format: ```pcp-tool {"tool":"tool_name","args":{}} ``` and continue with your plain-text answer.'
-      : '',
+    toolInstruction,
     runtime.activeSkills.length > 0
       ? `Active skills: ${runtime.activeSkills.map((skill) => skill.name).join(', ')}`
       : '',
@@ -2396,14 +2443,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const prompt = buildPromptEnvelope(agentId, runtime, ledger, raw);
     const turnStartedAt = Date.now();
     const backendGate = toolPolicy.getBackendToolGate();
-    const passthroughArgs =
-      runtime.toolRouting !== 'backend'
-        ? ['--allowedTools', '']
-        : backendGate.mode === 'off'
-          ? ['--allowedTools', '']
-          : backendGate.mode === 'privileged'
-            ? []
-            : ['--allowedTools', backendGate.allowedTools.join(',')];
+    const passthroughPlan = buildBackendToolPassthrough(
+      runtime.backend,
+      runtime.toolRouting,
+      backendGate
+    );
+    const passthroughArgs = passthroughPlan.passthroughArgs;
 
     if (runtime.toolRouting === 'backend' && backendGate.mode === 'backend' && runtime.verbose) {
       printLine(
@@ -2415,6 +2460,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }`
         )
       );
+    }
+    if (passthroughPlan.warning && runtime.verbose) {
+      printLine(chalk.yellow(passthroughPlan.warning));
     }
 
     // Ink handles waiting via its own component; legacy uses animated indicator
@@ -2663,6 +2711,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   };
 
+  let rl: ReturnType<typeof createInterface> | null = null;
+
   let turnQueue: Promise<void> = Promise.resolve();
   let pendingTurns = 0;
   let lastStatusSummary = '';
@@ -2766,7 +2816,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // ── Mount the REPL input layer (Ink or legacy readline) ──
 
   let readlineClosed = false;
-  let rl: ReturnType<typeof createInterface> | null = null;
   let keepRunning = true;
   let lastUsageTotal: number | undefined;
   let lastCtrlCAt = 0;

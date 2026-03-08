@@ -1291,6 +1291,52 @@ describe('runChat integration', () => {
     expect(localToolCall).toBeTruthy();
   });
 
+  it('does not pass unsupported --allowedTools passthrough to codex backend', async () => {
+    testState.inputs = ['codex local turn', '/quit'];
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'codex',
+      toolRouting: 'local',
+      pollSeconds: '999',
+    });
+
+    expect(testState.runBackendImpl).toHaveBeenCalledTimes(1);
+    const backendRequest = testState.runBackendImpl.mock.calls[0][0] as {
+      passthroughArgs: string[];
+    };
+    expect(backendRequest.passthroughArgs).toEqual([]);
+  });
+
+  it('handles non-interactive local tool blocks without readline crashes', async () => {
+    testState.runBackendImpl.mockResolvedValue({
+      success: true,
+      stdout:
+        '```pcp-tool\n{"tool":"send_to_inbox","args":{"recipientAgentId":"wren","content":"ping"}}\n```',
+      stderr: '',
+      exitCode: 0,
+      durationMs: 5,
+      command: 'mock',
+    });
+
+    await expect(
+      runChat({
+        agent: 'lumen',
+        backend: 'claude',
+        nonInteractive: true,
+        message: 'one shot',
+        toolRouting: 'local',
+        pollSeconds: '999',
+      })
+    ).resolves.toBeUndefined();
+
+    // In non-interactive mode there is no readline prompt, so this tool call must be denied
+    // instead of crashing from an uninitialized readline reference.
+    expect(testState.pcpCalls.some((call) => call.tool === 'send_to_inbox')).toBe(false);
+    const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
+    expect(logText).toContain('Local tool denied (send_to_inbox)');
+  });
+
   it('exits gracefully on double ctrl+c', async () => {
     testState.inputs = ['__ABORT__', '__ABORT__'];
 
