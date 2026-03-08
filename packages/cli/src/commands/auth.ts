@@ -27,6 +27,11 @@ import {
   updateConfigEmail,
   CLIENT_ID,
 } from '../auth/tokens.js';
+import {
+  getBackendAuthStatus,
+  runBackendInteractiveLogin,
+  type BackendAuthBackend,
+} from '../lib/backend-auth.js';
 
 // ============================================================================
 // Helpers
@@ -361,6 +366,91 @@ async function delegateCommand(options: { agent: string }): Promise<void> {
   );
 }
 
+const AUTH_BACKENDS: BackendAuthBackend[] = ['claude', 'codex', 'gemini'];
+
+function parseBackendName(value?: string): BackendAuthBackend | null {
+  if (!value) return null;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'claude' || normalized === 'codex' || normalized === 'gemini') {
+    return normalized;
+  }
+  return null;
+}
+
+async function backendStatusCommand(options: { backend?: string }): Promise<void> {
+  const selected = parseBackendName(options.backend);
+  if (options.backend && !selected) {
+    console.log(chalk.red(`Unknown backend: ${options.backend}`));
+    console.log(chalk.dim('Valid: claude, codex, gemini'));
+    process.exitCode = 1;
+    return;
+  }
+
+  const targets = selected ? [selected] : AUTH_BACKENDS;
+  console.log(chalk.bold('\nBackend Auth Status\n'));
+  for (const backend of targets) {
+    const status = await getBackendAuthStatus(backend);
+    const state = status.authenticated
+      ? chalk.green('authenticated')
+      : chalk.yellow('unauthenticated');
+    console.log(`  ${chalk.bold(backend)}: ${state} ${chalk.dim(`(${status.detail})`)}`);
+    console.log(chalk.dim(`    source: ${status.credentialSource}`));
+    if (!status.authenticated && status.loginCommand) {
+      console.log(chalk.dim(`    login:  ${status.loginCommand}`));
+    }
+  }
+  console.log('');
+}
+
+async function backendLoginCommand(options: { backend: string }): Promise<void> {
+  const backend = parseBackendName(options.backend);
+  if (!backend) {
+    console.log(chalk.red(`Unknown backend: ${options.backend}`));
+    console.log(chalk.dim('Valid: claude, codex, gemini'));
+    process.exitCode = 1;
+    return;
+  }
+
+  const before = await getBackendAuthStatus(backend);
+  if (before.authenticated) {
+    console.log(chalk.green(`${backend} already authenticated (${before.detail})`));
+    return;
+  }
+
+  if (!before.canInteractiveLogin || !before.loginCommand) {
+    console.log(chalk.yellow(`${backend} login must be completed in backend CLI.`));
+    console.log(chalk.dim(`Status: ${before.detail}`));
+    if (backend === 'gemini') {
+      console.log(
+        chalk.dim('Run `gemini` and complete authentication, then re-run this status check.')
+      );
+    }
+    return;
+  }
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.log(chalk.yellow('backend login requires interactive TTY.'));
+    console.log(chalk.dim(`Run interactively: ${before.loginCommand}`));
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log(chalk.dim(`Launching: ${before.loginCommand}`));
+  const exitCode = await runBackendInteractiveLogin(backend);
+  if (exitCode !== 0) {
+    console.log(chalk.red(`${before.loginCommand} exited with ${exitCode}`));
+    process.exitCode = exitCode;
+    return;
+  }
+  const after = await getBackendAuthStatus(backend);
+  if (!after.authenticated) {
+    console.log(chalk.red(`${backend} still unauthenticated (${after.detail})`));
+    process.exitCode = 1;
+    return;
+  }
+  console.log(chalk.green(`${backend} authenticated (${after.detail})`));
+}
+
 // ============================================================================
 // Register
 // ============================================================================
@@ -383,4 +473,20 @@ export function registerAuthCommands(program: Command): void {
     .description('Mint and store an SB-scoped delegated MCP token')
     .requiredOption('-a, --agent <agentId>', 'SB agentId (e.g. wren, lumen, aster)')
     .action(delegateCommand);
+
+  const backend = auth
+    .command('backend')
+    .description('Manage backend CLI authentication status/login');
+
+  backend
+    .command('status')
+    .description('Show backend CLI auth status')
+    .option('-b, --backend <name>', 'Backend (claude, codex, gemini)')
+    .action(backendStatusCommand);
+
+  backend
+    .command('login')
+    .description('Run backend CLI login flow (interactive when supported)')
+    .requiredOption('-b, --backend <name>', 'Backend (claude, codex, gemini)')
+    .action(backendLoginCommand);
 }
