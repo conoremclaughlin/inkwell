@@ -31,7 +31,7 @@ import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 /** Maximum time (ms) to wait for a Gemini CLI subprocess before killing it.
  *  Override with GEMINI_PROCESS_TIMEOUT_MS env var. */
 const PROCESS_TIMEOUT_MS =
-  parseInt(process.env.GEMINI_PROCESS_TIMEOUT_MS || '', 10) || 15 * 60 * 1000; // 15 minutes
+  parseInt(process.env.GEMINI_PROCESS_TIMEOUT_MS || '', 10) || 30 * 60 * 1000; // 30 minutes
 
 /** Idle timeout: no output for this long = stuck */
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
