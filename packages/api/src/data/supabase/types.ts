@@ -133,6 +133,7 @@ export type Database = {
           relationships: Json | null;
           role: string;
           soul: string | null;
+          studio_hint: string | null;
           updated_at: string | null;
           user_id: string;
           values: Json | null;
@@ -152,6 +153,7 @@ export type Database = {
           relationships?: Json | null;
           role: string;
           soul?: string | null;
+          studio_hint?: string | null;
           updated_at?: string | null;
           user_id: string;
           values?: Json | null;
@@ -171,6 +173,7 @@ export type Database = {
           relationships?: Json | null;
           role?: string;
           soul?: string | null;
+          studio_hint?: string | null;
           updated_at?: string | null;
           user_id?: string;
           values?: Json | null;
@@ -1908,6 +1911,7 @@ export type Database = {
           next_run_at: string;
           run_count: number | null;
           status: string;
+          studio_hint: string | null;
           title: string;
           updated_at: string | null;
           user_id: string;
@@ -1926,6 +1930,7 @@ export type Database = {
           next_run_at: string;
           run_count?: number | null;
           status?: string;
+          studio_hint?: string | null;
           title: string;
           updated_at?: string | null;
           user_id: string;
@@ -1944,6 +1949,7 @@ export type Database = {
           next_run_at?: string;
           run_count?: number | null;
           status?: string;
+          studio_hint?: string | null;
           title?: string;
           updated_at?: string | null;
           user_id?: string;

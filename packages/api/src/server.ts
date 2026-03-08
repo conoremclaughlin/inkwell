@@ -380,11 +380,24 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       }
     }
 
-    // Resolve studioHint from channel_routes for the delivery channel + target
-    // delivery_target is the chat/conversation ID (e.g., Telegram chat ID)
-    // This enables per-chat routing for multi-user scenarios
+    // Resolve studioHint via cascade:
+    //   1. reminder.studio_hint (direct override)
+    //   2. channel_routes.studio_hint (matched by delivery channel)
+    //   3. agent_identities.studio_hint (agent's home studio)
+    //   4. 'home' (hardcoded fallback)
     let reminderStudioHint: string | null = null;
-    if (dataComposer && reminder.delivery_channel) {
+
+    // Check reminder-level override first
+    if (reminder.studio_hint) {
+      reminderStudioHint = reminder.studio_hint;
+      logger.debug(`[Heartbeat] Using reminder-level studioHint`, {
+        studioHint: reminderStudioHint,
+        reminderId: reminder.id,
+      });
+    }
+
+    // Fallback to channel_routes
+    if (!reminderStudioHint && dataComposer && reminder.delivery_channel) {
       const route = await resolveRouteAgentId(
         dataComposer.getClient(),
         userId,
@@ -400,6 +413,28 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
           deliveryTarget: reminder.delivery_target,
         });
       }
+    }
+
+    // Fallback to agent identity's home studio
+    if (!reminderStudioHint && reminder.identity_id && dataComposer) {
+      const { data: identity } = await dataComposer
+        .getClient()
+        .from('agent_identities')
+        .select('studio_hint')
+        .eq('id', reminder.identity_id)
+        .single();
+      if (identity?.studio_hint) {
+        reminderStudioHint = identity.studio_hint;
+        logger.debug(`[Heartbeat] Using agent home studio`, {
+          studioHint: reminderStudioHint,
+          identityId: reminder.identity_id,
+        });
+      }
+    }
+
+    // Final fallback
+    if (!reminderStudioHint) {
+      reminderStudioHint = 'home';
     }
 
     const reminderContent = `[HEARTBEAT REMINDER]

@@ -1458,7 +1458,7 @@ router.get('/routing', async (req: Request, res: Response) => {
 
     const { data: identitiesData, error: identitiesError } = await supabase
       .from('agent_identities')
-      .select('id, agent_id, name, role, backend')
+      .select('id, agent_id, name, role, backend, studio_hint')
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
       .order('agent_id', { ascending: true });
@@ -1533,6 +1533,7 @@ router.get('/routing', async (req: Request, res: Response) => {
         name: identity.name,
         role: identity.role,
         backend: identity.backend,
+        studioHint: identity.studio_hint || 'home',
       })),
       routes,
     });
@@ -1556,7 +1557,9 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
 
     const { data: identity, error: identityError } = await supabase
       .from('agent_identities')
-      .select('id, agent_id, name, role, description, backend, workspace_id, updated_at')
+      .select(
+        'id, agent_id, name, role, description, backend, studio_hint, workspace_id, updated_at'
+      )
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
       .eq('agent_id', agentId)
@@ -1618,7 +1621,8 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
         status,
         run_count,
         max_runs,
-        identity_id
+        identity_id,
+        studio_hint
       `
       )
       .eq('user_id', authReq.pcpUserId)
@@ -1666,6 +1670,7 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
         role: identity.role,
         description: identity.description,
         backend: identity.backend,
+        studioHint: identity.studio_hint || 'home',
         updatedAt: identity.updated_at,
       },
       studios: (studiosData || []).map((s) => ({
@@ -1688,6 +1693,7 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
         runCount: reminder.run_count,
         maxRuns: reminder.max_runs,
         identityId: reminder.identity_id,
+        studioHint: reminder.studio_hint ?? null,
       })),
     });
   } catch (error) {
@@ -1996,6 +2002,108 @@ router.delete('/routing/routes/:routeId', async (req: Request, res: Response) =>
 });
 
 /**
+ * PATCH /api/admin/routing/identities/:identityId
+ * Update an agent identity's studio_hint (home studio).
+ */
+router.patch('/routing/identities/:identityId', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const { identityId } = req.params;
+    const { studioHint } = req.body;
+
+    if (typeof studioHint !== 'string' || !studioHint.trim()) {
+      res.status(400).json({ error: 'studioHint is required (non-empty string)' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    // Verify identity belongs to user + workspace
+    const { data: identity, error: fetchError } = await supabase
+      .from('agent_identities')
+      .select('id, agent_id')
+      .eq('id', identityId)
+      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .single();
+
+    if (fetchError || !identity) {
+      res.status(404).json({ error: 'Identity not found' });
+      return;
+    }
+
+    const { error: updateError } = await supabase
+      .from('agent_identities')
+      .update({ studio_hint: studioHint.trim() })
+      .eq('id', identityId);
+
+    if (updateError) {
+      logger.error('Failed to update identity studio_hint:', updateError);
+      res.status(500).json(errorJson('Failed to update identity', updateError));
+      return;
+    }
+
+    res.json({ success: true, identityId, studioHint: studioHint.trim() });
+  } catch (error) {
+    logger.error('Failed to update identity studio_hint:', error);
+    res.status(500).json(errorJson('Failed to update identity', error));
+  }
+});
+
+/**
+ * PATCH /api/admin/routing/reminders/:reminderId
+ * Update a reminder's studio_hint override.
+ */
+router.patch('/routing/reminders/:reminderId', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const { reminderId } = req.params;
+    const { studioHint } = req.body;
+
+    // studioHint can be a string (set override) or null (clear override, inherit from agent)
+    if (studioHint !== null && (typeof studioHint !== 'string' || !studioHint.trim())) {
+      res.status(400).json({ error: 'studioHint must be a non-empty string or null (to clear)' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    // Verify reminder belongs to user
+    const { data: reminder, error: fetchError } = await supabase
+      .from('scheduled_reminders')
+      .select('id')
+      .eq('id', reminderId)
+      .eq('user_id', authReq.pcpUserId)
+      .single();
+
+    if (fetchError || !reminder) {
+      res.status(404).json({ error: 'Reminder not found' });
+      return;
+    }
+
+    const { error: updateError } = await supabase
+      .from('scheduled_reminders')
+      .update({ studio_hint: studioHint ? studioHint.trim() : null })
+      .eq('id', reminderId);
+
+    if (updateError) {
+      logger.error('Failed to update reminder studio_hint:', updateError);
+      res.status(500).json(errorJson('Failed to update reminder', updateError));
+      return;
+    }
+
+    res.json({ success: true, reminderId, studioHint: studioHint ? studioHint.trim() : null });
+  } catch (error) {
+    logger.error('Failed to update reminder studio_hint:', error);
+    res.status(500).json(errorJson('Failed to update reminder', error));
+  }
+});
+
+/**
  * GET /api/admin/reminders
  * List reminders for the active user (admin view)
  */
@@ -2032,6 +2140,7 @@ router.get('/reminders', async (req: Request, res: Response) => {
         status: r.status,
         runCount: r.run_count,
         maxRuns: r.max_runs,
+        studioHint: r.studio_hint ?? null,
         agentId: r.agent_identities?.agent_id ?? null,
         agentName: r.agent_identities?.name ?? null,
         createdAt: r.created_at,

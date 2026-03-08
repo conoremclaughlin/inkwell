@@ -10,6 +10,7 @@ import {
   AlertTriangle,
   ChevronRight,
   Globe,
+  Home,
   MessageCircle,
   Send,
   Hash,
@@ -32,6 +33,7 @@ interface RoutingIdentity {
   name: string;
   role: string;
   backend: string | null;
+  studioHint: string;
 }
 
 interface RoutingRoute {
@@ -79,6 +81,7 @@ interface SBGroup {
   agentName: string;
   agentRole: string | null;
   identityId: string;
+  studioHint: string;
   routes: RoutingRoute[];
   totalReminders: number;
   activeRoutes: number;
@@ -192,17 +195,28 @@ export default function RoutingPage() {
     unassignedReminderCount: 0,
   };
 
+  // Build identity lookup for studioHint
+  const identityMap = useMemo(() => {
+    const map = new Map<string, RoutingIdentity>();
+    for (const identity of identities) {
+      map.set(identity.id, identity);
+    }
+    return map;
+  }, [identities]);
+
   // Group routes by SB
   const sbGroups = useMemo<SBGroup[]>(() => {
     const groups = new Map<string, SBGroup>();
     for (const route of routes) {
       const key = route.agentId || route.identityId;
       if (!groups.has(key)) {
+        const identity = identityMap.get(route.identityId);
         groups.set(key, {
           agentId: route.agentId || 'unknown',
           agentName: route.agentName || route.agentId || 'Unknown agent',
           agentRole: route.agentRole || null,
           identityId: route.identityId,
+          studioHint: identity?.studioHint || 'home',
           routes: [],
           totalReminders: 0,
           activeRoutes: 0,
@@ -421,6 +435,13 @@ export default function RoutingPage() {
                     )}
                   </div>
                   <div className="flex items-center gap-4 shrink-0">
+                    <div className="text-right">
+                      <div className="text-xs text-gray-400">Home</div>
+                      <div className="flex items-center gap-1 justify-end">
+                        <Home className="h-3.5 w-3.5 text-gray-500" />
+                        <span className="font-medium text-gray-700">{group.studioHint}</span>
+                      </div>
+                    </div>
                     <div className="text-right">
                       <div className="text-xs text-gray-400">Reminders</div>
                       <div className="flex items-center gap-1 justify-end">

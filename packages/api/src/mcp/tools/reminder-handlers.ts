@@ -149,6 +149,12 @@ export const createReminderSchema = z.object({
     .positive()
     .optional()
     .describe('Maximum number of times to run (for recurring reminders)'),
+  studioHint: z
+    .string()
+    .optional()
+    .describe(
+      'Studio to run this reminder in (e.g., "home", "main", studio name). Overrides the agent\'s default. If omitted, inherits from agent identity.'
+    ),
 });
 
 export async function handleCreateReminder(
@@ -269,6 +275,7 @@ export async function handleCreateReminder(
         cron_expression: args.cronExpression || null,
         next_run_at: nextRunAt.toISOString(),
         max_runs: args.maxRuns || null,
+        studio_hint: args.studioHint || null,
         status: 'active',
       })
       .select()
@@ -290,6 +297,7 @@ export async function handleCreateReminder(
         deliveryTarget: data.delivery_target,
         cronExpression: data.cron_expression,
         nextRunAt: data.next_run_at,
+        studioHint: data.studio_hint,
         status: data.status,
         isRecurring: !!data.cron_expression,
       },
@@ -394,6 +402,7 @@ export async function handleListReminders(
       cronExpression: r.cron_expression,
       nextRunAt: r.next_run_at,
       lastRunAt: r.last_run_at,
+      studioHint: r.studio_hint,
       status: r.status,
       runCount: r.run_count,
       maxRuns: r.max_runs,
@@ -459,6 +468,12 @@ export const updateReminderSchema = z.object({
     .describe('New cron expression (set to null to make one-time)'),
   nextRunAt: z.string().datetime().optional().describe('Reschedule to specific time'),
   status: z.enum(['active', 'paused']).optional().describe('Pause or resume the reminder'),
+  studioHint: z
+    .string()
+    .optional()
+    .describe(
+      'Studio to run this reminder in. Set to override agent default, or empty string to clear override.'
+    ),
 });
 
 export async function handleUpdateReminder(
@@ -509,6 +524,7 @@ export async function handleUpdateReminder(
     if (args.cronExpression !== undefined) updates.cron_expression = args.cronExpression || null;
     if (args.nextRunAt !== undefined) updates.next_run_at = args.nextRunAt;
     if (args.status !== undefined) updates.status = args.status;
+    if (args.studioHint !== undefined) updates.studio_hint = args.studioHint || null;
 
     if (Object.keys(updates).length === 0) {
       return mcpResponse({ success: false, error: 'No updates provided' }, true);
@@ -533,6 +549,7 @@ export async function handleUpdateReminder(
         description: data.description,
         cronExpression: data.cron_expression,
         nextRunAt: data.next_run_at,
+        studioHint: data.studio_hint,
         status: data.status,
       },
     });
