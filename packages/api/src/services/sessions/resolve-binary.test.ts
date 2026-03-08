@@ -7,6 +7,12 @@ vi.mock('child_process', () => ({
   execFile: mockExecFile,
 }));
 
+// Mock fs/promises for pathExists
+const mockAccess = vi.fn();
+vi.mock('fs/promises', () => ({
+  access: mockAccess,
+}));
+
 vi.mock('../../utils/logger.js', () => ({
   logger: {
     info: vi.fn(),
@@ -19,7 +25,7 @@ vi.mock('../../utils/logger.js', () => ({
 // Dynamic import so mocks are in place before module loads
 const { resolveBinaryPath, buildSpawnPath } = await import('./resolve-binary.js');
 
-// Helper: make mockExecFile behave like Node's callback-style execFile
+// Helper: make mockExecFile resolve with stdout
 function mockWhichResult(stdout: string) {
   mockExecFile.mockImplementation(
     (
@@ -28,7 +34,6 @@ function mockWhichResult(stdout: string) {
       _opts: unknown,
       cb?: (err: Error | null, result: { stdout: string; stderr: string }) => void
     ) => {
-      // promisify calls with (cmd, args, opts, callback)
       if (typeof cb === 'function') {
         cb(null, { stdout, stderr: '' });
       }
@@ -49,17 +54,18 @@ function mockWhichError() {
 describe('resolveBinaryPath', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // Clear the module-level cache between tests by re-importing would be ideal,
-    // but we can test the caching behavior by resolving different binary names
+    // Default: pathExists returns true for any path
+    mockAccess.mockResolvedValue(undefined);
   });
 
   it('resolves a binary found via which', async () => {
     mockWhichResult('/usr/local/bin/test-binary\n');
-    const result = await resolveBinaryPath('test-binary-' + Date.now());
+    const name = 'test-binary-' + Date.now();
+    const result = await resolveBinaryPath(name);
     expect(result).toBe('/usr/local/bin/test-binary');
     expect(mockExecFile).toHaveBeenCalledWith(
       'which',
-      [expect.stringContaining('test-binary')],
+      [name],
       expect.any(Object),
       expect.any(Function)
     );
@@ -69,7 +75,7 @@ describe('resolveBinaryPath', () => {
     let callCount = 0;
     mockExecFile.mockImplementation(
       (
-        cmd: string,
+        _cmd: string,
         _args: string[],
         _opts: unknown,
         cb?: (err: Error | null, result?: { stdout: string; stderr: string }) => void
@@ -77,11 +83,12 @@ describe('resolveBinaryPath', () => {
         callCount++;
         if (typeof cb !== 'function') return;
         if (callCount === 1) {
-          // First call (which) fails
           cb(new Error('not found'));
         } else {
-          // Second call (zsh -ilc) succeeds
-          cb(null, { stdout: 'Now using node v22\n/opt/homebrew/bin/zsh-binary\n', stderr: '' });
+          cb(null, {
+            stdout: 'Now using node v22\n/opt/homebrew/bin/zsh-binary\n',
+            stderr: '',
+          });
         }
       }
     );
@@ -98,6 +105,16 @@ describe('resolveBinaryPath', () => {
     expect(result).toBe(name);
   });
 
+  it('rejects resolved path that does not exist on disk', async () => {
+    mockWhichResult('/usr/local/bin/ghost-binary\n');
+    mockAccess.mockRejectedValue(new Error('ENOENT'));
+
+    const name = 'ghost-binary-' + Date.now();
+    const result = await resolveBinaryPath(name);
+    // Both which and zsh paths fail pathExists, so bare name returned
+    expect(result).toBe(name);
+  });
+
   it('returns cached result on subsequent calls', async () => {
     const name = 'cached-binary-' + Date.now();
     mockWhichResult('/usr/bin/cached-binary\n');
@@ -107,9 +124,8 @@ describe('resolveBinaryPath', () => {
 
     expect(first).toBe('/usr/bin/cached-binary');
     expect(second).toBe('/usr/bin/cached-binary');
-    // execFile should only be called once (first call), second hits cache
-    // (may be called twice due to which + zsh fallback, but not 4 times)
-    expect(mockExecFile.mock.calls.filter((c) => c[1]?.includes(name))).toHaveLength(1);
+    // execFile should only be called for the first resolution
+    expect(mockExecFile.mock.calls.filter((c: string[][]) => c[1]?.includes(name))).toHaveLength(1);
   });
 });
 
