@@ -33,7 +33,12 @@ import {
   type ChannelGateway,
 } from './mcp/server';
 import type { GatewayChannel } from './channels/gateway';
-import { initHeartbeatService, processHeartbeat, type DueReminder } from './services/heartbeat';
+import {
+  initHeartbeatService,
+  stopHeartbeatService,
+  processHeartbeat,
+  type DueReminder,
+} from './services/heartbeat';
 import { setResponseCallback, hasExplicitResponse } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
 import { resolveRouteAgentId } from './services/routing/resolve-route';
@@ -954,6 +959,14 @@ async function shutdown(): Promise<void> {
   isShuttingDown = true;
 
   logger.info('\nShutting down PCP Server...');
+
+  // Stop heartbeat cron job
+  stopHeartbeatService();
+  logger.info('Heartbeat service stopped');
+
+  // Remove agent gateway listeners to release event loop references
+  getAgentGateway().removeAllListeners();
+  logger.info('Agent gateway listeners removed');
 
   // Shutdown MCP server (includes ChannelGateway shutdown)
   if (mcpServer) {
