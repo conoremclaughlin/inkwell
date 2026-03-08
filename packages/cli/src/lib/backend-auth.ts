@@ -132,7 +132,7 @@ export function parseCodexLoginStatusOutput(output: string): {
   };
 }
 
-function readGeminiAuthFile(now = Date.now()): { authenticated: boolean; detail: string } {
+function readGeminiAuthFile(): { authenticated: boolean; detail: string } {
   if (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY) {
     return { authenticated: true, detail: 'using API key from environment' };
   }
@@ -143,18 +143,18 @@ function readGeminiAuthFile(now = Date.now()): { authenticated: boolean; detail:
   try {
     const raw = JSON.parse(readFileSync(credsPath, 'utf8')) as {
       access_token?: unknown;
-      expiry_date?: unknown;
+      refresh_token?: unknown;
     };
-    if (typeof raw.access_token !== 'string' || !raw.access_token.trim()) {
-      return { authenticated: false, detail: 'oauth creds missing access token' };
-    }
-    if (typeof raw.expiry_date === 'number' && Number.isFinite(raw.expiry_date)) {
-      if (raw.expiry_date <= now) {
-        return { authenticated: false, detail: 'oauth creds expired' };
-      }
+    // Gemini CLI handles token refresh internally — an expired access_token
+    // is fine as long as a refresh_token exists. Only fail if there are no
+    // credentials at all.
+    if (typeof raw.refresh_token === 'string' && raw.refresh_token.trim()) {
       return { authenticated: true, detail: 'oauth creds available' };
     }
-    return { authenticated: true, detail: 'oauth creds available' };
+    if (typeof raw.access_token === 'string' && raw.access_token.trim()) {
+      return { authenticated: true, detail: 'oauth creds available' };
+    }
+    return { authenticated: false, detail: 'oauth creds missing tokens' };
   } catch {
     return { authenticated: false, detail: 'oauth creds unreadable' };
   }
