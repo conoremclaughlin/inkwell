@@ -396,6 +396,134 @@ describe('handleUpdateArtifact', () => {
   });
 
   describe('non-content updates', () => {
+    it('allows workspace-scoped edits even when agent is not in explicit editors list', async () => {
+      const { supabase } = createMockSupabase({
+        artifact: {
+          id: 'artifact-1',
+          uri: 'pcp://test/doc',
+          title: 'Test Doc',
+          content: 'Original content',
+          version: 3,
+          metadata: {},
+          edit_mode: 'workspace',
+          collaborators: ['wren'],
+          created_by_identity_id: null,
+          created_at: '2026-01-01',
+          updated_at: '2026-01-01',
+        },
+      });
+      const dataComposer = createMockDataComposer(supabase);
+
+      const result = await handleUpdateArtifact(
+        {
+          userId: '00000000-0000-0000-0000-000000000001',
+          uri: 'pcp://test/doc',
+          content: 'Updated by another workspace agent',
+          agentId: 'myra',
+        },
+        dataComposer
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(true);
+    });
+
+    it('rejects edits when editMode is editors and agent is not listed', async () => {
+      const { supabase } = createMockSupabase({
+        artifact: {
+          id: 'artifact-1',
+          uri: 'pcp://test/doc',
+          title: 'Test Doc',
+          content: 'Original content',
+          version: 3,
+          metadata: {},
+          edit_mode: 'editors',
+          collaborators: ['wren'],
+          created_by_identity_id: null,
+          created_at: '2026-01-01',
+          updated_at: '2026-01-01',
+        },
+      });
+      const dataComposer = createMockDataComposer(supabase);
+
+      await expect(
+        handleUpdateArtifact(
+          {
+            userId: '00000000-0000-0000-0000-000000000001',
+            uri: 'pcp://test/doc',
+            content: 'Unauthorized edit',
+            agentId: 'myra',
+          },
+          dataComposer
+        )
+      ).rejects.toThrow('Agent myra does not have permission to edit this artifact');
+    });
+
+    it('rejects editMode=editors updates without at least one editor', async () => {
+      const { supabase } = createMockSupabase({
+        artifact: {
+          id: 'artifact-1',
+          uri: 'pcp://test/doc',
+          title: 'Test Doc',
+          content: 'Original content',
+          version: 3,
+          metadata: {},
+          edit_mode: 'workspace',
+          collaborators: [],
+          created_by_identity_id: null,
+          created_at: '2026-01-01',
+          updated_at: '2026-01-01',
+        },
+      });
+      const dataComposer = createMockDataComposer(supabase);
+
+      await expect(
+        handleUpdateArtifact(
+          {
+            userId: '00000000-0000-0000-0000-000000000001',
+            uri: 'pcp://test/doc',
+            editMode: 'editors',
+            editors: [],
+            agentId: 'wren',
+          },
+          dataComposer
+        )
+      ).rejects.toThrow('editMode "editors" requires at least one editor');
+    });
+
+    it('preserves existing editor list when switching to workspace mode', async () => {
+      const { supabase, updatedArtifact } = createMockSupabase({
+        artifact: {
+          id: 'artifact-1',
+          uri: 'pcp://test/doc',
+          title: 'Test Doc',
+          content: 'Original content',
+          version: 3,
+          metadata: {},
+          edit_mode: 'editors',
+          collaborators: ['identity-wren', 'identity-lumen'],
+          created_by_identity_id: null,
+          created_at: '2026-01-01',
+          updated_at: '2026-01-01',
+        },
+      });
+      const dataComposer = createMockDataComposer(supabase);
+
+      const result = await handleUpdateArtifact(
+        {
+          userId: '00000000-0000-0000-0000-000000000001',
+          uri: 'pcp://test/doc',
+          editMode: 'workspace',
+          agentId: 'identity-wren',
+        },
+        dataComposer
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(true);
+      expect(updatedArtifact.collaborators).toEqual(['identity-wren', 'identity-lumen']);
+    });
+
     it('should not trigger merge for metadata-only updates even with baseVersion', async () => {
       const { supabase } = createMockSupabase({
         artifact: {
@@ -668,6 +796,35 @@ describe('artifact comment + identity UUID flows', () => {
     ).toMatchObject({
       changed_by_identity_id: 'identity-1',
     });
+  });
+
+  it('handleCreateArtifact rejects editMode=editors when no editors are provided', async () => {
+    const supabase = createTableAwareSupabaseMock({
+      agent_identities: [
+        {
+          then: {
+            data: [{ workspace_id: '11111111-1111-1111-1111-111111111111' }],
+            error: null,
+          },
+        },
+      ],
+    });
+
+    await expect(
+      handleCreateArtifact(
+        {
+          userId: '00000000-0000-0000-0000-000000000001',
+          uri: 'pcp://specs/no-editors',
+          title: 'No editors',
+          content: '# Hello',
+          artifactType: 'spec',
+          agentId: 'lumen',
+          editMode: 'editors',
+          editors: [],
+        },
+        createMockDataComposer(supabase)
+      )
+    ).rejects.toThrow('editMode "editors" requires at least one editor');
   });
 
   it('handleCreateArtifact keeps slug behavior when identity row is missing', async () => {

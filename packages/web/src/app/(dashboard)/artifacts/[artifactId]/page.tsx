@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { Card, CardContent } from '@/components/ui/card';
@@ -19,10 +19,14 @@ import {
   History,
   Loader2,
 } from 'lucide-react';
-import { useApiPost, useApiQuery, useQueryClient } from '@/lib/api';
+import { apiPatch, useApiPost, useApiQuery, useQueryClient } from '@/lib/api';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import clsx from 'clsx';
+import {
+  ObjectPermissionsEditor,
+  type PermissionIdentityOption,
+} from '@/components/permissions/object-permissions-editor';
 
 interface Artifact {
   id: string;
@@ -32,6 +36,8 @@ interface Artifact {
   contentType: string;
   artifactType: 'spec' | 'design' | 'decision' | 'document' | 'note';
   createdByAgentId?: string;
+  editMode: 'workspace' | 'editors';
+  editors: string[];
   collaborators?: string[];
   visibility: 'private' | 'shared' | 'public';
   version: number;
@@ -77,6 +83,16 @@ interface ArtifactComment {
 interface ArtifactCommentsResponse {
   artifactId: string;
   comments: ArtifactComment[];
+}
+
+interface IndividualIdentity {
+  id: string;
+  agentId: string;
+  name: string;
+}
+
+interface IndividualsResponse {
+  individuals: IndividualIdentity[];
 }
 
 const typeConfig = {
@@ -133,6 +149,13 @@ export default function ArtifactDetailPage() {
   const queryClient = useQueryClient();
   const [commentDraft, setCommentDraft] = useState('');
   const [commentAgentId, setCommentAgentId] = useState('');
+  const [permissionEditMode, setPermissionEditMode] = useState<'workspace' | 'editors'>(
+    'workspace'
+  );
+  const [permissionEditorIdentityIds, setPermissionEditorIdentityIds] = useState<string[]>([]);
+  const [isSavingPermissions, setIsSavingPermissions] = useState(false);
+  const [permissionError, setPermissionError] = useState<string | null>(null);
+  const [permissionSuccess, setPermissionSuccess] = useState<string | null>(null);
 
   const {
     data: artifactData,
@@ -150,6 +173,10 @@ export default function ArtifactDetailPage() {
     ['artifact-comments', artifactId],
     `/api/admin/artifacts/${artifactId}/comments`
   );
+  const { data: identitiesData } = useApiQuery<IndividualsResponse>(
+    ['individual-identities'],
+    '/api/admin/individuals'
+  );
 
   const addCommentMutation = useApiPost<
     { comment: ArtifactComment },
@@ -166,6 +193,49 @@ export default function ArtifactDetailPage() {
 
   const artifact = artifactData?.artifact ?? null;
   const comments = commentsData?.comments ?? [];
+  const identityOptions: PermissionIdentityOption[] = useMemo(
+    () =>
+      identitiesData?.individuals.map((identity) => ({
+        id: identity.id,
+        name: identity.name,
+      })) ?? [],
+    [identitiesData?.individuals]
+  );
+  const identityNameById = useMemo(
+    () => new Map(identityOptions.map((identity) => [identity.id, identity.name] as const)),
+    [identityOptions]
+  );
+  const identityIdByAgentId = useMemo(
+    () =>
+      new Map(
+        (identitiesData?.individuals ?? []).map(
+          (identity) => [identity.agentId, identity.id] as const
+        )
+      ),
+    [identitiesData?.individuals]
+  );
+
+  useEffect(() => {
+    if (!artifact) return;
+    const normalizedEditorIds = Array.from(
+      new Set(
+        (artifact.editors || [])
+          .map((value) => value.trim())
+          .filter((value) => value.length > 0)
+          .map((value) =>
+            identityNameById.get(value) ? value : identityIdByAgentId.get(value) || value
+          )
+      )
+    );
+    setPermissionEditMode(artifact.editMode || 'workspace');
+    setPermissionEditorIdentityIds(normalizedEditorIds);
+  }, [artifact, identityNameById, identityIdByAgentId]);
+
+  useEffect(() => {
+    if (!permissionSuccess) return;
+    const timeout = window.setTimeout(() => setPermissionSuccess(null), 3000);
+    return () => window.clearTimeout(timeout);
+  }, [permissionSuccess]);
 
   if (isLoading) {
     return (
@@ -212,6 +282,29 @@ export default function ArtifactDetailPage() {
       content: commentDraft.trim(),
       ...(commentAgentId.trim() ? { agentId: commentAgentId.trim() } : {}),
     });
+  };
+
+  const handleSavePermissions = async () => {
+    setPermissionError(null);
+    setPermissionSuccess(null);
+    setIsSavingPermissions(true);
+
+    try {
+      await apiPatch(`/api/admin/artifacts/${artifactId}/permissions`, {
+        editMode: permissionEditMode,
+        editors: permissionEditorIdentityIds,
+      });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['artifacts', artifactId] }),
+        queryClient.invalidateQueries({ queryKey: ['artifacts'] }),
+      ]);
+      setPermissionSuccess('Permissions updated.');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to update permissions';
+      setPermissionError(message);
+    } finally {
+      setIsSavingPermissions(false);
+    }
   };
 
   return (
@@ -266,6 +359,26 @@ export default function ArtifactDetailPage() {
           <div className="prose prose-sm max-w-none prose-headings:font-semibold prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-0">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{artifact.content}</ReactMarkdown>
           </div>
+        </CardContent>
+      </Card>
+
+      <Card className="mt-6">
+        <CardContent className="p-6 space-y-4">
+          <ObjectPermissionsEditor
+            title="Edit permissions"
+            description="Control who can update this document. “Anyone” mode keeps stored editor selections so you can switch back safely."
+            mode={permissionEditMode}
+            onModeChange={setPermissionEditMode}
+            editorIdentityIds={permissionEditorIdentityIds}
+            onEditorIdentityIdsChange={setPermissionEditorIdentityIds}
+            identities={identityOptions}
+            actionLabel="Save"
+            pendingActionLabel="Saving…"
+            onAction={handleSavePermissions}
+            isActionPending={isSavingPermissions}
+            error={permissionError}
+            success={permissionSuccess}
+          />
         </CardContent>
       </Card>
 
@@ -349,8 +462,23 @@ export default function ArtifactDetailPage() {
       <div className="mt-6 flex items-center justify-between text-sm text-gray-500">
         <div className="flex items-center gap-4">
           {artifact.createdByAgentId && <span>Created by: {artifact.createdByAgentId}</span>}
-          {artifact.collaborators && artifact.collaborators.length > 0 && (
-            <span>Collaborators: {artifact.collaborators.join(', ')}</span>
+          <span>
+            Edit mode:{' '}
+            {artifact.editMode === 'workspace' ? 'workspace editors' : 'specific editor list'}
+          </span>
+          {artifact.editMode === 'editors' && artifact.editors && artifact.editors.length > 0 && (
+            <span>
+              Editors:{' '}
+              {artifact.editors
+                .map((identityId) => {
+                  const identityName = identityNameById.get(identityId);
+                  if (identityName) return identityName;
+                  const remappedId = identityIdByAgentId.get(identityId);
+                  const remappedIdentityName = remappedId ? identityNameById.get(remappedId) : null;
+                  return remappedIdentityName || identityId;
+                })
+                .join(', ')}
+            </span>
           )}
         </div>
         <div className="flex items-center gap-4">

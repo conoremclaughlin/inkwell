@@ -23,6 +23,8 @@ interface Artifact {
   title: string;
   artifactType: 'spec' | 'design' | 'decision' | 'document' | 'note';
   visibility: 'private' | 'shared' | 'public';
+  editMode: 'workspace' | 'editors';
+  editors: string[];
   version: number;
   tags: string[] | null;
   createdAt: string;
@@ -193,6 +195,9 @@ export default function ArtifactsPage() {
                           <Badge variant="outline" className="text-xs">
                             <VisIcon className="h-3 w-3 mr-1" />
                             {visConfig.label}
+                          </Badge>
+                          <Badge variant="outline" className="text-xs">
+                            {artifact.editMode === 'workspace' ? 'Workspace edit' : 'Editors only'}
                           </Badge>
                           <span className="text-xs text-gray-400">v{artifact.version}</span>
                           {artifact.version > 1 && (

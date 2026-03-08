@@ -36,7 +36,13 @@ const createArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
     .default('document')
     .describe('Type of artifact'),
   agentId: z.string().optional().describe('Agent creating this artifact'),
-  collaborators: z.array(z.string()).optional().describe('Agent IDs who can edit'),
+  editMode: z
+    .enum(['workspace', 'editors'])
+    .optional()
+    .default('workspace')
+    .describe('Edit permission mode: workspace (all workspace agents) or editors list only'),
+  editors: z.array(z.string()).optional().describe('Editor IDs when editMode is editors'),
+  collaborators: z.array(z.string()).optional().describe('Backward-compatible alias for editors'),
   visibility: z
     .enum(['private', 'shared', 'public'])
     .optional()
@@ -76,7 +82,9 @@ const updateArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
       'Version this edit is based on. When provided, enables three-way merge: if the artifact has been modified since this version, the server will attempt to merge changes automatically. Omit for legacy last-write-wins behavior.'
     ),
   agentId: z.string().optional().describe('Agent making the update'),
-  collaborators: z.array(z.string()).optional().describe('Updated collaborator list'),
+  editMode: z.enum(['workspace', 'editors']).optional().describe('Updated edit permission mode'),
+  editors: z.array(z.string()).optional().describe('Updated editor IDs'),
+  collaborators: z.array(z.string()).optional().describe('Backward-compatible alias for editors'),
   tags: z.array(z.string()).optional().describe('Updated tags'),
   changeSummary: z.string().optional().describe('Summary of changes'),
 });
@@ -131,6 +139,19 @@ function parseWithContext<T extends z.ZodTypeAny>(schema: T, args: unknown): z.i
 function toArgsRecord(args: unknown): Record<string, unknown> {
   if (!args || typeof args !== 'object') return {};
   return args as Record<string, unknown>;
+}
+
+type ArtifactEditMode = 'workspace' | 'editors';
+
+function normalizeEditMode(value: string | null | undefined): ArtifactEditMode {
+  return value === 'editors' ? 'editors' : 'workspace';
+}
+
+function normalizeEditorAgentIds(values: string[] | undefined): string[] {
+  if (!values) return [];
+  return Array.from(
+    new Set(values.map((value) => value.trim()).filter((value) => value.length > 0))
+  );
 }
 
 async function deriveWorkspaceIdFromAgent(
@@ -267,12 +288,19 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
     title,
     content,
     artifactType = 'document',
-    collaborators = [],
+    editMode = 'workspace',
+    editors,
+    collaborators,
     visibility = 'private',
     tags = [],
     metadata = {},
     workspaceId,
   } = parsed;
+  const normalizedEditors = normalizeEditorAgentIds(editors ?? collaborators);
+  if (editMode === 'editors' && normalizedEditors.length === 0) {
+    throw new Error('editMode "editors" requires at least one editor');
+  }
+  const effectiveEditors = normalizedEditors;
   const agentId = getEffectiveAgentId(parsed.agentId);
   const workspaceResolution = await resolveWorkspaceScopeForWrite({
     rawArgs,
@@ -317,7 +345,8 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
       title,
       content,
       artifact_type: artifactType,
-      collaborators,
+      collaborators: effectiveEditors,
+      edit_mode: editMode,
       visibility,
       tags,
       metadata: metadata as Json,
@@ -358,6 +387,8 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
             uri: artifact.uri,
             title: artifact.title,
             artifactType: artifact.artifact_type,
+            editMode: normalizeEditMode(artifact.edit_mode),
+            editors: artifact.collaborators || [],
             version: artifact.version,
             createdAt: artifact.created_at,
           },
@@ -533,6 +564,8 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
             artifactType: artifact.artifact_type,
             createdByIdentityId: artifact.created_by_identity_id,
             collaborators: artifact.collaborators,
+            editMode: normalizeEditMode(artifact.edit_mode),
+            editors: artifact.collaborators || [],
             visibility: artifact.visibility,
             version: artifact.version,
             tags: artifact.tags,
@@ -559,6 +592,8 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     title,
     content,
     baseVersion,
+    editMode,
+    editors,
     collaborators,
     tags,
     changeSummary,
@@ -598,10 +633,17 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
   }
 
   // Check if agent has permission to edit
-  if (agentId && current.collaborators && !current.collaborators.includes(agentId)) {
-    // Compare via identity UUID when available, fall back to collaborators list
+  if (agentId) {
+    const currentEditMode = normalizeEditMode(current.edit_mode);
+    const currentEditors = current.collaborators || [];
+    const editorIdentityId = editorIdentity?.id || null;
     const isCreator = editorIdentity && current.created_by_identity_id === editorIdentity.id;
-    if (!isCreator) {
+    const hasEditorAccess =
+      currentEditMode === 'workspace' ||
+      (!!editorIdentityId && currentEditors.includes(editorIdentityId)) ||
+      currentEditors.includes(agentId);
+
+    if (!isCreator && !hasEditorAccess) {
       throw new Error(`Agent ${agentId} does not have permission to edit this artifact`);
     }
   }
@@ -714,9 +756,24 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     },
   };
 
+  const currentEditMode = normalizeEditMode(current.edit_mode);
+  const requestedEditors = normalizeEditorAgentIds(editors ?? collaborators);
+  const nextEditMode: ArtifactEditMode = editMode ?? currentEditMode;
+  let nextEditors =
+    editors !== undefined || collaborators !== undefined
+      ? requestedEditors
+      : current.collaborators || [];
+
+  if (nextEditMode === 'editors' && nextEditors.length === 0) {
+    throw new Error('editMode "editors" requires at least one editor');
+  }
+
   if (title !== undefined) updates.title = title;
   if (finalContent !== undefined) updates.content = finalContent;
-  if (collaborators !== undefined) updates.collaborators = collaborators;
+  if (editMode !== undefined || editors !== undefined || collaborators !== undefined) {
+    updates.edit_mode = nextEditMode;
+    updates.collaborators = nextEditors;
+  }
   if (tags !== undefined) updates.tags = tags;
 
   // CAS (compare-and-swap) guard: only write if version hasn't changed since we read it.
@@ -796,6 +853,8 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
             id: updated.id,
             uri: updated.uri,
             title: updated.title,
+            editMode: normalizeEditMode(updated.edit_mode),
+            editors: updated.collaborators || [],
             version: updated.version,
             updatedAt: updated.updated_at,
           },
@@ -817,7 +876,9 @@ export async function handleListArtifacts(args: unknown, dataComposer: DataCompo
 
   let query = supabase
     .from('artifacts')
-    .select('id, uri, title, artifact_type, visibility, version, tags, created_at, updated_at')
+    .select(
+      'id, uri, title, artifact_type, visibility, edit_mode, collaborators, version, tags, created_at, updated_at'
+    )
     .eq('user_id', resolved.user.id);
   query = withWorkspaceFilter(query, workspaceId);
   query = query.order('updated_at', { ascending: false }).limit(limit);
@@ -854,6 +915,8 @@ export async function handleListArtifacts(args: unknown, dataComposer: DataCompo
             title: a.title,
             artifactType: a.artifact_type,
             visibility: a.visibility,
+            editMode: normalizeEditMode(a.edit_mode),
+            editors: a.collaborators || [],
             version: a.version,
             tags: a.tags,
             createdAt: a.created_at,
