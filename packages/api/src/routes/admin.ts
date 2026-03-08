@@ -1557,7 +1557,9 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
 
     const { data: identity, error: identityError } = await supabase
       .from('agent_identities')
-      .select('id, agent_id, name, role, description, backend, workspace_id, updated_at')
+      .select(
+        'id, agent_id, name, role, description, backend, studio_hint, workspace_id, updated_at'
+      )
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
       .eq('agent_id', agentId)
@@ -1667,6 +1669,7 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
         role: identity.role,
         description: identity.description,
         backend: identity.backend,
+        studioHint: identity.studio_hint || 'home',
         updatedAt: identity.updated_at,
       },
       studios: (studiosData || []).map((s) => ({

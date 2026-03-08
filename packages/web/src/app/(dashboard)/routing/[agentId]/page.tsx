@@ -4,7 +4,18 @@ import Link from 'next/link';
 import { useEffect, useMemo, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { useMutation } from '@tanstack/react-query';
-import { ArrowLeft, Bell, Save, Trash2, Plus, GitBranch } from 'lucide-react';
+import {
+  ArrowLeft,
+  Bell,
+  Save,
+  Trash2,
+  Plus,
+  GitBranch,
+  Home,
+  Pencil,
+  Check,
+  X,
+} from 'lucide-react';
 import { apiDelete, apiPatch, useApiPost, useApiQuery, useQueryClient } from '@/lib/api';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -61,6 +72,7 @@ interface AgentRoutingResponse {
     role: string;
     description: string | null;
     backend: string | null;
+    studioHint: string;
     updatedAt: string;
   };
   studios: AgentStudio[];
@@ -89,9 +101,7 @@ function formatTime(value: string | null): string {
 }
 
 function buildStudioOptions(studios: AgentStudio[]): { value: string; label: string }[] {
-  const options: { value: string; label: string }[] = [
-    { value: 'main', label: 'Main' },
-  ];
+  const options: { value: string; label: string }[] = [{ value: 'main', label: 'Main' }];
   for (const s of studios) {
     // Skip if this IS the main branch studio (already covered by "Main" option)
     if (s.branch === 'main') continue;
@@ -133,6 +143,20 @@ export default function AgentRoutingPage() {
 
   const studios = data?.studios ?? [];
   const studioOptions = useMemo(() => buildStudioOptions(studios), [studios]);
+
+  // Home studio editing
+  const [editingHomeStudio, setEditingHomeStudio] = useState(false);
+  const [homeStudioValue, setHomeStudioValue] = useState('');
+
+  const updateHomeStudioMutation = useMutation({
+    mutationFn: ({ identityId, studioHint }: { identityId: string; studioHint: string }) =>
+      apiPatch(`/api/admin/routing/identities/${identityId}`, { studioHint }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['routing'] });
+      queryClient.invalidateQueries({ queryKey: ['routing-agent', agentId] });
+      setEditingHomeStudio(false);
+    },
+  });
 
   const [newRoute, setNewRoute] = useState<RouteFormState>({
     platform: 'telegram',
@@ -195,7 +219,8 @@ export default function AgentRoutingPage() {
   const mutationError =
     createRouteMutation.error?.message ||
     updateRouteMutation.error?.message ||
-    deleteRouteMutation.error?.message;
+    deleteRouteMutation.error?.message ||
+    updateHomeStudioMutation.error?.message;
 
   const selectClassName =
     'flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm';
@@ -217,11 +242,73 @@ export default function AgentRoutingPage() {
             {data?.agent?.role || 'Configure channel route scope and routing behavior for this SB.'}
           </p>
         </div>
-        {data?.agent?.backend && (
-          <Badge variant="secondary" className="text-sm">
-            {data.agent.backend}
-          </Badge>
-        )}
+        <div className="flex items-center gap-3 shrink-0">
+          {data?.agent && (
+            <div className="text-right">
+              <div className="text-xs text-gray-400 mb-1">Home studio</div>
+              {editingHomeStudio ? (
+                <div className="flex items-center gap-1">
+                  <select
+                    className="h-8 rounded-md border border-input bg-background px-2 text-sm"
+                    value={homeStudioValue}
+                    onChange={(event) => setHomeStudioValue(event.target.value)}
+                  >
+                    {studioOptions.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                    {/* Always include 'home' as an option */}
+                    {!studioOptions.some((o) => o.value === 'home') && (
+                      <option value="home">home</option>
+                    )}
+                  </select>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 w-8 p-0"
+                    disabled={updateHomeStudioMutation.isPending}
+                    onClick={() =>
+                      updateHomeStudioMutation.mutate({
+                        identityId: data.agent.id,
+                        studioHint: homeStudioValue,
+                      })
+                    }
+                  >
+                    <Check className="h-4 w-4 text-green-600" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 w-8 p-0"
+                    onClick={() => setEditingHomeStudio(false)}
+                  >
+                    <X className="h-4 w-4 text-gray-400" />
+                  </Button>
+                </div>
+              ) : (
+                <button
+                  className="flex items-center gap-1.5 text-sm text-gray-700 hover:text-gray-900 group cursor-pointer"
+                  onClick={() => {
+                    setHomeStudioValue(data.agent.studioHint || 'home');
+                    setEditingHomeStudio(true);
+                  }}
+                >
+                  <Home className="h-3.5 w-3.5 text-gray-500" />
+                  <span className="font-medium">
+                    {studioHintLabel(data.agent.studioHint, studios)}
+                  </span>
+                  <Pencil className="h-3 w-3 text-gray-400 opacity-0 group-hover:opacity-100 transition-opacity" />
+                </button>
+              )}
+            </div>
+          )}
+          {data?.agent?.backend && (
+            <Badge variant="secondary" className="text-sm">
+              {data.agent.backend}
+            </Badge>
+          )}
+        </div>
       </div>
 
       {data && !data.heartbeatProcessingEnabled && (
@@ -389,7 +476,9 @@ export default function AgentRoutingPage() {
                     <div className="mt-3 grid gap-3 md:grid-cols-3 text-sm">
                       <div>
                         <div className="text-gray-500">Account</div>
-                        <div className="font-mono text-xs">{route.platformAccountId || 'All accounts'}</div>
+                        <div className="font-mono text-xs">
+                          {route.platformAccountId || 'All accounts'}
+                        </div>
                       </div>
                       <div>
                         <div className="text-gray-500">Chat</div>
