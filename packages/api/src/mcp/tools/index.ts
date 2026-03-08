@@ -911,11 +911,22 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'send_response',
     {
-      description: `Send a response to a specific channel. Use this tool to reply to messages from Telegram, terminal, or other channels.
+      description: `Send a response to a specific channel (Telegram, WhatsApp, Discord, etc.).
 
-This is the primary way to send responses back to users. Always use this tool instead of just outputting text.
+This is the PRIMARY way to send messages to users on external channels. You MUST call this tool — just outputting text does nothing.
 
-Supports media attachments (images, videos, documents) via the media parameter. Provide a local file path for each attachment.`,
+## Media Attachments
+
+To send photos, videos, or documents, use the \`media\` array parameter. Each attachment needs a \`type\` and either a \`path\` (local file) or \`url\` (remote).
+
+Example — send a photo with caption:
+  content: "Here's the screenshot"
+  media: [{ type: "image", path: "/absolute/path/to/photo.png", caption: "Routing page" }]
+
+Example — send a document:
+  media: [{ type: "document", path: "/path/to/report.pdf", filename: "report.pdf" }]
+
+Supported types: image, video, audio, document. The \`content\` field is sent as a separate text message before the media.`,
       inputSchema: {
         channel: z
           .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'agent'])
