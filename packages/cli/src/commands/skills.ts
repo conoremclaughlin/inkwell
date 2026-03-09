@@ -404,12 +404,14 @@ export async function syncSkills(
     }
   }
 
+  const mcpAddedSet = new Set<string>();
   for (const targetDir of mcpTargets) {
     const mcpPath = join(targetDir, '.mcp.json');
     if (!existsSync(mcpPath)) continue;
     const { added } = injectMcpServers(mcpPath, mcpSkills);
-    result.mcpAdded.push(...added);
+    for (const name of added) mcpAddedSet.add(name);
   }
+  result.mcpAdded = [...mcpAddedSet];
 
   // Step 3: Sync to Codex/Gemini backend configs
   const syncTargets = options.all ? getWorktrees() : [cwd];
