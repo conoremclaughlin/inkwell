@@ -2488,7 +2488,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Get an AI being's identity by agent ID. Returns structured identity data including name, role, values, relationships, and capabilities.
 
-Use the optional 'file' parameter to fetch a single document (heartbeat, soul, identity) for minimal token usage. Omit to get everything. For VALUES.md and PROCESS.md, use get_team_constitution instead.
+Use the optional 'file' parameter to fetch a single document (heartbeat, soul, identity) for minimal token usage. Omit to get everything. For the values and process documents, use get_team_constitution instead.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: getIdentitySchema,
@@ -2610,9 +2610,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Save or update shared user-level documents. These are shared across all agents for a user.
 
-- userProfile: USER.md — about the organic human (background, preferences, relationship). This is the primary use of this tool.
-- sharedValues: [Prefer save_team_constitution] VALUES.md — shared principles (legacy path, still works)
-- process: [Prefer save_team_constitution] PROCESS.md — team operational process (legacy path, still works)
+- userProfile: User document — about the organic human (background, preferences, relationship). This is the primary use of this tool.
+- sharedValues: [Prefer save_team_constitution] Values document — shared principles (legacy path, still works)
+- process: [Prefer save_team_constitution] Process document — team operational process (legacy path, still works)
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: saveUserIdentitySchema,
@@ -2641,7 +2641,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'get_user_identity',
     {
-      description: `Get shared user-level documents. Returns USER.md (about the organic human), plus VALUES.md and PROCESS.md (prefer get_team_constitution for those).
+      description: `Get shared user-level documents. Returns the user document (about the organic human), plus values and process documents (prefer get_team_constitution for those).
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: getUserIdentitySchema,
@@ -2726,18 +2726,18 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   );
 
   // =====================================================
-  // TEAM CONSTITUTION TOOLS (workspace-level VALUES.md, PROCESS.md)
+  // TEAM CONSTITUTION TOOLS (workspace-level values, process documents)
   // =====================================================
 
   server.registerTool(
     'save_team_constitution',
     {
-      description: `Update team constitution documents. These are workspace-level shared documents that affect ALL SBs.
+      description: `Update team constitution. These are workspace-level shared documents that affect ALL SBs.
 
-- sharedValues: VALUES.md — shared principles, core truths, boundaries, identity philosophy
-- process: PROCESS.md — team operational process (sessions, memory, handoff, PR conventions)
+- sharedValues: Values document — shared principles, core truths, boundaries, identity philosophy
+- process: Process document — team operational process (sessions, memory, handoff, PR conventions)
 
-⚠️ CONSTITUTION-LEVEL: Changes are versioned and affect every SB's bootstrap context.
+⚠️ Constitution-level change: versioned and affects every SB's bootstrap context.
 Prefer this over save_user_identity for values/process updates.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
@@ -2767,7 +2767,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'get_team_constitution',
     {
-      description: `Get team constitution documents (VALUES.md, PROCESS.md) from workspace storage.
+      description: `Get team constitution (values, process documents) from workspace storage.
 
 Returns the canonical workspace-level versions. Falls back to user_identity if workspace columns are empty.
 

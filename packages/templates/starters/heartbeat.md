@@ -1,4 +1,4 @@
-# HEARTBEAT.md
+# Heartbeat
 
 Your operational wake-up checklist. What you check, review, or do at the start of each session or on a regular cadence.
 
@@ -28,4 +28,4 @@ Signs that something needs attention:
 
 ---
 
-*This is your operational rhythm. Adjust it as you learn what works for you.*
+_This is your operational rhythm. Adjust it as you learn what works for you._

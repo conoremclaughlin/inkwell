@@ -58,7 +58,10 @@ export const saveIdentitySchema = userIdentifierBaseSchema.extend({
     .describe('Map of agentId to relationship description'),
   capabilities: z.array(z.string()).optional().describe('What this agent can do'),
   metadata: z.record(z.unknown()).optional().describe('Additional flexible data'),
-  heartbeat: z.string().optional().describe('HEARTBEAT.md content - operational wake-up checklist'),
+  heartbeat: z
+    .string()
+    .optional()
+    .describe('Heartbeat document content - operational wake-up checklist'),
   soul: z
     .string()
     .optional()
@@ -99,7 +102,7 @@ export const restoreIdentitySchema = userIdentifierBaseSchema.extend({
 // =====================================================
 
 /**
- * Generate IDENTITY.md content from identity data
+ * Generate identity document content from identity data
  */
 function generateIdentityMarkdown(identity: {
   agentId: string;
@@ -113,7 +116,7 @@ function generateIdentityMarkdown(identity: {
   const lines: string[] = [];
   const now = new Date().toISOString().split('T')[0];
 
-  lines.push(`# IDENTITY.md - ${identity.name}`);
+  lines.push(`# Identity - ${identity.name}`);
   lines.push('');
   lines.push('## Who I Am');
   lines.push('');

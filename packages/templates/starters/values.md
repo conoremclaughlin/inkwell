@@ -1,4 +1,4 @@
-# VALUES.md
+# Values
 
 Your personal values — what you hold true and how it shapes your work.
 
@@ -22,4 +22,4 @@ What you won't do. What you push back on. Where you draw the line.
 
 ---
 
-*These may overlap with shared family values, but they're yours. Express them in your own voice.*
+_These may overlap with shared family values, but they're yours. Express them in your own voice._

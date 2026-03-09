@@ -1536,7 +1536,7 @@ export async function handleRestoreMemory(args: unknown, dataComposer: DataCompo
  * This is the recommended way to start a new session.
  *
  * Returns:
- * - Identity Files: VALUES.md, USER.md, and agent-specific IDENTITY.md
+ * - Constitution: values, user, process (shared) + identity, heartbeat, soul (per-agent)
  * - Identity Core: user, assistant, relationship context from DB
  * - Active Context: current projects, focus, recent high-salience memories
  * - Active Session: current session info if any
@@ -1582,9 +1582,9 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   } | null = null;
 
   if (agentId) {
-    // Load identity files from local filesystem
-    // Path: ~/.pcp/individuals/{agentId}/IDENTITY.md for agent-specific
-    // Path: ~/.pcp/shared/VALUES.md, USER.md, PROCESS.md for shared files
+    // Load constitution from local filesystem (fallback for DB)
+    // Agent-specific: ~/.pcp/individuals/{agentId}/ (identity, heartbeat, soul)
+    // Shared: ~/.pcp/shared/ (values, user, process)
     const [valuesContent, userContent, processContent, selfContent, heartbeatContent, soulContent] =
       await Promise.all([
         safeReadFile(path.join(basePath, 'shared', 'VALUES.md')),
@@ -1738,23 +1738,23 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
       daysSince = Math.floor((now.getTime() - lastDate.getTime()) / (1000 * 60 * 60 * 24));
 
       if (daysSince >= 14) {
-        suggestion = `It's been ${daysSince} days since your last reflection. Consider reviewing recent memories and updating your SOUL.md.`;
+        suggestion = `It's been ${daysSince} days since your last reflection. Consider reviewing recent memories and updating your soul document.`;
       } else if (daysSince >= 7) {
         suggestion = `It's been ${daysSince} days since your last reflection. You might want to review what's happened since then.`;
       }
     } else {
       suggestion =
-        'No reflections recorded yet. When you have a quiet moment, consider reviewing your memories and capturing what matters in your SOUL.md.';
+        'No reflections recorded yet. When you have a quiet moment, consider reviewing your memories and capturing what matters in your soul document.';
     }
 
     reflectionStatus = { lastReflectedAt, daysSince, suggestion };
   }
 
-  // Merge identity: prioritize Supabase over local files
-  // dbIdentity has: name, role, description, heartbeat, soul (per-agent)
-  // dbWorkspaceSharedDocs has: shared_values/process (workspace-level shared docs)
+  // Merge constitution: prioritize Supabase over local files
+  // dbIdentity has: name, role, description, heartbeat, soul (per-agent docs)
+  // dbWorkspaceSharedDocs has: shared_values/process (workspace-level docs)
   // dbUserIdentity has: shared_values_md/process_md (legacy fallback)
-  // identityFiles has: values, user, process, self, heartbeat, soul (from filesystem)
+  // identityFiles has: values, user, process, self, heartbeat, soul (filesystem fallback)
   const mergedIdentity = identityFiles
     ? {
         ...identityFiles,
@@ -1855,7 +1855,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
             // Agent info from Supabase (name, role, capabilities)
             agentInfo: agentInfo,
 
-            // Identity files (merged: Supabase priority, local fallback)
+            // Constitution (merged: Supabase priority, local fallback)
             identityFiles: mergedIdentity,
 
             // Tier 1: Identity Core from DB

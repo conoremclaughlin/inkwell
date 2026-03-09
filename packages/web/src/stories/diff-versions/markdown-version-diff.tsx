@@ -10,7 +10,7 @@ interface MarkdownVersionDiffProps {
 
 /**
  * MarkdownVersionDiff - Compare two markdown documents with rich diff highlighting
- * Generic component that can be used for any markdown content (USER.md, VALUES.md, etc.)
+ * Generic component that can be used for any document content (user, values, soul, etc.)
  */
 export default function MarkdownVersionDiff({
   currentMarkdown,
