@@ -10,6 +10,7 @@ import { execSync } from 'child_process';
 import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, cpSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { copyClaudePermissionsFromSource } from './studio.js';
 
 const TEST_DIR = join(tmpdir(), 'pcp-ws-new-test-' + Date.now());
 const TEST_REPO = join(TEST_DIR, 'test-repo');
@@ -332,6 +333,36 @@ describe('Config directory copying', () => {
     }
 
     expect(existsSync(join(wsPath, '.gemini'))).toBe(false);
+  });
+
+  it('should inherit Claude permissions while preserving existing hook config', () => {
+    const sourceRoot = join(realDir(realRepo), 'source-perms');
+    const wsPath = join(realDir(realRepo), `test-repo--inherit-perms`);
+    mkdirSync(join(sourceRoot, '.claude'), { recursive: true });
+    writeFileSync(
+      join(sourceRoot, '.claude', 'settings.local.json'),
+      JSON.stringify({
+        permissions: { allow: ['Bash(ls:*)'] },
+      })
+    );
+
+    git(`worktree add -b "wren/studio/inherit-perms" "${wsPath}"`, realRepo);
+    mkdirSync(join(wsPath, '.claude'), { recursive: true });
+    writeFileSync(
+      join(wsPath, '.claude', 'settings.local.json'),
+      JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: 'sb hooks on-stop' }] }] },
+      })
+    );
+
+    const copied = copyClaudePermissionsFromSource(sourceRoot, wsPath);
+    expect(copied).toBe(true);
+
+    const merged = JSON.parse(
+      readFileSync(join(wsPath, '.claude', 'settings.local.json'), 'utf-8')
+    );
+    expect(merged.permissions).toEqual({ allow: ['Bash(ls:*)'] });
+    expect(merged.hooks).toBeDefined();
   });
 });
 
