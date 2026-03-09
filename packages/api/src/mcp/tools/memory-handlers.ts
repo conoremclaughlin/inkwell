@@ -1396,10 +1396,81 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
     },
   };
 
+  const activityStreamRepo = dataComposer.repositories.activityStream;
+  if (params.backendSessionId) {
+    const backendSessionId = params.backendSessionId.trim();
+    if (backendSessionId) {
+      try {
+        const scan = await dataComposer.repositories.memory.listSessions(user.id, { limit: 200 });
+        const others = Array.isArray(scan) ? scan : [];
+        const conflict = others.find((session) => {
+          if (session.id === sessionId) return false;
+          const linked = (session.backendSessionId || session.claudeSessionId || '').trim();
+          return linked === backendSessionId;
+        });
+
+        if (
+          conflict &&
+          conflict.agentId &&
+          conflict.agentId !== (updated.agentId || params.agentId)
+        ) {
+          logger.warn('Session backendSessionId ownership conflict detected', {
+            sessionId,
+            agentId: updated.agentId || params.agentId || null,
+            backendSessionId,
+            conflictingSessionId: conflict.id,
+            conflictingAgentId: conflict.agentId,
+          });
+
+          result.sessionConflict = {
+            backendSessionId,
+            conflictingSessionId: conflict.id,
+            conflictingAgentId: conflict.agentId,
+          };
+
+          if (activityStreamRepo?.logActivity) {
+            try {
+              await activityStreamRepo.logActivity({
+                userId: user.id,
+                agentId:
+                  getEffectiveAgentId(params.agentId) ??
+                  params.agentId ??
+                  updated.agentId ??
+                  'unknown',
+                type: 'state_change',
+                subtype: 'session_backend_conflict',
+                sessionId,
+                status: 'completed',
+                content: `Session ${sessionId.slice(0, 8)} backendSessionId ${backendSessionId.slice(0, 8)} already linked to ${conflict.agentId}:${conflict.id.slice(0, 8)}`,
+                payload: {
+                  backendSessionId,
+                  targetSessionId: sessionId,
+                  targetAgentId: updated.agentId || params.agentId || null,
+                  conflictingSessionId: conflict.id,
+                  conflictingAgentId: conflict.agentId,
+                },
+              });
+            } catch (error) {
+              logger.warn('Failed to log session backend conflict activity', {
+                sessionId,
+                backendSessionId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+          }
+        }
+      } catch (error) {
+        logger.warn('Failed to scan sessions for backendSessionId conflicts', {
+          sessionId,
+          backendSessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
   const trace = buildSessionTraceDiff(beforeSession, updated);
   if (trace.changedFields.length > 0) {
-    const activityStreamRepo = dataComposer.repositories.activityStream;
-
     if (activityStreamRepo?.logActivity) {
       const effectiveAgentId =
         getEffectiveAgentId(params.agentId) ??
