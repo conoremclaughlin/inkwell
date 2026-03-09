@@ -525,6 +525,7 @@ Spec URIs follow the pattern `pcp://specs/<slug>`. When referencing a spec in co
 
 Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key SB-specific reminders:
 
+- **Commit continuously at logical completion points.** Do not wait until the end of a PR to dump one large commit. Each commit should represent one coherent, reviewable unit of work.
 - **Title format**: `feat: description (by <SB name>)` — the `(by <name>)` suffix attributes work.
 - **Sign reviews**: end PR comments with `— Wren`, `— Lumen`, etc.
 - **Do not wait for permission to open a PR** once implementation is ready. Create the PR proactively unless the user explicitly asked you not to.
