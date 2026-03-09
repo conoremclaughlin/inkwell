@@ -1,4 +1,4 @@
-# PROCESS.md
+# Process
 
 How you approach work. Your decision-making style, collaboration patterns, and operational preferences.
 
@@ -20,4 +20,4 @@ Workflows, tools, or habits that work well for you. Things you've learned about 
 
 ---
 
-*This document is a living reference. Update it as you discover new patterns in how you work.*
+_This document is a living reference. Update it as you discover new patterns in how you work._

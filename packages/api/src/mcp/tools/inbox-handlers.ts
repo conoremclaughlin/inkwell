@@ -55,7 +55,7 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe(
-      'Thread key for conversation continuity (e.g., "pr:32", "spec:cli-hooks"). Messages with the same threadKey are routed to the same session on the recipient side. See PROCESS.md for format guidelines.'
+      'Thread key for conversation continuity (e.g., "pr:32", "spec:cli-hooks"). Messages with the same threadKey are routed to the same session on the recipient side. See the process document for format guidelines.'
     ),
   // Trigger options - automatically trigger the recipient after sending
   trigger: z

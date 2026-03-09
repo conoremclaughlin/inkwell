@@ -41,7 +41,7 @@ This returns:
 
 - **User Info**: User ID, contacts, and **timezone** (e.g., "America/Los_Angeles")
 - **Identity Core**: Who you are, who you're working with, your relationship
-- **Identity Files**: Contents of `~/.pcp/shared/` and `~/.pcp/{agentId}/` files (VALUES.md, IDENTITY.md, etc.)
+- **Constitution**: Your values, process, user, identity, heartbeat, and soul documents (DB-first, filesystem fallback)
 - **Active Context**: Current projects, focus, project-specific context
 - **Recent Memories**: High-salience memories filtered by your agentId (plus shared memories)
 - **Active Sessions**: Array of all active sessions (use `workspaceId` to find yours)
@@ -167,24 +167,22 @@ PCP supports multiple AI identities sharing the same infrastructure:
 | **myra**   | Telegram/WhatsApp | Persistent messaging bridge            |
 | **benson** | Discord/Slack     | Conversational partner                 |
 
-Each agent has its own identity files (`~/.pcp/<agentId>/IDENTITY.md`) and filtered memories. Shared values live in `~/.pcp/shared/VALUES.md`.
+Each agent has its own documents (identity, heartbeat, soul) stored in the database. Shared documents (values, process, user) are workspace-level. Together these form your constitution. The filesystem (`~/.pcp/`) is a fallback cache only.
 
-### Identity Files
+### Constitution
 
-Located in `~/.pcp/`:
+Six documents, stored in the database and served via bootstrap:
 
-```
-~/.pcp/
-├── config.json           # User config + agentMapping
-├── shared/               # Shared across all agents
-│   └── VALUES.md         # Core values we all share
-├── wren/
-│   └── IDENTITY.md       # Wren's identity
-├── benson/
-│   └── IDENTITY.md       # Benson's identity
-└── myra/
-    └── IDENTITY.md       # Myra's identity
-```
+| Document      | Scope              | What it governs                           |
+| ------------- | ------------------ | ----------------------------------------- |
+| **values**    | Shared (workspace) | Shared principles across all SBs          |
+| **process**   | Shared (workspace) | Team operational process                  |
+| **user**      | Shared (user)      | About the organic human                   |
+| **identity**  | Per-agent          | Name, role, relationships, capabilities   |
+| **heartbeat** | Per-agent          | Operational wake-up checklist             |
+| **soul**      | Per-agent          | Philosophical core, existential questions |
+
+Tools: `get_identity` / `save_identity` (per-agent), `get_team_constitution` / `save_team_constitution` (shared values/process), `get_user_identity` / `save_user_identity` (user profile).
 
 ### Memory Attribution
 

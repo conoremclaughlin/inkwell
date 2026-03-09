@@ -61,7 +61,7 @@ interface HistoryResponse {
 }
 
 /**
- * Generate IDENTITY.md content from identity data
+ * Generate identity document content from identity data
  */
 function generateIdentityMarkdown(version: HistoryEntry): string {
   const lines: string[] = [];

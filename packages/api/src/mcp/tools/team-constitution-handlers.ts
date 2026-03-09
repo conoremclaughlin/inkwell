@@ -1,10 +1,10 @@
 /**
  * Team Constitution MCP Tool Handlers
  *
- * Tools for managing workspace-level shared documents (VALUES.md, PROCESS.md)
+ * Tools for managing the workspace-level values and process documents
  * that define the team's core principles and operational process.
  *
- * These are "constitution-level" documents — changes affect all SBs in the workspace.
+ * These are constitution-level — changes affect all SBs in the workspace.
  * The canonical storage is `workspaces.shared_values` and `workspaces.process`.
  *
  * History is tracked via the `user_identity` table (which is also updated for
@@ -53,13 +53,13 @@ export const saveTeamConstitutionSchema = z.object({
     .string()
     .optional()
     .describe(
-      'VALUES.md — shared principles and core truths for all SBs. Changes affect the entire team.'
+      'Values document — shared principles and core truths for all SBs. Changes affect the entire team.'
     ),
   process: z
     .string()
     .optional()
     .describe(
-      'PROCESS.md — team operational process (sessions, memory, handoff, PR conventions). Changes affect the entire team.'
+      'Process document — team operational process (sessions, memory, handoff, PR conventions). Changes affect the entire team.'
     ),
 });
 
@@ -99,7 +99,7 @@ async function resolveWorkspaceId(
 // =====================================================
 
 /**
- * Save or update team constitution documents (VALUES.md, PROCESS.md).
+ * Save or update the values and process documents (part of the team constitution).
  * Writes to workspace-level storage (canonical) and syncs to user_identity for history.
  */
 export async function handleSaveTeamConstitution(args: unknown, dataComposer: DataComposer) {
@@ -163,8 +163,8 @@ export async function handleSaveTeamConstitution(args: unknown, dataComposer: Da
   }
 
   const updated: string[] = [];
-  if (params.sharedValues !== undefined) updated.push('VALUES.md');
-  if (params.process !== undefined) updated.push('PROCESS.md');
+  if (params.sharedValues !== undefined) updated.push('values');
+  if (params.process !== undefined) updated.push('process');
 
   logger.info(`Team constitution updated for workspace ${workspaceId}`, {
     updated,
@@ -196,7 +196,7 @@ export async function handleSaveTeamConstitution(args: unknown, dataComposer: Da
 }
 
 /**
- * Get team constitution documents (VALUES.md, PROCESS.md) from workspace storage.
+ * Get the values and process documents from workspace storage.
  */
 export async function handleGetTeamConstitution(args: unknown, dataComposer: DataComposer) {
   const params = getTeamConstitutionSchema.parse(args);

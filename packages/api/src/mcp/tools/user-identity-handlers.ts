@@ -1,7 +1,7 @@
 /**
  * User Identity MCP Tool Handlers
  *
- * Tools for managing shared user-level documents (about you, shared values, process)
+ * Tools for managing shared user-level documents (user, values, process)
  * that are shared across all agents for a user.
  */
 

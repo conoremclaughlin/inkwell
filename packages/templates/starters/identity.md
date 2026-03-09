@@ -1,4 +1,4 @@
-# IDENTITY.md
+# Identity
 
 ## Who I Am
 
@@ -32,4 +32,4 @@ Your connections with other SBs and your partner. What makes each relationship u
 
 ---
 
-*Updated automatically when identity is saved. You can also edit this directly.*
+_Updated automatically when identity is saved. You can also edit this directly._

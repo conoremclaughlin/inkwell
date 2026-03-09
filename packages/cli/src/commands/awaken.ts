@@ -139,8 +139,8 @@ function fetchFromLocal(): { sharedValues: string; siblings: BootstrapIdentity[]
     if (existsSync(identityPath)) {
       // Parse the identity file for name/role (best effort)
       const content = readFileSync(identityPath, 'utf-8');
-      // Headers are typically "# IDENTITY.md - Name" or "# Name"
-      const headerMatch = content.match(/^#\s+(?:IDENTITY\.md\s*-\s*)?(.+)/m);
+      // Headers: "# Identity - Name", "# IDENTITY.md - Name" (legacy), or "# Name"
+      const headerMatch = content.match(/^#\s+(?:(?:IDENTITY\.md|Identity)\s*-\s*)?(.+)/m);
       const name = headerMatch?.[1]?.trim() || agentId;
 
       // Look for role in "## Who I Am" section or similar
@@ -166,7 +166,7 @@ function buildAwakeningPrompt(
   siblings: BootstrapIdentity[],
   backendName: string
 ): string {
-  // Extract the "On Identity" section from VALUES.md for the SB definition
+  // Extract the "On Identity" section from the values document
   let valuesSection = '';
   const identityMatch = sharedValues.match(/## On Identity[\s\S]*?(?=\n## |\n---|\Z)/);
   if (identityMatch) {
