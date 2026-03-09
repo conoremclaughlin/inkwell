@@ -2172,7 +2172,14 @@ async function persistBackendSessionLink(options: {
   });
 
   try {
-    await callPcpTool('update_session_phase', {
+    const updateResult = await callPcpTool<{
+      sessionConflict?: {
+        backendSessionId?: string;
+        conflictingSessionId?: string;
+        conflictingAgentId?: string;
+      };
+      sessionTrace?: { changedFields?: string[] };
+    }>('update_session_phase', {
       email: options.email,
       agentId: options.agentId,
       sessionId: options.pcpSessionId,
@@ -2180,6 +2187,22 @@ async function persistBackendSessionLink(options: {
       status: 'active',
       workingDir: process.cwd(),
     });
+
+    if (updateResult?.sessionConflict) {
+      sbDebugLog('claude', 'persist_backend_link_conflict_warning', {
+        backend: options.backend,
+        agentId: options.agentId,
+        pcpSessionId: options.pcpSessionId,
+        backendSessionId: options.backendSessionId,
+        conflict: updateResult.sessionConflict,
+      });
+    }
+    if (updateResult?.sessionTrace?.changedFields?.length) {
+      sbDebugLog('claude', 'persist_backend_link_session_trace', {
+        pcpSessionId: options.pcpSessionId,
+        changedFields: updateResult.sessionTrace.changedFields,
+      });
+    }
   } catch {
     // Best-effort linkage update only.
   }
