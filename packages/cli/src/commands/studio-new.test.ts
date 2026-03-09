@@ -10,7 +10,7 @@ import { execSync } from 'child_process';
 import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, cpSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { copyClaudePermissionsFromSource } from './studio.js';
+import { copyClaudePermissionsFromSource, installHooksForAllBackends } from './studio.js';
 
 const TEST_DIR = join(tmpdir(), 'pcp-ws-new-test-' + Date.now());
 const TEST_REPO = join(TEST_DIR, 'test-repo');
@@ -363,6 +363,19 @@ describe('Config directory copying', () => {
     );
     expect(merged.permissions).toEqual({ allow: ['Bash(ls:*)'] });
     expect(merged.hooks).toBeDefined();
+  });
+
+  it('should install hooks for all supported backends in the new studio', () => {
+    const wsPath = join(realDir(realRepo), `test-repo--hooks-all`);
+    git(`worktree add -b "wren/studio/hooks-all" "${wsPath}"`, realRepo);
+
+    const hookResults = installHooksForAllBackends(wsPath);
+    const backendNames = hookResults.map((h) => h.backend).sort();
+
+    expect(backendNames).toEqual(['claude-code', 'codex', 'gemini']);
+    expect(existsSync(join(wsPath, '.claude', 'settings.local.json'))).toBe(true);
+    expect(existsSync(join(wsPath, '.codex', 'config.toml'))).toBe(true);
+    expect(existsSync(join(wsPath, '.gemini', 'settings.json'))).toBe(true);
   });
 });
 

@@ -1444,6 +1444,7 @@ export {
   listRoleTemplates,
   isValidTemplateName,
   copyClaudePermissionsFromSource,
+  installHooksForAllBackends,
   BUILTIN_ROLE_TEMPLATES,
   getDefaultStudioMainBranch,
   planStudioHomeBranchRename,
