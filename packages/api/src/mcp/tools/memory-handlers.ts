@@ -263,7 +263,13 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
 });
 
 export const recallSchema = userIdentifierBaseSchema.extend({
-  query: z.string().optional().describe('Search query (text search for now, semantic later)'),
+  query: z.string().optional().describe('Search query across memory text and semantic embeddings'),
+  recallMode: z
+    .enum(['auto', 'text', 'semantic', 'hybrid'])
+    .optional()
+    .describe(
+      'Recall strategy: text (keyword only), semantic (embeddings only), hybrid (blend both), auto (semantic then fallback to text). Default: hybrid.'
+    ),
   source: memorySourceSchema.optional().describe('Filter by source'),
   salience: salienceSchema.optional().describe('Filter by salience'),
   topics: topicsSchema.describe('Filter by topics (any match)'),
@@ -650,6 +656,7 @@ export async function handleRecall(args: unknown, dataComposer: DataComposer) {
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
   const memories = await dataComposer.repositories.memory.recall(user.id, params.query, {
+    recallMode: params.recallMode,
     source: params.source as MemorySource,
     salience: params.salience as Salience,
     topics: params.topics,

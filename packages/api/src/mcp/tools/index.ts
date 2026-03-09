@@ -1130,12 +1130,18 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'recall',
     {
-      description: `Search and retrieve memories. Currently uses text search; semantic search coming soon.
+      description: `Search and retrieve memories using text, semantic vectors, or a hybrid blend.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
-        query: z.string().optional().describe('Search query (text search for now)'),
+        query: z.string().optional().describe('Search query across memory text and embeddings'),
+        recallMode: z
+          .enum(['auto', 'text', 'semantic', 'hybrid'])
+          .optional()
+          .describe(
+            'Recall strategy: text (keyword only), semantic (embeddings only), hybrid (blend both), auto (semantic then fallback). Default: hybrid.'
+          ),
         source: z.string().optional().describe('Filter by source'),
         salience: z
           .enum(['low', 'medium', 'high', 'critical'])

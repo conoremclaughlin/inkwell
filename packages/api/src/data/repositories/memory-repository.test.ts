@@ -179,7 +179,9 @@ describe('MemoryRepository', () => {
 
       await repo.recall('user-456', 'search term');
 
-      expect(mockSupabase._queryBuilder.ilike).toHaveBeenCalledWith('content', '%search term%');
+      expect(mockSupabase._queryBuilder.or).toHaveBeenCalledWith(
+        'content.ilike.%search term%,summary.ilike.%search term%,topic_key.ilike.%search term%,content.ilike.%search%,summary.ilike.%search%,topic_key.ilike.%search%,content.ilike.%term%,summary.ilike.%term%,topic_key.ilike.%term%'
+      );
     });
 
     it('should apply salience filter', async () => {

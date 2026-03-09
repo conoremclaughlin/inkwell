@@ -22,6 +22,19 @@ import type {
   Salience,
 } from '../models/memory';
 
+type RecallMode = NonNullable<MemorySearchOptions['recallMode']>;
+
+interface RecallCandidate {
+  memory: Memory;
+  semanticScore?: number;
+  textScore?: number;
+  finalScore: number;
+}
+
+interface SemanticMatchRow extends MemoryRow {
+  similarity?: number;
+}
+
 export class MemoryRepository {
   private embeddingRouter: EmbeddingRouter;
 
@@ -77,7 +90,7 @@ export class MemoryRepository {
   }
 
   /**
-   * Search memories by text (basic search for now, semantic later)
+   * Search memories by text and/or semantic vectors.
    */
   async recall(
     userId: string,
@@ -86,14 +99,169 @@ export class MemoryRepository {
   ): Promise<Memory[]> {
     const limit = options.limit || 20;
     const offset = options.offset || 0;
+    const recallMode: RecallMode = options.recallMode || 'hybrid';
 
-    if (query) {
-      const semanticResults = await this.trySemanticRecall(userId, query, options, limit, offset);
-      if (semanticResults && semanticResults.length > 0) {
-        return semanticResults;
-      }
+    if (!query?.trim()) {
+      return this.textRecall(userId, undefined, options, limit, offset);
     }
 
+    const normalizedQuery = query.trim();
+
+    if (recallMode === 'text') {
+      return this.textRecall(userId, normalizedQuery, options, limit, offset);
+    }
+
+    if (recallMode === 'semantic') {
+      const semanticCandidates = await this.trySemanticRecallCandidates(
+        userId,
+        normalizedQuery,
+        options,
+        limit,
+        offset
+      );
+      return semanticCandidates?.map((c) => c.memory) || [];
+    }
+
+    if (recallMode === 'auto') {
+      const semanticCandidates = await this.trySemanticRecallCandidates(
+        userId,
+        normalizedQuery,
+        options,
+        limit,
+        offset
+      );
+      if (semanticCandidates && semanticCandidates.length > 0) {
+        return semanticCandidates.map((c) => c.memory);
+      }
+      return this.textRecall(userId, normalizedQuery, options, limit, offset);
+    }
+
+    // hybrid mode: combine text + semantic signals with dedupe/reranking
+    return this.hybridRecall(userId, normalizedQuery, options, limit, offset);
+  }
+
+  private async hybridRecall(
+    userId: string,
+    query: string,
+    options: MemorySearchOptions,
+    limit: number,
+    offset: number
+  ): Promise<Memory[]> {
+    const config = this.embeddingRouter.getRuntimeConfig();
+    const candidatePool = Math.max(
+      limit,
+      (offset + limit) * Math.max(1, config.matchCountMultiplier)
+    );
+
+    const [semanticCandidates, textCandidates] = await Promise.all([
+      this.trySemanticRecallCandidates(userId, query, options, limit, offset),
+      this.textRecallCandidates(userId, query, options, candidatePool, 0),
+    ]);
+
+    const byId = new Map<string, RecallCandidate>();
+
+    for (const candidate of semanticCandidates || []) {
+      const existing = byId.get(candidate.memory.id);
+      byId.set(candidate.memory.id, {
+        memory: candidate.memory,
+        semanticScore: candidate.semanticScore,
+        textScore: existing?.textScore,
+        finalScore: 0,
+      });
+    }
+
+    for (const candidate of textCandidates) {
+      const existing = byId.get(candidate.memory.id);
+      byId.set(candidate.memory.id, {
+        memory: candidate.memory,
+        semanticScore: existing?.semanticScore,
+        textScore: candidate.textScore,
+        finalScore: 0,
+      });
+    }
+
+    const merged = Array.from(byId.values()).map((candidate) => ({
+      ...candidate,
+      finalScore: this.computeHybridScore(candidate.semanticScore, candidate.textScore),
+    }));
+
+    merged.sort(
+      (a, b) =>
+        b.finalScore - a.finalScore || b.memory.createdAt.getTime() - a.memory.createdAt.getTime()
+    );
+
+    return merged.slice(offset, offset + limit).map((c) => c.memory);
+  }
+
+  private computeHybridScore(semanticScore?: number, textScore?: number): number {
+    const s = semanticScore ?? 0;
+    const t = textScore ?? 0;
+    // Blend with heavier semantic weighting, but allow lexical key matches to lift ranking.
+    return s * 0.7 + t * 0.3;
+  }
+
+  private buildTextScore(query: string, memory: Memory): number {
+    const queryTokens = this.tokenize(query);
+    if (queryTokens.length === 0) return 0;
+
+    const haystack = [
+      memory.content,
+      memory.summary || '',
+      memory.topicKey || '',
+      memory.topics.join(' '),
+    ]
+      .join(' ')
+      .toLowerCase();
+
+    const overlapCount = queryTokens.filter((token) => haystack.includes(token)).length;
+    let score = overlapCount / queryTokens.length;
+
+    if (haystack.includes(query.toLowerCase())) score += 0.2;
+    if (
+      memory.topicKey &&
+      queryTokens.some((token) => memory.topicKey!.toLowerCase().includes(token))
+    ) {
+      score += 0.2;
+    }
+
+    return Math.min(1, score);
+  }
+
+  private tokenize(text: string): string[] {
+    return text
+      .toLowerCase()
+      .split(/[^a-z0-9]+/g)
+      .filter((token) => token.length > 1);
+  }
+
+  private buildTextSearchTerms(query: string): string[] {
+    const full = query
+      .trim()
+      .replace(/[,%()]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const tokens = this.tokenize(full).filter((token) => token.length > 2);
+    return Array.from(new Set([full, ...tokens].filter(Boolean)));
+  }
+
+  private async textRecall(
+    userId: string,
+    query: string | undefined,
+    options: MemorySearchOptions,
+    limit: number,
+    offset: number
+  ): Promise<Memory[]> {
+    const candidates = await this.textRecallCandidates(userId, query, options, limit, offset);
+    return candidates.map((c) => c.memory);
+  }
+
+  private async textRecallCandidates(
+    userId: string,
+    query: string | undefined,
+    options: MemorySearchOptions,
+    limit: number,
+    offset: number
+  ): Promise<RecallCandidate[]> {
     let queryBuilder = this.supabase
       .from('memories')
       .select('*')
@@ -132,9 +300,17 @@ export class MemoryRepository {
       queryBuilder = queryBuilder.or('expires_at.is.null,expires_at.gt.now()');
     }
 
-    // Text search on content (basic ILIKE for now)
+    // Text search on content/summary/topic_key
     if (query) {
-      queryBuilder = queryBuilder.ilike('content', `%${query}%`);
+      const terms = this.buildTextSearchTerms(query).slice(0, 10);
+      if (terms.length > 0) {
+        const clauses = terms.flatMap((term) => [
+          `content.ilike.%${term}%`,
+          `summary.ilike.%${term}%`,
+          `topic_key.ilike.%${term}%`,
+        ]);
+        queryBuilder = queryBuilder.or(clauses.join(','));
+      }
     }
 
     // Pagination
@@ -147,16 +323,24 @@ export class MemoryRepository {
       throw new Error(`Failed to recall memories: ${error.message}`);
     }
 
-    return (data || []).map(this.rowToMemory);
+    return (data || []).map((row) => {
+      const memory = this.rowToMemory(row);
+      const textScore = query ? this.buildTextScore(query, memory) : 0;
+      return {
+        memory,
+        textScore,
+        finalScore: textScore,
+      };
+    });
   }
 
-  private async trySemanticRecall(
+  private async trySemanticRecallCandidates(
     userId: string,
     query: string,
     options: MemorySearchOptions,
     limit: number,
     offset: number
-  ): Promise<Memory[] | null> {
+  ): Promise<RecallCandidate[] | null> {
     const queryEmbedding = await this.embeddingRouter.embedQuery(query);
     if (!queryEmbedding) return null;
 
@@ -186,9 +370,17 @@ export class MemoryRepository {
       return null;
     }
 
-    const rows = (data || []) as MemoryRow[];
+    const rows = (data || []) as SemanticMatchRow[];
     const pagedRows = rows.slice(offset, offset + limit);
-    return pagedRows.map(this.rowToMemory);
+    return pagedRows.map((row) => {
+      const memory = this.rowToMemory(row);
+      const semanticScore = Math.max(0, Math.min(1, row.similarity ?? 0));
+      return {
+        memory,
+        semanticScore,
+        finalScore: semanticScore,
+      };
+    });
   }
 
   private async tryEmbedMemory(memory: Memory, input: MemoryCreateInput): Promise<void> {
