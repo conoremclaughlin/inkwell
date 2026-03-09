@@ -558,6 +558,7 @@ export async function handleGetAgentStatus(args: unknown, dataComposer: DataComp
           threadKey: payload.threadKey || null,
           backend: payload.backend || null,
           triggeredBy: payload.triggeredBy || null,
+          studioId: payload.studioId || null,
           sessionId: a.session_id,
           startedAt: a.created_at,
           durationSoFarMs,
