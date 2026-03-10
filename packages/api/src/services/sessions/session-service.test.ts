@@ -1131,4 +1131,162 @@ describe('SessionService', () => {
       expect(mockRepoWithThreadKey.findByUserAndAgent).toHaveBeenCalled();
     });
   });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Reply Routing — recipientSessionId Priority
+  // ═══════════════════════════════════════════════════════════════
+  describe('Reply Routing — recipientSessionId', () => {
+    it('should route to recipientSession when it exists and is active', async () => {
+      const recipientSession = createMockSession({
+        id: 'recipient-session-abc',
+        agentId: 'wren',
+        threadKey: 'pr:210',
+        studioId: 'studio-wren',
+        endedAt: null,
+      });
+      vi.mocked(mockRepository.findById).mockResolvedValue(recipientSession);
+
+      const request = createMockRequest({
+        agentId: 'wren',
+        metadata: {
+          threadKey: 'pr:210',
+          recipientSessionId: 'recipient-session-abc',
+          triggerType: 'agent',
+        },
+      });
+
+      const result = await sessionService.handleMessage(request);
+
+      expect(result.success).toBe(true);
+      expect(result.sessionId).toBe('recipient-session-abc');
+      expect(mockRepository.findById).toHaveBeenCalledWith('recipient-session-abc');
+      // Should NOT have created a new session
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('should skip recipientSession when it has ended and fall through to threadKey', async () => {
+      const endedSession = createMockSession({
+        id: 'ended-session',
+        agentId: 'wren',
+        threadKey: 'pr:210',
+        endedAt: new Date(),
+      });
+      vi.mocked(mockRepository.findById).mockResolvedValue(endedSession);
+
+      const mockRepoWithThreadKey = {
+        ...mockRepository,
+        findById: vi.fn().mockResolvedValue(endedSession),
+        findByThreadKey: vi.fn().mockResolvedValue(null),
+        create: vi
+          .fn()
+          .mockResolvedValue(
+            createMockSession({ id: 'new-fallback-session', threadKey: 'pr:210' })
+          ),
+      };
+
+      const serviceWithThreadKey = new SessionService(
+        mockRepoWithThreadKey,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          compactionThreshold: 150000,
+        },
+        mockCodexRunner
+      );
+
+      const request = createMockRequest({
+        agentId: 'wren',
+        metadata: {
+          threadKey: 'pr:210',
+          recipientSessionId: 'ended-session',
+          triggerType: 'agent',
+        },
+      });
+
+      const result = await serviceWithThreadKey.handleMessage(request);
+
+      expect(result.success).toBe(true);
+      // Should have fallen through to create a new session
+      expect(result.sessionId).toBe('new-fallback-session');
+      expect(mockRepoWithThreadKey.findById).toHaveBeenCalledWith('ended-session');
+      expect(mockRepoWithThreadKey.create).toHaveBeenCalled();
+    });
+
+    it('should prioritize recipientSession over threadKey match', async () => {
+      const recipientSession = createMockSession({
+        id: 'recipient-session',
+        agentId: 'wren',
+        threadKey: 'pr:210',
+        studioId: 'studio-wren',
+        endedAt: null,
+      });
+      const differentThreadSession = createMockSession({
+        id: 'thread-match-session',
+        agentId: 'wren',
+        threadKey: 'pr:213',
+      });
+
+      const mockRepoWithThreadKey = {
+        ...mockRepository,
+        findById: vi.fn().mockResolvedValue(recipientSession),
+        findByThreadKey: vi.fn().mockResolvedValue(differentThreadSession),
+      };
+
+      const serviceWithThreadKey = new SessionService(
+        mockRepoWithThreadKey,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          compactionThreshold: 150000,
+        },
+        mockCodexRunner
+      );
+
+      const request = createMockRequest({
+        agentId: 'wren',
+        metadata: {
+          threadKey: 'pr:213',
+          recipientSessionId: 'recipient-session',
+          triggerType: 'agent',
+        },
+      });
+
+      const result = await serviceWithThreadKey.handleMessage(request);
+
+      expect(result.success).toBe(true);
+      // recipientSession wins over threadKey match
+      expect(result.sessionId).toBe('recipient-session');
+      // findByThreadKey should NOT have been called — recipientSession short-circuits
+      expect(mockRepoWithThreadKey.findByThreadKey).not.toHaveBeenCalled();
+    });
+
+    it('should skip recipientSession when findById returns null', async () => {
+      vi.mocked(mockRepository.findById).mockResolvedValue(null);
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+      vi.mocked(mockRepository.create).mockResolvedValue(
+        createMockSession({ id: 'fallback-session' })
+      );
+
+      const request = createMockRequest({
+        metadata: {
+          recipientSessionId: 'nonexistent-session',
+          triggerType: 'agent',
+        },
+      });
+
+      const result = await sessionService.handleMessage(request);
+
+      expect(result.success).toBe(true);
+      expect(result.sessionId).toBe('fallback-session');
+      expect(mockRepository.findById).toHaveBeenCalledWith('nonexistent-session');
+      // Falls through to normal creation
+      expect(mockRepository.create).toHaveBeenCalled();
+    });
+  });
 });
