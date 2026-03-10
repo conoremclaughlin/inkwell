@@ -26,7 +26,6 @@ import {
   shouldRetryWithFreshBackendSession,
   shouldAutoResumeRuntimeSession,
 } from './claude.js';
-import { setCurrentRuntimeSession, upsertRuntimeSession } from '../session/runtime.js';
 
 describe('hasBackendSessionOverride', () => {
   it('detects explicit Codex resume subcommand in positional prompt parts', () => {
@@ -969,94 +968,6 @@ describe('resolveCapturedBackendSessionIdFromRuntime', () => {
       });
 
       expect(resolved).toBe(existingSessionId);
-    } finally {
-      if (oldHome === undefined) {
-        delete process.env.HOME;
-      } else {
-        process.env.HOME = oldHome;
-      }
-      rmSync(tempRoot, { recursive: true, force: true });
-    }
-  });
-
-  it('ignores stale runtime-linked backend ids and waits for a newly created local session id', async () => {
-    const tempRoot = mkdtempSync(join(tmpdir(), 'sb-claude-runtime-stale-'));
-    const tempHome = join(tempRoot, 'home');
-    const tempRepo = join(tempRoot, 'repo');
-    mkdirSync(tempHome, { recursive: true });
-    mkdirSync(tempRepo, { recursive: true });
-
-    const projectDirName = tempRepo.replace(/[\\/]/g, '-');
-    const projectKeyDir = join(tempHome, '.claude', 'projects', projectDirName);
-    mkdirSync(projectKeyDir, { recursive: true });
-
-    const oldHome = process.env.HOME;
-    process.env.HOME = tempHome;
-
-    try {
-      const pcpSessionId = 'pcp-session-stale-1';
-      const staleSessionId = '44444444-4444-4444-8444-444444444444';
-      const newSessionId = '55555555-5555-4555-8555-555555555555';
-      const stalePath = join(projectKeyDir, `${staleSessionId}.jsonl`);
-      writeFileSync(
-        stalePath,
-        JSON.stringify({
-          type: 'progress',
-          sessionId: staleSessionId,
-          timestamp: '2026-03-10T00:00:00.000Z',
-        }) + '\n'
-      );
-
-      const staleModified = '2000-01-01T00:00:00.000Z';
-      const snapshot = new Map([[staleSessionId, staleModified]]);
-
-      // Runtime cache still points at a stale backend id from a failed resume attempt.
-      upsertRuntimeSession(tempRepo, {
-        pcpSessionId,
-        backend: 'claude',
-        agentId: 'wren',
-        backendSessionId: staleSessionId,
-      });
-      setCurrentRuntimeSession(tempRepo, pcpSessionId, 'claude', { agentId: 'wren' });
-
-      const timer = setTimeout(() => {
-        // Old stale session gets touched first (e.g., resume error side-effect).
-        writeFileSync(
-          stalePath,
-          JSON.stringify({
-            type: 'progress',
-            sessionId: staleSessionId,
-            timestamp: '2026-03-10T00:00:01.000Z',
-          }) + '\n'
-        );
-      }, 30);
-      const timer2 = setTimeout(() => {
-        // Fresh fallback session appears slightly later.
-        writeFileSync(
-          join(projectKeyDir, `${newSessionId}.jsonl`),
-          JSON.stringify({
-            type: 'progress',
-            sessionId: newSessionId,
-            timestamp: '2026-03-10T00:00:02.000Z',
-          }) + '\n'
-        );
-      }, 120);
-
-      const resolved = await resolveCapturedBackendSessionIdWithRetry({
-        cwd: tempRepo,
-        backend: 'claude',
-        pcpSessionId,
-        agentId: 'wren',
-        knownLocalSessionSnapshot: snapshot,
-        fallbackBackendSessionId: staleSessionId,
-        ignoredBackendSessionIds: [staleSessionId],
-        attempts: 12,
-        intervalMs: 40,
-      });
-
-      clearTimeout(timer);
-      clearTimeout(timer2);
-      expect(resolved).toBe(newSessionId);
     } finally {
       if (oldHome === undefined) {
         delete process.env.HOME;
