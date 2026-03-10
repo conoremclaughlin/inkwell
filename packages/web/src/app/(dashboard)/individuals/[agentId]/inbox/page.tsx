@@ -23,6 +23,7 @@ import {
   MessageSquare,
   AlertCircle,
   User,
+  Users,
 } from 'lucide-react';
 import { useApiQuery } from '@/lib/api';
 import clsx from 'clsx';
@@ -567,75 +568,114 @@ export default function InboxPage() {
           </CardContent>
         </Card>
       ) : (
-        <div className="space-y-6">
-          {/* Threaded conversations */}
-          {threads.length > 0 && (
-            <Card>
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                  <MessageSquare className="h-5 w-5" />
-                  Threads
-                </CardTitle>
-                <CardDescription>Click a thread to view the full conversation.</CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-2">
-                {threads.map((thread) => {
-                  const gk = threadGroupKey(thread);
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <MessageSquare className="h-5 w-5" />
+              Inbox
+            </CardTitle>
+            <CardDescription>Click a thread or message to view details.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {(() => {
+              // Build a unified list sorted by most recent activity
+              type UnifiedItem =
+                | { kind: 'thread'; key: string; sortDate: string; thread: ThreadGroup }
+                | { kind: 'group'; key: string; sortDate: string; group: GroupThread }
+                | { kind: 'message'; key: string; sortDate: string; message: InboxMessage };
+
+              const items: UnifiedItem[] = [];
+
+              for (const t of threads) {
+                items.push({
+                  kind: 'thread',
+                  key: threadGroupKey(t),
+                  sortDate: t.lastMessageAt,
+                  thread: t,
+                });
+              }
+              for (const gt of groupThreads) {
+                items.push({
+                  kind: 'group',
+                  key: `group:${gt.threadKey}`,
+                  sortDate: gt.lastMessageAt,
+                  group: gt,
+                });
+              }
+              for (const msg of flatMessages) {
+                items.push({
+                  kind: 'message',
+                  key: msg.id,
+                  sortDate: msg.createdAt,
+                  message: msg,
+                });
+              }
+
+              items.sort((a, b) => new Date(b.sortDate).getTime() - new Date(a.sortDate).getTime());
+
+              return items.map((item) => {
+                if (item.kind === 'thread') {
+                  const t = item.thread;
                   return (
                     <ThreadRow
-                      key={gk}
-                      thread={thread}
-                      isActive={activeThread === gk}
+                      key={item.key}
+                      thread={t}
+                      isActive={activeThread === item.key}
                       onClick={() => {
                         setActiveMessage(null);
-                        setActiveThread(activeThread === gk ? null : gk);
+                        setActiveThread(activeThread === item.key ? null : item.key);
                       }}
                     />
                   );
-                })}
-              </CardContent>
-            </Card>
-          )}
+                }
 
-          {/* Group threads (from thread tables) */}
-          {groupThreads.length > 0 && (
-            <Card>
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                  <MessageSquare className="h-5 w-5" />
-                  Group Threads
-                </CardTitle>
-                <CardDescription>
-                  Multi-participant threads. Click to view the full conversation.
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-2">
-                {groupThreads.map((gt) => {
-                  const gk = `group:${gt.threadKey}`;
+                if (item.kind === 'group') {
+                  const gt = item.group;
                   return (
                     <button
-                      key={gk}
+                      key={item.key}
                       onClick={() => {
                         setActiveMessage(null);
-                        setActiveThread(activeThread === gk ? null : gk);
+                        setActiveThread(activeThread === item.key ? null : item.key);
                       }}
                       className={clsx(
                         'flex w-full items-center gap-3 rounded-lg border px-4 py-3 text-left transition-colors',
-                        activeThread === gk
-                          ? 'border-blue-200 bg-blue-50/50'
-                          : 'border-gray-100 hover:bg-gray-50'
+                        activeThread === item.key
+                          ? 'border-blue-300 bg-blue-50/50 ring-1 ring-blue-200'
+                          : 'border-gray-200 bg-white hover:bg-gray-50/50'
                       )}
                     >
+                      {/* Stacked avatar for group threads */}
+                      <div className="relative flex h-8 w-8 shrink-0 items-center justify-center">
+                        <div
+                          className={clsx(
+                            'absolute -left-0.5 -top-0.5 h-6 w-6 rounded-full text-white text-[9px] font-semibold flex items-center justify-center ring-2 ring-white',
+                            agentColor(gt.participants[0] || 'unknown')
+                          )}
+                        >
+                          {(gt.participants[0] || '??').slice(0, 2).toUpperCase()}
+                        </div>
+                        <div
+                          className={clsx(
+                            'absolute right-0 bottom-0 h-6 w-6 rounded-full text-white text-[9px] font-semibold flex items-center justify-center ring-2 ring-white',
+                            agentColor(gt.participants[1] || 'unknown')
+                          )}
+                        >
+                          {gt.participants.length > 2 ? (
+                            <Users className="h-3 w-3" />
+                          ) : (
+                            (gt.participants[1] || '??').slice(0, 2).toUpperCase()
+                          )}
+                        </div>
+                      </div>
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2">
-                          <span className="font-medium text-sm">{gt.title || gt.threadKey}</span>
-                          {gt.status === 'closed' && (
-                            <Badge variant="outline" className="text-[10px]">
-                              closed
-                            </Badge>
-                          )}
-                          <span className="text-xs text-gray-500">
-                            {gt.participants.length} participants
+                          <Badge variant="outline" className="font-mono text-xs shrink-0">
+                            {gt.threadKey}
+                          </Badge>
+                          <span className="text-xs text-gray-400">&middot;</span>
+                          <span className="text-xs font-medium text-gray-700">
+                            {gt.participants.join(', ')}
                           </span>
                           <span className="text-xs text-gray-500">{gt.messageCount} msgs</span>
                           {gt.unreadCount > 0 && (
@@ -643,18 +683,22 @@ export default function InboxPage() {
                               {gt.unreadCount}
                             </span>
                           )}
+                          {gt.status === 'closed' && (
+                            <Badge variant="outline" className="text-[10px]">
+                              closed
+                            </Badge>
+                          )}
                         </div>
-                        <div className="mt-0.5 flex items-center gap-1">
-                          <span className="text-xs text-gray-400">
-                            {gt.participants.join(', ')}
-                          </span>
-                        </div>
-                        {gt.lastMessage && (
-                          <p className="mt-0.5 text-sm text-gray-600 truncate">
-                            <span className="font-medium">{gt.lastMessage.senderAgentId}:</span>{' '}
-                            {gt.lastMessage.content}
-                          </p>
-                        )}
+                        <p className="mt-0.5 text-sm text-gray-600 truncate">
+                          {gt.lastMessage ? (
+                            <>
+                              <span className="font-medium">{gt.lastMessage.senderAgentId}:</span>{' '}
+                              {gt.lastMessage.content}
+                            </>
+                          ) : (
+                            gt.title || gt.threadKey
+                          )}
+                        </p>
                       </div>
                       <div className="shrink-0 text-right">
                         <span className="text-xs text-gray-400">
@@ -664,25 +708,11 @@ export default function InboxPage() {
                       </div>
                     </button>
                   );
-                })}
-              </CardContent>
-            </Card>
-          )}
+                }
 
-          {/* Direct (unthreaded) messages */}
-          {flatMessages.length > 0 && (
-            <Card>
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                  <Mail className="h-5 w-5" />
-                  Direct Messages
-                </CardTitle>
-                <CardDescription>
-                  Messages without a thread key, routed to {agentName}&apos;s main process.
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-1">
-                {flatMessages.map((msg) => (
+                // kind === 'message'
+                const msg = item.message;
+                return (
                   <div
                     key={msg.id}
                     role="button"
@@ -709,11 +739,11 @@ export default function InboxPage() {
                       onShowRouting={setRoutingMessage}
                     />
                   </div>
-                ))}
-              </CardContent>
-            </Card>
-          )}
-        </div>
+                );
+              });
+            })()}
+          </CardContent>
+        </Card>
       )}
 
       {/* Pagination */}
