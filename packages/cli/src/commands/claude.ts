@@ -698,6 +698,58 @@ function extractMessageText(value: unknown): string | undefined {
   return undefined;
 }
 
+function normalizePreviewLeafText(value: string): string | undefined {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  if (!compact) return undefined;
+  if (/^<(local-command|tool[_-]?result|tool[_-]?use|bash-command)[^>]*>/i.test(compact)) {
+    return undefined;
+  }
+  return compact;
+}
+
+function extractClaudePreviewText(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    return normalizePreviewLeafText(value);
+  }
+
+  if (Array.isArray(value)) {
+    const chunks: string[] = [];
+    for (const item of value) {
+      const chunk = extractClaudePreviewText(item);
+      if (chunk) chunks.push(chunk);
+    }
+    if (chunks.length === 0) return undefined;
+    return chunks.join(' ');
+  }
+
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const blockType = typeof record.type === 'string' ? record.type.toLowerCase() : '';
+    if (
+      blockType === 'tool_result' ||
+      blockType === 'tool_use' ||
+      blockType === 'server_tool_use'
+    ) {
+      return undefined;
+    }
+
+    if (blockType === 'text' || blockType === 'input_text' || blockType === 'output_text') {
+      return extractClaudePreviewText(record.text);
+    }
+
+    const textLikeKeys = ['text', 'message', 'content', 'output', 'input'];
+    const chunks: string[] = [];
+    for (const key of textLikeKeys) {
+      const chunk = extractClaudePreviewText(record[key]);
+      if (chunk) chunks.push(chunk);
+    }
+    if (chunks.length === 0) return undefined;
+    return chunks.join(' ');
+  }
+
+  return undefined;
+}
+
 function roleFromUnknown(value: unknown): SessionPreviewSummary['role'] | undefined {
   if (value === 'user') return 'user';
   if (value === 'assistant' || value === 'model') return 'assistant';
@@ -844,7 +896,7 @@ function extractLatestPreviewFromPcpTranscriptJsonl(
   return latest;
 }
 
-function extractLatestPreviewFromClaudeSessionJsonl(
+export function extractLatestPreviewFromClaudeSessionJsonl(
   jsonl: string
 ): SessionPreviewSummary | undefined {
   const events = parseJsonl(jsonl);
@@ -859,7 +911,7 @@ function extractLatestPreviewFromClaudeSessionJsonl(
     const role = roleFromUnknown(message?.role || event.role || event.type);
     if (!role || role === 'inbox') continue;
 
-    const content = extractMessageText(message?.content || event.content || message);
+    const content = extractClaudePreviewText(message?.content || event.content || message);
     if (!content) continue;
     latest = { role, content, ts };
   }

@@ -5,6 +5,7 @@ import { tmpdir } from 'os';
 import {
   extractClaudeHistorySessionsForProject,
   extractBackendSessionOverrideId,
+  extractLatestPreviewFromClaudeSessionJsonl,
   extractSessionFromStartSessionResponse,
   filterUntrackedLocalBackendSessions,
   filterPcpSessionsForContext,
@@ -1060,6 +1061,100 @@ describe('getClaudeLocalSessionsForProject previews', () => {
       }
       rmSync(tempRoot, { recursive: true, force: true });
     }
+  });
+});
+
+describe('extractLatestPreviewFromClaudeSessionJsonl', () => {
+  it('ignores claude tool_result chatter and keeps meaningful assistant text', () => {
+    const sessionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const preview = extractLatestPreviewFromClaudeSessionJsonl(
+      [
+        JSON.stringify({
+          type: 'user',
+          sessionId,
+          timestamp: '2026-03-10T07:57:00.000Z',
+          message: { role: 'user', content: 'Hi Wren' },
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          sessionId,
+          timestamp: '2026-03-10T07:57:01.000Z',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Let me check that for you.' }],
+          },
+        }),
+        JSON.stringify({
+          type: 'user',
+          sessionId,
+          timestamp: '2026-03-10T07:57:02.000Z',
+          message: {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                content:
+                  '<local-command-stdout>Authentication successful. Connected to supabase.</local-command-stdout>',
+              },
+            ],
+          },
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          sessionId,
+          timestamp: '2026-03-10T07:57:03.000Z',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'All set — authentication worked.' }],
+          },
+        }),
+      ].join('\n')
+    );
+
+    expect(preview).toEqual({
+      role: 'assistant',
+      content: 'All set — authentication worked.',
+      ts: '2026-03-10T07:57:03.000Z',
+    });
+  });
+
+  it('falls back to the last real conversational message when latest entry is tool noise', () => {
+    const sessionId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const preview = extractLatestPreviewFromClaudeSessionJsonl(
+      [
+        JSON.stringify({
+          type: 'user',
+          sessionId,
+          timestamp: '2026-03-10T08:00:00.000Z',
+          message: { role: 'user', content: 'Can you check auth?' },
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          sessionId,
+          timestamp: '2026-03-10T08:00:01.000Z',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Running the command now.' }],
+          },
+        }),
+        JSON.stringify({
+          type: 'user',
+          sessionId,
+          timestamp: '2026-03-10T08:00:02.000Z',
+          message: {
+            role: 'user',
+            content:
+              '<local-command-stdout>Authentication successful. Connected to supabase.</local-command-stdout>',
+          },
+        }),
+      ].join('\n')
+    );
+
+    expect(preview).toEqual({
+      role: 'assistant',
+      content: 'Running the command now.',
+      ts: '2026-03-10T08:00:01.000Z',
+    });
   });
 });
 
