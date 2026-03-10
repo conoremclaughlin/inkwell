@@ -152,8 +152,29 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
 
   const reqCtx = getRequestContext();
   const sessCtx = getSessionContext();
-  const senderSessionId = reqCtx?.sessionId || sessCtx?.sessionId || null;
+  let senderSessionId: string | null = reqCtx?.sessionId || sessCtx?.sessionId || null;
   const senderStudioId = reqCtx?.workspaceId || sessCtx?.workspaceId || null;
+
+  // Fallback: resolve sender's active session from the database when no header/context
+  // provides it. This covers the common case where an agent calls send_to_inbox via
+  // StreamableHTTP MCP and the client doesn't inject x-pcp-session-id.
+  if (!senderSessionId && senderAgentId) {
+    try {
+      const activeSession = await dataComposer.repositories.memory.getActiveSession(
+        resolved.user.id,
+        senderAgentId,
+        senderStudioId
+      );
+      if (activeSession) {
+        senderSessionId = activeSession.id;
+      }
+    } catch (err) {
+      logger.warn('Failed to resolve sender session from active sessions', {
+        error: err instanceof Error ? err.message : String(err),
+        senderAgentId,
+      });
+    }
+  }
   const metadataRecord =
     metadata && typeof metadata === 'object' ? (metadata as Record<string, unknown>) : {};
   const existingPcp =
