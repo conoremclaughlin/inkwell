@@ -1722,9 +1722,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         memoryLimit: z
           .number()
           .min(1)
-          .max(20)
+          .max(100)
           .optional()
-          .describe('Max recent memories to include (default: 5)'),
+          .describe(
+            'Max high-salience memories to fetch for knowledge summary (default: 50). Critical memories always included regardless.'
+          ),
         agentId: z
           .string()
           .optional()
@@ -1735,6 +1737,18 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .string()
           .optional()
           .describe('Base path for identity files (default: ~/.pcp)'),
+        threadKey: z
+          .string()
+          .optional()
+          .describe(
+            'Optional active thread key used to prioritize bootstrap memories relevant to this conversation.'
+          ),
+        focusText: z
+          .string()
+          .optional()
+          .describe(
+            'Optional focus text to prioritize bootstrap memories. Falls back to current focus summary when omitted.'
+          ),
       },
     },
     async (args) => {

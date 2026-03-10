@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { MemoryRepository } from './memory-repository';
+import { MemoryRepository, computeKnowledgeMemoryScore } from './memory-repository';
 import { createMockSupabaseClient, type MockSupabaseClient } from '../../test/mocks/supabase.mock';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
@@ -1159,6 +1159,42 @@ describe('MemoryRepository', () => {
       const daysAgo = (Date.now() - cutoff.getTime()) / (24 * 60 * 60 * 1000);
       expect(daysAgo).toBeGreaterThan(13);
       expect(daysAgo).toBeLessThan(15);
+    });
+  });
+
+  describe('computeKnowledgeMemoryScore', () => {
+    const baseMemory = {
+      id: 'mem-score-1',
+      userId: 'user-456',
+      content: 'Review PR #204 blocker fixes and confirm tests pass',
+      summary: 'PR #204 re-review notes',
+      topicKey: 'pr:204',
+      source: 'observation' as const,
+      salience: 'high' as const,
+      topics: ['pr:204', 'review'],
+      metadata: { threadKey: 'pr:204' },
+      version: 1,
+      createdAt: new Date('2026-03-08T00:00:00Z'),
+    };
+
+    it('should boost score on exact thread match', () => {
+      const now = new Date('2026-03-10T00:00:00Z');
+      const baseline = computeKnowledgeMemoryScore(baseMemory, {}, now);
+      const withThread = computeKnowledgeMemoryScore(baseMemory, { threadKey: 'pr:204' }, now);
+
+      expect(withThread).toBeGreaterThan(baseline);
+    });
+
+    it('should boost score when focus text overlaps memory content', () => {
+      const now = new Date('2026-03-10T00:00:00Z');
+      const baseline = computeKnowledgeMemoryScore(baseMemory, {}, now);
+      const withFocus = computeKnowledgeMemoryScore(
+        baseMemory,
+        { focusText: 're-review PR blocker fixes before merge' },
+        now
+      );
+
+      expect(withFocus).toBeGreaterThan(baseline);
     });
   });
 

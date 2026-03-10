@@ -534,6 +534,18 @@ export const bootstrapSchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe('Base path for identity files (default: ~/.pcp)'),
+  threadKey: z
+    .string()
+    .optional()
+    .describe(
+      'Optional active thread key used to prioritize bootstrap memories relevant to this conversation.'
+    ),
+  focusText: z
+    .string()
+    .optional()
+    .describe(
+      'Optional focus text to prioritize bootstrap memories. Falls back to current focus summary when omitted.'
+    ),
 });
 
 // =====================================================
@@ -1573,6 +1585,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   });
 
   const includeMemories = params.includeRecentMemories !== false;
+  const memoryLimit = params.memoryLimit ?? 50;
   const agentId = params.agentId;
   const basePath = params.identityBasePath || path.join(os.homedir(), '.pcp');
   const supabase = dataComposer.getClient();
@@ -1621,53 +1634,58 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   // Fetch all context in parallel (including timezone and skills)
   const cloudSkillsService = getCloudSkillsService(dataComposer.getClient());
 
-  const [
-    contexts,
-    projects,
-    focus,
-    activeSessions,
-    knowledgeMemories,
-    dbIdentity,
-    userTimezone,
-    userSkills,
-  ] = await Promise.all([
-    // Identity Core: all context summaries
-    dataComposer.repositories.context.findAllByUser(user.id),
-    // Active projects
-    dataComposer.repositories.projects.findAllByUser(user.id, 'active'),
-    // Current focus
-    dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
-    // All active sessions (filter by agentId if provided) — client picks the right one
-    dataComposer.repositories.memory.getActiveSessions(user.id, agentId),
-    // Knowledge memories: all critical + recent high (for knowledge summary)
-    includeMemories
-      ? dataComposer.repositories.memory.getKnowledgeMemories(user.id, agentId)
-      : Promise.resolve([]),
-    // Database identity (for cloud agents, includes metadata, heartbeat, soul)
-    agentId
-      ? dataComposer
-          .getClient()
-          .from('agent_identities')
-          .select('*')
-          .eq('user_id', user.id)
-          .eq('agent_id', agentId)
-          .single()
-          .then(({ data }) => data)
-      : Promise.resolve(null),
-    // User timezone for timestamp conversion
-    dataComposer
-      .getClient()
-      .from('users')
-      .select('timezone')
-      .eq('id', user.id)
-      .single()
-      .then(({ data }) => data?.timezone || 'UTC'),
-    // User's installed skills (local + cloud merged)
-    cloudSkillsService.loadUserSkills(user.id).catch((err) => {
-      logger.warn('Failed to load user skills:', err);
-      return [];
-    }),
-  ]);
+  const [contexts, projects, focus, activeSessions, dbIdentity, userTimezone, userSkills] =
+    await Promise.all([
+      // Identity Core: all context summaries
+      dataComposer.repositories.context.findAllByUser(user.id),
+      // Active projects
+      dataComposer.repositories.projects.findAllByUser(user.id, 'active'),
+      // Current focus
+      dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
+      // All active sessions (filter by agentId if provided) — client picks the right one
+      dataComposer.repositories.memory.getActiveSessions(user.id, agentId),
+      // Database identity (for cloud agents, includes metadata, heartbeat, soul)
+      agentId
+        ? dataComposer
+            .getClient()
+            .from('agent_identities')
+            .select('*')
+            .eq('user_id', user.id)
+            .eq('agent_id', agentId)
+            .single()
+            .then(({ data }) => data)
+        : Promise.resolve(null),
+      // User timezone for timestamp conversion
+      dataComposer
+        .getClient()
+        .from('users')
+        .select('timezone')
+        .eq('id', user.id)
+        .single()
+        .then(({ data }) => data?.timezone || 'UTC'),
+      // User's installed skills (local + cloud merged)
+      cloudSkillsService.loadUserSkills(user.id).catch((err) => {
+        logger.warn('Failed to load user skills:', err);
+        return [];
+      }),
+    ]);
+
+  const inferredThreadKey =
+    params.threadKey || activeSessions.find((s) => !!s.threadKey)?.threadKey;
+  const focusText = params.focusText || focus?.focus_summary || undefined;
+
+  const knowledgeMemories = includeMemories
+    ? await dataComposer.repositories.memory.getKnowledgeMemories(
+        user.id,
+        agentId,
+        memoryLimit,
+        7,
+        {
+          threadKey: inferredThreadKey || undefined,
+          focusText,
+        }
+      )
+    : [];
 
   // Resolve workspace scope for shared docs:
   // 1) explicit workspaceId param
@@ -1831,6 +1849,11 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     knowledgeSummaryChars: knowledgeSummary.length,
     topicCount: topicIndex.length,
     usedCache: !!cachedSummary,
+    memorySelectionContext: {
+      threadKey: inferredThreadKey || null,
+      hasFocusText: !!focusText,
+      memoryLimit,
+    },
     skillCount: userSkills.length,
     activeSessionCount: activeSessions.length,
     hasIdentityFiles: !!identityFiles,

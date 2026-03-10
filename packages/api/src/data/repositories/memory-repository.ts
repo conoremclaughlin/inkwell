@@ -24,6 +24,11 @@ import type {
 
 type RecallMode = NonNullable<MemorySearchOptions['recallMode']>;
 
+export interface KnowledgeMemoryContext {
+  threadKey?: string;
+  focusText?: string;
+}
+
 interface RecallCandidate {
   memory: Memory;
   semanticScore?: number;
@@ -33,6 +38,98 @@ interface RecallCandidate {
 
 interface SemanticMatchRow extends MemoryRow {
   similarity?: number;
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function tokenizeRelevance(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/g)
+    .filter((token) => token.length > 1);
+}
+
+function extractThreadType(threadKey: string): string | null {
+  const idx = threadKey.indexOf(':');
+  if (idx <= 0) return null;
+  return threadKey.slice(0, idx).toLowerCase();
+}
+
+function computeThreadBoost(memory: Memory, threadKey?: string): number {
+  if (!threadKey?.trim()) return 1;
+
+  const normalized = threadKey.trim().toLowerCase();
+  const candidates = new Set<string>();
+  if (memory.topicKey) candidates.add(memory.topicKey.toLowerCase());
+  for (const t of memory.topics) candidates.add(t.toLowerCase());
+  const metadataThreadKey =
+    memory.metadata &&
+    typeof memory.metadata === 'object' &&
+    typeof (memory.metadata as Record<string, unknown>).threadKey === 'string'
+      ? ((memory.metadata as Record<string, unknown>).threadKey as string).toLowerCase()
+      : null;
+  if (metadataThreadKey) candidates.add(metadataThreadKey);
+
+  if (candidates.has(normalized)) return 1.8;
+
+  const threadType = extractThreadType(normalized);
+  if (threadType) {
+    for (const candidate of candidates) {
+      if (extractThreadType(candidate) === threadType) return 1.25;
+    }
+  }
+
+  const threadTokens = tokenizeRelevance(normalized);
+  if (threadTokens.length === 0) return 1;
+  const candidateText = Array.from(candidates).join(' ');
+  const tokenOverlap = threadTokens.filter((token) => candidateText.includes(token)).length;
+  if (tokenOverlap > 0) return 1.1;
+
+  return 1;
+}
+
+function computeFocusBoost(memory: Memory, focusText?: string): number {
+  if (!focusText?.trim()) return 1;
+
+  const focusTokens = tokenizeRelevance(focusText).filter((token) => token.length > 2);
+  if (focusTokens.length === 0) return 1;
+
+  const haystack = [
+    memory.content,
+    memory.summary || '',
+    memory.topicKey || '',
+    memory.topics.join(' '),
+  ]
+    .join(' ')
+    .toLowerCase();
+
+  const overlap = focusTokens.filter((token) => haystack.includes(token)).length;
+  if (overlap === 0) return 1;
+
+  const ratio = overlap / focusTokens.length;
+  return 1 + Math.min(0.35, ratio * 0.35);
+}
+
+export function computeKnowledgeMemoryScore(
+  memory: Memory,
+  context: KnowledgeMemoryContext = {},
+  now: Date = new Date()
+): number {
+  const salienceWeight =
+    memory.salience === 'critical'
+      ? 2
+      : memory.salience === 'high'
+        ? 1.2
+        : memory.salience === 'medium'
+          ? 0.9
+          : 0.6;
+
+  const ageDays = Math.max(0, (now.getTime() - memory.createdAt.getTime()) / DAY_MS);
+  const recencyDecay = Math.max(0.25, Math.exp(-ageDays / 45));
+  const threadBoost = computeThreadBoost(memory, context.threadKey);
+  const focusBoost = computeFocusBoost(memory, context.focusText);
+
+  return salienceWeight * recencyDecay * threadBoost * focusBoost;
 }
 
 export class MemoryRepository {
@@ -228,10 +325,7 @@ export class MemoryRepository {
   }
 
   private tokenize(text: string): string[] {
-    return text
-      .toLowerCase()
-      .split(/[^a-z0-9]+/g)
-      .filter((token) => token.length > 1);
+    return tokenizeRelevance(text);
   }
 
   private buildTextSearchTerms(query: string): string[] {
@@ -442,7 +536,8 @@ export class MemoryRepository {
     userId: string,
     agentId?: string,
     highLimit: number = 10,
-    highWindowDays: number = 7
+    highWindowDays: number = 7,
+    context: KnowledgeMemoryContext = {}
   ): Promise<Memory[]> {
     const buildQuery = (salience: string, limit: number) => {
       let q = this.supabase
@@ -511,8 +606,19 @@ export class MemoryRepository {
       (a, b) => b.createdAt.getTime() - a.createdAt.getTime()
     );
 
-    // Critical first, then high — both ordered by recency within their tier
-    return [...criticalMemories, ...highMemories];
+    const scoredHighMemories = highMemories
+      .map((memory) => ({
+        memory,
+        score: computeKnowledgeMemoryScore(memory, context),
+      }))
+      .sort(
+        (a, b) => b.score - a.score || b.memory.createdAt.getTime() - a.memory.createdAt.getTime()
+      )
+      .map((entry) => entry.memory);
+
+    // Critical first, then high.
+    // Critical remains recency-ordered; high can be boosted by thread/focus relevance.
+    return [...criticalMemories, ...scoredHighMemories];
   }
 
   // ==================== MEMORY SUMMARY CACHE ====================

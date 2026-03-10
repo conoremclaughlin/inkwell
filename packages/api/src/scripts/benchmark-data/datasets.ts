@@ -6,6 +6,16 @@ export interface BenchmarkCase {
   provenance?: string;
 }
 
+export interface BootstrapRelevanceCase {
+  id: string;
+  threadKey: string;
+  focusText: string;
+  targetTopicKey: string;
+  targetContent: string;
+  distractors: string[];
+  provenance?: string;
+}
+
 export const SMOKE_GOLDSET_V1: BenchmarkCase[] = [
   {
     id: 'exact-key-topic',
@@ -189,5 +199,86 @@ export function getBenchmarkDataset(dataset: string): BenchmarkCase[] {
   if (dataset === 'internal-gold-v1') return INTERNAL_GOLDSET_V1;
   throw new Error(
     `Unknown benchmark dataset "${dataset}". Supported datasets: smoke-v1, internal-gold-v1`
+  );
+}
+
+export const BOOTSTRAP_RELEVANCE_V1: BootstrapRelevanceCase[] = [
+  {
+    id: 'pr-thread-prioritization',
+    threadKey: 'pr:204',
+    focusText: 'review latest PR fixes and merge readiness',
+    targetTopicKey: 'pr:204',
+    targetContent:
+      'PR #204 re-review checklist: verify blocker fixes, confirm test green status, and post merge-ready verdict.',
+    distractors: [
+      'PR #199 review covered media callback propagation and sent-count correctness.',
+      'Studio routing decision uses home fallback when no explicit studio is provided.',
+      'Constitution storage is canonical in DB, not local files.',
+    ],
+    provenance: 'memory:7bea0871-4051-4e8b-9b14-d12da727c528 (lumen, pr:204)',
+  },
+  {
+    id: 'convention-thread-prioritization',
+    threadKey: 'convention:github-pr-reviews',
+    focusText: 'how review comments should be collected for sibling SBs',
+    targetTopicKey: 'convention:github-pr-reviews',
+    targetContent:
+      'Use get_comments/get_review_comments for PR review retrieval since shared account usage makes get_reviews noisy.',
+    distractors: [
+      'Hybrid recall combines lexical and semantic signals for robust retrieval.',
+      'Memory benchmark runs persist recall@k and MRR into dedicated tables.',
+      'Agent studio hints route reminders to the correct home studio.',
+    ],
+    provenance: 'memory:43b926d3-4ae0-47b2-9731-b02d97a069fb (wren, convention:github-pr-reviews)',
+  },
+  {
+    id: 'decision-thread-prioritization',
+    threadKey: 'decision:studio-routing',
+    focusText: 'select studio cascade rules for task execution',
+    targetTopicKey: 'decision:studio-routing',
+    targetContent:
+      'Studio routing cascade: explicit override first, then agent home studio_hint, then fallback to home.',
+    distractors: [
+      'Protocol v0.1 requires deterministic thread matching and sender authenticity checks.',
+      'Memory summaries should be cached and invalidated on new writes.',
+      'Never push directly to main; branch + PR is required.',
+    ],
+    provenance: 'memory:c92b5753-c9b2-4393-8b45-593fbcda7134 (wren, decision:studio-routing)',
+  },
+  {
+    id: 'project-thread-prioritization',
+    threadKey: 'project:pcp/memory',
+    focusText: 'bootstrap memory architecture and knowledge summary budget',
+    targetTopicKey: 'project:pcp/memory',
+    targetContent:
+      'Hierarchical memory phase 1 introduced summary + topicKey and budgeted topic-grouped bootstrap knowledge summaries.',
+    distractors: [
+      'Tool routing executes MCP calls through authenticated PCP client connections.',
+      'Playwright skill sync writes SKILL.md to backend-native directories.',
+      'Session lifecycle includes running, idle, completed, and failed.',
+    ],
+    provenance: 'memory:e770da50-5afc-4b99-b9a1-da012eebfdd2 (wren, project:pcp/memory)',
+  },
+  {
+    id: 'policy-thread-prioritization',
+    threadKey: 'decision:skill-tool-unification',
+    focusText: 'unify tool authorization pipeline and skill policy behavior',
+    targetTopicKey: 'decision:skill-tool-unification',
+    targetContent:
+      'Skills should be treated as labeled tools under the same allow/deny/prompt policy pipeline.',
+    distractors: [
+      'Bootstrap can load identity files from ~/.pcp as fallback.',
+      'Memory bridge in phase 2 can normalize topic hints asynchronously.',
+      'PR thread keys preserve continuity in cross-agent collaboration.',
+    ],
+    provenance:
+      'memory:a6ea834f-1066-4a16-9e6c-aa9cd68e629c (wren, decision:skill-tool-unification)',
+  },
+];
+
+export function getBootstrapRelevanceDataset(dataset: string): BootstrapRelevanceCase[] {
+  if (dataset === 'bootstrap-relevance-v1') return BOOTSTRAP_RELEVANCE_V1;
+  throw new Error(
+    `Unknown bootstrap relevance dataset "${dataset}". Supported datasets: bootstrap-relevance-v1`
   );
 }

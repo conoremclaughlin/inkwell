@@ -23,6 +23,7 @@
     "test:connection": "tsx src/test-connection.ts",
     "test:channels": "tsx src/test-channels.ts",
     "benchmark:memory-recall": "tsx src/scripts/benchmark-memory-recall.ts",
+    "benchmark:bootstrap-relevance": "tsx src/scripts/benchmark-bootstrap-relevance.ts",
     "lint": "eslint src --ext .ts",
     "type-check": "yarn workspace @personal-context/shared build && tsc --noEmit",
     "clean": "rm -rf dist"
