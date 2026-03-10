@@ -170,6 +170,7 @@ import {
   handleAddThreadParticipant,
   handleCloseThread,
   handleListThreads,
+  handleMarkThreadRead,
   threadToolDefinitions,
 } from './thread-handlers';
 
@@ -3643,6 +3644,35 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleListThreads(args, dataComposer);
       } catch (error) {
         logger.error('Error in list_threads:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'mark_thread_read',
+    {
+      description: `Mark a thread as read without fetching messages. Useful when you see thread activity in get_inbox and want to acknowledge it without reading the full history.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: threadToolDefinitions[5].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleMarkThreadRead(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in mark_thread_read:', error);
         return {
           content: [
             {

@@ -84,6 +84,11 @@ const listThreadsSchema = userIdentifierBaseSchema.extend({
   limit: z.number().int().min(1).max(100).optional().default(20),
 });
 
+const markThreadReadSchema = userIdentifierBaseSchema.extend({
+  threadKey: threadKeySchema,
+  agentId: agentIdSchema.describe('Agent ID marking the thread as read'),
+});
+
 // ============== Helpers ==============
 
 interface ThreadRow {
@@ -789,6 +794,69 @@ export async function handleListThreads(args: unknown, dataComposer: DataCompose
   };
 }
 
+export async function handleMarkThreadRead(args: unknown, dataComposer: DataComposer) {
+  const supabase = dataComposer.getClient();
+  const parsed = markThreadReadSchema.parse(args);
+  const resolved = await resolveUserOrThrow(parsed, dataComposer);
+
+  const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
+  const { threadKey } = parsed;
+
+  // Find thread
+  const thread = await findThread(supabase, resolved.user.id, threadKey);
+  if (!thread) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({ success: false, error: `Thread not found: ${threadKey}` }),
+        },
+      ],
+    };
+  }
+
+  // Verify participant membership
+  if (!(await isParticipant(supabase, thread.id, agentId))) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({
+            success: false,
+            error: `Agent ${agentId} is not a participant in thread ${threadKey}`,
+          }),
+        },
+      ],
+    };
+  }
+
+  // Upsert read status
+  await threadTable(supabase, 'inbox_thread_read_status').upsert(
+    {
+      thread_id: thread.id,
+      agent_id: agentId,
+      last_read_at: new Date().toISOString(),
+    },
+    { onConflict: 'thread_id,agent_id' }
+  );
+
+  logger.info('Thread marked as read', { threadKey, agentId });
+
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify({
+          success: true,
+          message: `Thread ${threadKey} marked as read`,
+          threadKey,
+          agentId,
+        }),
+      },
+    ],
+  };
+}
+
 // ============== Tool Registration ==============
 
 export const threadToolDefinitions = [
@@ -826,5 +894,12 @@ export const threadToolDefinitions = [
       'List threads an agent participates in, with unread counts and last message preview. Useful for heartbeat triage and inbox overview.',
     schema: listThreadsSchema,
     handler: handleListThreads,
+  },
+  {
+    name: 'mark_thread_read',
+    description:
+      'Mark a thread as read without fetching messages. Useful when you see thread activity in get_inbox and want to acknowledge it without reading the full history.',
+    schema: markThreadReadSchema,
+    handler: handleMarkThreadRead,
   },
 ];

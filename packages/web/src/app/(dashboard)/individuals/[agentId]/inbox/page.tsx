@@ -60,15 +60,32 @@ interface ThreadGroup {
   messages: InboxMessage[];
 }
 
+interface GroupThread {
+  threadKey: string;
+  title: string | null;
+  status: string;
+  participants: string[];
+  messageCount: number;
+  unreadCount: number;
+  lastMessage: InboxMessage | null;
+  firstMessageAt: string;
+  lastMessageAt: string;
+  messages: InboxMessage[];
+}
+
 interface InboxResponse {
   agentId: string;
   stats: {
     totalMessages: number;
     unreadCount: number;
+    threadUnreadCount?: number;
+    totalUnreadCount?: number;
     threadCount: number;
+    groupThreadCount?: number;
     flatCount: number;
   };
   threads: ThreadGroup[];
+  groupThreads?: GroupThread[];
   flatMessages: InboxMessage[];
   pagination: {
     limit: number;
@@ -437,6 +454,7 @@ export default function InboxPage() {
 
   const stats = data?.stats;
   const threads = data?.threads || [];
+  const groupThreads = data?.groupThreads || [];
   const flatMessages = data?.flatMessages || [];
   const pagination = data?.pagination;
 
@@ -444,10 +462,13 @@ export default function InboxPage() {
   const selectedThread = activeThread
     ? threads.find((t) => threadGroupKey(t) === activeThread)
     : undefined;
+  const selectedGroupThread = activeThread
+    ? groupThreads.find((t) => `group:${t.threadKey}` === activeThread)
+    : undefined;
   const selectedMessage = activeMessage
     ? flatMessages.find((m) => m.id === activeMessage)
     : undefined;
-  const panelOpen = !!selectedThread || !!selectedMessage;
+  const panelOpen = !!selectedThread || !!selectedGroupThread || !!selectedMessage;
 
   return (
     <div>
@@ -468,10 +489,14 @@ export default function InboxPage() {
         {stats && (
           <div className="mt-2 flex items-center gap-3">
             <Badge variant="outline">{stats.totalMessages} total</Badge>
-            {stats.unreadCount > 0 && (
-              <Badge className="bg-blue-100 text-blue-700">{stats.unreadCount} unread</Badge>
+            {(stats.totalUnreadCount ?? stats.unreadCount) > 0 && (
+              <Badge className="bg-blue-100 text-blue-700">
+                {stats.totalUnreadCount ?? stats.unreadCount} unread
+              </Badge>
             )}
-            <Badge variant="outline">{stats.threadCount} threads</Badge>
+            <Badge variant="outline">
+              {stats.threadCount + (stats.groupThreadCount || 0)} threads
+            </Badge>
             <Badge variant="outline">{stats.flatCount} direct</Badge>
           </div>
         )}
@@ -531,7 +556,7 @@ export default function InboxPage() {
 
       {isLoading ? (
         <p className="text-sm text-gray-500">Loading inbox...</p>
-      ) : threads.length === 0 && flatMessages.length === 0 ? (
+      ) : threads.length === 0 && groupThreads.length === 0 && flatMessages.length === 0 ? (
         <Card>
           <CardContent className="py-12 text-center">
             <Mail className="mx-auto mb-3 h-12 w-12 text-gray-300" />
@@ -566,6 +591,78 @@ export default function InboxPage() {
                         setActiveThread(activeThread === gk ? null : gk);
                       }}
                     />
+                  );
+                })}
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Group threads (from thread tables) */}
+          {groupThreads.length > 0 && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <MessageSquare className="h-5 w-5" />
+                  Group Threads
+                </CardTitle>
+                <CardDescription>
+                  Multi-participant threads. Click to view the full conversation.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-2">
+                {groupThreads.map((gt) => {
+                  const gk = `group:${gt.threadKey}`;
+                  return (
+                    <button
+                      key={gk}
+                      onClick={() => {
+                        setActiveMessage(null);
+                        setActiveThread(activeThread === gk ? null : gk);
+                      }}
+                      className={clsx(
+                        'flex w-full items-center gap-3 rounded-lg border px-4 py-3 text-left transition-colors',
+                        activeThread === gk
+                          ? 'border-blue-200 bg-blue-50/50'
+                          : 'border-gray-100 hover:bg-gray-50'
+                      )}
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="font-medium text-sm">{gt.title || gt.threadKey}</span>
+                          {gt.status === 'closed' && (
+                            <Badge variant="outline" className="text-[10px]">
+                              closed
+                            </Badge>
+                          )}
+                          <span className="text-xs text-gray-500">
+                            {gt.participants.length} participants
+                          </span>
+                          <span className="text-xs text-gray-500">{gt.messageCount} msgs</span>
+                          {gt.unreadCount > 0 && (
+                            <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-blue-500 px-1.5 text-[10px] font-semibold text-white">
+                              {gt.unreadCount}
+                            </span>
+                          )}
+                        </div>
+                        <div className="mt-0.5 flex items-center gap-1">
+                          <span className="text-xs text-gray-400">
+                            {gt.participants.join(', ')}
+                          </span>
+                        </div>
+                        {gt.lastMessage && (
+                          <p className="mt-0.5 text-sm text-gray-600 truncate">
+                            <span className="font-medium">{gt.lastMessage.senderAgentId}:</span>{' '}
+                            {gt.lastMessage.content}
+                          </p>
+                        )}
+                      </div>
+                      <div className="shrink-0 text-right">
+                        <span className="text-xs text-gray-400">
+                          {formatRelativeTime(gt.lastMessageAt)}
+                        </span>
+                        <ChevronRight className="mt-0.5 ml-auto h-4 w-4 text-gray-300" />
+                      </div>
+                    </button>
                   );
                 })}
               </CardContent>
@@ -666,7 +763,9 @@ export default function InboxPage() {
               <MessageSquare className="h-4 w-4 text-gray-500" />
               {selectedThread
                 ? `${selectedThread.threadKey} · ${selectedThread.counterpart}`
-                : 'Message'}
+                : selectedGroupThread
+                  ? selectedGroupThread.title || selectedGroupThread.threadKey
+                  : 'Message'}
             </SheetTitle>
             {selectedThread && (
               <SheetDescription>
@@ -674,11 +773,23 @@ export default function InboxPage() {
                 {selectedThread.counterpart}
               </SheetDescription>
             )}
+            {selectedGroupThread && (
+              <SheetDescription>
+                {selectedGroupThread.messageCount} messages &middot;{' '}
+                {selectedGroupThread.participants.join(', ')}
+              </SheetDescription>
+            )}
           </SheetHeader>
-          {(selectedThread || selectedMessage) && (
+          {(selectedThread || selectedGroupThread || selectedMessage) && (
             <ThreadMessages
               thread={selectedThread}
-              messages={selectedMessage ? [selectedMessage] : undefined}
+              messages={
+                selectedGroupThread
+                  ? selectedGroupThread.messages
+                  : selectedMessage
+                    ? [selectedMessage]
+                    : undefined
+              }
               agentId={agentId}
               onShowRouting={setRoutingMessage}
             />

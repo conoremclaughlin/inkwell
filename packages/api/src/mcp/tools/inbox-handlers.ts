@@ -584,79 +584,133 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   }
   const { count: unreadCount } = await unreadQuery;
 
-  // Get threads with unread counts (if agent has any thread participation)
-  let threadsWithUnread: Array<{
+  // Get threads with unread counts and preview messages.
+  // Works with or without agentId — when omitted, finds threads for ALL agents
+  // (used by `sb mission` unified timeline).
+  interface ThreadSummary {
     threadKey: string;
     title: string | null;
+    participants: string[];
     unreadCount: number;
     lastMessageAt: string | null;
-  }> = [];
+    previewMessages: Array<{
+      senderAgentId: string;
+      content: string;
+      messageType: string;
+      createdAt: string;
+    }>;
+  }
+  let threadsWithUnread: ThreadSummary[] = [];
+  let threadUnreadCount = 0;
 
-  if (agentId) {
-    try {
-      // Find threads this agent participates in
-      const { data: participantRows } = await threadTable(supabase, 'inbox_thread_participants')
-        .select('thread_id')
-        .eq('agent_id', agentId);
+  try {
+    // Find thread IDs this agent (or any agent for this user) participates in
+    let participantQuery = threadTable(supabase, 'inbox_thread_participants').select('thread_id');
+    if (agentId) {
+      participantQuery = participantQuery.eq('agent_id', agentId);
+    }
+    const { data: participantRows } = await participantQuery;
 
-      const threadIds = (participantRows || []).map((p: { thread_id: string }) => p.thread_id);
+    const threadIds = [
+      ...new Set((participantRows || []).map((p: { thread_id: string }) => p.thread_id)),
+    ];
 
-      if (threadIds.length > 0) {
-        // Get open threads
-        const { data: threads } = await threadTable(supabase, 'inbox_threads')
-          .select('id, thread_key, title, user_id, updated_at')
-          .eq('user_id', resolved.user.id)
-          .eq('status', 'open')
-          .in('id', threadIds)
-          .order('updated_at', { ascending: false })
-          .limit(10);
+    if (threadIds.length > 0) {
+      // Get open threads for this user
+      const { data: threads } = await threadTable(supabase, 'inbox_threads')
+        .select('id, thread_key, title, user_id, created_by_agent_id, updated_at')
+        .eq('user_id', resolved.user.id)
+        .eq('status', 'open')
+        .in('id', threadIds)
+        .order('updated_at', { ascending: false })
+        .limit(20);
 
-        if (threads?.length) {
-          threadsWithUnread = await Promise.all(
-            threads.map(
-              async (t: {
-                id: string;
-                thread_key: string;
-                title: string | null;
-                updated_at: string;
-              }) => {
-                // Get last read timestamp
+      if (threads?.length) {
+        threadsWithUnread = await Promise.all(
+          threads.map(
+            async (t: {
+              id: string;
+              thread_key: string;
+              title: string | null;
+              created_by_agent_id: string;
+              updated_at: string;
+            }) => {
+              // Get participants
+              const { data: parts } = await threadTable(supabase, 'inbox_thread_participants')
+                .select('agent_id')
+                .eq('thread_id', t.id);
+              const participants = (parts || []).map((p: { agent_id: string }) => p.agent_id);
+
+              // Get last read timestamp (only meaningful with agentId)
+              let lastReadAt: string | null = null;
+              if (agentId) {
                 const { data: readStatus } = await threadTable(supabase, 'inbox_thread_read_status')
                   .select('last_read_at')
                   .eq('thread_id', t.id)
                   .eq('agent_id', agentId)
                   .maybeSingle();
-
-                // Count unread messages
-                let countQuery = threadTable(supabase, 'inbox_thread_messages')
-                  .select('*', { count: 'exact', head: true })
-                  .eq('thread_id', t.id);
-
-                if (readStatus?.last_read_at) {
-                  countQuery = countQuery.gt('created_at', readStatus.last_read_at);
-                }
-
-                const { count } = await countQuery;
-
-                return {
-                  threadKey: t.thread_key,
-                  title: t.title,
-                  unreadCount: count || 0,
-                  lastMessageAt: t.updated_at,
-                };
+                lastReadAt = readStatus?.last_read_at || null;
               }
-            )
-          );
 
-          // Only include threads that actually have unread messages
-          threadsWithUnread = threadsWithUnread.filter((t) => t.unreadCount > 0);
-        }
+              // Count unread messages (after last read, or all if no read status)
+              let countQuery = threadTable(supabase, 'inbox_thread_messages')
+                .select('*', { count: 'exact', head: true })
+                .eq('thread_id', t.id);
+
+              if (lastReadAt) {
+                countQuery = countQuery.gt('created_at', lastReadAt);
+              }
+
+              const { count } = await countQuery;
+
+              // Get preview messages (last 3 non-system messages)
+              const { data: previewRows } = await threadTable(supabase, 'inbox_thread_messages')
+                .select('sender_agent_id, content, message_type, created_at')
+                .eq('thread_id', t.id)
+                .neq('message_type', 'system')
+                .order('created_at', { ascending: false })
+                .limit(3);
+
+              const previewMessages = (previewRows || [])
+                .reverse()
+                .map(
+                  (m: {
+                    sender_agent_id: string;
+                    content: string;
+                    message_type: string;
+                    created_at: string;
+                  }) => ({
+                    senderAgentId: m.sender_agent_id,
+                    content: m.content.slice(0, 200),
+                    messageType: m.message_type,
+                    createdAt: m.created_at,
+                  })
+                );
+
+              return {
+                threadKey: t.thread_key,
+                title: t.title,
+                participants,
+                unreadCount: count || 0,
+                lastMessageAt: t.updated_at,
+                previewMessages,
+              };
+            }
+          )
+        );
+
+        // Only include threads that actually have unread messages
+        threadsWithUnread = threadsWithUnread.filter((t) => t.unreadCount > 0);
+        threadUnreadCount = threadsWithUnread.reduce((sum, t) => sum + t.unreadCount, 0);
       }
-    } catch (err) {
-      // Thread tables may not exist yet (migration not applied) — graceful fallback
-      logger.debug('Failed to fetch thread unread counts (tables may not exist)', { err });
     }
+  } catch (err) {
+    // Thread tables may not exist yet (migration not applied) — graceful fallback
+    logger.debug('Failed to fetch thread unread counts (tables may not exist)', { err });
   }
+
+  const inboxUnreadCount = unreadCount || 0;
+  const totalUnreadCount = inboxUnreadCount + threadUnreadCount;
 
   return {
     content: [
@@ -665,7 +719,9 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         text: JSON.stringify({
           success: true,
           ...(agentId ? { agentId } : { allAgents: true }),
-          unreadCount: unreadCount || 0,
+          unreadCount: inboxUnreadCount,
+          threadUnreadCount,
+          totalUnreadCount,
           count: messages?.length || 0,
           messages: (messages || []).map((m) => ({
             id: m.id,
@@ -687,7 +743,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
             ? {
                 threadsWithUnread,
                 threadHint:
-                  'You have unread thread messages. Use get_thread_messages(threadKey) to read them, or list_threads() for an overview.',
+                  'You have unread thread messages. Use get_thread_messages(threadKey) to read them, reply_to_thread to respond, or mark_thread_read to acknowledge.',
               }
             : {}),
         }),
