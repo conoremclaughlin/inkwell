@@ -283,12 +283,19 @@ export class MCPServer {
         : {};
       const callerProfileHeader = req.header('x-pcp-caller-profile')?.trim().toLowerCase();
       // Trust boundary note:
-      // `x-pcp-caller-profile` is only consumed on the MCP transport entrypoint.
-      // Supported MCP clients in our stack do not expose arbitrary header injection to model prompts,
-      // so this remains a runtime/server-controlled signal rather than an LLM-controlled parameter.
+      // `x-pcp-caller-profile`, `x-pcp-session-id`, and `x-pcp-studio-id` are only consumed
+      // on the MCP transport entrypoint. Supported MCP clients in our stack do not expose
+      // arbitrary header injection to model prompts, so these remain runtime/server-controlled
+      // signals rather than LLM-controlled parameters.
       const callerProfile: 'agent' | 'runtime' =
         callerProfileHeader === 'runtime' ? 'runtime' : 'agent';
-      Object.assign(ctx, { callerProfile });
+      const sessionIdHeader = req.header('x-pcp-session-id')?.trim();
+      const studioIdHeader = req.header('x-pcp-studio-id')?.trim();
+      Object.assign(ctx, {
+        callerProfile,
+        ...(sessionIdHeader ? { sessionId: sessionIdHeader } : {}),
+        ...(studioIdHeader ? { workspaceId: studioIdHeader } : {}),
+      });
 
       if (userData) {
         try {

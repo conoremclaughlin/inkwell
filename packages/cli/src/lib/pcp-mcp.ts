@@ -52,7 +52,12 @@ function formatPcpFetchFailure(url: string, error: unknown): string {
 export async function callPcpTool<T = Record<string, unknown>>(
   tool: string,
   args: Record<string, unknown>,
-  options?: { timeoutMs?: number; callerProfile?: 'agent' | 'runtime' }
+  options?: {
+    timeoutMs?: number;
+    callerProfile?: 'agent' | 'runtime';
+    sessionId?: string;
+    studioId?: string;
+  }
 ): Promise<T> {
   const serverUrl = getPcpServerUrl();
   const url = `${serverUrl}/mcp`;
@@ -68,6 +73,12 @@ export async function callPcpTool<T = Record<string, unknown>>(
   }
   if (options?.callerProfile) {
     headers['x-pcp-caller-profile'] = options.callerProfile;
+  }
+  if (options?.sessionId) {
+    headers['x-pcp-session-id'] = options.sessionId;
+  }
+  if (options?.studioId) {
+    headers['x-pcp-studio-id'] = options.studioId;
   }
 
   sbDebugLog('pcp-mcp', 'call_start', {
