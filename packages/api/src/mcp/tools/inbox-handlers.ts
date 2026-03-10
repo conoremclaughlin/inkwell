@@ -158,13 +158,27 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   // Fallback: resolve sender's active session from the database when no header/context
   // provides it. This covers the common case where an agent calls send_to_inbox via
   // StreamableHTTP MCP and the client doesn't inject x-pcp-session-id.
+  // Prefer threadKey-specific lookup to avoid cross-thread misrouting when an agent
+  // has multiple active sessions.
   if (!senderSessionId && senderAgentId) {
     try {
-      const activeSession = await dataComposer.repositories.memory.getActiveSession(
-        resolved.user.id,
-        senderAgentId,
-        senderStudioId
-      );
+      const activeSession = threadKey
+        ? ((await dataComposer.repositories.memory.getActiveSessionByThreadKey(
+            resolved.user.id,
+            senderAgentId,
+            threadKey,
+            senderStudioId
+          )) ??
+          (await dataComposer.repositories.memory.getActiveSession(
+            resolved.user.id,
+            senderAgentId,
+            senderStudioId
+          )))
+        : await dataComposer.repositories.memory.getActiveSession(
+            resolved.user.id,
+            senderAgentId,
+            senderStudioId
+          );
       if (activeSession) {
         senderSessionId = activeSession.id;
       }
