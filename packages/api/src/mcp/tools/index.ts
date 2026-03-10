@@ -165,6 +165,15 @@ import {
 } from './inbox-handlers';
 
 import {
+  handleGetThreadMessages,
+  handleReplyToThread,
+  handleAddThreadParticipant,
+  handleCloseThread,
+  handleListThreads,
+  threadToolDefinitions,
+} from './thread-handlers';
+
+import {
   handleTriggerAgent,
   handleListRegisteredAgents,
   triggerAgentSchema,
@@ -3468,6 +3477,161 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleGetAgentStatus(args, dataComposer);
       } catch (error) {
         logger.error('Error in get_agent_status:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // THREAD TOOLS (group thread messaging)
+  // =====================================================
+
+  server.registerTool(
+    'get_thread_messages',
+    {
+      description: `Get the full message timeline of a thread. Requires participant membership. Automatically marks the thread as read for the requesting agent.
+
+Use to read conversation history in a group thread before replying.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: threadToolDefinitions[0].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleGetThreadMessages(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_thread_messages:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'reply_to_thread',
+    {
+      description: `Reply to a thread. Trigger behavior depends on thread size:
+- 1:1 thread: triggers the other participant by default
+- Group thread (non-creator reply): triggers creator by default
+- Group thread (creator reply): triggers no one by default
+Use triggerAgents for targeted waking, triggerAll for broadcast.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: threadToolDefinitions[1].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleReplyToThread(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in reply_to_thread:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'add_thread_participant',
+    {
+      description: `Add an agent to a thread. Idempotent (no-op if already a participant). Creates an audited system event in the thread. Triggers the new participant by default so they can catch up.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: threadToolDefinitions[2].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleAddThreadParticipant(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in add_thread_participant:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'close_thread',
+    {
+      description: `Close a thread. Closed threads can still be read but new messages are rejected. Any participant can close a thread.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: threadToolDefinitions[3].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleCloseThread(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in close_thread:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'list_threads',
+    {
+      description: `List threads an agent participates in, with unread counts and last message preview. Useful for heartbeat triage and inbox overview.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: threadToolDefinitions[4].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleListThreads(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_threads:', error);
         return {
           content: [
             {
