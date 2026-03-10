@@ -28,6 +28,7 @@ import {
   sortSessionEntriesByRecency,
   shouldRetryWithFreshBackendSession,
   shouldAutoResumeRuntimeSession,
+  withSessionFileSize,
 } from './claude.js';
 
 describe('hasBackendSessionOverride', () => {
@@ -146,6 +147,18 @@ describe('buildSessionPickerLabel', () => {
     expect(label).toContain('↳');
     expect(label).toContain('PCP');
     expect(label).toContain('c4ec2f5e');
+  });
+});
+
+describe('withSessionFileSize', () => {
+  it('prefixes file size before the preview text', () => {
+    expect(withSessionFileSize('you: Nah just run it again as is', 8.55 * 1024 * 1024)).toBe(
+      '8.55 MB · you: Nah just run it again as is'
+    );
+  });
+
+  it('shows file size before the session fallback label', () => {
+    expect(withSessionFileSize(undefined, 648)).toBe('648 B · (session)');
   });
 });
 

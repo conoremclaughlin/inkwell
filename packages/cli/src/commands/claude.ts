@@ -809,7 +809,7 @@ function withAgentPreviewSpeaker(
   return preview;
 }
 
-function withSessionFileSize(
+export function withSessionFileSize(
   preview: string | undefined,
   fileSizeBytes: number | undefined
 ): string | undefined {
@@ -817,9 +817,9 @@ function withSessionFileSize(
   if (!size) return preview;
 
   const normalized = preview?.trim();
-  if (!normalized) return `(session) · ${size}`;
+  if (!normalized) return `${size} · (session)`;
   if (normalized.includes(size)) return normalized;
-  return `${normalized} · ${size}`;
+  return `${size} · ${normalized}`;
 }
 
 function getSessionPhaseLabel(session: PcpSessionSummary): string | undefined {
