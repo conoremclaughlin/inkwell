@@ -391,6 +391,10 @@ export interface ClaudeRunnerConfig {
   systemPrompt?: string;
   appendSystemPrompt?: string;
   pcpAccessToken?: string;
+  /** PCP session ID for this run — written to runtime hint files so hooks link correctly */
+  pcpSessionId?: string;
+  /** Agent ID for this run — written to runtime hint files */
+  agentId?: string;
 }
 
 export interface ClaudeRunnerResult {

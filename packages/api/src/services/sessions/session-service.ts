@@ -363,6 +363,8 @@ export class SessionService implements ISessionService {
       ),
       ...(runtimeModel ? { model: runtimeModel } : {}),
       ...(pcpAccessToken ? { pcpAccessToken } : {}),
+      pcpSessionId: session.id,
+      agentId,
     };
 
     // 5. Run with selected backend
