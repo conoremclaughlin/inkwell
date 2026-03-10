@@ -365,6 +365,7 @@ export class SessionService implements ISessionService {
       ...(pcpAccessToken ? { pcpAccessToken } : {}),
       pcpSessionId: session.id,
       agentId,
+      ...(session.studioId ? { studioId: session.studioId } : {}),
     };
 
     // 5. Run with selected backend

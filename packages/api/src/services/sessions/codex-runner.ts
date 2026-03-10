@@ -29,7 +29,8 @@ function writeRuntimeSessionHint(
   pcpSessionId: string,
   agentId: string,
   backend: string,
-  runtimeLinkId: string
+  runtimeLinkId: string,
+  studioId?: string
 ): void {
   try {
     const runtimeDir = join(workingDirectory, '.pcp', 'runtime');
@@ -54,6 +55,7 @@ function writeRuntimeSessionHint(
       backend,
       agentId,
       runtimeLinkId,
+      ...(studioId ? { studioId } : {}),
       updatedAt: now,
       startedAt: now,
     };
@@ -66,7 +68,13 @@ function writeRuntimeSessionHint(
     } else {
       state.sessions.push(record);
     }
-    state.current = { pcpSessionId, backend, agentId, updatedAt: now };
+    state.current = {
+      pcpSessionId,
+      backend,
+      agentId,
+      ...(studioId ? { studioId } : {}),
+      updatedAt: now,
+    };
     writeFileSync(sessionsPath, JSON.stringify(state, null, 2));
   } catch {
     // Best-effort only.
@@ -197,7 +205,8 @@ export class CodexRunner implements IClaudeRunner {
         config.pcpSessionId,
         config.agentId || 'unknown',
         'codex',
-        runtimeLinkId
+        runtimeLinkId,
+        config.studioId
       );
     }
 
