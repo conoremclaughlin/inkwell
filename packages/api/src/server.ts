@@ -559,6 +559,72 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
 
       userId = inboxMsg?.recipient_user_id;
       recipientIdentityId = inboxMsg?.recipient_identity_id || undefined;
+    } else if (payload.threadMessageId) {
+      // Thread message: resolve user_id via inbox_thread_messages → inbox_threads
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const supabase = dataComposer!.getClient() as any;
+      const { data: threadMsg, error: tmError } = await supabase
+        .from('inbox_thread_messages')
+        .select('thread_id')
+        .eq('id', payload.threadMessageId)
+        .single();
+      if (tmError) {
+        logger.error('[Trigger] Failed to look up thread message', {
+          threadMessageId: payload.threadMessageId,
+          error: tmError.message,
+        });
+      }
+      if (threadMsg?.thread_id) {
+        const { data: thread, error: threadError } = await supabase
+          .from('inbox_threads')
+          .select('user_id')
+          .eq('id', threadMsg.thread_id)
+          .single();
+        if (threadError) {
+          logger.error('[Trigger] Failed to look up thread from message', {
+            threadId: threadMsg.thread_id,
+            error: threadError.message,
+          });
+        }
+        const threadUserId = thread?.user_id as string | undefined;
+        if (threadUserId && authUserId && threadUserId !== authUserId) {
+          logger.warn('[Trigger] SECURITY: thread owner does not match authenticated user', {
+            threadMessageId: payload.threadMessageId,
+            threadUserId,
+            authUserId,
+            targetAgentId,
+            fromAgentId: payload.fromAgentId,
+          });
+          throw new Error('Trigger denied: thread does not belong to authenticated user');
+        }
+        userId = threadUserId;
+      }
+    } else if (payload.threadId) {
+      // Thread (add_thread_participant): resolve user_id directly from inbox_threads
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: thread, error: threadError } = await (dataComposer!.getClient() as any)
+        .from('inbox_threads')
+        .select('user_id')
+        .eq('id', payload.threadId)
+        .single();
+      if (threadError) {
+        logger.error('[Trigger] Failed to look up thread', {
+          threadId: payload.threadId,
+          error: threadError.message,
+        });
+      }
+      const threadUserId = thread?.user_id as string | undefined;
+      if (threadUserId && authUserId && threadUserId !== authUserId) {
+        logger.warn('[Trigger] SECURITY: thread owner does not match authenticated user', {
+          threadId: payload.threadId,
+          threadUserId,
+          authUserId,
+          targetAgentId,
+          fromAgentId: payload.fromAgentId,
+        });
+        throw new Error('Trigger denied: thread does not belong to authenticated user');
+      }
+      userId = threadUserId;
     }
 
     // Fall back to authenticated user from OAuth context (trigger_agent called directly)
@@ -657,11 +723,14 @@ Type: ${payload.triggerType}`;
     if (payload.metadata && Object.keys(payload.metadata).length > 0) {
       triggerMessage += `\nContext:\n${JSON.stringify(payload.metadata, null, 2)}`;
     }
+    if (payload.threadKey) {
+      triggerMessage += `\n\nThread: ${payload.threadKey}`;
+    }
     triggerMessage += `
 
 ---
 IMPORTANT: This is a system trigger, NOT a user message on Telegram/WhatsApp.
-Check your inbox for the full message using get_inbox.
+${payload.threadKey ? `Fetch the thread using get_thread_messages(threadKey: "${payload.threadKey}"). Use reply_to_thread to respond.` : 'Check your inbox for the full message using get_inbox.'}
 If you need to message a user, use send_response with the appropriate channel and conversationId.
 When you complete a task_request, mark it as completed using update_inbox_message(messageId, status: "completed").`;
 
@@ -735,7 +804,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       const client = dataComposer?.getClient();
       if (!client) return;
 
-      // 1. Restore inbox message to unread (only if it was read — don't touch other states)
+      // 1. Restore inbox message to unread (only for agent_inbox rows — not thread messages)
       if (payload.inboxMessageId) {
         const { error: restoreErr } = await client
           .from('agent_inbox')
@@ -758,7 +827,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       // 2. Notify sender agent (if there is one) — skip if no sender to avoid loops
       if (!payload.fromAgentId) return;
 
-      // Look up the userId from the original inbox message (needed for sender inbox insert)
+      // Look up the userId from the original source row (needed for sender inbox insert).
       let recipientUserId: string | undefined;
       if (payload.inboxMessageId) {
         const { data: origMsg } = await client
@@ -767,6 +836,30 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           .eq('id', payload.inboxMessageId)
           .single();
         recipientUserId = origMsg?.recipient_user_id;
+      } else if (payload.threadMessageId) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { data: threadMsg } = await (client as any)
+          .from('inbox_thread_messages')
+          .select('thread_id')
+          .eq('id', payload.threadMessageId)
+          .single();
+        if (threadMsg?.thread_id) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const { data: thread } = await (client as any)
+            .from('inbox_threads')
+            .select('user_id')
+            .eq('id', threadMsg.thread_id)
+            .single();
+          recipientUserId = thread?.user_id;
+        }
+      } else if (payload.threadId) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { data: thread } = await (client as any)
+          .from('inbox_threads')
+          .select('user_id')
+          .eq('id', payload.threadId)
+          .single();
+        recipientUserId = thread?.user_id;
       }
 
       if (!recipientUserId) {

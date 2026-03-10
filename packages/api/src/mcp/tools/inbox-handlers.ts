@@ -15,12 +15,25 @@ import type { Json } from '../../data/supabase/types';
 import { getRequestContext, getSessionContext } from '../../utils/request-context';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
 
+// The thread tables are new and not yet in generated Supabase types.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const threadTable = (supabase: ReturnType<DataComposer['getClient']>, table: string) =>
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (supabase as any).from(table);
+
 // ============== Schemas ==============
 
 const sendToInboxSchema = userIdentifierBaseSchema.extend({
   recipientAgentId: z
     .string()
-    .describe('Agent ID to send message to (e.g., "wren", "myra", "claude-code")'),
+    .optional()
+    .describe('Agent ID to send message to. Required unless recipients[] is provided.'),
+  recipients: z
+    .array(z.string().min(1).max(64))
+    .min(1)
+    .max(16)
+    .optional()
+    .describe('Multiple recipient agent IDs for group thread creation. Requires threadKey.'),
   senderAgentId: z.string().optional().describe('Agent ID of sender (optional if from human)'),
   subject: z.string().optional().describe('Message subject'),
   content: z.string().describe('Message content'),
@@ -55,7 +68,7 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe(
-      'Thread key for conversation continuity (e.g., "pr:32", "spec:cli-hooks"). Messages with the same threadKey are routed to the same session on the recipient side. See the process document for format guidelines.'
+      'Thread key for conversation continuity (e.g., "pr:32", "spec:cli-hooks"). When provided, messages are stored in thread tables and all participants see the full history. Without it, messages go to the simple agent_inbox. Format: <type>:<identifier>.'
     ),
   // Trigger options - automatically trigger the recipient after sending
   trigger: z
@@ -112,6 +125,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
 
   const {
     recipientAgentId,
+    recipients,
     subject,
     content,
     messageType = 'message',
@@ -126,6 +140,22 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     triggerSummary,
     threadKey,
   } = parsed;
+
+  // Validate: exactly one of recipientAgentId or recipients
+  const hasSingle = !!recipientAgentId;
+  const hasMany = !!recipients?.length;
+  if (hasSingle === hasMany) {
+    throw new Error('Provide exactly one of recipientAgentId or recipients');
+  }
+  if (hasMany && !threadKey) {
+    throw new Error('threadKey is required when using recipients[]');
+  }
+  if (recipients && (recipientSessionId || recipientStudioId || recipientStudioHint)) {
+    throw new Error(
+      'recipientSessionId/recipientStudioId/recipientStudioHint are only valid for single-recipient sends'
+    );
+  }
+
   // Enforce identity on sender (who is performing the action), not recipient (target)
   const senderAgentId = getEffectiveAgentId(parsed.senderAgentId);
   const triggerSenderId = senderAgentId || 'system';
@@ -137,8 +167,140 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   // for messages that can genuinely wait 5+ hours.
   const trigger = parsed.trigger ?? true;
 
+  // ── Thread-first path: when threadKey is provided, route to thread tables ──
+  // Single-recipient with threadKey creates a 2-participant thread (spec invariant #5).
+  // recipients[] creates a multi-participant thread.
+  // Without threadKey, falls through to legacy agent_inbox path.
+  if (threadKey) {
+    const allRecipients = recipients || [recipientAgentId!];
+    // Include sender as participant if they have an identity
+    const allParticipants = senderAgentId
+      ? [...new Set([senderAgentId, ...allRecipients])]
+      : allRecipients;
+
+    // Find or create thread
+    let thread = await findOrCreateThread(supabase, {
+      userId: resolved.user.id,
+      threadKey,
+      creatorAgentId: triggerSenderId,
+      title: subject || null,
+      participants: allParticipants,
+    });
+
+    // Ensure all participants are registered (recipients + sender for existing threads)
+    for (const agentId of allParticipants) {
+      const { data: existing } = await threadTable(supabase, 'inbox_thread_participants')
+        .select('agent_id')
+        .eq('thread_id', thread.id)
+        .eq('agent_id', agentId)
+        .maybeSingle();
+
+      if (!existing) {
+        await threadTable(supabase, 'inbox_thread_participants').insert({
+          thread_id: thread.id,
+          agent_id: agentId,
+        });
+      }
+    }
+
+    // Insert thread message
+    const { data: threadMessage, error: tmError } = await threadTable(
+      supabase,
+      'inbox_thread_messages'
+    )
+      .insert({
+        thread_id: thread.id,
+        sender_agent_id: triggerSenderId,
+        content,
+        message_type: messageType === 'permission_grant' ? 'message' : messageType,
+        priority,
+        metadata: (metadata || {}) as Json,
+      })
+      .select()
+      .single();
+
+    if (tmError) {
+      throw new Error(`Failed to send thread message: ${tmError.message}`);
+    }
+
+    // Update thread updated_at
+    await threadTable(supabase, 'inbox_threads')
+      .update({ updated_at: new Date().toISOString() })
+      .eq('id', thread.id);
+
+    // Update sender's read status
+    if (senderAgentId) {
+      await threadTable(supabase, 'inbox_thread_read_status').upsert(
+        {
+          thread_id: thread.id,
+          agent_id: senderAgentId,
+          last_read_at: new Date().toISOString(),
+        },
+        { onConflict: 'thread_id,agent_id' }
+      );
+    }
+
+    logger.info('Thread message sent', {
+      messageId: threadMessage.id,
+      threadKey,
+      to: allRecipients,
+      from: triggerSenderId,
+      type: messageType,
+      isNewThread: thread.isNew,
+    });
+
+    // Trigger: on thread creation, trigger all initial participants
+    const triggeredAgents: string[] = [];
+    if (trigger) {
+      const gateway = getAgentGateway();
+      const agentsToTrigger = allRecipients.filter((a) => a !== senderAgentId);
+
+      for (const toAgentId of agentsToTrigger) {
+        const payload: AgentTriggerPayload = {
+          fromAgentId: triggerSenderId,
+          toAgentId,
+          threadMessageId: threadMessage.id,
+          triggerType: triggerType || 'message',
+          summary:
+            triggerSummary ||
+            subject ||
+            `New ${messageType} in thread ${threadKey} from ${triggerSenderId}`,
+          priority,
+          threadKey,
+        };
+        const result = gateway.dispatchTrigger(payload);
+        if (result.accepted) {
+          triggeredAgents.push(toAgentId);
+        }
+      }
+    }
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({
+            success: true,
+            message: `Thread message sent to ${threadKey}`,
+            messageId: threadMessage.id,
+            threadKey,
+            threadId: thread.id,
+            isNewThread: thread.isNew,
+            recipients: allRecipients,
+            participants: allParticipants,
+            messageType,
+            priority,
+            triggered: triggeredAgents,
+            createdAt: threadMessage.created_at,
+          }),
+        },
+      ],
+    };
+  }
+
+  // ── Legacy path: simple inbox message (no threadKey) ──
   const hasRoutingAnchor = Boolean(
-    threadKey || effectiveRecipientSessionId || recipientStudioId || recipientStudioHint
+    effectiveRecipientSessionId || recipientStudioId || recipientStudioHint
   );
   const requiresRoutingAnchor = Boolean(senderAgentId) && messageType !== 'message';
   const missingRoutingAnchor = requiresRoutingAnchor && !hasRoutingAnchor;
@@ -205,7 +367,6 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         studioId: senderStudioId,
       },
       recipient: {
-        threadKey: threadKey || null,
         sessionId: effectiveRecipientSessionId || null,
         studioId: recipientStudioId || null,
         studioHint: recipientStudioHint || null,
@@ -214,7 +375,11 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   };
 
   // Resolve canonical identity UUIDs for sender and recipient
-  const recipientIdentityId = await resolveIdentityId(supabase, resolved.user.id, recipientAgentId);
+  const recipientIdentityId = await resolveIdentityId(
+    supabase,
+    resolved.user.id,
+    recipientAgentId!
+  );
   const senderIdentityId = senderAgentId
     ? await resolveIdentityId(supabase, resolved.user.id, senderAgentId)
     : null;
@@ -223,7 +388,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     .from('agent_inbox')
     .insert({
       recipient_user_id: resolved.user.id,
-      recipient_agent_id: recipientAgentId,
+      recipient_agent_id: recipientAgentId!,
       recipient_identity_id: recipientIdentityId,
       sender_user_id: senderAgentId ? null : resolved.user.id,
       sender_agent_id: senderAgentId || null,
@@ -236,7 +401,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       related_artifact_uri: relatedArtifactUri || null,
       metadata: enrichedMetadata as Json,
       expires_at: expiresAt || null,
-      thread_key: threadKey || null,
+      thread_key: null, // threadKey messages route to thread tables above
     })
     .select()
     .single();
@@ -270,12 +435,11 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     const gateway = getAgentGateway();
     const payload: AgentTriggerPayload = {
       fromAgentId: triggerSenderId,
-      toAgentId: recipientAgentId,
+      toAgentId: recipientAgentId!,
       inboxMessageId: message.id,
       triggerType: triggerType || 'message',
       summary: triggerSummary || subject || `New ${messageType} from ${triggerSenderId}`,
       priority,
-      threadKey,
       recipientSessionId: effectiveRecipientSessionId,
       studioId: recipientStudioId,
       studioHint: recipientStudioHint,
@@ -326,7 +490,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           recipientAgentId,
           messageType,
           priority,
-          threadKey: threadKey || null,
+          threadKey: null,
           recipientSessionId: effectiveRecipientSessionId || null,
           recipientStudioId: recipientStudioId || null,
           recipientStudioHint: recipientStudioHint || null,
@@ -338,15 +502,69 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
                   'Actionable handoff is missing a routing anchor. Add one of: threadKey, recipientSessionId, recipientStudioId, or recipientStudioHint.',
               }
             : {}),
-          ...(!threadKey
-            ? {
-                hint: 'Consider adding a threadKey (e.g., "pr:32", "spec:cli-hooks") so the recipient can resume the same session for follow-up messages on this topic.',
-              }
-            : {}),
+          hint: 'Consider adding a threadKey (e.g., "pr:32", "spec:cli-hooks") to route this message to a group thread.',
         }),
       },
     ],
   };
+}
+
+/**
+ * Find or create a thread. Returns the thread row with an `isNew` flag.
+ */
+async function findOrCreateThread(
+  supabase: ReturnType<DataComposer['getClient']>,
+  opts: {
+    userId: string;
+    threadKey: string;
+    creatorAgentId: string;
+    title: string | null;
+    participants: string[];
+  }
+): Promise<{ id: string; isNew: boolean }> {
+  // Try to find existing
+  const { data: existing } = await threadTable(supabase, 'inbox_threads')
+    .select('id')
+    .eq('user_id', opts.userId)
+    .eq('thread_key', opts.threadKey)
+    .maybeSingle();
+
+  if (existing) {
+    return { id: existing.id, isNew: false };
+  }
+
+  // Create new thread
+  const { data: thread, error } = await threadTable(supabase, 'inbox_threads')
+    .insert({
+      thread_key: opts.threadKey,
+      user_id: opts.userId,
+      created_by_agent_id: opts.creatorAgentId,
+      title: opts.title,
+    })
+    .select()
+    .single();
+
+  if (error) {
+    // Race condition: another request may have created it
+    if (error.code === '23505') {
+      const { data: retry } = await threadTable(supabase, 'inbox_threads')
+        .select('id')
+        .eq('user_id', opts.userId)
+        .eq('thread_key', opts.threadKey)
+        .single();
+      if (retry) return { id: retry.id, isNew: false };
+    }
+    throw new Error(`Failed to create thread: ${error.message}`);
+  }
+
+  // Add all participants
+  const participantRows = opts.participants.map((agentId) => ({
+    thread_id: thread.id,
+    agent_id: agentId,
+  }));
+  await threadTable(supabase, 'inbox_thread_participants').insert(participantRows);
+
+  return { id: thread.id, isNew: true };
 }
 
 export async function handleGetInbox(args: unknown, dataComposer: DataComposer) {
@@ -401,6 +619,134 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   }
   const { count: unreadCount } = await unreadQuery;
 
+  // Get threads with unread counts and preview messages.
+  // Works with or without agentId — when omitted, finds threads for ALL agents
+  // (used by `sb mission` unified timeline).
+  interface ThreadSummary {
+    threadKey: string;
+    title: string | null;
+    participants: string[];
+    unreadCount: number;
+    lastMessageAt: string | null;
+    previewMessages: Array<{
+      senderAgentId: string;
+      content: string;
+      messageType: string;
+      createdAt: string;
+    }>;
+  }
+  let threadsWithUnread: ThreadSummary[] = [];
+  let threadUnreadCount = 0;
+
+  try {
+    // Find thread IDs this agent (or any agent for this user) participates in
+    let participantQuery = threadTable(supabase, 'inbox_thread_participants').select('thread_id');
+    if (agentId) {
+      participantQuery = participantQuery.eq('agent_id', agentId);
+    }
+    const { data: participantRows } = await participantQuery;
+
+    const threadIds = [
+      ...new Set((participantRows || []).map((p: { thread_id: string }) => p.thread_id)),
+    ];
+
+    if (threadIds.length > 0) {
+      // Get open threads for this user
+      const { data: threads } = await threadTable(supabase, 'inbox_threads')
+        .select('id, thread_key, title, user_id, created_by_agent_id, updated_at')
+        .eq('user_id', resolved.user.id)
+        .eq('status', 'open')
+        .in('id', threadIds)
+        .order('updated_at', { ascending: false })
+        .limit(20);
+
+      if (threads?.length) {
+        threadsWithUnread = await Promise.all(
+          threads.map(
+            async (t: {
+              id: string;
+              thread_key: string;
+              title: string | null;
+              created_by_agent_id: string;
+              updated_at: string;
+            }) => {
+              // Get participants
+              const { data: parts } = await threadTable(supabase, 'inbox_thread_participants')
+                .select('agent_id')
+                .eq('thread_id', t.id);
+              const participants = (parts || []).map((p: { agent_id: string }) => p.agent_id);
+
+              // Get last read timestamp (only meaningful with agentId)
+              let lastReadAt: string | null = null;
+              if (agentId) {
+                const { data: readStatus } = await threadTable(supabase, 'inbox_thread_read_status')
+                  .select('last_read_at')
+                  .eq('thread_id', t.id)
+                  .eq('agent_id', agentId)
+                  .maybeSingle();
+                lastReadAt = readStatus?.last_read_at || null;
+              }
+
+              // Count unread messages (after last read, or all if no read status)
+              let countQuery = threadTable(supabase, 'inbox_thread_messages')
+                .select('*', { count: 'exact', head: true })
+                .eq('thread_id', t.id);
+
+              if (lastReadAt) {
+                countQuery = countQuery.gt('created_at', lastReadAt);
+              }
+
+              const { count } = await countQuery;
+
+              // Get preview messages (last 3 non-system messages)
+              const { data: previewRows } = await threadTable(supabase, 'inbox_thread_messages')
+                .select('sender_agent_id, content, message_type, created_at')
+                .eq('thread_id', t.id)
+                .neq('message_type', 'system')
+                .order('created_at', { ascending: false })
+                .limit(3);
+
+              const previewMessages = (previewRows || [])
+                .reverse()
+                .map(
+                  (m: {
+                    sender_agent_id: string;
+                    content: string;
+                    message_type: string;
+                    created_at: string;
+                  }) => ({
+                    senderAgentId: m.sender_agent_id,
+                    content: m.content.slice(0, 200),
+                    messageType: m.message_type,
+                    createdAt: m.created_at,
+                  })
+                );
+
+              return {
+                threadKey: t.thread_key,
+                title: t.title,
+                participants,
+                unreadCount: count || 0,
+                lastMessageAt: t.updated_at,
+                previewMessages,
+              };
+            }
+          )
+        );
+
+        // Only include threads that actually have unread messages
+        threadsWithUnread = threadsWithUnread.filter((t) => t.unreadCount > 0);
+        threadUnreadCount = threadsWithUnread.reduce((sum, t) => sum + t.unreadCount, 0);
+      }
+    }
+  } catch (err) {
+    // Thread tables may not exist yet (migration not applied) — graceful fallback
+    logger.debug('Failed to fetch thread unread counts (tables may not exist)', { err });
+  }
+
+  const inboxUnreadCount = unreadCount || 0;
+  const totalUnreadCount = inboxUnreadCount + threadUnreadCount;
+
   return {
     content: [
       {
@@ -408,7 +754,9 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         text: JSON.stringify({
           success: true,
           ...(agentId ? { agentId } : { allAgents: true }),
-          unreadCount: unreadCount || 0,
+          unreadCount: inboxUnreadCount,
+          threadUnreadCount,
+          totalUnreadCount,
           count: messages?.length || 0,
           messages: (messages || []).map((m) => ({
             id: m.id,
@@ -426,6 +774,13 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
             createdAt: m.created_at,
             readAt: m.read_at,
           })),
+          ...(threadsWithUnread.length > 0
+            ? {
+                threadsWithUnread,
+                threadHint:
+                  'You have unread thread messages. Use get_thread_messages(threadKey) to read them, reply_to_thread to respond, or mark_thread_read to acknowledge.',
+              }
+            : {}),
         }),
       },
     ],
@@ -590,7 +945,7 @@ export const inboxToolDefinitions = [
   {
     name: 'send_to_inbox',
     description:
-      "Send a message to another agent's inbox. Use for cross-agent communication, task handoff, or session resume requests.\n\nMessage types:\n- message: General communication (triggers recipient by default)\n- task_request: Request another agent to do work (triggers recipient by default)\n- session_resume: Request agent to resume a specific session (triggers recipient by default)\n- notification: FYI, no response needed (triggers recipient by default)\n- permission_grant: Grant or revoke tool permissions for recipient (triggers recipient by default)\n\nIMPORTANT — Trigger behavior:\nAll message types trigger the recipient by default. This is intentional: most agents don't have heartbeats, so untriggered messages may sit unread for hours. Do NOT set `trigger: false` unless the message can genuinely wait 5+ hours for the next heartbeat cycle. Let the message type speak for itself — you almost never need to set `trigger` explicitly.\n\nReply conventions:\n- When replying to a task_request, send a task_request back on the SAME threadKey to signal completion\n- Use notification only for FYI messages that require no action from the recipient\n- Always include a threadKey (format: <type>:<id>, e.g. pr:127, spec:v0.1)\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId",
+      'Send a message to agent(s). Supports both simple inbox messages and group threads.\n\nSingle recipient: send_to_inbox(recipientAgentId: "lumen", content: "...")\nGroup thread: send_to_inbox(recipients: ["lumen", "aster"], threadKey: "pr:165", content: "...")\n\nWhen threadKey is provided, messages go to inbox_thread_messages (thread-first model). Late joiners see full history. Without threadKey, creates a simple agent_inbox row (unchanged behavior).\n\nFor existing threads, use reply_to_thread instead — it has smarter trigger defaults (1:1 triggers other participant, group triggers creator only).\n\nMessage types:\n- message: General communication\n- task_request: Request another agent to do work\n- session_resume: Request agent to resume a specific session\n- notification: FYI, no response needed\n- permission_grant: Grant or revoke tool permissions\n\nTrigger behavior:\nAll message types trigger recipients by default. On thread creation, all initial participants are triggered. Set trigger=false only if the message can wait 5+ hours.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
     schema: sendToInboxSchema,
     handler: handleSendToInbox,
   },

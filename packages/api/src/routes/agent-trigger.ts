@@ -19,7 +19,7 @@ const router: Router = Router();
  */
 router.post('/trigger', async (req, res) => {
   try {
-    const payload = req.body as AgentTriggerPayload;
+    const { recipientUserId: _stripped, ...payload } = req.body as AgentTriggerPayload;
 
     // Validate required fields
     if (!payload.fromAgentId || !payload.toAgentId || !payload.triggerType) {

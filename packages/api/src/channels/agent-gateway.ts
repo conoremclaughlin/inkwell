@@ -20,8 +20,14 @@ export interface AgentTriggerPayload {
   fromAgentId: string;
   /** Target agent to wake up (e.g., "myra") */
   toAgentId: string;
-  /** Optional inbox message ID that prompted this trigger */
+  /** Optional inbox message ID that prompted this trigger (agent_inbox rows only) */
   inboxMessageId?: string;
+  /** Optional thread message ID that prompted this trigger (inbox_thread_messages rows) */
+  threadMessageId?: string;
+  /** Optional thread ID that prompted this trigger (inbox_threads rows) */
+  threadId?: string;
+  /** Recipient user ID — legacy/internal field; do not trust for identity resolution on public trigger routes */
+  recipientUserId?: string;
   /** Trigger type for routing */
   triggerType: 'task_complete' | 'approval_needed' | 'message' | 'error' | 'custom';
   /** Short summary for logging/display */
@@ -267,7 +273,7 @@ export function createAgentGatewayRoutes(app: {
     };
 
     try {
-      const payload = request.body;
+      const { recipientUserId: _stripped, ...payload } = request.body;
 
       // Validate required fields
       if (!payload.fromAgentId || !payload.toAgentId || !payload.triggerType) {

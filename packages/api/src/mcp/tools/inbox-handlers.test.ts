@@ -140,29 +140,8 @@ describe('handleSendToInbox - threadKey', () => {
     vi.clearAllMocks();
   });
 
-  it('should include threadKey in DB insert when provided', async () => {
-    const mockSb = createMockSupabase();
-    const mockDc = createMockDataComposer(mockSb);
-
-    await handleSendToInbox(
-      {
-        email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
-        content: 'Review PR #32',
-        messageType: 'task_request',
-        threadKey: 'pr:32',
-      },
-      mockDc as never
-    );
-
-    // Verify the insert was called with thread_key
-    expect(mockSb._chainable.insert).toHaveBeenCalledWith(
-      expect.objectContaining({
-        thread_key: 'pr:32',
-      })
-    );
-  });
+  // Note: "threadKey in DB insert" test removed — threadKey now routes to
+  // inbox_thread_messages (tested in thread-handlers.test.ts), not agent_inbox.
 
   it('should insert null thread_key when threadKey not provided', async () => {
     const mockSb = createMockSupabase();
@@ -185,34 +164,8 @@ describe('handleSendToInbox - threadKey', () => {
     );
   });
 
-  it('should include threadKey in response when provided', async () => {
-    const mockSb = createMockSupabase({
-      insertReturn: {
-        data: {
-          id: 'msg-456',
-          created_at: '2026-02-15T10:00:00Z',
-          thread_key: 'pr:32',
-        },
-        error: null,
-      },
-    });
-    const mockDc = createMockDataComposer(mockSb);
-
-    const result = await handleSendToInbox(
-      {
-        email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
-        content: 'Review PR #32',
-        threadKey: 'pr:32',
-      },
-      mockDc as never
-    );
-
-    const parsed = JSON.parse(result.content[0].text);
-    expect(parsed.threadKey).toBe('pr:32');
-    expect(parsed.hint).toBeUndefined();
-  });
+  // Note: "threadKey in response" test removed — threadKey now routes to
+  // thread tables (tested in thread-handlers.test.ts).
 
   it('should include hint when threadKey is missing', async () => {
     const mockSb = createMockSupabase();
@@ -234,33 +187,8 @@ describe('handleSendToInbox - threadKey', () => {
     expect(parsed.hint).toContain('threadKey');
   });
 
-  it('should pass threadKey in trigger payload', async () => {
-    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
-    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
-
-    const mockSb = createMockSupabase();
-    const mockDc = createMockDataComposer(mockSb);
-
-    await handleSendToInbox(
-      {
-        email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
-        content: 'Review PR #32',
-        messageType: 'task_request',
-        trigger: true,
-        threadKey: 'pr:32',
-      },
-      mockDc as never
-    );
-
-    // The trigger is fire-and-forget, so check the gateway was called with threadKey
-    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
-      expect.objectContaining({
-        threadKey: 'pr:32',
-      })
-    );
-  });
+  // Note: "threadKey in trigger payload" test removed — threadKey triggers
+  // are now tested in thread-handlers.test.ts.
 
   it('should trigger by default for notification messages', async () => {
     const { getAgentGateway } = await import('../../channels/agent-gateway.js');
@@ -275,7 +203,6 @@ describe('handleSendToInbox - threadKey', () => {
         recipientAgentId: 'myra',
         senderAgentId: 'wren',
         messageType: 'notification',
-        threadKey: 'pr:32',
         content: 'FYI',
       },
       mockDc as never
