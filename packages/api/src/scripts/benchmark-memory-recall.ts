@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { createSupabaseClient } from '../data/supabase/client';
 import { MemoryRepository } from '../data/repositories/memory-repository';
 import { getBenchmarkDataset } from './benchmark-data/datasets';
+import { loadHfBenchmarkDataset } from './benchmark-data/hf-loader';
 
 type RecallMode = 'text' | 'semantic' | 'hybrid' | 'auto';
 
@@ -28,6 +29,7 @@ const TOP_K = 5;
 const BENCHMARK_TOPIC = 'benchmark:memory-recall';
 const BENCHMARK_AGENT_ID = 'lumen';
 const DEFAULT_DATASET = 'internal-gold-v1';
+const MAX_CONTENT_CHARS = 1200;
 
 function parseModes(raw?: string): RecallMode[] {
   if (!raw) return ['text', 'semantic', 'hybrid'];
@@ -50,6 +52,11 @@ function round(value: number): number {
 function parseBoolean(raw: string | undefined, defaultValue: boolean): boolean {
   if (raw === undefined) return defaultValue;
   return ['1', 'true', 'yes', 'on'].includes(raw.toLowerCase());
+}
+
+function clampContent(text: string): string {
+  if (text.length <= MAX_CONTENT_CHARS) return text;
+  return `${text.slice(0, MAX_CONTENT_CHARS)}...`;
 }
 
 function buildSummaryMetrics(modes: RecallMode[], runs: CaseRun[]): SummaryMetric[] {
@@ -141,6 +148,15 @@ async function writeJsonOutput(outputPath: string, payload: unknown): Promise<vo
   await writeFile(outputPath, JSON.stringify(payload, null, 2), 'utf-8');
 }
 
+async function loadBenchmarkCases(dataset: string) {
+  if (dataset === 'hf') {
+    const hf = await loadHfBenchmarkDataset();
+    return { cases: hf.cases, source: hf.source };
+  }
+
+  return { cases: getBenchmarkDataset(dataset), source: `builtin:${dataset}` };
+}
+
 async function main() {
   const userId = process.env.BENCHMARK_USER_ID;
   if (!userId) {
@@ -150,7 +166,7 @@ async function main() {
   }
 
   const dataset = process.env.MEMORY_BENCHMARK_DATASET || DEFAULT_DATASET;
-  const benchmarkCases = getBenchmarkDataset(dataset);
+  const { cases: benchmarkCases, source: datasetSource } = await loadBenchmarkCases(dataset);
   const modes = parseModes(process.env.MEMORY_BENCHMARK_MODES);
   const persistResults = parseBoolean(process.env.MEMORY_BENCHMARK_PERSIST, true);
   const writeOutputFile = parseBoolean(process.env.MEMORY_BENCHMARK_WRITE_FILE, true);
@@ -170,12 +186,12 @@ async function main() {
   try {
     for (const benchCase of benchmarkCases) {
       const caseTopic = `${BENCHMARK_TOPIC}:${runId}:${benchCase.id}`;
-      caseTopics[benchCase.id] = [BENCHMARK_TOPIC, caseTopic];
+      caseTopics[benchCase.id] = [caseTopic];
 
       const target = await repo.remember({
         userId,
         agentId: BENCHMARK_AGENT_ID,
-        content: benchCase.targetContent,
+        content: clampContent(benchCase.targetContent),
         summary: `benchmark target ${benchCase.id}`,
         source: 'observation',
         salience: 'low',
@@ -189,7 +205,7 @@ async function main() {
         const distractor = await repo.remember({
           userId,
           agentId: BENCHMARK_AGENT_ID,
-          content: benchCase.distractors[i],
+          content: clampContent(benchCase.distractors[i]),
           summary: `benchmark distractor ${benchCase.id} #${i + 1}`,
           source: 'observation',
           salience: 'low',
@@ -250,6 +266,7 @@ async function main() {
         topK: TOP_K,
         benchmarkCases: benchmarkCases.length,
         persistResults,
+        datasetSource,
       },
       summary,
       runs,
