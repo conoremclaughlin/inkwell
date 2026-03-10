@@ -3086,24 +3086,20 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       (a, b) => new Date(b.lastMessageAt).getTime() - new Date(a.lastMessageAt).getTime()
     );
 
-    const totalItems = threads.length + groupThreads.length + flatMessages.length;
     const inboxUnreadCount = allMessages.filter((m) => m.status === 'unread').length;
     const totalUnreadCount = inboxUnreadCount + threadTableUnreadCount;
 
-    // Paginate: legacy threads first, then group threads, then flat messages
+    // Paginate legacy threads and flat messages. Group threads are always
+    // returned in full (typically few) so they stay visible on every page.
     const paginatedThreads = threads.slice(offset, offset + limit);
     const remainingAfterThreads = limit - paginatedThreads.length;
-    const groupThreadOffset = Math.max(0, offset - threads.length);
-    const paginatedGroupThreads =
-      remainingAfterThreads > 0
-        ? groupThreads.slice(groupThreadOffset, groupThreadOffset + remainingAfterThreads)
-        : [];
-    const remainingAfterGroups = remainingAfterThreads - paginatedGroupThreads.length;
-    const flatOffset = Math.max(0, offset - threads.length - groupThreads.length);
+    const flatOffset = Math.max(0, offset - threads.length);
     const paginatedFlat =
-      remainingAfterGroups > 0
-        ? flatMessages.slice(flatOffset, flatOffset + remainingAfterGroups)
+      remainingAfterThreads > 0
+        ? flatMessages.slice(flatOffset, flatOffset + remainingAfterThreads)
         : [];
+
+    const totalItems = threads.length + flatMessages.length;
 
     res.json({
       agentId,
@@ -3117,7 +3113,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
         flatCount: flatMessages.length,
       },
       threads: paginatedThreads,
-      groupThreads: paginatedGroupThreads,
+      groupThreads,
       flatMessages: paginatedFlat,
       pagination: {
         limit,
