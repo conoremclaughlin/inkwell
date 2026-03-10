@@ -16,6 +16,7 @@ import {
   hasBackendSessionOverride,
   renderSessionCandidatesTable,
   resolveCapturedBackendSessionIdFromRuntime,
+  resolveCapturedBackendSessionIdWithRetry,
   resolveAdoptableLocalBackendSessionId,
   resolveBackendSessionIdForResume,
   resolveBackendSessionSeedId,
@@ -813,6 +814,54 @@ describe('resolveCapturedBackendSessionIdFromRuntime', () => {
       });
 
       expect(resolved).toBe(newSessionId);
+    } finally {
+      if (oldHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = oldHome;
+      }
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('retries local session detection to handle delayed transcript flushes', async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'sb-claude-runtime-retry-'));
+    const tempHome = join(tempRoot, 'home');
+    const tempRepo = join(tempRoot, 'repo');
+    mkdirSync(tempHome, { recursive: true });
+    mkdirSync(tempRepo, { recursive: true });
+
+    const projectDirName = tempRepo.replace(/[\\/]/g, '-');
+    const projectKeyDir = join(tempHome, '.claude', 'projects', projectDirName);
+    mkdirSync(projectKeyDir, { recursive: true });
+
+    const oldHome = process.env.HOME;
+    process.env.HOME = tempHome;
+
+    try {
+      const delayedSessionId = '20202020-2020-4020-8020-202020202020';
+      const timer = setTimeout(() => {
+        writeFileSync(
+          join(projectKeyDir, `${delayedSessionId}.jsonl`),
+          JSON.stringify({
+            type: 'progress',
+            sessionId: delayedSessionId,
+            timestamp: '2026-03-09T00:03:00.000Z',
+          }) + '\n'
+        );
+      }, 120);
+
+      const resolved = await resolveCapturedBackendSessionIdWithRetry({
+        cwd: tempRepo,
+        backend: 'claude',
+        pcpSessionId: 'pcp-session-retry',
+        knownLocalSessionSnapshot: new Map(),
+        attempts: 10,
+        intervalMs: 40,
+      });
+
+      clearTimeout(timer);
+      expect(resolved).toBe(delayedSessionId);
     } finally {
       if (oldHome === undefined) {
         delete process.env.HOME;

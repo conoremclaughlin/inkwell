@@ -1199,6 +1199,33 @@ export function resolveCapturedBackendSessionIdFromRuntime(options: {
   return resolveFromRecord(scopedRecords[0]) || fallbackBackendSessionId;
 }
 
+export async function resolveCapturedBackendSessionIdWithRetry(options: {
+  cwd?: string;
+  backend: string;
+  pcpSessionId?: string;
+  runtimeLinkId?: string;
+  agentId?: string;
+  studioId?: string;
+  knownLocalSessionSnapshot?: Map<string, string>;
+  fallbackBackendSessionId?: string;
+  attempts?: number;
+  intervalMs?: number;
+}): Promise<string | undefined> {
+  const attempts = Math.max(1, options.attempts ?? 6);
+  const intervalMs = Math.max(10, options.intervalMs ?? 75);
+
+  let resolved = resolveCapturedBackendSessionIdFromRuntime(options);
+  if (resolved) return resolved;
+
+  for (let attempt = 1; attempt < attempts; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    resolved = resolveCapturedBackendSessionIdFromRuntime(options);
+    if (resolved) return resolved;
+  }
+
+  return resolved;
+}
+
 export function extractSessionFromStartSessionResponse(
   payload: unknown
 ): PcpSessionSummary | undefined {
@@ -3333,7 +3360,7 @@ export async function runClaude(
       if (parsedSessionId) capturedBackendSessionId = parsedSessionId;
     }
     if (!capturedBackendSessionId) {
-      capturedBackendSessionId = resolveCapturedBackendSessionIdFromRuntime({
+      capturedBackendSessionId = await resolveCapturedBackendSessionIdWithRetry({
         backend: options.backend,
         pcpSessionId: sessionContext.pcpSessionId,
         runtimeLinkId,
@@ -3511,7 +3538,7 @@ export async function runClaudeInteractive(
 
       child.on('close', async (code) => {
         prepared.cleanup();
-        finalCapturedBackendSessionId = resolveCapturedBackendSessionIdFromRuntime({
+        finalCapturedBackendSessionId = await resolveCapturedBackendSessionIdWithRetry({
           backend: options.backend,
           pcpSessionId: sessionContext.pcpSessionId,
           runtimeLinkId,
