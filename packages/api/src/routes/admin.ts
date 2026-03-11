@@ -92,7 +92,7 @@ type ChannelRouteRow = {
 const ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS = 3600; // 1 hour
 const ADMIN_REFRESH_TOKEN_LIFETIME_DAYS = 90;
 const ADMIN_CLIENT_ID = 'dashboard';
-const MCP_SYNC_TRANSCRIPT_ROUTE = /^\/sessions\/[^/]+\/sync-transcript$/;
+const MCP_CLI_TRANSCRIPT_ROUTE = /^\/sessions(?:\/synced|\/[^/]+\/(?:sync-transcript|transcript))$/;
 const DEFAULT_SESSION_LOG_LIMIT = 50;
 const MAX_SESSION_LOG_LIMIT = 200;
 const ACTIVITY_PREVIEW_LIMIT_PER_SESSION = 3;
@@ -118,6 +118,23 @@ type SessionPreviewItem = {
 
 type SessionLogItem = SessionPreviewItem & {
   metadata?: Record<string, unknown>;
+};
+
+type WorkspaceIdentityScope = {
+  rows: Array<{
+    id: string;
+    agent_id: string;
+    name: string;
+    role: string | null;
+  }>;
+  identityIds: string[];
+  agentIds: Set<string>;
+};
+
+type WorkspaceScopedSessionRow = {
+  id: string;
+  identity_id: string | null;
+  agent_id: string | null;
 };
 
 function truncateText(input: string, max = 280): string {
@@ -839,6 +856,59 @@ async function fetchSyncedTranscriptLogs(
   return toSyncedTranscriptLogItems(row);
 }
 
+async function resolveWorkspaceIdentityScope(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  workspaceId: string
+): Promise<{ scope: WorkspaceIdentityScope | null; error: unknown }> {
+  const { data: scopedIdentities, error } = await supabase
+    .from('agent_identities')
+    .select('id, agent_id, name, role')
+    .eq('user_id', userId)
+    .eq('workspace_id', workspaceId);
+
+  if (error) {
+    return { scope: null, error };
+  }
+
+  const rows = (scopedIdentities || []).filter(
+    (
+      row
+    ): row is {
+      id: string;
+      agent_id: string;
+      name: string;
+      role: string | null;
+    } => Boolean(row.id) && Boolean(row.agent_id) && Boolean(row.name)
+  );
+
+  return {
+    scope: {
+      rows,
+      identityIds: rows.map((row) => row.id),
+      agentIds: new Set(rows.map((row) => row.agent_id)),
+    },
+    error: null,
+  };
+}
+
+function isSessionInWorkspace(
+  session: WorkspaceScopedSessionRow | null | undefined,
+  scope: WorkspaceIdentityScope
+): boolean {
+  if (!session) return false;
+  if (session.identity_id && scope.identityIds.includes(session.identity_id)) return true;
+  if (!session.identity_id && session.agent_id && scope.agentIds.has(session.agent_id)) return true;
+  return false;
+}
+
+function extractTranscriptFormat(payload: unknown): TranscriptFormat | null {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+  const value = (payload as Record<string, unknown>).format;
+  if (value === 'json' || value === 'jsonl') return value;
+  return null;
+}
+
 /**
  * Set the WhatsApp listener for admin endpoints
  */
@@ -889,7 +959,11 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
 
     // Convenience path: allow standard MCP access tokens for transcript sync,
     // so CLI users can run sync without dashboard cookie auth.
-    if (!pcpUserId && req.method === 'POST' && MCP_SYNC_TRANSCRIPT_ROUTE.test(req.path)) {
+    if (
+      !pcpUserId &&
+      (req.method === 'POST' || req.method === 'GET') &&
+      MCP_CLI_TRANSCRIPT_ROUTE.test(req.path)
+    ) {
       const mcpPayload = verifyPcpAccessToken(token, 'mcp_access');
       if (mcpPayload) {
         pcpUserId = mcpPayload.sub;
@@ -4919,6 +4993,232 @@ router.get('/studios', async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /api/admin/sessions/synced
+ * List synced transcript archives available in the active workspace scope.
+ */
+router.get('/sessions/synced', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const limit = Math.min(
+      200,
+      Math.max(1, Number.parseInt(String(req.query.limit || 50), 10) || 50)
+    );
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { scope, error: scopedIdentityError } = await resolveWorkspaceIdentityScope(
+      supabase,
+      authReq.pcpUserId,
+      authReq.pcpWorkspaceId
+    );
+
+    if (scopedIdentityError) {
+      logger.error(
+        'Failed to resolve workspace identities for synced transcripts:',
+        scopedIdentityError
+      );
+      res.status(500).json(errorJson('Failed to list synced transcripts', scopedIdentityError));
+      return;
+    }
+
+    if (!scope || scope.identityIds.length === 0) {
+      res.json({ archives: [], count: 0 });
+      return;
+    }
+
+    const { data: archiveRows, error: archiveError } = await supabase
+      .from('session_transcript_archives')
+      .select(
+        'id, session_id, backend, backend_session_id, line_count, byte_count, source_path, synced_at, payload'
+      )
+      .eq('user_id', authReq.pcpUserId)
+      .order('synced_at', { ascending: false })
+      .limit(limit);
+
+    if (archiveError) {
+      logger.error('Failed to list synced transcript archives:', archiveError);
+      res.status(500).json(errorJson('Failed to list synced transcripts', archiveError));
+      return;
+    }
+
+    const archiveSessionIds = Array.from(
+      new Set(
+        (archiveRows || [])
+          .map((row) => row.session_id)
+          .filter((sessionId): sessionId is string => Boolean(sessionId))
+      )
+    );
+
+    const sessionsById = new Map<
+      string,
+      {
+        id: string;
+        identity_id: string | null;
+        agent_id: string | null;
+        backend: string | null;
+        backend_session_id: string | null;
+        claude_session_id: string | null;
+        thread_key: string | null;
+        started_at: string;
+        updated_at: string;
+        working_dir: string | null;
+        studio_id: string | null;
+        workspace_id: string | null;
+      }
+    >();
+
+    if (archiveSessionIds.length > 0) {
+      const { data: sessionRows, error: sessionError } = await supabase
+        .from('sessions')
+        .select(
+          'id, identity_id, agent_id, backend, backend_session_id, claude_session_id, thread_key, started_at, updated_at, working_dir, studio_id, workspace_id'
+        )
+        .eq('user_id', authReq.pcpUserId)
+        .in('id', archiveSessionIds);
+
+      if (sessionError) {
+        logger.error('Failed to fetch sessions for synced transcript list:', sessionError);
+        res.status(500).json(errorJson('Failed to list synced transcripts', sessionError));
+        return;
+      }
+
+      for (const row of sessionRows || []) {
+        sessionsById.set(row.id, row);
+      }
+    }
+
+    const identityByAgentId = new Map(
+      scope.rows.map((row) => [row.agent_id, { name: row.name, role: row.role }])
+    );
+
+    const archives = (archiveRows || [])
+      .map((row) => {
+        const session = sessionsById.get(row.session_id);
+        if (!session || !isSessionInWorkspace(session, scope)) return null;
+
+        const format = extractTranscriptFormat(row.payload);
+        const identity = session.agent_id ? identityByAgentId.get(session.agent_id) : null;
+        return {
+          archiveId: row.id,
+          sessionId: row.session_id,
+          backend: row.backend,
+          backendSessionId: row.backend_session_id,
+          format,
+          lineCount: row.line_count,
+          byteCount: row.byte_count,
+          sourcePath: row.source_path,
+          syncedAt: row.synced_at,
+          session: {
+            id: session.id,
+            agentId: session.agent_id,
+            agentName: identity?.name || session.agent_id || 'Unknown',
+            agentRole: identity?.role || null,
+            backend: session.backend,
+            backendSessionId: session.backend_session_id || session.claude_session_id,
+            threadKey: session.thread_key,
+            startedAt: session.started_at,
+            updatedAt: session.updated_at,
+            workingDir: session.working_dir,
+            studioId: session.studio_id || session.workspace_id,
+          },
+        };
+      })
+      .filter((row): row is NonNullable<typeof row> => Boolean(row));
+
+    res.json({ archives, count: archives.length });
+  } catch (error) {
+    logger.error('Failed to list synced transcripts:', error);
+    res.status(500).json(errorJson('Failed to list synced transcripts', error));
+  }
+});
+
+/**
+ * GET /api/admin/sessions/:id/transcript
+ * Export the raw synced transcript archive for a single session.
+ */
+router.get('/sessions/:id/transcript', async (req: Request, res: Response) => {
+  try {
+    const sessionId = req.params.id;
+    const authReq = req as AdminAuthRequest;
+    const requestedFormat = String(req.query.format || 'json').toLowerCase();
+    const format: TranscriptFormat = requestedFormat === 'jsonl' ? 'jsonl' : 'json';
+    const download = req.query.download === '1' || req.query.download === 'true';
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { scope, error: scopedIdentityError } = await resolveWorkspaceIdentityScope(
+      supabase,
+      authReq.pcpUserId,
+      authReq.pcpWorkspaceId
+    );
+
+    if (scopedIdentityError) {
+      logger.error(
+        'Failed to resolve workspace identities for transcript export:',
+        scopedIdentityError
+      );
+      res.status(500).json(errorJson('Failed to export transcript', scopedIdentityError));
+      return;
+    }
+
+    if (!scope || scope.identityIds.length === 0) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const { data: session, error: sessionError } = await supabase
+      .from('sessions')
+      .select('id, identity_id, agent_id')
+      .eq('id', sessionId)
+      .eq('user_id', authReq.pcpUserId)
+      .single();
+
+    if (sessionError || !isSessionInWorkspace(session, scope)) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const { data: archive, error: archiveError } = await supabase
+      .from('session_transcript_archives')
+      .select('payload')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('session_id', sessionId)
+      .single();
+
+    if (archiveError || !archive?.payload || typeof archive.payload !== 'object') {
+      res.status(404).json({ error: 'Synced transcript not found' });
+      return;
+    }
+
+    const payload = archive.payload as Record<string, unknown>;
+    if (download) {
+      const extension = format === 'jsonl' ? 'jsonl' : 'json';
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename=\"session-${sessionId}-transcript.${extension}\"`
+      );
+    }
+
+    if (format === 'jsonl') {
+      const events = Array.isArray(payload.events) ? payload.events : [];
+      const body = events.map((event) => JSON.stringify(event)).join('\n');
+      res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+      res.send(body.length > 0 ? `${body}\n` : '');
+      return;
+    }
+
+    res.json(payload);
+  } catch (error) {
+    logger.error('Failed to export transcript:', error);
+    res.status(500).json(errorJson('Failed to export transcript', error));
+  }
+});
+
+/**
  * POST /api/admin/sessions/:id/sync-transcript
  * Sync full local backend transcript into Postgres jsonb for cross-server portability.
  */
@@ -4935,13 +5235,13 @@ router.post('/sessions/:id/sync-transcript', async (req: Request, res: Response)
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
-    const { data: scopedIdentities, error: scopedIdentityError } = await supabase
-      .from('agent_identities')
-      .select('id, agent_id')
-      .eq('user_id', authReq.pcpUserId)
-      .eq('workspace_id', authReq.pcpWorkspaceId);
+    const { scope, error: scopedIdentityError } = await resolveWorkspaceIdentityScope(
+      supabase,
+      authReq.pcpUserId,
+      authReq.pcpWorkspaceId
+    );
 
-    if (scopedIdentityError) {
+    if (scopedIdentityError || !scope) {
       logger.error(
         'Failed to resolve workspace identities for session transcript sync:',
         scopedIdentityError
@@ -4950,14 +5250,7 @@ router.post('/sessions/:id/sync-transcript', async (req: Request, res: Response)
       return;
     }
 
-    const scopedIdentityIds = (scopedIdentities || []).map((i) => i.id);
-    const scopedAgentIds = new Set(
-      (scopedIdentities || [])
-        .map((i) => i.agent_id)
-        .filter((agentId): agentId is string => Boolean(agentId))
-    );
-
-    if (scopedIdentityIds.length === 0) {
+    if (scope.identityIds.length === 0) {
       res.status(404).json({ error: 'Session not found' });
       return;
     }
@@ -4969,12 +5262,7 @@ router.post('/sessions/:id/sync-transcript', async (req: Request, res: Response)
       .eq('user_id', authReq.pcpUserId)
       .single();
 
-    const sessionInWorkspace =
-      session &&
-      ((session.identity_id && scopedIdentityIds.includes(session.identity_id)) ||
-        (!session.identity_id && session.agent_id && scopedAgentIds.has(session.agent_id)));
-
-    if (sessionError || !session || !sessionInWorkspace) {
+    if (sessionError || !isSessionInWorkspace(session, scope)) {
       res.status(404).json({ error: 'Session not found' });
       return;
     }
