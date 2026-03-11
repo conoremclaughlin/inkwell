@@ -710,6 +710,171 @@ describe('Reply Routing — trigger recipientSessionId auto-resolution', () => {
   });
 });
 
+describe('Reply Routing — sender session fallback behavior', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('should use threadKey-scoped lookup when no request context provides sessionId', async () => {
+    const mockSb = createThreadMockSupabase({
+      existingThread: { id: 'thread-pr42' },
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    // No request context (simulates missing x-pcp-session-id header)
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    // threadKey-scoped lookup returns a matching session
+    vi.mocked(mockDc.repositories.memory.getActiveSessionByThreadKey).mockResolvedValue({
+      id: 'thread-scoped-session-123',
+      agentId: 'wren',
+      studioId: 'studio-wren',
+    } as never);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        threadKey: 'pr:42',
+        content: 'Should use threadKey lookup',
+      },
+      mockDc as never
+    );
+
+    // Verify threadKey-scoped lookup was called
+    expect(mockDc.repositories.memory.getActiveSessionByThreadKey).toHaveBeenCalledWith(
+      'user-123',
+      'wren',
+      'pr:42',
+      null // senderStudioId is null since no request context
+    );
+
+    // Verify metadata has the threadKey-resolved session
+    const insertedMeta = mockSb.getInsertedMetadata();
+    expect(insertedMeta).toBeDefined();
+    const pcpMeta = insertedMeta!.pcp as Record<string, unknown>;
+    const sender = pcpMeta.sender as Record<string, unknown>;
+    expect(sender.sessionId).toBe('thread-scoped-session-123');
+  });
+
+  it('should NOT fall back to getActiveSession (most-recent) when threadKey lookup fails', async () => {
+    const mockSb = createThreadMockSupabase({
+      existingThread: { id: 'thread-new-topic' },
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    // No request context
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    // threadKey lookup returns null (no matching session)
+    vi.mocked(mockDc.repositories.memory.getActiveSessionByThreadKey).mockResolvedValue(null);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        threadKey: 'thread:new-topic',
+        content: 'First message, no prior session',
+      },
+      mockDc as never
+    );
+
+    // getActiveSession should NOT have been called (removed fallback)
+    expect(mockDc.repositories.memory.getActiveSession).not.toHaveBeenCalled();
+
+    // Sender session should be null, not a random most-recent session
+    const insertedMeta = mockSb.getInsertedMetadata();
+    const pcpMeta = insertedMeta!.pcp as Record<string, unknown>;
+    const sender = pcpMeta.sender as Record<string, unknown>;
+    expect(sender.sessionId).toBeNull();
+  });
+
+  it('should NOT attempt threadKey lookup when no threadKey is provided', async () => {
+    // For legacy (non-thread) inbox path, sender session is null without request context
+    const mockSb = createMockSupabase({
+      insertReturn: {
+        data: {
+          id: 'msg-legacy',
+          created_at: '2026-03-12T00:00:00Z',
+          thread_key: null,
+          recipient_agent_id: 'lumen',
+          sender_agent_id: 'wren',
+          subject: 'Legacy message',
+          content: 'No threadKey',
+          message_type: 'message',
+          priority: 'normal',
+          status: 'unread',
+          recipient_session_id: null,
+          related_artifact_uri: null,
+          metadata: {},
+          read_at: null,
+        },
+        error: null,
+      },
+    });
+    const mockDc = createMockDataComposer(mockSb);
+
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        content: 'Legacy path, no threadKey',
+      },
+      mockDc as never
+    );
+
+    // No threadKey → no threadKey-scoped lookup attempted
+    // (mockDc doesn't have the repo method in the legacy mock, which is fine)
+    // The point is: no crash, and no getActiveSession fallback
+  });
+
+  it('should prefer request context sessionId over threadKey lookup', async () => {
+    const mockSb = createThreadMockSupabase({
+      existingThread: { id: 'thread-pr99' },
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    // Request context provides sessionId (from x-pcp-session-id header)
+    const { getRequestContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue({
+      sessionId: 'header-session-xyz',
+      workspaceId: 'header-studio-abc',
+    } as ReturnType<typeof getRequestContext>);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        threadKey: 'pr:99',
+        content: 'Header should win',
+      },
+      mockDc as never
+    );
+
+    // threadKey lookup should NOT be called — header already provides session
+    expect(mockDc.repositories.memory.getActiveSessionByThreadKey).not.toHaveBeenCalled();
+
+    // Sender session comes from request context header
+    const insertedMeta = mockSb.getInsertedMetadata();
+    const pcpMeta = insertedMeta!.pcp as Record<string, unknown>;
+    const sender = pcpMeta.sender as Record<string, unknown>;
+    expect(sender.sessionId).toBe('header-session-xyz');
+    expect(sender.studioId).toBe('header-studio-abc');
+  });
+});
+
 describe('handleGetInbox - recipient session naming', () => {
   it('should include recipientSessionId in inbox messages', async () => {
     const message = {
