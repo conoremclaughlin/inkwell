@@ -1136,6 +1136,8 @@ export function resolveBackendSessionIdForResume(options: {
   selectedLocalBackendSessionId?: string;
   localBackendSessionIds: Set<string>;
   knownBackendSessionIds?: Set<string>;
+  /** Fallback from local runtime cache (sessions.json) when server-side backendSessionId is null */
+  runtimeCachedSessionId?: string;
 }): {
   backendSessionId?: string;
   staleTrackedBackendSessionId?: string;
@@ -1147,6 +1149,7 @@ export function resolveBackendSessionIdForResume(options: {
     selectedLocalBackendSessionId,
     localBackendSessionIds,
     knownBackendSessionIds,
+    runtimeCachedSessionId,
   } = options;
   const normalizedBackend = normalizeSessionBackendName(backend);
 
@@ -1161,7 +1164,8 @@ export function resolveBackendSessionIdForResume(options: {
     return {};
   }
 
-  const candidate = chosen.backendSessionId || chosen.claudeSessionId || undefined;
+  const candidate =
+    chosen.backendSessionId || chosen.claudeSessionId || runtimeCachedSessionId || undefined;
   if (!candidate) return {};
 
   if (localBackendSessionIds.size > 0 && !localBackendSessionIds.has(candidate)) {
@@ -3161,6 +3165,9 @@ async function ensurePcpSessionContext(
       selectedLocalBackendSessionId,
       localBackendSessionIds,
       knownBackendSessionIds,
+      runtimeCachedSessionId: chosen?.id
+        ? runtimeBackendSessionIdByPcpSessionId.get(chosen.id)
+        : undefined,
     });
   const preserveTrackedBackendSessionId = !createdNewPcpSession || backend === 'claude';
   const resolvedTrackedBackendSessionId = preserveTrackedBackendSessionId

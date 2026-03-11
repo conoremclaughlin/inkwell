@@ -6,6 +6,8 @@
  */
 
 import { spawn, type ChildProcess } from 'child_process';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { join } from 'path';
 import { randomUUID } from 'crypto';
 import type {
   InjectedContext,
@@ -19,6 +21,83 @@ import type {
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
+
+/**
+ * Write a minimal runtime session hint so the on-session-start hook can find
+ * the correct PCP session ID for this server-spawned run.
+ *
+ * The CLI hooks call resolveActivePcpSessionId() which reads from the local
+ * .pcp/runtime/sessions.json file. Without this hint, the hook picks up the
+ * last sb-launched session (wrong) instead of the server-triggered one.
+ */
+function writeRuntimeSessionHint(
+  workingDirectory: string,
+  pcpSessionId: string,
+  agentId: string,
+  backend: string,
+  runtimeLinkId: string,
+  studioId?: string
+): void {
+  try {
+    const runtimeDir = join(workingDirectory, '.pcp', 'runtime');
+    mkdirSync(runtimeDir, { recursive: true });
+
+    const sessionsPath = join(runtimeDir, 'sessions.json');
+    let state: {
+      version: 1;
+      current?: Record<string, unknown>;
+      sessions: Array<Record<string, unknown>>;
+    } = { version: 1, sessions: [] };
+
+    if (existsSync(sessionsPath)) {
+      try {
+        const raw = JSON.parse(readFileSync(sessionsPath, 'utf-8')) as typeof state;
+        if (raw.version === 1 && Array.isArray(raw.sessions)) {
+          state = raw;
+        }
+      } catch {
+        // Corrupt file — start fresh.
+      }
+    }
+
+    const now = new Date().toISOString();
+    const record: Record<string, unknown> = {
+      pcpSessionId,
+      backend,
+      agentId,
+      runtimeLinkId,
+      ...(studioId ? { studioId } : {}),
+      updatedAt: now,
+      startedAt: now,
+    };
+
+    const idx = state.sessions.findIndex(
+      (s) =>
+        s['pcpSessionId'] === pcpSessionId && s['backend'] === backend && s['agentId'] === agentId
+    );
+    if (idx >= 0) {
+      state.sessions[idx] = { ...state.sessions[idx], ...record };
+    } else {
+      state.sessions.push(record);
+    }
+
+    state.current = {
+      pcpSessionId,
+      backend,
+      agentId,
+      ...(studioId ? { studioId } : {}),
+      updatedAt: now,
+    };
+    writeFileSync(sessionsPath, JSON.stringify(state, null, 2));
+  } catch (err) {
+    // Best-effort only — hook will fall back to sessions.json current pointer.
+    logger.debug('Failed to write runtime session hint', {
+      workingDirectory,
+      pcpSessionId,
+      error: String(err),
+    });
+  }
+}
 
 /** Maximum time (ms) to wait for a Claude Code subprocess before killing it.
  *  Override with CLAUDE_PROCESS_TIMEOUT_MS env var. */
@@ -164,6 +243,21 @@ export class ClaudeRunner implements IClaudeRunner {
     toolCalls: ToolCall[];
   }> {
     const claudeBin = await resolveBinaryPath('claude');
+
+    // Write runtime hint files before spawning so the on-session-start hook
+    // picks up the correct PCP session ID (not the last sb-launched session).
+    const runtimeLinkId = randomUUID();
+    if (config.pcpSessionId && config.workingDirectory) {
+      writeRuntimeSessionHint(
+        config.workingDirectory,
+        config.pcpSessionId,
+        config.agentId || 'unknown',
+        'claude',
+        runtimeLinkId,
+        config.studioId
+      );
+    }
+
     return new Promise((resolve, reject) => {
       // Strip CLAUDECODE to prevent "nested session" detection when PCP is
       // launched from inside a Claude Code session (e.g., via PM2).
@@ -175,6 +269,9 @@ export class ClaudeRunner implements IClaudeRunner {
           // Ensure Claude Code uses correct paths
           HOME: process.env.HOME,
           PATH: buildSpawnPath(claudeBin),
+          // Pass runtime link ID so the on-session-start hook can find this
+          // PCP session in the runtime hint files we wrote above.
+          ...(config.pcpSessionId ? { PCP_RUNTIME_LINK_ID: runtimeLinkId } : {}),
         },
         stdio: ['pipe', 'pipe', 'pipe'],
       });

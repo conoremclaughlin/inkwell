@@ -427,9 +427,10 @@ function resolveActivePcpSessionId(cwd: string): string | undefined {
   const { studioId } = getIdentitySessionContext(cwd);
   const agentId = resolveAgentId() || 'unknown';
 
-  const current = getCurrentRuntimeSession(cwd, sessionBackend);
-  if (current?.pcpSessionId) return current.pcpSessionId;
-
+  // Check PCP_RUNTIME_LINK_ID first — it's set by both the sb launch path and
+  // the server-side runner (claude-runner/codex-runner) before spawning. This
+  // ensures server-triggered sessions are linked to the correct PCP session
+  // rather than the last sb-launched session recorded in sessions.json.
   const runtimeLinkId = process.env.PCP_RUNTIME_LINK_ID;
   if (runtimeLinkId) {
     const linked = findRuntimeSessionByLinkId(cwd, runtimeLinkId, {
@@ -439,6 +440,9 @@ function resolveActivePcpSessionId(cwd: string): string | undefined {
     });
     if (linked?.pcpSessionId) return linked.pcpSessionId;
   }
+
+  const current = getCurrentRuntimeSession(cwd, sessionBackend);
+  if (current?.pcpSessionId) return current.pcpSessionId;
 
   const fromLegacyFile = readRuntimeFile(cwd, 'pcp-session-id');
   if (fromLegacyFile) return fromLegacyFile;
