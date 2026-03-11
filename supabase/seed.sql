@@ -47,9 +47,9 @@ VALUES
   ('550e8400-e29b-41d4-a716-446655440000', 'Meeting Notes', 'Discussed the architecture for the MCP server implementation', ARRAY['meetings', 'work'])
 ON CONFLICT DO NOTHING;
 
--- Insert sample tasks
-INSERT INTO tasks (user_id, title, description, status, priority, due_date, tags)
+-- Insert sample tasks (unified table — project_id nullable, no due_date required)
+INSERT INTO tasks (user_id, title, description, status, priority, tags)
 VALUES
-  ('550e8400-e29b-41d4-a716-446655440000', 'Implement MCP server', 'Create the core MCP server with all tools', 'in_progress', 'high', NOW() + INTERVAL '7 days', ARRAY['development']),
-  ('550e8400-e29b-41d4-a716-446655440000', 'Set up Telegram bot', 'Configure Telegram bot with basic commands', 'pending', 'medium', NOW() + INTERVAL '14 days', ARRAY['development', 'telegram'])
+  ('550e8400-e29b-41d4-a716-446655440000', 'Implement MCP server', 'Create the core MCP server with all tools', 'in_progress', 'high', ARRAY['development']),
+  ('550e8400-e29b-41d4-a716-446655440000', 'Set up Telegram bot', 'Configure Telegram bot with basic commands', 'pending', 'medium', ARRAY['development', 'telegram'])
 ON CONFLICT DO NOTHING;

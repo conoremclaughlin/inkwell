@@ -73,10 +73,16 @@ CREATE POLICY "task_groups_service_access" ON task_groups
 ALTER TABLE project_tasks ALTER COLUMN project_id DROP NOT NULL;
 
 -- ---------------------------------------------------------------------------
--- 3. Absorb legacy tasks rows into project_tasks
+-- 3. Absorb legacy tasks rows into project_tasks (preserving all data)
 -- ---------------------------------------------------------------------------
 
+-- First, add columns to hold legacy-only fields so nothing is lost
+ALTER TABLE project_tasks
+  ADD COLUMN IF NOT EXISTS due_date timestamptz,
+  ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL DEFAULT '{}';
+
 INSERT INTO project_tasks (
+  id,
   user_id,
   project_id,
   title,
@@ -85,21 +91,34 @@ INSERT INTO project_tasks (
   priority,
   tags,
   completed_at,
+  due_date,
+  metadata,
   created_at,
   updated_at
 )
 SELECT
+  t.id,
   t.user_id,
   NULL,
   t.title,
   t.description,
-  t.status,
-  COALESCE(t.priority, 'medium'),
+  -- Normalize legacy enum values to unified vocabulary
+  CASE t.status
+    WHEN 'cancelled' THEN 'blocked'
+    ELSE COALESCE(t.status, 'pending')
+  END,
+  CASE t.priority
+    WHEN 'urgent' THEN 'critical'
+    ELSE COALESCE(t.priority, 'medium')
+  END,
   COALESCE(t.tags, '{}'),
   t.completed_at,
+  t.due_date,
+  COALESCE(t.metadata, '{}'),
   t.created_at,
   t.updated_at
-FROM tasks t;
+FROM tasks t
+ON CONFLICT (id) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- 4. Drop legacy tasks table
@@ -153,3 +172,69 @@ ALTER TABLE studios
 
 COMMENT ON COLUMN studios.permissions IS
   'Per-studio permission overrides. Studio permissions take precedence over agent permissions.';
+
+-- ---------------------------------------------------------------------------
+-- 8. Wire permissions into identity history
+-- ---------------------------------------------------------------------------
+
+-- Add permissions column to history table
+ALTER TABLE agent_identity_history
+  ADD COLUMN permissions jsonb NOT NULL DEFAULT '{}';
+
+-- Recreate archive triggers to include permissions
+CREATE OR REPLACE FUNCTION public.archive_agent_identity_on_update()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  IF OLD.name IS DISTINCT FROM NEW.name
+     OR OLD.role IS DISTINCT FROM NEW.role
+     OR OLD.description IS DISTINCT FROM NEW.description
+     OR OLD.values IS DISTINCT FROM NEW.values
+     OR OLD.relationships IS DISTINCT FROM NEW.relationships
+     OR OLD.capabilities IS DISTINCT FROM NEW.capabilities
+     OR OLD.metadata IS DISTINCT FROM NEW.metadata
+     OR OLD.soul IS DISTINCT FROM NEW.soul
+     OR OLD.heartbeat IS DISTINCT FROM NEW.heartbeat
+     OR OLD.backend IS DISTINCT FROM NEW.backend
+     OR OLD.permissions IS DISTINCT FROM NEW.permissions THEN
+
+    INSERT INTO agent_identity_history (
+      identity_id, user_id, agent_id,
+      name, role, description, values, relationships, capabilities, metadata,
+      soul, heartbeat, backend, permissions,
+      version, created_at, change_type
+    ) VALUES (
+      OLD.id, OLD.user_id, OLD.agent_id,
+      OLD.name, OLD.role, OLD.description, OLD.values, OLD.relationships, OLD.capabilities, OLD.metadata,
+      OLD.soul, OLD.heartbeat, OLD.backend, OLD.permissions,
+      OLD.version, OLD.created_at, 'update'
+    );
+
+    NEW.version := OLD.version + 1;
+  END IF;
+
+  RETURN NEW;
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.archive_agent_identity_on_delete()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  INSERT INTO agent_identity_history (
+    identity_id, user_id, agent_id,
+    name, role, description, values, relationships, capabilities, metadata,
+    soul, heartbeat, backend, permissions,
+    version, created_at, change_type
+  ) VALUES (
+    OLD.id, OLD.user_id, OLD.agent_id,
+    OLD.name, OLD.role, OLD.description, OLD.values, OLD.relationships, OLD.capabilities, OLD.metadata,
+    OLD.soul, OLD.heartbeat, OLD.backend, OLD.permissions,
+    OLD.version, OLD.created_at, 'delete'
+  );
+
+  RETURN OLD;
+END;
+$function$;

@@ -25,6 +25,8 @@ export interface ProjectTask {
   created_by?: string | null;
   completed_at?: string | null;
   task_group_id?: string | null;
+  due_date?: string | null;
+  metadata?: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 }
