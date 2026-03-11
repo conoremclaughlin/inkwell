@@ -4,7 +4,6 @@ import { createSupabaseClient } from './supabase/client';
 import { UsersRepository } from './repositories/users.repository';
 import { LinksRepository } from './repositories/links.repository';
 import { NotesRepository } from './repositories/notes.repository';
-import { TasksRepository } from './repositories/tasks.repository';
 import { RemindersRepository } from './repositories/reminders.repository';
 import { ConversationsRepository } from './repositories/conversations.repository';
 import { ContextRepository } from './repositories/context.repository';
@@ -24,13 +23,12 @@ export class DataComposer {
     users: UsersRepository;
     links: LinksRepository;
     notes: NotesRepository;
-    tasks: TasksRepository;
     reminders: RemindersRepository;
     conversations: ConversationsRepository;
     context: ContextRepository;
     projects: ProjectsRepository;
     sessionFocus: SessionFocusRepository;
-    projectTasks: ProjectTasksRepository;
+    tasks: ProjectTasksRepository;
     memory: MemoryRepository;
     activityStream: ActivityStreamRepository;
     studios: StudiosRepository;
@@ -45,13 +43,12 @@ export class DataComposer {
       users: new UsersRepository(supabaseClient),
       links: new LinksRepository(supabaseClient),
       notes: new NotesRepository(supabaseClient),
-      tasks: new TasksRepository(supabaseClient),
       reminders: new RemindersRepository(supabaseClient),
       conversations: new ConversationsRepository(supabaseClient),
       context: new ContextRepository(supabaseClient),
       projects: new ProjectsRepository(supabaseClient),
       sessionFocus: new SessionFocusRepository(supabaseClient),
-      projectTasks: new ProjectTasksRepository(supabaseClient),
+      tasks: new ProjectTasksRepository(supabaseClient),
       memory: new MemoryRepository(supabaseClient),
       activityStream: new ActivityStreamRepository(supabaseClient),
       studios: new StudiosRepository(supabaseClient),

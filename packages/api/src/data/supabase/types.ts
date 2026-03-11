@@ -130,6 +130,7 @@ export type Database = {
           id: string;
           metadata: Json | null;
           name: string;
+          permissions: Json;
           relationships: Json | null;
           role: string;
           soul: string | null;
@@ -150,6 +151,7 @@ export type Database = {
           id?: string;
           metadata?: Json | null;
           name: string;
+          permissions?: Json;
           relationships?: Json | null;
           role: string;
           soul?: string | null;
@@ -170,6 +172,7 @@ export type Database = {
           id?: string;
           metadata?: Json | null;
           name?: string;
+          permissions?: Json;
           relationships?: Json | null;
           role?: string;
           soul?: string | null;
@@ -211,6 +214,7 @@ export type Database = {
           identity_id: string;
           metadata: Json | null;
           name: string;
+          permissions: Json;
           relationships: Json | null;
           role: string;
           soul: string | null;
@@ -232,6 +236,7 @@ export type Database = {
           identity_id: string;
           metadata?: Json | null;
           name: string;
+          permissions?: Json;
           relationships?: Json | null;
           role: string;
           soul?: string | null;
@@ -253,6 +258,7 @@ export type Database = {
           identity_id?: string;
           metadata?: Json | null;
           name?: string;
+          permissions?: Json;
           relationships?: Json | null;
           role?: string;
           soul?: string | null;
@@ -291,9 +297,9 @@ export type Database = {
           read_at: string | null;
           recipient_agent_id: string;
           recipient_identity_id: string | null;
+          recipient_session_id: string | null;
           recipient_user_id: string;
           related_artifact_uri: string | null;
-          recipient_session_id: string | null;
           sender_agent_id: string | null;
           sender_identity_id: string | null;
           sender_user_id: string | null;
@@ -313,9 +319,9 @@ export type Database = {
           read_at?: string | null;
           recipient_agent_id: string;
           recipient_identity_id?: string | null;
+          recipient_session_id?: string | null;
           recipient_user_id: string;
           related_artifact_uri?: string | null;
-          recipient_session_id?: string | null;
           sender_agent_id?: string | null;
           sender_identity_id?: string | null;
           sender_user_id?: string | null;
@@ -335,9 +341,9 @@ export type Database = {
           read_at?: string | null;
           recipient_agent_id?: string;
           recipient_identity_id?: string | null;
+          recipient_session_id?: string | null;
           recipient_user_id?: string;
           related_artifact_uri?: string | null;
-          recipient_session_id?: string | null;
           sender_agent_id?: string | null;
           sender_identity_id?: string | null;
           sender_user_id?: string | null;
@@ -354,17 +360,17 @@ export type Database = {
             referencedColumns: ['id'];
           },
           {
-            foreignKeyName: 'agent_inbox_recipient_user_id_fkey';
-            columns: ['recipient_user_id'];
-            isOneToOne: false;
-            referencedRelation: 'users';
-            referencedColumns: ['id'];
-          },
-          {
             foreignKeyName: 'agent_inbox_recipient_session_id_fkey';
             columns: ['recipient_session_id'];
             isOneToOne: false;
             referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'agent_inbox_recipient_user_id_fkey';
+            columns: ['recipient_user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
@@ -818,6 +824,63 @@ export type Database = {
           },
         ];
       };
+      channel_routes: {
+        Row: {
+          chat_id: string | null;
+          created_at: string;
+          id: string;
+          identity_id: string;
+          is_active: boolean;
+          metadata: Json;
+          platform: string;
+          platform_account_id: string | null;
+          studio_hint: string | null;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          chat_id?: string | null;
+          created_at?: string;
+          id?: string;
+          identity_id: string;
+          is_active?: boolean;
+          metadata?: Json;
+          platform: string;
+          platform_account_id?: string | null;
+          studio_hint?: string | null;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          chat_id?: string | null;
+          created_at?: string;
+          id?: string;
+          identity_id?: string;
+          is_active?: boolean;
+          metadata?: Json;
+          platform?: string;
+          platform_account_id?: string | null;
+          studio_hint?: string | null;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'channel_routes_identity_id_fkey';
+            columns: ['identity_id'];
+            isOneToOne: false;
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'channel_routes_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       connected_accounts: {
         Row: {
           access_token: string;
@@ -1188,6 +1251,149 @@ export type Database = {
           },
         ];
       };
+      inbox_thread_messages: {
+        Row: {
+          content: string;
+          created_at: string | null;
+          id: string;
+          message_type: string;
+          metadata: Json | null;
+          priority: string;
+          sender_agent_id: string;
+          thread_id: string;
+        };
+        Insert: {
+          content: string;
+          created_at?: string | null;
+          id?: string;
+          message_type?: string;
+          metadata?: Json | null;
+          priority?: string;
+          sender_agent_id: string;
+          thread_id: string;
+        };
+        Update: {
+          content?: string;
+          created_at?: string | null;
+          id?: string;
+          message_type?: string;
+          metadata?: Json | null;
+          priority?: string;
+          sender_agent_id?: string;
+          thread_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'inbox_thread_messages_thread_id_fkey';
+            columns: ['thread_id'];
+            isOneToOne: false;
+            referencedRelation: 'inbox_threads';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      inbox_thread_participants: {
+        Row: {
+          agent_id: string;
+          joined_at: string | null;
+          thread_id: string;
+        };
+        Insert: {
+          agent_id: string;
+          joined_at?: string | null;
+          thread_id: string;
+        };
+        Update: {
+          agent_id?: string;
+          joined_at?: string | null;
+          thread_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'inbox_thread_participants_thread_id_fkey';
+            columns: ['thread_id'];
+            isOneToOne: false;
+            referencedRelation: 'inbox_threads';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      inbox_thread_read_status: {
+        Row: {
+          agent_id: string;
+          last_read_at: string | null;
+          thread_id: string;
+        };
+        Insert: {
+          agent_id: string;
+          last_read_at?: string | null;
+          thread_id: string;
+        };
+        Update: {
+          agent_id?: string;
+          last_read_at?: string | null;
+          thread_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'inbox_thread_read_status_thread_id_fkey';
+            columns: ['thread_id'];
+            isOneToOne: false;
+            referencedRelation: 'inbox_threads';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      inbox_threads: {
+        Row: {
+          closed_at: string | null;
+          closed_by_agent_id: string | null;
+          created_at: string | null;
+          created_by_agent_id: string;
+          id: string;
+          metadata: Json | null;
+          status: string;
+          thread_key: string;
+          title: string | null;
+          updated_at: string | null;
+          user_id: string;
+        };
+        Insert: {
+          closed_at?: string | null;
+          closed_by_agent_id?: string | null;
+          created_at?: string | null;
+          created_by_agent_id: string;
+          id?: string;
+          metadata?: Json | null;
+          status?: string;
+          thread_key: string;
+          title?: string | null;
+          updated_at?: string | null;
+          user_id: string;
+        };
+        Update: {
+          closed_at?: string | null;
+          closed_by_agent_id?: string | null;
+          created_at?: string | null;
+          created_by_agent_id?: string;
+          id?: string;
+          metadata?: Json | null;
+          status?: string;
+          thread_key?: string;
+          title?: string | null;
+          updated_at?: string | null;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'inbox_threads_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       integration_health: {
         Row: {
           created_at: string | null;
@@ -1363,6 +1569,8 @@ export type Database = {
           metadata: Json | null;
           salience: string;
           source: string;
+          summary: string | null;
+          topic_key: string | null;
           topics: string[] | null;
           user_id: string;
           version: number;
@@ -1378,6 +1586,8 @@ export type Database = {
           metadata?: Json | null;
           salience?: string;
           source?: string;
+          summary?: string | null;
+          topic_key?: string | null;
           topics?: string[] | null;
           user_id: string;
           version?: number;
@@ -1393,6 +1603,8 @@ export type Database = {
           metadata?: Json | null;
           salience?: string;
           source?: string;
+          summary?: string | null;
+          topic_key?: string | null;
           topics?: string[] | null;
           user_id?: string;
           version?: number;
@@ -1425,6 +1637,8 @@ export type Database = {
           metadata: Json | null;
           salience: string;
           source: string;
+          summary: string | null;
+          topic_key: string | null;
           topics: string[] | null;
           user_id: string;
           version: number;
@@ -1439,6 +1653,8 @@ export type Database = {
           metadata?: Json | null;
           salience: string;
           source: string;
+          summary?: string | null;
+          topic_key?: string | null;
           topics?: string[] | null;
           user_id: string;
           version?: number;
@@ -1453,6 +1669,8 @@ export type Database = {
           metadata?: Json | null;
           salience?: string;
           source?: string;
+          summary?: string | null;
+          topic_key?: string | null;
           topics?: string[] | null;
           user_id?: string;
           version?: number;
@@ -1460,6 +1678,179 @@ export type Database = {
         Relationships: [
           {
             foreignKeyName: 'memory_history_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      memory_recall_benchmark_case_results: {
+        Row: {
+          case_id: string;
+          created_at: string;
+          id: string;
+          mode: string;
+          query: string;
+          rank: number | null;
+          run_id: string;
+          top_summaries: Json;
+        };
+        Insert: {
+          case_id: string;
+          created_at?: string;
+          id?: string;
+          mode: string;
+          query: string;
+          rank?: number | null;
+          run_id: string;
+          top_summaries?: Json;
+        };
+        Update: {
+          case_id?: string;
+          created_at?: string;
+          id?: string;
+          mode?: string;
+          query?: string;
+          rank?: number | null;
+          run_id?: string;
+          top_summaries?: Json;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'memory_recall_benchmark_case_results_run_id_fkey';
+            columns: ['run_id'];
+            isOneToOne: false;
+            referencedRelation: 'memory_recall_benchmark_runs';
+            referencedColumns: ['run_id'];
+          },
+        ];
+      };
+      memory_recall_benchmark_metrics: {
+        Row: {
+          cases: number;
+          created_at: string;
+          id: string;
+          mode: string;
+          mrr: number;
+          recall_at_1: number;
+          recall_at_3: number;
+          recall_at_5: number;
+          run_id: string;
+        };
+        Insert: {
+          cases: number;
+          created_at?: string;
+          id?: string;
+          mode: string;
+          mrr: number;
+          recall_at_1: number;
+          recall_at_3: number;
+          recall_at_5: number;
+          run_id: string;
+        };
+        Update: {
+          cases?: number;
+          created_at?: string;
+          id?: string;
+          mode?: string;
+          mrr?: number;
+          recall_at_1?: number;
+          recall_at_3?: number;
+          recall_at_5?: number;
+          run_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'memory_recall_benchmark_metrics_run_id_fkey';
+            columns: ['run_id'];
+            isOneToOne: false;
+            referencedRelation: 'memory_recall_benchmark_runs';
+            referencedColumns: ['run_id'];
+          },
+        ];
+      };
+      memory_recall_benchmark_runs: {
+        Row: {
+          case_count: number;
+          created_at: string;
+          dataset: string;
+          embeddings_enabled: boolean;
+          id: string;
+          metadata: Json;
+          model: string;
+          modes: string[];
+          provider: string;
+          run_id: string;
+          summary: Json;
+          top_k: number;
+          user_id: string;
+        };
+        Insert: {
+          case_count?: number;
+          created_at?: string;
+          dataset: string;
+          embeddings_enabled?: boolean;
+          id?: string;
+          metadata?: Json;
+          model: string;
+          modes?: string[];
+          provider: string;
+          run_id: string;
+          summary?: Json;
+          top_k?: number;
+          user_id: string;
+        };
+        Update: {
+          case_count?: number;
+          created_at?: string;
+          dataset?: string;
+          embeddings_enabled?: boolean;
+          id?: string;
+          metadata?: Json;
+          model?: string;
+          modes?: string[];
+          provider?: string;
+          run_id?: string;
+          summary?: Json;
+          top_k?: number;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'memory_recall_benchmark_runs_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      memory_summary_cache: {
+        Row: {
+          agent_id: string;
+          computed_at: string;
+          memory_count: number;
+          summary_text: string;
+          user_id: string;
+        };
+        Insert: {
+          agent_id?: string;
+          computed_at?: string;
+          memory_count?: number;
+          summary_text: string;
+          user_id: string;
+        };
+        Update: {
+          agent_id?: string;
+          computed_at?: string;
+          memory_count?: number;
+          summary_text?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'memory_summary_cache_user_id_fkey';
             columns: ['user_id'];
             isOneToOne: false;
             referencedRelation: 'users';
@@ -1691,69 +2082,6 @@ export type Database = {
           risk_level?: string;
         };
         Relationships: [];
-      };
-      project_tasks: {
-        Row: {
-          blocked_by: string[] | null;
-          completed_at: string | null;
-          created_at: string;
-          created_by: string | null;
-          description: string | null;
-          id: string;
-          priority: string | null;
-          project_id: string;
-          status: string;
-          tags: string[] | null;
-          title: string;
-          updated_at: string;
-          user_id: string;
-        };
-        Insert: {
-          blocked_by?: string[] | null;
-          completed_at?: string | null;
-          created_at?: string;
-          created_by?: string | null;
-          description?: string | null;
-          id?: string;
-          priority?: string | null;
-          project_id: string;
-          status?: string;
-          tags?: string[] | null;
-          title: string;
-          updated_at?: string;
-          user_id: string;
-        };
-        Update: {
-          blocked_by?: string[] | null;
-          completed_at?: string | null;
-          created_at?: string;
-          created_by?: string | null;
-          description?: string | null;
-          id?: string;
-          priority?: string | null;
-          project_id?: string;
-          status?: string;
-          tags?: string[] | null;
-          title?: string;
-          updated_at?: string;
-          user_id?: string;
-        };
-        Relationships: [
-          {
-            foreignKeyName: 'project_tasks_project_id_fkey';
-            columns: ['project_id'];
-            isOneToOne: false;
-            referencedRelation: 'projects';
-            referencedColumns: ['id'];
-          },
-          {
-            foreignKeyName: 'project_tasks_user_id_fkey';
-            columns: ['user_id'];
-            isOneToOne: false;
-            referencedRelation: 'users';
-            referencedColumns: ['id'];
-          },
-        ];
       };
       projects: {
         Row: {
@@ -2063,6 +2391,66 @@ export type Database = {
             columns: ['session_id'];
             isOneToOne: false;
             referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      session_transcript_archives: {
+        Row: {
+          backend: string | null;
+          backend_session_id: string | null;
+          byte_count: number;
+          created_at: string;
+          id: string;
+          line_count: number;
+          payload: Json;
+          session_id: string;
+          source_path: string | null;
+          synced_at: string;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          backend?: string | null;
+          backend_session_id?: string | null;
+          byte_count?: number;
+          created_at?: string;
+          id?: string;
+          line_count?: number;
+          payload: Json;
+          session_id: string;
+          source_path?: string | null;
+          synced_at?: string;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          backend?: string | null;
+          backend_session_id?: string | null;
+          byte_count?: number;
+          created_at?: string;
+          id?: string;
+          line_count?: number;
+          payload?: Json;
+          session_id?: string;
+          source_path?: string | null;
+          synced_at?: string;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'session_transcript_archives_session_id_fkey';
+            columns: ['session_id'];
+            isOneToOne: false;
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'session_transcript_archives_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
             referencedColumns: ['id'];
           },
         ];
@@ -2419,50 +2807,258 @@ export type Database = {
           },
         ];
       };
-      tasks: {
+      studios: {
         Row: {
-          completed_at: string | null;
+          agent_id: string | null;
+          archived_at: string | null;
+          base_branch: string | null;
+          branch: string;
+          cleaned_at: string | null;
           created_at: string | null;
-          description: string | null;
-          due_date: string | null;
           id: string;
+          identity_id: string | null;
           metadata: Json | null;
-          priority: string | null;
-          status: string | null;
-          tags: string[] | null;
-          title: string;
+          permissions: Json;
+          purpose: string | null;
+          repo_root: string;
+          role_template: string | null;
+          session_id: string | null;
+          slug: string | null;
+          status: string;
           updated_at: string | null;
+          user_id: string;
+          work_type: string | null;
+          worktree_path: string;
+        };
+        Insert: {
+          agent_id?: string | null;
+          archived_at?: string | null;
+          base_branch?: string | null;
+          branch: string;
+          cleaned_at?: string | null;
+          created_at?: string | null;
+          id?: string;
+          identity_id?: string | null;
+          metadata?: Json | null;
+          permissions?: Json;
+          purpose?: string | null;
+          repo_root: string;
+          role_template?: string | null;
+          session_id?: string | null;
+          slug?: string | null;
+          status?: string;
+          updated_at?: string | null;
+          user_id: string;
+          work_type?: string | null;
+          worktree_path: string;
+        };
+        Update: {
+          agent_id?: string | null;
+          archived_at?: string | null;
+          base_branch?: string | null;
+          branch?: string;
+          cleaned_at?: string | null;
+          created_at?: string | null;
+          id?: string;
+          identity_id?: string | null;
+          metadata?: Json | null;
+          permissions?: Json;
+          purpose?: string | null;
+          repo_root?: string;
+          role_template?: string | null;
+          session_id?: string | null;
+          slug?: string | null;
+          status?: string;
+          updated_at?: string | null;
+          user_id?: string;
+          work_type?: string | null;
+          worktree_path?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'studios_identity_id_fkey';
+            columns: ['identity_id'];
+            isOneToOne: false;
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'studios_session_id_fkey';
+            columns: ['session_id'];
+            isOneToOne: false;
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'studios_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      task_groups: {
+        Row: {
+          autonomous: boolean;
+          context_summary: string | null;
+          created_at: string;
+          description: string | null;
+          id: string;
+          identity_id: string | null;
+          max_sessions: number | null;
+          metadata: Json;
+          next_run_after: string | null;
+          output_status: string | null;
+          output_target: string | null;
+          priority: string;
+          project_id: string | null;
+          sessions_used: number;
+          status: string;
+          tags: string[];
+          thread_key: string | null;
+          title: string;
+          updated_at: string;
           user_id: string;
         };
         Insert: {
-          completed_at?: string | null;
-          created_at?: string | null;
+          autonomous?: boolean;
+          context_summary?: string | null;
+          created_at?: string;
           description?: string | null;
-          due_date?: string | null;
           id?: string;
-          metadata?: Json | null;
-          priority?: string | null;
-          status?: string | null;
-          tags?: string[] | null;
+          identity_id?: string | null;
+          max_sessions?: number | null;
+          metadata?: Json;
+          next_run_after?: string | null;
+          output_status?: string | null;
+          output_target?: string | null;
+          priority?: string;
+          project_id?: string | null;
+          sessions_used?: number;
+          status?: string;
+          tags?: string[];
+          thread_key?: string | null;
           title: string;
-          updated_at?: string | null;
+          updated_at?: string;
           user_id: string;
         };
         Update: {
-          completed_at?: string | null;
-          created_at?: string | null;
+          autonomous?: boolean;
+          context_summary?: string | null;
+          created_at?: string;
           description?: string | null;
-          due_date?: string | null;
           id?: string;
-          metadata?: Json | null;
-          priority?: string | null;
-          status?: string | null;
-          tags?: string[] | null;
+          identity_id?: string | null;
+          max_sessions?: number | null;
+          metadata?: Json;
+          next_run_after?: string | null;
+          output_status?: string | null;
+          output_target?: string | null;
+          priority?: string;
+          project_id?: string | null;
+          sessions_used?: number;
+          status?: string;
+          tags?: string[];
+          thread_key?: string | null;
           title?: string;
-          updated_at?: string | null;
+          updated_at?: string;
           user_id?: string;
         };
         Relationships: [
+          {
+            foreignKeyName: 'task_groups_identity_id_fkey';
+            columns: ['identity_id'];
+            isOneToOne: false;
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_groups_project_id_fkey';
+            columns: ['project_id'];
+            isOneToOne: false;
+            referencedRelation: 'projects';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_groups_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      tasks: {
+        Row: {
+          blocked_by: string[] | null;
+          completed_at: string | null;
+          created_at: string;
+          created_by: string | null;
+          description: string | null;
+          due_date: string | null;
+          id: string;
+          metadata: Json;
+          priority: string | null;
+          project_id: string | null;
+          status: string;
+          tags: string[] | null;
+          task_group_id: string | null;
+          title: string;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          blocked_by?: string[] | null;
+          completed_at?: string | null;
+          created_at?: string;
+          created_by?: string | null;
+          description?: string | null;
+          due_date?: string | null;
+          id?: string;
+          metadata?: Json;
+          priority?: string | null;
+          project_id?: string | null;
+          status?: string;
+          tags?: string[] | null;
+          task_group_id?: string | null;
+          title: string;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          blocked_by?: string[] | null;
+          completed_at?: string | null;
+          created_at?: string;
+          created_by?: string | null;
+          description?: string | null;
+          due_date?: string | null;
+          id?: string;
+          metadata?: Json;
+          priority?: string | null;
+          project_id?: string | null;
+          status?: string;
+          tags?: string[] | null;
+          task_group_id?: string | null;
+          title?: string;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'tasks_project_id_fkey';
+            columns: ['project_id'];
+            isOneToOne: false;
+            referencedRelation: 'projects';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'tasks_task_group_id_fkey';
+            columns: ['task_group_id'];
+            isOneToOne: false;
+            referencedRelation: 'task_groups';
+            referencedColumns: ['id'];
+          },
           {
             foreignKeyName: 'tasks_user_id_fkey';
             columns: ['user_id'];
@@ -2747,6 +3343,45 @@ export type Database = {
         };
         Relationships: [];
       };
+      workspace_members: {
+        Row: {
+          created_at: string | null;
+          id: string;
+          role: string;
+          user_id: string;
+          workspace_id: string;
+        };
+        Insert: {
+          created_at?: string | null;
+          id?: string;
+          role?: string;
+          user_id: string;
+          workspace_id: string;
+        };
+        Update: {
+          created_at?: string | null;
+          id?: string;
+          role?: string;
+          user_id?: string;
+          workspace_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'workspace_members_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'workspace_members_workspace_id_fkey';
+            columns: ['workspace_id'];
+            isOneToOne: false;
+            referencedRelation: 'workspaces';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       workspaces: {
         Row: {
           archived_at: string | null;
@@ -2791,133 +3426,6 @@ export type Database = {
           user_id?: string;
         };
         Relationships: [
-          {
-            foreignKeyName: 'workspaces_user_id_fkey';
-            columns: ['user_id'];
-            isOneToOne: false;
-            referencedRelation: 'users';
-            referencedColumns: ['id'];
-          },
-        ];
-      };
-      workspace_members: {
-        Row: {
-          created_at: string | null;
-          id: string;
-          role: string;
-          user_id: string;
-          workspace_id: string;
-        };
-        Insert: {
-          created_at?: string | null;
-          id?: string;
-          role?: string;
-          user_id: string;
-          workspace_id: string;
-        };
-        Update: {
-          created_at?: string | null;
-          id?: string;
-          role?: string;
-          user_id?: string;
-          workspace_id?: string;
-        };
-        Relationships: [
-          {
-            foreignKeyName: 'workspace_members_user_id_fkey';
-            columns: ['user_id'];
-            isOneToOne: false;
-            referencedRelation: 'users';
-            referencedColumns: ['id'];
-          },
-          {
-            foreignKeyName: 'workspace_members_workspace_id_fkey';
-            columns: ['workspace_id'];
-            isOneToOne: false;
-            referencedRelation: 'workspaces';
-            referencedColumns: ['id'];
-          },
-        ];
-      };
-      studios: {
-        Row: {
-          agent_id: string | null;
-          archived_at: string | null;
-          base_branch: string | null;
-          branch: string;
-          cleaned_at: string | null;
-          created_at: string | null;
-          id: string;
-          identity_id: string | null;
-          metadata: Json | null;
-          purpose: string | null;
-          repo_root: string;
-          role_template: string | null;
-          session_id: string | null;
-          slug: string | null;
-          status: string;
-          updated_at: string | null;
-          user_id: string;
-          work_type: string | null;
-          worktree_path: string;
-        };
-        Insert: {
-          agent_id?: string | null;
-          archived_at?: string | null;
-          base_branch?: string | null;
-          branch: string;
-          cleaned_at?: string | null;
-          created_at?: string | null;
-          id?: string;
-          identity_id?: string | null;
-          metadata?: Json | null;
-          purpose?: string | null;
-          repo_root: string;
-          role_template?: string | null;
-          session_id?: string | null;
-          slug?: string | null;
-          status?: string;
-          updated_at?: string | null;
-          user_id: string;
-          work_type?: string | null;
-          worktree_path: string;
-        };
-        Update: {
-          agent_id?: string | null;
-          archived_at?: string | null;
-          base_branch?: string | null;
-          branch?: string;
-          cleaned_at?: string | null;
-          created_at?: string | null;
-          id?: string;
-          identity_id?: string | null;
-          metadata?: Json | null;
-          purpose?: string | null;
-          repo_root?: string;
-          role_template?: string | null;
-          session_id?: string | null;
-          slug?: string | null;
-          status?: string;
-          updated_at?: string | null;
-          user_id?: string;
-          work_type?: string | null;
-          worktree_path?: string;
-        };
-        Relationships: [
-          {
-            foreignKeyName: 'workspaces_identity_id_fkey';
-            columns: ['identity_id'];
-            isOneToOne: false;
-            referencedRelation: 'agent_identities';
-            referencedColumns: ['id'];
-          },
-          {
-            foreignKeyName: 'workspaces_session_id_fkey';
-            columns: ['session_id'];
-            isOneToOne: false;
-            referencedRelation: 'sessions';
-            referencedColumns: ['id'];
-          },
           {
             foreignKeyName: 'workspaces_user_id_fkey';
             columns: ['user_id'];
@@ -2984,6 +3492,38 @@ export type Database = {
           tags: string[];
           title: string;
           url: string;
+        }[];
+      };
+      match_memories: {
+        Args: {
+          match_count?: number;
+          match_threshold?: number;
+          p_agent_id?: string;
+          p_include_expired?: boolean;
+          p_include_shared?: boolean;
+          p_salience?: string;
+          p_source?: string;
+          p_topics?: string[];
+          p_user_id?: string;
+          query_embedding: string;
+        };
+        Returns: {
+          agent_id: string;
+          content: string;
+          created_at: string;
+          embedding: string;
+          expires_at: string;
+          id: string;
+          identity_id: string;
+          metadata: Json;
+          salience: string;
+          similarity: number;
+          source: string;
+          summary: string;
+          topic_key: string;
+          topics: string[];
+          user_id: string;
+          version: number;
         }[];
       };
       match_messages: {

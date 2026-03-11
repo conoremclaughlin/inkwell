@@ -1552,7 +1552,7 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
     try {
       const projects = await dataComposer.repositories.projects.findAllByUser(user.id, 'active');
       if (projects.length > 0) {
-        const task = await dataComposer.repositories.projectTasks.create({
+        const task = await dataComposer.repositories.tasks.create({
           project_id: projects[0].id,
           user_id: user.id,
           title: `[${params.phase}] ${params.note || 'Agent needs attention'}`,

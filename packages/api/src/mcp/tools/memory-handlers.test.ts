@@ -96,7 +96,7 @@ function createMockDataComposer() {
     repositories: {
       memory: mockMemoryRepo,
       projects: mockProjectsRepo,
-      projectTasks: mockProjectTasksRepo,
+      tasks: mockProjectTasksRepo,
       activityStream: mockActivityStreamRepo,
     },
   };
@@ -883,7 +883,7 @@ describe('handleUpdateSessionPhase', () => {
       mockDataComposer.repositories.projects.findAllByUser.mockResolvedValue([
         { id: 'project-1', name: 'PCP' },
       ]);
-      mockDataComposer.repositories.projectTasks.create.mockResolvedValue({
+      mockDataComposer.repositories.tasks.create.mockResolvedValue({
         id: 'task-1',
         title: '[blocked:awaiting-input] Need user feedback',
       });
@@ -903,7 +903,7 @@ describe('handleUpdateSessionPhase', () => {
       expect(parsed.taskCreated).toBeDefined();
       expect(parsed.taskCreated.id).toBe('task-1');
 
-      expect(mockDataComposer.repositories.projectTasks.create).toHaveBeenCalledWith(
+      expect(mockDataComposer.repositories.tasks.create).toHaveBeenCalledWith(
         expect.objectContaining({
           project_id: 'project-1',
           user_id: 'user-123',
@@ -928,7 +928,7 @@ describe('handleUpdateSessionPhase', () => {
       mockDataComposer.repositories.projects.findAllByUser.mockResolvedValue([
         { id: 'project-1', name: 'PCP' },
       ]);
-      mockDataComposer.repositories.projectTasks.create.mockResolvedValue({
+      mockDataComposer.repositories.tasks.create.mockResolvedValue({
         id: 'task-2',
         title: '[waiting:ci-build] CI running',
       });
@@ -964,7 +964,7 @@ describe('handleUpdateSessionPhase', () => {
       );
 
       expect(mockDataComposer.repositories.projects.findAllByUser).not.toHaveBeenCalled();
-      expect(mockDataComposer.repositories.projectTasks.create).not.toHaveBeenCalled();
+      expect(mockDataComposer.repositories.tasks.create).not.toHaveBeenCalled();
     });
 
     it('should NOT create task for non-blocked/waiting phases even with createTask=true', async () => {
@@ -976,7 +976,7 @@ describe('handleUpdateSessionPhase', () => {
         mockDataComposer as never
       );
 
-      expect(mockDataComposer.repositories.projectTasks.create).not.toHaveBeenCalled();
+      expect(mockDataComposer.repositories.tasks.create).not.toHaveBeenCalled();
     });
 
     it('should gracefully handle task creation failure', async () => {
@@ -992,7 +992,7 @@ describe('handleUpdateSessionPhase', () => {
       mockDataComposer.repositories.projects.findAllByUser.mockResolvedValue([
         { id: 'project-1', name: 'PCP' },
       ]);
-      mockDataComposer.repositories.projectTasks.create.mockRejectedValue(
+      mockDataComposer.repositories.tasks.create.mockRejectedValue(
         new Error('Database constraint violation')
       );
 
@@ -1027,7 +1027,7 @@ describe('handleUpdateSessionPhase', () => {
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.success).toBe(true);
       expect(parsed.taskCreated).toBeUndefined();
-      expect(mockDataComposer.repositories.projectTasks.create).not.toHaveBeenCalled();
+      expect(mockDataComposer.repositories.tasks.create).not.toHaveBeenCalled();
     });
   });
 

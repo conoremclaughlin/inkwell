@@ -143,13 +143,9 @@ export class ChannelAdapter {
             title: task.title,
             description: task.description,
             status: 'pending',
-            priority: task.priority || 'medium',
-            due_date: task.dueDate ? new Date(task.dueDate) : undefined,
+            priority: (task.priority || 'medium') as 'low' | 'medium' | 'high' | 'critical',
             tags: [],
-            metadata: {
-              extractedFrom: 'channel',
-              platform: message.platform,
-            },
+            created_by: `channel:${message.platform}`,
           });
           result.saved.tasks++;
         } catch (err) {

@@ -606,6 +606,78 @@ describe('Identity Handlers', () => {
       expect(parsed.history[0].changeType).toBe('update');
     });
 
+    it('should include permissions field in history response mapping', async () => {
+      const mockCurrent = { id: 'identity-123' };
+
+      let callCount = 0;
+      mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.resolve({ data: mockCurrent, error: null });
+        }
+        return Promise.resolve({ data: null, error: null });
+      });
+
+      const mockHistory = [
+        {
+          id: 'history-1',
+          identity_id: 'identity-123',
+          version: 2,
+          name: 'Wren v2',
+          role: 'Development collaborator',
+          description: 'A coding partner',
+          values: ['collaboration'],
+          relationships: { benson: 'sibling' },
+          capabilities: ['coding'],
+          soul: '# Soul\n\nI exist.',
+          heartbeat: '# Heartbeat\n\nCheck in.',
+          permissions: { canReview: true, canMerge: false },
+          change_type: 'update',
+          archived_at: '2026-01-28T12:00:00Z',
+          created_at: '2026-01-27T12:00:00Z',
+        },
+        {
+          id: 'history-2',
+          identity_id: 'identity-123',
+          version: 1,
+          name: 'Wren v1',
+          role: 'Development collaborator',
+          description: null,
+          values: [],
+          relationships: {},
+          capabilities: [],
+          soul: null,
+          heartbeat: null,
+          permissions: null,
+          change_type: 'update',
+          archived_at: '2026-01-27T13:00:00Z',
+          created_at: '2026-01-27T12:00:00Z',
+        },
+      ];
+
+      mockSupabase._queryBuilder.then = (
+        resolve: (value: { data: unknown; error: unknown }) => void
+      ) => {
+        resolve({ data: mockHistory, error: null });
+        return Promise.resolve({ data: mockHistory, error: null });
+      };
+
+      const result = await handleGetIdentityHistory(
+        { userId: 'user-123', agentId: 'wren' },
+        mockDataComposer as never
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(true);
+      expect(parsed.history).toHaveLength(2);
+
+      // First history entry has permissions set
+      expect(parsed.history[0].permissions).toEqual({ canReview: true, canMerge: false });
+
+      // Second history entry has null permissions (mapped as-is)
+      expect(parsed.history[1].permissions).toBeNull();
+    });
+
     it('should return not found when identity does not exist', async () => {
       mockSupabase._queryBuilder.single = vi.fn().mockResolvedValue({
         data: null,
@@ -716,6 +788,177 @@ describe('Identity Handlers', () => {
           mockDataComposer as never
         )
       ).rejects.toThrow('Version 999 not found in history');
+    });
+
+    it('should restore permissions field from history entry', async () => {
+      let callCount = 0;
+
+      mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          // Current identity lookup
+          return Promise.resolve({
+            data: { id: 'identity-123' },
+            error: null,
+          });
+        } else if (callCount === 2) {
+          // History entry with permissions
+          return Promise.resolve({
+            data: {
+              id: 'history-1',
+              name: 'Wren v1',
+              role: 'Development collaborator',
+              description: 'Original description',
+              values: ['original'],
+              relationships: {},
+              capabilities: [],
+              metadata: {},
+              soul: '# Soul\n\nOriginal soul.',
+              heartbeat: '# Heartbeat\n\nOriginal heartbeat.',
+              permissions: { canReview: true, canDeploy: false },
+            },
+            error: null,
+          });
+        } else {
+          // Restored identity
+          return Promise.resolve({
+            data: {
+              id: 'identity-123',
+              agent_id: 'wren',
+              name: 'Wren v1',
+              role: 'Development collaborator',
+              version: 3,
+            },
+            error: null,
+          });
+        }
+      });
+
+      await handleRestoreIdentity(
+        { userId: 'user-123', agentId: 'wren', version: 1 },
+        mockDataComposer as never
+      );
+
+      // Verify the update call includes permissions from history
+      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
+        .calls[0];
+      const updateData = updateCall[0];
+
+      expect(updateData.permissions).toEqual({ canReview: true, canDeploy: false });
+    });
+
+    it('should fall back to empty object when history permissions is null', async () => {
+      let callCount = 0;
+
+      mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          // Current identity lookup
+          return Promise.resolve({
+            data: { id: 'identity-123' },
+            error: null,
+          });
+        } else if (callCount === 2) {
+          // History entry with null permissions
+          return Promise.resolve({
+            data: {
+              id: 'history-1',
+              name: 'Wren v1',
+              role: 'Development collaborator',
+              description: 'Original description',
+              values: ['original'],
+              relationships: {},
+              capabilities: [],
+              metadata: {},
+              soul: null,
+              heartbeat: null,
+              permissions: null,
+            },
+            error: null,
+          });
+        } else {
+          // Restored identity
+          return Promise.resolve({
+            data: {
+              id: 'identity-123',
+              agent_id: 'wren',
+              name: 'Wren v1',
+              role: 'Development collaborator',
+              version: 3,
+            },
+            error: null,
+          });
+        }
+      });
+
+      await handleRestoreIdentity(
+        { userId: 'user-123', agentId: 'wren', version: 1 },
+        mockDataComposer as never
+      );
+
+      // Verify the update call falls back to {} for null permissions
+      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
+        .calls[0];
+      const updateData = updateCall[0];
+
+      expect(updateData.permissions).toEqual({});
+    });
+
+    it('should fall back to empty object when history permissions is undefined', async () => {
+      let callCount = 0;
+
+      mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          // Current identity lookup
+          return Promise.resolve({
+            data: { id: 'identity-123' },
+            error: null,
+          });
+        } else if (callCount === 2) {
+          // History entry without permissions field at all
+          return Promise.resolve({
+            data: {
+              id: 'history-1',
+              name: 'Wren v1',
+              role: 'Development collaborator',
+              description: 'Original description',
+              values: ['original'],
+              relationships: {},
+              capabilities: [],
+              metadata: {},
+              soul: null,
+              heartbeat: null,
+              // permissions deliberately omitted
+            },
+            error: null,
+          });
+        } else {
+          // Restored identity
+          return Promise.resolve({
+            data: {
+              id: 'identity-123',
+              agent_id: 'wren',
+              name: 'Wren v1',
+              role: 'Development collaborator',
+              version: 3,
+            },
+            error: null,
+          });
+        }
+      });
+
+      await handleRestoreIdentity(
+        { userId: 'user-123', agentId: 'wren', version: 1 },
+        mockDataComposer as never
+      );
+
+      // Verify the update call falls back to {} when permissions is undefined
+      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
+        .calls[0];
+      const updateData = updateCall[0];
+
+      expect(updateData.permissions).toEqual({});
     });
   });
 });

@@ -1,7 +1,9 @@
 /**
- * Project Tasks Repository
+ * Tasks Repository (formerly Project Tasks)
  *
- * Manages tasks tied to projects for persistent tracking across sessions.
+ * Manages tasks for persistent tracking across sessions.
+ * After the task unification migration, project_tasks was renamed to tasks.
+ * project_id is now nullable — tasks can be standalone or project-scoped.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -12,7 +14,7 @@ export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
 
 export interface ProjectTask {
   id: string;
-  project_id: string;
+  project_id: string | null;
   user_id: string;
   title: string;
   description?: string | null;
@@ -22,12 +24,15 @@ export interface ProjectTask {
   blocked_by?: string[] | null;
   created_by?: string | null;
   completed_at?: string | null;
+  task_group_id?: string | null;
+  due_date?: string | null;
+  metadata?: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 }
 
 export interface CreateProjectTaskInput {
-  project_id: string;
+  project_id?: string | null;
   user_id: string;
   title: string;
   description?: string;
@@ -55,7 +60,7 @@ export class ProjectTasksRepository {
    */
   async create(input: CreateProjectTaskInput): Promise<ProjectTask> {
     const { data, error } = await this.client
-      .from('project_tasks')
+      .from('tasks')
       .insert({
         project_id: input.project_id,
         user_id: input.user_id,
@@ -74,24 +79,20 @@ export class ProjectTasksRepository {
       throw new Error(`Failed to create task: ${error.message}`);
     }
 
-    return data as ProjectTask;
+    return data as unknown as ProjectTask;
   }
 
   /**
    * Find task by ID
    */
   async findById(id: string): Promise<ProjectTask | null> {
-    const { data, error } = await this.client
-      .from('project_tasks')
-      .select('*')
-      .eq('id', id)
-      .single();
+    const { data, error } = await this.client.from('tasks').select('*').eq('id', id).single();
 
     if (error && error.code !== 'PGRST116') {
       throw new Error(`Failed to find task: ${error.message}`);
     }
 
-    return data as ProjectTask | null;
+    return data as unknown as ProjectTask | null;
   }
 
   /**
@@ -106,7 +107,7 @@ export class ProjectTasksRepository {
     }
   ): Promise<ProjectTask[]> {
     let query = this.client
-      .from('project_tasks')
+      .from('tasks')
       .select('*')
       .eq('project_id', projectId)
       .order('created_at', { ascending: false });
@@ -133,7 +134,7 @@ export class ProjectTasksRepository {
       throw new Error(`Failed to list tasks: ${error.message}`);
     }
 
-    return (data || []) as ProjectTask[];
+    return (data || []) as unknown as ProjectTask[];
   }
 
   /**
@@ -148,7 +149,7 @@ export class ProjectTasksRepository {
     }
   ): Promise<ProjectTask[]> {
     let query = this.client
-      .from('project_tasks')
+      .from('tasks')
       .select('*')
       .eq('user_id', userId)
       .order('created_at', { ascending: false });
@@ -175,7 +176,7 @@ export class ProjectTasksRepository {
       throw new Error(`Failed to list tasks: ${error.message}`);
     }
 
-    return (data || []) as ProjectTask[];
+    return (data || []) as unknown as ProjectTask[];
   }
 
   /**
@@ -193,7 +194,7 @@ export class ProjectTasksRepository {
    */
   async update(id: string, input: UpdateProjectTaskInput): Promise<ProjectTask> {
     const { data, error } = await this.client
-      .from('project_tasks')
+      .from('tasks')
       .update(input as never)
       .eq('id', id)
       .select()
@@ -203,7 +204,7 @@ export class ProjectTasksRepository {
       throw new Error(`Failed to update task: ${error.message}`);
     }
 
-    return data as ProjectTask;
+    return data as unknown as ProjectTask;
   }
 
   /**
@@ -238,7 +239,7 @@ export class ProjectTasksRepository {
    * Delete a task
    */
   async delete(id: string): Promise<void> {
-    const { error } = await this.client.from('project_tasks').delete().eq('id', id);
+    const { error } = await this.client.from('tasks').delete().eq('id', id);
 
     if (error) {
       throw new Error(`Failed to delete task: ${error.message}`);

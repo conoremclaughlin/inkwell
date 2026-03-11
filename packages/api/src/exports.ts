@@ -11,7 +11,7 @@ export type { Database } from './data/supabase/types';
 // Repositories
 export { LinksRepository } from './data/repositories/links.repository';
 export { NotesRepository } from './data/repositories/notes.repository';
-export { TasksRepository } from './data/repositories/tasks.repository';
+export { ProjectTasksRepository as TasksRepository } from './data/repositories/project-tasks.repository';
 export { RemindersRepository } from './data/repositories/reminders.repository';
 export { ConversationsRepository } from './data/repositories/conversations.repository';
 export { UsersRepository } from './data/repositories/users.repository';

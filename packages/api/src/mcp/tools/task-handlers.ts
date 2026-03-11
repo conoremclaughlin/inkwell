@@ -1,8 +1,8 @@
 /**
- * MCP Tool Handlers for Project Tasks
+ * MCP Tool Handlers for Tasks
  *
- * These tools enable Claude to create, manage, and track tasks
- * tied to specific projects across sessions.
+ * These tools enable agents to create, manage, and track tasks
+ * across sessions. Tasks can optionally be scoped to projects.
  */
 
 import { z } from 'zod';
@@ -80,7 +80,7 @@ export async function handleCreateTask(
       return mcpResponse({ success: false, error: 'Project does not belong to this user' }, true);
     }
 
-    const task = await dataComposer.repositories.projectTasks.create({
+    const task = await dataComposer.repositories.tasks.create({
       project_id: args.projectId,
       user_id: resolved.user.id,
       title: args.title,
@@ -137,12 +137,12 @@ export async function handleListTasks(
 
     let tasks;
     if (args.activeOnly) {
-      tasks = await dataComposer.repositories.projectTasks.listActiveTasks(
+      tasks = await dataComposer.repositories.tasks.listActiveTasks(
         resolved.user.id,
         args.projectId
       );
     } else {
-      tasks = await dataComposer.repositories.projectTasks.listByUser(resolved.user.id, {
+      tasks = await dataComposer.repositories.tasks.listByUser(resolved.user.id, {
         status: args.status as TaskStatus | undefined,
         projectId: args.projectId,
         limit: args.limit,
@@ -150,7 +150,7 @@ export async function handleListTasks(
     }
 
     // Get project names for context
-    const projectIds = [...new Set(tasks.map((t) => t.project_id))];
+    const projectIds = [...new Set(tasks.map((t) => t.project_id).filter(Boolean))] as string[];
     const projects = await Promise.all(
       projectIds.map((id) => dataComposer.repositories.projects.findById(id))
     );
@@ -166,7 +166,7 @@ export async function handleListTasks(
         priority: task.priority,
         tags: task.tags,
         projectId: task.project_id,
-        projectName: projectMap.get(task.project_id) || 'Unknown',
+        projectName: task.project_id ? projectMap.get(task.project_id) || 'Unknown' : null,
         createdAt: task.created_at,
         completedAt: task.completed_at,
       })),
@@ -207,7 +207,7 @@ export async function handleUpdateTask(
     }
 
     // Verify task exists and belongs to user
-    const existing = await dataComposer.repositories.projectTasks.findById(args.taskId);
+    const existing = await dataComposer.repositories.tasks.findById(args.taskId);
     if (!existing) {
       return mcpResponse({ success: false, error: 'Task not found' }, true);
     }
@@ -222,7 +222,7 @@ export async function handleUpdateTask(
     if (args.priority !== undefined) updates.priority = args.priority;
     if (args.tags !== undefined) updates.tags = args.tags;
 
-    const task = await dataComposer.repositories.projectTasks.update(args.taskId, updates);
+    const task = await dataComposer.repositories.tasks.update(args.taskId, updates);
 
     return mcpResponse({
       success: true,
@@ -267,7 +267,7 @@ export async function handleCompleteTask(
     }
 
     // Verify task exists and belongs to user
-    const existing = await dataComposer.repositories.projectTasks.findById(args.taskId);
+    const existing = await dataComposer.repositories.tasks.findById(args.taskId);
     if (!existing) {
       return mcpResponse({ success: false, error: 'Task not found' }, true);
     }
@@ -275,7 +275,7 @@ export async function handleCompleteTask(
       return mcpResponse({ success: false, error: 'Task does not belong to this user' }, true);
     }
 
-    const task = await dataComposer.repositories.projectTasks.completeTask(args.taskId);
+    const task = await dataComposer.repositories.tasks.completeTask(args.taskId);
 
     // Auto-remember: persist task completion as a memory for session continuity
     try {
@@ -348,7 +348,7 @@ export async function handleGetTaskStats(
       return mcpResponse({ success: false, error: 'Project does not belong to this user' }, true);
     }
 
-    const stats = await dataComposer.repositories.projectTasks.getProjectStats(args.projectId);
+    const stats = await dataComposer.repositories.tasks.getProjectStats(args.projectId);
 
     return mcpResponse({
       success: true,

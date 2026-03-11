@@ -552,6 +552,7 @@ export async function handleGetIdentityHistory(args: unknown, dataComposer: Data
               capabilities: row.capabilities,
               soul: row.soul,
               heartbeat: row.heartbeat,
+              permissions: (row as any).permissions,
               hasSoul: !!row.soul,
               hasHeartbeat: !!row.heartbeat,
               changeType: row.change_type,
@@ -614,6 +615,7 @@ export async function handleRestoreIdentity(args: unknown, dataComposer: DataCom
       metadata: historyEntry.metadata,
       soul: historyEntry.soul,
       heartbeat: historyEntry.heartbeat,
+      permissions: (historyEntry as any).permissions ?? {},
     })
     .eq('id', current.id)
     .select()
