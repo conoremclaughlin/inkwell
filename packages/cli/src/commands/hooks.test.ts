@@ -487,6 +487,56 @@ describe('callPcpTool: auth header', () => {
     expect(body.params.arguments).toEqual({ agentId: 'wren', status: 'unread' });
   });
 
+  // ── PCP_SESSION_ID propagation through callPcpTool ──
+  // This is the most fragile link: hooks must forward PCP_SESSION_ID as
+  // x-pcp-session-id header so the MCP server can resolve studio scope.
+
+  it('should send x-pcp-session-id header when PCP_SESSION_ID env is set', async () => {
+    mockedGetValidAccessToken.mockResolvedValue('token');
+    process.env.PCP_SESSION_ID = 'session-xyz-789';
+
+    await callPcpTool('get_session', { sessionId: 'session-xyz-789' });
+
+    const [, options] = fetchSpy.mock.calls[0];
+    expect(options.headers).toHaveProperty('x-pcp-session-id', 'session-xyz-789');
+
+    delete process.env.PCP_SESSION_ID;
+  });
+
+  it('should NOT send x-pcp-session-id header when PCP_SESSION_ID env is absent', async () => {
+    mockedGetValidAccessToken.mockResolvedValue('token');
+    delete process.env.PCP_SESSION_ID;
+
+    await callPcpTool('bootstrap', { agentId: 'wren' });
+
+    const [, options] = fetchSpy.mock.calls[0];
+    expect(options.headers).not.toHaveProperty('x-pcp-session-id');
+  });
+
+  it('should trim PCP_SESSION_ID whitespace before sending as header', async () => {
+    mockedGetValidAccessToken.mockResolvedValue('token');
+    process.env.PCP_SESSION_ID = '  session-with-spaces  ';
+
+    await callPcpTool('bootstrap', { agentId: 'wren' });
+
+    const [, options] = fetchSpy.mock.calls[0];
+    expect(options.headers).toHaveProperty('x-pcp-session-id', 'session-with-spaces');
+
+    delete process.env.PCP_SESSION_ID;
+  });
+
+  it('should NOT send x-pcp-session-id for empty/whitespace-only PCP_SESSION_ID', async () => {
+    mockedGetValidAccessToken.mockResolvedValue('token');
+    process.env.PCP_SESSION_ID = '   ';
+
+    await callPcpTool('bootstrap', { agentId: 'wren' });
+
+    const [, options] = fetchSpy.mock.calls[0];
+    expect(options.headers).not.toHaveProperty('x-pcp-session-id');
+
+    delete process.env.PCP_SESSION_ID;
+  });
+
   it('should send spec-compliant Accept header (both JSON and SSE)', async () => {
     mockedGetValidAccessToken.mockResolvedValue('token');
 
