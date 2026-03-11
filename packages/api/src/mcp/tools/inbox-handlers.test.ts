@@ -29,6 +29,16 @@ vi.mock('../../utils/logger', () => ({
   },
 }));
 
+// Mock request context (for sender session resolution)
+vi.mock('../../utils/request-context', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../utils/request-context')>();
+  return {
+    ...actual,
+    getRequestContext: vi.fn().mockReturnValue(undefined),
+    getSessionContext: vi.fn().mockReturnValue(undefined),
+  };
+});
+
 // Mock agent gateway
 vi.mock('../../channels/agent-gateway.js', () => ({
   getAgentGateway: vi.fn().mockReturnValue({
@@ -347,6 +357,356 @@ describe('handleSendToInbox - threadKey', () => {
     expect(parsed.success).toBe(true);
     expect(parsed.routingHint).toContain('routing anchor');
     expect(mockGateway.dispatchTrigger).toHaveBeenCalled();
+  });
+});
+
+// =====================================================
+// REPLY ROUTING — Thread message metadata enrichment
+// =====================================================
+
+/**
+ * Build a Supabase mock that supports the full thread path:
+ * findOrCreateThread → participant registration → message insert → trigger dispatch.
+ *
+ * The thread path hits multiple tables with different chainable patterns.
+ * This mock returns table-specific chainable objects.
+ */
+function createThreadMockSupabase(
+  options: {
+    existingThread?: { id: string };
+    recipientPriorMessage?: { metadata: Record<string, unknown> } | null;
+    threadMessageId?: string;
+  } = {}
+) {
+  const threadId = options.existingThread?.id || 'thread-999';
+  const threadMessageId = options.threadMessageId || 'tmsg-123';
+  let insertedMetadata: Record<string, unknown> | null = null;
+
+  // inbox_threads table mock
+  const threadsFindChain = {
+    select: vi.fn().mockReturnValue({
+      eq: vi.fn().mockReturnValue({
+        eq: vi.fn().mockReturnValue({
+          maybeSingle: vi.fn().mockResolvedValue({
+            data: options.existingThread ? { id: threadId } : null,
+            error: null,
+          }),
+        }),
+      }),
+    }),
+    insert: vi.fn().mockReturnValue({
+      select: vi.fn().mockReturnValue({
+        single: vi.fn().mockResolvedValue({
+          data: { id: threadId },
+          error: null,
+        }),
+      }),
+    }),
+    update: vi.fn().mockReturnValue({
+      eq: vi.fn().mockResolvedValue({ data: null, error: null }),
+    }),
+  };
+
+  // inbox_thread_participants table mock
+  const participantsChain = {
+    select: vi.fn().mockReturnValue({
+      eq: vi.fn().mockReturnValue({
+        eq: vi.fn().mockReturnValue({
+          maybeSingle: vi.fn().mockResolvedValue({
+            data: { agent_id: 'existing' },
+            error: null,
+          }),
+        }),
+      }),
+    }),
+    insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+  };
+
+  // inbox_thread_messages table mock
+  const messagesChain = {
+    insert: vi.fn().mockImplementation((row: Record<string, unknown>) => {
+      insertedMetadata = row.metadata as Record<string, unknown>;
+      return {
+        select: vi.fn().mockReturnValue({
+          single: vi.fn().mockResolvedValue({
+            data: { id: threadMessageId, ...row },
+            error: null,
+          }),
+        }),
+      };
+    }),
+    select: vi.fn().mockReturnValue({
+      eq: vi.fn().mockReturnValue({
+        eq: vi.fn().mockReturnValue({
+          order: vi.fn().mockReturnValue({
+            limit: vi.fn().mockReturnValue({
+              maybeSingle: vi.fn().mockResolvedValue({
+                data: options.recipientPriorMessage || null,
+                error: null,
+              }),
+            }),
+          }),
+        }),
+      }),
+    }),
+  };
+
+  // inbox_thread_read_status table mock
+  const readStatusChain = {
+    upsert: vi.fn().mockResolvedValue({ data: null, error: null }),
+  };
+
+  // identity mock (for resolveIdentityId)
+  const identityChain = {
+    select: vi.fn().mockReturnValue({
+      eq: vi.fn().mockReturnValue({
+        eq: vi.fn().mockReturnValue({
+          order: vi.fn().mockResolvedValue({
+            data: [{ id: 'identity-123', workspace_id: 'ws-1', updated_at: null }],
+            error: null,
+          }),
+        }),
+      }),
+    }),
+  };
+
+  const fromFn = vi.fn().mockImplementation((table: string) => {
+    switch (table) {
+      case 'inbox_threads':
+        return threadsFindChain;
+      case 'inbox_thread_participants':
+        return participantsChain;
+      case 'inbox_thread_messages':
+        return messagesChain;
+      case 'inbox_thread_read_status':
+        return readStatusChain;
+      case 'agent_identities':
+        return identityChain;
+      default:
+        return threadsFindChain;
+    }
+  });
+
+  return {
+    from: fromFn,
+    getInsertedMetadata: () => insertedMetadata,
+  };
+}
+
+function createThreadMockDataComposer(supabase: ReturnType<typeof createThreadMockSupabase>) {
+  return {
+    getClient: vi.fn().mockReturnValue(supabase),
+    repositories: {
+      memory: {
+        getActiveSessionByThreadKey: vi.fn().mockResolvedValue(null),
+        getActiveSession: vi.fn().mockResolvedValue(null),
+      },
+    },
+  };
+}
+
+describe('Reply Routing — thread message metadata enrichment', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('should enrich thread message metadata with pcp.sender context', async () => {
+    const mockSb = createThreadMockSupabase({
+      existingThread: { id: 'thread-pr210' },
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    // Mock request context to provide sender session info
+    const { getRequestContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue({
+      sessionId: 'wren-session-123',
+      workspaceId: 'studio-wren',
+    } as ReturnType<typeof getRequestContext>);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        threadKey: 'pr:210',
+        content: 'Please review this PR',
+      },
+      mockDc as never
+    );
+
+    // Verify the inserted message metadata has pcp.sender
+    const insertedMeta = mockSb.getInsertedMetadata();
+    expect(insertedMeta).toBeDefined();
+    expect(insertedMeta!.pcp).toBeDefined();
+    const pcpMeta = insertedMeta!.pcp as Record<string, unknown>;
+    expect(pcpMeta.sender).toEqual({
+      agentId: 'wren',
+      sessionId: 'wren-session-123',
+      studioId: 'studio-wren',
+    });
+  });
+
+  it('should set sender sessionId to null when no request context is available', async () => {
+    const mockSb = createThreadMockSupabase({
+      existingThread: { id: 'thread-pr210' },
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    // Clear request context mock
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        threadKey: 'pr:210',
+        content: 'Hello',
+      },
+      mockDc as never
+    );
+
+    const insertedMeta = mockSb.getInsertedMetadata();
+    expect(insertedMeta).toBeDefined();
+    const pcpMeta = insertedMeta!.pcp as Record<string, unknown>;
+    const sender = pcpMeta.sender as Record<string, unknown>;
+    expect(sender.agentId).toBe('wren');
+    expect(sender.sessionId).toBeNull();
+    expect(sender.studioId).toBeNull();
+  });
+});
+
+describe('Reply Routing — trigger recipientSessionId auto-resolution', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('should auto-resolve recipientSessionId from prior thread message', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+
+    const mockSb = createThreadMockSupabase({
+      existingThread: { id: 'thread-pr210' },
+      // Lumen's prior message on this thread has their session context
+      recipientPriorMessage: {
+        metadata: {
+          pcp: {
+            sender: {
+              agentId: 'lumen',
+              sessionId: 'lumen-session-456',
+              studioId: 'studio-lumen',
+            },
+          },
+        },
+      },
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    // Clear request context
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        threadKey: 'pr:210',
+        content: 'Reply to your review',
+      },
+      mockDc as never
+    );
+
+    // Trigger should include the auto-resolved recipientSessionId
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toAgentId: 'lumen',
+        threadKey: 'pr:210',
+        recipientSessionId: 'lumen-session-456',
+      })
+    );
+  });
+
+  it('should not set recipientSessionId when no prior message exists', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+
+    const mockSb = createThreadMockSupabase({
+      existingThread: { id: 'thread-new' },
+      recipientPriorMessage: null, // No prior messages from recipient
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        threadKey: 'pr:999',
+        content: 'First message on this thread',
+      },
+      mockDc as never
+    );
+
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toAgentId: 'lumen',
+        threadKey: 'pr:999',
+        recipientSessionId: undefined,
+      })
+    );
+  });
+
+  it('should use explicit recipientSessionId over auto-resolved one', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+
+    const mockSb = createThreadMockSupabase({
+      existingThread: { id: 'thread-pr210' },
+      // Even though a prior message has a different session ID...
+      recipientPriorMessage: {
+        metadata: {
+          pcp: {
+            sender: {
+              agentId: 'lumen',
+              sessionId: 'lumen-old-session',
+              studioId: 'studio-lumen',
+            },
+          },
+        },
+      },
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        threadKey: 'pr:210',
+        recipientSessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+        content: 'Using explicit routing',
+      },
+      mockDc as never
+    );
+
+    // Explicit recipientSessionId should take priority
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recipientSessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+      })
+    );
   });
 });
 

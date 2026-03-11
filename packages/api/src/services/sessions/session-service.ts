@@ -582,6 +582,23 @@ export class SessionService implements ISessionService {
 
     // For primary sessions, try to find existing active session
     if (type === 'primary') {
+      // recipientSessionId takes highest priority — this is an explicit "route
+      // the reply back to THIS session" signal (e.g., auto-resolved from thread
+      // message history). If the session exists and isn't ended, use it directly
+      // regardless of threadKey mismatch.
+      if (options?.recipientSessionId) {
+        const recipientSession = await this.repository.findById(options.recipientSessionId);
+        if (recipientSession && !recipientSession.endedAt) {
+          logger.debug('Routing to explicit recipientSession', {
+            sessionId: recipientSession.id,
+            threadKey: options.threadKey,
+            sessionThreadKey: recipientSession.threadKey,
+            studioId: recipientSession.studioId || null,
+          });
+          return recipientSession;
+        }
+      }
+
       // ThreadKey match takes priority — find session scoped to this topic
       if (options?.threadKey && 'findByThreadKey' in this.repository) {
         const threadRepo = this.repository as {

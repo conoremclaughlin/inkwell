@@ -167,6 +167,44 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   // for messages that can genuinely wait 5+ hours.
   const trigger = parsed.trigger ?? true;
 
+  // ── Resolve sender session context (shared by both thread and legacy paths) ──
+  // This must happen BEFORE the thread/legacy branch so thread messages also
+  // capture the sender's session ID for reply-routing.
+  const reqCtx = getRequestContext();
+  const sessCtx = getSessionContext();
+  let senderSessionId: string | null = reqCtx?.sessionId || sessCtx?.sessionId || null;
+  const senderStudioId = reqCtx?.workspaceId || sessCtx?.workspaceId || null;
+
+  if (!senderSessionId && senderAgentId) {
+    try {
+      const activeSession = threadKey
+        ? ((await dataComposer.repositories.memory.getActiveSessionByThreadKey(
+            resolved.user.id,
+            senderAgentId,
+            threadKey,
+            senderStudioId
+          )) ??
+          (await dataComposer.repositories.memory.getActiveSession(
+            resolved.user.id,
+            senderAgentId,
+            senderStudioId
+          )))
+        : await dataComposer.repositories.memory.getActiveSession(
+            resolved.user.id,
+            senderAgentId,
+            senderStudioId
+          );
+      if (activeSession) {
+        senderSessionId = activeSession.id;
+      }
+    } catch (err) {
+      logger.warn('Failed to resolve sender session from active sessions', {
+        error: err instanceof Error ? err.message : String(err),
+        senderAgentId,
+      });
+    }
+  }
+
   // ── Thread-first path: when threadKey is provided, route to thread tables ──
   // Single-recipient with threadKey creates a 2-participant thread (spec invariant #5).
   // recipients[] creates a multi-participant thread.
@@ -203,6 +241,26 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       }
     }
 
+    // Enrich thread message metadata with sender session context so replies
+    // can route back to the correct session/studio.
+    const rawMeta =
+      metadata && typeof metadata === 'object' ? (metadata as Record<string, unknown>) : {};
+    const existingPcpMeta =
+      rawMeta.pcp && typeof rawMeta.pcp === 'object'
+        ? (rawMeta.pcp as Record<string, unknown>)
+        : {};
+    const threadMessageMetadata = {
+      ...rawMeta,
+      pcp: {
+        ...existingPcpMeta,
+        sender: {
+          agentId: triggerSenderId,
+          sessionId: senderSessionId,
+          studioId: senderStudioId,
+        },
+      },
+    };
+
     // Insert thread message
     const { data: threadMessage, error: tmError } = await threadTable(
       supabase,
@@ -214,7 +272,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         content,
         message_type: messageType === 'permission_grant' ? 'message' : messageType,
         priority,
-        metadata: (metadata || {}) as Json,
+        metadata: threadMessageMetadata as Json,
       })
       .select()
       .single();
@@ -256,6 +314,42 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       const agentsToTrigger = allRecipients.filter((a) => a !== senderAgentId);
 
       for (const toAgentId of agentsToTrigger) {
+        // Auto-resolve recipientSessionId: find the recipient's most recent
+        // message on this thread to extract their sender session. This ensures
+        // replies route back to the session that originated the conversation,
+        // not whatever session happens to be most recently updated.
+        let resolvedRecipientSessionId: string | undefined =
+          effectiveRecipientSessionId || undefined;
+        if (!resolvedRecipientSessionId) {
+          try {
+            const { data: recipientMsg } = await threadTable(supabase, 'inbox_thread_messages')
+              .select('metadata')
+              .eq('thread_id', thread.id)
+              .eq('sender_agent_id', toAgentId)
+              .order('created_at', { ascending: false })
+              .limit(1)
+              .maybeSingle();
+            const recipientPcp = (recipientMsg?.metadata as Record<string, unknown>)?.pcp as
+              | Record<string, unknown>
+              | undefined;
+            const recipientSender = recipientPcp?.sender as Record<string, unknown> | undefined;
+            if (recipientSender?.sessionId && typeof recipientSender.sessionId === 'string') {
+              resolvedRecipientSessionId = recipientSender.sessionId;
+              logger.debug('[ThreadTrigger] Auto-resolved recipientSessionId from thread history', {
+                threadKey,
+                toAgentId,
+                recipientSessionId: resolvedRecipientSessionId,
+              });
+            }
+          } catch (err) {
+            logger.warn('[ThreadTrigger] Failed to resolve recipientSessionId from thread', {
+              threadKey,
+              toAgentId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
         const payload: AgentTriggerPayload = {
           fromAgentId: triggerSenderId,
           toAgentId,
@@ -267,6 +361,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
             `New ${messageType} in thread ${threadKey} from ${triggerSenderId}`,
           priority,
           threadKey,
+          recipientSessionId: resolvedRecipientSessionId,
         };
         const result = gateway.dispatchTrigger(payload);
         if (result.accepted) {
@@ -312,45 +407,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     });
   }
 
-  const reqCtx = getRequestContext();
-  const sessCtx = getSessionContext();
-  let senderSessionId: string | null = reqCtx?.sessionId || sessCtx?.sessionId || null;
-  const senderStudioId = reqCtx?.workspaceId || sessCtx?.workspaceId || null;
-
-  // Fallback: resolve sender's active session from the database when no header/context
-  // provides it. This covers the common case where an agent calls send_to_inbox via
-  // StreamableHTTP MCP and the client doesn't inject x-pcp-session-id.
-  // Prefer threadKey-specific lookup to avoid cross-thread misrouting when an agent
-  // has multiple active sessions.
-  if (!senderSessionId && senderAgentId) {
-    try {
-      const activeSession = threadKey
-        ? ((await dataComposer.repositories.memory.getActiveSessionByThreadKey(
-            resolved.user.id,
-            senderAgentId,
-            threadKey,
-            senderStudioId
-          )) ??
-          (await dataComposer.repositories.memory.getActiveSession(
-            resolved.user.id,
-            senderAgentId,
-            senderStudioId
-          )))
-        : await dataComposer.repositories.memory.getActiveSession(
-            resolved.user.id,
-            senderAgentId,
-            senderStudioId
-          );
-      if (activeSession) {
-        senderSessionId = activeSession.id;
-      }
-    } catch (err) {
-      logger.warn('Failed to resolve sender session from active sessions', {
-        error: err instanceof Error ? err.message : String(err),
-        senderAgentId,
-      });
-    }
-  }
+  // senderSessionId and senderStudioId already resolved above (shared with thread path)
   const metadataRecord =
     metadata && typeof metadata === 'object' ? (metadata as Record<string, unknown>) : {};
   const existingPcp =
