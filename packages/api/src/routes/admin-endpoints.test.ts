@@ -542,7 +542,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
       expect((res._json as any).sessions).toEqual([]);
     });
 
-    it('scopes sessions by workspace identities (not sessions.workspace_id)', async () => {
+    it('scopes sessions by workspace identities (not sessions.studio_id)', async () => {
       const handler = findRouteHandler('get', '/sessions');
       expect(handler).not.toBeNull();
 
@@ -577,7 +577,6 @@ describe('admin endpoint handlers (no-500 regression)', () => {
                 backend_session_id: 'backend-1',
                 claude_session_id: null,
                 studio_id: 'studio-1',
-                workspace_id: 'studio-1', // Legacy studio alias, not top-level workspace
               },
             ]);
           }
@@ -603,7 +602,6 @@ describe('admin endpoint handlers (no-500 regression)', () => {
                 backend_session_id: 'backend-2',
                 claude_session_id: null,
                 studio_id: null,
-                workspace_id: null,
               },
             ]);
           }

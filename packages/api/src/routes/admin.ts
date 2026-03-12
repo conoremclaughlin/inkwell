@@ -4109,8 +4109,8 @@ router.get('/sessions', async (req: Request, res: Response) => {
     }
 
     // 2. Fetch sessions scoped to identities in the active top-level workspace.
-    // Sessions store studio/worktree scope in studio_id/workspace_id, so we scope
-    // via identity_id (with legacy agent_id fallback), not by sessions.workspace_id.
+    // Sessions store studio/worktree scope in studio_id, so we scope
+    // via identity_id (with legacy agent_id fallback), not by studio directly.
     let identitySessionsQuery = supabase
       .from('sessions')
       .select('*')
@@ -4175,9 +4175,7 @@ router.get('/sessions', async (req: Request, res: Response) => {
 
     // 3. Batch-fetch studios linked to these sessions (studio_id preferred, session_id fallback)
     const sessionIds = sessionRows.map((s) => s.id);
-    const studioIds = [
-      ...new Set(sessionRows.map((s) => s.studio_id || s.workspace_id).filter(Boolean)),
-    ] as string[];
+    const studioIds = [...new Set(sessionRows.map((s) => s.studio_id).filter(Boolean))] as string[];
 
     const studiosById = new Map<
       string,
@@ -4364,9 +4362,7 @@ router.get('/sessions', async (req: Request, res: Response) => {
       sessions: sessionRows.map((s) => {
         const identity = s.agent_id ? identitiesByAgentId.get(s.agent_id) : null;
         const studio =
-          studiosById.get(s.studio_id || s.workspace_id || '') ||
-          workspacesBySessionId.get(s.id) ||
-          null;
+          studiosById.get(s.studio_id || '') || workspacesBySessionId.get(s.id) || null;
         return {
           id: s.id,
           backendSessionId: s.backend_session_id || s.claude_session_id || null,
@@ -4466,7 +4462,6 @@ router.get('/studios', async (req: Request, res: Response) => {
         .from('sessions')
         .select('agent_id, lifecycle, current_phase, status, updated_at')
         .eq('user_id', authReq.pcpUserId)
-        .eq('workspace_id', authReq.pcpWorkspaceId)
         .in('agent_id', agentIds)
         .is('ended_at', null)
         .neq('lifecycle', 'failed')

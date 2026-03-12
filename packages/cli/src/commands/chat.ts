@@ -902,8 +902,8 @@ function extractSessionSummaries(
         workspaceId:
           typeof row.workspaceId === 'string'
             ? row.workspaceId
-            : typeof row.workspace_id === 'string'
-              ? row.workspace_id
+            : typeof row.studioId === 'string'
+              ? row.studioId
               : undefined,
         workspaceName:
           typeof row.workspaceName === 'string'

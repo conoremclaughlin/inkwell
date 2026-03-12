@@ -88,9 +88,7 @@ export interface Session {
   userId: string;
   agentId?: string;
   studioId?: string;
-  /**
-   * @deprecated Use studioId. Kept for backward compatibility during migration.
-   */
+  /** @deprecated Alias for studioId. No longer backed by a DB column. */
   workspaceId?: string;
   threadKey?: string;
   /** Runtime lifecycle state: running, idle, completed, failed */
@@ -116,9 +114,7 @@ export interface SessionCreateInput {
   userId: string;
   agentId?: string;
   studioId?: string;
-  /**
-   * @deprecated Use studioId. Kept for backward compatibility during migration.
-   */
+  /** @deprecated Alias for studioId. No longer backed by a DB column. */
   workspaceId?: string;
   threadKey?: string;
   backend?: string;

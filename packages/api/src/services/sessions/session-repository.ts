@@ -36,7 +36,7 @@ function mapDbToSession(row: DbSession): Session {
     userId: row.user_id,
     agentId: row.agent_id || '',
     identityId: row.identity_id || undefined,
-    studioId: row.studio_id || row.workspace_id || undefined,
+    studioId: row.studio_id || undefined,
     claudeSessionId: row.claude_session_id,
 
     type: (metadata.type as SessionType) || 'primary',
@@ -96,8 +96,6 @@ function mapSessionToDb(
     backend: session.backend,
     model: session.model,
     studio_id: session.studioId || null,
-    // Keep mirrored for compatibility with older server versions.
-    workspace_id: session.studioId || null,
     thread_key: session.threadKey || null,
     metadata: {
       type: session.type,
@@ -146,7 +144,7 @@ export class SessionRepository implements ISessionRepository {
       .limit(1);
 
     if (options?.studioId) {
-      query = query.or(`studio_id.eq.${options.studioId},workspace_id.eq.${options.studioId}`);
+      query = query.eq('studio_id', options.studioId);
     }
 
     if (options?.status) {
@@ -196,7 +194,7 @@ export class SessionRepository implements ISessionRepository {
       .limit(1);
 
     if (studioId) {
-      query = query.or(`studio_id.eq.${studioId},workspace_id.eq.${studioId}`);
+      query = query.eq('studio_id', studioId);
     }
 
     const { data, error } = await query;
@@ -320,8 +318,6 @@ export class SessionRepository implements ISessionRepository {
 
     if (updates.studioId !== undefined) {
       dbUpdates.studio_id = updates.studioId || null;
-      // Keep mirrored for compatibility with older server versions.
-      dbUpdates.workspace_id = updates.studioId || null;
     }
 
     // Merge metadata updates

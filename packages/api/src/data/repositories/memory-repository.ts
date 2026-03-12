@@ -372,8 +372,6 @@ export class MemoryRepository {
     const scopedStudioId = input.studioId ?? input.workspaceId;
     if (scopedStudioId !== undefined) {
       insertData.studio_id = scopedStudioId;
-      // Backward compatibility for older server versions still reading workspace_id.
-      insertData.workspace_id = scopedStudioId;
     }
     if (input.threadKey) {
       insertData.thread_key = input.threadKey;
@@ -935,7 +933,7 @@ export class MemoryRepository {
   }
 
   private rowToSession(row: SessionRow): Session {
-    const studioId = row.studio_id || row.workspace_id || undefined;
+    const studioId = row.studio_id || undefined;
     return {
       id: row.id,
       userId: row.user_id,

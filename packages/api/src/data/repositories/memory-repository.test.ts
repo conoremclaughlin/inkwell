@@ -284,13 +284,12 @@ describe('MemoryRepository', () => {
         expect(result.endedAt).toBeUndefined();
       });
 
-      it('should include studio_id and workspace_id in insert when studioId is provided', async () => {
+      it('should include studio_id in insert when studioId is provided', async () => {
         const mockSessionRow = {
           id: 'session-ws',
           user_id: 'user-456',
           agent_id: 'wren',
           studio_id: 'ws-abc-123',
-          workspace_id: 'ws-abc-123',
           started_at: '2026-02-10T00:00:00Z',
           ended_at: null,
           summary: null,
@@ -308,13 +307,13 @@ describe('MemoryRepository', () => {
         expect(result.studioId).toBe('ws-abc-123');
         expect(result.workspaceId).toBe('ws-abc-123');
 
-        // Verify insert was called with both studio_id (new) and workspace_id (legacy).
         expect(mockSupabase._queryBuilder.insert).toHaveBeenCalledWith(
           expect.objectContaining({
             studio_id: 'ws-abc-123',
-            workspace_id: 'ws-abc-123',
           })
         );
+        const insertCall = mockSupabase._queryBuilder.insert.mock.calls[0][0];
+        expect(insertCall).not.toHaveProperty('workspace_id');
       });
 
       it('should prefer studioId over workspaceId when both are provided', async () => {
@@ -323,7 +322,6 @@ describe('MemoryRepository', () => {
           user_id: 'user-456',
           agent_id: 'wren',
           studio_id: 'studio-abc',
-          workspace_id: 'studio-abc',
           started_at: '2026-02-10T00:00:00Z',
           ended_at: null,
           summary: null,
@@ -342,18 +340,18 @@ describe('MemoryRepository', () => {
         expect(mockSupabase._queryBuilder.insert).toHaveBeenCalledWith(
           expect.objectContaining({
             studio_id: 'studio-abc',
-            workspace_id: 'studio-abc',
           })
         );
+        const insertCall = mockSupabase._queryBuilder.insert.mock.calls[0][0];
+        expect(insertCall).not.toHaveProperty('workspace_id');
       });
 
-      it('should not include studio/workspace IDs in insert when studioId is omitted', async () => {
+      it('should not include studio_id in insert when studioId is omitted', async () => {
         const mockSessionRow = {
           id: 'session-no-ws',
           user_id: 'user-456',
           agent_id: 'wren',
           studio_id: null,
-          workspace_id: null,
           started_at: '2026-02-10T00:00:00Z',
           ended_at: null,
           summary: null,
@@ -367,10 +365,8 @@ describe('MemoryRepository', () => {
           agentId: 'wren',
         });
 
-        // Verify insert was called WITHOUT studio/workspace keys
         const insertCall = mockSupabase._queryBuilder.insert.mock.calls[0][0];
         expect(insertCall).not.toHaveProperty('studio_id');
-        expect(insertCall).not.toHaveProperty('workspace_id');
       });
     });
 
@@ -549,33 +545,12 @@ describe('MemoryRepository', () => {
         expect(result!.workspaceId).toBe('studio-mapped');
       });
 
-      it('should fall back to workspace_id when studio_id is missing', async () => {
-        const mockSessionRow = {
-          id: 'session-fallback',
-          user_id: 'user-456',
-          agent_id: 'wren',
-          studio_id: null,
-          workspace_id: 'legacy-workspace-id',
-          started_at: '2026-02-10T00:00:00Z',
-          ended_at: null,
-          summary: null,
-          metadata: {},
-        };
-
-        mockSupabase._setReturnData(mockSessionRow);
-
-        const result = await repo.getSession('session-fallback');
-        expect(result!.studioId).toBe('legacy-workspace-id');
-        expect(result!.workspaceId).toBe('legacy-workspace-id');
-      });
-
-      it('should map null studio/workspace IDs to undefined', async () => {
+      it('should map null studio_id to undefined', async () => {
         const mockSessionRow = {
           id: 'session-null-ws',
           user_id: 'user-456',
           agent_id: 'wren',
           studio_id: null,
-          workspace_id: null,
           started_at: '2026-02-10T00:00:00Z',
           ended_at: null,
           summary: null,
