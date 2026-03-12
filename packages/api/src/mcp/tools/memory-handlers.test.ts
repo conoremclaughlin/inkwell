@@ -132,16 +132,6 @@ describe('startSessionSchema', () => {
     }
   });
 
-  it('should accept deprecated workspaceId alias', () => {
-    const result = startSessionSchema.safeParse({
-      email: 'test@test.com',
-      agentId: 'wren',
-      workspaceId: '550e8400-e29b-41d4-a716-446655440000',
-    });
-
-    expect(result.success).toBe(true);
-  });
-
   it('should reject non-UUID studioId', () => {
     const result = startSessionSchema.safeParse({
       email: 'test@test.com',
@@ -218,15 +208,6 @@ describe('listSessionsSchema', () => {
       expect(result.data.studioId).toBe('550e8400-e29b-41d4-a716-446655440000');
       expect(result.data.limit).toBe(10);
     }
-  });
-
-  it('should accept deprecated workspaceId alias', () => {
-    const result = listSessionsSchema.safeParse({
-      email: 'test@test.com',
-      workspaceId: '550e8400-e29b-41d4-a716-446655440000',
-    });
-
-    expect(result.success).toBe(true);
   });
 
   it('should reject non-UUID studioId', () => {
@@ -368,7 +349,6 @@ describe('handleUpdateSessionPhase', () => {
     email: 'test@test.com',
     agentId: 'wren',
     studioId: undefined,
-    workspaceId: undefined,
     currentPhase: undefined,
     startedAt: new Date('2026-02-10T10:00:00Z'),
     endedAt: undefined,
@@ -534,20 +514,20 @@ describe('handleUpdateSessionPhase', () => {
       );
     });
 
-    it('should support deprecated workspaceId alias for session resolution', async () => {
+    it('should resolve session by studioId', async () => {
       mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockUpdatedSession);
 
-      const workspaceId = '550e8400-e29b-41d4-a716-446655440099';
+      const studioId = '550e8400-e29b-41d4-a716-446655440099';
       await handleUpdateSessionPhase(
-        { email: 'test@test.com', phase: 'implementing', agentId: 'wren', workspaceId },
+        { email: 'test@test.com', phase: 'implementing', agentId: 'wren', studioId },
         mockDataComposer as never
       );
 
       expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith(
         'user-123',
         'wren',
-        workspaceId
+        studioId
       );
     });
   });
@@ -1114,7 +1094,6 @@ describe('handleUpdateSessionPhase', () => {
       const sessionWithWorkspace = {
         ...mockSession,
         studioId: 'workspace-abc',
-        workspaceId: 'workspace-abc',
         currentPhase: 'implementing',
       };
       mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
@@ -1129,7 +1108,6 @@ describe('handleUpdateSessionPhase', () => {
       expect(parsed.session.id).toBe('session-123');
       expect(parsed.session.agentId).toBe('wren');
       expect(parsed.session.studioId).toBe('workspace-abc');
-      expect(parsed.session.workspaceId).toBe('workspace-abc');
       expect(parsed.session.currentPhase).toBe('implementing');
     });
   });
@@ -1207,7 +1185,6 @@ describe('handleStartSession - threadKey matching', () => {
     userId: 'user-123',
     agentId: 'lumen',
     studioId: undefined,
-    workspaceId: undefined,
     threadKey: 'pr:32',
     currentPhase: 'reviewing',
     startedAt: new Date('2026-02-10T10:00:00Z'),
@@ -1221,7 +1198,6 @@ describe('handleStartSession - threadKey matching', () => {
     userId: 'user-123',
     agentId: 'lumen',
     studioId: undefined,
-    workspaceId: undefined,
     threadKey: 'pr:99',
     currentPhase: undefined,
     startedAt: new Date('2026-02-15T10:00:00Z'),

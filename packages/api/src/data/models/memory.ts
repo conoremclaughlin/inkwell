@@ -88,8 +88,6 @@ export interface Session {
   userId: string;
   agentId?: string;
   studioId?: string;
-  /** @deprecated Alias for studioId. No longer backed by a DB column. */
-  workspaceId?: string;
   threadKey?: string;
   /** Runtime lifecycle state: running, idle, completed, failed */
   lifecycle?: SessionLifecycle;
@@ -114,8 +112,6 @@ export interface SessionCreateInput {
   userId: string;
   agentId?: string;
   studioId?: string;
-  /** @deprecated Alias for studioId. No longer backed by a DB column. */
-  workspaceId?: string;
   threadKey?: string;
   backend?: string;
   model?: string;
@@ -176,7 +172,6 @@ export interface SessionRow {
   user_id: string;
   agent_id: string | null;
   studio_id: string | null;
-  workspace_id: string | null;
   thread_key: string | null;
   lifecycle?: string | null;
   status?: string | null;

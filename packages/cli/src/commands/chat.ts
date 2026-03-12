@@ -900,10 +900,10 @@ function extractSessionSummaries(
         id,
         agentId: typeof row.agentId === 'string' ? row.agentId : undefined,
         workspaceId:
-          typeof row.workspaceId === 'string'
-            ? row.workspaceId
-            : typeof row.studioId === 'string'
-              ? row.studioId
+          typeof row.studioId === 'string'
+            ? row.studioId
+            : typeof row.workspaceId === 'string'
+              ? row.workspaceId
               : undefined,
         workspaceName:
           typeof row.workspaceName === 'string'
@@ -2133,8 +2133,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (runtime.threadKey) startArgs.threadKey = runtime.threadKey;
     if (identity?.workspaceId) {
       startArgs.studioId = identity.workspaceId;
-      // Backward compatibility for older server builds.
-      startArgs.workspaceId = identity.workspaceId;
     }
 
     const sessionStartResult = (await pcp

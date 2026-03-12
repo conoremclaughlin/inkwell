@@ -369,7 +369,7 @@ export class MemoryRepository {
     };
     if (input.backend) insertData.backend = input.backend;
     if (input.model) insertData.model = input.model;
-    const scopedStudioId = input.studioId ?? input.workspaceId;
+    const scopedStudioId = input.studioId;
     if (scopedStudioId !== undefined) {
       insertData.studio_id = scopedStudioId;
     }
@@ -608,7 +608,6 @@ export class MemoryRepository {
       offset?: number;
       agentId?: string;
       studioId?: string;
-      workspaceId?: string;
     } = {}
   ): Promise<Session[]> {
     let query = this.supabase
@@ -621,7 +620,7 @@ export class MemoryRepository {
       query = query.eq('agent_id', options.agentId);
     }
 
-    const scopedStudioId = options.studioId ?? options.workspaceId;
+    const scopedStudioId = options.studioId;
     if (scopedStudioId) {
       query = query.eq('studio_id', scopedStudioId);
     }
@@ -939,7 +938,6 @@ export class MemoryRepository {
       userId: row.user_id,
       agentId: row.agent_id || undefined,
       studioId,
-      workspaceId: studioId,
       threadKey: row.thread_key || undefined,
       lifecycle: (row.lifecycle as Session['lifecycle']) || undefined,
       status: row.status || undefined,

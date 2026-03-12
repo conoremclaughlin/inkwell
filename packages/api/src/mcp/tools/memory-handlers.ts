@@ -47,8 +47,8 @@ const memorySourceSchema = z.enum([
 ]);
 const salienceSchema = z.enum(['low', 'medium', 'high', 'critical']);
 
-function resolveStudioId(params: { studioId?: string; workspaceId?: string }): string | undefined {
-  return params.studioId ?? params.workspaceId;
+function resolveStudioId(params: { studioId?: string }): string | undefined {
+  return params.studioId;
 }
 
 /** Coerce a comma-separated string into a string array so callers can pass either format. */
@@ -255,11 +255,6 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
     .describe(
       'Studio ID — preferred session scope for parallel worktree scenarios. Stored in metadata, not as a first-class field.'
     ),
-  workspaceId: z
-    .string()
-    .uuid()
-    .optional()
-    .describe('[Deprecated] Workspace ID alias for studioId.'),
 });
 
 export const recallSchema = userIdentifierBaseSchema.extend({
@@ -313,11 +308,6 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
     .describe(
       'Studio ID to scope this session to. Allows multiple active sessions per agent (one per studio).'
     ),
-  workspaceId: z
-    .string()
-    .uuid()
-    .optional()
-    .describe('[Deprecated] Workspace ID alias for studioId.'),
   threadKey: z
     .string()
     .optional()
@@ -351,11 +341,6 @@ export const logSessionSchema = userIdentifierBaseSchema.extend({
     .uuid()
     .optional()
     .describe('Studio ID for session resolution when sessionId not provided'),
-  workspaceId: z
-    .string()
-    .uuid()
-    .optional()
-    .describe('[Deprecated] Workspace ID alias for studioId.'),
   content: z.string().describe('Log entry content'),
   salience: salienceSchema.optional().describe('Importance level (default: medium)'),
 });
@@ -375,11 +360,6 @@ export const endSessionSchema = userIdentifierBaseSchema.extend({
     .uuid()
     .optional()
     .describe('Studio ID for session resolution when sessionId not provided'),
-  workspaceId: z
-    .string()
-    .uuid()
-    .optional()
-    .describe('[Deprecated] Workspace ID alias for studioId.'),
   summary: z.string().optional().describe('End-of-session summary'),
 });
 
@@ -398,22 +378,12 @@ export const getSessionSchema = userIdentifierBaseSchema.extend({
     .uuid()
     .optional()
     .describe('Studio ID for session resolution when sessionId not provided'),
-  workspaceId: z
-    .string()
-    .uuid()
-    .optional()
-    .describe('[Deprecated] Workspace ID alias for studioId.'),
   includeLogs: z.boolean().optional().describe('Include session logs (default: false)'),
 });
 
 export const listSessionsSchema = userIdentifierBaseSchema.extend({
   agentId: z.string().optional().describe('Filter by agent'),
   studioId: z.string().uuid().optional().describe('Filter by studio'),
-  workspaceId: z
-    .string()
-    .uuid()
-    .optional()
-    .describe('[Deprecated] Workspace ID alias for studioId.'),
   limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
 });
 
@@ -436,11 +406,6 @@ export const updateSessionPhaseSchema = userIdentifierBaseSchema.extend({
     .describe(
       'Studio ID for session resolution. When sessionId is not provided, finds the active session in this studio. Useful for parallel worktree scenarios.'
     ),
-  workspaceId: z
-    .string()
-    .uuid()
-    .optional()
-    .describe('[Deprecated] Workspace ID alias for studioId.'),
   phase: z
     .string()
     .optional()
@@ -549,11 +514,6 @@ export const compactSessionSchema = userIdentifierBaseSchema.extend({
     .uuid()
     .optional()
     .describe('Studio ID for session resolution when sessionId not provided'),
-  workspaceId: z
-    .string()
-    .uuid()
-    .optional()
-    .describe('[Deprecated] Workspace ID alias for studioId.'),
   groupByTopics: z.boolean().optional().describe('Group logs by inferred topics (default: true)'),
   minSalience: z
     .enum(['low', 'medium', 'high', 'critical'])
@@ -592,7 +552,7 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
   const metadata = {
     ...params.metadata,
     ...(sessionId ? { sessionId } : {}),
-    ...(studioId ? { studioId, workspaceId: studioId } : {}),
+    ...(studioId ? { studioId } : {}),
     ...(params.topicSummary ? { topicSummary: params.topicSummary } : {}),
   };
 
@@ -813,7 +773,6 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
                 id: existingSession.id,
                 agentId: existingSession.agentId,
                 studioId: existingSession.studioId,
-                workspaceId: existingSession.workspaceId,
                 threadKey: existingSession.threadKey || null,
                 status: existingSession.status || null,
                 backend: existingSession.backend || null,
@@ -837,7 +796,6 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
     userId: user.id,
     agentId,
     studioId,
-    workspaceId: params.workspaceId,
     threadKey: params.threadKey,
     backend: params.backend,
     model: params.model,
@@ -848,7 +806,6 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
     sessionId: session.id,
     agentId: session.agentId,
     studioId: session.studioId,
-    workspaceId: session.workspaceId,
     threadKey: session.threadKey,
   });
 
@@ -865,7 +822,6 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
               id: session.id,
               agentId: session.agentId,
               studioId: session.studioId,
-              workspaceId: session.workspaceId,
               threadKey: session.threadKey || null,
               status: session.status || null,
               backend: session.backend || null,
@@ -1015,7 +971,6 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
               id: session.id,
               agentId: session.agentId,
               studioId: session.studioId,
-              workspaceId: session.workspaceId,
               lifecycle: session.lifecycle || null,
               currentPhase: session.currentPhase || null,
               status: session.status || null,
@@ -1086,7 +1041,6 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
               id: session.id,
               agentId: session.agentId,
               studioId: session.studioId,
-              workspaceId: session.workspaceId,
               lifecycle: session.lifecycle || null,
               currentPhase: session.currentPhase || null,
               startedAt: session.startedAt.toISOString(),
@@ -1117,7 +1071,6 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
   const sessions = await dataComposer.repositories.memory.listSessions(user.id, {
     agentId: params.agentId,
     studioId,
-    workspaceId: params.workspaceId,
     limit: params.limit,
   });
 
@@ -1141,7 +1094,6 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
               id: s.id,
               agentId: s.agentId,
               studioId: s.studioId,
-              workspaceId: s.workspaceId,
               studio: s.studioId
                 ? (() => {
                     const workspace = workspaceById.get(s.studioId);
@@ -1390,7 +1342,6 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
       id: updated.id,
       agentId: updated.agentId,
       studioId: updated.studioId,
-      workspaceId: updated.workspaceId,
       lifecycle: updated.lifecycle || null,
       currentPhase: updated.currentPhase || null,
     },
@@ -1850,17 +1801,8 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 
   // Resolve workspace scope for shared docs:
   // 1) explicit workspaceId param
-  // 2) if all active sessions agree on one workspace, use that
-  // 3) deterministic fallback to personal workspace
+  // 2) deterministic fallback to personal workspace
   let resolvedWorkspaceId = params.workspaceId;
-  if (!resolvedWorkspaceId) {
-    const sessionWorkspaceIds = Array.from(
-      new Set(activeSessions.map((s) => s.workspaceId).filter((id): id is string => !!id))
-    );
-    if (sessionWorkspaceIds.length === 1) {
-      resolvedWorkspaceId = sessionWorkspaceIds[0];
-    }
-  }
 
   if (!resolvedWorkspaceId) {
     const { data: personalWorkspace } = await supabase
@@ -2086,13 +2028,12 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
                 : null,
             },
 
-            // Recent active sessions (most recent 10) — use workspaceId to pick yours
+            // Recent active sessions (most recent 10) — use studioId to pick yours
             // Match against .pcp/identity.json workspaceId in your local environment
             activeSessions: activeSessions.map((s) => ({
               id: s.id,
               agentId: s.agentId,
               studioId: s.studioId || null,
-              workspaceId: s.workspaceId || null,
               threadKey: s.threadKey || null,
               lifecycle: s.lifecycle || null,
               currentPhase: s.currentPhase || null,
