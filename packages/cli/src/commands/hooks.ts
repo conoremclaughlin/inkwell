@@ -466,16 +466,14 @@ function getIdentitySessionContext(cwd: string): {
   try {
     const identity = JSON.parse(readFileSync(identityPath, 'utf-8')) as {
       studioId?: string;
-      workspaceId?: string;
       identityId?: string;
       studio?: string;
-      workspace?: string;
       role?: string;
     };
     return {
-      studioId: identity.studioId || identity.workspaceId,
+      studioId: identity.studioId,
       identityId: identity.identityId,
-      studioName: identity.studio || identity.workspace,
+      studioName: identity.studio,
       role: identity.role,
     };
   } catch {

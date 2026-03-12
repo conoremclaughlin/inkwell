@@ -573,11 +573,10 @@ function getIdentityContextFromIdentityJson(cwd = process.cwd()): {
   try {
     const identity = JSON.parse(readFileSync(identityPath, 'utf-8')) as {
       studioId?: string;
-      workspaceId?: string;
       identityId?: string;
     };
     return {
-      studioId: identity.studioId || identity.workspaceId,
+      studioId: identity.studioId,
       identityId: identity.identityId,
     };
   } catch {

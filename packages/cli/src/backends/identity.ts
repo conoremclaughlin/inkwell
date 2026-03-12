@@ -41,15 +41,7 @@ export function readIdentityJson(cwd: string): IdentityJson | null {
   const identityPath = join(cwd, '.pcp', 'identity.json');
   if (!existsSync(identityPath)) return null;
   try {
-    const raw = JSON.parse(readFileSync(identityPath, 'utf-8'));
-    // Migrate deprecated field names from pre-studio rename
-    if (raw.workspaceId && !raw.studioId) {
-      raw.studioId = raw.workspaceId;
-    }
-    if (raw.workspace && !raw.studio) {
-      raw.studio = raw.workspace;
-    }
-    return raw as IdentityJson;
+    return JSON.parse(readFileSync(identityPath, 'utf-8'));
   } catch {
     return null;
   }
