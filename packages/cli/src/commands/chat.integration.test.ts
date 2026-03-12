@@ -7,7 +7,7 @@ import { mintDelegationToken, verifyDelegationToken } from '@personal-context/sh
 const testState = vi.hoisted(() => ({
   inputs: [] as string[],
   pcpCalls: [] as Array<{ tool: string; args: Record<string, unknown> }>,
-  identity: { workspaceId: 'studio-test' } as { workspaceId?: string },
+  identity: { studioId: 'studio-test' } as { studioId?: string },
   callToolImpl: vi.fn(),
   runBackendImpl: vi.fn(),
   discoverSkillsImpl: vi.fn(),
@@ -90,7 +90,7 @@ describe('runChat integration', () => {
     vi.setSystemTime(new Date('2026-02-27T00:00:00.000Z'));
     testState.inputs = [];
     testState.pcpCalls = [];
-    testState.identity = { workspaceId: 'studio-test' };
+    testState.identity = { studioId: 'studio-test' };
     testState.callToolImpl.mockReset();
     testState.runBackendImpl.mockReset();
     testState.discoverSkillsImpl.mockReset();
@@ -164,7 +164,6 @@ describe('runChat integration', () => {
       agentId: 'lumen',
       threadKey: 'heartbeat:myra',
       studioId: 'studio-test',
-      workspaceId: 'studio-test',
     });
 
     const replDir = join(testCwd, '.pcp', 'runtime', 'repl');
@@ -608,7 +607,6 @@ describe('runChat integration', () => {
               {
                 id: 'sess-wren-new',
                 agentId: 'wren',
-                workspaceId: 'studio-test',
                 studioId: 'studio-test',
                 status: 'active',
                 threadKey: 'pr:900',
@@ -617,7 +615,6 @@ describe('runChat integration', () => {
               {
                 id: 'sess-lumen-mid',
                 agentId: 'lumen',
-                workspaceId: 'studio-test',
                 studioId: 'studio-2',
                 status: 'active',
                 threadKey: 'pr:901',
@@ -626,7 +623,6 @@ describe('runChat integration', () => {
               {
                 id: 'sess-lumen-old',
                 agentId: 'lumen',
-                workspaceId: 'workspace-other',
                 studioId: 'studio-3',
                 status: 'active',
                 threadKey: 'pr:902',

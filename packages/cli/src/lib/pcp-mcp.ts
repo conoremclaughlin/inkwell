@@ -10,7 +10,6 @@ function pickDebugArgValues(args: Record<string, unknown>): Record<string, unkno
     'agentId',
     'backend',
     'studioId',
-    'workspaceId',
     'threadKey',
     'forceNew',
   ] as const;

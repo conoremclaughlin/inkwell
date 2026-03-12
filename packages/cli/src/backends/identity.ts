@@ -30,10 +30,6 @@ export interface IdentityJson {
   role?: string;
   studioId?: string;
   studio?: string;
-  /** @deprecated Use studioId */
-  workspaceId?: string;
-  /** @deprecated Use studio */
-  workspace?: string;
   /** Persisted runtime preferences for sb chat */
   runtime?: RuntimePreferences;
 }
@@ -45,7 +41,15 @@ export function readIdentityJson(cwd: string): IdentityJson | null {
   const identityPath = join(cwd, '.pcp', 'identity.json');
   if (!existsSync(identityPath)) return null;
   try {
-    return JSON.parse(readFileSync(identityPath, 'utf-8'));
+    const raw = JSON.parse(readFileSync(identityPath, 'utf-8'));
+    // Migrate deprecated field names from pre-studio rename
+    if (raw.workspaceId && !raw.studioId) {
+      raw.studioId = raw.workspaceId;
+    }
+    if (raw.workspace && !raw.studio) {
+      raw.studio = raw.workspace;
+    }
+    return raw as IdentityJson;
   } catch {
     return null;
   }
