@@ -359,7 +359,12 @@ export class SessionService implements ISessionService {
         injectedContext.agent.name,
         injectedContext.agent.soul,
         injectedContext.user.timezone,
-        injectedContext.agent.heartbeat
+        injectedContext.agent.heartbeat,
+        {
+          pcpSessionId: session.id,
+          studioId: session.studioId || undefined,
+          threadKey: session.threadKey || undefined,
+        }
       ),
       ...(runtimeModel ? { model: runtimeModel } : {}),
       ...(pcpAccessToken ? { pcpAccessToken } : {}),

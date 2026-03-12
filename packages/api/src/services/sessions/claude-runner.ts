@@ -510,7 +510,8 @@ export function buildIdentityPrompt(
   agentName: string,
   soul?: string,
   timezone?: string,
-  heartbeat?: string
+  heartbeat?: string,
+  sessionIds?: { pcpSessionId?: string; studioId?: string; threadKey?: string }
 ): string {
   let prompt = `## Identity Override (CRITICAL)
 
@@ -520,6 +521,14 @@ When calling PCP tools (bootstrap, remember, recall, start_session, etc.), use \
 
 Do NOT read \`.pcp/identity.json\` — your identity is set by this system prompt.
 Do NOT run \`echo $AGENT_ID\` — you are running headlessly without shell access.`;
+
+  // Session identity — always in context for debugging and routing verification
+  if (sessionIds?.pcpSessionId) {
+    const idParts = [`- PCP Session: \`${sessionIds.pcpSessionId}\``];
+    if (sessionIds.studioId) idParts.push(`- Studio: \`${sessionIds.studioId}\``);
+    if (sessionIds.threadKey) idParts.push(`- Thread: \`${sessionIds.threadKey}\``);
+    prompt += `\n\n### Session Identity\n${idParts.join('\n')}`;
+  }
 
   if (soul) {
     prompt += `\n\n### Soul\n${soul}`;

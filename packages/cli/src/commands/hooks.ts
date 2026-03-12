@@ -1851,10 +1851,23 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     }
   }
 
+  // Build session identity block so the agent always has its own IDs in context
+  const sessionIdentityParts: string[] = [];
+  if (pcpSessionId) sessionIdentityParts.push(`PCP Session: \`${pcpSessionId}\``);
+  if (backendSessionId) sessionIdentityParts.push(`Backend Session: \`${backendSessionId}\``);
+  if (studioId) {
+    const studioLabel = studioName ? `${studioId} (${studioName})` : studioId;
+    sessionIdentityParts.push(`Studio: \`${studioLabel}\``);
+  }
+  if (pcpThreadKey) sessionIdentityParts.push(`Thread: \`${pcpThreadKey}\``);
+  const sessionIdentityBlock =
+    sessionIdentityParts.length > 0 ? sessionIdentityParts.map((p) => `- ${p}`).join('\n') : '';
+
   const template = loadTemplate('hook-session-start');
   const output = renderTemplate(template, {
     AGENT_ID: agentId,
     WORKSPACE_LINE: studioLine,
+    SESSION_IDENTITY: sessionIdentityBlock,
     ROLE_BLOCK: roleBlock,
     IDENTITY_BLOCK: identityBlock,
     MEMORIES_BLOCK: memoriesBlock,
