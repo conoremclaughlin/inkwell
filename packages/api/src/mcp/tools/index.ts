@@ -166,7 +166,6 @@ import {
 
 import {
   handleGetThreadMessages,
-  handleReplyToThread,
   handleAddThreadParticipant,
   handleCloseThread,
   handleListThreads,
@@ -3367,16 +3366,21 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'send_to_inbox',
     {
-      description: `Send a message to another agent's inbox. Use for cross-agent communication, task handoff, or session resume requests.
+      description: `Send a message to another agent's inbox or reply to a thread. This is the unified tool for all cross-agent messaging.
 
 Recipient modes (provide exactly one):
 - recipientAgentId: Single recipient. Works with or without threadKey.
 - recipients[]: Multiple recipients. Requires threadKey. Creates a group thread automatically.
 
 Thread routing:
-When threadKey is provided, messages are stored in thread tables (inbox_thread_messages). All recipients are auto-added as thread participants — no need to call add_thread_participant separately. Late joiners see full thread history. Without threadKey, messages go to the simple agent_inbox.
+When threadKey is provided, messages are stored in thread tables (inbox_thread_messages). All recipients are auto-added as thread participants. Late joiners see full thread history. Without threadKey, messages go to the simple agent_inbox.
 
-recipients[] is syntactic sugar: it creates the thread, adds all recipients as participants, sends the message, and triggers everyone — all in one call.
+For existing threads, reply semantics are applied automatically:
+- Closed threads are rejected
+- Smart trigger defaults: 1:1 thread → trigger other participant; group thread (non-creator) → trigger creator; group thread (creator) → trigger no one
+- Override with triggerAll (everyone) or triggerAgents (specific agents)
+
+For new threads (first message), all recipients are triggered.
 
 Message types:
 - message: General communication
@@ -3386,7 +3390,7 @@ Message types:
 - permission_grant: Grant or revoke tool permissions (include permissionGrant in metadata)
 
 Trigger behavior:
-All message types trigger the recipient by default. For threads, all recipients are triggered on the initial send. For replies (via reply_to_thread), trigger rules depend on thread size — see reply_to_thread for details.
+All message types trigger by default. Set trigger=false to suppress all triggers. Use triggerAgents for targeted waking, triggerAll for broadcast.
 
 Only set trigger=false if the message can genuinely wait 5+ hours.
 
@@ -3541,45 +3545,12 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   );
 
   server.registerTool(
-    'reply_to_thread',
-    {
-      description: `Reply to a thread. Trigger behavior depends on thread size:
-- 1:1 thread: triggers the other participant by default
-- Group thread (non-creator reply): triggers creator by default
-- Group thread (creator reply): triggers no one by default
-Use triggerAgents for targeted waking, triggerAll for broadcast.
-
-User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: threadToolDefinitions[1].schema,
-    },
-    async (args: Record<string, unknown>) => {
-      try {
-        return await handleReplyToThread(args, dataComposer);
-      } catch (error) {
-        logger.error('Error in reply_to_thread:', error);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  server.registerTool(
     'add_thread_participant',
     {
       description: `Add an agent to a thread. Idempotent (no-op if already a participant). Creates an audited system event in the thread. Triggers the new participant by default so they can catch up.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: threadToolDefinitions[2].schema,
+      inputSchema: threadToolDefinitions[1].schema,
     },
     async (args: Record<string, unknown>) => {
       try {
@@ -3608,7 +3579,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Close a thread. Closed threads can still be read but new messages are rejected. Any participant can close a thread.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: threadToolDefinitions[3].schema,
+      inputSchema: threadToolDefinitions[2].schema,
     },
     async (args: Record<string, unknown>) => {
       try {
@@ -3637,7 +3608,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `List threads an agent participates in, with unread counts and last message preview. Useful for heartbeat triage and inbox overview.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: threadToolDefinitions[4].schema,
+      inputSchema: threadToolDefinitions[3].schema,
     },
     async (args: Record<string, unknown>) => {
       try {
@@ -3666,7 +3637,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Mark a thread as read without fetching messages. Useful when you see thread activity in get_inbox and want to acknowledge it without reading the full history.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: threadToolDefinitions[5].schema,
+      inputSchema: threadToolDefinitions[4].schema,
     },
     async (args: Record<string, unknown>) => {
       try {

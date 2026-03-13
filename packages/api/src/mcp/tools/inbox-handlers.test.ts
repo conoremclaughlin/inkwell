@@ -51,6 +51,13 @@ vi.mock('../../channels/agent-gateway.js', () => ({
   }),
 }));
 
+// Mock thread-handlers (imported by inbox-handlers for reply semantics)
+vi.mock('./thread-handlers.js', () => ({
+  findThread: vi.fn().mockResolvedValue(null),
+  getParticipants: vi.fn().mockResolvedValue([]),
+  resolveTriggeredAgents: vi.fn().mockReturnValue([]),
+}));
+
 function createMockSupabase(
   overrides: {
     insertReturn?: { data: unknown; error: unknown };
@@ -506,8 +513,25 @@ function createThreadMockDataComposer(supabase: ReturnType<typeof createThreadMo
 }
 
 describe('Reply Routing — thread message metadata enrichment', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
+    // Configure findThread mock to return existing thread for these tests
+    const { findThread } = await import('./thread-handlers.js');
+    vi.mocked(findThread).mockResolvedValue({
+      id: 'thread-pr210',
+      thread_key: 'pr:210',
+      user_id: 'user-123',
+      created_by_agent_id: 'wren',
+      title: null,
+      status: 'open',
+      metadata: null,
+      created_at: '2026-03-09T10:00:00Z',
+      updated_at: '2026-03-09T10:00:00Z',
+      closed_at: null,
+      closed_by_agent_id: null,
+    });
+    const { getParticipants } = await import('./thread-handlers.js');
+    vi.mocked(getParticipants).mockResolvedValue(['wren', 'lumen']);
   });
 
   it('should enrich thread message metadata with pcp.sender context', async () => {
@@ -579,8 +603,27 @@ describe('Reply Routing — thread message metadata enrichment', () => {
 });
 
 describe('Reply Routing — trigger recipientSessionId auto-resolution', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
+    // Configure findThread to return existing thread for reply tests
+    const { findThread, getParticipants, resolveTriggeredAgents } =
+      await import('./thread-handlers.js');
+    vi.mocked(findThread).mockResolvedValue({
+      id: 'thread-pr210',
+      thread_key: 'pr:210',
+      user_id: 'user-123',
+      created_by_agent_id: 'wren',
+      title: null,
+      status: 'open',
+      metadata: null,
+      created_at: '2026-03-09T10:00:00Z',
+      updated_at: '2026-03-09T10:00:00Z',
+      closed_at: null,
+      closed_by_agent_id: null,
+    });
+    vi.mocked(getParticipants).mockResolvedValue(['wren', 'lumen']);
+    // For reply triggers, resolveTriggeredAgents should return the other participant
+    vi.mocked(resolveTriggeredAgents).mockReturnValue(['lumen']);
   });
 
   it('should auto-resolve recipientSessionId from prior thread message', async () => {
@@ -711,8 +754,26 @@ describe('Reply Routing — trigger recipientSessionId auto-resolution', () => {
 });
 
 describe('Reply Routing — sender session fallback behavior', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
+    // Configure findThread to return existing thread for reply tests
+    const { findThread, getParticipants, resolveTriggeredAgents } =
+      await import('./thread-handlers.js');
+    vi.mocked(findThread).mockResolvedValue({
+      id: 'thread-pr42',
+      thread_key: 'pr:42',
+      user_id: 'user-123',
+      created_by_agent_id: 'wren',
+      title: null,
+      status: 'open',
+      metadata: null,
+      created_at: '2026-03-09T10:00:00Z',
+      updated_at: '2026-03-09T10:00:00Z',
+      closed_at: null,
+      closed_by_agent_id: null,
+    });
+    vi.mocked(getParticipants).mockResolvedValue(['wren', 'lumen']);
+    vi.mocked(resolveTriggeredAgents).mockReturnValue(['lumen']);
   });
 
   it('should use threadKey-scoped lookup when no request context provides sessionId', async () => {

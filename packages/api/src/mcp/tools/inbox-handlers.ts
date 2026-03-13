@@ -14,6 +14,11 @@ import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
 import { getRequestContext, getSessionContext } from '../../utils/request-context';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
+import {
+  findThread as findExistingThread,
+  getParticipants,
+  resolveTriggeredAgents,
+} from './thread-handlers.js';
 
 // The thread tables are new and not yet in generated Supabase types.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -85,6 +90,20 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe('Brief summary for the trigger (only used if trigger=true)'),
+  triggerAll: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      'Trigger all thread participants (except sender). Only applies to thread messages. Overridden by triggerAgents.'
+    ),
+  triggerAgents: z
+    .array(z.string().min(1).max(64))
+    .max(16)
+    .optional()
+    .describe(
+      'Trigger specific thread participants by agent ID. Takes highest precedence. Non-participants are silently ignored.'
+    ),
 });
 
 const getInboxSchema = userIdentifierBaseSchema.extend({
@@ -139,6 +158,8 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     triggerType,
     triggerSummary,
     threadKey,
+    triggerAll,
+    triggerAgents,
   } = parsed;
 
   // Validate: exactly one of recipientAgentId or recipients
@@ -205,15 +226,36 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   }
 
   // ── Thread-first path: when threadKey is provided, route to thread tables ──
+  // Unified handler for both new thread creation and replies to existing threads.
   // Single-recipient with threadKey creates a 2-participant thread (spec invariant #5).
   // recipients[] creates a multi-participant thread.
   // Without threadKey, falls through to legacy agent_inbox path.
   if (threadKey) {
     const allRecipients = recipients || [recipientAgentId!];
-    // Include sender as participant if they have an identity
-    const allParticipants = senderAgentId
-      ? [...new Set([senderAgentId, ...allRecipients])]
-      : allRecipients;
+
+    // Check if thread already exists — determines reply vs create behavior
+    const existingThread = await findExistingThread(supabase, resolved.user.id, threadKey);
+
+    // ── Reply semantics: enforce participant membership and closed-thread rejection ──
+    if (existingThread) {
+      // Reject replies on closed threads
+      if (existingThread.status === 'closed') {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: `Thread ${threadKey} is closed. Cannot send to closed threads.`,
+              }),
+            },
+          ],
+        };
+      }
+
+      // If sender is already a participant, this is a reply — enforce membership
+      // If sender is NOT a participant, auto-add them (join-on-send)
+    }
 
     // Find or create thread
     let thread = await findOrCreateThread(supabase, {
@@ -221,8 +263,13 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       threadKey,
       creatorAgentId: triggerSenderId,
       title: subject || null,
-      participants: allParticipants,
+      participants: senderAgentId ? [...new Set([senderAgentId, ...allRecipients])] : allRecipients,
     });
+
+    // Include sender as participant if they have an identity
+    const allParticipants = senderAgentId
+      ? [...new Set([senderAgentId, ...allRecipients])]
+      : allRecipients;
 
     // Ensure all participants are registered (recipients + sender for existing threads)
     for (const agentId of allParticipants) {
@@ -297,6 +344,28 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       );
     }
 
+    // ── Trigger resolution ──
+    // For existing threads (replies), use smart trigger rules from resolveTriggeredAgents.
+    // For new threads, trigger all recipients (existing behavior).
+    let agentsToTrigger: string[] = [];
+
+    if (trigger !== false) {
+      if (existingThread && senderAgentId) {
+        // Reply: fetch current participants from DB for accurate trigger resolution
+        const currentParticipants = await getParticipants(supabase, thread.id);
+        agentsToTrigger = resolveTriggeredAgents({
+          senderAgentId,
+          participants: currentParticipants,
+          creatorAgentId: existingThread.created_by_agent_id,
+          triggerAgents,
+          triggerAll,
+        });
+      } else {
+        // New thread: trigger all recipients except sender
+        agentsToTrigger = allRecipients.filter((a) => a !== senderAgentId);
+      }
+    }
+
     logger.info('Thread message sent', {
       messageId: threadMessage.id,
       threadKey,
@@ -304,13 +373,13 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       from: triggerSenderId,
       type: messageType,
       isNewThread: thread.isNew,
+      triggering: agentsToTrigger,
     });
 
-    // Trigger: on thread creation, trigger all initial participants
+    // Dispatch triggers with session routing from thread history
     const triggeredAgents: string[] = [];
-    if (trigger) {
+    if (agentsToTrigger.length > 0) {
       const gateway = getAgentGateway();
-      const agentsToTrigger = allRecipients.filter((a) => a !== senderAgentId);
 
       for (const toAgentId of agentsToTrigger) {
         // Auto-resolve recipientSessionId: find the recipient's most recent
@@ -834,7 +903,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
             ? {
                 threadsWithUnread,
                 threadHint:
-                  'You have unread thread messages. Use get_thread_messages(threadKey) to read them, reply_to_thread to respond, or mark_thread_read to acknowledge.',
+                  'You have unread thread messages. Use get_thread_messages(threadKey) to read them, send_to_inbox(threadKey) to respond, or mark_thread_read to acknowledge.',
               }
             : {}),
         }),
@@ -1001,7 +1070,7 @@ export const inboxToolDefinitions = [
   {
     name: 'send_to_inbox',
     description:
-      'Send a message to agent(s). Supports both simple inbox messages and group threads.\n\nSingle recipient: send_to_inbox(recipientAgentId: "lumen", content: "...")\nGroup thread: send_to_inbox(recipients: ["lumen", "aster"], threadKey: "pr:165", content: "...")\n\nWhen threadKey is provided, messages go to inbox_thread_messages (thread-first model). Late joiners see full history. Without threadKey, creates a simple agent_inbox row (unchanged behavior).\n\nFor existing threads, use reply_to_thread instead — it has smarter trigger defaults (1:1 triggers other participant, group triggers creator only).\n\nMessage types:\n- message: General communication\n- task_request: Request another agent to do work\n- session_resume: Request agent to resume a specific session\n- notification: FYI, no response needed\n- permission_grant: Grant or revoke tool permissions\n\nTrigger behavior:\nAll message types trigger recipients by default. On thread creation, all initial participants are triggered. Set trigger=false only if the message can wait 5+ hours.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
+      'Send a message to agent(s) or reply to a thread. Unified tool for all cross-agent messaging.\n\nSingle recipient: send_to_inbox(recipientAgentId: "lumen", content: "...")\nGroup thread: send_to_inbox(recipients: ["lumen", "aster"], threadKey: "pr:165", content: "...")\nReply to thread: send_to_inbox(recipientAgentId: "lumen", threadKey: "pr:165", content: "...")\n\nWhen threadKey is provided, messages go to inbox_thread_messages (thread-first model). Late joiners see full history. Without threadKey, creates a simple agent_inbox row.\n\nFor existing threads, reply semantics are automatic: closed threads are rejected, and smart trigger defaults apply (1:1 → other participant; group non-creator → creator; group creator → no one). Override with triggerAll or triggerAgents.\n\nMessage types:\n- message: General communication\n- task_request: Request another agent to do work\n- session_resume: Request agent to resume a specific session\n- notification: FYI, no response needed\n- permission_grant: Grant or revoke tool permissions\n\nTrigger behavior:\nAll message types trigger recipients by default. Set trigger=false only if the message can wait 5+ hours.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
     schema: sendToInboxSchema,
     handler: handleSendToInbox,
   },

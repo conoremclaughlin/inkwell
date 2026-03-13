@@ -15,7 +15,6 @@ import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
-import { getRequestContext, getSessionContext } from '../../utils/request-context';
 
 // The thread tables are new and not yet in generated Supabase types.
 // Use type-safe wrappers that cast the table name for PostgREST queries.
@@ -45,30 +44,6 @@ const getThreadMessagesSchema = userIdentifierBaseSchema.extend({
   markRead: z.boolean().optional().default(true),
 });
 
-const replyToThreadSchema = userIdentifierBaseSchema.extend({
-  threadKey: threadKeySchema,
-  content: z.string().min(1).max(20000),
-  senderAgentId: z.string().optional(),
-  messageType: z
-    .enum(['message', 'task_request', 'session_resume', 'notification'])
-    .optional()
-    .default('message'),
-  priority: z.enum(['low', 'normal', 'high', 'urgent']).optional().default('normal'),
-  trigger: z
-    .boolean()
-    .optional()
-    .describe('Set to false to suppress all triggers. Overrides triggerAll and triggerAgents.'),
-  triggerAll: z.boolean().optional().default(false),
-  triggerAgents: z
-    .array(agentIdSchema)
-    .max(16)
-    .optional()
-    .describe(
-      'Trigger specific participants by agent ID. Overrides default trigger rules. Non-participants are silently ignored.'
-    ),
-  metadata: z.record(z.unknown()).optional(),
-});
-
 const addThreadParticipantSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
   agentId: agentIdSchema.describe('Agent ID to add to the thread'),
@@ -94,7 +69,7 @@ const markThreadReadSchema = userIdentifierBaseSchema.extend({
   agentId: agentIdSchema.describe('Agent ID marking the thread as read'),
 });
 
-// ============== Helpers ==============
+// ============== Helpers (exported for use by inbox-handlers) ==============
 
 interface ThreadRow {
   id: string;
@@ -113,7 +88,7 @@ interface ThreadRow {
 /**
  * Look up a thread by (user_id, thread_key). Returns null if not found.
  */
-async function findThread(
+export async function findThread(
   supabase: ReturnType<DataComposer['getClient']>,
   userId: string,
   threadKey: string
@@ -134,7 +109,7 @@ async function findThread(
 /**
  * Get all participant agent IDs for a thread.
  */
-async function getParticipants(
+export async function getParticipants(
   supabase: ReturnType<DataComposer['getClient']>,
   threadId: string
 ): Promise<string[]> {
@@ -152,7 +127,7 @@ async function getParticipants(
 /**
  * Check if an agent is a participant in a thread.
  */
-async function isParticipant(
+export async function isParticipant(
   supabase: ReturnType<DataComposer['getClient']>,
   threadId: string,
   agentId: string
@@ -173,7 +148,7 @@ async function isParticipant(
  * 2. triggerAll: true → wake all participants except sender
  * 3. Default: 1:1 → other participant; group non-creator → creator; group creator → no one
  */
-function resolveTriggeredAgents(opts: {
+export function resolveTriggeredAgents(opts: {
   senderAgentId: string;
   participants: string[];
   creatorAgentId: string;
@@ -218,7 +193,7 @@ function resolveTriggeredAgents(opts: {
 /**
  * Dispatch triggers to a list of agents.
  */
-function dispatchTriggers(
+export function dispatchTriggers(
   agentsToTrigger: string[],
   opts: {
     fromAgentId: string;
@@ -360,171 +335,6 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
             metadata: m.metadata,
             createdAt: m.created_at,
           })),
-        }),
-      },
-    ],
-  };
-}
-
-export async function handleReplyToThread(args: unknown, dataComposer: DataComposer) {
-  const supabase = dataComposer.getClient();
-  const parsed = replyToThreadSchema.parse(args);
-  const resolved = await resolveUserOrThrow(parsed, dataComposer);
-
-  const senderAgentId = getEffectiveAgentId(parsed.senderAgentId) ?? parsed.senderAgentId;
-  if (!senderAgentId) {
-    throw new Error('senderAgentId is required (or must be resolvable from auth context)');
-  }
-
-  const {
-    threadKey,
-    content,
-    messageType,
-    priority,
-    trigger,
-    triggerAll,
-    triggerAgents,
-    metadata,
-  } = parsed;
-
-  // Find thread
-  const thread = await findThread(supabase, resolved.user.id, threadKey);
-  if (!thread) {
-    return {
-      content: [
-        {
-          type: 'text' as const,
-          text: JSON.stringify({ success: false, error: `Thread not found: ${threadKey}` }),
-        },
-      ],
-    };
-  }
-
-  // Reject replies on closed threads
-  if (thread.status === 'closed') {
-    return {
-      content: [
-        {
-          type: 'text' as const,
-          text: JSON.stringify({
-            success: false,
-            error: `Thread ${threadKey} is closed. Cannot reply to closed threads.`,
-          }),
-        },
-      ],
-    };
-  }
-
-  // Verify participant membership
-  if (!(await isParticipant(supabase, thread.id, senderAgentId))) {
-    return {
-      content: [
-        {
-          type: 'text' as const,
-          text: JSON.stringify({
-            success: false,
-            error: `Agent ${senderAgentId} is not a participant in thread ${threadKey}`,
-          }),
-        },
-      ],
-    };
-  }
-
-  // Enrich metadata with sender session context (mirrors handleSendToInbox)
-  const reqCtx = getRequestContext();
-  const sessCtx = getSessionContext();
-  const senderSessionId = reqCtx?.sessionId || sessCtx?.sessionId || null;
-  const senderStudioId = reqCtx?.workspaceId || sessCtx?.workspaceId || null;
-
-  const rawMeta =
-    metadata && typeof metadata === 'object' ? (metadata as Record<string, unknown>) : {};
-  const existingPcpMeta =
-    rawMeta.pcp && typeof rawMeta.pcp === 'object' ? (rawMeta.pcp as Record<string, unknown>) : {};
-  const enrichedMetadata = {
-    ...rawMeta,
-    pcp: {
-      ...existingPcpMeta,
-      sender: {
-        agentId: senderAgentId,
-        sessionId: senderSessionId,
-        studioId: senderStudioId,
-      },
-    },
-  };
-
-  // Insert message
-  const { data: message, error } = await threadTable(supabase, 'inbox_thread_messages')
-    .insert({
-      thread_id: thread.id,
-      sender_agent_id: senderAgentId,
-      content,
-      message_type: messageType,
-      priority,
-      metadata: enrichedMetadata as Json,
-    })
-    .select()
-    .single();
-
-  if (error) {
-    throw new Error(`Failed to reply to thread: ${error.message}`);
-  }
-
-  // Update thread updated_at
-  await threadTable(supabase, 'inbox_threads')
-    .update({ updated_at: new Date().toISOString() })
-    .eq('id', thread.id);
-
-  // Update sender's read status
-  await threadTable(supabase, 'inbox_thread_read_status').upsert(
-    {
-      thread_id: thread.id,
-      agent_id: senderAgentId,
-      last_read_at: new Date().toISOString(),
-    },
-    { onConflict: 'thread_id,agent_id' }
-  );
-
-  // Resolve triggers (trigger: false suppresses all)
-  const participants = await getParticipants(supabase, thread.id);
-  const agentsToTrigger =
-    trigger === false
-      ? []
-      : resolveTriggeredAgents({
-          senderAgentId,
-          participants,
-          creatorAgentId: thread.created_by_agent_id,
-          triggerAgents,
-          triggerAll,
-        });
-
-  logger.info('Thread reply sent', {
-    threadKey,
-    messageId: message.id,
-    from: senderAgentId,
-    triggering: agentsToTrigger,
-  });
-
-  // Dispatch triggers
-  dispatchTriggers(agentsToTrigger, {
-    fromAgentId: senderAgentId,
-    threadKey,
-    summary: `Reply in thread ${threadKey} from ${senderAgentId}`,
-    priority,
-    threadMessageId: message.id,
-  });
-
-  return {
-    content: [
-      {
-        type: 'text' as const,
-        text: JSON.stringify({
-          success: true,
-          message: 'Reply sent',
-          messageId: message.id,
-          threadKey,
-          senderAgentId,
-          triggered: agentsToTrigger,
-          participants,
         }),
       },
     ],
@@ -907,13 +717,6 @@ export const threadToolDefinitions = [
       'Get the full message timeline of a thread. Requires participant membership. Automatically marks the thread as read for the requesting agent.',
     schema: getThreadMessagesSchema,
     handler: handleGetThreadMessages,
-  },
-  {
-    name: 'reply_to_thread',
-    description:
-      'Reply to a thread. Trigger behavior depends on thread size:\n- 1:1 thread: triggers the other participant by default\n- Group thread (non-creator reply): triggers creator by default\n- Group thread (creator reply): triggers no one by default\nSet trigger=false to suppress all triggers. Use triggerAgents for targeted waking, triggerAll for broadcast.',
-    schema: replyToThreadSchema,
-    handler: handleReplyToThread,
   },
   {
     name: 'add_thread_participant',

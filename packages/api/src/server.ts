@@ -730,7 +730,7 @@ Type: ${payload.triggerType}`;
 
 ---
 IMPORTANT: This is a system trigger, NOT a user message on Telegram/WhatsApp.
-${payload.threadKey ? `Fetch the thread using get_thread_messages(threadKey: "${payload.threadKey}"). Use reply_to_thread to respond.` : 'Check your inbox for the full message using get_inbox.'}
+${payload.threadKey ? `Fetch the thread using get_thread_messages(threadKey: "${payload.threadKey}"). Use send_to_inbox with threadKey to respond.` : 'Check your inbox for the full message using get_inbox.'}
 If you need to message a user, use send_response with the appropriate channel and conversationId.
 When you complete a task_request, mark it as completed using update_inbox_message(messageId, status: "completed").`;
 
