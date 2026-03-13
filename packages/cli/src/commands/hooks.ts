@@ -2051,11 +2051,13 @@ export function registerHooksCommands(program: Command): void {
   hooks
     .command('pre-compact')
     .description('Hook: output pre-compaction reminder')
+    .option('--backend <name>', 'Backend context for this hook invocation')
     .action(preCompactHandler);
 
   hooks
     .command('post-compact')
     .description('Hook: post-compaction bootstrap and inbox check')
+    .option('--backend <name>', 'Backend context for this hook invocation')
     .action(postCompactHandler);
 
   hooks
