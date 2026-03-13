@@ -54,6 +54,10 @@ const replyToThreadSchema = userIdentifierBaseSchema.extend({
     .optional()
     .default('message'),
   priority: z.enum(['low', 'normal', 'high', 'urgent']).optional().default('normal'),
+  trigger: z
+    .boolean()
+    .optional()
+    .describe('Set to false to suppress all triggers. Overrides triggerAll and triggerAgents.'),
   triggerAll: z.boolean().optional().default(false),
   triggerAgents: z
     .array(agentIdSchema)
@@ -372,7 +376,16 @@ export async function handleReplyToThread(args: unknown, dataComposer: DataCompo
     throw new Error('senderAgentId is required (or must be resolvable from auth context)');
   }
 
-  const { threadKey, content, messageType, priority, triggerAll, triggerAgents, metadata } = parsed;
+  const {
+    threadKey,
+    content,
+    messageType,
+    priority,
+    trigger,
+    triggerAll,
+    triggerAgents,
+    metadata,
+  } = parsed;
 
   // Find thread
   const thread = await findThread(supabase, resolved.user.id, threadKey);
@@ -471,15 +484,18 @@ export async function handleReplyToThread(args: unknown, dataComposer: DataCompo
     { onConflict: 'thread_id,agent_id' }
   );
 
-  // Resolve triggers
+  // Resolve triggers (trigger: false suppresses all)
   const participants = await getParticipants(supabase, thread.id);
-  const agentsToTrigger = resolveTriggeredAgents({
-    senderAgentId,
-    participants,
-    creatorAgentId: thread.created_by_agent_id,
-    triggerAgents,
-    triggerAll,
-  });
+  const agentsToTrigger =
+    trigger === false
+      ? []
+      : resolveTriggeredAgents({
+          senderAgentId,
+          participants,
+          creatorAgentId: thread.created_by_agent_id,
+          triggerAgents,
+          triggerAll,
+        });
 
   logger.info('Thread reply sent', {
     threadKey,
@@ -895,7 +911,7 @@ export const threadToolDefinitions = [
   {
     name: 'reply_to_thread',
     description:
-      'Reply to a thread. Trigger behavior depends on thread size:\n- 1:1 thread: triggers the other participant by default\n- Group thread (non-creator reply): triggers creator by default\n- Group thread (creator reply): triggers no one by default\nUse triggerAgents for targeted waking, triggerAll for broadcast.',
+      'Reply to a thread. Trigger behavior depends on thread size:\n- 1:1 thread: triggers the other participant by default\n- Group thread (non-creator reply): triggers creator by default\n- Group thread (creator reply): triggers no one by default\nSet trigger=false to suppress all triggers. Use triggerAgents for targeted waking, triggerAll for broadcast.',
     schema: replyToThreadSchema,
     handler: handleReplyToThread,
   },

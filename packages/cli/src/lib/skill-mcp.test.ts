@@ -67,12 +67,15 @@ type: guide
 describe('buildMergedMcpConfig', () => {
   let tmpDir: string;
   let savedPcpSessionId: string | undefined;
+  let savedPcpStudioId: string | undefined;
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'merged-mcp-'));
-    // Isolate PCP_SESSION_ID — some tests depend on it being absent
+    // Isolate PCP_SESSION_ID and PCP_STUDIO_ID — some tests depend on them being absent
     savedPcpSessionId = process.env.PCP_SESSION_ID;
+    savedPcpStudioId = process.env.PCP_STUDIO_ID;
     delete process.env.PCP_SESSION_ID;
+    delete process.env.PCP_STUDIO_ID;
   });
 
   afterEach(() => {
@@ -81,6 +84,11 @@ describe('buildMergedMcpConfig', () => {
       process.env.PCP_SESSION_ID = savedPcpSessionId;
     } else {
       delete process.env.PCP_SESSION_ID;
+    }
+    if (savedPcpStudioId !== undefined) {
+      process.env.PCP_STUDIO_ID = savedPcpStudioId;
+    } else {
+      delete process.env.PCP_STUDIO_ID;
     }
   });
 
