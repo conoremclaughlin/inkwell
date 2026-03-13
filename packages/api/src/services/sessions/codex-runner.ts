@@ -7,7 +7,7 @@
 
 import { spawn, type ChildProcess } from 'child_process';
 import { randomUUID } from 'crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import type {
@@ -22,65 +22,7 @@ import type {
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
-import { buildSessionEnv } from '@personal-context/shared';
-
-/** Write runtime hint files so the on-session-start hook finds the right PCP session. */
-function writeRuntimeSessionHint(
-  workingDirectory: string,
-  pcpSessionId: string,
-  agentId: string,
-  backend: string,
-  runtimeLinkId: string,
-  studioId?: string
-): void {
-  try {
-    const runtimeDir = join(workingDirectory, '.pcp', 'runtime');
-    mkdirSync(runtimeDir, { recursive: true });
-    const sessionsPath = join(runtimeDir, 'sessions.json');
-    let state: {
-      version: 1;
-      current?: Record<string, unknown>;
-      sessions: Array<Record<string, unknown>>;
-    } = { version: 1, sessions: [] };
-    if (existsSync(sessionsPath)) {
-      try {
-        const raw = JSON.parse(readFileSync(sessionsPath, 'utf-8')) as typeof state;
-        if (raw.version === 1 && Array.isArray(raw.sessions)) state = raw;
-      } catch {
-        // Corrupt file — start fresh.
-      }
-    }
-    const now = new Date().toISOString();
-    const record: Record<string, unknown> = {
-      pcpSessionId,
-      backend,
-      agentId,
-      runtimeLinkId,
-      ...(studioId ? { studioId } : {}),
-      updatedAt: now,
-      startedAt: now,
-    };
-    const idx = state.sessions.findIndex(
-      (s) =>
-        s['pcpSessionId'] === pcpSessionId && s['backend'] === backend && s['agentId'] === agentId
-    );
-    if (idx >= 0) {
-      state.sessions[idx] = { ...state.sessions[idx], ...record };
-    } else {
-      state.sessions.push(record);
-    }
-    state.current = {
-      pcpSessionId,
-      backend,
-      agentId,
-      ...(studioId ? { studioId } : {}),
-      updatedAt: now,
-    };
-    writeFileSync(sessionsPath, JSON.stringify(state, null, 2));
-  } catch {
-    // Best-effort only.
-  }
-}
+import { buildSessionEnv, writeRuntimeSessionHint } from '@personal-context/shared';
 
 /** Maximum time (ms) to wait for a Codex CLI subprocess before killing it.
  *  Override with CODEX_PROCESS_TIMEOUT_MS env var. */

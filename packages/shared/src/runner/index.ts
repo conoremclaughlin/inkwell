@@ -12,3 +12,5 @@ export {
   type InjectSessionHeadersOptions,
   type InjectSessionHeadersResult,
 } from './mcp-config.js';
+
+export { writeRuntimeSessionHint } from './runtime-hints.js';

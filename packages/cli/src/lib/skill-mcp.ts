@@ -3,11 +3,15 @@
  *
  * Reads skills that provide MCP servers (via `mcp` field in YAML frontmatter)
  * and merges them into a temporary .mcp.json for the backend to consume.
+ *
+ * Session header injection is delegated to the shared `injectSessionHeaders`
+ * utility (packages/shared) so the same logic runs in both CLI and server paths.
  */
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { injectSessionHeaders } from '@personal-context/shared';
 import { discoverSkills } from '../repl/skills.js';
 
 export interface SkillMcpServer {
@@ -135,9 +139,12 @@ interface McpJsonConfig {
 
 /**
  * Build a merged MCP config that includes both the project's .mcp.json
- * and any skill-provided MCP servers. Also injects PCP session headers
- * when the PCP_SESSION_ID env var is set (propagates session identity
- * through to the MCP server via HTTP headers).
+ * and any skill-provided MCP servers. Also injects PCP session/studio
+ * headers via the shared injectSessionHeaders utility.
+ *
+ * Two layers:
+ * 1. Session header injection (shared with server runners via @personal-context/shared)
+ * 2. Skill MCP server merging (CLI-only — server runners don't load skills)
  *
  * Returns the path to a temp file and a cleanup function.
  * When no modifications are needed, returns the original .mcp.json path.
@@ -147,44 +154,46 @@ export function buildMergedMcpConfig(cwd: string): {
   cleanup: () => void;
 } {
   const projectMcpPath = join(cwd, '.mcp.json');
-  const skillServers = discoverSkillMcpServers(cwd);
+  const hasProjectConfig = existsSync(projectMcpPath);
 
-  // Load existing project config (if any)
+  // ── Layer 1: Session header injection (shared logic) ──
+  // Delegates to the same injectSessionHeaders used by server runners.
+  const cleanups: Array<() => void> = [];
+  let effectivePath = hasProjectConfig ? projectMcpPath : null;
+
+  if (effectivePath && process.env.PCP_SESSION_ID) {
+    const injection = injectSessionHeaders({
+      mcpConfigPath: effectivePath,
+      pcpSessionId: process.env.PCP_SESSION_ID,
+      studioId: process.env.PCP_STUDIO_ID,
+    });
+    if (injection.modified) {
+      effectivePath = injection.mcpConfigPath;
+      cleanups.push(injection.cleanup);
+    }
+  }
+
+  // ── Layer 2: Skill MCP server merging (CLI-only) ──
+  const skillServers = discoverSkillMcpServers(cwd);
+  if (skillServers.length === 0) {
+    return {
+      mcpConfigPath: effectivePath,
+      cleanup: () => cleanups.forEach((fn) => fn()),
+    };
+  }
+
+  // Load config (from injection temp file or original)
   let config: McpJsonConfig = { mcpServers: {} };
-  let hasProjectConfig = false;
-  if (existsSync(projectMcpPath)) {
-    hasProjectConfig = true;
+  if (effectivePath) {
     try {
-      const parsed = JSON.parse(readFileSync(projectMcpPath, 'utf-8'));
+      const parsed = JSON.parse(readFileSync(effectivePath, 'utf-8'));
       config = { mcpServers: {}, ...parsed };
     } catch {
       config = { mcpServers: {} };
     }
   }
 
-  let modified = false;
-
-  // Inject PCP session/studio headers when env vars are present.
-  // Uses ${VAR} interpolation — Claude Code resolves env vars in headers at runtime.
-  // Only inject if not already present (respect user-configured headers).
-  if (config.mcpServers.pcp) {
-    if (process.env.PCP_SESSION_ID && !config.mcpServers.pcp.headers?.['x-pcp-session-id']) {
-      config.mcpServers.pcp.headers = {
-        ...config.mcpServers.pcp.headers,
-        'x-pcp-session-id': '${PCP_SESSION_ID}',
-      };
-      modified = true;
-    }
-    if (process.env.PCP_STUDIO_ID && !config.mcpServers.pcp.headers?.['x-pcp-studio-id']) {
-      config.mcpServers.pcp.headers = {
-        ...config.mcpServers.pcp.headers,
-        'x-pcp-studio-id': '${PCP_STUDIO_ID}',
-      };
-      modified = true;
-    }
-  }
-
-  // Merge skill-provided servers (don't override existing ones)
+  let skillsModified = false;
   for (const server of skillServers) {
     if (!config.mcpServers[server.name]) {
       config.mcpServers[server.name] = {
@@ -193,23 +202,25 @@ export function buildMergedMcpConfig(cwd: string): {
         args: server.args,
         ...(server.env ? { env: server.env } : {}),
       };
-      modified = true;
+      skillsModified = true;
     }
   }
 
-  // No modifications needed — return original path
-  if (!modified) {
+  if (!skillsModified) {
     return {
-      mcpConfigPath: hasProjectConfig ? projectMcpPath : null,
-      cleanup: () => {},
+      mcpConfigPath: effectivePath,
+      cleanup: () => cleanups.forEach((fn) => fn()),
     };
   }
 
-  // Write merged config to temp file
+  // Write final merged config (skills + headers) to temp file
   const tmpDir = join(tmpdir(), 'sb-mcp');
   mkdirSync(tmpDir, { recursive: true });
   const tmpPath = join(tmpDir, `mcp-${process.pid}.json`);
   writeFileSync(tmpPath, JSON.stringify(config, null, 2));
+
+  // Clean up the injection temp file (if any) since we wrote a new one
+  cleanups.forEach((fn) => fn());
 
   return {
     mcpConfigPath: tmpPath,
