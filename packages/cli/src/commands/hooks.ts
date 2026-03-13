@@ -1623,6 +1623,7 @@ async function postCompactHandler(): Promise<void> {
     const bootstrap = await callPcpTool('bootstrap', {
       email: config?.email,
       agentId,
+      postCompact: true,
     });
     identityBlock = buildIdentityBlock(bootstrap);
     memoriesBlock = buildMemoriesBlock(

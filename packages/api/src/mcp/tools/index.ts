@@ -1739,6 +1739,12 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .max(20)
           .optional()
           .describe('Max recent memories to include (default: 5)'),
+        postCompact: z
+          .boolean()
+          .optional()
+          .describe(
+            'Set true when bootstrapping after context compaction. Includes the most recent memories regardless of salience to restore context continuity.'
+          ),
         agentId: z
           .string()
           .optional()

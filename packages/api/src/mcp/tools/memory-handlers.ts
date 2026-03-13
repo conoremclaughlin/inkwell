@@ -483,6 +483,12 @@ export const bootstrapSchema = userIdentifierBaseSchema.extend({
     .describe(
       'Max high-salience memories to fetch for knowledge summary (default: 50). Critical memories always included regardless.'
     ),
+  postCompact: z
+    .boolean()
+    .optional()
+    .describe(
+      'Set true when bootstrapping after context compaction. Includes the most recent memories regardless of salience to restore context continuity.'
+    ),
   agentId: z
     .string()
     .optional()
@@ -1703,6 +1709,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   });
 
   const includeMemories = params.includeRecentMemories !== false;
+  const postCompact = params.postCompact === true;
   const agentId = params.agentId;
   const basePath = params.identityBasePath || path.join(os.homedir(), '.pcp');
   const supabase = dataComposer.getClient();
@@ -1756,7 +1763,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     projects,
     focus,
     activeSessions,
-    knowledgeMemories,
+    knowledgeMemoriesBase,
     dbIdentity,
     userTimezone,
     userSkills,
@@ -1798,6 +1805,23 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
       return [];
     }),
   ]);
+
+  // Post-compact: merge in most recent memories regardless of salience
+  // to restore context continuity after lossy compaction
+  let knowledgeMemories = knowledgeMemoriesBase;
+  if (postCompact && includeMemories) {
+    const recentMemories = await dataComposer.repositories.memory.getRecentMemories(
+      user.id,
+      agentId,
+      10
+    );
+    // Merge and dedupe — recent memories may already be in the knowledge set
+    const existingIds = new Set(knowledgeMemories.map((m) => m.id));
+    const newRecents = recentMemories.filter((m) => !existingIds.has(m.id));
+    if (newRecents.length > 0) {
+      knowledgeMemories = [...knowledgeMemories, ...newRecents];
+    }
+  }
 
   // Resolve workspace scope for shared docs:
   // 1) explicit workspaceId param

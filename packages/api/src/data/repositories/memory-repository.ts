@@ -220,6 +220,32 @@ export class MemoryRepository {
     return [...criticalMemories, ...highMemories];
   }
 
+  /**
+   * Fetch the most recent memories regardless of salience.
+   * Used after compaction to restore context continuity — the agent
+   * likely just saved these via `remember` before compaction hit.
+   */
+  async getRecentMemories(userId: string, agentId?: string, limit: number = 10): Promise<Memory[]> {
+    let q = this.supabase
+      .from('memories')
+      .select('*')
+      .eq('user_id', userId)
+      .or('expires_at.is.null,expires_at.gt.now()')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (agentId) {
+      q = q.or(`agent_id.eq.${agentId},agent_id.is.null`);
+    }
+
+    const { data, error } = await q;
+    if (error) {
+      logger.error('Failed to fetch recent memories:', error);
+      return [];
+    }
+    return (data || []).map(this.rowToMemory);
+  }
+
   // ==================== MEMORY SUMMARY CACHE ====================
 
   /**
