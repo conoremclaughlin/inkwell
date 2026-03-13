@@ -80,7 +80,7 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .boolean()
     .optional()
     .describe(
-      'Whether to trigger (wake) the recipient agent after sending. Defaults to true for ALL message types. Only set to false if the message can genuinely wait 5+ hours for the next heartbeat cycle. Most agents do not have heartbeats — untriggered messages may never be seen.'
+      'Whether to trigger (wake) recipient agents after sending. Defaults to true. When false, overrides triggerAll and triggerAgents — no agents are triggered. Only set to false if the message can genuinely wait 5+ hours. Most agents do not have heartbeats — untriggered messages may never be seen.'
     ),
   triggerType: z
     .enum(['task_complete', 'approval_needed', 'message', 'error', 'custom'])
