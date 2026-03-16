@@ -62,6 +62,18 @@ function mapUserContext(row: DbUser, contacts: DbContact[]): UserContext {
 /**
  * Build temporal context for current time in user's timezone.
  */
+
+function isLowValueRecentMemory(memory: DbMemory): boolean {
+  const content = (memory.content || '').trim();
+  const topics = Array.isArray(memory.topics) ? memory.topics : [];
+
+  if (/^Session entered phase:/i.test(content)) return true;
+  if (topics.includes('session-phase') && /^\[[^\]]+\]\s*$/.test(content)) return true;
+  if (/^\[complete\]\s+Equivalent of end_session/i.test(content)) return true;
+
+  return false;
+}
+
 function buildTemporalContext(timezone: string): TemporalContext {
   const now = new Date();
 
@@ -138,11 +150,13 @@ export class ContextBuilder implements IContextBuilder {
     const userContext = mapUserContext(user, contacts);
     const temporal = buildTemporalContext(userContext.timezone);
 
+    const filteredRecentMemories = recentMemories.filter((m) => !isLowValueRecentMemory(m));
+
     const context: InjectedContext = {
       agent: agentIdentity,
       user: userContext,
       temporal,
-      recentMemories: recentMemories.map((m) => ({
+      recentMemories: filteredRecentMemories.map((m) => ({
         id: m.id,
         content: m.content,
         source: m.source,
@@ -223,7 +237,12 @@ export class ContextBuilder implements IContextBuilder {
         .maybeSingle();
 
       if (byIdError) {
-        logger.error('Error fetching agent identity by identityId', { userId, agentId, identityId, error: byIdError });
+        logger.error('Error fetching agent identity by identityId', {
+          userId,
+          agentId,
+          identityId,
+          error: byIdError,
+        });
         throw byIdError;
       }
 

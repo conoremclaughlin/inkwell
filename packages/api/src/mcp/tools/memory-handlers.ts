@@ -1201,10 +1201,26 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
 
 /**
  * Determines whether a phase transition should auto-create a memory.
- * Blocked and waiting phases create memories; active work phases don't.
+ * Only blocked/waiting/complete transitions are candidates, and they still
+ * require meaningful context before becoming durable memory.
  */
 function isSignificantPhaseTransition(phase: string): boolean {
   return phase.startsWith('blocked:') || phase.startsWith('waiting:') || phase === 'complete';
+}
+
+function buildPhaseTransitionMemoryContent(params: {
+  phase: string;
+  note?: string;
+  context?: string;
+}): string | null {
+  const detail = (params.note || params.context || '').trim();
+  if (!detail) return null;
+
+  if (params.phase === 'complete') {
+    return `[complete] ${detail}`;
+  }
+
+  return `[${params.phase}] ${detail}`;
 }
 
 export async function handleUpdateSessionPhase(args: unknown, dataComposer: DataComposer) {
@@ -1348,32 +1364,38 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
     },
   };
 
-  // Auto-create memory for significant phase transitions
+  // Auto-create memory for significant phase transitions only when there is
+  // meaningful outcome context. Bare state changes like "Session entered phase:
+  // complete" belong in session state/activity logs, not durable memory.
   if (params.phase && isSignificantPhaseTransition(params.phase)) {
-    const memoryContent = params.note
-      ? `[${params.phase}] ${params.note}`
-      : `Session entered phase: ${params.phase}`;
-
-    const memory = await dataComposer.repositories.memory.remember({
-      userId: user.id,
-      content: memoryContent,
-      source: 'session',
-      salience: 'high',
-      topics: ['session-phase', params.phase.split(':')[0]],
-      metadata: { sessionId, phase: params.phase },
-      agentId: params.agentId || updated.agentId,
-    });
-
-    result.memoryCreated = {
-      id: memory.id,
-      content: memoryContent,
-    };
-
-    logger.info(`Phase transition auto-created memory`, {
-      sessionId,
+    const memoryContent = buildPhaseTransitionMemoryContent({
       phase: params.phase,
-      memoryId: memory.id,
+      note: params.note,
+      context: params.context,
     });
+
+    if (memoryContent) {
+      const memory = await dataComposer.repositories.memory.remember({
+        userId: user.id,
+        content: memoryContent,
+        source: 'session',
+        salience: 'high',
+        topics: ['session-phase', params.phase.split(':')[0]],
+        metadata: { sessionId, phase: params.phase },
+        agentId: params.agentId || updated.agentId,
+      });
+
+      result.memoryCreated = {
+        id: memory.id,
+        content: memoryContent,
+      };
+
+      logger.info(`Phase transition auto-created memory`, {
+        sessionId,
+        phase: params.phase,
+        memoryId: memory.id,
+      });
+    }
   }
 
   // Optionally create a task for blockers
