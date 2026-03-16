@@ -586,6 +586,42 @@ describe('SessionService', () => {
         })
       );
     });
+
+    it('should pass existing backendSessionId to runner for resume', async () => {
+      const session = createMockSession({ backendSessionId: 'existing-thread-uuid' });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      const request = createMockRequest();
+      await sessionService.handleMessage(request);
+
+      expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+      const runArgs = vi.mocked(mockClaudeRunner.run).mock.calls[0][1];
+      expect(runArgs.backendSessionId).toBe('existing-thread-uuid');
+    });
+
+    it('should not inject context when resuming an existing backend session', async () => {
+      const session = createMockSession({ backendSessionId: 'existing-thread-uuid' });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      const request = createMockRequest();
+      await sessionService.handleMessage(request);
+
+      expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+      const runArgs = vi.mocked(mockClaudeRunner.run).mock.calls[0][1];
+      expect(runArgs.injectedContext).toBeUndefined();
+    });
+
+    it('should inject context for fresh sessions without backendSessionId', async () => {
+      const session = createMockSession({ backendSessionId: null });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      const request = createMockRequest();
+      await sessionService.handleMessage(request);
+
+      expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+      const runArgs = vi.mocked(mockClaudeRunner.run).mock.calls[0][1];
+      expect(runArgs.injectedContext).toBeDefined();
+    });
   });
 
   describe('Activity Stream Logging', () => {
@@ -913,6 +949,38 @@ describe('SessionService', () => {
 
       // Compaction should still complete
       expect(mockRepository.markCompacted).toHaveBeenCalledWith('session-123', 'claude-abc');
+    });
+
+    it('should pass runner backendSessionId to markCompacted (new session ID from compaction)', async () => {
+      const session = createMockSession({ backendSessionId: 'claude-abc' });
+      vi.mocked(mockRepository.findById).mockResolvedValue(session);
+      vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+
+      // Runner returns a NEW backend session ID (e.g., Claude Code creates a fresh session)
+      vi.mocked(mockClaudeRunner.run).mockResolvedValue(
+        createMockClaudeResult({ success: true, backendSessionId: 'claude-new-xyz' })
+      );
+
+      await sessionService.triggerCompaction('session-123');
+
+      // markCompacted should receive the NEW session ID from the runner, not the old one
+      expect(mockRepository.markCompacted).toHaveBeenCalledWith('session-123', 'claude-new-xyz');
+    });
+
+    it('should pass null to markCompacted when runner returns no backendSessionId (preserve existing)', async () => {
+      const session = createMockSession({ backendSessionId: 'codex-thread-uuid' });
+      vi.mocked(mockRepository.findById).mockResolvedValue(session);
+      vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
+
+      // Runner returns null/undefined backendSessionId (e.g., Codex reuses same thread)
+      vi.mocked(mockClaudeRunner.run).mockResolvedValue(
+        createMockClaudeResult({ success: true, backendSessionId: null })
+      );
+
+      await sessionService.triggerCompaction('session-123');
+
+      // null means "don't rotate" — existing backend_session_id should be preserved
+      expect(mockRepository.markCompacted).toHaveBeenCalledWith('session-123', null);
     });
   });
 
