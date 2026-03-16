@@ -1041,7 +1041,7 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
         return { agentId, count: count || 0 };
       })
     ),
-    // Latest session per agent
+    // Active (non-ended) sessions per agent — no limit so we get accurate counts
     Promise.all(
       agentIds.map(async (agentId) => {
         const { data } = await supabase
@@ -1049,8 +1049,8 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
           .select('id, agent_id, lifecycle, current_phase, started_at, ended_at, workspace_id')
           .eq('user_id', userId)
           .eq('agent_id', agentId)
-          .order('started_at', { ascending: false })
-          .limit(5);
+          .is('ended_at', null)
+          .order('started_at', { ascending: false });
         return { agentId, sessions: data || [] };
       })
     ),
@@ -1153,8 +1153,14 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
   // Assemble summaries
   const agents = agentIds.map((agentId) => {
     const sessions = sessionMap.get(agentId) || [];
-    const activeSessions = sessions.filter((s) => !s.ended_at);
     const latest = sessions[0] || null;
+
+    // Count sessions by lifecycle state
+    const byLifecycle: Record<string, number> = {};
+    for (const s of sessions) {
+      const lc = s.lifecycle || 'unknown';
+      byLifecycle[lc] = (byLifecycle[lc] || 0) + 1;
+    }
 
     const inboxUnread = inboxCountMap.get(agentId) || 0;
     const threadUnread = threadUnreadByAgent[agentId] || 0;
@@ -1164,7 +1170,8 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
       inboxUnread,
       threadUnread,
       totalUnread: inboxUnread + threadUnread,
-      activeSessions: activeSessions.length,
+      activeSessions: sessions.length,
+      sessionsByLifecycle: byLifecycle,
       latestSession: latest
         ? {
             id: latest.id,

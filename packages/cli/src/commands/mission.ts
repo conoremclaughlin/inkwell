@@ -27,6 +27,7 @@ interface MissionRow {
   latestLifecycle?: string;
   latestPhase?: string;
   latestBackendSessionId?: string;
+  sessionsByLifecycle?: Record<string, number>;
 }
 
 interface MissionSnapshot {
@@ -491,7 +492,8 @@ function newestSession(sessions: Session[]): Session | undefined {
 
 export function summarizeMissionRows(
   sessions: Session[],
-  unreadByAgent: Record<string, number>
+  unreadByAgent: Record<string, number>,
+  lifecycleByAgent?: Record<string, Record<string, number>>
 ): MissionRow[] {
   const grouped = new Map<string, Session[]>();
 
@@ -508,6 +510,14 @@ export function summarizeMissionRows(
     .map((agent) => {
       const list = grouped.get(agent) || [];
       const latest = newestSession(list);
+
+      // Count sessions by lifecycle
+      const byLifecycle: Record<string, number> = {};
+      for (const s of list) {
+        const lc = s.lifecycle || 'unknown';
+        byLifecycle[lc] = (byLifecycle[lc] || 0) + 1;
+      }
+
       return {
         agent,
         activeSessions: list.length,
@@ -517,6 +527,9 @@ export function summarizeMissionRows(
         latestLifecycle: latest?.lifecycle || 'idle',
         latestPhase: latest?.currentPhase || undefined,
         latestBackendSessionId: latest?.backendSessionId || latest?.claudeSessionId,
+        sessionsByLifecycle:
+          lifecycleByAgent?.[agent] ||
+          (Object.keys(byLifecycle).length > 0 ? byLifecycle : undefined),
       } satisfies MissionRow;
     })
     .sort((a, b) => {
@@ -613,9 +626,10 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
   const allInboxMessages: InboxMessage[] = [];
   const fetchAllInbox = options.feed || options.watch;
 
-  // Use get_agent_summaries for accurate per-agent unread counts.
+  // Use get_agent_summaries for accurate per-agent unread counts and session breakdowns.
   // This computes thread unreads with proper per-agent last_read_at (no inflation).
   const unreadByAgent: Record<string, number> = {};
+  const lifecycleByAgent: Record<string, Record<string, number>> = {};
   try {
     const summariesResult = (await pcp.callTool('get_agent_summaries', {
       email: config.email,
@@ -629,6 +643,16 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
       const totalUnread = typeof agent.totalUnread === 'number' ? agent.totalUnread : 0;
       unreadByAgent[agentId] = totalUnread;
       allAgents.add(agentId);
+
+      // Extract session lifecycle breakdown
+      const byLc = agent.sessionsByLifecycle;
+      if (byLc && typeof byLc === 'object' && !Array.isArray(byLc)) {
+        const breakdown: Record<string, number> = {};
+        for (const [lc, count] of Object.entries(byLc as Record<string, unknown>)) {
+          if (typeof count === 'number') breakdown[lc] = count;
+        }
+        if (Object.keys(breakdown).length > 0) lifecycleByAgent[agentId] = breakdown;
+      }
     }
   } catch {
     // Fallback: server doesn't support get_agent_summaries yet — derive from get_inbox
@@ -695,7 +719,7 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
   }
 
   return {
-    rows: summarizeMissionRows(sessions, unreadByAgent),
+    rows: summarizeMissionRows(sessions, unreadByAgent, lifecycleByAgent),
     sessions,
     feed,
     inboxMessages: allInboxMessages,
@@ -954,6 +978,7 @@ async function runInkMission(options: MissionOptions): Promise<void> {
         phase: row.latestPhase,
         unread: row.unreadInbox,
         sessions: row.activeSessions,
+        sessionsByLifecycle: row.sessionsByLifecycle,
         latestThread: row.latestThreadKey,
       }));
       mission.setAgents(agentSummaries);

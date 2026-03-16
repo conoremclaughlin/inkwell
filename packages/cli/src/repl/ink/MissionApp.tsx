@@ -24,6 +24,8 @@ export interface AgentSummary {
   phase?: string;
   unread: number;
   sessions: number;
+  /** Breakdown of session counts by lifecycle state, e.g. { running: 2, idle: 1 } */
+  sessionsByLifecycle?: Record<string, number>;
   latestThread?: string;
 }
 
@@ -212,11 +214,35 @@ export const MissionApp = React.forwardRef<MissionAppHandle, MissionAppProps>(fu
       <Box paddingX={1} flexDirection="column">
         {agents.length > 0 ? (
           agents.map((a) => {
+            // Format session counts by lifecycle (e.g. "2 running, 1 idle")
+            const byLc = a.sessionsByLifecycle;
+            let sessionLabel: string;
+            if (byLc && Object.keys(byLc).length > 0) {
+              const parts: string[] = [];
+              // Show running first (most important), then others
+              const order = ['running', 'idle', 'completed', 'failed'];
+              const seen = new Set<string>();
+              for (const lc of order) {
+                if (byLc[lc]) {
+                  parts.push(`${byLc[lc]} ${lc}`);
+                  seen.add(lc);
+                }
+              }
+              for (const [lc, count] of Object.entries(byLc)) {
+                if (!seen.has(lc)) parts.push(`${count} ${lc}`);
+              }
+              sessionLabel = parts.join(', ');
+            } else {
+              sessionLabel =
+                a.sessions > 0
+                  ? `${a.sessions} session${a.sessions !== 1 ? 's' : ''}`
+                  : 'no sessions';
+            }
+
             const line = [
               a.agent.padEnd(8),
-              a.status.padEnd(10),
               (a.phase || '-').padEnd(14),
-              `${a.sessions} session${a.sessions !== 1 ? 's' : ''}`,
+              sessionLabel,
               a.unread > 0 ? `${a.unread} unread` : '',
               a.latestThread || '',
             ]

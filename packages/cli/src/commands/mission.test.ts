@@ -22,12 +22,14 @@ describe('summarizeMissionRows', () => {
         id: '1',
         agentId: 'lumen',
         status: 'active',
+        lifecycle: 'running',
         startedAt: '2026-02-20T08:00:00.000Z',
       },
       {
         id: '2',
         agentId: 'lumen',
         status: 'active',
+        lifecycle: 'idle',
         startedAt: '2026-02-20T08:05:00.000Z',
         threadKey: 'pr:70',
         currentPhase: 'implementing',
@@ -37,6 +39,7 @@ describe('summarizeMissionRows', () => {
         id: '3',
         agentId: 'wren',
         status: 'active',
+        lifecycle: 'running',
         startedAt: '2026-02-20T07:55:00.000Z',
       },
     ];
@@ -53,6 +56,7 @@ describe('summarizeMissionRows', () => {
         latestLifecycle: 'idle',
         latestPhase: 'implementing',
         latestBackendSessionId: 'backend-123',
+        sessionsByLifecycle: { running: 1, idle: 1 },
       },
       {
         agent: 'wren',
@@ -60,9 +64,10 @@ describe('summarizeMissionRows', () => {
         unreadInbox: 1,
         latestSessionId: '3',
         latestThreadKey: undefined,
-        latestLifecycle: 'idle',
+        latestLifecycle: 'running',
         latestPhase: undefined,
         latestBackendSessionId: undefined,
+        sessionsByLifecycle: { running: 1 },
       },
       {
         agent: 'aster',
@@ -73,6 +78,7 @@ describe('summarizeMissionRows', () => {
         latestLifecycle: 'idle',
         latestPhase: undefined,
         latestBackendSessionId: undefined,
+        sessionsByLifecycle: undefined,
       },
     ]);
   });
