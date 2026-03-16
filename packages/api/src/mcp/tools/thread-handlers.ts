@@ -143,10 +143,11 @@ export async function isParticipant(
 /**
  * Determine which agents to trigger based on thread context.
  *
- * Rules (from spec v7):
+ * Rules:
  * 1. triggerAgents [...] → wake exactly these (filter to participants)
  * 2. triggerAll: true → wake all participants except sender
- * 3. Default: 1:1 → other participant; group non-creator → creator; group creator → no one
+ * 3. Actionable messages (task_request, session_resume) → trigger all recipients
+ * 4. Default: 1:1 → other participant; group non-creator → creator; group creator → no one
  */
 export function resolveTriggeredAgents(opts: {
   senderAgentId: string;
@@ -154,8 +155,11 @@ export function resolveTriggeredAgents(opts: {
   creatorAgentId: string;
   triggerAgents?: string[];
   triggerAll?: boolean;
+  messageType?: string;
+  recipients?: string[];
 }): string[] {
-  const { senderAgentId, participants, creatorAgentId, triggerAgents, triggerAll } = opts;
+  const { senderAgentId, participants, creatorAgentId, triggerAgents, triggerAll, messageType } =
+    opts;
 
   // Precedence 1: explicit triggerAgents (filter to actual participants, exclude sender)
   if (triggerAgents && triggerAgents.length > 0) {
@@ -179,6 +183,16 @@ export function resolveTriggeredAgents(opts: {
   // 1:1 thread (2 participants): trigger the other one
   if (participants.length === 2) {
     return otherParticipants;
+  }
+
+  // Group thread: actionable message types (task_request, session_resume) always
+  // trigger all recipients. The sender explicitly wants someone to act — silently
+  // triggering nobody violates the contract that "all message types trigger by default."
+  const actionableTypes = new Set(['task_request', 'session_resume']);
+  if (messageType && actionableTypes.has(messageType)) {
+    // Trigger explicit recipients if provided, otherwise all other participants
+    const targets = opts.recipients?.filter((a) => a !== senderAgentId) ?? otherParticipants;
+    return targets.filter((a) => participants.includes(a));
   }
 
   // Group thread: non-creator reply → trigger creator only

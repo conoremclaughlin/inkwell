@@ -359,6 +359,8 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           creatorAgentId: existingThread.created_by_agent_id,
           triggerAgents,
           triggerAll,
+          messageType,
+          recipients: allRecipients,
         });
       } else {
         // New thread: trigger all recipients except sender

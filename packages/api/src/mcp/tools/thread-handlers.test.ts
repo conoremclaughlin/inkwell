@@ -21,8 +21,11 @@ function resolveTriggeredAgents(opts: {
   creatorAgentId: string;
   triggerAgents?: string[];
   triggerAll?: boolean;
+  messageType?: string;
+  recipients?: string[];
 }): string[] {
-  const { senderAgentId, participants, creatorAgentId, triggerAgents, triggerAll } = opts;
+  const { senderAgentId, participants, creatorAgentId, triggerAgents, triggerAll, messageType } =
+    opts;
 
   if (triggerAgents && triggerAgents.length > 0) {
     const participantSet = new Set(participants);
@@ -41,6 +44,12 @@ function resolveTriggeredAgents(opts: {
 
   if (participants.length === 2) {
     return otherParticipants;
+  }
+
+  const actionableTypes = new Set(['task_request', 'session_resume']);
+  if (messageType && actionableTypes.has(messageType)) {
+    const targets = opts.recipients?.filter((a) => a !== senderAgentId) ?? otherParticipants;
+    return targets.filter((a) => participants.includes(a));
   }
 
   if (senderAgentId !== creatorAgentId) {
@@ -83,13 +92,70 @@ describe('resolveTriggeredAgents', () => {
       expect(result).toEqual(['wren']);
     });
 
-    it('should trigger no one when creator replies', () => {
+    it('should trigger no one when creator replies with a plain message', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants,
+        creatorAgentId: 'wren',
+        messageType: 'message',
+      });
+      expect(result).toEqual([]);
+    });
+
+    it('should trigger no one when creator replies with no messageType (default)', () => {
       const result = resolveTriggeredAgents({
         senderAgentId: 'wren',
         participants,
         creatorAgentId: 'wren',
       });
       expect(result).toEqual([]);
+    });
+  });
+
+  describe('actionable message types in group threads', () => {
+    const participants = ['wren', 'lumen', 'aster', 'myra'];
+
+    it('should trigger recipients when creator sends task_request', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants,
+        creatorAgentId: 'wren',
+        messageType: 'task_request',
+        recipients: ['lumen'],
+      });
+      expect(result).toEqual(['lumen']);
+    });
+
+    it('should trigger all other participants when creator sends task_request without explicit recipients', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants,
+        creatorAgentId: 'wren',
+        messageType: 'task_request',
+      });
+      expect(result).toEqual(['lumen', 'aster', 'myra']);
+    });
+
+    it('should trigger recipients when creator sends session_resume', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants,
+        creatorAgentId: 'wren',
+        messageType: 'session_resume',
+        recipients: ['aster'],
+      });
+      expect(result).toEqual(['aster']);
+    });
+
+    it('should filter recipients to actual participants only', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants: ['wren', 'lumen'],
+        creatorAgentId: 'wren',
+        messageType: 'task_request',
+        recipients: ['lumen', 'aster'], // aster is not a participant
+      });
+      expect(result).toEqual(['lumen']);
     });
   });
 

@@ -46,12 +46,14 @@ export const logger = winston.createLogger({
       level: 'error',
       maxsize: 5242880, // 5MB
       maxFiles: 5,
+      tailable: true,
     }),
     // Write all logs to combined.log
     new winston.transports.File({
       filename: join(PCP_LOG_DIR, 'combined.log'),
-      maxsize: 5242880, // 5MB
+      maxsize: 10485760, // 10MB
       maxFiles: 5,
+      tailable: true,
     }),
   ],
   exceptionHandlers: [
