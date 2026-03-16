@@ -305,8 +305,18 @@ export class MCPServer {
         try {
           const session = await this.dataComposer.repositories.memory.getSession(sessionIdHeader);
           if (session?.studioId) {
-            Object.assign(ctx, { workspaceId: session.studioId, workspaceSource: 'session' });
-            hasSessionDerivedWorkspace = true;
+            // Verify the session belongs to the authenticated user before
+            // trusting its studioId for workspace scoping.
+            if (session.userId !== userData.userId) {
+              logger.warn('Session-derived studioId rejected: session belongs to different user', {
+                sessionId: sessionIdHeader,
+                sessionUserId: session.userId,
+                authenticatedUserId: userData.userId,
+              });
+            } else {
+              Object.assign(ctx, { workspaceId: session.studioId, workspaceSource: 'session' });
+              hasSessionDerivedWorkspace = true;
+            }
           }
         } catch (error) {
           logger.debug('Failed to resolve studioId from session header', {
