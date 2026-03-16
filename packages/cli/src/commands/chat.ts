@@ -120,7 +120,6 @@ interface ChatRuntime {
   toolRouting: 'backend' | 'local';
   uiMode: 'scroll' | 'live';
   threadKey?: string;
-  workspaceId?: string;
   studioId?: string;
   userTimezone?: string;
   backendTokenWindow: number;
@@ -143,8 +142,6 @@ interface ChatRuntime {
 interface SessionSummary {
   id: string;
   agentId?: string;
-  workspaceId?: string;
-  workspaceName?: string;
   studioId?: string;
   studioName?: string;
   status?: string;
@@ -899,20 +896,6 @@ function extractSessionSummaries(
       return {
         id,
         agentId: typeof row.agentId === 'string' ? row.agentId : undefined,
-        workspaceId:
-          typeof row.workspaceId === 'string'
-            ? row.workspaceId
-            : typeof row.workspace_id === 'string'
-              ? row.workspace_id
-              : undefined,
-        workspaceName:
-          typeof row.workspaceName === 'string'
-            ? row.workspaceName
-            : typeof row.workspace_name === 'string'
-              ? row.workspace_name
-              : typeof studio?.worktreeFolder === 'string'
-                ? studio.worktreeFolder
-                : undefined,
         studioId:
           typeof row.studioId === 'string'
             ? row.studioId
@@ -1260,14 +1243,12 @@ function formatStudioForDisplay(studioId?: string, mode: 'short' | 'full' = 'sho
 }
 
 function sessionStudioLabel(
-  session: Pick<SessionSummary, 'studioId' | 'studioName' | 'workspaceId' | 'workspaceName'>,
+  session: Pick<SessionSummary, 'studioId' | 'studioName'>,
   mode: 'short' | 'full' = 'short'
 ): string {
-  const name = session.studioName || session.workspaceName;
   // Prefer name over UUID — UUIDs are noise for humans
-  if (name) return name;
-  const id = session.studioId || session.workspaceId;
-  return formatStudioForDisplay(id, mode);
+  if (session.studioName) return session.studioName;
+  return formatStudioForDisplay(session.studioId, mode);
 }
 
 function sessionBackendLabel(session: SessionSummary): string {
@@ -1480,14 +1461,12 @@ function filterSessionsByPolicy(
           sessionId: runtime.sessionId,
           threadKey: runtime.threadKey,
           studioId: runtime.studioId,
-          workspaceId: runtime.workspaceId,
           agentId,
         },
         target: {
           sessionId: session.id,
           threadKey: session.threadKey,
           studioId: session.studioId,
-          workspaceId: session.workspaceId,
           agentId: session.agentId,
         },
       }).allowed
@@ -1515,7 +1494,7 @@ function matchesAttachQuery(session: SessionSummary, query?: string): boolean {
     session.currentPhase || session.status || ''
   } ${session.backend || ''} ${session.model || ''} ${session.backendSessionId || session.claudeSessionId || ''} ${
     session.studioId || ''
-  } ${session.workspaceId || ''}`.toLowerCase();
+  }`.toLowerCase();
   return haystack.includes(query.toLowerCase());
 }
 
@@ -1552,7 +1531,7 @@ async function pickSessionToAttach(
     const historyMeta = sessionHistoryLabel(transcriptMeta);
     const lastMsg = formatTimestampForSessionList(transcriptMeta?.lastMessageAt, options?.timezone);
     const preview = sessionLatestMessagePreview(session, transcriptMeta);
-    const studioName = session.studioName || session.workspaceName;
+    const studioName = session.studioName;
     const thread = session.threadKey || '';
 
     // Compact two-line format: number + id + phase on line 1, details on line 2
@@ -1862,8 +1841,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       : persisted?.toolRouting || 'local',
     uiMode: options.ui === 'scroll' ? 'scroll' : 'live',
     threadKey: options.threadKey,
-    workspaceId: identity?.workspaceId,
-    studioId: identity?.workspaceId,
+    studioId: identity?.studioId,
     userTimezone: undefined,
     backendTokenWindow: initialBackendTokenWindow,
     sessionId: options.sessionId?.trim() || undefined,
@@ -1911,13 +1889,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
   );
   toolPolicy.setContext({
     agentId,
-    workspaceId: runtime.workspaceId,
     studioId: runtime.studioId,
   });
   if (runtime.studioId) {
     toolPolicy.setMutationScope('studio');
-  } else if (runtime.workspaceId) {
-    toolPolicy.setMutationScope('workspace');
   } else {
     toolPolicy.setMutationScope('agent');
   }
@@ -2061,9 +2036,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
       attachedSessionSummary = selected;
       runtime.sessionId = selected.id;
-      if (selected.workspaceId) {
-        runtime.workspaceId = selected.workspaceId;
-      }
       if (selected.studioId) {
         runtime.studioId = selected.studioId;
       }
@@ -2072,7 +2044,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
       toolPolicy.setContext({
         agentId,
-        workspaceId: runtime.workspaceId,
         studioId: runtime.studioId,
       });
       const currentScope = toolPolicy.getMutationScope();
@@ -2104,9 +2075,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (selected) {
       attachedSessionSummary = selected;
       runtime.sessionId = selected.id;
-      if (selected.workspaceId) {
-        runtime.workspaceId = selected.workspaceId;
-      }
       if (selected.studioId) {
         runtime.studioId = selected.studioId;
       }
@@ -2116,7 +2084,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
       autoAttachedLatest = true;
       toolPolicy.setContext({
         agentId,
-        workspaceId: runtime.workspaceId,
         studioId: runtime.studioId,
       });
       const currentScope = toolPolicy.getMutationScope();
@@ -2131,10 +2098,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
   if (!runtime.sessionId) {
     const startArgs: Record<string, unknown> = { agentId };
     if (runtime.threadKey) startArgs.threadKey = runtime.threadKey;
-    if (identity?.workspaceId) {
-      startArgs.studioId = identity.workspaceId;
-      // Backward compatibility for older server builds.
-      startArgs.workspaceId = identity.workspaceId;
+    if (identity?.studioId) {
+      startArgs.studioId = identity.studioId;
     }
 
     const sessionStartResult = (await pcp
@@ -2151,9 +2116,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
       (session) => session.id === runtime.sessionId
     );
     if (attachedSessionSummary) {
-      if (!runtime.workspaceId && attachedSessionSummary.workspaceId) {
-        runtime.workspaceId = attachedSessionSummary.workspaceId;
-      }
       if (!runtime.studioId && attachedSessionSummary.studioId) {
         runtime.studioId = attachedSessionSummary.studioId;
       }
@@ -2211,7 +2173,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
     threadKey: runtime.threadKey || null,
     sessionId: runtime.sessionId || null,
     studioId: runtime.studioId || null,
-    workspaceId: runtime.workspaceId || null,
     historySource: historyHydration?.source || null,
     attachedBackend: attachedSessionSummary?.backend || null,
     attachedModel: attachedSessionSummary?.model || null,
@@ -2239,8 +2200,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // Use studio slug/name where available, fall back to short ID
   const studioSlug =
     attachedSessionSummary?.studioName ||
-    attachedSessionSummary?.workspaceName ||
-    (identity?.workspaceId ? formatStudioForDisplay(identity.workspaceId, 'short') : undefined);
+    (identity?.studioId ? formatStudioForDisplay(identity.studioId, 'short') : undefined);
   const bannerParts = [
     chip('agent', agentId, chalk.cyan),
     chip(
@@ -2326,14 +2286,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
               sessionId: runtime.sessionId,
               threadKey: runtime.threadKey,
               studioId: runtime.studioId,
-              workspaceId: runtime.workspaceId,
               agentId,
             },
             target: {
               sessionId: msg.relatedSessionId,
               threadKey: msg.threadKey,
               studioId: msg.recipientStudioId,
-              workspaceId: runtime.workspaceId,
               agentId,
             },
           }).allowed
@@ -2558,14 +2516,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
               sessionId: runtime.sessionId,
               threadKey: runtime.threadKey,
               studioId: runtime.studioId,
-              workspaceId: runtime.workspaceId,
               agentId,
             },
             target: {
               sessionId: activity.sessionId,
               threadKey: runtime.threadKey,
               studioId: runtime.studioId,
-              workspaceId: runtime.workspaceId,
               agentId: activity.agentId,
             },
           }).allowed
@@ -3479,10 +3435,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               : null;
             const sessionStudio = attachedSessionSummary
               ? sessionStudioLabel(attachedSessionSummary, 'full')
-              : sessionStudioLabel(
-                  { studioId: runtime.studioId, workspaceId: runtime.workspaceId },
-                  'full'
-                );
+              : sessionStudioLabel({ studioId: runtime.studioId }, 'full');
             console.log(
               chalk.dim(
                 `session=${runtime.sessionId || 'none'} backend=${runtime.backend} model=${
@@ -4251,7 +4204,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               ttlSeconds: Number.isFinite(ttlMinutes) ? Math.max(1, ttlMinutes) * 60 : 15 * 60,
               sessionId: runtime.sessionId,
               threadKey: runtime.threadKey,
-              studioId: identity?.workspaceId,
+              studioId: identity?.studioId,
             },
             secret
           );
@@ -4335,7 +4288,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               ttlSeconds: 15 * 60,
               sessionId: runtime.sessionId,
               threadKey: runtime.threadKey,
-              studioId: identity?.workspaceId,
+              studioId: identity?.studioId,
             },
             secret
           );

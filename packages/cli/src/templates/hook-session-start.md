@@ -2,6 +2,7 @@
 
 Agent: **{{AGENT_ID}}**
 {{WORKSPACE_LINE}}
+{{SESSION_IDENTITY}}
 
 {{ROLE_BLOCK}}
 

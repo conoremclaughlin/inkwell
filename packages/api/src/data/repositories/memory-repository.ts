@@ -220,6 +220,32 @@ export class MemoryRepository {
     return [...criticalMemories, ...highMemories];
   }
 
+  /**
+   * Fetch the most recent memories regardless of salience.
+   * Used after compaction to restore context continuity — the agent
+   * likely just saved these via `remember` before compaction hit.
+   */
+  async getRecentMemories(userId: string, agentId?: string, limit: number = 10): Promise<Memory[]> {
+    let q = this.supabase
+      .from('memories')
+      .select('*')
+      .eq('user_id', userId)
+      .or('expires_at.is.null,expires_at.gt.now()')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (agentId) {
+      q = q.or(`agent_id.eq.${agentId},agent_id.is.null`);
+    }
+
+    const { data, error } = await q;
+    if (error) {
+      logger.error('Failed to fetch recent memories:', error);
+      return [];
+    }
+    return (data || []).map(this.rowToMemory);
+  }
+
   // ==================== MEMORY SUMMARY CACHE ====================
 
   /**
@@ -369,11 +395,9 @@ export class MemoryRepository {
     };
     if (input.backend) insertData.backend = input.backend;
     if (input.model) insertData.model = input.model;
-    const scopedStudioId = input.studioId ?? input.workspaceId;
+    const scopedStudioId = input.studioId;
     if (scopedStudioId !== undefined) {
       insertData.studio_id = scopedStudioId;
-      // Backward compatibility for older server versions still reading workspace_id.
-      insertData.workspace_id = scopedStudioId;
     }
     if (input.threadKey) {
       insertData.thread_key = input.threadKey;
@@ -610,7 +634,6 @@ export class MemoryRepository {
       offset?: number;
       agentId?: string;
       studioId?: string;
-      workspaceId?: string;
     } = {}
   ): Promise<Session[]> {
     let query = this.supabase
@@ -623,7 +646,7 @@ export class MemoryRepository {
       query = query.eq('agent_id', options.agentId);
     }
 
-    const scopedStudioId = options.studioId ?? options.workspaceId;
+    const scopedStudioId = options.studioId;
     if (scopedStudioId) {
       query = query.eq('studio_id', scopedStudioId);
     }
@@ -935,13 +958,12 @@ export class MemoryRepository {
   }
 
   private rowToSession(row: SessionRow): Session {
-    const studioId = row.studio_id || row.workspace_id || undefined;
+    const studioId = row.studio_id || undefined;
     return {
       id: row.id,
       userId: row.user_id,
       agentId: row.agent_id || undefined,
       studioId,
-      workspaceId: studioId,
       threadKey: row.thread_key || undefined,
       lifecycle: (row.lifecycle as Session['lifecycle']) || undefined,
       status: row.status || undefined,

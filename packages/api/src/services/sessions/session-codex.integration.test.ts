@@ -12,7 +12,7 @@ import { SessionService } from './session-service.js';
 import { SessionRepository } from './session-repository.js';
 import { ContextBuilder } from './context-builder.js';
 import type { IActivityStream } from './session-service.js';
-import type { IClaudeRunner } from './types.js';
+import type { IRunner } from './types.js';
 import { ensureEchoIntegrationFixture } from '../../test/integration-fixtures.js';
 
 describe('SessionService Codex backend integration', () => {
@@ -20,10 +20,10 @@ describe('SessionService Codex backend integration', () => {
   let testUserId: string;
   let sessionService: SessionService;
 
-  const claudeRunner: IClaudeRunner = {
+  const claudeRunner: IRunner = {
     run: vi.fn(async () => ({
       success: true,
-      claudeSessionId: 'claude-test-session',
+      backendSessionId: 'claude-test-session',
       responses: [],
       usage: { contextTokens: 10, inputTokens: 5, outputTokens: 5 },
       finalTextResponse: 'claude response',
@@ -31,10 +31,10 @@ describe('SessionService Codex backend integration', () => {
     })),
   };
 
-  const codexRunner: IClaudeRunner = {
+  const codexRunner: IRunner = {
     run: vi.fn(async () => ({
       success: true,
-      claudeSessionId: 'codex-test-session',
+      backendSessionId: 'codex-test-session',
       responses: [],
       usage: { contextTokens: 10, inputTokens: 5, outputTokens: 5 },
       finalTextResponse: 'codex response',

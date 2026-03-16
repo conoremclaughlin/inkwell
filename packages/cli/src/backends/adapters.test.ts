@@ -200,6 +200,131 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
+  // ── PCP_SESSION_ID env propagation ──
+  // These tests verify the most fragile link in the session identity chain:
+  // the CLI backends must inject PCP_SESSION_ID into the spawned process's
+  // environment so hooks + buildMergedMcpConfig can propagate it to the server.
+
+  it('injects PCP_SESSION_ID into claude env when pcpSessionId is provided', () => {
+    const adapter = new ClaudeAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'wren',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+      pcpSessionId: 'pcp-sess-abc-123',
+    });
+
+    expect(prepared.env).toBeDefined();
+    expect(prepared.env!.PCP_SESSION_ID).toBe('pcp-sess-abc-123');
+  });
+
+  it('does not inject PCP_SESSION_ID into claude env when pcpSessionId is absent', () => {
+    const adapter = new ClaudeAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'wren',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+    });
+
+    expect(prepared.env?.PCP_SESSION_ID).toBeUndefined();
+  });
+
+  it('injects PCP_SESSION_ID into codex env when pcpSessionId is provided', () => {
+    const adapter = new CodexAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'lumen',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+      pcpSessionId: 'pcp-sess-def-456',
+    });
+
+    try {
+      expect(prepared.env).toBeDefined();
+      expect(prepared.env!.PCP_SESSION_ID).toBe('pcp-sess-def-456');
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('does not inject PCP_SESSION_ID into codex env when pcpSessionId is absent', () => {
+    const adapter = new CodexAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'lumen',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+    });
+
+    try {
+      expect(prepared.env?.PCP_SESSION_ID).toBeUndefined();
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('injects PCP_SESSION_ID into gemini env when pcpSessionId is provided', () => {
+    const adapter = new GeminiAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'aster',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+      pcpSessionId: 'pcp-sess-ghi-789',
+    });
+
+    try {
+      expect(prepared.env).toBeDefined();
+      expect(prepared.env!.PCP_SESSION_ID).toBe('pcp-sess-ghi-789');
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('does not inject PCP_SESSION_ID into gemini env when pcpSessionId is absent', () => {
+    const adapter = new GeminiAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'aster',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+    });
+
+    try {
+      expect(prepared.env?.PCP_SESSION_ID).toBeUndefined();
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('injects both AGENT_ID and PCP_SESSION_ID into all backend envs', () => {
+    const configs = [
+      { adapter: new ClaudeAdapter(), agentId: 'wren', cleanup: false },
+      { adapter: new CodexAdapter(), agentId: 'lumen', cleanup: true },
+      { adapter: new GeminiAdapter(), agentId: 'aster', cleanup: true },
+    ] as const;
+
+    for (const { adapter, agentId, cleanup } of configs) {
+      const prepared = (adapter as { prepare: typeof ClaudeAdapter.prototype.prepare }).prepare({
+        agentId,
+        model: undefined,
+        promptParts: [],
+        passthroughArgs: [],
+        pcpSessionId: 'pcp-sess-shared',
+      });
+
+      try {
+        expect(prepared.env).toBeDefined();
+        expect(prepared.env!.AGENT_ID).toBe(agentId);
+        expect(prepared.env!.PCP_SESSION_ID).toBe('pcp-sess-shared');
+      } finally {
+        if (cleanup) prepared.cleanup();
+      }
+    }
+  });
+
   it('passes backendSessionId through gemini --resume flag', () => {
     const adapter = new GeminiAdapter();
     const prepared = adapter.prepare({

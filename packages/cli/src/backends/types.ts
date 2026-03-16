@@ -15,6 +15,7 @@ export interface BackendConfig {
   pcpSessionId?: string;
   backendSessionId?: string;
   backendSessionSeedId?: string;
+  studioId?: string;
   dangerous?: boolean;
 }
 

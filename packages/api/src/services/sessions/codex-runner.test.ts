@@ -105,7 +105,7 @@ describe('CodexRunner', () => {
 
     const result = await runPromise;
     expect(result.success).toBe(true);
-    expect(result.claudeSessionId).toBe('codex-session-123');
+    expect(result.backendSessionId).toBe('codex-session-123');
     expect(result.responses).toEqual([
       {
         channel: 'telegram',
@@ -131,7 +131,7 @@ describe('CodexRunner', () => {
 
     const runner = new CodexRunner();
     const runPromise = runner.run('resume msg', {
-      claudeSessionId: 'existing-session-abc',
+      backendSessionId: 'existing-session-abc',
       config: {
         workingDirectory: process.cwd(),
         mcpConfigPath: '',
@@ -185,6 +185,224 @@ describe('CodexRunner', () => {
       { env?: Record<string, string> },
     ];
     expect(options.env?.PCP_ACCESS_TOKEN).toBe('test-pcp-token');
+  });
+
+  it('should return null backendSessionId when no session ID is found in stdout', async () => {
+    const mockProc = createMockProcess();
+    (spawn as Mock).mockReturnValue(mockProc);
+
+    const runner = new CodexRunner();
+    const runPromise = runner.run('hello', {
+      config: {
+        workingDirectory: process.cwd(),
+        mcpConfigPath: '',
+        model: 'gpt-5-codex',
+        appendSystemPrompt: 'identity override',
+      },
+    });
+
+    setTimeout(() => {
+      // No session_id, thread_id, or session_meta in the output
+      mockProc.stdout.emit(
+        'data',
+        Buffer.from(`${JSON.stringify({ type: 'item.completed', item: { text: 'hello' } })}\n`)
+      );
+      mockProc.emit('close', 0);
+    }, 5);
+
+    const result = await runPromise;
+    expect(result.success).toBe(true);
+    expect(result.backendSessionId).toBeNull();
+  });
+
+  it('should extract session ID from Codex session_meta event', async () => {
+    const mockProc = createMockProcess();
+    (spawn as Mock).mockReturnValue(mockProc);
+
+    const runner = new CodexRunner();
+    const runPromise = runner.run('hello', {
+      config: {
+        workingDirectory: process.cwd(),
+        mcpConfigPath: '',
+        model: 'gpt-5-codex',
+        appendSystemPrompt: 'identity override',
+      },
+    });
+
+    const codexSessionId = '019ceb00-82c5-7b02-b7f3-df9cbd17b334';
+
+    setTimeout(() => {
+      // Codex emits session_meta as the first event with the session UUID at payload.id
+      mockProc.stdout.emit(
+        'data',
+        Buffer.from(
+          `${JSON.stringify({
+            type: 'session_meta',
+            payload: {
+              id: codexSessionId,
+              timestamp: '2026-03-14T06:20:05.232Z',
+              cwd: '/tmp/test',
+              originator: 'codex_exec',
+              source: 'exec',
+            },
+          })}\n`
+        )
+      );
+      mockProc.stdout.emit(
+        'data',
+        Buffer.from(`${JSON.stringify({ result: 'done', input_tokens: 10, output_tokens: 5 })}\n`)
+      );
+      mockProc.emit('close', 0);
+    }, 5);
+
+    const result = await runPromise;
+    expect(result.success).toBe(true);
+    expect(result.backendSessionId).toBe(codexSessionId);
+  });
+
+  it('should extract session ID from thread.started thread_id (real Codex stdout format)', async () => {
+    const mockProc = createMockProcess();
+    (spawn as Mock).mockReturnValue(mockProc);
+
+    const runner = new CodexRunner();
+    const runPromise = runner.run('hello', {
+      config: {
+        workingDirectory: process.cwd(),
+        mcpConfigPath: '',
+        model: 'gpt-5-codex',
+        appendSystemPrompt: 'identity override',
+      },
+    });
+
+    const codexThreadId = '019cf13d-486a-7bd1-913b-b23490d476cf';
+
+    setTimeout(() => {
+      // This is what Codex exec --json actually outputs on stdout
+      mockProc.stdout.emit(
+        'data',
+        Buffer.from(`${JSON.stringify({ type: 'thread.started', thread_id: codexThreadId })}\n`)
+      );
+      mockProc.stdout.emit('data', Buffer.from(`${JSON.stringify({ type: 'turn.started' })}\n`));
+      mockProc.stdout.emit(
+        'data',
+        Buffer.from(
+          `${JSON.stringify({
+            type: 'turn.completed',
+            usage: { input_tokens: 100, output_tokens: 20 },
+          })}\n`
+        )
+      );
+      mockProc.emit('close', 0);
+    }, 5);
+
+    const result = await runPromise;
+    expect(result.success).toBe(true);
+    expect(result.backendSessionId).toBe(codexThreadId);
+  });
+
+  it('should not overwrite thread.started ID with conversationId from later tool calls', async () => {
+    const mockProc = createMockProcess();
+    (spawn as Mock).mockReturnValue(mockProc);
+
+    const runner = new CodexRunner();
+    const runPromise = runner.run('hello', {
+      config: {
+        workingDirectory: process.cwd(),
+        mcpConfigPath: '',
+        model: 'gpt-5-codex',
+        appendSystemPrompt: 'identity override',
+      },
+    });
+
+    const codexThreadId = '019cf752-e3a3-7773-9ced-c407047b73c5';
+
+    setTimeout(() => {
+      // thread.started comes first with the real Codex thread UUID
+      mockProc.stdout.emit(
+        'data',
+        Buffer.from(`${JSON.stringify({ type: 'thread.started', thread_id: codexThreadId })}\n`)
+      );
+      mockProc.stdout.emit('data', Buffer.from(`${JSON.stringify({ type: 'turn.started' })}\n`));
+      // Later: a tool call with conversationId (PCP routing key, NOT a backend session ID)
+      mockProc.stdout.emit(
+        'data',
+        Buffer.from(
+          `${JSON.stringify({
+            type: 'item.completed',
+            item: {
+              type: 'function_call',
+              name: 'mcp__pcp__send_response',
+              arguments: JSON.stringify({
+                channel: 'agent',
+                conversationId: 'trigger:lumen:thread:some-thread',
+                content: 'hello',
+              }),
+            },
+          })}\n`
+        )
+      );
+      mockProc.stdout.emit(
+        'data',
+        Buffer.from(
+          `${JSON.stringify({
+            type: 'turn.completed',
+            usage: { input_tokens: 100, output_tokens: 20 },
+          })}\n`
+        )
+      );
+      mockProc.emit('close', 0);
+    }, 5);
+
+    const result = await runPromise;
+    expect(result.success).toBe(true);
+    // The thread.started ID must be preserved, NOT overwritten by conversationId
+    expect(result.backendSessionId).toBe(codexThreadId);
+  });
+
+  it('should prefer first session ID found and not overwrite with later events', async () => {
+    const mockProc = createMockProcess();
+    (spawn as Mock).mockReturnValue(mockProc);
+
+    const runner = new CodexRunner();
+    const runPromise = runner.run('hello', {
+      config: {
+        workingDirectory: process.cwd(),
+        mcpConfigPath: '',
+        model: 'gpt-5-codex',
+        appendSystemPrompt: 'identity override',
+      },
+    });
+
+    const codexSessionId = '019ceb00-real-session-id';
+
+    setTimeout(() => {
+      // session_meta comes first — this should be used
+      mockProc.stdout.emit(
+        'data',
+        Buffer.from(
+          `${JSON.stringify({
+            type: 'session_meta',
+            payload: { id: codexSessionId, source: 'exec' },
+          })}\n`
+        )
+      );
+      // Later event has a different session_id key — should NOT override
+      mockProc.stdout.emit(
+        'data',
+        Buffer.from(
+          `${JSON.stringify({
+            type: 'some_event',
+            session_id: 'generic-session-456',
+          })}\n`
+        )
+      );
+      mockProc.stdout.emit('data', Buffer.from(`${JSON.stringify({ result: 'done' })}\n`));
+      mockProc.emit('close', 0);
+    }, 5);
+
+    const result = await runPromise;
+    // session_meta was first — later session_id must not overwrite it
+    expect(result.backendSessionId).toBe(codexSessionId);
   });
 
   it('includes parsed startup events in diagnostics when codex exits non-zero without stderr', async () => {

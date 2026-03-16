@@ -502,7 +502,31 @@ npx @modelcontextprotocol/inspector packages/api/dist/index.js
 4. Add Next.js rewrite in `packages/web/next.config.ts`
 5. Call from frontend via `useApiQuery`/`useApiPost` (never direct Supabase)
 
-### Debugging
+### Debugging & Logs
+
+Winston writes to **both** the console and persistent log files:
+
+| Log            | Path                         | Contents                                  |
+| -------------- | ---------------------------- | ----------------------------------------- |
+| **combined**   | `~/.pcp/logs/combined.log`   | All log levels (info, warn, error, debug) |
+| **error**      | `~/.pcp/logs/error.log`      | Errors only                               |
+| **exceptions** | `~/.pcp/logs/exceptions.log` | Uncaught exceptions                       |
+| **rejections** | `~/.pcp/logs/rejections.log` | Unhandled promise rejections              |
+
+Logs rotate at 10MB (combined) or 5MB (error), keeping 5 files each. `tailable: true` means the base filename (`combined.log`) is always the active log — `tail -f ~/.pcp/logs/combined.log` always works.
+
+```bash
+# Tail live server logs
+tail -f ~/.pcp/logs/combined.log
+
+# Search for trigger activity
+grep "trigger\|Dispatching" ~/.pcp/logs/combined.log
+
+# Search for a specific thread
+grep "pr:218" ~/.pcp/logs/combined.log
+```
+
+These log files are written regardless of how the server is started (`yarn dev`, `yarn dev:pm2`, or `yarn pm2:start`). PM2 adds its own log layer at `~/.pm2/logs/` but the winston logs are the canonical source.
 
 - Logger available via `import { logger } from '../utils/logger'`
 - Use `logger.info()`, `logger.error()`, `logger.debug()`

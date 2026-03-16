@@ -66,13 +66,30 @@ type: guide
 
 describe('buildMergedMcpConfig', () => {
   let tmpDir: string;
+  let savedPcpSessionId: string | undefined;
+  let savedPcpStudioId: string | undefined;
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'merged-mcp-'));
+    // Isolate PCP_SESSION_ID and PCP_STUDIO_ID — some tests depend on them being absent
+    savedPcpSessionId = process.env.PCP_SESSION_ID;
+    savedPcpStudioId = process.env.PCP_STUDIO_ID;
+    delete process.env.PCP_SESSION_ID;
+    delete process.env.PCP_STUDIO_ID;
   });
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
+    if (savedPcpSessionId !== undefined) {
+      process.env.PCP_SESSION_ID = savedPcpSessionId;
+    } else {
+      delete process.env.PCP_SESSION_ID;
+    }
+    if (savedPcpStudioId !== undefined) {
+      process.env.PCP_STUDIO_ID = savedPcpStudioId;
+    } else {
+      delete process.env.PCP_STUDIO_ID;
+    }
   });
 
   it('returns project .mcp.json when no skill servers exist', () => {
@@ -184,6 +201,150 @@ mcp:
       // Original pcp config preserved, not overridden by skill
       expect(merged.mcpServers.pcp.type).toBe('http');
       expect(merged.mcpServers.pcp.url).toBe('http://localhost:3001/mcp');
+    } finally {
+      cleanup();
+    }
+  });
+
+  // ─── PCP Session Header Injection ───
+
+  it('injects x-pcp-session-id header when PCP_SESSION_ID is set', () => {
+    process.env.PCP_SESSION_ID = 'abc-123-def';
+    writeFileSync(
+      join(tmpDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          pcp: { type: 'http', url: 'http://localhost:3001/mcp' },
+        },
+      })
+    );
+
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir);
+    try {
+      expect(mcpConfigPath).not.toBeNull();
+      // Should be a temp file (modified), not the original
+      expect(mcpConfigPath).not.toBe(join(tmpDir, '.mcp.json'));
+
+      const merged = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
+      expect(merged.mcpServers.pcp.headers).toBeDefined();
+      expect(merged.mcpServers.pcp.headers['x-pcp-session-id']).toBe('${PCP_SESSION_ID}');
+      // Original config preserved
+      expect(merged.mcpServers.pcp.url).toBe('http://localhost:3001/mcp');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('does not inject header when PCP_SESSION_ID is not set', () => {
+    writeFileSync(
+      join(tmpDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          pcp: { type: 'http', url: 'http://localhost:3001/mcp' },
+        },
+      })
+    );
+
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir);
+    try {
+      // Returns original — no modifications
+      expect(mcpConfigPath).toBe(join(tmpDir, '.mcp.json'));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('respects existing user-configured x-pcp-session-id header', () => {
+    process.env.PCP_SESSION_ID = 'should-not-override';
+    writeFileSync(
+      join(tmpDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          pcp: {
+            type: 'http',
+            url: 'http://localhost:3001/mcp',
+            headers: { 'x-pcp-session-id': 'user-configured-value' },
+          },
+        },
+      })
+    );
+
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir);
+    try {
+      // No modification — user already configured the header
+      expect(mcpConfigPath).toBe(join(tmpDir, '.mcp.json'));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('preserves existing headers when injecting session id', () => {
+    process.env.PCP_SESSION_ID = 'abc-123';
+    writeFileSync(
+      join(tmpDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          pcp: {
+            type: 'http',
+            url: 'http://localhost:3001/mcp',
+            headers: { Authorization: 'Bearer existing-token' },
+          },
+        },
+      })
+    );
+
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir);
+    try {
+      const merged = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
+      // Both headers present
+      expect(merged.mcpServers.pcp.headers.Authorization).toBe('Bearer existing-token');
+      expect(merged.mcpServers.pcp.headers['x-pcp-session-id']).toBe('${PCP_SESSION_ID}');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('injects header via explicit options even without env var', () => {
+    // Simulates the CLI passing pcpSessionId directly (before setting spawn env)
+    delete process.env.PCP_SESSION_ID;
+    writeFileSync(
+      join(tmpDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          pcp: { type: 'http', url: 'http://localhost:3001/mcp' },
+        },
+      })
+    );
+
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, {
+      pcpSessionId: 'explicit-session-id',
+      studioId: 'explicit-studio-id',
+    });
+    try {
+      expect(mcpConfigPath).not.toBe(join(tmpDir, '.mcp.json'));
+      const merged = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
+      expect(merged.mcpServers.pcp.headers['x-pcp-session-id']).toBe('${PCP_SESSION_ID}');
+      expect(merged.mcpServers.pcp.headers['x-pcp-studio-id']).toBe('${PCP_STUDIO_ID}');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('does not inject header when no PCP server entry exists', () => {
+    process.env.PCP_SESSION_ID = 'abc-123';
+    writeFileSync(
+      join(tmpDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          github: { type: 'http', url: 'https://api.github.com/mcp' },
+        },
+      })
+    );
+
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir);
+    try {
+      // No PCP server to inject into — return original
+      expect(mcpConfigPath).toBe(join(tmpDir, '.mcp.json'));
     } finally {
       cleanup();
     }

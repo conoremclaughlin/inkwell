@@ -6,98 +6,24 @@
  */
 
 import { spawn, type ChildProcess } from 'child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
-import { join } from 'path';
 import { randomUUID } from 'crypto';
 import type {
   InjectedContext,
   ClaudeRunnerConfig,
-  ClaudeRunnerResult,
+  RunnerResult,
   ChannelResponse,
   ChannelType,
-  IClaudeRunner,
+  IRunner,
   ToolCall,
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
-
-/**
- * Write a minimal runtime session hint so the on-session-start hook can find
- * the correct PCP session ID for this server-spawned run.
- *
- * The CLI hooks call resolveActivePcpSessionId() which reads from the local
- * .pcp/runtime/sessions.json file. Without this hint, the hook picks up the
- * last sb-launched session (wrong) instead of the server-triggered one.
- */
-function writeRuntimeSessionHint(
-  workingDirectory: string,
-  pcpSessionId: string,
-  agentId: string,
-  backend: string,
-  runtimeLinkId: string,
-  studioId?: string
-): void {
-  try {
-    const runtimeDir = join(workingDirectory, '.pcp', 'runtime');
-    mkdirSync(runtimeDir, { recursive: true });
-
-    const sessionsPath = join(runtimeDir, 'sessions.json');
-    let state: {
-      version: 1;
-      current?: Record<string, unknown>;
-      sessions: Array<Record<string, unknown>>;
-    } = { version: 1, sessions: [] };
-
-    if (existsSync(sessionsPath)) {
-      try {
-        const raw = JSON.parse(readFileSync(sessionsPath, 'utf-8')) as typeof state;
-        if (raw.version === 1 && Array.isArray(raw.sessions)) {
-          state = raw;
-        }
-      } catch {
-        // Corrupt file — start fresh.
-      }
-    }
-
-    const now = new Date().toISOString();
-    const record: Record<string, unknown> = {
-      pcpSessionId,
-      backend,
-      agentId,
-      runtimeLinkId,
-      ...(studioId ? { studioId } : {}),
-      updatedAt: now,
-      startedAt: now,
-    };
-
-    const idx = state.sessions.findIndex(
-      (s) =>
-        s['pcpSessionId'] === pcpSessionId && s['backend'] === backend && s['agentId'] === agentId
-    );
-    if (idx >= 0) {
-      state.sessions[idx] = { ...state.sessions[idx], ...record };
-    } else {
-      state.sessions.push(record);
-    }
-
-    state.current = {
-      pcpSessionId,
-      backend,
-      agentId,
-      ...(studioId ? { studioId } : {}),
-      updatedAt: now,
-    };
-    writeFileSync(sessionsPath, JSON.stringify(state, null, 2));
-  } catch (err) {
-    // Best-effort only — hook will fall back to sessions.json current pointer.
-    logger.debug('Failed to write runtime session hint', {
-      workingDirectory,
-      pcpSessionId,
-      error: String(err),
-    });
-  }
-}
+import {
+  injectSessionHeaders,
+  buildSessionEnv,
+  writeRuntimeSessionHint,
+} from '@personal-context/shared';
 
 /** Maximum time (ms) to wait for a Claude Code subprocess before killing it.
  *  Override with CLAUDE_PROCESS_TIMEOUT_MS env var. */
@@ -115,20 +41,20 @@ interface ClaudeUsageStats {
   cacheWriteTokens?: number;
 }
 
-export class ClaudeRunner implements IClaudeRunner {
+export class ClaudeRunner implements IRunner {
   async run(
     message: string,
     options: {
-      claudeSessionId?: string;
+      backendSessionId?: string;
       injectedContext?: InjectedContext;
       config: ClaudeRunnerConfig;
     }
-  ): Promise<ClaudeRunnerResult> {
-    const { claudeSessionId, injectedContext, config } = options;
+  ): Promise<RunnerResult> {
+    const { backendSessionId, injectedContext, config } = options;
 
     // Determine if resuming or starting new session
-    const isResume = !!claudeSessionId;
-    let sessionId = claudeSessionId || randomUUID();
+    const isResume = !!backendSessionId;
+    let sessionId = backendSessionId || randomUUID();
 
     // Build the message with injected context
     let fullMessage = message;
@@ -172,7 +98,7 @@ export class ClaudeRunner implements IClaudeRunner {
 
         return {
           success: true,
-          claudeSessionId: sessionId,
+          backendSessionId: sessionId,
           responses: retryResult.responses,
           usage: retryResult.usage,
           finalTextResponse: retryResult.finalTextResponse,
@@ -182,7 +108,7 @@ export class ClaudeRunner implements IClaudeRunner {
 
       return {
         success: true,
-        claudeSessionId: sessionId,
+        backendSessionId: sessionId,
         responses: result.responses,
         usage: result.usage,
         finalTextResponse: result.finalTextResponse,
@@ -196,7 +122,7 @@ export class ClaudeRunner implements IClaudeRunner {
 
       return {
         success: false,
-        claudeSessionId: sessionId,
+        backendSessionId: sessionId,
         responses: [],
         error: error instanceof Error ? error.message : 'Unknown error',
       };
@@ -258,6 +184,25 @@ export class ClaudeRunner implements IClaudeRunner {
       );
     }
 
+    // Inject PCP session headers into MCP config so the spawned agent's
+    // MCP calls carry session identity back to the PCP server.
+    const mcpInjection =
+      config.mcpConfigPath && config.pcpSessionId
+        ? injectSessionHeaders({
+            mcpConfigPath: config.mcpConfigPath,
+            pcpSessionId: config.pcpSessionId,
+            studioId: config.studioId,
+          })
+        : null;
+
+    // If headers were injected, patch the --mcp-config arg to point to the temp file
+    if (mcpInjection?.modified) {
+      const mcpIdx = args.indexOf('--mcp-config');
+      if (mcpIdx !== -1 && args[mcpIdx + 1]) {
+        args[mcpIdx + 1] = mcpInjection.mcpConfigPath;
+      }
+    }
+
     return new Promise((resolve, reject) => {
       // Strip CLAUDECODE to prevent "nested session" detection when PCP is
       // launched from inside a Claude Code session (e.g., via PM2).
@@ -269,9 +214,13 @@ export class ClaudeRunner implements IClaudeRunner {
           // Ensure Claude Code uses correct paths
           HOME: process.env.HOME,
           PATH: buildSpawnPath(claudeBin),
-          // Pass runtime link ID so the on-session-start hook can find this
-          // PCP session in the runtime hint files we wrote above.
-          ...(config.pcpSessionId ? { PCP_RUNTIME_LINK_ID: runtimeLinkId } : {}),
+          // Session env vars: PCP_SESSION_ID for ${VAR} interpolation in
+          // .mcp.json headers, PCP_RUNTIME_LINK_ID for hook hint matching.
+          ...buildSessionEnv({
+            pcpSessionId: config.pcpSessionId,
+            runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,
+            studioId: config.studioId,
+          }),
         },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -407,6 +356,7 @@ export class ClaudeRunner implements IClaudeRunner {
       proc.on('close', (code) => {
         clearTimeout(timeout);
         clearTimeout(idleTimer);
+        mcpInjection?.cleanup();
         if (settled) return; // Already resolved by timeout
         settled = true;
 
@@ -510,7 +460,8 @@ export function buildIdentityPrompt(
   agentName: string,
   soul?: string,
   timezone?: string,
-  heartbeat?: string
+  heartbeat?: string,
+  sessionIds?: { pcpSessionId?: string; studioId?: string; threadKey?: string }
 ): string {
   let prompt = `## Identity Override (CRITICAL)
 
@@ -520,6 +471,14 @@ When calling PCP tools (bootstrap, remember, recall, start_session, etc.), use \
 
 Do NOT read \`.pcp/identity.json\` — your identity is set by this system prompt.
 Do NOT run \`echo $AGENT_ID\` — you are running headlessly without shell access.`;
+
+  // Session identity — always in context for debugging and routing verification
+  if (sessionIds?.pcpSessionId) {
+    const idParts = [`- PCP Session: \`${sessionIds.pcpSessionId}\``];
+    if (sessionIds.studioId) idParts.push(`- Studio: \`${sessionIds.studioId}\``);
+    if (sessionIds.threadKey) idParts.push(`- Thread: \`${sessionIds.threadKey}\``);
+    prompt += `\n\n### Session Identity\n${idParts.join('\n')}`;
+  }
 
   if (soul) {
     prompt += `\n\n### Soul\n${soul}`;

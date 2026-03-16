@@ -37,8 +37,6 @@ export interface PcpConfig {
   email?: string;
   agentMapping?: Record<string, string>;
   studioId?: string;
-  /** @deprecated Use studioId */
-  workspaceId?: string;
 }
 
 export interface CreateStudioOptions {

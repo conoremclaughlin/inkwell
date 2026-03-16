@@ -40,8 +40,13 @@ export class ClaudeAdapter implements BackendAdapter {
       args.push('--session-id', config.backendSessionSeedId);
     }
 
-    // MCP config: merge project .mcp.json with skill-provided MCP servers
-    const { mcpConfigPath, cleanup: mcpCleanup } = buildMergedMcpConfig(process.cwd());
+    // MCP config: merge project .mcp.json with skill-provided MCP servers.
+    // Pass pcpSessionId/studioId explicitly — process.env doesn't have them yet
+    // (they're set in the spawn env below, not in the sb CLI's own env).
+    const { mcpConfigPath, cleanup: mcpCleanup } = buildMergedMcpConfig(process.cwd(), {
+      pcpSessionId: config.pcpSessionId,
+      studioId: config.studioId,
+    });
     if (mcpConfigPath) {
       args.push('--mcp-config', mcpConfigPath);
     }
@@ -60,6 +65,7 @@ export class ClaudeAdapter implements BackendAdapter {
       env: {
         AGENT_ID: config.agentId,
         ...(config.pcpSessionId ? { PCP_SESSION_ID: config.pcpSessionId } : {}),
+        ...(config.studioId ? { PCP_STUDIO_ID: config.studioId } : {}),
       },
       cleanup: mcpCleanup,
     };

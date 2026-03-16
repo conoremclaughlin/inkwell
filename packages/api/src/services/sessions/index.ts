@@ -51,8 +51,10 @@ export type {
   ISessionRepository,
   IContextBuilder,
 
-  // Claude runner types
+  // Runner types
   ClaudeRunnerConfig,
-  ClaudeRunnerResult,
-  IClaudeRunner,
+  RunnerResult,
+  ClaudeRunnerResult, // deprecated alias
+  IRunner,
+  IClaudeRunner, // deprecated alias
 } from './types.js';

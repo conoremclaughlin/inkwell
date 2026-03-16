@@ -2,13 +2,25 @@
  * Codex CLI Backend Adapter
  *
  * Identity injection via --config model_instructions_file=<tmpfile>
- * MCP config via --config mcp_servers (TOML format, not yet implemented)
+ * PCP session headers via --config mcp_servers.pcp.env_http_headers (env-var-backed)
  *
  * Docs: https://developers.openai.com/codex/cli/
  */
 
 import { createIdentityPromptFile } from './identity.js';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
+
+/**
+ * PCP headers to inject as env_http_headers on the "pcp" MCP server.
+ * Each entry maps a header name to the env var that holds its value.
+ * Codex resolves env var → value at runtime, so multiple sessions in
+ * the same studio each get their own scoped headers.
+ */
+const PCP_ENV_HEADERS: Array<{ header: string; envVar: string; configKey: () => string }> = [
+  { header: 'x-pcp-agent-id', envVar: 'AGENT_ID', configKey: () => 'AGENT_ID' },
+  { header: 'x-pcp-session-id', envVar: 'PCP_SESSION_ID', configKey: () => 'PCP_SESSION_ID' },
+  { header: 'x-pcp-studio-id', envVar: 'PCP_STUDIO_ID', configKey: () => 'PCP_STUDIO_ID' },
+];
 
 export class CodexAdapter implements BackendAdapter {
   readonly name = 'codex';
@@ -24,6 +36,11 @@ export class CodexAdapter implements BackendAdapter {
 
     // Identity injection via config override
     args.push('--config', `model_instructions_file=${promptFile}`);
+
+    // PCP session headers — Codex resolves env var names to values at runtime
+    for (const { header, envVar } of PCP_ENV_HEADERS) {
+      args.push('--config', `mcp_servers.pcp.env_http_headers.${header}="${envVar}"`);
+    }
 
     // Model (only if explicitly specified by user)
     if (config.model) {
@@ -72,6 +89,7 @@ export class CodexAdapter implements BackendAdapter {
       env: {
         AGENT_ID: config.agentId,
         ...(config.pcpSessionId ? { PCP_SESSION_ID: config.pcpSessionId } : {}),
+        ...(config.studioId ? { PCP_STUDIO_ID: config.studioId } : {}),
       },
       cleanup,
     };

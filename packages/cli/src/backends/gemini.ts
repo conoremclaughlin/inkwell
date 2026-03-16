@@ -53,6 +53,7 @@ export class GeminiAdapter implements BackendAdapter {
         AGENT_ID: config.agentId,
         GEMINI_SYSTEM_MD: promptFile,
         ...(config.pcpSessionId ? { PCP_SESSION_ID: config.pcpSessionId } : {}),
+        ...(config.studioId ? { PCP_STUDIO_ID: config.studioId } : {}),
       },
       cleanup,
     };

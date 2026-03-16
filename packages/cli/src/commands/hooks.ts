@@ -232,6 +232,11 @@ export async function callPcpTool(
       ? args.agentId.trim().toLowerCase()
       : null;
 
+  // Propagate PCP session/studio IDs so the server can resolve studio scope and
+  // attribute tool calls to the correct session context.
+  const pcpSessionId = process.env.PCP_SESSION_ID?.trim() || undefined;
+  const pcpStudioId = process.env.PCP_STUDIO_ID?.trim() || undefined;
+
   const baseHeaders: Record<string, string> = {
     'Content-Type': 'application/json',
     Accept: 'application/json, text/event-stream',
@@ -239,6 +244,8 @@ export async function callPcpTool(
     // Forward-looking runtime identity signal for stricter server-side enforcement.
     // Today, effective agent identity is still sourced from JWT claims.
     ...(delegatedAgentId ? { 'x-pcp-agent-id': delegatedAgentId } : {}),
+    ...(pcpSessionId ? { 'x-pcp-session-id': pcpSessionId } : {}),
+    ...(pcpStudioId ? { 'x-pcp-studio-id': pcpStudioId } : {}),
   };
 
   const callOnce = async (token: string | null): Promise<Response> => {
@@ -422,15 +429,16 @@ function normalizeSessionBackend(backendName: string): string {
 }
 
 function resolveActivePcpSessionId(cwd: string): string | undefined {
+  // 1. PCP_SESSION_ID env var — canonical, set by all CLI backends at spawn
+  const envSessionId = process.env.PCP_SESSION_ID?.trim();
+  if (envSessionId) return envSessionId;
+
   const detectedBackend = detectBackend(cwd);
   const sessionBackend = normalizeSessionBackend(detectedBackend.name);
   const { studioId } = getIdentitySessionContext(cwd);
   const agentId = resolveAgentId() || 'unknown';
 
-  // Check PCP_RUNTIME_LINK_ID first — it's set by both the sb launch path and
-  // the server-side runner (claude-runner/codex-runner) before spawning. This
-  // ensures server-triggered sessions are linked to the correct PCP session
-  // rather than the last sb-launched session recorded in sessions.json.
+  // 2. PCP_RUNTIME_LINK_ID → sessions.json lookup (server-spawned sessions)
   const runtimeLinkId = process.env.PCP_RUNTIME_LINK_ID;
   if (runtimeLinkId) {
     const linked = findRuntimeSessionByLinkId(cwd, runtimeLinkId, {
@@ -441,11 +449,9 @@ function resolveActivePcpSessionId(cwd: string): string | undefined {
     if (linked?.pcpSessionId) return linked.pcpSessionId;
   }
 
+  // 3. sessions.json current pointer (CLI-launched sessions)
   const current = getCurrentRuntimeSession(cwd, sessionBackend);
   if (current?.pcpSessionId) return current.pcpSessionId;
-
-  const fromLegacyFile = readRuntimeFile(cwd, 'pcp-session-id');
-  if (fromLegacyFile) return fromLegacyFile;
 
   return undefined;
 }
@@ -462,16 +468,14 @@ function getIdentitySessionContext(cwd: string): {
   try {
     const identity = JSON.parse(readFileSync(identityPath, 'utf-8')) as {
       studioId?: string;
-      workspaceId?: string;
       identityId?: string;
       studio?: string;
-      workspace?: string;
       role?: string;
     };
     return {
-      studioId: identity.studioId || identity.workspaceId,
+      studioId: identity.studioId,
       identityId: identity.identityId,
-      studioName: identity.studio || identity.workspace,
+      studioName: identity.studio,
       role: identity.role,
     };
   } catch {
@@ -557,9 +561,6 @@ async function reconcileBackendSignal(
     runtimeLinkId: runtimeLinkId || null,
     stdinKeys: Object.keys(stdin),
   });
-  if (runtimeLinkId) {
-    writeRuntimeFile(cwd, 'runtime-link-id', runtimeLinkId);
-  }
   const { studioId, identityId } = getIdentitySessionContext(cwd);
 
   let pcpSessionId = options?.initialPcpSessionId || resolveActivePcpSessionId(cwd);
@@ -640,10 +641,6 @@ async function reconcileBackendSignal(
     }
   }
 
-  if (backendSessionId) {
-    writeRuntimeFile(cwd, 'session-id', backendSessionId);
-  }
-
   if (!pcpSessionId) {
     sbDebugLog('hooks', 'reconcile_result', {
       sessionBackend,
@@ -659,7 +656,6 @@ async function reconcileBackendSignal(
     };
   }
 
-  writeRuntimeFile(cwd, 'pcp-session-id', pcpSessionId);
   upsertRuntimeSession(cwd, {
     pcpSessionId,
     backend: sessionBackend,
@@ -1627,6 +1623,7 @@ async function postCompactHandler(): Promise<void> {
     const bootstrap = await callPcpTool('bootstrap', {
       email: config?.email,
       agentId,
+      postCompact: true,
     });
     identityBlock = buildIdentityBlock(bootstrap);
     memoriesBlock = buildMemoriesBlock(
@@ -1747,7 +1744,8 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
       if (role) createArgs.roleTemplate = role;
 
       const created = await callPcpTool('create_studio', createArgs);
-      const ws = created.workspace as Record<string, unknown> | undefined;
+      // create_studio returns { studio: { id, ... } }, not { workspace: ... }
+      const ws = (created.studio || created.workspace) as Record<string, unknown> | undefined;
       if (ws && typeof ws.id === 'string') {
         studioId = ws.id;
         // Persist studioId back to identity.json for future sessions
@@ -1856,10 +1854,23 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     }
   }
 
+  // Build session identity block so the agent always has its own IDs in context
+  const sessionIdentityParts: string[] = [];
+  if (pcpSessionId) sessionIdentityParts.push(`PCP Session: \`${pcpSessionId}\``);
+  if (backendSessionId) sessionIdentityParts.push(`Backend Session: \`${backendSessionId}\``);
+  if (studioId) {
+    const studioLabel = studioName ? `${studioId} (${studioName})` : studioId;
+    sessionIdentityParts.push(`Studio: \`${studioLabel}\``);
+  }
+  if (pcpThreadKey) sessionIdentityParts.push(`Thread: \`${pcpThreadKey}\``);
+  const sessionIdentityBlock =
+    sessionIdentityParts.length > 0 ? sessionIdentityParts.map((p) => `- ${p}`).join('\n') : '';
+
   const template = loadTemplate('hook-session-start');
   const output = renderTemplate(template, {
     AGENT_ID: agentId,
     WORKSPACE_LINE: studioLine,
+    SESSION_IDENTITY: sessionIdentityBlock,
     ROLE_BLOCK: roleBlock,
     IDENTITY_BLOCK: identityBlock,
     MEMORIES_BLOCK: memoriesBlock,
@@ -2041,11 +2052,13 @@ export function registerHooksCommands(program: Command): void {
   hooks
     .command('pre-compact')
     .description('Hook: output pre-compaction reminder')
+    .option('--backend <name>', 'Backend context for this hook invocation')
     .action(preCompactHandler);
 
   hooks
     .command('post-compact')
     .description('Hook: post-compaction bootstrap and inbox check')
+    .option('--backend <name>', 'Backend context for this hook invocation')
     .action(postCompactHandler);
 
   hooks

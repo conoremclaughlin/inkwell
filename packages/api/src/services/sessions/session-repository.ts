@@ -36,8 +36,8 @@ function mapDbToSession(row: DbSession): Session {
     userId: row.user_id,
     agentId: row.agent_id || '',
     identityId: row.identity_id || undefined,
-    studioId: row.studio_id || row.workspace_id || undefined,
-    claudeSessionId: row.claude_session_id,
+    studioId: row.studio_id || undefined,
+    backendSessionId: row.backend_session_id || row.claude_session_id,
 
     type: (metadata.type as SessionType) || 'primary',
     lifecycle: (row.lifecycle as SessionLifecycle) || 'idle',
@@ -87,7 +87,8 @@ function mapSessionToDb(
     user_id: session.userId,
     agent_id: session.agentId,
     identity_id: session.identityId || null,
-    claude_session_id: session.claudeSessionId,
+    claude_session_id: session.backendSessionId,
+    backend_session_id: session.backendSessionId,
     lifecycle: session.lifecycle,
     status: session.status,
     ended_at: session.endedAt?.toISOString() || null,
@@ -96,8 +97,6 @@ function mapSessionToDb(
     backend: session.backend,
     model: session.model,
     studio_id: session.studioId || null,
-    // Keep mirrored for compatibility with older server versions.
-    workspace_id: session.studioId || null,
     thread_key: session.threadKey || null,
     metadata: {
       type: session.type,
@@ -146,7 +145,7 @@ export class SessionRepository implements ISessionRepository {
       .limit(1);
 
     if (options?.studioId) {
-      query = query.or(`studio_id.eq.${options.studioId},workspace_id.eq.${options.studioId}`);
+      query = query.eq('studio_id', options.studioId);
     }
 
     if (options?.status) {
@@ -196,7 +195,7 @@ export class SessionRepository implements ISessionRepository {
       .limit(1);
 
     if (studioId) {
-      query = query.or(`studio_id.eq.${studioId},workspace_id.eq.${studioId}`);
+      query = query.eq('studio_id', studioId);
     }
 
     const { data, error } = await query;
@@ -286,8 +285,10 @@ export class SessionRepository implements ISessionRepository {
 
     const dbUpdates: DbSessionUpdate = {};
 
-    if (updates.claudeSessionId !== undefined) {
-      dbUpdates.claude_session_id = updates.claudeSessionId;
+    if (updates.backendSessionId !== undefined) {
+      dbUpdates.backend_session_id = updates.backendSessionId;
+      // Keep legacy column in sync during migration
+      dbUpdates.claude_session_id = updates.backendSessionId;
     }
 
     if (updates.lifecycle !== undefined) {
@@ -320,8 +321,6 @@ export class SessionRepository implements ISessionRepository {
 
     if (updates.studioId !== undefined) {
       dbUpdates.studio_id = updates.studioId || null;
-      // Keep mirrored for compatibility with older server versions.
-      dbUpdates.workspace_id = updates.studioId || null;
     }
 
     // Merge metadata updates
@@ -394,22 +393,29 @@ export class SessionRepository implements ISessionRepository {
     logger.debug('Updated token usage', { id, usage });
   }
 
-  async markCompacted(id: string, newClaudeSessionId: string): Promise<void> {
+  async markCompacted(id: string, newBackendSessionId: string | null): Promise<void> {
     const current = await this.findById(id);
     if (!current) {
       throw new Error(`Session not found: ${id}`);
     }
 
-    await this.update(id, {
-      claudeSessionId: newClaudeSessionId,
+    const updates: Partial<Session> = {
       lastCompactionAt: new Date(),
       compactionCount: current.compactionCount + 1,
       contextTokens: 0, // Reset after compaction
-    });
+    };
+
+    // Only rotate the backend session ID if a new one was provided.
+    // null means "keep the existing ID" (e.g., Codex reuses the same thread UUID).
+    if (newBackendSessionId) {
+      updates.backendSessionId = newBackendSessionId;
+    }
+
+    await this.update(id, updates);
 
     logger.info('Marked session as compacted', {
       id,
-      newClaudeSessionId,
+      newBackendSessionId: newBackendSessionId || '(preserved)',
       compactionCount: current.compactionCount + 1,
     });
   }

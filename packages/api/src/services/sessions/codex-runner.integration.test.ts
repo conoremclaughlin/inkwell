@@ -70,8 +70,8 @@ describe('CodexRunner E2E (real codex cli)', () => {
     });
 
     expect(result.success).toBe(true);
-    expect(typeof result.claudeSessionId).toBe('string');
-    expect(result.claudeSessionId.length).toBeGreaterThan(0);
+    expect(typeof result.backendSessionId).toBe('string');
+    expect(result.backendSessionId.length).toBeGreaterThan(0);
     expect(result.finalTextResponse).toBeTruthy();
   });
 });

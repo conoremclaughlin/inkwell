@@ -11,22 +11,22 @@
  */
 
 import { spawn, type ChildProcess } from 'child_process';
-import { randomUUID } from 'crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import type {
   InjectedContext,
   ClaudeRunnerConfig,
-  ClaudeRunnerResult,
+  RunnerResult,
   ChannelResponse,
   ChannelType,
-  IClaudeRunner,
+  IRunner,
   ToolCall,
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
+import { buildSessionEnv } from '@personal-context/shared';
 
 /** Maximum time (ms) to wait for a Gemini CLI subprocess before killing it.
  *  Override with GEMINI_PROCESS_TIMEOUT_MS env var. */
@@ -42,17 +42,17 @@ interface GeminiUsageStats {
   outputTokens: number;
 }
 
-export class GeminiRunner implements IClaudeRunner {
+export class GeminiRunner implements IRunner {
   async run(
     message: string,
     options: {
-      claudeSessionId?: string;
+      backendSessionId?: string;
       injectedContext?: InjectedContext;
       config: ClaudeRunnerConfig;
     }
-  ): Promise<ClaudeRunnerResult> {
-    const { claudeSessionId, injectedContext, config } = options;
-    const isResume = !!claudeSessionId;
+  ): Promise<RunnerResult> {
+    const { backendSessionId, injectedContext, config } = options;
+    const isResume = !!backendSessionId;
 
     // Build the message with injected context on first turn (same as Claude/Codex)
     let fullMessage = message;
@@ -67,10 +67,10 @@ export class GeminiRunner implements IClaudeRunner {
     );
 
     try {
-      const args = this.buildArgs(fullMessage, config, policyPath, claudeSessionId);
+      const args = this.buildArgs(fullMessage, config, policyPath, backendSessionId);
       logger.info('Spawning Gemini CLI', {
         isResume,
-        claudeSessionId: claudeSessionId || '(new)',
+        backendSessionId: backendSessionId || '(new)',
         workingDirectory: config.workingDirectory,
         messageLength: fullMessage.length,
         hasPcpAccessToken: !!config.pcpAccessToken,
@@ -79,11 +79,11 @@ export class GeminiRunner implements IClaudeRunner {
       const result = await this.spawnProcess(args, config);
 
       // Use session ID from Gemini's init event, fall back to the one we passed in
-      const resolvedSessionId = result.sessionId || claudeSessionId || randomUUID();
+      const resolvedSessionId = result.sessionId || backendSessionId || undefined;
 
       return {
         success: true,
-        claudeSessionId: resolvedSessionId,
+        backendSessionId: resolvedSessionId || null,
         responses: result.responses,
         usage: result.usage,
         finalTextResponse: result.finalTextResponse,
@@ -91,12 +91,12 @@ export class GeminiRunner implements IClaudeRunner {
       };
     } catch (error) {
       logger.error('Gemini process failed', {
-        claudeSessionId,
+        backendSessionId,
         error: error instanceof Error ? error.message : String(error),
       });
       return {
         success: false,
-        claudeSessionId: claudeSessionId || randomUUID(),
+        backendSessionId: backendSessionId || null,
         responses: [],
         error: error instanceof Error ? error.message : 'Unknown error',
       };
@@ -149,6 +149,10 @@ export class GeminiRunner implements IClaudeRunner {
           HOME: process.env.HOME,
           PATH: buildSpawnPath(geminiBin),
           ...(config.pcpAccessToken ? { PCP_ACCESS_TOKEN: config.pcpAccessToken } : {}),
+          ...buildSessionEnv({
+            pcpSessionId: config.pcpSessionId,
+            studioId: config.studioId,
+          }),
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       });

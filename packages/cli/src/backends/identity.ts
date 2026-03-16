@@ -30,10 +30,6 @@ export interface IdentityJson {
   role?: string;
   studioId?: string;
   studio?: string;
-  /** @deprecated Use studioId */
-  workspaceId?: string;
-  /** @deprecated Use studio */
-  workspace?: string;
   /** Persisted runtime preferences for sb chat */
   runtime?: RuntimePreferences;
 }
