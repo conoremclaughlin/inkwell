@@ -700,9 +700,12 @@ async function updateRuntimeGenerationState(
 
   try {
     const serverUrl = getPcpServerUrl();
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const token = await getValidAccessToken(serverUrl);
+    if (token) headers.Authorization = `Bearer ${token}`;
     const resp = await fetch(`${serverUrl}/api/hooks/lifecycle`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({ sessionId, lifecycle, agentId, workingDir: cwd }),
       signal: AbortSignal.timeout(5000),
     });
