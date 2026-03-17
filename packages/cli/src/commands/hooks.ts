@@ -693,7 +693,7 @@ async function updateRuntimeGenerationState(
   cwd: string,
   config: PcpConfig | null,
   agentId: string,
-  lifecycle: 'running' | 'idle'
+  lifecycle: 'running' | 'idle' | 'compacting'
 ): Promise<void> {
   const sessionId = resolveActivePcpSessionId(cwd);
   if (!sessionId) return;
@@ -1603,6 +1603,13 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
 
 async function preCompactHandler(): Promise<void> {
   await readStdin(); // consume stdin but we don't need it
+
+  // Mark session as compacting so mission control can see it
+  const cwd = process.cwd();
+  const config = getPcpConfig();
+  const agentId = resolveAgentId() || 'unknown';
+  await updateRuntimeGenerationState(cwd, config, agentId, 'compacting');
+
   process.stdout.write(loadTemplate('hook-pre-compact'));
 }
 
@@ -1612,6 +1619,9 @@ async function postCompactHandler(): Promise<void> {
   const cwd = process.cwd();
   const config = getPcpConfig();
   const agentId = resolveAgentId() || 'unknown';
+
+  // Reset lifecycle from compacting back to idle
+  await updateRuntimeGenerationState(cwd, config, agentId, 'idle');
 
   let identityBlock = '';
   let memoriesBlock = '';

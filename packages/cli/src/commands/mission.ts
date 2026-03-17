@@ -565,7 +565,13 @@ function renderMissionTable(rows: MissionRow[]): string[] {
   lines.push(chalk.dim('SB       phase          generating  today  studios  unread  thread'));
   for (const row of rows) {
     const gen = row.generating ?? 0;
-    const genLabel = gen > 0 ? `⚡ ${gen}` : '0';
+    const compacting = row.sessionsByLifecycle?.['compacting'] ?? 0;
+    let genLabel: string;
+    if (compacting > 0) {
+      genLabel = gen > 0 ? `⚡ ${gen} 🔄 ${compacting}` : `🔄 ${compacting}`;
+    } else {
+      genLabel = gen > 0 ? `⚡ ${gen}` : '0';
+    }
     lines.push(
       chalk.dim(
         `${pad(row.agent, 8)} ${pad(row.latestPhase || '-', 14)} ${pad(genLabel, 10)} ${pad(String(row.sessionsToday ?? 0), 5)} ${pad(String(row.studioCount ?? 0), 7)} ${pad(String(row.unreadInbox), 6)} ${pad(row.latestThreadKey || '-', 12)}`

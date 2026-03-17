@@ -223,8 +223,13 @@ export const MissionApp = React.forwardRef<MissionAppHandle, MissionAppProps>(fu
             // Build compact status: "⚡ N generating · M today · K studios"
             const parts: string[] = [];
             const gen = a.generating ?? 0;
-            if (gen > 0) {
+            const compacting = a.sessionsByLifecycle?.['compacting'] ?? 0;
+            if (gen > 0 && compacting > 0) {
+              parts.push(`⚡ ${gen} generating · 🔄 ${compacting} compacting`);
+            } else if (gen > 0) {
               parts.push(`⚡ ${gen} generating`);
+            } else if (compacting > 0) {
+              parts.push(`🔄 ${compacting} compacting`);
             } else {
               parts.push('0 generating');
             }

@@ -410,10 +410,10 @@ export const updateSessionPhaseSchema = userIdentifierBaseSchema.extend({
     .optional()
     .describe('Backend session ID for resumption (e.g., Claude Code session ID, Codex session ID)'),
   lifecycle: z
-    .enum(['running', 'idle', 'completed', 'failed'])
+    .enum(['running', 'idle', 'compacting', 'completed', 'failed'])
     .optional()
     .describe(
-      'Runtime lifecycle state (managed by hooks). running=generating, idle=waiting for input, completed=session done, failed=backend crashed.'
+      'Runtime lifecycle state (managed by hooks). running=generating, idle=waiting for input, compacting=context compaction in progress, completed=session done, failed=backend crashed.'
     ),
   status: z
     .enum(['active', 'paused', 'resumable', 'completed'])
