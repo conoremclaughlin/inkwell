@@ -5804,6 +5804,21 @@ __metadata:
   languageName: node
   linkType: hard
 
+"create-pcp@workspace:packages/create-pcp":
+  version: 0.0.0-use.local
+  resolution: "create-pcp@workspace:packages/create-pcp"
+  dependencies:
+    "@inquirer/prompts": "npm:^8.2.0"
+    "@types/node": "npm:^20.10.0"
+    chalk: "npm:^5.3.0"
+    ora: "npm:^8.0.1"
+    tsx: "npm:^4.7.0"
+    typescript: "npm:^5.3.0"
+  bin:
+    create-pcp: ./dist/index.js
+  languageName: unknown
+  linkType: soft
+
 "crelt@npm:^1.0.0":
   version: 1.0.6
   resolution: "crelt@npm:1.0.6"
