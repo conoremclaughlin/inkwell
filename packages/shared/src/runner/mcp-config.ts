@@ -36,6 +36,8 @@ export interface InjectSessionHeadersOptions {
   pcpSessionId: string;
   /** Optional studio ID to inject */
   studioId?: string;
+  /** Optional access token — injected as Authorization header for triggered sessions */
+  accessToken?: string;
 }
 
 export interface InjectSessionHeadersResult {
@@ -65,7 +67,7 @@ export interface InjectSessionHeadersResult {
 export function injectSessionHeaders(
   options: InjectSessionHeadersOptions
 ): InjectSessionHeadersResult {
-  const { mcpConfigPath, studioId } = options;
+  const { mcpConfigPath, studioId, accessToken } = options;
 
   // No config path or session — nothing to inject
   if (!mcpConfigPath || !existsSync(mcpConfigPath) || !options.pcpSessionId) {
@@ -105,6 +107,17 @@ export function injectSessionHeaders(
     modified = true;
   }
 
+  // Inject Authorization header for triggered sessions.
+  // Uses ${VAR} interpolation so the token is resolved from PCP_ACCESS_TOKEN
+  // env var at runtime, not hardcoded in the config file.
+  if (accessToken && !config.mcpServers.pcp.headers?.['Authorization']) {
+    config.mcpServers.pcp.headers = {
+      ...config.mcpServers.pcp.headers,
+      Authorization: 'Bearer ${PCP_ACCESS_TOKEN}',
+    };
+    modified = true;
+  }
+
   if (!modified) {
     return { mcpConfigPath, cleanup: () => {}, modified: false };
   }
@@ -140,6 +153,7 @@ export function buildSessionEnv(options: {
   pcpSessionId?: string;
   runtimeLinkId?: string;
   studioId?: string;
+  accessToken?: string;
 }): Record<string, string> {
   const env: Record<string, string> = {};
 
@@ -151,6 +165,9 @@ export function buildSessionEnv(options: {
   }
   if (options.studioId) {
     env.PCP_STUDIO_ID = options.studioId;
+  }
+  if (options.accessToken) {
+    env.PCP_ACCESS_TOKEN = options.accessToken;
   }
 
   return env;

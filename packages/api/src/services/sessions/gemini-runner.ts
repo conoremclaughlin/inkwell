@@ -148,10 +148,10 @@ export class GeminiRunner implements IRunner {
           ...cleanEnv,
           HOME: process.env.HOME,
           PATH: buildSpawnPath(geminiBin),
-          ...(config.pcpAccessToken ? { PCP_ACCESS_TOKEN: config.pcpAccessToken } : {}),
           ...buildSessionEnv({
             pcpSessionId: config.pcpSessionId,
             studioId: config.studioId,
+            accessToken: config.pcpAccessToken,
           }),
         },
         stdio: ['ignore', 'pipe', 'pipe'],

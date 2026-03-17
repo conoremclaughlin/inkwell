@@ -170,11 +170,11 @@ export class CodexRunner implements IRunner {
           HOME: process.env.HOME,
           PATH: buildSpawnPath(codexBin),
           ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
-          ...(config.pcpAccessToken ? { PCP_ACCESS_TOKEN: config.pcpAccessToken } : {}),
           ...buildSessionEnv({
             pcpSessionId: config.pcpSessionId,
             runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,
             studioId: config.studioId,
+            accessToken: config.pcpAccessToken,
           }),
         },
         stdio: ['ignore', 'pipe', 'pipe'],

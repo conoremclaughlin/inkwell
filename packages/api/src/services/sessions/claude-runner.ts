@@ -192,6 +192,7 @@ export class ClaudeRunner implements IRunner {
             mcpConfigPath: config.mcpConfigPath,
             pcpSessionId: config.pcpSessionId,
             studioId: config.studioId,
+            accessToken: config.pcpAccessToken,
           })
         : null;
 
@@ -220,6 +221,7 @@ export class ClaudeRunner implements IRunner {
             pcpSessionId: config.pcpSessionId,
             runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,
             studioId: config.studioId,
+            accessToken: config.pcpAccessToken,
           }),
         },
         stdio: ['pipe', 'pipe', 'pipe'],
