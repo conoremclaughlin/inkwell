@@ -93,7 +93,7 @@ const GEMINI: HookCapabilities = {
   events: {
     sessionStart: 'SessionStart',
     preCompact: 'PreCompress',
-    postCompact: null,
+    postCompact: 'SessionStart', // uses "compress" matcher on SessionStart (Gemini uses "compress", not Claude's "compact")
     onPrompt: 'BeforeAgent',
     onStop: 'AfterAgent',
   },
@@ -1115,8 +1115,20 @@ function installGemini(cwd: string, force: boolean): InstallResult {
 
   const sbPath = resolveSbBinaryPath(cwd);
   const pcpHooks: Record<string, unknown> = {
+    // SessionStart: two matchers — "compress" for post-compression identity re-injection,
+    // "startup" for initial session setup. Gemini uses "compress" (not Claude's "compact").
     [GEMINI.events.sessionStart!]: [
       {
+        matcher: 'compress',
+        hooks: [
+          {
+            type: 'command',
+            command: buildManagedHookCommand(sbPath, 'post-compact', GEMINI.name),
+          },
+        ],
+      },
+      {
+        matcher: 'startup',
         hooks: [
           {
             type: 'command',
@@ -1187,13 +1199,13 @@ function installGemini(cwd: string, force: boolean): InstallResult {
     const allPresent = Object.entries(pcpHooks).every(([event, targetEntries]) => {
       const existingEntries = hooksObj[event];
       if (!Array.isArray(existingEntries)) return false;
-      const targetCmd = (
-        (targetEntries as Array<Record<string, unknown>>)[0]?.hooks as
-          | Array<Record<string, unknown>>
-          | undefined
-      )?.[0]?.command as string | undefined;
-      if (!targetCmd) return false;
-      return existingEntries.some((entry) => entryHasCommand(entry, targetCmd));
+      // Verify ALL target entries are present (e.g. SessionStart has both compress + startup)
+      return (targetEntries as Array<Record<string, unknown>>).every((targetEntry) => {
+        const targetCmd = (targetEntry.hooks as Array<Record<string, unknown>> | undefined)?.[0]
+          ?.command as string | undefined;
+        if (!targetCmd) return false;
+        return existingEntries.some((entry) => entryHasCommand(entry, targetCmd));
+      });
     });
 
     if (allPresent) {
@@ -1327,12 +1339,14 @@ function printInstallResult(
     console.log(
       chalk.dim(`      ${events.preCompact} → ${formatHookHint(backend.name, 'pre-compact')}`)
     );
-  if (events.postCompact)
+  if (events.postCompact) {
+    const compactMatcher = backend.name === 'gemini' ? 'compress' : 'compact';
     console.log(
       chalk.dim(
-        `      ${events.postCompact} (compact) → ${formatHookHint(backend.name, 'post-compact')}`
+        `      ${events.postCompact} (${compactMatcher}) → ${formatHookHint(backend.name, 'post-compact')}`
       )
     );
+  }
   if (events.sessionStart)
     console.log(
       chalk.dim(
@@ -1418,12 +1432,14 @@ async function installCommand(options: {
       console.log(
         chalk.dim(`  ${events.preCompact} → ${formatHookHint(backend.name, 'pre-compact')}`)
       );
-    if (events.postCompact)
+    if (events.postCompact) {
+      const compactMatcher = backend.name === 'gemini' ? 'compress' : 'compact';
       console.log(
         chalk.dim(
-          `  ${events.postCompact} (compact) → ${formatHookHint(backend.name, 'post-compact')}`
+          `  ${events.postCompact} (${compactMatcher}) → ${formatHookHint(backend.name, 'post-compact')}`
         )
       );
+    }
     if (events.sessionStart)
       console.log(
         chalk.dim(

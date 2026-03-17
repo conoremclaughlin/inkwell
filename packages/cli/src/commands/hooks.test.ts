@@ -194,7 +194,11 @@ describe('installHooks: Gemini', () => {
     expect(existsSync(configPath)).toBe(true);
 
     const config = JSON.parse(readFileSync(configPath, 'utf-8'));
-    expect(config.hooks.SessionStart[0].hooks[0].command).toContain('hooks on-session-start');
+    // SessionStart[0] = compress matcher (post-compact), SessionStart[1] = startup matcher
+    expect(config.hooks.SessionStart[0].matcher).toBe('compress');
+    expect(config.hooks.SessionStart[0].hooks[0].command).toContain('hooks post-compact');
+    expect(config.hooks.SessionStart[1].matcher).toBe('startup');
+    expect(config.hooks.SessionStart[1].hooks[0].command).toContain('hooks on-session-start');
     expect(config.hooks.BeforeAgent[0].hooks[0].command).toContain('hooks on-prompt');
     expect(config.hooks.AfterAgent[0].hooks[0].command).toContain('hooks on-stop');
     expect(config.hooks.PreCompress[0].hooks[0].command).toContain('hooks pre-compact');
