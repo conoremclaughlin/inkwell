@@ -3,13 +3,17 @@
  *
  * HTTP endpoints for agent-to-agent communication triggers.
  * This provides the "doorbell" mechanism - instant wake-up for agents.
+ *
+ * Auth: same JWT token used by MCP requests.
  */
 
 import { Router } from 'express';
 import { getAgentGateway, type AgentTriggerPayload } from '../channels/agent-gateway';
+import { PcpAuthProvider } from '../mcp/auth/pcp-auth-provider';
 import { logger } from '../utils/logger';
 
 const router: Router = Router();
+const authProvider = new PcpAuthProvider();
 
 /**
  * POST /api/agent/trigger
@@ -19,6 +23,13 @@ const router: Router = Router();
  */
 router.post('/trigger', async (req, res) => {
   try {
+    // Authenticate using same JWT as MCP requests
+    const userData = authProvider.verifyAccessToken(req.headers.authorization);
+    if (!userData) {
+      res.status(401).json({ success: false, error: 'Authentication required' });
+      return;
+    }
+
     const { recipientUserId: _stripped, ...payload } = req.body as AgentTriggerPayload;
 
     // Validate required fields
@@ -34,6 +45,7 @@ router.post('/trigger', async (req, res) => {
       from: payload.fromAgentId,
       to: payload.toAgentId,
       type: payload.triggerType,
+      userId: userData.userId,
     });
 
     const gateway = getAgentGateway();
