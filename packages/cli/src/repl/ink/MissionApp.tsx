@@ -220,30 +220,33 @@ export const MissionApp = React.forwardRef<MissionAppHandle, MissionAppProps>(fu
       <Box paddingX={1} flexDirection="column">
         {agents.length > 0 ? (
           agents.map((a) => {
-            // Build compact status: "⚡ N generating · 🔄 M compacting" or "idle"
-            const statusParts: string[] = [];
+            // Build compact status: "⚡ N generating · 🔄 M compacting · N today · K studios"
+            const parts: string[] = [];
             const gen = a.generating ?? 0;
             const compacting = a.sessionsByLifecycle?.['compacting'] ?? 0;
-            if (gen > 0) statusParts.push(`⚡ ${gen} generating`);
-            if (compacting > 0) statusParts.push(`🔄 ${compacting} compacting`);
-            if (statusParts.length === 0) statusParts.push('idle');
-            const statusLabel = statusParts.join(' · ');
-
-            const unread = a.unread > 0 ? `${a.unread} unread` : '';
-            const sessions = `${a.sessions} sessions`;
+            if (gen > 0 && compacting > 0) {
+              parts.push(`⚡ ${gen} generating · 🔄 ${compacting} compacting`);
+            } else if (gen > 0) {
+              parts.push(`⚡ ${gen} generating`);
+            } else if (compacting > 0) {
+              parts.push(`🔄 ${compacting} compacting`);
+            } else {
+              parts.push('0 generating');
+            }
             const today = a.sessionsToday ?? 0;
+            parts.push(`${today} today`);
             const studios = a.studioCount ?? 0;
+            if (studios > 0) {
+              parts.push(`${studios} studio${studios !== 1 ? 's' : ''}`);
+            }
+            if (a.unread > 0) {
+              parts.push(`${a.unread} unread`);
+            }
+            const sessionLabel = parts.join(' · ');
 
-            const infoParts = [
-              unread,
-              sessions,
-              statusLabel,
-              `${today} today`,
-              studios > 0 ? `${studios} studio${studios !== 1 ? 's' : ''}` : '',
-              a.latestThread || '',
-            ].filter(Boolean);
-
-            const line = [a.agent.padEnd(8), infoParts.join(' · ')].join('  ');
+            const line = [a.agent.padEnd(8), sessionLabel, a.latestThread || '']
+              .filter(Boolean)
+              .join('  ');
             return (
               <Box key={a.agent}>
                 <Text wrap="truncate">{truncLine(line)}</Text>
