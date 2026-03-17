@@ -9,6 +9,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import type { DataComposer } from '../../data/composer';
+import type { Json } from '../../data/supabase/types';
 import { logger } from '../../utils/logger';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
 import { setSessionContext, pinSessionAgent, getRequestContext } from '../../utils/request-context';
@@ -1223,6 +1224,10 @@ function buildSessionTraceDiff(before: Session | null | undefined, after: Sessio
   return { beforeSnapshot, afterSnapshot, changedFields };
 }
 
+function toJsonObject(value: Record<string, unknown>): Json {
+  return value as Json;
+}
+
 export async function handleUpdateSessionPhase(args: unknown, dataComposer: DataComposer) {
   const params = updateSessionPhaseSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
@@ -1464,7 +1469,7 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
           sessionId,
           status: 'completed',
           content: `Session ${sessionId.slice(0, 8)} updated (${trace.changedFields.join(', ')})`,
-          payload: {
+          payload: toJsonObject({
             sessionId,
             changedFields: trace.changedFields,
             before: trace.beforeSnapshot,
@@ -1478,7 +1483,7 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
               contextProvided: params.context !== undefined,
               workingDirProvided: params.workingDir !== undefined,
             },
-          },
+          }),
         });
         result.sessionTrace = {
           changedFields: trace.changedFields,
