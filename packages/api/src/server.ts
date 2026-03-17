@@ -1038,7 +1038,9 @@ function printStatus(): void {
 }
 
 /**
- * Graceful shutdown
+ * Graceful shutdown with force-kill timeout.
+ * If graceful teardown hangs (open connections, polling loops, etc.),
+ * force-exit after 10 seconds so tsx --watch can restart cleanly.
  */
 async function shutdown(): Promise<void> {
   if (isShuttingDown) return;
@@ -1046,21 +1048,34 @@ async function shutdown(): Promise<void> {
 
   logger.info('\nShutting down PCP Server...');
 
-  // Stop heartbeat cron job
-  stopHeartbeatService();
-  logger.info('Heartbeat service stopped');
+  // Force-kill safety net: if graceful shutdown hangs, exit anyway.
+  const forceKillTimer = setTimeout(() => {
+    logger.error('Graceful shutdown timed out after 10s — force exiting');
+    process.exit(1);
+  }, 10_000);
+  forceKillTimer.unref(); // Don't let the timer itself keep the process alive
 
-  // Remove agent gateway listeners to release event loop references
-  getAgentGateway().removeAllListeners();
-  logger.info('Agent gateway listeners removed');
+  try {
+    // Stop heartbeat cron job
+    stopHeartbeatService();
+    logger.info('Heartbeat service stopped');
 
-  // Shutdown MCP server (includes ChannelGateway shutdown)
-  if (mcpServer) {
-    await mcpServer.shutdown();
-    logger.info('MCP server stopped');
+    // Remove agent gateway listeners to release event loop references
+    getAgentGateway().removeAllListeners();
+    logger.info('Agent gateway listeners removed');
+
+    // Shutdown MCP server (includes ChannelGateway shutdown)
+    if (mcpServer) {
+      await mcpServer.shutdown();
+      logger.info('MCP server stopped');
+    }
+
+    logger.info('Shutdown complete');
+  } catch (error) {
+    logger.error('Error during shutdown:', error);
   }
 
-  logger.info('Shutdown complete');
+  clearTimeout(forceKillTimer);
   process.exit(0);
 }
 
