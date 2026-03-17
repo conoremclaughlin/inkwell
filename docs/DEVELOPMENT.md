@@ -4,33 +4,21 @@ This guide covers the development workflow for the Personal Context Protocol (PC
 
 ## Architecture Overview
 
-The project runs as **three separate processes** for optimal development experience:
+PCP runs as a **single unified server** process that hosts all services:
 
-| Process | Purpose | Restarts on code changes? |
-|---------|---------|---------------------------|
-| **mcp** | MCP Server - tools, admin API, database | Yes (auto-restart) |
-| **myra** | Messaging - Telegram/WhatsApp connections | No (manual only) |
-| **web** | Next.js admin dashboard | Yes (HMR) |
+| Service     | Purpose                             | Port              |
+| ----------- | ----------------------------------- | ----------------- |
+| **API/MCP** | MCP tools, admin API, agent gateway | `PCP_PORT_BASE`   |
+| **Web**     | Next.js admin dashboard             | `PCP_PORT_BASE+1` |
+| **Myra**    | Telegram/WhatsApp messaging bridge  | `PCP_PORT_BASE+2` |
 
-### Why Separate Processes?
-
-**Myra** holds authentication sessions for Telegram and WhatsApp. These connections:
-- Take time to establish (WhatsApp QR scanning)
-- Should persist while you develop
-- Only need restart when messaging code changes
-
-**MCP Server** handles tools and API endpoints. It can restart freely without affecting messaging connections.
-
-**Web App** uses Next.js Hot Module Replacement (HMR) for instant updates.
+Default `PCP_PORT_BASE` is **3001**, so API runs on 3001, web on 3002, Myra on 3003.
 
 ## Getting Started
 
 ### Prerequisites
 
 ```bash
-# Install pm2 globally
-npm install -g pm2
-
 # Install dependencies
 yarn install
 ```
@@ -38,178 +26,106 @@ yarn install
 ### Start Development
 
 ```bash
-# Start all three processes
+# Start all services with hot reload
 yarn dev
 
-# View process status
-yarn status
-
-# View logs (all processes)
-yarn logs
-
-# View Myra logs only
-yarn logs:myra
+# View server logs
+yarn logs:pcp              # Structured JSON logs
+yarn logs:pcp:raw          # Raw log output
+yarn logs:pcp:errors       # Errors only
 ```
 
-### Managing Processes
+`yarn dev` runs `scripts/dev-concurrently.mjs`, which starts API and web in parallel with hot reload. Migration status warnings are checked on startup.
+
+### Running on a Different Port
+
+To run an isolated instance (e.g., for testing changes without disrupting the main server):
 
 ```bash
-# Restart MCP server only (Myra stays connected)
-yarn restart:mcp
+# Starts API on 4001, web on 4002, Myra on 4003
+PCP_PORT_BASE=4001 yarn dev
 
-# Restart Myra (reconnects Telegram/WhatsApp)
-yarn restart:myra
-
-# Stop everything
-yarn stop
-
-# Clean up pm2 processes
-pm2 delete all
+# Point CLI at your test server
+PCP_SERVER_URL=http://localhost:4001 sb mission
 ```
 
-## Process Details
-
-### MCP Server (`mcp`)
-
-**Entry point:** `packages/api/src/index.ts`
-
-**Features:**
-- MCP tools for context management
-- Admin REST API at `/api/admin/*`
-- Auto-restarts when code in `packages/api/src/` changes
-- Ignores changes to `src/myra/` directory
-
-**Port:** 3001
-
-### Myra (`myra`)
-
-**Entry point:** `packages/api/src/myra/index.ts`
-
-**Features:**
-- Telegram bot listener
-- WhatsApp listener (optional, set `ENABLE_WHATSAPP=true`)
-- Claude Code backend for AI processing
-- Persistent process - survives MCP restarts
-
-**Configuration:**
-```bash
-# In packages/api/.env
-TELEGRAM_BOT_TOKEN=your_bot_token
-ENABLE_WHATSAPP=true  # Optional
-```
-
-**Manual restart only:**
-```bash
-yarn restart:myra
-# or
-pm2 restart myra
-```
-
-### Web App (`web`)
-
-**Entry point:** `packages/web/`
-
-**Features:**
-- Next.js 16 admin dashboard
-- Supabase Auth with magic links
-- Admin pages for trusted users, groups, challenge codes
-- WhatsApp QR display
-
-**Port:** 3002
+Both instances share the same Supabase database, so data changes are visible to both.
 
 ## Environment Variables
 
-### packages/api/.env
+Environment is configured via `.env` files at the **project root** (not per-package):
+
+| File               | Purpose                                 |
+| ------------------ | --------------------------------------- |
+| `.env`             | Base config (can be committed)          |
+| `.env.local`       | Machine-specific overrides (gitignored) |
+| `.env.development` | Development-specific (or `.env.dev`)    |
+| `.env.production`  | Production-specific (or `.env.prod`)    |
+
+Priority (highest wins): shell env > `.env.local` > `.env.{NODE_ENV}` > `.env`
+
+### Required Variables
 
 ```bash
-# Required
 SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_ANON_KEY=your_anon_key
-SUPABASE_SERVICE_KEY=your_service_key
-
-# Telegram (for Myra)
-TELEGRAM_BOT_TOKEN=your_bot_token
-
-# WhatsApp (optional)
-ENABLE_WHATSAPP=true
-
-# MCP
-MCP_TRANSPORT=http
-MCP_HTTP_PORT=3001
+SUPABASE_PUBLISHABLE_KEY=your_publishable_key
+SUPABASE_SECRET_KEY=your_secret_key
+JWT_SECRET=your_jwt_secret_min_32_chars
 ```
 
-### packages/web/.env.local
+### Optional Variables
 
 ```bash
-NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your_anon_key
-API_URL=http://localhost:3001
+PCP_PORT_BASE=3001              # Base port (default: 3001)
+MCP_TRANSPORT=http              # stdio or http (default: stdio)
+TELEGRAM_BOT_TOKEN=...          # For Myra Telegram
+ENABLE_WHATSAPP=true            # WhatsApp support
+ENABLE_DISCORD=false            # Discord bot
+LOG_LEVEL=info                  # error, warn, info, debug
 ```
 
 ## Development Workflow
 
 ### Typical Session
 
-1. Start all processes: `yarn dev`
+1. Start all services: `yarn dev`
 2. Open dashboard: http://localhost:3002
-3. Send messages via Telegram/WhatsApp
-4. Edit code - MCP/web restart automatically, Myra stays connected
-5. When done: `yarn stop`
-
-### When to Restart Myra
-
-Restart Myra (`yarn restart:myra`) when you change:
-- `packages/api/src/myra/` code
-- `packages/api/src/channels/` code (Telegram/WhatsApp listeners)
-- `packages/api/src/agent/` code (Session Host)
-- System prompt configuration
+3. Edit code — API and web restart automatically
+4. When done: Ctrl+C
 
 ### Viewing Logs
 
-```bash
-# All logs with colors
-pm2 logs
-
-# Myra only
-pm2 logs myra
-
-# MCP only
-pm2 logs mcp
-
-# Web only
-pm2 logs web
-
-# Follow mode (like tail -f)
-pm2 logs --lines 50
-```
-
-## PM2 Tips
-
-### Save Process List
+Winston writes structured logs to `~/.pcp/logs/`:
 
 ```bash
-# Save current process list
-pm2 save
+yarn logs:pcp              # Formatted JSON logs
+yarn logs:pcp:errors       # Errors only
 
-# Restore on system startup
-pm2 startup
+# Or tail directly
+tail -f ~/.pcp/logs/combined.log
 ```
 
-### Monitor Resources
+### Running Individual Services
+
+For debugging, run services individually:
 
 ```bash
-# Interactive monitor
-pm2 monit
-
-# Status with memory/CPU
-pm2 status
+yarn dev:api               # API server only
+yarn dev:web               # Web dashboard only
+yarn dev:mcp               # MCP server (stdio mode)
 ```
 
-### Flush Logs
+## Production
 
 ```bash
-pm2 flush  # Clear all logs
+yarn prod                  # One-shot: build + migrate + start
+# Or step by step:
+yarn prod:refresh          # Install + build after git pull
+yarn prod:migrate          # Apply pending migrations
+yarn prod:direct           # Start (no rebuild)
 ```
+
+For containerized deployment, see `docker-compose.app.yml`.
 
 ## Troubleshooting
 
@@ -221,55 +137,20 @@ lsof -i :3001
 
 # Kill it
 kill -9 <PID>
-
-# Or use pm2 to restart
-pm2 restart mcp
 ```
-
-### Myra Not Receiving Messages
-
-1. Check Telegram token is valid
-2. Ensure bot was started with `/start` command
-3. Check logs: `pm2 logs myra`
-
-### WhatsApp QR Not Showing
-
-1. Set `ENABLE_WHATSAPP=true` in `.env`
-2. Restart Myra: `yarn restart:myra`
-3. Check logs for QR output: `pm2 logs myra`
 
 ### MCP Tools Not Working
 
-1. Ensure MCP server is running: `pm2 status`
-2. Check port 3001 is accessible
-3. Verify `.mcp.json` config file exists
-
-## MCP Transport TODOs
-
-- Revisit full SSE stream support for `GET /mcp` in Streamable HTTP mode (resumability / server-pushed notifications).
-- Keep compatibility notes for Gemini CLI and other MCP clients that probe `GET /mcp` during discovery.
-
-## Running Individual Processes
-
-For debugging, you can run processes individually without pm2:
-
-```bash
-# MCP server only
-yarn dev:mcp
-
-# Myra only
-yarn dev:myra
-
-# Web only
-yarn dev:web
-```
+1. Check the server is running and port 3001 is accessible
+2. Verify `.mcp.json` config file exists in the project root
+3. Check logs: `yarn logs:pcp`
 
 ## Architecture Diagram
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        User                                  │
-│            (Telegram / WhatsApp / Web Dashboard)            │
+│      (Telegram / WhatsApp / Web Dashboard / CLI)            │
 └──────────────────────────┬──────────────────────────────────┘
                            │
         ┌──────────────────┼──────────────────┐
@@ -277,13 +158,13 @@ yarn dev:web
         ▼                  ▼                  ▼
 ┌───────────────┐  ┌───────────────┐  ┌───────────────┐
 │     Myra      │  │  MCP Server   │  │   Web App     │
-│  (Persistent) │  │ (Restartable) │  │   (HMR)       │
+│  (Messaging)  │  │  (API + Tools)│  │   (HMR)       │
 │               │  │               │  │               │
-│ • Telegram    │  │ • Tools       │  │ • Dashboard   │
+│ • Telegram    │  │ • MCP Tools   │  │ • Dashboard   │
 │ • WhatsApp    │──│ • Admin API   │──│ • Auth        │
-│ • Claude Code │  │ • Database    │  │ • Settings    │
+│ • Discord     │  │ • Gateway     │  │ • Settings    │
 │               │  │               │  │               │
-│   Port: N/A   │  │  Port: 3001   │  │  Port: 3002   │
+│  Port: +2     │  │  Port: base   │  │  Port: +1     │
 └───────────────┘  └───────────────┘  └───────────────┘
         │                  │
         │                  │

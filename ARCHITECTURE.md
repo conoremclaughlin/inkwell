@@ -54,7 +54,7 @@ The unified entry point. Starts all components in order:
 4. Heartbeat service (scheduled reminders)
 5. Agent trigger handler
 
-Runs as a single pm2 process (`pcp`).
+Runs as a single Node.js process.
 
 ### MCP Server (`src/mcp/server.ts`)
 
@@ -63,7 +63,6 @@ Exposes PCP tools over HTTP/SSE at `http://localhost:3001/mcp`. Each client conn
 Additional HTTP endpoints:
 
 - `/health` — service health check
-- `/api/agent/trigger` — inter-agent trigger
 - OAuth2 endpoints (`/authorize`, `/token`, `/register`)
 
 ### Channel Gateway (`src/channels/gateway.ts`)
@@ -201,12 +200,15 @@ Identity is resolved from: system prompt override → `$AGENT_ID` env var → `.
 
 ## Process Management
 
-Single pm2 configuration (`ecosystem.config.cjs`):
+`yarn dev` runs both services concurrently with hot reload via `scripts/dev-concurrently.mjs`. Port allocation is driven by `PCP_PORT_BASE` (default 3001):
 
-| Process | Description                                             |
-| ------- | ------------------------------------------------------- |
-| `pcp`   | Main server: MCP + channels + heartbeat + agent gateway |
-| `web`   | Next.js admin dashboard (port 3002)                     |
+| Service | Port              | Description                                             |
+| ------- | ----------------- | ------------------------------------------------------- |
+| API/MCP | `PCP_PORT_BASE`   | Main server: MCP + channels + heartbeat + agent gateway |
+| Web     | `PCP_PORT_BASE+1` | Next.js admin dashboard                                 |
+| Myra    | `PCP_PORT_BASE+2` | Persistent messaging bridge                             |
+
+For production, use `yarn prod:direct` or Docker Compose (`docker-compose.app.yml`).
 
 ## Key Design Decisions
 

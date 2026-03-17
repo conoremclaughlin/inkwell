@@ -172,12 +172,11 @@ npx prettier --write "path/to/file"
 ## Development Commands
 
 ```bash
-yarn dev                   # Start all services (pm2)
-yarn dev:direct            # Start API+web directly (no pm2, auto-restarts on code changes)
+yarn dev                   # Start API+web with hot reload (default: port 3001)
 yarn prod                  # One-shot: build + migrate + start (alias for prod:up)
 yarn prod:refresh          # Install + build latest code after pull
 yarn prod:migrate          # Apply pending migrations (auto-detects local vs remote)
-yarn prod:direct           # Run API+web directly in production mode (no pm2)
+yarn prod:direct           # Run API+web directly in production mode
 yarn build                 # Build all packages
 yarn type-check            # Type check all packages
 yarn test                  # Unit tests (all workspaces)
@@ -189,8 +188,6 @@ yarn linked:migrate        # Apply linked (remote) migrations
 yarn test:integration:db:local   # DB integration suite against isolated local Supabase
 yarn test:integration:runtime    # Runtime/CLI integration suite
 yarn logs:pcp              # View PCP server logs (structured JSON)
-yarn pm2 list              # List running processes
-yarn pm2 restart pcp       # Restart PCP server
 ```
 
 ### Migration target auto-detection
@@ -202,9 +199,7 @@ yarn pm2 restart pcp       # Restart PCP server
 - Otherwise `linked` (remote)
 - Source precedence: process env → `.env.local` → `.env`
 
-### Low-power runtime (no PM2)
-
-If PM2/watcher overhead is undesirable, run PCP directly:
+### Production startup
 
 ```bash
 yarn prod                  # One-shot: build + migrate + start
@@ -216,7 +211,7 @@ yarn prod:direct           # Start (no rebuild, uses existing artifacts)
 
 Notes:
 
-- `yarn dev` / `yarn dev:direct` run migration-status warnings on startup.
+- `yarn dev` runs migration-status warnings on startup.
 - To run API only (no dashboard): `PCP_RUN_WEB=false yarn prod:direct`
 - After `git pull`, run `yarn prod:refresh` and restart your process.
 - `sb doctor` checks migration status and points to `yarn prod:migrate` when pending.
@@ -231,5 +226,4 @@ Notes:
 - **MCP SDK**: `@modelcontextprotocol/sdk`
 - **Database**: Supabase (PostgreSQL + pgvector)
 - **Messaging**: Telegraf (Telegram), Baileys (WhatsApp)
-- **Process Management**: pm2
 - **CLI**: Commander.js, Ink (React for CLI)

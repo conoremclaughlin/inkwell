@@ -11,8 +11,6 @@
     "dev:api": "yarn workspace @personal-context/api server:dev",
     "dev:web": "yarn workspace @personal-context/web dev",
     "dev:mcp": "yarn workspace @personal-context/api dev:mcp",
-    "dev:pm2": "./scripts/dev.sh",
-    "dev:pm2:isolated": "PM2_HOME=.pm2 ./scripts/dev.sh",
     "dev:direct:deprecated": "echo 'DEPRECATED: use yarn dev instead (runs in your shell context).' && ./scripts/dev-direct.sh",
     "prod:direct": "./scripts/prod-direct.sh",
     "prod:refresh": "./scripts/prod-refresh.sh",
@@ -23,13 +21,6 @@
     "linked:migrate": "./scripts/prod-migrate.sh --linked",
     "prod:up": "./scripts/prod-up.sh",
     "prod": "yarn prod:up",
-    "pm2:dev": "pm2 start ecosystem.config.cjs --only pcp-dev",
-    "pm2:start": "pm2 start ecosystem.config.cjs --only pcp,web",
-    "pm2:stop": "pm2 stop all",
-    "pm2:restart": "pm2 restart all",
-    "pm2:logs": "pm2 logs",
-    "pm2:status": "pm2 status",
-    "pm2": "pm2",
     "logs:pcp": "tail -n 200 -f $HOME/.pcp/logs/combined.log | jq -r '.timestamp + \" [\" + .level + \"]: \" + .message'",
     "logs:pcp:raw": "tail -n 200 -f $HOME/.pcp/logs/combined.log",
     "logs:pcp:errors": "tail -n 200 -f $HOME/.pcp/logs/error.log | jq -r '.timestamp + \" [\" + .level + \"]: \" + .message'",
@@ -52,7 +43,7 @@
     "test:integration:runtime": "yarn workspace @personal-context/api test:integration:runtime",
     "lint": "yarn workspaces foreach -A run lint",
     "type-check": "yarn workspaces foreach -A -t run type-check",
-    "clean": "yarn workspaces foreach -A run clean && rm -rf node_modules && pm2 delete all",
+    "clean": "yarn workspaces foreach -A run clean && rm -rf node_modules",
     "prepare": "husky"
   },
   "engines": {
@@ -76,7 +67,6 @@
     "concurrently": "^9.2.1",
     "husky": "^9.1.7",
     "lint-staged": "^16.2.7",
-    "pm2": "^6.0.14",
     "prettier": "^3.8.1"
   },
   "lint-staged": {

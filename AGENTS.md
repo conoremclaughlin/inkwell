@@ -293,14 +293,10 @@ yarn build
 # Type checking
 yarn type-check
 
-# Test database connection
-yarn test:connection
-
-# Process management (pm2)
-yarn pm2 list              # List running processes
-yarn pm2 restart pcp       # Restart PCP server
-yarn pm2 logs pcp          # View PCP logs
-yarn pm2 start ecosystem.config.cjs  # Start all processes
+# View server logs
+yarn logs:pcp              # Structured JSON logs
+yarn logs:pcp:raw          # Raw log output
+yarn logs:pcp:errors       # Errors only
 ```
 
 ## Testing with an Isolated Server (IMPORTANT)
@@ -543,7 +539,7 @@ grep "trigger\|Dispatching" ~/.pcp/logs/combined.log
 grep "pr:218" ~/.pcp/logs/combined.log
 ```
 
-These log files are written regardless of how the server is started (`yarn dev`, `yarn dev:pm2`, or `yarn pm2:start`). PM2 adds its own log layer at `~/.pm2/logs/` but the winston logs are the canonical source.
+These log files are written regardless of how the server is started (`yarn dev`, `yarn prod:direct`, etc.). The winston logs are the canonical source.
 
 - Logger available via `import { logger } from '../utils/logger'`
 - Use `logger.info()`, `logger.error()`, `logger.debug()`
