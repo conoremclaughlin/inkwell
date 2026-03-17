@@ -1148,12 +1148,18 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'recall',
     {
-      description: `Search and retrieve memories. Currently uses text search; semantic search coming soon.
+      description: `Search and retrieve memories using text, semantic vectors, or a hybrid blend.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
-        query: z.string().optional().describe('Search query (text search for now)'),
+        query: z.string().optional().describe('Search query across memory text and embeddings'),
+        recallMode: z
+          .enum(['auto', 'text', 'semantic', 'hybrid'])
+          .optional()
+          .describe(
+            'Recall strategy: text (keyword only), semantic (embeddings only), hybrid (blend both), auto (semantic then fallback). Default: hybrid.'
+          ),
         source: z.string().optional().describe('Filter by source'),
         salience: z
           .enum(['low', 'medium', 'high', 'critical'])
@@ -1734,9 +1740,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         memoryLimit: z
           .number()
           .min(1)
-          .max(20)
+          .max(100)
           .optional()
-          .describe('Max recent memories to include (default: 5)'),
+          .describe(
+            'Max high-salience memories to fetch for knowledge summary (default: 50). Critical memories always included regardless.'
+          ),
         postCompact: z
           .boolean()
           .optional()
@@ -1753,6 +1761,18 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .string()
           .optional()
           .describe('Base path for identity files (default: ~/.pcp)'),
+        threadKey: z
+          .string()
+          .optional()
+          .describe(
+            'Optional active thread key used to prioritize bootstrap memories relevant to this conversation.'
+          ),
+        focusText: z
+          .string()
+          .optional()
+          .describe(
+            'Optional focus text to prioritize bootstrap memories. Falls back to current focus summary when omitted.'
+          ),
       },
     },
     async (args) => {

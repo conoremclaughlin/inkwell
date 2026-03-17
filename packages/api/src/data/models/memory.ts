@@ -63,6 +63,7 @@ export interface MemoryCreateInput {
 }
 
 export interface MemorySearchOptions {
+  recallMode?: 'auto' | 'text' | 'semantic' | 'hybrid';
   source?: MemorySource;
   salience?: Salience;
   topics?: string[];

@@ -105,6 +105,34 @@ sb -a <agent-name> -b gemini       # specify a backend
 
 Your SB now has persistent identity, memory, and session continuity across every interaction.
 
+### Optional: enable semantic memory embeddings
+
+PCP's memory system works **without** local embeddings — `remember`/`recall` still function with text-based retrieval and the embedding write path is best-effort. If you want local semantic recall on top of that, install Ollama-backed embeddings:
+
+```bash
+sb memory install
+```
+
+This:
+
+- checks that `ollama` is installed
+- pulls the default vetted model (`mxbai-embed-large`)
+- writes the needed memory embedding settings into `.env.local`
+
+If you already have the model:
+
+```bash
+sb memory install --skip-pull
+```
+
+If you want to keep using PCP memory **without** embeddings, set:
+
+```bash
+MEMORY_EMBEDDINGS_ENABLED=false
+```
+
+in `.env.local`.
+
 ### Alternative: Use PCP from another platform
 
 If you're using [OpenClaw](https://github.com/openclaw) or another MCP-compatible client, you can connect directly to the PCP server without the `sb` CLI:

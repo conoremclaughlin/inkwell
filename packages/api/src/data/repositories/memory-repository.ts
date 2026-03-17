@@ -3,8 +3,10 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
+import type { Database } from '../supabase/types';
 import { resolveIdentityId } from '../../auth/resolve-identity';
 import { logger } from '../../utils/logger';
+import { EmbeddingRouter } from '../../services/embeddings/router';
 import type {
   Memory,
   MemoryCreateInput,
@@ -21,8 +23,150 @@ import type {
   Salience,
 } from '../models/memory';
 
+type RecallMode = NonNullable<MemorySearchOptions['recallMode']>;
+
+export interface KnowledgeMemoryContext {
+  threadKey?: string;
+  focusText?: string;
+}
+
+interface RecallCandidate {
+  memory: Memory;
+  semanticScore?: number;
+  textScore?: number;
+  finalScore: number;
+}
+
+type MatchMemoriesArgs = Database['public']['Functions']['match_memories']['Args'];
+type MatchMemoriesReturn = Database['public']['Functions']['match_memories']['Returns'][number];
+type MatchMemoriesRpcResult = {
+  data: MatchMemoriesReturn[] | null;
+  error: { message: string } | null;
+};
+type MatchMemoriesRpcClient = {
+  rpc(fn: 'match_memories', args: MatchMemoriesArgs): Promise<MatchMemoriesRpcResult>;
+};
+
+type SemanticMatchRow = Omit<MemoryRow, 'embedding'> & {
+  embedding: number[] | string | null;
+  similarity?: number;
+};
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function formatVectorLiteral(vector: number[]): string {
+  return `[${vector.join(',')}]`;
+}
+
+function parseEmbeddingValue(value: MemoryRow['embedding'] | string | null): number[] | undefined {
+  if (!value) return undefined;
+  if (Array.isArray(value)) return value;
+  if (typeof value !== 'string') return undefined;
+
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map((entry) => Number(entry)) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function tokenizeRelevance(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/g)
+    .filter((token) => token.length > 1);
+}
+
+function extractThreadType(threadKey: string): string | null {
+  const idx = threadKey.indexOf(':');
+  if (idx <= 0) return null;
+  return threadKey.slice(0, idx).toLowerCase();
+}
+
+function computeThreadBoost(memory: Memory, threadKey?: string): number {
+  if (!threadKey?.trim()) return 1;
+
+  const normalized = threadKey.trim().toLowerCase();
+  const candidates = new Set<string>();
+  if (memory.topicKey) candidates.add(memory.topicKey.toLowerCase());
+  for (const t of memory.topics) candidates.add(t.toLowerCase());
+  const metadataThreadKey =
+    memory.metadata &&
+    typeof memory.metadata === 'object' &&
+    typeof (memory.metadata as Record<string, unknown>).threadKey === 'string'
+      ? ((memory.metadata as Record<string, unknown>).threadKey as string).toLowerCase()
+      : null;
+  if (metadataThreadKey) candidates.add(metadataThreadKey);
+
+  if (candidates.has(normalized)) return 1.8;
+
+  const threadType = extractThreadType(normalized);
+  if (threadType) {
+    for (const candidate of candidates) {
+      if (extractThreadType(candidate) === threadType) return 1.25;
+    }
+  }
+
+  const threadTokens = tokenizeRelevance(normalized);
+  if (threadTokens.length === 0) return 1;
+  const candidateText = Array.from(candidates).join(' ');
+  const tokenOverlap = threadTokens.filter((token) => candidateText.includes(token)).length;
+  if (tokenOverlap > 0) return 1.1;
+
+  return 1;
+}
+
+function computeFocusBoost(memory: Memory, focusText?: string): number {
+  if (!focusText?.trim()) return 1;
+
+  const focusTokens = tokenizeRelevance(focusText).filter((token) => token.length > 2);
+  if (focusTokens.length === 0) return 1;
+
+  const haystack = [
+    memory.content,
+    memory.summary || '',
+    memory.topicKey || '',
+    memory.topics.join(' '),
+  ]
+    .join(' ')
+    .toLowerCase();
+
+  const overlap = focusTokens.filter((token) => haystack.includes(token)).length;
+  if (overlap === 0) return 1;
+
+  const ratio = overlap / focusTokens.length;
+  return 1 + Math.min(0.35, ratio * 0.35);
+}
+
+export function computeKnowledgeMemoryScore(
+  memory: Memory,
+  context: KnowledgeMemoryContext = {},
+  now: Date = new Date()
+): number {
+  const salienceWeight =
+    memory.salience === 'critical'
+      ? 2
+      : memory.salience === 'high'
+        ? 1.2
+        : memory.salience === 'medium'
+          ? 0.9
+          : 0.6;
+
+  const ageDays = Math.max(0, (now.getTime() - memory.createdAt.getTime()) / DAY_MS);
+  const recencyDecay = Math.max(0.25, Math.exp(-ageDays / 45));
+  const threadBoost = computeThreadBoost(memory, context.threadKey);
+  const focusBoost = computeFocusBoost(memory, context.focusText);
+
+  return salienceWeight * recencyDecay * threadBoost * focusBoost;
+}
+
 export class MemoryRepository {
-  constructor(private supabase: SupabaseClient) {}
+  private embeddingRouter: EmbeddingRouter;
+
+  constructor(private supabase: SupabaseClient) {
+    this.embeddingRouter = new EmbeddingRouter();
+  }
 
   // ==================== MEMORIES ====================
 
@@ -64,17 +208,189 @@ export class MemoryRepository {
       throw new Error(`Failed to create memory: ${error.message}`);
     }
 
-    return this.rowToMemory(data);
+    const memory = this.rowToMemory(data);
+
+    // Embedding persistence is intentionally eventually consistent: we insert the
+    // memory row first so writes never fail on provider/network issues, then best-
+    // effort persist the vector in a follow-up update.
+    await this.tryEmbedMemory(memory, input);
+
+    return memory;
   }
 
   /**
-   * Search memories by text (basic search for now, semantic later)
+   * Search memories by text and/or semantic vectors.
    */
   async recall(
     userId: string,
     query?: string,
     options: MemorySearchOptions = {}
   ): Promise<Memory[]> {
+    const limit = options.limit || 20;
+    const offset = options.offset || 0;
+    const recallMode: RecallMode = options.recallMode || 'hybrid';
+
+    if (!query?.trim()) {
+      return this.textRecall(userId, undefined, options, limit, offset);
+    }
+
+    const normalizedQuery = query.trim();
+
+    if (recallMode === 'text') {
+      return this.textRecall(userId, normalizedQuery, options, limit, offset);
+    }
+
+    if (recallMode === 'semantic') {
+      const semanticCandidates = await this.trySemanticRecallCandidates(
+        userId,
+        normalizedQuery,
+        options,
+        limit,
+        offset
+      );
+      return semanticCandidates?.map((c) => c.memory) || [];
+    }
+
+    if (recallMode === 'auto') {
+      const semanticCandidates = await this.trySemanticRecallCandidates(
+        userId,
+        normalizedQuery,
+        options,
+        limit,
+        offset
+      );
+      if (semanticCandidates && semanticCandidates.length > 0) {
+        return semanticCandidates.map((c) => c.memory);
+      }
+      return this.textRecall(userId, normalizedQuery, options, limit, offset);
+    }
+
+    // hybrid mode: combine text + semantic signals with dedupe/reranking
+    return this.hybridRecall(userId, normalizedQuery, options, limit, offset);
+  }
+
+  private async hybridRecall(
+    userId: string,
+    query: string,
+    options: MemorySearchOptions,
+    limit: number,
+    offset: number
+  ): Promise<Memory[]> {
+    const config = this.embeddingRouter.getRuntimeConfig();
+    const candidatePool = Math.max(
+      limit,
+      (offset + limit) * Math.max(1, config.matchCountMultiplier)
+    );
+
+    const [semanticCandidates, textCandidates] = await Promise.all([
+      this.trySemanticRecallCandidates(userId, query, options, limit, offset),
+      this.textRecallCandidates(userId, query, options, candidatePool, 0),
+    ]);
+
+    const byId = new Map<string, RecallCandidate>();
+
+    for (const candidate of semanticCandidates || []) {
+      const existing = byId.get(candidate.memory.id);
+      byId.set(candidate.memory.id, {
+        memory: candidate.memory,
+        semanticScore: candidate.semanticScore,
+        textScore: existing?.textScore,
+        finalScore: 0,
+      });
+    }
+
+    for (const candidate of textCandidates) {
+      const existing = byId.get(candidate.memory.id);
+      byId.set(candidate.memory.id, {
+        memory: candidate.memory,
+        semanticScore: existing?.semanticScore,
+        textScore: candidate.textScore,
+        finalScore: 0,
+      });
+    }
+
+    const merged = Array.from(byId.values()).map((candidate) => ({
+      ...candidate,
+      finalScore: this.computeHybridScore(candidate.semanticScore, candidate.textScore),
+    }));
+
+    merged.sort(
+      (a, b) =>
+        b.finalScore - a.finalScore || b.memory.createdAt.getTime() - a.memory.createdAt.getTime()
+    );
+
+    return merged.slice(offset, offset + limit).map((c) => c.memory);
+  }
+
+  private computeHybridScore(semanticScore?: number, textScore?: number): number {
+    const s = semanticScore ?? 0;
+    const t = textScore ?? 0;
+    // Blend with heavier semantic weighting, but allow lexical key matches to lift ranking.
+    return s * 0.7 + t * 0.3;
+  }
+
+  private buildTextScore(query: string, memory: Memory): number {
+    const queryTokens = this.tokenize(query);
+    if (queryTokens.length === 0) return 0;
+
+    const haystack = [
+      memory.content,
+      memory.summary || '',
+      memory.topicKey || '',
+      memory.topics.join(' '),
+    ]
+      .join(' ')
+      .toLowerCase();
+
+    const overlapCount = queryTokens.filter((token) => haystack.includes(token)).length;
+    let score = overlapCount / queryTokens.length;
+
+    if (haystack.includes(query.toLowerCase())) score += 0.2;
+    if (
+      memory.topicKey &&
+      queryTokens.some((token) => memory.topicKey!.toLowerCase().includes(token))
+    ) {
+      score += 0.2;
+    }
+
+    return Math.min(1, score);
+  }
+
+  private tokenize(text: string): string[] {
+    return tokenizeRelevance(text);
+  }
+
+  private buildTextSearchTerms(query: string): string[] {
+    const full = query
+      .trim()
+      .replace(/[,%()]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const tokens = this.tokenize(full)
+      .filter((token) => token.length > 2)
+      .sort((a, b) => b.length - a.length)
+      .slice(0, 3);
+    return Array.from(new Set([full, ...tokens].filter(Boolean)));
+  }
+
+  private async textRecall(
+    userId: string,
+    query: string | undefined,
+    options: MemorySearchOptions,
+    limit: number,
+    offset: number
+  ): Promise<Memory[]> {
+    const candidates = await this.textRecallCandidates(userId, query, options, limit, offset);
+    return candidates.map((c) => c.memory);
+  }
+
+  private async textRecallCandidates(
+    userId: string,
+    query: string | undefined,
+    options: MemorySearchOptions,
+    limit: number,
+    offset: number
+  ): Promise<RecallCandidate[]> {
     let queryBuilder = this.supabase
       .from('memories')
       .select('*')
@@ -113,14 +429,20 @@ export class MemoryRepository {
       queryBuilder = queryBuilder.or('expires_at.is.null,expires_at.gt.now()');
     }
 
-    // Text search on content (basic ILIKE for now)
+    // Text search on content/summary/topic_key
     if (query) {
-      queryBuilder = queryBuilder.ilike('content', `%${query}%`);
+      const terms = this.buildTextSearchTerms(query).slice(0, 10);
+      if (terms.length > 0) {
+        const clauses = terms.flatMap((term) => [
+          `content.ilike.%${term}%`,
+          `summary.ilike.%${term}%`,
+          `topic_key.ilike.%${term}%`,
+        ]);
+        queryBuilder = queryBuilder.or(clauses.join(','));
+      }
     }
 
     // Pagination
-    const limit = options.limit || 20;
-    const offset = options.offset || 0;
     queryBuilder = queryBuilder.range(offset, offset + limit - 1);
 
     const { data, error } = await queryBuilder;
@@ -130,7 +452,122 @@ export class MemoryRepository {
       throw new Error(`Failed to recall memories: ${error.message}`);
     }
 
-    return (data || []).map(this.rowToMemory);
+    return (data || []).map((row) => {
+      const memory = this.rowToMemory(row);
+      const textScore = query ? this.buildTextScore(query, memory) : 0;
+      return {
+        memory,
+        textScore,
+        finalScore: textScore,
+      };
+    });
+  }
+
+  private async trySemanticRecallCandidates(
+    userId: string,
+    query: string,
+    options: MemorySearchOptions,
+    limit: number,
+    offset: number
+  ): Promise<RecallCandidate[] | null> {
+    const queryEmbedding = await this.embeddingRouter.embedQuery(query);
+    if (!queryEmbedding) return null;
+
+    const config = this.embeddingRouter.getRuntimeConfig();
+    if (queryEmbedding.dimensions !== config.dimensions) {
+      logger.warn('Skipping semantic recall due to embedding dimension mismatch', {
+        provider: queryEmbedding.provider,
+        model: queryEmbedding.model,
+        embeddingDimensions: queryEmbedding.dimensions,
+        expectedDimensions: config.dimensions,
+      });
+      return null;
+    }
+
+    const matchCount = Math.max(
+      limit,
+      (offset + limit) * Math.max(1, config.matchCountMultiplier || 1)
+    );
+
+    const rpcArgs: MatchMemoriesArgs = {
+      query_embedding: formatVectorLiteral(queryEmbedding.vector),
+      match_threshold: config.queryThreshold,
+      match_count: matchCount,
+      p_user_id: userId,
+      p_source: options.source,
+      p_salience: options.salience,
+      p_topics: options.topics && options.topics.length > 0 ? options.topics : undefined,
+      p_agent_id: options.agentId,
+      p_include_shared: options.includeShared !== false,
+      p_include_expired: options.includeExpired === true,
+    };
+
+    const rpcClient = this.supabase as unknown as MatchMemoriesRpcClient;
+    const { data, error } = await rpcClient.rpc('match_memories', rpcArgs);
+
+    if (error) {
+      logger.warn('Semantic memory recall failed, falling back to text recall', {
+        error: error.message,
+      });
+      return null;
+    }
+
+    const rows = (data || []) as SemanticMatchRow[];
+    const pagedRows = rows.slice(offset, offset + limit);
+    return pagedRows.map((row) => {
+      const memory = this.rowToMemory(row);
+      const semanticScore = Math.max(0, Math.min(1, row.similarity ?? 0));
+      return {
+        memory,
+        semanticScore,
+        finalScore: semanticScore,
+      };
+    });
+  }
+
+  private async tryEmbedMemory(memory: Memory, input: MemoryCreateInput): Promise<void> {
+    if (!this.embeddingRouter.isEnabled()) return;
+
+    const sourceText = [input.summary, input.content].filter(Boolean).join('\n\n').trim();
+    if (!sourceText) return;
+
+    const embedding = await this.embeddingRouter.embedDocument(sourceText);
+    if (!embedding) return;
+
+    const { error } = await this.supabase
+      .from('memories')
+      .update({
+        embedding: embedding.vector,
+        metadata: {
+          ...(memory.metadata || {}),
+          embedding: {
+            provider: embedding.provider,
+            model: embedding.model,
+            dimensions: embedding.dimensions,
+            updatedAt: new Date().toISOString(),
+          },
+        },
+      })
+      .eq('id', memory.id)
+      .eq('user_id', memory.userId);
+
+    if (error) {
+      logger.warn('Failed to persist memory embedding', {
+        memoryId: memory.id,
+        error: error.message,
+      });
+      return;
+    }
+
+    memory.embedding = embedding.vector;
+    memory.metadata = {
+      ...(memory.metadata || {}),
+      embedding: {
+        provider: embedding.provider,
+        model: embedding.model,
+        dimensions: embedding.dimensions,
+      },
+    };
   }
 
   /**
@@ -147,7 +584,8 @@ export class MemoryRepository {
     userId: string,
     agentId?: string,
     highLimit: number = 10,
-    highWindowDays: number = 7
+    highWindowDays: number = 7,
+    context: KnowledgeMemoryContext = {}
   ): Promise<Memory[]> {
     const buildQuery = (salience: string, limit: number) => {
       let q = this.supabase
@@ -216,8 +654,19 @@ export class MemoryRepository {
       (a, b) => b.createdAt.getTime() - a.createdAt.getTime()
     );
 
-    // Critical first, then high — both ordered by recency within their tier
-    return [...criticalMemories, ...highMemories];
+    const scoredHighMemories = highMemories
+      .map((memory) => ({
+        memory,
+        score: computeKnowledgeMemoryScore(memory, context),
+      }))
+      .sort(
+        (a, b) => b.score - a.score || b.memory.createdAt.getTime() - a.memory.createdAt.getTime()
+      )
+      .map((entry) => entry.memory);
+
+    // Critical first, then high.
+    // Critical remains recency-ordered; high can be boosted by thread/focus relevance.
+    return [...criticalMemories, ...scoredHighMemories];
   }
 
   /**
@@ -919,7 +1368,7 @@ export class MemoryRepository {
 
   // ==================== HELPERS ====================
 
-  private rowToMemory(row: MemoryRow): Memory {
+  private rowToMemory(row: MemoryRow | SemanticMatchRow): Memory {
     return {
       id: row.id,
       userId: row.user_id,
@@ -930,7 +1379,7 @@ export class MemoryRepository {
       salience: row.salience,
       topics: row.topics,
       agentId: row.agent_id || undefined,
-      embedding: row.embedding || undefined,
+      embedding: parseEmbeddingValue(row.embedding),
       metadata: row.metadata,
       version: row.version || 1,
       createdAt: new Date(row.created_at),

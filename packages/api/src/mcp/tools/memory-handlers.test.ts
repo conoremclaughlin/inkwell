@@ -740,15 +740,11 @@ describe('handleUpdateSessionPhase', () => {
       );
     });
 
-    it('should create memory for complete phase', async () => {
+    it('should NOT create memory for complete phase without outcome detail', async () => {
       mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue({
         ...mockSession,
         currentPhase: 'complete',
-      });
-      mockDataComposer.repositories.memory.remember.mockResolvedValue({
-        id: 'memory-101',
-        content: 'Session entered phase: complete',
       });
 
       const result = await handleUpdateSessionPhase(
@@ -757,18 +753,44 @@ describe('handleUpdateSessionPhase', () => {
       );
 
       const parsed = JSON.parse(result.content[0].text);
-      expect(parsed.memoryCreated).toBeDefined();
+      expect(parsed.memoryCreated).toBeUndefined();
+      expect(mockDataComposer.repositories.memory.remember).not.toHaveBeenCalled();
     });
 
-    it('should create memory with default content when no note provided', async () => {
+    it('should create memory for complete phase when outcome detail is provided', async () => {
+      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue({
+        ...mockSession,
+        currentPhase: 'complete',
+      });
+      mockDataComposer.repositories.memory.remember.mockResolvedValue({
+        id: 'memory-101',
+        content: '[complete] Merged PR #214 after resolving sender-metadata propagation bug.',
+      });
+
+      const result = await handleUpdateSessionPhase(
+        {
+          email: 'test@test.com',
+          phase: 'complete',
+          note: 'Merged PR #214 after resolving sender-metadata propagation bug.',
+        },
+        mockDataComposer as never
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.memoryCreated).toBeDefined();
+      expect(mockDataComposer.repositories.memory.remember).toHaveBeenCalledWith(
+        expect.objectContaining({
+          content: '[complete] Merged PR #214 after resolving sender-metadata propagation bug.',
+        })
+      );
+    });
+
+    it('should NOT create memory when no note or context is provided', async () => {
       mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue({
         ...mockSession,
         currentPhase: 'blocked:unknown-issue',
-      });
-      mockDataComposer.repositories.memory.remember.mockResolvedValue({
-        id: 'memory-102',
-        content: 'Session entered phase: blocked:unknown-issue',
       });
 
       await handleUpdateSessionPhase(
@@ -776,11 +798,7 @@ describe('handleUpdateSessionPhase', () => {
         mockDataComposer as never
       );
 
-      expect(mockDataComposer.repositories.memory.remember).toHaveBeenCalledWith(
-        expect.objectContaining({
-          content: 'Session entered phase: blocked:unknown-issue',
-        })
-      );
+      expect(mockDataComposer.repositories.memory.remember).not.toHaveBeenCalled();
     });
 
     it('should NOT create memory for non-significant phases', async () => {
@@ -828,11 +846,15 @@ describe('handleUpdateSessionPhase', () => {
       });
       mockDataComposer.repositories.memory.remember.mockResolvedValue({
         id: 'memory-103',
-        content: 'Session entered phase: blocked:test',
+        content: '[blocked:test] Awaiting review from Wren.',
       });
 
       await handleUpdateSessionPhase(
-        { email: 'test@test.com', phase: 'blocked:test' },
+        {
+          email: 'test@test.com',
+          phase: 'blocked:test',
+          note: 'Awaiting review from Wren.',
+        },
         mockDataComposer as never
       );
 

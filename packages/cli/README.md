@@ -210,6 +210,34 @@ sb workspace list               # List workspaces (team/personal)
 sb --help                       # Full help
 ```
 
+### Optional: local semantic memory embeddings
+
+The PCP memory system does **not** require embeddings to work. Without them, `remember` and `recall` still work via text retrieval.
+
+If you want local semantic recall via Ollama:
+
+```bash
+sb memory install
+```
+
+This command:
+
+- verifies `ollama` is installed
+- pulls the default vetted embedding model (`mxbai-embed-large`)
+- writes the required memory embedding settings into `.env.local`
+
+If the model is already present:
+
+```bash
+sb memory install --skip-pull
+```
+
+To explicitly disable embeddings and keep text-only recall:
+
+```bash
+echo 'MEMORY_EMBEDDINGS_ENABLED=false' >> .env.local
+```
+
 ### Identity Resolution
 
 The agent ID is resolved in order:

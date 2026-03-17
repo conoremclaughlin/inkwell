@@ -102,6 +102,11 @@ const optionalUrl = z
   .optional()
   .or(z.literal(''))
   .transform((val) => (val === '' ? undefined : val));
+const optionalNumber = z
+  .string()
+  .optional()
+  .or(z.literal(''))
+  .transform((val) => (val === '' || val === undefined ? undefined : Number(val)));
 
 // Environment variable schema
 const envSchema = z.object({
@@ -160,6 +165,20 @@ const envSchema = z.object({
   GOOGLE_CLIENT_ID: optionalString,
   GOOGLE_CLIENT_SECRET: optionalString,
   OAUTH_REDIRECT_BASE_URL: optionalUrl, // OAuth callback URL - can be origin only (http://localhost:3001) or full URL (http://localhost:3001/api/admin/oauth/google/callback)
+
+  // Embeddings
+  MEMORY_EMBEDDINGS_ENABLED: z
+    .enum(['true', 'false'])
+    .default(nodeEnv === 'test' ? 'false' : 'true')
+    .transform((v) => v === 'true'),
+  MEMORY_EMBEDDING_PROVIDER: z.enum(['ollama', 'openai']).optional(),
+  MEMORY_EMBEDDING_MODEL: optionalString,
+  MEMORY_EMBEDDING_DIMENSIONS: optionalNumber,
+  MEMORY_EMBEDDING_QUERY_THRESHOLD: optionalNumber,
+  MEMORY_EMBEDDING_MATCH_COUNT_MULTIPLIER: optionalNumber,
+  OLLAMA_BASE_URL: optionalUrl,
+  OPENAI_API_KEY: optionalString,
+  OPENAI_BASE_URL: optionalUrl,
 });
 
 // Parse and validate environment variables
@@ -198,6 +217,9 @@ const parseEnv = () => {
       parsed.MYRA_HTTP_PORT === undefined || (hasBaseOverride && parsed.MYRA_HTTP_PORT === 3003)
         ? portBase + 2
         : parsed.MYRA_HTTP_PORT;
+    const memoryEmbeddingDimensions = parsed.MEMORY_EMBEDDING_DIMENSIONS ?? 1024;
+    const memoryEmbeddingQueryThreshold = parsed.MEMORY_EMBEDDING_QUERY_THRESHOLD ?? 0.2;
+    const memoryEmbeddingMatchCountMultiplier = parsed.MEMORY_EMBEDDING_MATCH_COUNT_MULTIPLIER ?? 5;
 
     return {
       ...parsed,
@@ -207,6 +229,10 @@ const parseEnv = () => {
       MYRA_HTTP_PORT: myraHttpPort,
       SUPABASE_PUBLISHABLE_KEY: parsed.SUPABASE_PUBLISHABLE_KEY || parsed.SUPABASE_ANON_KEY,
       SUPABASE_SECRET_KEY: parsed.SUPABASE_SECRET_KEY || parsed.SUPABASE_SERVICE_KEY,
+      OLLAMA_BASE_URL: parsed.OLLAMA_BASE_URL || 'http://127.0.0.1:11434',
+      MEMORY_EMBEDDING_DIMENSIONS: memoryEmbeddingDimensions,
+      MEMORY_EMBEDDING_QUERY_THRESHOLD: memoryEmbeddingQueryThreshold,
+      MEMORY_EMBEDDING_MATCH_COUNT_MULTIPLIER: memoryEmbeddingMatchCountMultiplier,
     } as typeof parsed & {
       PCP_PORT_BASE: number;
       PORT: number;
@@ -214,6 +240,10 @@ const parseEnv = () => {
       MYRA_HTTP_PORT: number;
       SUPABASE_PUBLISHABLE_KEY: string;
       SUPABASE_SECRET_KEY: string;
+      OLLAMA_BASE_URL: string;
+      MEMORY_EMBEDDING_DIMENSIONS: number;
+      MEMORY_EMBEDDING_QUERY_THRESHOLD: number;
+      MEMORY_EMBEDDING_MATCH_COUNT_MULTIPLIER: number;
     };
   } catch (error) {
     if (error instanceof z.ZodError) {

@@ -157,3 +157,8 @@ vite.config.ts.timestamp-*
 
 # PCP hook runtime state (transient, per-session)
 .pcp/runtime/
+
+# Local automation / benchmark artifacts
+.playwright-cli/
+output/
+packages/api/output/

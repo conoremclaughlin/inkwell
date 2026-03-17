@@ -50,6 +50,8 @@
     "supabase:local:setup": "bash ./scripts/setup-local-supabase.sh",
     "test:integration:db:local": "bash ./scripts/test-integration-db-local.sh",
     "test:integration:runtime": "yarn workspace @personal-context/api test:integration:runtime",
+    "benchmark:memory-recall": "yarn workspace @personal-context/api benchmark:memory-recall",
+    "benchmark:bootstrap-relevance": "yarn workspace @personal-context/api benchmark:bootstrap-relevance",
     "lint": "yarn workspaces foreach -A run lint",
     "type-check": "yarn workspaces foreach -A -t run type-check",
     "clean": "yarn workspaces foreach -A run clean && rm -rf node_modules && pm2 delete all",

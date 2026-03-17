@@ -9,6 +9,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import type { DataComposer } from '../../data/composer';
+import type { Json } from '../../data/supabase/types';
 import { logger } from '../../utils/logger';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
 import { setSessionContext, pinSessionAgent, getRequestContext } from '../../utils/request-context';
@@ -65,10 +66,8 @@ const topicsSchema = z
   )
   .optional();
 
-// =====================================================
-// KNOWLEDGE SUMMARY BUILDER
-// =====================================================
-
+// ==============================================// KNOWLEDGE SUMMARY BUILDER
+// ==============================================
 /** Default character budget for the bootstrap knowledge summary. Override with BOOTSTRAP_MEMORY_BUDGET env var. */
 const DEFAULT_MEMORY_BUDGET = 8000;
 
@@ -215,10 +214,8 @@ function truncateContent(content: string, maxLen: number): string {
   return content.slice(0, maxLen - 3) + '...';
 }
 
-// =====================================================
-// MEMORY TOOLS
-// =====================================================
-
+// ==============================================// MEMORY TOOLS
+// ==============================================
 export const rememberSchema = userIdentifierBaseSchema.extend({
   content: z.string().describe('The content to remember'),
   summary: z
@@ -258,7 +255,13 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
 });
 
 export const recallSchema = userIdentifierBaseSchema.extend({
-  query: z.string().optional().describe('Search query (text search for now, semantic later)'),
+  query: z.string().optional().describe('Search query across memory text and semantic embeddings'),
+  recallMode: z
+    .enum(['auto', 'text', 'semantic', 'hybrid'])
+    .optional()
+    .describe(
+      'Recall strategy: text (keyword only), semantic (embeddings only), hybrid (blend both), auto (semantic then fallback to text). Default: hybrid.'
+    ),
   source: memorySourceSchema.optional().describe('Filter by source'),
   salience: salienceSchema.optional().describe('Filter by salience'),
   topics: topicsSchema.describe('Filter by topics (any match)'),
@@ -285,10 +288,8 @@ export const updateMemorySchema = userIdentifierBaseSchema.extend({
   metadata: z.record(z.unknown()).optional().describe('Additional metadata to merge'),
 });
 
-// =====================================================
-// SESSION TOOLS
-// =====================================================
-
+// ==============================================// SESSION TOOLS
+// ==============================================
 export const startSessionSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
@@ -387,10 +388,8 @@ export const listSessionsSchema = userIdentifierBaseSchema.extend({
   limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
 });
 
-// =====================================================
-// SESSION PHASE SCHEMA
-// =====================================================
-
+// ==============================================// SESSION PHASE SCHEMA
+// ==============================================
 export const updateSessionPhaseSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
@@ -444,10 +443,8 @@ export const updateSessionPhaseSchema = userIdentifierBaseSchema.extend({
   workingDir: z.string().optional().describe('Working directory'),
 });
 
-// =====================================================
-// MEMORY HISTORY SCHEMAS
-// =====================================================
-
+// ==============================================// MEMORY HISTORY SCHEMAS
+// ==============================================
 export const getMemoryHistorySchema = userIdentifierBaseSchema.extend({
   memoryId: z.string().uuid().describe('ID of the memory to get history for'),
 });
@@ -461,10 +458,8 @@ export const restoreMemorySchema = userIdentifierBaseSchema.extend({
   historyId: z.string().uuid().describe('ID of the history entry to restore from'),
 });
 
-// =====================================================
-// BOOTSTRAP SCHEMA
-// =====================================================
-
+// ==============================================// BOOTSTRAP SCHEMA
+// ==============================================
 export const bootstrapSchema = userIdentifierBaseSchema.extend({
   workspaceId: z
     .string()
@@ -499,12 +494,22 @@ export const bootstrapSchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe('Base path for identity files (default: ~/.pcp)'),
+  threadKey: z
+    .string()
+    .optional()
+    .describe(
+      'Optional active thread key used to prioritize bootstrap memories relevant to this conversation.'
+    ),
+  focusText: z
+    .string()
+    .optional()
+    .describe(
+      'Optional focus text to prioritize bootstrap memories. Falls back to current focus summary when omitted.'
+    ),
 });
 
-// =====================================================
-// COMPACTION SCHEMAS
-// =====================================================
-
+// ==============================================// COMPACTION SCHEMAS
+// ==============================================
 export const compactSessionSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
@@ -531,10 +536,8 @@ export const compactSessionSchema = userIdentifierBaseSchema.extend({
     .describe('Keep original logs after compaction (default: false)'),
 });
 
-// =====================================================
-// HANDLERS
-// =====================================================
-
+// ==============================================// HANDLERS
+// ==============================================
 export async function handleRemember(args: unknown, dataComposer: DataComposer) {
   const params = rememberSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
@@ -616,6 +619,7 @@ export async function handleRecall(args: unknown, dataComposer: DataComposer) {
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
   const memories = await dataComposer.repositories.memory.recall(user.id, params.query, {
+    recallMode: params.recallMode,
     source: params.source as MemorySource,
     salience: params.salience as Salience,
     topics: params.topics,
@@ -733,10 +737,8 @@ export async function handleUpdateMemory(args: unknown, dataComposer: DataCompos
   };
 }
 
-// =====================================================
-// SESSION HANDLERS
-// =====================================================
-
+// ==============================================// SESSION HANDLERS
+// ==============================================
 export async function handleStartSession(args: unknown, dataComposer: DataComposer) {
   const params = startSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
@@ -1139,16 +1141,30 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
   };
 }
 
-// =====================================================
-// SESSION PHASE HANDLER
-// =====================================================
-
+// ==============================================// SESSION PHASE HANDLER
+// ==============================================
 /**
  * Determines whether a phase transition should auto-create a memory.
- * Blocked and waiting phases create memories; active work phases don't.
+ * Only blocked/waiting/complete transitions are candidates, and they still
+ * require meaningful context before becoming durable memory.
  */
 function isSignificantPhaseTransition(phase: string): boolean {
   return phase.startsWith('blocked:') || phase.startsWith('waiting:') || phase === 'complete';
+}
+
+function buildPhaseTransitionMemoryContent(params: {
+  phase: string;
+  note?: string;
+  context?: string;
+}): string | null {
+  const detail = (params.note || params.context || '').trim();
+  if (!detail) return null;
+
+  if (params.phase === 'complete') {
+    return `[complete] ${detail}`;
+  }
+
+  return `[${params.phase}] ${detail}`;
 }
 
 type SessionTraceField =
@@ -1206,6 +1222,10 @@ function buildSessionTraceDiff(before: Session | null | undefined, after: Sessio
     (field) => beforeSnapshot[field] !== afterSnapshot[field]
   );
   return { beforeSnapshot, afterSnapshot, changedFields };
+}
+
+function toJsonObject(value: Record<string, unknown>): Json {
+  return value as Json;
 }
 
 export async function handleUpdateSessionPhase(args: unknown, dataComposer: DataComposer) {
@@ -1449,7 +1469,7 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
           sessionId,
           status: 'completed',
           content: `Session ${sessionId.slice(0, 8)} updated (${trace.changedFields.join(', ')})`,
-          payload: {
+          payload: toJsonObject({
             sessionId,
             changedFields: trace.changedFields,
             before: trace.beforeSnapshot,
@@ -1463,7 +1483,7 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
               contextProvided: params.context !== undefined,
               workingDirProvided: params.workingDir !== undefined,
             },
-          },
+          }),
         });
         result.sessionTrace = {
           changedFields: trace.changedFields,
@@ -1477,32 +1497,38 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
     }
   }
 
-  // Auto-create memory for significant phase transitions
+  // Auto-create memory for significant phase transitions only when there is
+  // meaningful outcome context. Bare state changes like "Session entered phase:
+  // complete" belong in session state/activity logs, not durable memory.
   if (params.phase && isSignificantPhaseTransition(params.phase)) {
-    const memoryContent = params.note
-      ? `[${params.phase}] ${params.note}`
-      : `Session entered phase: ${params.phase}`;
-
-    const memory = await dataComposer.repositories.memory.remember({
-      userId: user.id,
-      content: memoryContent,
-      source: 'session',
-      salience: 'high',
-      topics: ['session-phase', params.phase.split(':')[0]],
-      metadata: { sessionId, phase: params.phase },
-      agentId: params.agentId || updated.agentId,
-    });
-
-    result.memoryCreated = {
-      id: memory.id,
-      content: memoryContent,
-    };
-
-    logger.info(`Phase transition auto-created memory`, {
-      sessionId,
+    const memoryContent = buildPhaseTransitionMemoryContent({
       phase: params.phase,
-      memoryId: memory.id,
+      note: params.note,
+      context: params.context,
     });
+
+    if (memoryContent) {
+      const memory = await dataComposer.repositories.memory.remember({
+        userId: user.id,
+        content: memoryContent,
+        source: 'session',
+        salience: 'high',
+        topics: ['session-phase', params.phase.split(':')[0]],
+        metadata: { sessionId, phase: params.phase },
+        agentId: params.agentId || updated.agentId,
+      });
+
+      result.memoryCreated = {
+        id: memory.id,
+        content: memoryContent,
+      };
+
+      logger.info(`Phase transition auto-created memory`, {
+        sessionId,
+        phase: params.phase,
+        memoryId: memory.id,
+      });
+    }
   }
 
   // Optionally create a task for blockers
@@ -1557,10 +1583,8 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
   };
 }
 
-// =====================================================
-// MEMORY HISTORY HANDLERS
-// =====================================================
-
+// ==============================================// MEMORY HISTORY HANDLERS
+// ==============================================
 export async function handleGetMemoryHistory(args: unknown, dataComposer: DataComposer) {
   const params = getMemoryHistorySchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
@@ -1675,10 +1699,8 @@ export async function handleRestoreMemory(args: unknown, dataComposer: DataCompo
   };
 }
 
-// =====================================================
-// BOOTSTRAP HANDLER
-// =====================================================
-
+// ==============================================// BOOTSTRAP HANDLER
+// ==============================================
 /**
  * Bootstrap loads identity core + active context in one call.
  * This is the recommended way to start a new session.
@@ -1714,6 +1736,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   });
 
   const includeMemories = params.includeRecentMemories !== false;
+  const memoryLimit = params.memoryLimit ?? 50;
   const postCompact = params.postCompact === true;
   const agentId = params.agentId;
   const basePath = params.identityBasePath || path.join(os.homedir(), '.pcp');
@@ -1763,53 +1786,58 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   // Fetch all context in parallel (including timezone and skills)
   const cloudSkillsService = getCloudSkillsService(dataComposer.getClient());
 
-  const [
-    contexts,
-    projects,
-    focus,
-    activeSessions,
-    knowledgeMemoriesBase,
-    dbIdentity,
-    userTimezone,
-    userSkills,
-  ] = await Promise.all([
-    // Identity Core: all context summaries
-    dataComposer.repositories.context.findAllByUser(user.id),
-    // Active projects
-    dataComposer.repositories.projects.findAllByUser(user.id, 'active'),
-    // Current focus
-    dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
-    // All active sessions (filter by agentId if provided) — client picks the right one
-    dataComposer.repositories.memory.getActiveSessions(user.id, agentId),
-    // Knowledge memories: all critical + recent high (for knowledge summary)
-    includeMemories
-      ? dataComposer.repositories.memory.getKnowledgeMemories(user.id, agentId)
-      : Promise.resolve([]),
-    // Database identity (for cloud agents, includes metadata, heartbeat, soul)
-    agentId
-      ? dataComposer
-          .getClient()
-          .from('agent_identities')
-          .select('*')
-          .eq('user_id', user.id)
-          .eq('agent_id', agentId)
-          .single()
-          .then(({ data }) => data)
-      : Promise.resolve(null),
-    // User timezone for timestamp conversion
-    dataComposer
-      .getClient()
-      .from('users')
-      .select('timezone')
-      .eq('id', user.id)
-      .single()
-      .then(({ data }) => data?.timezone || 'UTC'),
-    // User's installed skills (local + cloud merged)
-    cloudSkillsService.loadUserSkills(user.id).catch((err) => {
-      logger.warn('Failed to load user skills:', err);
-      return [];
-    }),
-  ]);
+  const [contexts, projects, focus, activeSessions, dbIdentity, userTimezone, userSkills] =
+    await Promise.all([
+      // Identity Core: all context summaries
+      dataComposer.repositories.context.findAllByUser(user.id),
+      // Active projects
+      dataComposer.repositories.projects.findAllByUser(user.id, 'active'),
+      // Current focus
+      dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
+      // All active sessions (filter by agentId if provided) — client picks the right one
+      dataComposer.repositories.memory.getActiveSessions(user.id, agentId),
+      // Database identity (for cloud agents, includes metadata, heartbeat, soul)
+      agentId
+        ? dataComposer
+            .getClient()
+            .from('agent_identities')
+            .select('*')
+            .eq('user_id', user.id)
+            .eq('agent_id', agentId)
+            .single()
+            .then(({ data }) => data)
+        : Promise.resolve(null),
+      // User timezone for timestamp conversion
+      dataComposer
+        .getClient()
+        .from('users')
+        .select('timezone')
+        .eq('id', user.id)
+        .single()
+        .then(({ data }) => data?.timezone || 'UTC'),
+      // User's installed skills (local + cloud merged)
+      cloudSkillsService.loadUserSkills(user.id).catch((err) => {
+        logger.warn('Failed to load user skills:', err);
+        return [];
+      }),
+    ]);
+
+  const inferredThreadKey =
+    params.threadKey || activeSessions.find((session) => !!session.threadKey)?.threadKey;
+  const focusText = params.focusText || focus?.focus_summary || undefined;
+
+  const knowledgeMemoriesBase = includeMemories
+    ? await dataComposer.repositories.memory.getKnowledgeMemories(
+        user.id,
+        agentId,
+        memoryLimit,
+        7,
+        {
+          threadKey: inferredThreadKey || undefined,
+          focusText,
+        }
+      )
+    : [];
 
   // Post-compact: merge in most recent memories regardless of salience
   // to restore context continuity after lossy compaction
@@ -1981,6 +2009,11 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     knowledgeSummaryChars: knowledgeSummary.length,
     topicCount: topicIndex.length,
     usedCache: !!cachedSummary,
+    memorySelectionContext: {
+      threadKey: inferredThreadKey || null,
+      hasFocusText: !!focusText,
+      memoryLimit,
+    },
     skillCount: userSkills.length,
     activeSessionCount: activeSessions.length,
     hasIdentityFiles: !!identityFiles,
@@ -2118,10 +2151,8 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   };
 }
 
-// =====================================================
-// COMPACTION HANDLER
-// =====================================================
-
+// ==============================================// COMPACTION HANDLER
+// ==============================================
 /**
  * Compact session logs into memories.
  *
