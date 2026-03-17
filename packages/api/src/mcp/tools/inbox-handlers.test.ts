@@ -132,8 +132,20 @@ function createMockSupabase(
     }),
   };
 
+  // Read pointer for agent_inbox_read_status (pointer-based unread tracking)
+  const readPointerChainable = {
+    select: vi.fn().mockReturnValue({
+      eq: vi.fn().mockReturnValue({
+        eq: vi.fn().mockReturnValue({
+          maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      }),
+    }),
+  };
+
   const fromFn = vi.fn().mockImplementation((table: string) => {
     if (table === 'agent_identities') return identityChainable;
+    if (table === 'agent_inbox_read_status') return readPointerChainable;
     return chainable;
   });
 
