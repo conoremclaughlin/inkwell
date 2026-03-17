@@ -82,8 +82,14 @@ console.log(`  API_URL=${apiUrl}`);
 console.log(`  ENABLE_TELEGRAM=${process.env.ENABLE_TELEGRAM ?? '<auto>'}`);
 console.log(`  ENABLE_HEARTBEAT_SERVICE=${process.env.ENABLE_HEARTBEAT_SERVICE ?? '<unset>'}`);
 
+// Ensure node_modules/.bin is on PATH so hoisted binaries (next, tsx, etc.)
+// are resolvable by yarn script shells spawned via concurrently.
+const binDir = path.join(rootDir, 'node_modules', '.bin');
+const envPATH = `${binDir}:${process.env.PATH || ''}`;
+
 const apiEnv = {
   ...process.env,
+  PATH: envPATH,
   PCP_PORT_BASE: String(basePort),
   MYRA_HTTP_PORT: String(myraPort),
   API_URL: apiUrl,
@@ -94,6 +100,7 @@ const apiEnv = {
 
 const webEnv = {
   ...process.env,
+  PATH: envPATH,
   PCP_PORT_BASE: String(basePort),
   WEB_PORT: String(webPort),
   API_URL: apiUrl,
