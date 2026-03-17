@@ -101,7 +101,7 @@ This launches an interactive session where your new SB explores shared values, m
 ```bash
 sb -a <agent-name>                 # launch a session with your SB
 sb -a <agent-name> -b gemini       # specify a backend
-sb -a <agent-name> --dangerous     # skip all permission prompts (auto-approve)
+sb -a <agent-name> --dangerous     # auto-approve all prompts + bypass sandbox (use with care)
 ```
 
 Your SB now has persistent identity, memory, and session continuity across every interaction.

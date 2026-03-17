@@ -1044,6 +1044,13 @@ async function shutdown(): Promise<void> {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
+  // Hard deadline: force-exit if graceful shutdown takes too long
+  const forceExitTimer = setTimeout(() => {
+    logger.warn('Graceful shutdown timed out after 10s — force exiting');
+    process.exit(1);
+  }, 10_000);
+  forceExitTimer.unref();
+
   logger.info('\nShutting down PCP Server...');
 
   // Stop heartbeat cron job
