@@ -14,7 +14,8 @@ import ora from 'ora';
 import { confirm, input, select } from '@inquirer/prompts';
 import { execSync, spawn } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -252,11 +253,13 @@ async function installDeps(state: ProgressState): Promise<boolean> {
 async function setupDatabase(state: ProgressState): Promise<boolean> {
   stepHeader(4, 'Set up database');
 
-  // Check if already configured
+  // Check if already configured (match lines starting with the key, not comments)
   const envPath = join(state.targetDir, '.env.local');
   if (existsSync(envPath)) {
     const env = readFileSync(envPath, 'utf-8');
-    if (env.includes('SUPABASE_URL=') && env.includes('SUPABASE_SECRET_KEY=')) {
+    const hasUrl = /^SUPABASE_URL=/m.test(env);
+    const hasSecret = /^SUPABASE_SECRET_KEY=/m.test(env);
+    if (hasUrl && hasSecret) {
       skip('.env.local already configured');
       return true;
     }
@@ -603,11 +606,73 @@ const STEPS: StepDef[] = [
   { id: 'awaken', fn: awakenSb, required: false },
 ];
 
+function getVersion(): string {
+  try {
+    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+    return pkg.version || '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
+
+function showHelp(): void {
+  console.log(`
+  ${chalk.bold('create-pcp')} v${getVersion()}
+
+  ${chalk.dim('Set up Personal Context Protocol — AI beings with identity, memory, and coordination.')}
+
+  ${chalk.bold('Usage')}
+    npx create-pcp [target-directory]
+
+  ${chalk.bold('Options')}
+    --help, -h       Show this help message
+    --version, -v    Show version number
+
+  ${chalk.bold('Examples')}
+    npx create-pcp                         Interactive setup (prompts for directory)
+    npx create-pcp my-project              Clone into ./my-project
+    npx create-pcp ~/dev/pcp               Use an absolute path
+
+  ${chalk.bold('Resumability')}
+    If setup fails midway, re-run the same command pointing at the same
+    directory. Completed steps are tracked and skipped automatically.
+
+  ${chalk.dim('https://github.com/conoremclaughlin/personal-context-protocol')}
+`);
+}
+
+/** Validate that target dir is a reasonable path (not root, system dirs, etc.) */
+function validateTargetDir(dir: string): string | null {
+  const resolved = resolve(dir);
+  const forbidden = ['/', '/usr', '/bin', '/sbin', '/etc', '/var', '/tmp', '/System', '/Library'];
+  if (forbidden.includes(resolved)) {
+    return `"${resolved}" is a system directory — choose a project directory instead`;
+  }
+  // Check parent directory exists (we'll create the target, but parent must exist)
+  const parent = dirname(resolved);
+  if (!existsSync(parent)) {
+    return `Parent directory "${parent}" does not exist`;
+  }
+  return null;
+}
+
 async function main(): Promise<void> {
+  // Handle --help and --version before anything else
+  const args = process.argv.slice(2);
+  if (args.includes('--help') || args.includes('-h')) {
+    showHelp();
+    process.exit(0);
+  }
+  if (args.includes('--version') || args.includes('-v')) {
+    console.log(getVersion());
+    process.exit(0);
+  }
+
   showBanner();
 
-  // Target directory from argv or prompt
-  let targetDir = process.argv[2];
+  // Target directory from argv or prompt (skip flags)
+  let targetDir = args.find((a) => !a.startsWith('-'));
   if (!targetDir) {
     targetDir = await input({
       message: 'Where should we set up PCP?',
@@ -615,6 +680,13 @@ async function main(): Promise<void> {
     });
   }
   targetDir = resolve(targetDir);
+
+  // Validate target directory
+  const dirError = validateTargetDir(targetDir);
+  if (dirError) {
+    fail(dirError);
+    process.exit(1);
+  }
 
   // Load state (for resumability)
   const state: ProgressState = existsSync(join(targetDir, STATE_FILE))
