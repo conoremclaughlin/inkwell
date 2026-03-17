@@ -45,7 +45,7 @@ export { ClawdbotBridge, createClawdbotBridge, convertClawdbotContext } from './
 
 // Agent Gateway (agent-to-agent triggers)
 export type { AgentTriggerPayload, AgentTriggerResponse, TriggerCallback } from './agent-gateway';
-export { AgentGateway, getAgentGateway, createAgentGatewayRoutes } from './agent-gateway';
+export { AgentGateway, getAgentGateway } from './agent-gateway';
 
 // Channel Gateway (Telegram/WhatsApp/Discord listeners)
 export type { ChannelGatewayConfig, IncomingMessageHandler, GatewayChannel } from './gateway';

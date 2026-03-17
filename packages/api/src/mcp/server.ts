@@ -22,7 +22,7 @@ import {
   type LoadedMiniApp,
 } from '../mini-apps';
 import adminRouter, { setWhatsAppListener } from '../routes/admin';
-import agentTriggerRouter, { getAgentGateway } from '../routes/agent-trigger';
+import { getAgentGateway } from '../channels/agent-gateway';
 import { createChatRouter } from '../routes/chat';
 import { createHookLifecycleRouter } from '../routes/hook-lifecycle';
 import {
@@ -723,9 +723,6 @@ export class MCPServer {
     app.use(cookieParser());
     app.use('/api/admin', adminRouter);
     logger.info('Admin API routes registered at /api/admin');
-
-    app.use('/api/agent', agentTriggerRouter);
-    logger.info('Agent trigger routes registered at /api/agent');
 
     const hookLifecycleRouter = createHookLifecycleRouter(this.dataComposer);
     app.use('/api/hooks', hookLifecycleRouter);

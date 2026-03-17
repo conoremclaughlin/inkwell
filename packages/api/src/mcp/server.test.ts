@@ -67,13 +67,13 @@ vi.mock('../routes/admin', () => {
   };
 });
 
-vi.mock('../routes/agent-trigger', () => {
-  const { Router } = require('express');
-  return {
-    default: Router(),
-    getAgentGateway: vi.fn(),
-  };
-});
+vi.mock('../channels/agent-gateway', () => ({
+  getAgentGateway: vi.fn(() => ({
+    registerHandler: vi.fn(),
+    setDefaultHandler: vi.fn(),
+    getRegisteredAgents: vi.fn(() => []),
+  })),
+}));
 
 vi.mock('../utils/request-context', () => ({
   runWithRequestContext: vi.fn((_ctx: unknown, fn: () => unknown) => fn()),
