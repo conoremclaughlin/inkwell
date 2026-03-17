@@ -214,68 +214,41 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   const reqCtx = getRequestContext();
   const sessCtx = getSessionContext();
   let senderSessionId: string | null = reqCtx?.sessionId || sessCtx?.sessionId || null;
-  let senderStudioId: string | null = reqCtx?.workspaceId || sessCtx?.workspaceId || null;
+  const senderStudioId = reqCtx?.workspaceId || sessCtx?.workspaceId || null;
 
   // When the caller's session ID wasn't provided via request context headers
-  // (x-pcp-session-id), resolve it server-side so thread messages carry
-  // sender session context for reply routing.
-  if (!senderSessionId && senderAgentId) {
+  // (x-pcp-session-id), try threadKey-scoped lookup as a deterministic fallback.
+  // We intentionally do NOT fall back to "most recent active session" — that's
+  // non-deterministic and can route replies to the wrong worktree/studio.
+  if (!senderSessionId && senderAgentId && threadKey) {
     try {
-      // 1) ThreadKey-scoped lookup: find session already scoped to this thread
-      if (threadKey) {
-        const threadSession = await dataComposer.repositories.memory.getActiveSessionByThreadKey(
-          resolved.user.id,
+      const threadSession = await dataComposer.repositories.memory.getActiveSessionByThreadKey(
+        resolved.user.id,
+        senderAgentId,
+        threadKey,
+        senderStudioId
+      );
+      if (threadSession) {
+        senderSessionId = threadSession.id;
+        logger.debug('Resolved sender session from threadKey match (no header)', {
           senderAgentId,
           threadKey,
-          senderStudioId
-        );
-        if (threadSession) {
-          senderSessionId = threadSession.id;
-          logger.debug('Resolved sender session from threadKey match (no header)', {
-            senderAgentId,
-            threadKey,
-            senderSessionId,
-          });
-        }
-      }
-
-      // 2) Interactive session fallback: find the agent's most recent active
-      //    session without a threadKey (the interactive/general-purpose session).
-      //    This handles the common case where a user runs Claude Code directly
-      //    (not via `sb`) and sends thread messages — the session headers are
-      //    missing but we can still attach the correct session for reply routing.
-      if (!senderSessionId) {
-        const { data: interactiveSession } = await supabase
-          .from('sessions')
-          .select('id, studio_id')
-          .eq('user_id', resolved.user.id)
-          .eq('agent_id', senderAgentId)
-          .is('ended_at', null)
-          .is('thread_key', null)
-          .order('updated_at', { ascending: false })
-          .limit(1)
-          .maybeSingle();
-
-        if (interactiveSession) {
-          senderSessionId = interactiveSession.id;
-          if (!senderStudioId && interactiveSession.studio_id) {
-            senderStudioId = interactiveSession.studio_id;
-          }
-          logger.debug('Resolved sender session from interactive session fallback', {
-            senderAgentId,
-            senderSessionId,
-            studioId: interactiveSession.studio_id,
-          });
-        }
+          senderSessionId,
+        });
       }
     } catch (err) {
-      logger.warn('Failed to resolve sender session', {
+      logger.warn('Failed to resolve sender session from threadKey', {
         error: err instanceof Error ? err.message : String(err),
         senderAgentId,
         threadKey,
       });
     }
   }
+
+  // Track whether session context is missing — used to suppress triggers
+  // and warn the sender. Without session context, reply routing is broken
+  // (recipients can't auto-resolve back to the sender's session/studio).
+  const missingSenderSession = !senderSessionId && !!senderAgentId;
 
   // ── Thread-first path: when threadKey is provided, route to thread tables ──
   // Unified handler for both new thread creation and replies to existing threads.
@@ -401,7 +374,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // For new threads, trigger all recipients (existing behavior).
     let agentsToTrigger: string[] = [];
 
-    if (trigger !== false) {
+    if (trigger !== false && !missingSenderSession) {
       if (existingThread && senderAgentId) {
         // Reply: fetch current participants from DB for accurate trigger resolution
         const currentParticipants = await getParticipants(supabase, thread.id);
@@ -509,6 +482,12 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
             priority,
             triggered: triggeredAgents,
             createdAt: threadMessage.created_at,
+            ...(missingSenderSession
+              ? {
+                  warning:
+                    'Session context missing (no x-pcp-session-id header). Triggers suppressed — recipients will not be woken. They will see this message on their next inbox check. To fix: launch via `sb` CLI which injects session headers, or ensure PCP_SESSION_ID is set.',
+                }
+              : {}),
           }),
         },
       ],
@@ -610,7 +589,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     triggered: false,
   };
 
-  if (trigger) {
+  if (trigger && !missingSenderSession) {
     const gateway = getAgentGateway();
     const payload: AgentTriggerPayload = {
       fromAgentId: triggerSenderId,
@@ -669,6 +648,12 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
             ? {
                 routingHint:
                   'Actionable handoff is missing a routing anchor. Add one of: threadKey, recipientSessionId, recipientStudioId, or recipientStudioHint.',
+              }
+            : {}),
+          ...(missingSenderSession
+            ? {
+                warning:
+                  'Session context missing (no x-pcp-session-id header). Triggers suppressed — recipient will not be woken. They will see this message on their next inbox check. To fix: launch via `sb` CLI which injects session headers.',
               }
             : {}),
           hint: 'Consider adding a threadKey (e.g., "pr:32", "spec:cli-hooks") to route this message to a group thread.',
