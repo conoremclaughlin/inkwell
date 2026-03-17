@@ -338,23 +338,37 @@ async function setupDatabase(state: ProgressState): Promise<boolean> {
     writeFileSync(envPath, envContent);
     ok('Credentials saved to .env.local');
 
-    // Offer migration
+    // Offer migration — requires `supabase link` first for hosted projects
     if (commandExists('supabase')) {
       const migrate = await confirm({
-        message: 'Apply database migrations now?',
+        message:
+          'Link Supabase project and apply migrations now? (requires project ref + DB password)',
         default: true,
       });
       if (migrate) {
-        const code = await execStream('bash scripts/prod-migrate.sh --linked', state.targetDir);
-        if (code !== 0) {
-          warn('Migration failed — run "yarn linked:migrate" manually later');
+        console.log(chalk.dim('    First, link your Supabase project:'));
+        console.log();
+        const linkCode = await execInteractive('supabase link', state.targetDir);
+        if (linkCode !== 0) {
+          warn('Supabase link failed — run "supabase link" then "yarn linked:migrate" manually');
         } else {
-          ok('Migrations applied');
+          ok('Supabase project linked');
+          const migrateCode = await execStream(
+            'bash scripts/prod-migrate.sh --linked',
+            state.targetDir
+          );
+          if (migrateCode !== 0) {
+            warn('Migration failed — run "yarn linked:migrate" manually later');
+          } else {
+            ok('Migrations applied');
+          }
         }
+      } else {
+        console.log(chalk.dim('    Run "supabase link" then "yarn linked:migrate" when ready.'));
       }
     } else {
       warn(
-        'Supabase CLI not installed — install it and run "yarn linked:migrate" to apply migrations'
+        'Supabase CLI not installed — install it, run "supabase link", then "yarn linked:migrate"'
       );
     }
   }
@@ -525,8 +539,8 @@ async function awakenSb(state: ProgressState): Promise<boolean> {
     message: 'Choose a backend:',
     choices: [
       { name: 'Claude Code (recommended)', value: 'claude' },
-      { name: 'Codex', value: 'codex' },
-      { name: 'Gemini', value: 'gemini' },
+      { name: 'Codex (requires codex CLI installed + authed)', value: 'codex' },
+      { name: 'Gemini (requires gemini CLI installed + authed)', value: 'gemini' },
     ],
     default: 'claude',
   });
