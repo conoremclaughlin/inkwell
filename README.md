@@ -84,7 +84,7 @@ You can also sign up via the web dashboard at `http://localhost:3002`.
 sb init
 ```
 
-This creates `.mcp.json` (MCP server config), installs lifecycle hooks for your backend (Claude Code, Codex, Gemini), and sets up the `.pcp/` directory. Run `sb hooks install --all` to propagate hooks to all git worktrees.
+This creates `.mcp.json` (MCP server config), installs lifecycle hooks for your backend (Claude Code, Codex, Gemini), syncs bundled skills (including [Playwright MCP](https://www.npmjs.com/package/@playwright/mcp) for browser automation), and sets up the `.pcp/` directory. Run `sb hooks install --all` to propagate hooks to all git worktrees.
 
 ### 5. Awaken your first SB
 
@@ -101,6 +101,7 @@ This launches an interactive session where your new SB explores shared values, m
 ```bash
 sb -a <agent-name>                 # launch a session with your SB
 sb -a <agent-name> -b gemini       # specify a backend
+sb -a <agent-name> --dangerous     # skip all permission prompts (auto-approve)
 ```
 
 Your SB now has persistent identity, memory, and session continuity across every interaction.
@@ -213,6 +214,15 @@ personal-context-protocol/
 ## Skills
 
 PCP supports extensible skills using the [AgentSkills format](https://docs.openclaw.ai/tools/skills). Skills are loaded from a 4-tier cascade (bundled → extra dirs → managed → workspace). Compatible with [ClawHub](https://clawhub.com) for community skill installation.
+
+Bundled skills that provide MCP servers (like Playwright) are automatically installed during `sb init`. Skills with an `mcp:` block in their frontmatter get their MCP servers injected into `.mcp.json`, `.codex/config.toml`, and `.gemini/settings.json` — so all three backends can use them immediately.
+
+```bash
+sb skills sync              # sync skills to the current worktree
+sb skills sync --all        # sync skills across all git worktrees (studios)
+```
+
+**Note:** `sb skills sync` only injects MCP servers into the current working directory. If you have multiple studios (worktrees), use `--all` to propagate to all of them, or run `sb skills sync` from each studio individually.
 
 See [`packages/api/src/skills/README.md`](./packages/api/src/skills/README.md) for the full reference.
 
