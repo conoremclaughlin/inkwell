@@ -1,11 +1,4 @@
-# Supabase configuration
-#
-# Remote project ID (from SUPABASE_URL in .env.local):
-#   https://<project_id>.supabase.co
-#
-# Used by MCP Supabase tools (execute_sql, apply_migration, etc.)
-# and `supabase link`. Read from .env.local to get the correct value.
-project_id = "xzcdodccpjmveubfitvo"
+# Supabase local development configuration
 
 [api]
 enabled = true

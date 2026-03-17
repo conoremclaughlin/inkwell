@@ -323,12 +323,13 @@ Both servers share the same Supabase database, so data changes are visible to bo
 
 ## Supabase Project ID
 
-The Supabase project ID is stored in two places:
+When using MCP Supabase tools (`execute_sql`, `apply_migration`, `list_tables`, etc.), you need the project ID. **Read it from `.env.local`** — it's the subdomain in `SUPABASE_URL`:
 
-1. **`supabase/config.toml`** — `project_id` field at the top of the file (canonical, committed)
-2. **`.env.local`** — embedded in `SUPABASE_URL` (e.g., `https://<project_id>.supabase.co`)
+```
+SUPABASE_URL=https://<project_id>.supabase.co
+```
 
-When using MCP Supabase tools (`execute_sql`, `apply_migration`, `list_tables`, etc.), read the project ID from `supabase/config.toml` or extract it from `SUPABASE_URL` in `.env.local`. **Do not hardcode project IDs** — always read from config.
+**Do not hardcode project IDs** in committed files. `.env.local` is gitignored and is the single source of truth for environment-specific Supabase credentials.
 
 ## Database Migrations
 
