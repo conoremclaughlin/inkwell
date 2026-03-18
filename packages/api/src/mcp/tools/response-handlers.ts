@@ -9,7 +9,7 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import type { ChannelType, AgentResponse, ResponseFormat, OutboundMedia } from '../../agent/types';
 import { logger } from '../../utils/logger';
-import { getPinnedAgentId } from '../../utils/request-context';
+import { getPinnedAgentId, getRequestContext } from '../../utils/request-context';
 
 // Response result returned by the callback (optional — void is still accepted)
 export interface ResponseResult {
@@ -281,11 +281,17 @@ export async function handleGetPendingMessages(
   try {
     let filtered = pendingMessages;
 
-    // Scope by calling agent — prevents cross-agent message leaks.
-    // Uses the pinned agent identity from the request context.
+    // Scope by calling agent + session — prevents cross-agent and
+    // cross-session message leaks. Uses request context for identity.
     const callerAgentId = getPinnedAgentId();
+    const reqCtx = getRequestContext();
+    const callerSessionId = reqCtx?.sessionId;
+
     if (callerAgentId) {
       filtered = filtered.filter((m) => !m.agentId || m.agentId === callerAgentId);
+    }
+    if (callerSessionId) {
+      filtered = filtered.filter((m) => !m.sessionId || m.sessionId === callerSessionId);
     }
 
     // Filter by channel
