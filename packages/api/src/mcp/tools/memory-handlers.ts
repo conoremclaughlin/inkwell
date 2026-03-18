@@ -885,6 +885,15 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
     };
   }
 
+  // Clear cli_attached flag so triggers don't get stuck in the pending queue
+  // after the CLI detaches. endSession already sets ended_at which prevents
+  // matching, but this is belt-and-suspenders for edge cases.
+  if (session) {
+    await dataComposer.repositories.memory
+      .updateSession(session.id, { cliAttached: false })
+      .catch(() => {});
+  }
+
   logger.info(`Session ended`, { sessionId: session.id, hasSummary: !!params.summary });
 
   // If summary provided, also save it as a memory

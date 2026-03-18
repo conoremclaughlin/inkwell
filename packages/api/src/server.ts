@@ -768,15 +768,35 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     const { data: cliSession } = (await dataComposer!
       .getClient()
       .from('sessions')
-      .select('id, cli_attached')
+      .select('id, cli_attached, updated_at')
       .eq('user_id', userId)
       .eq('agent_id', targetAgentId)
       .eq('cli_attached', true)
       .is('ended_at', null)
       .limit(1)
-      .maybeSingle()) as { data: { id: string; cli_attached: boolean } | null };
+      .maybeSingle()) as { data: { id: string; cli_attached: boolean; updated_at: string } | null };
 
-    if (cliSession?.cli_attached) {
+    // Staleness guard: if cli_attached but session not updated in >10 minutes,
+    // the CLI likely disconnected without calling end_session. Clear the flag
+    // and fall through to normal spawn.
+    const CLI_STALE_MS = 10 * 60 * 1000;
+    const isCliStale =
+      cliSession?.updated_at &&
+      Date.now() - new Date(cliSession.updated_at).getTime() > CLI_STALE_MS;
+
+    if (isCliStale && cliSession) {
+      logger.warn('[Trigger] CLI-attached session is stale, clearing flag', {
+        sessionId: cliSession.id,
+        updatedAt: cliSession.updated_at,
+      });
+      await dataComposer!
+        .getClient()
+        .from('sessions')
+        .update({ cli_attached: false } as never)
+        .eq('id', cliSession.id);
+    }
+
+    if (cliSession?.cli_attached && !isCliStale) {
       const { addPendingMessage } = await import('./mcp/tools/response-handlers.js');
       addPendingMessage({
         id: `trigger-${Date.now()}`,

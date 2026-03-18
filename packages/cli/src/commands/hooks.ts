@@ -1964,6 +1964,36 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     }
   }
 
+  // Always drain pending message queue first — these are trigger messages
+  // routed here because cli_attached=true. Must run before the inbox stale
+  // check to ensure delivery on every prompt, not just stale ones.
+  try {
+    const pending = await callPcpTool('get_pending_messages', {
+      channel: 'agent',
+    });
+    const pendingMessages = pending.messages as Array<Record<string, unknown>> | undefined;
+    if (pendingMessages?.length) {
+      const pendingTag = buildInboxTag(
+        pendingMessages.map((m) => ({
+          ...m,
+          senderAgentId:
+            typeof m.sender === 'object' ? (m.sender as Record<string, unknown>).id : m.sender,
+          messageType: 'trigger',
+        }))
+      );
+      if (pendingTag) {
+        process.stdout.write(pendingTag);
+      }
+      // Mark as read so they don't replay on next prompt
+      const messageIds = pendingMessages.map((m) => m.id as string).filter(Boolean);
+      if (messageIds.length) {
+        await callPcpTool('mark_messages_read', { messageIds }).catch(() => {});
+      }
+    }
+  } catch {
+    // Silent — pending queue may not have messages
+  }
+
   // Check if inbox check is stale (> 5 minutes)
   const lastCheck = readRuntimeFile(cwd, 'last-inbox-check');
   const staleThresholdMs = 5 * 60 * 1000;
@@ -1972,7 +2002,6 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     const lastCheckTime = new Date(lastCheck).getTime();
     const elapsed = Date.now() - lastCheckTime;
     if (elapsed < staleThresholdMs) {
-      // Fast path: inbox was checked recently, output nothing
       return;
     }
   }
@@ -1993,31 +2022,6 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     }
   } catch {
     // Silent failure — don't interrupt the user's prompt
-  }
-
-  // Drain pending message queue (messages routed here because cli_attached=true).
-  // These are trigger messages that were stored instead of spawning a new process.
-  try {
-    const pending = await callPcpTool('get_pending_messages', {
-      channel: 'agent',
-    });
-    const pendingMessages = pending.messages as Array<Record<string, unknown>> | undefined;
-    if (pendingMessages?.length) {
-      const pendingTag = buildInboxTag(
-        pendingMessages.map((m) => ({
-          ...m,
-          // Normalize pending message fields to match inbox format
-          senderAgentId:
-            typeof m.sender === 'object' ? (m.sender as Record<string, unknown>).id : m.sender,
-          messageType: 'trigger',
-        }))
-      );
-      if (pendingTag) {
-        process.stdout.write(pendingTag);
-      }
-    }
-  } catch {
-    // Silent — pending queue may not have messages
   }
 }
 
