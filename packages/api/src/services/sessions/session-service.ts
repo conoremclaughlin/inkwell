@@ -770,12 +770,13 @@ export class SessionService implements ISessionService {
         return undefined;
       }
 
+      // Studios use 'slug' not 'name' — match studioHint against slug
       const { data: namedStudio } = await this.supabase
         .from('studios')
         .select('id')
         .eq('user_id', userId)
         .eq('agent_id', agentId)
-        .eq('name', options.studioHint)
+        .eq('slug', options.studioHint)
         .in('status', ['active', 'idle'])
         .limit(1)
         .maybeSingle();
