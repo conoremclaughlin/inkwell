@@ -76,7 +76,7 @@ const TYPE_ICONS: Record<FeedEventType, string> = {
 /** Max lines shown for detail when collapsed. */
 const DETAIL_COLLAPSED_LINES = 3;
 
-function collapseDetail(detail: string, maxLines: number, cols: number = 80): string {
+export function collapseDetail(detail: string, maxLines: number, cols: number = 80): string {
   const availableWidth = Math.max(1, cols - 4); // paddingLeft is always 4 for inbox
   const lines = detail.split('\n');
   const kept: string[] = [];
@@ -92,6 +92,13 @@ function collapseDetail(detail: string, maxLines: number, cols: number = 80): st
     visualRows += rows;
   }
   return detail;
+}
+
+export function estimateRows(text: string, cols: number): number {
+  const width = Math.max(1, cols);
+  return text.split('\n').reduce((sum, line) => {
+    return sum + (line.length === 0 ? 1 : Math.ceil(line.length / width));
+  }, 0);
 }
 
 const FeedEventLine = React.memo(function FeedEventLine({
