@@ -485,7 +485,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
             ...(missingSenderSession
               ? {
                   warning:
-                    'Session context missing (no x-pcp-session-id header). Triggers suppressed — recipients will not be woken. They will see this message on their next inbox check. To fix: launch via `sb` CLI which injects session headers, or ensure PCP_SESSION_ID is set.',
+                    'Session context missing (no x-pcp-session-id header). Triggers suppressed — recipients will not be woken. They will see this message on their next inbox check. To fix: set the x-pcp-session-id header on your MCP connection (the sb CLI does this automatically).',
                 }
               : {}),
           }),
@@ -653,7 +653,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           ...(missingSenderSession
             ? {
                 warning:
-                  'Session context missing (no x-pcp-session-id header). Triggers suppressed — recipient will not be woken. They will see this message on their next inbox check. To fix: launch via `sb` CLI which injects session headers.',
+                  'Session context missing (no x-pcp-session-id header). Triggers suppressed — recipient will not be woken. They will see this message on their next inbox check. To fix: set the x-pcp-session-id header on your MCP connection (the sb CLI does this automatically).',
               }
             : {}),
           hint: 'Consider adding a threadKey (e.g., "pr:32", "spec:cli-hooks") to route this message to a group thread.',
