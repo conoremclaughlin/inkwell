@@ -928,7 +928,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
                     created_at: string;
                   }) => ({
                     senderAgentId: m.sender_agent_id,
-                    content: m.content.slice(0, 200),
+                    content: m.content,
                     messageType: m.message_type,
                     createdAt: m.created_at,
                   })
