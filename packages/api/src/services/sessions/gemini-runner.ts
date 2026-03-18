@@ -152,6 +152,8 @@ export class GeminiRunner implements IRunner {
             pcpSessionId: config.pcpSessionId,
             studioId: config.studioId,
             accessToken: config.pcpAccessToken,
+            agentId: config.agentId,
+            runtime: 'gemini',
           }),
         },
         stdio: ['ignore', 'pipe', 'pipe'],

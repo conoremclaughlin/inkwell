@@ -118,6 +118,15 @@ export function injectSessionHeaders(
     modified = true;
   }
 
+  // Inject consolidated context token (Phase 1 — alongside individual headers)
+  if (!config.mcpServers.pcp.headers?.['x-pcp-context']) {
+    config.mcpServers.pcp.headers = {
+      ...config.mcpServers.pcp.headers,
+      'x-pcp-context': '${PCP_CONTEXT_TOKEN}',
+    };
+    modified = true;
+  }
+
   if (!modified) {
     return { mcpConfigPath, cleanup: () => {}, modified: false };
   }
@@ -141,22 +150,67 @@ export function injectSessionHeaders(
   };
 }
 
+// ─── Context Token ──────────────────────────────────────────
+
+/**
+ * PCP context token payload — consolidated session/routing metadata.
+ * Carried in the `x-pcp-context` header as base64url-encoded JSON.
+ * See spec: pcp://specs/mcp-context-token
+ */
+export interface PcpContextToken {
+  sessionId: string;
+  studioId: string;
+  agentId: string;
+  cliAttached: boolean;
+  runtime: string; // 'claude' | 'codex' | 'gemini'
+}
+
+/**
+ * Encode a context token for the `x-pcp-context` header.
+ */
+export function encodeContextToken(token: PcpContextToken): string {
+  return Buffer.from(JSON.stringify(token)).toString('base64url');
+}
+
+/**
+ * Decode a context token from the `x-pcp-context` header.
+ * Returns null if the header is missing or malformed.
+ */
+export function decodeContextToken(header: string | undefined | null): PcpContextToken | null {
+  if (!header) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(header, 'base64url').toString());
+    if (typeof parsed.sessionId !== 'string' || typeof parsed.agentId !== 'string') {
+      return null;
+    }
+    return parsed as PcpContextToken;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Session Env ────────────────────────────────────────────
+
 /**
  * Build the session-related env vars for a spawned backend process.
  *
- * Consolidates the env var naming:
- * - PCP_SESSION_ID: The PCP session ID (used by ${VAR} interpolation in .mcp.json headers)
- * - PCP_RUNTIME_LINK_ID: Unique runtime link for session hint file matching
- * - PCP_STUDIO_ID: The studio/workspace ID (if available)
+ * Sets both:
+ * - PCP_CONTEXT_TOKEN: consolidated context token for x-pcp-context header
+ * - Legacy individual env vars (PCP_SESSION_ID, PCP_STUDIO_ID, etc.)
+ *   for backward compat during Phase 1 migration
  */
 export function buildSessionEnv(options: {
   pcpSessionId?: string;
   runtimeLinkId?: string;
   studioId?: string;
   accessToken?: string;
+  agentId?: string;
+  cliAttached?: boolean;
+  runtime?: string;
 }): Record<string, string> {
   const env: Record<string, string> = {};
 
+  // Legacy individual env vars (Phase 1 backward compat)
   if (options.pcpSessionId) {
     env.PCP_SESSION_ID = options.pcpSessionId;
   }
@@ -168,6 +222,19 @@ export function buildSessionEnv(options: {
   }
   if (options.accessToken) {
     env.PCP_ACCESS_TOKEN = options.accessToken;
+    // Codex env_http_headers maps env var name → full header value
+    env.PCP_AUTH_BEARER = `Bearer ${options.accessToken}`;
+  }
+
+  // Consolidated context token (new — Phase 1)
+  if (options.pcpSessionId && options.agentId) {
+    env.PCP_CONTEXT_TOKEN = encodeContextToken({
+      sessionId: options.pcpSessionId,
+      studioId: options.studioId || '',
+      agentId: options.agentId,
+      cliAttached: options.cliAttached || false,
+      runtime: options.runtime || 'claude',
+    });
   }
 
   return env;

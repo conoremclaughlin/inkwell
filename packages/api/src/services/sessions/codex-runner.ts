@@ -175,6 +175,8 @@ export class CodexRunner implements IRunner {
             runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,
             studioId: config.studioId,
             accessToken: config.pcpAccessToken,
+            agentId: config.agentId,
+            runtime: 'codex',
           }),
         },
         stdio: ['ignore', 'pipe', 'pipe'],

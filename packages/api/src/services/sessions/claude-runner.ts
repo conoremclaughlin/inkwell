@@ -230,6 +230,8 @@ export class ClaudeRunner implements IRunner {
             runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,
             studioId: config.studioId,
             accessToken: config.pcpAccessToken,
+            agentId: config.agentId,
+            runtime: 'claude',
           }),
         },
         stdio: ['pipe', 'pipe', 'pipe'],

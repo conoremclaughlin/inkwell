@@ -9,8 +9,11 @@ export {
 export {
   injectSessionHeaders,
   buildSessionEnv,
+  encodeContextToken,
+  decodeContextToken,
   type InjectSessionHeadersOptions,
   type InjectSessionHeadersResult,
+  type PcpContextToken,
 } from './mcp-config.js';
 
 export { writeRuntimeSessionHint } from './runtime-hints.js';

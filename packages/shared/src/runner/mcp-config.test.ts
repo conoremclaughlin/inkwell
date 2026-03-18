@@ -2,7 +2,13 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { injectSessionHeaders, buildSessionEnv } from './mcp-config.js';
+import {
+  injectSessionHeaders,
+  buildSessionEnv,
+  encodeContextToken,
+  decodeContextToken,
+  type PcpContextToken,
+} from './mcp-config.js';
 
 const testDir = join(tmpdir(), 'sb-mcp-test');
 
@@ -107,6 +113,7 @@ describe('injectSessionHeaders', () => {
           headers: {
             'x-pcp-session-id': '${PCP_SESSION_ID}',
             Authorization: 'Bearer ${PCP_ACCESS_TOKEN}',
+            'x-pcp-context': '${PCP_CONTEXT_TOKEN}',
           },
         },
       },
@@ -124,16 +131,18 @@ describe('injectSessionHeaders', () => {
 });
 
 describe('buildSessionEnv', () => {
-  it('includes PCP_ACCESS_TOKEN when accessToken provided', () => {
+  it('includes PCP_ACCESS_TOKEN and PCP_AUTH_BEARER when accessToken provided', () => {
     const env = buildSessionEnv({
       pcpSessionId: 'sess-123',
       studioId: 'studio-456',
       accessToken: 'tok-789',
+      agentId: 'wren',
     });
 
     expect(env.PCP_SESSION_ID).toBe('sess-123');
     expect(env.PCP_STUDIO_ID).toBe('studio-456');
     expect(env.PCP_ACCESS_TOKEN).toBe('tok-789');
+    expect(env.PCP_AUTH_BEARER).toBe('Bearer tok-789');
   });
 
   it('omits PCP_ACCESS_TOKEN when not provided', () => {
@@ -143,5 +152,71 @@ describe('buildSessionEnv', () => {
 
     expect(env.PCP_SESSION_ID).toBe('sess-123');
     expect(env).not.toHaveProperty('PCP_ACCESS_TOKEN');
+    expect(env).not.toHaveProperty('PCP_AUTH_BEARER');
+  });
+
+  it('includes PCP_CONTEXT_TOKEN when agentId and sessionId provided', () => {
+    const env = buildSessionEnv({
+      pcpSessionId: 'sess-123',
+      studioId: 'studio-456',
+      agentId: 'wren',
+      runtime: 'claude',
+      cliAttached: false,
+    });
+
+    expect(env.PCP_CONTEXT_TOKEN).toBeDefined();
+    // Decode and verify
+    const decoded = JSON.parse(Buffer.from(env.PCP_CONTEXT_TOKEN, 'base64url').toString());
+    expect(decoded.sessionId).toBe('sess-123');
+    expect(decoded.studioId).toBe('studio-456');
+    expect(decoded.agentId).toBe('wren');
+    expect(decoded.runtime).toBe('claude');
+    expect(decoded.cliAttached).toBe(false);
+  });
+
+  it('sets cliAttached in context token', () => {
+    const env = buildSessionEnv({
+      pcpSessionId: 'sess-123',
+      agentId: 'wren',
+      cliAttached: true,
+    });
+
+    const decoded = JSON.parse(Buffer.from(env.PCP_CONTEXT_TOKEN, 'base64url').toString());
+    expect(decoded.cliAttached).toBe(true);
+  });
+
+  it('omits PCP_CONTEXT_TOKEN when agentId is missing', () => {
+    const env = buildSessionEnv({
+      pcpSessionId: 'sess-123',
+    });
+
+    expect(env).not.toHaveProperty('PCP_CONTEXT_TOKEN');
+  });
+});
+
+describe('encodeContextToken / decodeContextToken', () => {
+  it('round-trips correctly', () => {
+    const token: PcpContextToken = {
+      sessionId: 'sess-abc',
+      studioId: 'studio-def',
+      agentId: 'myra',
+      cliAttached: true,
+      runtime: 'claude',
+    };
+    const encoded = encodeContextToken(token);
+    const decoded = decodeContextToken(encoded);
+    expect(decoded).toEqual(token);
+  });
+
+  it('returns null for invalid input', () => {
+    expect(decodeContextToken(null)).toBeNull();
+    expect(decodeContextToken(undefined)).toBeNull();
+    expect(decodeContextToken('')).toBeNull();
+    expect(decodeContextToken('not-valid-base64!!')).toBeNull();
+  });
+
+  it('returns null for JSON missing required fields', () => {
+    const bad = Buffer.from(JSON.stringify({ foo: 'bar' })).toString('base64url');
+    expect(decodeContextToken(bad)).toBeNull();
   });
 });

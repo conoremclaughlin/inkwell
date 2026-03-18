@@ -288,14 +288,25 @@ export class MCPServer {
       // on the MCP transport entrypoint. Supported MCP clients in our stack do not expose
       // arbitrary header injection to model prompts, so these remain runtime/server-controlled
       // signals rather than LLM-controlled parameters.
+      // Parse consolidated context token first (Phase 1 — preferred source).
+      // Falls back to individual headers for backward compat.
+      const contextHeader = req.header('x-pcp-context')?.trim();
+      let contextToken: import('@personal-context/shared').PcpContextToken | null = null;
+      if (contextHeader) {
+        const { decodeContextToken } = await import('@personal-context/shared');
+        contextToken = decodeContextToken(contextHeader);
+      }
+
       const callerProfile: 'agent' | 'runtime' =
         callerProfileHeader === 'runtime' ? 'runtime' : 'agent';
-      const sessionIdHeader = req.header('x-pcp-session-id')?.trim();
-      const studioIdHeader = req.header('x-pcp-studio-id')?.trim();
+      const sessionIdHeader = contextToken?.sessionId || req.header('x-pcp-session-id')?.trim();
+      const studioIdHeader = contextToken?.studioId || req.header('x-pcp-studio-id')?.trim();
       Object.assign(ctx, {
         callerProfile,
         ...(sessionIdHeader ? { sessionId: sessionIdHeader } : {}),
         ...(studioIdHeader ? { workspaceId: studioIdHeader } : {}),
+        ...(contextToken?.cliAttached ? { cliAttached: true } : {}),
+        ...(contextToken?.runtime ? { runtime: contextToken.runtime } : {}),
       });
 
       // Resolve studioId from session when x-pcp-session-id is provided

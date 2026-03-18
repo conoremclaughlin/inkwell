@@ -45,6 +45,10 @@ export interface RequestContextData {
   timestamp: Date;
   /** Caller profile for MCP access control */
   callerProfile?: 'agent' | 'runtime';
+  /** Whether a human is attached to the CLI session */
+  cliAttached?: boolean;
+  /** Backend runtime: 'claude' | 'codex' | 'gemini' */
+  runtime?: string;
 }
 
 const asyncLocalStorage = new AsyncLocalStorage<RequestContextData>();
