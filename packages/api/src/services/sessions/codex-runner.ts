@@ -117,10 +117,13 @@ export class CodexRunner implements IRunner {
     args.push('--json');
     args.push('-c', `model_instructions_file=${promptPath}`);
 
-    // PCP session headers — Codex resolves env var names to values at runtime
+    // PCP headers — Codex resolves env var names to values at runtime.
+    // Authorization must be a full "Bearer <token>" value, so we use
+    // PCP_AUTH_BEARER which buildSessionEnv sets with the complete value.
     args.push('-c', 'mcp_servers.pcp.env_http_headers.x-pcp-agent-id="AGENT_ID"');
     args.push('-c', 'mcp_servers.pcp.env_http_headers.x-pcp-session-id="PCP_SESSION_ID"');
     args.push('-c', 'mcp_servers.pcp.env_http_headers.x-pcp-studio-id="PCP_STUDIO_ID"');
+    args.push('-c', 'mcp_servers.pcp.env_http_headers.Authorization="PCP_AUTH_BEARER"');
 
     if (config.model) {
       args.push('-m', config.model);
