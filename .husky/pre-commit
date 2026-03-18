@@ -1,1 +1,11 @@
+# Ensure yarn.lock is in sync with package.json changes.
+# --mode=update-lockfile refreshes the lockfile without downloading packages.
+if git diff --cached --name-only | grep -q 'package\.json'; then
+  yarn install --mode=update-lockfile 2>/dev/null
+  if ! git diff --quiet yarn.lock 2>/dev/null; then
+    git add yarn.lock
+    echo "📦 yarn.lock updated and staged."
+  fi
+fi
+
 npx lint-staged
