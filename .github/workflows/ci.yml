@@ -12,15 +12,18 @@ concurrency:
 
 jobs:
   test:
-    name: Unit Tests
+    name: Unit Tests (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20, 22]
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ matrix.node-version }}
           cache: yarn
 
       # Rewrite git+ssh:// to git+https:// so transitive deps
