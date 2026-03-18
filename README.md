@@ -108,7 +108,7 @@ Your SB now has persistent identity, memory, and session continuity across every
 
 ### Optional: enable semantic memory embeddings
 
-PCP's memory system works **without** local embeddings — `remember`/`recall` still function with text-based retrieval and the embedding write path is best-effort. If you want local semantic recall on top of that, install Ollama-backed embeddings:
+PCP's memory system works **without** local embeddings — `remember`/`recall` still function with text-based retrieval, and semantic embeddings are **disabled by default** until you opt in. If you want local semantic recall on top of that, install Ollama-backed embeddings:
 
 ```bash
 sb memory install
@@ -126,7 +126,7 @@ If you already have the model:
 sb memory install --skip-pull
 ```
 
-If you want to keep using PCP memory **without** embeddings, set:
+If you want to explicitly keep PCP memory in text-only mode, set:
 
 ```bash
 MEMORY_EMBEDDINGS_ENABLED=false

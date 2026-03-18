@@ -169,7 +169,7 @@ const envSchema = z.object({
   // Embeddings
   MEMORY_EMBEDDINGS_ENABLED: z
     .enum(['true', 'false'])
-    .default(nodeEnv === 'test' ? 'false' : 'true')
+    .default('false')
     .transform((v) => v === 'true'),
   MEMORY_EMBEDDING_PROVIDER: z.enum(['ollama', 'openai']).optional(),
   MEMORY_EMBEDDING_MODEL: optionalString,

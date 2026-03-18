@@ -212,7 +212,7 @@ sb --help                       # Full help
 
 ### Optional: local semantic memory embeddings
 
-The PCP memory system does **not** require embeddings to work. Without them, `remember` and `recall` still work via text retrieval.
+The PCP memory system does **not** require embeddings to work. Without them, `remember` and `recall` still work via text retrieval. Semantic embeddings are **disabled by default** until you opt in.
 
 If you want local semantic recall via Ollama:
 
