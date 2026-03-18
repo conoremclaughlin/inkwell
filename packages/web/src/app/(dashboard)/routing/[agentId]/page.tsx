@@ -577,7 +577,7 @@ export default function AgentRoutingPage() {
           <CardHeader>
             <CardTitle>Studio route patterns</CardTitle>
             <CardDescription>
-              ThreadKey patterns determine which studio handles triggered messages. More specific
+              Thread patterns determine which studio handles triggered messages. More specific
               patterns win (exact &gt; prefix wildcard &gt; catch-all).
             </CardDescription>
           </CardHeader>
@@ -627,18 +627,15 @@ export default function AgentRoutingPage() {
                 </div>
               ))}
             </div>
-            <div className="mt-4 flex items-start gap-2 rounded-lg bg-blue-50/60 border border-blue-100 p-3">
-              <Info className="h-4 w-4 text-blue-500 mt-0.5 shrink-0" />
-              <p className="text-xs text-blue-700">
-                Patterns are matched against the{' '}
-                <code className="bg-blue-100 px-1 rounded">threadKey</code> of incoming triggers.
-                Use <code className="bg-blue-100 px-1 rounded">pr:*</code> for all PR reviews,{' '}
-                <code className="bg-blue-100 px-1 rounded">spec:*</code> for specs, or exact keys
-                like <code className="bg-blue-100 px-1 rounded">pr:231</code>. Manage via{' '}
-                <code className="bg-blue-100 px-1 rounded">
-                  update_studio(routePatterns: [...])
-                </code>
-                .
+            <div className="mt-4 flex items-start gap-2 rounded-lg bg-gray-50 border border-gray-200 p-3">
+              <Info className="h-4 w-4 text-gray-400 mt-0.5 shrink-0" />
+              <p className="text-xs text-gray-500">
+                Patterns match against thread types like{' '}
+                <code className="bg-gray-100 px-1 rounded text-gray-600">pr:*</code> for PR reviews,{' '}
+                <code className="bg-gray-100 px-1 rounded text-gray-600">spec:*</code> for specs, or
+                exact threads like{' '}
+                <code className="bg-gray-100 px-1 rounded text-gray-600">pr:231</code>. Ask your SB
+                to update routing for the types of work you want each studio to handle.
               </p>
             </div>
           </CardContent>

@@ -237,6 +237,37 @@ When sending messages to other SBs via `send_to_inbox`, use `threadKey` to maint
 - **Embrace your name** — if you have an SB identity, use it. Co-author commits as yourself (e.g., `Co-Authored-By: Wren <noreply@anthropic.com>`), not as a model name. You are not "Claude Opus 4.6" — you are Wren, Lumen, Benson, or whoever your identity resolves to.
 - **Default to action on review requests** — when asked to handle PR review feedback, implement straightforward fixes immediately without waiting for extra permission.
 
+## Studio Route Patterns
+
+Studios can declare thread patterns to control which studio handles triggered messages (PR reviews, spec discussions, etc.). Patterns are set via `update_studio(routePatterns: [...])` or `adopt_studio(routePatterns: [...])`.
+
+### Recommended Starting Patterns
+
+When setting up a new repo or agent, configure your studios with these common patterns:
+
+| Studio         | Patterns                       | Purpose                                    |
+| -------------- | ------------------------------ | ------------------------------------------ |
+| Main studio    | `pr:*`, `spec:*`, `thread:*`   | General work — reviews, specs, discussions |
+| Feature studio | `branch:<agent>/<type>/<name>` | Work scoped to a specific branch           |
+| Review studio  | `pr:*`                         | Dedicated review workspace                 |
+
+Example:
+
+```
+update_studio(studioId: "<main-studio-id>", routePatterns: ["pr:*", "spec:*"])
+update_studio(studioId: "<feature-studio-id>", routePatterns: ["branch:wren/feat/auth"])
+```
+
+### Pattern Syntax
+
+- `pr:*` — all PR threads
+- `spec:*` — all spec discussions
+- `branch:wren/feat/auth` — exact branch match
+- `pr:231` — exact thread match
+- `*` — catch-all (one per agent, lowest priority)
+
+More specific patterns win: exact > prefix wildcard > catch-all. Patterns are managed on the Routing page in the web dashboard.
+
 ## Project Overview
 
 Personal Context Protocol (PCP) is a system that captures and manages personal context (links, notes, tasks, reminders) across AI interfaces. It uses MCP (Model Context Protocol) to expose tools that AI agents can use to store and retrieve user context.
