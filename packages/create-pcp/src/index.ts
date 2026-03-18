@@ -238,14 +238,24 @@ async function installDeps(state: ProgressState): Promise<boolean> {
   console.log(chalk.dim('    Running yarn install (this may take a minute)...'));
   console.log();
 
-  const code = await execStream('yarn install', state.targetDir);
-  if (code !== 0) {
+  const installCode = await execStream('yarn install', state.targetDir);
+  if (installCode !== 0) {
     fail('yarn install failed');
     return false;
   }
 
   console.log();
-  ok('Dependencies installed');
+  console.log(chalk.dim('    Building workspace packages...'));
+  console.log();
+
+  const buildCode = await execStream('yarn build', state.targetDir);
+  if (buildCode !== 0) {
+    fail('yarn build failed');
+    return false;
+  }
+
+  console.log();
+  ok('Dependencies installed and built');
   return true;
 }
 
