@@ -64,6 +64,10 @@ export function registerWaitCommand(program: Command): void {
 
       if (threadKey) {
         try {
+          // Fetch recent messages to find the latest message ID as anchor.
+          // Known limitation: threads with >200 messages will anchor on #200,
+          // not the true latest. Needs server-side "latest message" support
+          // or descending order in get_thread_messages to fix properly.
           const threadResult = (await pcp.callTool('get_thread_messages', {
             email: config.email,
             agentId,
