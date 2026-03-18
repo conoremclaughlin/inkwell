@@ -168,14 +168,27 @@ export function inboxMessageToFeedEvent(msg: InboxMessage, timezone?: string): F
     typeof recipientMeta?.studioHint === 'string' ? recipientMeta.studioHint : undefined;
   const studioId = typeof recipientMeta?.studioId === 'string' ? recipientMeta.studioId : undefined;
 
-  const detailParts: string[] = [];
+  const metaParts: string[] = [];
   if (msg.messageType && msg.messageType !== 'message') {
-    detailParts.push(`type: ${msg.messageType}`);
+    metaParts.push(`type: ${msg.messageType}`);
   }
-  if (msg.threadKey) detailParts.push(`thread: ${msg.threadKey}`);
+  if (msg.threadKey) metaParts.push(`thread: ${msg.threadKey}`);
   const studioLabel = studioHint || (studioId ? studioId.slice(0, 8) : undefined);
-  if (studioLabel) detailParts.push(`studio: ${studioLabel}`);
-  if (msg.priority && msg.priority !== 'normal') detailParts.push(`priority: ${msg.priority}`);
+  if (studioLabel) metaParts.push(`studio: ${studioLabel}`);
+  if (msg.priority && msg.priority !== 'normal') metaParts.push(`priority: ${msg.priority}`);
+
+  // Show full message body when it was truncated in the preview line, or when
+  // the preview used the subject (meaning the body wasn't shown at all).
+  const detailLines: string[] = [];
+  if (metaParts.length > 0) detailLines.push(metaParts.join('  ·  '));
+  if (msg.content) {
+    const body = msg.content.trim();
+    const wasSubjectUsed = Boolean(msg.subject);
+    const wasTruncated = body.replace(/\s+/g, ' ').length > maxPreview;
+    if (wasSubjectUsed || wasTruncated) {
+      detailLines.push(body);
+    }
+  }
 
   return {
     id: `inbox-${msg.id}`,
@@ -183,7 +196,7 @@ export function inboxMessageToFeedEvent(msg: InboxMessage, timezone?: string): F
     agent: recipient,
     content,
     time: formatHumanTime(msg.createdAt, timezone),
-    detail: detailParts.length > 0 ? detailParts.join('  ·  ') : undefined,
+    detail: detailLines.length > 0 ? detailLines.join('\n') : undefined,
   };
 }
 
