@@ -761,72 +761,73 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       workspaceId: resolvedWorkspaceId || null,
     });
 
-    // Check if target agent has a CLI-attached session — route to pending
-    // queue instead of spawning a new process. The on-prompt hook will
-    // deliver the message on the next user prompt.
-    // Check for CLI-attached session, scoped by studio/session to avoid
-    // misrouting when multiple sessions of the same agent are attached.
-    // cli_attached is not yet in generated Supabase types — cast result.
-    let cliQuery = dataComposer!
-      .getClient()
-      .from('sessions')
-      .select('id, cli_attached, updated_at, studio_id')
-      .eq('user_id', userId)
-      .eq('agent_id', targetAgentId)
-      .eq('cli_attached', true)
-      .is('ended_at', null);
-
-    // Prefer exact session match if recipientSessionId is available
-    if (payload.recipientSessionId) {
-      cliQuery = cliQuery.eq('id', payload.recipientSessionId);
-    } else if (resolvedWorkspaceId) {
-      // Scope by studio to avoid picking the wrong worktree
-      cliQuery = cliQuery.eq('studio_id', resolvedWorkspaceId);
-    }
-
-    const { data: cliSession } = (await cliQuery.limit(1).maybeSingle()) as {
-      data: { id: string; cli_attached: boolean; updated_at: string; studio_id: string } | null;
-    };
-
-    // Staleness guard: if cli_attached but session not updated in >10 minutes,
-    // the CLI likely disconnected without calling end_session. Clear the flag
-    // and fall through to normal spawn.
-    const CLI_STALE_MS = 10 * 60 * 1000;
-    const isCliStale =
-      cliSession?.updated_at &&
-      Date.now() - new Date(cliSession.updated_at).getTime() > CLI_STALE_MS;
-
-    if (isCliStale && cliSession) {
-      logger.warn('[Trigger] CLI-attached session is stale, clearing flag', {
-        sessionId: cliSession.id,
-        updatedAt: cliSession.updated_at,
+    // Check if the routed session is CLI-attached — if so, queue the message
+    // for the on-prompt hook instead of spawning a new process.
+    // Uses getOrCreateSession to resolve through the SAME routing logic
+    // (recipientSessionId → threadKey → route patterns → studio fallback)
+    // that handleMessage would use. This ensures CLI-attached delivery
+    // respects route patterns, not just the identity workspace.
+    try {
+      const routedSession = await sessionService!.getOrCreateSession(userId, targetAgentId, {
+        threadKey: payload.threadKey,
+        studioId: payload.studioId,
+        studioHint: payload.studioHint,
+        recipientSessionId: payload.recipientSessionId,
       });
-      await dataComposer!
+
+      // Check cli_attached from the DB (not on the Session type yet)
+      const { data: sessionRow } = (await dataComposer!
         .getClient()
         .from('sessions')
-        .update({ cli_attached: false } as never)
-        .eq('id', cliSession.id);
-    }
+        .select('cli_attached, updated_at')
+        .eq('id', routedSession.id)
+        .single()) as { data: { cli_attached: boolean; updated_at: string } | null };
 
-    if (cliSession?.cli_attached && !isCliStale) {
-      const { addPendingMessage } = await import('./mcp/tools/response-handlers.js');
-      addPendingMessage({
-        id: `trigger-${Date.now()}`,
-        channel: 'agent',
-        conversationId: request.conversationId,
-        content: triggerMessage,
-        sender: { id: payload.fromAgentId, name: payload.fromAgentId },
-        timestamp: new Date(),
-        read: false,
-        agentId: targetAgentId,
-        sessionId: cliSession.id,
+      const CLI_STALE_MS = 10 * 60 * 1000;
+      const isCliAttached = sessionRow?.cli_attached === true;
+      const isCliStale =
+        isCliAttached &&
+        sessionRow?.updated_at &&
+        Date.now() - new Date(sessionRow.updated_at).getTime() > CLI_STALE_MS;
+
+      if (isCliStale) {
+        logger.warn('[Trigger] CLI-attached session is stale, clearing flag', {
+          sessionId: routedSession.id,
+          updatedAt: sessionRow?.updated_at,
+        });
+        await dataComposer!
+          .getClient()
+          .from('sessions')
+          .update({ cli_attached: false } as never)
+          .eq('id', routedSession.id);
+      }
+
+      if (isCliAttached && !isCliStale) {
+        const { addPendingMessage } = await import('./mcp/tools/response-handlers.js');
+        addPendingMessage({
+          id: `trigger-${Date.now()}`,
+          channel: 'agent',
+          conversationId: request.conversationId,
+          content: triggerMessage,
+          sender: { id: payload.fromAgentId, name: payload.fromAgentId },
+          timestamp: new Date(),
+          read: false,
+          agentId: targetAgentId,
+          sessionId: routedSession.id,
+        });
+        logger.info('[Trigger] CLI-attached session detected, routed to pending queue', {
+          targetAgentId,
+          sessionId: routedSession.id,
+          studioId: routedSession.studioId,
+          threadKey: payload.threadKey,
+        });
+        return;
+      }
+    } catch (err) {
+      // If session resolution fails, fall through to normal handleMessage
+      logger.debug('[Trigger] CLI-attached check failed, falling through to spawn', {
+        error: err instanceof Error ? err.message : String(err),
       });
-      logger.info('[Trigger] CLI-attached session detected, routed to pending queue', {
-        targetAgentId,
-        sessionId: cliSession.id,
-        threadKey: payload.threadKey,
-      });
-      return;
     }
 
     const result = await sessionService!.handleMessage(request);
