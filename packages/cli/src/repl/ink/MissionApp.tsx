@@ -290,7 +290,7 @@ export const MissionApp = React.forwardRef<MissionAppHandle, MissionAppProps>(fu
       <Box paddingX={1}>
         <Text dimColor wrap="truncate">
           {truncLine(
-            `ctrl+c x2 quit  ·  ctrl+o detail ${detailExpanded ? 'on' : 'off'}  ·  SB Mission Control`
+            `ctrl+c x2 quit  ·  ctrl+o ${detailExpanded ? 'collapse' : 'expand'} details  ·  SB Mission Control`
           )}
         </Text>
       </Box>
