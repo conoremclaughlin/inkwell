@@ -22,6 +22,7 @@ import {
   handleUpdateTask,
   handleCompleteTask,
   handleGetTaskStats,
+  handleAddTaskComment,
 } from './task-handlers';
 
 import { handleSendResponse, handleGetPendingMessages, handleMarkRead } from './response-handlers';
@@ -772,12 +773,13 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'list_tasks',
     {
-      description: `List tasks for a user, optionally filtered by project or status.
+      description: `List tasks for a user, optionally filtered by project, task group, or status. Returns task group info, creator, blocked-by, due dates, and metadata.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
         projectId: z.string().uuid().optional().describe('Filter by project'),
+        groupId: z.string().uuid().optional().describe('Filter by task group'),
         status: z.enum(['pending', 'in_progress', 'completed', 'blocked']).optional(),
         activeOnly: z
           .boolean()
@@ -896,6 +898,45 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleGetTaskStats(args, dataComposer);
       } catch (error) {
         logger.error('Error in get_task_stats:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register add_task_comment tool
+  server.registerTool(
+    'add_task_comment',
+    {
+      description: `Add a comment to a task. Comments are attributed to the calling agent automatically. Use this to leave notes, context, or discussion on tasks.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+        taskId: z.string().uuid().describe('Task ID to comment on'),
+        content: z.string().min(1).max(5000).describe('Comment content'),
+        parentCommentId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Parent comment ID for threaded replies'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleAddTaskComment(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in add_task_comment:', error);
         return {
           content: [
             {

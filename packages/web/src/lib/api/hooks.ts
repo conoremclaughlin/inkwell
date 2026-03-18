@@ -5,7 +5,7 @@ import {
   type UseQueryOptions,
   type UseMutationOptions,
 } from '@tanstack/react-query';
-import { apiGet, apiPost, apiDelete, type ApiError } from './client';
+import { apiGet, apiPost, apiPut, apiDelete, type ApiError } from './client';
 
 /**
  * Hook for authenticated GET requests with React Query caching.
@@ -63,6 +63,27 @@ export function useApiDelete<TResponse = void>(
 ) {
   return useMutation<TResponse, ApiError, string>({
     mutationFn: (id) => apiDelete<TResponse>(`${basePath}/${id}`),
+    ...options,
+  });
+}
+
+/**
+ * Hook for authenticated PUT mutations with dynamic path.
+ *
+ * @example
+ * const mutation = useApiPut<Task, { id: string; body: UpdateInput }>(
+ *   ({ id }) => `/api/admin/tasks/${id}`,
+ *   ({ body }) => body,
+ *   { onSuccess: () => queryClient.invalidateQueries(['tasks']) }
+ * );
+ */
+export function useApiPut<TResponse, TInput>(
+  pathFn: (input: TInput) => string,
+  bodyFn: (input: TInput) => unknown,
+  options?: Omit<UseMutationOptions<TResponse, ApiError, TInput>, 'mutationFn'>
+) {
+  return useMutation<TResponse, ApiError, TInput>({
+    mutationFn: (input) => apiPut<TResponse>(pathFn(input), bodyFn(input)),
     ...options,
   });
 }
