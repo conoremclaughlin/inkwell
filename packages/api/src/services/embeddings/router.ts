@@ -54,6 +54,12 @@ function assertExpectedDimensions(
   return vector;
 }
 
+function clampEmbeddingInput(text: string, vettedModel: VettedEmbeddingModel | null): string {
+  const maxInputChars = vettedModel?.maxInputChars;
+  if (!maxInputChars || text.length <= maxInputChars) return text;
+  return `${text.slice(0, maxInputChars)}...`;
+}
+
 function buildRuntimeConfig(): EmbeddingRuntimeConfig {
   const provider = env.MEMORY_EMBEDDING_PROVIDER || 'ollama';
   const model = env.MEMORY_EMBEDDING_MODEL || getDefaultVettedModel(provider);
@@ -121,12 +127,23 @@ export class EmbeddingRouter {
     if (!this.config.enabled) return null;
     const input = text.trim();
     if (!input) return null;
+    const vettedModel = findVettedModel(this.config.provider, this.config.model);
+    const providerInput = clampEmbeddingInput(input, vettedModel);
+
+    if (providerInput !== input) {
+      logger.info('Clamped embedding input to vetted model limit', {
+        provider: this.config.provider,
+        model: this.config.model,
+        originalChars: input.length,
+        clampedChars: providerInput.length,
+      });
+    }
 
     try {
       if (this.config.provider === 'openai') {
-        return await this.embedWithOpenAI(input);
+        return await this.embedWithOpenAI(providerInput);
       }
-      return await this.embedWithOllama(input);
+      return await this.embedWithOllama(providerInput);
     } catch (primaryError) {
       logger.warn('Primary embedding provider failed, attempting fallback', {
         provider: this.config.provider,
@@ -137,7 +154,7 @@ export class EmbeddingRouter {
       try {
         if (this.config.provider === 'ollama' && this.config.hasOpenAIKey) {
           const fallback = await this.embedWithOpenAI(
-            input,
+            providerInput,
             getDefaultVettedModel('openai'),
             this.config.dimensions
           );
@@ -151,7 +168,7 @@ export class EmbeddingRouter {
 
         if (this.config.provider === 'openai') {
           const fallback = await this.embedWithOllama(
-            input,
+            providerInput,
             getDefaultVettedModel('ollama'),
             this.config.dimensions
           );

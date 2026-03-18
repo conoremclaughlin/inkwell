@@ -68,4 +68,28 @@ describe('EmbeddingRouter', () => {
     const result = await router.embedDocument('doc');
     expect(result).toBeNull();
   });
+
+  it('clamps long Ollama inputs to the vetted model limit', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch' as any).mockResolvedValue({
+      ok: true,
+      json: async () => ({ embeddings: [new Array(1024).fill(0.1)] }),
+    } as Response);
+
+    const router = new EmbeddingRouter({
+      ...baseConfig,
+      provider: 'ollama',
+      model: 'mxbai-embed-large',
+      dimensions: 1024,
+      hasOpenAIKey: false,
+    });
+
+    await router.embedDocument('x'.repeat(2000));
+
+    const request = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
+    const body = request?.body;
+    expect(typeof body).toBe('string');
+    const parsed = JSON.parse(body as string) as { input: string[] };
+    expect(parsed.input[0].length).toBe(1203);
+    expect(parsed.input[0].endsWith('...')).toBe(true);
+  });
 });

@@ -5,6 +5,7 @@ export interface VettedEmbeddingModel {
   model: string;
   recommendedFor: string;
   dimensions: number[];
+  maxInputChars?: number;
   notes: string;
   default?: boolean;
 }
@@ -19,6 +20,7 @@ export const VETTED_EMBEDDING_MODELS: VettedEmbeddingModel[] = [
     model: 'mxbai-embed-large',
     recommendedFor: 'Best local quality (recommended local default)',
     dimensions: [1024],
+    maxInputChars: 1200,
     notes: 'Higher quality local embeddings; larger model footprint.',
     default: true,
   },
@@ -27,6 +29,7 @@ export const VETTED_EMBEDDING_MODELS: VettedEmbeddingModel[] = [
     model: 'nomic-embed-text',
     recommendedFor: 'Balanced local quality/speed',
     dimensions: [768, 512, 256, 128, 64],
+    maxInputChars: 1200,
     notes: 'Good local option when lower dimensionality is desired.',
   },
   {
@@ -34,6 +37,7 @@ export const VETTED_EMBEDDING_MODELS: VettedEmbeddingModel[] = [
     model: 'all-minilm',
     recommendedFor: 'Fastest lightweight local baseline',
     dimensions: [384],
+    maxInputChars: 1200,
     notes: 'Small footprint; useful for quick experiments.',
   },
   {
