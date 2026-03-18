@@ -794,6 +794,54 @@ describe('inboxMessageToFeedEvent', () => {
     const event = inboxMessageToFeedEvent(msg);
     expect(event.content).toContain('from user');
   });
+
+  it('shows full body in detail when subject is used as preview', () => {
+    const msg: InboxMessage = {
+      id: 'msg-4',
+      subject: 'Review PR #232',
+      content: 'Hey, please review this fix for the stuck compacting lifecycle on Gemini sessions.',
+      messageType: 'task_request',
+      senderAgentId: 'wren',
+      recipientAgentId: 'lumen',
+      createdAt: '2026-03-18T16:36:00Z',
+    };
+    const event = inboxMessageToFeedEvent(msg);
+    expect(event.content).toContain('Review PR #232');
+    expect(event.detail).toContain(
+      'Hey, please review this fix for the stuck compacting lifecycle on Gemini sessions.'
+    );
+  });
+
+  it('shows full body in detail when content is truncated', () => {
+    const longContent = 'A'.repeat(200);
+    const msg: InboxMessage = {
+      id: 'msg-5',
+      content: longContent,
+      messageType: 'message',
+      senderAgentId: 'aster',
+      recipientAgentId: 'wren',
+      createdAt: '2026-03-18T17:00:00Z',
+    };
+    const event = inboxMessageToFeedEvent(msg);
+    // Preview should be truncated
+    expect(event.content.length).toBeLessThan(longContent.length);
+    // Detail should contain the full body
+    expect(event.detail).toContain(longContent);
+  });
+
+  it('does not duplicate short content in detail', () => {
+    const msg: InboxMessage = {
+      id: 'msg-6',
+      content: 'Quick question',
+      messageType: 'message',
+      senderAgentId: 'aster',
+      recipientAgentId: 'wren',
+      createdAt: '2026-03-18T17:00:00Z',
+    };
+    const event = inboxMessageToFeedEvent(msg);
+    // Content fits in preview, no subject — detail should not repeat it
+    expect(event.detail).toBeUndefined();
+  });
 });
 
 // ── backendFromSubtype ──
