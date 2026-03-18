@@ -28,7 +28,8 @@
     "commander": "^12.1.0",
     "ink": "npm:@jrichman/ink@6.4.11",
     "ora": "^8.0.1",
-    "react": "^19.2.4"
+    "react": "^19.2.4",
+    "yaml": "^2.8.2"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",

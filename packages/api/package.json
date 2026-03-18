@@ -24,6 +24,7 @@
     "test:channels": "tsx src/test-channels.ts",
     "benchmark:memory-recall": "tsx src/scripts/benchmark-memory-recall.ts",
     "benchmark:bootstrap-relevance": "tsx src/scripts/benchmark-bootstrap-relevance.ts",
+    "backfill:memory-embeddings": "tsx src/scripts/backfill-memory-embeddings.ts",
     "lint": "eslint src --ext .ts",
     "type-check": "yarn workspace @personal-context/shared build && tsc --noEmit",
     "clean": "rm -rf dist"

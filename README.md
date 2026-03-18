@@ -120,10 +120,22 @@ This:
 - pulls the default vetted model (`mxbai-embed-large`)
 - writes the needed memory embedding settings into `.env.local`
 
+To enable embeddings across every git worktree in the repo:
+
+```bash
+sb memory install --all
+```
+
 If you already have the model:
 
 ```bash
 sb memory install --skip-pull
+```
+
+To backfill embeddings for existing memories after enabling semantic recall:
+
+```bash
+sb memory backfill
 ```
 
 If you want to explicitly keep PCP memory in text-only mode, set:

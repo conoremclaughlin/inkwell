@@ -226,10 +226,22 @@ This command:
 - pulls the default vetted embedding model (`mxbai-embed-large`)
 - writes the required memory embedding settings into `.env.local`
 
+To write the same config into every git worktree for the repo:
+
+```bash
+sb memory install --all
+```
+
 If the model is already present:
 
 ```bash
 sb memory install --skip-pull
+```
+
+To backfill embeddings for existing memories after enabling them:
+
+```bash
+sb memory backfill
 ```
 
 To explicitly disable embeddings and keep text-only recall:

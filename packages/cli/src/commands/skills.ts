@@ -12,6 +12,7 @@
 
 import { Command } from 'commander';
 import chalk from 'chalk';
+import * as yaml from 'yaml';
 import {
   existsSync,
   lstatSync,
@@ -109,7 +110,7 @@ function getWorktrees(): string[] {
   }
 }
 
-function buildSkillMd(skill: GetSkillResponse): string {
+export function buildSkillMd(skill: GetSkillResponse): string {
   const frontmatter: Record<string, unknown> = {
     name: skill.skillName,
     description: skill.description,
@@ -126,40 +127,8 @@ function buildSkillMd(skill: GetSkillResponse): string {
     frontmatter.mcp = skill.mcp;
   }
 
-  const yamlLines = serializeYaml(frontmatter, 0);
-  return `---\n${yamlLines}---\n\n${skill.content}\n`;
-}
-
-function serializeYaml(obj: unknown, indent: number): string {
-  const prefix = '  '.repeat(indent);
-  if (obj === null || obj === undefined) return '';
-
-  if (Array.isArray(obj)) {
-    if (obj.length === 0) return '[]\n';
-    if (obj.every((v) => typeof v === 'string')) {
-      const items = obj.map((v) => JSON.stringify(v)).join(', ');
-      return `[${items}]\n`;
-    }
-    return obj.map((v) => `${prefix}- ${String(v)}`).join('\n') + '\n';
-  }
-
-  if (typeof obj === 'object') {
-    const entries = Object.entries(obj as Record<string, unknown>);
-    if (entries.length === 0) return '{}\n';
-    return entries
-      .map(([key, val]) => {
-        if (typeof val === 'object' && val !== null && !Array.isArray(val)) {
-          const nested = serializeYaml(val, indent + 1);
-          return `${prefix}${key}:\n${nested}`;
-        }
-        const serialized = serializeYaml(val, indent).trimEnd();
-        return `${prefix}${key}: ${serialized}\n`;
-      })
-      .join('');
-  }
-
-  if (typeof obj === 'string') return obj;
-  return String(obj);
+  const yamlLines = yaml.stringify(frontmatter).trimEnd();
+  return `---\n${yamlLines}\n---\n\n${skill.content}\n`;
 }
 
 function injectMcpServers(
