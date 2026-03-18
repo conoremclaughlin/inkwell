@@ -57,9 +57,11 @@ export const logger = winston.createLogger({
     }),
   ],
   exceptionHandlers: [
+    new winston.transports.Console({ format: consoleFormat }),
     new winston.transports.File({ filename: join(PCP_LOG_DIR, 'exceptions.log') }),
   ],
   rejectionHandlers: [
+    new winston.transports.Console({ format: consoleFormat }),
     new winston.transports.File({ filename: join(PCP_LOG_DIR, 'rejections.log') }),
   ],
 });

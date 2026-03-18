@@ -162,3 +162,6 @@ vite.config.ts.timestamp-*
 .playwright-cli/
 output/
 packages/api/output/
+
+# create-pcp scaffolder state
+.create-pcp-progress.json

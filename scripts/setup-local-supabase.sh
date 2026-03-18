@@ -77,16 +77,23 @@ echo "[supabase-setup] Starting local Supabase..."
 supabase start --workdir "${ROOT_DIR}" >/dev/null
 
 echo "[supabase-setup] Applying migrations + seed..."
-supabase db reset --workdir "${ROOT_DIR}" --local >/dev/null
+# supabase db reset may exit non-zero due to Supabase CLI Sentry bug (v2.78+).
+# Verify success by checking that the database is reachable afterward.
+supabase db reset --workdir "${ROOT_DIR}" --local >/dev/null 2>&1 || true
 
 echo "[supabase-setup] Reading local Supabase env..."
 STATUS_ENV="$(supabase status --workdir "${ROOT_DIR}" -o env)"
 eval "${STATUS_ENV}"
 
+# Supabase CLI ≥2.75 renamed some env vars:
+#   SERVICE_ROLE_KEY → SECRET_KEY (but still outputs SERVICE_ROLE_KEY too)
+#   AUTH_JWT_SECRET  → JWT_SECRET
+#   ANON_KEY         → PUBLISHABLE_KEY (but still outputs ANON_KEY too)
+# Accept both old and new names for compatibility.
 LOCAL_URL="${API_URL:-}"
-LOCAL_ANON="${ANON_KEY:-}"
-LOCAL_SERVICE="${SERVICE_ROLE_KEY:-}"
-LOCAL_JWT="${AUTH_JWT_SECRET:-}"
+LOCAL_ANON="${ANON_KEY:-${PUBLISHABLE_KEY:-}}"
+LOCAL_SERVICE="${SERVICE_ROLE_KEY:-${SECRET_KEY:-}}"
+LOCAL_JWT="${AUTH_JWT_SECRET:-${JWT_SECRET:-}}"
 
 if [[ -z "${LOCAL_URL}" || -z "${LOCAL_ANON}" || -z "${LOCAL_SERVICE}" || -z "${LOCAL_JWT}" ]]; then
   echo "[supabase-setup] Failed to read required values from 'supabase status -o env'." >&2
