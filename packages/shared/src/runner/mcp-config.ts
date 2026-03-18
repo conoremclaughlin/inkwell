@@ -168,6 +168,9 @@ export function buildSessionEnv(options: {
   }
   if (options.accessToken) {
     env.PCP_ACCESS_TOKEN = options.accessToken;
+    // Codex env_http_headers maps env var name → full header value.
+    // PCP_AUTH_BEARER provides the complete "Bearer <token>" string.
+    env.PCP_AUTH_BEARER = `Bearer ${options.accessToken}`;
   }
 
   return env;

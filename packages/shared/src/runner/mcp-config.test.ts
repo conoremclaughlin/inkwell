@@ -124,7 +124,7 @@ describe('injectSessionHeaders', () => {
 });
 
 describe('buildSessionEnv', () => {
-  it('includes PCP_ACCESS_TOKEN when accessToken provided', () => {
+  it('includes PCP_ACCESS_TOKEN and PCP_AUTH_BEARER when accessToken provided', () => {
     const env = buildSessionEnv({
       pcpSessionId: 'sess-123',
       studioId: 'studio-456',
@@ -134,14 +134,16 @@ describe('buildSessionEnv', () => {
     expect(env.PCP_SESSION_ID).toBe('sess-123');
     expect(env.PCP_STUDIO_ID).toBe('studio-456');
     expect(env.PCP_ACCESS_TOKEN).toBe('tok-789');
+    expect(env.PCP_AUTH_BEARER).toBe('Bearer tok-789');
   });
 
-  it('omits PCP_ACCESS_TOKEN when not provided', () => {
+  it('omits PCP_ACCESS_TOKEN and PCP_AUTH_BEARER when not provided', () => {
     const env = buildSessionEnv({
       pcpSessionId: 'sess-123',
     });
 
     expect(env.PCP_SESSION_ID).toBe('sess-123');
     expect(env).not.toHaveProperty('PCP_ACCESS_TOKEN');
+    expect(env).not.toHaveProperty('PCP_AUTH_BEARER');
   });
 });
