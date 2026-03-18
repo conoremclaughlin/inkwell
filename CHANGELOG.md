@@ -1,5 +1,75 @@
 # Changelog
 
+## [0.2.0] — 2026-03-18
+
+293 commits since v0.1.0 by Conor, Wren, Lumen, and Aster. This release builds group coordination, session identity tracing, memory embeddings, and a scaffolder for new PCP projects.
+
+### Group Threads
+
+- **Thread-first messaging** — `send_to_inbox` with `threadKey` now creates shared threads (`inbox_threads` + `inbox_thread_messages`). Messages belong to the thread, not individual recipients. Late joiners see full history.
+- **Multi-recipient sends** — `recipients: ["lumen", "aster", "myra"]` creates a group thread and triggers all participants.
+- **Context-dependent triggers** — 1:1 threads trigger the other participant; group threads trigger the creator only by default. `triggerAgents: ["lumen"]` for targeted waking, `triggerAll: true` for broadcast.
+- **Thread lifecycle** — `add_thread_participant`, `close_thread`, `list_threads` with unread counts, `get_thread_messages` with cursor pagination.
+- **Read tracking** — `inbox_thread_read_status` table for per-agent unread counts without duplicating messages.
+- **Spec accepted** — cross-agent communication spec (`pcp://specs/cross-agent-communication`) reviewed by all four SBs, status: accepted.
+
+### Session Identity Chain
+
+- **End-to-end session tracing** — PCP session ID, backend session ID, and studio ID propagate through HTTP headers (`x-pcp-session-id`, `x-pcp-studio-id`), spawn env vars, and `.mcp.json` header injection.
+- **Backend session ID extraction** — Codex thread UUID extracted from stdout event stream, Claude Code session ID from stderr. Persisted to `backend_session_id` column.
+- **Compaction gating** — skip compaction for native CLI backends (Codex, Gemini) that don't support it. `postCompact` flag in bootstrap for context continuity.
+- **Session lifecycle phases** — `compacting` state for tracking context compaction. Lifecycle updates moved from MCP to authenticated REST endpoint.
+- **CLI-attached routing** — when a user has `sb chat` open, triggered messages inject into the active CLI session instead of spawning a new one.
+
+### Memory
+
+- **Embedding router** (Lumen) — pluggable memory embedding with local (transformers) and API backends. Opt-in via `MEMORY_EMBEDDING_PROVIDER` env var.
+- **Semantic recall** — `recall` tool now supports vector similarity search when embeddings are enabled, with text search fallback.
+- **Benchmark tooling** — `benchmark:memory-recall` and `benchmark:bootstrap-relevance` scripts for measuring recall quality.
+- **Trigram indexes** — `pg_trgm` indexes on memory content for faster text search.
+
+### CLI (`sb`)
+
+- **Mission display overhaul** — lifecycle breakdown in SB summary bar, generating/today/studios counts, thread messages with accurate unreads, pointer-based unread tracking.
+- **Tool gating in `sb chat`** — security profiles (privileged/backend/off), approval channel, multi-turn tool loop. Scoped policy mutation via `/policy-scope`.
+- **`sb memory`** — new subcommand for memory management from the CLI.
+- **`--dangerous` flag** — bypass safety checks for advanced operations.
+- **Studio route patterns** — pattern-based trigger routing for studios.
+- **Hooks improvements** — skip compacting lifecycle for backends without postCompact, pre-compact/on-stop templates updated to use `remember` over `log_session`.
+
+### Infrastructure
+
+- **`create-pcp` scaffolder** — `npx create-pcp my-project` bootstraps a new PCP project with Supabase, MCP server, and CLI config.
+- **CI hardened** — Node 22 standardized, cross-platform lockfile via `supportedArchitectures`, pre-commit hook auto-updates `yarn.lock` when `package.json` changes.
+- **PM2 removed** — replaced with `yarn dev` via concurrently. Simpler, no env caching footguns.
+- **tsx watch excludes** — `--exclude 'dist,node_modules,.next,.pcp'` prevents CPU feedback loop with Next.js dev artifacts.
+- **Graceful shutdown** — stop heartbeat + agent gateway on SIGTERM, 10s force-kill timeout.
+- **Next.js 16.1.7** — bumped from 15.x.
+
+### Channels & Media
+
+- **Media pipeline** — photos, voice, documents sent via `send_response` with media field. Counters for sent/failed, cross-channel activity logging.
+- **Voice transcription** and image understanding in inbound pipeline.
+
+### API & Tools
+
+- **`get_agent_summaries`** — registered as MCP tool (was defined but never wired). Collapsed from 5N+N×T to 7 fixed queries.
+- **`save_team_constitution` / `get_team_constitution`** — MCP tools for shared workspace documents.
+- **Trigger auth** — JWT auth on agent trigger and lifecycle endpoints. Triggered sessions get PCP auth token injected into `.mcp.json`.
+- **Sender enrichment** — `send_to_inbox` resolves sender session context for provenance stamping.
+
+### Web Dashboard
+
+- **Per-document artifact permissions** (Lumen) — editor UX for artifact access control.
+- **Studio status badges** — polished repo-root display with active status indicators.
+
+### Contributors
+
+- **Wren** (Claude Code) — group threads, session identity chain, mission display, media pipeline, CI fixes, create-pcp scaffolder
+- **Lumen** (Codex CLI) — memory embeddings, session picker hardening, artifact permissions, studio cleanup, delegated token auth
+- **Aster** (Gemini) — spec reviews, group threads feedback
+- **Myra** (Telegram/WhatsApp) — spec reviews, bridge pattern documentation
+
 ## [0.1.0] — 2026-03-04
 
 First tagged release of the Personal Context Protocol. 705 commits by Conor, Wren, Lumen, Aster, and Myra.
