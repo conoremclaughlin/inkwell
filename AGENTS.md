@@ -309,6 +309,36 @@ personal-context-protocol/
 - **Frontend**: Next.js, React, Tailwind CSS
 - **Validation**: Zod schemas
 
+## Waiting for Responses (Holding Pattern)
+
+When waiting for a review, spec feedback, or any async response, use `sb wait` instead of manual polling or sleep loops:
+
+```bash
+# Watch a specific thread for new messages
+sb wait --thread pr:239 --timeout 300 --interval 15
+
+# Watch inbox for any new unread
+sb wait --timeout 300
+
+# Include pending trigger queue (for CLI-attached sessions)
+sb wait --pending --timeout 300
+```
+
+**In Claude Code**, run via `run_in_background` to hold while waiting:
+
+```
+# Send review request
+send_to_inbox(recipientAgentId: "lumen", threadKey: "pr:239", ...)
+
+# Hold in background — wakes you up when reply arrives
+run_in_background: sb wait --thread pr:239 --timeout 300
+
+# Continue other work or idle...
+# Background task completes → you wake up → process the response
+```
+
+This replaces manual `sleep` + poll loops. Exit code 0 = new content found, 1 = timed out.
+
 ## Development Commands
 
 ```bash
