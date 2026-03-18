@@ -764,17 +764,29 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // Check if target agent has a CLI-attached session — route to pending
     // queue instead of spawning a new process. The on-prompt hook will
     // deliver the message on the next user prompt.
-    // cli_attached is not yet in generated Supabase types — cast result
-    const { data: cliSession } = (await dataComposer!
+    // Check for CLI-attached session, scoped by studio/session to avoid
+    // misrouting when multiple sessions of the same agent are attached.
+    // cli_attached is not yet in generated Supabase types — cast result.
+    let cliQuery = dataComposer!
       .getClient()
       .from('sessions')
-      .select('id, cli_attached, updated_at')
+      .select('id, cli_attached, updated_at, studio_id')
       .eq('user_id', userId)
       .eq('agent_id', targetAgentId)
       .eq('cli_attached', true)
-      .is('ended_at', null)
-      .limit(1)
-      .maybeSingle()) as { data: { id: string; cli_attached: boolean; updated_at: string } | null };
+      .is('ended_at', null);
+
+    // Prefer exact session match if recipientSessionId is available
+    if (payload.recipientSessionId) {
+      cliQuery = cliQuery.eq('id', payload.recipientSessionId);
+    } else if (resolvedWorkspaceId) {
+      // Scope by studio to avoid picking the wrong worktree
+      cliQuery = cliQuery.eq('studio_id', resolvedWorkspaceId);
+    }
+
+    const { data: cliSession } = (await cliQuery.limit(1).maybeSingle()) as {
+      data: { id: string; cli_attached: boolean; updated_at: string; studio_id: string } | null;
+    };
 
     // Staleness guard: if cli_attached but session not updated in >10 minutes,
     // the CLI likely disconnected without calling end_session. Clear the flag

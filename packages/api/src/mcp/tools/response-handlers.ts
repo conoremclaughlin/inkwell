@@ -225,7 +225,7 @@ export async function handleSendResponse(
 
 export const getPendingMessagesSchema = z.object({
   channel: z
-    .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'slack', 'http', 'api', 'all'])
+    .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'slack', 'http', 'api', 'agent', 'all'])
     .optional()
     .default('all')
     .describe('Filter by channel (default: all)'),
