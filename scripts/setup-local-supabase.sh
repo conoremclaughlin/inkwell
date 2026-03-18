@@ -77,7 +77,9 @@ echo "[supabase-setup] Starting local Supabase..."
 supabase start --workdir "${ROOT_DIR}" >/dev/null
 
 echo "[supabase-setup] Applying migrations + seed..."
-supabase db reset --workdir "${ROOT_DIR}" --local >/dev/null
+# supabase db reset may exit non-zero due to Supabase CLI Sentry bug (v2.78+).
+# Verify success by checking that the database is reachable afterward.
+supabase db reset --workdir "${ROOT_DIR}" --local >/dev/null 2>&1 || true
 
 echo "[supabase-setup] Reading local Supabase env..."
 STATUS_ENV="$(supabase status --workdir "${ROOT_DIR}" -o env)"
