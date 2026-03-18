@@ -160,14 +160,14 @@ async function runStreamingCommand(
 
     child.once('error', (error) => {
       logStream.write(`[${new Date().toISOString()}] Command failed to start: ${error.message}\n`);
-      logStream.end();
-      reject(error);
+      logStream.end(() => reject(error));
     });
     child.once('exit', (code) => {
       logStream.write(`[${new Date().toISOString()}] Command exited with code ${code ?? 'null'}\n`);
-      logStream.end();
-      if (code === 0) resolve();
-      else reject(new Error(`${command} ${args.join(' ')} exited with code ${code}`));
+      logStream.end(() => {
+        if (code === 0) resolve();
+        else reject(new Error(`${command} ${args.join(' ')} exited with code ${code}`));
+      });
     });
   });
 }
