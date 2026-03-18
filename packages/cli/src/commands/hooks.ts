@@ -1613,14 +1613,20 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
 // Hook Handlers
 // ============================================================================
 
-async function preCompactHandler(): Promise<void> {
+async function preCompactHandler(options?: { backend?: string }): Promise<void> {
   await readStdin(); // consume stdin but we don't need it
 
-  // Mark session as compacting so mission control can see it
   const cwd = process.cwd();
   const config = getPcpConfig();
   const agentId = resolveAgentId() || 'unknown';
-  await updateRuntimeGenerationState(cwd, config, agentId, 'compacting');
+  const backend = resolveLifecycleBackend(cwd, options?.backend);
+
+  // Only set 'compacting' lifecycle if this backend has a postCompact event
+  // that will reset it to 'idle'. Without postCompact (e.g., Gemini/PreCompress),
+  // the lifecycle gets stuck at 'compacting' permanently.
+  if (backend.events.postCompact) {
+    await updateRuntimeGenerationState(cwd, config, agentId, 'compacting');
+  }
 
   process.stdout.write(loadTemplate('hook-pre-compact'));
 }
@@ -2075,7 +2081,7 @@ export function registerHooksCommands(program: Command): void {
     .command('pre-compact')
     .description('Hook: output pre-compaction reminder')
     .option('--backend <name>', 'Backend context for this hook invocation')
-    .action(preCompactHandler);
+    .action((opts) => preCompactHandler(opts));
 
   hooks
     .command('post-compact')
