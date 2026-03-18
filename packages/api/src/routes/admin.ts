@@ -1690,11 +1690,11 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
     // Fetch studios owned by this agent
     const { data: studiosData } = await supabase
       .from('studios')
-      .select('id, name, branch, status')
+      .select('id, slug, branch, status, route_patterns')
       .eq('user_id', authReq.pcpUserId)
       .eq('agent_id', identity.agent_id)
       .in('status', ['active', 'idle'])
-      .order('name', { ascending: true });
+      .order('slug', { ascending: true });
     const { enabled: heartbeatProcessingEnabled } = getHeartbeatProcessingConfig();
 
     res.json({
@@ -1709,11 +1709,12 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
         studioHint: identity.studio_hint || null,
         updatedAt: identity.updated_at,
       },
-      studios: (studiosData || []).map((s) => ({
+      studios: (studiosData || []).map((s: Record<string, unknown>) => ({
         id: s.id,
-        name: s.name,
+        name: s.slug || s.branch || s.id,
         branch: s.branch,
         status: s.status,
+        routePatterns: (s.route_patterns as string[] | null) || [],
       })),
       routes,
       reminders: (remindersData || []).map((reminder) => ({
