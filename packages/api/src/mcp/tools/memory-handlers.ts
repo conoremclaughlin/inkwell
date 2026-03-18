@@ -793,6 +793,16 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
     metadata: params.metadata,
   });
 
+  // Persist CLI-attached flag from request context to session record.
+  // This tells the trigger handler to route messages to the pending queue
+  // instead of spawning a new process.
+  const reqCtx = getRequestContext();
+  if (reqCtx?.cliAttached) {
+    await dataComposer.repositories.memory.updateSession(session.id, {
+      cliAttached: true,
+    });
+  }
+
   logger.info(`Session started for user ${user.id}`, {
     sessionId: session.id,
     agentId: session.agentId,

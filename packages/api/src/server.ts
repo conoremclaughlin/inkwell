@@ -761,6 +761,40 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       workspaceId: resolvedWorkspaceId || null,
     });
 
+    // Check if target agent has a CLI-attached session — route to pending
+    // queue instead of spawning a new process. The on-prompt hook will
+    // deliver the message on the next user prompt.
+    // cli_attached is not yet in generated Supabase types — cast result
+    const { data: cliSession } = (await dataComposer!
+      .getClient()
+      .from('sessions')
+      .select('id, cli_attached')
+      .eq('user_id', userId)
+      .eq('agent_id', targetAgentId)
+      .eq('cli_attached', true)
+      .is('ended_at', null)
+      .limit(1)
+      .maybeSingle()) as { data: { id: string; cli_attached: boolean } | null };
+
+    if (cliSession?.cli_attached) {
+      const { addPendingMessage } = await import('./mcp/tools/response-handlers.js');
+      addPendingMessage({
+        id: `trigger-${Date.now()}`,
+        channel: 'agent',
+        conversationId: request.conversationId,
+        content: triggerMessage,
+        sender: { id: payload.fromAgentId, name: payload.fromAgentId },
+        timestamp: new Date(),
+        read: false,
+      });
+      logger.info('[Trigger] CLI-attached session detected, routed to pending queue', {
+        targetAgentId,
+        sessionId: cliSession.id,
+        threadKey: payload.threadKey,
+      });
+      return;
+    }
+
     const result = await sessionService!.handleMessage(request);
 
     // 5. Route any responses
