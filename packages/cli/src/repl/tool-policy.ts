@@ -689,9 +689,12 @@ export class ToolPolicyState {
       return Boolean(requester.agentId && target.agentId && requester.agentId === target.agentId);
     }
     if (visibility === 'workspace') {
-      return Boolean(
-        requester.workspaceId && target.workspaceId && requester.workspaceId === target.workspaceId
-      );
+      // Fall back to studioId comparison when workspaceId is absent — the
+      // separate workspace concept was removed and callers no longer populate
+      // workspaceId on session access queries.
+      const rId = requester.workspaceId || requester.studioId;
+      const tId = target.workspaceId || target.studioId;
+      return Boolean(rId && tId && rId === tId);
     }
     if (visibility === 'studio') {
       return Boolean(
@@ -714,10 +717,14 @@ export class ToolPolicyState {
   }
 
   public setContext(context: ToolPolicyContext): void {
+    const studioNorm = context.studioId ? normalizeScopeId(context.studioId) : undefined;
     this.context = {
       agentId: context.agentId ? normalizeScopeId(context.agentId) : undefined,
-      workspaceId: context.workspaceId ? normalizeScopeId(context.workspaceId) : undefined,
-      studioId: context.studioId ? normalizeScopeId(context.studioId) : undefined,
+      // Derive workspaceId from studioId when not explicitly provided — the
+      // separate workspace concept was removed but the scope layer remains for
+      // backwards-compatible policy files.
+      workspaceId: context.workspaceId ? normalizeScopeId(context.workspaceId) : studioNorm,
+      studioId: studioNorm,
     };
 
     if (this.mutationScope.scope !== 'global') {

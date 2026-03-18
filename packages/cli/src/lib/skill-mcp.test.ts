@@ -1,8 +1,22 @@
-import { describe, expect, it, beforeEach, afterEach } from 'vitest';
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { parseSkillMcpConfig, discoverSkillMcpServers, buildMergedMcpConfig } from './skill-mcp.js';
+
+// Mock discoverSkills so tests don't pick up user-installed skills from ~/.pcp/skills/
+vi.mock('../repl/skills.js', () => ({
+  discoverSkills: (cwd: string) => {
+    // Only scan cwd/.pcp/skills/ (workspace tier) — skip managed/bundled/extra tiers
+    const { existsSync, readdirSync } = require('fs');
+    const { join } = require('path');
+    const skillsDir = join(cwd, '.pcp', 'skills');
+    if (!existsSync(skillsDir)) return [];
+    return readdirSync(skillsDir, { withFileTypes: true })
+      .filter((d: { isDirectory: () => boolean }) => d.isDirectory())
+      .map((d: { name: string }) => ({ name: d.name, path: join(skillsDir, d.name) }));
+  },
+}));
 
 describe('parseSkillMcpConfig', () => {
   let tmpDir: string;
