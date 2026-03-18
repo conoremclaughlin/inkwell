@@ -92,4 +92,84 @@ describe('ContextLedger', () => {
     expect(bookmarks[0]?.id).toBe(bookmark.id);
     expect(bookmarks[0]?.entryIndex).toBeGreaterThanOrEqual(0);
   });
+
+  describe('evictEntries', () => {
+    it('removes specific entries by ID', () => {
+      const ledger = new ContextLedger();
+      const e1 = ledger.addEntry('user', 'keep this');
+      const e2 = ledger.addEntry('inbox', 'irrelevant inbox message');
+      const e3 = ledger.addEntry('assistant', 'keep this too');
+      const e4 = ledger.addEntry('inbox', 'another irrelevant message');
+
+      const result = ledger.evictEntries([e2.id, e4.id]);
+      expect(result.removedEntries).toHaveLength(2);
+      expect(result.removedTokens).toBeGreaterThan(0);
+      expect(ledger.listEntries().map((e) => e.id)).toEqual([e1.id, e3.id]);
+    });
+
+    it('returns empty result for non-existent IDs', () => {
+      const ledger = new ContextLedger();
+      ledger.addEntry('user', 'hello');
+      const result = ledger.evictEntries([999]);
+      expect(result.removedEntries).toHaveLength(0);
+      expect(ledger.listEntries()).toHaveLength(1);
+    });
+
+    it('adjusts bookmarks after eviction', () => {
+      const ledger = new ContextLedger();
+      ledger.addEntry('user', 'a');
+      const e2 = ledger.addEntry('inbox', 'remove me');
+      ledger.addEntry('assistant', 'b');
+      const bm = ledger.createBookmark('after-b');
+      ledger.addEntry('user', 'c');
+
+      ledger.evictEntries([e2.id]);
+      const bookmarks = ledger.listBookmarks();
+      expect(bookmarks).toHaveLength(1);
+      expect(bookmarks[0].entryIndex).toBe(1); // was 2, shifted down by 1
+    });
+  });
+
+  describe('evictBySource', () => {
+    it('removes all entries from a source', () => {
+      const ledger = new ContextLedger();
+      ledger.addEntry('system', 'bootstrap data', 'bootstrap');
+      ledger.addEntry('user', 'hello');
+      ledger.addEntry('system', 'more bootstrap', 'bootstrap');
+      ledger.addEntry('assistant', 'response');
+
+      const result = ledger.evictBySource('bootstrap');
+      expect(result.removedEntries).toHaveLength(2);
+      expect(ledger.listEntries()).toHaveLength(2);
+      expect(ledger.listEntries().map((e) => e.role)).toEqual(['user', 'assistant']);
+    });
+  });
+
+  describe('evictByRole', () => {
+    it('removes all entries of a role', () => {
+      const ledger = new ContextLedger();
+      ledger.addEntry('inbox', 'inbox 1');
+      ledger.addEntry('user', 'user msg');
+      ledger.addEntry('inbox', 'inbox 2');
+      ledger.addEntry('assistant', 'reply');
+
+      const result = ledger.evictByRole('inbox');
+      expect(result.removedEntries).toHaveLength(2);
+      expect(ledger.listEntries()).toHaveLength(2);
+    });
+  });
+
+  describe('summarizeEntries', () => {
+    it('returns entry metadata with previews', () => {
+      const ledger = new ContextLedger();
+      ledger.addEntry('user', 'a short message');
+      ledger.addEntry('assistant', 'x'.repeat(200), 'pcp-tool');
+
+      const summary = ledger.summarizeEntries();
+      expect(summary).toHaveLength(2);
+      expect(summary[0].preview).toBe('a short message');
+      expect(summary[1].preview.length).toBeLessThanOrEqual(123); // 120 + "..."
+      expect(summary[1].source).toBe('pcp-tool');
+    });
+  });
 });

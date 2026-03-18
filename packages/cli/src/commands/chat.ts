@@ -35,6 +35,7 @@ import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../
 import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
 import { ensurePcpToolAllowed } from '../repl/tool-gate.js';
 import { executeToolCalls, type ToolCallResult } from '../repl/tool-call-executor.js';
+import { isClientLocalTool, handleClientLocalTool } from '../repl/context-tools.js';
 import { applyProfile, formatProfileList, isValidProfileId } from '../repl/tool-profiles.js';
 import { ApprovalRequestManager } from '../repl/approval-request.js';
 import {
@@ -1745,7 +1746,7 @@ function buildPromptEnvelope(
 
   const toolInstruction =
     runtime.toolRouting === 'local'
-      ? 'Backend-native tool calling is disabled for this run. If you need PCP tool access, emit fenced blocks in this exact format: ```pcp-tool {"tool":"tool_name","args":{}} ``` and continue with your plain-text answer.'
+      ? 'Backend-native tool calling is disabled for this run. If you need PCP tool access, emit fenced blocks in this exact format: ```pcp-tool {"tool":"tool_name","args":{}} ``` and continue with your plain-text answer.\n\nContext management tools (client-local, no server round-trip):\n- list_context: Introspect your context window — see all entries with IDs, token counts, sources, and previews. Use this to decide what to evict.\n- evict_context: Remove specific entries from your context to reclaim tokens. Args: entryIds (number[]), source (string), or role (string). Evicted content is gone from your working context but the conversation continues. Use this when you notice irrelevant memories, old tool results, or stale inbox messages consuming your context budget.'
       : runtime.toolMode === 'off'
         ? 'Do not call backend-native tools. Provide reasoning and instructions only.'
         : runtime.toolMode === 'privileged'
@@ -2781,7 +2782,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const iterationResults: typeof allToolResults = [];
       await executeToolCalls(localToolCalls, {
         policy: toolPolicy,
-        callTool: (tool, args) => pcp.callTool(tool, args),
+        callTool: (tool, args) => {
+          // Client-local tools (context management) are handled in-process
+          if (isClientLocalTool(tool)) {
+            const result = handleClientLocalTool(tool, args, ledger);
+            if (result) return Promise.resolve(result);
+          }
+          return pcp.callTool(tool, args);
+        },
         sessionId: runtime.sessionId,
         promptForApproval: async (tool, reason) => {
           if (!runtime.awayMode) {

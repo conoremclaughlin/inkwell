@@ -30,6 +30,12 @@ export interface LedgerTrimResult {
   totalAfter: number;
 }
 
+export interface LedgerEvictResult {
+  removedEntries: LedgerEntry[];
+  removedTokens: number;
+  totalAfter: number;
+}
+
 export interface PromptBuildOptions {
   maxTokens?: number;
   includeSources?: boolean;
@@ -179,5 +185,83 @@ export class ContextLedger {
 
     runningTotal = this.totalTokens();
     return { removedEntries, removedTokens, totalAfter: runningTotal };
+  }
+
+  /**
+   * Evict specific entries by ID. Unlike eject (positional) or trim (oldest-first),
+   * this removes arbitrary entries — enabling the SB to surgically drop irrelevant
+   * context while preserving everything else.
+   */
+  public evictEntries(entryIds: number[]): LedgerEvictResult {
+    const idSet = new Set(entryIds);
+    const removedEntries: LedgerEntry[] = [];
+    let removedTokens = 0;
+
+    const kept: LedgerEntry[] = [];
+    for (const entry of this.entries) {
+      if (idSet.has(entry.id)) {
+        removedEntries.push(entry);
+        removedTokens += entry.approxTokens;
+      } else {
+        kept.push(entry);
+      }
+    }
+
+    if (removedEntries.length === 0) {
+      return { removedEntries: [], removedTokens: 0, totalAfter: this.totalTokens() };
+    }
+
+    // Rebuild bookmark indices to match new array positions
+    const oldToNew = new Map<number, number>();
+    kept.forEach((entry, idx) => {
+      const oldIdx = this.entries.indexOf(entry);
+      oldToNew.set(oldIdx, idx);
+    });
+
+    this.entries = kept;
+    this.bookmarks = this.bookmarks
+      .filter((b) => oldToNew.has(b.entryIndex))
+      .map((b) => ({ ...b, entryIndex: oldToNew.get(b.entryIndex)! }));
+
+    return { removedEntries, removedTokens, totalAfter: this.totalTokens() };
+  }
+
+  /**
+   * Evict all entries from a given source (e.g., "pcp-inbox", "bootstrap", "local-tool").
+   * Useful for bulk cleanup of a category of context.
+   */
+  public evictBySource(source: string): LedgerEvictResult {
+    const ids = this.entries.filter((e) => e.source === source).map((e) => e.id);
+    return this.evictEntries(ids);
+  }
+
+  /**
+   * Evict all entries matching a role (e.g., "inbox", "system").
+   */
+  public evictByRole(role: LedgerRole): LedgerEvictResult {
+    const ids = this.entries.filter((e) => e.role === role).map((e) => e.id);
+    return this.evictEntries(ids);
+  }
+
+  /**
+   * Get a compact summary of context entries for introspection.
+   * Returns entry metadata without full content (for the SB to decide what to evict).
+   */
+  public summarizeEntries(): Array<{
+    id: number;
+    role: LedgerRole;
+    source?: string;
+    approxTokens: number;
+    createdAt: string;
+    preview: string;
+  }> {
+    return this.entries.map((e) => ({
+      id: e.id,
+      role: e.role,
+      source: e.source,
+      approxTokens: e.approxTokens,
+      createdAt: e.createdAt,
+      preview: e.content.slice(0, 120) + (e.content.length > 120 ? '...' : ''),
+    }));
   }
 }
