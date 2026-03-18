@@ -79,7 +79,7 @@ const DETAIL_COLLAPSED_LINES = 3;
 function collapseDetail(detail: string, maxLines: number): string {
   const lines = detail.split('\n');
   if (lines.length <= maxLines) return detail;
-  return lines.slice(0, maxLines).join('\n') + '\n…';
+  return lines.slice(0, maxLines).join('\n') + '…';
 }
 
 const FeedEventLine = React.memo(function FeedEventLine({
