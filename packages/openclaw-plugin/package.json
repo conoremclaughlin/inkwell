@@ -1,0 +1,31 @@
+{
+  "name": "pcp-openclaw",
+  "version": "0.1.0",
+  "description": "Personal Context Protocol plugin for OpenClaw — identity, memory, sessions, and cross-agent messaging",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/conoremclaughlin/personal-context-protocol.git",
+    "directory": "packages/openclaw-plugin"
+  },
+  "keywords": [
+    "openclaw",
+    "pcp",
+    "personal-context-protocol",
+    "mcp",
+    "ai-agent",
+    "memory",
+    "identity"
+  ],
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "index.ts",
+    "openclaw.plugin.json",
+    "skills/"
+  ]
+}

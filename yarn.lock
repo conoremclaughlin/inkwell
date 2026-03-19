@@ -10596,6 +10596,12 @@ __metadata:
   languageName: node
   linkType: hard
 
+"pcp-openclaw@workspace:packages/openclaw-plugin":
+  version: 0.0.0-use.local
+  resolution: "pcp-openclaw@workspace:packages/openclaw-plugin"
+  languageName: unknown
+  linkType: soft
+
 "personal-context-protocol@workspace:.":
   version: 0.0.0-use.local
   resolution: "personal-context-protocol@workspace:."

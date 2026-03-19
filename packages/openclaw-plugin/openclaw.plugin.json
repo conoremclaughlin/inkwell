@@ -1,0 +1,54 @@
+{
+  "id": "pcp",
+  "skills": ["skills"],
+  "uiHints": {
+    "serverUrl": {
+      "label": "PCP Server URL",
+      "placeholder": "http://localhost:3001",
+      "help": "URL of the running PCP server"
+    },
+    "accessToken": {
+      "label": "Access Token",
+      "sensitive": true,
+      "placeholder": "eyJhbGciOi...",
+      "help": "PCP access token (from ~/.pcp/auth.json or 'sb login')"
+    },
+    "agentId": {
+      "label": "Agent ID",
+      "placeholder": "wren",
+      "help": "Your PCP agent identity. If omitted, reads from ~/.pcp/config.json agentMapping."
+    },
+    "autoBootstrap": {
+      "label": "Auto-Bootstrap",
+      "help": "Inject PCP identity context at the start of each agent turn"
+    },
+    "autoSessionEnd": {
+      "label": "Auto Session End",
+      "help": "Automatically end the PCP session when the agent turn completes"
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "serverUrl": {
+        "type": "string",
+        "default": "http://localhost:3001"
+      },
+      "accessToken": {
+        "type": "string"
+      },
+      "agentId": {
+        "type": "string"
+      },
+      "autoBootstrap": {
+        "type": "boolean",
+        "default": true
+      },
+      "autoSessionEnd": {
+        "type": "boolean",
+        "default": true
+      }
+    }
+  }
+}
