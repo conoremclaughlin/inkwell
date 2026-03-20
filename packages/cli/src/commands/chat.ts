@@ -36,6 +36,8 @@ import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-ap
 import { ensurePcpToolAllowed } from '../repl/tool-gate.js';
 import { executeToolCalls, type ToolCallResult } from '../repl/tool-call-executor.js';
 import { isClientLocalTool, handleClientLocalTool } from '../repl/context-tools.js';
+import { SbHookRegistry } from '../repl/hook-registry.js';
+import { registerBuiltinHooks } from '../repl/builtin-hooks.js';
 import { applyProfile, formatProfileList, isValidProfileId } from '../repl/tool-profiles.js';
 import { ApprovalRequestManager } from '../repl/approval-request.js';
 import {
@@ -1949,6 +1951,38 @@ export async function runChat(options: ChatOptions): Promise<void> {
   };
 
   const ledger = new ContextLedger();
+  const hookRegistry = new SbHookRegistry();
+  let hookTurnCount = 0;
+
+  // Register built-in hooks (passive recall + budget monitor).
+  // callRecall wraps pcp.callTool('recall', ...) into the shape hooks expect.
+  const { passiveRecall: passiveRecallHandle } = registerBuiltinHooks(hookRegistry, {
+    callRecall: async (query, limit) => {
+      try {
+        const result = await pcp.callTool('recall', {
+          query,
+          agentId,
+          includeShared: true,
+          limit,
+          recallMode: 'hybrid',
+        });
+        // PcpClient.callTool() parses the JSON-RPC response and returns
+        // the tool result directly (e.g., { success, memories, ... })
+        const parsed = result as Record<string, unknown>;
+        if (!parsed.success) return [];
+        const memories = parsed.memories as Array<Record<string, unknown>> | undefined;
+        return (memories || []).map((m) => ({
+          id: m.id as string,
+          content: m.content as string,
+          summary: (m.summary as string) || null,
+          topics: (m.topics as string[]) || [],
+        }));
+      } catch {
+        return [];
+      }
+    },
+  });
+
   const seenInboxIds = new Set<string>();
   const seenActivityIds = new Set<string>();
   let pollTimer: NodeJS.Timeout | null = null;
@@ -2609,6 +2643,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
         .catch(() => undefined);
     }
 
+    // ── Fire prompt_build hooks (budget monitor, etc.) ──
+    await hookRegistry.fire('prompt_build', {
+      ledger,
+      runtime: {
+        sessionId: runtime.sessionId,
+        agentId,
+        backend: runtime.backend,
+        budgetUtilization:
+          runtime.maxContextTokens > 0 ? ledger.totalTokens() / runtime.maxContextTokens : 0,
+        turnCount: hookTurnCount,
+      },
+    });
+
     let prompt = buildPromptEnvelope(agentId, runtime, ledger, raw);
     const turnStartedAt = Date.now();
     const backendGate = toolPolicy.getBackendToolGate();
@@ -2994,6 +3041,27 @@ export async function runChat(options: ChatOptions): Promise<void> {
       usage: runResult.usage || null,
     });
     lastBackendUsage = runResult.usage;
+
+    // ── Fire turn_end hooks (passive recall, etc.) ──
+    hookTurnCount++;
+    hookRegistry
+      .fire('turn_end', {
+        ledger,
+        runtime: {
+          sessionId: runtime.sessionId,
+          agentId,
+          backend: runtime.backend,
+          budgetUtilization:
+            runtime.maxContextTokens > 0 ? ledger.totalTokens() / runtime.maxContextTokens : 0,
+          turnCount: hookTurnCount,
+        },
+        lastTurn: {
+          userInput: raw,
+          assistantResponse: assistantDisplayText,
+          turnIndex: hookTurnCount,
+        },
+      })
+      .catch(() => undefined); // fire-and-forget, never block the REPL
 
     if (!runResult.success) {
       printLine(chalk.red(`\n[${runtime.backend}] exit=${runResult.exitCode}`));
