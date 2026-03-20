@@ -34,22 +34,25 @@ export class CodexAdapter implements BackendAdapter {
 
     const args: string[] = [];
 
-    // Identity injection via config override
-    args.push('--config', `model_instructions_file=${promptFile}`);
+    // Resume MUST come before --config flags. Codex treats `resume` as a
+    // subcommand with its own `-c` flag — config flags before `resume`
+    // are root-level and don't apply to the resumed session.
+    if (config.backendSessionId) {
+      args.push('resume', config.backendSessionId);
+    }
+
+    // Identity injection via config override (uses -c which works both
+    // as root --config and as resume's -c flag)
+    args.push('-c', `model_instructions_file=${promptFile}`);
 
     // PCP session headers — Codex resolves env var names to values at runtime
     for (const { header, envVar } of PCP_ENV_HEADERS) {
-      args.push('--config', `mcp_servers.pcp.env_http_headers.${header}="${envVar}"`);
+      args.push('-c', `mcp_servers.pcp.env_http_headers.${header}="${envVar}"`);
     }
 
     // Model (only if explicitly specified by user)
     if (config.model) {
       args.push('--model', config.model);
-    }
-
-    // Resume a specific backend-native Codex session when available.
-    if (config.backendSessionId) {
-      args.push('resume', config.backendSessionId);
     }
     // NOTE:
     // Codex does not currently expose a reliable "set session id on first run"
