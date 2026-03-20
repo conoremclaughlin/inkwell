@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { ContextLedger } from './context-ledger.js';
 import { isClientLocalTool, handleClientLocalTool, CLIENT_LOCAL_TOOLS } from './context-tools.js';
+import type { PcpToolCallResult } from '../lib/pcp-client.js';
+
+/** Extract parsed JSON from a tool call result */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function parseResult(result: PcpToolCallResult | null): any {
+  const content = result?.content as Array<{ type: string; text: string }> | undefined;
+  return JSON.parse(content?.[0]?.text || '{}');
+}
 
 // ─── isClientLocalTool ──────────────────────────────────────────
 
@@ -37,7 +45,7 @@ describe('handleClientLocalTool: list_context', () => {
     const result = handleClientLocalTool('list_context', {}, ledger);
     expect(result).not.toBeNull();
 
-    const parsed = JSON.parse(result!.content[0].text);
+    const parsed = parseResult(result);
     expect(parsed.success).toBe(true);
     expect(parsed.totalEntries).toBe(4);
     expect(parsed.totalTokens).toBeGreaterThan(0);
@@ -57,7 +65,7 @@ describe('handleClientLocalTool: list_context', () => {
   it('returns empty state for fresh ledger', () => {
     const ledger = new ContextLedger();
     const result = handleClientLocalTool('list_context', {}, ledger);
-    const parsed = JSON.parse(result!.content[0].text);
+    const parsed = parseResult(result);
 
     expect(parsed.totalEntries).toBe(0);
     expect(parsed.totalTokens).toBe(0);
@@ -71,7 +79,7 @@ describe('handleClientLocalTool: list_context', () => {
     ledger.addEntry('assistant', 'world');
 
     const result = handleClientLocalTool('list_context', {}, ledger);
-    const parsed = JSON.parse(result!.content[0].text);
+    const parsed = parseResult(result);
 
     expect(parsed.bookmarks).toHaveLength(1);
     expect(parsed.bookmarks[0].label).toBe('checkpoint-1');
@@ -82,7 +90,7 @@ describe('handleClientLocalTool: list_context', () => {
     ledger.addEntry('system', 'x'.repeat(300), 'bootstrap');
 
     const result = handleClientLocalTool('list_context', {}, ledger);
-    const parsed = JSON.parse(result!.content[0].text);
+    const parsed = parseResult(result);
 
     expect(parsed.entries[0].preview.length).toBeLessThanOrEqual(123); // 120 + "..."
     expect(parsed.entries[0].preview).toContain('...');
@@ -99,7 +107,7 @@ describe('handleClientLocalTool: evict_context', () => {
     const e3 = ledger.addEntry('assistant', 'keep too');
 
     const result = handleClientLocalTool('evict_context', { entryIds: [e2.id] }, ledger);
-    const parsed = JSON.parse(result!.content[0].text);
+    const parsed = parseResult(result);
 
     expect(parsed.success).toBe(true);
     expect(parsed.evicted).toBe(1);
@@ -115,7 +123,7 @@ describe('handleClientLocalTool: evict_context', () => {
     ledger.addEntry('assistant', 'reply');
 
     const result = handleClientLocalTool('evict_context', { source: 'bootstrap' }, ledger);
-    const parsed = JSON.parse(result!.content[0].text);
+    const parsed = parseResult(result);
 
     expect(parsed.evicted).toBe(2);
     expect(ledger.listEntries()).toHaveLength(2);
@@ -130,7 +138,7 @@ describe('handleClientLocalTool: evict_context', () => {
     ledger.addEntry('assistant', 'response');
 
     const result = handleClientLocalTool('evict_context', { role: 'inbox' }, ledger);
-    const parsed = JSON.parse(result!.content[0].text);
+    const parsed = parseResult(result);
 
     expect(parsed.evicted).toBe(2);
     expect(ledger.listEntries()).toHaveLength(2);
@@ -141,7 +149,7 @@ describe('handleClientLocalTool: evict_context', () => {
     ledger.addEntry('user', 'hello');
 
     const result = handleClientLocalTool('evict_context', {}, ledger);
-    const parsed = JSON.parse(result!.content[0].text);
+    const parsed = parseResult(result);
 
     expect(parsed.success).toBe(false);
     expect(parsed.error).toContain('Provide at least one filter');
@@ -153,7 +161,7 @@ describe('handleClientLocalTool: evict_context', () => {
     ledger.addEntry('user', 'hello');
 
     const result = handleClientLocalTool('evict_context', { entryIds: [999, 888] }, ledger);
-    const parsed = JSON.parse(result!.content[0].text);
+    const parsed = parseResult(result);
 
     expect(parsed.success).toBe(true);
     expect(parsed.evicted).toBe(0);
@@ -169,7 +177,7 @@ describe('handleClientLocalTool: evict_context', () => {
 
     const before = ledger.totalTokens();
     const result = handleClientLocalTool('evict_context', { entryIds: [e2.id] }, ledger);
-    const parsed = JSON.parse(result!.content[0].text);
+    const parsed = parseResult(result);
 
     expect(parsed.totalAfter).toBe(before - parsed.tokensFreed);
     expect(parsed.totalAfter).toBe(ledger.totalTokens());
@@ -182,7 +190,7 @@ describe('handleClientLocalTool: evict_context', () => {
     }
 
     const result = handleClientLocalTool('evict_context', { role: 'inbox' }, ledger);
-    const parsed = JSON.parse(result!.content[0].text);
+    const parsed = parseResult(result);
 
     expect(parsed.evicted).toBe(15);
     expect(parsed.removedPreviews).toHaveLength(10); // capped
@@ -214,7 +222,7 @@ describe('evict → list consistency', () => {
 
     // List should show 3 entries, no pcp-inbox source
     const listResult = handleClientLocalTool('list_context', {}, ledger);
-    const parsed = JSON.parse(listResult!.content[0].text);
+    const parsed = parseResult(listResult);
 
     expect(parsed.totalEntries).toBe(3);
     expect(parsed.bySource['pcp-inbox']).toBeUndefined();
