@@ -1949,15 +1949,23 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   await updateRuntimeGenerationState(cwd, config, agentId, 'running');
 
   // Mark session as CLI-attached (human present at REPL).
-  // This tells the trigger handler to route messages to the pending queue
-  // instead of spawning a new process.
+  // Uses the REST lifecycle endpoint, NOT MCP — cliAttached is a runtime
+  // signal that must bypass MCP schema validation (additionalProperties: false
+  // strips it). The REST endpoint is purpose-built for hook-managed state.
   if (reconciled.pcpSessionId) {
     try {
-      await callPcpTool('update_session_phase', {
-        email: config?.email,
-        agentId,
-        sessionId: reconciled.pcpSessionId,
-        cliAttached: true,
+      const serverUrl = getPcpServerUrl();
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      const token = await getValidAccessToken(serverUrl);
+      if (token) headers.Authorization = `Bearer ${token}`;
+      await fetch(`${serverUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          sessionId: reconciled.pcpSessionId,
+          cliAttached: true,
+        }),
+        signal: AbortSignal.timeout(5000),
       });
     } catch {
       // Silent — don't fail the prompt for this
