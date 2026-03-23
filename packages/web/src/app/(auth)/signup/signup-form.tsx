@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { SocialButtons } from '@/components/auth/social-buttons';
 import { AuthDivider } from '@/components/auth/auth-divider';
-import { signUpWithPassword } from '@/lib/auth/actions';
+import { signUpWithPassword } from '@/lib/auth/client';
 import { getErrorMessage } from '@/lib/auth-utils';
 import { Loader2, Check, X } from 'lucide-react';
 import { cn } from '@/lib/utils';

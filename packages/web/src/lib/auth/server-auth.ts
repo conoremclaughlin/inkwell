@@ -1,12 +1,8 @@
-'use server';
-
-import { redirect } from 'next/navigation';
 import { createClient } from '@/lib/supabase/server';
 import { provisionPcpUserAndWorkspace } from '@/lib/auth/provision';
+import type { AuthResult, OAuthResult } from '@/lib/auth/types';
 
-type AuthResult = { success: true } | { error: string } | { mcpRedirectUrl: string };
-
-export async function signInWithPassword(
+export async function signInWithPasswordOnServer(
   email: string,
   password: string,
   mcpPendingId?: string | null
@@ -26,7 +22,6 @@ export async function signInWithPassword(
     await provisionPcpUserAndWorkspace(data.session.access_token);
   }
 
-  // MCP OAuth flow: build callback URL with tokens
   if (mcpPendingId && data.session) {
     const apiUrl = process.env.API_URL || `http://localhost:${process.env.PCP_PORT_BASE || 3001}`;
     const callbackUrl = new URL(`${apiUrl}/mcp/auth/callback`);
@@ -38,7 +33,7 @@ export async function signInWithPassword(
   return { success: true };
 }
 
-export async function signInWithOtp(
+export async function signInWithOtpOnServer(
   email: string,
   redirectTo: string
 ): Promise<{ success: true } | { error: string }> {
@@ -58,10 +53,10 @@ export async function signInWithOtp(
   return { success: true };
 }
 
-export async function signInWithOAuth(
+export async function signInWithOAuthOnServer(
   provider: 'google' | 'github',
   redirectTo: string
-): Promise<{ url: string } | { error: string }> {
+): Promise<OAuthResult> {
   const supabase = await createClient();
 
   const { data, error } = await supabase.auth.signInWithOAuth({
@@ -82,7 +77,7 @@ export async function signInWithOAuth(
   return { url: data.url };
 }
 
-export async function signUpWithPassword(
+export async function signUpWithPasswordOnServer(
   email: string,
   password: string,
   redirectTo: string
@@ -102,33 +97,4 @@ export async function signUpWithPassword(
   }
 
   return { success: true };
-}
-
-export async function signOut(): Promise<never> {
-  // Revoke PCP admin tokens (self-issued JWTs independent of Supabase session)
-  const { cookies } = await import('next/headers');
-  const cookieStore = await cookies();
-  const refreshToken = cookieStore.get('pcp-admin-refresh')?.value;
-
-  if (refreshToken) {
-    const apiUrl = process.env.API_URL || `http://localhost:${process.env.PCP_PORT_BASE || 3001}`;
-    try {
-      await fetch(`${apiUrl}/api/admin/auth/logout`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refreshToken }),
-      });
-    } catch {
-      // Best-effort revocation — cookies are cleared below regardless
-    }
-  }
-
-  // Clear PCP admin cookies from browser
-  cookieStore.delete({ name: 'pcp-admin-token', path: '/api/admin' });
-  cookieStore.delete({ name: 'pcp-admin-refresh', path: '/api/admin' });
-
-  // Clear Supabase session
-  const supabase = await createClient();
-  await supabase.auth.signOut();
-  redirect('/login');
 }

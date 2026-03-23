@@ -1,6 +1,6 @@
 'use client';
 
-import { signInWithOAuth } from '@/lib/auth/actions';
+import { signInWithOAuth } from '@/lib/auth/client';
 
 interface SocialButtonsProps {
   mode: 'login' | 'signup';
