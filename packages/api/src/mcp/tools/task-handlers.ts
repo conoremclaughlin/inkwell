@@ -10,6 +10,7 @@ import type { DataComposer } from '../../data/composer';
 import type { TaskStatus, TaskPriority } from '../../data/repositories/project-tasks.repository';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
+import { getRequestContext } from '../../utils/request-context';
 import { logger } from '../../utils/logger';
 
 // Common user identifier schema
@@ -240,7 +241,14 @@ export async function handleUpdateTask(
     const updates: Record<string, unknown> = {};
     if (args.title !== undefined) updates.title = args.title;
     if (args.description !== undefined) updates.description = args.description;
-    if (args.status !== undefined) updates.status = args.status;
+    if (args.status !== undefined) {
+      updates.status = args.status;
+      // Clear completed_at when reopening a task (non-completed status).
+      // Without this, reopened tasks retain the green "done" badge.
+      if (args.status !== 'completed') {
+        updates.completed_at = null;
+      }
+    }
     if (args.priority !== undefined) updates.priority = args.priority;
     if (args.tags !== undefined) updates.tags = args.tags;
 
@@ -401,6 +409,7 @@ export const addTaskCommentSchema = z.object({
   taskId: z.string().uuid().describe('Task ID to comment on'),
   content: z.string().min(1).max(5000).describe('Comment content'),
   parentCommentId: z.string().uuid().optional().describe('Parent comment ID for threaded replies'),
+  agentId: z.string().optional().describe('Agent ID for identity attribution'),
 });
 
 export async function handleAddTaskComment(
@@ -422,19 +431,23 @@ export async function handleAddTaskComment(
       return mcpResponse({ success: false, error: 'Task does not belong to this user' }, true);
     }
 
-    const agentId = getEffectiveAgentId(undefined);
+    const agentId = getEffectiveAgentId(args.agentId);
+    const reqCtx = getRequestContext();
+    const workspaceId = reqCtx?.workspaceId;
 
-    // Resolve agent identity ID if we have an agentId
+    // Resolve agent identity ID with workspace scoping when available
     let identityId: string | null = null;
     if (agentId) {
-      const { data: identity } = await dataComposer
+      let identityQuery = dataComposer
         .getClient()
         .from('agent_identities')
         .select('id')
         .eq('agent_id', agentId)
-        .eq('user_id', resolved.user.id)
-        .limit(1)
-        .single();
+        .eq('user_id', resolved.user.id);
+      if (workspaceId) {
+        identityQuery = identityQuery.eq('workspace_id', workspaceId);
+      }
+      const { data: identity } = await identityQuery.limit(1).single();
       if (identity) identityId = identity.id;
     }
 

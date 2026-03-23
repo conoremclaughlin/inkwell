@@ -5235,6 +5235,10 @@ router.put('/tasks/:id', async (req: Request, res: Response) => {
 
     if ('status' in body && body.status !== undefined) {
       updates.status = body.status;
+      // Clear completed_at when reopening a task
+      if (body.status !== 'completed') {
+        updates.completed_at = null;
+      }
     }
     if ('priority' in body && body.priority !== undefined) {
       updates.priority = body.priority;

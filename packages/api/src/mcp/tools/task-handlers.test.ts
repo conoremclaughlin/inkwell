@@ -525,6 +525,7 @@ describe('handleUpdateTask', () => {
       title: 'New title',
       description: 'Updated description',
       status: 'in_progress',
+      completed_at: null,
       priority: 'high',
       tags: ['updated'],
     });
@@ -556,9 +557,10 @@ describe('handleUpdateTask', () => {
       dc as any
     );
 
-    // Only status should be in the updates object
+    // Status + completed_at clearing for non-completed transitions
     expect(dc.repositories.tasks.update).toHaveBeenCalledWith('task-1', {
       status: 'in_progress',
+      completed_at: null,
     });
   });
 
