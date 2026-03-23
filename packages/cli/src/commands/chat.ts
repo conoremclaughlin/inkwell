@@ -2644,14 +2644,20 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
 
     // ── Fire prompt_build hooks (budget monitor, etc.) ──
+    // Budget utilization must account for bootstrap tokens — the ledger only
+    // holds transcript, but bootstrap is reserved from the total budget.
+    const bootstrapReserve = runtime.bootstrapContext
+      ? estimateTokens(runtime.bootstrapContext)
+      : 0;
+    const effectiveBudget = Math.max(1, runtime.maxContextTokens - bootstrapReserve);
+
     await hookRegistry.fire('prompt_build', {
       ledger,
       runtime: {
         sessionId: runtime.sessionId,
         agentId,
         backend: runtime.backend,
-        budgetUtilization:
-          runtime.maxContextTokens > 0 ? ledger.totalTokens() / runtime.maxContextTokens : 0,
+        budgetUtilization: ledger.totalTokens() / effectiveBudget,
         turnCount: hookTurnCount,
       },
     });
@@ -3044,6 +3050,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     // ── Fire turn_end hooks (passive recall, etc.) ──
     hookTurnCount++;
+    const turnEndBootstrapReserve = runtime.bootstrapContext
+      ? estimateTokens(runtime.bootstrapContext)
+      : 0;
+    const turnEndEffectiveBudget = Math.max(1, runtime.maxContextTokens - turnEndBootstrapReserve);
+
     hookRegistry
       .fire('turn_end', {
         ledger,
@@ -3051,8 +3062,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           sessionId: runtime.sessionId,
           agentId,
           backend: runtime.backend,
-          budgetUtilization:
-            runtime.maxContextTokens > 0 ? ledger.totalTokens() / runtime.maxContextTokens : 0,
+          budgetUtilization: ledger.totalTokens() / turnEndEffectiveBudget,
           turnCount: hookTurnCount,
         },
         lastTurn: {
