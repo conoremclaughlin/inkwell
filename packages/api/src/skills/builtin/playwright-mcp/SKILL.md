@@ -78,7 +78,16 @@ browser_navigate → browser_type (fields) → browser_click (submit) → browse
 ### Screenshot a page
 
 ```
-browser_navigate → browser_snapshot
+browser_resize (1440x900+) → browser_navigate → browser_take_screenshot
+```
+
+For desktop screenshots, always set the viewport to at least **1440x900** before capturing. This ensures UI elements render at a realistic desktop size and avoids narrow/mobile layouts that misrepresent the actual design.
+
+```
+browser_resize({ width: 1440, height: 900 })
+browser_navigate({ url: "..." })
+browser_take_screenshot({ filename: "page.png" })        # viewport
+browser_take_screenshot({ filename: "full.png", fullPage: true })  # full page
 ```
 
 ## Options

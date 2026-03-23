@@ -20,6 +20,7 @@ import {
   Activity,
   Route,
   MessageSquare,
+  ListTodo,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useRouter } from 'next/navigation';
@@ -57,6 +58,7 @@ const mainNav: NavGroup[] = [
     label: 'Team',
     items: [
       { name: 'Individuals', href: '/individuals', icon: Bot },
+      { name: 'Tasks', href: '/tasks', icon: ListTodo },
       { name: 'Documents', href: '/artifacts', icon: FileText },
       { name: 'Messaging', href: '/messaging', icon: MessageSquare },
       { name: 'Skills', href: '/skills', icon: Puzzle },

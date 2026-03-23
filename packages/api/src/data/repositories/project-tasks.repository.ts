@@ -145,6 +145,7 @@ export class ProjectTasksRepository {
     options?: {
       status?: TaskStatus | TaskStatus[];
       projectId?: string;
+      groupId?: string;
       limit?: number;
     }
   ): Promise<ProjectTask[]> {
@@ -164,6 +165,10 @@ export class ProjectTasksRepository {
 
     if (options?.projectId) {
       query = query.eq('project_id', options.projectId);
+    }
+
+    if (options?.groupId) {
+      query = query.eq('task_group_id', options.groupId);
     }
 
     if (options?.limit) {

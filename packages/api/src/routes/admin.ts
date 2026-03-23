@@ -5114,4 +5114,469 @@ router.post('/skills/manage/:skillId/fork', async (req: Request, res: Response) 
   }
 });
 
+// =============================================================================
+// Tasks
+// =============================================================================
+
+/**
+ * GET /api/admin/tasks
+ * List tasks for the active user with optional filters
+ */
+router.get('/tasks', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    let query = supabase
+      .from('tasks')
+      .select('*, projects(name), task_groups(title)')
+      .eq('user_id', authReq.pcpUserId);
+
+    // Optional filters
+    const { status, projectId, groupId, activeOnly } = req.query;
+    if (status) {
+      query = query.eq('status', status as string);
+    }
+    if (projectId) {
+      query = query.eq('project_id', projectId as string);
+    }
+    if (groupId) {
+      query = query.eq('task_group_id', groupId as string);
+    }
+    if (activeOnly === 'true') {
+      query = query.in('status', ['pending', 'in_progress', 'blocked']);
+    }
+
+    const { data, error } = await query.limit(200);
+
+    if (error) {
+      res.status(500).json(errorJson('Failed to list tasks', error));
+      return;
+    }
+
+    const tasks = data || [];
+
+    // Sort: status priority (in_progress, pending, blocked, completed),
+    // then by priority (critical, high, medium, low), then by created_at desc
+    const statusOrder: Record<string, number> = {
+      in_progress: 0,
+      pending: 1,
+      blocked: 2,
+      completed: 3,
+    };
+    const priorityOrder: Record<string, number> = {
+      critical: 0,
+      high: 1,
+      medium: 2,
+      low: 3,
+    };
+
+    tasks.sort((a, b) => {
+      const statusDiff = (statusOrder[a.status] ?? 99) - (statusOrder[b.status] ?? 99);
+      if (statusDiff !== 0) return statusDiff;
+      const priorityDiff = (priorityOrder[a.priority] ?? 99) - (priorityOrder[b.priority] ?? 99);
+      if (priorityDiff !== 0) return priorityDiff;
+      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+    });
+
+    // Compute stats
+    const stats = {
+      total: tasks.length,
+      pending: tasks.filter((t) => t.status === 'pending').length,
+      inProgress: tasks.filter((t) => t.status === 'in_progress').length,
+      completed: tasks.filter((t) => t.status === 'completed').length,
+      blocked: tasks.filter((t) => t.status === 'blocked').length,
+    };
+
+    res.json({
+      tasks: tasks.map((t) => ({
+        id: t.id,
+        title: t.title,
+        description: t.description,
+        status: t.status,
+        priority: t.priority,
+        tags: t.tags,
+        projectId: t.project_id,
+        projectName: (t.projects as { name: string } | null)?.name ?? null,
+        taskGroupId: t.task_group_id,
+        taskGroupTitle: (t.task_groups as { title: string } | null)?.title ?? null,
+        blockedBy: t.blocked_by,
+        createdBy: t.created_by,
+        completedAt: t.completed_at,
+        dueDate: t.due_date,
+        metadata: t.metadata,
+        createdAt: t.created_at,
+        updatedAt: t.updated_at,
+      })),
+      stats,
+    });
+  } catch (error) {
+    logger.error('Failed to list tasks:', error);
+    res.status(500).json(errorJson('Failed to list tasks', error));
+  }
+});
+
+/**
+ * PUT /api/admin/tasks/:id
+ * Update a task's status, priority, title, description, or tags
+ */
+router.put('/tasks/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    const body = (req.body || {}) as Record<string, unknown>;
+    const updates: Record<string, unknown> = {};
+
+    if ('status' in body && body.status !== undefined) {
+      updates.status = body.status;
+      // Clear completed_at when reopening a task
+      if (body.status !== 'completed') {
+        updates.completed_at = null;
+      }
+    }
+    if ('priority' in body && body.priority !== undefined) {
+      updates.priority = body.priority;
+    }
+    if ('title' in body && body.title !== undefined) {
+      updates.title = body.title;
+    }
+    if ('description' in body && body.description !== undefined) {
+      updates.description = body.description;
+    }
+    if ('tags' in body && body.tags !== undefined) {
+      updates.tags = body.tags;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      res
+        .status(400)
+        .json(
+          errorJson(
+            'No valid fields to update',
+            'Request body is empty or contains no recognized fields'
+          )
+        );
+      return;
+    }
+
+    // If status is being set to completed, set completed_at
+    if (updates.status === 'completed') {
+      updates.completed_at = new Date().toISOString();
+    }
+
+    const { data, error } = await supabase
+      .from('tasks')
+      .update(updates)
+      .eq('id', id)
+      .eq('user_id', authReq.pcpUserId)
+      .select('*, projects(name), task_groups(title)')
+      .single();
+
+    if (error) {
+      res.status(500).json(errorJson('Failed to update task', error));
+      return;
+    }
+
+    if (!data) {
+      res.status(404).json(errorJson('Task not found', `No task with id ${id} for this user`));
+      return;
+    }
+
+    res.json({
+      task: {
+        id: data.id,
+        title: data.title,
+        description: data.description,
+        status: data.status,
+        priority: data.priority,
+        tags: data.tags,
+        projectId: data.project_id,
+        projectName: (data.projects as { name: string } | null)?.name ?? null,
+        taskGroupId: data.task_group_id,
+        taskGroupTitle: (data.task_groups as { title: string } | null)?.title ?? null,
+        blockedBy: data.blocked_by,
+        createdBy: data.created_by,
+        completedAt: data.completed_at,
+        dueDate: data.due_date,
+        metadata: data.metadata,
+        createdAt: data.created_at,
+        updatedAt: data.updated_at,
+      },
+    });
+  } catch (error) {
+    logger.error('Failed to update task:', error);
+    res.status(500).json(errorJson('Failed to update task', error));
+  }
+});
+
+// =============================================================================
+// Task Groups
+// =============================================================================
+
+/**
+ * GET /api/admin/task-groups
+ * List task groups for the active user
+ */
+router.get('/task-groups', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    // Fetch task groups with joined agent identity and project
+    const { data, error } = await supabase
+      .from('task_groups')
+      .select('*, agent_identities(agent_id, name), projects(name)')
+      .eq('user_id', authReq.pcpUserId)
+      .order('created_at', { ascending: false })
+      .limit(200);
+
+    if (error) {
+      res.status(500).json(errorJson('Failed to list task groups', error));
+      return;
+    }
+
+    const groups = data || [];
+
+    // Fetch task counts per group in a separate query
+    const groupIds = groups.map((g) => g.id);
+    let taskCountMap: Record<string, number> = {};
+
+    if (groupIds.length > 0) {
+      const { data: taskCountData, error: taskCountError } = await supabase
+        .from('tasks')
+        .select('task_group_id')
+        .eq('user_id', authReq.pcpUserId)
+        .in('task_group_id', groupIds);
+
+      if (!taskCountError && taskCountData) {
+        for (const row of taskCountData) {
+          if (row.task_group_id) {
+            taskCountMap[row.task_group_id] = (taskCountMap[row.task_group_id] || 0) + 1;
+          }
+        }
+      }
+    }
+
+    res.json({
+      groups: groups.map((g) => ({
+        id: g.id,
+        title: g.title,
+        description: g.description,
+        status: g.status,
+        priority: g.priority,
+        tags: g.tags,
+        autonomous: g.autonomous,
+        maxSessions: g.max_sessions,
+        sessionsUsed: g.sessions_used,
+        contextSummary: g.context_summary,
+        nextRunAfter: g.next_run_after,
+        outputTarget: g.output_target,
+        outputStatus: g.output_status,
+        threadKey: g.thread_key,
+        projectId: g.project_id,
+        projectName: (g.projects as { name: string } | null)?.name ?? null,
+        identityId: g.identity_id,
+        agentId:
+          (g.agent_identities as { agent_id: string; name: string } | null)?.agent_id ?? null,
+        agentName: (g.agent_identities as { agent_id: string; name: string } | null)?.name ?? null,
+        taskCount: taskCountMap[g.id] || 0,
+        metadata: g.metadata,
+        createdAt: g.created_at,
+        updatedAt: g.updated_at,
+      })),
+    });
+  } catch (error) {
+    logger.error('Failed to list task groups:', error);
+    res.status(500).json(errorJson('Failed to list task groups', error));
+  }
+});
+
+/**
+ * GET /api/admin/tasks/:id/comments
+ * List comments for a task
+ */
+router.get('/tasks/:id/comments', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    // Verify task belongs to user
+    const { data: task } = await supabase
+      .from('tasks')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', authReq.pcpUserId)
+      .single();
+
+    if (!task) {
+      res.status(404).json({ error: 'Task not found' });
+      return;
+    }
+
+    const { data: comments, error } = await supabase
+      .from('task_comments')
+      .select('*')
+      .eq('task_id', id)
+      .eq('user_id', authReq.pcpUserId)
+      .is('deleted_at', null)
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      logger.error('Failed to list task comments:', error);
+      res.status(500).json(errorJson('Failed to list task comments', error));
+      return;
+    }
+
+    // Resolve agent identity names for comment authors
+    const identityIds = Array.from(
+      new Set((comments || []).map((c) => c.created_by_identity_id).filter(Boolean) as string[])
+    );
+    const identitiesById = new Map<string, { agent_id: string; name: string }>();
+
+    if (identityIds.length > 0) {
+      const { data: identities } = await supabase
+        .from('agent_identities')
+        .select('id, agent_id, name')
+        .in('id', identityIds);
+
+      for (const ident of identities || []) {
+        identitiesById.set(ident.id, { agent_id: ident.agent_id, name: ident.name });
+      }
+    }
+
+    res.json({
+      comments: (comments || []).map((c) => {
+        const identity = c.created_by_identity_id
+          ? identitiesById.get(c.created_by_identity_id)
+          : null;
+        return {
+          id: c.id,
+          taskId: c.task_id,
+          parentCommentId: c.parent_comment_id,
+          content: c.content,
+          authorAgentId: c.created_by_agent_id || identity?.agent_id || null,
+          authorName: identity?.name || c.created_by_agent_id || 'Unknown',
+          metadata: c.metadata,
+          createdAt: c.created_at,
+          updatedAt: c.updated_at,
+        };
+      }),
+    });
+  } catch (error) {
+    logger.error('Failed to list task comments:', error);
+    res.status(500).json(errorJson('Failed to list task comments', error));
+  }
+});
+
+/**
+ * POST /api/admin/tasks/:id/comments
+ * Add a comment to a task
+ */
+router.post('/tasks/:id/comments', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { content, parentCommentId } = req.body;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    if (!content || typeof content !== 'string' || content.trim().length === 0) {
+      res.status(400).json({ error: 'Content is required' });
+      return;
+    }
+
+    // Verify task belongs to user
+    const { data: task } = await supabase
+      .from('tasks')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', authReq.pcpUserId)
+      .single();
+
+    if (!task) {
+      res.status(404).json({ error: 'Task not found' });
+      return;
+    }
+
+    const { data: comment, error } = await supabase
+      .from('task_comments')
+      .insert({
+        task_id: id,
+        user_id: authReq.pcpUserId,
+        workspace_id: authReq.pcpWorkspaceId || null,
+        parent_comment_id: parentCommentId || null,
+        content: content.trim(),
+      } as never)
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Failed to create task comment:', error);
+      res.status(500).json(errorJson('Failed to create task comment', error));
+      return;
+    }
+
+    res.status(201).json({
+      comment: {
+        id: comment.id,
+        taskId: comment.task_id,
+        parentCommentId: comment.parent_comment_id,
+        content: comment.content,
+        authorAgentId: null,
+        authorName: 'You',
+        metadata: comment.metadata,
+        createdAt: comment.created_at,
+        updatedAt: comment.updated_at,
+      },
+    });
+  } catch (error) {
+    logger.error('Failed to create task comment:', error);
+    res.status(500).json(errorJson('Failed to create task comment', error));
+  }
+});
+
+/**
+ * DELETE /api/admin/tasks/:taskId/comments/:commentId
+ * Soft-delete a comment
+ */
+router.delete('/tasks/:taskId/comments/:commentId', async (req: Request, res: Response) => {
+  try {
+    const { taskId, commentId } = req.params;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    const { error } = await supabase
+      .from('task_comments')
+      .update({ deleted_at: new Date().toISOString() } as never)
+      .eq('id', commentId)
+      .eq('task_id', taskId)
+      .eq('user_id', authReq.pcpUserId);
+
+    if (error) {
+      logger.error('Failed to delete task comment:', error);
+      res.status(500).json(errorJson('Failed to delete task comment', error));
+      return;
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    logger.error('Failed to delete task comment:', error);
+    res.status(500).json(errorJson('Failed to delete task comment', error));
+  }
+});
+
 export default router;
