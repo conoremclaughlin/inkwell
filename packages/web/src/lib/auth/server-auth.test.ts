@@ -65,6 +65,18 @@ describe('server auth helpers', () => {
       expect(mockProvision).not.toHaveBeenCalled();
     });
 
+    it('returns a friendly Supabase connection error when auth fetch fails', async () => {
+      mockSignInWithPassword.mockRejectedValue(
+        Object.assign(new Error('AuthRetryableFetchError: {}'), { status: 502 })
+      );
+
+      const result = await signInWithPasswordOnServer('user@test.com', 'wrong');
+      expect(result).toEqual({
+        error:
+          'Supabase auth connection failed. Please verify your Supabase instance is running and try again.',
+      });
+    });
+
     it('returns mcpRedirectUrl for MCP OAuth flow', async () => {
       mockSignInWithPassword.mockResolvedValue({
         data: {
