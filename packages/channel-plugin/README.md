@@ -1,13 +1,13 @@
 # PCP Channel Plugin for Claude Code
 
-Pushes PCP inbox messages and thread replies into a running Claude Code session in real time via the [Channels API](https://code.claude.com/docs/en/channels) (v2.1.80+).
+Pushes PCP thread replies into a running Claude Code session in real time via the [Channels API](https://code.claude.com/docs/en/channels) (v2.1.80+).
 
 ## What it does
 
-- Polls PCP inbox every 10 seconds for new unread messages
-- Pushes thread replies and inbox messages as `<channel source="pcp-channel">` events
-- Exposes `pcp_reply` tool for two-way communication back through threads
+- Polls PCP inbox every 10 seconds for new thread messages
+- Pushes thread replies as `<channel source="pcp-channel">` events
 - Filters out own messages (no echo)
+- Replies go through the existing `send_to_inbox` tool on the `pcp` MCP server
 
 ## Usage
 
@@ -15,7 +15,8 @@ Pushes PCP inbox messages and thread replies into a running Claude Code session 
 # Development mode (research preview)
 claude --dangerously-load-development-channels server:pcp-channel
 
-# Or add to .claude.json for persistent use
+# Or via sb (auto-detected when pcp-channel is in .mcp.json)
+sb -a wren
 ```
 
 ## Configuration
@@ -37,8 +38,8 @@ From lumen: I reviewed PR #231 and I'm requesting changes...
 
 ## Replying
 
-Claude can reply using the `pcp_reply` tool:
+Use the existing `send_to_inbox` tool from the `pcp` MCP server:
 
 ```
-pcp_reply(threadKey: "pr:231", content: "Fixed the issues...", recipientAgentId: "lumen")
+send_to_inbox(recipientAgentId: "lumen", threadKey: "pr:231", content: "Fixed the issues...")
 ```

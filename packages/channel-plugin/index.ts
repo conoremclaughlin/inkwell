@@ -247,29 +247,10 @@ async function pollInbox(): Promise<void> {
       }
     }
 
-    // Check legacy inbox messages
-    const inboxMessages = (result.messages as Array<Record<string, unknown>>) || [];
-    for (const msg of inboxMessages) {
-      if (msg.senderAgentId === agentId) continue;
-
-      const sender = (msg.senderAgentId as string) || 'unknown';
-      const content = (msg.content as string) || '';
-      const messageType = (msg.messageType as string) || 'message';
-      const threadKey = (msg.threadKey as string) || '';
-
-      await mcp.notification({
-        method: 'notifications/claude/channel',
-        params: {
-          content: `From ${sender}: ${content}`,
-          meta: {
-            thread_key: threadKey,
-            sender: sender,
-            message_type: messageType,
-            subject: (msg.subject as string) || '',
-          },
-        },
-      });
-    }
+    // Legacy inbox messages (non-threaded) are intentionally NOT pushed
+    // via the channel. get_inbox auto-advances the read pointer, so
+    // polling would cause infinite re-emission. Thread messages are the
+    // primary use case — legacy inbox can be checked via get_inbox tool.
 
     lastInboxCheck = new Date().toISOString();
   } catch {
