@@ -123,6 +123,11 @@ const getInboxSchema = userIdentifierBaseSchema.extend({
     .enum(['message', 'task_request', 'session_resume', 'notification', 'permission_grant'])
     .optional(),
   limit: z.number().min(1).max(200).optional().default(20).describe('Max messages'),
+  since: z
+    .string()
+    .datetime()
+    .optional()
+    .describe('Only return messages created after this ISO timestamp'),
 });
 
 const updateInboxMessageSchema = userIdentifierBaseSchema.extend({
@@ -726,7 +731,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   const parsed = getInboxSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { status = 'unread', priority, messageType, limit = 20 } = parsed;
+  const { status = 'unread', priority, messageType, limit = 20, since } = parsed;
   // Enforce identity: pinned agents can only read their own inbox.
   // When agentId is omitted, return inbox across ALL agents (unified timeline).
   const agentId = parsed.agentId
@@ -745,6 +750,9 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   }
   if (status !== 'all') {
     query = query.eq('status', status);
+  }
+  if (since) {
+    query = query.gt('created_at', since);
   }
   if (priority) {
     query = query.eq('priority', priority);

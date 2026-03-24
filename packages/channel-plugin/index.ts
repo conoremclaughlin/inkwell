@@ -177,8 +177,8 @@ Do NOT ignore channel messages — they are from your teammates and deserve time
 
 // ─── Polling Loop ───────────────────────────────────────────
 
-let lastInboxCheck = new Date().toISOString();
-let lastThreadTimestamps = new Map<string, string>(); // threadKey → last seen created_at
+let lastPollTime = new Date().toISOString(); // only fetch messages after this timestamp
+const seenMessageIds = new Set<string>(); // prevent re-emission across poll cycles
 
 async function pollInbox(): Promise<void> {
   if (!email) return;
@@ -187,8 +187,9 @@ async function pollInbox(): Promise<void> {
     const result = await callPcp('get_inbox', {
       email,
       agentId,
-      status: 'unread',
-      limit: 10,
+      status: 'all',
+      since: lastPollTime,
+      limit: 20,
     });
 
     if (!result?.success) return;
@@ -215,11 +216,12 @@ async function pollInbox(): Promise<void> {
       const lastKnownTs = lastThreadTimestamps.get(threadKey);
 
       for (const msg of messages) {
-        // Skip own messages
-        if (msg.senderAgentId === agentId) continue;
-        // Skip already-seen messages (compare timestamps, not UUIDs)
+        const msgId = msg.id as string;
         const msgTs = msg.createdAt as string;
+        if (msg.senderAgentId === agentId) continue;
+        if (msgId && seenMessageIds.has(msgId)) continue;
         if (lastKnownTs && msgTs && msgTs <= lastKnownTs) continue;
+        if (msgId) seenMessageIds.add(msgId);
 
         const sender = (msg.senderAgentId as string) || 'unknown';
         const content = (msg.content as string) || '';
@@ -247,11 +249,15 @@ async function pollInbox(): Promise<void> {
       }
     }
 
-    // Legacy inbox messages (non-threaded). The read pointer auto-advances
-    // on get_inbox, so these only appear once per poll cycle.
+    // Legacy inbox messages (non-threaded). Since we pass `since: lastPollTime`
+    // to get_inbox, only new messages are returned. seenMessageIds prevents
+    // any edge-case re-emission.
     const inboxMessages = (result.messages as Array<Record<string, unknown>>) || [];
     for (const msg of inboxMessages) {
+      const msgId = msg.id as string;
       if (msg.senderAgentId === agentId) continue;
+      if (msgId && seenMessageIds.has(msgId)) continue;
+      if (msgId) seenMessageIds.add(msgId);
 
       const sender = (msg.senderAgentId as string) || 'unknown';
       const content = (msg.content as string) || '';
@@ -272,7 +278,7 @@ async function pollInbox(): Promise<void> {
       });
     }
 
-    lastInboxCheck = new Date().toISOString();
+    lastPollTime = new Date().toISOString();
   } catch {
     // Silent — polling should not crash the plugin
   }
