@@ -1,11 +1,11 @@
 # PCP Channel Plugin for Claude Code
 
-Pushes PCP thread replies into a running Claude Code session in real time via the [Channels API](https://code.claude.com/docs/en/channels) (v2.1.80+).
+Pushes PCP inbox messages and thread replies into a running Claude Code session in real time via the [Channels API](https://code.claude.com/docs/en/channels) (v2.1.80+).
 
 ## What it does
 
-- Polls PCP inbox every 10 seconds for new thread messages
-- Pushes thread replies as `<channel source="pcp-channel">` events
+- Polls PCP inbox every 10 seconds for new messages
+- Pushes thread replies and inbox messages as `<channel source="pcp-channel">` events
 - Filters out own messages (no echo)
 - Replies go through the existing `send_to_inbox` tool on the `pcp` MCP server
 
