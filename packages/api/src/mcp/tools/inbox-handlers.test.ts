@@ -30,11 +30,12 @@ vi.mock('../../utils/logger', () => ({
 }));
 
 // Mock request context (for sender session resolution)
+// Provide a sessionId so triggers aren't suppressed by the missingSenderSession guard.
 vi.mock('../../utils/request-context', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../utils/request-context')>();
   return {
     ...actual,
-    getRequestContext: vi.fn().mockReturnValue(undefined),
+    getRequestContext: vi.fn().mockReturnValue({ sessionId: 'session-mock-123' }),
     getSessionContext: vi.fn().mockReturnValue(undefined),
   };
 });
@@ -102,6 +103,7 @@ function createMockSupabase(
       eq: vi.fn().mockReturnThis(),
       order: vi.fn().mockReturnThis(),
       limit: vi.fn().mockReturnThis(),
+      maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
       or: vi
         .fn()
         .mockResolvedValue(overrides.selectReturn || { data: [defaultMessage], error: null }),
@@ -134,6 +136,7 @@ function createMockSupabase(
 
   // Read pointer for agent_inbox_read_status (pointer-based unread tracking)
   const readPointerChainable = {
+    upsert: vi.fn().mockResolvedValue({ data: null, error: null }),
     select: vi.fn().mockReturnValue({
       eq: vi.fn().mockReturnValue({
         eq: vi.fn().mockReturnValue({
@@ -659,10 +662,9 @@ describe('Reply Routing — trigger recipientSessionId auto-resolution', () => {
     });
     const mockDc = createThreadMockDataComposer(mockSb);
 
-    // Clear request context
-    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
-    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
-    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+    // Provide session context so triggers aren't suppressed by missingSenderSession guard
+    const { getRequestContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'wren-session-abc' } as never);
 
     await handleSendToInbox(
       {
@@ -695,9 +697,9 @@ describe('Reply Routing — trigger recipientSessionId auto-resolution', () => {
     });
     const mockDc = createThreadMockDataComposer(mockSb);
 
-    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
-    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
-    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+    // Provide session context so triggers aren't suppressed by missingSenderSession guard
+    const { getRequestContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'wren-session-abc' } as never);
 
     await handleSendToInbox(
       {
@@ -740,9 +742,9 @@ describe('Reply Routing — trigger recipientSessionId auto-resolution', () => {
     });
     const mockDc = createThreadMockDataComposer(mockSb);
 
-    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
-    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
-    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+    // Provide session context so triggers aren't suppressed
+    const { getRequestContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'wren-session-abc' } as never);
 
     await handleSendToInbox(
       {
