@@ -2658,7 +2658,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       : 0;
     const effectiveBudget = Math.max(1, runtime.maxContextTokens - bootstrapReserve);
 
-    await hookRegistry.fire('prompt_build', {
+    const promptHookResult = await hookRegistry.fire('prompt_build', {
       ledger,
       runtime: {
         sessionId: runtime.sessionId,
@@ -2668,6 +2668,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
         turnCount: hookTurnCount,
       },
     });
+
+    // Print budget warnings from prompt_build hooks
+    if (promptHookResult.injected > 0) {
+      const util = Math.round((ledger.totalTokens() / effectiveBudget) * 100);
+      printLine(
+        chalk.yellow(
+          `  ⚠ Context at ${util}% — ${ledger.totalTokens().toLocaleString()} / ${effectiveBudget.toLocaleString()} tok (bootstrap: ${bootstrapReserve.toLocaleString()} reserved)`
+        )
+      );
+    }
 
     let prompt = buildPromptEnvelope(agentId, runtime, ledger, raw);
     const turnStartedAt = Date.now();
@@ -2931,7 +2941,42 @@ export async function runChat(options: ChatOptions): Promise<void> {
             });
           } else if (result.status === 'executed' || result.status === 'approved') {
             const resultJson = JSON.stringify(result.result);
-            printLine(chalk.cyan(`🛠 local tool ${result.tool} ${resultJson}`));
+
+            // Format context-management and signal tools with friendly output
+            if (result.tool === 'evict_context') {
+              const r = result.result as Record<string, unknown> | undefined;
+              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+              if (content) {
+                const parsed = JSON.parse(content);
+                printLine(chalk.dim(`  🗑 evicted ${parsed.evicted} entries (${parsed.tokensFreed} tok freed, ${parsed.totalAfter} tok remaining)`));
+              }
+            } else if (result.tool === 'list_context') {
+              const r = result.result as Record<string, unknown> | undefined;
+              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+              if (content) {
+                const parsed = JSON.parse(content);
+                printLine(chalk.dim(`  📋 context: ${parsed.totalEntries} entries, ~${parsed.totalTokens} tok`));
+                if (parsed.bySource) {
+                  const sources = Object.entries(parsed.bySource as Record<string, { count: number; tokens: number }>)
+                    .map(([src, { count, tokens }]) => `${src}(${count}/${tokens}t)`)
+                    .join(' ');
+                  printLine(chalk.dim(`     ${sources}`));
+                }
+              }
+            } else if (result.tool === 'signal_status') {
+              const r = result.result as Record<string, unknown> | undefined;
+              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+              if (content) {
+                const parsed = JSON.parse(content);
+                const signal = parsed.signal as { status: string; reason?: string } | undefined;
+                if (signal) {
+                  const icon = signal.status === 'completed' ? '✅' : signal.status === 'blocked' ? '🚫' : '➡️';
+                  printLine(chalk.dim(`  ${icon} signal: ${signal.status}${signal.reason ? ` — ${signal.reason}` : ''}`));
+                }
+              }
+            } else {
+              printLine(chalk.cyan(`🛠 local tool ${result.tool} ${resultJson}`));
+            }
             appendTranscript(runtime.transcriptPath, {
               type: 'local_tool_call',
               tool: result.tool,
@@ -3081,7 +3126,29 @@ export async function runChat(options: ChatOptions): Promise<void> {
           turnIndex: hookTurnCount,
         },
       })
-      .catch(() => undefined); // fire-and-forget, never block the REPL
+      .then((hookResult) => {
+        // Notify the user about passive recall injections
+        if (hookResult.injected > 0) {
+          const recallEntries = ledger
+            .listEntries()
+            .filter((e) => e.source === 'passive-recall')
+            .slice(-hookResult.injected);
+
+          for (const entry of recallEntries) {
+            const preview = entry.content
+              .replace(/^\[passive-recall\]\s*/, '')
+              .slice(0, 120);
+            const tokens = entry.approxTokens;
+            printLine(
+              chalk.dim(`  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${tokens} tok)`)
+            );
+          }
+        }
+        if (hookResult.evicted > 0) {
+          printLine(chalk.dim(`  🗑 ${hookResult.evicted} entries auto-evicted by hooks`));
+        }
+      })
+      .catch(() => undefined); // never block the REPL
 
     if (!runResult.success) {
       printLine(chalk.red(`\n[${runtime.backend}] exit=${runResult.exitCode}`));
