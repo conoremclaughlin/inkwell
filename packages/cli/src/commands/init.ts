@@ -43,18 +43,39 @@ function getPcpServerUrl(): string {
   return process.env.PCP_SERVER_URL || 'http://localhost:3001';
 }
 
-function buildDefaultMcpJson(serverUrl: string): Record<string, unknown> {
-  return {
-    mcpServers: {
-      pcp: {
-        type: 'http',
-        url: `${serverUrl}/mcp`,
-        headers: {
-          Authorization: 'Bearer ${PCP_ACCESS_TOKEN}',
-        },
+function resolveChannelPluginPath(cwd: string): string | null {
+  // Look for the channel plugin relative to the repo root
+  const candidates = [
+    join(cwd, 'packages', 'channel-plugin', 'index.ts'),
+    join(cwd, '..', 'personal-context-protocol', 'packages', 'channel-plugin', 'index.ts'),
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+
+function buildDefaultMcpJson(serverUrl: string, cwd?: string): Record<string, unknown> {
+  const servers: Record<string, unknown> = {
+    pcp: {
+      type: 'http',
+      url: `${serverUrl}/mcp`,
+      headers: {
+        Authorization: 'Bearer ${PCP_ACCESS_TOKEN}',
       },
     },
   };
+
+  // Add PCP channel plugin for real-time inbox push notifications
+  const channelPath = cwd ? resolveChannelPluginPath(cwd) : null;
+  if (channelPath) {
+    servers['pcp-channel'] = {
+      command: 'npx',
+      args: ['tsx', channelPath],
+    };
+  }
+
+  return { mcpServers: servers };
 }
 
 // ============================================================================
@@ -126,7 +147,7 @@ function ensureMcpJson(cwd: string): InitStepResult {
   }
 
   const serverUrl = getPcpServerUrl();
-  writeFileSync(mcpPath, JSON.stringify(buildDefaultMcpJson(serverUrl), null, 2) + '\n');
+  writeFileSync(mcpPath, JSON.stringify(buildDefaultMcpJson(serverUrl, cwd), null, 2) + '\n');
   return { label: '.mcp.json', status: 'created', detail: `pcp → ${serverUrl}/mcp` };
 }
 

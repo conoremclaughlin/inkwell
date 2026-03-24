@@ -5,9 +5,27 @@
  * MCP config via --mcp-config <path>
  */
 
+import { existsSync, readFileSync } from 'fs';
+import { join } from 'path';
 import { buildIdentityPrompt } from './identity.js';
 import { buildMergedMcpConfig } from '../lib/skill-mcp.js';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
+
+/**
+ * Check if the PCP channel plugin is registered in .mcp.json.
+ * If present, Claude Code should be started with --dangerously-load-development-channels
+ * so it accepts push notifications from the channel.
+ */
+function hasPcpChannelPlugin(cwd: string): boolean {
+  const mcpJsonPath = join(cwd, '.mcp.json');
+  if (!existsSync(mcpJsonPath)) return false;
+  try {
+    const config = JSON.parse(readFileSync(mcpJsonPath, 'utf-8'));
+    return Boolean(config?.mcpServers?.['pcp-channel']);
+  } catch {
+    return false;
+  }
+}
 
 export class ClaudeAdapter implements BackendAdapter {
   readonly name = 'claude';
@@ -54,6 +72,13 @@ export class ClaudeAdapter implements BackendAdapter {
     // Auto-approve: skip all permission prompts
     if (config.dangerous) {
       args.push('--dangerously-skip-permissions');
+    }
+
+    // PCP channel plugin: enable real-time inbox push notifications.
+    // The channel plugin is a stdio MCP server that bridges PCP's HTTP
+    // inbox to Claude Code's channel notification system.
+    if (hasPcpChannelPlugin(process.cwd())) {
+      args.push('--dangerously-load-development-channels', 'server:pcp-channel');
     }
 
     // Passthrough flags
