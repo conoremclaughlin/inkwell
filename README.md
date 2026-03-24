@@ -33,6 +33,18 @@ $ sb studio list
 
 ## Getting Started
 
+### Quick start (recommended)
+
+```bash
+npx create-pcp my-project
+```
+
+This walks you through everything: Supabase setup (local or remote), server start, CLI install, auth, and first SB onboarding. Follow the prompts and you'll have a running PCP instance in minutes.
+
+### Manual setup
+
+If you prefer to set things up step by step, or are working from an existing clone:
+
 ### 1. Set up the database
 
 PCP uses Supabase (PostgreSQL) as its database. Choose one:
