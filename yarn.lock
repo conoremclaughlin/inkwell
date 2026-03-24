@@ -1783,7 +1783,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@modelcontextprotocol/sdk@npm:^1.26.0":
+"@modelcontextprotocol/sdk@npm:^1.12.1, @modelcontextprotocol/sdk@npm:^1.26.0":
   version: 1.27.1
   resolution: "@modelcontextprotocol/sdk@npm:1.27.1"
   dependencies:
@@ -2007,6 +2007,15 @@ __metadata:
     winston: "npm:^3.11.0"
     yaml: "npm:^2.8.2"
     zod: "npm:^3.25.0"
+  languageName: unknown
+  linkType: soft
+
+"@personal-context/channel-plugin@workspace:packages/channel-plugin":
+  version: 0.0.0-use.local
+  resolution: "@personal-context/channel-plugin@workspace:packages/channel-plugin"
+  dependencies:
+    "@modelcontextprotocol/sdk": "npm:^1.12.1"
+    tsx: "npm:^4.19.0"
   languageName: unknown
   linkType: soft
 
@@ -12883,7 +12892,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"tsx@npm:^4.7.0":
+"tsx@npm:^4.19.0, tsx@npm:^4.7.0":
   version: 4.21.0
   resolution: "tsx@npm:4.21.0"
   dependencies:
