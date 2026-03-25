@@ -871,18 +871,19 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
     ];
 
     if (threadIds.length > 0) {
-      // Get open threads for this user (optionally filtered by since)
-      let threadQuery = threadTable(supabase, 'inbox_threads')
+      // Get open threads for this user.
+      // NOTE: `since` is NOT applied to threads — thread read pointers
+      // (inbox_thread_read_status.last_read_at) already handle "which
+      // messages have I seen." Filtering threads by updated_at would
+      // cause missed messages when lastPollTime advances past the
+      // thread's updated_at between polls.
+      const { data: threads } = await threadTable(supabase, 'inbox_threads')
         .select('id, thread_key, title, user_id, created_by_agent_id, updated_at')
         .eq('user_id', resolved.user.id)
         .eq('status', 'open')
         .in('id', threadIds)
         .order('updated_at', { ascending: false })
         .limit(20);
-      if (since) {
-        threadQuery = threadQuery.gt('updated_at', since);
-      }
-      const { data: threads } = await threadQuery;
 
       if (threads?.length) {
         threadsWithUnread = await Promise.all(
@@ -912,19 +913,12 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
               }
 
               // Count unread messages (after last read, or all if no read status)
-              // When `since` is provided, use the later of lastReadAt and since
               let countQuery = threadTable(supabase, 'inbox_thread_messages')
                 .select('*', { count: 'exact', head: true })
                 .eq('thread_id', t.id);
 
-              const effectiveCutoff =
-                since && lastReadAt
-                  ? since > lastReadAt
-                    ? since
-                    : lastReadAt
-                  : since || lastReadAt;
-              if (effectiveCutoff) {
-                countQuery = countQuery.gt('created_at', effectiveCutoff);
+              if (lastReadAt) {
+                countQuery = countQuery.gt('created_at', lastReadAt);
               }
 
               const { count } = await countQuery;
