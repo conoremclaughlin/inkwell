@@ -1872,7 +1872,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
         : options.approvalMode === 'auto-approve'
           ? 'auto-approve'
           : options.nonInteractive
-            ? 'auto-deny'
+            ? options.profile === 'full'
+              ? 'auto-approve' // --profile full + non-interactive = trust all tools
+              : 'auto-deny'
             : 'interactive',
   };
   await ensureBackendAuthReady(runtime.backend, {
