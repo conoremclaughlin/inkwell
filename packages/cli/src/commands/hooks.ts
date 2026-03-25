@@ -1988,9 +1988,27 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     }
   }
 
-  // Always drain pending message queue first — these are trigger messages
-  // routed here because cli_attached=true. Must run before the inbox stale
-  // check to ensure delivery on every prompt, not just stale ones.
+  // Skip inbox injection when the channel plugin is active — it handles
+  // real-time delivery via the Channels API. Fall back to hook-based
+  // injection when the channel plugin is not present.
+  const mcpJsonPath = join(cwd, '.mcp.json');
+  let hasChannelPlugin = false;
+  try {
+    if (existsSync(mcpJsonPath)) {
+      const mcpConfig = JSON.parse(readFileSync(mcpJsonPath, 'utf-8'));
+      hasChannelPlugin = Boolean(mcpConfig?.mcpServers?.['pcp-channel']);
+    }
+  } catch {
+    // ignore
+  }
+
+  if (hasChannelPlugin) {
+    return;
+  }
+
+  // No channel plugin — use hook-based inbox injection as fallback.
+  // Drain pending message queue first — these are trigger messages
+  // routed here because cli_attached=true.
   try {
     const pending = await callPcpTool('get_pending_messages', {
       channel: 'agent',
