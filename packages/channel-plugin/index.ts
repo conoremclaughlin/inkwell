@@ -182,19 +182,18 @@ Do NOT ignore channel messages — they are from your teammates and deserve time
 
 // ─── Polling Loop ───────────────────────────────────────────
 
-const seenMessageIds = new Set<string>(); // prevent re-emission across poll cycles
+let lastPollTime = new Date().toISOString();
+const seenMessageIds = new Set<string>(); // belt-and-suspenders dedup
 
 async function pollInbox(): Promise<void> {
   if (!email) return;
 
   try {
-    // Use status: 'unread' — the pointer auto-advances on each get_inbox
-    // call, so messages are only returned once. seenMessageIds provides
-    // belt-and-suspenders dedup.
     const result = await callPcp('get_inbox', {
       email,
       agentId,
-      status: 'unread',
+      status: 'all',
+      since: lastPollTime,
       limit: 20,
     });
 
@@ -292,7 +291,7 @@ async function pollInbox(): Promise<void> {
       });
     }
 
-    // Read pointer auto-advances on get_inbox — no manual tracking needed
+    lastPollTime = new Date().toISOString();
   } catch (err) {
     process.stderr.write(`[pcp-channel] poll error: ${err instanceof Error ? err.message : String(err)}\n`);
   }
