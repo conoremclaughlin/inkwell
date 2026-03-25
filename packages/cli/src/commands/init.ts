@@ -60,9 +60,6 @@ function buildDefaultMcpJson(serverUrl: string, cwd?: string): Record<string, un
     pcp: {
       type: 'http',
       url: `${serverUrl}/mcp`,
-      headers: {
-        Authorization: 'Bearer ${PCP_ACCESS_TOKEN}',
-      },
     },
   };
 
@@ -105,37 +102,19 @@ function ensureMcpJson(cwd: string): InitStepResult {
       const existing = JSON.parse(readFileSync(mcpPath, 'utf-8')) as Record<string, unknown>;
       const servers = existing.mcpServers as Record<string, unknown> | undefined;
       if (servers?.pcp) {
-        let needsWrite = false;
-        const updatedServers = { ...servers };
-
-        // Migrate existing pcp entry to include auth header if missing
-        const pcpEntry = servers.pcp as Record<string, unknown>;
-        const headers = pcpEntry.headers as Record<string, string> | undefined;
-        if (!headers?.Authorization) {
-          updatedServers.pcp = {
-            ...pcpEntry,
-            headers: { ...headers, Authorization: 'Bearer ${PCP_ACCESS_TOKEN}' },
-          };
-          needsWrite = true;
-        }
-
         // Add pcp-inbox if missing and plugin exists locally
         if (!servers['pcp-inbox']) {
           const channelPath = resolveChannelPluginPath(cwd);
           if (channelPath) {
-            updatedServers['pcp-inbox'] = { command: 'npx', args: ['tsx', channelPath] };
-            needsWrite = true;
+            const updatedServers = { ...servers, 'pcp-inbox': { command: 'npx', args: ['tsx', channelPath] } };
+            const updated = { ...existing, mcpServers: updatedServers };
+            writeFileSync(mcpPath, JSON.stringify(updated, null, 2) + '\n');
+            return {
+              label: '.mcp.json',
+              status: 'updated',
+              detail: 'added pcp-inbox channel plugin',
+            };
           }
-        }
-
-        if (needsWrite) {
-          const updated = { ...existing, mcpServers: updatedServers };
-          writeFileSync(mcpPath, JSON.stringify(updated, null, 2) + '\n');
-          return {
-            label: '.mcp.json',
-            status: 'updated',
-            detail: 'updated pcp config',
-          };
         }
         return { label: '.mcp.json', status: 'exists', detail: 'pcp server configured' };
       }
@@ -148,7 +127,6 @@ function ensureMcpJson(cwd: string): InitStepResult {
           pcp: {
             type: 'http',
             url: `${serverUrl}/mcp`,
-            headers: { Authorization: 'Bearer ${PCP_ACCESS_TOKEN}' },
           },
         },
       };

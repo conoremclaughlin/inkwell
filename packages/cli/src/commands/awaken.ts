@@ -22,6 +22,7 @@ import { fileURLToPath } from 'url';
 import { homedir, tmpdir } from 'os';
 import { getBackend, BACKEND_NAMES } from '../backends/index.js';
 import { callPcpTool } from '../lib/pcp-mcp.js';
+import { getValidAccessToken } from '../auth/tokens.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -344,11 +345,21 @@ async function awakenCommand(options: { backend: string; verbose: boolean }): Pr
     )
   );
 
-  // 5. Spawn the backend process
+  // 5. Resolve PCP auth token (same as sb chat) so MCP tools work
+  const authEnv: Record<string, string> = {};
+  try {
+    const token = await getValidAccessToken(process.env.PCP_SERVER_URL || 'http://localhost:3001');
+    if (token) authEnv.PCP_ACCESS_TOKEN = token;
+  } catch {
+    // Auth is best-effort — the backend can fall back to MCP OAuth
+  }
+
+  // 6. Spawn the backend process
   const child = spawn(prepared.binary, prepared.args, {
     stdio: 'inherit',
     env: {
       ...process.env,
+      ...authEnv,
       ...prepared.env,
       AGENT_ID: 'nascent',
     },

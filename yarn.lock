@@ -1960,6 +1960,12 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@pcp/openclaw-plugin@workspace:packages/openclaw-plugin":
+  version: 0.0.0-use.local
+  resolution: "@pcp/openclaw-plugin@workspace:packages/openclaw-plugin"
+  languageName: unknown
+  linkType: soft
+
 "@personal-context/api@workspace:packages/api":
   version: 0.0.0-use.local
   resolution: "@personal-context/api@workspace:packages/api"
