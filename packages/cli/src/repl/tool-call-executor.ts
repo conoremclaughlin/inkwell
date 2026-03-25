@@ -10,6 +10,7 @@
 
 import type { ToolPolicyState } from './tool-policy.js';
 import type { PcpToolCallResult } from '../lib/pcp-client.js';
+import { isClientLocalTool } from './context-tools.js';
 
 export interface LocalToolCall {
   tool: string;
@@ -71,8 +72,18 @@ async function executeOneToolCall(
 ): Promise<ToolCallResult> {
   const { policy, callTool, sessionId, promptForApproval } = deps;
 
-  // 1. Check policy
-  const decision = policy.canCallPcpTool(call.tool, sessionId);
+  // Client-local tools (context management + signaling) always bypass policy.
+  // They operate on the in-memory ledger — no external side effects, no PCP
+  // server calls. Eviction removes from working memory but the JSONL transcript
+  // retains the full immutable log. The SB must have full control over its own
+  // context window without permission gates.
+  if (isClientLocalTool(call.tool)) {
+    return executeTool(call, callTool);
+  }
+
+  // 1. Check policy — strip MCP namespace prefix for policy lookup
+  const policyToolName = call.tool.replace(/^mcp__pcp__/, '');
+  const decision = policy.canCallPcpTool(policyToolName, sessionId);
 
   if (decision.allowed) {
     // Allowed — execute immediately
@@ -101,7 +112,8 @@ async function executeOneToolCall(
   }
 
   // Re-check policy after approval (the grant was applied by the prompt handler)
-  const postApprovalDecision = policy.canCallPcpTool(call.tool, sessionId);
+  // Use the stripped name — same as the initial policy check above
+  const postApprovalDecision = policy.canCallPcpTool(policyToolName, sessionId);
   if (!postApprovalDecision.allowed) {
     // Edge case: approval was granted but policy still blocks (e.g., deny overrides grant)
     return {

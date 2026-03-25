@@ -35,6 +35,14 @@ import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../
 import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
 import { ensurePcpToolAllowed } from '../repl/tool-gate.js';
 import { executeToolCalls, type ToolCallResult } from '../repl/tool-call-executor.js';
+import {
+  isClientLocalTool,
+  handleClientLocalTool,
+  getLastSignal,
+  clearLastSignal,
+} from '../repl/context-tools.js';
+import { SbHookRegistry } from '../repl/hook-registry.js';
+import { registerBuiltinHooks } from '../repl/builtin-hooks.js';
 import { applyProfile, formatProfileList, isValidProfileId } from '../repl/tool-profiles.js';
 import { ApprovalRequestManager } from '../repl/approval-request.js';
 import {
@@ -89,6 +97,7 @@ type ChatOptions = {
   profile?: string;
   message?: string;
   nonInteractive?: boolean;
+  maxTurns?: string;
   backendTimeoutSeconds?: string;
   tailTranscript?: string;
   sbStrictTools?: boolean;
@@ -1745,7 +1754,7 @@ function buildPromptEnvelope(
 
   const toolInstruction =
     runtime.toolRouting === 'local'
-      ? 'Backend-native tool calling is disabled for this run. If you need PCP tool access, emit fenced blocks in this exact format: ```pcp-tool {"tool":"tool_name","args":{}} ``` and continue with your plain-text answer.'
+      ? 'IMPORTANT: To call PCP tools (get_inbox, recall, remember, list_tasks, send_response, etc.), you MUST emit fenced code blocks in this exact format:\n\n```pcp-tool\n{"tool":"tool_name","args":{}}\n```\n\nDo NOT use ToolSearch, mcp__pcp__*, or native MCP tool calling for PCP tools — those will not work in this runtime. Only the fenced block format above will execute PCP tools. You can emit multiple pcp-tool blocks in one response.\n\nClient-local tools (also via pcp-tool blocks, no server round-trip):\n- list_context: Introspect your context window — see all entries with IDs, token counts, sources, and previews.\n- evict_context: Remove specific entries from your context to reclaim tokens. Args: entryIds (number[]), source (string), or role (string).\n- signal_status: Signal your session status. Args: status ("completed" | "blocked" | "continuing"), reason (string, optional). Use this at the end of your work to tell the runtime whether you are done, blocked on something, or need another turn.'
       : runtime.toolMode === 'off'
         ? 'Do not call backend-native tools. Provide reasoning and instructions only.'
         : runtime.toolMode === 'privileged'
@@ -1862,8 +1871,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
         ? 'jsonl'
         : options.approvalMode === 'auto-approve'
           ? 'auto-approve'
-          : options.nonInteractive
-            ? 'auto-deny'
+          : options.nonInteractive || options.message
+            ? options.profile === 'full'
+              ? 'auto-approve' // --profile full + non-interactive = trust all tools
+              : 'auto-deny'
             : 'interactive',
   };
   await ensureBackendAuthReady(runtime.backend, {
@@ -1948,6 +1959,38 @@ export async function runChat(options: ChatOptions): Promise<void> {
   };
 
   const ledger = new ContextLedger();
+  const hookRegistry = new SbHookRegistry();
+  let hookTurnCount = 0;
+
+  // Register built-in hooks (passive recall + budget monitor).
+  // callRecall wraps pcp.callTool('recall', ...) into the shape hooks expect.
+  const { passiveRecall: passiveRecallHandle } = registerBuiltinHooks(hookRegistry, {
+    callRecall: async (query, limit) => {
+      try {
+        const result = await pcp.callTool('recall', {
+          query,
+          agentId,
+          includeShared: true,
+          limit,
+          recallMode: 'hybrid',
+        });
+        // PcpClient.callTool() parses the JSON-RPC response and returns
+        // the tool result directly (e.g., { success, memories, ... })
+        const parsed = result as Record<string, unknown>;
+        if (!parsed.success) return [];
+        const memories = parsed.memories as Array<Record<string, unknown>> | undefined;
+        return (memories || []).map((m) => ({
+          id: m.id as string,
+          content: m.content as string,
+          summary: (m.summary as string) || null,
+          topics: (m.topics as string[]) || [],
+        }));
+      } catch {
+        return [];
+      }
+    },
+  });
+
   const seenInboxIds = new Set<string>();
   const seenActivityIds = new Set<string>();
   let pollTimer: NodeJS.Timeout | null = null;
@@ -2213,6 +2256,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     chip('time', formatNow(runtime.userTimezone), chalk.magenta),
   ].filter(Boolean);
   console.log(bannerParts.join(chalk.dim('  •  ')));
+  if (runtime.sessionId) console.log(chalk.dim(`Session: ${runtime.sessionId}`));
   if (runtime.threadKey) console.log(chalk.dim(`Thread: ${runtime.threadKey}`));
   if (attachedToExistingSession) {
     console.log(
@@ -2608,6 +2652,60 @@ export async function runChat(options: ChatOptions): Promise<void> {
         .catch(() => undefined);
     }
 
+    // ── Fire prompt_build hooks (budget monitor, etc.) ──
+    // Budget utilization must account for bootstrap tokens — the ledger only
+    // holds transcript, but bootstrap is reserved from the total budget.
+    const bootstrapReserve = runtime.bootstrapContext
+      ? estimateTokens(runtime.bootstrapContext)
+      : 0;
+    const effectiveBudget = Math.max(1, runtime.maxContextTokens - bootstrapReserve);
+
+    const promptHookResult = await hookRegistry.fire('prompt_build', {
+      ledger,
+      runtime: {
+        sessionId: runtime.sessionId,
+        agentId,
+        backend: runtime.backend,
+        budgetUtilization: ledger.totalTokens() / effectiveBudget,
+        turnCount: hookTurnCount,
+      },
+      // Pass user input so passive recall can surface memories BEFORE the backend responds
+      lastTurn: {
+        userInput: raw,
+        assistantResponse: '',
+        turnIndex: hookTurnCount + 1,
+      },
+    });
+
+    // Print notifications from prompt_build hooks
+    if (promptHookResult.injected > 0) {
+      // Check if any were passive recall vs budget warnings
+      const recallEntries = ledger
+        .listEntries()
+        .filter((e) => e.source === 'passive-recall')
+        .slice(-promptHookResult.injected);
+      const budgetEntries = ledger
+        .listEntries()
+        .filter((e) => e.source === 'budget-monitor')
+        .slice(-promptHookResult.injected);
+
+      for (const entry of recallEntries) {
+        const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+        printLine(
+          chalk.dim(`  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`)
+        );
+      }
+
+      if (budgetEntries.length > 0) {
+        const util = Math.round((ledger.totalTokens() / effectiveBudget) * 100);
+        printLine(
+          chalk.yellow(
+            `  ⚠ Context at ${util}% — ${ledger.totalTokens().toLocaleString()} / ${effectiveBudget.toLocaleString()} tok (bootstrap: ${bootstrapReserve.toLocaleString()} reserved)`
+          )
+        );
+      }
+    }
+
     let prompt = buildPromptEnvelope(agentId, runtime, ledger, raw);
     const turnStartedAt = Date.now();
     const backendGate = toolPolicy.getBackendToolGate();
@@ -2781,7 +2879,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const iterationResults: typeof allToolResults = [];
       await executeToolCalls(localToolCalls, {
         policy: toolPolicy,
-        callTool: (tool, args) => pcp.callTool(tool, args),
+        callTool: (tool, args) => {
+          // Client-local tools (context management) are handled in-process
+          if (isClientLocalTool(tool)) {
+            const result = handleClientLocalTool(tool, args, ledger);
+            if (result) return Promise.resolve(result);
+          }
+          // Strip MCP namespace prefix — the SB may emit mcp__pcp__tool_name
+          // but PcpClient expects bare tool names (get_inbox, recall, etc.)
+          const bareTool = tool.replace(/^mcp__pcp__/, '');
+          return pcp.callTool(bareTool, args);
+        },
         sessionId: runtime.sessionId,
         promptForApproval: async (tool, reason) => {
           if (!runtime.awayMode) {
@@ -2860,7 +2968,42 @@ export async function runChat(options: ChatOptions): Promise<void> {
             });
           } else if (result.status === 'executed' || result.status === 'approved') {
             const resultJson = JSON.stringify(result.result);
-            printLine(chalk.cyan(`🛠 local tool ${result.tool} ${resultJson}`));
+
+            // Format context-management and signal tools with friendly output
+            if (result.tool === 'evict_context') {
+              const r = result.result as Record<string, unknown> | undefined;
+              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+              if (content) {
+                const parsed = JSON.parse(content);
+                printLine(chalk.dim(`  🗑 evicted ${parsed.evicted} entries (${parsed.tokensFreed} tok freed, ${parsed.totalAfter} tok remaining)`));
+              }
+            } else if (result.tool === 'list_context') {
+              const r = result.result as Record<string, unknown> | undefined;
+              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+              if (content) {
+                const parsed = JSON.parse(content);
+                printLine(chalk.dim(`  📋 context: ${parsed.totalEntries} entries, ~${parsed.totalTokens} tok`));
+                if (parsed.bySource) {
+                  const sources = Object.entries(parsed.bySource as Record<string, { count: number; tokens: number }>)
+                    .map(([src, { count, tokens }]) => `${src}(${count}/${tokens}t)`)
+                    .join(' ');
+                  printLine(chalk.dim(`     ${sources}`));
+                }
+              }
+            } else if (result.tool === 'signal_status') {
+              const r = result.result as Record<string, unknown> | undefined;
+              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+              if (content) {
+                const parsed = JSON.parse(content);
+                const signal = parsed.signal as { status: string; reason?: string } | undefined;
+                if (signal) {
+                  const icon = signal.status === 'completed' ? '✅' : signal.status === 'blocked' ? '🚫' : '➡️';
+                  printLine(chalk.dim(`  ${icon} signal: ${signal.status}${signal.reason ? ` — ${signal.reason}` : ''}`));
+                }
+              }
+            } else {
+              printLine(chalk.cyan(`🛠 local tool ${result.tool} ${resultJson}`));
+            }
             appendTranscript(runtime.transcriptPath, {
               type: 'local_tool_call',
               tool: result.tool,
@@ -2868,11 +3011,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
               status: result.status,
               result: result.result,
             });
-            ledger.addEntry(
-              'system',
-              compactForLedger(`local tool ${result.tool} -> ${resultJson}`, 500),
-              'local-tool'
-            );
+            // Context-management tools (list_context, evict_context) must NOT
+            // persist their results back into the ledger — doing so pollutes the
+            // context they're managing and reintroduces evicted content.
+            if (!isClientLocalTool(result.tool)) {
+              ledger.addEntry(
+                'system',
+                compactForLedger(`local tool ${result.tool} -> ${resultJson}`, 500),
+                'local-tool'
+              );
+            }
             iterationResults.push({
               tool: result.tool,
               result: result.result,
@@ -2981,6 +3129,53 @@ export async function runChat(options: ChatOptions): Promise<void> {
       usage: runResult.usage || null,
     });
     lastBackendUsage = runResult.usage;
+
+    // ── Fire turn_end hooks (passive recall, etc.) ──
+    hookTurnCount++;
+    const turnEndBootstrapReserve = runtime.bootstrapContext
+      ? estimateTokens(runtime.bootstrapContext)
+      : 0;
+    const turnEndEffectiveBudget = Math.max(1, runtime.maxContextTokens - turnEndBootstrapReserve);
+
+    hookRegistry
+      .fire('turn_end', {
+        ledger,
+        runtime: {
+          sessionId: runtime.sessionId,
+          agentId,
+          backend: runtime.backend,
+          budgetUtilization: ledger.totalTokens() / turnEndEffectiveBudget,
+          turnCount: hookTurnCount,
+        },
+        lastTurn: {
+          userInput: raw,
+          assistantResponse: assistantDisplayText,
+          turnIndex: hookTurnCount,
+        },
+      })
+      .then((hookResult) => {
+        // Notify the user about passive recall injections
+        if (hookResult.injected > 0) {
+          const recallEntries = ledger
+            .listEntries()
+            .filter((e) => e.source === 'passive-recall')
+            .slice(-hookResult.injected);
+
+          for (const entry of recallEntries) {
+            const preview = entry.content
+              .replace(/^\[passive-recall\]\s*/, '')
+              .slice(0, 120);
+            const tokens = entry.approxTokens;
+            printLine(
+              chalk.dim(`  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${tokens} tok)`)
+            );
+          }
+        }
+        if (hookResult.evicted > 0) {
+          printLine(chalk.dim(`  🗑 ${hookResult.evicted} entries auto-evicted by hooks`));
+        }
+      })
+      .catch(() => undefined); // never block the REPL
 
     if (!runResult.success) {
       printLine(chalk.red(`\n[${runtime.backend}] exit=${runResult.exitCode}`));
@@ -3097,20 +3292,74 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (!message) {
       throw new Error('--non-interactive requires --message "<text>"');
     }
+    const maxTurns = parseInt(options.maxTurns || '1', 10);
+
+    // Turn 1: user-provided message
+    clearLastSignal();
     await enqueueTurn(message);
+
+    // Check for signal after turn 1
+    let exitReason: string | undefined;
+    const signal1 = getLastSignal();
+    if (signal1?.status === 'completed' || signal1?.status === 'blocked') {
+      exitReason = `${signal1.status}${signal1.reason ? `: ${signal1.reason}` : ''}`;
+    }
+
+    // Turns 2..N: continuation prompts — the SB signals when it's done
+    if (!exitReason) {
+      for (let turn = 2; turn <= maxTurns; turn++) {
+        clearLastSignal();
+        await enqueueTurn(
+          'Continue working. Use signal_status to indicate when you are completed, blocked, or continuing.'
+        );
+
+        const signal = getLastSignal();
+        if (signal?.status === 'completed' || signal?.status === 'blocked') {
+          exitReason = `${signal.status}${signal.reason ? `: ${signal.reason}` : ''}`;
+          break;
+        }
+        // No signal or 'continuing' → keep going
+      }
+    }
+
     if (pollTimer) clearInterval(pollTimer);
     const summary = summarizeForSessionEnd(ledger);
-    if (runtime.sessionId && !attachedToExistingSession) {
+
+    // Map the signal to a session phase. Don't end the session — leave it
+    // resumable so the user or another SB can attach and follow up.
+    const finalSignal = getLastSignal();
+    const phase =
+      finalSignal?.status === 'blocked'
+        ? 'blocked:needs-input'
+        : finalSignal?.status === 'completed'
+          ? 'idle:completed'
+          : 'idle:awaiting-input';
+
+    if (runtime.sessionId) {
       await pcp
-        .callTool('end_session', { agentId, sessionId: runtime.sessionId, summary })
+        .callTool('update_session_phase', {
+          agentId,
+          sessionId: runtime.sessionId,
+          phase,
+        })
         .catch(() => undefined);
     }
     appendTranscript(runtime.transcriptPath, {
-      type: 'session_end',
+      type: 'session_pause',
       sessionId: runtime.sessionId || null,
       summary,
-      attached: attachedToExistingSession,
+      turnsCompleted: maxTurns,
+      signal: finalSignal || undefined,
     });
+
+    if (finalSignal?.status === 'blocked') {
+      console.log(chalk.yellow(`\nSession blocked: ${finalSignal.reason || 'needs input'}`));
+    } else if (finalSignal?.status === 'completed') {
+      console.log(chalk.green(`\nSession completed.`));
+    } else {
+      console.log(chalk.dim(`\nSession paused (${maxTurns} turn(s) completed).`));
+    }
+    console.log(chalk.cyan(`  Resume with: sb chat --attach-latest ${agentId}\n`));
     return;
   }
 
@@ -4574,6 +4823,7 @@ export function registerChatCommand(program: Command): void {
       .option('--auto-run', 'Automatically execute backend turns for new inbox task messages')
       .option('--message <text>', 'Single-turn message for non-interactive mode')
       .option('--non-interactive', 'Run one turn and exit (requires --message)')
+      .option('--max-turns <n>', 'Run up to N conversational turns then exit (requires --message)')
       .option(
         '--backend-timeout-seconds <n>',
         'Backend turn timeout in seconds (default: 120 for --non-interactive, otherwise 1200)'
