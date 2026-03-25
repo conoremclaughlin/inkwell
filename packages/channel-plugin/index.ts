@@ -22,9 +22,29 @@
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync, appendFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+
+// ─── Logging ────────────────────────────────────────────────
+// Logs to ~/.pcp/logs/channel-plugin.log for debugging.
+// Cannot use stdout (reserved for MCP stdio transport).
+
+const LOG_DIR = join(homedir(), '.pcp', 'logs');
+const LOG_FILE = join(LOG_DIR, 'channel-plugin.log');
+
+function log(level: 'info' | 'warn' | 'error' | 'debug', message: string, data?: Record<string, unknown>): void {
+  try {
+    mkdirSync(LOG_DIR, { recursive: true });
+    const ts = new Date().toISOString();
+    const line = data
+      ? `${ts} [${level}] ${message} ${JSON.stringify(data)}\n`
+      : `${ts} [${level}] ${message}\n`;
+    appendFileSync(LOG_FILE, line);
+  } catch {
+    // Can't log — don't crash the plugin
+  }
+}
 
 // ─── Config ─────────────────────────────────────────────────
 
@@ -89,6 +109,14 @@ function resolveAccessToken(): string | undefined {
 const agentId = resolveAgentId();
 const email = resolveEmail();
 const accessToken = resolveAccessToken();
+
+log('info', 'Channel plugin starting', {
+  agentId,
+  email: email || '(none)',
+  hasToken: !!accessToken,
+  server: PCP_SERVER_URL,
+  pollIntervalMs: POLL_INTERVAL_MS,
+});
 
 async function callPcp(
   tool: string,
@@ -177,8 +205,9 @@ Do NOT ignore channel messages — they are from your teammates and deserve time
 
 // ─── Polling Loop ───────────────────────────────────────────
 
-let lastPollTime = new Date().toISOString(); // only fetch messages after this timestamp
-const seenMessageIds = new Set<string>(); // prevent re-emission across poll cycles
+let lastPollTime = new Date().toISOString();
+const seenMessageIds = new Set<string>(); // belt-and-suspenders dedup
+const lastThreadTimestamps = new Map<string, string>(); // threadKey → last seen created_at
 
 async function pollInbox(): Promise<void> {
   if (!email) return;
@@ -192,7 +221,14 @@ async function pollInbox(): Promise<void> {
       limit: 20,
     });
 
-    if (!result?.success) return;
+    if (!result?.success) {
+      log('error', 'Poll failed', { result: JSON.stringify(result).slice(0, 300) });
+      return;
+    }
+    const threadCount = ((result.threadsWithUnread as unknown[]) || []).length;
+    const msgCount = ((result.messages as unknown[]) || []).length;
+    const totalUnread = (result.totalUnreadCount as number) || 0;
+    log('debug', 'Poll result', { threadCount, msgCount, totalUnread, since: lastPollTime });
 
     // Check for new thread messages
     const threads = (result.threadsWithUnread as Array<Record<string, unknown>>) || [];
@@ -227,6 +263,7 @@ async function pollInbox(): Promise<void> {
         const content = (msg.content as string) || '';
         const messageType = (msg.messageType as string) || 'message';
 
+        log('info', 'Pushing thread message to channel', { threadKey, sender, msgId, msgTs });
         await mcp.notification({
           method: 'notifications/claude/channel',
           params: {
@@ -279,15 +316,17 @@ async function pollInbox(): Promise<void> {
     }
 
     lastPollTime = new Date().toISOString();
-  } catch {
-    // Silent — polling should not crash the plugin
+  } catch (err) {
+    log('error', 'Poll error', { error: err instanceof Error ? err.message : String(err) });
   }
 }
 
 // ─── Start ──────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  log('info', 'Connecting MCP stdio transport');
   await mcp.connect(new StdioServerTransport());
+  log('info', 'MCP connected, starting poll loop');
 
   // Start polling loop
   setInterval(pollInbox, POLL_INTERVAL_MS);
@@ -299,6 +338,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  process.stderr.write(`PCP channel plugin failed: ${err.message}\n`);
+  log('error', 'Channel plugin crashed', { error: err.message });
   process.exit(1);
 });

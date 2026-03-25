@@ -871,7 +871,12 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
     ];
 
     if (threadIds.length > 0) {
-      // Get open threads for this user
+      // Get open threads for this user.
+      // NOTE: `since` is NOT applied to threads — thread read pointers
+      // (inbox_thread_read_status.last_read_at) already handle "which
+      // messages have I seen." Filtering threads by updated_at would
+      // cause missed messages when lastPollTime advances past the
+      // thread's updated_at between polls.
       const { data: threads } = await threadTable(supabase, 'inbox_threads')
         .select('id, thread_key, title, user_id, created_by_agent_id, updated_at')
         .eq('user_id', resolved.user.id)
