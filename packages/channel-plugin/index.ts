@@ -295,12 +295,15 @@ async function pollInbox(): Promise<void> {
       const unreadCount = (thread.unreadCount as number) || 0;
       if (!threadKey || unreadCount === 0) continue;
 
-      // Fetch new messages for this thread
+      // Peek at thread messages WITHOUT advancing the read pointer.
+      // We must check studio ownership before marking read — the read pointer
+      // is per-agent (not per-studio), so a non-owning studio marking read
+      // would prevent the owning studio from ever seeing these as unread.
       const threadResult = await callPcp('get_thread_messages', {
         email,
         agentId,
         threadKey,
-        markRead: true,
+        markRead: false,
         limit: 5,
       });
 
@@ -316,6 +319,9 @@ async function pollInbox(): Promise<void> {
         log('debug', 'Skipping thread (owned by different studio)', { threadKey, studioId });
         continue;
       }
+
+      // Now mark read — we've confirmed this studio owns the thread.
+      await callPcp('mark_thread_read', { email, agentId, threadKey });
 
       for (const msg of messages) {
         const msgId = msg.id as string;
