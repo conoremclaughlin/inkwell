@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Box, Static, Text, useApp, useStdout } from 'ink';
+import { Box, Static, Text, useApp, useInput, useStdout } from 'ink';
 import { Separator } from './Separator.js';
 import { formatNow } from '../tui-components.js';
 
@@ -73,15 +73,47 @@ const TYPE_ICONS: Record<FeedEventType, string> = {
  * Single feed event rendered as a proper React component for <Static>.
  * Uses Box/Text layout so Ink handles wrapping at the current terminal width.
  */
+/** Max lines shown for detail when collapsed. */
+const DETAIL_COLLAPSED_LINES = 3;
+
+export function collapseDetail(detail: string, maxLines: number, cols: number = 80): string {
+  const availableWidth = Math.max(1, cols - 4); // paddingLeft is always 4 for inbox
+  const lines = detail.split('\n');
+  const kept: string[] = [];
+  let visualRows = 0;
+  for (const line of lines) {
+    const rows = line.length === 0 ? 1 : Math.ceil(line.length / availableWidth);
+    if (visualRows + rows > maxLines) {
+      const remaining = maxLines - visualRows;
+      if (remaining > 0) kept.push(line.slice(0, remaining * availableWidth));
+      return kept.join('\n') + '…';
+    }
+    kept.push(line);
+    visualRows += rows;
+  }
+  return detail;
+}
+
+export function estimateRows(text: string, cols: number): number {
+  const width = Math.max(1, cols);
+  return text.split('\n').reduce((sum, line) => {
+    return sum + (line.length === 0 ? 1 : Math.ceil(line.length / width));
+  }, 0);
+}
+
 const FeedEventLine = React.memo(function FeedEventLine({
   type,
   agent,
   content,
   time,
   detail,
-}: Omit<FeedEvent, 'id'>) {
+  detailExpanded,
+  cols,
+}: Omit<FeedEvent, 'id'> & { detailExpanded?: boolean; cols?: number }) {
   const color = TYPE_COLORS[type] || 'gray';
   const icon = TYPE_ICONS[type] || '•';
+  const renderedDetail =
+    detail && !detailExpanded ? collapseDetail(detail, DETAIL_COLLAPSED_LINES, cols) : detail;
 
   return (
     <Box flexDirection="column" paddingLeft={1} marginTop={type !== 'system' ? 1 : 0}>
@@ -103,10 +135,10 @@ const FeedEventLine = React.memo(function FeedEventLine({
         <Text wrap="wrap">{content}</Text>
       </Box>
       {/* Optional detail */}
-      {detail ? (
+      {renderedDetail ? (
         <Box paddingLeft={agent ? 4 : 2}>
           <Text dimColor wrap="wrap">
-            {detail}
+            {renderedDetail}
           </Text>
         </Box>
       ) : null}
@@ -131,6 +163,7 @@ export const MissionApp = React.forwardRef<MissionAppHandle, MissionAppProps>(fu
   const [status, setStatus] = useState('initializing...');
   const [ctrlCCount, setCtrlCCount] = useState(0);
   const ctrlCTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [detailExpanded, setDetailExpanded] = useState(false);
 
   React.useImperativeHandle(ref, () => ({
     addEvent: (event: FeedEvent) => {
@@ -163,6 +196,14 @@ export const MissionApp = React.forwardRef<MissionAppHandle, MissionAppProps>(fu
       if (debounceTimer) clearTimeout(debounceTimer);
     };
   }, [stdout]);
+
+  // Ctrl+O to toggle detail expansion (re-renders all feed events)
+  useInput((_input, key) => {
+    if (key.ctrl && _input === 'o') {
+      setDetailExpanded((prev) => !prev);
+      setRemountKey((k) => k + 1);
+    }
+  });
 
   // Double Ctrl+C to exit
   useEffect(() => {
@@ -211,6 +252,8 @@ export const MissionApp = React.forwardRef<MissionAppHandle, MissionAppProps>(fu
             content={event.content}
             time={event.time}
             detail={event.detail}
+            detailExpanded={detailExpanded}
+            cols={cols}
           />
         )}
       </Static>
@@ -267,7 +310,9 @@ export const MissionApp = React.forwardRef<MissionAppHandle, MissionAppProps>(fu
       <Separator />
       <Box paddingX={1}>
         <Text dimColor wrap="truncate">
-          {truncLine('ctrl+c x2 quit  ·  SB Mission Control')}
+          {truncLine(
+            `ctrl+c x2 quit  ·  ctrl+o ${detailExpanded ? 'collapse' : 'expand'} details  ·  SB Mission Control`
+          )}
         </Text>
       </Box>
     </Box>

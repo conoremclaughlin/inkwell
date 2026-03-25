@@ -12,6 +12,7 @@
 import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway';
+import { resolveUser } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
 
 type McpResponse = {
@@ -153,7 +154,13 @@ export async function handleListRegisteredAgents(
   dataComposer: DataComposer
 ): Promise<McpResponse> {
   try {
-    // Query agent_identities for all known agents (the source of truth).
+    // Resolve current user from request context (OAuth token)
+    const resolved = await resolveUser({}, dataComposer);
+    if (!resolved) {
+      return mcpResponse({ success: false, error: 'User not found' }, true);
+    }
+
+    // Query agent_identities scoped to the current user.
     // The in-memory trigger handler registry only tracks agents with active
     // runtime listeners — it's empty after restarts or when agents use
     // polling instead of persistent connections.
@@ -161,6 +168,7 @@ export async function handleListRegisteredAgents(
       .getClient()
       .from('agent_identities')
       .select('agent_id, name, backend')
+      .eq('user_id', resolved.user.id)
       .order('agent_id');
 
     if (error) {

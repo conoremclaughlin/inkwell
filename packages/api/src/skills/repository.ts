@@ -257,7 +257,7 @@ export class SkillsRepository {
    */
   async getUserInstalledSkills(userId: string): Promise<UserInstalledSkill[]> {
     const { data, error } = await this.supabase
-      .from('user_installed_skills')
+      .from('skill_installations')
       .select('*')
       .eq('user_id', userId)
       .eq('enabled', true);

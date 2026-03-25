@@ -93,7 +93,7 @@ const GEMINI: HookCapabilities = {
   events: {
     sessionStart: 'SessionStart',
     preCompact: 'PreCompress',
-    postCompact: null,
+    postCompact: 'SessionStart', // uses "compress" matcher on SessionStart (Gemini uses "compress", not Claude's "compact")
     onPrompt: 'BeforeAgent',
     onStop: 'AfterAgent',
   },
@@ -844,6 +844,22 @@ function buildInboxBlock(messages: Array<Record<string, unknown>> | undefined): 
   return lines.join('\n');
 }
 
+/**
+ * Check if the PCP channel plugin is registered in .mcp.json.
+ * When active, the channel handles real-time inbox delivery — hook-based
+ * injection is skipped to avoid duplicate messages.
+ */
+function hasActiveChannelPlugin(cwd: string): boolean {
+  try {
+    const mcpJsonPath = join(cwd, '.mcp.json');
+    if (!existsSync(mcpJsonPath)) return false;
+    const mcpConfig = JSON.parse(readFileSync(mcpJsonPath, 'utf-8'));
+    return Boolean(mcpConfig?.mcpServers?.['pcp-inbox']);
+  } catch {
+    return false;
+  }
+}
+
 function buildInboxTag(messages: Array<Record<string, unknown>> | undefined): string {
   if (!messages || messages.length === 0) return '';
   const lines = [`<pcp-inbox count="${messages.length}">`];
@@ -1127,8 +1143,20 @@ function installGemini(cwd: string, force: boolean): InstallResult {
 
   const sbPath = resolveSbBinaryPath(cwd);
   const pcpHooks: Record<string, unknown> = {
+    // SessionStart: two matchers — "compress" for post-compression identity re-injection,
+    // "startup" for initial session setup. Gemini uses "compress" (not Claude's "compact").
     [GEMINI.events.sessionStart!]: [
       {
+        matcher: 'compress',
+        hooks: [
+          {
+            type: 'command',
+            command: buildManagedHookCommand(sbPath, 'post-compact', GEMINI.name),
+          },
+        ],
+      },
+      {
+        matcher: 'startup',
         hooks: [
           {
             type: 'command',
@@ -1199,13 +1227,13 @@ function installGemini(cwd: string, force: boolean): InstallResult {
     const allPresent = Object.entries(pcpHooks).every(([event, targetEntries]) => {
       const existingEntries = hooksObj[event];
       if (!Array.isArray(existingEntries)) return false;
-      const targetCmd = (
-        (targetEntries as Array<Record<string, unknown>>)[0]?.hooks as
-          | Array<Record<string, unknown>>
-          | undefined
-      )?.[0]?.command as string | undefined;
-      if (!targetCmd) return false;
-      return existingEntries.some((entry) => entryHasCommand(entry, targetCmd));
+      // Verify ALL target entries are present (e.g. SessionStart has both compress + startup)
+      return (targetEntries as Array<Record<string, unknown>>).every((targetEntry) => {
+        const targetCmd = (targetEntry.hooks as Array<Record<string, unknown>> | undefined)?.[0]
+          ?.command as string | undefined;
+        if (!targetCmd) return false;
+        return existingEntries.some((entry) => entryHasCommand(entry, targetCmd));
+      });
     });
 
     if (allPresent) {
@@ -1339,12 +1367,14 @@ function printInstallResult(
     console.log(
       chalk.dim(`      ${events.preCompact} → ${formatHookHint(backend.name, 'pre-compact')}`)
     );
-  if (events.postCompact)
+  if (events.postCompact) {
+    const compactMatcher = backend.name === 'gemini' ? 'compress' : 'compact';
     console.log(
       chalk.dim(
-        `      ${events.postCompact} (compact) → ${formatHookHint(backend.name, 'post-compact')}`
+        `      ${events.postCompact} (${compactMatcher}) → ${formatHookHint(backend.name, 'post-compact')}`
       )
     );
+  }
   if (events.sessionStart)
     console.log(
       chalk.dim(
@@ -1430,12 +1460,14 @@ async function installCommand(options: {
       console.log(
         chalk.dim(`  ${events.preCompact} → ${formatHookHint(backend.name, 'pre-compact')}`)
       );
-    if (events.postCompact)
+    if (events.postCompact) {
+      const compactMatcher = backend.name === 'gemini' ? 'compress' : 'compact';
       console.log(
         chalk.dim(
-          `  ${events.postCompact} (compact) → ${formatHookHint(backend.name, 'post-compact')}`
+          `  ${events.postCompact} (${compactMatcher}) → ${formatHookHint(backend.name, 'post-compact')}`
         )
       );
+    }
     if (events.sessionStart)
       console.log(
         chalk.dim(
@@ -1949,24 +1981,39 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   await updateRuntimeGenerationState(cwd, config, agentId, 'running');
 
   // Mark session as CLI-attached (human present at REPL).
-  // This tells the trigger handler to route messages to the pending queue
-  // instead of spawning a new process.
+  // Uses the REST lifecycle endpoint, NOT MCP — cliAttached is a runtime
+  // signal that must bypass MCP schema validation (additionalProperties: false
+  // strips it). The REST endpoint is purpose-built for hook-managed state.
   if (reconciled.pcpSessionId) {
     try {
-      await callPcpTool('update_session_phase', {
-        email: config?.email,
-        agentId,
-        sessionId: reconciled.pcpSessionId,
-        cliAttached: true,
+      const serverUrl = getPcpServerUrl();
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      const token = await getValidAccessToken(serverUrl);
+      if (token) headers.Authorization = `Bearer ${token}`;
+      await fetch(`${serverUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          sessionId: reconciled.pcpSessionId,
+          cliAttached: true,
+        }),
+        signal: AbortSignal.timeout(5000),
       });
     } catch {
       // Silent — don't fail the prompt for this
     }
   }
 
-  // Always drain pending message queue first — these are trigger messages
-  // routed here because cli_attached=true. Must run before the inbox stale
-  // check to ensure delivery on every prompt, not just stale ones.
+  // Skip inbox injection when the channel plugin is active — it handles
+  // real-time delivery via the Channels API. Fall back to hook-based
+  // injection when the channel plugin is not present.
+  if (hasActiveChannelPlugin(cwd)) {
+    return;
+  }
+
+  // No channel plugin — use hook-based inbox injection as fallback.
+  // Drain pending message queue first — these are trigger messages
+  // routed here because cli_attached=true.
   try {
     const pending = await callPcpTool('get_pending_messages', {
       channel: 'agent',
@@ -2060,7 +2107,15 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
     parts.push(renderTemplate(template, { TOOL_COUNT: String(count) }));
   }
 
-  // Check inbox if stale
+  // Skip inbox injection when channel plugin handles it
+  if (hasActiveChannelPlugin(cwd)) {
+    if (parts.length > 0) {
+      process.stdout.write(parts.join('\n\n'));
+    }
+    return;
+  }
+
+  // Check inbox if stale (fallback when no channel plugin)
   const lastCheck = readRuntimeFile(cwd, 'last-inbox-check');
   const staleThresholdMs = 5 * 60 * 1000;
   let shouldCheckInbox = !lastCheck;

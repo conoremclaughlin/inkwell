@@ -8,6 +8,7 @@ export default defineConfig({
       'packages/cli/src/**/*.test.ts',
       'packages/create-pcp/src/**/*.test.ts',
       'packages/shared/src/**/*.test.ts',
+      'packages/channel-plugin/**/*.test.ts',
     ],
     exclude: ['node_modules', 'dist', 'packages/clawdbot/**', '**/*.integration.test.ts'],
   },

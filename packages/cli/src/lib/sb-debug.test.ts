@@ -1,11 +1,17 @@
 import { mkdtempSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { initSbDebug, isSbDebugEnabled, resolveSbDebugFile, sbDebugLog } from './sb-debug.js';
 
 const originalSbDebug = process.env.SB_DEBUG;
 const originalSbDebugFile = process.env.SB_DEBUG_FILE;
+
+beforeEach(() => {
+  // Isolate from env — some tests depend on SB_DEBUG being absent
+  delete process.env.SB_DEBUG;
+  delete process.env.SB_DEBUG_FILE;
+});
 
 afterEach(() => {
   if (originalSbDebug === undefined) delete process.env.SB_DEBUG;

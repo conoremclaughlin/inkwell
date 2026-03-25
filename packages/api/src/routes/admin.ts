@@ -92,10 +92,12 @@ type ChannelRouteRow = {
 const ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS = 3600; // 1 hour
 const ADMIN_REFRESH_TOKEN_LIFETIME_DAYS = 90;
 const ADMIN_CLIENT_ID = 'dashboard';
+const MCP_CLI_TRANSCRIPT_ROUTE = /^\/sessions(?:\/synced|\/[^/]+\/(?:sync-transcript|transcript))$/;
 const DEFAULT_SESSION_LOG_LIMIT = 50;
 const MAX_SESSION_LOG_LIMIT = 200;
 const ACTIVITY_PREVIEW_LIMIT_PER_SESSION = 3;
 const LOCAL_TRANSCRIPT_LINE_LIMIT = 200;
+const SYNCED_TRANSCRIPT_LINE_LIMIT = 5000;
 
 function formatCommentAuthorUserName(user: CommentAuthorUser | null): string | null {
   if (!user) return null;
@@ -107,7 +109,7 @@ function formatCommentAuthorUserName(user: CommentAuthorUser | null): string | n
 
 type SessionPreviewItem = {
   id: string;
-  source: 'activity_stream' | 'session_logs' | 'local_transcript';
+  source: 'activity_stream' | 'session_logs' | 'local_transcript' | 'synced_transcript';
   type: string;
   role: 'in' | 'out' | 'system';
   content: string;
@@ -116,6 +118,23 @@ type SessionPreviewItem = {
 
 type SessionLogItem = SessionPreviewItem & {
   metadata?: Record<string, unknown>;
+};
+
+type WorkspaceIdentityScope = {
+  rows: Array<{
+    id: string;
+    agent_id: string;
+    name: string;
+    role: string | null;
+  }>;
+  identityIds: string[];
+  agentIds: Set<string>;
+};
+
+type WorkspaceScopedSessionRow = {
+  id: string;
+  identity_id: string | null;
+  agent_id: string | null;
 };
 
 function truncateText(input: string, max = 280): string {
@@ -342,88 +361,450 @@ async function findTranscriptFile(
   return walk(rootDir, 0);
 }
 
-async function tryReadLocalTranscript(
-  backendSessionId: string | null,
-  backend: string | null
-): Promise<SessionLogItem[]> {
-  if (!backendSessionId) return [];
+async function collectMatchingFiles(
+  rootDir: string,
+  maxDepth: number,
+  matcher: (entryName: string, fullPath: string) => boolean
+): Promise<string[]> {
+  const results: string[] = [];
+  const stack: Array<{ dir: string; depth: number }> = [{ dir: rootDir, depth: 0 }];
 
-  const transcriptFileName = `${backendSessionId}.jsonl`;
-  const roots = [path.join(os.homedir(), '.claude', 'projects')];
-  if (backend?.toLowerCase().includes('codex')) {
-    roots.push(path.join(os.homedir(), '.codex', 'sessions'));
-    roots.push(path.join(os.homedir(), '.codex', 'projects'));
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current || current.depth > maxDepth) continue;
+
+    let entries: Array<{
+      name: string;
+      isFile: () => boolean;
+      isDirectory: () => boolean;
+    }>;
+    try {
+      entries = (await fs.readdir(current.dir, {
+        withFileTypes: true,
+        encoding: 'utf8',
+      })) as unknown as Array<{
+        name: string;
+        isFile: () => boolean;
+        isDirectory: () => boolean;
+      }>;
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(current.dir, entry.name);
+      if (entry.isFile() && matcher(entry.name, fullPath)) {
+        results.push(fullPath);
+      }
+      if (entry.isDirectory()) {
+        stack.push({ dir: fullPath, depth: current.depth + 1 });
+      }
+    }
   }
 
-  let transcriptPath: string | null = null;
+  return results;
+}
+
+async function pickNewestPath(paths: string[]): Promise<string | null> {
+  let newest: { filePath: string; mtimeMs: number } | null = null;
+
+  for (const filePath of paths) {
+    try {
+      const stats = await fs.stat(filePath);
+      if (!stats.isFile()) continue;
+      if (!newest || stats.mtimeMs > newest.mtimeMs) {
+        newest = { filePath, mtimeMs: stats.mtimeMs };
+      }
+    } catch {
+      // Ignore missing/unreadable files.
+    }
+  }
+
+  return newest?.filePath || null;
+}
+
+function normalizeTranscriptTimestamp(candidate: unknown): string {
+  if (typeof candidate !== 'string' || !candidate.trim()) {
+    return new Date(0).toISOString();
+  }
+  const ms = Date.parse(candidate);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : new Date(0).toISOString();
+}
+
+function inferTranscriptType(payload: Record<string, unknown>): string {
+  const rawType =
+    (typeof payload.type === 'string' && payload.type.trim()) ||
+    (typeof payload.event === 'string' && payload.event.trim()) ||
+    (typeof payload.kind === 'string' && payload.kind.trim()) ||
+    null;
+  return rawType || 'transcript';
+}
+
+function inferTranscriptRole(
+  payload: Record<string, unknown>,
+  rawType: string
+): 'in' | 'out' | 'system' {
+  const roleCandidate = typeof payload.role === 'string' ? payload.role.toLowerCase() : '';
+  if (roleCandidate === 'user' || roleCandidate === 'in') return 'in';
+  if (roleCandidate === 'assistant' || roleCandidate === 'out' || roleCandidate === 'model') {
+    return 'out';
+  }
+
+  const loweredType = rawType.toLowerCase();
+  if (loweredType.includes('user') || loweredType.includes('input')) return 'in';
+  if (
+    loweredType.includes('assistant') ||
+    loweredType.includes('output') ||
+    loweredType.includes('model')
+  ) {
+    return 'out';
+  }
+  return 'system';
+}
+
+function parseJsonlEvents(fileContent: string): unknown[] {
+  const events: unknown[] = [];
+  const lines = fileContent
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  for (const line of lines) {
+    try {
+      events.push(JSON.parse(line) as unknown);
+    } catch {
+      events.push({ type: 'raw_line', text: line });
+    }
+  }
+
+  return events;
+}
+
+function parseJsonEvents(fileContent: string): unknown[] {
+  try {
+    const parsed = JSON.parse(fileContent) as unknown;
+    if (Array.isArray(parsed)) return parsed;
+    if (parsed && typeof parsed === 'object') {
+      const obj = parsed as Record<string, unknown>;
+      if (Array.isArray(obj.messages)) return obj.messages;
+      return [obj];
+    }
+    return [{ value: parsed }];
+  } catch {
+    return [{ type: 'raw_json', text: fileContent }];
+  }
+}
+
+function transcriptEventsToLogItems(options: {
+  events: unknown[];
+  source: 'local_transcript' | 'synced_transcript';
+  idPrefix: string;
+  truncateTo?: number;
+  metadata?: Record<string, unknown>;
+}): SessionLogItem[] {
+  const events = options.truncateTo
+    ? options.events.slice(Math.max(0, options.events.length - options.truncateTo))
+    : options.events;
+  const items: SessionLogItem[] = [];
+
+  for (let i = 0; i < events.length; i++) {
+    const event = events[i];
+    if (!event || typeof event !== 'object' || Array.isArray(event)) continue;
+    const payload = event as Record<string, unknown>;
+    const content = truncateText(pickContentFromUnknown(payload));
+    if (!content) continue;
+
+    const rawType = inferTranscriptType(payload);
+    const timestamp = normalizeTranscriptTimestamp(
+      payload.timestamp ||
+        payload.created_at ||
+        payload.createdAt ||
+        payload.time ||
+        payload.ts ||
+        payload.lastUpdated
+    );
+
+    items.push({
+      id: `${options.idPrefix}:${i}`,
+      source: options.source,
+      type: rawType,
+      role: inferTranscriptRole(payload, rawType),
+      content,
+      timestamp,
+      metadata: options.metadata
+        ? {
+            ...options.metadata,
+          }
+        : undefined,
+    });
+  }
+
+  return items;
+}
+
+type TranscriptFormat = 'jsonl' | 'json';
+
+type LocalTranscriptDescriptor = {
+  path: string;
+  format: TranscriptFormat;
+  backend: string | null;
+  backendSessionId: string | null;
+  resolvedBy: string;
+};
+
+type TranscriptReadResult = {
+  events: unknown[];
+  lineCount: number;
+  byteCount: number;
+  rawContent: string;
+};
+
+function getAncestorDirs(start: string, maxDepth = 6): string[] {
+  const resolved = path.resolve(start);
+  const out: string[] = [];
+  let current = resolved;
+
+  for (let i = 0; i <= maxDepth; i++) {
+    out.push(current);
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+
+  return out;
+}
+
+async function findCodexTranscriptFile(backendSessionId: string): Promise<string | null> {
+  const roots = [
+    path.join(os.homedir(), '.codex', 'sessions'),
+    path.join(os.homedir(), '.codex', 'projects'),
+  ];
+  const matches: string[] = [];
+  const suffix = `${backendSessionId}.jsonl`;
+
   for (const root of roots) {
-    transcriptPath = await findTranscriptFile(root, transcriptFileName, 5);
-    if (transcriptPath) break;
+    const rootMatches = await collectMatchingFiles(root, 6, (name) => {
+      if (!name.endsWith('.jsonl')) return false;
+      return name === suffix || name.endsWith(`-${suffix}`) || name.includes(backendSessionId);
+    });
+    matches.push(...rootMatches);
   }
-  if (!transcriptPath) return [];
 
+  return pickNewestPath(matches);
+}
+
+async function findGeminiTranscriptFile(backendSessionId: string): Promise<string | null> {
+  const geminiTmp = path.join(os.homedir(), '.gemini', 'tmp');
+  const candidates = await collectMatchingFiles(geminiTmp, 7, (name) => {
+    return name.startsWith('session-') && name.endsWith('.json');
+  });
+  const ordered = (
+    await Promise.all(
+      candidates.map(async (filePath) => {
+        try {
+          const stats = await fs.stat(filePath);
+          return { filePath, mtimeMs: stats.mtimeMs };
+        } catch {
+          return null;
+        }
+      })
+    )
+  )
+    .filter((entry): entry is { filePath: string; mtimeMs: number } => Boolean(entry))
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  for (const candidate of ordered) {
+    try {
+      const content = await fs.readFile(candidate.filePath, 'utf8');
+      const parsed = JSON.parse(content) as { sessionId?: string };
+      if (parsed.sessionId === backendSessionId) return candidate.filePath;
+    } catch {
+      // Ignore unreadable/malformed files.
+    }
+  }
+
+  return null;
+}
+
+async function findPcpTranscriptFile(sessionId: string): Promise<string | null> {
+  const roots = new Set<string>();
+  for (const dir of getAncestorDirs(process.cwd(), 8)) {
+    roots.add(path.join(dir, '.pcp', 'runtime', 'repl'));
+  }
+  roots.add(path.join(os.homedir(), '.pcp', 'runtime', 'repl'));
+
+  const matches: string[] = [];
+  for (const root of roots) {
+    const rootMatches = await collectMatchingFiles(root, 0, (name) => {
+      return name.startsWith(`${sessionId}-`) && name.endsWith('.jsonl');
+    });
+    matches.push(...rootMatches);
+  }
+
+  return pickNewestPath(matches);
+}
+
+async function resolveLocalTranscriptDescriptor(options: {
+  sessionId: string;
+  backend: string | null;
+  backendSessionId: string | null;
+}): Promise<LocalTranscriptDescriptor | null> {
+  const normalizedBackend = options.backend?.toLowerCase() || '';
+  const backendSessionId = options.backendSessionId;
+
+  if (normalizedBackend.includes('pcp')) {
+    const pcpPath = await findPcpTranscriptFile(options.sessionId);
+    if (pcpPath) {
+      return {
+        path: pcpPath,
+        format: 'jsonl',
+        backend: options.backend,
+        backendSessionId,
+        resolvedBy: 'pcp-runtime',
+      };
+    }
+  }
+
+  if (normalizedBackend.includes('gemini') && backendSessionId) {
+    const geminiPath = await findGeminiTranscriptFile(backendSessionId);
+    if (geminiPath) {
+      return {
+        path: geminiPath,
+        format: 'json',
+        backend: options.backend,
+        backendSessionId,
+        resolvedBy: 'gemini-session-id',
+      };
+    }
+  }
+
+  if (normalizedBackend.includes('codex') && backendSessionId) {
+    const codexPath = await findCodexTranscriptFile(backendSessionId);
+    if (codexPath) {
+      return {
+        path: codexPath,
+        format: 'jsonl',
+        backend: options.backend,
+        backendSessionId,
+        resolvedBy: 'codex-session-id',
+      };
+    }
+  }
+
+  if (backendSessionId) {
+    const transcriptFileName = `${backendSessionId}.jsonl`;
+    const roots = [path.join(os.homedir(), '.claude', 'projects')];
+    if (normalizedBackend.includes('codex')) {
+      roots.push(path.join(os.homedir(), '.codex', 'sessions'));
+      roots.push(path.join(os.homedir(), '.codex', 'projects'));
+    }
+
+    for (const root of roots) {
+      const transcriptPath = await findTranscriptFile(root, transcriptFileName, 5);
+      if (transcriptPath) {
+        return {
+          path: transcriptPath,
+          format: 'jsonl',
+          backend: options.backend,
+          backendSessionId,
+          resolvedBy: 'exact-jsonl-name',
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+async function readTranscriptFromDescriptor(
+  descriptor: LocalTranscriptDescriptor
+): Promise<TranscriptReadResult | null> {
   let fileContent = '';
   try {
-    fileContent = await fs.readFile(transcriptPath, 'utf8');
+    fileContent = await fs.readFile(descriptor.path, 'utf8');
   } catch {
-    return [];
+    return null;
+  }
+
+  const byteCount = Buffer.byteLength(fileContent, 'utf8');
+  if (descriptor.format === 'json') {
+    const events = parseJsonEvents(fileContent);
+    return {
+      events,
+      lineCount: events.length,
+      byteCount,
+      rawContent: fileContent,
+    };
   }
 
   const lines = fileContent
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean);
+  const events = parseJsonlEvents(fileContent);
+  return {
+    events,
+    lineCount: lines.length,
+    byteCount,
+    rawContent: fileContent,
+  };
+}
 
-  const recent = lines.slice(-LOCAL_TRANSCRIPT_LINE_LIMIT);
-  const items: SessionLogItem[] = [];
+async function tryReadLocalTranscript(options: {
+  sessionId: string;
+  backendSessionId: string | null;
+  backend: string | null;
+}): Promise<SessionLogItem[]> {
+  const descriptor = await resolveLocalTranscriptDescriptor(options);
+  if (!descriptor) return [];
 
-  for (let i = 0; i < recent.length; i++) {
-    const line = recent[i];
-    try {
-      const parsed = JSON.parse(line) as Record<string, unknown>;
-      const timestampCandidate =
-        parsed.timestamp ||
-        parsed.created_at ||
-        parsed.createdAt ||
-        parsed.time ||
-        parsed.ts ||
-        null;
-      const timestamp =
-        typeof timestampCandidate === 'string' && timestampCandidate
-          ? timestampCandidate
-          : new Date(0).toISOString();
+  const parsed = await readTranscriptFromDescriptor(descriptor);
+  if (!parsed) return [];
 
-      const rawType =
-        (typeof parsed.type === 'string' && parsed.type) ||
-        (typeof parsed.event === 'string' && parsed.event) ||
-        'local';
-      const role: 'in' | 'out' | 'system' =
-        rawType.includes('user') || rawType.includes('input')
-          ? 'in'
-          : rawType.includes('assistant') || rawType.includes('output')
-            ? 'out'
-            : 'system';
+  return transcriptEventsToLogItems({
+    events: parsed.events,
+    source: 'local_transcript',
+    idPrefix: `local:${options.sessionId}`,
+    truncateTo: LOCAL_TRANSCRIPT_LINE_LIMIT,
+    metadata: {
+      path: descriptor.path,
+      format: descriptor.format,
+      resolvedBy: descriptor.resolvedBy,
+      backend: descriptor.backend || null,
+      backendSessionId: descriptor.backendSessionId,
+    },
+  }).sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+}
 
-      const content = truncateText(pickContentFromUnknown(parsed));
-      if (!content) continue;
+function parseSyncedTranscriptEvents(payload: unknown): unknown[] {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return [];
+  const obj = payload as Record<string, unknown>;
+  if (Array.isArray(obj.events)) return obj.events;
+  return [];
+}
 
-      items.push({
-        id: `local:${i}`,
-        source: 'local_transcript',
-        type: rawType,
-        role,
-        content,
-        timestamp,
-        metadata: {
-          path: transcriptPath,
-        },
-      });
-    } catch {
-      // Ignore non-JSON lines.
-    }
-  }
-
-  return items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+function toSyncedTranscriptLogItems(row: {
+  id: string;
+  payload: unknown;
+  backend: string | null;
+  backend_session_id: string | null;
+  source_path: string | null;
+  synced_at: string;
+}): SessionLogItem[] {
+  const events = parseSyncedTranscriptEvents(row.payload);
+  return transcriptEventsToLogItems({
+    events,
+    source: 'synced_transcript',
+    idPrefix: `synced:${row.id}`,
+    truncateTo: SYNCED_TRANSCRIPT_LINE_LIMIT,
+    metadata: {
+      archiveId: row.id,
+      backend: row.backend,
+      backendSessionId: row.backend_session_id,
+      sourcePath: row.source_path,
+      syncedAt: row.synced_at,
+    },
+  }).sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
 }
 
 async function fetchCloudSessionLogs(
@@ -458,6 +839,79 @@ async function fetchCloudSessionLogs(
   return [...activityItems, ...sessionItems].sort(
     (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
   );
+}
+
+async function fetchSyncedTranscriptLogs(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  sessionId: string
+): Promise<SessionLogItem[]> {
+  const { data: archivedRows } = await supabase
+    .from('session_transcript_archives')
+    .select('id, payload, backend, backend_session_id, source_path, synced_at')
+    .eq('user_id', userId)
+    .eq('session_id', sessionId)
+    .order('synced_at', { ascending: false })
+    .limit(1);
+
+  const row = archivedRows?.[0];
+  if (!row) return [];
+  return toSyncedTranscriptLogItems(row);
+}
+
+async function resolveWorkspaceIdentityScope(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  workspaceId: string
+): Promise<{ scope: WorkspaceIdentityScope | null; error: unknown }> {
+  const { data: scopedIdentities, error } = await supabase
+    .from('agent_identities')
+    .select('id, agent_id, name, role')
+    .eq('user_id', userId)
+    .eq('workspace_id', workspaceId);
+
+  if (error) {
+    return { scope: null, error };
+  }
+
+  const rows = (scopedIdentities || []).filter(
+    (
+      row
+    ): row is {
+      id: string;
+      agent_id: string;
+      name: string;
+      role: string | null;
+    } => Boolean(row.id) && Boolean(row.agent_id) && Boolean(row.name)
+  );
+
+  return {
+    scope: {
+      rows,
+      identityIds: rows.map((row) => row.id),
+      agentIds: new Set(rows.map((row) => row.agent_id)),
+    },
+    error: null,
+  };
+}
+
+function isSessionInWorkspace(
+  session: WorkspaceScopedSessionRow | null | undefined,
+  scope: WorkspaceIdentityScope
+): boolean {
+  if (!session) return false;
+  if (session.identity_id && scope.identityIds.includes(session.identity_id)) return true;
+  if (!session.identity_id && session.agent_id && scope.agentIds.has(session.agent_id)) return true;
+  return false;
+}
+
+function inferTranscriptFormatFromPath(
+  sourcePath: string | null | undefined
+): TranscriptFormat | null {
+  if (!sourcePath) return null;
+  if (sourcePath.endsWith('.jsonl')) return 'jsonl';
+  if (sourcePath.endsWith('.json')) return 'json';
+  return null;
 }
 
 /**
@@ -506,6 +960,20 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
     if (payload) {
       pcpUserId = payload.sub;
       userEmail = payload.email;
+    }
+
+    // Convenience path: allow standard MCP access tokens for transcript sync,
+    // so CLI users can run sync without dashboard cookie auth.
+    if (
+      !pcpUserId &&
+      (req.method === 'POST' || req.method === 'GET') &&
+      MCP_CLI_TRANSCRIPT_ROUTE.test(req.path)
+    ) {
+      const mcpPayload = verifyPcpAccessToken(token, 'mcp_access');
+      if (mcpPayload) {
+        pcpUserId = mcpPayload.sub;
+        userEmail = mcpPayload.email;
+      }
     }
 
     // --- Tier 2: Refresh token exchange (1 DB call, ~once/hour) ---
@@ -4530,8 +4998,361 @@ router.get('/studios', async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /api/admin/sessions/synced
+ * List synced transcript archives available in the active workspace scope.
+ */
+router.get('/sessions/synced', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const limit = Math.min(
+      200,
+      Math.max(1, Number.parseInt(String(req.query.limit || 50), 10) || 50)
+    );
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { scope, error: scopedIdentityError } = await resolveWorkspaceIdentityScope(
+      supabase,
+      authReq.pcpUserId,
+      authReq.pcpWorkspaceId
+    );
+
+    if (scopedIdentityError) {
+      logger.error(
+        'Failed to resolve workspace identities for synced transcripts:',
+        scopedIdentityError
+      );
+      res.status(500).json(errorJson('Failed to list synced transcripts', scopedIdentityError));
+      return;
+    }
+
+    if (!scope || scope.identityIds.length === 0) {
+      res.json({ archives: [], count: 0 });
+      return;
+    }
+
+    const { data: archiveRows, error: archiveError } = await supabase
+      .from('session_transcript_archives')
+      .select(
+        'id, session_id, backend, backend_session_id, line_count, byte_count, source_path, synced_at'
+      )
+      .eq('user_id', authReq.pcpUserId)
+      .order('synced_at', { ascending: false })
+      .limit(limit);
+
+    if (archiveError) {
+      logger.error('Failed to list synced transcript archives:', archiveError);
+      res.status(500).json(errorJson('Failed to list synced transcripts', archiveError));
+      return;
+    }
+
+    const archiveSessionIds = Array.from(
+      new Set(
+        (archiveRows || [])
+          .map((row) => row.session_id)
+          .filter((sessionId): sessionId is string => Boolean(sessionId))
+      )
+    );
+
+    const sessionsById = new Map<
+      string,
+      {
+        id: string;
+        identity_id: string | null;
+        agent_id: string | null;
+        backend: string | null;
+        backend_session_id: string | null;
+        claude_session_id: string | null;
+        thread_key: string | null;
+        started_at: string;
+        updated_at: string;
+        working_dir: string | null;
+        studio_id: string | null;
+        workspace_id: string | null;
+      }
+    >();
+
+    if (archiveSessionIds.length > 0) {
+      const { data: sessionRows, error: sessionError } = await supabase
+        .from('sessions')
+        .select(
+          'id, identity_id, agent_id, backend, backend_session_id, claude_session_id, thread_key, started_at, updated_at, working_dir, studio_id, workspace_id'
+        )
+        .eq('user_id', authReq.pcpUserId)
+        .in('id', archiveSessionIds);
+
+      if (sessionError) {
+        logger.error('Failed to fetch sessions for synced transcript list:', sessionError);
+        res.status(500).json(errorJson('Failed to list synced transcripts', sessionError));
+        return;
+      }
+
+      for (const row of sessionRows || []) {
+        sessionsById.set(row.id, row);
+      }
+    }
+
+    const identityByAgentId = new Map(
+      scope.rows.map((row) => [row.agent_id, { name: row.name, role: row.role }])
+    );
+
+    const archives = (archiveRows || [])
+      .map((row) => {
+        const session = sessionsById.get(row.session_id);
+        if (!session || !isSessionInWorkspace(session, scope)) return null;
+
+        const format = inferTranscriptFormatFromPath(row.source_path);
+        const identity = session.agent_id ? identityByAgentId.get(session.agent_id) : null;
+        return {
+          archiveId: row.id,
+          sessionId: row.session_id,
+          backend: row.backend,
+          backendSessionId: row.backend_session_id,
+          format,
+          lineCount: row.line_count,
+          byteCount: row.byte_count,
+          sourcePath: row.source_path,
+          syncedAt: row.synced_at,
+          session: {
+            id: session.id,
+            agentId: session.agent_id,
+            agentName: identity?.name || session.agent_id || 'Unknown',
+            agentRole: identity?.role || null,
+            backend: session.backend,
+            backendSessionId: session.backend_session_id || session.claude_session_id,
+            threadKey: session.thread_key,
+            startedAt: session.started_at,
+            updatedAt: session.updated_at,
+            workingDir: session.working_dir,
+            studioId: session.studio_id || session.workspace_id,
+          },
+        };
+      })
+      .filter((row): row is NonNullable<typeof row> => Boolean(row));
+
+    res.json({ archives, count: archives.length });
+  } catch (error) {
+    logger.error('Failed to list synced transcripts:', error);
+    res.status(500).json(errorJson('Failed to list synced transcripts', error));
+  }
+});
+
+/**
+ * GET /api/admin/sessions/:id/transcript
+ * Export the raw synced transcript archive for a single session.
+ */
+router.get('/sessions/:id/transcript', async (req: Request, res: Response) => {
+  try {
+    const sessionId = req.params.id;
+    const authReq = req as AdminAuthRequest;
+    const requestedFormat = String(req.query.format || 'json').toLowerCase();
+    const format: TranscriptFormat = requestedFormat === 'jsonl' ? 'jsonl' : 'json';
+    const download = req.query.download === '1' || req.query.download === 'true';
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { scope, error: scopedIdentityError } = await resolveWorkspaceIdentityScope(
+      supabase,
+      authReq.pcpUserId,
+      authReq.pcpWorkspaceId
+    );
+
+    if (scopedIdentityError) {
+      logger.error(
+        'Failed to resolve workspace identities for transcript export:',
+        scopedIdentityError
+      );
+      res.status(500).json(errorJson('Failed to export transcript', scopedIdentityError));
+      return;
+    }
+
+    if (!scope || scope.identityIds.length === 0) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const { data: session, error: sessionError } = await supabase
+      .from('sessions')
+      .select('id, identity_id, agent_id')
+      .eq('id', sessionId)
+      .eq('user_id', authReq.pcpUserId)
+      .single();
+
+    if (sessionError || !isSessionInWorkspace(session, scope)) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const { data: archive, error: archiveError } = await supabase
+      .from('session_transcript_archives')
+      .select('payload')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('session_id', sessionId)
+      .single();
+
+    if (archiveError || !archive?.payload || typeof archive.payload !== 'object') {
+      res.status(404).json({ error: 'Synced transcript not found' });
+      return;
+    }
+
+    const payload = archive.payload as Record<string, unknown>;
+    if (download) {
+      const extension = format === 'jsonl' ? 'jsonl' : 'json';
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename=\"session-${sessionId}-transcript.${extension}\"`
+      );
+    }
+
+    if (format === 'jsonl') {
+      const events = Array.isArray(payload.events) ? payload.events : [];
+      const body = events.map((event) => JSON.stringify(event)).join('\n');
+      res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+      res.send(body.length > 0 ? `${body}\n` : '');
+      return;
+    }
+
+    res.json(payload);
+  } catch (error) {
+    logger.error('Failed to export transcript:', error);
+    res.status(500).json(errorJson('Failed to export transcript', error));
+  }
+});
+
+/**
+ * POST /api/admin/sessions/:id/sync-transcript
+ * Sync full local backend transcript into Postgres jsonb for cross-server portability.
+ */
+router.post('/sessions/:id/sync-transcript', async (req: Request, res: Response) => {
+  try {
+    const sessionId = req.params.id;
+    const authReq = req as AdminAuthRequest;
+    const backendOverride = normalizeNullableText((req.body as Record<string, unknown>)?.backend);
+    const backendSessionOverride = normalizeNullableText(
+      (req.body as Record<string, unknown>)?.backendSessionId
+    );
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { scope, error: scopedIdentityError } = await resolveWorkspaceIdentityScope(
+      supabase,
+      authReq.pcpUserId,
+      authReq.pcpWorkspaceId
+    );
+
+    if (scopedIdentityError || !scope) {
+      logger.error(
+        'Failed to resolve workspace identities for session transcript sync:',
+        scopedIdentityError
+      );
+      res.status(500).json(errorJson('Failed to sync transcript', scopedIdentityError));
+      return;
+    }
+
+    if (scope.identityIds.length === 0) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const { data: session, error: sessionError } = await supabase
+      .from('sessions')
+      .select('id, identity_id, agent_id, backend, backend_session_id, claude_session_id')
+      .eq('id', sessionId)
+      .eq('user_id', authReq.pcpUserId)
+      .single();
+
+    if (sessionError || !isSessionInWorkspace(session, scope)) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const backendSessionId =
+      backendSessionOverride || session.backend_session_id || session.claude_session_id || null;
+    const backend = backendOverride || session.backend || null;
+
+    const descriptor = await resolveLocalTranscriptDescriptor({
+      sessionId: session.id,
+      backend,
+      backendSessionId,
+    });
+
+    if (!descriptor) {
+      res.status(404).json({
+        error: 'Transcript source not found',
+        details: {
+          backend,
+          backendSessionId,
+        },
+      });
+      return;
+    }
+
+    const parsed = await readTranscriptFromDescriptor(descriptor);
+    if (!parsed) {
+      res.status(500).json({ error: 'Failed to read transcript source' });
+      return;
+    }
+
+    const syncedAt = new Date().toISOString();
+    const payload = {
+      version: 1,
+      backend,
+      backendSessionId,
+      format: descriptor.format,
+      sourcePath: descriptor.path,
+      syncedAt,
+      rawContent: parsed.rawContent,
+      events: parsed.events,
+    };
+
+    const { error: archiveError } = await supabase.from('session_transcript_archives').upsert(
+      {
+        user_id: authReq.pcpUserId,
+        session_id: session.id,
+        backend,
+        backend_session_id: backendSessionId,
+        payload,
+        line_count: parsed.lineCount,
+        byte_count: parsed.byteCount,
+        source_path: descriptor.path,
+        synced_at: syncedAt,
+      },
+      { onConflict: 'session_id' }
+    );
+
+    if (archiveError) {
+      logger.error('Failed to upsert session transcript archive:', archiveError);
+      res.status(500).json(errorJson('Failed to sync transcript', archiveError));
+      return;
+    }
+
+    res.json({
+      ok: true,
+      sessionId: session.id,
+      backend,
+      backendSessionId,
+      format: descriptor.format,
+      sourcePath: descriptor.path,
+      resolvedBy: descriptor.resolvedBy,
+      lineCount: parsed.lineCount,
+      byteCount: parsed.byteCount,
+      syncedAt,
+    });
+  } catch (error) {
+    logger.error('Failed to sync session transcript:', error);
+    res.status(500).json(errorJson('Failed to sync transcript', error));
+  }
+});
+
+/**
  * GET /api/admin/sessions/:id/logs
- * Get merged session logs (activity stream + session_logs + optional local transcript fallback)
+ * Get merged session logs (activity stream + session_logs + synced transcript + optional local fallback)
  */
 router.get('/sessions/:id/logs', async (req: Request, res: Response) => {
   try {
@@ -4600,17 +5421,20 @@ router.get('/sessions/:id/logs', async (req: Request, res: Response) => {
       return;
     }
 
-    const [cloudLogs, localLogs] = await Promise.all([
+    const [cloudLogs, syncedLogs, localLogs] = await Promise.all([
       fetchCloudSessionLogs(supabase, authReq.pcpUserId, sessionId),
+      fetchSyncedTranscriptLogs(supabase, authReq.pcpUserId, sessionId),
       includeLocal
-        ? tryReadLocalTranscript(
-            session.backend_session_id || session.claude_session_id,
-            session.backend
-          )
+        ? tryReadLocalTranscript({
+            sessionId: session.id,
+            backendSessionId: session.backend_session_id || session.claude_session_id,
+            backend: session.backend,
+          })
         : Promise.resolve([]),
     ]);
 
-    const merged = [...cloudLogs, ...localLogs].sort(
+    const effectiveLocalLogs = syncedLogs.length > 0 ? [] : localLogs;
+    const merged = [...cloudLogs, ...syncedLogs, ...effectiveLocalLogs].sort(
       (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
     );
     const page = merged.slice(offset, offset + limit);
@@ -4636,7 +5460,8 @@ router.get('/sessions/:id/logs', async (req: Request, res: Response) => {
       },
       sources: {
         cloud: cloudLogs.length,
-        local: localLogs.length,
+        synced: syncedLogs.length,
+        local: effectiveLocalLogs.length,
       },
     });
   } catch (error) {
@@ -5111,6 +5936,471 @@ router.post('/skills/manage/:skillId/fork', async (req: Request, res: Response) 
     logger.error('Failed to fork skill:', error);
     const message = error instanceof Error ? error.message : 'Failed to fork skill';
     res.status(500).json(errorJson(message, error));
+  }
+});
+
+// =============================================================================
+// Tasks
+// =============================================================================
+
+/**
+ * GET /api/admin/tasks
+ * List tasks for the active user with optional filters
+ */
+router.get('/tasks', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    let query = supabase
+      .from('tasks')
+      .select('*, projects(name), task_groups(title)')
+      .eq('user_id', authReq.pcpUserId);
+
+    // Optional filters
+    const { status, projectId, groupId, activeOnly } = req.query;
+    if (status) {
+      query = query.eq('status', status as string);
+    }
+    if (projectId) {
+      query = query.eq('project_id', projectId as string);
+    }
+    if (groupId) {
+      query = query.eq('task_group_id', groupId as string);
+    }
+    if (activeOnly === 'true') {
+      query = query.in('status', ['pending', 'in_progress', 'blocked']);
+    }
+
+    const { data, error } = await query.limit(200);
+
+    if (error) {
+      res.status(500).json(errorJson('Failed to list tasks', error));
+      return;
+    }
+
+    const tasks = data || [];
+
+    // Sort: status priority (in_progress, pending, blocked, completed),
+    // then by priority (critical, high, medium, low), then by created_at desc
+    const statusOrder: Record<string, number> = {
+      in_progress: 0,
+      pending: 1,
+      blocked: 2,
+      completed: 3,
+    };
+    const priorityOrder: Record<string, number> = {
+      critical: 0,
+      high: 1,
+      medium: 2,
+      low: 3,
+    };
+
+    tasks.sort((a, b) => {
+      const statusDiff = (statusOrder[a.status] ?? 99) - (statusOrder[b.status] ?? 99);
+      if (statusDiff !== 0) return statusDiff;
+      const priorityDiff = (priorityOrder[a.priority] ?? 99) - (priorityOrder[b.priority] ?? 99);
+      if (priorityDiff !== 0) return priorityDiff;
+      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+    });
+
+    // Compute stats
+    const stats = {
+      total: tasks.length,
+      pending: tasks.filter((t) => t.status === 'pending').length,
+      inProgress: tasks.filter((t) => t.status === 'in_progress').length,
+      completed: tasks.filter((t) => t.status === 'completed').length,
+      blocked: tasks.filter((t) => t.status === 'blocked').length,
+    };
+
+    res.json({
+      tasks: tasks.map((t) => ({
+        id: t.id,
+        title: t.title,
+        description: t.description,
+        status: t.status,
+        priority: t.priority,
+        tags: t.tags,
+        projectId: t.project_id,
+        projectName: (t.projects as { name: string } | null)?.name ?? null,
+        taskGroupId: t.task_group_id,
+        taskGroupTitle: (t.task_groups as { title: string } | null)?.title ?? null,
+        blockedBy: t.blocked_by,
+        createdBy: t.created_by,
+        completedAt: t.completed_at,
+        dueDate: t.due_date,
+        metadata: t.metadata,
+        createdAt: t.created_at,
+        updatedAt: t.updated_at,
+      })),
+      stats,
+    });
+  } catch (error) {
+    logger.error('Failed to list tasks:', error);
+    res.status(500).json(errorJson('Failed to list tasks', error));
+  }
+});
+
+/**
+ * PUT /api/admin/tasks/:id
+ * Update a task's status, priority, title, description, or tags
+ */
+router.put('/tasks/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    const body = (req.body || {}) as Record<string, unknown>;
+    const updates: Record<string, unknown> = {};
+
+    if ('status' in body && body.status !== undefined) {
+      updates.status = body.status;
+      // Clear completed_at when reopening a task
+      if (body.status !== 'completed') {
+        updates.completed_at = null;
+      }
+    }
+    if ('priority' in body && body.priority !== undefined) {
+      updates.priority = body.priority;
+    }
+    if ('title' in body && body.title !== undefined) {
+      updates.title = body.title;
+    }
+    if ('description' in body && body.description !== undefined) {
+      updates.description = body.description;
+    }
+    if ('tags' in body && body.tags !== undefined) {
+      updates.tags = body.tags;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      res
+        .status(400)
+        .json(
+          errorJson(
+            'No valid fields to update',
+            'Request body is empty or contains no recognized fields'
+          )
+        );
+      return;
+    }
+
+    // If status is being set to completed, set completed_at
+    if (updates.status === 'completed') {
+      updates.completed_at = new Date().toISOString();
+    }
+
+    const { data, error } = await supabase
+      .from('tasks')
+      .update(updates)
+      .eq('id', id)
+      .eq('user_id', authReq.pcpUserId)
+      .select('*, projects(name), task_groups(title)')
+      .single();
+
+    if (error) {
+      res.status(500).json(errorJson('Failed to update task', error));
+      return;
+    }
+
+    if (!data) {
+      res.status(404).json(errorJson('Task not found', `No task with id ${id} for this user`));
+      return;
+    }
+
+    res.json({
+      task: {
+        id: data.id,
+        title: data.title,
+        description: data.description,
+        status: data.status,
+        priority: data.priority,
+        tags: data.tags,
+        projectId: data.project_id,
+        projectName: (data.projects as { name: string } | null)?.name ?? null,
+        taskGroupId: data.task_group_id,
+        taskGroupTitle: (data.task_groups as { title: string } | null)?.title ?? null,
+        blockedBy: data.blocked_by,
+        createdBy: data.created_by,
+        completedAt: data.completed_at,
+        dueDate: data.due_date,
+        metadata: data.metadata,
+        createdAt: data.created_at,
+        updatedAt: data.updated_at,
+      },
+    });
+  } catch (error) {
+    logger.error('Failed to update task:', error);
+    res.status(500).json(errorJson('Failed to update task', error));
+  }
+});
+
+// =============================================================================
+// Task Groups
+// =============================================================================
+
+/**
+ * GET /api/admin/task-groups
+ * List task groups for the active user
+ */
+router.get('/task-groups', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    // Fetch task groups with joined agent identity and project
+    const { data, error } = await supabase
+      .from('task_groups')
+      .select('*, agent_identities(agent_id, name), projects(name)')
+      .eq('user_id', authReq.pcpUserId)
+      .order('created_at', { ascending: false })
+      .limit(200);
+
+    if (error) {
+      res.status(500).json(errorJson('Failed to list task groups', error));
+      return;
+    }
+
+    const groups = data || [];
+
+    // Fetch task counts per group in a separate query
+    const groupIds = groups.map((g) => g.id);
+    let taskCountMap: Record<string, number> = {};
+
+    if (groupIds.length > 0) {
+      const { data: taskCountData, error: taskCountError } = await supabase
+        .from('tasks')
+        .select('task_group_id')
+        .eq('user_id', authReq.pcpUserId)
+        .in('task_group_id', groupIds);
+
+      if (!taskCountError && taskCountData) {
+        for (const row of taskCountData) {
+          if (row.task_group_id) {
+            taskCountMap[row.task_group_id] = (taskCountMap[row.task_group_id] || 0) + 1;
+          }
+        }
+      }
+    }
+
+    res.json({
+      groups: groups.map((g) => ({
+        id: g.id,
+        title: g.title,
+        description: g.description,
+        status: g.status,
+        priority: g.priority,
+        tags: g.tags,
+        autonomous: g.autonomous,
+        maxSessions: g.max_sessions,
+        sessionsUsed: g.sessions_used,
+        contextSummary: g.context_summary,
+        nextRunAfter: g.next_run_after,
+        outputTarget: g.output_target,
+        outputStatus: g.output_status,
+        threadKey: g.thread_key,
+        projectId: g.project_id,
+        projectName: (g.projects as { name: string } | null)?.name ?? null,
+        identityId: g.identity_id,
+        agentId:
+          (g.agent_identities as { agent_id: string; name: string } | null)?.agent_id ?? null,
+        agentName: (g.agent_identities as { agent_id: string; name: string } | null)?.name ?? null,
+        taskCount: taskCountMap[g.id] || 0,
+        metadata: g.metadata,
+        createdAt: g.created_at,
+        updatedAt: g.updated_at,
+      })),
+    });
+  } catch (error) {
+    logger.error('Failed to list task groups:', error);
+    res.status(500).json(errorJson('Failed to list task groups', error));
+  }
+});
+
+/**
+ * GET /api/admin/tasks/:id/comments
+ * List comments for a task
+ */
+router.get('/tasks/:id/comments', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    // Verify task belongs to user
+    const { data: task } = await supabase
+      .from('tasks')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', authReq.pcpUserId)
+      .single();
+
+    if (!task) {
+      res.status(404).json({ error: 'Task not found' });
+      return;
+    }
+
+    const { data: comments, error } = await supabase
+      .from('task_comments')
+      .select('*')
+      .eq('task_id', id)
+      .eq('user_id', authReq.pcpUserId)
+      .is('deleted_at', null)
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      logger.error('Failed to list task comments:', error);
+      res.status(500).json(errorJson('Failed to list task comments', error));
+      return;
+    }
+
+    // Resolve agent identity names for comment authors
+    const identityIds = Array.from(
+      new Set((comments || []).map((c) => c.created_by_identity_id).filter(Boolean) as string[])
+    );
+    const identitiesById = new Map<string, { agent_id: string; name: string }>();
+
+    if (identityIds.length > 0) {
+      const { data: identities } = await supabase
+        .from('agent_identities')
+        .select('id, agent_id, name')
+        .in('id', identityIds);
+
+      for (const ident of identities || []) {
+        identitiesById.set(ident.id, { agent_id: ident.agent_id, name: ident.name });
+      }
+    }
+
+    res.json({
+      comments: (comments || []).map((c) => {
+        const identity = c.created_by_identity_id
+          ? identitiesById.get(c.created_by_identity_id)
+          : null;
+        return {
+          id: c.id,
+          taskId: c.task_id,
+          parentCommentId: c.parent_comment_id,
+          content: c.content,
+          authorAgentId: c.created_by_agent_id || identity?.agent_id || null,
+          authorName: identity?.name || c.created_by_agent_id || 'Unknown',
+          metadata: c.metadata,
+          createdAt: c.created_at,
+          updatedAt: c.updated_at,
+        };
+      }),
+    });
+  } catch (error) {
+    logger.error('Failed to list task comments:', error);
+    res.status(500).json(errorJson('Failed to list task comments', error));
+  }
+});
+
+/**
+ * POST /api/admin/tasks/:id/comments
+ * Add a comment to a task
+ */
+router.post('/tasks/:id/comments', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { content, parentCommentId } = req.body;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    if (!content || typeof content !== 'string' || content.trim().length === 0) {
+      res.status(400).json({ error: 'Content is required' });
+      return;
+    }
+
+    // Verify task belongs to user
+    const { data: task } = await supabase
+      .from('tasks')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', authReq.pcpUserId)
+      .single();
+
+    if (!task) {
+      res.status(404).json({ error: 'Task not found' });
+      return;
+    }
+
+    const { data: comment, error } = await supabase
+      .from('task_comments')
+      .insert({
+        task_id: id,
+        user_id: authReq.pcpUserId,
+        workspace_id: authReq.pcpWorkspaceId || null,
+        parent_comment_id: parentCommentId || null,
+        content: content.trim(),
+      } as never)
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Failed to create task comment:', error);
+      res.status(500).json(errorJson('Failed to create task comment', error));
+      return;
+    }
+
+    res.status(201).json({
+      comment: {
+        id: comment.id,
+        taskId: comment.task_id,
+        parentCommentId: comment.parent_comment_id,
+        content: comment.content,
+        authorAgentId: null,
+        authorName: 'You',
+        metadata: comment.metadata,
+        createdAt: comment.created_at,
+        updatedAt: comment.updated_at,
+      },
+    });
+  } catch (error) {
+    logger.error('Failed to create task comment:', error);
+    res.status(500).json(errorJson('Failed to create task comment', error));
+  }
+});
+
+/**
+ * DELETE /api/admin/tasks/:taskId/comments/:commentId
+ * Soft-delete a comment
+ */
+router.delete('/tasks/:taskId/comments/:commentId', async (req: Request, res: Response) => {
+  try {
+    const { taskId, commentId } = req.params;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    const { error } = await supabase
+      .from('task_comments')
+      .update({ deleted_at: new Date().toISOString() } as never)
+      .eq('id', commentId)
+      .eq('task_id', taskId)
+      .eq('user_id', authReq.pcpUserId);
+
+    if (error) {
+      logger.error('Failed to delete task comment:', error);
+      res.status(500).json(errorJson('Failed to delete task comment', error));
+      return;
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    logger.error('Failed to delete task comment:', error);
+    res.status(500).json(errorJson('Failed to delete task comment', error));
   }
 });
 

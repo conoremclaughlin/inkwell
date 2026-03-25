@@ -42,11 +42,12 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         return;
       }
 
-      const { sessionId, lifecycle, agentId, workingDir } = req.body as {
+      const { sessionId, lifecycle, agentId, workingDir, cliAttached } = req.body as {
         sessionId?: string;
         lifecycle?: string;
         agentId?: string;
         workingDir?: string;
+        cliAttached?: boolean;
       };
 
       if (!sessionId) {
@@ -54,7 +55,11 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         return;
       }
 
-      if (!lifecycle || !VALID_LIFECYCLES.includes(lifecycle as Lifecycle)) {
+      // lifecycle is required unless cliAttached is the only update
+      if (
+        (!lifecycle || !VALID_LIFECYCLES.includes(lifecycle as Lifecycle)) &&
+        cliAttached === undefined
+      ) {
         res.status(400).json({
           success: false,
           error: `lifecycle must be one of: ${VALID_LIFECYCLES.join(', ')}`,
@@ -73,8 +78,10 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         return;
       }
 
-      const updates: { lifecycle: string; workingDir?: string } = { lifecycle };
+      const updates: { lifecycle?: string; workingDir?: string; cliAttached?: boolean } = {};
+      if (lifecycle) updates.lifecycle = lifecycle;
       if (workingDir) updates.workingDir = workingDir;
+      if (cliAttached !== undefined) updates.cliAttached = cliAttached;
 
       const updated = await dataComposer.repositories.memory.updateSession(sessionId, updates);
 

@@ -1,0 +1,16 @@
+{
+  "name": "@personal-context/channel-plugin",
+  "version": "0.1.0",
+  "description": "PCP channel plugin for Claude Code — pushes inbox messages into running sessions",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "start": "tsx index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0"
+  }
+}

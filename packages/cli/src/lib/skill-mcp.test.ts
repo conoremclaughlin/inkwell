@@ -277,7 +277,10 @@ mcp:
           pcp: {
             type: 'http',
             url: 'http://localhost:3001/mcp',
-            headers: { 'x-pcp-session-id': 'user-configured-value' },
+            headers: {
+              'x-pcp-session-id': 'user-configured-value',
+              'x-pcp-context': 'already-set',
+            },
           },
         },
       })

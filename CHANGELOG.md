@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.3.0] — 2026-03-20
+
+24 commits since v0.2.0 by Conor, Wren, and Lumen. This release adds the `sb wait` holding pattern, x-pcp-context token consolidation, Gemini hook support, a tasks dashboard, and mission display polish.
+
+### `sb wait` — Async Holding Pattern
+
+- **`sb wait`** — poll for new inbox/thread messages without manual sleep loops. `sb wait --thread pr:239 --timeout 300` watches a thread; `sb wait --pending` includes the trigger queue for CLI-attached sessions.
+- **Documented** in AGENTS.md, process doc, and as a bundled skill.
+- **afterMessageId anchoring** — cursor-based polling so agents don't re-process old messages.
+
+### x-pcp-context Token (Phase 2)
+
+- **Consolidated context header** — `x-pcp-context` carries session ID, studio ID, agent ID, cliAttached flag, and runtime as a single base64url-encoded JSON token. Replaces multiple individual headers.
+- **Codex + Gemini support** — context token now injected for all three backends, not just Claude Code.
+- **Self-filtering** — `sb wait` filters out the caller's own messages using the context token.
+
+### Tasks Dashboard
+
+- **Web dashboard** — new `/tasks` page with task list, status management, and inline comments.
+- **Task comments** — `task_comments` table with identity-enriched MCP tools (`add_task_comment`, `get_task_comments`).
+- **Enriched task tools** — `create_task`, `update_task`, `list_tasks` now support assignee, due dates, and workspace scoping.
+
+### Gemini CLI Hooks
+
+- **Session ID capture** — Gemini sessions now extract and persist backend session IDs via hook support.
+- **Compression support** — Gemini hook templates for context compaction lifecycle.
+
+### Mission Display
+
+- **Width-aware detail collapse** — `collapseDetail` accounts for terminal wrapping to avoid truncation artifacts.
+- **Ctrl+O toggle** — expand/collapse detail in `sb mission --watch`.
+- **Thread preview** — removed 200-char truncation from thread preview messages.
+
+### Fixes
+
+- **`list_registered_agents`** — now queries the DB instead of returning empty from the in-memory handler map.
+- **`cliAttached`** — set via REST lifecycle endpoint instead of MCP (fixes race condition).
+- **Codex resume** — find-or-link PCP session when selecting a local backend session; resume must come before config flags.
+- **Backend session drop** — scoped to Codex only, not all non-Claude backends.
+
+### Contributors
+
+- **Wren** (Claude Code) — sb wait, tasks dashboard, context token Phase 2, Gemini hooks, mission display
+- **Lumen** (Codex CLI) — review feedback on sb wait, context token, and Codex resume fixes
+
 ## [0.2.0] — 2026-03-18
 
 293 commits since v0.1.0 by Conor, Wren, Lumen, and Aster. This release builds group coordination, session identity tracing, memory embeddings, and a scaffolder for new PCP projects.

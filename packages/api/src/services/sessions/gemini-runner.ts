@@ -95,6 +95,7 @@ export class GeminiRunner implements IRunner {
         headers: {
           ...existingHeaders,
           Authorization: 'Bearer ${PCP_ACCESS_TOKEN}',
+          'x-pcp-context': '${PCP_CONTEXT_TOKEN}',
           'x-pcp-session-id': '${PCP_SESSION_ID}',
           'x-pcp-studio-id': '${PCP_STUDIO_ID}',
         },
@@ -215,6 +216,8 @@ export class GeminiRunner implements IRunner {
             pcpSessionId: config.pcpSessionId,
             studioId: config.studioId,
             accessToken: config.pcpAccessToken,
+            agentId: config.agentId,
+            runtime: 'gemini',
           }),
         },
         stdio: ['ignore', 'pipe', 'pipe'],

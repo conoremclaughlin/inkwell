@@ -282,7 +282,7 @@ vi.mock('../../auth/resolve-identity', () => ({
 }));
 
 vi.mock('../../utils/request-context', () => ({
-  getRequestContext: vi.fn().mockReturnValue(null),
+  getRequestContext: vi.fn().mockReturnValue({ sessionId: 'session-mock-123' }),
   getSessionContext: vi.fn().mockReturnValue(null),
 }));
 

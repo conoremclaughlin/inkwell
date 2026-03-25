@@ -10,6 +10,7 @@ import type { DataComposer } from '../../data/composer';
 import type { TaskStatus, TaskPriority } from '../../data/repositories/project-tasks.repository';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
+import { getRequestContext } from '../../utils/request-context';
 import { logger } from '../../utils/logger';
 
 // Common user identifier schema
@@ -119,7 +120,8 @@ export async function handleCreateTask(
 
 export const listTasksSchema = z.object({
   ...userIdentifierSchema.shape,
-  projectId: z.string().uuid().optional().describe('Filter by project (optional)'),
+  projectId: z.string().uuid().optional().describe('Filter by project'),
+  groupId: z.string().uuid().optional().describe('Filter by task group'),
   status: z.enum(['pending', 'in_progress', 'completed', 'blocked']).optional(),
   activeOnly: z.boolean().optional().default(false).describe('Only show pending/in_progress tasks'),
   limit: z.number().optional().default(50),
@@ -145,16 +147,31 @@ export async function handleListTasks(
       tasks = await dataComposer.repositories.tasks.listByUser(resolved.user.id, {
         status: args.status as TaskStatus | undefined,
         projectId: args.projectId,
+        groupId: args.groupId,
         limit: args.limit,
       });
     }
 
-    // Get project names for context
+    // Resolve project names
     const projectIds = [...new Set(tasks.map((t) => t.project_id).filter(Boolean))] as string[];
     const projects = await Promise.all(
       projectIds.map((id) => dataComposer.repositories.projects.findById(id))
     );
     const projectMap = new Map(projects.filter(Boolean).map((p) => [p!.id, p!.name]));
+
+    // Resolve task group names
+    const groupIds = [...new Set(tasks.map((t) => t.task_group_id).filter(Boolean))] as string[];
+    const groupMap = new Map<string, string>();
+    if (groupIds.length > 0) {
+      const { data: groups } = await dataComposer
+        .getClient()
+        .from('task_groups' as never)
+        .select('id, title')
+        .in('id', groupIds as never);
+      for (const g of (groups || []) as Array<{ id: string; title: string }>) {
+        groupMap.set(g.id, g.title);
+      }
+    }
 
     return mcpResponse({
       success: true,
@@ -167,6 +184,12 @@ export async function handleListTasks(
         tags: task.tags,
         projectId: task.project_id,
         projectName: task.project_id ? projectMap.get(task.project_id) || 'Unknown' : null,
+        taskGroupId: task.task_group_id || null,
+        taskGroupTitle: task.task_group_id ? groupMap.get(task.task_group_id) || null : null,
+        createdBy: task.created_by || null,
+        blockedBy: task.blocked_by || null,
+        dueDate: task.due_date || null,
+        metadata: task.metadata || null,
         createdAt: task.created_at,
         completedAt: task.completed_at,
       })),
@@ -218,7 +241,14 @@ export async function handleUpdateTask(
     const updates: Record<string, unknown> = {};
     if (args.title !== undefined) updates.title = args.title;
     if (args.description !== undefined) updates.description = args.description;
-    if (args.status !== undefined) updates.status = args.status;
+    if (args.status !== undefined) {
+      updates.status = args.status;
+      // Clear completed_at when reopening a task (non-completed status).
+      // Without this, reopened tasks retain the green "done" badge.
+      if (args.status !== 'completed') {
+        updates.completed_at = null;
+      }
+    }
     if (args.priority !== undefined) updates.priority = args.priority;
     if (args.tags !== undefined) updates.tags = args.tags;
 
@@ -364,6 +394,106 @@ export async function handleGetTaskStats(
       {
         success: false,
         error: error instanceof Error ? error.message : 'Failed to get task stats',
+      },
+      true
+    );
+  }
+}
+
+// ============================================================================
+// ADD TASK COMMENT
+// ============================================================================
+
+export const addTaskCommentSchema = z.object({
+  ...userIdentifierSchema.shape,
+  taskId: z.string().uuid().describe('Task ID to comment on'),
+  content: z.string().min(1).max(5000).describe('Comment content'),
+  parentCommentId: z.string().uuid().optional().describe('Parent comment ID for threaded replies'),
+  agentId: z.string().optional().describe('Agent ID for identity attribution'),
+});
+
+export async function handleAddTaskComment(
+  args: z.infer<typeof addTaskCommentSchema>,
+  dataComposer: DataComposer
+): Promise<McpResponse> {
+  try {
+    const resolved = await resolveUser(args as UserIdentifier, dataComposer);
+    if (!resolved) {
+      return mcpResponse({ success: false, error: 'User not found' }, true);
+    }
+
+    // Verify task exists and belongs to user
+    const existing = await dataComposer.repositories.tasks.findById(args.taskId);
+    if (!existing) {
+      return mcpResponse({ success: false, error: 'Task not found' }, true);
+    }
+    if (existing.user_id !== resolved.user.id) {
+      return mcpResponse({ success: false, error: 'Task does not belong to this user' }, true);
+    }
+
+    const agentId = getEffectiveAgentId(args.agentId);
+    const reqCtx = getRequestContext();
+    const workspaceId = reqCtx?.workspaceId;
+
+    // Resolve agent identity ID with workspace scoping when available
+    let identityId: string | null = null;
+    if (agentId) {
+      let identityQuery = dataComposer
+        .getClient()
+        .from('agent_identities')
+        .select('id')
+        .eq('agent_id', agentId)
+        .eq('user_id', resolved.user.id);
+      if (workspaceId) {
+        identityQuery = identityQuery.eq('workspace_id', workspaceId);
+      }
+      const { data: identity } = await identityQuery.limit(1).single();
+      if (identity) identityId = identity.id;
+    }
+
+    const { data: rawComment, error } = await dataComposer
+      .getClient()
+      .from('task_comments' as never)
+      .insert({
+        task_id: args.taskId,
+        user_id: resolved.user.id,
+        content: args.content.trim(),
+        parent_comment_id: args.parentCommentId || null,
+        created_by_agent_id: agentId || null,
+        created_by_identity_id: identityId,
+      } as never)
+      .select()
+      .single();
+
+    if (error) {
+      return mcpResponse(
+        { success: false, error: `Failed to add comment: ${error.message}` },
+        true
+      );
+    }
+
+    const comment = rawComment as unknown as {
+      id: string;
+      task_id: string;
+      content: string;
+      created_at: string;
+    };
+
+    return mcpResponse({
+      success: true,
+      comment: {
+        id: comment.id,
+        taskId: comment.task_id,
+        content: comment.content,
+        authorAgentId: agentId || null,
+        createdAt: comment.created_at,
+      },
+    });
+  } catch (error) {
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to add task comment',
       },
       true
     );

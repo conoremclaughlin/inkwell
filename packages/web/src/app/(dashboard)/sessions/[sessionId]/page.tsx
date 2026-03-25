@@ -14,7 +14,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { useApiQuery } from '@/lib/api';
+import { useApiPost, useApiQuery, useQueryClient } from '@/lib/api';
 import clsx from 'clsx';
 
 interface SessionLogsResponse {
@@ -31,7 +31,7 @@ interface SessionLogsResponse {
   };
   logs: Array<{
     id: string;
-    source: 'activity_stream' | 'session_logs' | 'local_transcript';
+    source: 'activity_stream' | 'session_logs' | 'local_transcript' | 'synced_transcript';
     type: string;
     role: 'in' | 'out' | 'system';
     content: string;
@@ -46,6 +46,7 @@ interface SessionLogsResponse {
   };
   sources: {
     cloud: number;
+    synced: number;
     local: number;
   };
 }
@@ -203,6 +204,7 @@ export default function SessionLogsPage() {
     type: string;
     json: string;
   } | null>(null);
+  const queryClient = useQueryClient();
   const limit = 50;
 
   const queryPath = useMemo(
@@ -215,6 +217,18 @@ export default function SessionLogsPage() {
     queryPath,
     { refetchInterval: 15000 }
   );
+
+  const syncTranscript = useApiPost<
+    {
+      ok: boolean;
+      lineCount: number;
+    },
+    Record<string, never>
+  >(`/api/admin/sessions/${sessionId}/sync-transcript`, {
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['session-logs', sessionId] });
+    },
+  });
 
   const logs = data?.logs || [];
   const pagination = data?.pagination;
@@ -264,11 +278,29 @@ export default function SessionLogsPage() {
         <CardHeader>
           <CardTitle>Timeline</CardTitle>
           <CardDescription>
-            Latest activity, session logs, and local transcript fallback when available.
+            Latest activity, session logs, synced transcript archive, and local fallback when
+            available.
           </CardDescription>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => syncTranscript.mutate({})}
+              disabled={syncTranscript.isPending}
+            >
+              {syncTranscript.isPending ? 'Syncing…' : 'Sync full transcript'}
+            </Button>
+            {syncTranscript.isSuccess ? (
+              <span className="text-xs text-emerald-700">Synced transcript to cloud archive.</span>
+            ) : null}
+            {syncTranscript.error ? (
+              <span className="text-xs text-red-600">{syncTranscript.error.message}</span>
+            ) : null}
+          </div>
           {data && (
             <div className="flex flex-wrap gap-2 text-xs text-gray-500">
               <Badge variant="outline">Cloud: {data.sources.cloud}</Badge>
+              <Badge variant="outline">Synced: {data.sources.synced}</Badge>
               <Badge variant="outline">Local: {data.sources.local}</Badge>
               <Badge variant="outline">Total: {data.pagination.total}</Badge>
             </div>

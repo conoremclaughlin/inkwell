@@ -43,18 +43,36 @@ function getPcpServerUrl(): string {
   return process.env.PCP_SERVER_URL || 'http://localhost:3001';
 }
 
-function buildDefaultMcpJson(serverUrl: string): Record<string, unknown> {
-  return {
-    mcpServers: {
-      pcp: {
-        type: 'http',
-        url: `${serverUrl}/mcp`,
-        headers: {
-          Authorization: 'Bearer ${PCP_ACCESS_TOKEN}',
-        },
-      },
+function resolveChannelPluginPath(cwd: string): string | null {
+  // Look for the channel plugin relative to the repo root
+  const candidates = [
+    join(cwd, 'packages', 'channel-plugin', 'index.ts'),
+    join(cwd, '..', 'personal-context-protocol', 'packages', 'channel-plugin', 'index.ts'),
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+
+function buildDefaultMcpJson(serverUrl: string, cwd?: string): Record<string, unknown> {
+  const servers: Record<string, unknown> = {
+    pcp: {
+      type: 'http',
+      url: `${serverUrl}/mcp`,
     },
   };
+
+  // Add PCP channel plugin for real-time inbox push notifications
+  const channelPath = cwd ? resolveChannelPluginPath(cwd) : null;
+  if (channelPath) {
+    servers['pcp-inbox'] = {
+      command: 'npx',
+      args: ['tsx', channelPath],
+    };
+  }
+
+  return { mcpServers: servers };
 }
 
 // ============================================================================
@@ -84,24 +102,19 @@ function ensureMcpJson(cwd: string): InitStepResult {
       const existing = JSON.parse(readFileSync(mcpPath, 'utf-8')) as Record<string, unknown>;
       const servers = existing.mcpServers as Record<string, unknown> | undefined;
       if (servers?.pcp) {
-        // Migrate existing pcp entry to include auth header if missing
-        const pcpEntry = servers.pcp as Record<string, unknown>;
-        const headers = pcpEntry.headers as Record<string, string> | undefined;
-        if (!headers?.Authorization) {
-          const updatedPcp = {
-            ...pcpEntry,
-            headers: { ...headers, Authorization: 'Bearer ${PCP_ACCESS_TOKEN}' },
-          };
-          const updated = {
-            ...existing,
-            mcpServers: { ...servers, pcp: updatedPcp },
-          };
-          writeFileSync(mcpPath, JSON.stringify(updated, null, 2) + '\n');
-          return {
-            label: '.mcp.json',
-            status: 'updated',
-            detail: 'added auth header to pcp entry',
-          };
+        // Add pcp-inbox if missing and plugin exists locally
+        if (!servers['pcp-inbox']) {
+          const channelPath = resolveChannelPluginPath(cwd);
+          if (channelPath) {
+            const updatedServers = { ...servers, 'pcp-inbox': { command: 'npx', args: ['tsx', channelPath] } };
+            const updated = { ...existing, mcpServers: updatedServers };
+            writeFileSync(mcpPath, JSON.stringify(updated, null, 2) + '\n');
+            return {
+              label: '.mcp.json',
+              status: 'updated',
+              detail: 'added pcp-inbox channel plugin',
+            };
+          }
         }
         return { label: '.mcp.json', status: 'exists', detail: 'pcp server configured' };
       }
@@ -114,7 +127,6 @@ function ensureMcpJson(cwd: string): InitStepResult {
           pcp: {
             type: 'http',
             url: `${serverUrl}/mcp`,
-            headers: { Authorization: 'Bearer ${PCP_ACCESS_TOKEN}' },
           },
         },
       };
@@ -126,7 +138,7 @@ function ensureMcpJson(cwd: string): InitStepResult {
   }
 
   const serverUrl = getPcpServerUrl();
-  writeFileSync(mcpPath, JSON.stringify(buildDefaultMcpJson(serverUrl), null, 2) + '\n');
+  writeFileSync(mcpPath, JSON.stringify(buildDefaultMcpJson(serverUrl, cwd), null, 2) + '\n');
   return { label: '.mcp.json', status: 'created', detail: `pcp → ${serverUrl}/mcp` };
 }
 

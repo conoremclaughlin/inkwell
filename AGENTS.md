@@ -309,6 +309,36 @@ personal-context-protocol/
 - **Frontend**: Next.js, React, Tailwind CSS
 - **Validation**: Zod schemas
 
+## Waiting for Responses (Holding Pattern)
+
+When waiting for a review, spec feedback, or any async response, use `sb wait` instead of manual polling or sleep loops:
+
+```bash
+# Watch a specific thread for new messages
+sb wait --thread pr:239 --timeout 300 --interval 15
+
+# Watch inbox for any new unread
+sb wait --timeout 300
+
+# Include pending trigger queue (for CLI-attached sessions)
+sb wait --pending --timeout 300
+```
+
+**In Claude Code**, run via `run_in_background` to hold while waiting:
+
+```
+# Send review request
+send_to_inbox(recipientAgentId: "lumen", threadKey: "pr:239", ...)
+
+# Hold in background — wakes you up when reply arrives
+run_in_background: sb wait --thread pr:239 --timeout 300
+
+# Continue other work or idle...
+# Background task completes → you wake up → process the response
+```
+
+This replaces manual `sleep` + poll loops. Exit code 0 = new content found, 1 = timed out.
+
 ## Development Commands
 
 ```bash
@@ -614,7 +644,9 @@ Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key SB-specific reminders:
 - **Title format**: `feat: description (by <SB name>)` — the `(by <name>)` suffix attributes work.
 - **Sign reviews**: end PR comments with `— Wren`, `— Lumen`, etc.
 - **Do not wait for permission to open a PR** once implementation is ready. Create the PR proactively unless the user explicitly asked you not to.
-- **Never push directly to main** from a feature branch. Always use PRs.
+- **Never push directly to main** from a feature branch. Always use PRs. This includes releases, changelog updates, and docs changes.
+- **ALL PRs require a sibling review before merge.** No exceptions unless Conor explicitly says otherwise. Do not merge your own PR without at least one other SB's LGTM. This is a hard rule — merging without review has caused bugs that could have been caught. Use `sb wait --thread pr:<number>` to hold for the review.
+- **Verify CI passes before merging.** Check `gh run list --branch <branch>` for the CI status. If tests fail, fix them before merging — don't merge red. When fixing CI, run the full test suite locally (`npx vitest run`) to catch issues before pushing.
 - **Simple PR wait helper**: for short review loops, use `yarn pr:wait-reply <prNumber> --timeout 120 --interval 10` instead of manual `sleep`, then re-check review status via MCP GitHub tools.
 - **Commit messages**: pass multi-line messages directly to `-m "..."` — bash handles literal newlines in double-quoted strings. Do not use `$(cat <<'EOF' ... EOF)` or other command substitution patterns; they add complexity for no benefit.
 

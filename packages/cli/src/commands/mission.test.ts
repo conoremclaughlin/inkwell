@@ -12,6 +12,7 @@ import {
   summarizeMissionFeedRows,
   summarizeMissionRows,
 } from './mission.js';
+import { collapseDetail, estimateRows } from '../repl/ink/index.js';
 import type { MissionActivity, InboxMessage } from './mission.js';
 import type { Session } from './session.js';
 
@@ -1073,5 +1074,76 @@ describe('activityToFeedEvent state_change', () => {
     );
     // Only shows currentPhase (context is >80 chars, skipped)
     expect(event.content).toBe('Session deadbeef → currentPhase: reviewing');
+  });
+});
+
+// ── estimateRows ──
+
+describe('estimateRows', () => {
+  it('counts a single short line as 1 row', () => {
+    expect(estimateRows('hello', 80)).toBe(1);
+  });
+
+  it('counts multiple newline-separated lines', () => {
+    expect(estimateRows('line1\nline2\nline3', 80)).toBe(3);
+  });
+
+  it('accounts for soft wrapping of long lines', () => {
+    // 160 chars at width 80 = 2 rows
+    expect(estimateRows('A'.repeat(160), 80)).toBe(2);
+  });
+
+  it('combines newlines and wrapping', () => {
+    // First line: 100 chars at width 50 = 2 rows; second line: 10 chars = 1 row
+    expect(estimateRows('A'.repeat(100) + '\n' + 'B'.repeat(10), 50)).toBe(3);
+  });
+
+  it('treats empty lines as 1 row each', () => {
+    expect(estimateRows('a\n\nb', 80)).toBe(3);
+  });
+
+  it('handles width of 1 gracefully', () => {
+    expect(estimateRows('abc', 1)).toBe(3);
+  });
+});
+
+// ── collapseDetail ──
+
+describe('collapseDetail', () => {
+  it('returns full text when it fits within row budget', () => {
+    const text = 'short line';
+    expect(collapseDetail(text, 3, 80)).toBe(text);
+  });
+
+  it('truncates multi-line text exceeding row budget', () => {
+    const text = 'line1\nline2\nline3\nline4\nline5';
+    const result = collapseDetail(text, 3, 80);
+    expect(result).toBe('line1\nline2\nline3…');
+  });
+
+  it('truncates a long single paragraph that wraps past row budget', () => {
+    // 400 chars at width 80 = 5 rows, budget is 3 rows = 240 chars
+    const text = 'A'.repeat(400);
+    const result = collapseDetail(text, 3, 80);
+    expect(result.length).toBeLessThan(400);
+    expect(result.endsWith('…')).toBe(true);
+    // Should keep approximately 3 * 80 = 240 chars (exact count varies with wrapping logic)
+    expect(result.length).toBeGreaterThan(200);
+    expect(result.length).toBeLessThanOrEqual(241);
+  });
+
+  it('does not add ellipsis when text fits exactly', () => {
+    const text = 'line1\nline2\nline3';
+    expect(collapseDetail(text, 3, 80)).toBe(text);
+  });
+
+  it('handles text with mixed short and long lines', () => {
+    // Line 1: 10 chars = 1 row; Line 2: 200 chars at width 80 = 3 rows → budget 3 total
+    // Budget: row 1 for line1 (1 row), line2 needs 3 rows but only 2 remain → partial
+    const text = 'short line\n' + 'B'.repeat(200);
+    const result = collapseDetail(text, 3, 80);
+    expect(result).toContain('short line');
+    expect(result.endsWith('…')).toBe(true);
+    expect(result.length).toBeLessThan(text.length);
   });
 });
