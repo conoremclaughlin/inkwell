@@ -844,6 +844,22 @@ function buildInboxBlock(messages: Array<Record<string, unknown>> | undefined): 
   return lines.join('\n');
 }
 
+/**
+ * Check if the PCP channel plugin is registered in .mcp.json.
+ * When active, the channel handles real-time inbox delivery — hook-based
+ * injection is skipped to avoid duplicate messages.
+ */
+function hasActiveChannelPlugin(cwd: string): boolean {
+  try {
+    const mcpJsonPath = join(cwd, '.mcp.json');
+    if (!existsSync(mcpJsonPath)) return false;
+    const mcpConfig = JSON.parse(readFileSync(mcpJsonPath, 'utf-8'));
+    return Boolean(mcpConfig?.mcpServers?.['pcp-channel']);
+  } catch {
+    return false;
+  }
+}
+
 function buildInboxTag(messages: Array<Record<string, unknown>> | undefined): string {
   if (!messages || messages.length === 0) return '';
   const lines = [`<pcp-inbox count="${messages.length}">`];
@@ -1991,18 +2007,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   // Skip inbox injection when the channel plugin is active — it handles
   // real-time delivery via the Channels API. Fall back to hook-based
   // injection when the channel plugin is not present.
-  const mcpJsonPath = join(cwd, '.mcp.json');
-  let hasChannelPlugin = false;
-  try {
-    if (existsSync(mcpJsonPath)) {
-      const mcpConfig = JSON.parse(readFileSync(mcpJsonPath, 'utf-8'));
-      hasChannelPlugin = Boolean(mcpConfig?.mcpServers?.['pcp-channel']);
-    }
-  } catch {
-    // ignore
-  }
-
-  if (hasChannelPlugin) {
+  if (hasActiveChannelPlugin(cwd)) {
     return;
   }
 
@@ -2102,7 +2107,15 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
     parts.push(renderTemplate(template, { TOOL_COUNT: String(count) }));
   }
 
-  // Check inbox if stale
+  // Skip inbox injection when channel plugin handles it
+  if (hasActiveChannelPlugin(cwd)) {
+    if (parts.length > 0) {
+      process.stdout.write(parts.join('\n\n'));
+    }
+    return;
+  }
+
+  // Check inbox if stale (fallback when no channel plugin)
   const lastCheck = readRuntimeFile(cwd, 'last-inbox-check');
   const staleThresholdMs = 5 * 60 * 1000;
   let shouldCheckInbox = !lastCheck;
