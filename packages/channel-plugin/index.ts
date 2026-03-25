@@ -113,13 +113,50 @@ const studioId = process.env.PCP_STUDIO_ID || undefined;
 const sessionId = process.env.PCP_SESSION_ID || undefined;
 
 /**
- * Check if a message is addressed to this session's studio.
- * Messages without studio scoping are broadcast (show everywhere).
+ * Check if this studio is a participant in a thread by examining message history.
+ *
+ * Thread messages don't have explicit recipient routing — instead, each message
+ * carries `metadata.pcp.sender.studioId` identifying which studio sent it.
+ * If our agent has sent messages on this thread from a DIFFERENT studio, this
+ * studio should not receive push events (that thread belongs to the other studio).
+ *
+ * Returns true (accept) when:
+ * - No studioId configured (accept all — single-studio setup)
+ * - Our agent has no messages on the thread yet (new thread — accept in any studio)
+ * - Our agent's messages on the thread came from THIS studioId
+ *
+ * Returns false (skip) when:
+ * - Our agent has messages on the thread from a DIFFERENT studioId
  */
-function isMessageForThisStudio(msg: Record<string, unknown>): boolean {
+function isThreadOwnedByThisStudio(
+  messages: Array<Record<string, unknown>>
+): boolean {
   if (!studioId) return true; // no studio context — accept all
 
-  // Check thread message metadata for recipient studio
+  // Find messages sent by our agent and check which studio they came from
+  const ourMessages = messages.filter((m) => m.senderAgentId === agentId);
+  if (ourMessages.length === 0) return true; // new thread for us — accept
+
+  for (const msg of ourMessages) {
+    const metadata = msg.metadata as Record<string, unknown> | undefined;
+    const pcp = metadata?.pcp as Record<string, unknown> | undefined;
+    const sender = pcp?.sender as Record<string, unknown> | undefined;
+    const senderStudioId = sender?.studioId as string | undefined;
+
+    if (senderStudioId && senderStudioId === studioId) return true; // we participated from this studio
+  }
+
+  // Our agent participated but from a different studio — skip
+  return false;
+}
+
+/**
+ * Check if a legacy inbox message is addressed to this studio.
+ * Legacy messages (non-threaded) carry explicit recipient routing.
+ */
+function isLegacyMessageForThisStudio(msg: Record<string, unknown>): boolean {
+  if (!studioId) return true;
+
   const metadata = msg.metadata as Record<string, unknown> | undefined;
   const pcp = metadata?.pcp as Record<string, unknown> | undefined;
   const recipient = pcp?.recipient as Record<string, unknown> | undefined;
@@ -272,6 +309,14 @@ async function pollInbox(): Promise<void> {
       const messages = (threadResult.messages as Array<Record<string, unknown>>) || [];
       const lastKnownTs = lastThreadTimestamps.get(threadKey);
 
+      // Studio filter: check if this studio owns the thread (based on our
+      // agent's participation history). Skip entire thread if another studio
+      // of the same agent is the active participant.
+      if (!isThreadOwnedByThisStudio(messages)) {
+        log('debug', 'Skipping thread (owned by different studio)', { threadKey, studioId });
+        continue;
+      }
+
       for (const msg of messages) {
         const msgId = msg.id as string;
         const msgTs = msg.createdAt as string;
@@ -279,12 +324,6 @@ async function pollInbox(): Promise<void> {
         if (msgId && seenMessageIds.has(msgId)) continue;
         if (lastKnownTs && msgTs && msgTs <= lastKnownTs) continue;
         if (msgId) seenMessageIds.add(msgId);
-
-        // Studio filter: only push messages addressed to this studio (or broadcast)
-        if (!isMessageForThisStudio(msg)) {
-          log('debug', 'Skipping thread message (different studio)', { threadKey, msgId });
-          continue;
-        }
 
         const sender = (msg.senderAgentId as string) || 'unknown';
         const content = (msg.content as string) || '';
@@ -321,7 +360,7 @@ async function pollInbox(): Promise<void> {
       const msgId = msg.id as string;
       if (msg.senderAgentId === agentId) continue;
       if (msgId && seenMessageIds.has(msgId)) continue;
-      if (!isMessageForThisStudio(msg)) continue;
+      if (!isLegacyMessageForThisStudio(msg)) continue;
       if (msgId) seenMessageIds.add(msgId);
 
       const sender = (msg.senderAgentId as string) || 'unknown';
