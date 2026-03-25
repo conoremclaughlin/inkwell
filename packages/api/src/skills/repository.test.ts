@@ -262,7 +262,7 @@ describe('SkillsRepository', () => {
       const repository = new SkillsRepository(mockSupabase);
       const result = await repository.getUserInstalledSkills('user-123');
 
-      expect(mockSupabase.from).toHaveBeenCalledWith('user_installed_skills');
+      expect(mockSupabase.from).toHaveBeenCalledWith('skill_installations');
       expect(result).toHaveLength(1);
       expect(result[0].name).toBe('bill-split');
     });
