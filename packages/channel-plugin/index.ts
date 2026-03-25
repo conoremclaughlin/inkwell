@@ -109,11 +109,32 @@ function resolveAccessToken(): string | undefined {
 const agentId = resolveAgentId();
 const email = resolveEmail();
 const accessToken = resolveAccessToken();
+const studioId = process.env.PCP_STUDIO_ID || undefined;
+const sessionId = process.env.PCP_SESSION_ID || undefined;
+
+/**
+ * Check if a message is addressed to this session's studio.
+ * Messages without studio scoping are broadcast (show everywhere).
+ */
+function isMessageForThisStudio(msg: Record<string, unknown>): boolean {
+  if (!studioId) return true; // no studio context — accept all
+
+  // Check thread message metadata for recipient studio
+  const metadata = msg.metadata as Record<string, unknown> | undefined;
+  const pcp = metadata?.pcp as Record<string, unknown> | undefined;
+  const recipient = pcp?.recipient as Record<string, unknown> | undefined;
+  const recipientStudioId = recipient?.studioId as string | undefined;
+
+  if (!recipientStudioId) return true; // no studio scoping — broadcast
+  return recipientStudioId === studioId;
+}
 
 log('info', 'Channel plugin starting', {
   agentId,
   email: email || '(none)',
   hasToken: !!accessToken,
+  studioId: studioId || '(none)',
+  sessionId: sessionId || '(none)',
   server: PCP_SERVER_URL,
   pollIntervalMs: POLL_INTERVAL_MS,
 });
@@ -259,6 +280,12 @@ async function pollInbox(): Promise<void> {
         if (lastKnownTs && msgTs && msgTs <= lastKnownTs) continue;
         if (msgId) seenMessageIds.add(msgId);
 
+        // Studio filter: only push messages addressed to this studio (or broadcast)
+        if (!isMessageForThisStudio(msg)) {
+          log('debug', 'Skipping thread message (different studio)', { threadKey, msgId });
+          continue;
+        }
+
         const sender = (msg.senderAgentId as string) || 'unknown';
         const content = (msg.content as string) || '';
         const messageType = (msg.messageType as string) || 'message';
@@ -294,6 +321,7 @@ async function pollInbox(): Promise<void> {
       const msgId = msg.id as string;
       if (msg.senderAgentId === agentId) continue;
       if (msgId && seenMessageIds.has(msgId)) continue;
+      if (!isMessageForThisStudio(msg)) continue;
       if (msgId) seenMessageIds.add(msgId);
 
       const sender = (msg.senderAgentId as string) || 'unknown';
