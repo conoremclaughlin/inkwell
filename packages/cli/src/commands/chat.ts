@@ -3339,6 +3339,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       await pcp
         .callTool('update_session_phase', {
           agentId,
+          sessionId: runtime.sessionId,
           phase,
         })
         .catch(() => undefined);

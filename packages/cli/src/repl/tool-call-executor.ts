@@ -112,7 +112,8 @@ async function executeOneToolCall(
   }
 
   // Re-check policy after approval (the grant was applied by the prompt handler)
-  const postApprovalDecision = policy.canCallPcpTool(call.tool, sessionId);
+  // Use the stripped name — same as the initial policy check above
+  const postApprovalDecision = policy.canCallPcpTool(policyToolName, sessionId);
   if (!postApprovalDecision.allowed) {
     // Edge case: approval was granted but policy still blocks (e.g., deny overrides grant)
     return {
