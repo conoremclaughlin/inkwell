@@ -207,6 +207,7 @@ Do NOT ignore channel messages — they are from your teammates and deserve time
 
 let lastPollTime = new Date().toISOString();
 const seenMessageIds = new Set<string>(); // belt-and-suspenders dedup
+const lastThreadTimestamps = new Map<string, string>(); // threadKey → last seen created_at
 
 async function pollInbox(): Promise<void> {
   if (!email) return;
