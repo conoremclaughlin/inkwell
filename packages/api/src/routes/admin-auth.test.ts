@@ -341,6 +341,72 @@ describe('adminAuthMiddleware', () => {
       expect(res._status).toBe(401);
       expect(next).not.toHaveBeenCalled();
     });
+
+    it('should accept mcp_access tokens only for transcript sync route', async () => {
+      mockVerifyPcpAccessToken
+        .mockReturnValueOnce(null) // pcp_admin check
+        .mockReturnValueOnce({
+          type: 'mcp_access',
+          sub: 'user-mcp',
+          email: 'mcp@example.com',
+          scope: 'mcp:tools',
+        });
+
+      const req = createMockReq({
+        method: 'POST',
+        path: '/sessions/session-123/sync-transcript',
+      });
+      const res = createMockRes();
+      const next = vi.fn();
+
+      await middleware(req, res, next);
+
+      expect(next).toHaveBeenCalled();
+      expect(mockGetUser).not.toHaveBeenCalled();
+      expect((req as any).pcpUserId).toBe('user-mcp');
+    });
+
+    it('should accept mcp_access tokens for transcript list/export routes', async () => {
+      mockVerifyPcpAccessToken.mockReturnValueOnce(null).mockReturnValueOnce({
+        type: 'mcp_access',
+        sub: 'user-mcp',
+        email: 'mcp@example.com',
+        scope: 'mcp:tools',
+      });
+
+      const listReq = createMockReq({
+        method: 'GET',
+        path: '/sessions/synced',
+      });
+      const listRes = createMockRes();
+      const listNext = vi.fn();
+
+      await middleware(listReq, listRes, listNext);
+
+      expect(listNext).toHaveBeenCalled();
+      expect(mockGetUser).not.toHaveBeenCalled();
+
+      mockVerifyPcpAccessToken.mockReset();
+      mockVerifyPcpAccessToken.mockReturnValueOnce(null).mockReturnValueOnce({
+        type: 'mcp_access',
+        sub: 'user-mcp',
+        email: 'mcp@example.com',
+        scope: 'mcp:tools',
+      });
+
+      const exportReq = createMockReq({
+        method: 'GET',
+        path: '/sessions/session-123/transcript',
+      });
+      const exportRes = createMockRes();
+      const exportNext = vi.fn();
+
+      await middleware(exportReq, exportRes, exportNext);
+
+      expect(exportNext).toHaveBeenCalled();
+      expect(mockGetUser).not.toHaveBeenCalled();
+      expect((exportReq as any).pcpUserId).toBe('user-mcp');
+    });
   });
 
   // =========================================================================

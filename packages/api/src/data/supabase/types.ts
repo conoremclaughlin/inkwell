@@ -2410,6 +2410,66 @@ export type Database = {
           },
         ];
       };
+      session_transcript_archives: {
+        Row: {
+          backend: string | null;
+          backend_session_id: string | null;
+          byte_count: number;
+          created_at: string;
+          id: string;
+          line_count: number;
+          payload: Json;
+          session_id: string;
+          source_path: string | null;
+          synced_at: string;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          backend?: string | null;
+          backend_session_id?: string | null;
+          byte_count?: number;
+          created_at?: string;
+          id?: string;
+          line_count?: number;
+          payload: Json;
+          session_id: string;
+          source_path?: string | null;
+          synced_at?: string;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          backend?: string | null;
+          backend_session_id?: string | null;
+          byte_count?: number;
+          created_at?: string;
+          id?: string;
+          line_count?: number;
+          payload?: Json;
+          session_id?: string;
+          source_path?: string | null;
+          synced_at?: string;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'session_transcript_archives_session_id_fkey';
+            columns: ['session_id'];
+            isOneToOne: false;
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'session_transcript_archives_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       session_logs: {
         Row: {
           compacted_at: string | null;

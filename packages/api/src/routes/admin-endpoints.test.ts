@@ -122,6 +122,7 @@ function createQueryChain(resolvedData: unknown[] | null = [], error: unknown = 
   const chain: Record<string, any> = {};
   chain.select = vi.fn(() => chain);
   chain.insert = vi.fn(() => chain);
+  chain.upsert = vi.fn(() => chain);
   chain.update = vi.fn(() => chain);
   chain.delete = vi.fn(() => chain);
   chain.eq = vi.fn(() => chain);
@@ -193,6 +194,8 @@ function createAuthenticatedReq(overrides: Record<string, unknown> = {}): Reques
 interface MockResponse extends Response {
   _status: number;
   _json: unknown;
+  _sent: unknown;
+  _headers: Record<string, unknown>;
   _cookies: Record<string, unknown>;
 }
 
@@ -200,6 +203,8 @@ function createMockRes(): MockResponse {
   const res: Record<string, unknown> = {
     _status: 200,
     _json: null,
+    _sent: null,
+    _headers: {},
     _cookies: {},
     status(code: number) {
       res._status = code;
@@ -213,7 +218,12 @@ function createMockRes(): MockResponse {
       (res._cookies as Record<string, unknown>)[name] = { value, options };
       return res;
     },
-    setHeader() {
+    setHeader(name: string, value: unknown) {
+      (res._headers as Record<string, unknown>)[name] = value;
+      return res;
+    },
+    send(payload: unknown) {
+      res._sent = payload;
       return res;
     },
     write() {
@@ -623,6 +633,232 @@ describe('admin endpoint handlers (no-500 regression)', () => {
       expect(json.sessions.map((s: any) => s.id)).toEqual(['session-identity', 'session-legacy']);
       expect(json.sessions[0].agentName).toBe('Wren');
       expect(json.stats.total).toBe(2);
+    });
+  });
+
+  // =========================================================================
+  // GET /sessions/synced — list transcript archives available in workspace
+  // =========================================================================
+
+  describe('GET /sessions/synced', () => {
+    it('returns only archives whose sessions are scoped to the active workspace', async () => {
+      const handler = findRouteHandler('get', '/sessions/synced');
+      expect(handler).not.toBeNull();
+
+      const archiveQuery = createQueryChain([
+        {
+          id: 'archive-1',
+          session_id: 'session-in-workspace',
+          backend: 'claude',
+          backend_session_id: 'backend-1',
+          line_count: 42,
+          byte_count: 4200,
+          source_path: '/tmp/backend-1.jsonl',
+          synced_at: '2026-03-11T10:00:00Z',
+        },
+        {
+          id: 'archive-2',
+          session_id: 'session-outside-workspace',
+          backend: 'claude',
+          backend_session_id: 'backend-2',
+          line_count: 12,
+          byte_count: 1200,
+          source_path: '/tmp/backend-2.jsonl',
+          synced_at: '2026-03-10T10:00:00Z',
+        },
+      ]);
+
+      mockSupabaseFrom.mockImplementation((table: string) => {
+        if (table === 'agent_identities') {
+          return createQueryChain([
+            { id: 'identity-1', agent_id: 'wren', name: 'Wren', role: 'SB' },
+          ]);
+        }
+
+        if (table === 'session_transcript_archives') {
+          return archiveQuery;
+        }
+
+        if (table === 'sessions') {
+          return createQueryChain([
+            {
+              id: 'session-in-workspace',
+              identity_id: 'identity-1',
+              agent_id: 'wren',
+              backend: 'claude',
+              backend_session_id: 'backend-1',
+              claude_session_id: null,
+              thread_key: 'pr:219',
+              started_at: '2026-03-11T09:00:00Z',
+              updated_at: '2026-03-11T10:05:00Z',
+              working_dir: '/repo',
+              studio_id: 'studio-1',
+              workspace_id: 'studio-1',
+            },
+            {
+              id: 'session-outside-workspace',
+              identity_id: 'identity-other',
+              agent_id: 'wren',
+              backend: 'claude',
+              backend_session_id: 'backend-2',
+              claude_session_id: null,
+              thread_key: 'pr:999',
+              started_at: '2026-03-10T09:00:00Z',
+              updated_at: '2026-03-10T10:05:00Z',
+              working_dir: '/other',
+              studio_id: null,
+              workspace_id: null,
+            },
+          ]);
+        }
+
+        return createQueryChain([]);
+      });
+
+      const req = createAuthenticatedReq({
+        query: { limit: '10' },
+      });
+      const res = createMockRes();
+      await handler!(req, res);
+
+      expect(res._status).toBe(200);
+      expect((archiveQuery.select as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]).toBe(
+        'id, session_id, backend, backend_session_id, line_count, byte_count, source_path, synced_at'
+      );
+      expect(res._json).toEqual({
+        archives: [
+          {
+            archiveId: 'archive-1',
+            sessionId: 'session-in-workspace',
+            backend: 'claude',
+            backendSessionId: 'backend-1',
+            format: 'jsonl',
+            lineCount: 42,
+            byteCount: 4200,
+            sourcePath: '/tmp/backend-1.jsonl',
+            syncedAt: '2026-03-11T10:00:00Z',
+            session: {
+              id: 'session-in-workspace',
+              agentId: 'wren',
+              agentName: 'Wren',
+              agentRole: 'SB',
+              backend: 'claude',
+              backendSessionId: 'backend-1',
+              threadKey: 'pr:219',
+              startedAt: '2026-03-11T09:00:00Z',
+              updatedAt: '2026-03-11T10:05:00Z',
+              workingDir: '/repo',
+              studioId: 'studio-1',
+            },
+          },
+        ],
+        count: 1,
+      });
+    });
+  });
+
+  // =========================================================================
+  // GET /sessions/:id/transcript — export synced transcript archive
+  // =========================================================================
+
+  describe('GET /sessions/:id/transcript', () => {
+    it('exports jsonl payload for a workspace-scoped session', async () => {
+      const handler = findRouteHandler('get', '/sessions/:id/transcript');
+      expect(handler).not.toBeNull();
+
+      mockSupabaseFrom.mockImplementation((table: string) => {
+        if (table === 'agent_identities') {
+          return createQueryChain([
+            { id: 'identity-1', agent_id: 'wren', name: 'Wren', role: 'SB' },
+          ]);
+        }
+
+        if (table === 'sessions') {
+          return createQueryChain([
+            {
+              id: 'session-123',
+              identity_id: 'identity-1',
+              agent_id: 'wren',
+            },
+          ]);
+        }
+
+        if (table === 'session_transcript_archives') {
+          return createQueryChain([
+            {
+              payload: {
+                backend: 'claude',
+                backendSessionId: 'backend-1',
+                format: 'jsonl',
+                events: [
+                  { type: 'user', content: 'hello' },
+                  { type: 'assistant', content: 'hi' },
+                ],
+              },
+            },
+          ]);
+        }
+
+        return createQueryChain([]);
+      });
+
+      const req = createAuthenticatedReq({
+        params: { id: 'session-123' },
+        query: { format: 'jsonl', download: '1' },
+      });
+      const res = createMockRes();
+      await handler!(req, res);
+
+      expect(res._status).toBe(200);
+      expect(res._headers['Content-Type']).toBe('application/x-ndjson; charset=utf-8');
+      expect(res._headers['Content-Disposition']).toBe(
+        'attachment; filename="session-session-123-transcript.jsonl"'
+      );
+      expect(res._sent).toBe(
+        '{"type":"user","content":"hello"}\n{"type":"assistant","content":"hi"}\n'
+      );
+    });
+  });
+
+  // =========================================================================
+  // POST /sessions/:id/sync-transcript — manual transcript archive sync
+  // =========================================================================
+
+  describe('POST /sessions/:id/sync-transcript', () => {
+    it('returns 404 when session identity is outside active workspace', async () => {
+      const handler = findRouteHandler('post', '/sessions/:id/sync-transcript');
+      expect(handler).not.toBeNull();
+
+      mockSupabaseFrom.mockImplementation((table: string) => {
+        if (table === 'agent_identities') {
+          return createQueryChain([{ id: 'identity-1', agent_id: 'wren' }]);
+        }
+
+        if (table === 'sessions') {
+          return createQueryChain([
+            {
+              id: 'session-other-workspace',
+              identity_id: 'identity-other',
+              agent_id: 'wren',
+              backend: 'claude',
+              backend_session_id: 'backend-2',
+              claude_session_id: null,
+            },
+          ]);
+        }
+
+        return createQueryChain([]);
+      });
+
+      const req = createAuthenticatedReq({
+        params: { id: 'session-other-workspace' },
+        body: {},
+      });
+      const res = createMockRes();
+      await handler!(req, res);
+
+      expect(res._status).toBe(404);
+      expect(res._json).toEqual({ error: 'Session not found' });
     });
   });
 

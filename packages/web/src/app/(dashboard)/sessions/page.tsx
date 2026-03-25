@@ -51,7 +51,7 @@ interface Session {
   studio: SessionWorkspace | null;
   preview: Array<{
     id: string;
-    source: 'activity_stream' | 'session_logs' | 'local_transcript';
+    source: 'activity_stream' | 'session_logs' | 'local_transcript' | 'synced_transcript';
     type: string;
     role: 'in' | 'out' | 'system';
     content: string;
