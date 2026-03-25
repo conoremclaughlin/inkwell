@@ -4,8 +4,14 @@
  * Tests for contact management and name resolution.
  */
 
-import { describe, it, expect } from 'vitest';
-import { calculateSimilarity, levenshteinDistance } from './contacts-repository';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import {
+  ContactsRepository,
+  calculateSimilarity,
+  levenshteinDistance,
+} from './contacts-repository';
+import { createMockSupabaseClient, type MockSupabaseClient } from '../../test/mocks/supabase.mock';
+import type { SupabaseClient } from '@supabase/supabase-js';
 
 describe('levenshteinDistance', () => {
   it('should return 0 for identical strings', () => {
@@ -132,5 +138,159 @@ describe('bill-split name scenarios', () => {
     // Partial match but not the same person
     expect(similarity).toBeLessThan(0.8);
     expect(similarity).toBeGreaterThan(0.4);
+  });
+});
+
+// ─── Contact Auto-Resolution Tests ───
+
+describe('ContactsRepository', () => {
+  let mockSupabase: MockSupabaseClient;
+  let repo: ContactsRepository;
+
+  const mockContactRow = {
+    id: 'contact-123',
+    user_id: 'user-456',
+    name: 'Alice',
+    display_name: 'Alice',
+    aliases: [],
+    email: null,
+    phone: null,
+    telegram_id: '99887766',
+    telegram_username: 'alice_tg',
+    imessage_id: null,
+    discord_id: null,
+    whatsapp_id: null,
+    notes: null,
+    tags: ['auto-created', 'external'],
+    created_at: '2026-03-25T12:00:00Z',
+    updated_at: '2026-03-25T12:00:00Z',
+  };
+
+  beforeEach(() => {
+    mockSupabase = createMockSupabaseClient();
+    repo = new ContactsRepository(mockSupabase as unknown as SupabaseClient<any>);
+  });
+
+  describe('findOrCreateByPlatformId', () => {
+    it('should return existing contact when found', async () => {
+      mockSupabase._setReturnData(mockContactRow);
+
+      const result = await repo.findOrCreateByPlatformId('user-456', 'telegram', '99887766', {
+        name: 'Alice',
+        username: 'alice_tg',
+      });
+
+      expect(result.id).toBe('contact-123');
+      expect(result.telegramId).toBe('99887766');
+      // findByPlatformId is called first (select chain)
+      expect(mockSupabase.from).toHaveBeenCalledWith('contacts');
+    });
+
+    it('should create contact when not found', async () => {
+      // First call (findByPlatformId): not found
+      // Second call (createContact): returns new row
+      let callCount = 0;
+      mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          // findByPlatformId returns not found
+          return Promise.resolve({ data: null, error: { code: 'PGRST116', message: 'not found' } });
+        }
+        // createContact returns new row
+        return Promise.resolve({ data: mockContactRow, error: null });
+      });
+
+      const result = await repo.findOrCreateByPlatformId('user-456', 'telegram', '99887766', {
+        name: 'Alice',
+        username: 'alice_tg',
+      });
+
+      expect(result.id).toBe('contact-123');
+      expect(result.tags).toEqual(['auto-created', 'external']);
+    });
+
+    it('should handle race condition on duplicate create', async () => {
+      let callCount = 0;
+      mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          // findByPlatformId: not found
+          return Promise.resolve({ data: null, error: { code: 'PGRST116', message: 'not found' } });
+        }
+        if (callCount === 2) {
+          // createContact: duplicate error (Supabase returns plain object, not Error)
+          return Promise.resolve({
+            data: null,
+            error: { code: '23505', message: 'duplicate key value violates unique constraint' },
+          });
+        }
+        // retry findByPlatformId: found
+        return Promise.resolve({ data: mockContactRow, error: null });
+      });
+
+      const result = await repo.findOrCreateByPlatformId('user-456', 'telegram', '99887766', {
+        name: 'Alice',
+      });
+
+      expect(result.id).toBe('contact-123');
+    });
+
+    it('should use platform ID as display name when no name provided', async () => {
+      let callCount = 0;
+      mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.resolve({ data: null, error: { code: 'PGRST116', message: 'not found' } });
+        }
+        return Promise.resolve({
+          data: { ...mockContactRow, name: 'telegram:99887766', display_name: null },
+          error: null,
+        });
+      });
+
+      const result = await repo.findOrCreateByPlatformId('user-456', 'telegram', '99887766');
+
+      expect(result.name).toBe('telegram:99887766');
+    });
+  });
+
+  describe('findOrCreateGroupContact', () => {
+    const mockGroupRow = {
+      ...mockContactRow,
+      id: 'group-789',
+      name: 'Dinner Gang',
+      display_name: 'Dinner Gang',
+      telegram_id: 'group-chat-123',
+      tags: ['auto-created', 'group'],
+    };
+
+    it('should return existing group contact when found', async () => {
+      mockSupabase._setReturnData(mockGroupRow);
+
+      const result = await repo.findOrCreateGroupContact('user-456', 'telegram', 'group-chat-123', {
+        groupName: 'Dinner Gang',
+      });
+
+      expect(result.id).toBe('group-789');
+      expect(result.tags).toContain('group');
+    });
+
+    it('should create group contact when not found', async () => {
+      let callCount = 0;
+      mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.resolve({ data: null, error: { code: 'PGRST116', message: 'not found' } });
+        }
+        return Promise.resolve({ data: mockGroupRow, error: null });
+      });
+
+      const result = await repo.findOrCreateGroupContact('user-456', 'telegram', 'group-chat-123', {
+        groupName: 'Dinner Gang',
+      });
+
+      expect(result.id).toBe('group-789');
+      expect(result.tags).toContain('group');
+    });
   });
 });

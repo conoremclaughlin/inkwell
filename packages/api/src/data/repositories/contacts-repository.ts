@@ -396,9 +396,16 @@ export class ContactsRepository {
         tags: ['auto-created', 'external'],
       });
     } catch (error: unknown) {
-      // Unique constraint race — another request created it first
-      const msg = error instanceof Error ? error.message : String(error);
-      if (msg.includes('duplicate') || msg.includes('unique') || msg.includes('23505')) {
+      // Unique constraint race — another request created it first.
+      // Supabase errors are plain objects with { code, message }, not Error instances.
+      const err = error as Record<string, unknown>;
+      const msg = err?.message
+        ? String(err.message)
+        : error instanceof Error
+          ? error.message
+          : String(error);
+      const code = err?.code ? String(err.code) : '';
+      if (msg.includes('duplicate') || msg.includes('unique') || code === '23505') {
         const retried = await this.findByPlatformId(userId, platform, platformId);
         if (retried) return retried;
       }
@@ -447,8 +454,14 @@ export class ContactsRepository {
         tags: ['auto-created', 'group'],
       });
     } catch (error: unknown) {
-      const msg = error instanceof Error ? error.message : String(error);
-      if (msg.includes('duplicate') || msg.includes('unique') || msg.includes('23505')) {
+      const err = error as Record<string, unknown>;
+      const msg = err?.message
+        ? String(err.message)
+        : error instanceof Error
+          ? error.message
+          : String(error);
+      const code = err?.code ? String(err.code) : '';
+      if (msg.includes('duplicate') || msg.includes('unique') || code === '23505') {
         // Race — try lookup again
         if (platform === 'slack') {
           const retried = await this.findByPlatformId(userId, 'discord', groupId);

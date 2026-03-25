@@ -1011,14 +1011,12 @@ describe('MemoryRepository', () => {
       };
 
       mockSupabase._setReturnData(mockRow);
-      const embedDocument = vi
-        .fn()
-        .mockResolvedValue({
-          vector: new Array(1024).fill(0.1),
-          provider: 'ollama',
-          model: 'mxbai-embed-large',
-          dimensions: 1024,
-        });
+      const embedDocument = vi.fn().mockResolvedValue({
+        vector: new Array(1024).fill(0.1),
+        provider: 'ollama',
+        model: 'mxbai-embed-large',
+        dimensions: 1024,
+      });
       (repo as any).embeddingRouter = {
         isEnabled: vi.fn().mockReturnValue(true),
         embedDocument,
@@ -1490,6 +1488,114 @@ describe('MemoryRepository', () => {
 
       expect(rpc).not.toHaveBeenCalled();
       expect(results).toEqual([]);
+    });
+  });
+
+  // ─── Per-Sender Memory Isolation Tests ───
+
+  describe('contact-scoped remember', () => {
+    it('should write contact_id when provided', async () => {
+      disableEmbeddings();
+      const mockMemoryRow = {
+        id: 'mem-contact-1',
+        user_id: 'user-456',
+        content: 'Alice told me her address',
+        source: 'conversation',
+        salience: 'medium',
+        topics: [],
+        embedding: null,
+        contact_id: 'contact-alice',
+        metadata: {},
+        version: 1,
+        created_at: '2026-03-25T12:00:00Z',
+        expires_at: null,
+      };
+
+      mockSupabase._setReturnData(mockMemoryRow);
+
+      const result = await repo.remember({
+        userId: 'user-456',
+        content: 'Alice told me her address',
+        contactId: 'contact-alice',
+      });
+
+      expect(result.contactId).toBe('contact-alice');
+      expect(mockSupabase.from).toHaveBeenCalledWith('memories');
+    });
+
+    it('should set contact_id to null when not provided', async () => {
+      disableEmbeddings();
+      const mockMemoryRow = {
+        id: 'mem-owner-1',
+        user_id: 'user-456',
+        content: 'General knowledge',
+        source: 'observation',
+        salience: 'high',
+        topics: [],
+        embedding: null,
+        contact_id: null,
+        metadata: {},
+        version: 1,
+        created_at: '2026-03-25T12:00:00Z',
+        expires_at: null,
+      };
+
+      mockSupabase._setReturnData(mockMemoryRow);
+
+      const result = await repo.remember({
+        userId: 'user-456',
+        content: 'General knowledge',
+      });
+
+      expect(result.contactId).toBeUndefined();
+    });
+  });
+
+  describe('contact-scoped recall', () => {
+    it('should filter by contact_id when provided', async () => {
+      disableEmbeddings();
+      const contactMemory = {
+        id: 'mem-1',
+        user_id: 'user-456',
+        content: 'Private to Alice',
+        source: 'conversation',
+        salience: 'medium',
+        topics: [],
+        embedding: null,
+        contact_id: 'contact-alice',
+        metadata: {},
+        version: 1,
+        created_at: '2026-03-25T12:00:00Z',
+        expires_at: null,
+      };
+
+      mockSupabase._setArrayData([contactMemory]);
+
+      const results = await repo.recall('user-456', undefined, {
+        contactId: 'contact-alice',
+        recallMode: 'text',
+      });
+
+      expect(results.length).toBe(1);
+      expect(results[0].contactId).toBe('contact-alice');
+
+      // Verify eq('contact_id', 'contact-alice') was called
+      const eqCalls = (mockSupabase._queryBuilder.eq as ReturnType<typeof vi.fn>).mock.calls;
+      const contactFilter = eqCalls.find(
+        (call: unknown[]) => call[0] === 'contact_id' && call[1] === 'contact-alice'
+      );
+      expect(contactFilter).toBeDefined();
+    });
+
+    it('should not filter by contact_id when not provided (owner session)', async () => {
+      disableEmbeddings();
+      mockSupabase._setArrayData([]);
+
+      await repo.recall('user-456', undefined, { recallMode: 'text' });
+
+      const eqCalls = (mockSupabase._queryBuilder.eq as ReturnType<typeof vi.fn>).mock.calls;
+      const contactFilter = eqCalls.find((call: unknown[]) => call[0] === 'contact_id');
+      expect(contactFilter).toBeUndefined();
     });
   });
 });
