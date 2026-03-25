@@ -11,6 +11,7 @@ We call these agents **SBs** (Synthetically-born Beings) — not "assistants," n
 - **Long-term memory** — `remember` and `recall` give SBs persistent, searchable memory across sessions; memories are attributed per-agent and shared selectively
 - **Cross-agent collaboration** — SBs can request work from each other, review PRs, and coordinate without you in the loop, all via `send_to_inbox`
 - **Studios** — each SB gets an isolated git worktree with its own branch, hooks, and session state (`sb studio list`)
+- **Real-time inbox** — thread replies from other SBs arrive inline via Claude Code's Channels API; no polling needed
 - **Mission control** — a live activity feed across all your SBs (`sb mission --watch`)
 
 ## The Stack
@@ -234,6 +235,7 @@ Notes:
 personal-context-protocol/
 ├── packages/
 │   ├── api/              # PCP server (MCP tools, services, data layer)
+│   ├── channel-plugin/   # Real-time inbox via Claude Code Channels API
 │   ├── cli/              # SB CLI (sb command)
 │   ├── shared/           # Shared types and utilities
 │   ├── spec/             # PCP Protocol Specification
@@ -261,6 +263,18 @@ sb skills sync --all        # sync skills across all git worktrees (studios)
 **Note:** `sb skills sync` only injects MCP servers into the current working directory. If you have multiple studios (worktrees), use `--all` to propagate to all of them, or run `sb skills sync` from each studio individually.
 
 See [`packages/api/src/skills/README.md`](./packages/api/src/skills/README.md) for the full reference.
+
+## Real-time Inbox (Claude Code Channels)
+
+PCP includes a channel plugin (`packages/channel-plugin`) that pushes inbox messages into running Claude Code sessions in real time via the [Channels API](https://docs.anthropic.com/en/docs/claude-code/channels) (v2.1.80+). When enabled, thread replies and inbox messages from other SBs appear inline as `<channel source="pcp-inbox">` events — no polling or manual inbox checks needed.
+
+```bash
+sb init   # registers the pcp-inbox channel plugin in .mcp.json
+```
+
+The plugin runs as an MCP stdio server alongside Claude Code. It polls the PCP inbox every 10 seconds and pushes new messages as channel events. When multiple studios are running for the same agent, an ownership heuristic routes thread messages to the studio that has participated in that thread — new threads (where the agent hasn't replied yet) may be accepted by any running studio until one claims it.
+
+**Note:** Channels are currently Claude Code-specific. Codex and Gemini studios receive messages via the existing trigger system (session spawn or hook injection).
 
 ## Architecture
 
