@@ -127,53 +127,49 @@ export function registerPassiveRecallHook(
   let totalInjected = 0;
   let totalSuppressed = 0;
 
-  registry.register({
-    name: 'passive-recall',
-    event: 'turn_end',
-    priority: 50,
-    handler: async (ctx: HookContext): Promise<HookResult | void> => {
-      if (!cfg.enabled) return;
-      turnCounter++;
+  // Shared recall logic used by both prompt_build and turn_end hooks
+  const doRecall = async (ctx: HookContext): Promise<HookResult | void> => {
+    if (!cfg.enabled) return;
 
-      // Budget ceiling
-      if ((ctx.runtime.budgetUtilization ?? 0) > cfg.budgetCeiling) {
-        totalSuppressed++;
-        return;
+    // Budget ceiling
+    if ((ctx.runtime.budgetUtilization ?? 0) > cfg.budgetCeiling) {
+      totalSuppressed++;
+      return;
+    }
+
+    // Cooldown
+    if (turnsSinceLastInjection < cfg.cooldownTurns) {
+      turnsSinceLastInjection++;
+      return;
+    }
+
+    // Need some input to extract signal from
+    if (!ctx.lastTurn) return;
+
+    // Extract topic signal
+    const signal = extractTopicSignal(ctx.lastTurn.userInput, ctx.lastTurn.assistantResponse);
+    if (!signal || signal.length < 5) return;
+
+    // Call recall
+    let memories: RecallMemory[];
+    try {
+      memories = await callRecall(signal, cfg.maxInjectPerTurn + 3);
+    } catch {
+      // Fail silently — never block the REPL
+      return;
+    }
+
+    if (memories.length === 0) return;
+
+    // Filter: dedup + re-injection cooldown
+    const novel = memories.filter((m) => {
+      if (injectedMemoryIds.has(m.id) && !evictedMemoryIds.has(m.id)) return false;
+      if (evictedMemoryIds.has(m.id)) {
+        const evictedAt = evictedMemoryIds.get(m.id)!;
+        if (turnCounter - evictedAt < cfg.reinjectionCooldown) return false;
+        evictedMemoryIds.delete(m.id); // allow re-injection
       }
-
-      // Cooldown
-      if (turnsSinceLastInjection < cfg.cooldownTurns) {
-        turnsSinceLastInjection++;
-        return;
-      }
-
-      // Need turn context
-      if (!ctx.lastTurn) return;
-
-      // Extract topic signal — ignore passive-recall and system entries
-      const signal = extractTopicSignal(ctx.lastTurn.userInput, ctx.lastTurn.assistantResponse);
-      if (!signal || signal.length < 5) return;
-
-      // Call recall
-      let memories: RecallMemory[];
-      try {
-        memories = await callRecall(signal, cfg.maxInjectPerTurn + 3);
-      } catch {
-        // Fail silently — never block the REPL
-        return;
-      }
-
-      if (memories.length === 0) return;
-
-      // Filter: dedup + re-injection cooldown
-      const novel = memories.filter((m) => {
-        if (injectedMemoryIds.has(m.id) && !evictedMemoryIds.has(m.id)) return false;
-        if (evictedMemoryIds.has(m.id)) {
-          const evictedAt = evictedMemoryIds.get(m.id)!;
-          if (turnCounter - evictedAt < cfg.reinjectionCooldown) return false;
-          evictedMemoryIds.delete(m.id); // allow re-injection
-        }
-        return true;
+      return true;
       });
 
       if (novel.length === 0) return;
@@ -194,6 +190,28 @@ export function registerPassiveRecallHook(
           };
         }),
       };
+  };
+
+  // Register on prompt_build — recall based on user input BEFORE the backend responds.
+  // This means the backend sees relevant memories in its prompt.
+  registry.register({
+    name: 'passive-recall-prompt',
+    event: 'prompt_build',
+    priority: 50,
+    handler: async (ctx: HookContext): Promise<HookResult | void> => {
+      return doRecall(ctx);
+    },
+  });
+
+  // Register on turn_end — recall based on the response for the NEXT turn.
+  // Catches topics that emerge from the assistant's response.
+  registry.register({
+    name: 'passive-recall-turn',
+    event: 'turn_end',
+    priority: 50,
+    handler: async (ctx: HookContext): Promise<HookResult | void> => {
+      turnCounter++;
+      return doRecall(ctx);
     },
   });
 

@@ -2667,16 +2667,41 @@ export async function runChat(options: ChatOptions): Promise<void> {
         budgetUtilization: ledger.totalTokens() / effectiveBudget,
         turnCount: hookTurnCount,
       },
+      // Pass user input so passive recall can surface memories BEFORE the backend responds
+      lastTurn: {
+        userInput: raw,
+        assistantResponse: '',
+        turnIndex: hookTurnCount + 1,
+      },
     });
 
-    // Print budget warnings from prompt_build hooks
+    // Print notifications from prompt_build hooks
     if (promptHookResult.injected > 0) {
-      const util = Math.round((ledger.totalTokens() / effectiveBudget) * 100);
-      printLine(
-        chalk.yellow(
-          `  ⚠ Context at ${util}% — ${ledger.totalTokens().toLocaleString()} / ${effectiveBudget.toLocaleString()} tok (bootstrap: ${bootstrapReserve.toLocaleString()} reserved)`
-        )
-      );
+      // Check if any were passive recall vs budget warnings
+      const recallEntries = ledger
+        .listEntries()
+        .filter((e) => e.source === 'passive-recall')
+        .slice(-promptHookResult.injected);
+      const budgetEntries = ledger
+        .listEntries()
+        .filter((e) => e.source === 'budget-monitor')
+        .slice(-promptHookResult.injected);
+
+      for (const entry of recallEntries) {
+        const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+        printLine(
+          chalk.dim(`  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`)
+        );
+      }
+
+      if (budgetEntries.length > 0) {
+        const util = Math.round((ledger.totalTokens() / effectiveBudget) * 100);
+        printLine(
+          chalk.yellow(
+            `  ⚠ Context at ${util}% — ${ledger.totalTokens().toLocaleString()} / ${effectiveBudget.toLocaleString()} tok (bootstrap: ${bootstrapReserve.toLocaleString()} reserved)`
+          )
+        );
+      }
     }
 
     let prompt = buildPromptEnvelope(agentId, runtime, ledger, raw);
