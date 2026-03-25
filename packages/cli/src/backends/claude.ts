@@ -16,7 +16,7 @@ import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js'
  * If present, Claude Code should be started with --dangerously-load-development-channels
  * so it accepts push notifications from the channel.
  */
-function hasPcpChannelPlugin(cwd: string): boolean {
+function hasPcpInboxPlugin(cwd: string): boolean {
   const mcpJsonPath = join(cwd, '.mcp.json');
   if (!existsSync(mcpJsonPath)) return false;
   try {
@@ -77,7 +77,7 @@ export class ClaudeAdapter implements BackendAdapter {
     // PCP channel plugin: enable real-time inbox push notifications.
     // The channel plugin is a stdio MCP server that bridges PCP's HTTP
     // inbox to Claude Code's channel notification system.
-    if (hasPcpChannelPlugin(process.cwd())) {
+    if (hasPcpInboxPlugin(process.cwd())) {
       args.push('--dangerously-load-development-channels', 'server:pcp-inbox');
     }
 
