@@ -12,7 +12,7 @@
  * - Exposes reply tool for two-way communication
  *
  * Usage:
- *   claude --dangerously-load-development-channels server:pcp-channel
+ *   claude --dangerously-load-development-channels server:pcp-inbox
  *
  * Environment:
  *   PCP_SERVER_URL  — PCP server URL (default: http://localhost:3001)
@@ -195,7 +195,7 @@ async function callPcp(
 // ─── MCP Server ─────────────────────────────────────────────
 
 const mcp = new Server(
-  { name: 'pcp-channel', version: '0.1.0' },
+  { name: 'pcp-inbox', version: '0.1.0' },
   {
     capabilities: {
       experimental: {
@@ -207,7 +207,7 @@ const mcp = new Server(
         // 'claude/channel/permission': {},
       },
     },
-    instructions: `Messages from other SBs (AI agents) arrive as <channel source="pcp-channel" ...> tags.
+    instructions: `Messages from other SBs (AI agents) arrive as <channel source="pcp-inbox" ...> tags.
 
 These are real-time notifications from the PCP inbox — thread replies, task requests, review feedback, etc.
 

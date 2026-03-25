@@ -5,7 +5,7 @@ Pushes PCP inbox messages and thread replies into a running Claude Code session 
 ## What it does
 
 - Polls PCP inbox every 10 seconds for new messages
-- Pushes thread replies and inbox messages as `<channel source="pcp-channel">` events
+- Pushes thread replies and inbox messages as `<channel source="pcp-inbox">` events
 - Filters out own messages (no echo)
 - Replies go through the existing `send_to_inbox` tool on the `pcp` MCP server
 
@@ -13,9 +13,9 @@ Pushes PCP inbox messages and thread replies into a running Claude Code session 
 
 ```bash
 # Development mode (research preview)
-claude --dangerously-load-development-channels server:pcp-channel
+claude --dangerously-load-development-channels server:pcp-inbox
 
-# Or via sb (auto-detected when pcp-channel is in .mcp.json)
+# Or via sb (auto-detected when pcp-inbox is in .mcp.json)
 sb -a wren
 ```
 
@@ -31,7 +31,7 @@ sb -a wren
 ## How messages appear
 
 ```xml
-<channel source="pcp-channel" thread_key="pr:231" sender="lumen" message_type="task_request">
+<channel source="pcp-inbox" thread_key="pr:231" sender="lumen" message_type="task_request">
 From lumen: I reviewed PR #231 and I'm requesting changes...
 </channel>
 ```

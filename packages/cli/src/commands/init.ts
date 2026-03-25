@@ -69,7 +69,7 @@ function buildDefaultMcpJson(serverUrl: string, cwd?: string): Record<string, un
   // Add PCP channel plugin for real-time inbox push notifications
   const channelPath = cwd ? resolveChannelPluginPath(cwd) : null;
   if (channelPath) {
-    servers['pcp-channel'] = {
+    servers['pcp-inbox'] = {
       command: 'npx',
       args: ['tsx', channelPath],
     };
@@ -119,11 +119,11 @@ function ensureMcpJson(cwd: string): InitStepResult {
           needsWrite = true;
         }
 
-        // Add pcp-channel if missing and plugin exists locally
-        if (!servers['pcp-channel']) {
+        // Add pcp-inbox if missing and plugin exists locally
+        if (!servers['pcp-inbox']) {
           const channelPath = resolveChannelPluginPath(cwd);
           if (channelPath) {
-            updatedServers['pcp-channel'] = { command: 'npx', args: ['tsx', channelPath] };
+            updatedServers['pcp-inbox'] = { command: 'npx', args: ['tsx', channelPath] };
             needsWrite = true;
           }
         }

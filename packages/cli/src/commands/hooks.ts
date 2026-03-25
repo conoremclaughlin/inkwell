@@ -854,7 +854,7 @@ function hasActiveChannelPlugin(cwd: string): boolean {
     const mcpJsonPath = join(cwd, '.mcp.json');
     if (!existsSync(mcpJsonPath)) return false;
     const mcpConfig = JSON.parse(readFileSync(mcpJsonPath, 'utf-8'));
-    return Boolean(mcpConfig?.mcpServers?.['pcp-channel']);
+    return Boolean(mcpConfig?.mcpServers?.['pcp-inbox']);
   } catch {
     return false;
   }
