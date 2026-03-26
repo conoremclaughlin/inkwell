@@ -1162,9 +1162,12 @@ export class MemoryRepository {
       }
     }
 
-    // Per-sender isolation: scope to contact when provided
+    // Per-sender isolation: always scope by contact to prevent collision.
+    // Contact sessions match their contact; owner sessions match NULL.
     if (contactId) {
       query = query.eq('contact_id', contactId);
+    } else {
+      query = query.is('contact_id', null);
     }
 
     const { data, error } = await query.single();
@@ -1208,9 +1211,12 @@ export class MemoryRepository {
       }
     }
 
-    // Per-sender isolation: scope to contact when provided
+    // Per-sender isolation: always scope by contact to prevent collision.
+    // Contact sessions match their contact; owner sessions match NULL.
     if (contactId) {
       query = query.eq('contact_id', contactId);
+    } else {
+      query = query.is('contact_id', null);
     }
 
     const { data, error } = await query.single();

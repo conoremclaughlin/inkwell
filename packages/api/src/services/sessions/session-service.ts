@@ -689,10 +689,12 @@ export class SessionService implements ISessionService {
 
       if (!options?.threadKey) {
         // Fall back to general active session match only for non-threaded requests.
+        // Always pass contactId to enforce isolation: contact sessions match their
+        // contact, owner sessions (contactId=undefined) match only NULL rows.
         const existing = await this.repository.findByUserAndAgent(userId, agentId, {
           type: 'primary',
           ...(resolvedStudioId ? { studioId: resolvedStudioId } : {}),
-          ...(options?.contactId ? { contactId: options.contactId } : {}),
+          contactId: options?.contactId,
         });
 
         if (existing) {

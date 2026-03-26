@@ -164,15 +164,35 @@ describe('Per-Sender Session Isolation', () => {
       expect(session).toBeNull();
     });
 
-    it('should not filter by contact_id when not provided (owner session)', async () => {
+    it('should not filter by contact_id when options not provided (backward compat)', async () => {
       const { supabase, filters } = createMockSupabase();
       const repo = new SessionRepository(supabase as never);
 
+      // No options at all — backward compatible, no contact filtering
       await repo.findByUserAndAgent('user-1', 'myra');
 
-      // Verify contact_id filter was NOT applied
-      const contactFilters = filters.filter((f) => f.method === 'eq' && f.args[0] === 'contact_id');
-      expect(contactFilters).toHaveLength(0);
+      const contactEqFilters = filters.filter(
+        (f) => f.method === 'eq' && f.args[0] === 'contact_id'
+      );
+      const contactIsFilters = filters.filter(
+        (f) => f.method === 'is' && f.args[0] === 'contact_id'
+      );
+      expect(contactEqFilters).toHaveLength(0);
+      expect(contactIsFilters).toHaveLength(0);
+    });
+
+    it('should filter for contact_id IS NULL when contactId explicitly undefined (owner session)', async () => {
+      const { supabase, filters } = createMockSupabase();
+      const repo = new SessionRepository(supabase as never);
+
+      // Owner session: contactId key is present but undefined → filter IS NULL
+      // This is how session-service calls it for owner requests
+      await repo.findByUserAndAgent('user-1', 'myra', { contactId: undefined });
+
+      const contactIsNull = filters.find(
+        (f) => f.method === 'is' && f.args[0] === 'contact_id' && f.args[1] === null
+      );
+      expect(contactIsNull).toBeDefined();
     });
   });
 
