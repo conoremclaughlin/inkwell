@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { handleSendToInbox, handleGetInbox, isThreadOwnedByStudio } from './inbox-handlers';
+import { handleSendToInbox, handleGetInbox, handleUpdateInboxMessage, isThreadOwnedByStudio } from './inbox-handlers';
 
 // Mock user-resolver
 vi.mock('../../services/user-resolver', async (importOriginal) => {
@@ -1066,5 +1066,124 @@ describe('isThreadOwnedByStudio', () => {
       },
     ];
     expect(isThreadOwnedByStudio(messages, MY_STUDIO)).toBe(false);
+  });
+});
+
+// =====================================================
+// update_inbox_message — thread message fallback
+// =====================================================
+
+describe('handleUpdateInboxMessage — thread message fallback', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('should update thread read pointer when given a thread message ID', async () => {
+    const threadMsgId = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
+    const threadId = 'f1e2d3c4-b5a6-7890-abcd-ef0987654321';
+
+    // Track upsert calls
+    const upsertCalls: unknown[] = [];
+
+    const fromFn = vi.fn().mockImplementation((table: string) => {
+      if (table === 'agent_inbox') {
+        // Legacy inbox: no match
+        return {
+          select: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                eq: vi.fn().mockReturnValue({
+                  maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
+                }),
+              }),
+            }),
+          }),
+        };
+      }
+      if (table === 'inbox_thread_messages') {
+        // Thread message found
+        return {
+          select: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              maybeSingle: vi.fn().mockResolvedValue({
+                data: { id: threadMsgId, thread_id: threadId },
+                error: null,
+              }),
+            }),
+          }),
+        };
+      }
+      if (table === 'inbox_threads') {
+        // Thread belongs to user
+        return {
+          select: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                maybeSingle: vi.fn().mockResolvedValue({
+                  data: { id: threadId },
+                  error: null,
+                }),
+              }),
+            }),
+          }),
+        };
+      }
+      if (table === 'inbox_thread_participants') {
+        // Agent is a participant
+        return {
+          select: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                maybeSingle: vi.fn().mockResolvedValue({
+                  data: { agent_id: 'wren' },
+                  error: null,
+                }),
+              }),
+            }),
+          }),
+        };
+      }
+      if (table === 'inbox_thread_read_status') {
+        return {
+          upsert: vi.fn().mockImplementation((data: unknown) => {
+            upsertCalls.push(data);
+            return Promise.resolve({ data: null, error: null });
+          }),
+        };
+      }
+      if (table === 'agent_identities') {
+        return {
+          select: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                order: vi.fn().mockResolvedValue({ data: [], error: null }),
+              }),
+            }),
+          }),
+        };
+      }
+      return { select: vi.fn().mockReturnThis(), eq: vi.fn().mockReturnThis() };
+    });
+
+    const mockDc = {
+      getClient: vi.fn().mockReturnValue({ from: fromFn }),
+      repositories: {},
+    };
+
+    const result = await handleUpdateInboxMessage(
+      {
+        email: 'test@test.com',
+        messageId: threadMsgId,
+        agentId: 'wren',
+        status: 'completed',
+      },
+      mockDc as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.threadId).toBe(threadId);
+    expect(parsed.status).toBe('completed');
+    expect(upsertCalls.length).toBe(1);
   });
 });

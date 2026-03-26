@@ -1151,56 +1151,121 @@ export async function handleUpdateInboxMessage(args: unknown, dataComposer: Data
 
   const { messageId, agentId, status } = parsed;
 
-  // Verify the message belongs to this agent
-  const { data: existing, error: fetchError } = await supabase
+  // Try legacy agent_inbox first
+  const { data: existing } = await supabase
     .from('agent_inbox')
     .select('*')
     .eq('id', messageId)
     .eq('recipient_user_id', resolved.user.id)
     .eq('recipient_agent_id', agentId)
-    .single();
+    .maybeSingle();
 
-  if (fetchError) {
-    throw new Error(`Message not found or not accessible: ${messageId}`);
+  if (existing) {
+    // Legacy inbox message — update in agent_inbox
+    const updates: Record<string, unknown> = { status };
+    if (status === 'read' && !existing.read_at) {
+      updates.read_at = new Date().toISOString();
+    }
+    if (status === 'acknowledged') {
+      updates.acknowledged_at = new Date().toISOString();
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('agent_inbox')
+      .update(updates)
+      .eq('id', messageId)
+      .select()
+      .single();
+
+    if (updateError) {
+      throw new Error(`Failed to update message: ${updateError.message}`);
+    }
+
+    logger.info('Inbox message updated', { messageId, agentId, newStatus: status });
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({
+            success: true,
+            message: 'Message updated',
+            messageId,
+            status: updated.status,
+            readAt: updated.read_at,
+            acknowledgedAt: updated.acknowledged_at,
+          }),
+        },
+      ],
+    };
   }
 
-  const updates: Record<string, unknown> = { status };
-
-  if (status === 'read' && !existing.read_at) {
-    updates.read_at = new Date().toISOString();
-  }
-  if (status === 'acknowledged') {
-    updates.acknowledged_at = new Date().toISOString();
-  }
-
-  const { data: updated, error: updateError } = await supabase
-    .from('agent_inbox')
-    .update(updates)
+  // Try thread message — verify thread belongs to this user AND agent is a participant
+  const { data: threadMsg } = await threadTable(supabase, 'inbox_thread_messages')
+    .select('id, thread_id')
     .eq('id', messageId)
-    .select()
-    .single();
+    .maybeSingle();
 
-  if (updateError) {
-    throw new Error(`Failed to update message: ${updateError.message}`);
+  if (threadMsg) {
+    // Verify the thread belongs to this user
+    const { data: thread } = await threadTable(supabase, 'inbox_threads')
+      .select('id')
+      .eq('id', threadMsg.thread_id)
+      .eq('user_id', resolved.user.id)
+      .maybeSingle();
+
+    if (!thread) {
+      throw new Error(`Message not found or not accessible: ${messageId}`);
+    }
+
+    // Verify this agent is a participant on the thread
+    const { data: participant } = await threadTable(supabase, 'inbox_thread_participants')
+      .select('agent_id')
+      .eq('thread_id', threadMsg.thread_id)
+      .eq('agent_id', agentId)
+      .maybeSingle();
+
+    if (!participant) {
+      throw new Error(`Message not found or not accessible: ${messageId}`);
+    }
+
+    // Thread messages don't have a status column — mark the thread as read instead
+    if (status === 'read' || status === 'acknowledged' || status === 'completed') {
+      await threadTable(supabase, 'inbox_thread_read_status').upsert(
+        {
+          thread_id: threadMsg.thread_id,
+          agent_id: agentId,
+          last_read_at: new Date().toISOString(),
+        },
+        { onConflict: 'thread_id,agent_id' }
+      );
+    }
+
+    logger.info('Thread message status updated (via read pointer)', {
+      messageId,
+      threadId: threadMsg.thread_id,
+      agentId,
+      newStatus: status,
+    });
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({
+            success: true,
+            message: 'Thread message acknowledged (thread marked as read)',
+            messageId,
+            threadId: threadMsg.thread_id,
+            status,
+          }),
+        },
+      ],
+    };
   }
 
-  logger.info('Inbox message updated', { messageId, agentId, newStatus: status });
-
-  return {
-    content: [
-      {
-        type: 'text' as const,
-        text: JSON.stringify({
-          success: true,
-          message: 'Message updated',
-          messageId,
-          status: updated.status,
-          readAt: updated.read_at,
-          acknowledgedAt: updated.acknowledged_at,
-        }),
-      },
-    ],
-  };
+  // Neither table had this message
+  throw new Error(`Message not found or not accessible: ${messageId}`);
 }
 
 export async function handleMarkInboxRead(args: unknown, dataComposer: DataComposer) {
