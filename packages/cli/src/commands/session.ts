@@ -15,7 +15,6 @@ import chalk from 'chalk';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { basename, dirname, join, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
-import { readIdentityJson } from '../backends/identity.js';
 import { createInterface } from 'readline/promises';
 import { callPcpTool, getPcpServerUrl } from '../lib/pcp-mcp.js';
 import { getValidAccessToken } from '../auth/tokens.js';
@@ -134,15 +133,6 @@ function getPcpConfig(): PcpConfig | null {
   return null;
 }
 
-export function resolveSyncWorkspaceId(
-  explicitWorkspaceId?: string,
-  cwd = process.cwd()
-): string | undefined {
-  if (explicitWorkspaceId?.trim()) return explicitWorkspaceId.trim();
-
-  const identity = readIdentityJson(cwd);
-  return identity?.workspaceId || identity?.studioId || undefined;
-}
 
 function normalizePath(input: string): string {
   return resolvePath(input);
@@ -340,9 +330,8 @@ async function fetchAdminJson<T>(options: {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
   };
-  const workspaceId = resolveSyncWorkspaceId(options.workspaceId);
-  if (workspaceId) {
-    headers['x-pcp-workspace-id'] = workspaceId;
+  if (options.workspaceId?.trim()) {
+    headers['x-pcp-workspace-id'] = options.workspaceId.trim();
   }
   if (options.body) {
     headers['Content-Type'] = 'application/json';
