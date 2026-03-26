@@ -334,6 +334,13 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
     .optional()
     .describe('Backend runtime (e.g., "claude-code", "codex", "gemini")'),
   model: z.string().optional().describe('Model identifier (e.g., "opus-4-6", "sonnet", "o3")'),
+  contactId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe(
+      'Contact ID for per-sender session isolation. When set, the session is scoped to this contact.'
+    ),
   metadata: z.record(z.unknown()).optional().describe('Additional session metadata'),
   forceNew: z
     .boolean()
@@ -764,7 +771,8 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
     existingSession = await dataComposer.repositories.memory.getActiveSession(
       user.id,
       agentId,
-      studioId
+      studioId,
+      params.contactId
     );
   }
 
@@ -811,6 +819,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
     backend: params.backend,
     model: params.model,
     metadata: params.metadata,
+    contactId: params.contactId,
   });
 
   // Persist CLI-attached flag from request context to session record.

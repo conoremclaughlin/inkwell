@@ -1012,6 +1012,9 @@ export class MemoryRepository {
     if (input.threadKey) {
       insertData.thread_key = input.threadKey;
     }
+    if (input.contactId) {
+      insertData.contact_id = input.contactId;
+    }
 
     const { data, error } = await this.supabase
       .from('sessions')
@@ -1135,7 +1138,8 @@ export class MemoryRepository {
   async getActiveSession(
     userId: string,
     agentId?: string,
-    studioId?: string | null
+    studioId?: string | null,
+    contactId?: string
   ): Promise<Session | null> {
     let query = this.supabase
       .from('sessions')
@@ -1156,6 +1160,11 @@ export class MemoryRepository {
       } else {
         query = query.eq('studio_id', studioId);
       }
+    }
+
+    // Per-sender isolation: scope to contact when provided
+    if (contactId) {
+      query = query.eq('contact_id', contactId);
     }
 
     const { data, error } = await query.single();

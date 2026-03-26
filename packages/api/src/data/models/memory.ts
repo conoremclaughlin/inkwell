@@ -117,6 +117,7 @@ export interface SessionCreateInput {
   agentId?: string;
   studioId?: string;
   threadKey?: string;
+  contactId?: string;
   backend?: string;
   model?: string;
   metadata?: Record<string, unknown>;
