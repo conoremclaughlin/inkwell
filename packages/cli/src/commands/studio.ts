@@ -43,6 +43,7 @@ import { homedir } from 'os';
 import { installHooks, callPcpTool } from './hooks.js';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
 import { resolveAgentId } from '../backends/identity.js';
+import { registerStudioSandboxCommands } from './studio-sandbox.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -1583,4 +1584,6 @@ export function registerStudioCommands(program: Command): void {
     .option('-n, --name <name>', 'Binary name (default: sb-<agent> from .pcp/identity.json)')
     .option('--unlink', 'Remove the linked binary instead of creating it')
     .action(cliLinkCommand);
+
+  registerStudioSandboxCommands(studio);
 }

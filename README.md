@@ -229,6 +229,64 @@ Notes:
   3. `.env.local`
   4. `.env`
 
+## Studio sandbox runtime (Docker, studio-first)
+
+PCP also supports a **studio-first Docker sandbox** for SB work. This is separate from the app-stack container above.
+
+The sandbox model is:
+
+- active studio mounted at **`/studio`**
+- sibling studios mounted under **`/studios/<folder>`**
+- the canonical repo `.git` directory mounted so git worktrees still work
+- the rest of the host filesystem unavailable by default
+- active studio `.mcp.json` rewritten for Docker so `localhost` MCP servers resolve to `host.docker.internal`
+
+Build the image:
+
+```bash
+yarn docker:studio:build
+# or:
+sb studio sandbox build
+```
+
+Inspect the current plan:
+
+```bash
+sb studio sandbox plan
+sb studio sandbox plan --json
+```
+
+Run a one-shot command:
+
+```bash
+sb studio sandbox run -- bash -lc 'pwd && git status --short --branch'
+```
+
+Start a persistent sandbox for the current studio:
+
+```bash
+sb studio sandbox up
+sb studio sandbox status
+sb studio sandbox shell
+sb studio sandbox exec -- git status --short --branch
+sb studio sandbox down
+```
+
+Useful options:
+
+- `--studio-access none|ro|rw` — disable studio mounts, or make them read-only
+- `--network default|none` — default outbound networking, or no network
+- `--backend-auth claude,codex,gemini` — explicitly mount backend auth/config dirs into the container (read-only by default)
+- `--mount hostPath:containerPath[:ro|rw]` — add a narrow explicit extra mount
+
+The sandbox image currently includes:
+
+- Node 22
+- git, bash, curl, jq, ripgrep
+- `@anthropic-ai/claude-code`
+- `@openai/codex`
+- `@google/gemini-cli`
+
 ## Project Structure
 
 ```
