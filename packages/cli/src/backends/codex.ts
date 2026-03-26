@@ -8,6 +8,7 @@
  */
 
 import { createIdentityPromptFile } from './identity.js';
+import { encodeContextToken } from '@personal-context/shared';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
 
 /**
@@ -15,11 +16,16 @@ import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js'
  * Each entry maps a header name to the env var that holds its value.
  * Codex resolves env var → value at runtime, so multiple sessions in
  * the same studio each get their own scoped headers.
+ *
+ * x-pcp-context is the consolidated token (preferred). Individual headers
+ * are kept for backward compat during migration.
  */
-const PCP_ENV_HEADERS: Array<{ header: string; envVar: string; configKey: () => string }> = [
-  { header: 'x-pcp-agent-id', envVar: 'AGENT_ID', configKey: () => 'AGENT_ID' },
-  { header: 'x-pcp-session-id', envVar: 'PCP_SESSION_ID', configKey: () => 'PCP_SESSION_ID' },
-  { header: 'x-pcp-studio-id', envVar: 'PCP_STUDIO_ID', configKey: () => 'PCP_STUDIO_ID' },
+const PCP_ENV_HEADERS: Array<{ header: string; envVar: string }> = [
+  { header: 'x-pcp-context', envVar: 'PCP_CONTEXT_TOKEN' },
+  { header: 'Authorization', envVar: 'PCP_AUTH_BEARER' },
+  { header: 'x-pcp-agent-id', envVar: 'AGENT_ID' },
+  { header: 'x-pcp-session-id', envVar: 'PCP_SESSION_ID' },
+  { header: 'x-pcp-studio-id', envVar: 'PCP_STUDIO_ID' },
 ];
 
 export class CodexAdapter implements BackendAdapter {
@@ -86,11 +92,25 @@ export class CodexAdapter implements BackendAdapter {
       }
     }
 
+    // Build consolidated context token for x-pcp-context header
+    const contextToken = encodeContextToken({
+      sessionId: config.pcpSessionId || '',
+      studioId: config.studioId || '',
+      agentId: config.agentId,
+      cliAttached: true,
+      runtime: 'codex',
+    });
+
+    // PCP_AUTH_BEARER is constructed at the spawn site from PCP_ACCESS_TOKEN
+    // (set via authEnv). The adapter declares the header mapping; the spawn
+    // site provides the env var value.
+
     return {
       binary: this.binary,
       args,
       env: {
         AGENT_ID: config.agentId,
+        PCP_CONTEXT_TOKEN: contextToken,
         ...(config.pcpSessionId ? { PCP_SESSION_ID: config.pcpSessionId } : {}),
         ...(config.studioId ? { PCP_STUDIO_ID: config.studioId } : {}),
       },

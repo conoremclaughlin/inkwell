@@ -3558,6 +3558,10 @@ export async function runClaude(
     env: {
       ...process.env,
       ...authEnv,
+      // PCP_AUTH_BEARER: full "Bearer <token>" for Codex env_http_headers
+      ...(authEnv.PCP_ACCESS_TOKEN
+        ? { PCP_AUTH_BEARER: `Bearer ${authEnv.PCP_ACCESS_TOKEN}` }
+        : {}),
       ...prepared.env,
       ...(runtimeLinkId ? { PCP_RUNTIME_LINK_ID: runtimeLinkId } : {}),
     },
