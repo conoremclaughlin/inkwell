@@ -2,32 +2,11 @@ import { describe, it, expect } from 'vitest';
 
 /**
  * Unit tests for channel plugin filtering logic.
- * These test the pure functions without needing a running server.
+ *
+ * Thread studio filtering is now handled server-side via channelPoll=true
+ * on get_inbox. These tests cover the remaining client-side logic:
+ * legacy inbox message filtering, dedup, and since behavior.
  */
-
-// ─── Thread ownership check (extracted from plugin) ────────────────
-// Determines if a thread belongs to this studio based on participation history.
-function isThreadOwnedByThisStudio(
-  messages: Array<Record<string, unknown>>,
-  myAgentId: string,
-  myStudioId: string | undefined
-): boolean {
-  if (!myStudioId) return true;
-
-  const ourMessages = messages.filter((m) => m.senderAgentId === myAgentId);
-  if (ourMessages.length === 0) return true; // new thread — accept
-
-  for (const msg of ourMessages) {
-    const metadata = msg.metadata as Record<string, unknown> | undefined;
-    const pcp = metadata?.pcp as Record<string, unknown> | undefined;
-    const sender = pcp?.sender as Record<string, unknown> | undefined;
-    const senderStudioId = sender?.studioId as string | undefined;
-
-    if (senderStudioId && senderStudioId === myStudioId) return true;
-  }
-
-  return false; // our agent participated from a different studio
-}
 
 // ─── Legacy inbox message filter (extracted from plugin) ───────────
 function isLegacyMessageForThisStudio(
@@ -47,107 +26,6 @@ function isLegacyMessageForThisStudio(
 
 const MY_STUDIO = 'ef511db1-a158-4a06-ba40-abb61785dbbc';
 const OTHER_STUDIO = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
-const MY_AGENT = 'wren';
-
-describe('isThreadOwnedByThisStudio', () => {
-  it('accepts threads where our agent participated from this studio', () => {
-    const messages = [
-      {
-        senderAgentId: 'wren',
-        content: 'hello',
-        metadata: { pcp: { sender: { agentId: 'wren', studioId: MY_STUDIO } } },
-      },
-      {
-        senderAgentId: 'lumen',
-        content: 'ack',
-        metadata: { pcp: { sender: { agentId: 'lumen', studioId: 'lumen-studio' } } },
-      },
-    ];
-    expect(isThreadOwnedByThisStudio(messages, MY_AGENT, MY_STUDIO)).toBe(true);
-  });
-
-  it('rejects threads where our agent participated from a different studio', () => {
-    const messages = [
-      {
-        senderAgentId: 'wren',
-        content: 'hello',
-        metadata: { pcp: { sender: { agentId: 'wren', studioId: OTHER_STUDIO } } },
-      },
-      {
-        senderAgentId: 'lumen',
-        content: 'ack',
-        metadata: { pcp: { sender: { agentId: 'lumen' } } },
-      },
-    ];
-    expect(isThreadOwnedByThisStudio(messages, MY_AGENT, MY_STUDIO)).toBe(false);
-  });
-
-  it('accepts new threads where our agent has no messages yet', () => {
-    const messages = [
-      {
-        senderAgentId: 'lumen',
-        content: 'hey wren',
-        metadata: { pcp: { sender: { agentId: 'lumen' } } },
-      },
-    ];
-    expect(isThreadOwnedByThisStudio(messages, MY_AGENT, MY_STUDIO)).toBe(true);
-  });
-
-  it('accepts all threads when studioId is undefined', () => {
-    const messages = [
-      {
-        senderAgentId: 'wren',
-        content: 'hello',
-        metadata: { pcp: { sender: { agentId: 'wren', studioId: OTHER_STUDIO } } },
-      },
-    ];
-    expect(isThreadOwnedByThisStudio(messages, MY_AGENT, undefined)).toBe(true);
-  });
-
-  it('accepts threads where our agent has messages with no studio metadata', () => {
-    // Pre-studio messages (no metadata.pcp.sender.studioId) — treat as unowned
-    const messages = [
-      {
-        senderAgentId: 'wren',
-        content: 'old message',
-        metadata: { pcp: { sender: { agentId: 'wren' } } },
-      },
-    ];
-    // No studioId in sender → never matches → falls through to false
-    // BUT: this is pre-studio data, so we shouldn't reject it.
-    // Actually, the function returns false here — which is incorrect for legacy data.
-    // For now this is acceptable since all active studios stamp studioId.
-    expect(isThreadOwnedByThisStudio(messages, MY_AGENT, MY_STUDIO)).toBe(false);
-  });
-
-  it('accepts threads with mixed studio participation (at least one match)', () => {
-    const messages = [
-      {
-        senderAgentId: 'wren',
-        content: 'from other studio',
-        metadata: { pcp: { sender: { agentId: 'wren', studioId: OTHER_STUDIO } } },
-      },
-      {
-        senderAgentId: 'wren',
-        content: 'from this studio',
-        metadata: { pcp: { sender: { agentId: 'wren', studioId: MY_STUDIO } } },
-      },
-    ];
-    expect(isThreadOwnedByThisStudio(messages, MY_AGENT, MY_STUDIO)).toBe(true);
-  });
-
-  it('ignores other agents studio IDs when checking ownership', () => {
-    const messages = [
-      {
-        senderAgentId: 'lumen',
-        content: 'from lumen',
-        metadata: { pcp: { sender: { agentId: 'lumen', studioId: MY_STUDIO } } },
-      },
-    ];
-    // lumen's messages have our studioId, but we (wren) have no messages — new thread
-    expect(isThreadOwnedByThisStudio(messages, MY_AGENT, MY_STUDIO)).toBe(true);
-  });
-});
 
 describe('isLegacyMessageForThisStudio', () => {
   it('accepts messages addressed to this studio', () => {

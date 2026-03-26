@@ -113,46 +113,10 @@ const studioId = process.env.PCP_STUDIO_ID || undefined;
 const sessionId = process.env.PCP_SESSION_ID || undefined;
 
 /**
- * Check if this studio is a participant in a thread by examining message history.
- *
- * Thread messages don't have explicit recipient routing — instead, each message
- * carries `metadata.pcp.sender.studioId` identifying which studio sent it.
- * If our agent has sent messages on this thread from a DIFFERENT studio, this
- * studio should not receive push events (that thread belongs to the other studio).
- *
- * Returns true (accept) when:
- * - No studioId configured (accept all — single-studio setup)
- * - Our agent has no messages on the thread yet (new thread — accept in any studio)
- * - Our agent's messages on the thread came from THIS studioId
- *
- * Returns false (skip) when:
- * - Our agent has messages on the thread from a DIFFERENT studioId
- */
-function isThreadOwnedByThisStudio(
-  messages: Array<Record<string, unknown>>
-): boolean {
-  if (!studioId) return true; // no studio context — accept all
-
-  // Find messages sent by our agent and check which studio they came from
-  const ourMessages = messages.filter((m) => m.senderAgentId === agentId);
-  if (ourMessages.length === 0) return true; // new thread for us — accept
-
-  for (const msg of ourMessages) {
-    const metadata = msg.metadata as Record<string, unknown> | undefined;
-    const pcp = metadata?.pcp as Record<string, unknown> | undefined;
-    const sender = pcp?.sender as Record<string, unknown> | undefined;
-    const senderStudioId = sender?.studioId as string | undefined;
-
-    if (senderStudioId && senderStudioId === studioId) return true; // we participated from this studio
-  }
-
-  // Our agent participated but from a different studio — skip
-  return false;
-}
-
-/**
  * Check if a legacy inbox message is addressed to this studio.
  * Legacy messages (non-threaded) carry explicit recipient routing.
+ *
+ * Thread filtering is handled server-side via channelPoll=true on get_inbox.
  */
 function isLegacyMessageForThisStudio(msg: Record<string, unknown>): boolean {
   if (!studioId) return true;
@@ -187,6 +151,13 @@ async function callPcp(
   };
   if (accessToken) {
     headers.Authorization = `Bearer ${accessToken}`;
+  }
+  // Forward studio/session context so the server can apply channelPoll filtering
+  if (studioId) {
+    headers['x-pcp-studio-id'] = studioId;
+  }
+  if (sessionId) {
+    headers['x-pcp-session-id'] = sessionId;
   }
 
   try {
@@ -277,6 +248,7 @@ async function pollInbox(): Promise<void> {
       status: 'all',
       since: lastPollTime,
       limit: 20,
+      channelPoll: true,
     });
 
     if (!result?.success) {
@@ -295,15 +267,14 @@ async function pollInbox(): Promise<void> {
       const unreadCount = (thread.unreadCount as number) || 0;
       if (!threadKey || unreadCount === 0) continue;
 
-      // Peek at thread messages WITHOUT advancing the read pointer.
-      // We must check studio ownership before marking read — the read pointer
-      // is per-agent (not per-studio), so a non-owning studio marking read
-      // would prevent the owning studio from ever seeing these as unread.
+      // Studio filtering is handled server-side via channelPoll=true.
+      // The server only returns threads owned by this studio (or broadcast
+      // threads with no studio affinity), so we can safely mark read here.
       const threadResult = await callPcp('get_thread_messages', {
         email,
         agentId,
         threadKey,
-        markRead: false,
+        markRead: true,
         limit: 5,
       });
 
@@ -311,17 +282,6 @@ async function pollInbox(): Promise<void> {
 
       const messages = (threadResult.messages as Array<Record<string, unknown>>) || [];
       const lastKnownTs = lastThreadTimestamps.get(threadKey);
-
-      // Studio filter: check if this studio owns the thread (based on our
-      // agent's participation history). Skip entire thread if another studio
-      // of the same agent is the active participant.
-      if (!isThreadOwnedByThisStudio(messages)) {
-        log('debug', 'Skipping thread (owned by different studio)', { threadKey, studioId });
-        continue;
-      }
-
-      // Now mark read — we've confirmed this studio owns the thread.
-      await callPcp('mark_thread_read', { email, agentId, threadKey });
 
       for (const msg of messages) {
         const msgId = msg.id as string;

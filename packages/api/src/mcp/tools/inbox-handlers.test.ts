@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { handleSendToInbox, handleGetInbox } from './inbox-handlers';
+import { handleSendToInbox, handleGetInbox, isThreadOwnedByStudio } from './inbox-handlers';
 
 // Mock user-resolver
 vi.mock('../../services/user-resolver', async (importOriginal) => {
@@ -984,5 +984,57 @@ describe('handleGetInbox - recipient session naming', () => {
 
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.messages[0].recipientSessionId).toBe('b85490f5-0836-4bdd-8193-f6cfa2562a41');
+  });
+});
+
+// =====================================================
+// channelPoll — server-side studio filtering
+// =====================================================
+
+describe('isThreadOwnedByStudio', () => {
+  const MY_STUDIO = 'studio-omega';
+  const OTHER_STUDIO = 'studio-review';
+
+  it('accepts when agent has no messages (new/broadcast thread)', () => {
+    expect(isThreadOwnedByStudio([], MY_STUDIO)).toBe(true);
+  });
+
+  it('accepts when agent has a message from this studio', () => {
+    const messages = [
+      { metadata: { pcp: { sender: { agentId: 'wren', studioId: MY_STUDIO } } } },
+    ];
+    expect(isThreadOwnedByStudio(messages, MY_STUDIO)).toBe(true);
+  });
+
+  it('rejects when agent has messages only from a different studio', () => {
+    const messages = [
+      { metadata: { pcp: { sender: { agentId: 'wren', studioId: OTHER_STUDIO } } } },
+    ];
+    expect(isThreadOwnedByStudio(messages, MY_STUDIO)).toBe(false);
+  });
+
+  it('accepts when at least one message matches (mixed studios)', () => {
+    const messages = [
+      { metadata: { pcp: { sender: { agentId: 'wren', studioId: OTHER_STUDIO } } } },
+      { metadata: { pcp: { sender: { agentId: 'wren', studioId: MY_STUDIO } } } },
+    ];
+    expect(isThreadOwnedByStudio(messages, MY_STUDIO)).toBe(true);
+  });
+
+  it('rejects when messages have no pcp metadata', () => {
+    const messages = [{ metadata: {} }];
+    expect(isThreadOwnedByStudio(messages, MY_STUDIO)).toBe(false);
+  });
+
+  it('rejects when messages have pcp.sender but no studioId', () => {
+    const messages = [
+      { metadata: { pcp: { sender: { agentId: 'wren' } } } },
+    ];
+    expect(isThreadOwnedByStudio(messages, MY_STUDIO)).toBe(false);
+  });
+
+  it('rejects when metadata is null', () => {
+    const messages = [{ metadata: null }];
+    expect(isThreadOwnedByStudio(messages, MY_STUDIO)).toBe(false);
   });
 });
