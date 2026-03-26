@@ -128,6 +128,15 @@ const getInboxSchema = userIdentifierBaseSchema.extend({
     .datetime()
     .optional()
     .describe('Only return messages created after this ISO timestamp'),
+  channelPoll: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      'When true, filter threads by studio ownership using the studioId from request context. ' +
+        'Used by channel plugins to only receive threads belonging to their studio. ' +
+        'Threads with no studio affinity (new, unrouted) are included as broadcast.'
+    ),
 });
 
 const updateInboxMessageSchema = userIdentifierBaseSchema.extend({
@@ -731,7 +740,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   const parsed = getInboxSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { status = 'unread', priority, messageType, limit = 20, since } = parsed;
+  const { status = 'unread', priority, messageType, limit = 20, since, channelPoll } = parsed;
   // Enforce identity: pinned agents can only read their own inbox.
   // When agentId is omitted, return inbox across ALL agents (unified timeline).
   const agentId = parsed.agentId
@@ -961,6 +970,64 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
 
         // Only include threads that actually have unread messages
         threadsWithUnread = threadsWithUnread.filter((t) => t.unreadCount > 0);
+
+        // Channel poll studio filtering: when channelPoll=true, filter threads
+        // to only those owned by the requesting studio. Uses the same sender
+        // metadata that the trigger system stamps on thread messages.
+        if (channelPoll && agentId) {
+          const reqCtx = getRequestContext();
+          const sessCtx = getSessionContext();
+          const callerStudioId = reqCtx?.workspaceId || sessCtx?.workspaceId || null;
+
+          if (callerStudioId) {
+            const filteredThreads: typeof threadsWithUnread = [];
+
+            for (const thread of threadsWithUnread) {
+              // Fetch our agent's messages on this thread to check studio ownership
+              const threadRow = threads?.find(
+                (t: { thread_key: string }) => t.thread_key === thread.threadKey
+              );
+              if (!threadRow) {
+                filteredThreads.push(thread); // safety fallback — include if we can't check
+                continue;
+              }
+
+              const { data: ourMessages } = await threadTable(supabase, 'inbox_thread_messages')
+                .select('metadata')
+                .eq('thread_id', (threadRow as { id: string }).id)
+                .eq('sender_agent_id', agentId)
+                .order('created_at', { ascending: false })
+                .limit(5);
+
+              if (!ourMessages?.length) {
+                // We haven't sent any messages on this thread — broadcast (accept in any studio)
+                filteredThreads.push(thread);
+                continue;
+              }
+
+              // Check if any of our messages came from this studio
+              const ownsThread = ourMessages.some((m: { metadata: Json }) => {
+                const pcp = (m.metadata as Record<string, unknown>)?.pcp as
+                  | Record<string, unknown>
+                  | undefined;
+                const sender = pcp?.sender as Record<string, unknown> | undefined;
+                return sender?.studioId === callerStudioId;
+              });
+
+              if (ownsThread) {
+                filteredThreads.push(thread);
+              } else {
+                logger.debug('[ChannelPoll] Filtered thread (owned by different studio)', {
+                  threadKey: thread.threadKey,
+                  callerStudioId,
+                });
+              }
+            }
+
+            threadsWithUnread = filteredThreads;
+          }
+        }
+
         threadUnreadCount = threadsWithUnread.reduce((sum, t) => sum + t.unreadCount, 0);
       }
     }
