@@ -203,7 +203,7 @@ program
   .option('--session-candidates-json', 'Output session candidates as JSON (testing/debug)')
   .option(
     '--session-candidates-all',
-    'Include all backend-local sessions in picker/json (debug mode; includes non-interactive sources)'
+    'Include all backend-local session sources in picker/json (debug mode)'
   )
   .option('--session-choice <choice>', 'Force session selection (new | pcp:<id> | local:<id>)')
   .option('--sb-debug', 'Enable SB debug logging to ~/.pcp/sb-debug.log')
