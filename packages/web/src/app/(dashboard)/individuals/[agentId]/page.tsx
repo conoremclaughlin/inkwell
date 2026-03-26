@@ -1,5 +1,6 @@
 'use client';
 
+import { useState } from 'react';
 import Link from 'next/link';
 import { useRouter, useParams } from 'next/navigation';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -12,26 +13,44 @@ import {
   FileText,
   History,
   Inbox,
+  Settings,
   Share2,
   Sparkles,
   User,
   Zap,
+  Save,
+  Loader2,
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { useApiQuery } from '@/lib/api';
+import { useApiQuery, useApiPut, useQueryClient } from '@/lib/api';
 import { normalizeDocMarkdown } from '@/lib/markdown/normalize-doc';
+import clsx from 'clsx';
+
+interface RuntimeConfig {
+  toolProfile?: string;
+  toolRouting?: string;
+  maxTurns?: number;
+  passiveRecall?: {
+    enabled?: boolean;
+    cooldownTurns?: number;
+    budgetCeiling?: number;
+    maxInjectPerTurn?: number;
+  };
+}
 
 interface Identity {
   id: string;
   agentId: string;
   name: string;
   role: string;
+  backend?: string | null;
   description?: string;
   values?: string[];
   relationships?: Record<string, string>;
   capabilities?: string[];
   metadata?: Record<string, unknown>;
+  runtimeConfig?: RuntimeConfig | null;
   heartbeat?: string;
   soul?: string;
   hasSoul: boolean;
@@ -43,6 +62,235 @@ interface Identity {
 
 interface IndividualsResponse {
   individuals: Identity[];
+}
+
+// ─── Runtime Settings Panel ─────────────────────────────────────
+
+const BACKENDS = [
+  { value: '', label: 'Not set' },
+  { value: 'claude', label: 'Claude (Anthropic)' },
+  { value: 'claude-code', label: 'Claude Code' },
+  { value: 'codex', label: 'Codex (OpenAI)' },
+  { value: 'gemini', label: 'Gemini (Google)' },
+];
+
+const TOOL_PROFILES = [
+  { value: '', label: 'Not set (use CLI default)' },
+  { value: 'minimal', label: 'Minimal — Read-only, no writes or comms' },
+  { value: 'safe', label: 'Safe — Memory + session allowed, comms prompted' },
+  { value: 'collaborative', label: 'Collaborative — Full collaboration, no prompts' },
+  { value: 'full', label: 'Full — Privileged, all tools, no restrictions' },
+];
+
+const TOOL_ROUTING = [
+  { value: '', label: 'Not set (use CLI default)' },
+  { value: 'local', label: 'Local — PCP tools via pcp-tool blocks' },
+  { value: 'backend', label: 'Backend — Native MCP tool calling' },
+];
+
+function RuntimeSettingsPanel({ agentId, identity }: { agentId: string; identity: Identity }) {
+  const queryClient = useQueryClient();
+  const rc = identity.runtimeConfig || {};
+
+  const [backend, setBackend] = useState(identity.backend || '');
+  const [toolProfile, setToolProfile] = useState(rc.toolProfile || '');
+  const [toolRouting, setToolRouting] = useState(rc.toolRouting || '');
+  const [maxTurns, setMaxTurns] = useState(String(rc.maxTurns || ''));
+  const [recallEnabled, setRecallEnabled] = useState(rc.passiveRecall?.enabled !== false);
+  const [recallCooldown, setRecallCooldown] = useState(String(rc.passiveRecall?.cooldownTurns ?? '3'));
+  const [recallCeiling, setRecallCeiling] = useState(String(rc.passiveRecall?.budgetCeiling ?? '0.8'));
+  const [recallMaxInject, setRecallMaxInject] = useState(String(rc.passiveRecall?.maxInjectPerTurn ?? '2'));
+
+  const saveSettings = useApiPut<
+    { success: boolean },
+    { id: string; body: Record<string, unknown> }
+  >(
+    ({ id }) => `/api/admin/individuals/${id}/settings`,
+    ({ body }) => body,
+    { onSuccess: () => queryClient.invalidateQueries({ queryKey: ['individuals'] }) }
+  );
+
+  const handleSave = () => {
+    saveSettings.mutate({
+      id: agentId,
+      body: {
+        backend: backend || null,
+        toolProfile: toolProfile || null,
+        toolRouting: toolRouting || null,
+        maxTurns: maxTurns ? parseInt(maxTurns, 10) : null,
+        passiveRecall: {
+          enabled: recallEnabled,
+          cooldownTurns: parseInt(recallCooldown, 10) || 3,
+          budgetCeiling: parseFloat(recallCeiling) || 0.8,
+          maxInjectPerTurn: parseInt(recallMaxInject, 10) || 2,
+        },
+      },
+    });
+  };
+
+  const selectClass =
+    'w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-gray-300 bg-white';
+  const inputClass =
+    'w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-gray-300';
+  const labelClass = 'block text-sm font-medium text-gray-700 mb-1';
+
+  return (
+    <div className="space-y-6">
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Settings className="h-5 w-5 text-gray-500" />
+            Runtime Settings
+          </CardTitle>
+          <CardDescription>
+            Configure default backend, tool permissions, and passive recall for{' '}
+            <span className="font-semibold">{identity.name}</span>. These settings apply when
+            launching via <code className="bg-gray-100 px-1.5 py-0.5 rounded text-xs">sb chat --agent {agentId}</code>.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          {/* Backend */}
+          <div>
+            <label className={labelClass}>Default Backend</label>
+            <select value={backend} onChange={(e) => setBackend(e.target.value)} className={selectClass}>
+              {BACKENDS.map((b) => (
+                <option key={b.value} value={b.value}>{b.label}</option>
+              ))}
+            </select>
+            <p className="mt-1 text-xs text-gray-400">Which AI provider runs this agent by default.</p>
+          </div>
+
+          <div className="grid gap-6 md:grid-cols-2">
+            {/* Tool Profile */}
+            <div>
+              <label className={labelClass}>Tool Profile</label>
+              <select value={toolProfile} onChange={(e) => setToolProfile(e.target.value)} className={selectClass}>
+                {TOOL_PROFILES.map((p) => (
+                  <option key={p.value} value={p.value}>{p.label}</option>
+                ))}
+              </select>
+              <p className="mt-1 text-xs text-gray-400">Which PCP tools are allowed without prompting.</p>
+            </div>
+
+            {/* Tool Routing */}
+            <div>
+              <label className={labelClass}>Tool Routing</label>
+              <select value={toolRouting} onChange={(e) => setToolRouting(e.target.value)} className={selectClass}>
+                {TOOL_ROUTING.map((r) => (
+                  <option key={r.value} value={r.value}>{r.label}</option>
+                ))}
+              </select>
+              <p className="mt-1 text-xs text-gray-400">How PCP tool calls are routed.</p>
+            </div>
+          </div>
+
+          {/* Max Turns */}
+          <div className="max-w-xs">
+            <label className={labelClass}>Max Turns (automated sessions)</label>
+            <input
+              type="number"
+              min="1"
+              max="20"
+              placeholder="3"
+              value={maxTurns}
+              onChange={(e) => setMaxTurns(e.target.value)}
+              className={inputClass}
+            />
+            <p className="mt-1 text-xs text-gray-400">How many conversational turns in --message mode.</p>
+          </div>
+
+          {/* Passive Recall */}
+          <div>
+            <label className={labelClass}>Passive Recall</label>
+            <div className="mt-2 space-y-3 rounded-lg border border-gray-100 p-4 bg-gray-50/50">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={recallEnabled}
+                  onChange={(e) => setRecallEnabled(e.target.checked)}
+                  className="rounded border-gray-300"
+                />
+                <span className="text-sm text-gray-700">Enable passive memory recall</span>
+              </label>
+
+              {recallEnabled && (
+                <div className="grid gap-4 md:grid-cols-3 pt-2">
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">Cooldown (turns)</label>
+                    <input
+                      type="number"
+                      min="0"
+                      max="20"
+                      value={recallCooldown}
+                      onChange={(e) => setRecallCooldown(e.target.value)}
+                      className={inputClass}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">Budget ceiling</label>
+                    <input
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                      value={recallCeiling}
+                      onChange={(e) => setRecallCeiling(e.target.value)}
+                      className={inputClass}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">Max inject/turn</label>
+                    <input
+                      type="number"
+                      min="1"
+                      max="10"
+                      value={recallMaxInject}
+                      onChange={(e) => setRecallMaxInject(e.target.value)}
+                      className={inputClass}
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Save */}
+          <div className="flex items-center gap-3 pt-2">
+            <Button onClick={handleSave} disabled={saveSettings.isPending}>
+              {saveSettings.isPending ? (
+                <Loader2 className="h-4 w-4 animate-spin mr-2" />
+              ) : (
+                <Save className="h-4 w-4 mr-2" />
+              )}
+              Save Settings
+            </Button>
+            {saveSettings.isSuccess && (
+              <span className="text-sm text-green-600">Settings saved.</span>
+            )}
+            {saveSettings.isError && (
+              <span className="text-sm text-red-600">Failed to save: {saveSettings.error?.message}</span>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* CLI Quick Reference */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm text-gray-500">CLI Quick Reference</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <pre className="bg-gray-900 text-gray-100 p-3 rounded-md text-xs font-mono overflow-x-auto">
+{`# Run ${identity.name} with saved settings
+sb chat --agent ${agentId}${backend ? ` --backend ${backend}` : ''}${toolProfile ? ` --profile ${toolProfile}` : ''}${toolRouting ? ` --tool-routing ${toolRouting}` : ''}${maxTurns ? ` --max-turns ${maxTurns}` : ''}
+
+# Heartbeat mode
+sb chat --agent ${agentId}${backend ? ` --backend ${backend}` : ''} --profile ${toolProfile || 'collaborative'} --max-turns ${maxTurns || '3'} --message "Heartbeat check"`}
+          </pre>
+        </CardContent>
+      </Card>
+    </div>
+  );
 }
 
 export default function AgentDetailPage() {
@@ -129,13 +377,17 @@ export default function AgentDetailPage() {
 
       {/* Main Content Tabs */}
       <Tabs defaultValue="overview" className="w-full">
-        <TabsList className="grid w-full grid-cols-4 lg:w-[600px]">
+        <TabsList className="grid w-full grid-cols-5 lg:w-[750px]">
           <TabsTrigger value="overview">Overview</TabsTrigger>
           <TabsTrigger value="soul" disabled={!identity.hasSoul}>
             Constitution
           </TabsTrigger>
           <TabsTrigger value="heartbeat" disabled={!identity.hasHeartbeat}>
             Operating guide
+          </TabsTrigger>
+          <TabsTrigger value="runtime">
+            <Settings className="h-3.5 w-3.5 mr-1" />
+            Runtime
           </TabsTrigger>
           <TabsTrigger value="raw">Identity JSON</TabsTrigger>
         </TabsList>
@@ -271,6 +523,11 @@ export default function AgentDetailPage() {
               </div>
             </CardContent>
           </Card>
+        </TabsContent>
+
+        {/* Runtime Settings Tab */}
+        <TabsContent value="runtime" className="mt-6">
+          <RuntimeSettingsPanel agentId={agentId} identity={identity} />
         </TabsContent>
 
         {/* Raw Identity Tab */}

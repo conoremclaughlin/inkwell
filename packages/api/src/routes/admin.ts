@@ -2932,28 +2932,108 @@ router.get('/individuals', async (req: Request, res: Response) => {
     }
 
     res.json({
-      individuals: (data || []).map((identity) => ({
-        id: identity.id,
-        agentId: identity.agent_id,
-        name: identity.name,
-        role: identity.role,
-        description: identity.description,
-        values: identity.values,
-        relationships: identity.relationships,
-        capabilities: identity.capabilities,
-        metadata: identity.metadata,
-        heartbeat: identity.heartbeat,
-        soul: identity.soul,
-        hasSoul: !!identity.soul,
-        hasHeartbeat: !!identity.heartbeat,
-        version: identity.version,
-        createdAt: identity.created_at,
-        updatedAt: identity.updated_at,
-      })),
+      individuals: (data || []).map((identity) => {
+        const meta = (identity.metadata || {}) as Record<string, unknown>;
+        return {
+          id: identity.id,
+          agentId: identity.agent_id,
+          name: identity.name,
+          role: identity.role,
+          backend: identity.backend || null,
+          description: identity.description,
+          values: identity.values,
+          relationships: identity.relationships,
+          capabilities: identity.capabilities,
+          metadata: identity.metadata,
+          runtimeConfig: (meta.runtimeConfig as Record<string, unknown>) || null,
+          heartbeat: identity.heartbeat,
+          soul: identity.soul,
+          hasSoul: !!identity.soul,
+          hasHeartbeat: !!identity.heartbeat,
+          version: identity.version,
+          createdAt: identity.created_at,
+          updatedAt: identity.updated_at,
+        };
+      }),
     });
   } catch (error) {
     logger.error('Failed to list individuals:', error);
     res.status(500).json(errorJson('Failed to list individuals', error));
+  }
+});
+
+/**
+ * PUT /api/admin/individuals/:agentId/settings
+ * Update runtime settings for an AI being
+ */
+router.put('/individuals/:agentId/settings', async (req: Request, res: Response) => {
+  try {
+    const { agentId } = req.params;
+    const { backend, toolProfile, toolRouting, maxTurns, passiveRecall } = req.body;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    // Find the identity
+    const { data: identity, error: findError } = await supabase
+      .from('agent_identities')
+      .select('id, metadata, backend')
+      .eq('agent_id', agentId)
+      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
+      .single();
+
+    if (findError || !identity) {
+      res.status(404).json({ error: 'Agent not found' });
+      return;
+    }
+
+    // Build updates
+    const existingMeta = (identity.metadata || {}) as Record<string, unknown>;
+    const runtimeConfig: Record<string, unknown> = {
+      ...(existingMeta.runtimeConfig as Record<string, unknown> || {}),
+    };
+
+    if (toolProfile !== undefined) runtimeConfig.toolProfile = toolProfile;
+    if (toolRouting !== undefined) runtimeConfig.toolRouting = toolRouting;
+    if (maxTurns !== undefined) runtimeConfig.maxTurns = maxTurns;
+    if (passiveRecall !== undefined) runtimeConfig.passiveRecall = passiveRecall;
+
+    const updates: Record<string, unknown> = {
+      metadata: { ...existingMeta, runtimeConfig },
+    };
+
+    // backend is a top-level column, not metadata
+    if (backend !== undefined) {
+      updates.backend = backend;
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('agent_identities')
+      .update(updates as never)
+      .eq('id', identity.id)
+      .select()
+      .single();
+
+    if (updateError) {
+      logger.error('Failed to update agent settings:', updateError);
+      res.status(500).json(errorJson('Failed to update settings', updateError));
+      return;
+    }
+
+    const meta = (updated.metadata || {}) as Record<string, unknown>;
+    res.json({
+      success: true,
+      settings: {
+        agentId,
+        backend: updated.backend || null,
+        runtimeConfig: (meta.runtimeConfig as Record<string, unknown>) || null,
+      },
+    });
+  } catch (error) {
+    logger.error('Failed to update agent settings:', error);
+    res.status(500).json(errorJson('Failed to update agent settings', error));
   }
 });
 
