@@ -152,6 +152,13 @@ async function callPcp(
   if (accessToken) {
     headers.Authorization = `Bearer ${accessToken}`;
   }
+  // Forward studio/session context so the server can apply channelPoll filtering
+  if (studioId) {
+    headers['x-pcp-studio-id'] = studioId;
+  }
+  if (sessionId) {
+    headers['x-pcp-session-id'] = sessionId;
+  }
 
   try {
     const resp = await fetch(url, {

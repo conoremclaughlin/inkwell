@@ -106,6 +106,32 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     ),
 });
 
+/**
+ * Check if a thread is owned by a specific studio based on the agent's
+ * message metadata. Used by channelPoll filtering.
+ *
+ * Returns true (accept) when:
+ * - Agent has no messages on the thread (new/broadcast — accept in any studio)
+ * - Agent's messages include one from this studioId
+ *
+ * Returns false (skip) when:
+ * - Agent has messages but none from this studioId (different studio owns it)
+ */
+export function isThreadOwnedByStudio(
+  agentMessages: Array<{ metadata: unknown }>,
+  callerStudioId: string
+): boolean {
+  if (!agentMessages.length) return true; // no messages from us — broadcast
+
+  return agentMessages.some((m) => {
+    const pcp = (m.metadata as Record<string, unknown>)?.pcp as
+      | Record<string, unknown>
+      | undefined;
+    const sender = pcp?.sender as Record<string, unknown> | undefined;
+    return sender?.studioId === callerStudioId;
+  });
+}
+
 const getInboxSchema = userIdentifierBaseSchema.extend({
   agentId: z
     .string()
@@ -999,22 +1025,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
                 .order('created_at', { ascending: false })
                 .limit(5);
 
-              if (!ourMessages?.length) {
-                // We haven't sent any messages on this thread — broadcast (accept in any studio)
-                filteredThreads.push(thread);
-                continue;
-              }
-
-              // Check if any of our messages came from this studio
-              const ownsThread = ourMessages.some((m: { metadata: Json }) => {
-                const pcp = (m.metadata as Record<string, unknown>)?.pcp as
-                  | Record<string, unknown>
-                  | undefined;
-                const sender = pcp?.sender as Record<string, unknown> | undefined;
-                return sender?.studioId === callerStudioId;
-              });
-
-              if (ownsThread) {
+              if (isThreadOwnedByStudio(ourMessages || [], callerStudioId)) {
                 filteredThreads.push(thread);
               } else {
                 logger.debug('[ChannelPoll] Filtered thread (owned by different studio)', {
