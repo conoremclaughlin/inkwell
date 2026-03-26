@@ -1941,4 +1941,165 @@ describe('runChat integration', () => {
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('[delegation:wren->lumen:send_to_inbox]');
   });
+
+  // ─── Per-Sender Session Isolation Tests ───
+
+  describe('per-sender session isolation', () => {
+    it('passes contactId to start_session when --contact-id is provided', async () => {
+      testState.inputs = ['/quit'];
+
+      await runChat({
+        agent: 'myra',
+        backend: 'claude',
+        contactId: 'contact-alice-uuid',
+        pollSeconds: '999',
+      });
+
+      const startCall = testState.pcpCalls.find((call) => call.tool === 'start_session');
+      expect(startCall).toBeDefined();
+      expect(startCall!.args.contactId).toBe('contact-alice-uuid');
+    });
+
+    it('creates separate sessions for different contacts', async () => {
+      // Sender A
+      testState.callToolImpl.mockImplementation(async (tool: string) => {
+        switch (tool) {
+          case 'bootstrap':
+            return { user: { timezone: 'America/Los_Angeles' } };
+          case 'start_session':
+            return { session: { id: 'sess-alice' } };
+          case 'get_inbox':
+            return { messages: [] };
+          default:
+            return { success: true };
+        }
+      });
+      testState.inputs = ['/quit'];
+
+      await runChat({
+        agent: 'myra',
+        backend: 'claude',
+        contactId: 'contact-alice',
+        pollSeconds: '999',
+      });
+
+      const aliceStart = testState.pcpCalls.find((c) => c.tool === 'start_session');
+      expect(aliceStart!.args.contactId).toBe('contact-alice');
+
+      // Reset for Sender B
+      testState.pcpCalls = [];
+      testState.callToolImpl.mockImplementation(async (tool: string) => {
+        switch (tool) {
+          case 'bootstrap':
+            return { user: { timezone: 'America/Los_Angeles' } };
+          case 'start_session':
+            return { session: { id: 'sess-bob' } };
+          case 'get_inbox':
+            return { messages: [] };
+          default:
+            return { success: true };
+        }
+      });
+      testState.inputs = ['/quit'];
+
+      await runChat({
+        agent: 'myra',
+        backend: 'claude',
+        contactId: 'contact-bob',
+        pollSeconds: '999',
+      });
+
+      const bobStart = testState.pcpCalls.find((c) => c.tool === 'start_session');
+      expect(bobStart!.args.contactId).toBe('contact-bob');
+
+      // Different contacts → different session IDs requested
+      expect(aliceStart!.args.contactId).not.toBe(bobStart!.args.contactId);
+    });
+
+    it('does not pass contactId for normal owner sessions', async () => {
+      testState.inputs = ['/quit'];
+
+      await runChat({
+        agent: 'wren',
+        backend: 'claude',
+        pollSeconds: '999',
+      });
+
+      const startCall = testState.pcpCalls.find((call) => call.tool === 'start_session');
+      expect(startCall).toBeDefined();
+      expect(startCall!.args.contactId).toBeUndefined();
+    });
+
+    it('resolves --sender via API and passes contactId', async () => {
+      // Mock the fetch call to /api/admin/contacts/resolve
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = vi.fn().mockImplementation(async (url: string | URL) => {
+        const urlStr = typeof url === 'string' ? url : url.toString();
+        if (urlStr.includes('/api/admin/contacts/resolve')) {
+          return {
+            ok: true,
+            json: async () => ({
+              contact: { id: 'resolved-contact-123', name: 'telegram:55512345' },
+            }),
+          } as Response;
+        }
+        return originalFetch(url);
+      }) as typeof fetch;
+
+      // Mock auth token resolution
+      vi.doMock('../auth/tokens.js', () => ({
+        getValidAccessToken: async () => 'test-token-123',
+      }));
+
+      testState.inputs = ['/quit'];
+
+      await runChat({
+        agent: 'myra',
+        backend: 'claude',
+        sender: 'telegram:55512345',
+        pollSeconds: '999',
+      });
+
+      const startCall = testState.pcpCalls.find((call) => call.tool === 'start_session');
+      expect(startCall).toBeDefined();
+      expect(startCall!.args.contactId).toBe('resolved-contact-123');
+
+      // Restore
+      globalThis.fetch = originalFetch;
+      vi.doUnmock('../auth/tokens.js');
+    });
+
+    it('sends user message through backend with contact-scoped session', async () => {
+      testState.callToolImpl.mockImplementation(async (tool: string) => {
+        switch (tool) {
+          case 'bootstrap':
+            return { user: { timezone: 'America/Los_Angeles' } };
+          case 'start_session':
+            return { session: { id: 'sess-contact-1' } };
+          case 'get_inbox':
+            return { messages: [] };
+          default:
+            return { success: true };
+        }
+      });
+
+      testState.inputs = ['what is my balance?', '/quit'];
+
+      await runChat({
+        agent: 'myra',
+        backend: 'claude',
+        contactId: 'contact-alice',
+        pollSeconds: '999',
+      });
+
+      // Backend should have been called with the user's message
+      expect(testState.runBackendImpl).toHaveBeenCalledTimes(1);
+      const backendRequest = testState.runBackendImpl.mock.calls[0][0] as { prompt: string };
+      expect(backendRequest.prompt).toContain('what is my balance?');
+
+      // Session should have been started with contactId
+      const startCall = testState.pcpCalls.find((call) => call.tool === 'start_session');
+      expect(startCall!.args.contactId).toBe('contact-alice');
+    });
+  });
 });
