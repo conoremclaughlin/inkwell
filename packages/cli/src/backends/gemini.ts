@@ -10,6 +10,11 @@
 import { createIdentityPromptFile } from './identity.js';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
 
+// TODO: Gemini reads MCP headers from .gemini/settings.json, not env vars.
+// PCP_CONTEXT_TOKEN + Authorization need to be wired via a generated
+// settings.json override (like gemini-runner.ts does server-side).
+// See: packages/api/src/services/sessions/gemini-runner.ts:88-102
+
 export class GeminiAdapter implements BackendAdapter {
   readonly name = 'gemini';
   readonly binary = 'gemini';

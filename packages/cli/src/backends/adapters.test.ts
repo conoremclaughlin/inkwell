@@ -3,6 +3,7 @@ import { readFileSync } from 'fs';
 import { ClaudeAdapter } from './claude.js';
 import { CodexAdapter } from './codex.js';
 import { GeminiAdapter } from './gemini.js';
+import { decodeContextToken } from '@personal-context/shared';
 
 describe('backend adapters session resume wiring', () => {
   it('passes claude backendSessionId through --resume', () => {
@@ -343,4 +344,61 @@ describe('backend adapters session resume wiring', () => {
       prepared.cleanup();
     }
   });
+
+  // ── PCP_CONTEXT_TOKEN + auth header regression ──
+  // Codex and Gemini adapters must produce PCP_CONTEXT_TOKEN in env and
+  // wire x-pcp-context + Authorization via env_http_headers. Without these,
+  // MCP tool calls go to PCP unauthenticated and without session context,
+  // causing "Session context missing — triggers suppressed."
+
+  it('codex adapter produces PCP_CONTEXT_TOKEN with session/studio/agent', () => {
+    const adapter = new CodexAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'lumen',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+      pcpSessionId: 'sess-codex-123',
+      studioId: 'studio-lumen-456',
+    });
+
+    try {
+      expect(prepared.env.PCP_CONTEXT_TOKEN).toBeDefined();
+      const token = decodeContextToken(prepared.env.PCP_CONTEXT_TOKEN);
+      expect(token).not.toBeNull();
+      expect(token!.sessionId).toBe('sess-codex-123');
+      expect(token!.studioId).toBe('studio-lumen-456');
+      expect(token!.agentId).toBe('lumen');
+      expect(token!.runtime).toBe('codex');
+      expect(token!.cliAttached).toBe(true);
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('codex adapter injects x-pcp-context and Authorization env_http_headers', () => {
+    const adapter = new CodexAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'lumen',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+      pcpSessionId: 'sess-codex-123',
+    });
+
+    try {
+      const contextArg = prepared.args.find((a) => a.includes('x-pcp-context'));
+      expect(contextArg).toBeDefined();
+      expect(contextArg).toContain('PCP_CONTEXT_TOKEN');
+
+      const authArg = prepared.args.find((a) => a.includes('Authorization'));
+      expect(authArg).toBeDefined();
+      expect(authArg).toContain('PCP_AUTH_BEARER');
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  // TODO: Gemini adapter auth regression test — needs settings.json override
+  // wiring first. See packages/cli/src/backends/gemini.ts TODO comment.
 });
