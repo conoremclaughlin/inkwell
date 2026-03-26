@@ -1132,7 +1132,9 @@ describe('SessionService', () => {
       expect(mockRepoWithThreadKey.findByThreadKey).toHaveBeenCalledWith(
         'user-456',
         'myra',
-        'pr:43'
+        'pr:43',
+        undefined, // studioId
+        undefined // contactId
       );
       // Should NOT have created a new session
       expect(mockRepoWithThreadKey.create).not.toHaveBeenCalled();
@@ -1178,7 +1180,9 @@ describe('SessionService', () => {
       expect(mockRepoWithThreadKey.findByThreadKey).toHaveBeenCalledWith(
         'user-456',
         'myra',
-        'pr:999'
+        'pr:999',
+        undefined, // studioId
+        undefined // contactId
       );
       expect(mockRepoWithThreadKey.findByUserAndAgent).not.toHaveBeenCalled();
       expect(mockRepoWithThreadKey.create).toHaveBeenCalledWith(

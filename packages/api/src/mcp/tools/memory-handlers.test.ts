@@ -1252,7 +1252,8 @@ describe('handleStartSession - threadKey matching', () => {
       'user-123',
       'lumen',
       'pr:32',
-      undefined
+      undefined,
+      undefined // contactId
     );
     // Should NOT have fallen through to studioId lookup
     expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
@@ -1318,7 +1319,8 @@ describe('handleStartSession - threadKey matching', () => {
       'user-123',
       'lumen',
       'pr:32',
-      studioId
+      studioId,
+      undefined // contactId
     );
   });
 

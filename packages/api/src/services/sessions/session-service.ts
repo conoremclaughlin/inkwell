@@ -646,11 +646,21 @@ export class SessionService implements ISessionService {
       // ThreadKey match takes priority — find session scoped to this topic
       if (options?.threadKey && 'findByThreadKey' in this.repository) {
         const threadRepo = this.repository as {
-          findByThreadKey: (u: string, a: string, t: string, s?: string) => Promise<Session | null>;
+          findByThreadKey: (
+            u: string,
+            a: string,
+            t: string,
+            s?: string,
+            c?: string
+          ) => Promise<Session | null>;
         };
-        const threadMatch = resolvedStudioId
-          ? await threadRepo.findByThreadKey(userId, agentId, options.threadKey, resolvedStudioId)
-          : await threadRepo.findByThreadKey(userId, agentId, options.threadKey);
+        const threadMatch = await threadRepo.findByThreadKey(
+          userId,
+          agentId,
+          options.threadKey,
+          resolvedStudioId,
+          options?.contactId
+        );
         if (threadMatch) {
           logger.debug('Found existing session by threadKey', {
             sessionId: threadMatch.id,

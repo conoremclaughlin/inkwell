@@ -1186,7 +1186,8 @@ export class MemoryRepository {
     userId: string,
     agentId: string,
     threadKey: string,
-    studioId?: string | null
+    studioId?: string | null,
+    contactId?: string
   ): Promise<Session | null> {
     let query = this.supabase
       .from('sessions')
@@ -1205,6 +1206,11 @@ export class MemoryRepository {
       } else {
         query = query.eq('studio_id', studioId);
       }
+    }
+
+    // Per-sender isolation: scope to contact when provided
+    if (contactId) {
+      query = query.eq('contact_id', contactId);
     }
 
     const { data, error } = await query.single();
