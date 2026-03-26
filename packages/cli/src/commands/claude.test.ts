@@ -12,6 +12,7 @@ import {
   filterPcpSessionsForContext,
   filterUntrackedLocalClaudeSessions,
   buildSessionPickerLabel,
+  getBackendLocalSessionsForProject,
   getClaudeLocalSessionsForProject,
   getKnownClaudeSessionIds,
   getCodexLocalSessionsForProject,
@@ -1319,9 +1320,25 @@ describe('getCodexLocalSessionsForProject', () => {
 
     try {
       const sessions = getCodexLocalSessionsForProject(projectPath, 10);
-      expect(sessions.map((session) => session.sessionId)).toEqual([matchingSessionId]);
-      expect(sessions[0]?.latestPrompt).toBe('assistant: Most recent assistant reply');
-      expect(sessions[0]?.transcriptPath).toContain(matchingSessionId);
+      expect(sessions.map((session) => session.sessionId)).toEqual([
+        nonCliSessionId,
+        matchingSessionId,
+      ]);
+      expect(sessions[1]?.latestPrompt).toBe('assistant: Most recent assistant reply');
+      expect(sessions[1]?.transcriptPath).toContain(matchingSessionId);
+
+      const cliOnlySessions = getCodexLocalSessionsForProject(projectPath, 10, {
+        includeExecSources: false,
+      });
+      expect(cliOnlySessions.map((session) => session.sessionId)).toEqual([matchingSessionId]);
+
+      const defaultBackendSessions = getBackendLocalSessionsForProject('codex', projectPath, 10, {
+        includeAllSources: false,
+      });
+      expect(defaultBackendSessions.map((session) => session.sessionId)).toEqual([
+        nonCliSessionId,
+        matchingSessionId,
+      ]);
 
       const sessionsIncludingExec = getCodexLocalSessionsForProject(projectPath, 10, {
         includeExecSources: true,

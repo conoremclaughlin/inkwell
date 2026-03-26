@@ -1644,7 +1644,10 @@ export function getCodexLocalSessionsForProject(
     includeExecSources?: boolean;
   } = {}
 ): BackendLocalSessionSummary[] {
-  const includeExecSources = options.includeExecSources === true;
+  // Default to including exec/runner-owned Codex sessions. Those automated runs are
+  // still attachable debugging artifacts, and hiding them regressed `sb -b codex`
+  // session visibility compared to prior behavior.
+  const includeExecSources = options.includeExecSources !== false;
   const fallbackToJsonl = (reason: string): BackendLocalSessionSummary[] => {
     const fallback = getCodexLocalSessionsFromJsonl(cwd, limit, { includeExecSources });
     sbDebugLog('backend', 'codex_local_sessions_fallback_jsonl', {
@@ -1763,7 +1766,7 @@ function getCodexLocalSessionsFromJsonl(
     includeExecSources?: boolean;
   } = {}
 ): BackendLocalSessionSummary[] {
-  const includeExecSources = options.includeExecSources === true;
+  const includeExecSources = options.includeExecSources !== false;
   const codexSessionsDir = join(homedir(), '.codex', 'sessions');
   if (!existsSync(codexSessionsDir)) return [];
 
@@ -2046,9 +2049,11 @@ export function getBackendLocalSessionsForProject(
 ): BackendLocalSessionSummary[] {
   if (backend === 'claude') return getClaudeLocalSessionsForProject(cwd, limit);
   if (backend === 'codex') {
-    return getCodexLocalSessionsForProject(cwd, limit, {
-      includeExecSources: options.includeAllSources,
-    });
+    return getCodexLocalSessionsForProject(
+      cwd,
+      limit,
+      options.includeAllSources ? { includeExecSources: true } : {}
+    );
   }
   if (backend === 'gemini') return getGeminiLocalSessionsForProject(cwd, limit);
   return [];
