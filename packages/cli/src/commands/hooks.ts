@@ -122,12 +122,16 @@ const GEMINI: HookCapabilities = {
   configFormat: 'json',
   events: {
     sessionStart: 'SessionStart',
-    preCompact: 'PreCompress',
-    postCompact: 'SessionStart', // uses "compress" matcher on SessionStart (Gemini uses "compress", not Claude's "compact")
+    // PreCompress/postCompact disabled: Gemini fires PreCompress but has no
+    // post-compression SessionStart event (SessionStartSource only has
+    // 'startup'/'resume'/'clear' — no 'compress'). The "compress" matcher
+    // on SessionStart is dead code and lifecycle gets stuck at 'compacting'.
+    preCompact: null,
+    postCompact: null,
     onPrompt: 'BeforeAgent',
     onStop: 'AfterAgent',
   },
-  supportsCompaction: true,
+  supportsCompaction: false,
   supportsPromptHook: true,
 };
 
@@ -1173,18 +1177,9 @@ function installGemini(cwd: string, force: boolean): InstallResult {
 
   const sbPath = resolveSbBinaryPath(cwd);
   const pcpHooks: Record<string, unknown> = {
-    // SessionStart: two matchers — "compress" for post-compression identity re-injection,
-    // "startup" for initial session setup. Gemini uses "compress" (not Claude's "compact").
+    // SessionStart: startup matcher only. PreCompress/postCompact disabled —
+    // Gemini has no post-compression SessionStart event so lifecycle gets stuck.
     [GEMINI.events.sessionStart!]: [
-      {
-        matcher: 'compress',
-        hooks: [
-          {
-            type: 'command',
-            command: buildManagedHookCommand(sbPath, 'post-compact', GEMINI.name),
-          },
-        ],
-      },
       {
         matcher: 'startup',
         hooks: [
@@ -1211,16 +1206,6 @@ function installGemini(cwd: string, force: boolean): InstallResult {
           {
             type: 'command',
             command: buildManagedHookCommand(sbPath, 'on-stop', GEMINI.name),
-          },
-        ],
-      },
-    ],
-    [GEMINI.events.preCompact!]: [
-      {
-        hooks: [
-          {
-            type: 'command',
-            command: buildManagedHookCommand(sbPath, 'pre-compact', GEMINI.name),
           },
         ],
       },
