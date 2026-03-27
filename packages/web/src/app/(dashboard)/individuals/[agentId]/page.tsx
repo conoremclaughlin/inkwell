@@ -389,7 +389,7 @@ export default function AgentDetailPage() {
             <Settings className="h-3.5 w-3.5 mr-1" />
             Runtime
           </TabsTrigger>
-          <TabsTrigger value="raw">Identity JSON</TabsTrigger>
+          <TabsTrigger value="raw">Advanced</TabsTrigger>
         </TabsList>
 
         {/* Overview Tab */}
@@ -536,9 +536,9 @@ export default function AgentDetailPage() {
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <FileText className="h-5 w-5 text-gray-500" />
-                Identity JSON
+                Advanced
               </CardTitle>
-              <CardDescription>Structured identity payload used by API/UI.</CardDescription>
+              <CardDescription>Raw identity data used by the system.</CardDescription>
             </CardHeader>
             <CardContent>
               <pre className="bg-gray-900 text-gray-100 p-4 rounded-md overflow-x-auto text-sm font-mono">
