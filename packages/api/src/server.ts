@@ -907,6 +907,8 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       const errorText = error instanceof Error ? error.message : String(error);
       const classification = classifyError({ errorText });
 
+      // Log full error text — truncateSummary only keeps the first line,
+      // which loses stderr content that's critical for diagnosis.
       logger.warn('[TriggerFailure] Processing failure notification', {
         triggerId,
         from: payload.fromAgentId,
@@ -914,6 +916,8 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         category: classification.category,
         retryable: classification.retryable,
         inboxMessageId: payload.inboxMessageId,
+        threadKey: payload.threadKey,
+        errorText: errorText.slice(0, 2000),
       });
 
       const client = dataComposer?.getClient();
@@ -1000,6 +1004,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           triggerId,
           errorCategory: classification.category,
           errorSummary: classification.summary,
+          errorDetail: errorText.slice(0, 4000),
           retryable: classification.retryable,
           originalInboxMessageId: payload.inboxMessageId || null,
         },
