@@ -301,7 +301,7 @@ export async function handleGetActivity(args: unknown, dataComposer: DataCompose
     offset: params.offset,
   });
 
-  logger.info(`Retrieved ${activities.length} activities for user ${user.id}`);
+  logger.debug(`Retrieved ${activities.length} activities for user ${user.id}`);
 
   return {
     content: [
@@ -404,7 +404,7 @@ export async function handleGetSessionContext(args: unknown, dataComposer: DataC
     }
   );
 
-  logger.info(`Retrieved ${activities.length} activities for session context`, {
+  logger.debug(`Retrieved ${activities.length} activities for session context`, {
     userId: user.id,
     sessionId: params.sessionId,
   });
