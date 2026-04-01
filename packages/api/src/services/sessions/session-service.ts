@@ -437,6 +437,11 @@ export class SessionService implements ISessionService {
 
     // 5a. Log backend spawn to activity stream (fire-and-forget)
     const triggerSource = metadata?.triggerType as string | undefined;
+    // Derive studio hint (worktree folder name) for mission display so it
+    // doesn't depend on the session still being active when the feed renders.
+    const worktreeFolder = resolvedWorkingDirectory
+      ? resolvedWorkingDirectory.replace(/\/+$/, '').split('/').pop()
+      : undefined;
     this.activityStream
       .logActivity({
         userId,
@@ -448,6 +453,7 @@ export class SessionService implements ISessionService {
         payload: {
           backend: resolvedBackend,
           studioId: session.studioId,
+          ...(worktreeFolder ? { studioHint: worktreeFolder } : {}),
           ...(triggerSource ? { triggerSource } : {}),
           ...(request.sender?.id ? { triggeredBy: request.sender.id } : {}),
           ...(metadata?.threadKey ? { threadKey: metadata.threadKey } : {}),
@@ -501,6 +507,7 @@ export class SessionService implements ISessionService {
           backend: resolvedBackend,
           durationMs: turnDurationMs,
           studioId: session.studioId,
+          ...(worktreeFolder ? { studioHint: worktreeFolder } : {}),
           ...(triggerSource ? { triggerSource } : {}),
           ...(request.sender?.id ? { triggeredBy: request.sender.id } : {}),
           ...(metadata?.threadKey ? { threadKey: metadata.threadKey } : {}),
