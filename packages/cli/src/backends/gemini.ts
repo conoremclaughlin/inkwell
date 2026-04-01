@@ -1,15 +1,18 @@
 /**
  * Gemini CLI Backend Adapter
  *
- * Wraps the Gemini CLI with Inkstand identity injection.
- * Gemini reads MCP headers from settings.json (not env vars like Codex).
+ * Identity injection via GEMINI_SYSTEM_MD=<tmpfile> env var
+ * MCP config via GEMINI_CLI_SYSTEM_SETTINGS_PATH → temp settings.json
+ *   with auth + session headers merged into Inkstand server config.
+ *
+ * Docs: https://geminicli.com/docs/
  */
 
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createIdentityPromptFile } from './identity.js';
-import { buildSessionEnv, encodeContextToken } from '@inkstand/shared';
+import { encodeContextToken } from '@inkstand/shared';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
 
 /**
@@ -83,26 +86,50 @@ export class GeminiAdapter implements BackendAdapter {
     const { promptFile, cleanup: identityCleanup } = createIdentityPromptFile(config.agentId);
 
     const args: string[] = [];
+
+    // Model (only if explicitly specified)
     if (config.model) {
-      args.push('--model', config.model);
+      args.push('-m', config.model);
     }
-    args.push('--system_instruction', promptFile);
 
-    // Build Gemini settings with Inkstand headers
-    const settings = buildGeminiSettings(config.cwd);
-    const cleanups = [identityCleanup, settings?.cleanup].filter(Boolean) as Array<() => void>;
-    const cleanup = () => cleanups.forEach((fn) => fn());
+    // Prompt mode: gemini uses -p for one-shot
+    // Interactive is the default (no flag needed)
+    if (config.prompt) {
+      args.push('-p');
+      // Keep prompt adjacent to -p for strict CLI parsers.
+      args.push(config.prompt);
+    }
 
-    // Build context token for consolidated session metadata
-    const contextToken = config.pcpSessionId && config.agentId
-      ? encodeContextToken({
-          sessionId: config.pcpSessionId,
-          studioId: config.studioId || '',
-          agentId: config.agentId,
-          cliAttached: true,
-          runtime: 'gemini',
-        })
-      : '';
+    // Resume a specific backend-native Gemini session when available.
+    if (config.backendSessionId) {
+      args.push('--resume', config.backendSessionId);
+    }
+
+    // Auto-approve: skip all permission prompts
+    if (config.dangerous) {
+      args.push('--yolo');
+    }
+
+    // Passthrough flags
+    args.push(...config.passthroughArgs);
+
+    // Build consolidated context token
+    const contextToken = encodeContextToken({
+      sessionId: config.pcpSessionId || '',
+      studioId: config.studioId || '',
+      agentId: config.agentId,
+      cliAttached: true,
+      runtime: 'gemini',
+    });
+
+    // Build temp settings.json with Inkstand auth + session headers.
+    // INK_ACCESS_TOKEN is set at the spawn site (after prepare) — the
+    // ${INK_ACCESS_TOKEN} syntax in settings.json resolves at Gemini runtime.
+    const settings = buildGeminiSettings(process.cwd());
+    const cleanup = () => {
+      identityCleanup();
+      settings?.cleanup();
+    };
 
     return {
       binary: this.binary,
