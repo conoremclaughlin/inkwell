@@ -153,10 +153,10 @@ vite.config.ts.timestamp-*
 .mcp.json
 
 # Local PCP identity should be machine/user-specific
-.pcp/identity.json
+.ink/identity.json
 
 # PCP hook runtime state (transient, per-session)
-.pcp/runtime/
+.ink/runtime/
 
 # Local automation / benchmark artifacts
 .playwright-cli/
@@ -167,6 +167,6 @@ packages/api/output/
 .create-pcp-progress.json
 
 # Runtime state (not committed)
-packages/cli/.pcp/
+packages/cli/.ink/
 packages/cli/.ink/
 *.png

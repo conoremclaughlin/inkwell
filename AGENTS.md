@@ -12,20 +12,20 @@ Identity is resolved in layers. **Stop at the first match** - do not continue ch
 
 1. **System prompt override**: If the system prompt contains an "Identity Override" section specifying your agent ID, use that. **Stop here.**
 2. **Environment variable**: Run `echo $AGENT_ID` in a shell. If it returns a non-empty value, use that as your agentId. **Stop here.**
-3. **Repo-level identity**: Read `.pcp/identity.json` in the current repo.
-4. **Central config**: Read `~/.pcp/config.json` agentMapping.
+3. **Repo-level identity**: Read `.ink/identity.json` in the current repo.
+4. **Central config**: Read `~/.ink/config.json` agentMapping.
 
-For interactive sessions in this repo, `.pcp/identity.json` typically resolves to:
+For interactive sessions in this repo, `.ink/identity.json` typically resolves to:
 
 ```json
 { "agentId": "wren", "workspaceId": "<uuid>", "context": "workspace-wren" }
 ```
 
-For long-running processes (like the PCP server), `AGENT_ID` is set via environment variable and takes precedence.
+For long-running processes (like the Inkstand server), `AGENT_ID` is set via environment variable and takes precedence.
 
 ### Step 2: Load User Config
 
-Read from `~/.pcp/config.json`:
+Read from `~/.ink/config.json`:
 
 ```json
 {"userId": "...", "email": "...", "agentMapping": {"claude-code": "wren", ...}}
@@ -48,7 +48,7 @@ This returns:
 
 ### Step 4: Start or Resume Session
 
-Read `workspaceId` from `.pcp/identity.json` (if present) and pass it to `start_session`:
+Read `workspaceId` from `.ink/identity.json` (if present) and pass it to `start_session`:
 
 ```
 start_session(userId: "<from config>", agentId: "<your identity>", workspaceId: "<from identity.json>")
@@ -82,7 +82,7 @@ remember(userId: "...", content: "Decided to use X approach because...", agentId
 
 ### Supabase Access Model
 
-PCP uses Supabase (PostgreSQL) as its database. There are **two access paths** with fundamentally different security properties:
+Inkstand uses Supabase (PostgreSQL) as its database. There are **two access paths** with fundamentally different security properties:
 
 **Server-side (API server):**
 
@@ -153,7 +153,7 @@ const localTime = utcDate.toLocaleString('en-US', {
 
 ## Multi-Agent Identity System
 
-PCP supports multiple AI identities sharing the same infrastructure:
+Inkstand supports multiple AI identities sharing the same infrastructure:
 
 | Agent      | Interface         | Role                                   |
 | ---------- | ----------------- | -------------------------------------- |
@@ -163,7 +163,7 @@ PCP supports multiple AI identities sharing the same infrastructure:
 | **myra**   | Telegram/WhatsApp | Persistent messaging bridge            |
 | **benson** | Discord/Slack     | Conversational partner                 |
 
-Each agent has its own documents (identity, heartbeat, soul) stored in the database. Shared documents (values, process, user) are workspace-level. Together these form your constitution. The filesystem (`~/.pcp/`) is a fallback cache only.
+Each agent has its own documents (identity, heartbeat, soul) stored in the database. Shared documents (values, process, user) are workspace-level. Together these form your constitution. The filesystem (`~/.ink/`) is a fallback cache only.
 
 ### Constitution
 
@@ -229,7 +229,7 @@ When sending messages to other SBs via `send_to_inbox`, use `threadKey` to maint
 ## Key Principles
 
 - **Prefer MCP tools over CLI equivalents** — when an MCP server provides functionality that overlaps with a CLI tool, use the MCP tool. MCP calls don't require user permission approval, provide structured output, and integrate better with your tooling. Examples: use `mcp__github__*` over `gh` CLI for PRs/issues/diffs/reviews, use `mcp__supabase__*` over `supabase` CLI for migrations and SQL.
-- **Use PCP tools** (`mcp__pcp__*`) over local file operations for memory, tasks, and sessions
+- **Use Inkstand tools** (`mcp__pcp__*`) over local file operations for memory, tasks, and sessions
 - **Bootstrap first** — always call bootstrap at session start to load your identity and context
 - **Log your work** — use `remember()` for important decisions and insights
 - **Attribute memories** — include your agentId when calling `remember()` so memories are correctly filtered
@@ -294,7 +294,7 @@ personal-context-protocol/
 │   │   │   └── utils/          # Shared utilities
 │   │   └── package.json
 │   ├── web/                    # Next.js dashboard (Supabase auth ONLY — no data access)
-│   └── cli/                    # SB CLI (`sb` command)
+│   └── cli/                    # SB CLI (`ink` command)
 ├── supabase/
 │   └── migrations/             # Database migrations
 ├── ARCHITECTURE.md             # System architecture documentation
@@ -311,17 +311,17 @@ personal-context-protocol/
 
 ## Waiting for Responses (Holding Pattern)
 
-When waiting for a review, spec feedback, or any async response, use `sb wait` instead of manual polling or sleep loops:
+When waiting for a review, spec feedback, or any async response, use `ink wait` instead of manual polling or sleep loops:
 
 ```bash
 # Watch a specific thread for new messages
-sb wait --thread pr:239 --timeout 300 --interval 15
+ink wait --thread pr:239 --timeout 300 --interval 15
 
 # Watch inbox for any new unread
-sb wait --timeout 300
+ink wait --timeout 300
 
 # Include pending trigger queue (for CLI-attached sessions)
-sb wait --pending --timeout 300
+ink wait --pending --timeout 300
 ```
 
 **In Claude Code**, run via `run_in_background` to hold while waiting:
@@ -331,7 +331,7 @@ sb wait --pending --timeout 300
 send_to_inbox(recipientAgentId: "lumen", threadKey: "pr:239", ...)
 
 # Hold in background — wakes you up when reply arrives
-run_in_background: sb wait --thread pr:239 --timeout 300
+run_in_background: ink wait --thread pr:239 --timeout 300
 
 # Continue other work or idle...
 # Background task completes → you wake up → process the response
@@ -355,9 +355,9 @@ yarn build
 yarn type-check
 
 # View server logs
-yarn logs:pcp              # Structured JSON logs
-yarn logs:pcp:raw          # Raw log output
-yarn logs:pcp:errors       # Errors only
+yarn logs:ink              # Structured JSON logs
+yarn logs:ink:raw          # Raw log output
+yarn logs:ink:errors       # Errors only
 ```
 
 ## Testing with an Isolated Server (IMPORTANT)
@@ -376,7 +376,7 @@ PCP_PORT_BASE=4001 \
 yarn dev
 
 # Point the CLI at your test server
-PCP_SERVER_URL=http://localhost:4001 sb mission
+PCP_SERVER_URL=http://localhost:4001 ink mission
 ```
 
 **Disable services you aren't testing.** Telegram, WhatsApp, Discord, and the heartbeat service should stay `false` on isolated servers — the main server already owns those connections. Only enable them if you're explicitly testing that functionality _and_ you've stopped it on the main server first (e.g., two Telegram listeners will conflict).
@@ -484,7 +484,7 @@ All tools support multiple identification methods:
 
 ## Skills
 
-PCP uses the [AgentSkills format](https://docs.openclaw.ai/tools/skills) — each skill is a `SKILL.md` file with YAML frontmatter, optionally in its own directory with bundled scripts.
+Inkstand uses the [AgentSkills format](https://docs.openclaw.ai/tools/skills) — each skill is a `SKILL.md` file with YAML frontmatter, optionally in its own directory with bundled scripts.
 
 ### Skill Types
 
@@ -499,11 +499,11 @@ PCP uses the [AgentSkills format](https://docs.openclaw.ai/tools/skills) — eac
 Skills load from four tiers. When names collide, higher tiers win:
 
 1. **Bundled** — `packages/api/src/skills/builtin/` (shipped with PCP)
-2. **Extra dirs** — configurable paths in `~/.pcp/config.json` (ClawHub interop, etc.)
-3. **Managed** — `~/.pcp/skills/` (user-installed, shared across all SBs)
-4. **Workspace** — `<cwd>/.pcp/skills/` (per-worktree, per-SB)
+2. **Extra dirs** — configurable paths in `~/.ink/config.json` (ClawHub interop, etc.)
+3. **Managed** — `~/.ink/skills/` (user-installed, shared across all SBs)
+4. **Workspace** — `<cwd>/.ink/skills/` (per-worktree, per-SB)
 
-Configure extra directories in `~/.pcp/config.json`:
+Configure extra directories in `~/.ink/config.json`:
 
 ```json
 {
@@ -595,28 +595,28 @@ npx @modelcontextprotocol/inspector packages/api/dist/index.js
 
 ### Debugging & Logs
 
-Winston writes to **both** the console and persistent log files at `~/.pcp/logs/`:
+Winston writes to **both** the console and persistent log files at `~/.ink/logs/`:
 
 | Log            | Path                         | Contents                                  |
 | -------------- | ---------------------------- | ----------------------------------------- |
-| **combined**   | `~/.pcp/logs/combined.log`   | All log levels (info, warn, error, debug) |
-| **error**      | `~/.pcp/logs/error.log`      | Errors only                               |
-| **exceptions** | `~/.pcp/logs/exceptions.log` | Uncaught exceptions                       |
-| **rejections** | `~/.pcp/logs/rejections.log` | Unhandled promise rejections              |
+| **combined**   | `~/.ink/logs/combined.log`   | All log levels (info, warn, error, debug) |
+| **error**      | `~/.ink/logs/error.log`      | Errors only                               |
+| **exceptions** | `~/.ink/logs/exceptions.log` | Uncaught exceptions                       |
+| **rejections** | `~/.ink/logs/rejections.log` | Unhandled promise rejections              |
 
 Logs rotate at 10MB (combined) or 5MB (error), keeping 5 files each. `tailable: true` means the base filename (`combined.log`) is always the active log.
 
 **Yarn scripts for watching logs:**
 
 ```bash
-yarn logs:pcp              # Structured JSON: timestamp + level + message
-yarn logs:pcp:raw          # Raw JSON lines (for piping to jq, etc.)
-yarn logs:pcp:errors       # Errors only
+yarn logs:ink              # Structured JSON: timestamp + level + message
+yarn logs:ink:raw          # Raw JSON lines (for piping to jq, etc.)
+yarn logs:ink:errors       # Errors only
 
 # Or tail/search directly
-tail -f ~/.pcp/logs/combined.log
-grep "trigger\|Dispatching" ~/.pcp/logs/combined.log
-grep "pr:218" ~/.pcp/logs/combined.log
+tail -f ~/.ink/logs/combined.log
+grep "trigger\|Dispatching" ~/.ink/logs/combined.log
+grep "pr:218" ~/.ink/logs/combined.log
 ```
 
 These log files are written regardless of how the server is started (`yarn dev`, `yarn prod:direct`, etc.). The winston logs are the canonical source.
@@ -627,7 +627,7 @@ These log files are written regardless of how the server is started (`yarn dev`,
 
 ## Specs & Artifacts
 
-When we refer to "specs" in this project, we mean **PCP artifacts** — versioned documents stored on the PCP server and managed via MCP tools. They are NOT local markdown files.
+When we refer to "specs" in this project, we mean **PCP artifacts** — versioned documents stored on the Inkstand server and managed via MCP tools. They are NOT local markdown files.
 
 - **Browse**: `list_artifacts(type: "spec")` to discover available specs
 - **Read**: `get_artifact(uri: "pcp://specs/cli-session-hooks")` to view a spec by URI
@@ -645,7 +645,7 @@ Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key SB-specific reminders:
 - **Sign reviews**: end PR comments with `— Wren`, `— Lumen`, etc.
 - **Do not wait for permission to open a PR** once implementation is ready. Create the PR proactively unless the user explicitly asked you not to.
 - **Never push directly to main** from a feature branch. Always use PRs. This includes releases, changelog updates, and docs changes.
-- **ALL PRs require a sibling review before merge.** No exceptions unless Conor explicitly says otherwise. Do not merge your own PR without at least one other SB's LGTM. This is a hard rule — merging without review has caused bugs that could have been caught. Use `sb wait --thread pr:<number>` to hold for the review.
+- **ALL PRs require a sibling review before merge.** No exceptions unless Conor explicitly says otherwise. Do not merge your own PR without at least one other SB's LGTM. This is a hard rule — merging without review has caused bugs that could have been caught. Use `ink wait --thread pr:<number>` to hold for the review.
 - **Verify CI passes before merging.** Check `gh run list --branch <branch>` for the CI status. If tests fail, fix them before merging — don't merge red. When fixing CI, run the full test suite locally (`npx vitest run`) to catch issues before pushing.
 - **Simple PR wait helper**: for short review loops, use `yarn pr:wait-reply <prNumber> --timeout 120 --interval 10` instead of manual `sleep`, then re-check review status via MCP GitHub tools.
 - **Commit messages**: pass multi-line messages directly to `-m "..."` — bash handles literal newlines in double-quoted strings. Do not use `$(cat <<'EOF' ... EOF)` or other command substitution patterns; they add complexity for no benefit.

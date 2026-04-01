@@ -1,10 +1,10 @@
 services:
-  pcp-app:
+  inkstand-app:
     build:
       context: .
       dockerfile: Dockerfile.app
-    image: personal-context-protocol:app
-    container_name: pcp-app
+    image: inkstand:app
+    container_name: inkstand-app
     restart: unless-stopped
     environment:
       NODE_ENV: ${NODE_ENV:-production}
