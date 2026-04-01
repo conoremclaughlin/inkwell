@@ -980,6 +980,7 @@ export type Database = {
           tags: string[] | null;
           telegram_id: string | null;
           telegram_username: string | null;
+          type: string;
           updated_at: string | null;
           user_id: string;
           whatsapp_id: string | null;
@@ -998,6 +999,7 @@ export type Database = {
           tags?: string[] | null;
           telegram_id?: string | null;
           telegram_username?: string | null;
+          type?: string;
           updated_at?: string | null;
           user_id: string;
           whatsapp_id?: string | null;
@@ -1016,6 +1018,7 @@ export type Database = {
           tags?: string[] | null;
           telegram_id?: string | null;
           telegram_username?: string | null;
+          type?: string;
           updated_at?: string | null;
           user_id?: string;
           whatsapp_id?: string | null;

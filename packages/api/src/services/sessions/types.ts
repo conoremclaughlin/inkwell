@@ -215,10 +215,21 @@ export interface TemporalContext {
   greeting: string;
 }
 
+/** Contact identity for per-sender session context */
+export interface ContactContext {
+  id: string;
+  name: string;
+  displayName?: string;
+  type: 'personal' | 'external' | 'group';
+  platform?: string;
+}
+
 export interface InjectedContext {
   agent: AgentIdentity;
   user: UserContext;
   temporal: TemporalContext;
+  /** Contact identity when in a per-sender session */
+  contact?: ContactContext;
   recentMemories: Array<{
     id: string;
     content: string;
