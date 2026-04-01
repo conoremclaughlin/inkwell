@@ -1,6 +1,6 @@
 #!/usr/bin/env npx tsx
 /**
- * PCP Server - Personal Context Protocol
+ * Inkstand Server
  *
  * Main entry point that orchestrates:
  * - MCP Server with integrated ChannelGateway (Telegram/WhatsApp)
@@ -101,7 +101,7 @@ async function routeResponses(responses: ChannelResponse[]): Promise<void> {
  * Start the PCP server
  */
 async function startServer(config: ServerConfig = {}): Promise<void> {
-  logger.info('Starting PCP Server...');
+  logger.info('Starting Inkstand Server...');
 
   // Resolve configuration
   const workingDirectory = config.workingDirectory || path.resolve(__dirname, '../../..');
@@ -1031,7 +1031,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
   // Ready
   logger.info('');
   logger.info('='.repeat(60));
-  logger.info('PCP Server is running (SessionService architecture)');
+  logger.info('Inkstand Server is running (SessionService architecture)');
   logger.info('='.repeat(60));
   logger.info('');
 
@@ -1166,7 +1166,7 @@ async function shutdown(): Promise<void> {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
-  logger.info('\nShutting down PCP Server...');
+  logger.info('\nShutting down Inkstand Server...');
 
   // Force-kill safety net: if graceful shutdown hangs, exit anyway.
   const forceKillTimer = setTimeout(() => {
