@@ -27,7 +27,7 @@ import { useRouter } from 'next/navigation';
 import { useApiPost, useApiPostDynamic, useApiQuery, useQueryClient } from '@/lib/api/hooks';
 import { getSelectedWorkspaceId, setSelectedWorkspaceId } from '@/lib/workspace-selection';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { signOut } from '@/lib/auth/actions';
+import { signOut } from '@/lib/auth/client';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {

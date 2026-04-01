@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { SocialButtons } from '@/components/auth/social-buttons';
 import { AuthDivider } from '@/components/auth/auth-divider';
-import { signInWithPassword, signInWithOtp } from '@/lib/auth/actions';
+import { signInWithPassword, signInWithOtp } from '@/lib/auth/client';
 import { getErrorMessage } from '@/lib/auth-utils';
 import { Loader2, Zap } from 'lucide-react';
 import { cn } from '@/lib/utils';
