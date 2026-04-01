@@ -1,7 +1,7 @@
 {
-  "name": "@personal-context/spec",
+  "name": "@inkstand/spec",
   "version": "0.1.0",
   "private": true,
-  "description": "PCP Protocol Specification",
+  "description": "Inkstand Protocol Specification",
   "license": "MIT"
 }

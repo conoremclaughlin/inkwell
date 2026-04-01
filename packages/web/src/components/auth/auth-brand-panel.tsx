@@ -23,7 +23,7 @@ export function AuthBrandPanel() {
       {/* Content */}
       <div className="relative z-10 flex flex-col justify-between p-12 xl:p-16 w-full">
         <div>
-          <h1 className="text-3xl font-bold text-white tracking-tight">Personal Context</h1>
+          <h1 className="text-3xl font-bold text-white tracking-tight">Inkstand</h1>
           <p className="mt-3 text-lg text-indigo-200/80 max-w-sm leading-relaxed">
             Your AI beings remember what matters to you — across every conversation, every
             interface.

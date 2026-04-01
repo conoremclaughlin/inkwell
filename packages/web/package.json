@@ -1,9 +1,9 @@
 {
-  "name": "@personal-context/web",
+  "name": "@inkstand/web",
   "version": "1.0.0",
   "private": true,
   "license": "MIT",
-  "description": "PCP Admin Dashboard - Manage WhatsApp, trusted users, and groups",
+  "description": "Inkstand Admin Dashboard - Manage WhatsApp, trusted users, and groups",
   "scripts": {
     "dev": "BASE_PORT=${PCP_PORT_BASE:-3001}; WEB_PORT=${WEB_PORT:-$((BASE_PORT + 1))}; next dev -p $WEB_PORT",
     "build": "next build",

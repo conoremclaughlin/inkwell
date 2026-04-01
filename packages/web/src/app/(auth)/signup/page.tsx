@@ -2,7 +2,7 @@ import { Suspense } from 'react';
 import SignupForm from './signup-form';
 
 export const metadata = {
-  title: 'Sign Up - Personal Context',
+  title: 'Sign Up - Inkstand',
 };
 
 export default function SignupPage() {

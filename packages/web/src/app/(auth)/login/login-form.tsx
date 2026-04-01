@@ -101,7 +101,7 @@ export default function LoginForm() {
   if (mcpRedirecting) {
     return (
       <div className="text-center py-12">
-        <h2 className="text-2xl font-bold tracking-tight text-gray-900">Personal Context</h2>
+        <h2 className="text-2xl font-bold tracking-tight text-gray-900">Inkstand</h2>
         <p className="mt-2 text-sm text-gray-500">Granting MCP access to Claude Code...</p>
         <div className="mt-8 flex justify-center">
           <Loader2 className="h-8 w-8 animate-spin text-indigo-600" />
@@ -119,8 +119,8 @@ export default function LoginForm() {
         <h2 className="text-2xl font-bold tracking-tight text-gray-900">Welcome back</h2>
         <p className="mt-2 text-sm text-gray-500">
           {isMcpAuth
-            ? 'Sign in to connect Claude Code to Personal Context.'
-            : 'Sign in to your Personal Context account.'}
+            ? 'Sign in to connect Claude Code to Inkstand.'
+            : 'Sign in to your Inkstand account.'}
         </p>
         {isMcpAuth && (
           <div className="mt-3 flex items-center gap-2 rounded-lg bg-indigo-50 px-3 py-2 text-xs text-indigo-700">

@@ -1,19 +1,19 @@
 #!/usr/bin/env node
 /**
- * SB CLI - Synthetically-born Being
+ * Ink CLI — Inkstand
  *
  * A lightweight CLI that wraps AI coding tools (Claude Code, etc.) with
  * identity injection and session tracking. Unrecognized flags are passed
  * through to the underlying tool.
  *
  * Usage:
- *   sb                         Interactive session (default: claude)
- *   sb "your prompt"           One-shot prompt mode
- *   sb -b codex "fix the bug"  Use Codex CLI backend
- *   sb -b gemini "review this" Use Gemini CLI backend
- *   sb --resume <id>           Passthrough flags to backend
- *   sb studio create <name>    Create a studio (worktree)
- *   sb session list            List sessions
+ *   ink                         Interactive session (default: claude)
+ *   ink "your prompt"           One-shot prompt mode
+ *   ink -b codex "fix the bug"  Use Codex CLI backend
+ *   ink -b gemini "review this" Use Gemini CLI backend
+ *   ink --resume <id>           Passthrough flags to backend
+ *   ink studio create <name>    Create a studio (worktree)
+ *   ink session list            List sessions
  */
 
 import { program } from 'commander';
@@ -47,7 +47,7 @@ const VERSION = '0.3.0';
 // ============================================================================
 
 /**
- * Known SB flags and their config.
+ * Known Ink flags and their config.
  * Everything else is forwarded to the underlying AI tool.
  */
 const SB_FLAGS: Record<string, { hasValue: boolean; key: string }> = {
@@ -186,8 +186,8 @@ export function extractArgs(argv: string[]): ParsedArgs {
 // ============================================================================
 
 program
-  .name('sb')
-  .description('SB CLI — launch AI coding sessions with persistent identity')
+  .name('ink')
+  .description('Ink CLI — launch AI coding sessions with persistent identity')
   .version(VERSION)
   .enablePositionalOptions()
   .allowUnknownOption(true)
@@ -206,7 +206,7 @@ program
     'Include all backend-local session sources in picker/json (debug mode)'
   )
   .option('--session-choice <choice>', 'Force session selection (new | pcp:<id> | local:<id>)')
-  .option('--sb-debug', 'Enable SB debug logging to ~/.pcp/sb-debug.log')
+  .option('--sb-debug', 'Enable debug logging to ~/.inkstand/ink-debug.log')
   .option('--sb-verbose', 'Verbose SB output')
   .option('--dangerous', 'Skip all permission prompts (maps to backend-native auto-approve)')
   .argument('[prompt...]', 'Prompt to send (omit for interactive)')

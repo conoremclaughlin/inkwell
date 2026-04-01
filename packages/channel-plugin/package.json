@@ -1,7 +1,7 @@
 {
-  "name": "@personal-context/channel-plugin",
+  "name": "@inkstand/channel-plugin",
   "version": "0.1.0",
-  "description": "PCP channel plugin for Claude Code — pushes inbox messages into running sessions",
+  "description": "Inkstand channel plugin for Claude Code — pushes inbox messages into running sessions",
   "type": "module",
   "main": "index.ts",
   "scripts": {

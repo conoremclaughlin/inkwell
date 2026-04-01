@@ -1,9 +1,9 @@
 {
-  "name": "@personal-context/api",
+  "name": "@inkstand/api",
   "version": "1.0.0",
   "private": true,
   "license": "SEE LICENSE IN LICENSE",
-  "description": "Personal context protocol API server with MCP, Telegram bot, and REST API",
+  "description": "Inkstand API server with MCP, Telegram bot, and REST API",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
@@ -16,8 +16,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:integration": "yarn test:integration:db && yarn test:integration:runtime",
-    "test:integration:db": "yarn workspace @personal-context/shared build && vitest run --config vitest.integration.db.config.ts",
-    "test:integration:runtime": "yarn workspace @personal-context/shared build && vitest run --config vitest.integration.runtime.config.ts",
+    "test:integration:db": "yarn workspace @inkstand/shared build && vitest run --config vitest.integration.db.config.ts",
+    "test:integration:runtime": "yarn workspace @inkstand/shared build && vitest run --config vitest.integration.runtime.config.ts",
     "test:codex-e2e": "RUN_CODEX_E2E=1 vitest run --config vitest.integration.runtime.config.ts src/services/sessions/codex-runner.integration.test.ts",
     "test:coverage": "vitest run --coverage",
     "test:connection": "tsx src/test-connection.ts",
@@ -26,7 +26,7 @@
     "benchmark:bootstrap-relevance": "tsx src/scripts/benchmark-bootstrap-relevance.ts",
     "backfill:memory-embeddings": "tsx src/scripts/backfill-memory-embeddings.ts",
     "lint": "eslint src --ext .ts",
-    "type-check": "yarn workspace @personal-context/shared build && tsc --noEmit",
+    "type-check": "yarn workspace @inkstand/shared build && tsc --noEmit",
     "clean": "rm -rf dist"
   },
   "dependencies": {

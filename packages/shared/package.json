@@ -1,10 +1,10 @@
 {
-  "name": "@personal-context/shared",
+  "name": "@inkstand/shared",
   "version": "1.0.0",
   "private": true,
   "license": "MIT",
   "type": "module",
-  "description": "Shared types and utilities for personal context protocol",
+  "description": "Shared types and utilities for Inkstand",
   "main": "dist/cjs/index.js",
   "types": "dist/index.d.ts",
   "exports": {
@@ -22,7 +22,7 @@
   "scripts": {
     "build": "tsc && tsc -p tsconfig.cjs.json && echo '{\"type\":\"commonjs\"}' > dist/cjs/package.json",
     "dev": "tsc --watch",
-    "test": "echo \"No tests for @personal-context/shared\"",
+    "test": "echo \"No tests for @inkstand/shared\"",
     "lint": "eslint src --ext .ts",
     "type-check": "tsc --noEmit",
     "clean": "rm -rf dist *.tsbuildinfo"

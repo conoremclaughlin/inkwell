@@ -77,7 +77,7 @@ export default function SignupForm() {
     <>
       <div className="mb-8">
         <h2 className="text-2xl font-bold tracking-tight text-gray-900">Create your account</h2>
-        <p className="mt-2 text-sm text-gray-500">Get started with Personal Context.</p>
+        <p className="mt-2 text-sm text-gray-500">Get started with Inkstand.</p>
       </div>
 
       <SocialButtons

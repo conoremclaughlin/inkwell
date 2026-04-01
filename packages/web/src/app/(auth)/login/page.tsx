@@ -2,7 +2,7 @@ import { Suspense } from 'react';
 import LoginForm from './login-form';
 
 export const metadata = {
-  title: 'Sign In - Personal Context',
+  title: 'Sign In - Inkstand',
 };
 
 export default function LoginPage() {

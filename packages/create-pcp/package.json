@@ -1,7 +1,7 @@
 {
-  "name": "create-pcp",
+  "name": "create-inkstand",
   "version": "0.1.0",
-  "description": "Set up Personal Context Protocol — AI beings with identity, memory, and coordination",
+  "description": "Set up Inkstand — AI beings with identity, memory, and coordination",
   "license": "MIT",
   "type": "module",
   "bin": "./dist/index.js",
@@ -30,12 +30,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/conoremclaughlin/personal-context-protocol.git",
+    "url": "https://github.com/conoremclaughlin/inkstand.git",
     "directory": "packages/create-pcp"
   },
   "keywords": [
-    "pcp",
-    "personal-context-protocol",
+    "inkstand",
     "ai-agents",
     "create",
     "scaffolder",
