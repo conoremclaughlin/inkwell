@@ -64,11 +64,11 @@ describe('parsePermissionGrant', () => {
 
   it('parses grant-session', () => {
     const result = parsePermissionGrant({
-      permissionGrant: { action: 'grant-session', tools: ['group:pcp-memory'] },
+      permissionGrant: { action: 'grant-session', tools: ['group:ink-memory'] },
     });
     expect(result).toEqual({
       action: 'grant-session',
-      tools: ['group:pcp-memory'],
+      tools: ['group:ink-memory'],
     });
   });
 
@@ -176,7 +176,7 @@ describe('applyPermissionGrant', () => {
   it('expands group specs', () => {
     const result = applyPermissionGrant({
       policy,
-      grant: { action: 'allow', tools: ['group:pcp-memory'] },
+      grant: { action: 'allow', tools: ['group:ink-memory'] },
     });
     expect(result.applied).toBe(true);
     expect(result.summary).toContain('remember');

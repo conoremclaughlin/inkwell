@@ -138,7 +138,7 @@ function sanitizeSlug(value: string): string {
 function buildContainerName(context: StudioSandboxContext): string {
   const label = sanitizeSlug(context.studioName || basename(context.studioPath) || 'studio');
   const digest = createHash('sha256').update(context.studioPath).digest('hex').slice(0, 10);
-  return `pcp-studio-sandbox-${label}-${digest}`;
+  return `ink-studio-sandbox-${label}-${digest}`;
 }
 
 function rewriteLoopbackUrl(rawUrl: string): string {

@@ -303,14 +303,14 @@ export function loadAllSkills(options?: string | SkillLoadOptions): LoadedSkill[
   }
 
   // Tier 3: Managed (~/.ink/skills/)
-  const userPath = opts.userSkillsPath || join(HOME, '.pcp', 'skills');
+  const userPath = opts.userSkillsPath || join(HOME, '.ink', 'skills');
   for (const s of scanDirectory(userPath)) {
     skills.set(s.manifest.name, s);
   }
 
   // Tier 4: Workspace (<cwd>/.ink/skills/) — highest precedence
   if (opts.workspacePath) {
-    const wsSkillsPath = join(opts.workspacePath, '.pcp', 'skills');
+    const wsSkillsPath = join(opts.workspacePath, '.ink', 'skills');
     for (const s of scanDirectory(wsSkillsPath)) {
       skills.set(s.manifest.name, s);
     }
@@ -345,10 +345,10 @@ export function getSkillPaths(options?: string | SkillLoadOptions): string[] {
     }
   }
 
-  paths.push(opts.userSkillsPath || join(HOME, '.pcp', 'skills'));
+  paths.push(opts.userSkillsPath || join(HOME, '.ink', 'skills'));
 
   if (opts.workspacePath) {
-    paths.push(join(opts.workspacePath, '.pcp', 'skills'));
+    paths.push(join(opts.workspacePath, '.ink', 'skills'));
   }
 
   return paths;

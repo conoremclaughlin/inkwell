@@ -46,7 +46,7 @@ describe('ToolPolicyState', () => {
 
   it('expands group rules for allow', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
-    policy.allowTool('group:pcp-comms');
+    policy.allowTool('group:ink-comms');
     expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
     expect(policy.canCallPcpTool('trigger_agent').allowed).toBe(true);
   });
@@ -97,7 +97,7 @@ describe('ToolPolicyState', () => {
 
   it('enforces deny precedence over allow', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
-    policy.allowTool('group:pcp-comms');
+    policy.allowTool('group:ink-comms');
     policy.denyTool('send_to_inbox');
     expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(false);
     expect(policy.canCallPcpTool('trigger_agent').allowed).toBe(true);
@@ -228,7 +228,7 @@ describe('ToolPolicyState', () => {
 
   it('applies scoped allowlist narrowing across active scopes', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
-    policy.allowTool('group:pcp-comms', { scope: 'global' });
+    policy.allowTool('group:ink-comms', { scope: 'global' });
     policy.setContext({ workspaceId: 'ws-1' });
     policy.allowTool('send_to_inbox', { scope: 'workspace', id: 'ws-1' });
     expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
@@ -241,7 +241,7 @@ describe('ToolPolicyState', () => {
 
   it('applies scoped deny rules only within matching scope', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
-    policy.allowTool('group:pcp-comms', { scope: 'global' });
+    policy.allowTool('group:ink-comms', { scope: 'global' });
     policy.denyTool('send_response', { scope: 'workspace', id: 'ws-1' });
 
     policy.setContext({ workspaceId: 'ws-1' });
@@ -283,7 +283,7 @@ describe('ToolPolicyState', () => {
 
   it('supports context-based mutation scopes', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
-    policy.allowTool('group:pcp-comms', { scope: 'global' });
+    policy.allowTool('group:ink-comms', { scope: 'global' });
     policy.setContext({ workspaceId: 'ws-1' });
     expect(policy.setMutationScope('workspace').success).toBe(true);
     policy.denyTool('send_to_inbox');
@@ -357,7 +357,7 @@ describe('ToolPolicyState', () => {
 
   it('resets scoped policies with clearScopeRules', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
-    policy.allowTool('group:pcp-comms', { scope: 'global' });
+    policy.allowTool('group:ink-comms', { scope: 'global' });
     policy.setContext({ workspaceId: 'ws-1' });
     policy.setMutationScope('workspace');
     policy.denyTool('send_to_inbox');
@@ -530,7 +530,7 @@ describe('ToolPolicyState', () => {
       {
         name: 'scoped allowlist narrowing blocks tools outside scope allow',
         setup: (policy) => {
-          policy.allowTool('group:pcp-comms', { scope: 'global' });
+          policy.allowTool('group:ink-comms', { scope: 'global' });
           policy.allowTool('trigger_agent', { scope: 'workspace', id: 'ws-1' });
           policy.setContext({ workspaceId: 'ws-1' });
         },
@@ -540,7 +540,7 @@ describe('ToolPolicyState', () => {
       {
         name: 'scoped allowlist narrowing still permits allowed member',
         setup: (policy) => {
-          policy.allowTool('group:pcp-comms', { scope: 'global' });
+          policy.allowTool('group:ink-comms', { scope: 'global' });
           policy.allowTool('trigger_agent', { scope: 'workspace', id: 'ws-1' });
           policy.setContext({ workspaceId: 'ws-1' });
         },
