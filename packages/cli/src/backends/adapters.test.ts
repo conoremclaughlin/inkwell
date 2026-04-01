@@ -3,7 +3,7 @@ import { readFileSync } from 'fs';
 import { ClaudeAdapter } from './claude.js';
 import { CodexAdapter } from './codex.js';
 import { GeminiAdapter } from './gemini.js';
-import { decodeContextToken } from '@personal-context/shared';
+import { decodeContextToken } from '@inkstand/shared';
 
 describe('backend adapters session resume wiring', () => {
   it('passes claude backendSessionId through --resume', () => {

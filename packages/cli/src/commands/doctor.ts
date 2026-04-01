@@ -59,7 +59,7 @@ function resolveCliRoot(fsOps: Pick<DoctorFs, 'existsSync' | 'readFileSync'>): s
       if (fsOps.existsSync(pkgPath)) {
         try {
           const pkg = JSON.parse(fsOps.readFileSync(pkgPath, 'utf-8'));
-          if (pkg.name === '@personal-context/cli') return candidate;
+          if (pkg.name === '@inkstand/cli') return candidate;
         } catch {
           // continue walking
         }
@@ -68,7 +68,7 @@ function resolveCliRoot(fsOps: Pick<DoctorFs, 'existsSync' | 'readFileSync'>): s
     if (dir === root) break;
     dir = dirname(dir);
   }
-  throw new Error('Could not find @personal-context/cli package. Run from within the repo.');
+  throw new Error('Could not find @inkstand/cli package. Run from within the repo.');
 }
 
 function resolveDefaultCliName(fsOps: Pick<DoctorFs, 'existsSync' | 'readFileSync'>): string {
@@ -76,28 +76,28 @@ function resolveDefaultCliName(fsOps: Pick<DoctorFs, 'existsSync' | 'readFileSyn
     .map((value) => basename(String(value || '')).trim())
     .filter(Boolean);
   for (const candidate of invokedCandidates) {
-    if (/^sb(?:-[a-z0-9][a-z0-9_-]*)?$/i.test(candidate)) {
+    if (/^ink(?:-[a-z0-9][a-z0-9_-]*)?$/i.test(candidate)) {
       return candidate.toLowerCase();
     }
   }
 
   const fromEnv = process.env.AGENT_ID?.trim().toLowerCase();
-  if (fromEnv) return `sb-${fromEnv}`;
+  if (fromEnv) return `ink-${fromEnv}`;
 
   const cwd = process.cwd();
   const identityPath = join(cwd, '.ink', 'identity.json');
   if (fsOps.existsSync(identityPath)) {
     try {
       const identity = JSON.parse(fsOps.readFileSync(identityPath, 'utf-8'));
-      if (identity.agentId) return `sb-${identity.agentId}`;
+      if (identity.agentId) return `ink-${identity.agentId}`;
     } catch {
       // fall through
     }
   }
   const dirName = basename(cwd);
   const match = dirName.match(/--(.+)$/);
-  if (match) return `sb-${match[1]}`;
-  return 'sb';
+  if (match) return `ink-${match[1]}`;
+  return 'ink';
 }
 
 export function analyzeCliLink(
@@ -116,7 +116,7 @@ export function analyzeCliLink(
     checks.push({
       name: 'CLI root',
       status: 'warn',
-      detail: 'Could not resolve @personal-context/cli root from current directory.',
+      detail: 'Could not resolve @inkstand/cli root from current directory.',
     });
   }
 
@@ -215,8 +215,8 @@ function iconForStatus(status: CheckStatus): string {
 }
 
 function buildFixCommand(binaryName: string): string {
-  if (binaryName === 'sb') return 'sb studio cli';
-  return `sb studio cli --name ${binaryName}`;
+  if (binaryName === 'ink') return 'ink studio cli';
+  return `ink studio cli --name ${binaryName}`;
 }
 
 function resolveRepoRoot(fsOps: Pick<DoctorFs, 'existsSync'>): string | undefined {

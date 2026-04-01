@@ -259,7 +259,7 @@ async function backfillCommand(options: BackfillOptions): Promise<void> {
 
   await runStreamingCommand(
     'yarn',
-    ['workspace', '@personal-context/api', 'backfill:memory-embeddings'],
+    ['workspace', '@inkstand/api', 'backfill:memory-embeddings'],
     { cwd, env, logFile }
   );
 }

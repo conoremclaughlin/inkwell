@@ -28,7 +28,7 @@ RUN apt-get update \
 COPY --from=builder /app /app
 
 ENV NODE_ENV=production
-ENV PCP_PORT_BASE=3001
+ENV INK_PORT_BASE=3001
 ENV WEB_PORT=3002
 ENV MYRA_HTTP_PORT=3003
 ENV API_URL=http://localhost:3001

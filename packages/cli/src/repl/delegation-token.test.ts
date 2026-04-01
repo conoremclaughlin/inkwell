@@ -3,7 +3,7 @@ import {
   decodeDelegationToken,
   mintDelegationToken,
   verifyDelegationToken,
-} from '@personal-context/shared';
+} from '@inkstand/shared';
 
 describe('delegation token helpers', () => {
   const secret = 'pcp-delegation-test-secret';

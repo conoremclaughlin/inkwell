@@ -99,7 +99,7 @@ function isLocalSupabaseUrl(value) {
 function resolveTarget(args) {
   if (args.target === 'local' || args.target === 'linked') return args.target;
 
-  const override = String(process.env.PCP_MIGRATION_TARGET || '')
+  const override = String(process.env.INK_MIGRATION_TARGET || '')
     .trim()
     .toLowerCase();
   if (override === 'local' || override === 'linked') return override;

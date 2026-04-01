@@ -8,7 +8,7 @@
  * 4. Token expiration handling
  * 5. Client ID isolation
  *
- * Run via: yarn workspace @personal-context/api test:integration
+ * Run via: yarn workspace @inkstand/api test:integration
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';

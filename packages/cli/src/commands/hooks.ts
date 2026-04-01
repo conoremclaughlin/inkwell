@@ -990,9 +990,9 @@ function looksLikeSbEntrypoint(path: string): boolean {
   return (
     normalized.endsWith('/packages/cli/dist/cli.js') ||
     normalized.endsWith('/packages/cli/src/cli.ts') ||
-    normalized.endsWith('/node_modules/.bin/sb') ||
-    normalized.endsWith('/sb') ||
-    /^sb(?:[-_.][a-z0-9_-]+)?$/i.test(baseName)
+    normalized.endsWith('/node_modules/.bin/ink') ||
+    normalized.endsWith('/ink') ||
+    /^ink(?:[-_.][a-z0-9_-]+)?$/i.test(baseName)
   );
 }
 
@@ -1004,8 +1004,8 @@ function buildSbCommandPrefix(path: string): string {
 }
 
 /**
- * Resolve absolute path to the `sb` CLI binary from the main worktree's
- * node_modules/.bin/sb. This ensures hooks work from PM2 and other
+ * Resolve absolute path to the `ink` CLI binary from the main worktree's
+ * node_modules/.bin/ink. This ensures hooks work from PM2 and other
  * environments where ~/.local/bin may not be in PATH.
  */
 function resolveSbBinaryPath(cwd: string): string {
@@ -1016,17 +1016,17 @@ function resolveSbBinaryPath(cwd: string): string {
 
   const worktrees = listWorktreePaths(cwd);
   const mainWorktree = worktrees[0] || cwd;
-  const binPath = join(mainWorktree, 'node_modules', '.bin', 'sb');
+  const binPath = join(mainWorktree, 'node_modules', '.bin', 'ink');
   if (existsSync(binPath)) return buildSbCommandPrefix(binPath);
-  // Fallback: bare `sb` (relies on PATH)
-  return 'sb';
+  // Fallback: bare `ink` (relies on PATH)
+  return 'ink';
 }
 
-/** Check if a hook command is PCP-managed (handles both bare `sb` and absolute paths) */
+/** Check if a hook command is PCP-managed (handles both bare `ink` and absolute paths) */
 function isPcpHookCommand(cmd: string | undefined): boolean {
   if (!cmd) return false;
   return (
-    /\bsb hooks\b/.test(cmd) || PCP_HOOK_SIGNATURES.some((signature) => cmd.includes(signature))
+    /\bink hooks\b/.test(cmd) || PCP_HOOK_SIGNATURES.some((signature) => cmd.includes(signature))
   );
 }
 
@@ -1046,7 +1046,7 @@ function buildManagedHookCommand(sbPath: string, hookName: string, backendName: 
 }
 
 function formatHookHint(backendName: string, hookName: string): string {
-  return `sb hooks ${hookName} --backend ${backendName}`;
+  return `ink hooks ${hookName} --backend ${backendName}`;
 }
 
 function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
@@ -1337,7 +1337,7 @@ function removePcpTomlSection(content: string): string {
 
 /**
  * Programmatic hooks installer. Returns the result without printing.
- * Used by `sb hooks install`, `sb studio create`, and `sb init`.
+ * Used by `ink hooks install`, `ink studio create`, and `ink init`.
  */
 export function installHooks(
   cwd: string,
@@ -1575,7 +1575,7 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
 
     if (!existsSync(configPath)) {
       console.log(chalk.yellow('\n  No config file found. Hooks not installed.'));
-      console.log(chalk.dim(`  Run: sb hooks install -b ${backend.name}`));
+      console.log(chalk.dim(`  Run: ink hooks install -b ${backend.name}`));
       console.log('');
       continue;
     }
@@ -1637,7 +1637,7 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
 
     if (!hasHooks) {
       console.log(chalk.yellow('\n  No hooks installed.'));
-      console.log(chalk.dim(`  Run: sb hooks install -b ${backend.name}`));
+      console.log(chalk.dim(`  Run: ink hooks install -b ${backend.name}`));
     }
 
     // Show capabilities

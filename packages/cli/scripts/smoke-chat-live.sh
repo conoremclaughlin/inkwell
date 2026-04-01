@@ -26,7 +26,7 @@ DEBUG_FILE="${SB_SMOKE_DEBUG_FILE:-/tmp/sb-chat-smoke-debug.log}"
 PCP_URL="${INK_SERVER_URL:-http://localhost:3101}"
 
 if [[ ! -f "dist/cli.js" ]]; then
-  echo "dist/cli.js not found. Run: yarn workspace @personal-context/cli build"
+  echo "dist/cli.js not found. Run: yarn workspace @inkstand/cli build"
   exit 1
 fi
 

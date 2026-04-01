@@ -35,7 +35,7 @@ import { CodexRunner } from './codex-runner.js';
 import { GeminiRunner } from './gemini-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import { resolveIdentityId } from '../../auth/resolve-identity.js';
-import { classifyError } from '@personal-context/shared';
+import { classifyError } from '@inkstand/shared';
 import { logger } from '../../utils/logger.js';
 
 /**

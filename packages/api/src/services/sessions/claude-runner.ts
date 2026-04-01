@@ -23,7 +23,7 @@ import {
   injectSessionHeaders,
   buildSessionEnv,
   writeRuntimeSessionHint,
-} from '@personal-context/shared';
+} from '@inkstand/shared';
 
 /** Maximum time (ms) to wait for a Claude Code subprocess before killing it.
  *  Override with CLAUDE_PROCESS_TIMEOUT_MS env var. */

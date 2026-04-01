@@ -77,7 +77,7 @@ import {
   mintDelegationToken,
   verifyDelegationToken,
   type DelegationTokenPayload,
-} from '@personal-context/shared';
+} from '@inkstand/shared';
 
 type ChatOptions = {
   agent?: string;

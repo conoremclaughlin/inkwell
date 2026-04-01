@@ -8,7 +8,7 @@
  */
 
 import { createIdentityPromptFile } from './identity.js';
-import { encodeContextToken } from '@personal-context/shared';
+import { encodeContextToken } from '@inkstand/shared';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
 
 /**

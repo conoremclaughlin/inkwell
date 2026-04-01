@@ -44,7 +44,7 @@ import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gate
 import { resolveRouteAgentId } from './services/routing/resolve-route';
 import { resolveAgentFromMention } from './services/routing/resolve-mention';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
-import { classifyError } from '@personal-context/shared';
+import { classifyError } from '@inkstand/shared';
 import { logger } from './utils/logger';
 import { getUserFromContext } from './utils/request-context';
 import { env } from './config/env';

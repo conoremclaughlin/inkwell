@@ -1,4 +1,4 @@
-import { spawnBackend } from '@personal-context/shared';
+import { spawnBackend } from '@inkstand/shared';
 import { getBackend } from '../backends/index.js';
 import { extractBackendTokenUsage, type BackendTokenUsage } from './token-usage.js';
 

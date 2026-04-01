@@ -69,13 +69,13 @@ function parsePort(rawValue, fallback, envName) {
   return parsed;
 }
 
-const basePort = parsePort(process.env.PCP_PORT_BASE, 3001, 'PCP_PORT_BASE');
+const basePort = parsePort(process.env.INK_PORT_BASE, 3001, 'INK_PORT_BASE');
 const webPort = parsePort(process.env.WEB_PORT, basePort + 1, 'WEB_PORT');
 const myraPort = parsePort(process.env.MYRA_HTTP_PORT, basePort + 2, 'MYRA_HTTP_PORT');
 const apiUrl = process.env.API_URL || `http://localhost:${basePort}`;
 
 console.log('Starting concurrent dev mode');
-console.log(`  PCP_PORT_BASE=${basePort}`);
+console.log(`  INK_PORT_BASE=${basePort}`);
 console.log(`  WEB_PORT=${webPort}`);
 console.log(`  MYRA_HTTP_PORT=${myraPort}`);
 console.log(`  API_URL=${apiUrl}`);
@@ -90,7 +90,7 @@ const envPATH = `${binDir}:${process.env.PATH || ''}`;
 const apiEnv = {
   ...process.env,
   PATH: envPATH,
-  PCP_PORT_BASE: String(basePort),
+  INK_PORT_BASE: String(basePort),
   MYRA_HTTP_PORT: String(myraPort),
   API_URL: apiUrl,
   ENABLE_TELEGRAM: process.env.ENABLE_TELEGRAM ?? '',
@@ -101,7 +101,7 @@ const apiEnv = {
 const webEnv = {
   ...process.env,
   PATH: envPATH,
-  PCP_PORT_BASE: String(basePort),
+  INK_PORT_BASE: String(basePort),
   WEB_PORT: String(webPort),
   API_URL: apiUrl,
 };
@@ -109,13 +109,13 @@ const webEnv = {
 const { result } = concurrently(
   [
     {
-      command: 'yarn workspace @personal-context/api server:dev',
+      command: 'yarn workspace @inkstand/api server:dev',
       name: 'api',
       prefixColor: 'blue',
       env: apiEnv,
     },
     {
-      command: 'yarn workspace @personal-context/web dev',
+      command: 'yarn workspace @inkstand/web dev',
       name: 'web',
       prefixColor: 'magenta',
       env: webEnv,
