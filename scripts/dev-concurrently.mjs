@@ -69,7 +69,7 @@ function parsePort(rawValue, fallback, envName) {
   return parsed;
 }
 
-const basePort = parsePort(process.env.INK_PORT_BASE, 3001, 'INK_PORT_BASE');
+const basePort = parsePort(process.env.INK_PORT_BASE || process.env.PCP_PORT_BASE, 3001, 'INK_PORT_BASE');
 const webPort = parsePort(process.env.WEB_PORT, basePort + 1, 'WEB_PORT');
 const myraPort = parsePort(process.env.MYRA_HTTP_PORT, basePort + 2, 'MYRA_HTTP_PORT');
 const apiUrl = process.env.API_URL || `http://localhost:${basePort}`;
@@ -81,6 +81,18 @@ console.log(`  MYRA_HTTP_PORT=${myraPort}`);
 console.log(`  API_URL=${apiUrl}`);
 console.log(`  ENABLE_TELEGRAM=${process.env.ENABLE_TELEGRAM ?? '<auto>'}`);
 console.log(`  ENABLE_HEARTBEAT_SERVICE=${process.env.ENABLE_HEARTBEAT_SERVICE ?? '<unset>'}`);
+
+// Build @inkstand/shared before starting servers — the API imports its CJS
+// dist at runtime, and a stale or missing build will crash on startup.
+import { execSync } from 'node:child_process';
+try {
+  execSync('yarn workspace @inkstand/shared build', {
+    cwd: rootDir,
+    stdio: 'inherit',
+  });
+} catch {
+  console.error('[dev] Failed to build @inkstand/shared — API may not start correctly');
+}
 
 // Ensure node_modules/.bin is on PATH so hoisted binaries (next, tsx, etc.)
 // are resolvable by yarn script shells spawned via concurrently.

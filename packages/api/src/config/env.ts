@@ -113,6 +113,7 @@ const envSchema = z.object({
   // Server
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   INK_PORT_BASE: z.string().transform(Number).optional(),
+  PCP_PORT_BASE: z.string().transform(Number).optional(), // backward compat
   PORT: z.string().transform(Number).optional(),
 
   // Database - Supabase (supports both old and new naming conventions)
@@ -198,10 +199,10 @@ const parseEnv = () => {
       );
     }
 
-    // Create normalized keys (prefer new naming)
-    const hasBaseOverride = parsed.INK_PORT_BASE !== undefined;
+    // Create normalized keys (prefer INK_, fall back to PCP_ for backward compat)
+    const hasBaseOverride = parsed.INK_PORT_BASE !== undefined || parsed.PCP_PORT_BASE !== undefined;
     // Base is MCP-first: MCP=base, WEB=base+1, MYRA=base+2
-    const portBase = parsed.INK_PORT_BASE ?? 3001;
+    const portBase = parsed.INK_PORT_BASE ?? parsed.PCP_PORT_BASE ?? 3001;
 
     // If INK_PORT_BASE is provided and legacy defaults are still present,
     // treat those defaults as unset so the base can drive derived ports.
