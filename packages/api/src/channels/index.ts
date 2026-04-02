@@ -2,7 +2,7 @@
  * Channels module
  *
  * This module provides integration with messaging platforms through clawdbot.
- * It allows the personal context protocol to receive and process messages from:
+ * It allows Inkstand to receive and process messages from:
  * - Telegram
  * - WhatsApp
  * - Discord

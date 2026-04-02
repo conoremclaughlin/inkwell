@@ -1,5 +1,5 @@
 /**
- * Public API exports for @personal-context-protocol/api
+ * Public API exports for @inkstand/api
  *
  * This file exports all public APIs that can be used by consumers of this package.
  */

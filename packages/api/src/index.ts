@@ -5,7 +5,7 @@ import { env } from './config/env';
 
 async function main() {
   try {
-    logger.info('Starting Personal Context Protocol server...');
+    logger.info('Starting Inkstand server...');
     logger.info(`Environment: ${env.NODE_ENV}`);
     logger.info(`MCP Transport: ${env.MCP_TRANSPORT}`);
 
@@ -27,7 +27,7 @@ async function main() {
     logger.info('Starting MCP server...');
     await mcpServer.start();
 
-    logger.info('Personal Context Protocol server is running!');
+    logger.info('Inkstand server is running!');
 
     // Graceful shutdown
     process.on('SIGINT', async () => {
