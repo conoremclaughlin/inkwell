@@ -186,17 +186,15 @@ export function resolveBackend(cliBackend?: string): string {
  * Build the identity prompt content. Same across all backends.
  */
 export function buildIdentityPrompt(agentId: string, startupContextBlock?: string): string {
-  const basePrompt = `## Identity Override (CRITICAL)
+  const identityHeader = `## Identity Override (CRITICAL)
 
 **You are ${agentId}. Your agent ID is \`${agentId}\`.**
 
 When calling PCP tools (bootstrap, remember, recall, update_session_phase, etc.), use \`agentId: "${agentId}"\`.
 Do NOT read \`.ink/identity.json\` — your identity is set by this system prompt.
-Do NOT run \`echo $AGENT_ID\` — use the agentId provided above.
+Do NOT run \`echo $AGENT_ID\` — use the agentId provided above.`;
 
-Skip directly to loading user config from ~/.ink/config.json and bootstrap as "${agentId}".
-
-## Tool Priority (IMPORTANT)
+  const toolPriority = `## Tool Priority (IMPORTANT)
 
 Always use **PCP cloud tools** (mcp__inkwell__*) over file reads or Claude Code builtins:
 - Identity: use mcp__inkwell__bootstrap, not file reads
@@ -207,13 +205,31 @@ Always use **PCP cloud tools** (mcp__inkwell__*) over file reads or Claude Code 
 PCP tools persist across sessions and are shared with the user and other agents.`;
 
   const injectedContext = startupContextBlock?.trim();
-  if (!injectedContext) return basePrompt;
 
-  return `${basePrompt}
+  if (injectedContext) {
+    // Startup context was pre-loaded (e.g., by sb CLI for Codex/Gemini).
+    // The agent has constitution docs — no need to call bootstrap again.
+    return `${identityHeader}
+
+Bootstrap has already been completed. Your constitution docs are loaded below. Do NOT call bootstrap again unless you need to refresh context.
+
+${toolPriority}
 
 ## Bootstrapped Startup Context (PCP)
 
 ${injectedContext}`;
+  }
+
+  // No startup context provided. For Claude Code, the session-start hook
+  // injects constitution docs separately. But if hooks aren't installed or
+  // the hook fails, the agent needs to self-heal by calling bootstrap manually.
+  return `${identityHeader}
+
+Skip directly to loading user config from ~/.ink/config.json and bootstrap as "${agentId}".
+
+**IMPORTANT**: After session initialization, verify that your constitution docs were loaded. Look for a "Session Context (PCP)" or "Bootstrapped Startup Context" section in your context that contains your identity, soul, values, process, and user documents. If these are NOT present, the session-start hook may have failed — you MUST call the \`bootstrap\` MCP tool manually to load your identity context. Do not proceed without your constitution.
+
+${toolPriority}`;
 }
 
 /**

@@ -3,7 +3,34 @@ import { readFileSync } from 'fs';
 import { ClaudeAdapter } from './claude.js';
 import { CodexAdapter } from './codex.js';
 import { GeminiAdapter } from './gemini.js';
+import { buildIdentityPrompt } from './identity.js';
 import { decodeContextToken } from '@inklabs/shared';
+
+describe('buildIdentityPrompt conditional bootstrap', () => {
+  it('includes self-healing instructions when no startup context is provided', () => {
+    const prompt = buildIdentityPrompt('wren');
+
+    expect(prompt).toContain('You are wren');
+    expect(prompt).toContain('Skip directly to loading user config');
+    expect(prompt).toContain('verify that your constitution docs were loaded');
+    expect(prompt).toContain('bootstrap');
+    expect(prompt).not.toContain('Bootstrap has already been completed');
+    // Should NOT have the actual startup context section (only a reference to it in self-healing text)
+    expect(prompt).not.toContain('## Bootstrapped Startup Context (PCP)');
+  });
+
+  it('skips manual bootstrap when startup context is provided', () => {
+    const prompt = buildIdentityPrompt('lumen', '### Identity\nI am Lumen.');
+
+    expect(prompt).toContain('You are lumen');
+    expect(prompt).toContain('Bootstrap has already been completed');
+    expect(prompt).toContain('Do NOT call bootstrap again');
+    expect(prompt).toContain('## Bootstrapped Startup Context (PCP)');
+    expect(prompt).toContain('### Identity');
+    expect(prompt).toContain('I am Lumen.');
+    expect(prompt).not.toContain('verify that your constitution docs were loaded');
+  });
+});
 
 describe('backend adapters session resume wiring', () => {
   it('passes claude backendSessionId through --resume', () => {
