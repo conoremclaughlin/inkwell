@@ -57,7 +57,7 @@ export interface ParsedExtraMount {
   readOnly: boolean;
 }
 
-const DEFAULT_IMAGE = 'personal-context-protocol:studio-sandbox';
+const DEFAULT_IMAGE = 'inkstand:studio-sandbox';
 const CONTAINER_HOME = '/home/sb';
 const BACKEND_AUTH_DIRS: Record<BackendAuthName, string> = {
   claude: join(homedir(), '.claude'),

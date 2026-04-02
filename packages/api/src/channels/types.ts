@@ -1,5 +1,5 @@
 /**
- * Channel integration types for personal-context-protocol
+ * Channel integration types for Inkstand
  * These types are designed to be compatible with clawdbot's message context format
  */
 
