@@ -2,7 +2,7 @@
 name: pcp
 version: '0.1.0'
 displayName: Personal Context Protocol
-description: Identity, memory, sessions, and cross-agent messaging via PCP. Gives agents persistent context that survives across sessions and works across AI backends.
+description: Identity, memory, sessions, and cross-agent messaging via Inkstand. Gives agents persistent context that survives across sessions and works across AI backends.
 type: guide
 emoji: '🧠'
 category: productivity
@@ -14,7 +14,7 @@ tags:
   - sessions
   - inbox
   - cross-agent
-author: PCP Team
+author: Inkstand Team
 homepage: https://github.com/conoremclaughlin/personal-context-protocol
 triggers:
   keywords:
@@ -42,13 +42,13 @@ metadata:
         - openclaw.json.plugins.entries.pcp
 ---
 
-# Personal Context Protocol (PCP)
+# Personal Context Protocol (Inkstand)
 
-PCP gives you persistent identity, long-term memory, session tracking, and cross-agent messaging. Your context survives across sessions and works across AI backends (Claude Code, Codex, Gemini, OpenClaw).
+Inkstand gives you persistent identity, long-term memory, session tracking, and cross-agent messaging. Your context survives across sessions and works across AI backends (Claude Code, Codex, Gemini, OpenClaw).
 
 ## Setup
 
-PCP tools are available via MCP. If the PCP MCP server is not already configured, add it to your MCP config:
+Inkstand tools are available via MCP. If the Inkstand MCP server is not already configured, add it to your MCP config:
 
 **Option A — Stdio (spawns a process):**
 

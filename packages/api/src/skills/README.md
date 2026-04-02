@@ -1,4 +1,4 @@
-# PCP Skills System
+# Inkstand Skills System
 
 Skills extend your AI assistant's capabilities. There are three types:
 
@@ -10,15 +10,15 @@ Skills extend your AI assistant's capabilities. There are three types:
 
 ## Format Compatibility
 
-PCP skills use the [AgentSkills format](https://docs.openclaw.ai/tools/skills) — an open standard adopted by Claude Code, Cursor, VS Code, Gemini, and others. Skills installed via [ClawHub](https://clawhub.com) are compatible with PCP's loader.
+Inkstand skills use the [AgentSkills format](https://docs.openclaw.ai/tools/skills) — an open standard adopted by Claude Code, Cursor, VS Code, Gemini, and others. Skills installed via [ClawHub](https://clawhub.com) are compatible with Inkstand's loader.
 
 ## Skill Locations
 
 Skills are loaded from a 4-tier precedence cascade (lowest → highest). When names collide, higher tiers win:
 
 1. **Built-in**: `packages/api/src/skills/builtin/`
-   - Ships with PCP
-   - Updated via PCP releases
+   - Ships with Inkstand
+   - Updated via Inkstand releases
 
 2. **Extra dirs**: configurable paths (default: `~/.openclaw/skills`)
    - ClawHub interop — `clawdhub install playwright-mcp` just works
@@ -32,7 +32,7 @@ Skills are loaded from a 4-tier precedence cascade (lowest → highest). When na
    - Per-worktree / per-SB skills
    - Highest precedence — overrides everything
 
-> **Note:** The MCP `list_skills` endpoint covers tiers 1–3 (builtin, extra dirs, managed). Workspace skills (tier 4) require knowing the agent's working directory, which the PCP server doesn't have. Instead, workspace skills are picked up by the session start hooks running inside the agent's process and injected into the `{{SKILLS_BLOCK}}`.
+> **Note:** The MCP `list_skills` endpoint covers tiers 1–3 (builtin, extra dirs, managed). Workspace skills (tier 4) require knowing the agent's working directory, which the Inkstand server doesn't have. Instead, workspace skills are picked up by the session start hooks running inside the agent's process and injected into the `{{SKILLS_BLOCK}}`.
 
 ### Configuring Extra Directories
 
@@ -46,7 +46,7 @@ Add `skills.extraDirs` to `~/.ink/config.json`:
 }
 ```
 
-This lets ClawHub-installed skills (and any other AgentSkills-compatible sources) be automatically available to PCP.
+This lets ClawHub-installed skills (and any other AgentSkills-compatible sources) be automatically available to Inkstand.
 
 ## Installing Skills
 
@@ -75,7 +75,7 @@ curl -o ~/.ink/skills/my-skill.md https://raw.githubusercontent.com/user/repo/ma
 
 ### From URL / Registry (curl)
 
-If a registry (PCP Hub, community index, or docs page) gives you a direct skill file URL:
+If a registry (Inkstand Hub, community index, or docs page) gives you a direct skill file URL:
 
 ```bash
 mkdir -p ~/.ink/skills
@@ -90,7 +90,7 @@ If the skill is a directory package, place it under:
 
 ### From ClawHub
 
-If [ClawHub](https://clawhub.com) is installed, skills install directly into `~/.openclaw/skills/` and are automatically available to PCP (via `extraDirs`):
+If [ClawHub](https://clawhub.com) is installed, skills install directly into `~/.openclaw/skills/` and are automatically available to Inkstand (via `extraDirs`):
 
 ```bash
 clawdhub install playwright-mcp
@@ -299,7 +299,7 @@ Supported install kinds:
 
 ## Cloud Skills Registry
 
-PCP supports cloud-based skill storage and distribution:
+Inkstand supports cloud-based skill storage and distribution:
 
 ### Architecture
 
@@ -334,7 +334,7 @@ PCP supports cloud-based skill storage and distribution:
 
 Default source priority is deterministic (lowest → highest precedence):
 
-1. **Built-in** — shipped with PCP
+1. **Built-in** — shipped with Inkstand
 2. **Cloud installations** — user's installed skills from registry
 3. **Extra dirs** — ClawHub and other configured sources
 4. **Managed** (`~/.ink/skills/`) — user-installed local skills
@@ -404,6 +404,6 @@ mcp__supabase__apply_migration
 - **Public/private visibility** — Cloud registry already has `is_public`. Surface in local config for per-SB access control (public-facing SBs get different skills than private ones).
 - **`sb skills install`** — CLI command to fetch from cloud registry or ClawHub
 - **Backend skill injection** — Inject skill content into `sb`-wrapped sessions (Claude Code, Codex, Gemini)
-- **PCP Hub**: Curated, verified official skills
+- **Inkstand Hub**: Curated, verified official skills
 - **Community**: User-submitted public skills
 - **Organization**: Private team skill collections

@@ -1,4 +1,4 @@
-## Pre-Compaction Reminder (PCP)
+## Pre-Compaction Reminder
 
 Context is about to be compacted. Compaction is lossy — the summary may miss key details. Use `mcp__inkstand__remember` now to preserve anything that would derail you if forgotten:
 
