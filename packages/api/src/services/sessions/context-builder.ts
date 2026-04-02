@@ -12,6 +12,7 @@ import type {
   AgentIdentity,
   UserContext,
   TemporalContext,
+  ContactContext,
   InjectedContext,
   IContextBuilder,
 } from './types.js';
@@ -169,6 +170,30 @@ export class ContextBuilder implements IContextBuilder {
         status: p.status || 'active',
       })),
     };
+
+    // Inject contact identity for per-sender sessions
+    if (session.contactId) {
+      const contactRow = await this.getContact(session.contactId);
+      if (contactRow) {
+        const platform = contactRow.telegram_id
+          ? 'telegram'
+          : contactRow.whatsapp_id
+            ? 'whatsapp'
+            : contactRow.discord_id
+              ? 'discord'
+              : contactRow.imessage_id
+                ? 'imessage'
+                : undefined;
+        context.contact = {
+          id: contactRow.id,
+          name: contactRow.name,
+          displayName: contactRow.display_name || undefined,
+          type:
+            ((contactRow as Record<string, unknown>).type as ContactContext['type']) || 'external',
+          platform,
+        };
+      }
+    }
 
     // Add session history if there's compaction data
     if (session.compactionCount > 0) {
@@ -350,6 +375,22 @@ export class ContextBuilder implements IContextBuilder {
     return data || [];
   }
 
+  private async getContact(contactId: string): Promise<DbContact | null> {
+    const { data, error } = await this.supabase
+      .from('contacts')
+      .select('*')
+      .eq('id', contactId)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') return null;
+      logger.error('Error fetching contact', { contactId, error });
+      return null;
+    }
+
+    return data;
+  }
+
   private async getActiveProjects(userId: string): Promise<DbProject[]> {
     const { data, error } = await this.supabase
       .from('projects')
@@ -392,6 +433,16 @@ ${context.temporal.greeting}! It is ${context.temporal.currentTime} on ${context
   // User context
   sections.push(`## User Context
 User timezone: ${context.user.timezone}`);
+
+  // Contact identity for per-sender sessions
+  if (context.contact) {
+    const c = context.contact;
+    const platformNote = c.platform ? ` via ${c.platform}` : '';
+    const typeNote = c.type === 'group' ? ' (group chat)' : '';
+    sections.push(`## Current Sender
+You are talking to **${c.displayName || c.name}**${platformNote}${typeNote}.
+This is a contact-scoped session — memories and conversation history are private to this sender.`);
+  }
 
   // Recent memories (if any)
   if (context.recentMemories.length > 0) {

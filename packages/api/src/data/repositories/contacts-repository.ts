@@ -7,11 +7,14 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database } from '../supabase/types.js';
 
+export type ContactType = 'personal' | 'external' | 'group';
+
 export interface Contact {
   id: string;
   userId: string;
   name: string;
   displayName: string | null;
+  type: ContactType;
   aliases: string[];
   email: string | null;
   phone: string | null;
@@ -40,6 +43,7 @@ export interface CreateContactOptions {
   whatsappId?: string;
   notes?: string;
   tags?: string[];
+  type?: ContactType;
 }
 
 export interface ResolveNameResult {
@@ -112,6 +116,7 @@ export class ContactsRepository {
         user_id: options.userId,
         name: options.name,
         display_name: options.displayName,
+        type: options.type || 'personal',
         aliases: options.aliases || [],
         email: options.email,
         phone: options.phone,
@@ -391,9 +396,10 @@ export class ContactsRepository {
         userId,
         name: displayName,
         displayName: info?.name,
+        type: 'external',
         [platformField]: platformId,
         ...(platform === 'telegram' && info?.username ? { telegramUsername: info.username } : {}),
-        tags: ['auto-created', 'external'],
+        tags: ['auto-created'],
       });
     } catch (error: unknown) {
       // Unique constraint race — another request created it first.
@@ -429,10 +435,10 @@ export class ContactsRepository {
     if (platform === 'slack') {
       // Slack uses discord_id column as a generic "chat platform" slot
       const existing = await this.findByPlatformId(userId, 'discord', groupId);
-      if (existing && existing.tags.includes('group')) return existing;
+      if (existing && existing.type === 'group') return existing;
     } else {
       const existing = await this.findByPlatformId(userId, platformForLookup, groupId);
-      if (existing && existing.tags.includes('group')) return existing;
+      if (existing && existing.type === 'group') return existing;
     }
 
     const displayName = info?.groupName || `${platform}-group:${groupId}`;
@@ -450,8 +456,9 @@ export class ContactsRepository {
         userId,
         name: displayName,
         displayName: info?.groupName,
+        type: 'group',
         [platformField]: groupId,
-        tags: ['auto-created', 'group'],
+        tags: ['auto-created'],
       });
     } catch (error: unknown) {
       const err = error as Record<string, unknown>;
@@ -513,6 +520,7 @@ export class ContactsRepository {
       userId: row.user_id,
       name: row.name,
       displayName: row.display_name,
+      type: ((row as Record<string, unknown>).type as ContactType) || 'personal',
       aliases: row.aliases || [],
       email: row.email,
       phone: row.phone,
