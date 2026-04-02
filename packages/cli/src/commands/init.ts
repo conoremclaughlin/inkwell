@@ -63,7 +63,7 @@ function buildDefaultMcpJson(serverUrl: string, cwd?: string): Record<string, un
     },
   };
 
-  // Add PCP channel plugin for real-time inbox push notifications
+  // Add InkMail channel plugin for real-time inbox push notifications
   const channelPath = cwd ? resolveChannelPluginPath(cwd) : null;
   if (channelPath) {
     servers['inkmail'] = {
@@ -167,7 +167,7 @@ function runInstallHooks(cwd: string, force?: boolean): InitStepResult[] {
         results.push({
           label: `hooks (${resolvedBackend.name})`,
           status: 'skipped',
-          detail: 'existing non-PCP hooks (use ink hooks install --force)',
+          detail: 'existing non-Inkstand hooks (use ink hooks install --force)',
         });
         break;
     }
@@ -201,7 +201,7 @@ async function initCommand(options: { force?: boolean }): Promise<void> {
   const cwd = process.cwd();
   const config = getPcpConfig();
 
-  console.log(chalk.bold('\nInitializing PCP...\n'));
+  console.log(chalk.bold('\nInitializing Inkstand...\n'));
 
   const auth = loadAuth();
   if (auth && !isTokenExpired(auth)) {
@@ -222,7 +222,7 @@ async function initCommand(options: { force?: boolean }): Promise<void> {
     syncBackendConfigs(cwd),
   ];
 
-  // Async step: sync skills from PCP server (best-effort)
+  // Async step: sync skills from Inkstand server (best-effort)
   try {
     const skillsResult = await syncSkills(cwd);
     if (skillsResult.serverUnreachable) {
@@ -271,7 +271,7 @@ async function initCommand(options: { force?: boolean }): Promise<void> {
 export function registerInitCommand(program: Command): void {
   program
     .command('init')
-    .description('Initialize PCP in the current repo (hooks, .mcp.json, backend configs, skills)')
-    .option('-f, --force', 'Overwrite existing hooks even if non-PCP hooks are present')
+    .description('Initialize Inkstand in the current repo (hooks, .mcp.json, backend configs, skills)')
+    .option('-f, --force', 'Overwrite existing hooks even if non-Inkstand hooks are present')
     .action(initCommand);
 }
