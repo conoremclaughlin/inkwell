@@ -2062,7 +2062,7 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
     const { data: identity, error: identityError } = await supabase
       .from('agent_identities')
       .select(
-        'id, agent_id, name, role, description, backend, studio_hint, workspace_id, updated_at, sandbox_bypass'
+        'id, agent_id, name, role, description, backend, studio_hint, workspace_id, updated_at, sandbox_bypass, session_scope'
       )
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)

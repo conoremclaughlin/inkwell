@@ -78,6 +78,7 @@ interface AgentRoutingResponse {
     backend: string | null;
     studioHint: string;
     sandboxBypass: boolean;
+    sessionScope: string;
     updatedAt: string;
   };
   studios: AgentStudio[];
