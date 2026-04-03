@@ -44,7 +44,7 @@ export async function maybeWarnServerUpdate(): Promise<void> {
 
     console.log(
       chalk.yellow(
-        `⚠ Inkstand server restart recommended: running ${shortSha(body.build.startupGitSha)}, latest ${shortSha(body.build.currentGitSha)}`
+        `⚠ Inkwell server restart recommended: running ${shortSha(body.build.startupGitSha)}, latest ${shortSha(body.build.currentGitSha)}`
       )
     );
     console.log(chalk.dim('  Run `yarn prod:refresh` and restart the server process.\n'));

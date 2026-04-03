@@ -27,7 +27,7 @@ const workspaceScopedUserIdentifierSchema = userIdentifierBaseSchema.extend({
 });
 
 const createArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
-  uri: z.string().describe('Unique URI for the artifact (e.g., "pcp://specs/orchestration")'),
+  uri: z.string().describe('Unique URI for the artifact (e.g., "ink://specs/orchestration")'),
   title: z.string().describe('Title of the artifact'),
   content: z.string().describe('Content (typically markdown)'),
   artifactType: z

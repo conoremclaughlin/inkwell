@@ -50,7 +50,7 @@ describe('syncMcpConfig', () => {
       join(TEST_DIR, '.mcp.json'),
       JSON.stringify({
         mcpServers: {
-          inkstand: {
+          inkwell: {
             type: 'http',
             url: 'http://localhost:3001/mcp',
           },
@@ -65,7 +65,7 @@ describe('syncMcpConfig', () => {
 
     const toml = readFileSync(join(TEST_DIR, '.codex', 'config.toml'), 'utf-8');
     expect(toml).toContain('# pcp-managed:start mcp_servers');
-    expect(toml).toContain('[mcp_servers.pcp]');
+    expect(toml).toContain('[mcp_servers.inkwell]');
     expect(toml).toContain('url = "http://localhost:3001/mcp"');
     expect(toml).toContain('# pcp-managed:end mcp_servers');
   });
@@ -75,7 +75,7 @@ describe('syncMcpConfig', () => {
       join(TEST_DIR, '.mcp.json'),
       JSON.stringify({
         mcpServers: {
-          inkstand: {
+          inkwell: {
             type: 'http',
             url: 'http://localhost:3001/mcp',
           },
@@ -89,9 +89,9 @@ describe('syncMcpConfig', () => {
     expect(existsSync(join(TEST_DIR, '.gemini', 'settings.json'))).toBe(true);
 
     const settings = JSON.parse(readFileSync(join(TEST_DIR, '.gemini', 'settings.json'), 'utf-8'));
-    expect(settings.mcpServers.inkstand).toBeDefined();
-    expect(settings.mcpServers.inkstand.url).toBe('http://localhost:3001/mcp');
-    expect(settings.mcpServers.inkstand.type).toBe('http');
+    expect(settings.mcpServers.inkwell).toBeDefined();
+    expect(settings.mcpServers.inkwell.url).toBe('http://localhost:3001/mcp');
+    expect(settings.mcpServers.inkwell.type).toBe('http');
   });
 
   it('should handle servers with command and args', () => {
@@ -131,7 +131,7 @@ describe('syncMcpConfig', () => {
     writeFileSync(
       join(TEST_DIR, '.mcp.json'),
       JSON.stringify({
-        mcpServers: { inkstand: { url: 'http://localhost:3001/mcp' } },
+        mcpServers: { inkwell: { url: 'http://localhost:3001/mcp' } },
       })
     );
 
@@ -139,14 +139,14 @@ describe('syncMcpConfig', () => {
 
     const settings = JSON.parse(readFileSync(join(geminiDir, 'settings.json'), 'utf-8'));
     expect(settings.existingKey).toBe('should-persist');
-    expect(settings.mcpServers.inkstand).toBeDefined();
+    expect(settings.mcpServers.inkwell).toBeDefined();
   });
 
   it('should add .codex/ and .gemini/ to .gitignore', () => {
     writeFileSync(
       join(TEST_DIR, '.mcp.json'),
       JSON.stringify({
-        mcpServers: { inkstand: { url: 'http://localhost:3001/mcp' } },
+        mcpServers: { inkwell: { url: 'http://localhost:3001/mcp' } },
       })
     );
 
@@ -161,7 +161,7 @@ describe('syncMcpConfig', () => {
     writeFileSync(
       join(TEST_DIR, '.mcp.json'),
       JSON.stringify({
-        mcpServers: { inkstand: { url: 'http://localhost:3001/mcp' } },
+        mcpServers: { inkwell: { url: 'http://localhost:3001/mcp' } },
       })
     );
 
@@ -224,7 +224,7 @@ describe('syncMcpConfig', () => {
     writeFileSync(
       join(subDir, '.mcp.json'),
       JSON.stringify({
-        mcpServers: { inkstand: { url: 'http://localhost:3001/mcp' } },
+        mcpServers: { inkwell: { url: 'http://localhost:3001/mcp' } },
       })
     );
 
@@ -327,7 +327,7 @@ describe('syncMcpConfig', () => {
       join(TEST_DIR, '.mcp.json'),
       JSON.stringify({
         mcpServers: {
-          inkstand: { url: 'http://localhost:3001/mcp' },
+          inkwell: { url: 'http://localhost:3001/mcp' },
         },
       })
     );
@@ -336,7 +336,7 @@ describe('syncMcpConfig', () => {
     syncMcpConfig(TEST_DIR);
 
     const settings = JSON.parse(readFileSync(join(TEST_DIR, '.gemini', 'settings.json'), 'utf-8'));
-    expect(settings.mcpServers.inkstand.env).toBeUndefined();
+    expect(settings.mcpServers.inkwell.env).toBeUndefined();
   });
 
   it('should work fine without .env.local present', () => {
@@ -413,7 +413,7 @@ describe('syncMcpConfig', () => {
     writeFileSync(
       join(TEST_DIR, '.mcp.json'),
       JSON.stringify({
-        mcpServers: { inkstand: { url: 'http://localhost:3001/mcp' } },
+        mcpServers: { inkwell: { url: 'http://localhost:3001/mcp' } },
       })
     );
 
@@ -422,7 +422,7 @@ describe('syncMcpConfig', () => {
     const toml = readFileSync(join(TEST_DIR, '.codex', 'config.toml'), 'utf-8');
     expect(toml).toContain('[hooks]');
     expect(toml).toContain('enabled = true');
-    expect(toml).toContain('[mcp_servers.pcp]');
+    expect(toml).toContain('[mcp_servers.inkwell]');
     expect(toml).not.toContain('[mcp_servers.old]');
   });
 

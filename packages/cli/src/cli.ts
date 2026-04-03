@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Ink CLI — Inkstand
+ * Ink CLI — Inkwell
  *
  * A lightweight CLI that wraps AI coding tools (Claude Code, etc.) with
  * identity injection and session tracking. Unrecognized flags are passed
@@ -206,7 +206,7 @@ program
     'Include all backend-local session sources in picker/json (debug mode)'
   )
   .option('--session-choice <choice>', 'Force session selection (new | pcp:<id> | local:<id>)')
-  .option('--sb-debug', 'Enable debug logging to ~/.inkstand/ink-debug.log')
+  .option('--sb-debug', 'Enable debug logging to ~/.inkwell/ink-debug.log')
   .option('--sb-verbose', 'Verbose SB output')
   .option('--dangerous', 'Skip all permission prompts (maps to backend-native auto-approve)')
   .argument('[prompt...]', 'Prompt to send (omit for interactive)')

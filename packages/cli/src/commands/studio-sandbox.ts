@@ -57,7 +57,7 @@ export interface ParsedExtraMount {
   readOnly: boolean;
 }
 
-const DEFAULT_IMAGE = 'inkstand:studio-sandbox';
+const DEFAULT_IMAGE = 'inkwell:studio-sandbox';
 const CONTAINER_HOME = '/home/sb';
 const BACKEND_AUTH_DIRS: Record<BackendAuthName, string> = {
   claude: join(homedir(), '.claude'),
@@ -225,9 +225,7 @@ function isDangerousSourcePath(source: string): boolean {
 export function parseExtraMount(spec: string): ParsedExtraMount {
   const parts = spec.split(':');
   if (parts.length < 2 || parts.length > 3) {
-    throw new Error(
-      `Invalid mount "${spec}". Expected hostPath:containerPath[:ro|rw] format.`
-    );
+    throw new Error(`Invalid mount "${spec}". Expected hostPath:containerPath[:ro|rw] format.`);
   }
 
   const [source, target, mode = 'rw'] = parts;
@@ -585,7 +583,9 @@ function shellCommand(options: Record<string, unknown>): void {
 function execCommand(command: string[], options: Record<string, unknown>): void {
   const plan = buildPlanFromCommand(process.cwd(), options);
   if (!inspectContainerName(plan.containerName)) {
-    throw new Error(`Sandbox is not running: ${plan.containerName}. Start it with ink studio sandbox up`);
+    throw new Error(
+      `Sandbox is not running: ${plan.containerName}. Start it with ink studio sandbox up`
+    );
   }
   if (command.length === 0) {
     throw new Error('No command provided for sandbox exec');
@@ -655,10 +655,14 @@ export function registerStudioSandboxCommands(studio: Command): void {
       .command('run [command...]')
       .allowExcessArguments(true)
       .description('Run a one-shot command in a new studio sandbox container')
-  ).action((command: string[], options: Record<string, unknown>) => runCommand(command || [], options));
+  ).action((command: string[], options: Record<string, unknown>) =>
+    runCommand(command || [], options)
+  );
 
   addCommonSandboxOptions(
-    sandbox.command('shell').description('Open a shell in the running sandbox, or start an ephemeral one')
+    sandbox
+      .command('shell')
+      .description('Open a shell in the running sandbox, or start an ephemeral one')
   ).action(shellCommand);
 
   addCommonSandboxOptions(
@@ -666,7 +670,9 @@ export function registerStudioSandboxCommands(studio: Command): void {
       .command('exec <command...>')
       .allowExcessArguments(true)
       .description('Run a command inside the running studio sandbox')
-  ).action((command: string[], options: Record<string, unknown>) => execCommand(command || [], options));
+  ).action((command: string[], options: Record<string, unknown>) =>
+    execCommand(command || [], options)
+  );
 
   addCommonSandboxOptions(
     sandbox.command('status').description('Show status for the current studio sandbox')

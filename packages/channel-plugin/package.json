@@ -1,5 +1,5 @@
 {
-  "name": "@inkstand/inkmail-plugin",
+  "name": "@inkwell/inkmail-plugin",
   "version": "0.1.0",
   "description": "InkMail plugin for Claude Code — pushes inbox messages into running sessions",
   "type": "module",

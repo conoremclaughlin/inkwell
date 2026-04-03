@@ -1523,7 +1523,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       inputSchema: {
         ...userIdentifierFields,
         agentId: z.string().optional().describe('Filter by agent'),
-        studioId: z.string().uuid().optional().describe('Filter by studio'),
+        studioId: z
+          .string()
+          .optional()
+          .describe('Filter by studio (UUID or "main" for the main studio)'),
         workspaceId: z
           .string()
           .uuid()

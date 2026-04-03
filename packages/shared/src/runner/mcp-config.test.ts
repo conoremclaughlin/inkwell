@@ -28,9 +28,9 @@ afterEach(() => {
 });
 
 describe('injectSessionHeaders', () => {
-  it('injects session and studio headers into inkstand server config', () => {
+  it('injects session and studio headers into inkwell server config', () => {
     const configPath = writeTempConfig({
-      mcpServers: { inkstand: { type: 'http', url: 'http://localhost:3001/mcp' } },
+      mcpServers: { inkwell: { type: 'http', url: 'http://localhost:3001/mcp' } },
     });
 
     const result = injectSessionHeaders({
@@ -41,15 +41,15 @@ describe('injectSessionHeaders', () => {
 
     expect(result.modified).toBe(true);
     const config = JSON.parse(readFileSync(result.mcpConfigPath, 'utf-8'));
-    expect(config.mcpServers.inkstand.headers['x-ink-session-id']).toBe('${INK_SESSION_ID}');
-    expect(config.mcpServers.inkstand.headers['x-ink-studio-id']).toBe('${INK_STUDIO_ID}');
-    expect(config.mcpServers.inkstand.headers).not.toHaveProperty('Authorization');
+    expect(config.mcpServers.inkwell.headers['x-ink-session-id']).toBe('${INK_SESSION_ID}');
+    expect(config.mcpServers.inkwell.headers['x-ink-studio-id']).toBe('${INK_STUDIO_ID}');
+    expect(config.mcpServers.inkwell.headers).not.toHaveProperty('Authorization');
     result.cleanup();
   });
 
   it('injects Authorization header when accessToken is provided', () => {
     const configPath = writeTempConfig({
-      mcpServers: { inkstand: { type: 'http', url: 'http://localhost:3001/mcp' } },
+      mcpServers: { inkwell: { type: 'http', url: 'http://localhost:3001/mcp' } },
     });
 
     const result = injectSessionHeaders({
@@ -60,15 +60,15 @@ describe('injectSessionHeaders', () => {
 
     expect(result.modified).toBe(true);
     const config = JSON.parse(readFileSync(result.mcpConfigPath, 'utf-8'));
-    expect(config.mcpServers.inkstand.headers['Authorization']).toBe('Bearer ${INK_ACCESS_TOKEN}');
-    expect(config.mcpServers.inkstand.headers['x-ink-session-id']).toBe('${INK_SESSION_ID}');
+    expect(config.mcpServers.inkwell.headers['Authorization']).toBe('Bearer ${INK_ACCESS_TOKEN}');
+    expect(config.mcpServers.inkwell.headers['x-ink-session-id']).toBe('${INK_SESSION_ID}');
     result.cleanup();
   });
 
   it('does not overwrite existing Authorization header', () => {
     const configPath = writeTempConfig({
       mcpServers: {
-        inkstand: {
+        inkwell: {
           type: 'http',
           url: 'http://localhost:3001/mcp',
           headers: { Authorization: 'Bearer existing-token' },
@@ -84,11 +84,11 @@ describe('injectSessionHeaders', () => {
 
     expect(result.modified).toBe(true);
     const config = JSON.parse(readFileSync(result.mcpConfigPath, 'utf-8'));
-    expect(config.mcpServers.inkstand.headers['Authorization']).toBe('Bearer existing-token');
+    expect(config.mcpServers.inkwell.headers['Authorization']).toBe('Bearer existing-token');
     result.cleanup();
   });
 
-  it('returns original path when no inkstand server entry exists', () => {
+  it('returns original path when no inkwell server entry exists', () => {
     const configPath = writeTempConfig({
       mcpServers: { github: { type: 'http', url: 'https://api.github.com' } },
     });
@@ -107,7 +107,7 @@ describe('injectSessionHeaders', () => {
   it('returns original path when headers already present', () => {
     const configPath = writeTempConfig({
       mcpServers: {
-        inkstand: {
+        inkwell: {
           type: 'http',
           url: 'http://localhost:3001/mcp',
           headers: {

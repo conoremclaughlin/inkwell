@@ -54,7 +54,7 @@ function createMockSupabase(
 ) {
   const artifact = overrides.artifact ?? {
     id: 'artifact-1',
-    uri: 'pcp://test/doc',
+    uri: 'ink://test/doc',
     title: 'Test Doc',
     content: 'Line 1\nLine 2\nLine 3\n',
     version: 1,
@@ -177,7 +177,7 @@ describe('handleUpdateArtifact', () => {
       const result = await handleUpdateArtifact(
         {
           userId: '00000000-0000-0000-0000-000000000001',
-          uri: 'pcp://test/doc',
+          uri: 'ink://test/doc',
           content: 'Completely new content',
           agentId: 'wren',
         },
@@ -199,7 +199,7 @@ describe('handleUpdateArtifact', () => {
       const result = await handleUpdateArtifact(
         {
           userId: '00000000-0000-0000-0000-000000000001',
-          uri: 'pcp://test/doc',
+          uri: 'ink://test/doc',
           content: 'Updated content',
           baseVersion: 1,
           agentId: 'wren',
@@ -226,7 +226,7 @@ describe('handleUpdateArtifact', () => {
       const { supabase, updatedArtifact, insertedHistory } = createMockSupabase({
         artifact: {
           id: 'artifact-1',
-          uri: 'pcp://test/doc',
+          uri: 'ink://test/doc',
           title: 'Test Doc',
           content: currentContent,
           version: 2,
@@ -243,7 +243,7 @@ describe('handleUpdateArtifact', () => {
       const result = await handleUpdateArtifact(
         {
           userId: '00000000-0000-0000-0000-000000000001',
-          uri: 'pcp://test/doc',
+          uri: 'ink://test/doc',
           content: incomingContent,
           baseVersion: 1,
           agentId: 'wren',
@@ -268,7 +268,7 @@ describe('handleUpdateArtifact', () => {
       const { supabase } = createMockSupabase({
         artifact: {
           id: 'artifact-1',
-          uri: 'pcp://test/doc',
+          uri: 'ink://test/doc',
           title: 'Test Doc',
           content: currentContent,
           version: 2,
@@ -285,7 +285,7 @@ describe('handleUpdateArtifact', () => {
       const result = await handleUpdateArtifact(
         {
           userId: '00000000-0000-0000-0000-000000000001',
-          uri: 'pcp://test/doc',
+          uri: 'ink://test/doc',
           content: incomingContent,
           baseVersion: 1,
           agentId: 'wren',
@@ -309,7 +309,7 @@ describe('handleUpdateArtifact', () => {
       const { supabase } = createMockSupabase({
         artifact: {
           id: 'artifact-1',
-          uri: 'pcp://test/doc',
+          uri: 'ink://test/doc',
           title: 'Test Doc',
           content: currentContent,
           version: 2,
@@ -326,7 +326,7 @@ describe('handleUpdateArtifact', () => {
       const result = await handleUpdateArtifact(
         {
           userId: '00000000-0000-0000-0000-000000000001',
-          uri: 'pcp://test/doc',
+          uri: 'ink://test/doc',
           content: incomingContent,
           baseVersion: 1,
           agentId: 'wren',
@@ -342,7 +342,7 @@ describe('handleUpdateArtifact', () => {
       const { supabase } = createMockSupabase({
         artifact: {
           id: 'artifact-1',
-          uri: 'pcp://test/doc',
+          uri: 'ink://test/doc',
           title: 'Test Doc',
           content: 'Current content',
           version: 5,
@@ -360,7 +360,7 @@ describe('handleUpdateArtifact', () => {
         handleUpdateArtifact(
           {
             userId: '00000000-0000-0000-0000-000000000001',
-            uri: 'pcp://test/doc',
+            uri: 'ink://test/doc',
             content: 'New content',
             baseVersion: 1,
             agentId: 'wren',
@@ -381,7 +381,7 @@ describe('handleUpdateArtifact', () => {
       const result = await handleUpdateArtifact(
         {
           userId: '00000000-0000-0000-0000-000000000001',
-          uri: 'pcp://test/doc',
+          uri: 'ink://test/doc',
           content: 'My update',
           agentId: 'wren',
         },
@@ -400,7 +400,7 @@ describe('handleUpdateArtifact', () => {
       const { supabase } = createMockSupabase({
         artifact: {
           id: 'artifact-1',
-          uri: 'pcp://test/doc',
+          uri: 'ink://test/doc',
           title: 'Test Doc',
           content: 'Original content',
           version: 3,
@@ -417,7 +417,7 @@ describe('handleUpdateArtifact', () => {
       const result = await handleUpdateArtifact(
         {
           userId: '00000000-0000-0000-0000-000000000001',
-          uri: 'pcp://test/doc',
+          uri: 'ink://test/doc',
           content: 'Updated by another workspace agent',
           agentId: 'myra',
         },
@@ -432,7 +432,7 @@ describe('handleUpdateArtifact', () => {
       const { supabase } = createMockSupabase({
         artifact: {
           id: 'artifact-1',
-          uri: 'pcp://test/doc',
+          uri: 'ink://test/doc',
           title: 'Test Doc',
           content: 'Original content',
           version: 3,
@@ -450,7 +450,7 @@ describe('handleUpdateArtifact', () => {
         handleUpdateArtifact(
           {
             userId: '00000000-0000-0000-0000-000000000001',
-            uri: 'pcp://test/doc',
+            uri: 'ink://test/doc',
             content: 'Unauthorized edit',
             agentId: 'myra',
           },
@@ -463,7 +463,7 @@ describe('handleUpdateArtifact', () => {
       const { supabase } = createMockSupabase({
         artifact: {
           id: 'artifact-1',
-          uri: 'pcp://test/doc',
+          uri: 'ink://test/doc',
           title: 'Test Doc',
           content: 'Original content',
           version: 3,
@@ -481,7 +481,7 @@ describe('handleUpdateArtifact', () => {
         handleUpdateArtifact(
           {
             userId: '00000000-0000-0000-0000-000000000001',
-            uri: 'pcp://test/doc',
+            uri: 'ink://test/doc',
             editMode: 'editors',
             editors: [],
             agentId: 'wren',
@@ -495,7 +495,7 @@ describe('handleUpdateArtifact', () => {
       const { supabase, updatedArtifact } = createMockSupabase({
         artifact: {
           id: 'artifact-1',
-          uri: 'pcp://test/doc',
+          uri: 'ink://test/doc',
           title: 'Test Doc',
           content: 'Original content',
           version: 3,
@@ -512,7 +512,7 @@ describe('handleUpdateArtifact', () => {
       const result = await handleUpdateArtifact(
         {
           userId: '00000000-0000-0000-0000-000000000001',
-          uri: 'pcp://test/doc',
+          uri: 'ink://test/doc',
           editMode: 'workspace',
           agentId: 'identity-wren',
         },
@@ -528,7 +528,7 @@ describe('handleUpdateArtifact', () => {
       const { supabase } = createMockSupabase({
         artifact: {
           id: 'artifact-1',
-          uri: 'pcp://test/doc',
+          uri: 'ink://test/doc',
           title: 'Test Doc',
           content: 'Original content',
           version: 3,
@@ -544,7 +544,7 @@ describe('handleUpdateArtifact', () => {
       const result = await handleUpdateArtifact(
         {
           userId: '00000000-0000-0000-0000-000000000001',
-          uri: 'pcp://test/doc',
+          uri: 'ink://test/doc',
           tags: ['new-tag'],
           baseVersion: 1,
           agentId: 'wren',
@@ -564,7 +564,7 @@ describe('handleUpdateArtifact', () => {
         handleUpdateArtifact(
           {
             userId: '00000000-0000-0000-0000-000000000001',
-            uri: 'pcp://test/doc',
+            uri: 'ink://test/doc',
             content: 'Updated content',
           },
           createMockDataComposer({ from: vi.fn() })
@@ -591,7 +591,7 @@ describe('artifact comment + identity UUID flows', () => {
             {
               data: {
                 id: '11111111-1111-1111-1111-111111111111',
-                uri: 'pcp://specs/test',
+                uri: 'ink://specs/test',
                 title: 'Test Spec',
                 content: '# Spec',
                 content_type: 'text/markdown',
@@ -688,7 +688,7 @@ describe('artifact comment + identity UUID flows', () => {
             {
               data: {
                 id: '11111111-1111-1111-1111-111111111111',
-                uri: 'pcp://specs/test',
+                uri: 'ink://specs/test',
                 title: 'Test Spec',
                 content: '# Spec',
                 content_type: 'text/markdown',
@@ -748,7 +748,7 @@ describe('artifact comment + identity UUID flows', () => {
             {
               data: {
                 id: 'artifact-1',
-                uri: 'pcp://specs/test',
+                uri: 'ink://specs/test',
                 title: 'Test Spec',
                 artifact_type: 'spec',
                 version: 1,
@@ -765,7 +765,7 @@ describe('artifact comment + identity UUID flows', () => {
     const result = await handleCreateArtifact(
       {
         userId: '00000000-0000-0000-0000-000000000001',
-        uri: 'pcp://specs/test',
+        uri: 'ink://specs/test',
         title: 'Test Spec',
         content: '# Hello',
         artifactType: 'spec',
@@ -814,7 +814,7 @@ describe('artifact comment + identity UUID flows', () => {
       handleCreateArtifact(
         {
           userId: '00000000-0000-0000-0000-000000000001',
-          uri: 'pcp://specs/no-editors',
+          uri: 'ink://specs/no-editors',
           title: 'No editors',
           content: '# Hello',
           artifactType: 'spec',
@@ -845,7 +845,7 @@ describe('artifact comment + identity UUID flows', () => {
             {
               data: {
                 id: 'artifact-2',
-                uri: 'pcp://specs/slug-only',
+                uri: 'ink://specs/slug-only',
                 title: 'Slug only',
                 artifact_type: 'spec',
                 version: 1,
@@ -862,7 +862,7 @@ describe('artifact comment + identity UUID flows', () => {
     const result = await handleCreateArtifact(
       {
         userId: '550e8400-e29b-41d4-a716-446655440000',
-        uri: 'pcp://specs/slug-only',
+        uri: 'ink://specs/slug-only',
         title: 'Slug only',
         content: '# Hi',
         artifactType: 'spec',
@@ -910,7 +910,7 @@ describe('artifact comment + identity UUID flows', () => {
             {
               data: {
                 id: 'artifact-ctx-1',
-                uri: 'pcp://specs/context-workspace',
+                uri: 'ink://specs/context-workspace',
                 title: 'Context scoped spec',
                 artifact_type: 'spec',
                 version: 1,
@@ -927,7 +927,7 @@ describe('artifact comment + identity UUID flows', () => {
     const result = await handleCreateArtifact(
       {
         userId: '00000000-0000-0000-0000-000000000001',
-        uri: 'pcp://specs/context-workspace',
+        uri: 'ink://specs/context-workspace',
         title: 'Context scoped spec',
         content: '# Context Workspace',
         artifactType: 'spec',
@@ -968,7 +968,7 @@ describe('artifact comment + identity UUID flows', () => {
             {
               data: {
                 id: 'artifact-header-1',
-                uri: 'pcp://specs/header-workspace',
+                uri: 'ink://specs/header-workspace',
                 title: 'Header scoped spec',
                 artifact_type: 'spec',
                 version: 1,
@@ -993,7 +993,7 @@ describe('artifact comment + identity UUID flows', () => {
           {
             userId: '00000000-0000-0000-0000-000000000001',
             workspaceId: '44444444-4444-4444-4444-444444444444',
-            uri: 'pcp://specs/header-workspace',
+            uri: 'ink://specs/header-workspace',
             title: 'Header scoped spec',
             content: '# Header Workspace',
             artifactType: 'spec',
@@ -1039,7 +1039,7 @@ describe('artifact comment + identity UUID flows', () => {
             {
               data: {
                 id: 'artifact-header-first-1',
-                uri: 'pcp://specs/header-first',
+                uri: 'ink://specs/header-first',
                 title: 'Header first',
                 artifact_type: 'spec',
                 version: 1,
@@ -1063,7 +1063,7 @@ describe('artifact comment + identity UUID flows', () => {
         const result = await handleCreateArtifact(
           {
             userId: '00000000-0000-0000-0000-000000000001',
-            uri: 'pcp://specs/header-first',
+            uri: 'ink://specs/header-first',
             title: 'Header first',
             content: '# Header first',
             artifactType: 'spec',
@@ -1114,7 +1114,7 @@ describe('artifact comment + identity UUID flows', () => {
             {
               data: {
                 id: 'artifact-derived-over-default-1',
-                uri: 'pcp://specs/derived-over-default',
+                uri: 'ink://specs/derived-over-default',
                 title: 'Derived over default',
                 artifact_type: 'spec',
                 version: 1,
@@ -1138,7 +1138,7 @@ describe('artifact comment + identity UUID flows', () => {
         const result = await handleCreateArtifact(
           {
             userId: '00000000-0000-0000-0000-000000000001',
-            uri: 'pcp://specs/derived-over-default',
+            uri: 'ink://specs/derived-over-default',
             title: 'Derived over default',
             content: '# Derived over default',
             artifactType: 'spec',
@@ -1190,7 +1190,7 @@ describe('artifact comment + identity UUID flows', () => {
             {
               data: {
                 id: 'artifact-derived-1',
-                uri: 'pcp://specs/derived-workspace',
+                uri: 'ink://specs/derived-workspace',
                 title: 'Derived workspace spec',
                 artifact_type: 'spec',
                 version: 1,
@@ -1207,7 +1207,7 @@ describe('artifact comment + identity UUID flows', () => {
     const result = await handleCreateArtifact(
       {
         userId: '00000000-0000-0000-0000-000000000001',
-        uri: 'pcp://specs/derived-workspace',
+        uri: 'ink://specs/derived-workspace',
         title: 'Derived workspace spec',
         content: '# Derived Workspace',
         artifactType: 'spec',
@@ -1238,7 +1238,7 @@ describe('artifact comment + identity UUID flows', () => {
       handleCreateArtifact(
         {
           userId: '00000000-0000-0000-0000-000000000001',
-          uri: 'pcp://specs/no-workspace',
+          uri: 'ink://specs/no-workspace',
           title: 'No workspace',
           content: '# Missing workspace scope',
           artifactType: 'spec',
@@ -1254,7 +1254,7 @@ describe('artifact comment + identity UUID flows', () => {
         {
           single: [
             {
-              data: { id: '11111111-1111-1111-1111-111111111111', uri: 'pcp://specs/test' },
+              data: { id: '11111111-1111-1111-1111-111111111111', uri: 'ink://specs/test' },
               error: null,
             },
           ],
@@ -1328,7 +1328,7 @@ describe('artifact comment + identity UUID flows', () => {
         {
           single: [
             {
-              data: { id: '11111111-1111-1111-1111-111111111111', uri: 'pcp://specs/test' },
+              data: { id: '11111111-1111-1111-1111-111111111111', uri: 'ink://specs/test' },
               error: null,
             },
           ],
@@ -1371,7 +1371,7 @@ describe('artifact comment + identity UUID flows', () => {
         {
           single: [
             {
-              data: { id: '11111111-1111-1111-1111-111111111111', uri: 'pcp://specs/test' },
+              data: { id: '11111111-1111-1111-1111-111111111111', uri: 'ink://specs/test' },
               error: null,
             },
           ],

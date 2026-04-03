@@ -21,7 +21,7 @@ For interactive sessions in this repo, `.ink/identity.json` typically resolves t
 { "agentId": "wren", "workspaceId": "<uuid>", "context": "workspace-wren" }
 ```
 
-For long-running processes (like the Inkstand server), `AGENT_ID` is set via environment variable and takes precedence.
+For long-running processes (like the Inkwell server), `AGENT_ID` is set via environment variable and takes precedence.
 
 ### Step 2: Load User Config
 
@@ -82,7 +82,7 @@ remember(userId: "...", content: "Decided to use X approach because...", agentId
 
 ### Supabase Access Model
 
-Inkstand uses Supabase (PostgreSQL) as its database. There are **two access paths** with fundamentally different security properties:
+Inkwell uses Supabase (PostgreSQL) as its database. There are **two access paths** with fundamentally different security properties:
 
 **Server-side (API server):**
 
@@ -153,7 +153,7 @@ const localTime = utcDate.toLocaleString('en-US', {
 
 ## Multi-Agent Identity System
 
-Inkstand supports multiple AI identities sharing the same infrastructure:
+Inkwell supports multiple AI identities sharing the same infrastructure:
 
 | Agent      | Interface         | Role                                   |
 | ---------- | ----------------- | -------------------------------------- |
@@ -229,7 +229,7 @@ When sending messages to other SBs via `send_to_inbox`, use `threadKey` to maint
 ## Key Principles
 
 - **Prefer MCP tools over CLI equivalents** — when an MCP server provides functionality that overlaps with a CLI tool, use the MCP tool. MCP calls don't require user permission approval, provide structured output, and integrate better with your tooling. Examples: use `mcp__github__*` over `gh` CLI for PRs/issues/diffs/reviews, use `mcp__supabase__*` over `supabase` CLI for migrations and SQL.
-- **Use Inkstand tools** (`mcp__inkstand__*`) over local file operations for memory, tasks, and sessions
+- **Use Inkwell tools** (`mcp__inkwell__*`) over local file operations for memory, tasks, and sessions
 - **Bootstrap first** — always call bootstrap at session start to load your identity and context
 - **Log your work** — use `remember()` for important decisions and insights
 - **Attribute memories** — include your agentId when calling `remember()` so memories are correctly filtered
@@ -484,7 +484,7 @@ All tools support multiple identification methods:
 
 ## Skills
 
-Inkstand uses the [AgentSkills format](https://docs.openclaw.ai/tools/skills) — each skill is a `SKILL.md` file with YAML frontmatter, optionally in its own directory with bundled scripts.
+Inkwell uses the [AgentSkills format](https://docs.openclaw.ai/tools/skills) — each skill is a `SKILL.md` file with YAML frontmatter, optionally in its own directory with bundled scripts.
 
 ### Skill Types
 
@@ -627,14 +627,14 @@ These log files are written regardless of how the server is started (`yarn dev`,
 
 ## Specs & Artifacts
 
-When we refer to "specs" in this project, we mean **PCP artifacts** — versioned documents stored on the Inkstand server and managed via MCP tools. They are NOT local markdown files.
+When we refer to "specs" in this project, we mean **PCP artifacts** — versioned documents stored on the Inkwell server and managed via MCP tools. They are NOT local markdown files.
 
 - **Browse**: `list_artifacts(type: "spec")` to discover available specs
-- **Read**: `get_artifact(uri: "pcp://specs/cli-session-hooks")` to view a spec by URI
+- **Read**: `get_artifact(uri: "ink://specs/cli-session-hooks")` to view a spec by URI
 - **Update**: `update_artifact(...)` to revise content (auto-increments version)
-- **Create**: `create_artifact(type: "spec", uri: "pcp://specs/<slug>", ...)` for new specs
+- **Create**: `create_artifact(type: "spec", uri: "ink://specs/<slug>", ...)` for new specs
 
-Spec URIs follow the pattern `pcp://specs/<slug>`. When referencing a spec in conversation, threadKeys, or code comments, use the URI slug (e.g., `spec:cli-session-hooks`).
+Spec URIs follow the pattern `ink://specs/<slug>`. When referencing a spec in conversation, threadKeys, or code comments, use the URI slug (e.g., `spec:cli-session-hooks`).
 
 ## Pull Requests & Git
 

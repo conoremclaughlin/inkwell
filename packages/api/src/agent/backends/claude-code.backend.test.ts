@@ -587,7 +587,7 @@ describe('Session Continuity', () => {
       'data',
       Buffer.from(
         '{"type":"system","session_id":"s1"}\n' +
-          '{"type":"assistant","message":{"content":[{"type":"text","text":"Let me check."},{"type":"tool_use","id":"toolu_01ABC","name":"mcp__inkstand__list_emails","input":{"userId":"user-456","maxResults":5}}]}}\n' +
+          '{"type":"assistant","message":{"content":[{"type":"text","text":"Let me check."},{"type":"tool_use","id":"toolu_01ABC","name":"mcp__inkwell__list_emails","input":{"userId":"user-456","maxResults":5}}]}}\n' +
           '{"type":"result","result":"","usage":{"input_tokens":1000,"output_tokens":200}}\n'
       )
     );
@@ -597,7 +597,7 @@ describe('Session Continuity', () => {
     expect(toolCalls).toHaveLength(1);
     expect(toolCalls[0]).toEqual({
       toolUseId: 'toolu_01ABC',
-      toolName: 'mcp__inkstand__list_emails',
+      toolName: 'mcp__inkwell__list_emails',
       input: { userId: 'user-456', maxResults: 5 },
     });
   });

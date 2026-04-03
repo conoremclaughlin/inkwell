@@ -244,7 +244,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     expect(sessionId).toBeNull();
 
     const result = parseSSEResult(res.body) as any;
-    expect(result.result.serverInfo.name).toBe('inkstand');
+    expect(result.result.serverInfo.name).toBe('inkwell');
     expect(result.result.protocolVersion).toBe('2025-03-26');
   });
 

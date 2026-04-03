@@ -1,9 +1,9 @@
 {
-  "name": "@inkstand/web",
+  "name": "@inkwell/web",
   "version": "1.0.0",
   "private": true,
   "license": "MIT",
-  "description": "Inkstand Admin Dashboard - Manage WhatsApp, trusted users, and groups",
+  "description": "Inkwell Admin Dashboard - Manage WhatsApp, trusted users, and groups",
   "scripts": {
     "dev": "BASE_PORT=${INK_PORT_BASE:-3001}; WEB_PORT=${WEB_PORT:-$((BASE_PORT + 1))}; next dev -p $WEB_PORT",
     "build": "next build",

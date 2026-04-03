@@ -405,7 +405,19 @@ export const getSessionSchema = userIdentifierBaseSchema.extend({
 
 export const listSessionsSchema = userIdentifierBaseSchema.extend({
   agentId: z.string().optional().describe('Filter by agent'),
-  studioId: z.string().uuid().optional().describe('Filter by studio'),
+  studioId: z
+    .string()
+    .optional()
+    .describe('Filter by studio (UUID or "main" for the main studio)')
+    .refine(
+      (v) =>
+        !v ||
+        v === 'main' ||
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v),
+      {
+        message: 'Must be a UUID or "main"',
+      }
+    ),
   limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
 });
 
@@ -1084,7 +1096,27 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
 export async function handleListSessions(args: unknown, dataComposer: DataComposer) {
   const params = listSessionsSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
-  const studioId = resolveStudioId(params);
+  const rawStudioId = resolveStudioId(params);
+  const isMainScope = rawStudioId === 'main';
+  // 'main' means sessions without a studio (repo root) — resolve to the main
+  // studio UUID if one exists, otherwise filter for null studioId
+  let studioId: string | undefined;
+  if (isMainScope) {
+    // Resolve 'main' using branch matching (mirrors SessionService.resolveMainStudioId)
+    const supabase = dataComposer.getClient();
+    const { data: mainStudio } = await supabase
+      .from('studios')
+      .select('id')
+      .eq('user_id', user.id)
+      .eq('branch', 'main')
+      .in('status', ['active', 'idle', 'archived'])
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    studioId = mainStudio?.id || undefined;
+  } else {
+    studioId = rawStudioId;
+  }
 
   const sessions = await dataComposer.repositories.memory.listSessions(user.id, {
     agentId: params.agentId,

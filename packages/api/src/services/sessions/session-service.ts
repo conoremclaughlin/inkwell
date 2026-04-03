@@ -35,7 +35,7 @@ import { CodexRunner } from './codex-runner.js';
 import { GeminiRunner } from './gemini-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import { resolveIdentityId } from '../../auth/resolve-identity.js';
-import { classifyError } from '@inkstand/shared';
+import { classifyError } from '@inkwell/shared';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -799,6 +799,16 @@ export class SessionService implements ISessionService {
     }
   ): Promise<string | undefined> {
     if (options.explicitStudioId) {
+      // 'main' is a reserved convention — resolve it the same way studioHint does
+      if (options.explicitStudioId === 'main') {
+        const mainId = await this.resolveMainStudioId(userId);
+        if (mainId) return mainId;
+        logger.warn('[StudioResolve] explicitStudioId=main but no main studio found', {
+          userId,
+          agentId,
+        });
+        return undefined;
+      }
       return options.explicitStudioId;
     }
 

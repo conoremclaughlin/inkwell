@@ -1,5 +1,5 @@
 /**
- * Channel integration types for Inkstand
+ * Channel integration types for Inkwell
  * These types are designed to be compatible with clawdbot's message context format
  */
 

@@ -1179,9 +1179,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@inkstand/api@workspace:packages/api":
+"@inkwell/api@workspace:packages/api":
   version: 0.0.0-use.local
-  resolution: "@inkstand/api@workspace:packages/api"
+  resolution: "@inkwell/api@workspace:packages/api"
   dependencies:
     "@anthropic-ai/sdk": "npm:^0.71.2"
     "@modelcontextprotocol/sdk": "npm:^1.26.0"
@@ -1229,11 +1229,11 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@inkstand/cli@workspace:packages/cli":
+"@inkwell/cli@workspace:packages/cli":
   version: 0.0.0-use.local
-  resolution: "@inkstand/cli@workspace:packages/cli"
+  resolution: "@inkwell/cli@workspace:packages/cli"
   dependencies:
-    "@inkstand/shared": "workspace:*"
+    "@inkwell/shared": "workspace:*"
     "@inquirer/prompts": "npm:^8.2.0"
     "@types/node": "npm:^20.10.0"
     "@types/react": "npm:^19.2.14"
@@ -1251,24 +1251,24 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@inkstand/inkmail-plugin@workspace:packages/channel-plugin":
+"@inkwell/inkmail-plugin@workspace:packages/channel-plugin":
   version: 0.0.0-use.local
-  resolution: "@inkstand/inkmail-plugin@workspace:packages/channel-plugin"
+  resolution: "@inkwell/inkmail-plugin@workspace:packages/channel-plugin"
   dependencies:
     "@modelcontextprotocol/sdk": "npm:^1.12.1"
     tsx: "npm:^4.19.0"
   languageName: unknown
   linkType: soft
 
-"@inkstand/openclaw-plugin@workspace:packages/openclaw-plugin":
+"@inkwell/openclaw-plugin@workspace:packages/openclaw-plugin":
   version: 0.0.0-use.local
-  resolution: "@inkstand/openclaw-plugin@workspace:packages/openclaw-plugin"
+  resolution: "@inkwell/openclaw-plugin@workspace:packages/openclaw-plugin"
   languageName: unknown
   linkType: soft
 
-"@inkstand/shared@workspace:*, @inkstand/shared@workspace:packages/shared":
+"@inkwell/shared@workspace:*, @inkwell/shared@workspace:packages/shared":
   version: 0.0.0-use.local
-  resolution: "@inkstand/shared@workspace:packages/shared"
+  resolution: "@inkwell/shared@workspace:packages/shared"
   dependencies:
     "@types/jest": "npm:^29.5.11"
     "@types/node": "npm:^20.10.6"
@@ -1281,21 +1281,21 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@inkstand/spec@workspace:packages/spec":
+"@inkwell/spec@workspace:packages/spec":
   version: 0.0.0-use.local
-  resolution: "@inkstand/spec@workspace:packages/spec"
+  resolution: "@inkwell/spec@workspace:packages/spec"
   languageName: unknown
   linkType: soft
 
-"@inkstand/templates@workspace:packages/templates":
+"@inkwell/templates@workspace:packages/templates":
   version: 0.0.0-use.local
-  resolution: "@inkstand/templates@workspace:packages/templates"
+  resolution: "@inkwell/templates@workspace:packages/templates"
   languageName: unknown
   linkType: soft
 
-"@inkstand/web@workspace:packages/web":
+"@inkwell/web@workspace:packages/web":
   version: 0.0.0-use.local
-  resolution: "@inkstand/web@workspace:packages/web"
+  resolution: "@inkwell/web@workspace:packages/web"
   dependencies:
     "@mantine/core": "npm:^8.2.4"
     "@mantine/hooks": "npm:^8.2.4"
@@ -5604,9 +5604,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"create-inkstand@workspace:packages/create-pcp":
+"create-inkwell@workspace:packages/create-pcp":
   version: 0.0.0-use.local
-  resolution: "create-inkstand@workspace:packages/create-pcp"
+  resolution: "create-inkwell@workspace:packages/create-pcp"
   dependencies:
     "@inquirer/prompts": "npm:^8.2.0"
     "@types/node": "npm:^20.10.0"
@@ -5616,7 +5616,7 @@ __metadata:
     typescript: "npm:^5.3.0"
     vitest: "npm:^4.0.18"
   bin:
-    create-inkstand: ./dist/index.js
+    create-inkwell: ./dist/index.js
   languageName: unknown
   linkType: soft
 
@@ -7484,9 +7484,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"inkstand@workspace:.":
+"inkwell@workspace:.":
   version: 0.0.0-use.local
-  resolution: "inkstand@workspace:."
+  resolution: "inkwell@workspace:."
   dependencies:
     concurrently: "npm:^9.2.1"
     husky: "npm:^9.1.7"

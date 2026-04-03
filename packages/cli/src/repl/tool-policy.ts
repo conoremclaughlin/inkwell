@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { dirname, join } from 'path';
-import * as sharedToolPolicyCore from '@inkstand/shared';
+import * as sharedToolPolicyCore from '@inkwell/shared';
 
 export type ToolGroupMap = Record<string, string[]>;
 
@@ -9,8 +9,8 @@ function requireSharedToolPolicyExport<T>(name: string): T {
   const value = (sharedToolPolicyCore as Record<string, unknown>)[name];
   if (typeof value !== 'function') {
     throw new Error(
-      `@inkstand/shared is missing required export "${name}". ` +
-        'Rebuild shared + cli: yarn workspace @inkstand/cli build'
+      `@inkwell/shared is missing required export "${name}". ` +
+        'Rebuild shared + cli: yarn workspace @inkwell/cli build'
     );
   }
   return value as T;

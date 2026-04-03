@@ -3,7 +3,7 @@ import { readFileSync } from 'fs';
 import { ClaudeAdapter } from './claude.js';
 import { CodexAdapter } from './codex.js';
 import { GeminiAdapter } from './gemini.js';
-import { decodeContextToken } from '@inkstand/shared';
+import { decodeContextToken } from '@inkwell/shared';
 
 describe('backend adapters session resume wiring', () => {
   it('passes claude backendSessionId through --resume', () => {
@@ -399,7 +399,7 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
-  it('gemini adapter produces PCP_CONTEXT_TOKEN with session/studio/agent', () => {
+  it('gemini adapter produces INK_CONTEXT_TOKEN with session/studio/agent', () => {
     const adapter = new GeminiAdapter();
     const prepared = adapter.prepare({
       agentId: 'aster',
@@ -411,8 +411,8 @@ describe('backend adapters session resume wiring', () => {
     });
 
     try {
-      expect(prepared.env.PCP_CONTEXT_TOKEN).toBeDefined();
-      const token = decodeContextToken(prepared.env.PCP_CONTEXT_TOKEN);
+      expect(prepared.env.INK_CONTEXT_TOKEN).toBeDefined();
+      const token = decodeContextToken(prepared.env.INK_CONTEXT_TOKEN);
       expect(token).not.toBeNull();
       expect(token!.sessionId).toBe('sess-gemini-789');
       expect(token!.studioId).toBe('studio-aster-012');
@@ -441,10 +441,10 @@ describe('backend adapters session resume wiring', () => {
       const settings = JSON.parse(settingsContent);
 
       // PCP server should have auth + context headers
-      expect(settings.mcpServers.pcp).toBeDefined();
-      expect(settings.mcpServers.pcp.headers.Authorization).toBe('Bearer ${PCP_ACCESS_TOKEN}');
-      expect(settings.mcpServers.pcp.headers['x-pcp-context']).toBe('${PCP_CONTEXT_TOKEN}');
-      expect(settings.mcpServers.pcp.headers['x-pcp-session-id']).toBe('${PCP_SESSION_ID}');
+      expect(settings.mcpServers.inkwell).toBeDefined();
+      expect(settings.mcpServers.inkwell.headers.Authorization).toBe('Bearer ${INK_ACCESS_TOKEN}');
+      expect(settings.mcpServers.inkwell.headers['x-ink-context']).toBe('${INK_CONTEXT_TOKEN}');
+      expect(settings.mcpServers.inkwell.headers['x-ink-session-id']).toBe('${INK_SESSION_ID}');
     } finally {
       prepared.cleanup();
     }

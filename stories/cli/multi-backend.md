@@ -17,23 +17,23 @@ sb -b gemini "review this"  # Use Gemini CLI
 
 ## Backend Comparison
 
-| Feature | Claude Code | Codex CLI | Gemini CLI |
-|---|---|---|---|
-| **Binary** | `claude` | `codex` | `gemini` |
-| **Install** | `npm i -g @anthropic-ai/claude-code` | `npm i -g @openai/codex` | `npm i -g @google/gemini-cli` |
-| **Instruction file** | `CLAUDE.md` | `AGENTS.md` | `GEMINI.md` |
-| **System prompt flag** | `--append-system-prompt <file>` | None | None |
-| **System prompt alt** | N/A | `model_instructions_file` in config.toml | `GEMINI_SYSTEM_MD` env var |
-| **MCP config format** | `.mcp.json` (JSON) | `config.toml` under `[mcp_servers.*]` | `settings.json` under `mcpServers` |
-| **MCP transport** | stdio, HTTP/SSE | stdio, Streamable HTTP | stdio, Streamable HTTP, SSE |
-| **Non-interactive** | `claude -p "prompt"` | `codex -q "prompt"` or `codex exec "prompt"` | `gemini -p "prompt"` |
-| **Interactive** | `claude` (default) | `codex` (default) | `gemini` (default) |
-| **Model flag** | `--model` | `--model` | `-m` / `--model` |
-| **Config location** | `~/.claude/` | `~/.codex/config.toml` | `~/.gemini/settings.json` |
-| **Config format** | JSON (various) | TOML | JSON |
-| **JSON output** | `--output-format json` | `codex exec --json` | `--output-format json` |
-| **Auto-approve** | `--dangerously-skip-permissions` | `--yolo` | `--yolo` |
-| **Written in** | TypeScript | Rust | TypeScript |
+| Feature                | Claude Code                          | Codex CLI                                    | Gemini CLI                         |
+| ---------------------- | ------------------------------------ | -------------------------------------------- | ---------------------------------- |
+| **Binary**             | `claude`                             | `codex`                                      | `gemini`                           |
+| **Install**            | `npm i -g @anthropic-ai/claude-code` | `npm i -g @openai/codex`                     | `npm i -g @google/gemini-cli`      |
+| **Instruction file**   | `CLAUDE.md`                          | `AGENTS.md`                                  | `GEMINI.md`                        |
+| **System prompt flag** | `--append-system-prompt <file>`      | None                                         | None                               |
+| **System prompt alt**  | N/A                                  | `model_instructions_file` in config.toml     | `GEMINI_SYSTEM_MD` env var         |
+| **MCP config format**  | `.mcp.json` (JSON)                   | `config.toml` under `[mcp_servers.*]`        | `settings.json` under `mcpServers` |
+| **MCP transport**      | stdio, HTTP/SSE                      | stdio, Streamable HTTP                       | stdio, Streamable HTTP, SSE        |
+| **Non-interactive**    | `claude -p "prompt"`                 | `codex -q "prompt"` or `codex exec "prompt"` | `gemini -p "prompt"`               |
+| **Interactive**        | `claude` (default)                   | `codex` (default)                            | `gemini` (default)                 |
+| **Model flag**         | `--model`                            | `--model`                                    | `-m` / `--model`                   |
+| **Config location**    | `~/.claude/`                         | `~/.codex/config.toml`                       | `~/.gemini/settings.json`          |
+| **Config format**      | JSON (various)                       | TOML                                         | JSON                               |
+| **JSON output**        | `--output-format json`               | `codex exec --json`                          | `--output-format json`             |
+| **Auto-approve**       | `--dangerously-skip-permissions`     | `--yolo`                                     | `--yolo`                           |
+| **Written in**         | TypeScript                           | Rust                                         | TypeScript                         |
 
 ## Identity Injection Strategy
 
@@ -43,13 +43,13 @@ The key challenge: **none of the three CLIs support system prompt injection via 
 
 For each backend, `sb` writes a temporary instruction file with the agent's identity, then invokes the CLI in the appropriate way:
 
-| Backend | Injection mechanism |
-|---|---|
-| **Claude** | `--append-system-prompt <tmpfile>` (current approach, works well) |
-| **Codex** | Write temp `AGENTS.md` in CWD or use `--config model_instructions_file=<tmpfile>` |
-| **Gemini** | Set `GEMINI_SYSTEM_MD=<tmpfile>` env var (full system prompt replacement) |
+| Backend    | Injection mechanism                                                               |
+| ---------- | --------------------------------------------------------------------------------- |
+| **Claude** | `--append-system-prompt <tmpfile>` (current approach, works well)                 |
+| **Codex**  | Write temp `AGENTS.md` in CWD or use `--config model_instructions_file=<tmpfile>` |
+| **Gemini** | Set `GEMINI_SYSTEM_MD=<tmpfile>` env var (full system prompt replacement)         |
 
-**Concern with Codex**: Writing a temporary `AGENTS.md` to CWD could conflict with an existing one. The `--config model_instructions_file=<tmpfile>` approach is cleaner but replaces *all* built-in instructions rather than appending.
+**Concern with Codex**: Writing a temporary `AGENTS.md` to CWD could conflict with an existing one. The `--config model_instructions_file=<tmpfile>` approach is cleaner but replaces _all_ built-in instructions rather than appending.
 
 **Concern with Gemini**: `GEMINI_SYSTEM_MD` does a full replacement of the system prompt. We'd need to include the standard Gemini instructions alongside our identity block, or accept that our identity instructions are the full system prompt.
 
@@ -72,16 +72,16 @@ For now, each backend adapter writes its own config:
 
 ```typescript
 // Claude: .mcp.json already exists, no transform needed
-// Codex: write [mcp_servers.inkstand] section to a temp config.toml
-// Gemini: write mcpServers.inkstand to a temp settings.json (or project .gemini/settings.json)
+// Codex: write [mcp_servers.inkwell] section to a temp config.toml
+// Gemini: write mcpServers.inkwell to a temp settings.json (or project .gemini/settings.json)
 ```
 
 ## Adapter Interface
 
 ```typescript
 interface BackendAdapter {
-  name: string;           // 'claude' | 'codex' | 'gemini'
-  binary: string;         // 'claude' | 'codex' | 'gemini'
+  name: string; // 'claude' | 'codex' | 'gemini'
+  binary: string; // 'claude' | 'codex' | 'gemini'
 
   // Check if the backend binary is installed
   isInstalled(): Promise<boolean>;
@@ -100,12 +100,12 @@ interface BackendAdapter {
 
 ## Flag Mapping
 
-| SB flag | Claude | Codex | Gemini |
-|---|---|---|---|
-| `-m <model>` | `--model <model>` | `--model <model>` | `-m <model>` |
-| `-b <backend>` | (self) | (self) | (self) |
-| `--no-session` | (internal) | (internal) | (internal) |
-| Passthrough | Direct pass | Direct pass | Direct pass |
+| SB flag        | Claude            | Codex             | Gemini       |
+| -------------- | ----------------- | ----------------- | ------------ |
+| `-m <model>`   | `--model <model>` | `--model <model>` | `-m <model>` |
+| `-b <backend>` | (self)            | (self)            | (self)       |
+| `--no-session` | (internal)        | (internal)        | (internal)   |
+| Passthrough    | Direct pass       | Direct pass       | Direct pass  |
 
 ## Open Questions
 

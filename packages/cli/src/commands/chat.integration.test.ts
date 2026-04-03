@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { mintDelegationToken, verifyDelegationToken } from '@inkstand/shared';
+import { mintDelegationToken, verifyDelegationToken } from '@inkwell/shared';
 
 const testState = vi.hoisted(() => ({
   inputs: [] as string[],
@@ -1061,7 +1061,7 @@ describe('runChat integration', () => {
       JSON.stringify(
         {
           mcpServers: {
-            inkstand: { type: 'http', url: 'http://localhost:3001/mcp' },
+            inkwell: { type: 'http', url: 'http://localhost:3001/mcp' },
             github: { command: 'github-mcp-server', args: ['stdio'] },
           },
         },
@@ -1099,7 +1099,7 @@ describe('runChat integration', () => {
       JSON.stringify(
         {
           mcpServers: {
-            inkstand: { type: 'http', url: 'http://localhost:3001/mcp' },
+            inkwell: { type: 'http', url: 'http://localhost:3001/mcp' },
           },
         },
         null,
@@ -1431,7 +1431,7 @@ describe('runChat integration', () => {
       '--config',
       'features.apps=false',
       '--config',
-      'mcp_servers.inkstand.enabled=false',
+      'mcp_servers.inkwell.enabled=false',
       '--config',
       'mcp_servers.next-devtools.enabled=false',
       '--config',

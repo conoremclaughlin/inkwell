@@ -34,7 +34,7 @@ const consoleFormat = winston.format.combine(
 export const logger = winston.createLogger({
   level: env.LOG_LEVEL,
   format: logFormat,
-  defaultMeta: { service: 'inkstand' },
+  defaultMeta: { service: 'inkwell' },
   transports: [
     // Write all logs to console
     new winston.transports.Console({

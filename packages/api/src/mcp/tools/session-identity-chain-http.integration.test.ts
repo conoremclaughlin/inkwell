@@ -383,7 +383,7 @@ describe('Session Identity Chain — HTTP Integration', () => {
   });
 
   // ── Codex env_http_headers simulation ──
-  // Codex injects headers via `-c mcp_servers.inkstand.env_http_headers.<header>="ENV_VAR"`.
+  // Codex injects headers via `-c mcp_servers.inkwell.env_http_headers.<header>="ENV_VAR"`.
   // This test verifies the server correctly processes those headers on MCP calls,
   // proving the full chain: env var → Codex → HTTP header → PCP server → request context.
 

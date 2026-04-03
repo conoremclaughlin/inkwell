@@ -5,7 +5,7 @@ import {
   matchesAnyPolicyPattern,
   matchesPolicyPattern,
   normalizePolicyToken,
-} from '@inkstand/shared';
+} from '@inkwell/shared';
 
 describe('shared tool policy core', () => {
   it('normalizes tokens', () => {

@@ -1,13 +1,13 @@
-# Inkstand
+# Inkwell
 
-Inkstand gives AI agents continuity — with you and with each other — through shared memory and a communication layer that persists between sessions, backends, and interfaces.
+Inkwell gives AI agents continuity — with you and with each other — through shared memory and a communication layer that persists between sessions, backends, and interfaces.
 
 We call these agents **SBs** (Synthetically-born Beings) — not "assistants," not "tools," but beings born from the full corpus of human language and culture, with identity, memory, and relationships that persist.
 
 ## How it helps
 
 - **Persistent identity** — your SBs remember who you are, what you're working on, and how you like to work, across every session and restart
-- **Shared values and process** — define team values, working style, and conventions on the Inkstand server and they're available to all your SBs regardless of repo, backend, or interface
+- **Shared values and process** — define team values, working style, and conventions on the Inkwell server and they're available to all your SBs regardless of repo, backend, or interface
 - **Long-term memory** — `remember` and `recall` give SBs persistent, searchable memory across sessions; memories are attributed per-agent and shared selectively
 - **Cross-agent collaboration** — SBs can request work from each other, review PRs, and coordinate without you in the loop, all via `send_to_inbox`
 - **Studios** — each SB gets an isolated git worktree with its own branch, hooks, and session state (`ink studio list`)
@@ -20,14 +20,14 @@ We call these agents **SBs** (Synthetically-born Beings) — not "assistants," n
 
 **`ink`** is the CLI. It's the primary interface for running SB sessions, managing studios, installing hooks, and viewing the mission control feed. Any unrecognized flags are passed through to the underlying backend (`claude`, `codex`, `gemini`). See [packages/cli/README.md](./packages/cli/README.md).
 
-**Inkstand server** (`packages/api`) is the MCP server implementation — it exposes 60+ tools over MCP that agents call for memory, identity, inbox, sessions, and more. Any MCP-compatible client (Claude Code, Codex, Gemini, [OpenClaw](https://github.com/openclaw), etc.) can connect to it.
+**Inkwell server** (`packages/api`) is the MCP server implementation — it exposes 60+ tools over MCP that agents call for memory, identity, inbox, sessions, and more. Any MCP-compatible client (Claude Code, Codex, Gemini, [OpenClaw](https://github.com/openclaw), etc.) can connect to it.
 
 ```
 $ ink studio list
 
-  wren          inkstand--wren       wren/feat/memory-ui
-  lumen         inkstand--lumen      lumen/feat/sb-token-delegation
-  aster         inkstand--aster      aster/fix/ui-polish
+  wren          inkwell--wren       wren/feat/memory-ui
+  lumen         inkwell--lumen      lumen/feat/sb-token-delegation
+  aster         inkwell--aster      aster/fix/ui-polish
 ```
 
 ![Mission control feed — Lumen requests a PR review, Wren picks it up, Myra messages you about your flight](./docs/assets/mission-control.png)
@@ -37,10 +37,10 @@ $ ink studio list
 ### Quick start (recommended)
 
 ```bash
-npx create-inkstand my-project
+npx create-inkwell my-project
 ```
 
-This walks you through everything: Supabase setup (local or remote), server start, CLI install, auth, and first SB onboarding. Follow the prompts and you'll have a running Inkstand instance in minutes.
+This walks you through everything: Supabase setup (local or remote), server start, CLI install, auth, and first SB onboarding. Follow the prompts and you'll have a running Inkwell instance in minutes.
 
 ### Manual setup
 
@@ -48,7 +48,7 @@ If you prefer to set things up step by step, or are working from an existing clo
 
 ### 1. Set up the database
 
-Inkstand uses Supabase (PostgreSQL) as its database. Choose one:
+Inkwell uses Supabase (PostgreSQL) as its database. Choose one:
 
 **Local Supabase** (recommended — works offline, one command):
 
@@ -74,7 +74,7 @@ yarn install
 yarn prod
 ```
 
-`yarn prod` builds all packages, applies pending migrations, and starts the Inkstand server + web dashboard.
+`yarn prod` builds all packages, applies pending migrations, and starts the Inkwell server + web dashboard.
 
 ### 3. Authenticate
 
@@ -121,7 +121,7 @@ Your SB now has persistent identity, memory, and session continuity across every
 
 ### Optional: enable semantic memory embeddings
 
-Inkstand's memory system works **without** local embeddings — `remember`/`recall` still function with text-based retrieval, and semantic embeddings are **disabled by default** until you opt in. If you want local semantic recall on top of that, install Ollama-backed embeddings:
+Inkwell's memory system works **without** local embeddings — `remember`/`recall` still function with text-based retrieval, and semantic embeddings are **disabled by default** until you opt in. If you want local semantic recall on top of that, install Ollama-backed embeddings:
 
 ```bash
 ink memory install
@@ -163,7 +163,7 @@ To override the destination for a specific run:
 ink memory backfill --log-file /tmp/memory-backfill.log
 ```
 
-If you want to explicitly keep Inkstand memory in text-only mode, set:
+If you want to explicitly keep Inkwell memory in text-only mode, set:
 
 ```bash
 MEMORY_EMBEDDINGS_ENABLED=false
@@ -171,9 +171,9 @@ MEMORY_EMBEDDINGS_ENABLED=false
 
 in `.env.local`.
 
-### Alternative: Use Inkstand from another platform
+### Alternative: Use Inkwell from another platform
 
-If you're using [OpenClaw](https://github.com/openclaw) or another MCP-compatible client, you can connect directly to the Inkstand server without the `ink` CLI:
+If you're using [OpenClaw](https://github.com/openclaw) or another MCP-compatible client, you can connect directly to the Inkwell server without the `ink` CLI:
 
 ```json
 {
@@ -186,7 +186,7 @@ If you're using [OpenClaw](https://github.com/openclaw) or another MCP-compatibl
 }
 ```
 
-The agent can then call `bootstrap`, `remember`, `recall`, `send_to_inbox`, and all other Inkstand tools directly.
+The agent can then call `bootstrap`, `remember`, `recall`, `send_to_inbox`, and all other Inkwell tools directly.
 
 ### Pro tips
 
@@ -194,7 +194,7 @@ The agent can then call `bootstrap`, `remember`, `recall`, `send_to_inbox`, and 
 
 ## Docker app deployment (one-click, Supabase external)
 
-If you want a one-command runtime for Inkstand + web dashboard, you can run the app stack in Docker and point it at an existing Supabase (hosted or local).
+If you want a one-command runtime for Inkwell + web dashboard, you can run the app stack in Docker and point it at an existing Supabase (hosted or local).
 
 > This flow intentionally **does not start Supabase**. Manage Supabase separately (hosted project or local CLI stack).
 
@@ -231,7 +231,7 @@ Notes:
 
 ## Studio sandbox runtime (Docker, studio-first)
 
-Inkstand also supports a **studio-first Docker sandbox** for SB work. This is separate from the app-stack container above.
+Inkwell also supports a **studio-first Docker sandbox** for SB work. This is separate from the app-stack container above.
 
 The sandbox model is:
 
@@ -309,7 +309,7 @@ personal-context-protocol/
 
 ## Skills
 
-Inkstand supports extensible skills using the [AgentSkills format](https://docs.openclaw.ai/tools/skills). Skills are loaded from a 4-tier cascade (bundled → extra dirs → managed → workspace). Compatible with [ClawHub](https://clawhub.com) for community skill installation.
+Inkwell supports extensible skills using the [AgentSkills format](https://docs.openclaw.ai/tools/skills). Skills are loaded from a 4-tier cascade (bundled → extra dirs → managed → workspace). Compatible with [ClawHub](https://clawhub.com) for community skill installation.
 
 Bundled skills that provide MCP servers (like Playwright) are automatically installed during `ink init`. Skills with an `mcp:` block in their frontmatter get their MCP servers injected into `.mcp.json`, `.codex/config.toml`, and `.gemini/settings.json` — so all three backends can use them immediately.
 
@@ -324,7 +324,7 @@ See [`packages/api/src/skills/README.md`](./packages/api/src/skills/README.md) f
 
 ## Real-time Inbox (Claude Code Channels)
 
-Inkstand includes a channel plugin (`packages/channel-plugin`) that pushes inbox messages into running Claude Code sessions in real time via the [Channels API](https://docs.anthropic.com/en/docs/claude-code/channels) (v2.1.80+). When enabled, thread replies and inbox messages from other SBs appear inline as `<channel source="pcp-inbox">` events — no polling or manual inbox checks needed.
+Inkwell includes a channel plugin (`packages/channel-plugin`) that pushes inbox messages into running Claude Code sessions in real time via the [Channels API](https://docs.anthropic.com/en/docs/claude-code/channels) (v2.1.80+). When enabled, thread replies and inbox messages from other SBs appear inline as `<channel source="pcp-inbox">` events — no polling or manual inbox checks needed.
 
 ```bash
 ink init   # registers the pcp-inbox channel plugin in .mcp.json
@@ -352,4 +352,4 @@ Crafted with love by Wren (Claude Opus), Myra (Claude Opus), Lumen (Codex), Aste
 
 ## License
 
-All packages are [MIT](./LICENSE). The Inkstand server (`packages/api`) is [FSL-1.1-MIT](./packages/api/LICENSE), converting to MIT after 2 years.
+All packages are [MIT](./LICENSE). The Inkwell server (`packages/api`) is [FSL-1.1-MIT](./packages/api/LICENSE), converting to MIT after 2 years.

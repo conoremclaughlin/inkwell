@@ -83,7 +83,7 @@ describe('CodexRunner', () => {
           `${JSON.stringify({
             type: 'tool_use',
             id: 'tu-1',
-            name: 'mcp__inkstand__send_response',
+            name: 'mcp__inkwell__send_response',
             input: { channel: 'telegram', conversationId: 'chat-1', content: 'hi from codex' },
           })}\n`
         )
@@ -149,8 +149,9 @@ describe('CodexRunner', () => {
 
     expect(spawn).toHaveBeenCalledTimes(1);
     const [, args] = (spawn as Mock).mock.calls[0] as [string, string[]];
-    expect(args[0]).toBe('exec');
-    expect(args[1]).toBe('resume');
+    // Default (no sandboxBypass) prefixes with -a never
+    expect(args).toContain('exec');
+    expect(args).toContain('resume');
     expect(args).toContain('--json');
     expect(args).toContain('existing-session-abc');
     expect(args).toContain('resume msg');
@@ -331,7 +332,7 @@ describe('CodexRunner', () => {
             type: 'item.completed',
             item: {
               type: 'function_call',
-              name: 'mcp__inkstand__send_response',
+              name: 'mcp__inkwell__send_response',
               arguments: JSON.stringify({
                 channel: 'agent',
                 conversationId: 'trigger:lumen:thread:some-thread',

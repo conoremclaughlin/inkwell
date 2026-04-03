@@ -1,14 +1,14 @@
 // Application constants
 
-export const APP_NAME = 'Inkstand';
+export const APP_NAME = 'Inkwell';
 export const APP_VERSION = '1.0.0';
 export const APP_DESCRIPTION =
   'MCP server for persistent memory and context management across AI agents';
 
 // MCP Server metadata
-export const MCP_SERVER_NAME = 'inkstand';
+export const MCP_SERVER_NAME = 'inkwell';
 export const MCP_SERVER_VERSION = '1.0.0';
-export const MCP_SERVER_DESCRIPTION = `Inkstand - Persistent memory and context management for AI agents.
+export const MCP_SERVER_DESCRIPTION = `Inkwell - Persistent memory and context management for AI agents.
 
 ## User Identification
 Most tools require identifying a user. You can use ANY ONE of these methods:

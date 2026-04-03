@@ -209,13 +209,13 @@ describe('installHooks: Gemini', () => {
     mkdirSync(configDir, { recursive: true });
     writeFileSync(
       join(configDir, 'settings.json'),
-      JSON.stringify({ mcpServers: { inkstand: { url: 'http://localhost:3001/mcp' } } })
+      JSON.stringify({ mcpServers: { inkwell: { url: 'http://localhost:3001/mcp' } } })
     );
 
     installHooks(TEST_DIR, { backend: 'gemini' });
 
     const config = JSON.parse(readFileSync(join(configDir, 'settings.json'), 'utf-8'));
-    expect(config.mcpServers.inkstand.url).toBe('http://localhost:3001/mcp');
+    expect(config.mcpServers.inkwell.url).toBe('http://localhost:3001/mcp');
     expect(config.hooks).toBeDefined();
   });
 
@@ -616,7 +616,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     vi.stubGlobal('fetch', fetchSpy);
 
     await expect(callPcpTool('bootstrap', { agentId: 'wren' })).rejects.toThrow(
-      'PCP SSE response contained no data lines'
+      'Inkwell SSE response contained no data lines'
     );
   });
 
@@ -630,7 +630,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     vi.stubGlobal('fetch', fetchSpy);
 
     await expect(callPcpTool('bootstrap', { agentId: 'wren' })).rejects.toThrow(
-      'PCP call failed (406)'
+      'Inkwell call failed (406)'
     );
   });
 
@@ -645,7 +645,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     vi.stubGlobal('fetch', fetchSpy);
 
     await expect(callPcpTool('bootstrap', { agentId: 'wren' })).rejects.toThrow(
-      'PCP tool error (-32001): Authentication required'
+      'Inkwell tool error (-32001): Authentication required'
     );
   });
 
@@ -660,7 +660,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     vi.stubGlobal('fetch', fetchSpy);
 
     await expect(callPcpTool('bootstrap', { agentId: 'wren' })).rejects.toThrow(
-      'PCP tool error (-32602): Invalid params'
+      'Inkwell tool error (-32602): Invalid params'
     );
   });
 
@@ -678,7 +678,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     vi.stubGlobal('fetch', fetchSpy);
 
     await expect(callPcpTool('start_session', { agentId: 'wren' })).rejects.toThrow(
-      'PCP tool error: start_session unavailable'
+      'Inkwell tool error: start_session unavailable'
     );
   });
 
@@ -811,7 +811,7 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
     vi.stubGlobal('fetch', fetchSpy);
 
     await expect(callPcpTool('bootstrap', { agentId: 'wren' })).rejects.toThrow(
-      'PCP call failed (401)'
+      'Inkwell call failed (401)'
     );
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });

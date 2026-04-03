@@ -3,7 +3,7 @@
  *
  * Identity injection via GEMINI_SYSTEM_MD=<tmpfile> env var
  * MCP config via GEMINI_CLI_SYSTEM_SETTINGS_PATH → temp settings.json
- *   with auth + session headers merged into Inkstand server config.
+ *   with auth + session headers merged into Inkwell server config.
  *
  * Docs: https://geminicli.com/docs/
  */
@@ -12,11 +12,11 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createIdentityPromptFile } from './identity.js';
-import { encodeContextToken } from '@inkstand/shared';
+import { encodeContextToken } from '@inkwell/shared';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
 
 /**
- * Build a temp Gemini settings.json that merges Inkstand auth + session headers
+ * Build a temp Gemini settings.json that merges Inkwell auth + session headers
  * into the MCP server config. Gemini reads MCP headers from settings.json
  * (not env vars like Codex), so we need a generated override file.
  *
@@ -26,7 +26,7 @@ import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js'
  *
  * NOTE: Gemini env var interpolation in MCP headers may be unreliable
  * (upstream issues #5282, #5828). Aster's existing settings use ${GITHUB_TOKEN}
- * for GitHub auth which works, but Inkstand headers haven't been verified end-to-end.
+ * for GitHub auth which works, but Inkwell headers haven't been verified end-to-end.
  * Live validation needed once Aster's quota resets.
  */
 function buildGeminiSettings(cwd: string): { path: string; cleanup: () => void } | null {
@@ -42,8 +42,8 @@ function buildGeminiSettings(cwd: string): { path: string; cleanup: () => void }
     }
   }
 
-  // Merge Inkstand auth + session headers — prefer 'inkstand', fall back to 'pcp'
-  const serverKey = mcpServers.inkstand ? 'inkstand' : mcpServers.pcp ? 'pcp' : 'inkstand';
+  // Merge Inkwell auth + session headers — prefer 'inkwell', fall back to 'pcp'
+  const serverKey = mcpServers.inkwell ? 'inkwell' : mcpServers.pcp ? 'pcp' : 'inkwell';
   const serverConfig = (mcpServers[serverKey] || {}) as Record<string, unknown>;
   const existingHeaders = (serverConfig.headers || {}) as Record<string, string>;
   mcpServers[serverKey] = {
@@ -123,7 +123,7 @@ export class GeminiAdapter implements BackendAdapter {
       runtime: 'gemini',
     });
 
-    // Build temp settings.json with Inkstand auth + session headers.
+    // Build temp settings.json with Inkwell auth + session headers.
     // INK_ACCESS_TOKEN is set at the spawn site (after prepare) — the
     // ${INK_ACCESS_TOKEN} syntax in settings.json resolves at Gemini runtime.
     const settings = buildGeminiSettings(process.cwd());

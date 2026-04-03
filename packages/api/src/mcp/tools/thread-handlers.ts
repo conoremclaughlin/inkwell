@@ -5,7 +5,7 @@
  * entities where messages belong to the thread, not individual recipients.
  * Late joiners see full history.
  *
- * Spec: pcp://specs/cross-agent-communication v7
+ * Spec: ink://specs/cross-agent-communication v7
  */
 
 import { z } from 'zod';
@@ -163,11 +163,18 @@ export function resolveTriggeredAgents(opts: {
   recipients?: string[];
   selfStudioTarget?: boolean;
 }): string[] {
-  const { senderAgentId, participants, creatorAgentId, triggerAgents, triggerAll, messageType,
-    selfStudioTarget } = opts;
+  const {
+    senderAgentId,
+    participants,
+    creatorAgentId,
+    triggerAgents,
+    triggerAll,
+    messageType,
+    selfStudioTarget,
+  } = opts;
 
   // When targeting self in a different studio, don't exclude sender from triggers
-  const excludeSelf = (a: string) => selfStudioTarget ? true : a !== senderAgentId;
+  const excludeSelf = (a: string) => (selfStudioTarget ? true : a !== senderAgentId);
 
   // Precedence 1: explicit triggerAgents (filter to actual participants)
   if (triggerAgents && triggerAgents.length > 0) {

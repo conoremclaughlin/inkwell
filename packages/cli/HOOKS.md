@@ -1,6 +1,6 @@
 # CLI Lifecycle Hooks
 
-Inkstand hooks bridge coding agents (Claude Code, Codex, Gemini) with Inkstand's session, memory, and inbox system. Each hook fires at a specific lifecycle event and injects context into the agent's conversation.
+Inkwell hooks bridge coding agents (Claude Code, Codex, Gemini) with Inkwell's session, memory, and inbox system. Each hook fires at a specific lifecycle event and injects context into the agent's conversation.
 
 **Source:** [`src/commands/hooks.ts`](src/commands/hooks.ts)
 **Templates:** [`src/templates/hook-*.md`](src/templates/)
@@ -28,11 +28,11 @@ Inkstand hooks bridge coding agents (Claude Code, Codex, Gemini) with Inkstand's
 1. Reads workspace ID from `.ink/identity.json`
 2. Calls `bootstrap` with agentId and workspaceId
 3. Calls `get_inbox` for unread messages
-4. Resolves Inkstand session ID (`INK_SESSION_ID` env from launcher, or `start_session` fallback)
-5. Reconciles Inkstand/backend session linkage when backend session ID is available (prefers existing server-side backend-session match)
+4. Resolves Inkwell session ID (`INK_SESSION_ID` env from launcher, or `start_session` fallback)
+5. Reconciles Inkwell/backend session linkage when backend session ID is available (prefers existing server-side backend-session match)
 6. Stores runtime session state in `.ink/runtime/sessions.json` (multi-session list + current pointer + correlation link)
 7. Stores backend session ID in `.ink/runtime/session-id` (legacy compatibility)
-8. Links backend session ID to Inkstand session via `update_session_phase(sessionId, backendSessionId)`
+8. Links backend session ID to Inkwell session via `update_session_phase(sessionId, backendSessionId)`
 
 **Output:**
 
@@ -73,9 +73,9 @@ Workspace: {workspace name}
 
 Context is about to be compacted. Before compaction completes:
 
-1. **Save critical decisions** — Use `mcp__inkstand__remember` to persist any
+1. **Save critical decisions** — Use `mcp__inkwell__remember` to persist any
    important reasoning, decisions, or context that should survive compaction.
-2. **Note current task state** — Use `mcp__inkstand__update_session_phase` to record
+2. **Note current task state** — Use `mcp__inkwell__update_session_phase` to record
    where you are in the current task so you can resume smoothly after compaction.
 
 This context will be lost after compaction unless you save it now.
@@ -151,7 +151,7 @@ Agent: {agentId}
 ```
 <pcp-reminder>
 You have completed ~{count} tool calls this session. Consider using
-`mcp__inkstand__remember` to save a progress snapshot.
+`mcp__inkwell__remember` to save a progress snapshot.
 </pcp-reminder>
 
 <inkmail count="{count}">
@@ -164,19 +164,19 @@ You have completed ~{count} tool calls this session. Consider using
 
 Hooks store ephemeral state in `.ink/runtime/` (gitignored):
 
-| File               | Purpose                                                                                                                           |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| `sessions.json`    | Runtime session registry (list of Inkstand sessions + backend session IDs/history + current pointer + runtimeLinkId correlation token) |
-| `ink-session-id`   | Current Inkstand session UUID (legacy convenience file)                                                                                |
-| `session-id`       | Backend session ID from on-session-start (legacy convenience file)                                                                |
-| `runtime-link-id`  | Current run correlation token (`INK_RUNTIME_LINK_ID`) for local reconciliation/debug                                              |
-| `last-inbox-check` | ISO timestamp of last inbox poll                                                                                                  |
-| `tool-count`       | Cumulative tool call counter for on-stop nudges                                                                                   |
+| File               | Purpose                                                                                                                               |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `sessions.json`    | Runtime session registry (list of Inkwell sessions + backend session IDs/history + current pointer + runtimeLinkId correlation token) |
+| `ink-session-id`   | Current Inkwell session UUID (legacy convenience file)                                                                                |
+| `session-id`       | Backend session ID from on-session-start (legacy convenience file)                                                                    |
+| `runtime-link-id`  | Current run correlation token (`INK_RUNTIME_LINK_ID`) for local reconciliation/debug                                                  |
+| `last-inbox-check` | ISO timestamp of last inbox poll                                                                                                      |
+| `tool-count`       | Cumulative tool call counter for on-stop nudges                                                                                       |
 
 ## Installation
 
 ```bash
 sb hooks install     # Auto-detects backend and installs hooks
 sb hooks status      # Show installed hook status
-sb hooks uninstall   # Remove Inkstand-managed hooks
+sb hooks uninstall   # Remove Inkwell-managed hooks
 ```

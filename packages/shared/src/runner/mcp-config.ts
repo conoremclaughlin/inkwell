@@ -55,14 +55,14 @@ export interface InjectSessionHeadersResult {
  * Inject Ink session headers into an MCP config file.
  *
  * Reads the given .mcp.json, adds x-ink-session-id (and optionally
- * x-ink-studio-id) headers to the "inkstand" server entry, and writes
+ * x-ink-studio-id) headers to the "inkwell" server entry, and writes
  * a temp file if modifications were needed.
  *
  * The header values use ${VAR} interpolation so Claude Code resolves
  * them from the spawned process's env vars at runtime.
  *
  * If the config already has the headers, or the file doesn't exist,
- * or there's no "inkstand" server entry, returns the original path unchanged.
+ * or there's no "inkwell" server entry, returns the original path unchanged.
  */
 export function injectSessionHeaders(
   options: InjectSessionHeadersOptions
@@ -82,8 +82,8 @@ export function injectSessionHeaders(
     return { mcpConfigPath, cleanup: () => {}, modified: false };
   }
 
-  // Find the server entry — prefer 'inkstand', fall back to 'pcp' for backward compat
-  const serverKey = config.mcpServers.inkstand ? 'inkstand' : config.mcpServers.pcp ? 'pcp' : null;
+  // Find the server entry — prefer 'inkwell', fall back to 'pcp' for backward compat
+  const serverKey = config.mcpServers.inkwell ? 'inkwell' : config.mcpServers.pcp ? 'pcp' : null;
   if (!serverKey) {
     return { mcpConfigPath, cleanup: () => {}, modified: false };
   }
@@ -156,7 +156,7 @@ export function injectSessionHeaders(
 /**
  * Ink context token payload — consolidated session/routing metadata.
  * Carried in the `x-ink-context` header as base64url-encoded JSON.
- * See spec: pcp://specs/mcp-context-token
+ * See spec: ink://specs/mcp-context-token
  */
 export interface PcpContextToken {
   sessionId: string;

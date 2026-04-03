@@ -31,7 +31,7 @@ export const assistantWithListEmailsToolUse: ClaudeStreamMessage = {
       {
         type: 'tool_use',
         id: 'toolu_01ABC123',
-        name: 'mcp__inkstand__list_emails',
+        name: 'mcp__inkwell__list_emails',
         input: {
           userId: '00000000-0000-0000-0000-000000000001',
           maxResults: 5,
@@ -115,7 +115,7 @@ export const assistantWithGetEmailToolUse: ClaudeStreamMessage = {
       {
         type: 'tool_use',
         id: 'toolu_02DEF456',
-        name: 'mcp__inkstand__get_email',
+        name: 'mcp__inkwell__get_email',
         input: {
           userId: '00000000-0000-0000-0000-000000000001',
           messageId: 'msg-fixture-001',
@@ -168,7 +168,7 @@ export const assistantWithSendResponse: ClaudeStreamMessage = {
       {
         type: 'tool_use',
         id: 'toolu_03GHI789',
-        name: 'mcp__inkstand__send_response',
+        name: 'mcp__inkwell__send_response',
         input: {
           userId: '00000000-0000-0000-0000-000000000001',
           channel: 'telegram',
