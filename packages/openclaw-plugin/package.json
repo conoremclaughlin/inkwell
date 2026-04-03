@@ -1,17 +1,17 @@
 {
-  "name": "@inkstand/openclaw-plugin",
+  "name": "@inkwell/openclaw-plugin",
   "version": "0.1.0",
-  "description": "Inkstand plugin for OpenClaw — identity, memory, sessions, and cross-agent messaging",
+  "description": "Inkwell plugin for OpenClaw — identity, memory, sessions, and cross-agent messaging",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/conoremclaughlin/inkstand.git",
+    "url": "https://github.com/conoremclaughlin/inkwell.git",
     "directory": "packages/openclaw-plugin"
   },
   "keywords": [
     "openclaw",
-    "inkstand",
+    "inkwell",
     "mcp",
     "ai-agent",
     "memory",

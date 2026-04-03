@@ -2,7 +2,7 @@
  * Channels module
  *
  * This module provides integration with messaging platforms through clawdbot.
- * It allows Inkstand to receive and process messages from:
+ * It allows Inkwell to receive and process messages from:
  * - Telegram
  * - WhatsApp
  * - Discord

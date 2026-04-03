@@ -2,17 +2,17 @@
  * Codex CLI Backend Adapter
  *
  * Identity injection via --config model_instructions_file=<tmpfile>
- * PCP session headers via --config mcp_servers.inkstand.env_http_headers (env-var-backed)
+ * PCP session headers via --config mcp_servers.inkwell.env_http_headers (env-var-backed)
  *
  * Docs: https://developers.openai.com/codex/cli/
  */
 
 import { createIdentityPromptFile } from './identity.js';
-import { encodeContextToken } from '@inkstand/shared';
+import { encodeContextToken } from '@inkwell/shared';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
 
 /**
- * PCP headers to inject as env_http_headers on the "inkstand" MCP server.
+ * PCP headers to inject as env_http_headers on the "inkwell" MCP server.
  * Each entry maps a header name to the env var that holds its value.
  * Codex resolves env var → value at runtime, so multiple sessions in
  * the same studio each get their own scoped headers.

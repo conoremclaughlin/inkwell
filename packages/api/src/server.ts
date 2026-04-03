@@ -1,6 +1,6 @@
 #!/usr/bin/env npx tsx
 /**
- * Inkstand Server
+ * Inkwell Server
  *
  * Main entry point that orchestrates:
  * - MCP Server with integrated ChannelGateway (Telegram/WhatsApp)
@@ -44,7 +44,7 @@ import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gate
 import { resolveRouteAgentId } from './services/routing/resolve-route';
 import { resolveAgentFromMention } from './services/routing/resolve-mention';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
-import { classifyError } from '@inkstand/shared';
+import { classifyError } from '@inkwell/shared';
 import { logger } from './utils/logger';
 import { getUserFromContext } from './utils/request-context';
 import { env } from './config/env';
@@ -101,7 +101,7 @@ async function routeResponses(responses: ChannelResponse[]): Promise<void> {
  * Start the PCP server
  */
 async function startServer(config: ServerConfig = {}): Promise<void> {
-  logger.info('Starting Inkstand Server...');
+  logger.info('Starting Inkwell Server...');
 
   // Resolve configuration
   const workingDirectory = config.workingDirectory || path.resolve(__dirname, '../../..');
@@ -1031,7 +1031,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
   // Ready
   logger.info('');
   logger.info('='.repeat(60));
-  logger.info('Inkstand Server is running (SessionService architecture)');
+  logger.info('Inkwell Server is running (SessionService architecture)');
   logger.info('='.repeat(60));
   logger.info('');
 
@@ -1166,7 +1166,7 @@ async function shutdown(): Promise<void> {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
-  logger.info('\nShutting down Inkstand Server...');
+  logger.info('\nShutting down Inkwell Server...');
 
   // Force-kill safety net: if graceful shutdown hangs, exit anyway.
   const forceKillTimer = setTimeout(() => {

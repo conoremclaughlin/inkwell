@@ -61,7 +61,7 @@ describe('studio sandbox planning', () => {
       JSON.stringify(
         {
           mcpServers: {
-            inkstand: { type: 'http', url: 'http://localhost:3001/mcp' },
+            inkwell: { type: 'http', url: 'http://localhost:3001/mcp' },
             supabase: { type: 'http', url: 'http://127.0.0.1:54321/mcp' },
             github: { type: 'http', url: 'https://api.githubcopilot.com/mcp/' },
           },
@@ -102,7 +102,7 @@ describe('studio sandbox planning', () => {
     const patched = JSON.parse(readFileSync(plan.patchedMcpConfigPath!, 'utf-8')) as {
       mcpServers: Record<string, { url: string }>;
     };
-    expect(patched.mcpServers.inkstand.url).toBe('http://host.docker.internal:3001/mcp');
+    expect(patched.mcpServers.inkwell.url).toBe('http://host.docker.internal:3001/mcp');
     expect(patched.mcpServers.supabase.url).toBe('http://host.docker.internal:54321/mcp');
     expect(patched.mcpServers.github.url).toBe('https://api.githubcopilot.com/mcp/');
 

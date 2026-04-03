@@ -57,7 +57,7 @@ function resolveChannelPluginPath(cwd: string): string | null {
 
 function buildDefaultMcpJson(serverUrl: string, cwd?: string): Record<string, unknown> {
   const servers: Record<string, unknown> = {
-    inkstand: {
+    inkwell: {
       type: 'http',
       url: `${serverUrl}/mcp`,
     },
@@ -97,16 +97,19 @@ function ensurePcpDir(cwd: string): InitStepResult {
 function ensureMcpJson(cwd: string): InitStepResult {
   const mcpPath = join(cwd, '.mcp.json');
   if (existsSync(mcpPath)) {
-    // Check if inkstand server entry exists
+    // Check if inkwell server entry exists
     try {
       const existing = JSON.parse(readFileSync(mcpPath, 'utf-8')) as Record<string, unknown>;
       const servers = existing.mcpServers as Record<string, unknown> | undefined;
-      if (servers?.inkstand) {
+      if (servers?.inkwell) {
         // Add inkmail if missing and plugin exists locally
         if (!servers['inkmail']) {
           const channelPath = resolveChannelPluginPath(cwd);
           if (channelPath) {
-            const updatedServers = { ...servers, 'inkmail': { command: 'npx', args: ['tsx', channelPath] } };
+            const updatedServers = {
+              ...servers,
+              inkmail: { command: 'npx', args: ['tsx', channelPath] },
+            };
             const updated = { ...existing, mcpServers: updatedServers };
             writeFileSync(mcpPath, JSON.stringify(updated, null, 2) + '\n');
             return {
@@ -116,22 +119,22 @@ function ensureMcpJson(cwd: string): InitStepResult {
             };
           }
         }
-        return { label: '.mcp.json', status: 'exists', detail: 'inkstand server configured' };
+        return { label: '.mcp.json', status: 'exists', detail: 'inkwell server configured' };
       }
-      // Add inkstand server to existing config
+      // Add inkwell server to existing config
       const serverUrl = getPcpServerUrl();
       const updated = {
         ...existing,
         mcpServers: {
           ...(servers || {}),
-          inkstand: {
+          inkwell: {
             type: 'http',
             url: `${serverUrl}/mcp`,
           },
         },
       };
       writeFileSync(mcpPath, JSON.stringify(updated, null, 2) + '\n');
-      return { label: '.mcp.json', status: 'updated', detail: 'added inkstand server' };
+      return { label: '.mcp.json', status: 'updated', detail: 'added inkwell server' };
     } catch {
       return { label: '.mcp.json', status: 'exists', detail: 'unparseable, skipping' };
     }
@@ -139,7 +142,7 @@ function ensureMcpJson(cwd: string): InitStepResult {
 
   const serverUrl = getPcpServerUrl();
   writeFileSync(mcpPath, JSON.stringify(buildDefaultMcpJson(serverUrl, cwd), null, 2) + '\n');
-  return { label: '.mcp.json', status: 'created', detail: `inkstand → ${serverUrl}/mcp` };
+  return { label: '.mcp.json', status: 'created', detail: `inkwell → ${serverUrl}/mcp` };
 }
 
 function runInstallHooks(cwd: string, force?: boolean): InitStepResult[] {
@@ -167,7 +170,7 @@ function runInstallHooks(cwd: string, force?: boolean): InitStepResult[] {
         results.push({
           label: `hooks (${resolvedBackend.name})`,
           status: 'skipped',
-          detail: 'existing non-Inkstand hooks (use ink hooks install --force)',
+          detail: 'existing non-Inkwell hooks (use ink hooks install --force)',
         });
         break;
     }
@@ -201,7 +204,7 @@ async function initCommand(options: { force?: boolean }): Promise<void> {
   const cwd = process.cwd();
   const config = getPcpConfig();
 
-  console.log(chalk.bold('\nInitializing Inkstand...\n'));
+  console.log(chalk.bold('\nInitializing Inkwell...\n'));
 
   const auth = loadAuth();
   if (auth && !isTokenExpired(auth)) {
@@ -222,7 +225,7 @@ async function initCommand(options: { force?: boolean }): Promise<void> {
     syncBackendConfigs(cwd),
   ];
 
-  // Async step: sync skills from Inkstand server (best-effort)
+  // Async step: sync skills from Inkwell server (best-effort)
   try {
     const skillsResult = await syncSkills(cwd);
     if (skillsResult.serverUnreachable) {
@@ -271,7 +274,9 @@ async function initCommand(options: { force?: boolean }): Promise<void> {
 export function registerInitCommand(program: Command): void {
   program
     .command('init')
-    .description('Initialize Inkstand in the current repo (hooks, .mcp.json, backend configs, skills)')
-    .option('-f, --force', 'Overwrite existing hooks even if non-Inkstand hooks are present')
+    .description(
+      'Initialize Inkwell in the current repo (hooks, .mcp.json, backend configs, skills)'
+    )
+    .option('-f, --force', 'Overwrite existing hooks even if non-Inkwell hooks are present')
     .action(initCommand);
 }

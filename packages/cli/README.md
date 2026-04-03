@@ -8,21 +8,21 @@ Supports multiple backends: Claude Code, Codex, and Gemini CLI. Unrecognized fla
 
 ```bash
 # Build and symlink into PATH (one-time)
-yarn workspace @inkstand/cli build
-yarn workspace @inkstand/cli install:cli
+yarn workspace @inkwell/cli build
+yarn workspace @inkwell/cli install:cli
 
 # Now available globally
 sb
 
 # Auto-rebuild on changes during development
-yarn workspace @inkstand/cli dev   # tsc --watch in another terminal
+yarn workspace @inkwell/cli dev   # tsc --watch in another terminal
 ```
 
 `install:cli` links `sb` to `~/.ink/bin/sb` and also creates a compatibility symlink at
 `~/.local/bin/sb`.
 If neither `~/.ink/bin` nor `~/.local/bin` is in your `PATH`, the installer prints a warning.
 
-To remove: `yarn workspace @inkstand/cli uninstall:cli`
+To remove: `yarn workspace @inkwell/cli uninstall:cli`
 
 ## Getting Started
 
@@ -476,9 +476,9 @@ Inside REPL:
 ## Development
 
 ```bash
-yarn workspace @inkstand/cli build      # Build once
-yarn workspace @inkstand/cli dev         # Watch mode (auto-rebuild on changes)
-yarn workspace @inkstand/cli test        # Run tests
+yarn workspace @inkwell/cli build      # Build once
+yarn workspace @inkwell/cli dev         # Watch mode (auto-rebuild on changes)
+yarn workspace @inkwell/cli test        # Run tests
 ```
 
 ### Running in development mode
@@ -486,13 +486,13 @@ yarn workspace @inkstand/cli test        # Run tests
 The global `sb` symlink points to `packages/cli/dist/cli.js` (compiled output). After pulling new code, rebuild to pick up changes:
 
 ```bash
-yarn workspace @inkstand/cli build
+yarn workspace @inkwell/cli build
 ```
 
 For continuous development, run watch mode in a background terminal so changes compile automatically:
 
 ```bash
-yarn workspace @inkstand/cli dev         # tsc --watch
+yarn workspace @inkwell/cli dev         # tsc --watch
 ```
 
 To test a feature branch without overwriting the global `sb`:

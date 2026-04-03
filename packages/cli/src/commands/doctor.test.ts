@@ -85,7 +85,7 @@ describe('analyzeCliLink', () => {
     const cliTarget = `${cliRoot}/dist/cli.js`;
     const fsOps = makeFs({
       files: {
-        [`${cliRoot}/package.json`]: JSON.stringify({ name: '@inkstand/cli' }),
+        [`${cliRoot}/package.json`]: JSON.stringify({ name: '@inkwell/cli' }),
         [cliTarget]: '#!/usr/bin/env node',
       },
       symlinks: {

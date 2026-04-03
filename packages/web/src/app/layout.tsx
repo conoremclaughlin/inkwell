@@ -6,7 +6,7 @@ import './globals.css';
 const inter = Inter({ subsets: ['latin'] });
 
 export const metadata: Metadata = {
-  title: 'Inkstand',
+  title: 'Inkwell',
   description: 'Your AI beings remember what matters to you',
 };
 

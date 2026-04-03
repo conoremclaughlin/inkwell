@@ -34,7 +34,7 @@ describe('status helpers', () => {
       join(claudeDir, 'settings.local.json'),
       JSON.stringify({
         permissions: {
-          allow: ['Bash(*)', 'mcp__inkstand__*'],
+          allow: ['Bash(*)', 'mcp__inkwell__*'],
           deny: ['Bash(rm -rf *)'],
         },
       })
@@ -56,7 +56,7 @@ describe('status helpers', () => {
       join(root, '.mcp.json'),
       JSON.stringify({
         mcpServers: {
-          inkstand: { type: 'http', url: 'http://localhost:3001/mcp' },
+          inkwell: { type: 'http', url: 'http://localhost:3001/mcp' },
           github: { type: 'http', url: 'https://api.githubcopilot.com/mcp/' },
         },
       })

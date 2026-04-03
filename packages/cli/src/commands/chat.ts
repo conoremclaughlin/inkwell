@@ -77,7 +77,7 @@ import {
   mintDelegationToken,
   verifyDelegationToken,
   type DelegationTokenPayload,
-} from '@inkstand/shared';
+} from '@inkwell/shared';
 
 type ChatOptions = {
   agent?: string;
@@ -309,7 +309,7 @@ function buildBackendToolPassthrough(
           '--config',
           'features.apps=false',
           '--config',
-          'mcp_servers.inkstand.enabled=false',
+          'mcp_servers.inkwell.enabled=false',
           '--config',
           'mcp_servers.next-devtools.enabled=false',
           '--config',
@@ -1757,7 +1757,7 @@ function buildPromptEnvelope(
 
   const toolInstruction =
     runtime.toolRouting === 'local'
-      ? 'IMPORTANT: To call Inkstand tools (get_inbox, recall, remember, list_tasks, send_response, etc.), you MUST emit fenced code blocks in this exact format:\n\n```ink-tool\n{"tool":"tool_name","args":{}}\n```\n\nDo NOT use ToolSearch, mcp__inkstand__*, or native MCP tool calling for Inkstand tools — those will not work in this runtime. Only the fenced block format above will execute Inkstand tools. You can emit multiple ink-tool blocks in one response.\n\nClient-local tools (also via ink-tool blocks, no server round-trip):\n- list_context: Introspect your context window — see all entries with IDs, token counts, sources, and previews.\n- evict_context: Remove specific entries from your context to reclaim tokens. Args: entryIds (number[]), source (string), or role (string).\n- signal_status: Signal your session status. Args: status ("completed" | "blocked" | "continuing"), reason (string, optional). Use this at the end of your work to tell the runtime whether you are done, blocked on something, or need another turn.'
+      ? 'IMPORTANT: To call Inkwell tools (get_inbox, recall, remember, list_tasks, send_response, etc.), you MUST emit fenced code blocks in this exact format:\n\n```ink-tool\n{"tool":"tool_name","args":{}}\n```\n\nDo NOT use ToolSearch, mcp__inkwell__*, or native MCP tool calling for Inkwell tools — those will not work in this runtime. Only the fenced block format above will execute Inkwell tools. You can emit multiple ink-tool blocks in one response.\n\nClient-local tools (also via ink-tool blocks, no server round-trip):\n- list_context: Introspect your context window — see all entries with IDs, token counts, sources, and previews.\n- evict_context: Remove specific entries from your context to reclaim tokens. Args: entryIds (number[]), source (string), or role (string).\n- signal_status: Signal your session status. Args: status ("completed" | "blocked" | "continuing"), reason (string, optional). Use this at the end of your work to tell the runtime whether you are done, blocked on something, or need another turn.'
       : runtime.toolMode === 'off'
         ? 'Do not call backend-native tools. Provide reasoning and instructions only.'
         : runtime.toolMode === 'privileged'
@@ -1779,7 +1779,7 @@ function buildPromptEnvelope(
     runtime.threadKey ? `Thread key: ${runtime.threadKey}.` : '',
     // Identity context from bootstrap — always included
     runtime.bootstrapContext
-      ? `\n=== Identity Context (from Inkstand bootstrap) ===\n${runtime.bootstrapContext}\n=== End Identity Context ===`
+      ? `\n=== Identity Context (from Inkwell bootstrap) ===\n${runtime.bootstrapContext}\n=== End Identity Context ===`
       : '',
     '',
     'Conversation transcript:',
@@ -2946,9 +2946,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
             const result = handleClientLocalTool(tool, args, ledger);
             if (result) return Promise.resolve(result);
           }
-          // Strip MCP namespace prefix — the SB may emit mcp__inkstand__tool_name
+          // Strip MCP namespace prefix — the SB may emit mcp__inkwell__tool_name
           // but PcpClient expects bare tool names (get_inbox, recall, etc.)
-          const bareTool = tool.replace(/^mcp__inkstand__/, '');
+          const bareTool = tool.replace(/^mcp__inkwell__/, '');
           return pcp.callTool(bareTool, args);
         },
         sessionId: runtime.sessionId,
@@ -3641,7 +3641,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '',
               '/help                      Show this help',
               '/quit | /exit              End chat',
-              '/refresh                   Re-bootstrap identity context from Inkstand',
+              '/refresh                   Re-bootstrap identity context from Inkwell',
               '/inbox                     Poll inbox now',
               '/inbox full                Show all unread messages expanded',
               '/events [now|on|off]       Poll/toggle merged activity stream',
@@ -3654,17 +3654,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '/backend <name>            Switch backend (claude|codex|gemini)',
               '/model <id>                Set/clear model override',
               '/tools <backend|off|privileged>  Toggle backend-native tools/policy',
-              '/grant <tool> [uses]       Grant blocked Inkstand tool for limited uses',
-              '/grant-session <tool>      Allow a tool for this Inkstand session only',
-              '/allow <tool>               Persistently allow Inkstand tool',
-              '/deny <tool>                Persistently deny Inkstand tool',
-              '/prompt <tool>              Require per-call approval for Inkstand tool',
+              '/grant <tool> [uses]       Grant blocked Inkwell tool for limited uses',
+              '/grant-session <tool>      Allow a tool for this Inkwell session only',
+              '/allow <tool>               Persistently allow Inkwell tool',
+              '/deny <tool>                Persistently deny Inkwell tool',
+              '/prompt <tool>              Require per-call approval for Inkwell tool',
               '/policy-scope [global|workspace|agent|studio] [id]  Set rule mutation scope',
               '/policy                     Show tool policy + storage path',
-              '/mcp [servers|call ...]     List MCP servers or call Inkstand tool via /mcp call',
+              '/mcp [servers|call ...]     List MCP servers or call Inkwell tool via /mcp call',
               '/mcp-servers                List configured MCP servers from .mcp.json',
               '/capabilities               Snapshot: MCP servers + skills + policy + grants',
-              '/ink <tool> [jsonArgs]     Call an Inkstand tool directly',
+              '/ink <tool> [jsonArgs]     Call an Inkwell tool directly',
               '/thread [key]              Show/set active thread key',
               '/sessions [watch|off]      Show active sessions (or stream each turn)',
               '/skills                    List discovered local skills',
@@ -3724,7 +3724,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }
           break;
         case 'refresh': {
-          console.log(chalk.dim('Refreshing identity context from Inkstand...'));
+          console.log(chalk.dim('Refreshing identity context from Inkwell...'));
           const refreshResult = (await pcp
             .callTool('bootstrap', { agentId })
             .catch((error) => ({ error: String(error) }))) as Record<string, unknown>;
@@ -4008,11 +4008,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
             break;
           }
           if (!runtime.sessionId) {
-            console.log(chalk.yellow('No Inkstand session id available.'));
+            console.log(chalk.yellow('No Inkwell session id available.'));
             break;
           }
           toolPolicy.grantToolForSession(runtime.sessionId, tool);
-          console.log(chalk.green(`Granted ${tool} for this Inkstand session.`));
+          console.log(chalk.green(`Granted ${tool} for this Inkwell session.`));
           break;
         }
         case 'grant-remote': {
@@ -4885,7 +4885,7 @@ export function registerChatCommand(program: Command): void {
         'local'
       )
       .option('--ui <mode>', 'UI mode: live (default) or scroll status rendering', 'live')
-      .option('--thread-key <key>', 'Thread key for Inkstand session routing')
+      .option('--thread-key <key>', 'Thread key for Inkwell session routing')
       .option(
         '--sender <platform:id>',
         'Simulate sender identity for per-contact isolation (e.g., telegram:99887766)'
@@ -4897,7 +4897,7 @@ export function registerChatCommand(program: Command): void {
         '--attach-latest [query]',
         'Attach to newest active session for this SB (optional query filter)'
       )
-      .option('--session-id <id>', 'Attach chat to an existing Inkstand session id')
+      .option('--session-id <id>', 'Attach chat to an existing Inkwell session id')
       .option(
         '--max-context-tokens <n>',
         'Approximate context budget for transcript (default: backend window policy, currently 1,000,000)'

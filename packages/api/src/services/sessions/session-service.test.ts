@@ -663,10 +663,10 @@ describe('SessionService', () => {
       vi.mocked(mockClaudeRunner.run).mockResolvedValue(
         createMockClaudeResult({
           toolCalls: [
-            { toolUseId: 'tu-1', toolName: 'mcp__inkstand__recall', input: { query: 'emails' } },
+            { toolUseId: 'tu-1', toolName: 'mcp__inkwell__recall', input: { query: 'emails' } },
             {
               toolUseId: 'tu-2',
-              toolName: 'mcp__inkstand__send_response',
+              toolName: 'mcp__inkwell__send_response',
               input: { content: 'Here are your emails' },
             },
           ],
@@ -687,16 +687,16 @@ describe('SessionService', () => {
       expect(mockActivityStream.logActivity).toHaveBeenCalledWith(
         expect.objectContaining({
           type: 'tool_call',
-          subtype: 'mcp__inkstand__recall',
-          content: 'mcp__inkstand__recall(query)',
+          subtype: 'mcp__inkwell__recall',
+          content: 'mcp__inkwell__recall(query)',
           sessionId: 'session-123',
         })
       );
       expect(mockActivityStream.logActivity).toHaveBeenCalledWith(
         expect.objectContaining({
           type: 'tool_call',
-          subtype: 'mcp__inkstand__send_response',
-          content: 'mcp__inkstand__send_response(content)',
+          subtype: 'mcp__inkwell__send_response',
+          content: 'mcp__inkwell__send_response(content)',
         })
       );
     });
@@ -729,7 +729,7 @@ describe('SessionService', () => {
       const largeInput = { data: 'x'.repeat(15_000) };
       vi.mocked(mockClaudeRunner.run).mockResolvedValue(
         createMockClaudeResult({
-          toolCalls: [{ toolUseId: 'tu-1', toolName: 'mcp__inkstand__remember', input: largeInput }],
+          toolCalls: [{ toolUseId: 'tu-1', toolName: 'mcp__inkwell__remember', input: largeInput }],
         })
       );
 
@@ -759,7 +759,7 @@ describe('SessionService', () => {
       vi.mocked(mockClaudeRunner.run).mockResolvedValue(
         createMockClaudeResult({
           toolCalls: [
-            { toolUseId: 'tu-1', toolName: 'mcp__inkstand__recall', input: { query: 'test' } },
+            { toolUseId: 'tu-1', toolName: 'mcp__inkwell__recall', input: { query: 'test' } },
           ],
         })
       );

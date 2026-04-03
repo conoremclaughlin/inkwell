@@ -26,7 +26,7 @@ import type {
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
-import { buildSessionEnv } from '@inkstand/shared';
+import { buildSessionEnv } from '@inkwell/shared';
 
 /** Maximum time (ms) to wait for a Gemini CLI subprocess before killing it.
  *  Override with GEMINI_PROCESS_TIMEOUT_MS env var. */
@@ -86,9 +86,9 @@ export class GeminiRunner implements IRunner {
       }
 
       // Ensure PCP server has auth + session headers
-      const pcpConfig = (mcpServers.inkstand || {}) as Record<string, unknown>;
+      const pcpConfig = (mcpServers.inkwell || {}) as Record<string, unknown>;
       const existingHeaders = (pcpConfig.headers || {}) as Record<string, string>;
-      mcpServers.inkstand = {
+      mcpServers.inkwell = {
         ...pcpConfig,
         type: pcpConfig.type || 'http',
         url: pcpConfig.url || 'http://localhost:3001/mcp',
@@ -491,7 +491,7 @@ export class GeminiRunner implements IRunner {
             input: input as Record<string, unknown>,
           });
 
-          if (name === 'mcp__inkstand__send_response') {
+          if (name === 'mcp__inkwell__send_response') {
             const typedInput = input as Record<string, unknown>;
             const channel = (typedInput.channel as ChannelType) || 'telegram';
             const conversationId = typedInput.conversationId as string | undefined;

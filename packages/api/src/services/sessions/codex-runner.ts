@@ -22,7 +22,7 @@ import type {
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
-import { buildSessionEnv, writeRuntimeSessionHint } from '@inkstand/shared';
+import { buildSessionEnv, writeRuntimeSessionHint } from '@inkwell/shared';
 
 /** Maximum time (ms) to wait for a Codex CLI subprocess before killing it.
  *  Override with CODEX_PROCESS_TIMEOUT_MS env var. */
@@ -126,16 +126,25 @@ export class CodexRunner implements IRunner {
     args.push('-c', `model_instructions_file=${promptPath}`);
 
     // Ink session headers — Codex resolves env var names to values at runtime.
-    // Use 'pcp' as the server key — Codex config.toml defines the server under
-    // mcp_servers.pcp (with url/transport). Creating mcp_servers.inkstand via -c
-    // flags without a url/transport causes Codex to reject it as "invalid transport".
-    // The server key in config.toml is independent of the product name.
-    const codexServerKey = 'pcp';
-    args.push('-c', `mcp_servers.${codexServerKey}.env_http_headers.x-ink-context="INK_CONTEXT_TOKEN"`);
+    // The server key must match what's in .codex/config.toml (mcp_servers.inkwell).
+    const codexServerKey = 'inkwell';
+    args.push(
+      '-c',
+      `mcp_servers.${codexServerKey}.env_http_headers.x-ink-context="INK_CONTEXT_TOKEN"`
+    );
     args.push('-c', `mcp_servers.${codexServerKey}.env_http_headers.x-ink-agent-id="AGENT_ID"`);
-    args.push('-c', `mcp_servers.${codexServerKey}.env_http_headers.x-ink-session-id="INK_SESSION_ID"`);
-    args.push('-c', `mcp_servers.${codexServerKey}.env_http_headers.x-ink-studio-id="INK_STUDIO_ID"`);
-    args.push('-c', `mcp_servers.${codexServerKey}.env_http_headers.Authorization="INK_AUTH_BEARER"`);
+    args.push(
+      '-c',
+      `mcp_servers.${codexServerKey}.env_http_headers.x-ink-session-id="INK_SESSION_ID"`
+    );
+    args.push(
+      '-c',
+      `mcp_servers.${codexServerKey}.env_http_headers.x-ink-studio-id="INK_STUDIO_ID"`
+    );
+    args.push(
+      '-c',
+      `mcp_servers.${codexServerKey}.env_http_headers.Authorization="INK_AUTH_BEARER"`
+    );
 
     if (config.model) {
       args.push('-m', config.model);
@@ -569,7 +578,7 @@ export class CodexRunner implements IRunner {
             input: input as Record<string, unknown>,
           });
 
-          if (name === 'mcp__inkstand__send_response') {
+          if (name === 'mcp__inkwell__send_response') {
             const channel = (input as Record<string, unknown>).channel as ChannelType | undefined;
             const conversationId = (input as Record<string, unknown>).conversationId as
               | string

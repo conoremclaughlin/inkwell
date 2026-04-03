@@ -1,7 +1,7 @@
 {
-  "name": "create-inkstand",
+  "name": "create-inkwell",
   "version": "0.1.0",
-  "description": "Set up Inkstand — AI beings with identity, memory, and coordination",
+  "description": "Set up Inkwell — AI beings with identity, memory, and coordination",
   "license": "MIT",
   "type": "module",
   "bin": "./dist/index.js",
@@ -30,11 +30,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/conoremclaughlin/inkstand.git",
+    "url": "https://github.com/conoremclaughlin/inkwell.git",
     "directory": "packages/create-pcp"
   },
   "keywords": [
-    "inkstand",
+    "inkwell",
     "ai-agents",
     "create",
     "scaffolder",

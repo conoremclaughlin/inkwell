@@ -1,10 +1,10 @@
 services:
-  inkstand-app:
+  inkwell-app:
     build:
       context: .
       dockerfile: Dockerfile.app
-    image: inkstand:app
-    container_name: inkstand-app
+    image: inkwell:app
+    container_name: inkwell-app
     restart: unless-stopped
     environment:
       NODE_ENV: ${NODE_ENV:-production}

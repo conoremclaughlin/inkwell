@@ -106,7 +106,7 @@ fi
   NODE_ENV="production" \
   WEB_PORT="${WEB_PORT}" \
   API_URL="${API_URL}" \
-  yarn --cwd "${ROOT_DIR}" workspace @inkstand/web start
+  yarn --cwd "${ROOT_DIR}" workspace @inkwell/web start
 ) &
 WEB_PID=$!
 

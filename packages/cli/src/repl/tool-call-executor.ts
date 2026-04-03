@@ -82,7 +82,7 @@ async function executeOneToolCall(
   }
 
   // 1. Check policy — strip MCP namespace prefix for policy lookup
-  const policyToolName = call.tool.replace(/^mcp__inkstand__/, '');
+  const policyToolName = call.tool.replace(/^mcp__inkwell__/, '');
   const decision = policy.canCallPcpTool(policyToolName, sessionId);
 
   if (decision.allowed) {

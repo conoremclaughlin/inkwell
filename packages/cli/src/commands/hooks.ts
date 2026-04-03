@@ -1,12 +1,12 @@
 /**
  * Hooks Commands
  *
- * Bridge CLI coding agents (Claude Code, Codex, Gemini) with Inkstand's
+ * Bridge CLI coding agents (Claude Code, Codex, Gemini) with Inkwell's
  * session/memory/inbox system via lifecycle hooks.
  *
  * Commands:
- *   hooks install     Install Inkstand hooks into the detected backend
- *   hooks uninstall   Remove Inkstand-managed hooks
+ *   hooks install     Install Inkwell hooks into the detected backend
+ *   hooks uninstall   Remove Inkwell-managed hooks
  *   hooks status      Show installed hook status
  *   hooks pre-compact         Hook: pre-compaction reminder
  *   hooks post-compact        Hook: post-compaction bootstrap
@@ -45,10 +45,7 @@ const HOOK_LOG_DIR = join(homedir(), '.ink', 'logs');
 const HOOK_LOG_FILE = join(HOOK_LOG_DIR, 'hooks.log');
 let hookLogDirCreated = false;
 
-function hookLog(
-  event: string,
-  data?: Record<string, unknown>
-): void {
+function hookLog(event: string, data?: Record<string, unknown>): void {
   try {
     if (!hookLogDirCreated) {
       mkdirSync(HOOK_LOG_DIR, { recursive: true });
@@ -233,7 +230,7 @@ async function readStdin(): Promise<Record<string, unknown>> {
 }
 
 // ============================================================================
-// Inkstand Client Helper
+// Inkwell Client Helper
 // ============================================================================
 
 function getPcpConfig(): PcpConfig | null {
@@ -266,7 +263,7 @@ export async function callPcpTool(
       ? args.agentId.trim().toLowerCase()
       : null;
 
-  // Propagate Inkstand session/studio IDs so the server can resolve studio scope and
+  // Propagate Inkwell session/studio IDs so the server can resolve studio scope and
   // attribute tool calls to the correct session context.
   const pcpSessionId = process.env.INK_SESSION_ID?.trim() || undefined;
   const pcpStudioId = process.env.INK_STUDIO_ID?.trim() || undefined;
@@ -340,7 +337,7 @@ export async function callPcpTool(
     if (hasInjectedEnvToken) {
       console.error(
         chalk.yellow(
-          '⚠ Inkstand hook auth token was rejected; retrying with local ~/.ink/auth.json token fallback.'
+          '⚠ Inkwell hook auth token was rejected; retrying with local ~/.ink/auth.json token fallback.'
         )
       );
     }
@@ -352,7 +349,7 @@ export async function callPcpTool(
   }
 
   if (!response.ok) {
-    throw new Error(`Inkstand call failed (${response.status}): ${await response.text()}`);
+    throw new Error(`Inkwell call failed (${response.status}): ${await response.text()}`);
   }
 
   // The MCP server uses Streamable HTTP transport, which may respond with
@@ -370,7 +367,7 @@ export async function callPcpTool(
       .map((line) => line.slice(6));
     const lastData = dataLines[dataLines.length - 1];
     if (!lastData) {
-      throw new Error('Inkstand SSE response contained no data lines');
+      throw new Error('Inkwell SSE response contained no data lines');
     }
     payload = JSON.parse(lastData) as Record<string, unknown>;
   } else {
@@ -380,7 +377,7 @@ export async function callPcpTool(
   // JSON-RPC error
   if (payload.error) {
     const err = payload.error as { message?: string; code?: number };
-    throw new Error(`Inkstand tool error (${err.code}): ${err.message}`);
+    throw new Error(`Inkwell tool error (${err.code}): ${err.message}`);
   }
 
   // Unwrap JSON-RPC result → MCP tool response → content text
@@ -408,7 +405,7 @@ export async function callPcpTool(
       }
     }
 
-    throw new Error(`Inkstand tool error: ${message}`);
+    throw new Error(`Inkwell tool error: ${message}`);
   }
 
   const mcpText = result?.content?.[0]?.text;
@@ -1022,7 +1019,7 @@ function resolveSbBinaryPath(cwd: string): string {
   return 'ink';
 }
 
-/** Check if a hook command is Inkstand-managed (handles both bare `ink` and absolute paths) */
+/** Check if a hook command is Inkwell-managed (handles both bare `ink` and absolute paths) */
 function isPcpHookCommand(cmd: string | undefined): boolean {
   if (!cmd) return false;
   return (
@@ -1106,7 +1103,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
   };
 }
 
-/** Check if existing Claude Code hooks already match the Inkstand hooks we'd write */
+/** Check if existing Claude Code hooks already match the Inkwell hooks we'd write */
 function claudeCodeHooksMatch(existing: Record<string, unknown>, cwd: string): boolean {
   const sbPath = resolveSbBinaryPath(cwd);
   const target = buildClaudeCodeHooks(sbPath);
@@ -1132,12 +1129,12 @@ function installClaudeCode(cwd: string, force: boolean): InstallResult {
   // Check for existing hooks
   const existingHooks = existing.hooks as Record<string, unknown> | undefined;
   if (existingHooks && !force) {
-    // Check if Inkstand hooks already match exactly
+    // Check if Inkwell hooks already match exactly
     if (claudeCodeHooksMatch(existing, cwd)) {
       return 'already-installed';
     }
 
-    // Check if any non-Inkstand hooks exist
+    // Check if any non-Inkwell hooks exist
     const hasNonPcpHooks = Object.entries(existingHooks).some(([, entries]) => {
       if (!Array.isArray(entries)) return false;
       return entries.some((entry: Record<string, unknown>) => {
@@ -1255,7 +1252,7 @@ function installGemini(cwd: string, force: boolean): InstallResult {
       return 'already-installed';
     }
 
-    // Check for any non-Inkstand hooks in these specific events
+    // Check for any non-Inkwell hooks in these specific events
     const hasConflict = Object.keys(pcpHooks).some((event) => {
       const entries = hooksObj[event];
       if (!Array.isArray(entries)) return false;
@@ -1297,7 +1294,7 @@ function installCodex(cwd: string, force: boolean): InstallResult {
     return 'conflict';
   }
 
-  // Remove existing Inkstand-managed hooks section if present
+  // Remove existing Inkwell-managed hooks section if present
   const cleaned = removePcpTomlSection(existingContent);
 
   const sbPath = resolveSbBinaryPath(cwd);
@@ -1417,7 +1414,7 @@ async function installCommand(options: {
     const worktrees = listWorktreePaths(cwd);
     console.log(
       chalk.bold(
-        `\nInstalling Inkstand hooks across ${worktrees.length} worktree(s) for ${backends
+        `\nInstalling Inkwell hooks across ${worktrees.length} worktree(s) for ${backends
           .map((backend) => backend.name)
           .join(', ')}:\n`
       )
@@ -1454,7 +1451,9 @@ async function installCommand(options: {
     });
 
     if (result === 'already-installed') {
-      console.log(chalk.green(`\nInkstand hooks already installed and up to date (${backend.name}).`));
+      console.log(
+        chalk.green(`\nInkwell hooks already installed and up to date (${backend.name}).`)
+      );
       console.log(chalk.dim(`Config: ${backend.configPath}`));
       continue;
     }
@@ -1463,13 +1462,13 @@ async function installCommand(options: {
       hasConflict = true;
       console.error(
         chalk.yellow(
-          `\nExisting non-Inkstand hooks detected (${backend.name}). Use --force to overwrite.`
+          `\nExisting non-Inkwell hooks detected (${backend.name}). Use --force to overwrite.`
         )
       );
       continue;
     }
 
-    console.log(chalk.green(`\nInkstand hooks installed (${backend.name}):`));
+    console.log(chalk.green(`\nInkwell hooks installed (${backend.name}):`));
     const events = backend.events;
     if (events.preCompact)
       console.log(
@@ -1532,7 +1531,7 @@ async function uninstallCommand(options: { backend?: string; all?: boolean }): P
 
   if (options.all) {
     const worktrees = listWorktreePaths(cwd);
-    console.log(chalk.bold(`\nRemoving Inkstand hooks across ${worktrees.length} worktree(s):\n`));
+    console.log(chalk.bold(`\nRemoving Inkwell hooks across ${worktrees.length} worktree(s):\n`));
 
     for (const wt of worktrees) {
       const backend = options.backend ? getBackendByName(options.backend) : detectBackend(wt);
@@ -1558,9 +1557,9 @@ async function uninstallCommand(options: { backend?: string; all?: boolean }): P
 
   const removed = uninstallFromDir(cwd, options.backend);
   if (removed) {
-    console.log(chalk.green(`Inkstand hooks removed from ${backend.configPath}`));
+    console.log(chalk.green(`Inkwell hooks removed from ${backend.configPath}`));
   } else {
-    console.log(chalk.yellow('No Inkstand hooks found to remove.'));
+    console.log(chalk.yellow('No Inkwell hooks found to remove.'));
   }
 }
 
@@ -1623,7 +1622,7 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
         const content = readFileSync(configPath, 'utf-8');
         if (hasCodexPcpHooks(content)) {
           hasHooks = true;
-          console.log(chalk.green('\n  Inkstand hooks installed (TOML)'));
+          console.log(chalk.green('\n  Inkwell hooks installed (TOML)'));
           const sessionStart = content.match(/session_start\s*=\s*"([^"]+)"/)?.[1];
           const sessionEnd = content.match(/session_end\s*=\s*"([^"]+)"/)?.[1];
           const userPrompt = content.match(/user_prompt\s*=\s*"([^"]+)"/)?.[1];
@@ -1706,7 +1705,7 @@ async function postCompactHandler(): Promise<void> {
     );
   } catch {
     identityBlock =
-      '*FAILED: Could not reach Inkstand server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
+      '*FAILED: Could not reach Inkwell server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
   }
 
   // Check inbox
@@ -1719,7 +1718,7 @@ async function postCompactHandler(): Promise<void> {
     writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
   } catch {
     inboxBlock =
-      '*FAILED: Could not reach Inkstand server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
+      '*FAILED: Could not reach Inkwell server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
   }
 
   // Load available skills
@@ -1806,7 +1805,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     );
   } catch {
     identityBlock =
-      '*FAILED: Could not reach Inkstand server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
+      '*FAILED: Could not reach Inkwell server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
   }
 
   // Auto-register CLI-created studio in the cloud if not yet tracked
@@ -1858,7 +1857,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
   } catch {
     inboxBlock =
-      '*FAILED: Could not reach Inkstand server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
+      '*FAILED: Could not reach Inkwell server for `get_inbox`. You should call the `get_inbox` MCP tool manually to check for messages.*';
   }
 
   // Load available skills (guide content included inline)
@@ -1871,7 +1870,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     // Non-fatal: skills are a nice-to-have at session start
   }
 
-  // Register Inkstand session with detected backend
+  // Register Inkwell session with detected backend
   const detectedBackend = resolveLifecycleBackend(cwd, options?.backend);
   const sessionBackend = normalizeSessionBackend(detectedBackend.name);
   let pcpSessionId: string | undefined;
@@ -1939,7 +1938,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
 
   // Build session identity block so the agent always has its own IDs in context
   const sessionIdentityParts: string[] = [];
-  if (pcpSessionId) sessionIdentityParts.push(`Inkstand Session: \`${pcpSessionId}\``);
+  if (pcpSessionId) sessionIdentityParts.push(`Inkwell Session: \`${pcpSessionId}\``);
   if (backendSessionId) sessionIdentityParts.push(`Backend Session: \`${backendSessionId}\``);
   if (studioId) {
     const studioLabel = studioName ? `${studioId} (${studioName})` : studioId;
@@ -2211,11 +2210,11 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
 export function registerHooksCommands(program: Command): void {
   const hooks = program
     .command('hooks')
-    .description('Manage CLI lifecycle hooks for Inkstand integration');
+    .description('Manage CLI lifecycle hooks for Inkwell integration');
 
   hooks
     .command('install')
-    .description('Install Inkstand hooks into the detected backend config')
+    .description('Install Inkwell hooks into the detected backend config')
     .option('-b, --backend <name>', 'Backend to target (claude-code, codex, gemini)')
     .option('--local', 'Write to local config (default for Claude Code)', true)
     .option('-f, --force', 'Overwrite existing hooks')
@@ -2224,7 +2223,7 @@ export function registerHooksCommands(program: Command): void {
 
   hooks
     .command('uninstall')
-    .description('Remove Inkstand-managed hooks from backend config')
+    .description('Remove Inkwell-managed hooks from backend config')
     .option('-b, --backend <name>', 'Backend to target')
     .option('-a, --all', 'Uninstall from all git worktrees')
     .action(uninstallCommand);

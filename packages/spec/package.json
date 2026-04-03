@@ -1,7 +1,7 @@
 {
-  "name": "@inkstand/spec",
+  "name": "@inkwell/spec",
   "version": "0.1.0",
   "private": true,
-  "description": "Inkstand Protocol Specification",
+  "description": "Inkwell Protocol Specification",
   "license": "MIT"
 }
