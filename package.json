@@ -80,6 +80,9 @@
   "resolutions": {
     "libsignal": "npm:2.0.1",
     "minimatch@9.0.3": "9.0.7",
-    "undici": "6.24.0"
+    "undici": "6.24.0",
+    "lodash": "4.18.0",
+    "brace-expansion": "1.1.13",
+    "@slack/bolt/path-to-regexp": "8.4.0"
   }
 }
