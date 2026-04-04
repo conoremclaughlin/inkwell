@@ -279,7 +279,7 @@ describe('installHooks: Codex', () => {
       join(configDir, 'config.toml'),
       [
         '# ink-managed:start mcp_servers',
-        '[mcp_servers.pcp]',
+        '[mcp_servers.inkwell]',
         'url = "http://localhost:3001/mcp"',
         '# ink-managed:end mcp_servers',
         '',
@@ -308,13 +308,13 @@ describe('installHooks: Codex', () => {
     mkdirSync(configDir, { recursive: true });
     writeFileSync(
       join(configDir, 'config.toml'),
-      '[mcp_servers.pcp]\nurl = "http://localhost:3001/mcp"\n'
+      '[mcp_servers.inkwell]\nurl = "http://localhost:3001/mcp"\n'
     );
 
     installHooks(TEST_DIR, { backend: 'codex' });
 
     const content = readFileSync(join(configDir, 'config.toml'), 'utf-8');
-    expect(content).toContain('[mcp_servers.pcp]');
+    expect(content).toContain('[mcp_servers.inkwell]');
     expect(content).toContain('# ink-managed:hooks:start');
   });
 
