@@ -107,6 +107,6 @@ if [[ -z "${SUPABASE_URL}" || -z "${SUPABASE_SECRET_KEY}" || -z "${JWT_SECRET}" 
 fi
 
 echo "[integration-db] Running API DB integration suite against ${SUPABASE_URL}"
-yarn --cwd "${ROOT_DIR}" workspace @inkwell/api test:integration:db
+yarn --cwd "${ROOT_DIR}" workspace @inklabs/api test:integration:db
 
 echo "[integration-db] ✅ Integration DB tests passed."

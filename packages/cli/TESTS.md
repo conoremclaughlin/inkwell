@@ -25,7 +25,7 @@ When touching session resolution logic, run this loop before opening/updating a 
 1. Build CLI:
 
 ```bash
-yarn workspace @inkwell/cli build
+yarn workspace @inklabs/cli build
 ```
 
 2. Validate **path scoping** across at least 2 repos/worktrees:
@@ -56,12 +56,12 @@ sb-alpha -a aster -b gemini --session-candidates-json --sb-debug
 At minimum:
 
 ```bash
-yarn workspace @inkwell/cli type-check
-yarn workspace @inkwell/cli test -- src/cli.test.ts
-yarn workspace @inkwell/cli test -- src/commands/claude.test.ts
-yarn workspace @inkwell/cli test -- src/commands/claude.integration.test.ts
-yarn workspace @inkwell/cli test -- src/commands/hooks.test.ts
-yarn workspace @inkwell/cli test -- src/lib/pcp-mcp.test.ts
+yarn workspace @inklabs/cli type-check
+yarn workspace @inklabs/cli test -- src/cli.test.ts
+yarn workspace @inklabs/cli test -- src/commands/claude.test.ts
+yarn workspace @inklabs/cli test -- src/commands/claude.integration.test.ts
+yarn workspace @inklabs/cli test -- src/commands/hooks.test.ts
+yarn workspace @inklabs/cli test -- src/lib/pcp-mcp.test.ts
 ```
 
 ## Optional local smoke tests (not CI)
@@ -70,7 +70,7 @@ For real-backend validation of `sb chat` local tool routing (`ink-tool` → sb r
 run:
 
 ```bash
-yarn workspace @inkwell/cli test:smoke:live
+yarn workspace @inklabs/cli test:smoke:live
 ```
 
 The smoke runner:
@@ -85,7 +85,7 @@ Environment overrides:
 SB_SMOKE_AGENT=lumen \
 SB_SMOKE_BACKENDS="claude codex gemini" \
 INK_SERVER_URL=http://localhost:3101 \
-yarn workspace @inkwell/cli test:smoke:live
+yarn workspace @inklabs/cli test:smoke:live
 ```
 
 ## Logging

@@ -68,7 +68,7 @@ echo "  API_URL=${API_URL}"
   ENABLE_TELEGRAM="${ENABLE_TELEGRAM}" \
   ENABLE_WHATSAPP="${ENABLE_WHATSAPP:-false}" \
   ENABLE_DISCORD="${ENABLE_DISCORD:-false}" \
-  yarn --cwd "${ROOT_DIR}" workspace @inkwell/api server:dev
+  yarn --cwd "${ROOT_DIR}" workspace @inklabs/api server:dev
 ) &
 API_PID=$!
 
@@ -100,7 +100,7 @@ wait_for_api
 
 (
   API_URL="${API_URL}" \
-  yarn --cwd "${ROOT_DIR}" workspace @inkwell/web exec next dev -p "${WEB_PORT}"
+  yarn --cwd "${ROOT_DIR}" workspace @inklabs/web exec next dev -p "${WEB_PORT}"
 ) &
 WEB_PID=$!
 

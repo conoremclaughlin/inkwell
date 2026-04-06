@@ -41,7 +41,7 @@ $ ink studio list
 ### Quick start (recommended)
 
 ```bash
-npx create-inkwell my-project
+npx @inklabs/create-inkwell my-project
 ```
 
 This walks you through everything: Supabase setup (local or remote), server start, CLI install, auth, and first SB onboarding. Follow the prompts and you'll have a running Inkwell instance in minutes.
