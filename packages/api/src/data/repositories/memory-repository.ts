@@ -1269,6 +1269,7 @@ export class MemoryRepository {
       offset?: number;
       agentId?: string;
       studioId?: string;
+      filterNullStudio?: boolean;
     } = {}
   ): Promise<Session[]> {
     let query = this.supabase
@@ -1281,9 +1282,10 @@ export class MemoryRepository {
       query = query.eq('agent_id', options.agentId);
     }
 
-    const scopedStudioId = options.studioId;
-    if (scopedStudioId) {
-      query = query.eq('studio_id', scopedStudioId);
+    if (options.filterNullStudio) {
+      query = query.is('studio_id', null);
+    } else if (options.studioId) {
+      query = query.eq('studio_id', options.studioId);
     }
 
     const limit = options.limit || 20;

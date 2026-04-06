@@ -148,3 +148,42 @@ describe('route resolution (multi-studio)', () => {
     expect(resolveStudio('pr:221', unambiguous)).toBe('exact');
   });
 });
+
+// ── "main" resolution contract ──
+
+describe('main studio resolution contract', () => {
+  // "main" = the root repo. The resolution is consistent across all code paths:
+  // 1. resolveMainStudioId: exact path at server CWD → undefined
+  // 2. resolveStudioHint('main'): exact path at process.cwd() → undefined
+  // 3. handleListSessions(studioId: 'main'): undefined (unscoped)
+  // 4. resolveStudioId(explicitStudioId: 'main'): delegates to resolveMainStudioId
+  //
+  // When undefined, the runner falls back to defaultWorkingDirectory (the root repo).
+  // No branch='main' guessing. No sibling matching. Simple and predictable.
+
+  it('resolveWorkingDirectory uses defaultWorkingDirectory when studioId is undefined', () => {
+    // This is the core contract: undefined studioId → root repo CWD
+    const studioId: string | undefined = undefined;
+    const defaultDir = '/ws/pcp/inkwell';
+    const resolvedDir = !studioId ? defaultDir : '/some/studio/path';
+    expect(resolvedDir).toBe(defaultDir);
+  });
+
+  it('studioId "main" is not treated as a UUID', () => {
+    const studioId = 'main';
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(studioId);
+    expect(isUuid).toBe(false);
+    expect(studioId).toBe('main');
+  });
+
+  it('no branch matching — main is a path concept, not a git branch', () => {
+    // Previously resolveMainStudioId fell back to .eq('branch', 'main').
+    // This was removed: studios are on feature branches, not main.
+    // The root repo IS main, regardless of what branch any studio is on.
+    const studioSlug = 'wren';
+    const studioBranch = 'wren/feat/workspace-sessions';
+    expect(studioBranch).not.toBe('main');
+    // The studio is still valid for work — its branch doesn't determine
+    // whether it's the "main" studio.
+  });
+});

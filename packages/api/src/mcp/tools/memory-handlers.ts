@@ -1101,19 +1101,11 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
   // 'main' means sessions without a studio (repo root) — resolve to the main
   // studio UUID if one exists, otherwise filter for null studioId
   let studioId: string | undefined;
+  let filterNullStudio = false;
   if (isMainScope) {
-    // Resolve 'main' using branch matching (mirrors SessionService.resolveMainStudioId)
-    const supabase = dataComposer.getClient();
-    const { data: mainStudio } = await supabase
-      .from('studios')
-      .select('id')
-      .eq('user_id', user.id)
-      .eq('branch', 'main')
-      .in('status', ['active', 'idle', 'archived'])
-      .order('updated_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    studioId = mainStudio?.id || undefined;
+    // 'main' = the root repo. Sessions from the root repo have no studio_id.
+    // Filter for studio_id IS NULL to show only root-repo sessions.
+    filterNullStudio = true;
   } else {
     studioId = rawStudioId;
   }
@@ -1121,6 +1113,7 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
   const sessions = await dataComposer.repositories.memory.listSessions(user.id, {
     agentId: params.agentId,
     studioId,
+    filterNullStudio,
     limit: params.limit,
   });
 
