@@ -3115,7 +3115,7 @@ async function ensurePcpSessionContext(
       const backendLabel = backend[0].toUpperCase() + backend.slice(1);
       const ownerLabel = session.agentId || null;
       const showOwner = Boolean(ownerLabel && ownerLabel !== agentId);
-      const sourceLabel = showOwner ? `Inkwell/${ownerLabel}` : 'Inkwell';
+      const sourceLabel = showOwner ? `Ink/${ownerLabel}` : 'Ink';
       const preview = pcpPreviewBySessionId.get(session.id);
       const phaseLabel = getSessionPhaseLabel(session);
       const pickerPreview = linkedPreviewWithSize || preview || session.context || undefined;
