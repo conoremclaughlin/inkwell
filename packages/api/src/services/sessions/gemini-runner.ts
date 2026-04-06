@@ -218,6 +218,7 @@ export class GeminiRunner implements IRunner {
             accessToken: config.pcpAccessToken,
             agentId: config.agentId,
             runtime: 'gemini',
+            repoRoot: config.repoRoot,
           }),
         },
         stdio: ['ignore', 'pipe', 'pipe'],

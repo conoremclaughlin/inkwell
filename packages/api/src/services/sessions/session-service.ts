@@ -230,6 +230,7 @@ export class SessionService implements ISessionService {
         studioHint: metadata?.studioHint,
         recipientSessionId: metadata?.recipientSessionId,
         contactId: metadata?.contactId,
+        repoRoot: metadata?.repoRoot,
       });
 
       // 2. Build lock key - must be per agent + session to support sub-agents
@@ -425,6 +426,8 @@ export class SessionService implements ISessionService {
       agentId,
       ...(session.studioId ? { studioId: session.studioId } : {}),
       ...(sandboxBypass ? { sandboxBypass: true } : {}),
+      // Propagate repo root so spawned backend's context token carries it
+      repoRoot: resolvedWorkingDirectory.replace(/--[^/]+$/, ''),
     };
 
     // 5. Run with selected backend
@@ -646,6 +649,7 @@ export class SessionService implements ISessionService {
       studioHint?: string;
       recipientSessionId?: string;
       contactId?: string;
+      repoRoot?: string;
     }
   ): Promise<Session> {
     const type = options?.type || 'primary';
@@ -656,6 +660,7 @@ export class SessionService implements ISessionService {
       explicitStudioId: options?.studioId,
       studioHint: options?.studioHint,
       recipientSessionId: options?.recipientSessionId,
+      repoRoot: options?.repoRoot,
       backend,
     });
 
@@ -796,12 +801,13 @@ export class SessionService implements ISessionService {
       studioHint?: string;
       recipientSessionId?: string;
       backend?: string;
+      repoRoot?: string;
     }
   ): Promise<string | undefined> {
     if (options.explicitStudioId) {
       // 'main' is a reserved convention — resolve it the same way studioHint does
       if (options.explicitStudioId === 'main') {
-        const mainId = await this.resolveMainStudioId(userId);
+        const mainId = await this.resolveMainStudioId(userId, options.repoRoot);
         if (mainId) return mainId;
         logger.warn('[StudioResolve] explicitStudioId=main but no main studio found', {
           userId,
@@ -821,7 +827,7 @@ export class SessionService implements ISessionService {
     // Other hints resolve by matching the studio name for this user + agent.
     if (options.studioHint) {
       if (options.studioHint === 'main') {
-        const mainId = await this.resolveMainStudioId(userId);
+        const mainId = await this.resolveMainStudioId(userId, options.repoRoot);
         if (mainId) return mainId;
         // studioHint was explicit — don't silently fall through to unrelated studios
         logger.warn('[StudioResolve] studioHint=main but no main studio found, skipping fallback', {
@@ -976,7 +982,7 @@ export class SessionService implements ISessionService {
     // inherit the bad studio. The studios table is the authoritative source.
 
     // 5) Shared per-user main studio fallback
-    const mainStudioId = await this.resolveMainStudioId(userId);
+    const mainStudioId = await this.resolveMainStudioId(userId, options.repoRoot);
     if (mainStudioId) return mainStudioId;
 
     // Codex is worktree-sensitive: keep a deterministic warning when no studio could be resolved.
@@ -994,24 +1000,28 @@ export class SessionService implements ISessionService {
     return undefined;
   }
 
-  private async resolveMainStudioId(userId: string): Promise<string | undefined> {
+  private async resolveMainStudioId(
+    userId: string,
+    repoRoot?: string
+  ): Promise<string | undefined> {
     if (!this.supabase) return undefined;
 
-    // "Main" = the root repo, not a worktree. If a studio exists at the
-    // server's CWD, use it. Otherwise return undefined — the runner falls
-    // back to defaultWorkingDirectory (the root repo), which is correct.
-    // TODO: for cross-project resolution (e.g., inkah vs inkwell), this
-    // needs a repo_root parameter. See task: repo_root column on studios.
-    const { data: exactMatch } = await this.supabase
+    // "Main" = the root repo. Find the most recently used studio whose
+    // repo_root matches the target project. Falls back to server CWD
+    // when no repoRoot is provided (e.g., from the context token).
+    const targetRoot = repoRoot || this.config.defaultWorkingDirectory;
+
+    const { data: match } = await this.supabase
       .from('studios')
-      .select('id')
+      .select('id, updated_at')
       .eq('user_id', userId)
-      .eq('worktree_path', this.config.defaultWorkingDirectory)
-      .neq('status', 'cleaned')
+      .eq('repo_root', targetRoot)
+      .in('status', ['active', 'idle', 'archived'])
+      .order('updated_at', { ascending: false })
       .limit(1)
       .maybeSingle();
 
-    return exactMatch?.id || undefined;
+    return match?.id || undefined;
   }
 
   private async resolveWorkingDirectory(
@@ -1158,6 +1168,7 @@ This session will continue with a fresh context after compaction. Your identity,
         ),
         ...(runtimeModel ? { model: runtimeModel } : {}),
         ...(compactionToken ? { pcpAccessToken: compactionToken } : {}),
+        repoRoot: compactionWorkingDirectory.replace(/--[^/]+$/, ''),
       };
 
       const runner =
@@ -1429,28 +1440,29 @@ This session will continue with a fresh context after compaction. Your identity,
  * Resolve a studio hint to a studioId. Shared by SessionService (private
  * resolveStudioId) and inbox-handlers (cross-studio self-messaging metadata).
  *
- * For 'main': check if a studio exists at the server CWD, otherwise undefined.
+ * For 'main': find the most recent studio in the target project via repo_root.
  * For named hints: slug match.
  */
 export async function resolveStudioHint(
   supabase: SupabaseClient<Database>,
   userId: string,
   hint: string,
-  agentId?: string
+  agentId?: string,
+  repoRoot?: string
 ): Promise<string | undefined> {
   if (hint === 'main') {
-    // "Main" = the root repo. Check for a studio at the server's CWD.
-    // If none exists, return undefined — the runner uses defaultWorkingDirectory.
-    // TODO: cross-project resolution needs repo_root on studios.
-    const { data: mainByPath } = await supabase
+    // "Main" = the root repo. Find the most recent studio in this project.
+    const targetRoot = repoRoot || process.cwd();
+    const { data: mainByRepo } = await supabase
       .from('studios')
-      .select('id')
+      .select('id, updated_at')
       .eq('user_id', userId)
-      .eq('worktree_path', process.cwd())
-      .neq('status', 'cleaned')
+      .eq('repo_root', targetRoot)
+      .in('status', ['active', 'idle', 'archived'])
+      .order('updated_at', { ascending: false })
       .limit(1)
       .maybeSingle();
-    return mainByPath?.id || undefined;
+    return mainByRepo?.id || undefined;
   }
 
   // Named hint: match by slug

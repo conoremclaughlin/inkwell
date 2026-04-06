@@ -201,6 +201,7 @@ export class CodexRunner implements IRunner {
             accessToken: config.pcpAccessToken,
             agentId: config.agentId,
             runtime: 'codex',
+            repoRoot: config.repoRoot,
           }),
         },
         stdio: ['ignore', 'pipe', 'pipe'],

@@ -51,6 +51,8 @@ export interface RequestContextData {
   cliAttached?: boolean;
   /** Backend runtime: 'claude' | 'codex' | 'gemini' */
   runtime?: string;
+  /** Root repo path for cross-project 'main' studio resolution */
+  repoRoot?: string;
 }
 
 const asyncLocalStorage = new AsyncLocalStorage<RequestContextData>();

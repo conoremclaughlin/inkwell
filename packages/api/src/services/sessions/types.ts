@@ -133,6 +133,8 @@ export interface SessionRequest {
     sessionType?: SessionType;
     taskDescription?: string;
     parentSessionId?: string;
+    // Root repo path for cross-project 'main' studio resolution
+    repoRoot?: string;
   };
 }
 
@@ -416,6 +418,8 @@ export interface ClaudeRunnerConfig {
   studioId?: string;
   /** When true, bypass sandbox restrictions (e.g., Codex --dangerously-bypass-approvals-and-sandbox). Opt-in per studio. */
   sandboxBypass?: boolean;
+  /** Root repo path — propagated via context token for cross-project 'main' resolution */
+  repoRoot?: string;
 }
 
 export interface RunnerResult {

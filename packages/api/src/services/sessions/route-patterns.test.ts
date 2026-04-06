@@ -152,38 +152,39 @@ describe('route resolution (multi-studio)', () => {
 // ── "main" resolution contract ──
 
 describe('main studio resolution contract', () => {
-  // "main" = the root repo. The resolution is consistent across all code paths:
-  // 1. resolveMainStudioId: exact path at server CWD → undefined
-  // 2. resolveStudioHint('main'): exact path at process.cwd() → undefined
-  // 3. handleListSessions(studioId: 'main'): undefined (unscoped)
+  // "main" = the root repo. Resolution uses repo_root column to find studios
+  // in the target project. All code paths are consistent:
+  // 1. resolveMainStudioId(userId, repoRoot): .eq('repo_root', repoRoot)
+  // 2. resolveStudioHint('main', repoRoot): same query
+  // 3. handleListSessions(studioId: 'main'): filters studio_id IS NULL
   // 4. resolveStudioId(explicitStudioId: 'main'): delegates to resolveMainStudioId
-  //
-  // When undefined, the runner falls back to defaultWorkingDirectory (the root repo).
-  // No branch='main' guessing. No sibling matching. Simple and predictable.
-
-  it('resolveWorkingDirectory uses defaultWorkingDirectory when studioId is undefined', () => {
-    // This is the core contract: undefined studioId → root repo CWD
-    const studioId: string | undefined = undefined;
-    const defaultDir = '/ws/pcp/inkwell';
-    const resolvedDir = !studioId ? defaultDir : '/some/studio/path';
-    expect(resolvedDir).toBe(defaultDir);
-  });
 
   it('studioId "main" is not treated as a UUID', () => {
     const studioId = 'main';
     const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(studioId);
     expect(isUuid).toBe(false);
-    expect(studioId).toBe('main');
   });
 
-  it('no branch matching — main is a path concept, not a git branch', () => {
-    // Previously resolveMainStudioId fell back to .eq('branch', 'main').
-    // This was removed: studios are on feature branches, not main.
-    // The root repo IS main, regardless of what branch any studio is on.
-    const studioSlug = 'wren';
-    const studioBranch = 'wren/feat/workspace-sessions';
-    expect(studioBranch).not.toBe('main');
-    // The studio is still valid for work — its branch doesn't determine
-    // whether it's the "main" studio.
+  it('repo_root distinguishes projects — not branch name', () => {
+    // Studios in different projects share the same agent but different repo_roots.
+    // "main" for inkwell != "main" for inkah.
+    const inkwellStudio = { repo_root: '/ws/pcp/inkwell', slug: 'wren' };
+    const inkahStudio = { repo_root: '/ws/inkah', slug: 'wren' };
+    expect(inkwellStudio.repo_root).not.toBe(inkahStudio.repo_root);
+    expect(inkwellStudio.slug).toBe(inkahStudio.slug); // same agent, different projects
+  });
+
+  it('repo_root is derived from worktree_path by stripping --<name>', () => {
+    // Convention: worktree_path = <repo_root>--<studio_slug>
+    const worktreePath = '/ws/pcp/inkwell--wren';
+    const repoRoot = worktreePath.replace(/--[^/]+$/, '');
+    expect(repoRoot).toBe('/ws/pcp/inkwell');
+  });
+
+  it('resolveWorkingDirectory uses defaultWorkingDirectory when studioId is undefined', () => {
+    const studioId: string | undefined = undefined;
+    const defaultDir = '/ws/pcp/inkwell';
+    const resolvedDir = !studioId ? defaultDir : '/some/studio/path';
+    expect(resolvedDir).toBe(defaultDir);
   });
 });

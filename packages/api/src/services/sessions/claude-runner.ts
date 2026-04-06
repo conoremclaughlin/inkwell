@@ -228,6 +228,7 @@ export class ClaudeRunner implements IRunner {
             accessToken: config.pcpAccessToken,
             agentId: config.agentId,
             runtime: 'claude',
+            repoRoot: config.repoRoot,
           }),
         },
         stdio: ['pipe', 'pipe', 'pipe'],

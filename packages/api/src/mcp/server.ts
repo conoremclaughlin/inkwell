@@ -307,6 +307,7 @@ export class MCPServer {
         ...(studioIdHeader ? { workspaceId: studioIdHeader } : {}),
         ...(contextToken?.cliAttached ? { cliAttached: true } : {}),
         ...(contextToken?.runtime ? { runtime: contextToken.runtime } : {}),
+        ...(contextToken?.repoRoot ? { repoRoot: contextToken.repoRoot } : {}),
       });
 
       // Resolve studioId from session when x-ink-session-id is provided

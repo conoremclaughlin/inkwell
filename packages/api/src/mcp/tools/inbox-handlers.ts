@@ -127,9 +127,7 @@ export function isThreadOwnedByStudio(
   if (!agentMessages.length) return true; // no messages from us — broadcast
 
   return agentMessages.some((m) => {
-    const pcp = (m.metadata as Record<string, unknown>)?.pcp as
-      | Record<string, unknown>
-      | undefined;
+    const pcp = (m.metadata as Record<string, unknown>)?.pcp as Record<string, unknown> | undefined;
     // Check sender studioId (standard ownership)
     const sender = pcp?.sender as Record<string, unknown> | undefined;
     if (sender?.studioId === callerStudioId) return true;
@@ -376,8 +374,13 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       try {
         // Reuse the shared resolution function (worktree path → branch fallback
         // for 'main', slug match for named hints).
+        const reqCtxForHint = getRequestContext();
         resolvedRecipientStudioId = await resolveStudioHint(
-          supabase, resolved.user.id, recipientStudioHint, senderAgentId
+          supabase,
+          resolved.user.id,
+          recipientStudioHint,
+          senderAgentId,
+          reqCtxForHint?.repoRoot
         );
       } catch {
         // Best-effort resolution — proceed without stamping
@@ -398,9 +401,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           sessionId: senderSessionId,
           studioId: senderStudioId,
         },
-        ...(selfStudioRecipient
-          ? { recipient: { studioId: resolvedRecipientStudioId } }
-          : {}),
+        ...(selfStudioRecipient ? { recipient: { studioId: resolvedRecipientStudioId } } : {}),
       },
     };
 

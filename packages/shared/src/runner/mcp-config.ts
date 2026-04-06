@@ -164,6 +164,7 @@ export interface PcpContextToken {
   agentId: string;
   cliAttached: boolean;
   runtime: string; // 'claude' | 'codex' | 'gemini'
+  repoRoot?: string; // root repo path for cross-project 'main' resolution
 }
 
 /**
@@ -208,6 +209,7 @@ export function buildSessionEnv(options: {
   agentId?: string;
   cliAttached?: boolean;
   runtime?: string;
+  repoRoot?: string;
 }): Record<string, string> {
   const env: Record<string, string> = {};
 
@@ -235,6 +237,7 @@ export function buildSessionEnv(options: {
       agentId: options.agentId,
       cliAttached: options.cliAttached || false,
       runtime: options.runtime || 'claude',
+      ...(options.repoRoot ? { repoRoot: options.repoRoot } : {}),
     });
   }
 
