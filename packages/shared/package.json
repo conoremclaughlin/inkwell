@@ -1,8 +1,10 @@
 {
-  "name": "@inkwell/shared",
-  "version": "1.0.0",
-  "private": true,
+  "name": "@inklabs/shared",
+  "version": "0.4.0",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "description": "Shared types and utilities for Inkwell",
   "main": "dist/cjs/index.js",
@@ -22,7 +24,7 @@
   "scripts": {
     "build": "tsc && tsc -p tsconfig.cjs.json && echo '{\"type\":\"commonjs\"}' > dist/cjs/package.json",
     "dev": "tsc --watch",
-    "test": "echo \"No tests for @inkwell/shared\"",
+    "test": "echo \"No tests for @inklabs/shared\"",
     "lint": "eslint src --ext .ts",
     "type-check": "tsc --noEmit",
     "clean": "rm -rf dist *.tsbuildinfo"

@@ -2,7 +2,7 @@ import { spawn } from 'child_process';
 import { homedir } from 'os';
 import { join } from 'path';
 import { existsSync, readFileSync } from 'fs';
-import { buildCleanEnv } from '@inkwell/shared';
+import { buildCleanEnv } from '@inklabs/shared';
 
 export type BackendAuthBackend = 'claude' | 'codex' | 'gemini';
 

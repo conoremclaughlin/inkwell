@@ -22,7 +22,7 @@ import {
 import { basename, dirname, join, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
 import { getBackend, resolveAgentId } from '../backends/index.js';
-import { classifyError } from '@inkwell/shared';
+import { classifyError } from '@inklabs/shared';
 import { getValidAccessToken } from '../auth/tokens.js';
 import { callPcpTool, getPcpServerUrl } from '../lib/pcp-mcp.js';
 import { sbDebugLog } from '../lib/sb-debug.js';

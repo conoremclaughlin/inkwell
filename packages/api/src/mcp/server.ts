@@ -291,9 +291,9 @@ export class MCPServer {
       // Parse consolidated context token first (Phase 1 — preferred source).
       // Falls back to individual headers for backward compat.
       const contextHeader = req.header('x-ink-context')?.trim();
-      let contextToken: import('@inkwell/shared').PcpContextToken | null = null;
+      let contextToken: import('@inklabs/shared').PcpContextToken | null = null;
       if (contextHeader) {
-        const { decodeContextToken } = await import('@inkwell/shared');
+        const { decodeContextToken } = await import('@inklabs/shared');
         contextToken = decodeContextToken(contextHeader);
       }
 

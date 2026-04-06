@@ -257,7 +257,7 @@ async function backfillCommand(options: BackfillOptions): Promise<void> {
   const logFile = options.logFile || buildDefaultJobLogPath('memory-backfill');
   console.log(chalk.dim(`Writing job log to ${logFile}`));
 
-  await runStreamingCommand('yarn', ['workspace', '@inkwell/api', 'backfill:memory-embeddings'], {
+  await runStreamingCommand('yarn', ['workspace', '@inklabs/api', 'backfill:memory-embeddings'], {
     cwd,
     env,
     logFile,

@@ -59,7 +59,7 @@ function resolveCliRoot(fsOps: Pick<DoctorFs, 'existsSync' | 'readFileSync'>): s
       if (fsOps.existsSync(pkgPath)) {
         try {
           const pkg = JSON.parse(fsOps.readFileSync(pkgPath, 'utf-8'));
-          if (pkg.name === '@inkwell/cli') return candidate;
+          if (pkg.name === '@inklabs/cli') return candidate;
         } catch {
           // continue walking
         }
@@ -68,7 +68,7 @@ function resolveCliRoot(fsOps: Pick<DoctorFs, 'existsSync' | 'readFileSync'>): s
     if (dir === root) break;
     dir = dirname(dir);
   }
-  throw new Error('Could not find @inkwell/cli package. Run from within the repo.');
+  throw new Error('Could not find @inklabs/cli package. Run from within the repo.');
 }
 
 function resolveDefaultCliName(fsOps: Pick<DoctorFs, 'existsSync' | 'readFileSync'>): string {
@@ -116,7 +116,7 @@ export function analyzeCliLink(
     checks.push({
       name: 'CLI root',
       status: 'warn',
-      detail: 'Could not resolve @inkwell/cli root from current directory.',
+      detail: 'Could not resolve @inklabs/cli root from current directory.',
     });
   }
 

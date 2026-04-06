@@ -44,7 +44,7 @@ import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gate
 import { resolveRouteAgentId } from './services/routing/resolve-route';
 import { resolveAgentFromMention } from './services/routing/resolve-mention';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
-import { classifyError } from '@inkwell/shared';
+import { classifyError } from '@inklabs/shared';
 import { logger } from './utils/logger';
 import { getUserFromContext } from './utils/request-context';
 import { env } from './config/env';

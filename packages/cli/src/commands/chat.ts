@@ -77,7 +77,7 @@ import {
   mintDelegationToken,
   verifyDelegationToken,
   type DelegationTokenPayload,
-} from '@inkwell/shared';
+} from '@inklabs/shared';
 
 type ChatOptions = {
   agent?: string;

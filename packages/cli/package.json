@@ -1,7 +1,10 @@
 {
-  "name": "@inkwell/cli",
-  "version": "0.2.0",
+  "name": "@inklabs/cli",
+  "version": "0.4.0",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Inkwell CLI - command-line interface",
   "type": "module",
   "main": "dist/index.js",
@@ -9,20 +12,20 @@
     "ink": "dist/cli.js"
   },
   "scripts": {
-    "build": "yarn workspace @inkwell/shared build && tsc && cp -r src/templates dist/templates && cp -r ../templates/studio-roles dist/templates/",
-    "dev": "sh -c 'yarn workspace @inkwell/shared run dev & SHARED_PID=$!; trap \"kill $SHARED_PID\" EXIT INT TERM; tsc --watch'",
-    "dev:relink-global": "echo '⚠️  This will overwrite the global ink symlink to point at THIS worktree.' && echo '   Press Ctrl+C to cancel, or wait 3s to continue...' && sleep 3 && yarn workspace @inkwell/shared build && tsc && cp -r src/templates dist/templates && cp -r ../templates/studio-roles dist/templates/ && chmod +x dist/cli.js && mkdir -p \"$HOME/.ink/bin\" \"$HOME/.local/bin\" && ln -sf \"$(pwd)/dist/cli.js\" \"$HOME/.ink/bin/ink\" && ln -sf \"$HOME/.ink/bin/ink\" \"$HOME/.local/bin/ink\" && echo \"✓ ink linked: $HOME/.ink/bin/ink (compat: $HOME/.local/bin/ink)\" && if ! printf '%s' \":$PATH:\" | grep -q \":$HOME/.ink/bin:\" && ! printf '%s' \":$PATH:\" | grep -q \":$HOME/.local/bin:\"; then echo \"⚠️  PATH warning: neither $HOME/.ink/bin nor $HOME/.local/bin is in PATH\"; echo \"   Add one of them in your shell profile so 'ink' resolves in new shells.\"; fi && sh -c 'yarn workspace @inkwell/shared run dev & SHARED_PID=$!; trap \"kill $SHARED_PID\" EXIT INT TERM; tsc --watch'",
-    "cli": "yarn workspace @inkwell/shared build && tsx src/cli.ts",
+    "build": "yarn workspace @inklabs/shared build && tsc && cp -r src/templates dist/templates && cp -r ../templates/studio-roles dist/templates/",
+    "dev": "sh -c 'yarn workspace @inklabs/shared run dev & SHARED_PID=$!; trap \"kill $SHARED_PID\" EXIT INT TERM; tsc --watch'",
+    "dev:relink-global": "echo '⚠️  This will overwrite the global ink symlink to point at THIS worktree.' && echo '   Press Ctrl+C to cancel, or wait 3s to continue...' && sleep 3 && yarn workspace @inklabs/shared build && tsc && cp -r src/templates dist/templates && cp -r ../templates/studio-roles dist/templates/ && chmod +x dist/cli.js && mkdir -p \"$HOME/.ink/bin\" \"$HOME/.local/bin\" && ln -sf \"$(pwd)/dist/cli.js\" \"$HOME/.ink/bin/ink\" && ln -sf \"$HOME/.ink/bin/ink\" \"$HOME/.local/bin/ink\" && echo \"✓ ink linked: $HOME/.ink/bin/ink (compat: $HOME/.local/bin/ink)\" && if ! printf '%s' \":$PATH:\" | grep -q \":$HOME/.ink/bin:\" && ! printf '%s' \":$PATH:\" | grep -q \":$HOME/.local/bin:\"; then echo \"⚠️  PATH warning: neither $HOME/.ink/bin nor $HOME/.local/bin is in PATH\"; echo \"   Add one of them in your shell profile so 'ink' resolves in new shells.\"; fi && sh -c 'yarn workspace @inklabs/shared run dev & SHARED_PID=$!; trap \"kill $SHARED_PID\" EXIT INT TERM; tsc --watch'",
+    "cli": "yarn workspace @inklabs/shared build && tsx src/cli.ts",
     "install:cli": "chmod +x dist/cli.js && mkdir -p \"$HOME/.ink/bin\" \"$HOME/.local/bin\" && ln -sf \"$(pwd)/dist/cli.js\" \"$HOME/.ink/bin/ink\" && ln -sf \"$HOME/.ink/bin/ink\" \"$HOME/.local/bin/ink\" && echo \"Linked: $HOME/.ink/bin/ink → dist/cli.js (compat: $HOME/.local/bin/ink)\" && node -e \"var p=process.env.PATH||'';if(!p.includes(process.env.HOME+'/.ink/bin')&&!p.includes(process.env.HOME+'/.local/bin')){console.log('\\u26a0\\ufe0f  PATH warning: neither ~/.ink/bin nor ~/.local/bin is in PATH');console.log('   Add one of them in your shell profile so ink resolves in new shells.')}\"",
     "uninstall:cli": "rm -f \"$HOME/.ink/bin/ink\" \"$HOME/.local/bin/ink\" && echo \"Unlinked: $HOME/.ink/bin/ink and $HOME/.local/bin/ink\"",
     "type-check": "tsc --noEmit",
-    "test": "yarn workspace @inkwell/shared build && vitest run",
+    "test": "yarn workspace @inklabs/shared build && vitest run",
     "test:smoke:live": "bash ./scripts/smoke-chat-live.sh",
     "test:watch": "vitest",
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@inkwell/shared": "workspace:*",
+    "@inklabs/shared": "workspace:*",
     "@inquirer/prompts": "^8.2.0",
     "chalk": "^5.3.0",
     "commander": "^12.1.0",

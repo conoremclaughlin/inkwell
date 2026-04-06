@@ -1,5 +1,5 @@
 /**
- * Types shared with @inkwell/shared.
+ * Types shared with @inklabs/shared.
  *
  * Duplicated here because the API (CJS) and shared (ESM) packages use
  * different module systems. These are simple type aliases — if they diverge,

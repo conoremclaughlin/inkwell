@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decodeDelegationToken, mintDelegationToken, verifyDelegationToken } from '@inkwell/shared';
+import { decodeDelegationToken, mintDelegationToken, verifyDelegationToken } from '@inklabs/shared';
 
 describe('delegation token helpers', () => {
   const secret = 'pcp-delegation-test-secret';

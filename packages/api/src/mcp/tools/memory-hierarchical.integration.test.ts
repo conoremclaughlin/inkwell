@@ -10,7 +10,7 @@
  * 6. Memory history preserves summary/topicKey on update/delete
  * 7. restoreMemory propagates summary/topicKey
  *
- * Run via: yarn workspace @inkwell/api test:integration
+ * Run via: yarn workspace @inklabs/api test:integration
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';

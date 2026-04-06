@@ -1,8 +1,11 @@
 {
-  "name": "create-inkwell",
-  "version": "0.1.0",
+  "name": "@inklabs/create",
+  "version": "0.4.0",
   "description": "Set up Inkwell — AI beings with identity, memory, and coordination",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "bin": "./dist/index.js",
   "files": [

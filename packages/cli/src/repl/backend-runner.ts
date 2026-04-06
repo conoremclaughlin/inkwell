@@ -1,4 +1,4 @@
-import { spawnBackend } from '@inkwell/shared';
+import { spawnBackend } from '@inklabs/shared';
 import { getBackend } from '../backends/index.js';
 import { extractBackendTokenUsage, type BackendTokenUsage } from './token-usage.js';
 

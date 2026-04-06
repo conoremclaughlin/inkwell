@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { mintDelegationToken, verifyDelegationToken } from '@inkwell/shared';
+import { mintDelegationToken, verifyDelegationToken } from '@inklabs/shared';
 
 const testState = vi.hoisted(() => ({
   inputs: [] as string[],

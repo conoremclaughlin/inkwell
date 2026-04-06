@@ -1,6 +1,6 @@
 {
-  "name": "@inkwell/web",
-  "version": "1.0.0",
+  "name": "@inklabs/web",
+  "version": "0.4.0",
   "private": true,
   "license": "MIT",
   "description": "Inkwell Admin Dashboard - Manage WhatsApp, trusted users, and groups",

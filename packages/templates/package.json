@@ -1,6 +1,6 @@
 {
-  "name": "@inkwell/templates",
-  "version": "1.0.0",
+  "name": "@inklabs/templates",
+  "version": "0.4.0",
   "private": true,
   "license": "MIT",
   "description": "Shared identity templates for Inkwell — awakening prompts and document starters"

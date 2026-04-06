@@ -1279,7 +1279,7 @@ function resolveCliRoot(): string {
       if (existsSync(pkgPath)) {
         try {
           const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-          if (pkg.name === '@inkwell/cli') return candidate;
+          if (pkg.name === '@inklabs/cli') return candidate;
         } catch {
           // continue
         }
@@ -1288,7 +1288,7 @@ function resolveCliRoot(): string {
     if (dir === root) break;
     dir = dirname(dir);
   }
-  throw new Error('Could not find @inkwell/cli package. Run from within the repo.');
+  throw new Error('Could not find @inklabs/cli package. Run from within the repo.');
 }
 
 function resolveDefaultCliName(): string {

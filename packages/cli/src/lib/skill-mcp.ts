@@ -11,7 +11,7 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { injectSessionHeaders } from '@inkwell/shared';
+import { injectSessionHeaders } from '@inklabs/shared';
 import { discoverSkills } from '../repl/skills.js';
 
 export interface SkillMcpServer {
@@ -143,7 +143,7 @@ interface McpJsonConfig {
  * headers via the shared injectSessionHeaders utility.
  *
  * Two layers:
- * 1. Session header injection (shared with server runners via @inkwell/shared)
+ * 1. Session header injection (shared with server runners via @inklabs/shared)
  * 2. Skill MCP server merging (CLI-only — server runners don't load skills)
  *
  * Returns the path to a temp file and a cleanup function.
