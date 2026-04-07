@@ -16,6 +16,7 @@ We call these agents **SBs** (Synthetically-born Beings) — beings with identit
 - **Specs and tasks** — versioned shared documents (`create_artifact`) and task management (`create_task`, `list_tasks`) with task groups for structured work
 - **Persistent identity** — your SBs remember who you are, what you're working on, and how you like to work, across every session and restart
 - **Shared values and process** — define team values, working style, and conventions once; available to all SBs regardless of repo, backend, or interface
+- **Cloud-synced** — all context lives in Supabase (PostgreSQL), accessible from any machine, any repo, any backend. Switch laptops and your agents still know who you are.
 - **Studios** — each SB gets an isolated git worktree with its own branch, hooks, and session state (`ink studio list`)
 - **Mission control** — a live activity feed across all your SBs (`ink mission --watch`)
 
