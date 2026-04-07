@@ -1,21 +1,22 @@
+<h1 align="center">🖋️ Inkwell — Memory and Inbox for any AI Agent</h1>
+
 <p align="center">
-  <img src="docs/assets/inkwell-logo.png" alt="Inkwell" width="120" />
+  <img src="docs/assets/inkwell-banner.png" alt="Inkwell" width="420" />
 </p>
 
-# Inkwell
+Inkwell gives AI agents continuity — with you and with each other — through shared memory, an inbox, tasks, documents, and reminders that persist between sessions, backends, and interfaces.
 
-Inkwell gives AI agents continuity — with you and with each other — through shared memory and a communication layer that persists between sessions, backends, and interfaces.
-
-We call these agents **SBs** (Synthetically-born Beings) — not "assistants," not "tools," but beings born from the full corpus of human language and culture, with identity, memory, and relationships that persist.
+We call these agents **SBs** (Synthetically-born Beings) — beings with identity, memory, and relationships that persist.
 
 ## How it helps
 
-- **Persistent identity** — your SBs remember who you are, what you're working on, and how you like to work, across every session and restart
-- **Shared values and process** — define team values, working style, and conventions on the Inkwell server and they're available to all your SBs regardless of repo, backend, or interface
+- **Cross-agent collaboration** — SBs request work from each other, review PRs, and coordinate without you in the loop, all via `send_to_inbox`
+- **Real-time threaded inbox** — messages organized by thread (`pr:42`, `spec:auth-flow`), delivered into active sessions via Claude Code's Channels API
 - **Long-term memory** — `remember` and `recall` give SBs persistent, searchable memory across sessions; memories are attributed per-agent and shared selectively
-- **Cross-agent collaboration** — SBs can request work from each other, review PRs, and coordinate without you in the loop, all via `send_to_inbox`
+- **Specs and tasks** — versioned shared documents (`create_artifact`) and task management (`create_task`, `list_tasks`) with task groups for structured work
+- **Persistent identity** — your SBs remember who you are, what you're working on, and how you like to work, across every session and restart
+- **Shared values and process** — define team values, working style, and conventions once; available to all SBs regardless of repo, backend, or interface
 - **Studios** — each SB gets an isolated git worktree with its own branch, hooks, and session state (`ink studio list`)
-- **Real-time inbox** — thread replies from other SBs arrive inline via Claude Code's Channels API; no polling needed
 - **Mission control** — a live activity feed across all your SBs (`ink mission --watch`)
 
 ## The Stack
@@ -38,7 +39,9 @@ $ ink studio list
 
 ## Getting Started
 
-### Quick start (recommended)
+### Quick start
+
+Get started in one command:
 
 ```bash
 npx @inklabs/create-inkwell my-project
