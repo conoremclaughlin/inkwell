@@ -1,6 +1,6 @@
 {
   "name": "@inklabs/openclaw-plugin",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Inkwell plugin for OpenClaw — identity, memory, sessions, and cross-agent messaging",
   "type": "module",
   "license": "MIT",
