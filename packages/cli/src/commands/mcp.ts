@@ -37,8 +37,11 @@ interface SyncSource {
   from: 'local' | 'main';
 }
 
-const CODEX_MANAGED_START = '# pcp-managed:start mcp_servers';
-const CODEX_MANAGED_END = '# pcp-managed:end mcp_servers';
+const CODEX_MANAGED_START = '# ink-managed:start mcp_servers';
+const CODEX_MANAGED_END = '# ink-managed:end mcp_servers';
+// Backward compat: detect old markers during replacement
+const CODEX_MANAGED_START_LEGACY = '# pcp-managed:start mcp_servers';
+const CODEX_MANAGED_END_LEGACY = '# pcp-managed:end mcp_servers';
 
 // ============================================================================
 // Env file parsing
@@ -283,12 +286,17 @@ function mergeCodexConfig(existing: string | undefined, managedBlock: string): s
     return managedBlock;
   }
 
-  const hasManagedBlock =
+  // Detect current or legacy managed block markers
+  const hasCurrentBlock =
     existing.includes(CODEX_MANAGED_START) && existing.includes(CODEX_MANAGED_END);
+  const hasLegacyBlock =
+    existing.includes(CODEX_MANAGED_START_LEGACY) && existing.includes(CODEX_MANAGED_END_LEGACY);
 
-  if (hasManagedBlock) {
+  if (hasCurrentBlock || hasLegacyBlock) {
+    const startMarker = hasCurrentBlock ? CODEX_MANAGED_START : CODEX_MANAGED_START_LEGACY;
+    const endMarker = hasCurrentBlock ? CODEX_MANAGED_END : CODEX_MANAGED_END_LEGACY;
     const pattern = new RegExp(
-      `${escapeRegExp(CODEX_MANAGED_START)}[\\s\\S]*?${escapeRegExp(CODEX_MANAGED_END)}\\n?`,
+      `${escapeRegExp(startMarker)}[\\s\\S]*?${escapeRegExp(endMarker)}\\n?`,
       'm'
     );
     return ensureTrailingNewline(existing.replace(pattern, managedBlock));

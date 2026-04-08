@@ -64,10 +64,10 @@ describe('syncMcpConfig', () => {
     expect(existsSync(join(TEST_DIR, '.codex', 'config.toml'))).toBe(true);
 
     const toml = readFileSync(join(TEST_DIR, '.codex', 'config.toml'), 'utf-8');
-    expect(toml).toContain('# pcp-managed:start mcp_servers');
+    expect(toml).toContain('# ink-managed:start mcp_servers');
     expect(toml).toContain('[mcp_servers.inkwell]');
     expect(toml).toContain('url = "http://localhost:3001/mcp"');
-    expect(toml).toContain('# pcp-managed:end mcp_servers');
+    expect(toml).toContain('# ink-managed:end mcp_servers');
   });
 
   it('should create .gemini/settings.json from .mcp.json', () => {
@@ -402,10 +402,10 @@ describe('syncMcpConfig', () => {
         '[hooks]',
         'enabled = true',
         '',
-        '# pcp-managed:start mcp_servers',
+        '# ink-managed:start mcp_servers',
         '[mcp_servers.old]',
         'url = "http://old"',
-        '# pcp-managed:end mcp_servers',
+        '# ink-managed:end mcp_servers',
         '',
       ].join('\n')
     );
