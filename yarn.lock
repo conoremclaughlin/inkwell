@@ -1251,9 +1251,9 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@inklabs/create-inkwell@workspace:packages/create-pcp":
+"@inklabs/create-inkwell@workspace:packages/create-inkwell":
   version: 0.0.0-use.local
-  resolution: "@inklabs/create-inkwell@workspace:packages/create-pcp"
+  resolution: "@inklabs/create-inkwell@workspace:packages/create-inkwell"
   dependencies:
     "@inquirer/prompts": "npm:^8.2.0"
     "@types/node": "npm:^20.10.0"

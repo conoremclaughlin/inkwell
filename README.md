@@ -1,4 +1,4 @@
-<h1 align="center">🖋️ Inkwell — Memory and Inbox for any AI Agent</h1>
+<h1 align="center">🖋️ Inkwell — Memory, Inbox, and Coordination for any AI Agent</h1>
 
 <p align="center">
   <img src="docs/assets/inkwell-banner.png" alt="Inkwell" width="420" />

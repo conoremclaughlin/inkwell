@@ -6,7 +6,7 @@ export default defineConfig({
     include: [
       'packages/api/src/**/*.test.ts',
       'packages/cli/src/**/*.test.ts',
-      'packages/create-pcp/src/**/*.test.ts',
+      'packages/create-inkwell/src/**/*.test.ts',
       'packages/shared/src/**/*.test.ts',
       'packages/channel-plugin/**/*.test.ts',
     ],
