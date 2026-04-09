@@ -10,8 +10,11 @@ import {
   buildChunkMetadataUpdate,
   buildChunkRows,
   buildMemoryEmbeddingChunks,
+  countChunkViews,
   type EmbeddedMemoryChunk,
   formatVectorLiteral,
+  inferChunkTypeFromMetadata,
+  type MemoryChunkType,
   MEMORY_EMBEDDING_CHUNKS_VERSION,
 } from '../../services/embeddings/memory-chunks';
 import { EmbeddingRouter } from '../../services/embeddings/router';
@@ -43,6 +46,7 @@ export interface RecallCandidate {
   memory: Memory;
   semanticScore?: number;
   textScore?: number;
+  matchedChunkType?: MemoryChunkType | null;
   finalScore: number;
 }
 
@@ -77,10 +81,26 @@ type SemanticChunkMatchRow = Omit<MemoryRow, 'embedding'> & {
   similarity?: number;
   matched_chunk_index?: number | null;
   matched_chunk_text?: string | null;
+  matched_chunk_type?: string | null;
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const EMBEDDING_PERSIST_RETRY_ATTEMPTS = 3;
+
+function computeChunkTypeBoost(chunkType?: MemoryChunkType | null): number {
+  switch (chunkType) {
+    case 'fact':
+      return 0.08;
+    case 'topic':
+      return 0.05;
+    case 'entity':
+      return 0.04;
+    case 'summary':
+      return 0.03;
+    default:
+      return 0;
+  }
+}
 
 function parseEmbeddingValue(value: MemoryRow['embedding'] | string | null): number[] | undefined {
   if (!value) return undefined;
@@ -418,6 +438,7 @@ export class MemoryRepository {
         memory: candidate.memory,
         semanticScore: candidate.semanticScore,
         textScore: existing?.textScore,
+        matchedChunkType: candidate.matchedChunkType,
         finalScore: 0,
       });
     }
@@ -428,13 +449,18 @@ export class MemoryRepository {
         memory: candidate.memory,
         semanticScore: existing?.semanticScore,
         textScore: candidate.textScore,
+        matchedChunkType: existing?.matchedChunkType,
         finalScore: 0,
       });
     }
 
     const merged = Array.from(byId.values()).map((candidate) => ({
       ...candidate,
-      finalScore: this.computeHybridScore(candidate.semanticScore, candidate.textScore),
+      finalScore: this.computeHybridScore(
+        candidate.semanticScore,
+        candidate.textScore,
+        candidate.matchedChunkType
+      ),
     }));
 
     merged.sort(
@@ -445,11 +471,15 @@ export class MemoryRepository {
     return merged.slice(offset, offset + limit);
   }
 
-  private computeHybridScore(semanticScore?: number, textScore?: number): number {
+  private computeHybridScore(
+    semanticScore?: number,
+    textScore?: number,
+    matchedChunkType?: MemoryChunkType | null
+  ): number {
     const s = semanticScore ?? 0;
     const t = textScore ?? 0;
     // Blend with heavier semantic weighting, but allow lexical key matches to lift ranking.
-    return s * 0.7 + t * 0.3;
+    return Math.min(1, s * 0.7 + t * 0.3 + computeChunkTypeBoost(matchedChunkType));
   }
 
   private buildTextScore(query: string, memory: Memory): number {
@@ -659,14 +689,21 @@ export class MemoryRepository {
         continue;
       }
 
+      const matchedChunkType =
+        row.matched_chunk_type &&
+        ['summary', 'fact', 'topic', 'entity', 'content'].includes(row.matched_chunk_type)
+          ? (row.matched_chunk_type as MemoryChunkType)
+          : inferChunkTypeFromMetadata(row.matched_chunk_index, memory.metadata);
       const semanticScore = Math.max(0, Math.min(1, row.similarity ?? 0));
+      const boostedSemanticScore = Math.min(1, semanticScore + computeChunkTypeBoost(matchedChunkType));
       const existing = grouped.get(memory.id);
 
-      if (!existing || semanticScore > (existing.semanticScore ?? 0)) {
+      if (!existing || boostedSemanticScore > existing.finalScore) {
         grouped.set(memory.id, {
           memory,
           semanticScore,
-          finalScore: semanticScore,
+          matchedChunkType,
+          finalScore: boostedSemanticScore,
         });
       }
     }
@@ -674,7 +711,7 @@ export class MemoryRepository {
     return Array.from(grouped.values())
       .sort(
         (a, b) =>
-          (b.semanticScore ?? 0) - (a.semanticScore ?? 0) ||
+          b.finalScore - a.finalScore ||
           b.memory.createdAt.getTime() - a.memory.createdAt.getTime()
       )
       .slice(offset, offset + limit);
@@ -741,6 +778,10 @@ export class MemoryRepository {
     const chunks = buildMemoryEmbeddingChunks({
       summary: input.summary,
       content: input.content,
+      topicKey: input.topicKey,
+      topics: input.topics,
+      source: input.source,
+      salience: input.salience,
       model: vettedModel,
     });
     if (chunks.length === 0) return;
@@ -812,6 +853,7 @@ export class MemoryRepository {
           provider: primaryEmbedding.provider,
           model: primaryEmbedding.model,
           chunkCount: embeddedChunks.length,
+          viewCounts: countChunkViews(embeddedChunks.map(({ chunk }) => chunk)),
           existingMetadata: memory.metadata || {},
         }),
         embedding: {
@@ -866,6 +908,7 @@ export class MemoryRepository {
         provider: primaryEmbedding.provider,
         model: primaryEmbedding.model,
         chunkCount: embeddedChunks.length,
+        viewCounts: countChunkViews(embeddedChunks.map(({ chunk }) => chunk)),
         existingMetadata: memory.metadata || {},
       }),
       embedding: {

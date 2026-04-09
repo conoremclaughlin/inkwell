@@ -1056,22 +1056,22 @@ describe('MemoryRepository', () => {
             chunk_index: 0,
             chunk_text: 'Chunked summary',
           }),
-          expect.objectContaining({
-            memory_id: 'mem-hm-5',
-            chunk_type: 'content',
-            chunk_index: 1,
-          }),
         ]),
         expect.objectContaining({ onConflict: 'memory_id,chunk_index' })
       );
+      expect(chunkRows.some((row) => row.chunk_type === 'content')).toBe(true);
+      expect(chunkRows.some((row) => row.chunk_type === 'topic')).toBe(true);
       expect(mockSupabase._queryBuilder.update).toHaveBeenCalledWith(
         expect.objectContaining({
-          embedding_chunks_version: 1,
+          embedding_chunks_version: 2,
           embedding_chunk_count: chunkRows.length,
           metadata: expect.objectContaining({
             embedding_chunks: expect.objectContaining({
               chunkCount: chunkRows.length,
-              version: 1,
+              version: 2,
+              viewCounts: expect.objectContaining({
+                summary: 1,
+              }),
             }),
             embedding: expect.objectContaining({
               provider: 'ollama',
@@ -1344,13 +1344,25 @@ describe('MemoryRepository', () => {
             topics: ['pr:214'],
             agent_id: 'lumen',
             embedding: '[0.1,0.2,0.3]',
-            metadata: {},
+            metadata: {
+              embedding_chunks: {
+                version: 2,
+                viewCounts: {
+                  summary: 1,
+                  fact: 1,
+                  topic: 1,
+                  entity: 0,
+                  content: 1,
+                },
+              },
+            },
             version: 1,
             created_at: '2026-03-16T00:00:00Z',
             expires_at: null,
             sb_id: null,
             matched_chunk_index: 0,
             matched_chunk_text: 'Semantic memory',
+            matched_chunk_type: 'summary',
             similarity: 0.9,
           },
         ],

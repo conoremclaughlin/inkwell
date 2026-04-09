@@ -4,6 +4,7 @@ import {
   buildChunkMetadataUpdate,
   buildChunkRows,
   buildMemoryEmbeddingChunks,
+  countChunkViews,
   formatVectorLiteral,
   MEMORY_EMBEDDING_CHUNKS_VERSION,
 } from '../services/embeddings/memory-chunks';
@@ -108,6 +109,10 @@ async function main() {
       const chunks = buildMemoryEmbeddingChunks({
         summary: row.summary,
         content: row.content,
+        topicKey: row.topic_key,
+        topics: row.topics,
+        source: row.source,
+        salience: row.salience,
         model: vettedModel,
       });
       if (chunks.length === 0) {
@@ -172,6 +177,7 @@ async function main() {
               provider: primaryEmbedding.provider,
               model: primaryEmbedding.model,
               chunkCount: embeddedChunks.length,
+              viewCounts: countChunkViews(embeddedChunks.map(({ chunk }) => chunk)),
               existingMetadata: ((row.metadata as Record<string, unknown> | null) || {}) as Record<
                 string,
                 unknown
