@@ -1,8 +1,8 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { createSupabaseClient } from '../data/supabase/client';
-import { MemoryRepository } from '../data/repositories/memory-repository';
+import { createSupabaseClient } from '../../api/src/data/supabase/client';
+import { MemoryRepository } from '../../api/src/data/repositories/memory-repository';
 import { getBootstrapRelevanceDataset } from './benchmark-data/datasets';
 
 type Mode = 'baseline' | 'thread_aware';

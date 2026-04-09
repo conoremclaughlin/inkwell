@@ -1,8 +1,8 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { createSupabaseClient } from '../data/supabase/client';
-import { MemoryRepository } from '../data/repositories/memory-repository';
+import { createSupabaseClient } from '../../api/src/data/supabase/client';
+import { MemoryRepository } from '../../api/src/data/repositories/memory-repository';
 import { getBenchmarkDataset } from './benchmark-data/datasets';
 import { loadHfBenchmarkDataset } from './benchmark-data/hf-loader';
 import { loadLongMemEvalDataset } from './benchmark-data/longmemeval-loader';

@@ -1886,6 +1886,15 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@inklabs/benchmarks@workspace:packages/benchmarks":
+  version: 0.0.0-use.local
+  resolution: "@inklabs/benchmarks@workspace:packages/benchmarks"
+  dependencies:
+    tsx: "npm:^4.20.6"
+    vitest: "npm:^4.0.18"
+  languageName: unknown
+  linkType: soft
+
 "@inklabs/cli@workspace:packages/cli":
   version: 0.0.0-use.local
   resolution: "@inklabs/cli@workspace:packages/cli"
@@ -14756,7 +14765,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"tsx@npm:^4.19.0, tsx@npm:^4.7.0":
+"tsx@npm:^4.19.0, tsx@npm:^4.20.6, tsx@npm:^4.7.0":
   version: 4.21.0
   resolution: "tsx@npm:4.21.0"
   dependencies:
