@@ -5,8 +5,14 @@ import { createSupabaseClient } from '../data/supabase/client';
 import { MemoryRepository } from '../data/repositories/memory-repository';
 import { getBenchmarkDataset } from './benchmark-data/datasets';
 import { loadHfBenchmarkDataset } from './benchmark-data/hf-loader';
+import { type PublicBenchmarkFamily, getPublicBenchmarkDescriptor } from './benchmark-data/public-benchmarks';
 
 type RecallMode = 'text' | 'semantic' | 'hybrid' | 'auto';
+
+function parseBenchmarkFamily(raw?: string): PublicBenchmarkFamily | null {
+  if (!raw) return null;
+  return getPublicBenchmarkDescriptor(raw.trim().toLowerCase() as PublicBenchmarkFamily).family;
+}
 
 interface CaseRun {
   caseId: string;
@@ -89,9 +95,11 @@ async function persistRun(
     modes: RecallMode[];
     summary: SummaryMetric[];
     runs: CaseRun[];
+    datasetSource: string;
+    benchmarkFamily: PublicBenchmarkFamily | null;
   }
 ): Promise<void> {
-  const { runId, userId, dataset, topK, caseCount, modes, summary, runs } = params;
+  const { runId, userId, dataset, topK, caseCount, modes, summary, runs, datasetSource, benchmarkFamily } = params;
 
   const modeRows = summary.map((metric) => ({
     run_id: runId,
@@ -126,6 +134,11 @@ async function persistRun(
     metadata: {
       benchmarkTopic: BENCHMARK_TOPIC,
       benchmarkAgentId: BENCHMARK_AGENT_ID,
+      datasetSource,
+      benchmarkFamily,
+      benchmarkFamilyDescriptor: benchmarkFamily
+        ? getPublicBenchmarkDescriptor(benchmarkFamily)
+        : null,
     },
   };
 
@@ -167,6 +180,7 @@ async function main() {
 
   const dataset = process.env.MEMORY_BENCHMARK_DATASET || DEFAULT_DATASET;
   const { cases: benchmarkCases, source: datasetSource } = await loadBenchmarkCases(dataset);
+  const benchmarkFamily = parseBenchmarkFamily(process.env.MEMORY_BENCHMARK_FAMILY);
   const modes = parseModes(process.env.MEMORY_BENCHMARK_MODES);
   const persistResults = parseBoolean(process.env.MEMORY_BENCHMARK_PERSIST, true);
   const writeOutputFile = parseBoolean(process.env.MEMORY_BENCHMARK_WRITE_FILE, true);
@@ -253,6 +267,8 @@ async function main() {
         modes,
         summary,
         runs,
+        datasetSource,
+        benchmarkFamily,
       });
     }
 
@@ -267,6 +283,10 @@ async function main() {
         benchmarkCases: benchmarkCases.length,
         persistResults,
         datasetSource,
+        benchmarkFamily,
+        benchmarkFamilyDescriptor: benchmarkFamily
+          ? getPublicBenchmarkDescriptor(benchmarkFamily)
+          : null,
       },
       summary,
       runs,
