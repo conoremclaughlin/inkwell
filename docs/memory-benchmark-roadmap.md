@@ -88,6 +88,27 @@ Question:
 
 This belongs after public benchmark parity, not before.
 
+## Parallel second brain implications
+
+The most relevant and unique lesson from our parallel second brain direction is that memory should not be a single retrieval layer. We should preserve **raw memories** while also letting a slower background system derive additional memory views.
+
+The likely long-term layers are:
+- raw chunked memory for faithful recall
+- durable fact extraction for concise stable claims
+- entity/person/project memories for who-or-what centric lookup
+- summary memories for coarse routing across large histories
+- override / contradiction links so newer policy or state can explicitly supersede older memory
+
+That means our future benchmark tiers should not just compare text vs semantic vs hybrid. They should eventually compare:
+- raw only
+- raw + durable facts
+- raw + entity/fact indexes
+- raw + override-aware scoring
+
+This is especially important for domains like policy and healthcare, where semantic similarity alone is not enough. If one memory overrides another, retrieval quality depends on chronology, provenance, and explicit linkage as much as embedding distance.
+
+For now, this affects the benchmark roadmap in one specific way: we should keep our baseline honest, but design the harness so we can later add multiple retrieval views and score how much each derived layer helps or hurts.
+
 ## Evaluation rules
 
 We should adopt explicit benchmark hygiene rules:
