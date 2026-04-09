@@ -10,6 +10,7 @@ import {
   buildChunkMetadataUpdate,
   buildChunkRows,
   buildMemoryEmbeddingChunks,
+  type EmbeddedMemoryChunk,
   formatVectorLiteral,
   MEMORY_EMBEDDING_CHUNKS_VERSION,
 } from '../../services/embeddings/memory-chunks';
@@ -79,6 +80,7 @@ type SemanticChunkMatchRow = Omit<MemoryRow, 'embedding'> & {
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const EMBEDDING_PERSIST_RETRY_ATTEMPTS = 3;
 
 function parseEmbeddingValue(value: MemoryRow['embedding'] | string | null): number[] | undefined {
   if (!value) return undefined;
@@ -159,6 +161,50 @@ function computeFocusBoost(memory: Memory, focusText?: string): number {
 
   const ratio = overlap / focusTokens.length;
   return 1 + Math.min(0.35, ratio * 0.35);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeErrorDetails(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    return {
+      message: error.message,
+      name: error.name,
+      stack: error.stack,
+    };
+  }
+
+  if (error && typeof error === 'object') {
+    return error as Record<string, unknown>;
+  }
+
+  return { message: String(error) };
+}
+
+function summarizeChunkPersistenceContext(params: {
+  memory: Memory;
+  embeddedChunks: EmbeddedMemoryChunk[];
+}): Record<string, unknown> {
+  const { memory, embeddedChunks } = params;
+  const primary = embeddedChunks[0]?.embedding;
+
+  return {
+    memoryId: memory.id,
+    userId: memory.userId,
+    salience: memory.salience,
+    topicKey: memory.topicKey,
+    topicCount: memory.topics.length,
+    summaryLength: memory.summary?.length ?? 0,
+    contentLength: memory.content.length,
+    chunkCount: embeddedChunks.length,
+    chunkTypes: embeddedChunks.map((chunk) => chunk.chunkType),
+    chunkLengths: embeddedChunks.map((chunk) => chunk.text.length),
+    provider: primary?.provider,
+    model: primary?.model,
+    dimensions: primary?.dimensions,
+  };
 }
 
 export function computeKnowledgeMemoryScore(
@@ -715,49 +761,101 @@ export class MemoryRepository {
       userId: memory.userId,
       chunks: embeddedChunks.map(({ chunk, embedding }) => ({ ...chunk, embedding })),
     });
+    const chunkContext = summarizeChunkPersistenceContext({
+      memory,
+      embeddedChunks: embeddedChunks.map(({ chunk, embedding }) => ({ ...chunk, embedding })),
+    });
 
-    const { error: chunkError } = await this.supabase
-      .from('memory_embedding_chunks')
-      .upsert(chunkRows, {
-        onConflict: 'memory_id,chunk_index',
+    let chunkErrorDetails: Record<string, unknown> | null = null;
+    for (let attempt = 1; attempt <= EMBEDDING_PERSIST_RETRY_ATTEMPTS; attempt += 1) {
+      const { error: chunkError } = await this.supabase
+        .from('memory_embedding_chunks')
+        .upsert(chunkRows, {
+          onConflict: 'memory_id,chunk_index',
+        });
+
+      if (!chunkError) {
+        chunkErrorDetails = null;
+        break;
+      }
+
+      chunkErrorDetails = normalizeErrorDetails(chunkError);
+      logger.warn('Failed to persist memory embedding chunks', {
+        ...chunkContext,
+        stage: 'chunk_upsert',
+        attempt,
+        retrying: attempt < EMBEDDING_PERSIST_RETRY_ATTEMPTS,
+        error: chunkErrorDetails,
       });
 
-    if (chunkError) {
-      logger.warn('Failed to persist memory embedding chunks', {
-        memoryId: memory.id,
-        error: chunkError.message,
+      if (attempt < EMBEDDING_PERSIST_RETRY_ATTEMPTS) {
+        await sleep(200 * attempt);
+      }
+    }
+
+    if (chunkErrorDetails) {
+      logger.error('Giving up on memory embedding chunk persistence', {
+        ...chunkContext,
+        stage: 'chunk_upsert',
+        attempts: EMBEDDING_PERSIST_RETRY_ATTEMPTS,
+        error: chunkErrorDetails,
       });
       return;
     }
 
-    const { error } = await this.supabase
-      .from('memories')
-      .update({
-        embedding: formatVectorLiteral(primaryEmbedding.vector),
-        embedding_chunks_version: MEMORY_EMBEDDING_CHUNKS_VERSION,
-        embedding_chunk_count: embeddedChunks.length,
-        metadata: {
-          ...buildChunkMetadataUpdate({
-            provider: primaryEmbedding.provider,
-            model: primaryEmbedding.model,
-            chunkCount: embeddedChunks.length,
-            existingMetadata: memory.metadata || {},
-          }),
-          embedding: {
-            provider: primaryEmbedding.provider,
-            model: primaryEmbedding.model,
-            dimensions: primaryEmbedding.dimensions,
-            updatedAt: new Date().toISOString(),
-          },
-        } as Database['public']['Tables']['memories']['Update']['metadata'],
-      })
-      .eq('id', memory.id)
-      .eq('user_id', memory.userId);
+    const memoryUpdate: Database['public']['Tables']['memories']['Update'] = {
+      embedding: formatVectorLiteral(primaryEmbedding.vector),
+      embedding_chunks_version: MEMORY_EMBEDDING_CHUNKS_VERSION,
+      embedding_chunk_count: embeddedChunks.length,
+      metadata: {
+        ...buildChunkMetadataUpdate({
+          provider: primaryEmbedding.provider,
+          model: primaryEmbedding.model,
+          chunkCount: embeddedChunks.length,
+          existingMetadata: memory.metadata || {},
+        }),
+        embedding: {
+          provider: primaryEmbedding.provider,
+          model: primaryEmbedding.model,
+          dimensions: primaryEmbedding.dimensions,
+          updatedAt: new Date().toISOString(),
+        },
+      } as Database['public']['Tables']['memories']['Update']['metadata'],
+    };
 
-    if (error) {
-      logger.warn('Failed to persist memory embedding', {
-        memoryId: memory.id,
-        error: error.message,
+    let memoryErrorDetails: Record<string, unknown> | null = null;
+    for (let attempt = 1; attempt <= EMBEDDING_PERSIST_RETRY_ATTEMPTS; attempt += 1) {
+      const { error } = await this.supabase
+        .from('memories')
+        .update(memoryUpdate)
+        .eq('id', memory.id)
+        .eq('user_id', memory.userId);
+
+      if (!error) {
+        memoryErrorDetails = null;
+        break;
+      }
+
+      memoryErrorDetails = normalizeErrorDetails(error);
+      logger.warn('Failed to persist memory embedding metadata', {
+        ...chunkContext,
+        stage: 'memory_update',
+        attempt,
+        retrying: attempt < EMBEDDING_PERSIST_RETRY_ATTEMPTS,
+        error: memoryErrorDetails,
+      });
+
+      if (attempt < EMBEDDING_PERSIST_RETRY_ATTEMPTS) {
+        await sleep(200 * attempt);
+      }
+    }
+
+    if (memoryErrorDetails) {
+      logger.error('Giving up on memory embedding metadata persistence', {
+        ...chunkContext,
+        stage: 'memory_update',
+        attempts: EMBEDDING_PERSIST_RETRY_ATTEMPTS,
+        error: memoryErrorDetails,
       });
       return;
     }
