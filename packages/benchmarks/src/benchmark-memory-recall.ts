@@ -1,18 +1,23 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { createSupabaseClient } from '../../api/src/data/supabase/client';
-import { MemoryRepository } from '../../api/src/data/repositories/memory-repository';
+import { createSupabaseClient, MemoryRepository } from '@inklabs/api/benchmarks';
 import { getBenchmarkDataset } from './benchmark-data/datasets';
 import { loadHfBenchmarkDataset } from './benchmark-data/hf-loader';
 import { loadLongMemEvalDataset } from './benchmark-data/longmemeval-loader';
-import { type PublicBenchmarkFamily, getPublicBenchmarkDescriptor } from './benchmark-data/public-benchmarks';
+import {
+  PUBLIC_BENCHMARKS,
+  type PublicBenchmarkFamily,
+  getPublicBenchmarkDescriptor,
+} from './benchmark-data/public-benchmarks';
 
 type RecallMode = 'text' | 'semantic' | 'hybrid' | 'auto';
 
 function parseBenchmarkFamily(raw?: string): PublicBenchmarkFamily | null {
   if (!raw) return null;
-  return getPublicBenchmarkDescriptor(raw.trim().toLowerCase() as PublicBenchmarkFamily).family;
+  const normalized = raw.trim().toLowerCase();
+  const match = PUBLIC_BENCHMARKS.find((entry) => entry.family === normalized);
+  return match ? match.family : null;
 }
 
 interface CaseRun {
