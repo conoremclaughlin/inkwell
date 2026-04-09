@@ -8,6 +8,7 @@
 import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import type { TaskStatus, TaskPriority } from '../../data/repositories/project-tasks.repository';
+import { StrategyService } from '../../services/strategy.service';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { getRequestContext } from '../../utils/request-context';
@@ -42,7 +43,9 @@ const userIdentifierSchema = z.object({
 
 export const createTaskSchema = z.object({
   ...userIdentifierSchema.shape,
-  projectId: z.string().uuid().describe('Project ID to add the task to'),
+  projectId: z.string().uuid().optional().describe('Project ID to add the task to'),
+  taskGroupId: z.string().uuid().optional().describe('Task group ID to add the task to'),
+  taskOrder: z.number().int().min(0).optional().describe('Order within the task group (0-based)'),
   title: z.string().min(1).max(500).describe('Task title'),
   description: z.string().optional().describe('Detailed task description'),
   priority: z.enum(['low', 'medium', 'high', 'critical']).optional().default('medium'),
@@ -72,23 +75,41 @@ export async function handleCreateTask(
       return mcpResponse({ success: false, error: 'User not found' }, true);
     }
 
-    // Verify project exists and belongs to user
-    const project = await dataComposer.repositories.projects.findById(args.projectId);
-    if (!project) {
-      return mcpResponse({ success: false, error: 'Project not found' }, true);
+    // Verify project exists and belongs to user (if provided)
+    if (args.projectId) {
+      const project = await dataComposer.repositories.projects.findById(args.projectId);
+      if (!project) {
+        return mcpResponse({ success: false, error: 'Project not found' }, true);
+      }
+      if (project.user_id !== resolved.user.id) {
+        return mcpResponse({ success: false, error: 'Project does not belong to this user' }, true);
+      }
     }
-    if (project.user_id !== resolved.user.id) {
-      return mcpResponse({ success: false, error: 'Project does not belong to this user' }, true);
+
+    // Verify task group exists and belongs to user (if provided)
+    if (args.taskGroupId) {
+      const group = await dataComposer.repositories.taskGroups.findById(args.taskGroupId);
+      if (!group) {
+        return mcpResponse({ success: false, error: 'Task group not found' }, true);
+      }
+      if (group.user_id !== resolved.user.id) {
+        return mcpResponse(
+          { success: false, error: 'Task group does not belong to this user' },
+          true
+        );
+      }
     }
 
     const task = await dataComposer.repositories.tasks.create({
-      project_id: args.projectId,
+      project_id: args.projectId || null,
       user_id: resolved.user.id,
       title: args.title,
       description: args.description,
       priority: args.priority as TaskPriority,
       tags: args.tags,
       created_by: args.createdBy || 'claude',
+      task_group_id: args.taskGroupId,
+      task_order: args.taskOrder,
     });
 
     return mcpResponse({
@@ -100,6 +121,8 @@ export async function handleCreateTask(
         status: task.status,
         priority: task.priority,
         tags: task.tags,
+        taskGroupId: task.task_group_id || null,
+        taskOrder: task.task_order ?? null,
         createdAt: task.created_at,
       },
     });
@@ -330,7 +353,31 @@ export async function handleCompleteTask(
       logger.warn('Failed to auto-remember task completion:', err);
     }
 
-    return mcpResponse({
+    // Strategy advancement: if task belongs to a group with an active strategy,
+    // advance to the next task and inject the strategy prompt.
+    let strategyResult = null;
+    if (task.task_group_id) {
+      try {
+        const group = await dataComposer.repositories.taskGroups.findById(task.task_group_id);
+        if (group && group.strategy && group.status === 'active') {
+          const strategyService = new StrategyService(dataComposer);
+          strategyResult = await strategyService.advanceStrategy(
+            task.task_group_id,
+            task.id,
+            resolved.user.id
+          );
+          logger.info(
+            `Strategy advanced for group ${task.task_group_id}: ${strategyResult.action}`,
+            { nextTaskId: strategyResult.nextTask?.id }
+          );
+        }
+      } catch (err) {
+        // Non-fatal — task completion is the primary action
+        logger.warn('Failed to advance strategy after task completion:', err);
+      }
+    }
+
+    const response: Record<string, unknown> = {
       success: true,
       task: {
         id: task.id,
@@ -338,7 +385,27 @@ export async function handleCompleteTask(
         status: task.status,
         completedAt: task.completed_at,
       },
-    });
+    };
+
+    if (strategyResult) {
+      response.strategy = {
+        action: strategyResult.action,
+        prompt: strategyResult.prompt || null,
+        progressSummary: strategyResult.progressSummary || null,
+        notified: strategyResult.notified || false,
+        nextTask: strategyResult.nextTask
+          ? {
+              id: strategyResult.nextTask.id,
+              title: strategyResult.nextTask.title,
+              description: strategyResult.nextTask.description,
+              taskOrder: strategyResult.nextTask.task_order,
+            }
+          : null,
+        stats: strategyResult.stats || null,
+      };
+    }
+
+    return mcpResponse(response);
   } catch (error) {
     return mcpResponse(
       {
