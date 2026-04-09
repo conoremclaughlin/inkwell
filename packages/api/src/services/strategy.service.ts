@@ -20,6 +20,7 @@ import type {
   VerificationMode,
 } from '../data/repositories/task-groups.repository';
 import type { ProjectTask } from '../data/repositories/project-tasks.repository';
+import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
 import { logger } from '../utils/logger';
 
 // ============================================================================
@@ -514,7 +515,8 @@ export class StrategyService {
   }
 
   /**
-   * Send a notification to a dispatcher agent via inbox.
+   * Send a notification to a dispatcher agent via the inbox/thread machinery.
+   * Routes through handleSendToInbox for proper thread continuity and trigger behavior.
    * Returns true if notification was sent, false if no dispatcher configured.
    */
   private async notifyDispatcher(
@@ -528,28 +530,26 @@ export class StrategyService {
     try {
       const threadKey = group.thread_key || `strategy:${group.id}`;
 
-      // Use the inbox to send notification
-      const { error } = await this.dataComposer
-        .getClient()
-        .from('inbox' as never)
-        .insert({
-          user_id: userId,
-          sender_agent_id: group.owner_agent_id || 'system',
-          recipient_agent_id: notifyAgentId,
+      await handleSendToInbox(
+        {
+          userId,
+          recipientAgentId: notifyAgentId,
+          senderAgentId: group.owner_agent_id || 'system',
           content: message,
-          thread_key: threadKey,
-          message_type: 'strategy_notification',
+          messageType: 'notification',
+          priority: 'high',
+          threadKey,
+          triggerSummary: `Strategy ${group.strategy}: ${group.title}`,
+          triggerType: 'message',
           metadata: {
             groupId: group.id,
             strategy: group.strategy,
             groupTitle: group.title,
+            source: 'strategy_service',
           },
-        } as never);
-
-      if (error) {
-        logger.warn(`Failed to notify dispatcher ${notifyAgentId}:`, error);
-        return false;
-      }
+        },
+        this.dataComposer
+      );
 
       logger.info(`Strategy notification sent to ${notifyAgentId} for group ${group.id}`);
       return true;
