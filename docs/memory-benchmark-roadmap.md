@@ -102,7 +102,7 @@ We should adopt explicit benchmark hygiene rules:
 - Treat retrieval and answer-generation as separate measurements.
 - Never publish a score without saying whether reranking / LLM extraction was involved.
 
-## PCP/Ink benchmark roadmap
+## Inkwell benchmark roadmap
 
 ### Phase 1 — Public benchmark parity
 

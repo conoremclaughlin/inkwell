@@ -15,7 +15,7 @@ export const PUBLIC_BENCHMARKS: PublicBenchmarkDescriptor[] = [
     displayName: 'LongMemEval',
     primaryQuestion: 'Can the system retrieve the right conversational memory over long horizons?',
     whyItMatters:
-      'This is the cleanest first benchmark for PCP/Ink memory retrieval because it tests long-horizon conversational recall without being Ink-specific.',
+      'This is the cleanest first benchmark for Inkwell memory retrieval because it tests long-horizon conversational recall without being Ink-specific.',
     recommendedMetrics: ['recall@1', 'recall@3', 'recall@5', 'mrr', 'ndcg', 'latency'],
     implementationNotes: [
       'Start here first.',
