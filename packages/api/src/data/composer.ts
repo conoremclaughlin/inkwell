@@ -15,6 +15,7 @@ import { ActivityStreamRepository } from './repositories/activity-stream.reposit
 import { StudiosRepository } from './repositories/studios.repository';
 import { WorkspacesRepository } from './repositories/workspaces.repository';
 import { ContactsRepository } from './repositories/contacts-repository';
+import { TaskGroupsRepository } from './repositories/task-groups.repository';
 import { logger } from '../utils/logger';
 
 export class DataComposer {
@@ -30,6 +31,7 @@ export class DataComposer {
     projects: ProjectsRepository;
     sessionFocus: SessionFocusRepository;
     tasks: ProjectTasksRepository;
+    taskGroups: TaskGroupsRepository;
     memory: MemoryRepository;
     activityStream: ActivityStreamRepository;
     studios: StudiosRepository;
@@ -51,6 +53,7 @@ export class DataComposer {
       projects: new ProjectsRepository(supabaseClient),
       sessionFocus: new SessionFocusRepository(supabaseClient),
       tasks: new ProjectTasksRepository(supabaseClient),
+      taskGroups: new TaskGroupsRepository(supabaseClient),
       memory: new MemoryRepository(supabaseClient),
       activityStream: new ActivityStreamRepository(supabaseClient),
       studios: new StudiosRepository(supabaseClient),

@@ -25,6 +25,7 @@ export interface ProjectTask {
   created_by?: string | null;
   completed_at?: string | null;
   task_group_id?: string | null;
+  task_order?: number | null;
   due_date?: string | null;
   metadata?: Record<string, unknown>;
   created_at: string;
@@ -41,6 +42,8 @@ export interface CreateProjectTaskInput {
   tags?: string[];
   blocked_by?: string[];
   created_by?: string;
+  task_group_id?: string;
+  task_order?: number;
 }
 
 export interface UpdateProjectTaskInput {
@@ -59,19 +62,23 @@ export class ProjectTasksRepository {
    * Create a new task
    */
   async create(input: CreateProjectTaskInput): Promise<ProjectTask> {
+    const insertData: Record<string, unknown> = {
+      project_id: input.project_id,
+      user_id: input.user_id,
+      title: input.title,
+      description: input.description,
+      status: input.status || 'pending',
+      priority: input.priority || 'medium',
+      tags: input.tags || [],
+      blocked_by: input.blocked_by,
+      created_by: input.created_by,
+    };
+    if (input.task_group_id !== undefined) insertData.task_group_id = input.task_group_id;
+    if (input.task_order !== undefined) insertData.task_order = input.task_order;
+
     const { data, error } = await this.client
       .from('tasks')
-      .insert({
-        project_id: input.project_id,
-        user_id: input.user_id,
-        title: input.title,
-        description: input.description,
-        status: input.status || 'pending',
-        priority: input.priority || 'medium',
-        tags: input.tags || [],
-        blocked_by: input.blocked_by,
-        created_by: input.created_by,
-      } as never)
+      .insert(insertData as never)
       .select()
       .single();
 
