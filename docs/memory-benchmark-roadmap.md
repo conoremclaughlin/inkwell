@@ -145,6 +145,12 @@ Deliverables:
 - regression tracking by architecture version
 - benchmark comparison tables over time
 
+Current implementation direction:
+- phase-2 retrieval should query **multiple chunk views** (`summary`, `fact`, `topic`, `entity`, `content`)
+- retrieval should be able to filter chunk types at the RPC layer
+- `memory_embedding_chunks(user_id, chunk_type)` should be indexed so view-specific retrieval stays cheap
+- derived-view matches and raw-content matches should merge before hybrid scoring
+
 ### Phase 3 — Dream-phase memory
 
 Goal: test the value of durable fact extraction and higher-order summaries.
@@ -156,6 +162,12 @@ Deliverables:
   - raw + dream-phase summaries
   - raw + dream-phase + rerank
 - explicit comparison between extraction-enhanced memory and verbatim baselines
+
+Early implementation slices:
+- chronology-aware reranking as the first optional second pass
+- durable fact candidates linked back to source memories
+- duplicate-candidate detection for same-topic memories
+- supersession / contradiction candidate detection for chronological review
 
 ### Phase 4 — Ink-native context eviction benchmark
 

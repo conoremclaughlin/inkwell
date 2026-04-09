@@ -1501,6 +1501,185 @@ describe('MemoryRepository', () => {
       expect(rpc).not.toHaveBeenCalled();
       expect(results).toEqual([]);
     });
+
+    it('hybrid recall queries derived and raw chunk views separately', async () => {
+      const rpc = vi
+        .fn()
+        .mockResolvedValueOnce({
+          data: [
+            {
+              id: 'mem-derived-1',
+              user_id: 'user-456',
+              content: 'Current policy override note',
+              summary: 'Current policy override note',
+              topic_key: 'policy:wound-care',
+              source: 'observation',
+              salience: 'high',
+              topics: ['policy:wound-care'],
+              agent_id: 'lumen',
+              embedding: '[0.1,0.2,0.3]',
+              metadata: {},
+              version: 1,
+              created_at: '2026-03-16T00:00:00Z',
+              expires_at: null,
+              identity_id: null,
+              matched_chunk_index: 1,
+              matched_chunk_text: 'Current policy override note',
+              matched_chunk_type: 'fact',
+              similarity: 0.88,
+            },
+          ],
+          error: null,
+        })
+        .mockResolvedValueOnce({
+          data: [
+            {
+              id: 'mem-derived-1',
+              user_id: 'user-456',
+              content: 'Current policy override note',
+              summary: 'Current policy override note',
+              topic_key: 'policy:wound-care',
+              source: 'observation',
+              salience: 'high',
+              topics: ['policy:wound-care'],
+              agent_id: 'lumen',
+              embedding: '[0.1,0.2,0.3]',
+              metadata: {},
+              version: 1,
+              created_at: '2026-03-16T00:00:00Z',
+              expires_at: null,
+              identity_id: null,
+              matched_chunk_index: 4,
+              matched_chunk_text: 'Current policy override note',
+              matched_chunk_type: 'content',
+              similarity: 0.81,
+            },
+          ],
+          error: null,
+        });
+
+      (mockSupabase as any).rpc = rpc;
+      (repo as any).embeddingRouter = {
+        embedQuery: vi.fn().mockResolvedValue({
+          vector: [0.1, 0.2, 0.3],
+          provider: 'openai',
+          model: 'text-embedding-3-small',
+          dimensions: 1024,
+        }),
+        getRuntimeConfig: vi.fn().mockReturnValue({
+          enabled: true,
+          provider: 'openai',
+          model: 'text-embedding-3-small',
+          dimensions: 1024,
+          queryThreshold: 0.2,
+          matchCountMultiplier: 5,
+          ollamaBaseUrl: 'http://localhost:11434',
+          openaiBaseUrl: 'https://api.openai.com',
+          hasOpenAIKey: true,
+        }),
+      };
+      (repo as any).textRecallCandidates = vi.fn().mockResolvedValue([]);
+
+      const results = await repo.recall('user-456', 'current override policy', {
+        recallMode: 'hybrid',
+      });
+
+      expect(rpc).toHaveBeenNthCalledWith(
+        1,
+        'match_memory_embedding_chunks',
+        expect.objectContaining({
+          p_chunk_types: ['summary', 'fact', 'topic', 'entity'],
+        })
+      );
+      expect(rpc).toHaveBeenNthCalledWith(
+        2,
+        'match_memory_embedding_chunks',
+        expect.objectContaining({
+          p_chunk_types: ['content'],
+        })
+      );
+      expect(results).toHaveLength(1);
+      expect(results[0].id).toBe('mem-derived-1');
+    });
+
+    it('chronology-aware reranking prefers newer override memories for current-policy queries', async () => {
+      const olderMemory = {
+        id: 'mem-old',
+        userId: 'user-456',
+        content: 'Wound-care escalation policy. Notify the old triage lead on call.',
+        summary: 'Old escalation policy',
+        topicKey: 'policy:wound-care',
+        source: 'observation',
+        salience: 'high',
+        topics: ['policy:wound-care'],
+        metadata: {},
+        version: 1,
+        createdAt: new Date('2026-03-01T00:00:00Z'),
+      };
+      const newerMemory = {
+        id: 'mem-new',
+        userId: 'user-456',
+        content:
+          'Current wound-care escalation policy now uses the inpatient lead and overrides the previous protocol.',
+        summary: 'Current escalation policy overrides previous protocol',
+        topicKey: 'policy:wound-care',
+        source: 'observation',
+        salience: 'high',
+        topics: ['policy:wound-care'],
+        metadata: {},
+        version: 1,
+        createdAt: new Date('2026-03-20T00:00:00Z'),
+      };
+
+      (repo as any).trySemanticRecallCandidates = vi
+        .fn()
+        .mockResolvedValueOnce([
+          {
+            memory: olderMemory,
+            semanticScore: 0.95,
+            matchedChunkType: 'summary',
+            finalScore: 0.95,
+          },
+          {
+            memory: newerMemory,
+            semanticScore: 0.9,
+            matchedChunkType: 'fact',
+            finalScore: 0.9,
+          },
+        ])
+        .mockResolvedValueOnce([
+          {
+            memory: olderMemory,
+            semanticScore: 0.9,
+            matchedChunkType: 'content',
+            finalScore: 0.9,
+          },
+          {
+            memory: newerMemory,
+            semanticScore: 0.88,
+            matchedChunkType: 'content',
+            finalScore: 0.88,
+          },
+        ]);
+      (repo as any).textRecallCandidates = vi.fn().mockResolvedValue([]);
+      (repo as any).embeddingRouter = {
+        getRuntimeConfig: vi.fn().mockReturnValue({
+          matchCountMultiplier: 5,
+        }),
+      };
+
+      const results = await (repo as any).hybridRecall(
+        'user-456',
+        'what is the current wound-care policy override',
+        {},
+        5,
+        0
+      );
+
+      expect(results).toHaveLength(2);
+      expect(results[0].id).toBe('mem-new');
+      expect(results[1].id).toBe('mem-old');
+    });
   });
 
   // ─── Per-Sender Memory Isolation Tests ───
