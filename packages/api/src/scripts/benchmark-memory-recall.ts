@@ -5,6 +5,7 @@ import { createSupabaseClient } from '../data/supabase/client';
 import { MemoryRepository } from '../data/repositories/memory-repository';
 import { getBenchmarkDataset } from './benchmark-data/datasets';
 import { loadHfBenchmarkDataset } from './benchmark-data/hf-loader';
+import { loadLongMemEvalDataset } from './benchmark-data/longmemeval-loader';
 import { type PublicBenchmarkFamily, getPublicBenchmarkDescriptor } from './benchmark-data/public-benchmarks';
 
 type RecallMode = 'text' | 'semantic' | 'hybrid' | 'auto';
@@ -165,6 +166,11 @@ async function loadBenchmarkCases(dataset: string) {
   if (dataset === 'hf') {
     const hf = await loadHfBenchmarkDataset();
     return { cases: hf.cases, source: hf.source };
+  }
+
+  if (dataset === 'longmemeval-s-cleaned') {
+    const longmemeval = await loadLongMemEvalDataset();
+    return { cases: longmemeval.cases, source: longmemeval.source };
   }
 
   return { cases: getBenchmarkDataset(dataset), source: `builtin:${dataset}` };
