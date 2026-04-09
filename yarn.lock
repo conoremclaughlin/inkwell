@@ -1179,7 +1179,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@inklabs/api@workspace:packages/api":
+"@inklabs/api@workspace:*, @inklabs/api@workspace:packages/api":
   version: 0.0.0-use.local
   resolution: "@inklabs/api@workspace:packages/api"
   dependencies:
@@ -1233,6 +1233,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@inklabs/benchmarks@workspace:packages/benchmarks"
   dependencies:
+    "@inklabs/api": "workspace:*"
     tsx: "npm:^4.20.6"
     vitest: "npm:^4.0.18"
   languageName: unknown

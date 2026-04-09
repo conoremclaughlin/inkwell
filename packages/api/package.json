@@ -6,6 +6,9 @@
   "publishConfig": {
     "access": "public"
   },
+  "exports": {
+    "./benchmarks": "./src/benchmarks.ts"
+  },
   "description": "Inkwell API server with MCP, Telegram bot, and REST API",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

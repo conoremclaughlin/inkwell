@@ -9,6 +9,9 @@
     "benchmark:bootstrap-relevance": "tsx src/benchmark-bootstrap-relevance.ts",
     "test": "vitest run --config vitest.config.ts"
   },
+  "dependencies": {
+    "@inklabs/api": "workspace:*"
+  },
   "devDependencies": {
     "tsx": "^4.20.6",
     "vitest": "^4.0.18"

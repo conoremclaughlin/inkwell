@@ -1,6 +1,6 @@
 # Memory Benchmark Roadmap
 
-This document lays out how PCP/Ink should evaluate its memory system as we move from simple retrieval toward richer long-term memory, reflection, and context-eviction behavior.
+This document lays out how Inkwell should evaluate its memory system as we move from simple retrieval toward richer long-term memory, reflection, and context-eviction behavior.
 
 ## Benchmark philosophy
 
@@ -33,7 +33,7 @@ Hermes draws a strong line between:
 - small curated memory that is always in-context
 - larger searchable history that is only pulled when needed
 
-That distinction matters for PCP/Ink too. Our future benchmarks should separate:
+That distinction matters for Inkwell too. Our future benchmarks should separate:
 - long-term retrieval quality
 - bootstrap relevance
 - live context budget behavior
@@ -106,7 +106,7 @@ We should adopt explicit benchmark hygiene rules:
 
 ### Phase 1 — Public benchmark parity
 
-Goal: run PCP/Ink against standard external benchmark families and produce honest baseline numbers.
+Goal: run Inkwell against standard external benchmark families and produce honest baseline numbers.
 
 Deliverables:
 - dataset loaders/adapters for standard public benchmarks
@@ -158,7 +158,7 @@ Possible metrics:
 ## What success looks like
 
 Short term:
-- PCP/Ink can run against the same public memory benchmarks other systems cite.
+- Inkwell can run against the same public memory benchmarks other systems cite.
 - We can report quality and cost honestly.
 - We can compare raw, hybrid, chunked, and reranked modes clearly.
 
