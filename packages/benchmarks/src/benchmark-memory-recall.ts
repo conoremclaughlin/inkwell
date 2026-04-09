@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { createSupabaseClient, MemoryRepository } from '@inklabs/api/benchmarks';
 import { getBenchmarkDataset } from './benchmark-data/datasets';
 import { loadHfBenchmarkDataset } from './benchmark-data/hf-loader';
+import { loadLoCoMoDataset } from './benchmark-data/locomo-loader';
 import { loadLongMemEvalDataset } from './benchmark-data/longmemeval-loader';
 import {
   PUBLIC_BENCHMARKS,
@@ -42,6 +43,7 @@ const BENCHMARK_TOPIC = 'benchmark:memory-recall';
 const BENCHMARK_AGENT_ID = 'lumen';
 const DEFAULT_DATASET = 'internal-gold-v1';
 const MAX_CONTENT_CHARS = 1200;
+const RETRY_ATTEMPTS = 3;
 
 function parseModes(raw?: string): RecallMode[] {
   if (!raw) return ['text', 'semantic', 'hybrid'];
@@ -69,6 +71,30 @@ function parseBoolean(raw: string | undefined, defaultValue: boolean): boolean {
 function clampContent(text: string): string {
   if (text.length <= MAX_CONTENT_CHARS) return text;
   return `${text.slice(0, MAX_CONTENT_CHARS)}...`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withRetries<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  let lastError: unknown = null;
+
+  for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (attempt === RETRY_ATTEMPTS) break;
+      console.warn(
+        `[memory-benchmark] ${label} failed on attempt ${attempt}/${RETRY_ATTEMPTS}; retrying...`,
+        error
+      );
+      await sleep(250 * attempt);
+    }
+  }
+
+  throw lastError;
 }
 
 function buildSummaryMetrics(modes: RecallMode[], runs: CaseRun[]): SummaryMetric[] {
@@ -178,6 +204,11 @@ async function loadBenchmarkCases(dataset: string) {
     return { cases: longmemeval.cases, source: longmemeval.source };
   }
 
+  if (dataset === 'locomo10') {
+    const locomo = await loadLoCoMoDataset();
+    return { cases: locomo.cases, source: locomo.source };
+  }
+
   return { cases: getBenchmarkDataset(dataset), source: `builtin:${dataset}` };
 }
 
@@ -213,30 +244,34 @@ async function main() {
       const caseTopic = `${BENCHMARK_TOPIC}:${runId}:${benchCase.id}`;
       caseTopics[benchCase.id] = [caseTopic];
 
-      const target = await repo.remember({
-        userId,
-        agentId: BENCHMARK_AGENT_ID,
-        content: clampContent(benchCase.targetContent),
-        summary: `benchmark target ${benchCase.id}`,
-        source: 'observation',
-        salience: 'low',
-        topicKey: BENCHMARK_TOPIC,
-        topics: [BENCHMARK_TOPIC, caseTopic],
-      });
-      createdMemoryIds.push(target.id);
-      caseTargets[benchCase.id] = target.id;
-
-      for (let i = 0; i < benchCase.distractors.length; i += 1) {
-        const distractor = await repo.remember({
+      const target = await withRetries(`remember target ${benchCase.id}`, () =>
+        repo.remember({
           userId,
           agentId: BENCHMARK_AGENT_ID,
-          content: clampContent(benchCase.distractors[i]),
-          summary: `benchmark distractor ${benchCase.id} #${i + 1}`,
+          content: clampContent(benchCase.targetContent),
+          summary: `benchmark target ${benchCase.id}`,
           source: 'observation',
           salience: 'low',
           topicKey: BENCHMARK_TOPIC,
           topics: [BENCHMARK_TOPIC, caseTopic],
-        });
+        })
+      );
+      createdMemoryIds.push(target.id);
+      caseTargets[benchCase.id] = target.id;
+
+      for (let i = 0; i < benchCase.distractors.length; i += 1) {
+        const distractor = await withRetries(`remember distractor ${benchCase.id} #${i + 1}`, () =>
+          repo.remember({
+            userId,
+            agentId: BENCHMARK_AGENT_ID,
+            content: clampContent(benchCase.distractors[i]),
+            summary: `benchmark distractor ${benchCase.id} #${i + 1}`,
+            source: 'observation',
+            salience: 'low',
+            topicKey: BENCHMARK_TOPIC,
+            topics: [BENCHMARK_TOPIC, caseTopic],
+          })
+        );
         createdMemoryIds.push(distractor.id);
       }
     }
@@ -245,13 +280,15 @@ async function main() {
 
     for (const mode of modes) {
       for (const benchCase of benchmarkCases) {
-        const results = await repo.recall(userId, benchCase.query, {
-          recallMode: mode,
-          limit: TOP_K,
-          agentId: BENCHMARK_AGENT_ID,
-          includeShared: true,
-          topics: caseTopics[benchCase.id],
-        });
+        const results = await withRetries(`recall ${benchCase.id} (${mode})`, () =>
+          repo.recall(userId, benchCase.query, {
+            recallMode: mode,
+            limit: TOP_K,
+            agentId: BENCHMARK_AGENT_ID,
+            includeShared: true,
+            topics: caseTopics[benchCase.id],
+          })
+        );
 
         const expectedId = caseTargets[benchCase.id];
         const rank = results.findIndex((m) => m.id === expectedId);
