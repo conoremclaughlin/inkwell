@@ -896,14 +896,23 @@ When you complete a task_request, mark it as completed using update_inbox_messag
 
     const result = await sessionService!.handleMessage(request);
 
-    // 5. Route any responses
-    if (result.responses && result.responses.length > 0) {
-      await routeResponses(result.responses);
-    }
-
     if (!result.success) {
       logger.error(`[Trigger] SessionService failed for ${targetAgentId}: ${result.error}`);
       throw new Error(result.error || 'SessionService processing failed');
+    }
+
+    // 5. Route any responses — wrapped in try-catch because the session already
+    // succeeded at this point. A failure here (channel send error, cleanup race)
+    // should NOT emit trigger:error or send a "Trigger failed" notification.
+    try {
+      if (result.responses && result.responses.length > 0) {
+        await routeResponses(result.responses);
+      }
+    } catch (routeErr) {
+      logger.error(
+        `[Trigger] Response routing failed for ${targetAgentId} (session succeeded):`,
+        routeErr
+      );
     }
 
     logger.info(`[Trigger] Successfully processed trigger for ${targetAgentId}`);
