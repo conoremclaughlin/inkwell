@@ -199,15 +199,19 @@ export class TaskGroupsRepository {
     return data as unknown as TaskGroup;
   }
 
-  async delete(id: string): Promise<void> {
-    const { error } = await this.client
-      .from('task_groups' as never)
-      .delete()
-      .eq('id', id);
+  /**
+   * Archive a task group (soft delete). Groups are never hard-deleted —
+   * the execution log must be reproducible.
+   */
+  async archive(id: string): Promise<TaskGroup> {
+    return this.update(id, { status: 'cancelled' });
+  }
 
-    if (error) {
-      throw new Error(`Failed to delete task group: ${error.message}`);
-    }
+  /**
+   * @deprecated Use archive() instead. Task groups should never be hard-deleted.
+   */
+  async delete(id: string): Promise<void> {
+    await this.archive(id);
   }
 
   /**

@@ -9,7 +9,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database } from '../supabase/types';
 
-export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'blocked';
+export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'blocked' | 'archived';
 export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
 
 export interface ProjectTask {
@@ -248,14 +248,19 @@ export class ProjectTasksRepository {
   }
 
   /**
-   * Delete a task
+   * Archive a task (soft delete). Tasks are never hard-deleted —
+   * the execution log must be reproducible.
+   */
+  async archive(id: string): Promise<ProjectTask> {
+    return this.update(id, { status: 'archived' as TaskStatus });
+  }
+
+  /**
+   * @deprecated Use archive() instead. Tasks should never be hard-deleted.
    */
   async delete(id: string): Promise<void> {
-    const { error } = await this.client.from('tasks').delete().eq('id', id);
-
-    if (error) {
-      throw new Error(`Failed to delete task: ${error.message}`);
-    }
+    // Soft delete: archive instead of destroying
+    await this.archive(id);
   }
 
   /**
