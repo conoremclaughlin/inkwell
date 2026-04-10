@@ -133,6 +133,7 @@ export type Database = {
           permissions: Json;
           relationships: Json | null;
           role: string;
+          session_scope: string;
           soul: string | null;
           studio_hint: string | null;
           updated_at: string | null;
@@ -154,6 +155,7 @@ export type Database = {
           permissions?: Json;
           relationships?: Json | null;
           role: string;
+          session_scope?: string;
           soul?: string | null;
           studio_hint?: string | null;
           updated_at?: string | null;
@@ -175,6 +177,7 @@ export type Database = {
           permissions?: Json;
           relationships?: Json | null;
           role?: string;
+          session_scope?: string;
           soul?: string | null;
           studio_hint?: string | null;
           updated_at?: string | null;

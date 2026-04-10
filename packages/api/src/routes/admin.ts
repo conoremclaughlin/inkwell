@@ -2062,7 +2062,7 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
     const { data: identity, error: identityError } = await supabase
       .from('agent_identities')
       .select(
-        'id, agent_id, name, role, description, backend, studio_hint, workspace_id, updated_at, sandbox_bypass'
+        'id, agent_id, name, role, description, backend, studio_hint, workspace_id, updated_at, sandbox_bypass, session_scope'
       )
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
@@ -2176,6 +2176,7 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
         backend: identity.backend,
         studioHint: identity.studio_hint || null,
         sandboxBypass: identity.sandbox_bypass ?? false,
+        sessionScope: identity.session_scope || 'global',
         updatedAt: identity.updated_at,
       },
       studios: (studiosData || []).map((s: Record<string, unknown>) => ({
@@ -2211,8 +2212,8 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
 
 /**
  * PATCH /api/admin/identities/:agentId/settings
- * Update SB-level settings: sandbox_bypass, backend, runtime config (tool profile,
- * tool routing, max turns, passive recall). Admin-only — not exposed via MCP.
+ * Update SB-level settings: sandbox_bypass, session_scope, backend, runtime config
+ * (tool profile, tool routing, max turns, passive recall). Admin-only — not exposed via MCP.
  */
 router.patch('/identities/:agentId/settings', async (req: Request, res: Response) => {
   try {
@@ -2266,6 +2267,10 @@ router.patch('/identities/:agentId/settings', async (req: Request, res: Response
       if (passiveRecall !== undefined) runtimeConfig.passiveRecall = passiveRecall;
 
       updates.metadata = { ...existingMeta, runtimeConfig };
+    }
+
+    if (body.sessionScope === 'global' || body.sessionScope === 'per_sender') {
+      updates.session_scope = body.sessionScope;
     }
 
     if (Object.keys(updates).length === 0) {
@@ -2342,10 +2347,7 @@ router.patch('/studios/:studioId', async (req: Request, res: Response) => {
 
     updates.updated_at = new Date().toISOString();
 
-    const { error: updateErr } = await supabase
-      .from('studios')
-      .update(updates)
-      .eq('id', studioId);
+    const { error: updateErr } = await supabase.from('studios').update(updates).eq('id', studioId);
 
     if (updateErr) {
       logger.error('Failed to update studio settings:', updateErr);

@@ -159,6 +159,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
     // Resolve agent: mention → channel_routes → AGENT_ID env fallback
     let routedAgentId = agentId;
+    let routedIdentityId: string | undefined;
     const isGroupChat = metadata?.chatType === 'group' || metadata?.chatType === 'channel';
 
     // For group chats, try mention-based routing first
@@ -173,6 +174,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       );
       if (mentionMatch) {
         routedAgentId = mentionMatch.agentId;
+        routedIdentityId = mentionMatch.identityId;
         logger.debug(`[Route] Resolved agent from @mention`, {
           platform: channel,
           agentId: mentionMatch.agentId,
@@ -193,6 +195,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       );
       if (route) {
         routedAgentId = route.agentId;
+        routedIdentityId = route.identityId;
         routeStudioHint = route.studioHint;
         logger.debug(`[Route] Resolved agent from channel_routes`, {
           platform: channel,
@@ -209,14 +212,29 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       }
     }
 
-    // Resolve contact for per-sender session isolation
+    // Resolve contact for per-sender session isolation (only when agent has session_scope: 'per_sender')
     let contactId: string | undefined;
     const isExternalChannelForContact =
       channel === 'telegram' ||
       channel === 'whatsapp' ||
       channel === 'discord' ||
       channel === 'slack';
+    let agentSessionScope: string | null = null;
     if (isExternalChannelForContact && dataComposer) {
+      try {
+        let scopeQuery = dataComposer.getClient().from('agent_identities').select('session_scope');
+        if (routedIdentityId) {
+          scopeQuery = scopeQuery.eq('id', routedIdentityId);
+        } else {
+          scopeQuery = scopeQuery.eq('user_id', userId).eq('agent_id', routedAgentId);
+        }
+        const { data: identity } = await scopeQuery.single();
+        agentSessionScope = identity?.session_scope || 'global';
+      } catch {
+        // Fall through — default to global (no isolation)
+      }
+    }
+    if (isExternalChannelForContact && dataComposer && agentSessionScope === 'per_sender') {
       try {
         const platformMap: Record<string, 'telegram' | 'discord' | 'whatsapp' | 'imessage'> = {
           telegram: 'telegram',
