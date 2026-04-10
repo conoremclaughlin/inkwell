@@ -53,6 +53,8 @@ export interface StrategyConfig {
   maxIterationsWithoutApproval?: number;
   contextSummaryInterval?: number;
   verificationGates?: string[];
+  /** How often (in minutes) the heartbeat should check if the strategy is stuck. Default: 10 */
+  watchdogIntervalMinutes?: number;
 }
 
 export interface CreateTaskGroupInput {

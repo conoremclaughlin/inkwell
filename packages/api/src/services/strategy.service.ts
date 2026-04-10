@@ -92,6 +92,7 @@ const STRATEGY_PROMPTS: Record<StrategyPreset, (group: TaskGroup, task: ProjectT
     const config = group.strategy_config as StrategyConfig;
     const parts = [
       `You're working through task group "${group.title}" autonomously using the persistence strategy.`,
+      `Task group ID: ${group.id}.`,
     ];
 
     if (group.plan_uri) {
@@ -104,7 +105,9 @@ const STRATEGY_PROMPTS: Record<StrategyPreset, (group: TaskGroup, task: ProjectT
       `Your current task is #${(task.task_order ?? 0) + 1}: "${task.title}"${task.description ? ` — ${task.description}` : ''}.`
     );
 
-    parts.push('When you finish this task, call complete_task to advance to the next one.');
+    parts.push(
+      `When you finish this task, call complete_task(taskId: "${task.id}") to advance to the next one. The system will return your next task automatically.`
+    );
 
     if (config.checkInInterval) {
       parts.push(`Post a progress check-in every ${config.checkInInterval} tasks.`);
@@ -113,6 +116,10 @@ const STRATEGY_PROMPTS: Record<StrategyPreset, (group: TaskGroup, task: ProjectT
     if (config.verificationGates?.length) {
       parts.push(`Before advancing, verify: ${config.verificationGates.join(', ')}.`);
     }
+
+    parts.push(
+      'When a task requires notifying or requesting action from another agent, use send_to_inbox with messageType: "task_request" (not "message") so they get triggered immediately. Use triggerAgents to target specific agents if needed.'
+    );
 
     return parts.join(' ');
   },
@@ -188,6 +195,9 @@ export class StrategyService {
     // Mark the first task as in_progress
     await this.dataComposer.repositories.tasks.startTask(nextTask.id);
 
+    // Create a watchdog reminder so the heartbeat checks progress periodically
+    await this.createWatchdogReminder(updated, input.userId);
+
     const prompt = STRATEGY_PROMPTS[input.strategy](updated, nextTask);
 
     return {
@@ -262,6 +272,9 @@ export class StrategyService {
         context_summary: `Strategy complete. ${completed}/${tasks.length} tasks done.`,
       });
 
+      // Cancel watchdog — strategy is done
+      await this.cancelWatchdogReminder(group.id);
+
       // Notify dispatcher of completion
       await this.notifyDispatcher(
         group,
@@ -330,6 +343,9 @@ export class StrategyService {
     if (group.user_id !== userId) throw new Error('Task group does not belong to this user');
     if (group.status !== 'active') throw new Error('Strategy is not active');
 
+    // Cancel watchdog while paused
+    await this.cancelWatchdogReminder(groupId);
+
     return this.dataComposer.repositories.taskGroups.update(groupId, {
       status: 'paused',
       strategy_paused_at: new Date().toISOString(),
@@ -351,6 +367,9 @@ export class StrategyService {
       strategy_paused_at: null,
       iterations_since_approval: 0,
     });
+
+    // Re-create watchdog reminder
+    await this.createWatchdogReminder(group, userId);
 
     const nextTask = await this.getTaskByOrder(groupId, group.current_task_index);
 
@@ -556,6 +575,83 @@ export class StrategyService {
     } catch (err) {
       logger.warn('Strategy notification failed:', err);
       return false;
+    }
+  }
+
+  /**
+   * Create a recurring watchdog reminder linked to the strategy.
+   * The heartbeat picks this up periodically and checks if the strategy is stuck.
+   */
+  private async createWatchdogReminder(group: TaskGroup, userId: string): Promise<void> {
+    const config = group.strategy_config as StrategyConfig;
+    const intervalMinutes = config.watchdogIntervalMinutes || 10;
+
+    try {
+      const nextRunAt = new Date();
+      nextRunAt.setMinutes(nextRunAt.getMinutes() + intervalMinutes);
+
+      // Resolve the owner agent's identity for reminder routing
+      let identityId: string | null = null;
+      if (group.owner_agent_id) {
+        const { data: identity } = await this.dataComposer
+          .getClient()
+          .from('agent_identities')
+          .select('id')
+          .eq('agent_id', group.owner_agent_id)
+          .eq('user_id', userId)
+          .limit(1)
+          .single();
+        if (identity) identityId = identity.id;
+      }
+
+      await this.dataComposer
+        .getClient()
+        .from('scheduled_reminders')
+        .insert({
+          user_id: userId,
+          title: `Strategy watchdog: "${group.title}"`,
+          description: [
+            `Check progress on task group ${group.id} (strategy: ${group.strategy}).`,
+            `Use get_strategy_status(groupId: "${group.id}") to check progress.`,
+            'If the strategy is stuck (no progress since last check), re-trigger the owner agent on the thread.',
+            group.thread_key ? `Thread: ${group.thread_key}` : null,
+          ]
+            .filter(Boolean)
+            .join(' '),
+          identity_id: identityId,
+          cron_expression: `*/${intervalMinutes} * * * *`,
+          next_run_at: nextRunAt.toISOString(),
+          status: 'active',
+          metadata: {
+            strategyWatchdog: true,
+            groupId: group.id,
+            strategy: group.strategy,
+            ownerAgentId: group.owner_agent_id,
+            threadKey: group.thread_key,
+          },
+        } as never);
+
+      logger.info(`Strategy watchdog created for group ${group.id} (every ${intervalMinutes}min)`);
+    } catch (err) {
+      // Non-fatal — the strategy still works without the watchdog
+      logger.warn('Failed to create strategy watchdog reminder:', err);
+    }
+  }
+
+  /**
+   * Cancel the watchdog reminder for a strategy (on pause/complete).
+   */
+  private async cancelWatchdogReminder(groupId: string): Promise<void> {
+    try {
+      await this.dataComposer
+        .getClient()
+        .from('scheduled_reminders')
+        .update({ status: 'cancelled' } as never)
+        .contains('metadata' as never, { strategyWatchdog: true, groupId } as never);
+
+      logger.info(`Strategy watchdog cancelled for group ${groupId}`);
+    } catch (err) {
+      logger.warn('Failed to cancel strategy watchdog reminder:', err);
     }
   }
 }
