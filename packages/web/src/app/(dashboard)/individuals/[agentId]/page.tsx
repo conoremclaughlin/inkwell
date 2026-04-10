@@ -142,8 +142,8 @@ function RuntimeSettingsPanel({ agentId, identity }: { agentId: string; identity
           </CardTitle>
           <CardDescription>
             Configure default backend, tool permissions, and passive recall for{' '}
-            <span className="font-semibold">{identity.name}</span>. These settings apply when
-            launching via <code className="bg-gray-100 px-1.5 py-0.5 rounded text-xs">ink chat --agent {agentId}</code>.
+            <span className="font-semibold">{identity.name}</span>. These are stored defaults
+            used by triggers and heartbeats. Use the CLI reference below to apply them manually.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
@@ -279,7 +279,7 @@ function RuntimeSettingsPanel({ agentId, identity }: { agentId: string; identity
         </CardHeader>
         <CardContent>
           <pre className="bg-gray-900 text-gray-100 p-3 rounded-md text-xs font-mono overflow-x-auto">
-{`# Run ${identity.name} with saved settings
+{`# Run ${identity.name} with these settings
 ink chat --agent ${agentId}${backend ? ` --backend ${backend}` : ''}${toolProfile ? ` --profile ${toolProfile}` : ''}${toolRouting ? ` --tool-routing ${toolRouting}` : ''}${maxTurns ? ` --max-turns ${maxTurns}` : ''}
 
 # Heartbeat mode
