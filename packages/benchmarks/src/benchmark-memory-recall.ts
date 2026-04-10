@@ -11,8 +11,14 @@ import {
   type PublicBenchmarkFamily,
   getPublicBenchmarkDescriptor,
 } from './benchmark-data/public-benchmarks';
-
-type RecallMode = 'text' | 'semantic' | 'hybrid' | 'auto';
+import {
+  createInitialBenchmarkRunState,
+  estimateRemainingDuration,
+  formatDurationMs,
+  loadBenchmarkRunState,
+  writeBenchmarkRunState,
+} from './benchmark-memory-recall.state';
+import type { RecallMode } from './benchmark-memory-recall.types';
 
 function parseBenchmarkFamily(raw?: string): PublicBenchmarkFamily | null {
   if (!raw) return null;
@@ -44,6 +50,7 @@ const BENCHMARK_AGENT_ID = 'lumen';
 const DEFAULT_DATASET = 'internal-gold-v1';
 const MAX_CONTENT_CHARS = 1200;
 const RETRY_ATTEMPTS = 3;
+const DEFAULT_PROGRESS_EVERY = 25;
 
 function parseModes(raw?: string): RecallMode[] {
   if (!raw) return ['text', 'semantic', 'hybrid'];
@@ -66,6 +73,13 @@ function round(value: number): number {
 function parseBoolean(raw: string | undefined, defaultValue: boolean): boolean {
   if (raw === undefined) return defaultValue;
   return ['1', 'true', 'yes', 'on'].includes(raw.toLowerCase());
+}
+
+function parsePositiveInt(raw: string | undefined, defaultValue: number): number {
+  if (!raw) return defaultValue;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return defaultValue;
+  return Math.floor(parsed);
 }
 
 function clampContent(text: string): string {
@@ -131,7 +145,18 @@ async function persistRun(
     benchmarkFamily: PublicBenchmarkFamily | null;
   }
 ): Promise<void> {
-  const { runId, userId, dataset, topK, caseCount, modes, summary, runs, datasetSource, benchmarkFamily } = params;
+  const {
+    runId,
+    userId,
+    dataset,
+    topK,
+    caseCount,
+    modes,
+    summary,
+    runs,
+    datasetSource,
+    benchmarkFamily,
+  } = params;
 
   const modeRows = summary.map((metric) => ({
     run_id: runId,
@@ -193,6 +218,24 @@ async function writeJsonOutput(outputPath: string, payload: unknown): Promise<vo
   await writeFile(outputPath, JSON.stringify(payload, null, 2), 'utf-8');
 }
 
+function logProgress(params: {
+  label: string;
+  completed: number;
+  total: number;
+  durationMs: number;
+  averageMs: number;
+}) {
+  console.log(
+    `[memory-benchmark] ${params.label} ${params.completed}/${params.total} ` +
+      `last=${formatDurationMs(params.durationMs)} avg=${formatDurationMs(Math.round(params.averageMs))} ` +
+      `eta=${estimateRemainingDuration({
+        completed: params.completed,
+        total: params.total,
+        averageMs: params.averageMs,
+      })}`
+  );
+}
+
 async function loadBenchmarkCases(dataset: string) {
   if (dataset === 'hf') {
     const hf = await loadHfBenchmarkDataset();
@@ -226,11 +269,22 @@ async function main() {
   const modes = parseModes(process.env.MEMORY_BENCHMARK_MODES);
   const persistResults = parseBoolean(process.env.MEMORY_BENCHMARK_PERSIST, true);
   const writeOutputFile = parseBoolean(process.env.MEMORY_BENCHMARK_WRITE_FILE, true);
+  const progressEvery = parsePositiveInt(
+    process.env.MEMORY_BENCHMARK_PROGRESS_EVERY,
+    DEFAULT_PROGRESS_EVERY
+  );
 
-  const runId = `membench-${Date.now()}-${randomUUID().slice(0, 8)}`;
+  const requestedRunId = process.env.MEMORY_BENCHMARK_RUN_ID;
+  const runId = requestedRunId || `membench-${Date.now()}-${randomUUID().slice(0, 8)}`;
   const outputPath =
     process.env.MEMORY_BENCHMARK_OUTPUT_PATH ||
     resolve(process.cwd(), 'output', 'memory-benchmarks', `${runId}.json`);
+  const statePath =
+    process.env.MEMORY_BENCHMARK_STATE_PATH ||
+    resolve(process.cwd(), 'output', 'memory-benchmarks', `${runId}.state.json`);
+  const existingState = await loadBenchmarkRunState(statePath);
+  const reuseSeeded = parseBoolean(process.env.MEMORY_BENCHMARK_REUSE_SEEDED, !!existingState);
+  const keepSeeded = parseBoolean(process.env.MEMORY_BENCHMARK_KEEP_SEEDED, !!existingState);
 
   const supabase = createSupabaseClient();
   const repo = new MemoryRepository(supabase);
@@ -238,11 +292,41 @@ async function main() {
 
   const caseTargets: Record<string, string> = {};
   const caseTopics: Record<string, string[]> = {};
+  const runState =
+    existingState ||
+    createInitialBenchmarkRunState({
+      runId,
+      dataset,
+      datasetSource,
+      benchmarkFamily,
+      userId,
+      modes,
+      outputPath,
+    });
+
+  if (existingState) {
+    console.log(
+      `[memory-benchmark] Resuming run ${runState.runId} from ${statePath} ` +
+        `(seeded=${Object.keys(runState.seededCases).length}, ` +
+        `completed=${Object.values(runState.completedRuns).reduce((acc, runs) => acc + Object.keys(runs || {}).length, 0)})`
+    );
+  } else {
+    await writeBenchmarkRunState(statePath, runState);
+  }
 
   try {
-    for (const benchCase of benchmarkCases) {
-      const caseTopic = `${BENCHMARK_TOPIC}:${runId}:${benchCase.id}`;
+    for (const [index, benchCase] of benchmarkCases.entries()) {
+      const caseTopic = `${BENCHMARK_TOPIC}:${runState.runId}:${benchCase.id}`;
       caseTopics[benchCase.id] = [caseTopic];
+
+      const seededCase = runState.seededCases[benchCase.id];
+      if (reuseSeeded && seededCase) {
+        caseTargets[benchCase.id] = seededCase.targetMemoryId;
+        caseTopics[benchCase.id] = [seededCase.topic];
+        continue;
+      }
+
+      const seedStartedAt = Date.now();
 
       const target = await withRetries(`remember target ${benchCase.id}`, () =>
         repo.remember({
@@ -258,6 +342,7 @@ async function main() {
       );
       createdMemoryIds.push(target.id);
       caseTargets[benchCase.id] = target.id;
+      const distractorIds: string[] = [];
 
       for (let i = 0; i < benchCase.distractors.length; i += 1) {
         const distractor = await withRetries(`remember distractor ${benchCase.id} #${i + 1}`, () =>
@@ -273,13 +358,54 @@ async function main() {
           })
         );
         createdMemoryIds.push(distractor.id);
+        distractorIds.push(distractor.id);
+      }
+
+      const seedMs = Date.now() - seedStartedAt;
+      runState.seededCases[benchCase.id] = {
+        caseId: benchCase.id,
+        topic: caseTopic,
+        targetMemoryId: target.id,
+        distractorMemoryIds: distractorIds,
+        seedMs,
+      };
+      runState.timings.seedCaseCount += 1;
+      runState.timings.seedTotalMs += seedMs;
+      await writeBenchmarkRunState(statePath, runState);
+
+      if ((index + 1) % progressEvery === 0 || index === benchmarkCases.length - 1) {
+        logProgress({
+          label: 'seeded cases',
+          completed: index + 1,
+          total: benchmarkCases.length,
+          durationMs: seedMs,
+          averageMs: runState.timings.seedTotalMs / Math.max(1, runState.timings.seedCaseCount),
+        });
       }
     }
 
     const runs: CaseRun[] = [];
 
     for (const mode of modes) {
-      for (const benchCase of benchmarkCases) {
+      const completedForMode = (runState.completedRuns[mode] ||= {});
+      console.log(
+        `[memory-benchmark] starting recall mode=${mode} completed=${Object.keys(completedForMode).length}/${benchmarkCases.length}`
+      );
+
+      for (const [index, benchCase] of benchmarkCases.entries()) {
+        const resumed = completedForMode[benchCase.id];
+        if (resumed) {
+          runs.push({
+            caseId: benchCase.id,
+            query: benchCase.query,
+            mode,
+            rank: resumed.rank,
+            topSummaries: resumed.topSummaries,
+          });
+          continue;
+        }
+
+        const recallStartedAt = Date.now();
         const results = await withRetries(`recall ${benchCase.id} (${mode})`, () =>
           repo.recall(userId, benchCase.query, {
             recallMode: mode,
@@ -292,14 +418,36 @@ async function main() {
 
         const expectedId = caseTargets[benchCase.id];
         const rank = results.findIndex((m) => m.id === expectedId);
+        const recallMs = Date.now() - recallStartedAt;
 
-        runs.push({
+        const caseRun: CaseRun = {
           caseId: benchCase.id,
           query: benchCase.query,
           mode,
           rank: rank >= 0 ? rank + 1 : null,
           topSummaries: results.map((m) => m.summary || m.content.slice(0, 80)),
-        });
+        };
+        runs.push(caseRun);
+        completedForMode[benchCase.id] = {
+          rank: caseRun.rank,
+          topSummaries: caseRun.topSummaries,
+          recallMs,
+        };
+        runState.timings.recallCaseCount += 1;
+        runState.timings.recallTotalMs += recallMs;
+        await writeBenchmarkRunState(statePath, runState);
+
+        const completedCount = Object.keys(completedForMode).length;
+        if (completedCount % progressEvery === 0 || index === benchmarkCases.length - 1) {
+          logProgress({
+            label: `recalled ${mode}`,
+            completed: completedCount,
+            total: benchmarkCases.length,
+            durationMs: recallMs,
+            averageMs:
+              runState.timings.recallTotalMs / Math.max(1, runState.timings.recallCaseCount),
+          });
+        }
       }
     }
 
@@ -335,10 +483,23 @@ async function main() {
         benchmarkFamilyDescriptor: benchmarkFamily
           ? getPublicBenchmarkDescriptor(benchmarkFamily)
           : null,
+        statePath,
+        reuseSeeded,
+        keepSeeded,
+        timings: {
+          seedCaseCount: runState.timings.seedCaseCount,
+          seedTotalMs: runState.timings.seedTotalMs,
+          seedAverageMs: runState.timings.seedTotalMs / Math.max(1, runState.timings.seedCaseCount),
+          recallCaseCount: runState.timings.recallCaseCount,
+          recallTotalMs: runState.timings.recallTotalMs,
+          recallAverageMs:
+            runState.timings.recallTotalMs / Math.max(1, runState.timings.recallCaseCount),
+        },
       },
       summary,
       runs,
       outputPath: writeOutputFile ? outputPath : null,
+      statePath,
     };
 
     if (writeOutputFile) {
@@ -347,11 +508,13 @@ async function main() {
 
     console.log(JSON.stringify(payload, null, 2));
   } finally {
-    for (const memoryId of createdMemoryIds) {
-      try {
-        await repo.forget(memoryId, userId);
-      } catch {
-        // best-effort cleanup
+    if (!keepSeeded) {
+      for (const memoryId of createdMemoryIds) {
+        try {
+          await repo.forget(memoryId, userId);
+        } catch {
+          // best-effort cleanup
+        }
       }
     }
   }
