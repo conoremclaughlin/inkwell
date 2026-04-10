@@ -35,13 +35,22 @@ interface StrategyTask {
   updatedAt: string;
 }
 
+interface WatchdogFire {
+  triggeredAt: string;
+  status: string;
+}
+
 interface WatchdogEntry {
   id: string;
-  content: string;
+  title: string;
+  description: string | null;
   status: string;
-  fireAt: string;
+  nextRunAt: string | null;
+  lastRunAt: string | null;
+  runCount: number;
   createdAt: string;
-  action: string | null;
+  ownerAgentId: string | null;
+  fires: WatchdogFire[];
 }
 
 interface Strategy {
@@ -263,16 +272,27 @@ function WatchdogSection({ entries }: { entries: WatchdogEntry[] }) {
         {expanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
       </button>
       {expanded && (
-        <div className="mt-2 space-y-1 pl-4 border-l-2 border-gray-200">
+        <div className="mt-2 space-y-2 pl-4 border-l-2 border-gray-200">
           {entries.map((e) => (
             <div key={e.id} className="text-xs text-gray-500">
-              <span className="text-gray-400">{formatDateTime(e.fireAt)}</span>
-              {' \u2014 '}
-              <span>{e.content}</span>
-              {e.status !== 'fired' && (
-                <Badge variant="outline" className="ml-1 text-xs py-0 px-1">
+              <div className="flex items-center gap-2">
+                <span className="font-medium text-gray-600">{e.title}</span>
+                <Badge variant="outline" className="text-xs py-0 px-1">
                   {e.status}
                 </Badge>
+                {e.runCount > 0 && <span className="text-gray-400">fired {e.runCount}x</span>}
+              </div>
+              {e.fires.length > 0 && (
+                <div className="mt-1 space-y-0.5 ml-2">
+                  {e.fires.slice(0, 5).map((fire, i) => (
+                    <div key={i} className="text-gray-400">
+                      {formatDateTime(fire.triggeredAt)} \u2014 {fire.status}
+                    </div>
+                  ))}
+                  {e.fires.length > 5 && (
+                    <div className="text-gray-400">+{e.fires.length - 5} more</div>
+                  )}
+                </div>
               )}
             </div>
           ))}
