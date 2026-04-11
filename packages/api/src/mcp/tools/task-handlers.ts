@@ -353,30 +353,6 @@ export async function handleCompleteTask(
       logger.warn('Failed to auto-remember task completion:', err);
     }
 
-    // Log task completion to activity stream for dashboard visibility
-    try {
-      const activityAgentId = getEffectiveAgentId(undefined);
-      const reqCtx = getRequestContext();
-      await dataComposer.repositories.activityStream.logActivity({
-        userId: resolved.user.id,
-        agentId: activityAgentId || 'unknown',
-        type: 'state_change',
-        subtype: 'task_completed',
-        content: `Completed task: ${task.title}`,
-        sessionId: reqCtx?.sessionId,
-        payload: {
-          taskId: task.id,
-          taskGroupId: task.task_group_id,
-          completedAt: task.completed_at,
-          priority: task.priority,
-          tags: task.tags,
-        } as unknown as import('../../data/repositories/activity-stream.repository').Json,
-        status: 'completed',
-      });
-    } catch (err) {
-      logger.warn('Failed to log task completion activity:', err);
-    }
-
     // Strategy advancement: if task belongs to a group with an active strategy,
     // advance to the next task and inject the strategy prompt.
     let strategyResult = null;
