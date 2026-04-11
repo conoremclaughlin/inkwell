@@ -769,9 +769,21 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       }
 
       if (identityRows.length > 1) {
-        throw new Error(
-          `Ambiguous identity for agent "${targetAgentId}" (multiple workspace-scoped identities). Include inboxMessageId with recipient_identity_id or pass metadata.workspaceId.`
+        // Disambiguate: prefer workspace-scoped over null-workspace (orphaned)
+        const workspaceScoped = identityRows.filter(
+          (r: { workspace_id: string | null }) => r.workspace_id != null
         );
+        if (workspaceScoped.length === 1) {
+          resolvedIdentityId = workspaceScoped[0].id;
+          resolvedWorkspaceId = workspaceScoped[0].workspace_id || undefined;
+          logger.info(
+            `[Trigger] Disambiguated ${targetAgentId}: preferred workspace-scoped identity ${resolvedIdentityId}`
+          );
+        } else {
+          throw new Error(
+            `Ambiguous identity for agent "${targetAgentId}" (${identityRows.length} identities, ${workspaceScoped.length} workspace-scoped). Include inboxMessageId with recipient_identity_id or pass metadata.workspaceId.`
+          );
+        }
       } else {
         resolvedIdentityId = identityRows[0].id;
         resolvedWorkspaceId = identityRows[0].workspace_id || undefined;
