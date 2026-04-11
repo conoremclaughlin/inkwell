@@ -94,9 +94,9 @@ export const INTERNAL_GOLDSET_V1: BenchmarkCase[] = [
   },
   {
     id: 'studio-routing-cascade',
-    query: 'how does studio routing resolve between override and default home',
+    query: 'how does studio routing resolve between override and default studio',
     targetContent:
-      'Studio routing follows a cascade: work-specific override first, then agent home studio_hint, then fallback to home.',
+      'Studio routing follows a cascade: work-specific override first, then agent default studio_hint, then fallback to main.',
     distractors: [
       'Thread keys keep multi-step conversations in one logical session.',
       'Session lifecycle and phase are orthogonal state dimensions.',
@@ -237,7 +237,7 @@ export const BOOTSTRAP_RELEVANCE_V1: BootstrapRelevanceCase[] = [
     focusText: 'select studio cascade rules for task execution',
     targetTopicKey: 'decision:studio-routing',
     targetContent:
-      'Studio routing cascade: explicit override first, then agent home studio_hint, then fallback to home.',
+      'Studio routing cascade: explicit override first, then agent default studio_hint, then fallback to main.',
     distractors: [
       'Protocol v0.1 requires deterministic thread matching and sender authenticity checks.',
       'Memory summaries should be cached and invalidated on new writes.',

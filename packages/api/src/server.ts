@@ -446,7 +446,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     // Resolve studioHint via cascade:
     //   1. reminder.studio_hint (direct override)
     //   2. channel_routes.studio_hint (matched by delivery channel)
-    //   3. agent_identities.studio_hint (agent's home studio)
+    //   3. agent_identities.studio_hint (agent's default studio)
     //   4. null → resolveStudioId() uses its own cascade (agent studio → main)
     let reminderStudioHint: string | null = null;
 
@@ -478,7 +478,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       }
     }
 
-    // Fallback to agent identity's home studio
+    // Fallback to agent identity's default studio
     if (!reminderStudioHint && reminder.identity_id && dataComposer) {
       const { data: identity } = await dataComposer
         .getClient()
@@ -488,7 +488,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         .single();
       if (identity?.studio_hint) {
         reminderStudioHint = identity.studio_hint;
-        logger.debug(`[Heartbeat] Using agent home studio`, {
+        logger.debug(`[Heartbeat] Using agent default studio`, {
           studioHint: reminderStudioHint,
           identityId: reminder.identity_id,
         });

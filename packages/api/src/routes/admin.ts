@@ -2664,7 +2664,7 @@ router.delete('/routing/routes/:routeId', async (req: Request, res: Response) =>
 
 /**
  * PATCH /api/admin/routing/identities/:identityId
- * Update an agent identity's studio_hint (home studio).
+ * Update an agent identity's studio_hint (default studio).
  */
 router.patch('/routing/identities/:identityId', async (req: Request, res: Response) => {
   try {
