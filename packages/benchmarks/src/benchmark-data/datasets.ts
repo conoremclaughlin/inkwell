@@ -1,7 +1,8 @@
 export interface BenchmarkCase {
   id: string;
   query: string;
-  targetContent: string;
+  targetContent?: string;
+  targetContents?: string[];
   distractors: string[];
   provenance?: string;
 }

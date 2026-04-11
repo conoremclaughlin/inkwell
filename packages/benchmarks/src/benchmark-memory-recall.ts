@@ -48,7 +48,6 @@ const TOP_K = 5;
 const BENCHMARK_TOPIC = 'benchmark:memory-recall';
 const BENCHMARK_AGENT_ID = 'lumen';
 const DEFAULT_DATASET = 'internal-gold-v1';
-const MAX_CONTENT_CHARS = 1200;
 const RETRY_ATTEMPTS = 3;
 const DEFAULT_PROGRESS_EVERY = 25;
 
@@ -82,13 +81,23 @@ function parsePositiveInt(raw: string | undefined, defaultValue: number): number
   return Math.floor(parsed);
 }
 
-function clampContent(text: string): string {
-  if (text.length <= MAX_CONTENT_CHARS) return text;
-  return `${text.slice(0, MAX_CONTENT_CHARS)}...`;
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getTargetDocuments(benchCase: {
+  targetContent?: string;
+  targetContents?: string[];
+}): string[] {
+  if (Array.isArray(benchCase.targetContents) && benchCase.targetContents.length > 0) {
+    return benchCase.targetContents;
+  }
+
+  if (typeof benchCase.targetContent === 'string' && benchCase.targetContent.trim().length > 0) {
+    return [benchCase.targetContent];
+  }
+
+  throw new Error('Benchmark case must define targetContent or targetContents.');
 }
 
 async function withRetries<T>(label: string, fn: () => Promise<T>): Promise<T> {
@@ -290,7 +299,7 @@ async function main() {
   const repo = new MemoryRepository(supabase);
   const createdMemoryIds: string[] = [];
 
-  const caseTargets: Record<string, string> = {};
+  const caseTargets: Record<string, string[]> = {};
   const caseTopics: Record<string, string[]> = {};
   const runState =
     existingState ||
@@ -321,27 +330,37 @@ async function main() {
 
       const seededCase = runState.seededCases[benchCase.id];
       if (reuseSeeded && seededCase) {
-        caseTargets[benchCase.id] = seededCase.targetMemoryId;
+        caseTargets[benchCase.id] = seededCase.targetMemoryIds;
         caseTopics[benchCase.id] = [seededCase.topic];
         continue;
       }
 
       const seedStartedAt = Date.now();
+      const targetMemoryIds: string[] = [];
+      const targetDocuments = getTargetDocuments(benchCase);
 
-      const target = await withRetries(`remember target ${benchCase.id}`, () =>
-        repo.remember({
-          userId,
-          agentId: BENCHMARK_AGENT_ID,
-          content: clampContent(benchCase.targetContent),
-          summary: `benchmark target ${benchCase.id}`,
-          source: 'observation',
-          salience: 'low',
-          topicKey: BENCHMARK_TOPIC,
-          topics: [BENCHMARK_TOPIC, caseTopic],
-        })
-      );
-      createdMemoryIds.push(target.id);
-      caseTargets[benchCase.id] = target.id;
+      for (let i = 0; i < targetDocuments.length; i += 1) {
+        const target = await withRetries(
+          `remember target ${benchCase.id}${targetDocuments.length > 1 ? ` #${i + 1}` : ''}`,
+          () =>
+            repo.remember({
+              userId,
+              agentId: BENCHMARK_AGENT_ID,
+              content: targetDocuments[i],
+              summary:
+                targetDocuments.length > 1
+                  ? `benchmark target ${benchCase.id} #${i + 1}`
+                  : `benchmark target ${benchCase.id}`,
+              source: 'observation',
+              salience: 'low',
+              topicKey: BENCHMARK_TOPIC,
+              topics: [BENCHMARK_TOPIC, caseTopic],
+            })
+        );
+        createdMemoryIds.push(target.id);
+        targetMemoryIds.push(target.id);
+      }
+      caseTargets[benchCase.id] = targetMemoryIds;
       const distractorIds: string[] = [];
 
       for (let i = 0; i < benchCase.distractors.length; i += 1) {
@@ -349,7 +368,7 @@ async function main() {
           repo.remember({
             userId,
             agentId: BENCHMARK_AGENT_ID,
-            content: clampContent(benchCase.distractors[i]),
+            content: benchCase.distractors[i],
             summary: `benchmark distractor ${benchCase.id} #${i + 1}`,
             source: 'observation',
             salience: 'low',
@@ -365,7 +384,7 @@ async function main() {
       runState.seededCases[benchCase.id] = {
         caseId: benchCase.id,
         topic: caseTopic,
-        targetMemoryId: target.id,
+        targetMemoryIds,
         distractorMemoryIds: distractorIds,
         seedMs,
       };
@@ -416,8 +435,8 @@ async function main() {
           })
         );
 
-        const expectedId = caseTargets[benchCase.id];
-        const rank = results.findIndex((m) => m.id === expectedId);
+        const expectedIds = new Set(caseTargets[benchCase.id]);
+        const rank = results.findIndex((m) => expectedIds.has(m.id));
         const recallMs = Date.now() - recallStartedAt;
 
         const caseRun: CaseRun = {

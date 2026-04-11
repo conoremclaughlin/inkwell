@@ -18,7 +18,7 @@ describe('loadLongMemEvalDataset', () => {
     else process.env.LONGMEMEVAL_MAX_DISTRACTORS = oldDistractors;
   });
 
-  it('maps answer sessions to a target document and non-answer sessions to distractors', async () => {
+  it('maps answer sessions to distinct target documents and non-answer sessions to distractors', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'longmemeval-'));
     const file = join(dir, 'sample.json');
     await writeFile(
@@ -40,9 +40,7 @@ describe('loadLongMemEvalDataset', () => {
               { role: 'user', content: 'I think postgres is the safer backend.' },
               { role: 'assistant', content: 'That sounds like the current preference.' },
             ],
-            [
-              { role: 'user', content: 'Decision made: we are standardizing on postgres.' },
-            ],
+            [{ role: 'user', content: 'Decision made: we are standardizing on postgres.' }],
           ],
         },
       ]),
@@ -58,8 +56,10 @@ describe('loadLongMemEvalDataset', () => {
     expect(loaded.cases).toHaveLength(1);
     expect(loaded.cases[0].id).toBe('q1');
     expect(loaded.cases[0].query).toContain('What database backend');
-    expect(loaded.cases[0].targetContent).toContain('session s2');
-    expect(loaded.cases[0].targetContent).toContain('session s3');
+    expect(loaded.cases[0].targetContents).toEqual([
+      expect.stringContaining('session s2'),
+      expect.stringContaining('session s3'),
+    ]);
     expect(loaded.cases[0].distractors).toHaveLength(1);
     expect(loaded.cases[0].distractors[0]).toContain('session s1');
     expect(loaded.cases[0].provenance).toContain('multi-session');
