@@ -5,7 +5,7 @@ import type { RecallMode } from './benchmark-memory-recall.types';
 export interface SeededCaseState {
   caseId: string;
   topic: string;
-  targetMemoryId: string;
+  targetMemoryIds: string[];
   distractorMemoryIds: string[];
   seedMs: number;
 }
@@ -61,7 +61,24 @@ export function createInitialBenchmarkRunState(params: {
 export async function loadBenchmarkRunState(statePath: string): Promise<BenchmarkRunState | null> {
   try {
     const raw = await readFile(statePath, 'utf-8');
-    return JSON.parse(raw) as BenchmarkRunState;
+    const parsed = JSON.parse(raw) as BenchmarkRunState & {
+      seededCases?: Record<
+        string,
+        SeededCaseState & {
+          targetMemoryId?: string;
+        }
+      >;
+    };
+
+    if (parsed.seededCases) {
+      for (const seededCase of Object.values(parsed.seededCases)) {
+        if (!Array.isArray(seededCase.targetMemoryIds)) {
+          seededCase.targetMemoryIds = seededCase.targetMemoryId ? [seededCase.targetMemoryId] : [];
+        }
+      }
+    }
+
+    return parsed as BenchmarkRunState;
   } catch (error) {
     const nodeError = error as NodeJS.ErrnoException;
     if (nodeError?.code === 'ENOENT') return null;

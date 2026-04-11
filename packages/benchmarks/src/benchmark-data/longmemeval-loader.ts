@@ -44,10 +44,14 @@ function formatSession(turns: LongMemEvalTurn[]): string {
     .join('\n');
 }
 
-function buildTargetContent(instance: LongMemEvalInstance): string | null {
-  const sessionIds = Array.isArray(instance.haystack_session_ids) ? instance.haystack_session_ids : [];
+function buildTargetContents(instance: LongMemEvalInstance): string[] {
+  const sessionIds = Array.isArray(instance.haystack_session_ids)
+    ? instance.haystack_session_ids
+    : [];
   const sessions = Array.isArray(instance.haystack_sessions) ? instance.haystack_sessions : [];
-  const answerIds = new Set(Array.isArray(instance.answer_session_ids) ? instance.answer_session_ids : []);
+  const answerIds = new Set(
+    Array.isArray(instance.answer_session_ids) ? instance.answer_session_ids : []
+  );
 
   const matched = sessionIds
     .map((sessionId, idx) => ({
@@ -61,14 +65,17 @@ function buildTargetContent(instance: LongMemEvalInstance): string | null {
     })
     .filter((text): text is string => !!text);
 
-  if (matched.length === 0) return null;
-  return matched.join('\n\n---\n\n');
+  return matched;
 }
 
 function buildDistractors(instance: LongMemEvalInstance, maxDistractors: number): string[] {
-  const sessionIds = Array.isArray(instance.haystack_session_ids) ? instance.haystack_session_ids : [];
+  const sessionIds = Array.isArray(instance.haystack_session_ids)
+    ? instance.haystack_session_ids
+    : [];
   const sessions = Array.isArray(instance.haystack_sessions) ? instance.haystack_sessions : [];
-  const answerIds = new Set(Array.isArray(instance.answer_session_ids) ? instance.answer_session_ids : []);
+  const answerIds = new Set(
+    Array.isArray(instance.answer_session_ids) ? instance.answer_session_ids : []
+  );
 
   const distractors = sessionIds
     .map((sessionId, idx) => ({
@@ -98,8 +105,8 @@ function mapInstancesToBenchmarkCases(
     const query = typeof instance.question === 'string' ? instance.question.trim() : null;
     if (!id || !query) continue;
 
-    const targetContent = buildTargetContent(instance);
-    if (!targetContent) continue;
+    const targetContents = buildTargetContents(instance);
+    if (targetContents.length === 0) continue;
 
     const distractors = buildDistractors(instance, maxDistractors);
     if (distractors.length === 0) continue;
@@ -107,7 +114,7 @@ function mapInstancesToBenchmarkCases(
     cases.push({
       id,
       query,
-      targetContent,
+      targetContents,
       distractors,
       provenance: `longmemeval:${instance.question_type || 'unknown'}:${instance.question_date || 'unknown-date'}`,
     });
