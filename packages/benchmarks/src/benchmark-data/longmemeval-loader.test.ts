@@ -64,4 +64,39 @@ describe('loadLongMemEvalDataset', () => {
     expect(loaded.cases[0].distractors[0]).toContain('session s1');
     expect(loaded.cases[0].provenance).toContain('multi-session');
   });
+
+  it('uses the full haystack when LONGMEMEVAL_MAX_DISTRACTORS is not set', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'longmemeval-full-'));
+    const file = join(dir, 'sample-full.json');
+    await writeFile(
+      file,
+      JSON.stringify([
+        {
+          question_id: 'q2',
+          question_type: 'single-session-user',
+          question: 'What city did I move to?',
+          question_date: '2025-01-11',
+          haystack_session_ids: ['s1', 's2', 's3', 's4'],
+          answer_session_ids: ['s4'],
+          haystack_sessions: [
+            [{ role: 'user', content: 'This is distractor one.' }],
+            [{ role: 'user', content: 'This is distractor two.' }],
+            [{ role: 'user', content: 'This is distractor three.' }],
+            [{ role: 'user', content: 'I moved to Portland last summer.' }],
+          ],
+        },
+      ]),
+      'utf-8'
+    );
+
+    process.env.LONGMEMEVAL_DATASET_PATH = file;
+    process.env.LONGMEMEVAL_LIMIT = '10';
+    delete process.env.LONGMEMEVAL_MAX_DISTRACTORS;
+
+    const loaded = await loadLongMemEvalDataset();
+
+    expect(loaded.cases).toHaveLength(1);
+    expect(loaded.cases[0].distractors).toHaveLength(3);
+    expect(loaded.cases[0].targetContents).toEqual([expect.stringContaining('session s4')]);
+  });
 });
