@@ -23,6 +23,7 @@ import { computeChronologyAwareBoost } from '../../services/memory-dreaming';
 import type {
   Memory,
   MemoryCreateInput,
+  MemorySearchChunkType,
   MemoryRow,
   MemorySearchOptions,
   MemoryHistory,
@@ -88,6 +89,13 @@ type SemanticChunkMatchRow = Omit<MemoryRow, 'embedding'> & {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const EMBEDDING_PERSIST_RETRY_ATTEMPTS = 3;
+const DERIVED_CHUNK_TYPES: MemoryChunkType[] = ['summary', 'fact', 'topic', 'entity'];
+const CONTENT_CHUNK_TYPES: MemoryChunkType[] = ['content'];
+
+function toMemoryChunkTypes(chunkTypes?: MemorySearchChunkType[]): MemoryChunkType[] | undefined {
+  if (!chunkTypes || chunkTypes.length === 0) return undefined;
+  return chunkTypes as MemoryChunkType[];
+}
 
 function computeChunkTypeBoost(chunkType?: MemoryChunkType | null): number {
   switch (chunkType) {
@@ -337,7 +345,8 @@ export class MemoryRepository {
         normalizedQuery,
         options,
         limit,
-        offset
+        offset,
+        toMemoryChunkTypes(options.semanticChunkTypes)
       );
       return semanticCandidates?.map((c) => c.memory) || [];
     }
@@ -348,7 +357,8 @@ export class MemoryRepository {
         normalizedQuery,
         options,
         limit,
-        offset
+        offset,
+        toMemoryChunkTypes(options.semanticChunkTypes)
       );
       if (semanticCandidates && semanticCandidates.length > 0) {
         return semanticCandidates.map((c) => c.memory);
@@ -372,23 +382,44 @@ export class MemoryRepository {
       limit,
       (offset + limit) * Math.max(1, config.matchCountMultiplier)
     );
+    const chunkStrategy = options.hybridChunkStrategy || 'default';
+    const includeDerived = chunkStrategy !== 'content-only';
+    const includeContent = chunkStrategy !== 'derived-only';
+    const applyChunkTypeBoosts = options.applyChunkTypeBoosts !== false;
+    const applyMultiViewBoost = options.applyMultiViewBoost !== false;
+    const applyChronologyBoost = options.applyChronologyBoost !== false;
 
-    const [derivedSemanticCandidates, contentSemanticCandidates, textCandidates] = await Promise.all([
-      this.trySemanticRecallCandidates(
-        userId,
-        query,
-        options,
-        candidatePool,
-        0,
-        ['summary', 'fact', 'topic', 'entity']
-      ),
-      this.trySemanticRecallCandidates(userId, query, options, candidatePool, 0, ['content']),
-      this.textRecallCandidates(userId, query, options, candidatePool, 0),
-    ]);
+    const [derivedSemanticCandidates, contentSemanticCandidates, textCandidates] =
+      await Promise.all([
+        includeDerived
+          ? this.trySemanticRecallCandidates(
+              userId,
+              query,
+              options,
+              candidatePool,
+              0,
+              DERIVED_CHUNK_TYPES
+            )
+          : Promise.resolve(null),
+        includeContent
+          ? this.trySemanticRecallCandidates(
+              userId,
+              query,
+              options,
+              candidatePool,
+              0,
+              CONTENT_CHUNK_TYPES
+            )
+          : Promise.resolve(null),
+        this.textRecallCandidates(userId, query, options, candidatePool, 0),
+      ]);
 
     const byId = new Map<string, RecallCandidate>();
 
-    for (const candidate of [...(derivedSemanticCandidates || []), ...(contentSemanticCandidates || [])]) {
+    for (const candidate of [
+      ...(derivedSemanticCandidates || []),
+      ...(contentSemanticCandidates || []),
+    ]) {
       const existing = byId.get(candidate.memory.id);
       byId.set(candidate.memory.id, {
         memory: candidate.memory,
@@ -416,7 +447,9 @@ export class MemoryRepository {
       });
     }
 
-    const chronologyWindow = this.buildChronologyWindow(Array.from(byId.values()).map((c) => c.memory));
+    const chronologyWindow = this.buildChronologyWindow(
+      Array.from(byId.values()).map((c) => c.memory)
+    );
     const merged = Array.from(byId.values()).map((candidate) => {
       const chronologyBoost = chronologyWindow
         ? computeChronologyAwareBoost({
@@ -434,7 +467,12 @@ export class MemoryRepository {
           candidate.textScore,
           candidate.matchedChunkType,
           candidate.semanticEvidenceCount,
-          chronologyBoost
+          chronologyBoost,
+          {
+            applyChunkTypeBoosts,
+            applyMultiViewBoost,
+            applyChronologyBoost,
+          }
         ),
       };
     });
@@ -452,22 +490,26 @@ export class MemoryRepository {
     textScore?: number,
     matchedChunkType?: MemoryChunkType | null,
     semanticEvidenceCount?: number,
-    chronologyBoost = 0
+    chronologyBoost = 0,
+    options: {
+      applyChunkTypeBoosts?: boolean;
+      applyMultiViewBoost?: boolean;
+      applyChronologyBoost?: boolean;
+    } = {}
   ): number {
     const s = semanticScore ?? 0;
     const t = textScore ?? 0;
-    const multiViewBoost = Math.max(0, (semanticEvidenceCount ?? 1) - 1) * 0.03;
+    const multiViewBoost =
+      options.applyMultiViewBoost === false
+        ? 0
+        : Math.max(0, (semanticEvidenceCount ?? 1) - 1) * 0.03;
+    const chunkTypeBoost =
+      options.applyChunkTypeBoosts === false ? 0 : computeChunkTypeBoost(matchedChunkType);
+    const chronologyScore = options.applyChronologyBoost === false ? 0 : chronologyBoost;
     // Blend with heavier semantic weighting, but allow lexical key matches to lift ranking.
     return Math.max(
       0,
-      Math.min(
-        1,
-        s * 0.7 +
-          t * 0.3 +
-          computeChunkTypeBoost(matchedChunkType) +
-          multiViewBoost +
-          chronologyBoost
-      )
+      Math.min(1, s * 0.7 + t * 0.3 + chunkTypeBoost + multiViewBoost + chronologyScore)
     );
   }
 
@@ -697,7 +739,11 @@ export class MemoryRepository {
           ? (row.matched_chunk_type as MemoryChunkType)
           : inferChunkTypeFromMetadata(row.matched_chunk_index, memory.metadata);
       const semanticScore = Math.max(0, Math.min(1, row.similarity ?? 0));
-      const boostedSemanticScore = Math.min(1, semanticScore + computeChunkTypeBoost(matchedChunkType));
+      const boostedSemanticScore = Math.min(
+        1,
+        semanticScore +
+          (options.applyChunkTypeBoosts === false ? 0 : computeChunkTypeBoost(matchedChunkType))
+      );
       const existing = grouped.get(memory.id);
 
       if (!existing || boostedSemanticScore > existing.finalScore) {
@@ -713,8 +759,7 @@ export class MemoryRepository {
     return Array.from(grouped.values())
       .sort(
         (a, b) =>
-          b.finalScore - a.finalScore ||
-          b.memory.createdAt.getTime() - a.memory.createdAt.getTime()
+          b.finalScore - a.finalScore || b.memory.createdAt.getTime() - a.memory.createdAt.getTime()
       )
       .slice(offset, offset + limit);
   }

@@ -16,6 +16,7 @@ describe('benchmark-memory-recall state helpers', () => {
       dataset: 'longmemeval-s-cleaned',
       datasetSource: 'url:test',
       benchmarkFamily: 'longmemeval',
+      variant: 'default',
       userId: 'user-123',
       modes: ['text', 'semantic', 'hybrid'],
       outputPath: '/tmp/out.json',
@@ -82,6 +83,7 @@ describe('benchmark-memory-recall state helpers', () => {
     );
 
     const state = await loadBenchmarkRunState(file);
+    expect(state?.variant).toBe('default');
     expect(state?.seededCases.caseA.targetMemoryIds).toEqual(['memory-1']);
   });
 });
