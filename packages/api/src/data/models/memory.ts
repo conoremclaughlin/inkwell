@@ -64,6 +64,9 @@ export interface MemoryCreateInput {
   contactId?: string; // Per-sender memory scoping
 }
 
+export type MemorySearchChunkType = 'summary' | 'fact' | 'topic' | 'entity' | 'content';
+export type MemoryHybridChunkStrategy = 'default' | 'content-only' | 'derived-only';
+
 export interface MemorySearchOptions {
   recallMode?: 'auto' | 'text' | 'semantic' | 'hybrid';
   source?: MemorySource;
@@ -75,6 +78,11 @@ export interface MemorySearchOptions {
   agentId?: string; // Filter by agent
   includeShared?: boolean; // Include shared memories (agentId=null) when filtering. Default true.
   contactId?: string; // Filter by contact for per-sender isolation
+  semanticChunkTypes?: MemorySearchChunkType[];
+  hybridChunkStrategy?: MemoryHybridChunkStrategy;
+  applyChunkTypeBoosts?: boolean;
+  applyMultiViewBoost?: boolean;
+  applyChronologyBoost?: boolean;
 }
 
 export type SessionPhase =

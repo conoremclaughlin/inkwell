@@ -208,6 +208,93 @@ describe('MemoryRepository', () => {
 
       expect(mockSupabase._queryBuilder.overlaps).toHaveBeenCalledWith('topics', ['work', 'ai']);
     });
+
+    it('passes semantic chunk type filters through to chunked semantic recall', async () => {
+      const semanticSpy = vi
+        .spyOn(repo as any, 'trySemanticRecallCandidates')
+        .mockResolvedValue([]);
+
+      await repo.recall('user-456', 'latest policy', {
+        recallMode: 'semantic',
+        semanticChunkTypes: ['content'],
+        applyChunkTypeBoosts: false,
+      });
+
+      expect(semanticSpy).toHaveBeenCalledWith(
+        'user-456',
+        'latest policy',
+        expect.objectContaining({
+          recallMode: 'semantic',
+          semanticChunkTypes: ['content'],
+          applyChunkTypeBoosts: false,
+        }),
+        20,
+        0,
+        ['content']
+      );
+    });
+
+    it('supports hybrid content-only ablations without derived semantic pass', async () => {
+      const textMemory = {
+        id: 'mem-text',
+        userId: 'user-456',
+        content: 'latest policy',
+        source: 'observation',
+        salience: 'medium',
+        topics: [],
+        metadata: {},
+        version: 1,
+        createdAt: new Date('2026-01-26T12:00:00Z'),
+      };
+
+      const semanticSpy = vi
+        .spyOn(repo as any, 'trySemanticRecallCandidates')
+        .mockImplementation(async (_userId, _query, _options, _limit, _offset, chunkTypes) => {
+          if (Array.isArray(chunkTypes) && chunkTypes.includes('content')) {
+            return [
+              {
+                memory: textMemory,
+                semanticScore: 0.8,
+                matchedChunkType: 'content',
+                finalScore: 0.8,
+              },
+            ];
+          }
+
+          return [];
+        });
+      vi.spyOn(repo as any, 'textRecallCandidates').mockResolvedValue([
+        {
+          memory: textMemory,
+          textScore: 1,
+          finalScore: 1,
+        },
+      ]);
+
+      const results = await repo.recall('user-456', 'latest policy', {
+        recallMode: 'hybrid',
+        hybridChunkStrategy: 'content-only',
+        applyChunkTypeBoosts: false,
+        applyMultiViewBoost: false,
+        applyChronologyBoost: false,
+      });
+
+      expect(results).toHaveLength(1);
+      expect(semanticSpy).toHaveBeenCalledTimes(1);
+      expect(semanticSpy).toHaveBeenCalledWith(
+        'user-456',
+        'latest policy',
+        expect.objectContaining({
+          hybridChunkStrategy: 'content-only',
+          applyChunkTypeBoosts: false,
+          applyMultiViewBoost: false,
+          applyChronologyBoost: false,
+        }),
+        expect.any(Number),
+        0,
+        ['content']
+      );
+    });
   });
 
   describe('forget', () => {

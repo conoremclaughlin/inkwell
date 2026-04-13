@@ -12,6 +12,11 @@ import {
   getPublicBenchmarkDescriptor,
 } from './benchmark-data/public-benchmarks';
 import {
+  buildBenchmarkRecallOptions,
+  describeBenchmarkRecallVariant,
+  parseBenchmarkRecallVariant,
+} from './benchmark-memory-recall.variant';
+import {
   createInitialBenchmarkRunState,
   estimateRemainingDuration,
   formatDurationMs,
@@ -275,6 +280,7 @@ async function main() {
   const dataset = process.env.MEMORY_BENCHMARK_DATASET || DEFAULT_DATASET;
   const { cases: benchmarkCases, source: datasetSource } = await loadBenchmarkCases(dataset);
   const benchmarkFamily = parseBenchmarkFamily(process.env.MEMORY_BENCHMARK_FAMILY);
+  const variant = parseBenchmarkRecallVariant(process.env.MEMORY_BENCHMARK_VARIANT);
   const modes = parseModes(process.env.MEMORY_BENCHMARK_MODES);
   const persistResults = parseBoolean(process.env.MEMORY_BENCHMARK_PERSIST, true);
   const writeOutputFile = parseBoolean(process.env.MEMORY_BENCHMARK_WRITE_FILE, true);
@@ -294,6 +300,7 @@ async function main() {
   const existingState = await loadBenchmarkRunState(statePath);
   const reuseSeeded = parseBoolean(process.env.MEMORY_BENCHMARK_REUSE_SEEDED, !!existingState);
   const keepSeeded = parseBoolean(process.env.MEMORY_BENCHMARK_KEEP_SEEDED, !!existingState);
+  const variantDescriptor = describeBenchmarkRecallVariant(variant);
 
   const supabase = createSupabaseClient();
   const repo = new MemoryRepository(supabase);
@@ -308,6 +315,7 @@ async function main() {
       dataset,
       datasetSource,
       benchmarkFamily,
+      variant,
       userId,
       modes,
       outputPath,
@@ -322,6 +330,13 @@ async function main() {
   } else {
     await writeBenchmarkRunState(statePath, runState);
   }
+
+  console.log(
+    `[memory-benchmark] variant=${variantDescriptor.name} ` +
+      `semanticChunkTypes=${Array.isArray(variantDescriptor.semanticChunkTypes) ? variantDescriptor.semanticChunkTypes.join('|') : variantDescriptor.semanticChunkTypes} ` +
+      `hybridChunkStrategy=${variantDescriptor.hybridChunkStrategy} ` +
+      `chunkBoost=${variantDescriptor.applyChunkTypeBoosts} multiView=${variantDescriptor.applyMultiViewBoost} chronology=${variantDescriptor.applyChronologyBoost}`
+  );
 
   try {
     for (const [index, benchCase] of benchmarkCases.entries()) {
@@ -426,13 +441,17 @@ async function main() {
 
         const recallStartedAt = Date.now();
         const results = await withRetries(`recall ${benchCase.id} (${mode})`, () =>
-          repo.recall(userId, benchCase.query, {
-            recallMode: mode,
-            limit: TOP_K,
-            agentId: BENCHMARK_AGENT_ID,
-            includeShared: true,
-            topics: caseTopics[benchCase.id],
-          })
+          repo.recall(
+            userId,
+            benchCase.query,
+            buildBenchmarkRecallOptions({
+              mode,
+              variant,
+              limit: TOP_K,
+              agentId: BENCHMARK_AGENT_ID,
+              topics: caseTopics[benchCase.id],
+            })
+          )
         );
 
         const expectedIds = new Set(caseTargets[benchCase.id]);
@@ -502,6 +521,7 @@ async function main() {
         benchmarkFamilyDescriptor: benchmarkFamily
           ? getPublicBenchmarkDescriptor(benchmarkFamily)
           : null,
+        variant: variantDescriptor,
         statePath,
         reuseSeeded,
         keepSeeded,

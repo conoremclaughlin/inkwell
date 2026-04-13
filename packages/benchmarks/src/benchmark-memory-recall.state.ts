@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { RecallMode } from './benchmark-memory-recall.types';
+import type { BenchmarkRecallVariant } from './benchmark-memory-recall.variant';
 
 export interface SeededCaseState {
   caseId: string;
@@ -28,6 +29,7 @@ export interface BenchmarkRunState {
   dataset: string;
   datasetSource: string;
   benchmarkFamily: string | null;
+  variant: BenchmarkRecallVariant;
   userId: string;
   modes: RecallMode[];
   outputPath: string;
@@ -41,6 +43,7 @@ export function createInitialBenchmarkRunState(params: {
   dataset: string;
   datasetSource: string;
   benchmarkFamily: string | null;
+  variant: BenchmarkRecallVariant;
   userId: string;
   modes: RecallMode[];
   outputPath: string;
@@ -76,6 +79,10 @@ export async function loadBenchmarkRunState(statePath: string): Promise<Benchmar
           seededCase.targetMemoryIds = seededCase.targetMemoryId ? [seededCase.targetMemoryId] : [];
         }
       }
+    }
+
+    if (!parsed.variant) {
+      parsed.variant = 'default';
     }
 
     return parsed as BenchmarkRunState;
