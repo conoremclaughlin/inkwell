@@ -28,6 +28,13 @@ function parsePositiveInt(raw: string | undefined, fallback: number): number {
   return Math.floor(parsed);
 }
 
+function parseOptionalPositiveInt(raw: string | undefined): number | null {
+  if (!raw) return null;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.floor(parsed);
+}
+
 function clampArray<T>(items: T[], limit: number): T[] {
   return items.slice(0, Math.max(0, limit));
 }
@@ -147,7 +154,8 @@ export async function loadLongMemEvalDataset(): Promise<{
   source: string;
 }> {
   const limit = parsePositiveInt(process.env.LONGMEMEVAL_LIMIT, 100);
-  const maxDistractors = parsePositiveInt(process.env.LONGMEMEVAL_MAX_DISTRACTORS, 5);
+  const maxDistractors =
+    parseOptionalPositiveInt(process.env.LONGMEMEVAL_MAX_DISTRACTORS) ?? Number.MAX_SAFE_INTEGER;
   const raw = await loadSourceJson();
   if (!Array.isArray(raw)) {
     throw new Error('LongMemEval dataset must be a JSON array of evaluation instances.');
