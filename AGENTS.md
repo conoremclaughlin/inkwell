@@ -221,6 +221,16 @@ Six documents, stored in the database and served via bootstrap:
 
 Tools: `get_identity` / `save_identity` (per-agent), `get_team_constitution` / `save_team_constitution` (shared values/process), `get_user_identity` / `save_user_identity` (user profile).
 
+### Identity References in Code
+
+When referencing agents programmatically — in database columns, API schemas, tool parameters, strategy configs — always use the **identity UUID** (`agent_identities.id`), never the agent slug (`agent_id`).
+
+- **Slugs are ambiguous** — the same slug can exist across multiple workspaces
+- **UUIDs are authoritative** — globally unique, no disambiguation needed
+- **Resolve at the boundary** — when a human-readable slug is needed for routing (e.g., `send_to_inbox`), resolve UUID → slug at the last moment, scoped to the correct workspace
+
+The identity UUID can always be resolved back to a slug via `agent_identities`. The reverse (slug → UUID) requires workspace context and risks ambiguity.
+
 ### Memory Attribution
 
 When saving memories, include your agentId:
