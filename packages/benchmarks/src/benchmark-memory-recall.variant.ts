@@ -26,7 +26,13 @@ const VARIANT_ALIASES: Record<string, BenchmarkRecallVariant> = {
 
 export function parseBenchmarkRecallVariant(raw?: string): BenchmarkRecallVariant {
   if (!raw) return 'default';
-  return VARIANT_ALIASES[raw.trim().toLowerCase()] || 'default';
+  const normalized = raw.trim().toLowerCase();
+  const variant = VARIANT_ALIASES[normalized];
+  if (!variant) {
+    console.warn(`[memory-benchmark] Unrecognized variant "${raw}", falling back to "default"`);
+    return 'default';
+  }
+  return variant;
 }
 
 function buildVariantSemanticOptions(
@@ -44,11 +50,12 @@ function buildVariantSemanticOptions(
         applyChunkTypeBoosts: false,
       };
     case 'multiview-no-boost':
-    case 'multiview-no-chrono':
       return {
         semanticChunkTypes: ['summary', 'fact', 'topic', 'entity', 'content'],
         applyChunkTypeBoosts: false,
       };
+    case 'multiview-no-chrono':
+      return {};
     case 'default':
     default:
       return {};

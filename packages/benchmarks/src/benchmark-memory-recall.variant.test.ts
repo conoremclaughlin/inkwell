@@ -61,4 +61,48 @@ describe('benchmark-memory-recall variants', () => {
       applyChronologyBoost: true,
     });
   });
+
+  it('keeps semantic defaults for multiview-no-chrono', () => {
+    expect(
+      buildBenchmarkRecallOptions({
+        mode: 'semantic',
+        variant: 'multiview-no-chrono',
+        limit: 5,
+        agentId: 'lumen',
+        topics: ['benchmark:memory-recall:case-3'],
+      })
+    ).toMatchObject({
+      recallMode: 'semantic',
+      limit: 5,
+      agentId: 'lumen',
+      topics: ['benchmark:memory-recall:case-3'],
+    });
+    expect(
+      buildBenchmarkRecallOptions({
+        mode: 'semantic',
+        variant: 'multiview-no-chrono',
+        limit: 5,
+        agentId: 'lumen',
+        topics: ['benchmark:memory-recall:case-3'],
+      })
+    ).not.toHaveProperty('semanticChunkTypes');
+  });
+
+  it('disables all boosts for multiview-no-boost', () => {
+    expect(
+      buildBenchmarkRecallOptions({
+        mode: 'hybrid',
+        variant: 'multiview-no-boost',
+        limit: 5,
+        agentId: 'lumen',
+        topics: ['benchmark:memory-recall:case-4'],
+      })
+    ).toMatchObject({
+      recallMode: 'hybrid',
+      hybridChunkStrategy: 'default',
+      applyChunkTypeBoosts: false,
+      applyMultiViewBoost: false,
+      applyChronologyBoost: false,
+    });
+  });
 });

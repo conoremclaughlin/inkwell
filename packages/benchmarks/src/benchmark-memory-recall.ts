@@ -157,6 +157,7 @@ async function persistRun(
     runs: CaseRun[];
     datasetSource: string;
     benchmarkFamily: PublicBenchmarkFamily | null;
+    variantName: string;
   }
 ): Promise<void> {
   const {
@@ -170,6 +171,7 @@ async function persistRun(
     runs,
     datasetSource,
     benchmarkFamily,
+    variantName,
   } = params;
 
   const modeRows = summary.map((metric) => ({
@@ -207,6 +209,7 @@ async function persistRun(
       benchmarkAgentId: BENCHMARK_AGENT_ID,
       datasetSource,
       benchmarkFamily,
+      variant: variantName,
       benchmarkFamilyDescriptor: benchmarkFamily
         ? getPublicBenchmarkDescriptor(benchmarkFamily)
         : null,
@@ -503,6 +506,7 @@ async function main() {
         runs,
         datasetSource,
         benchmarkFamily,
+        variantName: variantDescriptor.name,
       });
     }
 
