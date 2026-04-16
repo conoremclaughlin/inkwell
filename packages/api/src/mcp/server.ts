@@ -301,10 +301,16 @@ export class MCPServer {
         callerProfileHeader === 'runtime' ? 'runtime' : 'agent';
       const sessionIdHeader = contextToken?.sessionId || req.header('x-ink-session-id')?.trim();
       const studioIdHeader = contextToken?.studioId || req.header('x-ink-studio-id')?.trim();
+      // Only set workspaceId when the studio header is a UUID.
+      // Non-UUID values (e.g., "main") are studio hints, not workspace IDs.
+      // Passing a hint as workspaceId breaks Zod UUID validation in tool handlers.
+      const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      const studioIdIsUuid = studioIdHeader && UUID_RE.test(studioIdHeader);
       Object.assign(ctx, {
         callerProfile,
         ...(sessionIdHeader ? { sessionId: sessionIdHeader } : {}),
-        ...(studioIdHeader ? { workspaceId: studioIdHeader } : {}),
+        ...(studioIdIsUuid ? { workspaceId: studioIdHeader } : {}),
+        ...(studioIdHeader && !studioIdIsUuid ? { studioHint: studioIdHeader } : {}),
         ...(contextToken?.cliAttached ? { cliAttached: true } : {}),
         ...(contextToken?.runtime ? { runtime: contextToken.runtime } : {}),
         ...(contextToken?.repoRoot ? { repoRoot: contextToken.repoRoot } : {}),
