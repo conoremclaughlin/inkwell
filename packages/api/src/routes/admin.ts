@@ -17,6 +17,7 @@ import { env, isDevelopment } from '../config/env';
 import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
 import { runWithRequestContext } from '../utils/request-context';
 import { getDataComposer } from '../data/composer';
+import { notifyPlatformOfApprovalRequest } from '../channels/approval-interceptor';
 
 /**
  * Build a JSON error response. In development mode, includes the real error
@@ -6681,8 +6682,6 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
       return;
     }
 
-    // TODO (Phase 3b): Send approval message to connected platforms via platform listener
-    // For now, log the request — platform listener integration comes next
     logger.info('Approval request created', {
       requestId: data.id,
       tool,
@@ -6690,6 +6689,24 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
       requestingAgentId,
       studioId,
       expiresAt,
+    });
+
+    // Send notification to connected platforms (non-blocking)
+    notifyPlatformOfApprovalRequest({
+      id: data.id,
+      userId: authReq.pcpUserId,
+      tool,
+      args,
+      reason: req.body.reason,
+      requestingAgentId,
+      studioId,
+      sessionId,
+      expiresAt,
+    }).catch((err) => {
+      logger.error('Failed to send platform notification for approval request', {
+        requestId: data.id,
+        error: String(err),
+      });
     });
 
     res.status(201).json({
@@ -6762,114 +6779,11 @@ router.get('/approval-requests/:requestId/status', async (req: Request, res: Res
   }
 });
 
-/**
- * Resolve an approval request (grant or deny).
- * ONLY callable from platform listeners (system layer) — not from agents.
- * The platform listener verifies the human's identity via platformId before calling this.
- */
-router.post('/approval-requests/:requestId/resolve', async (req: Request, res: Response) => {
-  try {
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
-    const authReq = req as AdminAuthRequest;
-    const { requestId } = req.params;
-    const { action, grantedTools, grantedBy } = req.body;
-
-    if (!action || !['grant', 'grant-session', 'allow', 'deny'].includes(action)) {
-      res.status(400).json({ error: 'action must be one of: grant, grant-session, allow, deny' });
-      return;
-    }
-
-    // Verify this is a system-level call, not from an agent MCP session
-    // Platform listeners call this endpoint directly with server-side auth,
-    // not through the MCP tool layer. The x-ink-context header (set by CLI hooks)
-    // indicates an agent session — reject those.
-    const contextHeader = req.headers['x-ink-context'] as string | undefined;
-    if (contextHeader) {
-      try {
-        const decoded = JSON.parse(Buffer.from(contextHeader, 'base64url').toString());
-        if (decoded.agentId) {
-          res.status(403).json({
-            error: 'Approval resolution must come from system layer, not agent sessions',
-          });
-          return;
-        }
-      } catch {
-        // Malformed context header — not an agent, allow through
-      }
-    }
-
-    if (!grantedBy) {
-      res
-        .status(400)
-        .json({ error: 'grantedBy is required (e.g., "platform:telegram:<platformId>")' });
-      return;
-    }
-
-    // Fetch and validate the request
-    const { data: existing, error: fetchError } = await supabase
-      .from('approval_requests')
-      .select('id, status, user_id, expires_at')
-      .eq('id', requestId)
-      .eq('user_id', authReq.pcpUserId)
-      .single();
-
-    if (fetchError || !existing) {
-      res.status(404).json({ error: 'Approval request not found' });
-      return;
-    }
-
-    if (existing.status !== 'pending') {
-      res.status(409).json({ error: `Request already resolved: ${existing.status}` });
-      return;
-    }
-
-    if (new Date(existing.expires_at) < new Date()) {
-      await supabase
-        .from('approval_requests')
-        .update({ status: 'expired', resolved_at: new Date().toISOString() })
-        .eq('id', requestId);
-      res.status(410).json({ error: 'Request has expired' });
-      return;
-    }
-
-    const status = action === 'deny' ? 'denied' : 'granted';
-
-    const { error: updateError } = await supabase
-      .from('approval_requests')
-      .update({
-        status,
-        action,
-        granted_tools: grantedTools || null,
-        granted_by: grantedBy,
-        resolved_at: new Date().toISOString(),
-      })
-      .eq('id', requestId);
-
-    if (updateError) {
-      res.status(500).json(errorJson('Failed to resolve approval request', updateError));
-      return;
-    }
-
-    logger.info('Approval request resolved', {
-      requestId,
-      action,
-      grantedBy,
-      status,
-    });
-
-    res.json({
-      requestId,
-      status,
-      action,
-      grantedTools: grantedTools || null,
-      grantedBy,
-    });
-  } catch (error) {
-    logger.error('Failed to resolve approval request:', error);
-    res.status(500).json(errorJson('Failed to resolve approval request', error));
-  }
-});
+// NOTE: There is intentionally NO HTTP endpoint for resolving approval requests.
+// Resolution happens ONLY through the in-process approval interceptor
+// (approval-interceptor.ts → checkApprovalResponse), which runs inside
+// platform listeners. This ensures grants can only come from verified
+// platform identity — no HTTP endpoint means no client-asserted trust boundary.
+// See ink://specs/2fa-permission-grants for the security invariant.
 
 export default router;

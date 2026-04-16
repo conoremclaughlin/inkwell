@@ -140,26 +140,43 @@ export async function checkApprovalResponse(
 }
 
 /**
- * Send an approval request message to a user's Telegram chat.
- * Called by the approval request API when a new request is created.
+ * Send an approval request notification to a user's connected platform(s).
+ * Called by the create endpoint after the request is stored.
  *
- * Returns the Telegram message ID so it can be stored in request metadata
- * for reply-to threading.
+ * Looks up the user's trusted platform connections and sends the notification
+ * directly. Stores the platform message ID in request metadata for reply-to
+ * threading (so the interceptor can match responses unambiguously).
  */
-export async function sendApprovalRequestToTelegram(
-  sendFn: (chatId: string, content: string, options?: { parseMode?: string }) => Promise<void>,
-  chatId: string,
-  request: {
-    id: string;
-    tool: string;
-    args?: string | null;
-    reason?: string | null;
-    requestingAgentId: string;
-    studioId?: string | null;
-    sessionId?: string | null;
-    expiresAt: string;
+export async function notifyPlatformOfApprovalRequest(request: {
+  id: string;
+  userId: string;
+  tool: string;
+  args?: string | null;
+  reason?: string | null;
+  requestingAgentId: string;
+  studioId?: string | null;
+  sessionId?: string | null;
+  expiresAt: string;
+}): Promise<void> {
+  const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+
+  // Find the user's trusted Telegram connections
+  const { data: trustedUsers } = await supabase
+    .from('trusted_users')
+    .select('platform, platform_user_id')
+    .eq('user_id', request.userId)
+    .in('platform', ['telegram', 'whatsapp']);
+
+  if (!trustedUsers?.length) {
+    logger.warn('No connected platforms for approval notification', {
+      requestId: request.id,
+      userId: request.userId,
+    });
+    return;
   }
-): Promise<void> {
+
   const toolDisplay = request.args ? `${request.tool}(${request.args})` : request.tool;
   const expiresIn = Math.round((new Date(request.expiresAt).getTime() - Date.now()) / 60000);
 
@@ -171,5 +188,56 @@ export async function sendApprovalRequestToTelegram(
     `Expires in: ${expiresIn} min\n\n` +
     `Reply: *approve* / *deny* / *approve session*`;
 
-  await sendFn(chatId, message, { parseMode: 'Markdown' });
+  // Send to each connected platform
+  for (const tu of trustedUsers) {
+    if (tu.platform === 'telegram') {
+      try {
+        const botToken = env.TELEGRAM_BOT_TOKEN;
+        if (!botToken) continue;
+
+        // Send message via Telegram API directly (we're in-process, no need for listener)
+        const resp = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: tu.platform_user_id,
+            text: message,
+            parse_mode: 'Markdown',
+          }),
+        });
+
+        if (resp.ok) {
+          const result = (await resp.json()) as { result?: { message_id?: number } };
+          const telegramMessageId = result.result?.message_id;
+
+          // Store the telegram message ID in request metadata for reply-to threading
+          if (telegramMessageId) {
+            await supabase
+              .from('approval_requests')
+              .update({
+                metadata: { telegramMessageId, platform: 'telegram', chatId: tu.platform_user_id },
+              })
+              .eq('id', request.id);
+
+            logger.info('Approval request notification sent to Telegram', {
+              requestId: request.id,
+              chatId: tu.platform_user_id,
+              telegramMessageId,
+            });
+          }
+        } else {
+          logger.error('Failed to send Telegram approval notification', {
+            requestId: request.id,
+            status: resp.status,
+          });
+        }
+      } catch (err) {
+        logger.error('Error sending Telegram approval notification', {
+          requestId: request.id,
+          error: String(err),
+        });
+      }
+    }
+    // TODO: WhatsApp notification support
+  }
 }

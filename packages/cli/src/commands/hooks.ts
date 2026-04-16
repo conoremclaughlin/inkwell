@@ -2088,8 +2088,11 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
 
     if (!resp.ok) {
       hookLog('on_tool_approval_create_failed', { status: resp.status });
-      // On server error, allow through (fail open) to avoid blocking the session
-      process.exit(0);
+      // Fail closed — this is a security gate, don't allow through on errors
+      process.stdout.write(
+        `\n⚠️ Permission blocked: could not create approval request (server returned ${resp.status}).\n`
+      );
+      process.exit(1);
     }
 
     const body = (await resp.json()) as { requestId: string };
@@ -2097,7 +2100,11 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
     hookLog('on_tool_approval_created', { requestId });
   } catch (err) {
     hookLog('on_tool_approval_create_error', { error: String(err) });
-    process.exit(0); // Fail open
+    // Fail closed — security gate must not silently bypass on errors
+    process.stdout.write(
+      `\n⚠️ Permission blocked: could not reach approval server (${String(err)}).\n`
+    );
+    process.exit(1);
   }
 
   // Poll for resolution (up to 5 min, check every 3s)
