@@ -1149,16 +1149,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           ),
         studioId: z
           .string()
-          .uuid()
           .optional()
           .describe(
-            'Studio ID — helps auto-attach the correct session in parallel worktree scenarios. Stored in metadata.'
+            'Studio ID (UUID or "main") — helps auto-attach the correct session in parallel worktree scenarios. Stored in metadata.'
           ),
-        workspaceId: z
-          .string()
-          .uuid()
-          .optional()
-          .describe('[Deprecated] Workspace ID alias for studioId.'),
       },
     },
     async (args) => {
@@ -1333,8 +1327,6 @@ Session matching priority:
 2. studioId — scopes the session to a studio, allowing multiple active sessions per agent (one per studio). Read from .ink/identity.json.
 3. Default — returns any active session for the agent.
 
-workspaceId is accepted as a deprecated alias for studioId.
-
 When forceNew=true, start_session always creates a new session (skips active-session reuse). You can optionally provide sessionId to set a client-generated canonical UUID.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
@@ -1353,16 +1345,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
             ),
           studioId: z
             .string()
-            .uuid()
             .optional()
             .describe(
-              'Studio ID to scope this session to. Allows multiple active sessions per agent (one per studio). Read from .ink/identity.json.'
+              'Studio ID (UUID or "main") to scope this session to. Allows multiple active sessions per agent (one per studio). Read from .ink/identity.json.'
             ),
-          workspaceId: z
-            .string()
-            .uuid()
-            .optional()
-            .describe('[Deprecated] Workspace ID alias for studioId.'),
           threadKey: z
             .string()
             .optional()
@@ -1412,7 +1398,6 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         description: `End a session with an optional summary. The summary is automatically saved as a high-salience memory.
 
 Session resolution: sessionId (explicit) > agentId+studioId (scoped) > most recent active (fallback).
-workspaceId is accepted as a deprecated alias.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
         inputSchema: {
@@ -1428,14 +1413,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
             .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
           studioId: z
             .string()
-            .uuid()
             .optional()
-            .describe('Studio ID for session resolution when sessionId not provided'),
-          workspaceId: z
-            .string()
-            .uuid()
-            .optional()
-            .describe('[Deprecated] Workspace ID alias for studioId.'),
+            .describe(
+              'Studio ID (UUID or "main") for session resolution when sessionId not provided'
+            ),
           summary: z.string().optional().describe('End-of-session summary (saved as memory)'),
         },
       },
@@ -1481,14 +1462,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
         studioId: z
           .string()
-          .uuid()
           .optional()
-          .describe('Studio ID for session resolution when sessionId not provided'),
-        workspaceId: z
-          .string()
-          .uuid()
-          .optional()
-          .describe('[Deprecated] Workspace ID alias for studioId.'),
+          .describe(
+            'Studio ID (UUID or "main") for session resolution when sessionId not provided'
+          ),
         includeLogs: z.boolean().optional().describe('Include session logs (default: false)'),
       },
     },
@@ -1527,11 +1504,6 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .string()
           .optional()
           .describe('Filter by studio (UUID or "main" for the main studio)'),
-        workspaceId: z
-          .string()
-          .uuid()
-          .optional()
-          .describe('[Deprecated] Workspace ID alias for studioId.'),
         limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
       },
     },
@@ -1564,8 +1536,6 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 
 Session resolution: sessionId (explicit) > studioId (scoped lookup) > most recent active session.
 For parallel worktrees, pass studioId to target the correct session.
-workspaceId is accepted as a deprecated alias.
-
 Phase: Communicates real-time work status to other agents.
 - Active work phases (no auto-memory): investigating, implementing, reviewing
 - Significant transitions (auto-creates memory): blocked:<reason>, waiting:<reason>, complete
@@ -1585,16 +1555,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           ),
         studioId: z
           .string()
-          .uuid()
           .optional()
           .describe(
-            'Studio ID for session resolution when sessionId is not provided. Useful for parallel worktree scenarios.'
+            'Studio ID (UUID or "main") for session resolution when sessionId is not provided. Useful for parallel worktree scenarios.'
           ),
-        workspaceId: z
-          .string()
-          .uuid()
-          .optional()
-          .describe('[Deprecated] Workspace ID alias for studioId.'),
         phase: z
           .string()
           .optional()
@@ -1867,14 +1831,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
         studioId: z
           .string()
-          .uuid()
           .optional()
-          .describe('Studio ID for session resolution when sessionId not provided'),
-        workspaceId: z
-          .string()
-          .uuid()
-          .optional()
-          .describe('[Deprecated] Workspace ID alias for studioId.'),
+          .describe(
+            'Studio ID (UUID or "main") for session resolution when sessionId not provided'
+          ),
         minSalience: z
           .enum(['low', 'medium', 'high', 'critical'])
           .optional()

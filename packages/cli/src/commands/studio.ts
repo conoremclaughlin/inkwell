@@ -1071,8 +1071,8 @@ async function renameStudio(from: string, to: string): Promise<void> {
     if (studioId) {
       spinner.text = 'Syncing rename to cloud...';
       try {
-        await callPcpTool('update_workspace', {
-          workspaceId: studioId,
+        await callPcpTool('update_studio', {
+          studioId,
           agentId: resolveAgentId() || 'unknown',
           worktreePath: toPath,
           slug: to,

@@ -18,7 +18,7 @@ Identity is resolved in layers. **Stop at the first match** - do not continue ch
 For interactive sessions in this repo, `.ink/identity.json` typically resolves to:
 
 ```json
-{ "agentId": "wren", "workspaceId": "<uuid>", "context": "workspace-wren" }
+{ "agentId": "wren", "studioId": "<uuid-or-main>", "context": "main" }
 ```
 
 For long-running processes (like the Inkwell server), `AGENT_ID` is set via environment variable and takes precedence.
@@ -44,28 +44,28 @@ This returns:
 - **Constitution**: Your values, process, user, identity, heartbeat, and soul documents (DB-first, filesystem fallback)
 - **Active Context**: Current projects, focus, project-specific context
 - **Recent Memories**: High-salience memories filtered by your agentId (plus shared memories)
-- **Active Sessions**: Array of all active sessions (use `workspaceId` to find yours)
+- **Active Sessions**: Array of all active sessions (use `studioId` to find yours)
 
 ### Step 4: Start or Resume Session
 
-Read `workspaceId` from `.ink/identity.json` (if present) and pass it to `start_session`:
+Read `studioId` from `.ink/identity.json` (if present) and pass it to `start_session`:
 
 ```
-start_session(userId: "<from config>", agentId: "<your identity>", workspaceId: "<from identity.json>")
+start_session(userId: "<from config>", agentId: "<your identity>", studioId: "<from identity.json>")
 ```
 
-This scopes the session to your workspace. Multiple agents can have active sessions simultaneously in different worktrees.
+This scopes the session to your studio (worktree). Multiple agents can have active sessions simultaneously in different studios.
 
-To find your session from bootstrap's `activeSessions` array, match by `workspaceId`:
+To find your session from bootstrap's `activeSessions` array, match by `studioId`:
 
 ```javascript
-const mySession = activeSessions.find((s) => s.workspaceId === identityJson.workspaceId);
+const mySession = activeSessions.find((s) => s.studioId === identityJson.studioId);
 ```
 
 Throughout the session, use `update_session_phase` for structural status changes:
 
 ```
-update_session_phase(userId: "...", phase: "active:implementing", workspaceId: "...")
+update_session_phase(userId: "...", phase: "active:implementing", studioId: "...")
 ```
 
 Use `remember` for decisions, insights, and important events:
@@ -150,6 +150,47 @@ const localTime = utcDate.toLocaleString('en-US', {
 });
 // "Fri, Jan 30, 6:13 PM PST"
 ```
+
+## Workspace vs Studio Scope (IMPORTANT)
+
+These are **different concepts** — never conflate them:
+
+| Concept       | What it is                                  | DB table     |
+| ------------- | ------------------------------------------- | ------------ |
+| **Workspace** | Parent-level container for all docs and SBs | `workspaces` |
+| **Studio**    | A git worktree with its own session/branch  | `studios`    |
+
+A workspace contains many studios. A studio belongs to one workspace.
+
+### The `x-ink-context` header
+
+The primary mechanism for scope resolution is the **`x-ink-context`** header — a base64url-encoded JSON token set by CLI hooks. It carries:
+
+```typescript
+interface PcpContextToken {
+  sessionId: string; // PCP session ID
+  studioId: string; // Studio UUID (or "main" for root repo)
+  agentId: string; // Agent identity
+  cliAttached: boolean; // Whether a human is at the terminal
+  runtime: string; // 'claude' | 'codex' | 'gemini'
+  repoRoot?: string; // Root repo path
+}
+```
+
+The server decodes this token and extracts `studioId` for studio scope and other fields for session/identity context. Legacy individual headers (`x-ink-session-id`, `x-ink-studio-id`) are fallbacks when the context token is absent.
+
+### How scope is determined
+
+- **Studio scope** (`studioId`): Extracted from the `studioId` field in the `x-ink-context` token (preferred), or the `x-ink-studio-id` header (fallback). Set by CLI hooks based on `.ink/identity.json` in the current worktree. Used for session routing, inbox filtering, and worktree-specific operations.
+
+- **Workspace scope** (`workspaceId`): Resolved server-side from the `x-ink-workspace-id` header or derived from the agent's identity record. Used for document ownership (artifacts, constitution), shared resources, and cross-studio operations. **Do NOT pass `workspaceId` as a tool parameter** — the server resolves it from request context. Future use cases for querying across workspaces will require proper authorization checks.
+
+### Rules
+
+1. **Never map `studioId` to `workspaceId` or vice versa.** They are not interchangeable. There should be ZERO locations in the code where one is shimmed to the other.
+2. **Tool schemas should use `studioId` for studio-scoped operations** (sessions, inbox, studio management). Never accept `workspaceId` on studio-scoped tools.
+3. **Workspace scope is server-derived, not client-provided.** The server resolves the workspace from headers and agent identity — tools should not accept `workspaceId` as a user-facing parameter.
+4. **In `.ink/identity.json`**, the `studioId` field is a studio UUID (or `"main"` for the root repo). It is NOT a workspace ID.
 
 ## Multi-Agent Identity System
 

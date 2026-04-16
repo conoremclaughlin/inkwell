@@ -644,7 +644,9 @@ describe('runChat integration', () => {
     const matrix = [
       { visibility: 'agent', expectedSession: 'sess-lumen-mid', expectsAutoAttach: true },
       { visibility: 'all', expectedSession: 'sess-wren-new', expectsAutoAttach: true },
-      { visibility: 'workspace', expectedSession: 'sess-wren-new', expectsAutoAttach: true },
+      // workspace visibility requires explicit workspaceId (not derived from studioId).
+      // The chat flow doesn't resolve workspaceId yet, so workspace behaves like self.
+      { visibility: 'workspace', expectedSession: 'sess-1', expectsAutoAttach: false },
       { visibility: 'studio', expectedSession: 'sess-wren-new', expectsAutoAttach: true },
       { visibility: 'self', expectedSession: 'sess-1', expectsAutoAttach: false },
     ] as const;
@@ -1182,9 +1184,8 @@ describe('runChat integration', () => {
     expect(logText).toContain('Mutation scope set to global.');
     expect(logText).toContain('Persistently allowed send_to_inbox');
     expect(logText).toContain('Mutation scope: global');
-    expect(logText).toContain(
-      'Active scopes: global -> workspace:studio-test -> agent:lumen -> studio:studio-test'
-    );
+    // workspace scope only appears when explicit workspaceId is set (not derived from studioId)
+    expect(logText).toContain('Active scopes: global -> agent:lumen -> studio:studio-test');
   });
 
   it('supports /session-visibility and /policy-reset controls', async () => {

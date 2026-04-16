@@ -53,8 +53,20 @@ const memorySourceSchema = z.enum([
 ]);
 const salienceSchema = z.enum(['low', 'medium', 'high', 'critical']);
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Resolve studioId from tool args.
+ * Returns the raw value — callers that need a UUID should check isStudioUuid(),
+ * and callers that accept "main" should handle it explicitly (see handleListSessions).
+ */
 function resolveStudioId(params: { studioId?: string }): string | undefined {
   return params.studioId;
+}
+
+/** True when the studioId is a valid UUID (safe to use in DB queries). */
+function isStudioUuid(studioId: string | undefined): studioId is string {
+  return !!studioId && UUID_RE.test(studioId);
 }
 
 /**
@@ -578,7 +590,8 @@ export const compactSessionSchema = userIdentifierBaseSchema.extend({
 export async function handleRemember(args: unknown, dataComposer: DataComposer) {
   const params = rememberSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
-  const studioId = resolveStudioId(params);
+  const rawStudioId = resolveStudioId(params);
+  const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
   const agentId = getEffectiveAgentId(params.agentId);
 
   // If there's an active session, attach its ID to the memory metadata for traceability.
@@ -785,7 +798,8 @@ export async function handleUpdateMemory(args: unknown, dataComposer: DataCompos
 export async function handleStartSession(args: unknown, dataComposer: DataComposer) {
   const params = startSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
-  const studioId = resolveStudioId(params);
+  const rawStudioId = resolveStudioId(params);
+  const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
   const agentId = getEffectiveAgentId(params.agentId);
 
   // Session matching priority:
@@ -927,7 +941,8 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
 export async function handleEndSession(args: unknown, dataComposer: DataComposer) {
   const params = endSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
-  const studioId = resolveStudioId(params);
+  const rawStudioId = resolveStudioId(params);
+  const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
   const agentId = getEffectiveAgentId(params.agentId);
 
   // Get session ID (use provided or find active, scoped by agent+studio)
@@ -1026,7 +1041,8 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
 export async function handleGetSession(args: unknown, dataComposer: DataComposer) {
   const params = getSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
-  const studioId = resolveStudioId(params);
+  const rawStudioId = resolveStudioId(params);
+  const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
 
   let session;
   if (params.sessionId) {
@@ -1258,7 +1274,8 @@ function toJsonObject(value: Record<string, unknown>): Json {
 export async function handleUpdateSessionPhase(args: unknown, dataComposer: DataComposer) {
   const params = updateSessionPhaseSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
-  const studioId = resolveStudioId(params);
+  const rawStudioId = resolveStudioId(params);
+  const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
 
   // Require at least one field to update
   if (
@@ -2199,7 +2216,8 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 export async function handleCompactSession(args: unknown, dataComposer: DataComposer) {
   const params = compactSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
-  const studioId = resolveStudioId(params);
+  const rawStudioId = resolveStudioId(params);
+  const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
 
   const minSalience = params.minSalience || 'medium';
   const preserveLogs = params.preserveLogs ?? false;

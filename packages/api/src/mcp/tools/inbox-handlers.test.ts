@@ -5,7 +5,12 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { handleSendToInbox, handleGetInbox, handleUpdateInboxMessage, isThreadOwnedByStudio } from './inbox-handlers';
+import {
+  handleSendToInbox,
+  handleGetInbox,
+  handleUpdateInboxMessage,
+  isThreadOwnedByStudio,
+} from './inbox-handlers';
 
 // Mock user-resolver
 vi.mock('../../services/user-resolver', async (importOriginal) => {
@@ -559,7 +564,7 @@ describe('Reply Routing — thread message metadata enrichment', () => {
     const { getRequestContext } = await import('../../utils/request-context');
     vi.mocked(getRequestContext).mockReturnValue({
       sessionId: 'wren-session-123',
-      workspaceId: 'studio-wren',
+      studioId: 'studio-wren',
     } as ReturnType<typeof getRequestContext>);
 
     await handleSendToInbox(
@@ -924,7 +929,7 @@ describe('Reply Routing — sender session fallback behavior', () => {
     const { getRequestContext } = await import('../../utils/request-context');
     vi.mocked(getRequestContext).mockReturnValue({
       sessionId: 'header-session-xyz',
-      workspaceId: 'header-studio-abc',
+      studioId: 'header-studio-abc',
     } as ReturnType<typeof getRequestContext>);
 
     await handleSendToInbox(
@@ -1000,9 +1005,7 @@ describe('isThreadOwnedByStudio', () => {
   });
 
   it('accepts when agent has a message from this studio', () => {
-    const messages = [
-      { metadata: { pcp: { sender: { agentId: 'wren', studioId: MY_STUDIO } } } },
-    ];
+    const messages = [{ metadata: { pcp: { sender: { agentId: 'wren', studioId: MY_STUDIO } } } }];
     expect(isThreadOwnedByStudio(messages, MY_STUDIO)).toBe(true);
   });
 
@@ -1027,9 +1030,7 @@ describe('isThreadOwnedByStudio', () => {
   });
 
   it('rejects when messages have pcp.sender but no studioId', () => {
-    const messages = [
-      { metadata: { pcp: { sender: { agentId: 'wren' } } } },
-    ];
+    const messages = [{ metadata: { pcp: { sender: { agentId: 'wren' } } } }];
     expect(isThreadOwnedByStudio(messages, MY_STUDIO)).toBe(false);
   });
 

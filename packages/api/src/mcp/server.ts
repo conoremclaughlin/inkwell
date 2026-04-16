@@ -300,16 +300,16 @@ export class MCPServer {
       const callerProfile: 'agent' | 'runtime' =
         callerProfileHeader === 'runtime' ? 'runtime' : 'agent';
       const sessionIdHeader = contextToken?.sessionId || req.header('x-ink-session-id')?.trim();
+      // ── Studio scope (worktree-level) ──
+      // studioId and workspaceId are DIFFERENT concepts. Never conflate them.
+      // studioId = worktree/git scope. workspaceId = parent container for all docs/SBs.
       const studioIdHeader = contextToken?.studioId || req.header('x-ink-studio-id')?.trim();
-      // Only set workspaceId when the studio header is a UUID.
-      // Non-UUID values (e.g., "main") are studio hints, not workspace IDs.
-      // Passing a hint as workspaceId breaks Zod UUID validation in tool handlers.
       const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
       const studioIdIsUuid = studioIdHeader && UUID_RE.test(studioIdHeader);
       Object.assign(ctx, {
         callerProfile,
         ...(sessionIdHeader ? { sessionId: sessionIdHeader } : {}),
-        ...(studioIdIsUuid ? { workspaceId: studioIdHeader } : {}),
+        ...(studioIdIsUuid ? { studioId: studioIdHeader } : {}),
         ...(studioIdHeader && !studioIdIsUuid ? { studioHint: studioIdHeader } : {}),
         ...(contextToken?.cliAttached ? { cliAttached: true } : {}),
         ...(contextToken?.runtime ? { runtime: contextToken.runtime } : {}),
@@ -317,15 +317,11 @@ export class MCPServer {
       });
 
       // Resolve studioId from session when x-ink-session-id is provided
-      // but x-ink-studio-id is not. This avoids requiring a separate studio
-      // header — the session record already stores its studio scope.
-      let hasSessionDerivedWorkspace = false;
+      // but x-ink-studio-id is not. The session record stores its studio scope.
       if (sessionIdHeader && !studioIdHeader && userData) {
         try {
           const session = await this.dataComposer.repositories.memory.getSession(sessionIdHeader);
           if (session?.studioId) {
-            // Verify the session belongs to the authenticated user before
-            // trusting its studioId for workspace scoping.
             if (session.userId !== userData.userId) {
               logger.warn('Session-derived studioId rejected: session belongs to different user', {
                 sessionId: sessionIdHeader,
@@ -333,8 +329,7 @@ export class MCPServer {
                 authenticatedUserId: userData.userId,
               });
             } else {
-              Object.assign(ctx, { workspaceId: session.studioId, workspaceSource: 'session' });
-              hasSessionDerivedWorkspace = true;
+              Object.assign(ctx, { studioId: session.studioId });
             }
           }
         } catch (error) {
@@ -345,9 +340,9 @@ export class MCPServer {
         }
       }
 
-      // Only fall back to header/agent-derived workspace resolution when session
-      // didn't already provide one (session scope takes priority over derivation).
-      if (userData && !hasSessionDerivedWorkspace) {
+      // ── Workspace scope (parent-level) ──
+      // Always resolve workspace independently — it's a different scope than studio.
+      if (userData) {
         try {
           Object.assign(ctx, await this.resolveWorkspaceContextForMcpRequest(req, userData));
         } catch (error) {

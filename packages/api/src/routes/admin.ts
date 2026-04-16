@@ -5287,7 +5287,7 @@ router.get('/sessions/synced', async (req: Request, res: Response) => {
             startedAt: session.started_at,
             updatedAt: session.updated_at,
             workingDir: session.working_dir,
-            studioId: session.studio_id || session.workspace_id,
+            studioId: session.studio_id || session.workspace_id, // workspace_id is legacy column name for studio_id
           },
         };
       })

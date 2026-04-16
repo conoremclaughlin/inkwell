@@ -260,7 +260,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   const reqCtx = getRequestContext();
   const sessCtx = getSessionContext();
   let senderSessionId: string | null = reqCtx?.sessionId || sessCtx?.sessionId || null;
-  const senderStudioId = reqCtx?.workspaceId || sessCtx?.workspaceId || null;
+  const senderStudioId = reqCtx?.studioId || sessCtx?.studioId || null;
 
   // When the caller's session ID wasn't provided via request context headers
   // (x-ink-session-id), try threadKey-scoped lookup as a deterministic fallback.
@@ -1058,7 +1058,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         if (channelPoll && agentId) {
           const reqCtx = getRequestContext();
           const sessCtx = getSessionContext();
-          const callerStudioId = reqCtx?.workspaceId || sessCtx?.workspaceId || null;
+          const callerStudioId = reqCtx?.studioId || sessCtx?.studioId || null;
 
           if (callerStudioId) {
             const filteredThreads: typeof threadsWithUnread = [];

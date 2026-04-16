@@ -35,10 +35,14 @@ export interface RequestContextData {
   identityId?: string;
   /** Session ID if in a session */
   sessionId?: string;
-  /** Active product workspace ID */
+  /** Active product workspace ID (parent-level, contains all documents and SBs) */
   workspaceId?: string;
   /** How workspace scope was determined for this request/session */
   workspaceSource?: 'header' | 'default' | 'derived' | 'session';
+  /** Studio/worktree scope (NOT the same as workspaceId — studios are child scopes) */
+  studioId?: string;
+  /** Non-UUID studio hint (e.g., "main") when the raw header was not a UUID */
+  studioHint?: string;
   /** Conversation ID for channel routing */
   conversationId?: string;
   /** Contact ID for per-sender session isolation */
