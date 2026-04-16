@@ -1149,10 +1149,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           ),
         studioId: z
           .string()
-          .uuid()
           .optional()
           .describe(
-            'Studio ID — helps auto-attach the correct session in parallel worktree scenarios. Stored in metadata.'
+            'Studio ID (UUID or "main") — helps auto-attach the correct session in parallel worktree scenarios. Stored in metadata.'
           ),
       },
     },
@@ -1346,10 +1345,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
             ),
           studioId: z
             .string()
-            .uuid()
             .optional()
             .describe(
-              'Studio ID to scope this session to. Allows multiple active sessions per agent (one per studio). Read from .ink/identity.json.'
+              'Studio ID (UUID or "main") to scope this session to. Allows multiple active sessions per agent (one per studio). Read from .ink/identity.json.'
             ),
           threadKey: z
             .string()
@@ -1415,9 +1413,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
             .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
           studioId: z
             .string()
-            .uuid()
             .optional()
-            .describe('Studio ID for session resolution when sessionId not provided'),
+            .describe(
+              'Studio ID (UUID or "main") for session resolution when sessionId not provided'
+            ),
           summary: z.string().optional().describe('End-of-session summary (saved as memory)'),
         },
       },
@@ -1463,9 +1462,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
         studioId: z
           .string()
-          .uuid()
           .optional()
-          .describe('Studio ID for session resolution when sessionId not provided'),
+          .describe(
+            'Studio ID (UUID or "main") for session resolution when sessionId not provided'
+          ),
         includeLogs: z.boolean().optional().describe('Include session logs (default: false)'),
       },
     },
@@ -1555,10 +1555,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           ),
         studioId: z
           .string()
-          .uuid()
           .optional()
           .describe(
-            'Studio ID for session resolution when sessionId is not provided. Useful for parallel worktree scenarios.'
+            'Studio ID (UUID or "main") for session resolution when sessionId is not provided. Useful for parallel worktree scenarios.'
           ),
         phase: z
           .string()
@@ -1832,9 +1831,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
         studioId: z
           .string()
-          .uuid()
           .optional()
-          .describe('Studio ID for session resolution when sessionId not provided'),
+          .describe(
+            'Studio ID (UUID or "main") for session resolution when sessionId not provided'
+          ),
         minSalience: z
           .enum(['low', 'medium', 'high', 'critical'])
           .optional()
