@@ -188,7 +188,7 @@ The server decodes this token and extracts `studioId` for studio scope and other
 ### Rules
 
 1. **Never map `studioId` to `workspaceId` or vice versa.** They are not interchangeable. There should be ZERO locations in the code where one is shimmed to the other.
-2. **Tool schemas should use `studioId` for studio-scoped operations** (sessions, inbox, studio management). The deprecated `workspaceId` alias on session tools exists only for backward compatibility and will be removed.
+2. **Tool schemas should use `studioId` for studio-scoped operations** (sessions, inbox, studio management). Never accept `workspaceId` on studio-scoped tools.
 3. **Workspace scope is server-derived, not client-provided.** The server resolves the workspace from headers and agent identity — tools should not accept `workspaceId` as a user-facing parameter.
 4. **In `.ink/identity.json`**, the `studioId` field is a studio UUID (or `"main"` for the root repo). It is NOT a workspace ID.
 
