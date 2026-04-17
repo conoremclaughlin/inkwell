@@ -590,7 +590,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
             ...(missingSenderSession
               ? {
                   warning:
-                    'Session context missing (no x-ink-context token or x-ink-session-id header). Triggers suppressed — recipients will not be woken. They will see this message on their next inbox check. To fix: set the x-ink-context header on your MCP connection (the sb CLI does this automatically). For unsupported runtimes, use a heartbeat cron to periodically call get_inbox and process pending messages.',
+                    'Session context missing (no x-ink-context token or x-ink-session-id header). Triggers suppressed — recipients will not be woken. They will see this message on their next inbox check. To fix: set the x-ink-context header on your MCP connection (the ink CLI does this automatically). For unsupported runtimes, use a heartbeat cron to periodically call get_inbox and process pending messages.',
                 }
               : {}),
           }),
@@ -758,7 +758,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           ...(missingSenderSession
             ? {
                 warning:
-                  'Session context missing (no x-ink-context token or x-ink-session-id header). Triggers suppressed — recipient will not be woken. They will see this message on their next inbox check. To fix: set the x-ink-context header on your MCP connection (the sb CLI does this automatically). For unsupported runtimes, use a heartbeat cron to periodically call get_inbox and process pending messages.',
+                  'Session context missing (no x-ink-context token or x-ink-session-id header). Triggers suppressed — recipient will not be woken. They will see this message on their next inbox check. To fix: set the x-ink-context header on your MCP connection (the ink CLI does this automatically). For unsupported runtimes, use a heartbeat cron to periodically call get_inbox and process pending messages.',
               }
             : {}),
           hint: 'Consider adding a threadKey (e.g., "pr:32", "spec:cli-hooks") to route this message to a group thread.',
