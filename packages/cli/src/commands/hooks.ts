@@ -1998,7 +1998,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
  * Load the approval-required tool patterns from studio settings.
  * Falls back to empty array if no config exists.
  */
-function loadApprovalSet(cwd: string): string[] {
+export function loadApprovalSet(cwd: string): string[] {
   try {
     const settingsPath = join(cwd, '.claude', 'settings.local.json');
     if (!existsSync(settingsPath)) return [];
@@ -2013,7 +2013,11 @@ function loadApprovalSet(cwd: string): string[] {
  * Check if a tool call matches any pattern in the approval set.
  * Supports glob-style patterns: "Bash(docker push *)", "mcp__supabase__apply_migration"
  */
-function matchesApprovalSet(toolName: string, toolInput: string, patterns: string[]): boolean {
+export function matchesApprovalSet(
+  toolName: string,
+  toolInput: string,
+  patterns: string[]
+): boolean {
   for (const pattern of patterns) {
     // Exact tool match (no args pattern)
     if (pattern === toolName) return true;

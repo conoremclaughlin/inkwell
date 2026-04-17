@@ -385,6 +385,50 @@ describe('handleSendToInbox - threadKey', () => {
     expect(parsed.routingHint).toContain('routing anchor');
     expect(mockGateway.dispatchTrigger).toHaveBeenCalled();
   });
+
+  // ===================================================================
+  // 2FA SECURITY — permission_grant from agent senders must be rejected
+  // ===================================================================
+
+  it('rejects permission_grant when senderAgentId is present', async () => {
+    const mockSb = createMockSupabase();
+    const mockDc = createMockDataComposer(mockSb);
+
+    await expect(
+      handleSendToInbox(
+        {
+          email: 'test@test.com',
+          recipientAgentId: 'wren',
+          senderAgentId: 'wren',
+          messageType: 'permission_grant',
+          content: 'granting self permission',
+        },
+        mockDc as never
+      )
+    ).rejects.toThrow('permission_grant messages cannot be sent by agents');
+
+    expect(mockSb._chainable.insert).not.toHaveBeenCalled();
+  });
+
+  it('allows permission_grant from the system layer (no senderAgentId)', async () => {
+    // Use thread path so the message_type is exercised.
+    const mockSb = createMockSupabase();
+    const mockDc = createMockDataComposer(mockSb);
+
+    const result = await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        // no senderAgentId — treated as system sender
+        messageType: 'permission_grant',
+        content: 'granted',
+      },
+      mockDc as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+  });
 });
 
 // =====================================================
