@@ -412,6 +412,26 @@ export const addTaskCommentSchema = z.object({
   agentId: z.string().optional().describe('Agent ID for identity attribution'),
 });
 
+async function resolveIdentityIdForAgent(
+  dataComposer: DataComposer,
+  userId: string,
+  agentId: string | undefined,
+  workspaceId: string | undefined
+): Promise<string | null> {
+  if (!agentId) return null;
+  let query = dataComposer
+    .getClient()
+    .from('agent_identities')
+    .select('id')
+    .eq('agent_id', agentId)
+    .eq('user_id', userId);
+  if (workspaceId) {
+    query = query.eq('workspace_id', workspaceId);
+  }
+  const { data } = await query.limit(1).single();
+  return (data as { id: string } | null)?.id ?? null;
+}
+
 export async function handleAddTaskComment(
   args: z.infer<typeof addTaskCommentSchema>,
   dataComposer: DataComposer
@@ -435,21 +455,12 @@ export async function handleAddTaskComment(
     const reqCtx = getRequestContext();
     const workspaceId = reqCtx?.workspaceId;
 
-    // Resolve agent identity ID with workspace scoping when available
-    let identityId: string | null = null;
-    if (agentId) {
-      let identityQuery = dataComposer
-        .getClient()
-        .from('agent_identities')
-        .select('id')
-        .eq('agent_id', agentId)
-        .eq('user_id', resolved.user.id);
-      if (workspaceId) {
-        identityQuery = identityQuery.eq('workspace_id', workspaceId);
-      }
-      const { data: identity } = await identityQuery.limit(1).single();
-      if (identity) identityId = identity.id;
-    }
+    const identityId = await resolveIdentityIdForAgent(
+      dataComposer,
+      resolved.user.id,
+      agentId,
+      workspaceId
+    );
 
     const { data: rawComment, error } = await dataComposer
       .getClient()
@@ -494,6 +505,249 @@ export async function handleAddTaskComment(
       {
         success: false,
         error: error instanceof Error ? error.message : 'Failed to add task comment',
+      },
+      true
+    );
+  }
+}
+
+// ============================================================================
+// TASK GROUPS — CREATE / LIST
+// ============================================================================
+
+const taskGroupStatusEnum = z.enum(['active', 'paused', 'completed', 'cancelled']);
+const taskGroupPriorityEnum = z.enum(['low', 'normal', 'high', 'urgent']);
+const taskGroupOutputTargetEnum = z.enum(['spec', 'pr', 'report', 'proposal']);
+const taskGroupOutputStatusEnum = z.enum(['ready_for_review', 'needs_more_work', 'blocked']);
+
+export const createTaskGroupSchema = z.object({
+  ...userIdentifierSchema.shape,
+  title: z.string().min(1).max(500).describe('Task group title'),
+  description: z.string().optional().describe('Detailed description / strategy'),
+  projectId: z.string().uuid().optional().describe('Optional project scope'),
+  priority: taskGroupPriorityEnum.optional().default('normal'),
+  status: taskGroupStatusEnum.optional().default('active'),
+  tags: z.array(z.string()).optional(),
+  autonomous: z.boolean().optional().describe('Whether this group runs autonomously'),
+  maxSessions: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe('Cap on autonomous sessions spent on this group'),
+  contextSummary: z
+    .string()
+    .optional()
+    .describe('Rolling context handed to each autonomous session'),
+  threadKey: z
+    .string()
+    .optional()
+    .describe('Thread key for coordination (e.g. pr:123, thread:foo)'),
+  outputTarget: taskGroupOutputTargetEnum
+    .optional()
+    .describe('Expected deliverable type (spec, pr, report, proposal)'),
+  outputStatus: taskGroupOutputStatusEnum.optional(),
+  metadata: z.record(z.unknown()).optional(),
+  agentId: z
+    .string()
+    .optional()
+    .describe('Agent identity to attribute the group to (defaults to caller)'),
+});
+
+export async function handleCreateTaskGroup(
+  args: z.infer<typeof createTaskGroupSchema>,
+  dataComposer: DataComposer
+): Promise<McpResponse> {
+  try {
+    const resolved = await resolveUser(args as UserIdentifier, dataComposer);
+    if (!resolved) {
+      return mcpResponse({ success: false, error: 'User not found' }, true);
+    }
+
+    if (args.projectId) {
+      const project = await dataComposer.repositories.projects.findById(args.projectId);
+      if (!project) {
+        return mcpResponse({ success: false, error: 'Project not found' }, true);
+      }
+      if (project.user_id !== resolved.user.id) {
+        return mcpResponse({ success: false, error: 'Project does not belong to this user' }, true);
+      }
+    }
+
+    const agentId = getEffectiveAgentId(args.agentId);
+    const reqCtx = getRequestContext();
+    const identityId = await resolveIdentityIdForAgent(
+      dataComposer,
+      resolved.user.id,
+      agentId,
+      reqCtx?.workspaceId
+    );
+
+    const group = await dataComposer.repositories.taskGroups.create({
+      user_id: resolved.user.id,
+      identity_id: identityId,
+      project_id: args.projectId ?? null,
+      title: args.title,
+      description: args.description,
+      status: args.status,
+      priority: args.priority,
+      tags: args.tags,
+      metadata: args.metadata,
+      autonomous: args.autonomous,
+      max_sessions: args.maxSessions,
+      context_summary: args.contextSummary,
+      output_target: args.outputTarget,
+      output_status: args.outputStatus,
+      thread_key: args.threadKey,
+    });
+
+    return mcpResponse({
+      success: true,
+      group: {
+        id: group.id,
+        title: group.title,
+        description: group.description,
+        status: group.status,
+        priority: group.priority,
+        tags: group.tags,
+        projectId: group.project_id,
+        identityId: group.identity_id,
+        agentId: agentId || null,
+        autonomous: group.autonomous,
+        maxSessions: group.max_sessions,
+        sessionsUsed: group.sessions_used,
+        contextSummary: group.context_summary,
+        outputTarget: group.output_target,
+        outputStatus: group.output_status,
+        threadKey: group.thread_key,
+        metadata: group.metadata,
+        createdAt: group.created_at,
+        updatedAt: group.updated_at,
+      },
+    });
+  } catch (error) {
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to create task group',
+      },
+      true
+    );
+  }
+}
+
+export const listTaskGroupsSchema = z.object({
+  ...userIdentifierSchema.shape,
+  statuses: z
+    .array(taskGroupStatusEnum)
+    .optional()
+    .describe(
+      'Filter by one or more statuses: active, paused, completed, cancelled. Omit or pass empty array to include all statuses.'
+    ),
+  projectId: z.string().uuid().optional().describe('Filter by project'),
+  identityId: z.string().uuid().optional().describe('Filter by agent identity UUID'),
+  autonomousOnly: z.boolean().optional().default(false).describe('Only autonomous groups'),
+  includeTaskCounts: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe('Include per-status task counts per group'),
+  limit: z.number().int().positive().max(500).optional().default(200),
+});
+
+export async function handleListTaskGroups(
+  args: z.infer<typeof listTaskGroupsSchema>,
+  dataComposer: DataComposer
+): Promise<McpResponse> {
+  try {
+    const resolved = await resolveUser(args as UserIdentifier, dataComposer);
+    if (!resolved) {
+      return mcpResponse({ success: false, error: 'User not found' }, true);
+    }
+
+    // Empty array is treated the same as omitted: include all statuses.
+    const statuses = args.statuses && args.statuses.length > 0 ? args.statuses : undefined;
+
+    const groups = await dataComposer.repositories.taskGroups.listByUser(resolved.user.id, {
+      status: statuses,
+      projectId: args.projectId,
+      identityId: args.identityId,
+      autonomousOnly: args.autonomousOnly,
+      limit: args.limit,
+    });
+
+    const countsByGroup = args.includeTaskCounts
+      ? await dataComposer.repositories.taskGroups.taskCountsByGroup(
+          resolved.user.id,
+          groups.map((g) => g.id)
+        )
+      : {};
+
+    // Resolve project + identity names for display
+    const projectIds = [...new Set(groups.map((g) => g.project_id).filter(Boolean))] as string[];
+    const projects = await Promise.all(
+      projectIds.map((id) => dataComposer.repositories.projects.findById(id))
+    );
+    const projectMap = new Map(projects.filter(Boolean).map((p) => [p!.id, p!.name]));
+
+    const identityIds = [...new Set(groups.map((g) => g.identity_id).filter(Boolean))] as string[];
+    const identityMap = new Map<string, { agentId: string; name: string | null }>();
+    if (identityIds.length > 0) {
+      const { data: identities } = await dataComposer
+        .getClient()
+        .from('agent_identities')
+        .select('id, agent_id, name')
+        .in('id', identityIds);
+      for (const row of (identities || []) as Array<{
+        id: string;
+        agent_id: string;
+        name: string | null;
+      }>) {
+        identityMap.set(row.id, { agentId: row.agent_id, name: row.name });
+      }
+    }
+
+    return mcpResponse({
+      success: true,
+      groups: groups.map((g) => ({
+        id: g.id,
+        title: g.title,
+        description: g.description,
+        status: g.status,
+        priority: g.priority,
+        tags: g.tags,
+        projectId: g.project_id,
+        projectName: g.project_id ? projectMap.get(g.project_id) || null : null,
+        identityId: g.identity_id,
+        agentId: g.identity_id ? identityMap.get(g.identity_id)?.agentId || null : null,
+        agentName: g.identity_id ? identityMap.get(g.identity_id)?.name || null : null,
+        autonomous: g.autonomous,
+        maxSessions: g.max_sessions,
+        sessionsUsed: g.sessions_used,
+        contextSummary: g.context_summary,
+        nextRunAfter: g.next_run_after,
+        outputTarget: g.output_target,
+        outputStatus: g.output_status,
+        threadKey: g.thread_key,
+        taskCounts: args.includeTaskCounts
+          ? countsByGroup[g.id] || {
+              total: 0,
+              pending: 0,
+              in_progress: 0,
+              completed: 0,
+              blocked: 0,
+            }
+          : undefined,
+        metadata: g.metadata,
+        createdAt: g.created_at,
+        updatedAt: g.updated_at,
+      })),
+    });
+  } catch (error) {
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to list task groups',
       },
       true
     );

@@ -23,6 +23,10 @@ import {
   handleCompleteTask,
   handleGetTaskStats,
   handleAddTaskComment,
+  handleCreateTaskGroup,
+  handleListTaskGroups,
+  createTaskGroupSchema,
+  listTaskGroupsSchema,
 } from './task-handlers';
 
 import { handleSendResponse, handleGetPendingMessages, handleMarkRead } from './response-handlers';
@@ -934,6 +938,70 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleAddTaskComment(args, dataComposer);
       } catch (error) {
         logger.error('Error in add_task_comment:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // TASK GROUP TOOLS
+  // =====================================================
+
+  // Register create_task_group tool
+  server.registerTool(
+    'create_task_group',
+    {
+      description: `Create a task group — a container for related tasks that share a title, strategy/description, priority, and optionally an autonomous execution plan or output target (spec/pr/report/proposal). Use to bundle multi-step work under one thread key or strategy. Returns the created group with its UUID.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: createTaskGroupSchema.shape,
+    },
+    async (args) => {
+      try {
+        return await handleCreateTaskGroup(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in create_task_group:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register list_task_groups tool
+  server.registerTool(
+    'list_task_groups',
+    {
+      description: `List task groups for a user with per-status task counts per group. Omit \`statuses\` (or pass an empty array) to include all statuses. Pass a multi-select array to narrow (e.g. statuses: ["active","paused"]). Also supports projectId, identityId, and autonomousOnly filters.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: listTaskGroupsSchema.shape,
+    },
+    async (args) => {
+      try {
+        return await handleListTaskGroups(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_task_groups:', error);
         return {
           content: [
             {

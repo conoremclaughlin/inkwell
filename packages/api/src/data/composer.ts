@@ -10,6 +10,7 @@ import { ContextRepository } from './repositories/context.repository';
 import { ProjectsRepository } from './repositories/projects.repository';
 import { SessionFocusRepository } from './repositories/session-focus.repository';
 import { ProjectTasksRepository } from './repositories/project-tasks.repository';
+import { TaskGroupsRepository } from './repositories/task-groups.repository';
 import { MemoryRepository } from './repositories/memory-repository';
 import { ActivityStreamRepository } from './repositories/activity-stream.repository';
 import { StudiosRepository } from './repositories/studios.repository';
@@ -30,6 +31,7 @@ export class DataComposer {
     projects: ProjectsRepository;
     sessionFocus: SessionFocusRepository;
     tasks: ProjectTasksRepository;
+    taskGroups: TaskGroupsRepository;
     memory: MemoryRepository;
     activityStream: ActivityStreamRepository;
     studios: StudiosRepository;
@@ -51,6 +53,7 @@ export class DataComposer {
       projects: new ProjectsRepository(supabaseClient),
       sessionFocus: new SessionFocusRepository(supabaseClient),
       tasks: new ProjectTasksRepository(supabaseClient),
+      taskGroups: new TaskGroupsRepository(supabaseClient),
       memory: new MemoryRepository(supabaseClient),
       activityStream: new ActivityStreamRepository(supabaseClient),
       studios: new StudiosRepository(supabaseClient),
