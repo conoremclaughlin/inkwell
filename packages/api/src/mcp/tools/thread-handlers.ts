@@ -330,16 +330,26 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   // Get participants
   const participants = await getParticipants(supabase, thread.id);
 
-  // Mark as read
+  // Mark as read — advance the pointer to the latest created_at in the
+  // returned batch, NOT to NOW(). Otherwise a partial fetch (limit < total)
+  // silently marks untouched messages as read. This was the cause of the
+  // channel-plugin delivery failure for pr:321 on 2026-04-17.
   if (markRead && messages && messages.length > 0) {
-    await threadTable(supabase, 'inbox_thread_read_status').upsert(
-      {
-        thread_id: thread.id,
-        agent_id: agentId,
-        last_read_at: new Date().toISOString(),
-      },
-      { onConflict: 'thread_id,agent_id' }
-    );
+    let maxCreatedAt = '';
+    for (const m of messages as Array<{ created_at?: string }>) {
+      const ts = m.created_at;
+      if (ts && ts > maxCreatedAt) maxCreatedAt = ts;
+    }
+    if (maxCreatedAt) {
+      await threadTable(supabase, 'inbox_thread_read_status').upsert(
+        {
+          thread_id: thread.id,
+          agent_id: agentId,
+          last_read_at: maxCreatedAt,
+        },
+        { onConflict: 'thread_id,agent_id' }
+      );
+    }
   }
 
   return {

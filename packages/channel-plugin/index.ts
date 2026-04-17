@@ -33,7 +33,11 @@ import { homedir } from 'os';
 const LOG_DIR = join(homedir(), '.ink', 'logs');
 const LOG_FILE = join(LOG_DIR, 'channel-plugin.log');
 
-function log(level: 'info' | 'warn' | 'error' | 'debug', message: string, data?: Record<string, unknown>): void {
+function log(
+  level: 'info' | 'warn' | 'error' | 'debug',
+  message: string,
+  data?: Record<string, unknown>
+): void {
   try {
     mkdirSync(LOG_DIR, { recursive: true });
     const ts = new Date().toISOString();
@@ -237,6 +241,7 @@ Do NOT ignore channel messages — they are from your teammates and deserve time
 let lastPollTime = new Date().toISOString();
 const seenMessageIds = new Set<string>(); // belt-and-suspenders dedup
 const lastThreadTimestamps = new Map<string, string>(); // threadKey → last seen created_at
+const lastThreadMessageId = new Map<string, string>(); // threadKey → id of last delivered message (cursor)
 
 async function pollInbox(): Promise<void> {
   if (!email) return;
@@ -267,15 +272,20 @@ async function pollInbox(): Promise<void> {
       const unreadCount = (thread.unreadCount as number) || 0;
       if (!threadKey || unreadCount === 0) continue;
 
-      // Studio filtering is handled server-side via channelPoll=true.
-      // The server only returns threads owned by this studio (or broadcast
-      // threads with no studio affinity), so we can safely mark read here.
+      // Use our own cursor (afterMessageId) to avoid the ASC-sort + small-limit
+      // footgun: without a cursor, get_thread_messages returns the earliest N
+      // messages and a repeat poll keeps returning the same slice, never
+      // reaching new ones. markRead advances the server pointer to whatever
+      // was actually returned — safe now that the server respects that — but
+      // the plugin's own cursor is what guarantees forward progress.
+      const afterMessageId = lastThreadMessageId.get(threadKey);
       const threadResult = await callPcp('get_thread_messages', {
         email,
         agentId,
         threadKey,
         markRead: true,
-        limit: 5,
+        limit: 50,
+        ...(afterMessageId ? { afterMessageId } : {}),
       });
 
       if (!threadResult?.success) continue;
@@ -289,7 +299,9 @@ async function pollInbox(): Promise<void> {
         // Skip own messages UNLESS they came from a different studio (cross-studio self-message)
         if (msg.senderAgentId === agentId) {
           if (!studioId) continue; // no studio context — always skip self
-          const msgPcp = (msg.metadata as Record<string, unknown>)?.pcp as Record<string, unknown> | undefined;
+          const msgPcp = (msg.metadata as Record<string, unknown>)?.pcp as
+            | Record<string, unknown>
+            | undefined;
           const msgSender = msgPcp?.sender as Record<string, unknown> | undefined;
           const msgStudioId = msgSender?.studioId as string | undefined;
           if (!msgStudioId || msgStudioId === studioId) continue; // same studio or unknown — skip
@@ -318,11 +330,17 @@ async function pollInbox(): Promise<void> {
         });
       }
 
-      // Update last seen timestamp
+      // Advance cursors (id + timestamp) to the last returned message.
+      // The id cursor is what the next poll passes as afterMessageId to
+      // guarantee forward progress; the timestamp cursor is the legacy
+      // belt-and-suspenders dedup for cases where the id cursor is empty
+      // (first poll for a thread).
       if (messages.length > 0) {
         const lastMsg = messages[messages.length - 1];
         const lastTs = lastMsg.createdAt as string;
+        const lastId = lastMsg.id as string;
         if (lastTs) lastThreadTimestamps.set(threadKey, lastTs);
+        if (lastId) lastThreadMessageId.set(threadKey, lastId);
       }
     }
 
@@ -335,7 +353,9 @@ async function pollInbox(): Promise<void> {
       // Skip own messages unless cross-studio (same logic as thread path above)
       if (msg.senderAgentId === agentId) {
         if (!studioId) continue;
-        const msgPcp = (msg.metadata as Record<string, unknown>)?.pcp as Record<string, unknown> | undefined;
+        const msgPcp = (msg.metadata as Record<string, unknown>)?.pcp as
+          | Record<string, unknown>
+          | undefined;
         const msgSender = msgPcp?.sender as Record<string, unknown> | undefined;
         const msgStudioId = msgSender?.studioId as string | undefined;
         if (!msgStudioId || msgStudioId === studioId) continue;
