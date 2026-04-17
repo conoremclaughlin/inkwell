@@ -383,6 +383,31 @@ describe('backend adapters session resume wiring', () => {
   // MCP tool calls go to PCP unauthenticated and without session context,
   // causing "Session context missing — triggers suppressed."
 
+  it('claude adapter produces INK_CONTEXT with session/studio/agent', () => {
+    const adapter = new ClaudeAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'wren',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+      pcpSessionId: 'sess-claude-123',
+      studioId: 'studio-wren-456',
+    });
+
+    try {
+      expect(prepared.env.INK_CONTEXT).toBeDefined();
+      const token = decodeContextToken(prepared.env.INK_CONTEXT);
+      expect(token).not.toBeNull();
+      expect(token!.sessionId).toBe('sess-claude-123');
+      expect(token!.studioId).toBe('studio-wren-456');
+      expect(token!.agentId).toBe('wren');
+      expect(token!.runtime).toBe('claude');
+      expect(token!.cliAttached).toBe(true);
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
   it('codex adapter produces INK_CONTEXT with session/studio/agent', () => {
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
