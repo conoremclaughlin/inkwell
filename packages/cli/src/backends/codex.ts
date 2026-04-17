@@ -21,7 +21,7 @@ import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js'
  * are kept for backward compat during migration.
  */
 const PCP_ENV_HEADERS: Array<{ header: string; envVar: string }> = [
-  { header: 'x-ink-context', envVar: 'INK_CONTEXT_TOKEN' },
+  { header: 'x-ink-context', envVar: 'INK_CONTEXT' },
   { header: 'Authorization', envVar: 'INK_AUTH_BEARER' },
   { header: 'x-ink-agent-id', envVar: 'AGENT_ID' },
   { header: 'x-ink-session-id', envVar: 'INK_SESSION_ID' },
@@ -111,7 +111,7 @@ export class CodexAdapter implements BackendAdapter {
       args,
       env: {
         AGENT_ID: config.agentId,
-        INK_CONTEXT_TOKEN: contextToken,
+        INK_CONTEXT: contextToken,
         ...(config.pcpSessionId ? { INK_SESSION_ID: config.pcpSessionId } : {}),
         ...(config.studioId ? { INK_STUDIO_ID: config.studioId } : {}),
       },

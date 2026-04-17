@@ -1760,7 +1760,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   hookLog('on_session_start', {
     agentId,
     backend: resolvedBackend.name,
-    hasInkContextToken: !!process.env.INK_CONTEXT_TOKEN,
+    hasInkContextToken: !!process.env.INK_CONTEXT,
     hasInkSessionId: !!process.env.INK_SESSION_ID,
     hasInkStudioId: !!process.env.INK_STUDIO_ID,
   });

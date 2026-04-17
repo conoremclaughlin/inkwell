@@ -123,7 +123,7 @@ export function injectSessionHeaders(
   if (!config.mcpServers[serverKey].headers?.['x-ink-context']) {
     config.mcpServers[serverKey].headers = {
       ...config.mcpServers[serverKey].headers,
-      'x-ink-context': '${INK_CONTEXT_TOKEN}',
+      'x-ink-context': '${INK_CONTEXT}',
     };
     modified = true;
   }
@@ -197,7 +197,7 @@ export function decodeContextToken(header: string | undefined | null): PcpContex
  * Build the session-related env vars for a spawned backend process.
  *
  * Sets both:
- * - INK_CONTEXT_TOKEN: consolidated context token for x-ink-context header
+ * - INK_CONTEXT: consolidated context token for x-ink-context header
  * - Legacy individual env vars (INK_SESSION_ID, INK_STUDIO_ID, etc.)
  *   for backward compat during Phase 1 migration
  */
@@ -231,7 +231,7 @@ export function buildSessionEnv(options: {
 
   // Consolidated context token (new — Phase 1)
   if (options.pcpSessionId && options.agentId) {
-    env.INK_CONTEXT_TOKEN = encodeContextToken({
+    env.INK_CONTEXT = encodeContextToken({
       sessionId: options.pcpSessionId,
       studioId: options.studioId || '',
       agentId: options.agentId,
