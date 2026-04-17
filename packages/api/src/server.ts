@@ -867,24 +867,18 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       }
 
       if (isCliAttached && !isCliStale) {
-        const { addPendingMessage } = await import('./mcp/tools/response-handlers.js');
-        addPendingMessage({
-          id: `trigger-${Date.now()}`,
-          channel: 'agent',
-          conversationId: request.conversationId,
-          content: triggerMessage,
-          sender: { id: payload.fromAgentId, name: payload.fromAgentId },
-          timestamp: new Date(),
-          read: false,
-          agentId: targetAgentId,
-          sessionId: routedSession.id,
-        });
-        logger.info('[Trigger] CLI-attached session detected, routed to pending queue', {
-          targetAgentId,
-          sessionId: routedSession.id,
-          studioId: routedSession.studioId,
-          threadKey: payload.threadKey,
-        });
+        // CLI-attached: don't spawn a new session. The inbox message is
+        // already in the DB (written by send_to_inbox before trigger fires).
+        // The channel plugin will pick it up on its next poll cycle.
+        logger.info(
+          '[Trigger] CLI-attached session — skipping spawn, channel plugin will deliver',
+          {
+            targetAgentId,
+            sessionId: routedSession.id,
+            studioId: routedSession.studioId,
+            threadKey: payload.threadKey,
+          }
+        );
         return;
       }
     } catch (err) {

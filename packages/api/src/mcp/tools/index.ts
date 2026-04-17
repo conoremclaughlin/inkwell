@@ -254,7 +254,7 @@ import {
 } from './integration-health-handlers';
 
 // Re-export for external use
-export { setResponseCallback, addPendingMessage } from './response-handlers';
+export { setResponseCallback } from './response-handlers';
 export { setTelegramListener, registerChannelListener } from './chat-context-handlers';
 export { setMiniAppsRegistry } from './skill-handlers';
 

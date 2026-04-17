@@ -2243,36 +2243,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     return;
   }
 
-  // No channel plugin — use hook-based inbox injection as fallback.
-  // Drain pending message queue first — these are trigger messages
-  // routed here because cli_attached=true.
-  try {
-    const pending = await callPcpTool('get_pending_messages', {
-      channel: 'agent',
-    });
-    const pendingMessages = pending.messages as Array<Record<string, unknown>> | undefined;
-    if (pendingMessages?.length) {
-      const pendingTag = buildInboxTag(
-        pendingMessages.map((m) => ({
-          ...m,
-          senderAgentId:
-            typeof m.sender === 'object' ? (m.sender as Record<string, unknown>).id : m.sender,
-          messageType: 'trigger',
-        }))
-      );
-      if (pendingTag) {
-        process.stdout.write(pendingTag);
-      }
-      // Mark as read so they don't replay on next prompt
-      const messageIds = pendingMessages.map((m) => m.id as string).filter(Boolean);
-      if (messageIds.length) {
-        await callPcpTool('mark_messages_read', { messageIds }).catch(() => {});
-      }
-    }
-  } catch {
-    // Silent — pending queue may not have messages
-  }
-
+  // No channel plugin — use hook-based inbox polling as fallback.
   // Check if inbox check is stale (> 5 minutes)
   const lastCheck = readRuntimeFile(cwd, 'last-inbox-check');
   const staleThresholdMs = 5 * 60 * 1000;
