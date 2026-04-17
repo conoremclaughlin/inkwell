@@ -18,6 +18,8 @@
  *   INK_SERVER_URL  — Ink server URL (default: http://localhost:3001)
  *   INK_AGENT_ID    — Agent identity (default: from AGENT_ID or .ink/identity.json)
  *   INK_POLL_INTERVAL_MS — Poll interval in ms (default: 10000)
+ *   INK_CHANNEL_CURSOR_PATH — Override the cursor-state JSON path
+ *                              (default: ~/.ink/channel-plugin-cursors-<studioId>.json)
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -25,6 +27,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { readFileSync, existsSync, mkdirSync, appendFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { CursorStore, defaultCursorPath } from './cursor-store.js';
 
 // ─── Logging ────────────────────────────────────────────────
 // Logs to ~/.ink/logs/channel-plugin.log for debugging.
@@ -239,9 +242,17 @@ Do NOT ignore channel messages — they are from your teammates and deserve time
 // ─── Polling Loop ───────────────────────────────────────────
 
 let lastPollTime = new Date().toISOString();
-const seenMessageIds = new Set<string>(); // belt-and-suspenders dedup
-const lastThreadTimestamps = new Map<string, string>(); // threadKey → last seen created_at
-const lastThreadMessageId = new Map<string, string>(); // threadKey → id of last delivered message (cursor)
+
+// Persistent cursor store: in-memory state lives across plugin restarts via
+// ~/.ink/channel-plugin-cursors-<studioId>.json. Override the path with
+// INK_CHANNEL_CURSOR_PATH (intended for tests).
+const cursorStore = new CursorStore({
+  path: defaultCursorPath({
+    studioId,
+    envOverride: process.env.INK_CHANNEL_CURSOR_PATH,
+  }),
+  log,
+});
 
 async function pollInbox(): Promise<void> {
   if (!email) return;
@@ -278,7 +289,7 @@ async function pollInbox(): Promise<void> {
       // reaching new ones. markRead advances the server pointer to whatever
       // was actually returned — safe now that the server respects that — but
       // the plugin's own cursor is what guarantees forward progress.
-      const afterMessageId = lastThreadMessageId.get(threadKey);
+      const afterMessageId = cursorStore.getThreadMessageId(threadKey);
       const threadResult = await callPcp('get_thread_messages', {
         email,
         agentId,
@@ -291,7 +302,7 @@ async function pollInbox(): Promise<void> {
       if (!threadResult?.success) continue;
 
       const messages = (threadResult.messages as Array<Record<string, unknown>>) || [];
-      const lastKnownTs = lastThreadTimestamps.get(threadKey);
+      const lastKnownTs = cursorStore.getThreadTimestamp(threadKey);
 
       for (const msg of messages) {
         const msgId = msg.id as string;
@@ -307,9 +318,9 @@ async function pollInbox(): Promise<void> {
           if (!msgStudioId || msgStudioId === studioId) continue; // same studio or unknown — skip
           // Different studio — accept (cross-studio self-message)
         }
-        if (msgId && seenMessageIds.has(msgId)) continue;
+        if (msgId && cursorStore.hasSeen(msgId)) continue;
         if (lastKnownTs && msgTs && msgTs <= lastKnownTs) continue;
-        if (msgId) seenMessageIds.add(msgId);
+        if (msgId) cursorStore.markSeen(msgId);
 
         const sender = (msg.senderAgentId as string) || 'unknown';
         const content = (msg.content as string) || '';
@@ -339,8 +350,8 @@ async function pollInbox(): Promise<void> {
         const lastMsg = messages[messages.length - 1];
         const lastTs = lastMsg.createdAt as string;
         const lastId = lastMsg.id as string;
-        if (lastTs) lastThreadTimestamps.set(threadKey, lastTs);
-        if (lastId) lastThreadMessageId.set(threadKey, lastId);
+        if (lastTs) cursorStore.setThreadTimestamp(threadKey, lastTs);
+        if (lastId) cursorStore.setThreadMessageId(threadKey, lastId);
       }
     }
 
@@ -360,9 +371,9 @@ async function pollInbox(): Promise<void> {
         const msgStudioId = msgSender?.studioId as string | undefined;
         if (!msgStudioId || msgStudioId === studioId) continue;
       }
-      if (msgId && seenMessageIds.has(msgId)) continue;
+      if (msgId && cursorStore.hasSeen(msgId)) continue;
       if (!isLegacyMessageForThisStudio(msg)) continue;
-      if (msgId) seenMessageIds.add(msgId);
+      if (msgId) cursorStore.markSeen(msgId);
 
       const sender = (msg.senderAgentId as string) || 'unknown';
       const content = (msg.content as string) || '';
@@ -391,10 +402,43 @@ async function pollInbox(): Promise<void> {
 
 // ─── Start ──────────────────────────────────────────────────
 
+const SHUTDOWN_LVL_INFO = 'info';
+const SHUTDOWN_LVL_ERROR = 'error';
+const MSG_SHUTDOWN = 'Shutting down';
+const MSG_FLUSH_FAIL = 'Cursor flush on shutdown failed';
+const MSG_CONNECTING = 'Connecting MCP stdio transport';
+const MSG_LOADING = 'MCP connected, loading cursor state';
+const SIGINT_NAME = 'SIGINT';
+const SIGTERM_NAME = 'SIGTERM';
+
+let shuttingDown = false;
+
+async function shutdown(reason: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log(SHUTDOWN_LVL_INFO, MSG_SHUTDOWN, { reason });
+  try {
+    await cursorStore.close();
+  } catch (err) {
+    log(SHUTDOWN_LVL_ERROR, MSG_FLUSH_FAIL, {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  process.exit(0);
+}
+
 async function main(): Promise<void> {
-  log('info', 'Connecting MCP stdio transport');
+  log(SHUTDOWN_LVL_INFO, MSG_CONNECTING);
   await mcp.connect(new StdioServerTransport());
-  log('info', 'MCP connected, starting poll loop');
+  log(SHUTDOWN_LVL_INFO, MSG_LOADING);
+
+  // Restore persisted cursor state (tolerates missing file).
+  await cursorStore.load();
+
+  // Flush cursor state on graceful shutdown so the next start resumes from
+  // the last delivered message rather than replaying the backlog.
+  process.on(SIGINT_NAME, () => void shutdown(SIGINT_NAME));
+  process.on(SIGTERM_NAME, () => void shutdown(SIGTERM_NAME));
 
   // Start polling loop
   setInterval(pollInbox, POLL_INTERVAL_MS);

@@ -21,12 +21,13 @@ sb -a wren
 
 ## Configuration
 
-| Env var                | Default                                 | Description                   |
-| ---------------------- | --------------------------------------- | ----------------------------- |
-| `INK_SERVER_URL`       | `http://localhost:3001`                 | Ink server URL                |
-| `INK_AGENT_ID`         | from `AGENT_ID` or `.ink/identity.json` | Agent identity                |
-| `INK_POLL_INTERVAL_MS` | `10000`                                 | Poll interval in milliseconds |
-| `INK_ACCESS_TOKEN`     | from auth credentials                   | Ink auth token                |
+| Env var                   | Default                                         | Description                             |
+| ------------------------- | ----------------------------------------------- | --------------------------------------- |
+| `INK_SERVER_URL`          | `http://localhost:3001`                         | Ink server URL                          |
+| `INK_AGENT_ID`            | from `AGENT_ID` or `.ink/identity.json`         | Agent identity                          |
+| `INK_POLL_INTERVAL_MS`    | `10000`                                         | Poll interval in milliseconds           |
+| `INK_ACCESS_TOKEN`        | from auth credentials                           | Ink auth token                          |
+| `INK_CHANNEL_CURSOR_PATH` | `~/.ink/channel-plugin-cursors-<studioId>.json` | Override cursor-state JSON path (tests) |
 
 ## How messages appear
 
