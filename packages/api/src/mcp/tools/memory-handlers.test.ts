@@ -132,14 +132,19 @@ describe('startSessionSchema', () => {
     }
   });
 
-  it('should reject non-UUID studioId', () => {
+  it('should accept non-UUID studioId (e.g. "main")', () => {
+    // studioId accepts any string; non-UUID values like "main" are filtered
+    // by isStudioUuid() before reaching DB queries — see handleStartSession.
     const result = startSessionSchema.safeParse({
       email: 'test@test.com',
       agentId: 'wren',
-      studioId: 'not-a-uuid',
+      studioId: 'main',
     });
 
-    expect(result.success).toBe(false);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.studioId).toBe('main');
+    }
   });
 
   it('should still require user identification', () => {
@@ -1425,6 +1430,124 @@ describe('handleStartSession - threadKey matching', () => {
         id: '550e8400-e29b-41d4-a716-446655440000',
       })
     );
+  });
+});
+
+describe('handleStartSession - studioId="main" scope resolution', () => {
+  // Regression: before resolveStudioScope, studioId="main" collapsed to undefined,
+  // dropping the filter entirely. A main-repo attach could reattach to any
+  // active studio session for the same agent; new "main" sessions never wrote
+  // studio_id=NULL. See PR #322.
+  let mockDataComposer: ReturnType<typeof createMockDataComposer>;
+
+  beforeEach(() => {
+    mockDataComposer = createMockDataComposer();
+    vi.clearAllMocks();
+  });
+
+  it('passes null (not undefined) to getActiveSession when studioId="main"', async () => {
+    mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(null);
+    mockDataComposer.repositories.memory.startSession.mockResolvedValue({
+      id: 'session-main',
+      userId: 'user-123',
+      agentId: 'wren',
+      studioId: undefined,
+      threadKey: undefined,
+      currentPhase: undefined,
+      startedAt: new Date('2026-04-16T10:00:00Z'),
+      endedAt: undefined,
+      summary: undefined,
+      metadata: {},
+    });
+
+    await handleStartSession(
+      { email: 'test@test.com', agentId: 'wren', studioId: 'main' },
+      mockDataComposer as never
+    );
+
+    // null means "studio_id IS NULL" — not "any studio"
+    expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith(
+      'user-123',
+      'wren',
+      null,
+      undefined // contactId
+    );
+  });
+
+  it('persists studio_id=null on insert when studioId="main"', async () => {
+    mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(null);
+    mockDataComposer.repositories.memory.startSession.mockResolvedValue({
+      id: 'session-main',
+      userId: 'user-123',
+      agentId: 'wren',
+      studioId: undefined,
+      threadKey: undefined,
+      currentPhase: undefined,
+      startedAt: new Date('2026-04-16T10:00:00Z'),
+      endedAt: undefined,
+      summary: undefined,
+      metadata: {},
+    });
+
+    await handleStartSession(
+      { email: 'test@test.com', agentId: 'wren', studioId: 'main' },
+      mockDataComposer as never
+    );
+
+    expect(mockDataComposer.repositories.memory.startSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: 'user-123',
+        agentId: 'wren',
+        studioId: null, // explicit NULL — not undefined
+      })
+    );
+  });
+
+  it('does not reattach to a feature-studio session when attaching with studioId="main"', async () => {
+    // Simulates the bug: an active session exists in a feature studio.
+    // A "main" attach must NOT return it — null filter should scope to studio_id IS NULL.
+    // The mock mirrors the repo's real behavior: null means "IS NULL", so it returns null.
+    mockDataComposer.repositories.memory.getActiveSession.mockImplementation(
+      async (_userId: string, _agentId?: string, studioId?: string | null | undefined) => {
+        if (studioId === null) return null; // no root session exists
+        // Would return a feature-studio session for undefined (the buggy path) —
+        // this test documents that we never hit that branch.
+        return {
+          id: 'session-feature-studio',
+          userId: 'user-123',
+          agentId: 'wren',
+          studioId: '550e8400-e29b-41d4-a716-446655440001',
+          threadKey: undefined,
+          currentPhase: undefined,
+          startedAt: new Date(),
+          endedAt: undefined,
+          summary: undefined,
+          metadata: {},
+        };
+      }
+    );
+    mockDataComposer.repositories.memory.startSession.mockResolvedValue({
+      id: 'session-main-new',
+      userId: 'user-123',
+      agentId: 'wren',
+      studioId: undefined,
+      threadKey: undefined,
+      currentPhase: undefined,
+      startedAt: new Date(),
+      endedAt: undefined,
+      summary: undefined,
+      metadata: {},
+    });
+
+    const result = await handleStartSession(
+      { email: 'test@test.com', agentId: 'wren', studioId: 'main' },
+      mockDataComposer as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    // Should have created a fresh root-repo session, not reattached to the feature studio
+    expect(parsed.session.id).toBe('session-main-new');
+    expect(mockDataComposer.repositories.memory.startSession).toHaveBeenCalled();
   });
 });
 

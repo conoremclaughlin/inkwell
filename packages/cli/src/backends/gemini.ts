@@ -53,7 +53,7 @@ function buildGeminiSettings(cwd: string): { path: string; cleanup: () => void }
     headers: {
       ...existingHeaders,
       Authorization: 'Bearer ${INK_ACCESS_TOKEN}',
-      'x-ink-context': '${INK_CONTEXT_TOKEN}',
+      'x-ink-context': '${INK_CONTEXT}',
       'x-ink-session-id': '${INK_SESSION_ID}',
       'x-ink-studio-id': '${INK_STUDIO_ID}',
     },
@@ -138,7 +138,7 @@ export class GeminiAdapter implements BackendAdapter {
       env: {
         AGENT_ID: config.agentId,
         GEMINI_SYSTEM_MD: promptFile,
-        INK_CONTEXT_TOKEN: contextToken,
+        INK_CONTEXT: contextToken,
         ...(config.pcpSessionId ? { INK_SESSION_ID: config.pcpSessionId } : {}),
         ...(config.studioId ? { INK_STUDIO_ID: config.studioId } : {}),
         ...(settings ? { GEMINI_CLI_SYSTEM_SETTINGS_PATH: settings.path } : {}),

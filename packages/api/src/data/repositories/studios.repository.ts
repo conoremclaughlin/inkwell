@@ -177,6 +177,27 @@ export class StudiosRepository {
     return data ? this.mapRow(data as Record<string, unknown>) : null;
   }
 
+  /**
+   * Look up a studio by its human-readable slug, scoped to a user.
+   * Slugs (e.g. "wren", "wren-omega") are what users speak about; they
+   * resolve to UUIDs for DB operations. Scoped to user_id because slug
+   * uniqueness is only guaranteed per-user, not globally.
+   */
+  async findBySlug(userId: string, slug: string): Promise<Studio | null> {
+    const { data, error } = await this.client
+      .from('studios')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('slug', slug)
+      .single();
+
+    if (error && error.code !== 'PGRST116') {
+      throw new Error(`Failed to find studio by slug: ${error.message}`);
+    }
+
+    return data ? this.mapRow(data as Record<string, unknown>) : null;
+  }
+
   async listByUser(
     userId: string,
     opts?: { status?: StudioStatus; agentId?: string }

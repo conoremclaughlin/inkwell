@@ -62,7 +62,7 @@ export const ENV = {
   /** Studio ID */
   STUDIO_ID: 'INK_STUDIO_ID',
   /** Consolidated context token (base64url JSON) */
-  CONTEXT_TOKEN: 'INK_CONTEXT_TOKEN',
+  CONTEXT_TOKEN: 'INK_CONTEXT',
   /** Runtime link ID for session hint matching */
   RUNTIME_LINK_ID: 'INK_RUNTIME_LINK_ID',
   /** Debug mode toggle */

@@ -253,6 +253,8 @@ import {
   getIntegrationHealthSchema,
 } from './integration-health-handlers';
 
+import { handleDebugRequestContext } from './debug-handlers';
+
 // Re-export for external use
 export { setResponseCallback, addPendingMessage } from './response-handlers';
 export { setTelegramListener, registerChannelListener } from './chat-context-handlers';
@@ -3099,6 +3101,55 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       }
     }
   );
+
+  // =====================================================
+  // DEBUG TOOLS (reflects server state — used by .live.test.ts)
+  // Only registered when NODE_ENV !== 'production' so prod servers
+  // don't expose reflection endpoints. Opt out in dev by setting
+  // INK_DISABLE_DEBUG_TOOLS=1.
+  // =====================================================
+
+  const debugToolsEnabled =
+    process.env.NODE_ENV !== 'production' && process.env.INK_DISABLE_DEBUG_TOOLS !== '1';
+
+  if (debugToolsEnabled) {
+    server.registerTool(
+      'debug_request',
+      {
+        description: `Reflect the server-side request/session context back to the caller.
+
+Used by backend reflection tests (\`*.live.test.ts\`) to verify that CLI adapters
+are injecting \`x-ink-context\` and related headers correctly end-to-end. Not
+intended for agent use — calling it leaks no privileged data, it just reports
+what the server saw for the current call.
+
+Only registered when NODE_ENV !== 'production'.`,
+        inputSchema: {},
+      },
+      async () => {
+        try {
+          const result = await handleDebugRequestContext({});
+          return {
+            content: [{ type: 'text' as const, text: JSON.stringify(result) }],
+          };
+        } catch (error) {
+          logger.error('Error in debug_request:', error);
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  success: false,
+                  error: error instanceof Error ? error.message : 'Unknown error',
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+  }
 
   // =====================================================
   // ARTIFACT TOOLS (shared documents, specs, designs)
