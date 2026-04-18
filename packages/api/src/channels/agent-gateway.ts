@@ -151,6 +151,11 @@ export class AgentGateway extends EventEmitter {
       to: payload.toAgentId,
       type: payload.triggerType,
       priority: payload.priority,
+      threadKey: payload.threadKey || null,
+      threadMessageId: payload.threadMessageId || null,
+      recipientSessionId: payload.recipientSessionId || null,
+      studioId: payload.studioId || null,
+      studioHint: payload.studioHint || null,
     });
 
     const { handler, isDefaultHandler } = this.resolveHandler(payload);

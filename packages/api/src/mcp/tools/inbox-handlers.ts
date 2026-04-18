@@ -484,6 +484,10 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       type: messageType,
       isNewThread: thread.isNew,
       triggering: agentsToTrigger,
+      recipientStudioId: recipientStudioId || null,
+      recipientStudioHint: recipientStudioHint || null,
+      resolvedRecipientStudioId: resolvedRecipientStudioId || null,
+      effectiveRecipientSessionId: effectiveRecipientSessionId || null,
     });
 
     // Dispatch triggers with session routing from thread history
