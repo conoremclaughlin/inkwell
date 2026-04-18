@@ -2003,7 +2003,10 @@ export function loadApprovalSet(cwd: string): string[] {
     const settingsPath = join(cwd, '.claude', 'settings.local.json');
     if (!existsSync(settingsPath)) return [];
     const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    return settings.approvalRequired || [];
+    // Claude Code rejects unknown top-level fields; nest under `permissions`
+    // which accepts additionalProperties. Fall back to top-level for
+    // backcompat with any config written before this fix.
+    return settings.permissions?.approvalRequired || settings.approvalRequired || [];
   } catch {
     return [];
   }
@@ -2044,11 +2047,20 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
   const cwd = process.cwd();
 
   // Claude Code PreToolUse passes: { tool_name, tool_input }
+  // For Bash, tool_input is { command, description } — match against command
+  // so patterns like `Bash(docker push *)` work (Claude Code native syntax).
+  // For other tools, fall back to JSON so patterns can still inspect the full
+  // input shape if ever needed.
   const toolName = (stdin.tool_name as string) || '';
-  const toolInput =
-    typeof stdin.tool_input === 'string'
-      ? stdin.tool_input
-      : JSON.stringify(stdin.tool_input || '');
+  const rawInput = stdin.tool_input;
+  let toolInput: string;
+  if (typeof rawInput === 'string') {
+    toolInput = rawInput;
+  } else if (rawInput && typeof (rawInput as { command?: unknown }).command === 'string') {
+    toolInput = (rawInput as { command: string }).command;
+  } else {
+    toolInput = JSON.stringify(rawInput || '');
+  }
 
   hookLog('on_tool_approval', { toolName, toolInputPreview: toolInput.substring(0, 100) });
 
@@ -2068,7 +2080,7 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
   if (token) headers.Authorization = `Bearer ${token}`;
 
   // Forward context header so server knows the agent/studio
-  const contextToken = process.env.INK_CONTEXT_TOKEN?.trim();
+  const contextToken = process.env.INK_CONTEXT?.trim();
   if (contextToken) headers['x-ink-context'] = contextToken;
 
   const sessionId = process.env.INK_SESSION_ID?.trim() || undefined;

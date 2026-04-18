@@ -267,14 +267,16 @@ describe('POST /approval-requests', () => {
       error: null,
     });
 
+    const STUDIO_UUID = '11111111-2222-3333-4444-555555555555';
+    const SESSION_UUID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
     const handler = findRouteHandler('post', '/approval-requests');
     const req = createAuthenticatedReq({
       body: {
         tool: 'Bash',
         args: 'docker push registry/app',
         reason: 'deploy',
-        studioId: 'studio-7',
-        sessionId: 'sess-9',
+        studioId: STUDIO_UUID,
+        sessionId: SESSION_UUID,
         timeoutSeconds: 300,
       },
     });
@@ -295,13 +297,33 @@ describe('POST /approval-requests', () => {
         tool: 'Bash',
         args: 'docker push registry/app',
         reason: 'deploy',
-        studio_id: 'studio-7',
-        session_id: 'sess-9',
+        studio_id: STUDIO_UUID,
+        session_id: SESSION_UUID,
         timeout_seconds: 300,
         requesting_agent_id: 'unknown', // no x-ink-context header in this test
       })
     );
     expect(insertChain.select).toHaveBeenCalled();
+  });
+
+  it('coerces non-UUID studio_id/session_id to null (e.g. "main" from root repo)', async () => {
+    installInsertMock({
+      data: { id: 'req-main', status: 'pending', expires_at: futureIso() },
+      error: null,
+    });
+
+    const handler = findRouteHandler('post', '/approval-requests');
+    const req = createAuthenticatedReq({
+      body: { tool: 'Bash', args: 'ls', studioId: 'main', sessionId: 'not-a-uuid' },
+    });
+    const res = createMockRes();
+    await handler!(req as Request, res as unknown as Response);
+
+    expect(res._status).toBe(201);
+    const insertFn = mockSupabaseFrom.mock.results[0].value.insert as ReturnType<typeof vi.fn>;
+    expect(insertFn).toHaveBeenCalledWith(
+      expect.objectContaining({ studio_id: null, session_id: null })
+    );
   });
 
   it('resolves requestingAgentId from the x-ink-context header', async () => {

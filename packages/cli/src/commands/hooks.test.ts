@@ -944,19 +944,33 @@ describe('loadApprovalSet', () => {
     expect(loadApprovalSet(TEST_DIR)).toEqual([]);
   });
 
-  it('returns approvalRequired array from settings.local.json', () => {
+  it('returns permissions.approvalRequired array from settings.local.json', () => {
     const configDir = join(TEST_DIR, '.claude');
     mkdirSync(configDir, { recursive: true });
     writeFileSync(
       join(configDir, 'settings.local.json'),
       JSON.stringify({
-        approvalRequired: ['Bash(docker push *)', 'mcp__supabase__apply_migration'],
+        permissions: {
+          approvalRequired: ['Bash(docker push *)', 'mcp__supabase__apply_migration'],
+        },
       })
     );
     expect(loadApprovalSet(TEST_DIR)).toEqual([
       'Bash(docker push *)',
       'mcp__supabase__apply_migration',
     ]);
+  });
+
+  it('falls back to top-level approvalRequired for backcompat', () => {
+    const configDir = join(TEST_DIR, '.claude');
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      join(configDir, 'settings.local.json'),
+      JSON.stringify({
+        approvalRequired: ['Bash(docker push *)'],
+      })
+    );
+    expect(loadApprovalSet(TEST_DIR)).toEqual(['Bash(docker push *)']);
   });
 
   it('returns empty array when approvalRequired key is absent', () => {

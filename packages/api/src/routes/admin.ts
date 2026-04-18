@@ -94,6 +94,7 @@ const ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS = 3600; // 1 hour
 const ADMIN_REFRESH_TOKEN_LIFETIME_DAYS = 90;
 const ADMIN_CLIENT_ID = 'dashboard';
 const MCP_CLI_TRANSCRIPT_ROUTE = /^\/sessions(?:\/synced|\/[^/]+\/(?:sync-transcript|transcript))$/;
+const MCP_CLI_APPROVAL_ROUTE = /^\/approval-requests(?:\/[^/]+\/status)?$/;
 const DEFAULT_SESSION_LOG_LIMIT = 50;
 const MAX_SESSION_LOG_LIMIT = 200;
 const ACTIVITY_PREVIEW_LIMIT_PER_SESSION = 3;
@@ -963,12 +964,13 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       userEmail = payload.email;
     }
 
-    // Convenience path: allow standard MCP access tokens for transcript sync,
-    // so CLI users can run sync without dashboard cookie auth.
+    // Convenience path: allow standard MCP access tokens for CLI-driven flows
+    // (transcript sync, 2FA approval requests) so CLI users can operate without
+    // dashboard cookie auth.
     if (
       !pcpUserId &&
       (req.method === 'POST' || req.method === 'GET') &&
-      MCP_CLI_TRANSCRIPT_ROUTE.test(req.path)
+      (MCP_CLI_TRANSCRIPT_ROUTE.test(req.path) || MCP_CLI_APPROVAL_ROUTE.test(req.path))
     ) {
       const mcpPayload = verifyPcpAccessToken(token, 'mcp_access');
       if (mcpPayload) {
@@ -6746,12 +6748,19 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
       }
     }
 
+    // studio_id is a UUID column. The CLI sends the literal string "main"
+    // for the root repo (see .ink/identity.json), which would fail insert —
+    // coerce non-UUID values to null.
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const studioIdForInsert = studioId && UUID_RE.test(studioId) ? studioId : null;
+    const sessionIdForInsert = sessionId && UUID_RE.test(sessionId) ? sessionId : null;
+
     const { data, error } = await supabase
       .from('approval_requests')
       .insert({
         user_id: authReq.pcpUserId,
-        studio_id: studioId || null,
-        session_id: sessionId || null,
+        studio_id: studioIdForInsert,
+        session_id: sessionIdForInsert,
         requesting_agent_id: requestingAgentId,
         tool,
         args: args || null,
@@ -6763,6 +6772,13 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
       .single();
 
     if (error) {
+      logger.error('Failed to insert approval request', {
+        error: error.message,
+        code: error.code,
+        studioId,
+        sessionId,
+        tool,
+      });
       res.status(500).json(errorJson('Failed to create approval request', error));
       return;
     }
