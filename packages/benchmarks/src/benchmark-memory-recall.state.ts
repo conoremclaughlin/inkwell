@@ -11,6 +11,17 @@ export interface SeededCaseState {
   seedMs: number;
 }
 
+export interface BenchmarkSeedState {
+  seedId: string;
+  dataset: string;
+  datasetSource: string;
+  benchmarkFamily: string | null;
+  userId: string;
+  representationKey: string;
+  seededCases: Record<string, SeededCaseState>;
+  timings: BenchmarkTimingState;
+}
+
 export interface CompletedCaseRunState {
   rank: number | null;
   topSummaries: string[];
@@ -26,6 +37,7 @@ export interface BenchmarkTimingState {
 
 export interface BenchmarkRunState {
   runId: string;
+  seedId: string;
   dataset: string;
   datasetSource: string;
   benchmarkFamily: string | null;
@@ -38,8 +50,29 @@ export interface BenchmarkRunState {
   timings: BenchmarkTimingState;
 }
 
+export function createInitialBenchmarkSeedState(params: {
+  seedId: string;
+  dataset: string;
+  datasetSource: string;
+  benchmarkFamily: string | null;
+  userId: string;
+  representationKey: string;
+}): BenchmarkSeedState {
+  return {
+    ...params,
+    seededCases: {},
+    timings: {
+      seedCaseCount: 0,
+      seedTotalMs: 0,
+      recallCaseCount: 0,
+      recallTotalMs: 0,
+    },
+  };
+}
+
 export function createInitialBenchmarkRunState(params: {
   runId: string;
+  seedId: string;
   dataset: string;
   datasetSource: string;
   benchmarkFamily: string | null;
@@ -59,6 +92,36 @@ export function createInitialBenchmarkRunState(params: {
       recallTotalMs: 0,
     },
   };
+}
+
+export async function loadBenchmarkSeedState(
+  statePath: string
+): Promise<BenchmarkSeedState | null> {
+  try {
+    const raw = await readFile(statePath, 'utf-8');
+    const parsed = JSON.parse(raw) as BenchmarkSeedState & {
+      seededCases?: Record<
+        string,
+        SeededCaseState & {
+          targetMemoryId?: string;
+        }
+      >;
+    };
+
+    if (parsed.seededCases) {
+      for (const seededCase of Object.values(parsed.seededCases)) {
+        if (!Array.isArray(seededCase.targetMemoryIds)) {
+          seededCase.targetMemoryIds = seededCase.targetMemoryId ? [seededCase.targetMemoryId] : [];
+        }
+      }
+    }
+
+    return parsed as BenchmarkSeedState;
+  } catch (error) {
+    const nodeError = error as NodeJS.ErrnoException;
+    if (nodeError?.code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
 export async function loadBenchmarkRunState(statePath: string): Promise<BenchmarkRunState | null> {
@@ -85,6 +148,10 @@ export async function loadBenchmarkRunState(statePath: string): Promise<Benchmar
       parsed.variant = 'default';
     }
 
+    if (!parsed.seedId) {
+      parsed.seedId = parsed.runId;
+    }
+
     return parsed as BenchmarkRunState;
   } catch (error) {
     const nodeError = error as NodeJS.ErrnoException;
@@ -96,6 +163,14 @@ export async function loadBenchmarkRunState(statePath: string): Promise<Benchmar
 export async function writeBenchmarkRunState(
   statePath: string,
   state: BenchmarkRunState
+): Promise<void> {
+  await mkdir(dirname(statePath), { recursive: true });
+  await writeFile(statePath, JSON.stringify(state, null, 2), 'utf-8');
+}
+
+export async function writeBenchmarkSeedState(
+  statePath: string,
+  state: BenchmarkSeedState
 ): Promise<void> {
   await mkdir(dirname(statePath), { recursive: true });
   await writeFile(statePath, JSON.stringify(state, null, 2), 'utf-8');

@@ -17,10 +17,13 @@ import {
   parseBenchmarkRecallVariant,
 } from './benchmark-memory-recall.variant';
 import {
+  createInitialBenchmarkSeedState,
   createInitialBenchmarkRunState,
   estimateRemainingDuration,
   formatDurationMs,
   loadBenchmarkRunState,
+  loadBenchmarkSeedState,
+  writeBenchmarkSeedState,
   writeBenchmarkRunState,
 } from './benchmark-memory-recall.state';
 import type { RecallMode } from './benchmark-memory-recall.types';
@@ -55,6 +58,7 @@ const BENCHMARK_AGENT_ID = 'lumen';
 const DEFAULT_DATASET = 'internal-gold-v1';
 const RETRY_ATTEMPTS = 3;
 const DEFAULT_PROGRESS_EVERY = 25;
+type BenchmarkPhase = 'all' | 'seed' | 'recall';
 
 function parseModes(raw?: string): RecallMode[] {
   if (!raw) return ['text', 'semantic', 'hybrid'];
@@ -84,6 +88,35 @@ function parsePositiveInt(raw: string | undefined, defaultValue: number): number
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed <= 0) return defaultValue;
   return Math.floor(parsed);
+}
+
+function parseBenchmarkPhase(raw?: string): BenchmarkPhase {
+  const normalized = raw?.trim().toLowerCase();
+  if (normalized === 'seed' || normalized === 'recall' || normalized === 'all') return normalized;
+  return 'all';
+}
+
+function slugify(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
+}
+
+function buildRepresentationKey(): string {
+  const parts = [
+    'chunked',
+    process.env.MEMORY_EMBEDDINGS_ENABLED || 'default',
+    process.env.MEMORY_EMBEDDING_PROVIDER || 'default',
+    process.env.MEMORY_EMBEDDING_MODEL || 'default',
+    process.env.MEMORY_LLM_EXTRACTION_ENABLED || 'false',
+    process.env.MEMORY_LLM_ENTITY_ENABLED || 'false',
+    process.env.MEMORY_LLM_DURABLE_FACT_ENABLED || 'false',
+    process.env.MEMORY_LLM_SUMMARY_ENABLED || 'false',
+    process.env.MEMORY_LLM_CURRENT_STATE_ENABLED || 'false',
+  ];
+  return slugify(parts.join('-'));
 }
 
 function sleep(ms: number): Promise<void> {
@@ -291,18 +324,30 @@ async function main() {
     process.env.MEMORY_BENCHMARK_PROGRESS_EVERY,
     DEFAULT_PROGRESS_EVERY
   );
+  const phase = parseBenchmarkPhase(process.env.MEMORY_BENCHMARK_PHASE);
+  const representationKey = buildRepresentationKey();
 
   const requestedRunId = process.env.MEMORY_BENCHMARK_RUN_ID;
   const runId = requestedRunId || `membench-${Date.now()}-${randomUUID().slice(0, 8)}`;
+  const seedId =
+    process.env.MEMORY_BENCHMARK_SEED_ID ||
+    `${slugify(dataset)}-${benchmarkFamily || 'custom'}-${representationKey}`;
   const outputPath =
     process.env.MEMORY_BENCHMARK_OUTPUT_PATH ||
     resolve(process.cwd(), 'output', 'memory-benchmarks', `${runId}.json`);
   const statePath =
     process.env.MEMORY_BENCHMARK_STATE_PATH ||
     resolve(process.cwd(), 'output', 'memory-benchmarks', `${runId}.state.json`);
+  const seedPath =
+    process.env.MEMORY_BENCHMARK_SEED_PATH ||
+    resolve(process.cwd(), 'output', 'memory-benchmarks', `${seedId}.seed.json`);
+  const existingSeedState = await loadBenchmarkSeedState(seedPath);
   const existingState = await loadBenchmarkRunState(statePath);
-  const reuseSeeded = parseBoolean(process.env.MEMORY_BENCHMARK_REUSE_SEEDED, !!existingState);
-  const keepSeeded = parseBoolean(process.env.MEMORY_BENCHMARK_KEEP_SEEDED, !!existingState);
+  const reuseSeeded = parseBoolean(
+    process.env.MEMORY_BENCHMARK_REUSE_SEEDED,
+    !!existingSeedState || !!existingState
+  );
+  const keepSeeded = parseBoolean(process.env.MEMORY_BENCHMARK_KEEP_SEEDED, true);
   const variantDescriptor = describeBenchmarkRecallVariant(variant);
 
   const supabase = createSupabaseClient();
@@ -311,10 +356,21 @@ async function main() {
 
   const caseTargets: Record<string, string[]> = {};
   const caseTopics: Record<string, string[]> = {};
+  const seedState =
+    existingSeedState ||
+    createInitialBenchmarkSeedState({
+      seedId,
+      dataset,
+      datasetSource,
+      benchmarkFamily,
+      userId,
+      representationKey,
+    });
   const runState =
     existingState ||
     createInitialBenchmarkRunState({
       runId,
+      seedId,
       dataset,
       datasetSource,
       benchmarkFamily,
@@ -323,6 +379,10 @@ async function main() {
       modes,
       outputPath,
     });
+
+  if (!existingSeedState) {
+    await writeBenchmarkSeedState(seedPath, seedState);
+  }
 
   if (existingState) {
     console.log(
@@ -335,6 +395,9 @@ async function main() {
   }
 
   console.log(
+    `[memory-benchmark] phase=${phase} seedId=${seedId} representation=${representationKey} seedPath=${seedPath}`
+  );
+  console.log(
     `[memory-benchmark] variant=${variantDescriptor.name} ` +
       `semanticChunkTypes=${Array.isArray(variantDescriptor.semanticChunkTypes) ? variantDescriptor.semanticChunkTypes.join('|') : variantDescriptor.semanticChunkTypes} ` +
       `hybridChunkStrategy=${variantDescriptor.hybridChunkStrategy} ` +
@@ -343,14 +406,21 @@ async function main() {
 
   try {
     for (const [index, benchCase] of benchmarkCases.entries()) {
-      const caseTopic = `${BENCHMARK_TOPIC}:${runState.runId}:${benchCase.id}`;
+      const caseTopic = `${BENCHMARK_TOPIC}:${seedState.seedId}:${benchCase.id}`;
       caseTopics[benchCase.id] = [caseTopic];
 
-      const seededCase = runState.seededCases[benchCase.id];
+      const seededCase = seedState.seededCases[benchCase.id] || runState.seededCases[benchCase.id];
       if (reuseSeeded && seededCase) {
         caseTargets[benchCase.id] = seededCase.targetMemoryIds;
         caseTopics[benchCase.id] = [seededCase.topic];
+        runState.seededCases[benchCase.id] = seededCase;
         continue;
+      }
+
+      if (phase === 'recall') {
+        throw new Error(
+          `Missing seeded case for ${benchCase.id} in recall-only mode. Seed path: ${seedPath}`
+        );
       }
 
       const seedStartedAt = Date.now();
@@ -399,26 +469,56 @@ async function main() {
       }
 
       const seedMs = Date.now() - seedStartedAt;
-      runState.seededCases[benchCase.id] = {
+      const seededCaseState = {
         caseId: benchCase.id,
         topic: caseTopic,
         targetMemoryIds,
         distractorMemoryIds: distractorIds,
         seedMs,
       };
-      runState.timings.seedCaseCount += 1;
-      runState.timings.seedTotalMs += seedMs;
+      seedState.seededCases[benchCase.id] = seededCaseState;
+      runState.seededCases[benchCase.id] = seededCaseState;
+      seedState.timings.seedCaseCount += 1;
+      seedState.timings.seedTotalMs += seedMs;
+      runState.timings.seedCaseCount = seedState.timings.seedCaseCount;
+      runState.timings.seedTotalMs = seedState.timings.seedTotalMs;
+      await writeBenchmarkSeedState(seedPath, seedState);
       await writeBenchmarkRunState(statePath, runState);
 
       if ((index + 1) % progressEvery === 0 || index === benchmarkCases.length - 1) {
         logProgress({
           label: 'seeded cases',
-          completed: index + 1,
+          completed: Object.keys(seedState.seededCases).length,
           total: benchmarkCases.length,
           durationMs: seedMs,
-          averageMs: runState.timings.seedTotalMs / Math.max(1, runState.timings.seedCaseCount),
+          averageMs: seedState.timings.seedTotalMs / Math.max(1, seedState.timings.seedCaseCount),
         });
       }
+    }
+
+    if (phase === 'seed') {
+      console.log(
+        JSON.stringify(
+          {
+            seedId,
+            seedPath,
+            dataset,
+            datasetSource,
+            benchmarkFamily,
+            representationKey,
+            seededCaseCount: Object.keys(seedState.seededCases).length,
+            timings: {
+              seedCaseCount: seedState.timings.seedCaseCount,
+              seedTotalMs: seedState.timings.seedTotalMs,
+              seedAverageMs:
+                seedState.timings.seedTotalMs / Math.max(1, seedState.timings.seedCaseCount),
+            },
+          },
+          null,
+          2
+        )
+      );
+      return;
     }
 
     const runs: CaseRun[] = [];
@@ -527,12 +627,16 @@ async function main() {
           : null,
         variant: variantDescriptor,
         statePath,
+        seedPath,
         reuseSeeded,
         keepSeeded,
+        phase,
+        seedCaseCount: Object.keys(seedState.seededCases).length,
         timings: {
-          seedCaseCount: runState.timings.seedCaseCount,
-          seedTotalMs: runState.timings.seedTotalMs,
-          seedAverageMs: runState.timings.seedTotalMs / Math.max(1, runState.timings.seedCaseCount),
+          seedCaseCount: seedState.timings.seedCaseCount,
+          seedTotalMs: seedState.timings.seedTotalMs,
+          seedAverageMs:
+            seedState.timings.seedTotalMs / Math.max(1, seedState.timings.seedCaseCount),
           recallCaseCount: runState.timings.recallCaseCount,
           recallTotalMs: runState.timings.recallTotalMs,
           recallAverageMs:
@@ -543,6 +647,7 @@ async function main() {
       runs,
       outputPath: writeOutputFile ? outputPath : null,
       statePath,
+      seedPath,
     };
 
     if (writeOutputFile) {
