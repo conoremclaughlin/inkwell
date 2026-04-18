@@ -63,10 +63,20 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .uuid()
     .optional()
     .describe('Recipient studio ID hint for session routing'),
+  recipientStudioSlug: z
+    .string()
+    .min(1)
+    .max(100)
+    .optional()
+    .describe(
+      'Recipient studio slug for routing (matches studios.slug). Pass "main" to target the user\'s root-repo studio. Preferred over recipientStudioHint — accepts any studio slug, not just "main".'
+    ),
   recipientStudioHint: z
     .enum(['main'])
     .optional()
-    .describe('Recipient studio routing hint (e.g., "main")'),
+    .describe(
+      'DEPRECATED — use recipientStudioSlug instead. Kept for backward compatibility with callers that pass the literal string "main".'
+    ),
   relatedArtifactUri: z.string().optional().describe('Related artifact URI'),
   metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
   expiresAt: z.string().datetime().optional().describe('When this message expires'),
@@ -217,6 +227,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     priority = 'normal',
     recipientSessionId,
     recipientStudioId,
+    recipientStudioSlug,
     recipientStudioHint,
     relatedArtifactUri,
     metadata = {},
@@ -228,6 +239,12 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     triggerAgents,
   } = parsed;
 
+  // Merge recipientStudioSlug (preferred) and recipientStudioHint (legacy alias).
+  // Downstream code treats these uniformly — both resolve via resolveStudioHint,
+  // which does isMainStudio + slug lookup. If both are provided, slug wins.
+  const recipientStudioSlugOrHint: string | undefined =
+    recipientStudioSlug || recipientStudioHint || undefined;
+
   // Validate: exactly one of recipientAgentId or recipients
   const hasSingle = !!recipientAgentId;
   const hasMany = !!recipients?.length;
@@ -237,9 +254,9 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   if (hasMany && !threadKey) {
     throw new Error('threadKey is required when using recipients[]');
   }
-  if (recipients && (recipientSessionId || recipientStudioId || recipientStudioHint)) {
+  if (recipients && (recipientSessionId || recipientStudioId || recipientStudioSlugOrHint)) {
     throw new Error(
-      'recipientSessionId/recipientStudioId/recipientStudioHint are only valid for single-recipient sends'
+      'recipientSessionId/recipientStudioId/recipientStudioSlug/recipientStudioHint are only valid for single-recipient sends'
     );
   }
 
@@ -368,9 +385,9 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         : {};
     // Cross-studio self-messaging: stamp recipient studio on the message
     // so the channelPoll filter can recognize the target studio as an owner.
-    // Resolve recipientStudioHint to a studioId if needed.
+    // Resolve recipientStudioSlug/Hint to a studioId if needed.
     let resolvedRecipientStudioId: string | undefined = recipientStudioId || undefined;
-    if (!resolvedRecipientStudioId && recipientStudioHint && senderAgentId) {
+    if (!resolvedRecipientStudioId && recipientStudioSlugOrHint && senderAgentId) {
       try {
         // Reuse the shared resolution function (worktree path → branch fallback
         // for 'main', slug match for named hints).
@@ -378,7 +395,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         resolvedRecipientStudioId = await resolveStudioHint(
           supabase,
           resolved.user.id,
-          recipientStudioHint,
+          recipientStudioSlugOrHint,
           senderAgentId,
           reqCtxForHint?.repoRoot
         );
@@ -452,7 +469,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // exclude self from trigger resolution.
     const selfStudioTarget = !!(
       senderAgentId &&
-      (recipientStudioId || recipientStudioHint) &&
+      (recipientStudioId || recipientStudioSlugOrHint) &&
       allRecipients.includes(senderAgentId)
     );
 
@@ -553,8 +570,8 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           ...(isSelfStudioMessage && resolvedRecipientStudioId
             ? { studioId: resolvedRecipientStudioId }
             : {}),
-          ...(isSelfStudioMessage && !resolvedRecipientStudioId && recipientStudioHint
-            ? { studioHint: recipientStudioHint }
+          ...(isSelfStudioMessage && !resolvedRecipientStudioId && recipientStudioSlugOrHint
+            ? { studioHint: recipientStudioSlugOrHint }
             : {}),
         };
         const result = gateway.dispatchTrigger(payload);
@@ -595,7 +612,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
 
   // ── Legacy path: simple inbox message (no threadKey) ──
   const hasRoutingAnchor = Boolean(
-    effectiveRecipientSessionId || recipientStudioId || recipientStudioHint
+    effectiveRecipientSessionId || recipientStudioId || recipientStudioSlugOrHint
   );
   const requiresRoutingAnchor = Boolean(senderAgentId) && messageType !== 'message';
   const missingRoutingAnchor = requiresRoutingAnchor && !hasRoutingAnchor;
@@ -626,7 +643,10 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       recipient: {
         sessionId: effectiveRecipientSessionId || null,
         studioId: recipientStudioId || null,
-        studioHint: recipientStudioHint || null,
+        // Metadata field is `studioHint` for backward compat with mission.ts
+        // and other consumers that read this blob. recipientStudioSlug feeds
+        // into the same slot since both resolve via resolveStudioHint.
+        studioHint: recipientStudioSlugOrHint || null,
       },
     },
   };
@@ -699,7 +719,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       priority,
       recipientSessionId: effectiveRecipientSessionId,
       studioId: recipientStudioId,
-      studioHint: recipientStudioHint,
+      studioHint: recipientStudioSlugOrHint,
     };
 
     logger.info('Inbox message trigger dispatched (async)', {
@@ -740,13 +760,13 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           threadKey: null,
           recipientSessionId: effectiveRecipientSessionId || null,
           recipientStudioId: recipientStudioId || null,
-          recipientStudioHint: recipientStudioHint || null,
+          recipientStudioSlug: recipientStudioSlugOrHint || null,
           createdAt: message.created_at,
           trigger: triggerResult,
           ...(missingRoutingAnchor
             ? {
                 routingHint:
-                  'Actionable handoff is missing a routing anchor. Add one of: threadKey, recipientSessionId, recipientStudioId, or recipientStudioHint.',
+                  'Actionable handoff is missing a routing anchor. Add one of: threadKey, recipientSessionId, recipientStudioId, or recipientStudioSlug.',
               }
             : {}),
           ...(missingSenderSession
