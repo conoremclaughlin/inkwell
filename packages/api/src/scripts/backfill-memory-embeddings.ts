@@ -114,6 +114,10 @@ async function main() {
         source: row.source,
         salience: row.salience,
         model: vettedModel,
+        llmExtractions:
+          row.metadata && typeof row.metadata === 'object' && 'llm_extractions' in row.metadata
+            ? (row.metadata.llm_extractions as Record<string, unknown>)
+            : null,
       });
       if (chunks.length === 0) {
         skipped += 1;

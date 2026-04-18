@@ -64,7 +64,13 @@ export interface MemoryCreateInput {
   contactId?: string; // Per-sender memory scoping
 }
 
-export type MemorySearchChunkType = 'summary' | 'fact' | 'topic' | 'entity' | 'content';
+export type MemorySearchChunkType =
+  | 'summary'
+  | 'fact'
+  | 'topic'
+  | 'entity'
+  | 'current_state'
+  | 'content';
 export type MemoryHybridChunkStrategy = 'default' | 'content-only' | 'derived-only';
 
 export interface MemorySearchOptions {

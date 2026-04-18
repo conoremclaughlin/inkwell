@@ -177,6 +177,28 @@ const envSchema = z.object({
   MEMORY_EMBEDDING_DIMENSIONS: optionalNumber,
   MEMORY_EMBEDDING_QUERY_THRESHOLD: optionalNumber,
   MEMORY_EMBEDDING_MATCH_COUNT_MULTIPLIER: optionalNumber,
+  MEMORY_LLM_EXTRACTION_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  MEMORY_LLM_MODEL: optionalString,
+  MEMORY_LLM_MAX_INPUT_CHARS: optionalNumber,
+  MEMORY_LLM_ENTITY_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  MEMORY_LLM_DURABLE_FACT_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  MEMORY_LLM_SUMMARY_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  MEMORY_LLM_CURRENT_STATE_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
   OLLAMA_BASE_URL: optionalUrl,
   OPENAI_API_KEY: optionalString,
   OPENAI_BASE_URL: optionalUrl,
@@ -200,7 +222,8 @@ const parseEnv = () => {
     }
 
     // Create normalized keys (prefer INK_, fall back to PCP_ for backward compat)
-    const hasBaseOverride = parsed.INK_PORT_BASE !== undefined || parsed.PCP_PORT_BASE !== undefined;
+    const hasBaseOverride =
+      parsed.INK_PORT_BASE !== undefined || parsed.PCP_PORT_BASE !== undefined;
     // Base is MCP-first: MCP=base, WEB=base+1, MYRA=base+2
     const portBase = parsed.INK_PORT_BASE ?? parsed.PCP_PORT_BASE ?? 3001;
 
@@ -221,6 +244,7 @@ const parseEnv = () => {
     const memoryEmbeddingDimensions = parsed.MEMORY_EMBEDDING_DIMENSIONS ?? 1024;
     const memoryEmbeddingQueryThreshold = parsed.MEMORY_EMBEDDING_QUERY_THRESHOLD ?? 0.2;
     const memoryEmbeddingMatchCountMultiplier = parsed.MEMORY_EMBEDDING_MATCH_COUNT_MULTIPLIER ?? 5;
+    const memoryLlmMaxInputChars = parsed.MEMORY_LLM_MAX_INPUT_CHARS ?? 12000;
 
     return {
       ...parsed,
@@ -234,6 +258,7 @@ const parseEnv = () => {
       MEMORY_EMBEDDING_DIMENSIONS: memoryEmbeddingDimensions,
       MEMORY_EMBEDDING_QUERY_THRESHOLD: memoryEmbeddingQueryThreshold,
       MEMORY_EMBEDDING_MATCH_COUNT_MULTIPLIER: memoryEmbeddingMatchCountMultiplier,
+      MEMORY_LLM_MAX_INPUT_CHARS: memoryLlmMaxInputChars,
     } as typeof parsed & {
       INK_PORT_BASE: number;
       PORT: number;
@@ -245,6 +270,7 @@ const parseEnv = () => {
       MEMORY_EMBEDDING_DIMENSIONS: number;
       MEMORY_EMBEDDING_QUERY_THRESHOLD: number;
       MEMORY_EMBEDDING_MATCH_COUNT_MULTIPLIER: number;
+      MEMORY_LLM_MAX_INPUT_CHARS: number;
     };
   } catch (error) {
     if (error instanceof z.ZodError) {

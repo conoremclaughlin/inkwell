@@ -5,6 +5,7 @@ import {
   inferChunkTypeFromMetadata,
   MEMORY_EMBEDDING_CHUNKS_VERSION,
 } from './memory-chunks';
+import { memoryExtractionsSchema } from '../memory-llm-extraction';
 
 describe('memory chunk multi-view helpers', () => {
   it('builds summary, fact, topic, entity, and content views when structured data is available', () => {
@@ -27,6 +28,7 @@ describe('memory chunk multi-view helpers', () => {
 
     const viewCounts = countChunkViews(chunks);
     expect(viewCounts.summary).toBe(1);
+    expect(viewCounts.current_state).toBe(0);
     expect(viewCounts.content).toBeGreaterThan(0);
 
     const metadata = {
@@ -37,5 +39,77 @@ describe('memory chunk multi-view helpers', () => {
     };
 
     expect(inferChunkTypeFromMetadata(0, metadata)).toBe('summary');
+  });
+
+  it('prefers llm-derived summary, durable fact, entity, and current state chunks when provided', () => {
+    const llmExtractions = memoryExtractionsSchema.parse({
+      version: 1,
+      provider: 'openai',
+      model: 'gpt-4.1-mini',
+      extractedAt: '2026-04-18T12:00:00.000Z',
+      summary: {
+        summary: 'The benchmark doc discussion established the current feature-flag plan.',
+        keyPoints: ['feature flags gate extraction', 'current state is first-class'],
+        actionRelevance: 'Helps future agents route retrieval experiments correctly.',
+      },
+      durable_fact: {
+        durableFacts: [
+          {
+            fact: 'Current-state memory should be indexed separately from durable facts.',
+            category: 'decision',
+            subject: 'current_state index',
+            object: 'durable_fact index',
+            evidence:
+              'Current state should stay separate from durable facts because it is volatile.',
+          },
+        ],
+      },
+      entity: {
+        entities: [
+          {
+            name: 'Wren',
+            aliases: ['wren'],
+            entityType: 'person',
+            description: 'Reviewer providing memory-system feedback.',
+            evidence: 'Wren forgot that we were discussing a specific document.',
+          },
+        ],
+      },
+      current_state: {
+        state: 'The dev server auto-restarts on file change.',
+        scope: 'local dev server',
+        status: 'running',
+        volatility: 'volatile',
+        evidence:
+          'Current state is also important: like the currently running dev server will autorestart.',
+      },
+    });
+
+    const chunks = buildMemoryEmbeddingChunks({
+      summary: 'Fallback summary that should not be used',
+      content:
+        'Current state is also important: like the currently running dev server will autorestart.',
+      topicKey: 'spec:memory-benchmark-notes',
+      topics: ['person:wren'],
+      source: 'observation',
+      salience: 'high',
+      model: { maxInputChars: 1200 } as { maxInputChars: number },
+      llmExtractions,
+    });
+
+    expect(chunks.find((chunk) => chunk.chunkType === 'summary')?.text).toContain(
+      'action relevance'
+    );
+    expect(chunks.find((chunk) => chunk.chunkType === 'fact')?.text).toContain('durable fact:');
+    expect(chunks.find((chunk) => chunk.chunkType === 'entity')?.text).toContain('entity: Wren');
+    expect(chunks.find((chunk) => chunk.chunkType === 'current_state')?.text).toContain(
+      'current state:'
+    );
+
+    const viewCounts = countChunkViews(chunks);
+    expect(viewCounts.summary).toBe(1);
+    expect(viewCounts.fact).toBe(1);
+    expect(viewCounts.entity).toBe(1);
+    expect(viewCounts.current_state).toBe(1);
   });
 });

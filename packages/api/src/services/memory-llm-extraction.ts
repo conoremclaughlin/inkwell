@@ -1,3 +1,5 @@
+import { env } from '../config/env';
+import { logger } from '../utils/logger';
 import { z } from 'zod';
 
 export const MEMORY_EXTRACTION_VERSION = 1;
@@ -60,6 +62,19 @@ export const durableFactExtractionSchema = z.object({
   durableFacts: z.array(durableFactExtractionItemSchema).max(10),
 });
 
+export const memoryExtractionsSchema = z.object({
+  version: z.number().int().default(MEMORY_EXTRACTION_VERSION),
+  provider: z.string().min(1),
+  model: z.string().min(1),
+  extractedAt: z.string().min(1),
+  entity: entityExtractionSchema.optional(),
+  durable_fact: durableFactExtractionSchema.optional(),
+  summary: summaryExtractionSchema.optional(),
+  current_state: currentStateExtractionSchema.optional(),
+});
+
+export type MemoryExtractions = z.infer<typeof memoryExtractionsSchema>;
+
 export interface MemoryExtractionSource {
   summary?: string | null;
   content: string;
@@ -78,6 +93,18 @@ export interface ExtractionPromptBundle {
   schemaDescription: string;
 }
 
+export interface ExtractionRuntimeConfig {
+  enabled: boolean;
+  model: string;
+  baseUrl: string;
+  hasApiKey: boolean;
+  maxInputChars: number;
+  enabledKinds: ExtractionKind[];
+}
+
+const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com';
+const DEFAULT_MEMORY_LLM_MODEL = 'gpt-4.1-mini';
+
 function buildSourceBlock(source: MemoryExtractionSource): string {
   const parts: string[] = [];
   if (source.summary?.trim()) parts.push(`Summary:\n${source.summary.trim()}`);
@@ -88,6 +115,11 @@ function buildSourceBlock(source: MemoryExtractionSource): string {
   if (source.salience?.trim()) parts.push(`Salience: ${source.salience.trim()}`);
   parts.push(`Memory text:\n${source.content.trim()}`);
   return parts.join('\n\n');
+}
+
+function clampSourceText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
 }
 
 function compactWhitespace(text: string): string {
@@ -241,4 +273,169 @@ export function buildCurrentStateEmbeddingTexts(
       `current state: ${payload.state}; scope: ${payload.scope}; status: ${payload.status}; volatility: ${payload.volatility}; evidence: ${quote(payload.evidence)}`
     ),
   ];
+}
+
+export function normalizeMemoryExtractions(value: unknown): MemoryExtractions | null {
+  const parsed = memoryExtractionsSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+function buildRuntimeConfig(): ExtractionRuntimeConfig {
+  const enabledKinds: ExtractionKind[] = [];
+  if (env.MEMORY_LLM_ENTITY_ENABLED) enabledKinds.push('entity');
+  if (env.MEMORY_LLM_DURABLE_FACT_ENABLED) enabledKinds.push('durable_fact');
+  if (env.MEMORY_LLM_SUMMARY_ENABLED) enabledKinds.push('summary');
+  if (env.MEMORY_LLM_CURRENT_STATE_ENABLED) enabledKinds.push('current_state');
+
+  return {
+    enabled: env.MEMORY_LLM_EXTRACTION_ENABLED,
+    model: env.MEMORY_LLM_MODEL || DEFAULT_MEMORY_LLM_MODEL,
+    baseUrl: env.OPENAI_BASE_URL || DEFAULT_OPENAI_BASE_URL,
+    hasApiKey: Boolean(env.OPENAI_API_KEY),
+    maxInputChars: env.MEMORY_LLM_MAX_INPUT_CHARS,
+    enabledKinds,
+  };
+}
+
+function sanitizeSource(
+  source: MemoryExtractionSource,
+  maxInputChars: number
+): MemoryExtractionSource {
+  return {
+    ...source,
+    summary: source.summary
+      ? clampSourceText(source.summary, Math.min(maxInputChars, 2000))
+      : source.summary,
+    content: clampSourceText(source.content, maxInputChars),
+  };
+}
+
+function extractJsonObject(text: string): string {
+  const trimmed = text.trim();
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) return trimmed;
+  const firstBrace = trimmed.indexOf('{');
+  const lastBrace = trimmed.lastIndexOf('}');
+  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+    throw new Error('LLM extraction response did not contain a JSON object');
+  }
+  return trimmed.slice(firstBrace, lastBrace + 1);
+}
+
+export class MemoryLlmExtractor {
+  private readonly config: ExtractionRuntimeConfig;
+
+  constructor(config: ExtractionRuntimeConfig = buildRuntimeConfig()) {
+    this.config = config;
+  }
+
+  isEnabled(): boolean {
+    return this.config.enabled && this.config.enabledKinds.length > 0;
+  }
+
+  getEnabledKinds(): ExtractionKind[] {
+    return [...this.config.enabledKinds];
+  }
+
+  async extract(source: MemoryExtractionSource): Promise<MemoryExtractions | null> {
+    if (!this.isEnabled()) return null;
+    if (!this.config.hasApiKey) {
+      logger.warn('Memory LLM extraction enabled without OPENAI_API_KEY; skipping extraction', {
+        model: this.config.model,
+        enabledKinds: this.config.enabledKinds,
+      });
+      return null;
+    }
+
+    const sanitizedSource = sanitizeSource(source, this.config.maxInputChars);
+    const entries = await Promise.all(
+      this.config.enabledKinds.map(
+        async (kind) => [kind, await this.extractKind(kind, sanitizedSource)] as const
+      )
+    );
+
+    const payload: Partial<MemoryExtractions> = {
+      version: MEMORY_EXTRACTION_VERSION,
+      provider: 'openai',
+      model: this.config.model,
+      extractedAt: new Date().toISOString(),
+    };
+
+    for (const [kind, result] of entries) {
+      if (result) payload[kind] = result;
+    }
+
+    const normalized = normalizeMemoryExtractions(payload);
+    return normalized &&
+      Object.keys(normalized).some((key) =>
+        ['entity', 'durable_fact', 'summary', 'current_state'].includes(key)
+      )
+      ? normalized
+      : null;
+  }
+
+  private async extractKind(
+    kind: ExtractionKind,
+    source: MemoryExtractionSource
+  ): Promise<MemoryExtractions[ExtractionKind] | null> {
+    const prompt = buildExtractionPrompt(source, kind);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20_000);
+
+    try {
+      const response = await fetch(`${this.config.baseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: this.config.model,
+          temperature: 0,
+          response_format: { type: 'json_object' },
+          messages: [
+            {
+              role: 'system',
+              content: `${prompt.systemPrompt}\n${prompt.schemaDescription}`,
+            },
+            {
+              role: 'user',
+              content: prompt.userPrompt,
+            },
+          ],
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        throw new Error(`Memory LLM extraction failed (${response.status})`);
+      }
+
+      const data = (await response.json()) as {
+        choices?: Array<{ message?: { content?: string | null } }>;
+      };
+      const content = data.choices?.[0]?.message?.content;
+      if (!content?.trim()) throw new Error('Memory LLM extraction returned empty content');
+
+      const parsedJson = JSON.parse(extractJsonObject(content));
+      switch (kind) {
+        case 'entity':
+          return entityExtractionSchema.parse(parsedJson);
+        case 'durable_fact':
+          return durableFactExtractionSchema.parse(parsedJson);
+        case 'summary':
+          return summaryExtractionSchema.parse(parsedJson);
+        case 'current_state':
+          return currentStateExtractionSchema.parse(parsedJson);
+      }
+    } catch (error) {
+      logger.warn('Memory LLM extraction failed for kind', {
+        kind,
+        model: this.config.model,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
 }

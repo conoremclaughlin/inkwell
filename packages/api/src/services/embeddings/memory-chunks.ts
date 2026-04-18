@@ -1,4 +1,12 @@
 import type { Json, TablesInsert } from '../../data/supabase/types';
+import {
+  buildCurrentStateEmbeddingTexts,
+  buildDurableFactEmbeddingTexts,
+  buildEntityEmbeddingTexts,
+  buildSummaryEmbeddingTexts,
+  normalizeMemoryExtractions,
+  type MemoryExtractions,
+} from '../memory-llm-extraction';
 import type { EmbeddingResult } from './router';
 import { type VettedEmbeddingModel } from './vetted-models';
 
@@ -10,8 +18,15 @@ const MAX_ENTITY_CHUNKS = 2;
 const MIN_FACT_SENTENCE_CHARS = 48;
 const MAX_FACT_SENTENCE_CHARS = 280;
 
-export type MemoryChunkType = 'summary' | 'fact' | 'topic' | 'entity' | 'content';
-const CHUNK_TYPE_ORDER: MemoryChunkType[] = ['summary', 'fact', 'topic', 'entity', 'content'];
+export type MemoryChunkType = 'summary' | 'fact' | 'topic' | 'entity' | 'current_state' | 'content';
+const CHUNK_TYPE_ORDER: MemoryChunkType[] = [
+  'summary',
+  'fact',
+  'topic',
+  'entity',
+  'current_state',
+  'content',
+];
 
 export interface MemoryEmbeddingChunk {
   chunkIndex: number;
@@ -30,6 +45,7 @@ export interface MemoryChunkViewCounts {
   fact: number;
   topic: number;
   entity: number;
+  current_state: number;
   content: number;
 }
 
@@ -39,6 +55,7 @@ function emptyViewCounts(): MemoryChunkViewCounts {
     fact: 0,
     topic: 0,
     entity: 0,
+    current_state: 0,
     content: 0,
   };
 }
@@ -199,6 +216,19 @@ function buildTopicChunks(params: {
   ];
 }
 
+function buildChunksFromTexts(chunkType: MemoryChunkType, texts: string[]): MemoryEmbeddingChunk[] {
+  return texts
+    .map((text) => normalizeWhitespace(text))
+    .filter(Boolean)
+    .map((text, index) => ({
+      chunkIndex: index,
+      chunkType,
+      text,
+      startOffset: 0,
+      endOffset: text.length,
+    }));
+}
+
 function extractEntityPhrases(text: string): string[] {
   const matches = [
     ...text.matchAll(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\b/g),
@@ -277,12 +307,19 @@ export function inferChunkTypeFromMetadata(
   chunkIndex: number | null | undefined,
   metadata: Record<string, unknown> | null | undefined
 ): MemoryChunkType | null {
-  if (typeof chunkIndex !== 'number' || chunkIndex < 0 || !metadata || typeof metadata !== 'object') {
+  if (
+    typeof chunkIndex !== 'number' ||
+    chunkIndex < 0 ||
+    !metadata ||
+    typeof metadata !== 'object'
+  ) {
     return null;
   }
 
   const embeddingChunks =
-    'embedding_chunks' in metadata && metadata.embedding_chunks && typeof metadata.embedding_chunks === 'object'
+    'embedding_chunks' in metadata &&
+    metadata.embedding_chunks &&
+    typeof metadata.embedding_chunks === 'object'
       ? (metadata.embedding_chunks as Record<string, unknown>)
       : null;
   const viewCounts =
@@ -314,26 +351,55 @@ export function buildMemoryEmbeddingChunks(params: {
   source?: string | null;
   salience?: string | null;
   model?: VettedEmbeddingModel | null;
+  llmExtractions?: MemoryExtractions | Record<string, unknown> | null;
 }): MemoryEmbeddingChunk[] {
   const { summary, content, topicKey, topics, source, salience, model = null } = params;
   const maxChars = pickMaxChunkChars(model);
   const chunks: MemoryEmbeddingChunk[] = [];
+  const llmExtractions = normalizeMemoryExtractions(params.llmExtractions);
 
+  const extractedSummaryTexts = llmExtractions?.summary
+    ? buildSummaryEmbeddingTexts(llmExtractions.summary)
+    : [];
   const normalizedSummary = summary?.trim();
-  if (normalizedSummary) {
-    chunks.push({
-      chunkIndex: chunks.length,
-      chunkType: 'summary',
-      text: normalizedSummary,
-      startOffset: 0,
-      endOffset: normalizedSummary.length,
-    });
-  }
+  const summaryTexts =
+    extractedSummaryTexts.length > 0
+      ? extractedSummaryTexts
+      : normalizedSummary
+        ? [normalizedSummary]
+        : [];
+  chunks.push(...reindexChunks(buildChunksFromTexts('summary', summaryTexts), chunks.length));
 
-  chunks.push(...reindexChunks(buildFactChunks(`${normalizedSummary || ''}\n${content}`), chunks.length));
-  chunks.push(...reindexChunks(buildTopicChunks({ topicKey, topics, source, salience }), chunks.length));
-  chunks.push(...reindexChunks(buildEntityChunks({ summary, content, topicKey, topics }), chunks.length));
-  chunks.push(...reindexChunks(buildContentChunks(content, maxChars, DEFAULT_OVERLAP_CHARS), chunks.length));
+  const durableFactTexts = llmExtractions?.durable_fact
+    ? buildDurableFactEmbeddingTexts(llmExtractions.durable_fact)
+    : [];
+  const factChunks =
+    durableFactTexts.length > 0
+      ? buildChunksFromTexts('fact', durableFactTexts)
+      : buildFactChunks(`${normalizedSummary || ''}\n${content}`);
+  chunks.push(...reindexChunks(factChunks, chunks.length));
+  chunks.push(
+    ...reindexChunks(buildTopicChunks({ topicKey, topics, source, salience }), chunks.length)
+  );
+
+  const entityTexts = llmExtractions?.entity
+    ? buildEntityEmbeddingTexts(llmExtractions.entity)
+    : [];
+  const entityChunks =
+    entityTexts.length > 0
+      ? buildChunksFromTexts('entity', entityTexts)
+      : buildEntityChunks({ summary, content, topicKey, topics });
+  chunks.push(...reindexChunks(entityChunks, chunks.length));
+
+  const currentStateTexts = llmExtractions?.current_state
+    ? buildCurrentStateEmbeddingTexts(llmExtractions.current_state)
+    : [];
+  chunks.push(
+    ...reindexChunks(buildChunksFromTexts('current_state', currentStateTexts), chunks.length)
+  );
+  chunks.push(
+    ...reindexChunks(buildContentChunks(content, maxChars, DEFAULT_OVERLAP_CHARS), chunks.length)
+  );
 
   return chunks;
 }

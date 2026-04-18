@@ -20,6 +20,7 @@ import {
 import { EmbeddingRouter } from '../../services/embeddings/router';
 import { getVettedEmbeddingModel } from '../../services/embeddings/vetted-models';
 import { computeChronologyAwareBoost } from '../../services/memory-dreaming';
+import { MemoryLlmExtractor } from '../../services/memory-llm-extraction';
 import type {
   Memory,
   MemoryCreateInput,
@@ -89,7 +90,13 @@ type SemanticChunkMatchRow = Omit<MemoryRow, 'embedding'> & {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const EMBEDDING_PERSIST_RETRY_ATTEMPTS = 3;
-const DERIVED_CHUNK_TYPES: MemoryChunkType[] = ['summary', 'fact', 'topic', 'entity'];
+const DERIVED_CHUNK_TYPES: MemoryChunkType[] = [
+  'summary',
+  'fact',
+  'topic',
+  'entity',
+  'current_state',
+];
 const CONTENT_CHUNK_TYPES: MemoryChunkType[] = ['content'];
 
 function toMemoryChunkTypes(chunkTypes?: MemorySearchChunkType[]): MemoryChunkType[] | undefined {
@@ -107,6 +114,8 @@ function computeChunkTypeBoost(chunkType?: MemoryChunkType | null): number {
       return 0.04;
     case 'summary':
       return 0.03;
+    case 'current_state':
+      return 0.05;
     default:
       return 0;
   }
@@ -261,9 +270,11 @@ export function computeKnowledgeMemoryScore(
 
 export class MemoryRepository {
   private embeddingRouter: EmbeddingRouter;
+  private memoryLlmExtractor: MemoryLlmExtractor;
 
   constructor(private supabase: SupabaseClient) {
     this.embeddingRouter = new EmbeddingRouter();
+    this.memoryLlmExtractor = new MemoryLlmExtractor();
   }
 
   // ==================== MEMORIES ====================
@@ -822,6 +833,14 @@ export class MemoryRepository {
 
     const config = this.embeddingRouter.getRuntimeConfig();
     const vettedModel = getVettedEmbeddingModel(config.provider, config.model);
+    const llmExtractions = await this.memoryLlmExtractor.extract({
+      summary: input.summary,
+      content: input.content,
+      topicKey: input.topicKey,
+      topics: input.topics,
+      source: input.source,
+      salience: input.salience,
+    });
     const chunks = buildMemoryEmbeddingChunks({
       summary: input.summary,
       content: input.content,
@@ -830,6 +849,7 @@ export class MemoryRepository {
       source: input.source,
       salience: input.salience,
       model: vettedModel,
+      llmExtractions,
     });
     if (chunks.length === 0) return;
 
@@ -901,7 +921,10 @@ export class MemoryRepository {
           model: primaryEmbedding.model,
           chunkCount: embeddedChunks.length,
           viewCounts: countChunkViews(embeddedChunks.map(({ chunk }) => chunk)),
-          existingMetadata: memory.metadata || {},
+          existingMetadata: {
+            ...(memory.metadata || {}),
+            ...(llmExtractions ? { llm_extractions: llmExtractions } : {}),
+          },
         }),
         embedding: {
           provider: primaryEmbedding.provider,

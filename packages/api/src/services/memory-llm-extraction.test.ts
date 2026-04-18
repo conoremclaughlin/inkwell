@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   buildCurrentStateEmbeddingTexts,
   buildCurrentStateExtractionPrompt,
@@ -11,6 +11,9 @@ import {
   currentStateExtractionSchema,
   durableFactExtractionSchema,
   entityExtractionSchema,
+  MemoryLlmExtractor,
+  memoryExtractionsSchema,
+  normalizeMemoryExtractions,
   summaryExtractionSchema,
 } from './memory-llm-extraction';
 
@@ -24,6 +27,10 @@ describe('memory-llm-extraction', () => {
     source: 'observation',
     salience: 'high',
   };
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
 
   it('builds an entity prompt with explicit extraction guidance', () => {
     const prompt = buildEntityExtractionPrompt(source);
@@ -111,5 +118,97 @@ describe('memory-llm-extraction', () => {
     });
 
     expect(buildCurrentStateEmbeddingTexts(parsed)[0]).toContain('volatility: volatile');
+  });
+
+  it('normalizes extraction metadata', () => {
+    const normalized = normalizeMemoryExtractions({
+      version: 1,
+      provider: 'openai',
+      model: 'gpt-4.1-mini',
+      extractedAt: '2026-04-18T12:00:00.000Z',
+      summary: {
+        summary: 'Summary text',
+        keyPoints: [],
+        actionRelevance: 'Useful later',
+      },
+    });
+
+    expect(normalized).toEqual(
+      memoryExtractionsSchema.parse({
+        version: 1,
+        provider: 'openai',
+        model: 'gpt-4.1-mini',
+        extractedAt: '2026-04-18T12:00:00.000Z',
+        summary: {
+          summary: 'Summary text',
+          keyPoints: [],
+          actionRelevance: 'Useful later',
+        },
+      })
+    );
+  });
+
+  it('runs enabled extraction kinds and returns typed metadata', async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    entities: [
+                      {
+                        name: 'Wren',
+                        aliases: ['wren'],
+                        entityType: 'person',
+                        description: 'Reviewer',
+                        evidence: 'Wren reviewed the benchmark.',
+                      },
+                    ],
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    summary: 'Benchmark review covered feature flags.',
+                    keyPoints: ['feature flags', 'typed indexes'],
+                    actionRelevance: 'Helps route future experiments.',
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200 }
+        )
+      );
+
+    const extractor = new MemoryLlmExtractor({
+      enabled: true,
+      model: 'gpt-4.1-mini',
+      baseUrl: 'https://api.openai.com',
+      hasApiKey: true,
+      maxInputChars: 5000,
+      enabledKinds: ['entity', 'summary'],
+    });
+
+    const result = await extractor.extract(source);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result?.provider).toBe('openai');
+    expect(result?.entity?.entities[0]?.name).toBe('Wren');
+    expect(result?.summary?.summary).toContain('Benchmark review');
+    expect(result?.durable_fact).toBeUndefined();
   });
 });
