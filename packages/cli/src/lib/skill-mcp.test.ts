@@ -106,7 +106,7 @@ describe('buildMergedMcpConfig', () => {
     }
   });
 
-  it('returns project .mcp.json when no skill servers exist', () => {
+  it('injects x-ink-context header even when no skill servers and no session', () => {
     writeFileSync(
       join(tmpDir, '.mcp.json'),
       JSON.stringify({
@@ -118,8 +118,13 @@ describe('buildMergedMcpConfig', () => {
 
     const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir);
     try {
-      // Returns original path, not a temp file
-      expect(mcpConfigPath).toBe(join(tmpDir, '.mcp.json'));
+      // x-ink-context is now layered unconditionally so the backend runtime
+      // still receives agentId/studioId/runtime even without a session.
+      expect(mcpConfigPath).not.toBe(join(tmpDir, '.mcp.json'));
+      const merged = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
+      expect(merged.mcpServers.inkwell.headers['x-ink-context']).toBe('${INK_CONTEXT}');
+      // session-id header should NOT be injected when no session is known
+      expect(merged.mcpServers.inkwell.headers['x-ink-session-id']).toBeUndefined();
     } finally {
       cleanup();
     }
@@ -249,7 +254,7 @@ mcp:
     }
   });
 
-  it('does not inject header when INK_SESSION_ID is not set', () => {
+  it('omits x-ink-session-id header when INK_SESSION_ID is not set', () => {
     writeFileSync(
       join(tmpDir, '.mcp.json'),
       JSON.stringify({
@@ -261,8 +266,10 @@ mcp:
 
     const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir);
     try {
-      // Returns original — no modifications
-      expect(mcpConfigPath).toBe(join(tmpDir, '.mcp.json'));
+      // Injects a merged temp file (for x-ink-context) but NOT x-ink-session-id
+      const merged = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
+      expect(merged.mcpServers.inkwell.headers['x-ink-session-id']).toBeUndefined();
+      expect(merged.mcpServers.inkwell.headers['x-ink-context']).toBe('${INK_CONTEXT}');
     } finally {
       cleanup();
     }

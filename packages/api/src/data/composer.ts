@@ -10,12 +10,12 @@ import { ContextRepository } from './repositories/context.repository';
 import { ProjectsRepository } from './repositories/projects.repository';
 import { SessionFocusRepository } from './repositories/session-focus.repository';
 import { ProjectTasksRepository } from './repositories/project-tasks.repository';
+import { TaskGroupsRepository } from './repositories/task-groups.repository';
 import { MemoryRepository } from './repositories/memory-repository';
 import { ActivityStreamRepository } from './repositories/activity-stream.repository';
 import { StudiosRepository } from './repositories/studios.repository';
 import { WorkspacesRepository } from './repositories/workspaces.repository';
 import { ContactsRepository } from './repositories/contacts-repository';
-import { TaskGroupsRepository } from './repositories/task-groups.repository';
 import { logger } from '../utils/logger';
 
 export class DataComposer {

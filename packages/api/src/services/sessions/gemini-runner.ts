@@ -95,7 +95,7 @@ export class GeminiRunner implements IRunner {
         headers: {
           ...existingHeaders,
           Authorization: 'Bearer ${INK_ACCESS_TOKEN}',
-          'x-ink-context': '${INK_CONTEXT_TOKEN}',
+          'x-ink-context': '${INK_CONTEXT}',
           'x-ink-session-id': '${INK_SESSION_ID}',
           'x-ink-studio-id': '${INK_STUDIO_ID}',
         },

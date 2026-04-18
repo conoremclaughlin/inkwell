@@ -23,6 +23,10 @@ import {
   handleCompleteTask,
   handleGetTaskStats,
   handleAddTaskComment,
+  handleCreateTaskGroup,
+  handleListTaskGroups,
+  createTaskGroupSchema,
+  listTaskGroupsSchema,
 } from './task-handlers';
 
 import { handleSendResponse, handleGetPendingMessages, handleMarkRead } from './response-handlers';
@@ -247,13 +251,6 @@ import {
 import { handleCreateKindleToken, createKindleTokenSchema } from './kindle-handlers';
 
 import {
-  handleCreateTaskGroup,
-  handleListTaskGroups,
-  createTaskGroupSchema,
-  listTaskGroupsSchema,
-} from './task-group-handlers';
-
-import {
   handleStartStrategy,
   handlePauseStrategy,
   handleResumeStrategy,
@@ -271,8 +268,10 @@ import {
   getIntegrationHealthSchema,
 } from './integration-health-handlers';
 
+import { handleDebugRequestContext } from './debug-handlers';
+
 // Re-export for external use
-export { setResponseCallback, addPendingMessage } from './response-handlers';
+export { setResponseCallback } from './response-handlers';
 export { setTelegramListener, registerChannelListener } from './chat-context-handlers';
 export { setMiniAppsRegistry } from './skill-handlers';
 
@@ -980,7 +979,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'create_task_group',
     {
-      description: `Create a task group — a collection of ordered tasks for strategy execution. Add tasks with create_task(taskGroupId, taskOrder) after creating the group. Then activate with start_strategy.
+      description: `Create a task group — a container for related tasks that share a title, strategy/description, priority, and optionally an autonomous execution plan or output target (spec/pr/report/proposal). Add tasks with create_task(taskGroupId, taskOrder) after creating the group, then activate with start_strategy. Returns the created group with its UUID.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: createTaskGroupSchema.shape,
@@ -1009,7 +1008,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'list_task_groups',
     {
-      description: `List task groups for a user, optionally filtered by status, strategy, or owner agent.
+      description: `List task groups for a user with per-status task counts per group. Omit \`statuses\` (or pass an empty array) to include all statuses. Pass a multi-select array to narrow (e.g. statuses: ["active","paused"]). Also supports projectId, identityId, autonomousOnly, strategy, and ownerAgentId filters.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: listTaskGroupsSchema.shape,
@@ -3317,6 +3316,55 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       }
     }
   );
+
+  // =====================================================
+  // DEBUG TOOLS (reflects server state — used by .live.test.ts)
+  // Only registered when NODE_ENV !== 'production' so prod servers
+  // don't expose reflection endpoints. Opt out in dev by setting
+  // INK_DISABLE_DEBUG_TOOLS=1.
+  // =====================================================
+
+  const debugToolsEnabled =
+    process.env.NODE_ENV !== 'production' && process.env.INK_DISABLE_DEBUG_TOOLS !== '1';
+
+  if (debugToolsEnabled) {
+    server.registerTool(
+      'debug_request',
+      {
+        description: `Reflect the server-side request/session context back to the caller.
+
+Used by backend reflection tests (\`*.live.test.ts\`) to verify that CLI adapters
+are injecting \`x-ink-context\` and related headers correctly end-to-end. Not
+intended for agent use — calling it leaks no privileged data, it just reports
+what the server saw for the current call.
+
+Only registered when NODE_ENV !== 'production'.`,
+        inputSchema: {},
+      },
+      async () => {
+        try {
+          const result = await handleDebugRequestContext({});
+          return {
+            content: [{ type: 'text' as const, text: JSON.stringify(result) }],
+          };
+        } catch (error) {
+          logger.error('Error in debug_request:', error);
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  success: false,
+                  error: error instanceof Error ? error.message : 'Unknown error',
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+  }
 
   // =====================================================
   // ARTIFACT TOOLS (shared documents, specs, designs)

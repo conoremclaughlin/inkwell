@@ -169,7 +169,11 @@ export function buildMergedMcpConfig(
   const sessionId = options?.pcpSessionId || process.env.INK_SESSION_ID;
   const studioId = options?.studioId || process.env.INK_STUDIO_ID;
 
-  if (effectivePath && sessionId) {
+  // Always run injection when we have a config path. The x-ink-context header
+  // still carries useful identity (agentId/studioId/runtime) even when the
+  // session ID isn't known yet — sessionId-specific headers are gated inside
+  // injectSessionHeaders.
+  if (effectivePath) {
     const injection = injectSessionHeaders({
       mcpConfigPath: effectivePath,
       pcpSessionId: sessionId,

@@ -377,13 +377,38 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
-  // ── INK_CONTEXT_TOKEN + auth header regression ──
-  // Codex and Gemini adapters must produce INK_CONTEXT_TOKEN in env and
+  // ── INK_CONTEXT + auth header regression ──
+  // Codex and Gemini adapters must produce INK_CONTEXT in env and
   // wire x-ink-context + Authorization via env_http_headers. Without these,
   // MCP tool calls go to PCP unauthenticated and without session context,
   // causing "Session context missing — triggers suppressed."
 
-  it('codex adapter produces INK_CONTEXT_TOKEN with session/studio/agent', () => {
+  it('claude adapter produces INK_CONTEXT with session/studio/agent', () => {
+    const adapter = new ClaudeAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'wren',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+      pcpSessionId: 'sess-claude-123',
+      studioId: 'studio-wren-456',
+    });
+
+    try {
+      expect(prepared.env.INK_CONTEXT).toBeDefined();
+      const token = decodeContextToken(prepared.env.INK_CONTEXT);
+      expect(token).not.toBeNull();
+      expect(token!.sessionId).toBe('sess-claude-123');
+      expect(token!.studioId).toBe('studio-wren-456');
+      expect(token!.agentId).toBe('wren');
+      expect(token!.runtime).toBe('claude');
+      expect(token!.cliAttached).toBe(true);
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('codex adapter produces INK_CONTEXT with session/studio/agent', () => {
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
       agentId: 'lumen',
@@ -395,8 +420,8 @@ describe('backend adapters session resume wiring', () => {
     });
 
     try {
-      expect(prepared.env.INK_CONTEXT_TOKEN).toBeDefined();
-      const token = decodeContextToken(prepared.env.INK_CONTEXT_TOKEN);
+      expect(prepared.env.INK_CONTEXT).toBeDefined();
+      const token = decodeContextToken(prepared.env.INK_CONTEXT);
       expect(token).not.toBeNull();
       expect(token!.sessionId).toBe('sess-codex-123');
       expect(token!.studioId).toBe('studio-lumen-456');
@@ -421,7 +446,7 @@ describe('backend adapters session resume wiring', () => {
     try {
       const contextArg = prepared.args.find((a) => a.includes('x-ink-context'));
       expect(contextArg).toBeDefined();
-      expect(contextArg).toContain('INK_CONTEXT_TOKEN');
+      expect(contextArg).toContain('INK_CONTEXT');
 
       const authArg = prepared.args.find((a) => a.includes('Authorization'));
       expect(authArg).toBeDefined();
@@ -431,7 +456,7 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
-  it('gemini adapter produces INK_CONTEXT_TOKEN with session/studio/agent', () => {
+  it('gemini adapter produces INK_CONTEXT with session/studio/agent', () => {
     const adapter = new GeminiAdapter();
     const prepared = adapter.prepare({
       agentId: 'aster',
@@ -443,8 +468,8 @@ describe('backend adapters session resume wiring', () => {
     });
 
     try {
-      expect(prepared.env.INK_CONTEXT_TOKEN).toBeDefined();
-      const token = decodeContextToken(prepared.env.INK_CONTEXT_TOKEN);
+      expect(prepared.env.INK_CONTEXT).toBeDefined();
+      const token = decodeContextToken(prepared.env.INK_CONTEXT);
       expect(token).not.toBeNull();
       expect(token!.sessionId).toBe('sess-gemini-789');
       expect(token!.studioId).toBe('studio-aster-012');
@@ -475,7 +500,7 @@ describe('backend adapters session resume wiring', () => {
       // PCP server should have auth + context headers
       expect(settings.mcpServers.inkwell).toBeDefined();
       expect(settings.mcpServers.inkwell.headers.Authorization).toBe('Bearer ${INK_ACCESS_TOKEN}');
-      expect(settings.mcpServers.inkwell.headers['x-ink-context']).toBe('${INK_CONTEXT_TOKEN}');
+      expect(settings.mcpServers.inkwell.headers['x-ink-context']).toBe('${INK_CONTEXT}');
       expect(settings.mcpServers.inkwell.headers['x-ink-session-id']).toBe('${INK_SESSION_ID}');
     } finally {
       prepared.cleanup();

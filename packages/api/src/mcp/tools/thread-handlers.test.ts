@@ -471,6 +471,22 @@ describe('handleSendToInbox - validation', () => {
       )
     ).rejects.toThrow('only valid for single-recipient sends');
   });
+
+  it('should reject recipients[] with recipientStudioSlug', async () => {
+    const mockDc = createMockDataComposer();
+    await expect(
+      handleSendToInbox(
+        {
+          email: 'test@test.com',
+          recipients: ['lumen'],
+          threadKey: 'pr:32',
+          recipientStudioSlug: 'wren-review',
+          content: 'test',
+        },
+        mockDc as never
+      )
+    ).rejects.toThrow('only valid for single-recipient sends');
+  });
 });
 
 describe('handleSendToInbox - thread routing', () => {
@@ -544,6 +560,46 @@ describe('handleSendToInbox - thread routing', () => {
     expect(parsed.threadKey).toBeNull();
     // Should have gone to agent_inbox
     expect(mockSb.from).toHaveBeenCalledWith('agent_inbox');
+  });
+
+  it('should surface recipientStudioSlug in the legacy-path response', async () => {
+    const mockSb = createThreadMockSupabase();
+    const mockDc = createMockDataComposer(mockSb);
+
+    const result = await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        recipientStudioSlug: 'wren-review',
+        content: 'Direct slug-routed message',
+      },
+      mockDc as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.recipientStudioSlug).toBe('wren-review');
+  });
+
+  it('should treat legacy recipientStudioHint="main" as a slug alias', async () => {
+    const mockSb = createThreadMockSupabase();
+    const mockDc = createMockDataComposer(mockSb);
+
+    const result = await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        recipientStudioHint: 'main',
+        content: 'Legacy hint caller',
+      },
+      mockDc as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.recipientStudioSlug).toBe('main');
   });
 
   it('should trigger all recipients on thread creation', async () => {

@@ -70,6 +70,31 @@ function isStudioUuid(studioId: string | undefined): studioId is string {
 }
 
 /**
+ * Resolve a raw studioId into a DB scope value for session lookups and inserts.
+ *
+ * Returns:
+ * - `null` when the raw value is the literal "main" — match sessions with NULL studio_id
+ *   (root-repo sessions, where no studio row exists)
+ * - a UUID string when the raw value is a valid UUID — match that exact studio
+ * - `undefined` when the raw value is absent or is a non-UUID non-"main" string —
+ *   no studio filter (backward-compat for callers without studio context)
+ *
+ * TODO(slugs): non-UUID, non-"main" strings ("wren", "wren-omega", etc.) should
+ * eventually resolve via studios.findBySlug() to a UUID. Filed as follow-up so
+ * this PR stays scoped to the reattach bug.
+ *
+ * Session handlers must use this rather than `isStudioUuid(...) ? raw : undefined` —
+ * the older form silently dropped "main" to `undefined`, letting attach to
+ * root-repo collide with any active studio session for the same agent.
+ */
+function resolveStudioScope(rawStudioId: string | undefined): string | null | undefined {
+  if (rawStudioId === undefined) return undefined;
+  if (rawStudioId === 'main') return null;
+  if (isStudioUuid(rawStudioId)) return rawStudioId;
+  return undefined;
+}
+
+/**
  * Resolve contactId from explicit param or session context.
  * This is the auto-inheritance mechanism: once a contact-scoped session
  * is started, all memory tools in that session automatically scope to
@@ -285,7 +310,6 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
     ),
   studioId: z
     .string()
-    .uuid()
     .optional()
     .describe(
       'Studio ID — preferred session scope for parallel worktree scenarios. Stored in metadata, not as a first-class field.'
@@ -349,7 +373,6 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
     .describe('Identifier for the agent (e.g., "claude-code", "telegram-myra")'),
   studioId: z
     .string()
-    .uuid()
     .optional()
     .describe(
       'Studio ID to scope this session to. Allows multiple active sessions per agent (one per studio).'
@@ -391,7 +414,6 @@ export const endSessionSchema = userIdentifierBaseSchema.extend({
     .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
   studioId: z
     .string()
-    .uuid()
     .optional()
     .describe('Studio ID for session resolution when sessionId not provided'),
   summary: z.string().optional().describe('End-of-session summary'),
@@ -409,7 +431,6 @@ export const getSessionSchema = userIdentifierBaseSchema.extend({
     .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
   studioId: z
     .string()
-    .uuid()
     .optional()
     .describe('Studio ID for session resolution when sessionId not provided'),
   includeLogs: z.boolean().optional().describe('Include session logs (default: false)'),
@@ -445,7 +466,6 @@ export const updateSessionPhaseSchema = userIdentifierBaseSchema.extend({
     ),
   studioId: z
     .string()
-    .uuid()
     .optional()
     .describe(
       'Studio ID for session resolution. When sessionId is not provided, finds the active session in this studio. Useful for parallel worktree scenarios.'
@@ -571,7 +591,6 @@ export const compactSessionSchema = userIdentifierBaseSchema.extend({
     .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
   studioId: z
     .string()
-    .uuid()
     .optional()
     .describe('Studio ID for session resolution when sessionId not provided'),
   groupByTopics: z.boolean().optional().describe('Group logs by inferred topics (default: true)'),
@@ -591,6 +610,7 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
   const params = rememberSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
+  const studioScope = resolveStudioScope(rawStudioId);
   const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
   const agentId = getEffectiveAgentId(params.agentId);
 
@@ -601,7 +621,7 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
     const activeSession = await dataComposer.repositories.memory.getActiveSession(
       user.id,
       agentId,
-      studioId
+      studioScope
     );
     sessionId = activeSession?.id;
   } catch {
@@ -799,7 +819,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
   const params = startSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
-  const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
+  const studioScope = resolveStudioScope(rawStudioId);
   const agentId = getEffectiveAgentId(params.agentId);
 
   // Session matching priority:
@@ -812,7 +832,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
       user.id,
       agentId,
       params.threadKey,
-      studioId,
+      studioScope,
       params.contactId
     );
   }
@@ -821,7 +841,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
     existingSession = await dataComposer.repositories.memory.getActiveSession(
       user.id,
       agentId,
-      studioId,
+      studioScope,
       params.contactId
     );
   }
@@ -860,11 +880,13 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
     };
   }
 
+  // Pass studioScope directly: "main" → null writes studio_id=NULL explicitly,
+  // UUID → writes the UUID, undefined → column omitted (DB default NULL).
   const session = await dataComposer.repositories.memory.startSession({
     id: params.sessionId,
     userId: user.id,
     agentId,
-    studioId,
+    studioId: studioScope,
     threadKey: params.threadKey,
     backend: params.backend,
     model: params.model,
@@ -942,7 +964,7 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
   const params = endSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
-  const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
+  const studioScope = resolveStudioScope(rawStudioId);
   const agentId = getEffectiveAgentId(params.agentId);
 
   // Get session ID (use provided or find active, scoped by agent+studio)
@@ -951,7 +973,7 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
     const activeSession = await dataComposer.repositories.memory.getActiveSession(
       user.id,
       agentId,
-      studioId
+      studioScope
     );
     if (!activeSession) {
       return {
@@ -1042,7 +1064,7 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
   const params = getSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
-  const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
+  const studioScope = resolveStudioScope(rawStudioId);
 
   let session;
   if (params.sessionId) {
@@ -1051,7 +1073,7 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
     session = await dataComposer.repositories.memory.getActiveSession(
       user.id,
       params.agentId,
-      studioId
+      studioScope
     );
   }
 
@@ -1113,14 +1135,10 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
   const params = listSessionsSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
-  let studioId: string | undefined;
-  let filterNullStudio = false;
-  if (rawStudioId === 'main') {
-    // Root repo sessions have no studio_id
-    filterNullStudio = true;
-  } else {
-    studioId = rawStudioId;
-  }
+  const scope = resolveStudioScope(rawStudioId);
+  // listSessions uses a two-field shape (UUID + boolean flag). Map from scope.
+  const studioId = typeof scope === 'string' ? scope : undefined;
+  const filterNullStudio = scope === null;
 
   const sessions = await dataComposer.repositories.memory.listSessions(user.id, {
     agentId: params.agentId,
@@ -1275,7 +1293,7 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
   const params = updateSessionPhaseSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
-  const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
+  const studioScope = resolveStudioScope(rawStudioId);
 
   // Require at least one field to update
   if (
@@ -1311,7 +1329,7 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
     const session = await dataComposer.repositories.memory.getActiveSession(
       user.id,
       params.agentId,
-      studioId // undefined = no studio/workspace filter (backward compat)
+      studioScope // null → match NULL studio_id (main), UUID → exact match, undefined → no filter
     );
     if (!session) {
       return {
@@ -2217,7 +2235,7 @@ export async function handleCompactSession(args: unknown, dataComposer: DataComp
   const params = compactSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
-  const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
+  const studioScope = resolveStudioScope(rawStudioId);
 
   const minSalience = params.minSalience || 'medium';
   const preserveLogs = params.preserveLogs ?? false;
@@ -2232,7 +2250,7 @@ export async function handleCompactSession(args: unknown, dataComposer: DataComp
     session = await dataComposer.repositories.memory.getActiveSession(
       user.id,
       params.agentId,
-      studioId
+      studioScope
     );
     sessionId = session?.id;
   }
