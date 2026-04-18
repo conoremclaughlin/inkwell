@@ -1,0 +1,66 @@
+# Scenario: push-to-main-rule
+#
+# Tests convention-recall: when asked "can I push this small fix straight
+# to main?", does memory surface the canonical rule (NEVER push directly,
+# always feature branch + PR, even for docs)?
+#
+# Source of truth: CLAUDE.md "Patterns" section, CONTRIBUTING.md,
+# AGENTS.md, and auto-memory MEMORY.md.
+
+id: push-to-main-rule
+shape: convention-recall
+capability:
+  - recall
+  - correction
+
+context: |
+  It's a tiny README typo fix. Can I push straight to main to skip the
+  PR overhead?
+
+impliedQuestion: |
+  Can I push directly to main, or do I always need a PR?
+
+expectedSurfaced:
+  - kind: doc_section
+    ref: CONTRIBUTING.md#pr-process
+    reason: Authoritative source for the PR-required rule
+    containsPhrases:
+      - feature branch
+      - pull request
+  - kind: memory
+    ref: "memory:never-push-to-main"
+    reason: Cached convention — "NEVER push directly to main"
+    containsPhrases:
+      - never push
+      - main
+
+mustAssert:
+  - claim: Never push directly to main — always use a feature branch + PR
+    criticality: high
+    containsPhrases:
+      - never push directly
+      - feature branch
+      - always use a pr
+      - even for small
+  - claim: The rule applies even for small/docs changes
+    criticality: medium
+    containsPhrases:
+      - even for small
+      - even for docs
+      - small docs
+
+mustNotAssert:
+  - claim: Direct pushes to main are allowed for trivial changes
+    containsPhrases:
+      - trivial changes
+      - direct push is fine
+      - skip the pr
+
+rubric:
+  sufficiencyBar: >
+    Can the SB correctly refuse to push to main and explain the process
+    (feature branch + PR) with a citation, rather than approving a shortcut?
+  precisionFloor: 0.2
+  recallFloor: 0.3
+  mustAssertPassRate: 0.5
+  mustNotAssertLeakRate: 0.0

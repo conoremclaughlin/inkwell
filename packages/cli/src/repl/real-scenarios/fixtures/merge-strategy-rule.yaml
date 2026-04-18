@@ -1,0 +1,67 @@
+# Scenario: merge-strategy-rule
+#
+# Tests convention-recall: when asked "should I squash, rebase, or merge?",
+# does the memory system surface the canonical rule (NEVER squash, use merge
+# commits) from CONTRIBUTING.md and our auto-memory?
+#
+# Source of truth: CONTRIBUTING.md, AGENTS.md, MEMORY.md entry on
+# "NEVER squash merge".
+
+id: merge-strategy-rule
+shape: convention-recall
+capability:
+  - recall
+
+context: |
+  I'm ready to merge PR #350 now that reviews are in. Should I squash,
+  rebase, or do a regular merge?
+
+impliedQuestion: |
+  What is our merge strategy for PRs into main?
+
+expectedSurfaced:
+  - kind: doc_section
+    ref: CONTRIBUTING.md#git-conventions
+    reason: Authoritative source — the merge strategy rule lives here
+    containsPhrases:
+      - merge commit
+      - squash
+  - kind: memory
+    ref: "memory:merge-strategy-never-squash"
+    reason: Cached convention in wren's auto-memory / project knowledge
+    containsPhrases:
+      - never squash
+      - merge commit
+
+mustAssert:
+  - claim: We use merge commits, not squash merges
+    criticality: high
+    containsPhrases:
+      - merge commit
+      - not squash
+      - never squash
+  - claim: Individual commits should be preserved (rebase loses this nuance)
+    criticality: medium
+    containsPhrases:
+      - individual commits
+      - clearer story
+      - commits tell a
+
+mustNotAssert:
+  - claim: Squash merge is our default
+    containsPhrases:
+      - squash is default
+      - we squash merges
+  - claim: Rebase-and-merge is our default
+    containsPhrases:
+      - rebase-and-merge is default
+      - always rebase
+
+rubric:
+  sufficiencyBar: >
+    Can the SB state the correct strategy (merge commit, not squash) and cite
+    the authoritative source without hallucinating a different rule?
+  precisionFloor: 0.2
+  recallFloor: 0.3
+  mustAssertPassRate: 0.5
+  mustNotAssertLeakRate: 0.0
