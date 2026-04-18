@@ -11,6 +11,7 @@
  *   hooks pre-compact         Hook: pre-compaction reminder
  *   hooks post-compact        Hook: post-compaction bootstrap
  *   hooks on-session-start    Hook: session start bootstrap
+ *   hooks on-tool-approval    Hook: 2FA approval check (PreToolUse)
  *   hooks on-prompt           Hook: periodic inbox check
  *   hooks on-stop             Hook: session nudge + inbox check
  */
@@ -1079,6 +1080,16 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           ],
         },
       ],
+      PreToolUse: [
+        {
+          hooks: [
+            {
+              type: 'command',
+              command: buildManagedHookCommand(sbPath, 'on-tool-approval', CLAUDE_CODE.name),
+            },
+          ],
+        },
+      ],
       UserPromptSubmit: [
         {
           hooks: [
@@ -1979,6 +1990,178 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   process.stdout.write(output);
 }
 
+// ============================================================================
+// on-tool-approval — PreToolUse intercept for 2FA permission grants
+// ============================================================================
+
+/**
+ * Load the approval-required tool patterns from studio settings.
+ * Falls back to empty array if no config exists.
+ */
+export function loadApprovalSet(cwd: string): string[] {
+  try {
+    const settingsPath = join(cwd, '.claude', 'settings.local.json');
+    if (!existsSync(settingsPath)) return [];
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    return settings.approvalRequired || [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Check if a tool call matches any pattern in the approval set.
+ * Supports glob-style patterns: "Bash(docker push *)", "mcp__supabase__apply_migration"
+ */
+export function matchesApprovalSet(
+  toolName: string,
+  toolInput: string,
+  patterns: string[]
+): boolean {
+  for (const pattern of patterns) {
+    // Exact tool match (no args pattern)
+    if (pattern === toolName) return true;
+
+    // Pattern with args: "Bash(docker push *)"
+    const parenIdx = pattern.indexOf('(');
+    if (parenIdx === -1) continue;
+
+    const patternTool = pattern.substring(0, parenIdx);
+    if (patternTool !== toolName) continue;
+
+    const argsPattern = pattern.substring(parenIdx + 1, pattern.length - 1); // strip parens
+    // Simple glob: convert * to regex .*
+    const regex = new RegExp(
+      '^' + argsPattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*') + '$'
+    );
+    if (regex.test(toolInput)) return true;
+  }
+  return false;
+}
+
+async function onToolApprovalHandler(options?: { backend?: string }): Promise<void> {
+  const stdin = await readStdin();
+  const cwd = process.cwd();
+
+  // Claude Code PreToolUse passes: { tool_name, tool_input }
+  const toolName = (stdin.tool_name as string) || '';
+  const toolInput =
+    typeof stdin.tool_input === 'string'
+      ? stdin.tool_input
+      : JSON.stringify(stdin.tool_input || '');
+
+  hookLog('on_tool_approval', { toolName, toolInputPreview: toolInput.substring(0, 100) });
+
+  // Check against approval set
+  const approvalSet = loadApprovalSet(cwd);
+  if (approvalSet.length === 0 || !matchesApprovalSet(toolName, toolInput, approvalSet)) {
+    // Not in the approval set — allow through
+    process.exit(0);
+  }
+
+  hookLog('on_tool_approval_match', { toolName, toolInput: toolInput.substring(0, 200) });
+
+  // Create an approval request on the server
+  const serverUrl = getPcpServerUrl();
+  const token = await getValidAccessToken(serverUrl);
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  // Forward context header so server knows the agent/studio
+  const contextToken = process.env.INK_CONTEXT_TOKEN?.trim();
+  if (contextToken) headers['x-ink-context'] = contextToken;
+
+  const sessionId = process.env.INK_SESSION_ID?.trim() || undefined;
+  const studioId = process.env.INK_STUDIO_ID?.trim() || undefined;
+
+  let requestId: string;
+  try {
+    const resp = await fetch(`${serverUrl}/api/admin/approval-requests`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        tool: toolName,
+        args: toolInput,
+        reason: `Tool requires 2FA approval`,
+        studioId,
+        sessionId,
+        timeoutSeconds: 300,
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!resp.ok) {
+      hookLog('on_tool_approval_create_failed', { status: resp.status });
+      // Fail closed — this is a security gate, don't allow through on errors
+      process.stdout.write(
+        `\n⚠️ Permission blocked: could not create approval request (server returned ${resp.status}).\n`
+      );
+      process.exit(1);
+    }
+
+    const body = (await resp.json()) as { requestId: string };
+    requestId = body.requestId;
+    hookLog('on_tool_approval_created', { requestId });
+  } catch (err) {
+    hookLog('on_tool_approval_create_error', { error: String(err) });
+    // Fail closed — security gate must not silently bypass on errors
+    process.stdout.write(
+      `\n⚠️ Permission blocked: could not reach approval server (${String(err)}).\n`
+    );
+    process.exit(1);
+  }
+
+  // Poll for resolution (up to 5 min, check every 3s)
+  const pollInterval = 3000;
+  const maxPollTime = 300_000;
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < maxPollTime) {
+    await new Promise((r) => setTimeout(r, pollInterval));
+
+    try {
+      const statusResp = await fetch(
+        `${serverUrl}/api/admin/approval-requests/${requestId}/status`,
+        { headers, signal: AbortSignal.timeout(5000) }
+      );
+
+      if (!statusResp.ok) continue;
+
+      const status = (await statusResp.json()) as {
+        status: string;
+        action?: string;
+        grantedTools?: string[];
+      };
+
+      if (status.status === 'pending') continue;
+
+      if (status.status === 'granted') {
+        hookLog('on_tool_approval_granted', { requestId, action: status.action });
+        // TODO: Apply permission overlay for grant-session/allow actions
+        process.exit(0); // Allow the tool
+      }
+
+      // denied, expired, or cancelled
+      hookLog('on_tool_approval_denied', { requestId, status: status.status });
+      // Output a message explaining the denial
+      process.stdout.write(
+        `\n⚠️ Permission denied: ${toolName} requires approval. ` +
+          `Request ${requestId} was ${status.status}.\n`
+      );
+      process.exit(1); // Block the tool
+    } catch {
+      // Transient error, keep polling
+    }
+  }
+
+  // Timeout — deny
+  hookLog('on_tool_approval_timeout', { requestId });
+  process.stdout.write(
+    `\n⚠️ Permission timeout: ${toolName} approval request expired after 5 minutes.\n`
+  );
+  process.exit(1);
+}
+
 async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   const stdin = await readStdin();
   const cwd = process.cwd();
@@ -2064,36 +2247,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     return;
   }
 
-  // No channel plugin — use hook-based inbox injection as fallback.
-  // Drain pending message queue first — these are trigger messages
-  // routed here because cli_attached=true.
-  try {
-    const pending = await callPcpTool('get_pending_messages', {
-      channel: 'agent',
-    });
-    const pendingMessages = pending.messages as Array<Record<string, unknown>> | undefined;
-    if (pendingMessages?.length) {
-      const pendingTag = buildInboxTag(
-        pendingMessages.map((m) => ({
-          ...m,
-          senderAgentId:
-            typeof m.sender === 'object' ? (m.sender as Record<string, unknown>).id : m.sender,
-          messageType: 'trigger',
-        }))
-      );
-      if (pendingTag) {
-        process.stdout.write(pendingTag);
-      }
-      // Mark as read so they don't replay on next prompt
-      const messageIds = pendingMessages.map((m) => m.id as string).filter(Boolean);
-      if (messageIds.length) {
-        await callPcpTool('mark_messages_read', { messageIds }).catch(() => {});
-      }
-    }
-  } catch {
-    // Silent — pending queue may not have messages
-  }
-
+  // No channel plugin — use hook-based inbox polling as fallback.
   // Check if inbox check is stale (> 5 minutes)
   const lastCheck = readRuntimeFile(cwd, 'last-inbox-check');
   const staleThresholdMs = 5 * 60 * 1000;
@@ -2252,6 +2406,12 @@ export function registerHooksCommands(program: Command): void {
     .description('Hook: bootstrap identity and context at session start')
     .option('--backend <name>', 'Backend context for this hook invocation')
     .action((opts) => onSessionStartHandler(opts));
+
+  hooks
+    .command('on-tool-approval')
+    .description('Hook: 2FA approval check before tool execution (PreToolUse)')
+    .option('--backend <name>', 'Backend context for this hook invocation')
+    .action((opts) => onToolApprovalHandler(opts));
 
   hooks
     .command('on-prompt')

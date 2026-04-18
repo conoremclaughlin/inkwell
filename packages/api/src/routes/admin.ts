@@ -17,6 +17,7 @@ import { env, isDevelopment } from '../config/env';
 import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
 import { runWithRequestContext } from '../utils/request-context';
 import { getDataComposer } from '../data/composer';
+import { notifyPlatformOfApprovalRequest } from '../channels/approval-interceptor';
 
 /**
  * Build a JSON error response. In development mode, includes the real error
@@ -6623,5 +6624,166 @@ router.post('/contacts/resolve', async (req: Request, res: Response) => {
     res.status(500).json(errorJson('Failed to resolve contact', error));
   }
 });
+
+// ============== 2FA Approval Requests ==============
+
+/**
+ * Create an approval request for elevated permissions.
+ * Called by the CLI hook when a tool in the approval-required set is encountered.
+ * The server generates the request ID, sends to connected platforms, and returns
+ * the ID for polling.
+ */
+router.post('/approval-requests', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    const { tool, args, reason, studioId, sessionId, timeoutSeconds = 300 } = req.body;
+
+    if (!tool) {
+      res.status(400).json({ error: 'tool is required' });
+      return;
+    }
+
+    const expiresAt = new Date(Date.now() + timeoutSeconds * 1000).toISOString();
+
+    // Resolve requesting agent from session context header
+    const contextHeader = req.headers['x-ink-context'] as string | undefined;
+    let requestingAgentId = 'unknown';
+    if (contextHeader) {
+      try {
+        const decoded = JSON.parse(Buffer.from(contextHeader, 'base64url').toString());
+        requestingAgentId = decoded.agentId || 'unknown';
+      } catch {
+        // fall through
+      }
+    }
+
+    const { data, error } = await supabase
+      .from('approval_requests')
+      .insert({
+        user_id: authReq.pcpUserId,
+        studio_id: studioId || null,
+        session_id: sessionId || null,
+        requesting_agent_id: requestingAgentId,
+        tool,
+        args: args || null,
+        reason: reason || null,
+        timeout_seconds: timeoutSeconds,
+        expires_at: expiresAt,
+      })
+      .select('id, status, expires_at')
+      .single();
+
+    if (error) {
+      res.status(500).json(errorJson('Failed to create approval request', error));
+      return;
+    }
+
+    logger.info('Approval request created', {
+      requestId: data.id,
+      tool,
+      args,
+      requestingAgentId,
+      studioId,
+      expiresAt,
+    });
+
+    // Send notification to connected platforms (non-blocking)
+    notifyPlatformOfApprovalRequest({
+      id: data.id,
+      userId: authReq.pcpUserId,
+      tool,
+      args,
+      reason: req.body.reason,
+      requestingAgentId,
+      studioId,
+      sessionId,
+      expiresAt,
+    }).catch((err) => {
+      logger.error('Failed to send platform notification for approval request', {
+        requestId: data.id,
+        error: String(err),
+      });
+    });
+
+    res.status(201).json({
+      requestId: data.id,
+      status: data.status,
+      expiresAt: data.expires_at,
+    });
+  } catch (error) {
+    logger.error('Failed to create approval request:', error);
+    res.status(500).json(errorJson('Failed to create approval request', error));
+  }
+});
+
+/**
+ * Poll an approval request's status.
+ * Called by the CLI hook while waiting for human response.
+ * Returns current status + resolution details when resolved.
+ */
+router.get('/approval-requests/:requestId/status', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+    const { requestId } = req.params;
+
+    const { data, error } = await supabase
+      .from('approval_requests')
+      .select('id, status, action, granted_tools, granted_by, expires_at, resolved_at, created_at')
+      .eq('id', requestId)
+      .eq('user_id', authReq.pcpUserId)
+      .single();
+
+    if (error || !data) {
+      res.status(404).json({ error: 'Approval request not found' });
+      return;
+    }
+
+    // Auto-expire if past deadline and still pending
+    if (data.status === 'pending' && new Date(data.expires_at) < new Date()) {
+      await supabase
+        .from('approval_requests')
+        .update({ status: 'expired', resolved_at: new Date().toISOString() })
+        .eq('id', requestId);
+
+      res.json({
+        requestId: data.id,
+        status: 'expired',
+        action: null,
+        grantedTools: null,
+        grantedBy: null,
+        expiresAt: data.expires_at,
+        resolvedAt: new Date().toISOString(),
+      });
+      return;
+    }
+
+    res.json({
+      requestId: data.id,
+      status: data.status,
+      action: data.action,
+      grantedTools: data.granted_tools,
+      grantedBy: data.granted_by,
+      expiresAt: data.expires_at,
+      resolvedAt: data.resolved_at,
+    });
+  } catch (error) {
+    logger.error('Failed to get approval request status:', error);
+    res.status(500).json(errorJson('Failed to get approval request status', error));
+  }
+});
+
+// NOTE: There is intentionally NO HTTP endpoint for resolving approval requests.
+// Resolution happens ONLY through the in-process approval interceptor
+// (approval-interceptor.ts → checkApprovalResponse), which runs inside
+// platform listeners. This ensures grants can only come from verified
+// platform identity — no HTTP endpoint means no client-asserted trust boundary.
+// See ink://specs/2fa-permission-grants for the security invariant.
 
 export default router;

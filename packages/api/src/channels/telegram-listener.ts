@@ -13,6 +13,7 @@ import { MediaGroupBuffer } from './media-group-buffer';
 import { logger } from '../utils/logger';
 import { env } from '../config/env';
 import { getAuthorizationService, type AuthorizationService } from '../services/authorization';
+import { checkApprovalResponse } from './approval-interceptor';
 
 const TELEGRAM_API = 'https://api.telegram.org';
 
@@ -335,6 +336,9 @@ export class TelegramListener extends EventEmitter {
 
     // ========== AUTHORIZATION CHECK (before any processing) ==========
 
+    // Hoist trustedUser so the approval intercept can use it without re-querying
+    let trustedUser: Awaited<ReturnType<AuthorizationService['isUserTrusted']>> = null;
+
     if (isGroupChat) {
       // For group chats: check if group is authorized
       const isAuthorized = await this.authService.isGroupAuthorized('telegram', chatId);
@@ -356,7 +360,7 @@ export class TelegramListener extends EventEmitter {
         return;
       }
 
-      const trustedUser = await this.authService.isUserTrusted('telegram', userId);
+      trustedUser = await this.authService.isUserTrusted('telegram', userId);
 
       if (!trustedUser) {
         // Complete silence for untrusted users in DMs
@@ -367,6 +371,31 @@ export class TelegramListener extends EventEmitter {
       // Handle DM commands for trusted users
       if (await this.handleTrustedUserCommand(telegramMessage, chatId, userId)) {
         return; // Command was handled
+      }
+    }
+
+    // ========== 2FA APPROVAL INTERCEPT (before agent routing) ==========
+    // Check if this DM is a response to a pending permission approval request.
+    // Only runs for trusted DM users (approval responses from groups are not supported).
+    // This runs BEFORE the message reaches any agent — only verified platform identity
+    // can resolve approval requests. See ink://specs/2fa-permission-grants.
+    if (text && trustedUser?.userId) {
+      const replyToId = telegramMessage.reply_to_message
+        ? String(telegramMessage.reply_to_message.message_id)
+        : undefined;
+      const result = await checkApprovalResponse(
+        trustedUser.userId,
+        `telegram:${userId}`,
+        text,
+        replyToId
+      );
+      if (result.intercepted) {
+        const emoji = result.action === 'deny' ? '🚫' : '✅';
+        await this.sendMessage(
+          chatId,
+          `${emoji} Permission ${result.action}: request ${result.requestId}`
+        );
+        return; // Do NOT forward to agent routing
       }
     }
 
