@@ -213,6 +213,41 @@ import {
 } from '../../stories/gmail/handlers';
 
 import {
+  handleCreateSpreadsheet,
+  handleAppendSheetRows,
+  handleGetSheetValues,
+  handleUpdateSheetValues,
+  handleGetSpreadsheet,
+  createSpreadsheetSchema,
+  appendSheetRowsSchema,
+  getSheetValuesSchema,
+  updateSheetValuesSchema,
+  getSpreadsheetSchema,
+} from '../../stories/google-sheets/handlers';
+
+import {
+  handleCreateDocument,
+  handleGetDocument,
+  handleAppendText,
+  handleReplaceText,
+  createDocumentSchema,
+  getDocumentSchema,
+  appendTextSchema,
+  replaceTextSchema,
+} from '../../stories/google-docs/handlers';
+
+import {
+  handleListDriveFiles,
+  handleGetDriveFile,
+  handleCreateDriveFolder,
+  handleMoveDriveFile,
+  listDriveFilesSchema,
+  getDriveFileSchema,
+  createDriveFolderSchema,
+  moveDriveFileSchema,
+} from '../../stories/google-drive/handlers';
+
+import {
   handleLogActivity,
   handleLogMessage,
   handleGetActivity,
@@ -4459,6 +4494,457 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleModifyEmails(args, dataComposer);
       } catch (error) {
         logger.error('Error in modify_emails:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // GOOGLE SHEETS TOOLS (stories/google-sheets)
+  // =====================================================
+
+  server.registerTool(
+    'create_spreadsheet',
+    {
+      description: `Create a new Google Spreadsheet.
+
+Returns the new spreadsheet's ID, URL, and the metadata of its initial sheet/tab.
+
+User must have connected their Google account with Sheets permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: createSpreadsheetSchema,
+    },
+    async (args) => {
+      try {
+        return await handleCreateSpreadsheet(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in create_spreadsheet:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'append_sheet_rows',
+    {
+      description: `Append rows of data to a Google Spreadsheet.
+
+Pass a 2D array in "values": each inner array is one row of cells. Cell values can be strings, numbers, booleans, or null.
+
+valueInputOption:
+- "USER_ENTERED" (default) — values are parsed as if typed in the Sheets UI (formulas, dates, currencies)
+- "RAW" — values are inserted exactly as provided
+
+User must have connected their Google account with Sheets write permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: appendSheetRowsSchema,
+    },
+    async (args) => {
+      try {
+        return await handleAppendSheetRows(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in append_sheet_rows:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_sheet_values',
+    {
+      description: `Read cell values from a Google Spreadsheet range.
+
+Range uses A1 notation, e.g. "Sheet1!A1:C10" or "Sheet1" (entire sheet).
+
+valueRenderOption:
+- "FORMATTED_VALUE" (default) — strings as displayed in the UI
+- "UNFORMATTED_VALUE" — native types (dates as serial numbers)
+- "FORMULA" — formula text instead of computed value
+
+User must have connected their Google account with Sheets permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getSheetValuesSchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetSheetValues(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_sheet_values:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'update_sheet_values',
+    {
+      description: `Overwrite a range of cells in a Google Spreadsheet.
+
+Pass a 2D array in "values" matching the shape of the target range. Existing values in that range will be replaced.
+
+User must have connected their Google account with Sheets write permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: updateSheetValuesSchema,
+    },
+    async (args) => {
+      try {
+        return await handleUpdateSheetValues(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in update_sheet_values:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_spreadsheet',
+    {
+      description: `Get metadata for a Google Spreadsheet — title, URL, and the list of sheet/tab names with row/column counts. Does NOT return cell data; use get_sheet_values for that.
+
+User must have connected their Google account with Sheets permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getSpreadsheetSchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetSpreadsheet(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_spreadsheet:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // GOOGLE DOCS TOOLS (stories/google-docs)
+  // =====================================================
+
+  server.registerTool(
+    'create_document',
+    {
+      description: `Create a new Google Doc.
+
+Optionally pass "initialContent" to seed the body with text on creation.
+
+User must have connected their Google account with Docs permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: createDocumentSchema,
+    },
+    async (args) => {
+      try {
+        return await handleCreateDocument(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in create_document:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_document',
+    {
+      description: `Read a Google Doc's body as plain text. Tables are flattened (cells separated by tabs); formatting is dropped. Suitable for AI consumption, not exact reproduction.
+
+User must have connected their Google account with Docs permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getDocumentSchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetDocument(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_document:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'append_document_text',
+    {
+      description: `Append text to the end of a Google Doc.
+
+By default a leading newline is inserted so the appended text starts on a new line. Set separateWithNewline=false to append inline.
+
+User must have connected their Google account with Docs write permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: appendTextSchema,
+    },
+    async (args) => {
+      try {
+        return await handleAppendText(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in append_document_text:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'replace_document_text',
+    {
+      description: `Find-and-replace within a Google Doc. Replaces ALL occurrences of "find" with "replaceWith". Set matchCase=false for case-insensitive matching.
+
+Returns the number of occurrences changed.
+
+User must have connected their Google account with Docs write permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: replaceTextSchema,
+    },
+    async (args) => {
+      try {
+        return await handleReplaceText(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in replace_document_text:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // GOOGLE DRIVE TOOLS (stories/google-drive)
+  // =====================================================
+
+  server.registerTool(
+    'list_drive_files',
+    {
+      description: `List or search files in the user's Google Drive.
+
+Use the "query" parameter to filter using Google Drive's query syntax:
+- "name contains 'Tax'"
+- "mimeType='application/vnd.google-apps.spreadsheet'"
+- "modifiedTime > '2026-01-01T00:00:00'"
+- "'<folderId>' in parents"
+- "trashed = false"
+
+Returns up to pageSize files (default 25, max 100). Use nextPageToken to paginate.
+
+User must have connected their Google account with Drive permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: listDriveFilesSchema,
+    },
+    async (args) => {
+      try {
+        return await handleListDriveFiles(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_drive_files:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_drive_file',
+    {
+      description: `Get metadata for a Google Drive file by ID — name, mimeType, parents, owners, web view link, and modification times.
+
+User must have connected their Google account with Drive permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getDriveFileSchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetDriveFile(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_drive_file:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'create_drive_folder',
+    {
+      description: `Create a new folder in Google Drive.
+
+Pass parentFolderId to nest within an existing folder; omit it to create at the root of My Drive.
+
+User must have connected their Google account with Drive write permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: createDriveFolderSchema,
+    },
+    async (args) => {
+      try {
+        return await handleCreateDriveFolder(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in create_drive_folder:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'move_drive_file',
+    {
+      description: `Move a file or folder in Google Drive into a different parent folder. Removes the file from any current parents.
+
+NOTE: This tool does not delete or trash files — those operations are blocked for safety.
+
+User must have connected their Google account with Drive write permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: moveDriveFileSchema,
+    },
+    async (args) => {
+      try {
+        return await handleMoveDriveFile(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in move_drive_file:', error);
         return {
           content: [
             {

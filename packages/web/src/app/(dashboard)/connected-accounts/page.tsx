@@ -25,6 +25,7 @@ import {
   Calendar,
   User,
   Shield,
+  FolderOpen,
 } from 'lucide-react';
 import { useApiQuery, useApiDelete, apiGet, apiPost } from '@/lib/api';
 import { useQueryClient } from '@tanstack/react-query';
@@ -109,7 +110,7 @@ const statusConfig = {
 };
 
 // Permission groups for organized display
-type PermissionGroup = 'email' | 'calendar' | 'profile' | 'other';
+type PermissionGroup = 'email' | 'calendar' | 'files' | 'profile' | 'other';
 
 interface ScopeInfo {
   label: string;
@@ -130,6 +131,19 @@ const scopeTranslations: Record<string, ScopeInfo> = {
     group: 'calendar',
   },
   'https://www.googleapis.com/auth/calendar.events': { label: 'Manage events', group: 'calendar' },
+  'https://www.googleapis.com/auth/spreadsheets': {
+    label: 'Read & edit spreadsheets',
+    group: 'files',
+  },
+  'https://www.googleapis.com/auth/documents': { label: 'Read & edit documents', group: 'files' },
+  'https://www.googleapis.com/auth/drive': {
+    label: 'Manage Drive files & folders',
+    group: 'files',
+  },
+  'https://www.googleapis.com/auth/drive.file': {
+    label: 'Manage app-created Drive files',
+    group: 'files',
+  },
   'https://www.googleapis.com/auth/userinfo.email': { label: 'Email address', group: 'profile' },
   'https://www.googleapis.com/auth/userinfo.profile': { label: 'Profile info', group: 'profile' },
   openid: { label: 'OpenID', group: 'profile' },
@@ -138,6 +152,7 @@ const scopeTranslations: Record<string, ScopeInfo> = {
 const permissionGroups: Record<PermissionGroup, { label: string; icon: React.ReactNode }> = {
   email: { label: 'Email', icon: <Mail className="h-4 w-4" /> },
   calendar: { label: 'Calendar', icon: <Calendar className="h-4 w-4" /> },
+  files: { label: 'Docs / Sheets / Drive', icon: <FolderOpen className="h-4 w-4" /> },
   profile: { label: 'Profile', icon: <User className="h-4 w-4" /> },
   other: { label: 'Other', icon: <Shield className="h-4 w-4" /> },
 };
@@ -146,6 +161,7 @@ function groupScopes(scopes: string[]): Record<PermissionGroup, string[]> {
   const groups: Record<PermissionGroup, string[]> = {
     email: [],
     calendar: [],
+    files: [],
     profile: [],
     other: [],
   };
