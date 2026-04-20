@@ -35,6 +35,9 @@ const OAUTH_PROVIDERS: Record<string, OAuthProviderConfig> = {
       'https://www.googleapis.com/auth/userinfo.profile',
       'https://www.googleapis.com/auth/calendar.readonly',
       'https://www.googleapis.com/auth/calendar.events', // Read + write events (respond, update)
+      'https://www.googleapis.com/auth/spreadsheets', // Sheets read/write
+      'https://www.googleapis.com/auth/documents', // Docs read/write
+      'https://www.googleapis.com/auth/drive', // Drive (list/read/write/move/delete)
     ],
   },
 };
