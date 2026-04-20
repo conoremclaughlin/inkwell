@@ -703,6 +703,170 @@ export async function handleCreateTaskGroup(
   }
 }
 
+// ============================================================================
+// UPDATE TASK GROUP
+// ============================================================================
+
+export const updateTaskGroupSchema = z.object({
+  ...userIdentifierSchema.shape,
+  groupId: z.string().uuid().describe('Task group UUID to update'),
+  title: z.string().min(1).max(500).optional(),
+  description: z.string().nullable().optional(),
+  status: taskGroupStatusEnum.optional().describe('active | paused | completed | cancelled'),
+  priority: taskGroupPriorityEnum.optional(),
+  tags: z.array(z.string()).optional(),
+  metadata: z
+    .record(z.unknown())
+    .optional()
+    .describe(
+      'Metadata object. When provided with mergeMetadata=true (default), keys are merged into existing metadata; otherwise metadata is replaced.'
+    ),
+  mergeMetadata: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe(
+      'If true (default), merge provided metadata with existing; if false, replace wholesale'
+    ),
+  closedReason: z
+    .string()
+    .optional()
+    .describe(
+      'Shorthand for recording why a group was closed. Stored in metadata.closed_reason. Useful with status: completed|cancelled.'
+    ),
+  contextSummary: z.string().nullable().optional(),
+  outputTarget: taskGroupOutputTargetEnum.nullable().optional(),
+  outputStatus: taskGroupOutputStatusEnum.nullable().optional(),
+  threadKey: z.string().nullable().optional(),
+  ownerAgentId: z
+    .string()
+    .nullable()
+    .optional()
+    .describe('Agent slug owning this group (e.g. "wren"). Pass null to clear.'),
+  identityId: z
+    .string()
+    .uuid()
+    .nullable()
+    .optional()
+    .describe('Agent identity UUID. Pass null to clear.'),
+});
+
+export async function handleUpdateTaskGroup(
+  args: z.infer<typeof updateTaskGroupSchema>,
+  dataComposer: DataComposer
+): Promise<McpResponse> {
+  try {
+    const resolved = await resolveUser(args as UserIdentifier, dataComposer);
+    if (!resolved) {
+      return mcpResponse({ success: false, error: 'User not found' }, true);
+    }
+
+    const existing = await dataComposer.repositories.taskGroups.findById(args.groupId);
+    if (!existing) {
+      return mcpResponse({ success: false, error: 'Task group not found' }, true);
+    }
+    if (existing.user_id !== resolved.user.id) {
+      return mcpResponse(
+        { success: false, error: 'Task group does not belong to this user' },
+        true
+      );
+    }
+
+    const merge = args.mergeMetadata !== false;
+    let nextMetadata: Record<string, unknown> | undefined;
+    if (args.metadata !== undefined || args.closedReason !== undefined) {
+      const base = merge ? { ...(existing.metadata || {}) } : {};
+      if (args.metadata !== undefined) {
+        Object.assign(base, args.metadata);
+      }
+      if (args.closedReason !== undefined) {
+        base.closed_reason = args.closedReason;
+      }
+      nextMetadata = base;
+    }
+
+    // Security: service-role DB access bypasses RLS, so a direct `identityId`
+    // must be validated against the caller's user (and workspace, when known)
+    // before it's written. Without this, any caller who knows another
+    // agent_identities.id could rebind a task group across workspace boundaries.
+    // `undefined` means "don't touch"; `null` means "explicitly detach" and is
+    // allowed without a lookup.
+    let nextIdentityId: string | null | undefined = args.identityId;
+    if (typeof args.identityId === 'string') {
+      const reqCtx = getRequestContext();
+      const workspaceId = reqCtx?.workspaceId;
+      let q = dataComposer
+        .getClient()
+        .from('agent_identities')
+        .select('id')
+        .eq('id', args.identityId)
+        .eq('user_id', resolved.user.id);
+      if (workspaceId) {
+        q = q.eq('workspace_id', workspaceId);
+      }
+      const { data: owned } = await q.limit(1).single();
+      if (!owned) {
+        return mcpResponse(
+          {
+            success: false,
+            error: 'identityId not found or does not belong to this user/workspace.',
+          },
+          true
+        );
+      }
+      nextIdentityId = args.identityId;
+    }
+
+    const updated = await dataComposer.repositories.taskGroups.update(args.groupId, {
+      title: args.title,
+      description: args.description,
+      status: args.status,
+      priority: args.priority,
+      tags: args.tags,
+      metadata: nextMetadata,
+      context_summary: args.contextSummary,
+      output_target: args.outputTarget,
+      output_status: args.outputStatus,
+      thread_key: args.threadKey,
+      owner_agent_id: args.ownerAgentId,
+      identity_id: nextIdentityId,
+    });
+
+    return mcpResponse({
+      success: true,
+      group: {
+        id: updated.id,
+        title: updated.title,
+        description: updated.description,
+        status: updated.status,
+        priority: updated.priority,
+        tags: updated.tags,
+        metadata: updated.metadata,
+        projectId: updated.project_id,
+        identityId: updated.identity_id,
+        ownerAgentId: updated.owner_agent_id,
+        autonomous: updated.autonomous,
+        maxSessions: updated.max_sessions,
+        sessionsUsed: updated.sessions_used,
+        contextSummary: updated.context_summary,
+        outputTarget: updated.output_target,
+        outputStatus: updated.output_status,
+        threadKey: updated.thread_key,
+        createdAt: updated.created_at,
+        updatedAt: updated.updated_at,
+      },
+    });
+  } catch (error) {
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to update task group',
+      },
+      true
+    );
+  }
+}
+
 export const listTaskGroupsSchema = z.object({
   ...userIdentifierSchema.shape,
   statuses: z

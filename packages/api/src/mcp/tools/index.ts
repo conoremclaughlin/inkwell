@@ -25,8 +25,10 @@ import {
   handleAddTaskComment,
   handleCreateTaskGroup,
   handleListTaskGroups,
+  handleUpdateTaskGroup,
   createTaskGroupSchema,
   listTaskGroupsSchema,
+  updateTaskGroupSchema,
 } from './task-handlers';
 
 import { handleSendResponse, handleGetPendingMessages, handleMarkRead } from './response-handlers';
@@ -1024,6 +1026,39 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleCreateTaskGroup(args, dataComposer);
       } catch (error) {
         logger.error('Error in create_task_group:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'update_task_group',
+    {
+      description: `Update a task group — change its status (active/paused/completed/cancelled), title, description, priority, tags, metadata, thread key, or owner. Use this to close a group when its work ships (status: completed) or is abandoned (status: cancelled), or to reassign ownership.
+
+Pass \`closedReason\` as a shorthand to record why a group was closed — it's stored under \`metadata.closed_reason\`.
+
+Metadata is merged into existing metadata by default. Pass \`mergeMetadata: false\` to replace wholesale.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: updateTaskGroupSchema.shape,
+    },
+    async (args) => {
+      try {
+        return await handleUpdateTaskGroup(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in update_task_group:', error);
         return {
           content: [
             {
