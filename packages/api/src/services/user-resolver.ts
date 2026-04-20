@@ -3,6 +3,7 @@ import type { DataComposer } from '../data/composer';
 import type { User } from '../data/models/user.model';
 import { logger } from '../utils/logger';
 import { getUserFromContext } from '../utils/request-context';
+import { withSupabaseRetry } from '../utils/supabase-retry';
 
 /**
  * Base schema for user identification fields.
@@ -116,9 +117,18 @@ export async function resolveUser(
     }
   }
 
+  // Each lookup is wrapped in withSupabaseRetry so a transient PostgREST
+  // 503 / DB connection blip doesn't immediately fail the request and
+  // doesn't get instantly retried by upstream callers (which on 2026-04-19
+  // amplified a brownout into a 47GB Kong log spiral). The shared circuit
+  // breaker also short-circuits the rest of the pipeline once the DB
+  // really is down.
+
   // 1. Try userId first (most specific)
   if (effectiveIdentifier.userId) {
-    const user = await usersRepo.findById(effectiveIdentifier.userId);
+    const user = await withSupabaseRetry(() => usersRepo.findById(effectiveIdentifier.userId!), {
+      label: 'resolveUser.findById',
+    });
     if (user) {
       logger.debug(`User resolved by userId: ${effectiveIdentifier.userId}`);
       return { user, resolvedBy: 'userId' };
@@ -127,7 +137,9 @@ export async function resolveUser(
 
   // 2. Try email
   if (effectiveIdentifier.email) {
-    const user = await usersRepo.findByEmail(effectiveIdentifier.email);
+    const user = await withSupabaseRetry(() => usersRepo.findByEmail(effectiveIdentifier.email!), {
+      label: 'resolveUser.findByEmail',
+    });
     if (user) {
       logger.debug(`User resolved by email: ${effectiveIdentifier.email}`);
       return { user, resolvedBy: 'email' };
@@ -136,9 +148,10 @@ export async function resolveUser(
 
   // 3. Try platform + platformId
   if (effectiveIdentifier.platform && effectiveIdentifier.platformId) {
-    const user = await usersRepo.findByPlatformId(
-      effectiveIdentifier.platform,
-      effectiveIdentifier.platformId
+    const user = await withSupabaseRetry(
+      () =>
+        usersRepo.findByPlatformId(effectiveIdentifier.platform!, effectiveIdentifier.platformId!),
+      { label: 'resolveUser.findByPlatformId' }
     );
     if (user) {
       logger.debug(
@@ -150,7 +163,10 @@ export async function resolveUser(
 
   // 4. Try phone number
   if (effectiveIdentifier.phone) {
-    const user = await usersRepo.findByPhoneNumber(effectiveIdentifier.phone);
+    const user = await withSupabaseRetry(
+      () => usersRepo.findByPhoneNumber(effectiveIdentifier.phone!),
+      { label: 'resolveUser.findByPhoneNumber' }
+    );
     if (user) {
       logger.debug(`User resolved by phone: ${effectiveIdentifier.phone}`);
       return { user, resolvedBy: 'phone' };

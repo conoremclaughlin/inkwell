@@ -101,8 +101,24 @@ export function registerWaitCommand(program: Command): void {
         console.log(`[ink wait] Baseline: ${baselineInboxCount} unread`);
       }
 
+      // Exponential backoff on consecutive poll errors. This stops `ink wait`
+      // from hammering the server when it's brownouting (the 2026-04-19
+      // incident: background waits retried every 15s through a 503 storm
+      // and helped fill Docker's disk with Kong error logs).
+      let consecutiveErrors = 0;
+      const maxBackoffSec = Math.max(intervalSec, 120); // cap the pause at ~2 min
+
       while (Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, intervalSec * 1000));
+        const sleepMs =
+          consecutiveErrors === 0
+            ? intervalSec * 1000
+            : Math.min(
+                maxBackoffSec * 1000,
+                intervalSec * 1000 * 2 ** Math.min(consecutiveErrors, 6)
+              ) *
+              (0.5 + Math.random() * 0.5); // 50–100% jitter
+
+        await new Promise((resolve) => setTimeout(resolve, sleepMs));
 
         try {
           // Check pending queue only when --pending is explicitly passed
@@ -208,10 +224,19 @@ export function registerWaitCommand(program: Command): void {
             }
           }
 
+          // Successful poll — reset backoff.
+          consecutiveErrors = 0;
           console.log('[ink wait] No new messages yet...');
         } catch (error) {
+          consecutiveErrors += 1;
           const msg = error instanceof Error ? error.message : String(error);
-          console.log(`[ink wait] Poll error (will retry): ${msg.slice(0, 100)}`);
+          const nextBackoffSec = Math.min(
+            maxBackoffSec,
+            intervalSec * 2 ** Math.min(consecutiveErrors, 6)
+          );
+          console.log(
+            `[ink wait] Poll error #${consecutiveErrors} (next retry in ~${nextBackoffSec}s): ${msg.slice(0, 100)}`
+          );
         }
       }
 
