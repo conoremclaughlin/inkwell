@@ -1459,6 +1459,134 @@ describe('handleUpdateTaskGroup', () => {
     expect(data.error).toBe('Task group not found');
     expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
   });
+
+  it('rejects identityId that does not belong to this user', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
+    // Identity lookup returns nothing — not owned by this user
+    (dc.getClient() as any).from().single.mockResolvedValueOnce({ data: null, error: null });
+
+    const response = await handleUpdateTaskGroup(
+      {
+        userId: 'user-123',
+        groupId: '11111111-2222-3333-4444-555555555555',
+        identityId: '99999999-9999-9999-9999-999999999999',
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBe(true);
+    expect(data.error).toBe('identityId not found or does not belong to this user/workspace.');
+    expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
+  });
+
+  it('scopes identityId lookup to the workspace when request context supplies one', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
+    const { getRequestContext } = await import('../../utils/request-context');
+    (getRequestContext as any).mockReturnValueOnce({
+      workspaceId: 'ws-match',
+    });
+    // Identity lookup returns nothing — same user, but different workspace
+    const chain = (dc.getClient() as any).from();
+    chain.single.mockResolvedValueOnce({ data: null, error: null });
+
+    const response = await handleUpdateTaskGroup(
+      {
+        userId: 'user-123',
+        groupId: '11111111-2222-3333-4444-555555555555',
+        identityId: '77777777-7777-7777-7777-777777777777',
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBe(true);
+    expect(data.error).toBe('identityId not found or does not belong to this user/workspace.');
+    expect(chain.eq).toHaveBeenCalledWith('workspace_id', 'ws-match');
+    expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
+  });
+
+  it('accepts identityId that belongs to this user', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
+    (dc.getClient() as any).from().single.mockResolvedValueOnce({
+      data: { id: '77777777-7777-7777-7777-777777777777' },
+      error: null,
+    });
+    dc.repositories.taskGroups.update.mockResolvedValue({
+      ...existingGroup,
+      identity_id: '77777777-7777-7777-7777-777777777777',
+    });
+
+    const response = await handleUpdateTaskGroup(
+      {
+        userId: 'user-123',
+        groupId: '11111111-2222-3333-4444-555555555555',
+        identityId: '77777777-7777-7777-7777-777777777777',
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBeFalsy();
+    expect(data.success).toBe(true);
+    expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+      '11111111-2222-3333-4444-555555555555',
+      expect.objectContaining({
+        identity_id: '77777777-7777-7777-7777-777777777777',
+      })
+    );
+  });
+
+  it('accepts explicit null identityId as a clear without a lookup', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
+    dc.repositories.taskGroups.update.mockResolvedValue({
+      ...existingGroup,
+      identity_id: null,
+    });
+
+    await handleUpdateTaskGroup(
+      {
+        userId: 'user-123',
+        groupId: '11111111-2222-3333-4444-555555555555',
+        identityId: null,
+      } as any,
+      dc as any
+    );
+
+    // No identity lookup should have been issued — null bypasses validation.
+    const fromMock = (dc.getClient() as any).from;
+    expect(fromMock).not.toHaveBeenCalledWith('agent_identities');
+    expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+      '11111111-2222-3333-4444-555555555555',
+      expect.objectContaining({
+        identity_id: null,
+      })
+    );
+  });
+
+  it('does not touch identity_id when identityId is not provided', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
+    dc.repositories.taskGroups.update.mockResolvedValue({
+      ...existingGroup,
+      status: 'paused',
+    });
+
+    await handleUpdateTaskGroup(
+      {
+        userId: 'user-123',
+        groupId: '11111111-2222-3333-4444-555555555555',
+        status: 'paused',
+      } as any,
+      dc as any
+    );
+
+    const fromMock = (dc.getClient() as any).from;
+    expect(fromMock).not.toHaveBeenCalledWith('agent_identities');
+    // Repository sees undefined for identity_id — repository's upsert logic is
+    // then responsible for leaving the column alone.
+    const call = (dc.repositories.taskGroups.update as any).mock.calls[0][1];
+    expect(call.identity_id).toBeUndefined();
+  });
 });
 
 // =====================================================

@@ -192,4 +192,69 @@ describe.skipIf(!canRun)('handleUpdateTaskGroup (integration)', () => {
     const { data } = await client.from('task_groups').select('status').eq('id', groupId).single();
     expect(data?.status).toBe('active');
   });
+
+  it('rejects identityId that is not in agent_identities for this user', async () => {
+    const { handleUpdateTaskGroup } = await import('./task-handlers');
+    const groupId = await seedGroup();
+
+    const response = await handleUpdateTaskGroup(
+      {
+        userId: TEST_USER_ID!,
+        groupId,
+        // Valid UUID format, but will not match any row scoped to TEST_USER_ID.
+        identityId: '00000000-0000-4000-a000-000000000000',
+      } as any,
+      dc
+    );
+
+    expect(response.isError).toBe(true);
+    const body = JSON.parse(response.content[0].text);
+    expect(body.error).toBe('identityId not found or does not belong to this user/workspace.');
+
+    // Confirm no partial write — identity_id is still null.
+    const { data } = await client
+      .from('task_groups')
+      .select('identity_id')
+      .eq('id', groupId)
+      .single();
+    expect(data?.identity_id).toBeNull();
+  });
+
+  it('accepts a real identityId that belongs to this user', async () => {
+    const { handleUpdateTaskGroup } = await import('./task-handlers');
+
+    // Find any agent identity belonging to the test user — any real row works
+    // to exercise the accept path against the real DB.
+    const { data: identity } = await client
+      .from('agent_identities')
+      .select('id')
+      .eq('user_id', TEST_USER_ID!)
+      .limit(1)
+      .single();
+
+    if (!identity) {
+      // No agent_identities rows for this user — skip rather than flake.
+      return;
+    }
+
+    const groupId = await seedGroup();
+
+    const response = await handleUpdateTaskGroup(
+      {
+        userId: TEST_USER_ID!,
+        groupId,
+        identityId: identity.id,
+      } as any,
+      dc
+    );
+
+    expect(response.isError).toBeFalsy();
+
+    const { data } = await client
+      .from('task_groups')
+      .select('identity_id')
+      .eq('id', groupId)
+      .single();
+    expect(data?.identity_id).toBe(identity.id);
+  });
 });

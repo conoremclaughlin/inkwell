@@ -785,6 +785,38 @@ export async function handleUpdateTaskGroup(
       nextMetadata = base;
     }
 
+    // Security: service-role DB access bypasses RLS, so a direct `identityId`
+    // must be validated against the caller's user (and workspace, when known)
+    // before it's written. Without this, any caller who knows another
+    // agent_identities.id could rebind a task group across workspace boundaries.
+    // `undefined` means "don't touch"; `null` means "explicitly detach" and is
+    // allowed without a lookup.
+    let nextIdentityId: string | null | undefined = args.identityId;
+    if (typeof args.identityId === 'string') {
+      const reqCtx = getRequestContext();
+      const workspaceId = reqCtx?.workspaceId;
+      let q = dataComposer
+        .getClient()
+        .from('agent_identities')
+        .select('id')
+        .eq('id', args.identityId)
+        .eq('user_id', resolved.user.id);
+      if (workspaceId) {
+        q = q.eq('workspace_id', workspaceId);
+      }
+      const { data: owned } = await q.limit(1).single();
+      if (!owned) {
+        return mcpResponse(
+          {
+            success: false,
+            error: 'identityId not found or does not belong to this user/workspace.',
+          },
+          true
+        );
+      }
+      nextIdentityId = args.identityId;
+    }
+
     const updated = await dataComposer.repositories.taskGroups.update(args.groupId, {
       title: args.title,
       description: args.description,
@@ -797,7 +829,7 @@ export async function handleUpdateTaskGroup(
       output_status: args.outputStatus,
       thread_key: args.threadKey,
       owner_agent_id: args.ownerAgentId,
-      identity_id: args.identityId,
+      identity_id: nextIdentityId,
     });
 
     return mcpResponse({
