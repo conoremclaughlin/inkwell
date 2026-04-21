@@ -321,7 +321,14 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   // Track whether session context is missing — used to suppress triggers
   // and warn the sender. Without session context, reply routing is broken
   // (recipients can't auto-resolve back to the sender's session/studio).
-  const missingSenderSession = !senderSessionId && !!senderAgentId;
+  //
+  // 'system' is exempt: it is the canonical sender for heartbeat/watchdog/
+  // platform-originated sends, which by design run outside a request context
+  // (no x-ink-context token, no session). Suppressing those triggers silently
+  // broke the strategy watchdog — it inserted thread messages but never woke
+  // the owner agent. Since 'system' has no reply session anyway, the routing
+  // concerns that justify the suppression don't apply.
+  const missingSenderSession = !senderSessionId && !!senderAgentId && senderAgentId !== 'system';
 
   // ── Thread-first path: when threadKey is provided, route to thread tables ──
   // Unified handler for both new thread creation and replies to existing threads.
@@ -564,6 +571,18 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           }
         }
 
+        // Targeted studio routing: propagate studioId/Hint to the trigger
+        // payload for the agent the caller specifically addressed. Covers
+        // both self-studio sends (sender == recipient, different worktree)
+        // and cross-agent delegation (e.g., strategy service → owner agent
+        // in group.metadata.studioId). Incidental trigger participants —
+        // like a thread creator auto-woken on reply — do NOT inherit the
+        // routing, since the caller only explicitly targeted recipientAgentId.
+        //
+        // Before this fix, studio was only forwarded when `isSelfStudioMessage`
+        // was true, so system/human → owner delegation lost the assigned
+        // studio and fell back to route patterns / default studio.
+        const isAddressedRecipient = !recipients && toAgentId === recipientAgentId;
         const payload: AgentTriggerPayload = {
           fromAgentId: triggerSenderId,
           toAgentId,
@@ -576,11 +595,10 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           priority,
           threadKey,
           recipientSessionId: resolvedRecipientSessionId,
-          // Cross-studio self-message: route to the target studio explicitly
-          ...(isSelfStudioMessage && resolvedRecipientStudioId
+          ...(isAddressedRecipient && resolvedRecipientStudioId
             ? { studioId: resolvedRecipientStudioId }
             : {}),
-          ...(isSelfStudioMessage && !resolvedRecipientStudioId && recipientStudioSlugOrHint
+          ...(isAddressedRecipient && !resolvedRecipientStudioId && recipientStudioSlugOrHint
             ? { studioHint: recipientStudioSlugOrHint }
             : {}),
         };
