@@ -213,6 +213,13 @@ export class StrategyService {
     // Create a watchdog reminder so the heartbeat checks progress periodically
     await this.createWatchdogReminder(updated, input.userId);
 
+    // Kick off the owner agent in the assigned studio. Without this trigger,
+    // start_strategy only returns a prompt to the caller's session — which
+    // is useless when the caller is delegating to a different studio/agent.
+    // The trigger spawns (or resumes) a session in the target studio so work
+    // actually begins, matching how heartbeats/reminders already deliver.
+    const triggered = await this.triggerOwnerAgent(updated, nextTask, 'strategy_kickoff');
+
     // Log strategy start
     await this.logStrategyEvent(
       updated,
@@ -221,6 +228,7 @@ export class StrategyService {
       {
         firstTaskId: nextTask.id,
         firstTaskTitle: nextTask.title,
+        ownerTriggered: triggered,
       }
     );
 
@@ -230,6 +238,7 @@ export class StrategyService {
       action: 'next_task',
       nextTask,
       prompt,
+      notified: triggered,
     };
   }
 
@@ -690,6 +699,128 @@ export class StrategyService {
       logger.warn('Strategy notification failed:', err);
       return false;
     }
+  }
+
+  /**
+   * Trigger the strategy's owner agent with a task-aware prompt, routed to the
+   * studio the group is assigned to. Used for:
+   *   - startStrategy kickoff (spawn a session in the target studio so the agent
+   *     starts working without the user having to manually attach)
+   *   - watchdog re-triggers (wake a stuck session on the heartbeat)
+   *
+   * No-ops with a warn log if the group has no owner_agent_id. Non-fatal on
+   * send failure — returns false so callers can decide whether to escalate.
+   */
+  private async triggerOwnerAgent(
+    group: TaskGroup,
+    task: ProjectTask,
+    reason: 'strategy_kickoff' | 'watchdog' | 'manual_resume'
+  ): Promise<boolean> {
+    if (!group.owner_agent_id) {
+      logger.warn(
+        `Strategy triggerOwnerAgent: group ${group.id} has no owner_agent_id — cannot route trigger`
+      );
+      return false;
+    }
+    if (!group.strategy) {
+      logger.warn(
+        `Strategy triggerOwnerAgent: group ${group.id} has no strategy set — cannot build prompt`
+      );
+      return false;
+    }
+
+    try {
+      const threadKey = group.thread_key || `strategy:${group.id}`;
+      const metadata = (group.metadata || {}) as Record<string, unknown>;
+      const rawStudioId = metadata.studioId;
+      const rawStudioSlug = metadata.studioSlug;
+      const studioId = typeof rawStudioId === 'string' ? rawStudioId : undefined;
+      const studioSlug = typeof rawStudioSlug === 'string' ? rawStudioSlug : undefined;
+      const content = STRATEGY_PROMPTS[group.strategy as StrategyPreset](group, task);
+
+      await handleSendToInbox(
+        {
+          userId: group.user_id,
+          recipientAgentId: group.owner_agent_id,
+          senderAgentId: 'system',
+          // Prefer studioId (UUID); fall back to slug only when UUID is absent.
+          recipientStudioId: studioId,
+          recipientStudioSlug: studioId ? undefined : studioSlug,
+          content,
+          messageType: 'session_resume',
+          priority: 'high',
+          threadKey,
+          trigger: true,
+          triggerType: 'message',
+          triggerSummary: `Strategy "${group.strategy}" — ${reason === 'strategy_kickoff' ? 'start' : 'continue'}: ${task.title}`,
+          metadata: {
+            source: 'strategy_service',
+            strategyTrigger: true,
+            reason,
+            groupId: group.id,
+            taskId: task.id,
+            strategy: group.strategy,
+          },
+        },
+        this.dataComposer
+      );
+
+      logger.info(
+        `Strategy trigger sent to ${group.owner_agent_id} for group ${group.id} (task ${task.id}, reason: ${reason}${studioId ? `, studio: ${studioId}` : studioSlug ? `, studioSlug: ${studioSlug}` : ''})`
+      );
+      return true;
+    } catch (err) {
+      logger.warn(
+        `Strategy triggerOwnerAgent failed for group ${group.id} (reason: ${reason}):`,
+        err
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Public entry point for watchdog-driven triggers. Called from the heartbeat
+   * reminder-delivery path when a scheduled_reminder has
+   * metadata.strategyWatchdog === true.
+   *
+   * Loads the referenced group + its current in-progress task, skips if the
+   * strategy is no longer active or there is no pending work, then routes a
+   * task-aware prompt to the owner agent in the assigned studio.
+   *
+   * Returns true on successful trigger (reminder should be marked delivered).
+   * Returns false when the watchdog decides no action is needed — the heartbeat
+   * treats this as a failed delivery today, which re-runs the cron next tick.
+   * That's acceptable for now; the strategy will either become active again
+   * (next tick triggers) or be cancelled (watchdog reminder is cancelled).
+   */
+  async triggerWatchdog(groupId: string): Promise<boolean> {
+    const group = await this.dataComposer.repositories.taskGroups.findById(groupId);
+    if (!group) {
+      logger.warn(`Strategy watchdog: group ${groupId} not found, skipping`);
+      return false;
+    }
+    if (group.status !== 'active' || !group.strategy) {
+      logger.info(
+        `Strategy watchdog: group ${groupId} is ${group.status} (strategy=${group.strategy ?? 'null'}), skipping`
+      );
+      return false;
+    }
+
+    // Find the current in-progress task. If none, fall back to the next
+    // pending task at current_task_index.
+    const tasks = await this.getGroupTasks(groupId);
+    let currentTask = tasks.find((t) => t.status === 'in_progress') || null;
+    if (!currentTask) {
+      currentTask = await this.getTaskByOrder(groupId, group.current_task_index);
+    }
+    if (!currentTask) {
+      logger.info(
+        `Strategy watchdog: group ${groupId} has no in_progress or pending task, skipping`
+      );
+      return false;
+    }
+
+    return this.triggerOwnerAgent(group, currentTask, 'watchdog');
   }
 
   /**

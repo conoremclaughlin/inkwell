@@ -1085,4 +1085,255 @@ describe('StrategyService', () => {
       );
     });
   });
+
+  // ============================================================================
+  // triggerOwnerAgent (via startStrategy) and triggerWatchdog
+  // ============================================================================
+
+  describe('owner agent trigger routing', () => {
+    // Reuse getTaskByOrder-found chain pattern
+    function chainTaskFound(task: ProjectTask) {
+      return {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                }),
+              }),
+            }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      };
+    }
+
+    function chainGroupTasks(tasks: ProjectTask[]) {
+      return {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            order: vi.fn().mockReturnValue({
+              order: vi.fn().mockResolvedValue({ data: tasks, error: null }),
+            }),
+          }),
+        }),
+      };
+    }
+
+    function chainNoop() {
+      return {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              limit: vi.fn().mockReturnValue({
+                single: vi.fn().mockResolvedValue({ data: null, error: null }),
+              }),
+            }),
+            single: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      };
+    }
+
+    function setupChains(mockDc: ReturnType<typeof createMockDataComposer>, chains: object[]) {
+      let idx = 0;
+      const client = mockDc.getClient();
+      client.from.mockImplementation(() => chains[idx++] || chainNoop());
+    }
+
+    it('startStrategy fires a session_resume trigger to the owner agent with studioId', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+
+      const group = createMockGroup({
+        strategy: null,
+        owner_agent_id: 'wren',
+        thread_key: 'strategy:group-1',
+        metadata: { studioId: 'studio-uuid-omega', studioSlug: 'wren-omega' },
+      });
+      const updatedGroup = {
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+      };
+      const task = createMockTask({ id: 'task-1', title: 'Ship the migration' });
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
+      setupChains(dc, [chainTaskFound(task)]);
+
+      await service.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        ownerAgentId: 'wren',
+      });
+
+      expect(sendMock).toHaveBeenCalledTimes(1);
+      const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
+      const payload = call[0] as Record<string, unknown>;
+      expect(payload.recipientAgentId).toBe('wren');
+      expect(payload.senderAgentId).toBe('system');
+      expect(payload.messageType).toBe('session_resume');
+      expect(payload.trigger).toBe(true);
+      expect(payload.recipientStudioId).toBe('studio-uuid-omega');
+      expect(payload.recipientStudioSlug).toBeUndefined();
+      expect(payload.threadKey).toBe('strategy:group-1');
+      expect(payload.content).toContain('persistence strategy');
+      expect(payload.content).toContain('Ship the migration');
+      expect((payload.metadata as Record<string, unknown>).strategyTrigger).toBe(true);
+      expect((payload.metadata as Record<string, unknown>).reason).toBe('strategy_kickoff');
+    });
+
+    it('startStrategy falls back to studioSlug when no studioId is set', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+
+      const group = createMockGroup({
+        strategy: null,
+        owner_agent_id: 'wren',
+        metadata: { studioSlug: 'wren-omega' },
+      });
+      const updatedGroup = { ...group, strategy: 'persistence', status: 'active' };
+      const task = createMockTask();
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
+      setupChains(dc, [chainTaskFound(task)]);
+
+      await service.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        ownerAgentId: 'wren',
+      });
+
+      const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
+      const payload = call[0] as Record<string, unknown>;
+      expect(payload.recipientStudioId).toBeUndefined();
+      expect(payload.recipientStudioSlug).toBe('wren-omega');
+    });
+
+    it('startStrategy skips trigger when group has no owner_agent_id', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+
+      const group = createMockGroup({ strategy: null, owner_agent_id: null });
+      const updatedGroup = {
+        ...group,
+        strategy: 'persistence',
+        // owner_agent_id stays null because startStrategy passes ownerAgentId but
+        // for this test we're validating the triggerOwnerAgent no-op path; the
+        // service writes owner_agent_id=input.ownerAgentId. Force it back to null
+        // on the updated group to exercise the early-return.
+        owner_agent_id: null,
+        status: 'active',
+      };
+      const task = createMockTask();
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
+      setupChains(dc, [chainTaskFound(task)]);
+
+      await service.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        ownerAgentId: 'wren',
+      });
+
+      expect(sendMock).not.toHaveBeenCalled();
+    });
+
+    it('triggerWatchdog fires a trigger for an active strategy with an in-progress task', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+
+      const group = createMockGroup({
+        strategy: 'persistence',
+        status: 'active',
+        owner_agent_id: 'wren',
+        metadata: { studioId: 'studio-uuid-omega' },
+      });
+      const tasks = [
+        createMockTask({ id: 't1', status: 'completed', task_order: 0 }),
+        createMockTask({
+          id: 't2',
+          title: 'Current work',
+          status: 'in_progress',
+          task_order: 1,
+        }),
+        createMockTask({ id: 't3', status: 'pending', task_order: 2 }),
+      ];
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      setupChains(dc, [chainGroupTasks(tasks)]);
+
+      const fired = await service.triggerWatchdog('group-1');
+
+      expect(fired).toBe(true);
+      expect(sendMock).toHaveBeenCalledTimes(1);
+      const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
+      const payload = call[0] as Record<string, unknown>;
+      expect(payload.recipientAgentId).toBe('wren');
+      expect(payload.messageType).toBe('session_resume');
+      expect(payload.content).toContain('Current work');
+      expect((payload.metadata as Record<string, unknown>).reason).toBe('watchdog');
+    });
+
+    it('triggerWatchdog returns false when group is not active', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+
+      const group = createMockGroup({ strategy: 'persistence', status: 'paused' });
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+
+      const fired = await service.triggerWatchdog('group-1');
+
+      expect(fired).toBe(false);
+      expect(sendMock).not.toHaveBeenCalled();
+    });
+
+    it('triggerWatchdog returns false when group is not found', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(null);
+
+      const fired = await service.triggerWatchdog('group-missing');
+
+      expect(fired).toBe(false);
+      expect(sendMock).not.toHaveBeenCalled();
+    });
+
+    it('triggerWatchdog falls back to current_task_index when no in-progress task', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+
+      const group = createMockGroup({
+        strategy: 'persistence',
+        status: 'active',
+        owner_agent_id: 'wren',
+        current_task_index: 1,
+      });
+      const tasks = [
+        createMockTask({ id: 't1', status: 'completed', task_order: 0 }),
+        createMockTask({ id: 't2', status: 'pending', task_order: 1 }),
+      ];
+      const pendingTask = tasks[1];
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      // triggerWatchdog calls getGroupTasks first (no in_progress), then
+      // getTaskByOrder fallback which returns the pending task.
+      setupChains(dc, [chainGroupTasks(tasks), chainTaskFound(pendingTask)]);
+
+      const fired = await service.triggerWatchdog('group-1');
+
+      expect(fired).toBe(true);
+      const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
+      const payload = call[0] as Record<string, unknown>;
+      expect(payload.content).toContain(pendingTask.title);
+    });
+  });
 });

@@ -39,6 +39,7 @@ import {
   processHeartbeat,
   type DueReminder,
 } from './services/heartbeat';
+import { StrategyService } from './services/strategy.service';
 import { setResponseCallback, hasExplicitResponse } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
 import { resolveRouteAgentId } from './services/routing/resolve-route';
@@ -427,6 +428,39 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
    */
   const deliverReminderViaSession = async (reminder: DueReminder): Promise<boolean> => {
     const userId = reminder.user_id;
+
+    // Strategy watchdog branch: reminders created by StrategyService carry
+    // metadata.strategyWatchdog=true and route through the strategy service,
+    // which builds a task-aware prompt and dispatches to the owner agent in
+    // the assigned studio. Generic [HEARTBEAT REMINDER] content won't tell
+    // the target what task to work on, so we skip that path entirely.
+    const reminderMeta = reminder.metadata || {};
+    if (reminderMeta.strategyWatchdog === true && dataComposer) {
+      const groupId =
+        typeof reminderMeta.groupId === 'string' ? (reminderMeta.groupId as string) : null;
+      if (!groupId) {
+        logger.warn(
+          `[Heartbeat] strategyWatchdog reminder ${reminder.id} has no groupId in metadata, skipping`
+        );
+        return false;
+      }
+      try {
+        const strategyService = new StrategyService(dataComposer);
+        const fired = await strategyService.triggerWatchdog(groupId);
+        if (fired) {
+          logger.info(
+            `[Heartbeat] Strategy watchdog fired for group ${groupId} (reminder ${reminder.id})`
+          );
+        }
+        return fired;
+      } catch (err) {
+        logger.error(
+          `[Heartbeat] Strategy watchdog failed for group ${groupId} (reminder ${reminder.id}):`,
+          err
+        );
+        return false;
+      }
+    }
 
     // Resolve agent from reminder's identity_id, fall back to server default
     let reminderAgentId = agentId;

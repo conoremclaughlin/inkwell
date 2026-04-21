@@ -33,6 +33,7 @@ export interface DueReminder {
   run_count: number;
   max_runs: number | null;
   studio_hint: string | null;
+  metadata: Record<string, unknown> | null;
 }
 
 interface HeartbeatConfig {
