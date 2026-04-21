@@ -291,10 +291,12 @@ import {
   handleStartStrategy,
   handlePauseStrategy,
   handleResumeStrategy,
+  handleCancelStrategy,
   handleGetStrategyStatus,
   startStrategySchema,
   pauseStrategySchema,
   resumeStrategySchema,
+  cancelStrategySchema,
   getStrategyStatusSchema,
 } from './strategy-handlers';
 
@@ -1190,6 +1192,35 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleResumeStrategy(args, dataComposer);
       } catch (error) {
         logger.error('Error in resume_strategy:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'cancel_strategy',
+    {
+      description: `Cancel an active or paused strategy on a task group. Transitions the group to the terminal 'cancelled' state, cancels the watchdog reminder, and logs the optional reason to the activity stream. Cannot be called on groups that are already completed or cancelled. Tasks themselves are not modified — cancelling the strategy stops autonomous progression but leaves task records intact for audit.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: cancelStrategySchema.shape,
+    },
+    async (args) => {
+      try {
+        return await handleCancelStrategy(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in cancel_strategy:', error);
         return {
           content: [
             {

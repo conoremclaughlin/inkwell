@@ -516,6 +516,35 @@ export class StrategyService {
   }
 
   /**
+   * Cancel a strategy. Transitions a non-terminal group to the `cancelled`
+   * terminal state, cancels the watchdog, and logs a reason. Idempotent-adjacent:
+   * already-cancelled groups throw; completed groups throw (they're terminal).
+   */
+  async cancelStrategy(groupId: string, userId: string, reason?: string): Promise<TaskGroup> {
+    const group = await this.dataComposer.repositories.taskGroups.findById(groupId);
+    if (!group) throw new Error('Task group not found');
+    if (group.user_id !== userId) throw new Error('Task group does not belong to this user');
+    if (group.status === 'completed') throw new Error('Strategy is already completed');
+    if (group.status === 'cancelled') throw new Error('Strategy is already cancelled');
+
+    await this.cancelWatchdogReminder(groupId);
+
+    const summary = reason
+      ? `Strategy cancelled on "${group.title}": ${reason}`
+      : `Strategy cancelled on "${group.title}"`;
+
+    await this.logStrategyEvent(group, 'strategy_cancelled', summary, {
+      reason: reason || null,
+      previousStatus: group.status,
+    });
+
+    return this.dataComposer.repositories.taskGroups.update(groupId, {
+      status: 'cancelled',
+      strategy_paused_at: null,
+    });
+  }
+
+  /**
    * Get comprehensive strategy status with human-friendly summary.
    */
   async getStrategyStatus(groupId: string, userId: string): Promise<StrategyStatus> {

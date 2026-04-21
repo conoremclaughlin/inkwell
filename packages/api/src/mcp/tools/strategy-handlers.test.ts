@@ -11,6 +11,7 @@ import {
   handleStartStrategy,
   handlePauseStrategy,
   handleResumeStrategy,
+  handleCancelStrategy,
   handleGetStrategyStatus,
 } from './strategy-handlers';
 
@@ -23,6 +24,7 @@ const mocks = vi.hoisted(() => ({
   startStrategy: vi.fn(),
   pauseStrategy: vi.fn(),
   resumeStrategy: vi.fn(),
+  cancelStrategy: vi.fn(),
   getStrategyStatus: vi.fn(),
 }));
 
@@ -32,6 +34,7 @@ vi.mock('../../services/strategy.service', () => ({
     startStrategy = mocks.startStrategy;
     pauseStrategy = mocks.pauseStrategy;
     resumeStrategy = mocks.resumeStrategy;
+    cancelStrategy = mocks.cancelStrategy;
     getStrategyStatus = mocks.getStrategyStatus;
   },
 }));
@@ -312,6 +315,65 @@ describe('handleResumeStrategy', () => {
     const data = parseResponse(response);
     expect(response.isError).toBe(true);
     expect(data.error).toBe('Strategy is not paused');
+  });
+});
+
+describe('handleCancelStrategy', () => {
+  let dc: ReturnType<typeof createMockDataComposer>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dc = createMockDataComposer();
+    resolveUserMock.mockResolvedValue({
+      user: { id: 'user-123' } as any,
+      resolvedBy: 'userId',
+    });
+  });
+
+  it('should cancel strategy and pass reason to service', async () => {
+    mocks.cancelStrategy.mockResolvedValue({
+      id: 'group-1',
+      title: 'My Strategy',
+      status: 'cancelled',
+      strategy: 'persistence',
+    });
+
+    const response = await handleCancelStrategy(
+      { userId: 'user-123', groupId: 'group-1', reason: 'scope changed' },
+      dc
+    );
+
+    const data = parseResponse(response);
+    expect(data.success).toBe(true);
+    expect(data.status).toBe('cancelled');
+    expect(data.reason).toBe('scope changed');
+    expect(mocks.cancelStrategy).toHaveBeenCalledWith('group-1', 'user-123', 'scope changed');
+  });
+
+  it('should work without a reason', async () => {
+    mocks.cancelStrategy.mockResolvedValue({
+      id: 'group-1',
+      title: 'My Strategy',
+      status: 'cancelled',
+      strategy: 'persistence',
+    });
+
+    const response = await handleCancelStrategy({ userId: 'user-123', groupId: 'group-1' }, dc);
+
+    const data = parseResponse(response);
+    expect(data.success).toBe(true);
+    expect(data.reason).toBeNull();
+    expect(mocks.cancelStrategy).toHaveBeenCalledWith('group-1', 'user-123', undefined);
+  });
+
+  it('should return error when strategy is already completed', async () => {
+    mocks.cancelStrategy.mockRejectedValue(new Error('Strategy is already completed'));
+
+    const response = await handleCancelStrategy({ userId: 'user-123', groupId: 'group-1' }, dc);
+
+    const data = parseResponse(response);
+    expect(response.isError).toBe(true);
+    expect(data.error).toBe('Strategy is already completed');
   });
 });
 
