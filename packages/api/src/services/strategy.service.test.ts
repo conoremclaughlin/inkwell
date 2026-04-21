@@ -307,6 +307,87 @@ describe('StrategyService', () => {
     });
   });
 
+  describe('cancelStrategy', () => {
+    it('should cancel an active strategy, log reason, and set status=cancelled', async () => {
+      const group = createMockGroup({ status: 'active' });
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({ ...group, status: 'cancelled' });
+
+      const result = await service.cancelStrategy('group-1', 'user-123', 'blocked by upstream');
+
+      expect(result.status).toBe('cancelled');
+      expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith('group-1', {
+        status: 'cancelled',
+        strategy_paused_at: null,
+      });
+      expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({
+          subtype: 'strategy_cancelled',
+          taskGroupId: 'group-1',
+          content: expect.stringContaining('blocked by upstream'),
+          payload: expect.objectContaining({
+            reason: 'blocked by upstream',
+            previousStatus: 'active',
+          }),
+        })
+      );
+    });
+
+    it('should cancel a paused strategy without a reason', async () => {
+      const group = createMockGroup({ status: 'paused' });
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({ ...group, status: 'cancelled' });
+
+      const result = await service.cancelStrategy('group-1', 'user-123');
+
+      expect(result.status).toBe('cancelled');
+      expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({
+          subtype: 'strategy_cancelled',
+          payload: expect.objectContaining({
+            reason: null,
+            previousStatus: 'paused',
+          }),
+        })
+      );
+    });
+
+    it('should reject if already completed', async () => {
+      const group = createMockGroup({ status: 'completed' });
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+
+      await expect(service.cancelStrategy('group-1', 'user-123')).rejects.toThrow(
+        'already completed'
+      );
+      expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
+    });
+
+    it('should reject if already cancelled', async () => {
+      const group = createMockGroup({ status: 'cancelled' });
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+
+      await expect(service.cancelStrategy('group-1', 'user-123')).rejects.toThrow(
+        'already cancelled'
+      );
+      expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
+    });
+
+    it('should reject if group not found', async () => {
+      dc.repositories.taskGroups.findById.mockResolvedValue(null);
+
+      await expect(service.cancelStrategy('group-1', 'user-123')).rejects.toThrow('not found');
+    });
+
+    it('should reject if user does not own the group', async () => {
+      const group = createMockGroup({ status: 'active', user_id: 'someone-else' });
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+
+      await expect(service.cancelStrategy('group-1', 'user-123')).rejects.toThrow(
+        'does not belong'
+      );
+    });
+  });
+
   describe('getStrategyStatus', () => {
     it('should return comprehensive status with human-friendly summary', async () => {
       const group = createMockGroup({

@@ -248,6 +248,52 @@ export async function handleResumeStrategy(
 }
 
 // ============================================================================
+// CANCEL STRATEGY
+// ============================================================================
+
+export const cancelStrategySchema = z.object({
+  ...userIdentifierSchema.shape,
+  groupId: z.string().uuid().describe('Task group ID to cancel'),
+  reason: z
+    .string()
+    .max(500)
+    .optional()
+    .describe('Human-readable reason for cancellation (logged to activity stream)'),
+});
+
+export async function handleCancelStrategy(
+  args: z.infer<typeof cancelStrategySchema>,
+  dataComposer: DataComposer
+): Promise<McpResponse> {
+  try {
+    const resolved = await resolveUser(args as UserIdentifier, dataComposer);
+    if (!resolved) {
+      return mcpResponse({ success: false, error: 'User not found' }, true);
+    }
+
+    const service = new StrategyService(dataComposer);
+    const group = await service.cancelStrategy(args.groupId, resolved.user.id, args.reason);
+
+    return mcpResponse({
+      success: true,
+      groupId: group.id,
+      title: group.title,
+      status: group.status,
+      strategy: group.strategy,
+      reason: args.reason || null,
+    });
+  } catch (error) {
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to cancel strategy',
+      },
+      true
+    );
+  }
+}
+
+// ============================================================================
 // GET STRATEGY STATUS
 // ============================================================================
 
