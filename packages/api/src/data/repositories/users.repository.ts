@@ -10,9 +10,13 @@ export class UsersRepository extends BaseRepository {
 
   async findById(id: string): Promise<User | null> {
     try {
-      const { data, error } = await this.client.from('users').select('*').eq('id', id).single();
+      const { data, error, status } = await this.client
+        .from('users')
+        .select('*')
+        .eq('id', id)
+        .single();
 
-      if (error && error.code !== 'PGRST116') throw error; // PGRST116 is "not found"
+      if (error && error.code !== 'PGRST116') throw this.preserveStatus(error, status);
       return data;
     } catch (error) {
       this.handleError(error, 'findById');
@@ -21,13 +25,13 @@ export class UsersRepository extends BaseRepository {
 
   async findByTelegramId(telegramId: number): Promise<User | null> {
     try {
-      const { data, error } = await this.client
+      const { data, error, status } = await this.client
         .from('users')
         .select('*')
         .eq('telegram_id', telegramId)
         .single();
 
-      if (error && error.code !== 'PGRST116') throw error; // PGRST116 is "not found"
+      if (error && error.code !== 'PGRST116') throw this.preserveStatus(error, status);
       return data;
     } catch (error) {
       this.handleError(error, 'findByTelegramId');
@@ -36,13 +40,13 @@ export class UsersRepository extends BaseRepository {
 
   async findByEmail(email: string): Promise<User | null> {
     try {
-      const { data, error } = await this.client
+      const { data, error, status } = await this.client
         .from('users')
         .select('*')
         .eq('email', email)
         .single();
 
-      if (error && error.code !== 'PGRST116') throw error;
+      if (error && error.code !== 'PGRST116') throw this.preserveStatus(error, status);
       return data;
     } catch (error) {
       this.handleError(error, 'findByEmail');
@@ -51,13 +55,13 @@ export class UsersRepository extends BaseRepository {
 
   async findByPhoneNumber(phoneNumber: string): Promise<User | null> {
     try {
-      const { data, error } = await this.client
+      const { data, error, status } = await this.client
         .from('users')
         .select('*')
         .eq('phone_number', phoneNumber)
         .single();
 
-      if (error && error.code !== 'PGRST116') throw error;
+      if (error && error.code !== 'PGRST116') throw this.preserveStatus(error, status);
       return data;
     } catch (error) {
       this.handleError(error, 'findByPhoneNumber');
@@ -66,13 +70,13 @@ export class UsersRepository extends BaseRepository {
 
   async findByWhatsAppId(whatsappId: string): Promise<User | null> {
     try {
-      const { data, error } = await this.client
+      const { data, error, status } = await this.client
         .from('users')
         .select('*')
         .eq('whatsapp_id', whatsappId)
         .single();
 
-      if (error && error.code !== 'PGRST116') throw error;
+      if (error && error.code !== 'PGRST116') throw this.preserveStatus(error, status);
       return data;
     } catch (error) {
       this.handleError(error, 'findByWhatsAppId');
@@ -81,13 +85,13 @@ export class UsersRepository extends BaseRepository {
 
   async findByDiscordId(discordId: string): Promise<User | null> {
     try {
-      const { data, error } = await this.client
+      const { data, error, status } = await this.client
         .from('users')
         .select('*')
         .eq('discord_id', discordId)
         .single();
 
-      if (error && error.code !== 'PGRST116') throw error;
+      if (error && error.code !== 'PGRST116') throw this.preserveStatus(error, status);
       return data;
     } catch (error) {
       this.handleError(error, 'findByDiscordId');
@@ -96,13 +100,13 @@ export class UsersRepository extends BaseRepository {
 
   async findBySlackId(slackId: string): Promise<User | null> {
     try {
-      const { data, error } = await this.client
+      const { data, error, status } = await this.client
         .from('users')
         .select('*')
         .eq('slack_id', slackId)
         .single();
 
-      if (error && error.code !== 'PGRST116') throw error;
+      if (error && error.code !== 'PGRST116') throw this.preserveStatus(error, status);
       return data;
     } catch (error) {
       this.handleError(error, 'findBySlackId');
