@@ -233,9 +233,9 @@ export class SessionService implements ISessionService {
         repoRoot: metadata?.repoRoot,
       });
 
-      // 2. Log session routing for external channels (Telegram/WhatsApp/Discord)
+      // 2. Log session routing for external + heartbeat channels
       // so we can verify messages and heartbeats land in the same session.
-      const isExternalChannel = ['telegram', 'whatsapp', 'discord', 'slack'].includes(
+      const isExternalChannel = ['telegram', 'whatsapp', 'discord', 'slack', 'heartbeat'].includes(
         request.channel
       );
       if (isExternalChannel) {

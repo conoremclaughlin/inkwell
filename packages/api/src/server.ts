@@ -550,7 +550,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     const request: SessionRequest = {
       userId,
       agentId: reminderAgentId,
-      channel: 'agent',
+      channel: 'heartbeat',
       conversationId: `heartbeat:${reminder.id}`,
       sender: { id: 'system', name: 'heartbeat' },
       content: reminderContent,
