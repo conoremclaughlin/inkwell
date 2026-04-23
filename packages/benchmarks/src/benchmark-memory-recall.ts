@@ -2,6 +2,11 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createSupabaseClient, MemoryRepository } from '@inklabs/api/benchmarks';
+import {
+  buildRepresentationKey,
+  parseBenchmarkPhase,
+  slugify,
+} from './benchmark-memory-recall.config';
 import { getBenchmarkDataset } from './benchmark-data/datasets';
 import { loadHfBenchmarkDataset } from './benchmark-data/hf-loader';
 import { loadLoCoMoDataset } from './benchmark-data/locomo-loader';
@@ -58,7 +63,6 @@ const BENCHMARK_AGENT_ID = 'lumen';
 const DEFAULT_DATASET = 'internal-gold-v1';
 const RETRY_ATTEMPTS = 3;
 const DEFAULT_PROGRESS_EVERY = 25;
-type BenchmarkPhase = 'all' | 'seed' | 'recall';
 
 function parseModes(raw?: string): RecallMode[] {
   if (!raw) return ['text', 'semantic', 'hybrid'];
@@ -88,35 +92,6 @@ function parsePositiveInt(raw: string | undefined, defaultValue: number): number
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed <= 0) return defaultValue;
   return Math.floor(parsed);
-}
-
-function parseBenchmarkPhase(raw?: string): BenchmarkPhase {
-  const normalized = raw?.trim().toLowerCase();
-  if (normalized === 'seed' || normalized === 'recall' || normalized === 'all') return normalized;
-  return 'all';
-}
-
-function slugify(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 80);
-}
-
-function buildRepresentationKey(): string {
-  const parts = [
-    'chunked',
-    process.env.MEMORY_EMBEDDINGS_ENABLED || 'default',
-    process.env.MEMORY_EMBEDDING_PROVIDER || 'default',
-    process.env.MEMORY_EMBEDDING_MODEL || 'default',
-    process.env.MEMORY_LLM_EXTRACTION_ENABLED || 'false',
-    process.env.MEMORY_LLM_ENTITY_ENABLED || 'false',
-    process.env.MEMORY_LLM_DURABLE_FACT_ENABLED || 'false',
-    process.env.MEMORY_LLM_SUMMARY_ENABLED || 'false',
-    process.env.MEMORY_LLM_CURRENT_STATE_ENABLED || 'false',
-  ];
-  return slugify(parts.join('-'));
 }
 
 function sleep(ms: number): Promise<void> {
@@ -342,6 +317,15 @@ async function main() {
     process.env.MEMORY_BENCHMARK_SEED_PATH ||
     resolve(process.cwd(), 'output', 'memory-benchmarks', `${seedId}.seed.json`);
   const existingSeedState = await loadBenchmarkSeedState(seedPath);
+  if (
+    existingSeedState?.representationKey !== undefined &&
+    existingSeedState.representationKey !== representationKey
+  ) {
+    console.warn(
+      `[memory-benchmark] loaded seed has representationKey=${existingSeedState.representationKey} ` +
+        `but current config is ${representationKey}. Results may not reflect current memory pipeline.`
+    );
+  }
   const existingState = await loadBenchmarkRunState(statePath);
   const reuseSeeded = parseBoolean(
     process.env.MEMORY_BENCHMARK_REUSE_SEEDED,

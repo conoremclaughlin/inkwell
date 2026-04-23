@@ -19,6 +19,7 @@ const MIN_FACT_SENTENCE_CHARS = 48;
 const MAX_FACT_SENTENCE_CHARS = 280;
 
 export type MemoryChunkType = 'summary' | 'fact' | 'topic' | 'entity' | 'current_state' | 'content';
+export type MemoryExtractionChunkMode = 'heuristic' | 'llm' | 'merged';
 const CHUNK_TYPE_ORDER: MemoryChunkType[] = [
   'summary',
   'fact',
@@ -352,31 +353,33 @@ export function buildMemoryEmbeddingChunks(params: {
   salience?: string | null;
   model?: VettedEmbeddingModel | null;
   llmExtractions?: MemoryExtractions | Record<string, unknown> | null;
+  extractionMode?: MemoryExtractionChunkMode;
 }): MemoryEmbeddingChunk[] {
   const { summary, content, topicKey, topics, source, salience, model = null } = params;
   const maxChars = pickMaxChunkChars(model);
   const chunks: MemoryEmbeddingChunk[] = [];
   const llmExtractions = normalizeMemoryExtractions(params.llmExtractions);
+  const extractionMode = params.extractionMode || 'heuristic';
+  const includeHeuristic = extractionMode === 'heuristic' || extractionMode === 'merged';
+  const includeLlm = extractionMode === 'llm' || extractionMode === 'merged';
 
   const extractedSummaryTexts = llmExtractions?.summary
     ? buildSummaryEmbeddingTexts(llmExtractions.summary)
     : [];
   const normalizedSummary = summary?.trim();
-  const summaryTexts =
-    extractedSummaryTexts.length > 0
-      ? extractedSummaryTexts
-      : normalizedSummary
-        ? [normalizedSummary]
-        : [];
+  const summaryTexts = [
+    ...(includeLlm ? extractedSummaryTexts : []),
+    ...(includeHeuristic && normalizedSummary ? [normalizedSummary] : []),
+  ];
   chunks.push(...reindexChunks(buildChunksFromTexts('summary', summaryTexts), chunks.length));
 
   const durableFactTexts = llmExtractions?.durable_fact
     ? buildDurableFactEmbeddingTexts(llmExtractions.durable_fact)
     : [];
-  const factChunks =
-    durableFactTexts.length > 0
-      ? buildChunksFromTexts('fact', durableFactTexts)
-      : buildFactChunks(`${normalizedSummary || ''}\n${content}`);
+  const factChunks = [
+    ...(includeLlm ? buildChunksFromTexts('fact', durableFactTexts) : []),
+    ...(includeHeuristic ? buildFactChunks(`${normalizedSummary || ''}\n${content}`) : []),
+  ];
   chunks.push(...reindexChunks(factChunks, chunks.length));
   chunks.push(
     ...reindexChunks(buildTopicChunks({ topicKey, topics, source, salience }), chunks.length)
@@ -385,18 +388,20 @@ export function buildMemoryEmbeddingChunks(params: {
   const entityTexts = llmExtractions?.entity
     ? buildEntityEmbeddingTexts(llmExtractions.entity)
     : [];
-  const entityChunks =
-    entityTexts.length > 0
-      ? buildChunksFromTexts('entity', entityTexts)
-      : buildEntityChunks({ summary, content, topicKey, topics });
+  const entityChunks = [
+    ...(includeLlm ? buildChunksFromTexts('entity', entityTexts) : []),
+    ...(includeHeuristic ? buildEntityChunks({ summary, content, topicKey, topics }) : []),
+  ];
   chunks.push(...reindexChunks(entityChunks, chunks.length));
 
   const currentStateTexts = llmExtractions?.current_state
     ? buildCurrentStateEmbeddingTexts(llmExtractions.current_state)
     : [];
-  chunks.push(
-    ...reindexChunks(buildChunksFromTexts('current_state', currentStateTexts), chunks.length)
-  );
+  if (includeLlm) {
+    chunks.push(
+      ...reindexChunks(buildChunksFromTexts('current_state', currentStateTexts), chunks.length)
+    );
+  }
   chunks.push(
     ...reindexChunks(buildContentChunks(content, maxChars, DEFAULT_OVERLAP_CHARS), chunks.length)
   );
