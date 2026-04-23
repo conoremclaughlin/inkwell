@@ -3,13 +3,25 @@ import type { Database } from '../data/supabase/types';
 import { appendFile, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import {
+  buildExtractionPrompt,
   buildCurrentStateEmbeddingTexts,
   buildDurableFactEmbeddingTexts,
   buildEntityEmbeddingTexts,
   buildSummaryEmbeddingTexts,
   MemoryLlmExtractor,
+  durableFactExtractionSchema,
+  entityExtractionSchema,
+  currentStateExtractionSchema,
+  summaryExtractionSchema,
+  normalizeMemoryExtractions,
+  MEMORY_EXTRACTION_VERSION,
+  type ExtractionKind,
+  type MemoryExtractionSource,
   type MemoryExtractions,
 } from '../services/memory-llm-extraction';
+import { ClaudeRunner, CodexRunner } from '../services/sessions';
+import type { ClaudeRunnerConfig, IRunner } from '../services/sessions/types';
+import { env } from '../config/env';
 
 type MemoryRow = Database['public']['Tables']['memories']['Row'];
 
@@ -39,6 +51,166 @@ function buildExtractionEmbeddingTexts(
   };
 }
 
+function getEnabledKinds(): ExtractionKind[] {
+  const enabledKinds: ExtractionKind[] = [];
+  if (env.MEMORY_LLM_ENTITY_ENABLED) enabledKinds.push('entity');
+  if (env.MEMORY_LLM_DURABLE_FACT_ENABLED) enabledKinds.push('durable_fact');
+  if (env.MEMORY_LLM_SUMMARY_ENABLED) enabledKinds.push('summary');
+  if (env.MEMORY_LLM_CURRENT_STATE_ENABLED) enabledKinds.push('current_state');
+  return enabledKinds;
+}
+
+function extractJsonObject(text: string): string {
+  const trimmed = text.trim();
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) return trimmed;
+  const firstBrace = trimmed.indexOf('{');
+  const lastBrace = trimmed.lastIndexOf('}');
+  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+    throw new Error('runner extraction response did not contain a JSON object');
+  }
+  return trimmed.slice(firstBrace, lastBrace + 1);
+}
+
+function parseKindPayload(kind: ExtractionKind, raw: unknown): MemoryExtractions[ExtractionKind] {
+  switch (kind) {
+    case 'entity':
+      return entityExtractionSchema.parse(raw);
+    case 'durable_fact':
+      return durableFactExtractionSchema.parse(raw);
+    case 'summary':
+      return summaryExtractionSchema.parse(raw);
+    case 'current_state':
+      return currentStateExtractionSchema.parse(raw);
+  }
+}
+
+function clampText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}
+
+function sanitizeSourceForRunner(source: MemoryExtractionSource): MemoryExtractionSource {
+  return {
+    ...source,
+    summary: source.summary
+      ? clampText(source.summary, Math.min(env.MEMORY_LLM_MAX_INPUT_CHARS, 2000))
+      : source.summary,
+    content: clampText(source.content, env.MEMORY_LLM_MAX_INPUT_CHARS),
+  };
+}
+
+class RunnerBackedMemoryExtractor {
+  private readonly enabledKinds = getEnabledKinds();
+  private readonly runner: IRunner;
+  private readonly backend: 'claude' | 'codex';
+  private readonly config: ClaudeRunnerConfig;
+
+  constructor(backend: 'claude' | 'codex') {
+    this.backend = backend;
+    this.runner = backend === 'claude' ? new ClaudeRunner() : new CodexRunner();
+    this.config = {
+      workingDirectory: process.env.MEMORY_LLM_EXTRACT_WORKING_DIRECTORY || process.cwd(),
+      mcpConfigPath: process.env.MEMORY_LLM_EXTRACT_MCP_CONFIG_PATH || '',
+      ...(env.MEMORY_LLM_MODEL ? { model: env.MEMORY_LLM_MODEL } : {}),
+      systemPrompt:
+        'You are a deterministic memory extraction worker. Do not use tools. Return only strict JSON matching the requested schema.',
+      sandboxBypass: false,
+    };
+  }
+
+  isEnabled(): boolean {
+    return env.MEMORY_LLM_EXTRACTION_ENABLED && this.enabledKinds.length > 0;
+  }
+
+  getEnabledKinds(): ExtractionKind[] {
+    return [...this.enabledKinds];
+  }
+
+  async extract(source: MemoryExtractionSource): Promise<MemoryExtractions | null> {
+    if (!this.isEnabled()) return null;
+    const sanitizedSource = sanitizeSourceForRunner(source);
+    const payload: Partial<MemoryExtractions> = {
+      version: MEMORY_EXTRACTION_VERSION,
+      provider: `runner:${this.backend}`,
+      model: env.MEMORY_LLM_MODEL || this.backend,
+      extractedAt: new Date().toISOString(),
+    };
+
+    for (const kind of this.enabledKinds) {
+      const result = await this.extractKind(kind, sanitizedSource);
+      if (!result) continue;
+      switch (kind) {
+        case 'entity':
+          payload.entity = result as MemoryExtractions['entity'];
+          break;
+        case 'durable_fact':
+          payload.durable_fact = result as MemoryExtractions['durable_fact'];
+          break;
+        case 'summary':
+          payload.summary = result as MemoryExtractions['summary'];
+          break;
+        case 'current_state':
+          payload.current_state = result as MemoryExtractions['current_state'];
+          break;
+      }
+    }
+
+    const normalized = normalizeMemoryExtractions(payload);
+    return normalized &&
+      Object.keys(normalized).some((key) =>
+        ['entity', 'durable_fact', 'summary', 'current_state'].includes(key)
+      )
+      ? normalized
+      : null;
+  }
+
+  private async extractKind(
+    kind: ExtractionKind,
+    source: MemoryExtractionSource
+  ): Promise<MemoryExtractions[ExtractionKind] | null> {
+    const prompt = buildExtractionPrompt(source, kind);
+    const message = [
+      prompt.systemPrompt,
+      prompt.schemaDescription,
+      '',
+      'Return only the JSON object. Do not wrap it in Markdown. Do not call tools.',
+      '',
+      prompt.userPrompt,
+    ].join('\n');
+    const result = await this.runner.run(message, { config: this.config });
+    if (!result.success) {
+      console.warn(
+        `[memory-llm-extract] runner backend=${this.backend} kind=${kind} failed: ${result.error || 'unknown error'}`
+      );
+      return null;
+    }
+
+    const content =
+      result.finalTextResponse ||
+      result.responses
+        .map((response) => response.content)
+        .filter(Boolean)
+        .join('\n');
+    if (!content.trim()) {
+      console.warn(
+        `[memory-llm-extract] runner backend=${this.backend} kind=${kind} returned no text`
+      );
+      return null;
+    }
+
+    try {
+      return parseKindPayload(kind, JSON.parse(extractJsonObject(content)));
+    } catch (error) {
+      console.warn(
+        `[memory-llm-extract] runner backend=${this.backend} kind=${kind} returned invalid JSON: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      return null;
+    }
+  }
+}
+
 async function main() {
   const userId = process.env.MEMORY_LLM_EXTRACT_USER_ID || process.env.BENCHMARK_USER_ID;
   if (!userId) {
@@ -59,7 +231,14 @@ async function main() {
       `memory-llm-extract-${Date.now()}.jsonl`
     );
 
-  const extractor = new MemoryLlmExtractor();
+  const backend = (process.env.MEMORY_LLM_EXTRACT_BACKEND || 'direct').trim().toLowerCase();
+  if (!['direct', 'claude', 'codex'].includes(backend)) {
+    throw new Error('MEMORY_LLM_EXTRACT_BACKEND must be one of: direct, claude, codex');
+  }
+  const extractor =
+    backend === 'claude' || backend === 'codex'
+      ? new RunnerBackedMemoryExtractor(backend)
+      : new MemoryLlmExtractor();
   if (!extractor.isEnabled()) {
     throw new Error(
       'Memory LLM extraction is disabled. Set MEMORY_LLM_EXTRACTION_ENABLED=true and at least one per-type flag.'
@@ -78,6 +257,7 @@ async function main() {
       offset,
       dryRun,
       force,
+      backend,
       enabledKinds: extractor.getEnabledKinds(),
       startedAt: new Date().toISOString(),
     })}\n`
@@ -173,7 +353,7 @@ async function main() {
       })}\n`
     );
     console.log(
-      `[memory-llm-extract] ${dryRun ? 'dry-run ' : ''}extracted memory=${row.id} kinds=${extractor.getEnabledKinds().join(',')}`
+      `[memory-llm-extract] ${dryRun ? 'dry-run ' : ''}extracted memory=${row.id} backend=${backend} kinds=${extractor.getEnabledKinds().join(',')}`
     );
   }
 
@@ -185,12 +365,13 @@ async function main() {
       extracted,
       skipped,
       dryRun,
+      backend,
       completedAt: new Date().toISOString(),
     })}\n`
   );
 
   console.log(
-    `[memory-llm-extract] complete loaded=${rows.length} extracted=${extracted} skipped=${skipped} dryRun=${dryRun} auditOutput=${outputPath}`
+    `[memory-llm-extract] complete loaded=${rows.length} extracted=${extracted} skipped=${skipped} dryRun=${dryRun} backend=${backend} auditOutput=${outputPath}`
   );
 }
 
