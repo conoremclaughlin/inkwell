@@ -28,19 +28,21 @@ function parsePositiveInt(raw: string | undefined, defaultValue: number): number
 }
 
 async function main() {
-  const userId = process.env.BACKFILL_MEMORY_USER_ID;
+  const userId = process.env.BACKFILL_MEMORY_USER_ID || process.env.BENCHMARK_USER_ID;
   if (!userId) {
     throw new Error(
-      'BACKFILL_MEMORY_USER_ID is required. Example: BACKFILL_MEMORY_USER_ID=<uuid> yarn backfill:memory-embeddings'
+      'BACKFILL_MEMORY_USER_ID or BENCHMARK_USER_ID is required. Example: BACKFILL_MEMORY_USER_ID=<uuid> yarn backfill:memory-embeddings'
     );
   }
 
   const agentId = process.env.BACKFILL_MEMORY_AGENT_ID;
+  const topic = process.env.BACKFILL_MEMORY_TOPIC;
   const batchSize = parsePositiveInt(process.env.BACKFILL_MEMORY_BATCH_SIZE, DEFAULT_BATCH_SIZE);
   const limit = process.env.BACKFILL_MEMORY_LIMIT
     ? parsePositiveInt(process.env.BACKFILL_MEMORY_LIMIT, batchSize)
     : null;
   const dryRun = parseBoolean(process.env.BACKFILL_MEMORY_DRY_RUN, false);
+  const force = parseBoolean(process.env.MEMORY_EMBEDDINGS_FORCE, false);
 
   const router = new EmbeddingRouter();
   if (!router.isEnabled()) {
@@ -58,6 +60,12 @@ async function main() {
   let skipped = 0;
   let scanned = 0;
 
+  console.log(
+    `[memory-embedding-backfill] user=${userId} agent=${agentId || '*'} topic=${topic || '*'} ` +
+      `limit=${limit ?? 'all'} batchSize=${batchSize} force=${force} dryRun=${dryRun} ` +
+      `mode=${env.MEMORY_EXTRACTION_MODE} chunkVersion=${MEMORY_EMBEDDING_CHUNKS_VERSION}`
+  );
+
   while (limit === null || scanned < limit) {
     const remaining = limit === null ? batchSize : Math.min(batchSize, limit - scanned);
     if (remaining <= 0) break;
@@ -65,7 +73,7 @@ async function main() {
     let query = supabase
       .from('memories')
       .select(
-        'id,user_id,agent_id,content,summary,metadata,embedding,embedding_chunks_version,embedding_chunk_count'
+        'id,user_id,agent_id,content,summary,topic_key,topics,source,salience,metadata,embedding,embedding_chunks_version,embedding_chunk_count'
       )
       .eq('user_id', userId)
       .order('created_at', { ascending: true })
@@ -73,6 +81,10 @@ async function main() {
 
     if (agentId) {
       query = query.eq('agent_id', agentId);
+    }
+
+    if (topic?.trim()) {
+      query = query.contains('topics', [topic.trim()]);
     }
 
     const { data, error } = await query;
@@ -87,6 +99,10 @@ async function main() {
       | 'agent_id'
       | 'content'
       | 'summary'
+      | 'topic_key'
+      | 'topics'
+      | 'source'
+      | 'salience'
       | 'metadata'
       | 'embedding'
       | 'embedding_chunks_version'
@@ -98,9 +114,6 @@ async function main() {
 
     for (const row of rows) {
       processed += 1;
-      const force = ['1', 'true', 'yes', 'on'].includes(
-        (process.env.MEMORY_EMBEDDINGS_FORCE || '').toLowerCase()
-      );
       const hasCurrentChunks =
         row.embedding_chunks_version === MEMORY_EMBEDDING_CHUNKS_VERSION &&
         (row.embedding_chunk_count || 0) > 0;
@@ -216,7 +229,7 @@ async function main() {
   }
 
   console.log(
-    `Backfill complete. scanned=${scanned} processed=${processed} updated=${updated} skipped=${skipped} dryRun=${dryRun}`
+    `[memory-embedding-backfill] complete scanned=${scanned} processed=${processed} updated=${updated} skipped=${skipped} dryRun=${dryRun}`
   );
 }
 
