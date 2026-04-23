@@ -1278,7 +1278,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
                 eq: vi.fn().mockReturnValue({
                   eq: vi.fn().mockReturnValue({
                     maybeSingle: vi.fn().mockResolvedValue({
-                      data: { id: 'identity-abc' },
+                      data: { id: 'identity-abc', metadata: {} },
                       error: null,
                     }),
                   }),
@@ -1286,7 +1286,14 @@ describe('admin endpoint handlers (no-500 regression)', () => {
               }),
             }),
             update: vi.fn().mockReturnValue({
-              eq: vi.fn().mockResolvedValue({ data: null, error: null }),
+              eq: vi.fn().mockReturnValue({
+                select: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({
+                    data: { sandbox_bypass: true, backend: null, metadata: {} },
+                    error: null,
+                  }),
+                }),
+              }),
             }),
           };
         }

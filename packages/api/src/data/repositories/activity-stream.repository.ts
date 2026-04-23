@@ -70,6 +70,8 @@ export interface LogActivityInput {
   artifactId?: string;
   childSessionId?: string;
   status?: ActivityStatus;
+  /** Link to task group for strategy event correlation */
+  taskGroupId?: string;
 }
 
 export interface LogMessageInput {
@@ -147,7 +149,8 @@ export class ActivityStreamRepository {
         artifact_id: input.artifactId,
         child_session_id: input.childSessionId,
         status: input.status || 'completed',
-      })
+        task_group_id: input.taskGroupId,
+      } as never)
       .select()
       .single();
 

@@ -78,6 +78,7 @@ interface AgentRoutingResponse {
     backend: string | null;
     studioHint: string;
     sandboxBypass: boolean;
+    sessionScope: string;
     updatedAt: string;
   };
   studios: AgentStudio[];
@@ -287,7 +288,8 @@ export default function AgentRoutingPage() {
               <CardTitle className="text-base font-semibold">Security & Permissions</CardTitle>
             </div>
             <CardDescription>
-              Default settings for all of {data.agent.name || agentId}&apos;s studios. Individual studios can override below.
+              Default settings for all of {data.agent.name || agentId}&apos;s studios. Individual
+              studios can override below.
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -316,6 +318,38 @@ export default function AgentRoutingPage() {
                 <span
                   className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform shadow-sm ${
                     data.agent.sandboxBypass ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
+
+            <div className="flex items-center justify-between rounded-lg border p-3 bg-gray-50/50 mt-3">
+              <div>
+                <p className="text-sm font-medium text-gray-700">Per-sender session isolation</p>
+                <p className="text-xs text-gray-400 mt-0.5">
+                  Each external sender gets their own session and memories (for public-facing SBs)
+                </p>
+              </div>
+              <button
+                onClick={async () => {
+                  try {
+                    const newScope =
+                      data.agent.sessionScope === 'per_sender' ? 'global' : 'per_sender';
+                    await apiPatch(`/api/admin/identities/${agentId}/settings`, {
+                      sessionScope: newScope,
+                    });
+                    queryClient.invalidateQueries({ queryKey: ['routing-agent', agentId] });
+                  } catch (e) {
+                    console.error('Failed to update session scope:', e);
+                  }
+                }}
+                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                  data.agent.sessionScope === 'per_sender' ? 'bg-blue-600' : 'bg-gray-200'
+                }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform shadow-sm ${
+                    data.agent.sessionScope === 'per_sender' ? 'translate-x-6' : 'translate-x-1'
                   }`}
                 />
               </button>
@@ -665,9 +699,11 @@ export default function AgentRoutingPage() {
                   <div className="flex items-center gap-2 shrink-0">
                     <label
                       className="flex items-center gap-1.5 cursor-pointer"
-                      title={studio.sandboxBypass === null
-                        ? `MCP bypass: inheriting ${data?.agent?.sandboxBypass ? 'ON' : 'OFF'} from SB default (click to override)`
-                        : 'MCP bypass: studio override (click to toggle, shift+click to reset to inherit)'}
+                      title={
+                        studio.sandboxBypass === null
+                          ? `MCP bypass: inheriting ${data?.agent?.sandboxBypass ? 'ON' : 'OFF'} from SB default (click to override)`
+                          : 'MCP bypass: studio override (click to toggle, shift+click to reset to inherit)'
+                      }
                     >
                       <input
                         type="checkbox"
@@ -675,9 +711,10 @@ export default function AgentRoutingPage() {
                         onChange={async (e) => {
                           try {
                             // Shift+click resets to null (inherit from SB)
-                            const newValue = e.nativeEvent instanceof MouseEvent && e.nativeEvent.shiftKey
-                              ? null
-                              : !(studio.sandboxBypass ?? data?.agent?.sandboxBypass ?? false);
+                            const newValue =
+                              e.nativeEvent instanceof MouseEvent && e.nativeEvent.shiftKey
+                                ? null
+                                : !(studio.sandboxBypass ?? data?.agent?.sandboxBypass ?? false);
                             await apiPatch(`/api/admin/studios/${studio.id}`, {
                               sandboxBypass: newValue,
                             });

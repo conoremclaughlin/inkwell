@@ -320,6 +320,21 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
     if (cursor) {
       query = query.gt('created_at', cursor.created_at);
     }
+  } else if (!beforeMessageId) {
+    // No explicit cursor — fall back to the caller's last_read_at as an
+    // implicit "start from where I left off" cursor. Without this, a client
+    // whose in-memory cursor was reset (e.g. channel plugin restart) would
+    // replay the full thread history and — combined with markRead — could
+    // regress the server-side read pointer to an older timestamp.
+    const { data: readStatus } = await threadTable(supabase, 'inbox_thread_read_status')
+      .select('last_read_at')
+      .eq('thread_id', thread.id)
+      .eq('agent_id', agentId)
+      .maybeSingle();
+    const cursorTs = (readStatus as { last_read_at?: string } | null)?.last_read_at;
+    if (cursorTs) {
+      query = query.gt('created_at', cursorTs);
+    }
   }
 
   const { data: messages, error } = await query;
@@ -330,16 +345,34 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   // Get participants
   const participants = await getParticipants(supabase, thread.id);
 
-  // Mark as read
+  // Mark as read — advance the pointer to the latest created_at in the
+  // returned batch, never to NOW() and never backwards. Monotonicity matters:
+  // a caller passing an old explicit afterMessageId (or a client replaying
+  // with a partial set) must not regress the read pointer.
   if (markRead && messages && messages.length > 0) {
-    await threadTable(supabase, 'inbox_thread_read_status').upsert(
-      {
-        thread_id: thread.id,
-        agent_id: agentId,
-        last_read_at: new Date().toISOString(),
-      },
-      { onConflict: 'thread_id,agent_id' }
-    );
+    let maxCreatedAt = '';
+    for (const m of messages as Array<{ created_at?: string }>) {
+      const ts = m.created_at;
+      if (ts && ts > maxCreatedAt) maxCreatedAt = ts;
+    }
+    if (maxCreatedAt) {
+      const { data: existing } = await threadTable(supabase, 'inbox_thread_read_status')
+        .select('last_read_at')
+        .eq('thread_id', thread.id)
+        .eq('agent_id', agentId)
+        .maybeSingle();
+      const existingTs = (existing as { last_read_at?: string } | null)?.last_read_at;
+      if (!existingTs || maxCreatedAt > existingTs) {
+        await threadTable(supabase, 'inbox_thread_read_status').upsert(
+          {
+            thread_id: thread.id,
+            agent_id: agentId,
+            last_read_at: maxCreatedAt,
+          },
+          { onConflict: 'thread_id,agent_id' }
+        );
+      }
+    }
   }
 
   return {

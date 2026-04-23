@@ -39,6 +39,7 @@ import {
   processHeartbeat,
   type DueReminder,
 } from './services/heartbeat';
+import { StrategyService } from './services/strategy.service';
 import { setResponseCallback, hasExplicitResponse } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
 import { resolveRouteAgentId } from './services/routing/resolve-route';
@@ -159,6 +160,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
     // Resolve agent: mention → channel_routes → AGENT_ID env fallback
     let routedAgentId = agentId;
+    let routedIdentityId: string | undefined;
     const isGroupChat = metadata?.chatType === 'group' || metadata?.chatType === 'channel';
 
     // For group chats, try mention-based routing first
@@ -173,6 +175,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       );
       if (mentionMatch) {
         routedAgentId = mentionMatch.agentId;
+        routedIdentityId = mentionMatch.identityId;
         logger.debug(`[Route] Resolved agent from @mention`, {
           platform: channel,
           agentId: mentionMatch.agentId,
@@ -193,6 +196,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       );
       if (route) {
         routedAgentId = route.agentId;
+        routedIdentityId = route.identityId;
         routeStudioHint = route.studioHint;
         logger.debug(`[Route] Resolved agent from channel_routes`, {
           platform: channel,
@@ -209,14 +213,29 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       }
     }
 
-    // Resolve contact for per-sender session isolation
+    // Resolve contact for per-sender session isolation (only when agent has session_scope: 'per_sender')
     let contactId: string | undefined;
     const isExternalChannelForContact =
       channel === 'telegram' ||
       channel === 'whatsapp' ||
       channel === 'discord' ||
       channel === 'slack';
+    let agentSessionScope: string | null = null;
     if (isExternalChannelForContact && dataComposer) {
+      try {
+        let scopeQuery = dataComposer.getClient().from('agent_identities').select('session_scope');
+        if (routedIdentityId) {
+          scopeQuery = scopeQuery.eq('id', routedIdentityId);
+        } else {
+          scopeQuery = scopeQuery.eq('user_id', userId).eq('agent_id', routedAgentId);
+        }
+        const { data: identity } = await scopeQuery.single();
+        agentSessionScope = identity?.session_scope || 'global';
+      } catch {
+        // Fall through — default to global (no isolation)
+      }
+    }
+    if (isExternalChannelForContact && dataComposer && agentSessionScope === 'per_sender') {
       try {
         const platformMap: Record<string, 'telegram' | 'discord' | 'whatsapp' | 'imessage'> = {
           telegram: 'telegram',
@@ -410,6 +429,39 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   const deliverReminderViaSession = async (reminder: DueReminder): Promise<boolean> => {
     const userId = reminder.user_id;
 
+    // Strategy watchdog branch: reminders created by StrategyService carry
+    // metadata.strategyWatchdog=true and route through the strategy service,
+    // which builds a task-aware prompt and dispatches to the owner agent in
+    // the assigned studio. Generic [HEARTBEAT REMINDER] content won't tell
+    // the target what task to work on, so we skip that path entirely.
+    const reminderMeta = reminder.metadata || {};
+    if (reminderMeta.strategyWatchdog === true && dataComposer) {
+      const groupId =
+        typeof reminderMeta.groupId === 'string' ? (reminderMeta.groupId as string) : null;
+      if (!groupId) {
+        logger.warn(
+          `[Heartbeat] strategyWatchdog reminder ${reminder.id} has no groupId in metadata, skipping`
+        );
+        return false;
+      }
+      try {
+        const strategyService = new StrategyService(dataComposer);
+        const fired = await strategyService.triggerWatchdog(groupId);
+        if (fired) {
+          logger.info(
+            `[Heartbeat] Strategy watchdog fired for group ${groupId} (reminder ${reminder.id})`
+          );
+        }
+        return fired;
+      } catch (err) {
+        logger.error(
+          `[Heartbeat] Strategy watchdog failed for group ${groupId} (reminder ${reminder.id}):`,
+          err
+        );
+        return false;
+      }
+    }
+
     // Resolve agent from reminder's identity_id, fall back to server default
     let reminderAgentId = agentId;
     if (reminder.identity_id && dataComposer) {
@@ -428,7 +480,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     // Resolve studioHint via cascade:
     //   1. reminder.studio_hint (direct override)
     //   2. channel_routes.studio_hint (matched by delivery channel)
-    //   3. agent_identities.studio_hint (agent's home studio)
+    //   3. agent_identities.studio_hint (agent's default studio)
     //   4. null → resolveStudioId() uses its own cascade (agent studio → main)
     let reminderStudioHint: string | null = null;
 
@@ -460,7 +512,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       }
     }
 
-    // Fallback to agent identity's home studio
+    // Fallback to agent identity's default studio
     if (!reminderStudioHint && reminder.identity_id && dataComposer) {
       const { data: identity } = await dataComposer
         .getClient()
@@ -470,7 +522,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         .single();
       if (identity?.studio_hint) {
         reminderStudioHint = identity.studio_hint;
-        logger.debug(`[Heartbeat] Using agent home studio`, {
+        logger.debug(`[Heartbeat] Using agent default studio`, {
           studioHint: reminderStudioHint,
           identityId: reminder.identity_id,
         });
@@ -751,9 +803,21 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       }
 
       if (identityRows.length > 1) {
-        throw new Error(
-          `Ambiguous identity for agent "${targetAgentId}" (multiple workspace-scoped identities). Include inboxMessageId with recipient_identity_id or pass metadata.workspaceId.`
+        // Disambiguate: prefer workspace-scoped over null-workspace (orphaned)
+        const workspaceScoped = identityRows.filter(
+          (r: { workspace_id: string | null }) => r.workspace_id != null
         );
+        if (workspaceScoped.length === 1) {
+          resolvedIdentityId = workspaceScoped[0].id;
+          resolvedWorkspaceId = workspaceScoped[0].workspace_id || undefined;
+          logger.info(
+            `[Trigger] Disambiguated ${targetAgentId}: preferred workspace-scoped identity ${resolvedIdentityId}`
+          );
+        } else {
+          throw new Error(
+            `Ambiguous identity for agent "${targetAgentId}" (${identityRows.length} identities, ${workspaceScoped.length} workspace-scoped). Include inboxMessageId with recipient_identity_id or pass metadata.workspaceId.`
+          );
+        }
       } else {
         resolvedIdentityId = identityRows[0].id;
         resolvedWorkspaceId = identityRows[0].workspace_id || undefined;
@@ -849,24 +913,18 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       }
 
       if (isCliAttached && !isCliStale) {
-        const { addPendingMessage } = await import('./mcp/tools/response-handlers.js');
-        addPendingMessage({
-          id: `trigger-${Date.now()}`,
-          channel: 'agent',
-          conversationId: request.conversationId,
-          content: triggerMessage,
-          sender: { id: payload.fromAgentId, name: payload.fromAgentId },
-          timestamp: new Date(),
-          read: false,
-          agentId: targetAgentId,
-          sessionId: routedSession.id,
-        });
-        logger.info('[Trigger] CLI-attached session detected, routed to pending queue', {
-          targetAgentId,
-          sessionId: routedSession.id,
-          studioId: routedSession.studioId,
-          threadKey: payload.threadKey,
-        });
+        // CLI-attached: don't spawn a new session. The inbox message is
+        // already in the DB (written by send_to_inbox before trigger fires).
+        // The channel plugin will pick it up on its next poll cycle.
+        logger.info(
+          '[Trigger] CLI-attached session — skipping spawn, channel plugin will deliver',
+          {
+            targetAgentId,
+            sessionId: routedSession.id,
+            studioId: routedSession.studioId,
+            threadKey: payload.threadKey,
+          }
+        );
         return;
       }
     } catch (err) {
@@ -878,14 +936,23 @@ When you complete a task_request, mark it as completed using update_inbox_messag
 
     const result = await sessionService!.handleMessage(request);
 
-    // 5. Route any responses
-    if (result.responses && result.responses.length > 0) {
-      await routeResponses(result.responses);
-    }
-
     if (!result.success) {
       logger.error(`[Trigger] SessionService failed for ${targetAgentId}: ${result.error}`);
       throw new Error(result.error || 'SessionService processing failed');
+    }
+
+    // 5. Route any responses — wrapped in try-catch because the session already
+    // succeeded at this point. A failure here (channel send error, cleanup race)
+    // should NOT emit trigger:error or send a "Trigger failed" notification.
+    try {
+      if (result.responses && result.responses.length > 0) {
+        await routeResponses(result.responses);
+      }
+    } catch (routeErr) {
+      logger.error(
+        `[Trigger] Response routing failed for ${targetAgentId} (session succeeded):`,
+        routeErr
+      );
     }
 
     logger.info(`[Trigger] Successfully processed trigger for ${targetAgentId}`);

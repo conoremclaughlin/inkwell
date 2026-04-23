@@ -191,8 +191,8 @@ describe('runChat integration', () => {
     };
     expect(backendRequest.backend).toBe('gemini');
     expect(backendRequest.prompt).toContain('Latest user message:\nheartbeat pulse');
-    // Newly created session in non-interactive mode should be ended.
-    expect(testState.pcpCalls.some((call) => call.tool === 'end_session')).toBe(true);
+    // Non-interactive sessions are left resumable (update_session_phase, not end_session).
+    expect(testState.pcpCalls.some((call) => call.tool === 'update_session_phase')).toBe(true);
   });
 
   it('attaches to provided session id and does not end attached session', async () => {
@@ -644,7 +644,9 @@ describe('runChat integration', () => {
     const matrix = [
       { visibility: 'agent', expectedSession: 'sess-lumen-mid', expectsAutoAttach: true },
       { visibility: 'all', expectedSession: 'sess-wren-new', expectsAutoAttach: true },
-      { visibility: 'workspace', expectedSession: 'sess-wren-new', expectsAutoAttach: true },
+      // workspace visibility requires explicit workspaceId (not derived from studioId).
+      // The chat flow doesn't resolve workspaceId yet, so workspace behaves like self.
+      { visibility: 'workspace', expectedSession: 'sess-1', expectsAutoAttach: false },
       { visibility: 'studio', expectedSession: 'sess-wren-new', expectsAutoAttach: true },
       { visibility: 'self', expectedSession: 'sess-1', expectsAutoAttach: false },
     ] as const;
@@ -1088,7 +1090,7 @@ describe('runChat integration', () => {
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('Capabilities snapshot');
     expect(logText).toContain('MCP servers (2)');
-    expect(logText).toContain('pcp [http] http://localhost:3001/mcp');
+    expect(logText).toContain('inkwell [http] http://localhost:3001/mcp');
     expect(logText).toContain('github [stdio] github-mcp-server');
     expect(logText).toContain('Tool policy');
   });
@@ -1116,7 +1118,7 @@ describe('runChat integration', () => {
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('MCP servers (1)');
-    expect(logText).toContain('pcp [http] http://localhost:3001/mcp');
+    expect(logText).toContain('inkwell [http] http://localhost:3001/mcp');
   });
 
   it('toggles inbox auto-run via slash command', async () => {
@@ -1182,9 +1184,8 @@ describe('runChat integration', () => {
     expect(logText).toContain('Mutation scope set to global.');
     expect(logText).toContain('Persistently allowed send_to_inbox');
     expect(logText).toContain('Mutation scope: global');
-    expect(logText).toContain(
-      'Active scopes: global -> workspace:studio-test -> agent:lumen -> studio:studio-test'
-    );
+    // workspace scope only appears when explicit workspaceId is set (not derived from studioId)
+    expect(logText).toContain('Active scopes: global -> agent:lumen -> studio:studio-test');
   });
 
   it('supports /session-visibility and /policy-reset controls', async () => {

@@ -420,6 +420,15 @@ export interface ClaudeRunnerConfig {
   sandboxBypass?: boolean;
   /** Root repo path — propagated via context token for cross-project 'main' resolution */
   repoRoot?: string;
+  /**
+   * Additional permission rules to merge into .claude/settings.local.json
+   * before this session's spawn. Restored to the original after the process
+   * exits. Used by strategy configs and 2FA permission grants.
+   */
+  permissionOverlay?: {
+    allow?: string[];
+    deny?: string[];
+  };
 }
 
 export interface RunnerResult {

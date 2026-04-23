@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useMemo, useCallback, useRef } from 'react';
+import Link from 'next/link';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import {
@@ -22,6 +23,12 @@ import {
   MessageCircle,
   Send,
   Loader2,
+  Activity,
+  Play,
+  Pause,
+  RotateCcw,
+  ExternalLink,
+  GitBranch,
 } from 'lucide-react';
 import { useApiQuery, useApiPost, useApiPut, useQueryClient } from '@/lib/api';
 import clsx from 'clsx';
@@ -75,7 +82,29 @@ interface TaskGroupData {
   outputTarget: string | null;
   outputStatus: string | null;
   threadKey: string | null;
+  strategy: string | null;
+  ownerAgentId: string | null;
+  ownerAgentName: string | null;
+  currentTaskIndex: number;
+  strategyStartedAt: string | null;
+  strategyPausedAt: string | null;
+  planUri: string | null;
   createdAt: string;
+}
+
+interface ActivityEvent {
+  id: string;
+  type: string;
+  subtype: string | null;
+  content: string;
+  agentId: string;
+  sessionId: string | null;
+  payload: Record<string, unknown>;
+  createdAt: string;
+}
+
+interface ActivityResponse {
+  events: ActivityEvent[];
 }
 
 interface TaskGroupsResponse {
@@ -336,6 +365,98 @@ function CommentThread({ taskId }: { taskId: string }) {
   );
 }
 
+// ─── Activity Timeline ───
+
+const SUBTYPE_META: Record<string, { icon: typeof Play; label: string; color: string }> = {
+  strategy_started: { icon: Play, label: 'Strategy started', color: 'text-emerald-600' },
+  strategy_paused: { icon: Pause, label: 'Strategy paused', color: 'text-amber-600' },
+  strategy_resumed: { icon: RotateCcw, label: 'Strategy resumed', color: 'text-blue-600' },
+  strategy_completed: {
+    icon: CheckCircle2,
+    label: 'Strategy completed',
+    color: 'text-emerald-600',
+  },
+  task_advanced: { icon: ArrowUpCircle, label: 'Task advanced', color: 'text-indigo-600' },
+  approval_required: { icon: AlertCircle, label: 'Approval required', color: 'text-amber-600' },
+};
+
+function ActivityTimeline({ groupId }: { groupId: string }) {
+  const { data, isLoading } = useApiQuery<ActivityResponse>(
+    ['task-group-activity', groupId],
+    `/api/admin/task-groups/${groupId}/activity`
+  );
+
+  if (isLoading) {
+    return (
+      <div className="text-[11px] text-gray-400 flex items-center gap-1 py-3">
+        <Loader2 className="h-3 w-3 animate-spin" /> Loading timeline...
+      </div>
+    );
+  }
+
+  const events = data?.events ?? [];
+  if (events.length === 0) {
+    return <div className="text-[11px] text-gray-400 py-3">No activity recorded yet.</div>;
+  }
+
+  return (
+    <div className="relative pl-4 space-y-0">
+      {/* Vertical line */}
+      <div className="absolute left-[7px] top-2 bottom-2 w-px bg-gray-200" />
+
+      {events.map((event, i) => {
+        const meta = SUBTYPE_META[event.subtype ?? ''];
+        const Icon = meta?.icon ?? Activity;
+        const color = meta?.color ?? 'text-gray-400';
+        const label = meta?.label ?? event.subtype ?? event.type;
+        const isLast = i === events.length - 1;
+
+        return (
+          <div
+            key={event.id}
+            className={clsx('relative flex gap-3 items-start', !isLast && 'pb-3')}
+          >
+            {/* Dot */}
+            <div className={clsx('relative z-10 rounded-full bg-white p-0.5 -ml-[11px]')}>
+              <Icon className={clsx('h-3.5 w-3.5', color)} />
+            </div>
+
+            {/* Content */}
+            <div className="flex-1 min-w-0 -mt-0.5">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs font-medium text-gray-700">{label}</span>
+                {event.agentId && (
+                  <span
+                    className={clsx(
+                      'text-[10px] font-medium px-1.5 py-0.5 rounded-full',
+                      AGENT_COLORS[event.agentId] ?? 'bg-gray-100 text-gray-600'
+                    )}
+                  >
+                    {event.agentId}
+                  </span>
+                )}
+                {event.sessionId && (
+                  <Link
+                    href={`/sessions/${event.sessionId}`}
+                    className="text-[10px] text-blue-500 hover:text-blue-700 flex items-center gap-0.5 transition-colors"
+                  >
+                    <ExternalLink className="h-2.5 w-2.5" />
+                    session log
+                  </Link>
+                )}
+              </div>
+              <p className="text-[11px] text-gray-500 mt-0.5 line-clamp-2">{event.content}</p>
+              <span className="text-[10px] text-gray-400">
+                {formatRelativeTime(event.createdAt)}
+              </span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // ─── Sub-components ───
 
 function PriorityBadge({ priority }: { priority: Task['priority'] }) {
@@ -520,6 +641,7 @@ function TaskGroupSection({
   defaultCollapsed?: boolean;
 }) {
   const [collapsed, setCollapsed] = useState(defaultCollapsed ?? false);
+  const [showTimeline, setShowTimeline] = useState(false);
   const sorted = useMemo(() => sortTasks(tasks), [tasks]);
   const summary = useMemo(() => statusSummary(tasks), [tasks]);
   const allDone = summary.active === 0 && summary.blocked === 0 && summary.completed > 0;
@@ -553,12 +675,18 @@ function TaskGroupSection({
                 Autonomous
               </Badge>
             )}
+            {group.strategy && (
+              <Badge className="text-[10px] font-medium border bg-indigo-50 text-indigo-700 border-indigo-200 gap-1">
+                <GitBranch className="h-2.5 w-2.5" />
+                {group.strategy}
+              </Badge>
+            )}
           </div>
           <div className="flex items-center gap-2 mt-0.5 text-[11px] text-gray-400">
-            {group.agentName && (
+            {(group.strategy ? group.ownerAgentName : group.agentName) && (
               <span className="flex items-center gap-1">
                 <Bot className="h-3 w-3" />
-                {group.agentName}
+                {group.strategy ? group.ownerAgentName : group.agentName}
               </span>
             )}
             {group.projectName && (
@@ -607,6 +735,27 @@ function TaskGroupSection({
           {sorted.map((task) => (
             <TaskCard key={task.id} task={task} onStatusChange={onStatusChange} compact />
           ))}
+        </div>
+      )}
+
+      {/* Timeline toggle + panel */}
+      {!collapsed && (
+        <div className="border-t border-gray-100">
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              setShowTimeline(!showTimeline);
+            }}
+            className="flex items-center gap-2 px-5 py-2.5 text-[11px] text-gray-400 hover:text-gray-600 transition-colors w-full text-left"
+          >
+            <Activity className="h-3 w-3" />
+            {showTimeline ? 'Hide timeline' : 'Show timeline'}
+          </button>
+          {showTimeline && (
+            <div className="px-5 pb-4">
+              <ActivityTimeline groupId={group.id} />
+            </div>
+          )}
         </div>
       )}
     </div>

@@ -5,7 +5,7 @@ import {
   type UseQueryOptions,
   type UseMutationOptions,
 } from '@tanstack/react-query';
-import { apiGet, apiPost, apiPut, apiDelete, type ApiError } from './client';
+import { apiGet, apiPost, apiPut, apiPatch, apiDelete, type ApiError } from './client';
 
 /**
  * Hook for authenticated GET requests with React Query caching.
@@ -84,6 +84,20 @@ export function useApiPut<TResponse, TInput>(
 ) {
   return useMutation<TResponse, ApiError, TInput>({
     mutationFn: (input) => apiPut<TResponse>(pathFn(input), bodyFn(input)),
+    ...options,
+  });
+}
+
+/**
+ * Hook for authenticated PATCH mutations with dynamic path.
+ */
+export function useApiPatch<TResponse, TInput>(
+  pathFn: (input: TInput) => string,
+  bodyFn: (input: TInput) => unknown,
+  options?: Omit<UseMutationOptions<TResponse, ApiError, TInput>, 'mutationFn'>
+) {
+  return useMutation<TResponse, ApiError, TInput>({
+    mutationFn: (input) => apiPatch<TResponse>(pathFn(input), bodyFn(input)),
     ...options,
   });
 }

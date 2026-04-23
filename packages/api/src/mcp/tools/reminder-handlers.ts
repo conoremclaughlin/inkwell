@@ -153,7 +153,7 @@ export const createReminderSchema = z.object({
     .string()
     .optional()
     .describe(
-      'Studio to run this reminder in (e.g., "home", "main", studio name). Overrides the agent\'s default. If omitted, inherits from agent identity.'
+      'Studio to run this reminder in (e.g., "main", or a studio slug like "wren-omega"). Overrides the agent\'s default. If omitted, inherits from agent identity.'
     ),
 });
 

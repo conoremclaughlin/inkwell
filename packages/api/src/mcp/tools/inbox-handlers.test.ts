@@ -5,7 +5,12 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { handleSendToInbox, handleGetInbox, handleUpdateInboxMessage, isThreadOwnedByStudio } from './inbox-handlers';
+import {
+  handleSendToInbox,
+  handleGetInbox,
+  handleUpdateInboxMessage,
+  isThreadOwnedByStudio,
+} from './inbox-handlers';
 
 // Mock user-resolver
 vi.mock('../../services/user-resolver', async (importOriginal) => {
@@ -380,6 +385,50 @@ describe('handleSendToInbox - threadKey', () => {
     expect(parsed.routingHint).toContain('routing anchor');
     expect(mockGateway.dispatchTrigger).toHaveBeenCalled();
   });
+
+  // ===================================================================
+  // 2FA SECURITY — permission_grant from agent senders must be rejected
+  // ===================================================================
+
+  it('rejects permission_grant when senderAgentId is present', async () => {
+    const mockSb = createMockSupabase();
+    const mockDc = createMockDataComposer(mockSb);
+
+    await expect(
+      handleSendToInbox(
+        {
+          email: 'test@test.com',
+          recipientAgentId: 'wren',
+          senderAgentId: 'wren',
+          messageType: 'permission_grant',
+          content: 'granting self permission',
+        },
+        mockDc as never
+      )
+    ).rejects.toThrow('permission_grant messages cannot be sent by agents');
+
+    expect(mockSb._chainable.insert).not.toHaveBeenCalled();
+  });
+
+  it('allows permission_grant from the system layer (no senderAgentId)', async () => {
+    // Use thread path so the message_type is exercised.
+    const mockSb = createMockSupabase();
+    const mockDc = createMockDataComposer(mockSb);
+
+    const result = await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        // no senderAgentId — treated as system sender
+        messageType: 'permission_grant',
+        content: 'granted',
+      },
+      mockDc as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+  });
 });
 
 // =====================================================
@@ -559,7 +608,7 @@ describe('Reply Routing — thread message metadata enrichment', () => {
     const { getRequestContext } = await import('../../utils/request-context');
     vi.mocked(getRequestContext).mockReturnValue({
       sessionId: 'wren-session-123',
-      workspaceId: 'studio-wren',
+      studioId: 'studio-wren',
     } as ReturnType<typeof getRequestContext>);
 
     await handleSendToInbox(
@@ -924,7 +973,7 @@ describe('Reply Routing — sender session fallback behavior', () => {
     const { getRequestContext } = await import('../../utils/request-context');
     vi.mocked(getRequestContext).mockReturnValue({
       sessionId: 'header-session-xyz',
-      workspaceId: 'header-studio-abc',
+      studioId: 'header-studio-abc',
     } as ReturnType<typeof getRequestContext>);
 
     await handleSendToInbox(
@@ -1000,9 +1049,7 @@ describe('isThreadOwnedByStudio', () => {
   });
 
   it('accepts when agent has a message from this studio', () => {
-    const messages = [
-      { metadata: { pcp: { sender: { agentId: 'wren', studioId: MY_STUDIO } } } },
-    ];
+    const messages = [{ metadata: { pcp: { sender: { agentId: 'wren', studioId: MY_STUDIO } } } }];
     expect(isThreadOwnedByStudio(messages, MY_STUDIO)).toBe(true);
   });
 
@@ -1027,9 +1074,7 @@ describe('isThreadOwnedByStudio', () => {
   });
 
   it('rejects when messages have pcp.sender but no studioId', () => {
-    const messages = [
-      { metadata: { pcp: { sender: { agentId: 'wren' } } } },
-    ];
+    const messages = [{ metadata: { pcp: { sender: { agentId: 'wren' } } } }];
     expect(isThreadOwnedByStudio(messages, MY_STUDIO)).toBe(false);
   });
 
@@ -1185,5 +1230,134 @@ describe('handleUpdateInboxMessage — thread message fallback', () => {
     expect(parsed.threadId).toBe(threadId);
     expect(parsed.status).toBe('completed');
     expect(upsertCalls.length).toBe(1);
+  });
+});
+
+// =====================================================
+// SYSTEM SENDER + CROSS-AGENT DELEGATION ROUTING
+// (Lumen PR #334 review: strategy watchdog/kickoff path)
+// =====================================================
+
+describe('handleSendToInbox — system sender and cross-agent studio routing', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    // New thread path — findThread returns null so agentsToTrigger =
+    // allRecipients (which includes our addressed recipient).
+    const { findThread, getParticipants, resolveTriggeredAgents } =
+      await import('./thread-handlers.js');
+    vi.mocked(findThread).mockResolvedValue(null);
+    vi.mocked(getParticipants).mockResolvedValue([]);
+    vi.mocked(resolveTriggeredAgents).mockReturnValue([]);
+  });
+
+  it('fires a trigger even when senderAgentId is "system" and there is no request context', async () => {
+    // This is the watchdog/heartbeat path: StrategyService.triggerWatchdog()
+    // sends with senderAgentId='system' from a heartbeat tick that has no
+    // x-ink-context token and no session context. The old
+    // missingSenderSession guard suppressed the trigger here, so the
+    // watchdog marked the reminder delivered without waking the owner.
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({ existingThread: undefined });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    const result = await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        senderAgentId: 'system',
+        threadKey: 'strategy:group-1',
+        content: 'Resume strategy task',
+        messageType: 'session_resume',
+      },
+      mockDc as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    // Trigger must fire — not suppressed by missingSenderSession.
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toAgentId: 'wren',
+        fromAgentId: 'system',
+      })
+    );
+    // And the warning about suppressed triggers must NOT appear.
+    expect(parsed.warning).toBeUndefined();
+    expect(parsed.triggered).toContain('wren');
+  });
+
+  it('propagates recipientStudioId to the trigger payload for cross-agent delegation', async () => {
+    // This is the kickoff/watchdog path: the strategy service targets the
+    // owner agent (not self) in group.metadata.studioId. Before the fix,
+    // studio was only forwarded for self-studio messages (sender ==
+    // recipient), so cross-agent delegation lost the assigned studio and
+    // routing fell back to route patterns / default studio.
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({ existingThread: undefined });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        senderAgentId: 'system',
+        threadKey: 'strategy:group-1',
+        content: 'Resume strategy task',
+        messageType: 'session_resume',
+        recipientStudioId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      },
+      mockDc as never
+    );
+
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toAgentId: 'wren',
+        studioId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      })
+    );
+  });
+
+  it('propagates recipientStudioSlug to the trigger payload when no UUID is provided', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({ existingThread: undefined });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        senderAgentId: 'system',
+        threadKey: 'strategy:group-2',
+        content: 'Resume strategy task',
+        messageType: 'session_resume',
+        recipientStudioSlug: 'wren-omega',
+      },
+      mockDc as never
+    );
+
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toAgentId: 'wren',
+        studioHint: 'wren-omega',
+      })
+    );
   });
 });

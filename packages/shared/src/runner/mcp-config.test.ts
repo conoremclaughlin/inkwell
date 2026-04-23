@@ -113,7 +113,7 @@ describe('injectSessionHeaders', () => {
           headers: {
             'x-ink-session-id': '${INK_SESSION_ID}',
             Authorization: 'Bearer ${INK_ACCESS_TOKEN}',
-            'x-ink-context': '${INK_CONTEXT_TOKEN}',
+            'x-ink-context': '${INK_CONTEXT}',
           },
         },
       },
@@ -155,7 +155,7 @@ describe('buildSessionEnv', () => {
     expect(env).not.toHaveProperty('INK_AUTH_BEARER');
   });
 
-  it('includes INK_CONTEXT_TOKEN when agentId and sessionId provided', () => {
+  it('includes INK_CONTEXT when agentId and sessionId provided', () => {
     const env = buildSessionEnv({
       pcpSessionId: 'sess-123',
       studioId: 'studio-456',
@@ -164,9 +164,9 @@ describe('buildSessionEnv', () => {
       cliAttached: false,
     });
 
-    expect(env.INK_CONTEXT_TOKEN).toBeDefined();
+    expect(env.INK_CONTEXT).toBeDefined();
     // Decode and verify
-    const decoded = JSON.parse(Buffer.from(env.INK_CONTEXT_TOKEN, 'base64url').toString());
+    const decoded = JSON.parse(Buffer.from(env.INK_CONTEXT, 'base64url').toString());
     expect(decoded.sessionId).toBe('sess-123');
     expect(decoded.studioId).toBe('studio-456');
     expect(decoded.agentId).toBe('wren');
@@ -181,16 +181,16 @@ describe('buildSessionEnv', () => {
       cliAttached: true,
     });
 
-    const decoded = JSON.parse(Buffer.from(env.INK_CONTEXT_TOKEN, 'base64url').toString());
+    const decoded = JSON.parse(Buffer.from(env.INK_CONTEXT, 'base64url').toString());
     expect(decoded.cliAttached).toBe(true);
   });
 
-  it('omits INK_CONTEXT_TOKEN when agentId is missing', () => {
+  it('omits INK_CONTEXT when agentId is missing', () => {
     const env = buildSessionEnv({
       pcpSessionId: 'sess-123',
     });
 
-    expect(env).not.toHaveProperty('INK_CONTEXT_TOKEN');
+    expect(env).not.toHaveProperty('INK_CONTEXT');
   });
 });
 

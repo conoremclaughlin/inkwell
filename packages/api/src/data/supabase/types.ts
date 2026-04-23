@@ -1,10 +1,53 @@
 export type Json = string | number | boolean | null | { [key: string]: Json | undefined } | Json[];
 
 export type Database = {
-  // Allows to automatically instantiate createClient with right options
-  // instead of createClient<Database, { PostgrestVersion: 'XX' }>(URL, KEY)
-  __InternalSupabase: {
-    PostgrestVersion: '13.0.5';
+  graphql_public: {
+    Tables: {
+      [_ in never]: never;
+    };
+    Views: {
+      [_ in never]: never;
+    };
+    Functions: {
+      graphql: {
+        Args: {
+          extensions?: Json;
+          operationName?: string;
+          query?: string;
+          variables?: Json;
+        };
+        Returns: Json;
+      };
+    };
+    Enums: {
+      [_ in never]: never;
+    };
+    CompositeTypes: {
+      [_ in never]: never;
+    };
+  };
+  pgbouncer: {
+    Tables: {
+      [_ in never]: never;
+    };
+    Views: {
+      [_ in never]: never;
+    };
+    Functions: {
+      get_auth: {
+        Args: { p_usename: string };
+        Returns: {
+          password: string;
+          username: string;
+        }[];
+      };
+    };
+    Enums: {
+      [_ in never]: never;
+    };
+    CompositeTypes: {
+      [_ in never]: never;
+    };
   };
   public: {
     Tables: {
@@ -85,35 +128,30 @@ export type Database = {
           {
             foreignKeyName: 'activity_stream_contact_id_fkey';
             columns: ['contact_id'];
-            isOneToOne: false;
             referencedRelation: 'contacts';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'activity_stream_identity_id_fkey';
             columns: ['identity_id'];
-            isOneToOne: false;
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'activity_stream_parent_id_fkey';
             columns: ['parent_id'];
-            isOneToOne: false;
             referencedRelation: 'activity_stream';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'activity_stream_session_id_fkey';
             columns: ['session_id'];
-            isOneToOne: false;
             referencedRelation: 'sessions';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'activity_stream_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -133,6 +171,8 @@ export type Database = {
           permissions: Json;
           relationships: Json | null;
           role: string;
+          sandbox_bypass: boolean;
+          session_scope: string | null;
           soul: string | null;
           studio_hint: string | null;
           updated_at: string | null;
@@ -154,6 +194,8 @@ export type Database = {
           permissions?: Json;
           relationships?: Json | null;
           role: string;
+          sandbox_bypass?: boolean;
+          session_scope?: string | null;
           soul?: string | null;
           studio_hint?: string | null;
           updated_at?: string | null;
@@ -175,6 +217,8 @@ export type Database = {
           permissions?: Json;
           relationships?: Json | null;
           role?: string;
+          sandbox_bypass?: boolean;
+          session_scope?: string | null;
           soul?: string | null;
           studio_hint?: string | null;
           updated_at?: string | null;
@@ -187,14 +231,12 @@ export type Database = {
           {
             foreignKeyName: 'agent_identities_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'agent_identities_workspace_id_fkey';
             columns: ['workspace_id'];
-            isOneToOne: false;
             referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
@@ -271,14 +313,12 @@ export type Database = {
           {
             foreignKeyName: 'agent_identity_history_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'agent_identity_history_workspace_id_fkey';
             columns: ['workspace_id'];
-            isOneToOne: false;
             referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
@@ -355,35 +395,58 @@ export type Database = {
           {
             foreignKeyName: 'agent_inbox_recipient_identity_id_fkey';
             columns: ['recipient_identity_id'];
-            isOneToOne: false;
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'agent_inbox_recipient_session_id_fkey';
             columns: ['recipient_session_id'];
-            isOneToOne: false;
             referencedRelation: 'sessions';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'agent_inbox_recipient_user_id_fkey';
             columns: ['recipient_user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'agent_inbox_sender_identity_id_fkey';
             columns: ['sender_identity_id'];
-            isOneToOne: false;
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'agent_inbox_sender_user_id_fkey';
             columns: ['sender_user_id'];
-            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      agent_inbox_read_status: {
+        Row: {
+          agent_id: string;
+          last_read_at: string;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          agent_id: string;
+          last_read_at?: string;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          agent_id?: string;
+          last_read_at?: string;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'agent_inbox_read_status_user_id_fkey';
+            columns: ['user_id'];
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -451,7 +514,6 @@ export type Database = {
           {
             foreignKeyName: 'agent_sessions_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -504,42 +566,36 @@ export type Database = {
           {
             foreignKeyName: 'artifact_comments_artifact_id_fkey';
             columns: ['artifact_id'];
-            isOneToOne: false;
             referencedRelation: 'artifacts';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'artifact_comments_created_by_identity_id_fkey';
             columns: ['created_by_identity_id'];
-            isOneToOne: false;
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'artifact_comments_created_by_user_id_fkey';
             columns: ['created_by_user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'artifact_comments_parent_comment_id_fkey';
             columns: ['parent_comment_id'];
-            isOneToOne: false;
             referencedRelation: 'artifact_comments';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'artifact_comments_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'artifact_comments_workspace_id_fkey';
             columns: ['workspace_id'];
-            isOneToOne: false;
             referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
@@ -589,28 +645,24 @@ export type Database = {
           {
             foreignKeyName: 'artifact_history_artifact_id_fkey';
             columns: ['artifact_id'];
-            isOneToOne: false;
             referencedRelation: 'artifacts';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'artifact_history_changed_by_identity_id_fkey';
             columns: ['changed_by_identity_id'];
-            isOneToOne: false;
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'artifact_history_changed_by_user_id_fkey';
             columns: ['changed_by_user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'artifact_history_workspace_id_fkey';
             columns: ['workspace_id'];
-            isOneToOne: false;
             referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
@@ -678,21 +730,18 @@ export type Database = {
           {
             foreignKeyName: 'artifacts_created_by_identity_id_fkey';
             columns: ['created_by_identity_id'];
-            isOneToOne: false;
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'artifacts_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'artifacts_workspace_id_fkey';
             columns: ['workspace_id'];
-            isOneToOne: false;
             referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
@@ -754,7 +803,6 @@ export type Database = {
           {
             foreignKeyName: 'audit_log_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -804,21 +852,18 @@ export type Database = {
           {
             foreignKeyName: 'authorized_groups_authorized_by_fkey';
             columns: ['authorized_by'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'authorized_groups_revoked_by_fkey';
             columns: ['revoked_by'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'authorized_groups_workspace_id_fkey';
             columns: ['workspace_id'];
-            isOneToOne: false;
             referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
@@ -868,14 +913,12 @@ export type Database = {
           {
             foreignKeyName: 'channel_routes_identity_id_fkey';
             columns: ['identity_id'];
-            isOneToOne: false;
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'channel_routes_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -952,14 +995,12 @@ export type Database = {
           {
             foreignKeyName: 'connected_accounts_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'connected_accounts_workspace_id_fkey';
             columns: ['workspace_id'];
-            isOneToOne: false;
             referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
@@ -980,7 +1021,7 @@ export type Database = {
           tags: string[] | null;
           telegram_id: string | null;
           telegram_username: string | null;
-          type: string;
+          type: string | null;
           updated_at: string | null;
           user_id: string;
           whatsapp_id: string | null;
@@ -999,7 +1040,7 @@ export type Database = {
           tags?: string[] | null;
           telegram_id?: string | null;
           telegram_username?: string | null;
-          type?: string;
+          type?: string | null;
           updated_at?: string | null;
           user_id: string;
           whatsapp_id?: string | null;
@@ -1018,7 +1059,7 @@ export type Database = {
           tags?: string[] | null;
           telegram_id?: string | null;
           telegram_username?: string | null;
-          type?: string;
+          type?: string | null;
           updated_at?: string | null;
           user_id?: string;
           whatsapp_id?: string | null;
@@ -1027,7 +1068,6 @@ export type Database = {
           {
             foreignKeyName: 'contacts_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -1077,7 +1117,6 @@ export type Database = {
           {
             foreignKeyName: 'context_history_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -1121,7 +1160,6 @@ export type Database = {
           {
             foreignKeyName: 'context_summaries_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -1162,7 +1200,6 @@ export type Database = {
           {
             foreignKeyName: 'conversations_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -1206,14 +1243,12 @@ export type Database = {
           {
             foreignKeyName: 'group_challenge_codes_created_by_fkey';
             columns: ['created_by'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'group_challenge_codes_workspace_id_fkey';
             columns: ['workspace_id'];
-            isOneToOne: false;
             referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
@@ -1248,7 +1283,6 @@ export type Database = {
           {
             foreignKeyName: 'heartbeat_state_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: true;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -1289,7 +1323,6 @@ export type Database = {
           {
             foreignKeyName: 'inbox_thread_messages_thread_id_fkey';
             columns: ['thread_id'];
-            isOneToOne: false;
             referencedRelation: 'inbox_threads';
             referencedColumns: ['id'];
           },
@@ -1315,7 +1348,6 @@ export type Database = {
           {
             foreignKeyName: 'inbox_thread_participants_thread_id_fkey';
             columns: ['thread_id'];
-            isOneToOne: false;
             referencedRelation: 'inbox_threads';
             referencedColumns: ['id'];
           },
@@ -1341,7 +1373,6 @@ export type Database = {
           {
             foreignKeyName: 'inbox_thread_read_status_thread_id_fkey';
             columns: ['thread_id'];
-            isOneToOne: false;
             referencedRelation: 'inbox_threads';
             referencedColumns: ['id'];
           },
@@ -1391,7 +1422,6 @@ export type Database = {
           {
             foreignKeyName: 'inbox_threads_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -1444,7 +1474,6 @@ export type Database = {
           {
             foreignKeyName: 'integration_health_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -1494,7 +1523,6 @@ export type Database = {
           {
             foreignKeyName: 'links_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -1547,14 +1575,12 @@ export type Database = {
           {
             foreignKeyName: 'mcp_tokens_identity_id_fkey';
             columns: ['identity_id'];
-            isOneToOne: false;
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'mcp_tokens_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -1566,9 +1592,9 @@ export type Database = {
           contact_id: string | null;
           content: string;
           created_at: string | null;
+          embedding: string | null;
           embedding_chunk_count: number | null;
           embedding_chunks_version: number | null;
-          embedding: string | null;
           expires_at: string | null;
           id: string;
           identity_id: string | null;
@@ -1586,9 +1612,9 @@ export type Database = {
           contact_id?: string | null;
           content: string;
           created_at?: string | null;
+          embedding?: string | null;
           embedding_chunk_count?: number | null;
           embedding_chunks_version?: number | null;
-          embedding?: string | null;
           expires_at?: string | null;
           id?: string;
           identity_id?: string | null;
@@ -1606,9 +1632,9 @@ export type Database = {
           contact_id?: string | null;
           content?: string;
           created_at?: string | null;
+          embedding?: string | null;
           embedding_chunk_count?: number | null;
           embedding_chunks_version?: number | null;
-          embedding?: string | null;
           expires_at?: string | null;
           id?: string;
           identity_id?: string | null;
@@ -1623,16 +1649,20 @@ export type Database = {
         };
         Relationships: [
           {
+            foreignKeyName: 'memories_contact_id_fkey';
+            columns: ['contact_id'];
+            referencedRelation: 'contacts';
+            referencedColumns: ['id'];
+          },
+          {
             foreignKeyName: 'memories_identity_id_fkey';
             columns: ['identity_id'];
-            isOneToOne: false;
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'memories_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -1654,7 +1684,7 @@ export type Database = {
         Insert: {
           chunk_index: number;
           chunk_text: string;
-          chunk_type?: string;
+          chunk_type: string;
           created_at?: string;
           embedding: string;
           id?: string;
@@ -1679,14 +1709,12 @@ export type Database = {
           {
             foreignKeyName: 'memory_embedding_chunks_memory_id_fkey';
             columns: ['memory_id'];
-            isOneToOne: false;
             referencedRelation: 'memories';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'memory_embedding_chunks_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -1748,7 +1776,6 @@ export type Database = {
           {
             foreignKeyName: 'memory_history_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -1789,7 +1816,6 @@ export type Database = {
           {
             foreignKeyName: 'memory_recall_benchmark_case_results_run_id_fkey';
             columns: ['run_id'];
-            isOneToOne: false;
             referencedRelation: 'memory_recall_benchmark_runs';
             referencedColumns: ['run_id'];
           },
@@ -1833,7 +1859,6 @@ export type Database = {
           {
             foreignKeyName: 'memory_recall_benchmark_metrics_run_id_fkey';
             columns: ['run_id'];
-            isOneToOne: false;
             referencedRelation: 'memory_recall_benchmark_runs';
             referencedColumns: ['run_id'];
           },
@@ -1889,7 +1914,6 @@ export type Database = {
           {
             foreignKeyName: 'memory_recall_benchmark_runs_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -1921,7 +1945,6 @@ export type Database = {
           {
             foreignKeyName: 'memory_summary_cache_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -1965,14 +1988,12 @@ export type Database = {
           {
             foreignKeyName: 'messages_conversation_id_fkey';
             columns: ['conversation_id'];
-            isOneToOne: false;
             referencedRelation: 'conversations';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'messages_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -2037,21 +2058,18 @@ export type Database = {
           {
             foreignKeyName: 'mini_app_records_contact_id_fkey';
             columns: ['contact_id'];
-            isOneToOne: false;
             referencedRelation: 'contacts';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'mini_app_records_related_record_id_fkey';
             columns: ['related_record_id'];
-            isOneToOne: false;
             referencedRelation: 'mini_app_records';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'mini_app_records_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -2098,7 +2116,6 @@ export type Database = {
           {
             foreignKeyName: 'notes_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -2196,7 +2213,6 @@ export type Database = {
           {
             foreignKeyName: 'projects_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -2240,7 +2256,6 @@ export type Database = {
           {
             foreignKeyName: 'reminder_history_reminder_id_fkey';
             columns: ['reminder_id'];
-            isOneToOne: false;
             referencedRelation: 'scheduled_reminders';
             referencedColumns: ['id'];
           },
@@ -2290,7 +2305,6 @@ export type Database = {
           {
             foreignKeyName: 'reminders_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -2358,14 +2372,12 @@ export type Database = {
           {
             foreignKeyName: 'scheduled_reminders_identity_id_fkey';
             columns: ['identity_id'];
-            isOneToOne: false;
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'scheduled_reminders_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -2406,14 +2418,12 @@ export type Database = {
           {
             foreignKeyName: 'session_focus_project_id_fkey';
             columns: ['project_id'];
-            isOneToOne: false;
             referencedRelation: 'projects';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'session_focus_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -2451,14 +2461,12 @@ export type Database = {
           {
             foreignKeyName: 'session_logs_compacted_into_memory_id_fkey';
             columns: ['compacted_into_memory_id'];
-            isOneToOne: false;
             referencedRelation: 'memories';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'session_logs_session_id_fkey';
             columns: ['session_id'];
-            isOneToOne: false;
             referencedRelation: 'sessions';
             referencedColumns: ['id'];
           },
@@ -2511,14 +2519,12 @@ export type Database = {
           {
             foreignKeyName: 'session_transcript_archives_session_id_fkey';
             columns: ['session_id'];
-            isOneToOne: false;
             referencedRelation: 'sessions';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'session_transcript_archives_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -2530,6 +2536,7 @@ export type Database = {
           backend: string | null;
           backend_session_id: string | null;
           claude_session_id: string | null;
+          cli_attached: boolean | null;
           compacting_since: string | null;
           contact_id: string | null;
           context: string | null;
@@ -2550,13 +2557,13 @@ export type Database = {
           updated_at: string | null;
           user_id: string;
           working_dir: string | null;
-          workspace_id: string | null;
         };
         Insert: {
           agent_id?: string | null;
           backend?: string | null;
           backend_session_id?: string | null;
           claude_session_id?: string | null;
+          cli_attached?: boolean | null;
           compacting_since?: string | null;
           contact_id?: string | null;
           context?: string | null;
@@ -2577,13 +2584,13 @@ export type Database = {
           updated_at?: string | null;
           user_id: string;
           working_dir?: string | null;
-          workspace_id?: string | null;
         };
         Update: {
           agent_id?: string | null;
           backend?: string | null;
           backend_session_id?: string | null;
           claude_session_id?: string | null;
+          cli_attached?: boolean | null;
           compacting_since?: string | null;
           contact_id?: string | null;
           context?: string | null;
@@ -2604,35 +2611,30 @@ export type Database = {
           updated_at?: string | null;
           user_id?: string;
           working_dir?: string | null;
-          workspace_id?: string | null;
         };
         Relationships: [
           {
+            foreignKeyName: 'sessions_contact_id_fkey';
+            columns: ['contact_id'];
+            referencedRelation: 'contacts';
+            referencedColumns: ['id'];
+          },
+          {
             foreignKeyName: 'sessions_identity_id_fkey';
             columns: ['identity_id'];
-            isOneToOne: false;
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'sessions_studio_id_fkey';
             columns: ['studio_id'];
-            isOneToOne: false;
             referencedRelation: 'studios';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'sessions_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
-            referencedColumns: ['id'];
-          },
-          {
-            foreignKeyName: 'sessions_workspace_id_fkey';
-            columns: ['workspace_id'];
-            isOneToOne: false;
-            referencedRelation: 'studios';
             referencedColumns: ['id'];
           },
         ];
@@ -2675,21 +2677,12 @@ export type Database = {
           {
             foreignKeyName: 'skill_installations_skill_id_fkey';
             columns: ['skill_id'];
-            isOneToOne: false;
             referencedRelation: 'skills';
             referencedColumns: ['id'];
           },
           {
-            foreignKeyName: 'skill_installations_skill_id_fkey';
-            columns: ['skill_id'];
-            isOneToOne: false;
-            referencedRelation: 'user_installed_skills';
-            referencedColumns: ['skill_id'];
-          },
-          {
             foreignKeyName: 'skill_installations_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -2730,23 +2723,14 @@ export type Database = {
           {
             foreignKeyName: 'skill_versions_published_by_fkey';
             columns: ['published_by'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'skill_versions_skill_id_fkey';
             columns: ['skill_id'];
-            isOneToOne: false;
             referencedRelation: 'skills';
             referencedColumns: ['id'];
-          },
-          {
-            foreignKeyName: 'skill_versions_skill_id_fkey';
-            columns: ['skill_id'];
-            isOneToOne: false;
-            referencedRelation: 'user_installed_skills';
-            referencedColumns: ['skill_id'];
           },
         ];
       };
@@ -2845,35 +2829,24 @@ export type Database = {
           {
             foreignKeyName: 'skills_author_user_id_fkey';
             columns: ['author_user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'skills_deprecated_by_fkey';
             columns: ['deprecated_by'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'skills_forked_from_id_fkey';
             columns: ['forked_from_id'];
-            isOneToOne: false;
             referencedRelation: 'skills';
             referencedColumns: ['id'];
           },
           {
-            foreignKeyName: 'skills_forked_from_id_fkey';
-            columns: ['forked_from_id'];
-            isOneToOne: false;
-            referencedRelation: 'user_installed_skills';
-            referencedColumns: ['skill_id'];
-          },
-          {
             foreignKeyName: 'skills_last_published_by_fkey';
             columns: ['last_published_by'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -2894,6 +2867,8 @@ export type Database = {
           purpose: string | null;
           repo_root: string;
           role_template: string | null;
+          route_patterns: string[] | null;
+          sandbox_bypass: boolean | null;
           session_id: string | null;
           slug: string | null;
           status: string;
@@ -2916,6 +2891,8 @@ export type Database = {
           purpose?: string | null;
           repo_root: string;
           role_template?: string | null;
+          route_patterns?: string[] | null;
+          sandbox_bypass?: boolean | null;
           session_id?: string | null;
           slug?: string | null;
           status?: string;
@@ -2938,6 +2915,8 @@ export type Database = {
           purpose?: string | null;
           repo_root?: string;
           role_template?: string | null;
+          route_patterns?: string[] | null;
+          sandbox_bypass?: boolean | null;
           session_id?: string | null;
           slug?: string | null;
           status?: string;
@@ -2950,22 +2929,95 @@ export type Database = {
           {
             foreignKeyName: 'studios_identity_id_fkey';
             columns: ['identity_id'];
-            isOneToOne: false;
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'studios_session_id_fkey';
             columns: ['session_id'];
-            isOneToOne: false;
             referencedRelation: 'sessions';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'studios_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      task_comments: {
+        Row: {
+          content: string;
+          created_at: string | null;
+          created_by_agent_id: string | null;
+          created_by_identity_id: string | null;
+          deleted_at: string | null;
+          id: string;
+          metadata: Json | null;
+          parent_comment_id: string | null;
+          task_id: string;
+          updated_at: string | null;
+          user_id: string;
+          workspace_id: string | null;
+        };
+        Insert: {
+          content: string;
+          created_at?: string | null;
+          created_by_agent_id?: string | null;
+          created_by_identity_id?: string | null;
+          deleted_at?: string | null;
+          id?: string;
+          metadata?: Json | null;
+          parent_comment_id?: string | null;
+          task_id: string;
+          updated_at?: string | null;
+          user_id: string;
+          workspace_id?: string | null;
+        };
+        Update: {
+          content?: string;
+          created_at?: string | null;
+          created_by_agent_id?: string | null;
+          created_by_identity_id?: string | null;
+          deleted_at?: string | null;
+          id?: string;
+          metadata?: Json | null;
+          parent_comment_id?: string | null;
+          task_id?: string;
+          updated_at?: string | null;
+          user_id?: string;
+          workspace_id?: string | null;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'task_comments_created_by_identity_id_fkey';
+            columns: ['created_by_identity_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_comments_parent_comment_id_fkey';
+            columns: ['parent_comment_id'];
+            referencedRelation: 'task_comments';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_comments_task_id_fkey';
+            columns: ['task_id'];
+            referencedRelation: 'tasks';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_comments_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_comments_workspace_id_fkey';
+            columns: ['workspace_id'];
+            referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
         ];
@@ -2975,87 +3027,111 @@ export type Database = {
           autonomous: boolean;
           context_summary: string | null;
           created_at: string;
+          current_task_index: number;
           description: string | null;
           id: string;
           identity_id: string | null;
+          iterations_since_approval: number;
           max_sessions: number | null;
           metadata: Json;
           next_run_after: string | null;
           output_status: string | null;
           output_target: string | null;
+          owner_agent_id: string | null;
+          plan_uri: string | null;
           priority: string;
           project_id: string | null;
           sessions_used: number;
           status: string;
+          strategy: string | null;
+          strategy_config: Json;
+          strategy_paused_at: string | null;
+          strategy_started_at: string | null;
           tags: string[];
           thread_key: string | null;
           title: string;
           updated_at: string;
           user_id: string;
+          verification_mode: string;
         };
         Insert: {
           autonomous?: boolean;
           context_summary?: string | null;
           created_at?: string;
+          current_task_index?: number;
           description?: string | null;
           id?: string;
           identity_id?: string | null;
+          iterations_since_approval?: number;
           max_sessions?: number | null;
           metadata?: Json;
           next_run_after?: string | null;
           output_status?: string | null;
           output_target?: string | null;
+          owner_agent_id?: string | null;
+          plan_uri?: string | null;
           priority?: string;
           project_id?: string | null;
           sessions_used?: number;
           status?: string;
+          strategy?: string | null;
+          strategy_config?: Json;
+          strategy_paused_at?: string | null;
+          strategy_started_at?: string | null;
           tags?: string[];
           thread_key?: string | null;
           title: string;
           updated_at?: string;
           user_id: string;
+          verification_mode?: string;
         };
         Update: {
           autonomous?: boolean;
           context_summary?: string | null;
           created_at?: string;
+          current_task_index?: number;
           description?: string | null;
           id?: string;
           identity_id?: string | null;
+          iterations_since_approval?: number;
           max_sessions?: number | null;
           metadata?: Json;
           next_run_after?: string | null;
           output_status?: string | null;
           output_target?: string | null;
+          owner_agent_id?: string | null;
+          plan_uri?: string | null;
           priority?: string;
           project_id?: string | null;
           sessions_used?: number;
           status?: string;
+          strategy?: string | null;
+          strategy_config?: Json;
+          strategy_paused_at?: string | null;
+          strategy_started_at?: string | null;
           tags?: string[];
           thread_key?: string | null;
           title?: string;
           updated_at?: string;
           user_id?: string;
+          verification_mode?: string;
         };
         Relationships: [
           {
             foreignKeyName: 'task_groups_identity_id_fkey';
             columns: ['identity_id'];
-            isOneToOne: false;
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'task_groups_project_id_fkey';
             columns: ['project_id'];
-            isOneToOne: false;
             referencedRelation: 'projects';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'task_groups_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -3076,6 +3152,7 @@ export type Database = {
           status: string;
           tags: string[] | null;
           task_group_id: string | null;
+          task_order: number | null;
           title: string;
           updated_at: string;
           user_id: string;
@@ -3094,6 +3171,7 @@ export type Database = {
           status?: string;
           tags?: string[] | null;
           task_group_id?: string | null;
+          task_order?: number | null;
           title: string;
           updated_at?: string;
           user_id: string;
@@ -3112,6 +3190,7 @@ export type Database = {
           status?: string;
           tags?: string[] | null;
           task_group_id?: string | null;
+          task_order?: number | null;
           title?: string;
           updated_at?: string;
           user_id?: string;
@@ -3120,21 +3199,18 @@ export type Database = {
           {
             foreignKeyName: 'tasks_project_id_fkey';
             columns: ['project_id'];
-            isOneToOne: false;
             referencedRelation: 'projects';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'tasks_task_group_id_fkey';
             columns: ['task_group_id'];
-            isOneToOne: false;
             referencedRelation: 'task_groups';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'tasks_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -3175,21 +3251,18 @@ export type Database = {
           {
             foreignKeyName: 'trusted_users_added_by_fkey';
             columns: ['added_by'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'trusted_users_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'trusted_users_workspace_id_fkey';
             columns: ['workspace_id'];
-            isOneToOne: false;
             referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
@@ -3233,14 +3306,12 @@ export type Database = {
           {
             foreignKeyName: 'user_identity_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'user_identity_workspace_id_fkey';
             columns: ['workspace_id'];
-            isOneToOne: false;
             referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
@@ -3290,14 +3361,12 @@ export type Database = {
           {
             foreignKeyName: 'user_identity_history_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'user_identity_history_workspace_id_fkey';
             columns: ['workspace_id'];
-            isOneToOne: false;
             referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
@@ -3338,21 +3407,18 @@ export type Database = {
           {
             foreignKeyName: 'user_permissions_granted_by_fkey';
             columns: ['granted_by'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'user_permissions_permission_id_fkey';
             columns: ['permission_id'];
-            isOneToOne: false;
             referencedRelation: 'permission_definitions';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'user_permissions_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -3441,14 +3507,12 @@ export type Database = {
           {
             foreignKeyName: 'workspace_members_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
           {
             foreignKeyName: 'workspace_members_workspace_id_fkey';
             columns: ['workspace_id'];
-            isOneToOne: false;
             referencedRelation: 'workspaces';
             referencedColumns: ['id'];
           },
@@ -3501,7 +3565,6 @@ export type Database = {
           {
             foreignKeyName: 'workspaces_user_id_fkey';
             columns: ['user_id'];
-            isOneToOne: false;
             referencedRelation: 'users';
             referencedColumns: ['id'];
           },
@@ -3509,45 +3572,7 @@ export type Database = {
       };
     };
     Views: {
-      user_installed_skills: {
-        Row: {
-          author: string | null;
-          category: string | null;
-          content: string | null;
-          current_version: string | null;
-          description: string | null;
-          display_name: string | null;
-          emoji: string | null;
-          enabled: boolean | null;
-          installation_id: string | null;
-          installed_at: string | null;
-          is_official: boolean | null;
-          is_verified: boolean | null;
-          last_used_at: string | null;
-          manifest: Json | null;
-          name: string | null;
-          repository_url: string | null;
-          resolved_content: string | null;
-          resolved_manifest: Json | null;
-          resolved_version: string | null;
-          skill_id: string | null;
-          tags: string[] | null;
-          type: string | null;
-          usage_count: number | null;
-          user_config: Json | null;
-          user_id: string | null;
-          version_pinned: string | null;
-        };
-        Relationships: [
-          {
-            foreignKeyName: 'skill_installations_user_id_fkey';
-            columns: ['user_id'];
-            isOneToOne: false;
-            referencedRelation: 'users';
-            referencedColumns: ['id'];
-          },
-        ];
-      };
+      [_ in never]: never;
     };
     Functions: {
       match_links: {
@@ -3685,6 +3710,532 @@ export type Database = {
       [_ in never]: never;
     };
   };
+  storage: {
+    Tables: {
+      buckets: {
+        Row: {
+          allowed_mime_types: string[] | null;
+          avif_autodetection: boolean | null;
+          created_at: string | null;
+          file_size_limit: number | null;
+          id: string;
+          name: string;
+          owner: string | null;
+          owner_id: string | null;
+          public: boolean | null;
+          type: Database['storage']['Enums']['buckettype'];
+          updated_at: string | null;
+        };
+        Insert: {
+          allowed_mime_types?: string[] | null;
+          avif_autodetection?: boolean | null;
+          created_at?: string | null;
+          file_size_limit?: number | null;
+          id: string;
+          name: string;
+          owner?: string | null;
+          owner_id?: string | null;
+          public?: boolean | null;
+          type?: Database['storage']['Enums']['buckettype'];
+          updated_at?: string | null;
+        };
+        Update: {
+          allowed_mime_types?: string[] | null;
+          avif_autodetection?: boolean | null;
+          created_at?: string | null;
+          file_size_limit?: number | null;
+          id?: string;
+          name?: string;
+          owner?: string | null;
+          owner_id?: string | null;
+          public?: boolean | null;
+          type?: Database['storage']['Enums']['buckettype'];
+          updated_at?: string | null;
+        };
+        Relationships: [];
+      };
+      buckets_analytics: {
+        Row: {
+          created_at: string;
+          deleted_at: string | null;
+          format: string;
+          id: string;
+          name: string;
+          type: Database['storage']['Enums']['buckettype'];
+          updated_at: string;
+        };
+        Insert: {
+          created_at?: string;
+          deleted_at?: string | null;
+          format?: string;
+          id?: string;
+          name: string;
+          type?: Database['storage']['Enums']['buckettype'];
+          updated_at?: string;
+        };
+        Update: {
+          created_at?: string;
+          deleted_at?: string | null;
+          format?: string;
+          id?: string;
+          name?: string;
+          type?: Database['storage']['Enums']['buckettype'];
+          updated_at?: string;
+        };
+        Relationships: [];
+      };
+      buckets_vectors: {
+        Row: {
+          created_at: string;
+          id: string;
+          type: Database['storage']['Enums']['buckettype'];
+          updated_at: string;
+        };
+        Insert: {
+          created_at?: string;
+          id: string;
+          type?: Database['storage']['Enums']['buckettype'];
+          updated_at?: string;
+        };
+        Update: {
+          created_at?: string;
+          id?: string;
+          type?: Database['storage']['Enums']['buckettype'];
+          updated_at?: string;
+        };
+        Relationships: [];
+      };
+      iceberg_namespaces: {
+        Row: {
+          bucket_name: string;
+          catalog_id: string;
+          created_at: string;
+          id: string;
+          metadata: Json;
+          name: string;
+          updated_at: string;
+        };
+        Insert: {
+          bucket_name: string;
+          catalog_id: string;
+          created_at?: string;
+          id?: string;
+          metadata?: Json;
+          name: string;
+          updated_at?: string;
+        };
+        Update: {
+          bucket_name?: string;
+          catalog_id?: string;
+          created_at?: string;
+          id?: string;
+          metadata?: Json;
+          name?: string;
+          updated_at?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'iceberg_namespaces_catalog_id_fkey';
+            columns: ['catalog_id'];
+            referencedRelation: 'buckets_analytics';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      iceberg_tables: {
+        Row: {
+          bucket_name: string;
+          catalog_id: string;
+          created_at: string;
+          id: string;
+          location: string;
+          name: string;
+          namespace_id: string;
+          remote_table_id: string | null;
+          shard_id: string | null;
+          shard_key: string | null;
+          updated_at: string;
+        };
+        Insert: {
+          bucket_name: string;
+          catalog_id: string;
+          created_at?: string;
+          id?: string;
+          location: string;
+          name: string;
+          namespace_id: string;
+          remote_table_id?: string | null;
+          shard_id?: string | null;
+          shard_key?: string | null;
+          updated_at?: string;
+        };
+        Update: {
+          bucket_name?: string;
+          catalog_id?: string;
+          created_at?: string;
+          id?: string;
+          location?: string;
+          name?: string;
+          namespace_id?: string;
+          remote_table_id?: string | null;
+          shard_id?: string | null;
+          shard_key?: string | null;
+          updated_at?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'iceberg_tables_catalog_id_fkey';
+            columns: ['catalog_id'];
+            referencedRelation: 'buckets_analytics';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'iceberg_tables_namespace_id_fkey';
+            columns: ['namespace_id'];
+            referencedRelation: 'iceberg_namespaces';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      migrations: {
+        Row: {
+          executed_at: string | null;
+          hash: string;
+          id: number;
+          name: string;
+        };
+        Insert: {
+          executed_at?: string | null;
+          hash: string;
+          id: number;
+          name: string;
+        };
+        Update: {
+          executed_at?: string | null;
+          hash?: string;
+          id?: number;
+          name?: string;
+        };
+        Relationships: [];
+      };
+      objects: {
+        Row: {
+          bucket_id: string | null;
+          created_at: string | null;
+          id: string;
+          last_accessed_at: string | null;
+          metadata: Json | null;
+          name: string | null;
+          owner: string | null;
+          owner_id: string | null;
+          path_tokens: string[] | null;
+          updated_at: string | null;
+          user_metadata: Json | null;
+          version: string | null;
+        };
+        Insert: {
+          bucket_id?: string | null;
+          created_at?: string | null;
+          id?: string;
+          last_accessed_at?: string | null;
+          metadata?: Json | null;
+          name?: string | null;
+          owner?: string | null;
+          owner_id?: string | null;
+          path_tokens?: string[] | null;
+          updated_at?: string | null;
+          user_metadata?: Json | null;
+          version?: string | null;
+        };
+        Update: {
+          bucket_id?: string | null;
+          created_at?: string | null;
+          id?: string;
+          last_accessed_at?: string | null;
+          metadata?: Json | null;
+          name?: string | null;
+          owner?: string | null;
+          owner_id?: string | null;
+          path_tokens?: string[] | null;
+          updated_at?: string | null;
+          user_metadata?: Json | null;
+          version?: string | null;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'objects_bucketId_fkey';
+            columns: ['bucket_id'];
+            referencedRelation: 'buckets';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      s3_multipart_uploads: {
+        Row: {
+          bucket_id: string;
+          created_at: string;
+          id: string;
+          in_progress_size: number;
+          key: string;
+          owner_id: string | null;
+          upload_signature: string;
+          user_metadata: Json | null;
+          version: string;
+        };
+        Insert: {
+          bucket_id: string;
+          created_at?: string;
+          id: string;
+          in_progress_size?: number;
+          key: string;
+          owner_id?: string | null;
+          upload_signature: string;
+          user_metadata?: Json | null;
+          version: string;
+        };
+        Update: {
+          bucket_id?: string;
+          created_at?: string;
+          id?: string;
+          in_progress_size?: number;
+          key?: string;
+          owner_id?: string | null;
+          upload_signature?: string;
+          user_metadata?: Json | null;
+          version?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 's3_multipart_uploads_bucket_id_fkey';
+            columns: ['bucket_id'];
+            referencedRelation: 'buckets';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      s3_multipart_uploads_parts: {
+        Row: {
+          bucket_id: string;
+          created_at: string;
+          etag: string;
+          id: string;
+          key: string;
+          owner_id: string | null;
+          part_number: number;
+          size: number;
+          upload_id: string;
+          version: string;
+        };
+        Insert: {
+          bucket_id: string;
+          created_at?: string;
+          etag: string;
+          id?: string;
+          key: string;
+          owner_id?: string | null;
+          part_number: number;
+          size?: number;
+          upload_id: string;
+          version: string;
+        };
+        Update: {
+          bucket_id?: string;
+          created_at?: string;
+          etag?: string;
+          id?: string;
+          key?: string;
+          owner_id?: string | null;
+          part_number?: number;
+          size?: number;
+          upload_id?: string;
+          version?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 's3_multipart_uploads_parts_bucket_id_fkey';
+            columns: ['bucket_id'];
+            referencedRelation: 'buckets';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 's3_multipart_uploads_parts_upload_id_fkey';
+            columns: ['upload_id'];
+            referencedRelation: 's3_multipart_uploads';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      vector_indexes: {
+        Row: {
+          bucket_id: string;
+          created_at: string;
+          data_type: string;
+          dimension: number;
+          distance_metric: string;
+          id: string;
+          metadata_configuration: Json | null;
+          name: string;
+          updated_at: string;
+        };
+        Insert: {
+          bucket_id: string;
+          created_at?: string;
+          data_type: string;
+          dimension: number;
+          distance_metric: string;
+          id?: string;
+          metadata_configuration?: Json | null;
+          name: string;
+          updated_at?: string;
+        };
+        Update: {
+          bucket_id?: string;
+          created_at?: string;
+          data_type?: string;
+          dimension?: number;
+          distance_metric?: string;
+          id?: string;
+          metadata_configuration?: Json | null;
+          name?: string;
+          updated_at?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'vector_indexes_bucket_id_fkey';
+            columns: ['bucket_id'];
+            referencedRelation: 'buckets_vectors';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+    };
+    Views: {
+      [_ in never]: never;
+    };
+    Functions: {
+      can_insert_object: {
+        Args: { bucketid: string; metadata: Json; name: string; owner: string };
+        Returns: undefined;
+      };
+      extension: { Args: { name: string }; Returns: string };
+      filename: { Args: { name: string }; Returns: string };
+      foldername: { Args: { name: string }; Returns: string[] };
+      get_common_prefix: {
+        Args: { p_delimiter: string; p_key: string; p_prefix: string };
+        Returns: string;
+      };
+      get_size_by_bucket: {
+        Args: never;
+        Returns: {
+          bucket_id: string;
+          size: number;
+        }[];
+      };
+      list_multipart_uploads_with_delimiter: {
+        Args: {
+          bucket_id: string;
+          delimiter_param: string;
+          max_keys?: number;
+          next_key_token?: string;
+          next_upload_token?: string;
+          prefix_param: string;
+        };
+        Returns: {
+          created_at: string;
+          id: string;
+          key: string;
+        }[];
+      };
+      list_objects_with_delimiter: {
+        Args: {
+          _bucket_id: string;
+          delimiter_param: string;
+          max_keys?: number;
+          next_token?: string;
+          prefix_param: string;
+          sort_order?: string;
+          start_after?: string;
+        };
+        Returns: {
+          created_at: string;
+          id: string;
+          last_accessed_at: string;
+          metadata: Json;
+          name: string;
+          updated_at: string;
+        }[];
+      };
+      operation: { Args: never; Returns: string };
+      search: {
+        Args: {
+          bucketname: string;
+          levels?: number;
+          limits?: number;
+          offsets?: number;
+          prefix: string;
+          search?: string;
+          sortcolumn?: string;
+          sortorder?: string;
+        };
+        Returns: {
+          created_at: string;
+          id: string;
+          last_accessed_at: string;
+          metadata: Json;
+          name: string;
+          updated_at: string;
+        }[];
+      };
+      search_by_timestamp: {
+        Args: {
+          p_bucket_id: string;
+          p_level: number;
+          p_limit: number;
+          p_prefix: string;
+          p_sort_column: string;
+          p_sort_column_after: string;
+          p_sort_order: string;
+          p_start_after: string;
+        };
+        Returns: {
+          created_at: string;
+          id: string;
+          key: string;
+          last_accessed_at: string;
+          metadata: Json;
+          name: string;
+          updated_at: string;
+        }[];
+      };
+      search_v2: {
+        Args: {
+          bucket_name: string;
+          levels?: number;
+          limits?: number;
+          prefix: string;
+          sort_column?: string;
+          sort_column_after?: string;
+          sort_order?: string;
+          start_after?: string;
+        };
+        Returns: {
+          created_at: string;
+          id: string;
+          key: string;
+          last_accessed_at: string;
+          metadata: Json;
+          name: string;
+          updated_at: string;
+        }[];
+      };
+    };
+    Enums: {
+      buckettype: 'STANDARD' | 'ANALYTICS' | 'VECTOR';
+    };
+    CompositeTypes: {
+      [_ in never]: never;
+    };
+  };
 };
 
 type DatabaseWithoutInternals = Omit<Database, '__InternalSupabase'>;
@@ -3803,6 +4354,12 @@ export type CompositeTypes<
     : never;
 
 export const Constants = {
+  graphql_public: {
+    Enums: {},
+  },
+  pgbouncer: {
+    Enums: {},
+  },
   public: {
     Enums: {
       activity_type: [
@@ -3817,6 +4374,11 @@ export const Constants = {
         'error',
       ],
       trust_level: ['owner', 'admin', 'member'],
+    },
+  },
+  storage: {
+    Enums: {
+      buckettype: ['STANDARD', 'ANALYTICS', 'VECTOR'],
     },
   },
 } as const;

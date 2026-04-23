@@ -943,7 +943,25 @@ export class SessionService implements ISessionService {
             agentId,
             matchCount: matches.length,
           });
+        } else {
+          // matches.length === 0 — the common silent fall-through case: studios
+          // exist for this agent but none of their patterns match this threadKey.
+          // Previously invisible; now log so dispatch-routing failures are
+          // traceable (see thread:pcp-to-ink-rename 2026-04-17 post-mortem).
+          logger.warn('[StudioResolve] No studio pattern matched threadKey, falling through', {
+            threadKey: options.threadKey,
+            agentId,
+            candidateStudios: patternStudios.map((s) => ({
+              id: s.id,
+              patterns: s.route_patterns,
+            })),
+          });
         }
+      } else {
+        logger.debug('[StudioResolve] No studios with route_patterns for agent', {
+          threadKey: options.threadKey,
+          agentId,
+        });
       }
     }
 
@@ -959,6 +977,11 @@ export class SessionService implements ISessionService {
       .maybeSingle();
 
     if (agentStudio?.id) {
+      logger.debug("[StudioResolve] Fell back to agent's most recent studio", {
+        threadKey: options.threadKey || null,
+        agentId,
+        studioId: agentStudio.id,
+      });
       return agentStudio.id;
     }
 
@@ -968,7 +991,14 @@ export class SessionService implements ISessionService {
 
     // 5) Shared per-user main studio fallback
     const mainStudioId = await this.resolveMainStudioId(userId, options.repoRoot, agentId);
-    if (mainStudioId) return mainStudioId;
+    if (mainStudioId) {
+      logger.debug('[StudioResolve] Fell back to main studio', {
+        threadKey: options.threadKey || null,
+        agentId,
+        studioId: mainStudioId,
+      });
+      return mainStudioId;
+    }
 
     // Codex is worktree-sensitive: keep a deterministic warning when no studio could be resolved.
     if (options.backend === 'codex-cli') {

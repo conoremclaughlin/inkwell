@@ -128,10 +128,7 @@ export class CodexRunner implements IRunner {
     // Ink session headers — Codex resolves env var names to values at runtime.
     // The server key must match what's in .codex/config.toml (mcp_servers.inkwell).
     const codexServerKey = 'inkwell';
-    args.push(
-      '-c',
-      `mcp_servers.${codexServerKey}.env_http_headers.x-ink-context="INK_CONTEXT_TOKEN"`
-    );
+    args.push('-c', `mcp_servers.${codexServerKey}.env_http_headers.x-ink-context="INK_CONTEXT"`);
     args.push('-c', `mcp_servers.${codexServerKey}.env_http_headers.x-ink-agent-id="AGENT_ID"`);
     args.push(
       '-c',

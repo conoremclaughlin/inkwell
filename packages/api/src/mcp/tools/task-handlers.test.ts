@@ -12,6 +12,9 @@ import {
   handleUpdateTask,
   handleCompleteTask,
   handleGetTaskStats,
+  handleCreateTaskGroup,
+  handleListTaskGroups,
+  handleUpdateTaskGroup,
 } from './task-handlers';
 
 // =====================================================
@@ -64,8 +67,19 @@ function createMockDataComposer() {
     listByUser: vi.fn(),
     listActiveTasks: vi.fn(),
     update: vi.fn(),
+    startTask: vi.fn(),
     completeTask: vi.fn(),
     getProjectStats: vi.fn(),
+  };
+
+  const mockTaskGroupsRepo = {
+    create: vi.fn(),
+    findById: vi.fn(),
+    listByUser: vi.fn(),
+    update: vi.fn(),
+    delete: vi.fn(),
+    findActiveStrategies: vi.fn(),
+    taskCountsByGroup: vi.fn().mockResolvedValue({}),
   };
 
   const mockProjectsRepo = {
@@ -76,10 +90,25 @@ function createMockDataComposer() {
     remember: vi.fn(),
   };
 
+  // Minimal supabase client stub for identity/agent_identities lookups.
+  // Returns an empty result so `identityId` resolves to null by default.
+  const identityChain = {
+    select: vi.fn().mockReturnThis(),
+    eq: vi.fn().mockReturnThis(),
+    in: vi.fn().mockReturnThis(),
+    limit: vi.fn().mockReturnThis(),
+    single: vi.fn().mockResolvedValue({ data: null, error: null }),
+    then: undefined as unknown,
+  };
+  const mockClient = {
+    from: vi.fn().mockReturnValue(identityChain),
+  };
+
   return {
-    getClient: vi.fn(),
+    getClient: vi.fn().mockReturnValue(mockClient),
     repositories: {
       tasks: mockTasksRepo,
+      taskGroups: mockTaskGroupsRepo,
       projects: mockProjectsRepo,
       memory: mockMemoryRepo,
     },
@@ -1038,5 +1067,805 @@ describe('handleGetTaskStats', () => {
     expect(response.isError).toBe(true);
     expect(data.success).toBe(false);
     expect(data.error).toBe('User not found');
+  });
+});
+
+// =====================================================
+// handleCreateTask — task group support
+// =====================================================
+
+describe('handleCreateTask — task group support', () => {
+  let dc: ReturnType<typeof createMockDataComposer>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dc = createMockDataComposer();
+    resolveUserMock.mockResolvedValue({
+      user: { id: 'user-123' } as any,
+      resolvedBy: 'userId',
+    });
+  });
+
+  it('should create a task with taskGroupId and taskOrder', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue({
+      id: 'group-1',
+      user_id: 'user-123',
+      title: 'Build OAuth',
+    });
+    dc.repositories.tasks.create.mockResolvedValue({
+      id: 'task-1',
+      title: 'Implement /token endpoint',
+      description: 'Build the token exchange',
+      status: 'pending',
+      priority: 'high',
+      tags: [],
+      task_group_id: 'group-1',
+      task_order: 2,
+      created_at: '2026-04-09T10:00:00Z',
+    });
+
+    const response = await handleCreateTask(
+      {
+        userId: 'user-123',
+        taskGroupId: 'group-1',
+        taskOrder: 2,
+        title: 'Implement /token endpoint',
+        description: 'Build the token exchange',
+        priority: 'high',
+      },
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(data.success).toBe(true);
+    expect(data.task.taskGroupId).toBe('group-1');
+    expect(data.task.taskOrder).toBe(2);
+    expect(dc.repositories.tasks.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        task_group_id: 'group-1',
+        task_order: 2,
+      })
+    );
+  });
+
+  it('should create a standalone task without projectId or groupId', async () => {
+    dc.repositories.tasks.create.mockResolvedValue({
+      id: 'task-1',
+      title: 'Quick note',
+      status: 'pending',
+      priority: 'medium',
+      tags: [],
+      task_group_id: null,
+      task_order: null,
+      created_at: '2026-04-09T10:00:00Z',
+    });
+
+    const response = await handleCreateTask(
+      {
+        userId: 'user-123',
+        title: 'Quick note',
+        priority: 'medium',
+      },
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(data.success).toBe(true);
+    expect(data.task.taskGroupId).toBeNull();
+    expect(dc.repositories.projects.findById).not.toHaveBeenCalled();
+    expect(dc.repositories.taskGroups.findById).not.toHaveBeenCalled();
+  });
+
+  it('should return error when task group does not belong to user', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue({
+      id: 'group-1',
+      user_id: 'other-user-456',
+      title: 'Not yours',
+    });
+
+    const response = await handleCreateTask(
+      {
+        userId: 'user-123',
+        taskGroupId: 'group-1',
+        title: 'Some task',
+        priority: 'medium',
+      },
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBe(true);
+    expect(data.error).toBe('Task group does not belong to this user');
+  });
+});
+
+// =====================================================
+// handleCreateTaskGroup
+// =====================================================
+
+describe('handleCreateTaskGroup', () => {
+  let dc: ReturnType<typeof createMockDataComposer>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dc = createMockDataComposer();
+    resolveUserMock.mockResolvedValue({
+      user: { id: 'user-123' } as any,
+      resolvedBy: 'userId',
+    });
+  });
+
+  it('creates a task group and returns normalized fields', async () => {
+    dc.repositories.taskGroups.create.mockResolvedValue({
+      id: 'grp-1',
+      user_id: 'user-123',
+      identity_id: null,
+      project_id: null,
+      title: 'Ship feature X',
+      description: 'Multi-PR rollout',
+      status: 'active',
+      priority: 'high',
+      tags: ['feature'],
+      metadata: {},
+      autonomous: false,
+      max_sessions: null,
+      sessions_used: 0,
+      context_summary: null,
+      next_run_after: null,
+      output_target: 'pr',
+      output_status: null,
+      thread_key: 'thread:feat-x',
+      created_at: '2026-04-16T10:00:00Z',
+      updated_at: '2026-04-16T10:00:00Z',
+    });
+
+    const response = await handleCreateTaskGroup(
+      {
+        userId: 'user-123',
+        title: 'Ship feature X',
+        description: 'Multi-PR rollout',
+        priority: 'high',
+        status: 'active',
+        tags: ['feature'],
+        outputTarget: 'pr',
+        threadKey: 'thread:feat-x',
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBeFalsy();
+    expect(data.success).toBe(true);
+    expect(data.group.id).toBe('grp-1');
+    expect(data.group.title).toBe('Ship feature X');
+    expect(data.group.priority).toBe('high');
+    expect(data.group.outputTarget).toBe('pr');
+    expect(data.group.threadKey).toBe('thread:feat-x');
+    expect(dc.repositories.taskGroups.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        user_id: 'user-123',
+        title: 'Ship feature X',
+        description: 'Multi-PR rollout',
+        status: 'active',
+        priority: 'high',
+        tags: ['feature'],
+        output_target: 'pr',
+        thread_key: 'thread:feat-x',
+      })
+    );
+  });
+
+  it('validates project ownership when projectId is provided', async () => {
+    dc.repositories.projects.findById.mockResolvedValue({
+      id: 'proj-1',
+      user_id: 'other-user-999',
+      name: 'Not yours',
+    });
+
+    const response = await handleCreateTaskGroup(
+      {
+        userId: 'user-123',
+        title: 'Scoped group',
+        projectId: '00000000-0000-0000-0000-000000000001',
+        priority: 'normal',
+        status: 'active',
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBe(true);
+    expect(data.error).toBe('Project does not belong to this user');
+    expect(dc.repositories.taskGroups.create).not.toHaveBeenCalled();
+  });
+
+  it('returns error when user is not found (create)', async () => {
+    resolveUserMock.mockResolvedValue(null);
+
+    const response = await handleCreateTaskGroup(
+      {
+        userId: 'nonexistent',
+        title: 'Anything',
+        priority: 'normal',
+        status: 'active',
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBe(true);
+    expect(data.error).toBe('User not found');
+    expect(dc.repositories.taskGroups.create).not.toHaveBeenCalled();
+  });
+});
+
+// =====================================================
+// handleUpdateTaskGroup
+// =====================================================
+
+describe('handleUpdateTaskGroup', () => {
+  let dc: ReturnType<typeof createMockDataComposer>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dc = createMockDataComposer();
+    resolveUserMock.mockResolvedValue({
+      user: { id: 'user-123' } as any,
+      resolvedBy: 'userId',
+    });
+  });
+
+  const existingGroup = {
+    id: '11111111-2222-3333-4444-555555555555',
+    user_id: 'user-123',
+    identity_id: null,
+    project_id: null,
+    title: 'Feature X',
+    description: null,
+    status: 'active',
+    priority: 'normal',
+    tags: [],
+    metadata: { preset: 'wren' },
+    autonomous: false,
+    max_sessions: null,
+    sessions_used: 0,
+    context_summary: null,
+    next_run_after: null,
+    output_target: null,
+    output_status: null,
+    thread_key: null,
+    owner_agent_id: null,
+    created_at: '2026-04-18T10:00:00Z',
+    updated_at: '2026-04-18T10:00:00Z',
+  };
+
+  it('closes a group with completed status and records closedReason in metadata', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
+    dc.repositories.taskGroups.update.mockResolvedValue({
+      ...existingGroup,
+      status: 'completed',
+      metadata: { preset: 'wren', closed_reason: 'Shipped via PR #100' },
+    });
+
+    const response = await handleUpdateTaskGroup(
+      {
+        userId: 'user-123',
+        groupId: '11111111-2222-3333-4444-555555555555',
+        status: 'completed',
+        closedReason: 'Shipped via PR #100',
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBeFalsy();
+    expect(data.success).toBe(true);
+    expect(data.group.status).toBe('completed');
+    expect(data.group.metadata).toEqual({ preset: 'wren', closed_reason: 'Shipped via PR #100' });
+
+    expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+      '11111111-2222-3333-4444-555555555555',
+      expect.objectContaining({
+        status: 'completed',
+        metadata: { preset: 'wren', closed_reason: 'Shipped via PR #100' },
+      })
+    );
+  });
+
+  it('merges metadata by default, preserving existing keys', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
+    dc.repositories.taskGroups.update.mockResolvedValue({
+      ...existingGroup,
+      metadata: { preset: 'wren', studioSlug: 'wren-omega' },
+    });
+
+    await handleUpdateTaskGroup(
+      {
+        userId: 'user-123',
+        groupId: '11111111-2222-3333-4444-555555555555',
+        metadata: { studioSlug: 'wren-omega' },
+      } as any,
+      dc as any
+    );
+
+    expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+      '11111111-2222-3333-4444-555555555555',
+      expect.objectContaining({
+        metadata: { preset: 'wren', studioSlug: 'wren-omega' },
+      })
+    );
+  });
+
+  it('replaces metadata when mergeMetadata is false', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
+    dc.repositories.taskGroups.update.mockResolvedValue({
+      ...existingGroup,
+      metadata: { studioSlug: 'wren-omega' },
+    });
+
+    await handleUpdateTaskGroup(
+      {
+        userId: 'user-123',
+        groupId: '11111111-2222-3333-4444-555555555555',
+        metadata: { studioSlug: 'wren-omega' },
+        mergeMetadata: false,
+      } as any,
+      dc as any
+    );
+
+    expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+      '11111111-2222-3333-4444-555555555555',
+      expect.objectContaining({
+        metadata: { studioSlug: 'wren-omega' },
+      })
+    );
+  });
+
+  it('rejects update when group belongs to a different user', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue({
+      ...existingGroup,
+      user_id: 'someone-else',
+    });
+
+    const response = await handleUpdateTaskGroup(
+      {
+        userId: 'user-123',
+        groupId: '11111111-2222-3333-4444-555555555555',
+        status: 'completed',
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBe(true);
+    expect(data.error).toBe('Task group does not belong to this user');
+    expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
+  });
+
+  it('returns error when group does not exist', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue(null);
+
+    const response = await handleUpdateTaskGroup(
+      {
+        userId: 'user-123',
+        groupId: '11111111-2222-3333-4444-555555555555',
+        status: 'completed',
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBe(true);
+    expect(data.error).toBe('Task group not found');
+    expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
+  });
+
+  it('rejects identityId that does not belong to this user', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
+    // Identity lookup returns nothing — not owned by this user
+    (dc.getClient() as any).from().single.mockResolvedValueOnce({ data: null, error: null });
+
+    const response = await handleUpdateTaskGroup(
+      {
+        userId: 'user-123',
+        groupId: '11111111-2222-3333-4444-555555555555',
+        identityId: '99999999-9999-9999-9999-999999999999',
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBe(true);
+    expect(data.error).toBe('identityId not found or does not belong to this user/workspace.');
+    expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
+  });
+
+  it('scopes identityId lookup to the workspace when request context supplies one', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
+    const { getRequestContext } = await import('../../utils/request-context');
+    (getRequestContext as any).mockReturnValueOnce({
+      workspaceId: 'ws-match',
+    });
+    // Identity lookup returns nothing — same user, but different workspace
+    const chain = (dc.getClient() as any).from();
+    chain.single.mockResolvedValueOnce({ data: null, error: null });
+
+    const response = await handleUpdateTaskGroup(
+      {
+        userId: 'user-123',
+        groupId: '11111111-2222-3333-4444-555555555555',
+        identityId: '77777777-7777-7777-7777-777777777777',
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBe(true);
+    expect(data.error).toBe('identityId not found or does not belong to this user/workspace.');
+    expect(chain.eq).toHaveBeenCalledWith('workspace_id', 'ws-match');
+    expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
+  });
+
+  it('accepts identityId that belongs to this user', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
+    (dc.getClient() as any).from().single.mockResolvedValueOnce({
+      data: { id: '77777777-7777-7777-7777-777777777777' },
+      error: null,
+    });
+    dc.repositories.taskGroups.update.mockResolvedValue({
+      ...existingGroup,
+      identity_id: '77777777-7777-7777-7777-777777777777',
+    });
+
+    const response = await handleUpdateTaskGroup(
+      {
+        userId: 'user-123',
+        groupId: '11111111-2222-3333-4444-555555555555',
+        identityId: '77777777-7777-7777-7777-777777777777',
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBeFalsy();
+    expect(data.success).toBe(true);
+    expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+      '11111111-2222-3333-4444-555555555555',
+      expect.objectContaining({
+        identity_id: '77777777-7777-7777-7777-777777777777',
+      })
+    );
+  });
+
+  it('accepts explicit null identityId as a clear without a lookup', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
+    dc.repositories.taskGroups.update.mockResolvedValue({
+      ...existingGroup,
+      identity_id: null,
+    });
+
+    await handleUpdateTaskGroup(
+      {
+        userId: 'user-123',
+        groupId: '11111111-2222-3333-4444-555555555555',
+        identityId: null,
+      } as any,
+      dc as any
+    );
+
+    // No identity lookup should have been issued — null bypasses validation.
+    const fromMock = (dc.getClient() as any).from;
+    expect(fromMock).not.toHaveBeenCalledWith('agent_identities');
+    expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+      '11111111-2222-3333-4444-555555555555',
+      expect.objectContaining({
+        identity_id: null,
+      })
+    );
+  });
+
+  it('does not touch identity_id when identityId is not provided', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
+    dc.repositories.taskGroups.update.mockResolvedValue({
+      ...existingGroup,
+      status: 'paused',
+    });
+
+    await handleUpdateTaskGroup(
+      {
+        userId: 'user-123',
+        groupId: '11111111-2222-3333-4444-555555555555',
+        status: 'paused',
+      } as any,
+      dc as any
+    );
+
+    const fromMock = (dc.getClient() as any).from;
+    expect(fromMock).not.toHaveBeenCalledWith('agent_identities');
+    // Repository sees undefined for identity_id — repository's upsert logic is
+    // then responsible for leaving the column alone.
+    const call = (dc.repositories.taskGroups.update as any).mock.calls[0][1];
+    expect(call.identity_id).toBeUndefined();
+  });
+});
+
+// =====================================================
+// handleCompleteTask — strategy advancement
+// =====================================================
+
+describe('handleCompleteTask — strategy advancement', () => {
+  let dc: ReturnType<typeof createMockDataComposer>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dc = createMockDataComposer();
+    resolveUserMock.mockResolvedValue({
+      user: { id: 'user-123' } as any,
+      resolvedBy: 'userId',
+    });
+  });
+
+  it('should check for strategy group when completing a task with task_group_id', async () => {
+    dc.repositories.tasks.findById.mockResolvedValue({
+      id: 'task-1',
+      user_id: 'user-123',
+      title: 'First task',
+      status: 'in_progress',
+      task_group_id: 'group-1',
+    });
+    dc.repositories.tasks.completeTask.mockResolvedValue({
+      id: 'task-1',
+      title: 'First task',
+      description: null,
+      status: 'completed',
+      priority: 'medium',
+      tags: [],
+      project_id: null,
+      task_group_id: 'group-1',
+      completed_at: '2026-04-09T15:00:00Z',
+    });
+    dc.repositories.memory.remember.mockResolvedValue({ id: 'mem-1' });
+    // Group without active strategy — should not try to advance
+    dc.repositories.taskGroups.findById.mockResolvedValue({
+      id: 'group-1',
+      user_id: 'user-123',
+      title: 'Build OAuth',
+      status: 'active',
+      strategy: null,
+      strategy_config: {},
+    });
+
+    const response = await handleCompleteTask({ userId: 'user-123', taskId: 'task-1' }, dc as any);
+
+    const data = parseResponse(response);
+    expect(data.success).toBe(true);
+    // Verifies the task group was looked up
+    expect(dc.repositories.taskGroups.findById).toHaveBeenCalledWith('group-1');
+    // No strategy set → no strategy advancement
+    expect(data.strategy).toBeUndefined();
+  });
+
+  it('should not include strategy field for tasks without a group', async () => {
+    dc.repositories.tasks.findById.mockResolvedValue({
+      id: 'task-1',
+      user_id: 'user-123',
+      title: 'Standalone task',
+      status: 'in_progress',
+      task_group_id: null,
+    });
+    dc.repositories.tasks.completeTask.mockResolvedValue({
+      id: 'task-1',
+      title: 'Standalone task',
+      description: null,
+      status: 'completed',
+      priority: 'medium',
+      tags: [],
+      project_id: null,
+      task_group_id: null,
+      completed_at: '2026-04-09T15:00:00Z',
+    });
+    dc.repositories.memory.remember.mockResolvedValue({ id: 'mem-1' });
+
+    const response = await handleCompleteTask({ userId: 'user-123', taskId: 'task-1' }, dc as any);
+
+    const data = parseResponse(response);
+    expect(data.success).toBe(true);
+    expect(data.strategy).toBeUndefined();
+  });
+});
+
+// =====================================================
+// handleListTaskGroups
+// =====================================================
+
+describe('handleListTaskGroups', () => {
+  let dc: ReturnType<typeof createMockDataComposer>;
+
+  const sampleGroups = [
+    {
+      id: 'grp-1',
+      user_id: 'user-123',
+      identity_id: null,
+      project_id: null,
+      title: 'Active group',
+      description: null,
+      status: 'active',
+      priority: 'high',
+      tags: [],
+      metadata: {},
+      autonomous: false,
+      max_sessions: null,
+      sessions_used: 0,
+      context_summary: null,
+      next_run_after: null,
+      output_target: null,
+      output_status: null,
+      thread_key: null,
+      created_at: '2026-04-16T10:00:00Z',
+      updated_at: '2026-04-16T10:00:00Z',
+    },
+    {
+      id: 'grp-2',
+      user_id: 'user-123',
+      identity_id: null,
+      project_id: null,
+      title: 'Completed group',
+      description: null,
+      status: 'completed',
+      priority: 'normal',
+      tags: [],
+      metadata: {},
+      autonomous: false,
+      max_sessions: null,
+      sessions_used: 0,
+      context_summary: null,
+      next_run_after: null,
+      output_target: null,
+      output_status: null,
+      thread_key: null,
+      created_at: '2026-04-15T10:00:00Z',
+      updated_at: '2026-04-15T10:00:00Z',
+    },
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dc = createMockDataComposer();
+    resolveUserMock.mockResolvedValue({
+      user: { id: 'user-123' } as any,
+      resolvedBy: 'userId',
+    });
+  });
+
+  it('returns all groups when statuses is omitted', async () => {
+    dc.repositories.taskGroups.listByUser.mockResolvedValue(sampleGroups);
+    dc.repositories.taskGroups.taskCountsByGroup.mockResolvedValue({
+      'grp-1': { total: 3, pending: 1, in_progress: 1, completed: 1, blocked: 0 },
+    });
+
+    const response = await handleListTaskGroups(
+      {
+        userId: 'user-123',
+        autonomousOnly: false,
+        includeTaskCounts: true,
+        limit: 200,
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBeFalsy();
+    expect(data.success).toBe(true);
+    expect(data.groups).toHaveLength(2);
+    expect(dc.repositories.taskGroups.listByUser).toHaveBeenCalledWith(
+      'user-123',
+      expect.objectContaining({ status: undefined, limit: 200 })
+    );
+    expect(data.groups[0].taskCounts).toEqual({
+      total: 3,
+      pending: 1,
+      in_progress: 1,
+      completed: 1,
+      blocked: 0,
+    });
+    expect(data.groups[1].taskCounts.total).toBe(0);
+  });
+
+  it('treats empty statuses array the same as omitted (all statuses)', async () => {
+    dc.repositories.taskGroups.listByUser.mockResolvedValue(sampleGroups);
+
+    await handleListTaskGroups(
+      {
+        userId: 'user-123',
+        statuses: [],
+        autonomousOnly: false,
+        includeTaskCounts: false,
+        limit: 200,
+      } as any,
+      dc as any
+    );
+
+    expect(dc.repositories.taskGroups.listByUser).toHaveBeenCalledWith(
+      'user-123',
+      expect.objectContaining({ status: undefined })
+    );
+  });
+
+  it('passes statuses array through to the repository', async () => {
+    dc.repositories.taskGroups.listByUser.mockResolvedValue([sampleGroups[0]]);
+
+    await handleListTaskGroups(
+      {
+        userId: 'user-123',
+        statuses: ['active', 'paused'],
+        autonomousOnly: false,
+        includeTaskCounts: false,
+        limit: 200,
+      } as any,
+      dc as any
+    );
+
+    expect(dc.repositories.taskGroups.listByUser).toHaveBeenCalledWith(
+      'user-123',
+      expect.objectContaining({ status: ['active', 'paused'] })
+    );
+  });
+
+  it('supports single-element statuses arrays', async () => {
+    dc.repositories.taskGroups.listByUser.mockResolvedValue([sampleGroups[1]]);
+
+    await handleListTaskGroups(
+      {
+        userId: 'user-123',
+        statuses: ['completed'],
+        autonomousOnly: false,
+        includeTaskCounts: false,
+        limit: 200,
+      } as any,
+      dc as any
+    );
+
+    expect(dc.repositories.taskGroups.listByUser).toHaveBeenCalledWith(
+      'user-123',
+      expect.objectContaining({ status: ['completed'] })
+    );
+  });
+
+  it('skips count aggregation when includeTaskCounts=false', async () => {
+    dc.repositories.taskGroups.listByUser.mockResolvedValue(sampleGroups);
+
+    const response = await handleListTaskGroups(
+      {
+        userId: 'user-123',
+        autonomousOnly: false,
+        includeTaskCounts: false,
+        limit: 200,
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(data.success).toBe(true);
+    expect(dc.repositories.taskGroups.taskCountsByGroup).not.toHaveBeenCalled();
+    expect(data.groups[0].taskCounts).toBeUndefined();
+  });
+
+  it('returns error when user is not found (list)', async () => {
+    resolveUserMock.mockResolvedValue(null);
+
+    const response = await handleListTaskGroups(
+      {
+        userId: 'nonexistent',
+        autonomousOnly: false,
+        includeTaskCounts: true,
+        limit: 200,
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBe(true);
+    expect(data.error).toBe('User not found');
+    expect(dc.repositories.taskGroups.listByUser).not.toHaveBeenCalled();
   });
 });

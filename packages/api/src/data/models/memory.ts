@@ -129,7 +129,12 @@ export interface SessionCreateInput {
   id?: string;
   userId: string;
   agentId?: string;
-  studioId?: string;
+  /**
+   * Three-state: UUID = scoped to that studio; null = root-repo session
+   * (persisted as `studio_id = NULL`); undefined = column omitted on insert
+   * (DB default is NULL, so equivalent to null for new rows).
+   */
+  studioId?: string | null;
   threadKey?: string;
   contactId?: string;
   backend?: string;

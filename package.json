@@ -35,6 +35,7 @@
     "build:all": "yarn workspaces foreach -A -t run build",
     "build:web": "yarn workspace @inklabs/web build",
     "test": "yarn workspaces foreach -A -t run test",
+    "test:live": "vitest run --config vitest.live.config.ts",
     "docker:app:up": "bash ./scripts/docker-app-up.sh",
     "docker:app:down": "bash ./scripts/docker-app-down.sh",
     "docker:app:logs": "docker compose -f ./docker-compose.app.yml logs -f inkwell-app",

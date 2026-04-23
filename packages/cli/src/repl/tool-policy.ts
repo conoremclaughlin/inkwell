@@ -689,11 +689,10 @@ export class ToolPolicyState {
       return Boolean(requester.agentId && target.agentId && requester.agentId === target.agentId);
     }
     if (visibility === 'workspace') {
-      // Fall back to studioId comparison when workspaceId is absent — the
-      // separate workspace concept was removed and callers no longer populate
-      // workspaceId on session access queries.
-      const rId = requester.workspaceId || requester.studioId;
-      const tId = target.workspaceId || target.studioId;
+      // Workspace = parent-level container. Studio = worktree child scope.
+      // Compare workspaceIds only — do NOT fall back to studioId.
+      const rId = requester.workspaceId;
+      const tId = target.workspaceId;
       return Boolean(rId && tId && rId === tId);
     }
     if (visibility === 'studio') {
@@ -720,10 +719,8 @@ export class ToolPolicyState {
     const studioNorm = context.studioId ? normalizeScopeId(context.studioId) : undefined;
     this.context = {
       agentId: context.agentId ? normalizeScopeId(context.agentId) : undefined,
-      // Derive workspaceId from studioId when not explicitly provided — the
-      // separate workspace concept was removed but the scope layer remains for
-      // backwards-compatible policy files.
-      workspaceId: context.workspaceId ? normalizeScopeId(context.workspaceId) : studioNorm,
+      // Workspace and studio are separate scopes — never derive one from the other.
+      workspaceId: context.workspaceId ? normalizeScopeId(context.workspaceId) : undefined,
       studioId: studioNorm,
     };
 

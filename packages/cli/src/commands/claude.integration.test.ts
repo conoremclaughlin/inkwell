@@ -70,15 +70,15 @@ describe('claude command integration', () => {
     mkdirSync(homeDir, { recursive: true });
     mkdirSync(repoDir, { recursive: true });
     mkdirSync(binDir, { recursive: true });
-    mkdirSync(join(homeDir, '.pcp'), { recursive: true });
-    mkdirSync(join(repoDir, '.pcp'), { recursive: true });
+    mkdirSync(join(homeDir, '.ink'), { recursive: true });
+    mkdirSync(join(repoDir, '.ink'), { recursive: true });
 
     writeFileSync(
-      join(homeDir, '.pcp', 'config.json'),
+      join(homeDir, '.ink', 'config.json'),
       JSON.stringify({ email: 'integration@example.com' }, null, 2)
     );
     writeFileSync(
-      join(repoDir, '.pcp', 'identity.json'),
+      join(repoDir, '.ink', 'identity.json'),
       JSON.stringify({ studioId: 'studio-test' }, null, 2)
     );
 
@@ -169,7 +169,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CLAUDE_SESSION_ID || '
       await runClaude('hello integration', ['hello', 'integration'], options, []);
       await waitForFile(fakeClaudeArgsPath);
 
-      const runtimePath = join(repoDir, '.pcp', 'runtime', 'sessions.json');
+      const runtimePath = join(repoDir, '.ink', 'runtime', 'sessions.json');
       await waitForFile(runtimePath);
 
       const backendArgs = JSON.parse(readFileSync(fakeClaudeArgsPath, 'utf-8')) as string[];
@@ -224,15 +224,15 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CLAUDE_SESSION_ID || '
     mkdirSync(homeDir, { recursive: true });
     mkdirSync(repoDir, { recursive: true });
     mkdirSync(binDir, { recursive: true });
-    mkdirSync(join(homeDir, '.pcp'), { recursive: true });
-    mkdirSync(join(repoDir, '.pcp'), { recursive: true });
+    mkdirSync(join(homeDir, '.ink'), { recursive: true });
+    mkdirSync(join(repoDir, '.ink'), { recursive: true });
 
     writeFileSync(
-      join(homeDir, '.pcp', 'config.json'),
+      join(homeDir, '.ink', 'config.json'),
       JSON.stringify({ email: 'integration@example.com' }, null, 2)
     );
     writeFileSync(
-      join(repoDir, '.pcp', 'identity.json'),
+      join(repoDir, '.ink', 'identity.json'),
       JSON.stringify({ studioId: 'studio-test' }, null, 2)
     );
 
@@ -357,7 +357,7 @@ console.log('fake-claude-run-complete');
       );
       expect(observedLocalSessions).toContain(delayedSessionId);
 
-      const runtimePath = join(repoDir, '.pcp', 'runtime', 'sessions.json');
+      const runtimePath = join(repoDir, '.ink', 'runtime', 'sessions.json');
       await waitForFile(runtimePath);
       const runtimeState = JSON.parse(readFileSync(runtimePath, 'utf-8')) as {
         sessions?: Array<{ pcpSessionId?: string; backendSessionId?: string }>;
@@ -409,15 +409,15 @@ console.log('fake-claude-run-complete');
     mkdirSync(homeDir, { recursive: true });
     mkdirSync(repoDir, { recursive: true });
     mkdirSync(binDir, { recursive: true });
-    mkdirSync(join(homeDir, '.pcp'), { recursive: true });
-    mkdirSync(join(repoDir, '.pcp'), { recursive: true });
+    mkdirSync(join(homeDir, '.ink'), { recursive: true });
+    mkdirSync(join(repoDir, '.ink'), { recursive: true });
 
     writeFileSync(
-      join(homeDir, '.pcp', 'config.json'),
+      join(homeDir, '.ink', 'config.json'),
       JSON.stringify({ email: 'integration@example.com' }, null, 2)
     );
     writeFileSync(
-      join(repoDir, '.pcp', 'identity.json'),
+      join(repoDir, '.ink', 'identity.json'),
       JSON.stringify({ studioId: 'studio-test' }, null, 2)
     );
 
@@ -508,7 +508,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CODEX_SESSION_ID || 'c
       await runClaude('hello codex', ['hello', 'codex'], options, []);
       await waitForFile(fakeCodexArgsPath);
 
-      const runtimePath = join(repoDir, '.pcp', 'runtime', 'sessions.json');
+      const runtimePath = join(repoDir, '.ink', 'runtime', 'sessions.json');
       await waitForFile(runtimePath);
 
       const backendArgs = JSON.parse(readFileSync(fakeCodexArgsPath, 'utf-8')) as string[];
@@ -559,15 +559,15 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CODEX_SESSION_ID || 'c
     mkdirSync(homeDir, { recursive: true });
     mkdirSync(repoDir, { recursive: true });
     mkdirSync(binDir, { recursive: true });
-    mkdirSync(join(homeDir, '.pcp'), { recursive: true });
-    mkdirSync(join(repoDir, '.pcp'), { recursive: true });
+    mkdirSync(join(homeDir, '.ink'), { recursive: true });
+    mkdirSync(join(repoDir, '.ink'), { recursive: true });
 
     writeFileSync(
-      join(homeDir, '.pcp', 'config.json'),
+      join(homeDir, '.ink', 'config.json'),
       JSON.stringify({ email: 'integration@example.com' }, null, 2)
     );
     writeFileSync(
-      join(repoDir, '.pcp', 'identity.json'),
+      join(repoDir, '.ink', 'identity.json'),
       JSON.stringify({ studioId: 'studio-test' }, null, 2)
     );
 
@@ -658,7 +658,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_GEMINI_SESSION_ID || '
       await runClaude('hello gemini', ['hello', 'gemini'], options, []);
       await waitForFile(fakeGeminiArgsPath);
 
-      const runtimePath = join(repoDir, '.pcp', 'runtime', 'sessions.json');
+      const runtimePath = join(repoDir, '.ink', 'runtime', 'sessions.json');
       await waitForFile(runtimePath);
 
       const backendArgs = JSON.parse(readFileSync(fakeGeminiArgsPath, 'utf-8')) as string[];

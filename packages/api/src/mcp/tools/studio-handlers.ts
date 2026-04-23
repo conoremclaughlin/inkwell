@@ -13,6 +13,7 @@ import { existsSync } from 'fs';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
+import { ensureStudioSettings } from '../../services/studio-settings';
 
 // ============== Helpers ==============
 
@@ -218,6 +219,17 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
       logger.error('Git worktree creation failed', { error: errorMessage, branch, worktreePath });
       return errorResponse(`Failed to create git worktree: ${errorMessage}`);
     }
+  }
+
+  // Generate .claude/settings.local.json with default permissions + hooks
+  try {
+    await ensureStudioSettings(worktreePath);
+  } catch (settingsError) {
+    // Non-fatal — studio is usable without auto-generated settings
+    logger.warn('Failed to generate studio settings', {
+      worktreePath,
+      error: settingsError instanceof Error ? settingsError.message : String(settingsError),
+    });
   }
 
   // Insert studio record into the database
@@ -543,6 +555,16 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
 
   if (!studio) {
     return errorResponse('Studio not found');
+  }
+
+  // Ensure settings exist in the worktree (may be first time adopting an old studio)
+  try {
+    await ensureStudioSettings(studio.worktreePath);
+  } catch (settingsError) {
+    logger.warn('Failed to ensure studio settings on adopt', {
+      worktreePath: studio.worktreePath,
+      error: settingsError instanceof Error ? settingsError.message : String(settingsError),
+    });
   }
 
   // Link session and set to active

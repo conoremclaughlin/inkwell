@@ -378,7 +378,7 @@ describe('Session Identity Chain — HTTP Integration', () => {
 
     expect(status).toBe(200);
     // The explicit header should take priority — verified by the fact that
-    // the request doesn't get rejected with a workspace scope error
+    // the request doesn't get rejected with a scope error
     // (both studios belong to the test user, so either would work)
   });
 

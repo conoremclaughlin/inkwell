@@ -17,6 +17,7 @@ import { env, isDevelopment } from '../config/env';
 import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
 import { runWithRequestContext } from '../utils/request-context';
 import { getDataComposer } from '../data/composer';
+import { notifyPlatformOfApprovalRequest } from '../channels/approval-interceptor';
 
 /**
  * Build a JSON error response. In development mode, includes the real error
@@ -93,6 +94,7 @@ const ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS = 3600; // 1 hour
 const ADMIN_REFRESH_TOKEN_LIFETIME_DAYS = 90;
 const ADMIN_CLIENT_ID = 'dashboard';
 const MCP_CLI_TRANSCRIPT_ROUTE = /^\/sessions(?:\/synced|\/[^/]+\/(?:sync-transcript|transcript))$/;
+const MCP_CLI_APPROVAL_ROUTE = /^\/approval-requests(?:\/[^/]+\/status)?$/;
 const DEFAULT_SESSION_LOG_LIMIT = 50;
 const MAX_SESSION_LOG_LIMIT = 200;
 const ACTIVITY_PREVIEW_LIMIT_PER_SESSION = 3;
@@ -962,12 +964,13 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       userEmail = payload.email;
     }
 
-    // Convenience path: allow standard MCP access tokens for transcript sync,
-    // so CLI users can run sync without dashboard cookie auth.
+    // Convenience path: allow standard MCP access tokens for CLI-driven flows
+    // (transcript sync, 2FA approval requests) so CLI users can operate without
+    // dashboard cookie auth.
     if (
       !pcpUserId &&
       (req.method === 'POST' || req.method === 'GET') &&
-      MCP_CLI_TRANSCRIPT_ROUTE.test(req.path)
+      (MCP_CLI_TRANSCRIPT_ROUTE.test(req.path) || MCP_CLI_APPROVAL_ROUTE.test(req.path))
     ) {
       const mcpPayload = verifyPcpAccessToken(token, 'mcp_access');
       if (mcpPayload) {
@@ -2062,7 +2065,7 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
     const { data: identity, error: identityError } = await supabase
       .from('agent_identities')
       .select(
-        'id, agent_id, name, role, description, backend, studio_hint, workspace_id, updated_at, sandbox_bypass'
+        'id, agent_id, name, role, description, backend, studio_hint, workspace_id, updated_at, sandbox_bypass, session_scope'
       )
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
@@ -2176,6 +2179,7 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
         backend: identity.backend,
         studioHint: identity.studio_hint || null,
         sandboxBypass: identity.sandbox_bypass ?? false,
+        sessionScope: identity.session_scope || 'global',
         updatedAt: identity.updated_at,
       },
       studios: (studiosData || []).map((s: Record<string, unknown>) => ({
@@ -2211,7 +2215,8 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
 
 /**
  * PATCH /api/admin/identities/:agentId/settings
- * Update SB-level settings (sandbox_bypass, etc.). Admin-only — not exposed via MCP.
+ * Update SB-level settings: sandbox_bypass, session_scope, backend, runtime config
+ * (tool profile, tool routing, max turns, passive recall). Admin-only — not exposed via MCP.
  */
 router.patch('/identities/:agentId/settings', async (req: Request, res: Response) => {
   try {
@@ -2224,7 +2229,7 @@ router.patch('/identities/:agentId/settings', async (req: Request, res: Response
     // Find the identity for this agent + workspace
     const { data: identity, error: fetchErr } = await supabase
       .from('agent_identities')
-      .select('id')
+      .select('id, metadata')
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
       .eq('agent_id', agentId)
@@ -2238,8 +2243,37 @@ router.patch('/identities/:agentId/settings', async (req: Request, res: Response
     const body = (req.body || {}) as Record<string, unknown>;
     const updates: Record<string, unknown> = {};
 
+    // Top-level columns
     if (typeof body.sandboxBypass === 'boolean' || body.sandboxBypass === null) {
       updates.sandbox_bypass = body.sandboxBypass;
+    }
+    if (body.backend !== undefined) {
+      updates.backend = body.backend;
+    }
+
+    // Runtime config fields → stored in metadata.runtimeConfig
+    const { toolProfile, toolRouting, maxTurns, passiveRecall } = body;
+    if (
+      toolProfile !== undefined ||
+      toolRouting !== undefined ||
+      maxTurns !== undefined ||
+      passiveRecall !== undefined
+    ) {
+      const existingMeta = (identity.metadata || {}) as Record<string, unknown>;
+      const runtimeConfig: Record<string, unknown> = {
+        ...((existingMeta.runtimeConfig as Record<string, unknown>) || {}),
+      };
+
+      if (toolProfile !== undefined) runtimeConfig.toolProfile = toolProfile;
+      if (toolRouting !== undefined) runtimeConfig.toolRouting = toolRouting;
+      if (maxTurns !== undefined) runtimeConfig.maxTurns = maxTurns;
+      if (passiveRecall !== undefined) runtimeConfig.passiveRecall = passiveRecall;
+
+      updates.metadata = { ...existingMeta, runtimeConfig };
+    }
+
+    if (body.sessionScope === 'global' || body.sessionScope === 'per_sender') {
+      updates.session_scope = body.sessionScope;
     }
 
     if (Object.keys(updates).length === 0) {
@@ -2249,10 +2283,12 @@ router.patch('/identities/:agentId/settings', async (req: Request, res: Response
 
     updates.updated_at = new Date().toISOString();
 
-    const { error: updateErr } = await supabase
+    const { data: updated, error: updateErr } = await supabase
       .from('agent_identities')
       .update(updates)
-      .eq('id', identity.id);
+      .eq('id', identity.id)
+      .select()
+      .single();
 
     if (updateErr) {
       logger.error('Failed to update identity settings:', updateErr);
@@ -2260,8 +2296,15 @@ router.patch('/identities/:agentId/settings', async (req: Request, res: Response
       return;
     }
 
+    const meta = (updated.metadata || {}) as Record<string, unknown>;
     logger.info('Identity settings updated', { agentId, updates });
-    res.json({ success: true, agentId, ...updates });
+    res.json({
+      success: true,
+      agentId,
+      backend: updated.backend || null,
+      sandbox_bypass: updated.sandbox_bypass,
+      runtimeConfig: (meta.runtimeConfig as Record<string, unknown>) || null,
+    });
   } catch (error) {
     logger.error('Failed to update identity settings:', error);
     res.status(500).json(errorJson('Failed to update identity settings', error));
@@ -2307,10 +2350,7 @@ router.patch('/studios/:studioId', async (req: Request, res: Response) => {
 
     updates.updated_at = new Date().toISOString();
 
-    const { error: updateErr } = await supabase
-      .from('studios')
-      .update(updates)
-      .eq('id', studioId);
+    const { error: updateErr } = await supabase.from('studios').update(updates).eq('id', studioId);
 
     if (updateErr) {
       logger.error('Failed to update studio settings:', updateErr);
@@ -2627,7 +2667,7 @@ router.delete('/routing/routes/:routeId', async (req: Request, res: Response) =>
 
 /**
  * PATCH /api/admin/routing/identities/:identityId
- * Update an agent identity's studio_hint (home studio).
+ * Update an agent identity's studio_hint (default studio).
  */
 router.patch('/routing/identities/:identityId', async (req: Request, res: Response) => {
   try {
@@ -2932,24 +2972,29 @@ router.get('/individuals', async (req: Request, res: Response) => {
     }
 
     res.json({
-      individuals: (data || []).map((identity) => ({
-        id: identity.id,
-        agentId: identity.agent_id,
-        name: identity.name,
-        role: identity.role,
-        description: identity.description,
-        values: identity.values,
-        relationships: identity.relationships,
-        capabilities: identity.capabilities,
-        metadata: identity.metadata,
-        heartbeat: identity.heartbeat,
-        soul: identity.soul,
-        hasSoul: !!identity.soul,
-        hasHeartbeat: !!identity.heartbeat,
-        version: identity.version,
-        createdAt: identity.created_at,
-        updatedAt: identity.updated_at,
-      })),
+      individuals: (data || []).map((identity) => {
+        const meta = (identity.metadata || {}) as Record<string, unknown>;
+        return {
+          id: identity.id,
+          agentId: identity.agent_id,
+          name: identity.name,
+          role: identity.role,
+          backend: identity.backend || null,
+          description: identity.description,
+          values: identity.values,
+          relationships: identity.relationships,
+          capabilities: identity.capabilities,
+          metadata: identity.metadata,
+          runtimeConfig: (meta.runtimeConfig as Record<string, unknown>) || null,
+          heartbeat: identity.heartbeat,
+          soul: identity.soul,
+          hasSoul: !!identity.soul,
+          hasHeartbeat: !!identity.heartbeat,
+          version: identity.version,
+          createdAt: identity.created_at,
+          updatedAt: identity.updated_at,
+        };
+      }),
     });
   } catch (error) {
     logger.error('Failed to list individuals:', error);
@@ -5245,7 +5290,7 @@ router.get('/sessions/synced', async (req: Request, res: Response) => {
             startedAt: session.started_at,
             updatedAt: session.updated_at,
             workingDir: session.working_dir,
-            studioId: session.studio_id || session.workspace_id,
+            studioId: session.studio_id || session.workspace_id, // workspace_id is legacy column name for studio_id
           },
         };
       })
@@ -6309,6 +6354,28 @@ router.get('/task-groups', async (req: Request, res: Response) => {
       }
     }
 
+    // Resolve strategy owner display names (owner_agent_id may differ from creator)
+    const ownerAgentIds = [
+      ...new Set(groups.map((g) => g.owner_agent_id).filter(Boolean)),
+    ] as string[];
+    let ownerNameMap: Record<string, string> = {};
+
+    if (ownerAgentIds.length > 0) {
+      const { data: ownerData } = await supabase
+        .from('agent_identities')
+        .select('agent_id, name')
+        .eq('user_id', authReq.pcpUserId)
+        .in('agent_id', ownerAgentIds);
+
+      if (ownerData) {
+        for (const row of ownerData) {
+          if (row.agent_id && row.name) {
+            ownerNameMap[row.agent_id] = row.name;
+          }
+        }
+      }
+    }
+
     res.json({
       groups: groups.map((g) => ({
         id: g.id,
@@ -6332,6 +6399,13 @@ router.get('/task-groups', async (req: Request, res: Response) => {
           (g.agent_identities as { agent_id: string; name: string } | null)?.agent_id ?? null,
         agentName: (g.agent_identities as { agent_id: string; name: string } | null)?.name ?? null,
         taskCount: taskCountMap[g.id] || 0,
+        strategy: g.strategy ?? null,
+        ownerAgentId: g.owner_agent_id ?? null,
+        ownerAgentName: (g.owner_agent_id && ownerNameMap[g.owner_agent_id]) || null,
+        currentTaskIndex: g.current_task_index ?? 0,
+        strategyStartedAt: g.strategy_started_at ?? null,
+        strategyPausedAt: g.strategy_paused_at ?? null,
+        planUri: g.plan_uri ?? null,
         metadata: g.metadata,
         createdAt: g.created_at,
         updatedAt: g.updated_at,
@@ -6340,6 +6414,62 @@ router.get('/task-groups', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to list task groups:', error);
     res.status(500).json(errorJson('Failed to list task groups', error));
+  }
+});
+
+/**
+ * GET /api/admin/task-groups/:id/activity
+ * Returns activity stream events for a task group (strategy timeline).
+ */
+router.get('/task-groups/:id/activity', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const limit = Math.min(Number(req.query.limit) || 50, 200);
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    // Verify the group belongs to this user
+    const { data: group, error: groupError } = await supabase
+      .from('task_groups')
+      .select('id, user_id')
+      .eq('id', id)
+      .eq('user_id', authReq.pcpUserId)
+      .single();
+
+    if (groupError || !group) {
+      res.status(404).json(errorJson('Task group not found', groupError));
+      return;
+    }
+
+    const { data: events, error: eventsError } = await supabase
+      .from('activity_stream')
+      .select('id, type, subtype, content, payload, agent_id, session_id, created_at')
+      .eq('task_group_id' as never, id)
+      .order('created_at', { ascending: true })
+      .limit(limit);
+
+    if (eventsError) {
+      res.status(500).json(errorJson('Failed to fetch activity', eventsError));
+      return;
+    }
+
+    res.json({
+      events: (events || []).map((e) => ({
+        id: e.id,
+        type: e.type,
+        subtype: e.subtype,
+        content: e.content,
+        agentId: e.agent_id,
+        sessionId: e.session_id,
+        payload: e.payload,
+        createdAt: e.created_at,
+      })),
+    });
+  } catch (error) {
+    logger.error('Failed to fetch task group activity:', error);
+    res.status(500).json(errorJson('Failed to fetch task group activity', error));
   }
 });
 
@@ -6581,5 +6711,180 @@ router.post('/contacts/resolve', async (req: Request, res: Response) => {
     res.status(500).json(errorJson('Failed to resolve contact', error));
   }
 });
+
+// ============== 2FA Approval Requests ==============
+
+/**
+ * Create an approval request for elevated permissions.
+ * Called by the CLI hook when a tool in the approval-required set is encountered.
+ * The server generates the request ID, sends to connected platforms, and returns
+ * the ID for polling.
+ */
+router.post('/approval-requests', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    const { tool, args, reason, studioId, sessionId, timeoutSeconds = 300 } = req.body;
+
+    if (!tool) {
+      res.status(400).json({ error: 'tool is required' });
+      return;
+    }
+
+    const expiresAt = new Date(Date.now() + timeoutSeconds * 1000).toISOString();
+
+    // Resolve requesting agent from session context header
+    const contextHeader = req.headers['x-ink-context'] as string | undefined;
+    let requestingAgentId = 'unknown';
+    if (contextHeader) {
+      try {
+        const decoded = JSON.parse(Buffer.from(contextHeader, 'base64url').toString());
+        requestingAgentId = decoded.agentId || 'unknown';
+      } catch {
+        // fall through
+      }
+    }
+
+    // studio_id is a UUID column. The CLI sends the literal string "main"
+    // for the root repo (see .ink/identity.json), which would fail insert —
+    // coerce non-UUID values to null.
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const studioIdForInsert = studioId && UUID_RE.test(studioId) ? studioId : null;
+    const sessionIdForInsert = sessionId && UUID_RE.test(sessionId) ? sessionId : null;
+
+    const { data, error } = await supabase
+      .from('approval_requests')
+      .insert({
+        user_id: authReq.pcpUserId,
+        studio_id: studioIdForInsert,
+        session_id: sessionIdForInsert,
+        requesting_agent_id: requestingAgentId,
+        tool,
+        args: args || null,
+        reason: reason || null,
+        timeout_seconds: timeoutSeconds,
+        expires_at: expiresAt,
+      })
+      .select('id, status, expires_at')
+      .single();
+
+    if (error) {
+      logger.error('Failed to insert approval request', {
+        error: error.message,
+        code: error.code,
+        studioId,
+        sessionId,
+        tool,
+      });
+      res.status(500).json(errorJson('Failed to create approval request', error));
+      return;
+    }
+
+    logger.info('Approval request created', {
+      requestId: data.id,
+      tool,
+      args,
+      requestingAgentId,
+      studioId,
+      expiresAt,
+    });
+
+    // Send notification to connected platforms (non-blocking)
+    notifyPlatformOfApprovalRequest({
+      id: data.id,
+      userId: authReq.pcpUserId,
+      tool,
+      args,
+      reason: req.body.reason,
+      requestingAgentId,
+      studioId,
+      sessionId,
+      expiresAt,
+    }).catch((err) => {
+      logger.error('Failed to send platform notification for approval request', {
+        requestId: data.id,
+        error: String(err),
+      });
+    });
+
+    res.status(201).json({
+      requestId: data.id,
+      status: data.status,
+      expiresAt: data.expires_at,
+    });
+  } catch (error) {
+    logger.error('Failed to create approval request:', error);
+    res.status(500).json(errorJson('Failed to create approval request', error));
+  }
+});
+
+/**
+ * Poll an approval request's status.
+ * Called by the CLI hook while waiting for human response.
+ * Returns current status + resolution details when resolved.
+ */
+router.get('/approval-requests/:requestId/status', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+    const { requestId } = req.params;
+
+    const { data, error } = await supabase
+      .from('approval_requests')
+      .select('id, status, action, granted_tools, granted_by, expires_at, resolved_at, created_at')
+      .eq('id', requestId)
+      .eq('user_id', authReq.pcpUserId)
+      .single();
+
+    if (error || !data) {
+      res.status(404).json({ error: 'Approval request not found' });
+      return;
+    }
+
+    // Auto-expire if past deadline and still pending
+    if (data.status === 'pending' && new Date(data.expires_at) < new Date()) {
+      await supabase
+        .from('approval_requests')
+        .update({ status: 'expired', resolved_at: new Date().toISOString() })
+        .eq('id', requestId);
+
+      res.json({
+        requestId: data.id,
+        status: 'expired',
+        action: null,
+        grantedTools: null,
+        grantedBy: null,
+        expiresAt: data.expires_at,
+        resolvedAt: new Date().toISOString(),
+      });
+      return;
+    }
+
+    res.json({
+      requestId: data.id,
+      status: data.status,
+      action: data.action,
+      grantedTools: data.granted_tools,
+      grantedBy: data.granted_by,
+      expiresAt: data.expires_at,
+      resolvedAt: data.resolved_at,
+    });
+  } catch (error) {
+    logger.error('Failed to get approval request status:', error);
+    res.status(500).json(errorJson('Failed to get approval request status', error));
+  }
+});
+
+// NOTE: There is intentionally NO HTTP endpoint for resolving approval requests.
+// Resolution happens ONLY through the in-process approval interceptor
+// (approval-interceptor.ts → checkApprovalResponse), which runs inside
+// platform listeners. This ensures grants can only come from verified
+// platform identity — no HTTP endpoint means no client-asserted trust boundary.
+// See ink://specs/2fa-permission-grants for the security invariant.
 
 export default router;
