@@ -4,11 +4,13 @@ import {
   buildChunkMetadataUpdate,
   buildChunkRows,
   buildMemoryEmbeddingChunks,
+  countChunkViews,
   formatVectorLiteral,
   MEMORY_EMBEDDING_CHUNKS_VERSION,
 } from '../services/embeddings/memory-chunks';
 import { EmbeddingRouter } from '../services/embeddings/router';
 import { getVettedEmbeddingModel } from '../services/embeddings/vetted-models';
+import { env } from '../config/env';
 
 type MemoryRow = Database['public']['Tables']['memories']['Row'];
 
@@ -26,19 +28,22 @@ function parsePositiveInt(raw: string | undefined, defaultValue: number): number
 }
 
 async function main() {
-  const userId = process.env.BACKFILL_MEMORY_USER_ID;
+  const userId = process.env.BACKFILL_MEMORY_USER_ID || process.env.BENCHMARK_USER_ID;
   if (!userId) {
     throw new Error(
-      'BACKFILL_MEMORY_USER_ID is required. Example: BACKFILL_MEMORY_USER_ID=<uuid> yarn backfill:memory-embeddings'
+      'BACKFILL_MEMORY_USER_ID or BENCHMARK_USER_ID is required. Example: BACKFILL_MEMORY_USER_ID=<uuid> yarn backfill:memory-embeddings'
     );
   }
 
   const agentId = process.env.BACKFILL_MEMORY_AGENT_ID;
+  const topic = process.env.BACKFILL_MEMORY_TOPIC;
+  const memoryId = process.env.BACKFILL_MEMORY_ID;
   const batchSize = parsePositiveInt(process.env.BACKFILL_MEMORY_BATCH_SIZE, DEFAULT_BATCH_SIZE);
   const limit = process.env.BACKFILL_MEMORY_LIMIT
     ? parsePositiveInt(process.env.BACKFILL_MEMORY_LIMIT, batchSize)
     : null;
   const dryRun = parseBoolean(process.env.BACKFILL_MEMORY_DRY_RUN, false);
+  const force = parseBoolean(process.env.MEMORY_EMBEDDINGS_FORCE, false);
 
   const router = new EmbeddingRouter();
   if (!router.isEnabled()) {
@@ -56,6 +61,12 @@ async function main() {
   let skipped = 0;
   let scanned = 0;
 
+  console.log(
+    `[memory-embedding-backfill] user=${userId} agent=${agentId || '*'} memory=${memoryId || '*'} topic=${topic || '*'} ` +
+      `limit=${limit ?? 'all'} batchSize=${batchSize} force=${force} dryRun=${dryRun} ` +
+      `mode=${env.MEMORY_EXTRACTION_MODE} chunkVersion=${MEMORY_EMBEDDING_CHUNKS_VERSION}`
+  );
+
   while (limit === null || scanned < limit) {
     const remaining = limit === null ? batchSize : Math.min(batchSize, limit - scanned);
     if (remaining <= 0) break;
@@ -63,7 +74,7 @@ async function main() {
     let query = supabase
       .from('memories')
       .select(
-        'id,user_id,agent_id,content,summary,metadata,embedding,embedding_chunks_version,embedding_chunk_count'
+        'id,user_id,agent_id,content,summary,topic_key,topics,source,salience,metadata,embedding,embedding_chunks_version,embedding_chunk_count'
       )
       .eq('user_id', userId)
       .order('created_at', { ascending: true })
@@ -71,6 +82,14 @@ async function main() {
 
     if (agentId) {
       query = query.eq('agent_id', agentId);
+    }
+
+    if (topic?.trim()) {
+      query = query.contains('topics', [topic.trim()]);
+    }
+
+    if (memoryId?.trim()) {
+      query = query.eq('id', memoryId.trim());
     }
 
     const { data, error } = await query;
@@ -85,6 +104,10 @@ async function main() {
       | 'agent_id'
       | 'content'
       | 'summary'
+      | 'topic_key'
+      | 'topics'
+      | 'source'
+      | 'salience'
       | 'metadata'
       | 'embedding'
       | 'embedding_chunks_version'
@@ -100,7 +123,7 @@ async function main() {
         row.embedding_chunks_version === MEMORY_EMBEDDING_CHUNKS_VERSION &&
         (row.embedding_chunk_count || 0) > 0;
 
-      if (hasCurrentChunks) {
+      if (hasCurrentChunks && !force) {
         skipped += 1;
         continue;
       }
@@ -108,7 +131,16 @@ async function main() {
       const chunks = buildMemoryEmbeddingChunks({
         summary: row.summary,
         content: row.content,
+        topicKey: row.topic_key,
+        topics: row.topics,
+        source: row.source,
+        salience: row.salience,
         model: vettedModel,
+        extractionMode: env.MEMORY_EXTRACTION_MODE,
+        llmExtractions:
+          row.metadata && typeof row.metadata === 'object' && 'llm_extractions' in row.metadata
+            ? (row.metadata.llm_extractions as Record<string, unknown>)
+            : null,
       });
       if (chunks.length === 0) {
         skipped += 1;
@@ -172,6 +204,7 @@ async function main() {
               provider: primaryEmbedding.provider,
               model: primaryEmbedding.model,
               chunkCount: embeddedChunks.length,
+              viewCounts: countChunkViews(embeddedChunks.map(({ chunk }) => chunk)),
               existingMetadata: ((row.metadata as Record<string, unknown> | null) || {}) as Record<
                 string,
                 unknown
@@ -201,7 +234,7 @@ async function main() {
   }
 
   console.log(
-    `Backfill complete. scanned=${scanned} processed=${processed} updated=${updated} skipped=${skipped} dryRun=${dryRun}`
+    `[memory-embedding-backfill] complete scanned=${scanned} processed=${processed} updated=${updated} skipped=${skipped} dryRun=${dryRun}`
   );
 }
 

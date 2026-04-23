@@ -6,6 +6,9 @@
   "publishConfig": {
     "access": "public"
   },
+  "exports": {
+    "./benchmarks": "./src/benchmarks.ts"
+  },
   "description": "Inkwell API server with MCP, Telegram bot, and REST API",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -25,9 +28,10 @@
     "test:coverage": "vitest run --coverage",
     "test:connection": "tsx src/test-connection.ts",
     "test:channels": "tsx src/test-channels.ts",
-    "benchmark:memory-recall": "tsx src/scripts/benchmark-memory-recall.ts",
-    "benchmark:bootstrap-relevance": "tsx src/scripts/benchmark-bootstrap-relevance.ts",
+    "benchmark:memory-recall": "yarn workspace @inklabs/benchmarks benchmark:memory-recall",
+    "benchmark:bootstrap-relevance": "yarn workspace @inklabs/benchmarks benchmark:bootstrap-relevance",
     "backfill:memory-embeddings": "tsx src/scripts/backfill-memory-embeddings.ts",
+    "extract:memory-llm-views": "tsx src/scripts/extract-memory-llm-views.ts",
     "lint": "eslint src --ext .ts",
     "type-check": "yarn workspace @inklabs/shared build && tsc --noEmit",
     "clean": "rm -rf dist"
