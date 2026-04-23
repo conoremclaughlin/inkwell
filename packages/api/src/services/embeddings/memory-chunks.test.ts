@@ -95,6 +95,7 @@ describe('memory chunk multi-view helpers', () => {
       salience: 'high',
       model: { maxInputChars: 1200 } as { maxInputChars: number },
       llmExtractions,
+      extractionMode: 'llm',
     });
 
     expect(chunks.find((chunk) => chunk.chunkType === 'summary')?.text).toContain(
@@ -111,5 +112,31 @@ describe('memory chunk multi-view helpers', () => {
     expect(viewCounts.fact).toBe(1);
     expect(viewCounts.entity).toBe(1);
     expect(viewCounts.current_state).toBe(1);
+  });
+
+  it('uses heuristic extraction mode by default even when llm metadata exists', () => {
+    const llmExtractions = memoryExtractionsSchema.parse({
+      version: 1,
+      provider: 'openai',
+      model: 'gpt-4.1-mini',
+      extractedAt: '2026-04-18T12:00:00.000Z',
+      current_state: {
+        state: 'The dev server auto-restarts on file change.',
+        scope: 'local dev server',
+        status: 'running',
+        volatility: 'volatile',
+        evidence: 'The current dev server auto-restarts when files change.',
+      },
+    });
+
+    const chunks = buildMemoryEmbeddingChunks({
+      summary: 'Policy B replaces Policy A for wound escalation.',
+      content: 'Policy B replaces Policy A and requires portal escalation within 24 hours.',
+      model: { maxInputChars: 1200 } as { maxInputChars: number },
+      llmExtractions,
+    });
+
+    expect(chunks.some((chunk) => chunk.chunkType === 'current_state')).toBe(false);
+    expect(chunks.some((chunk) => chunk.chunkType === 'fact')).toBe(true);
   });
 });

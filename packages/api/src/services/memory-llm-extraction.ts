@@ -103,7 +103,7 @@ export interface ExtractionRuntimeConfig {
 }
 
 const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com';
-const DEFAULT_MEMORY_LLM_MODEL = 'gpt-4.1-mini';
+export const DEFAULT_MEMORY_LLM_MODEL = 'gpt-4.1-mini';
 
 function buildSourceBlock(source: MemoryExtractionSource): string {
   const parts: string[] = [];

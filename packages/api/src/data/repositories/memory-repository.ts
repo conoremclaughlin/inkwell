@@ -20,7 +20,7 @@ import {
 import { EmbeddingRouter } from '../../services/embeddings/router';
 import { getVettedEmbeddingModel } from '../../services/embeddings/vetted-models';
 import { computeChronologyAwareBoost } from '../../services/memory-dreaming';
-import { MemoryLlmExtractor } from '../../services/memory-llm-extraction';
+import { env } from '../../config/env';
 import type {
   Memory,
   MemoryCreateInput,
@@ -270,11 +270,9 @@ export function computeKnowledgeMemoryScore(
 
 export class MemoryRepository {
   private embeddingRouter: EmbeddingRouter;
-  private memoryLlmExtractor: MemoryLlmExtractor;
 
   constructor(private supabase: SupabaseClient) {
     this.embeddingRouter = new EmbeddingRouter();
-    this.memoryLlmExtractor = new MemoryLlmExtractor();
   }
 
   // ==================== MEMORIES ====================
@@ -887,14 +885,10 @@ export class MemoryRepository {
 
     const config = this.embeddingRouter.getRuntimeConfig();
     const vettedModel = getVettedEmbeddingModel(config.provider, config.model);
-    const llmExtractions = await this.memoryLlmExtractor.extract({
-      summary: input.summary,
-      content: input.content,
-      topicKey: input.topicKey,
-      topics: input.topics,
-      source: input.source,
-      salience: input.salience,
-    });
+    const llmExtractions =
+      memory.metadata && typeof memory.metadata === 'object' && 'llm_extractions' in memory.metadata
+        ? (memory.metadata.llm_extractions as Record<string, unknown>)
+        : null;
     const chunks = buildMemoryEmbeddingChunks({
       summary: input.summary,
       content: input.content,
@@ -904,6 +898,7 @@ export class MemoryRepository {
       salience: input.salience,
       model: vettedModel,
       llmExtractions,
+      extractionMode: env.MEMORY_EXTRACTION_MODE,
     });
     if (chunks.length === 0) return;
 
@@ -975,10 +970,7 @@ export class MemoryRepository {
           model: primaryEmbedding.model,
           chunkCount: embeddedChunks.length,
           viewCounts: countChunkViews(embeddedChunks.map(({ chunk }) => chunk)),
-          existingMetadata: {
-            ...(memory.metadata || {}),
-            ...(llmExtractions ? { llm_extractions: llmExtractions } : {}),
-          },
+          existingMetadata: memory.metadata || {},
         }),
         embedding: {
           provider: primaryEmbedding.provider,

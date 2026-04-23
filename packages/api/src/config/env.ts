@@ -181,6 +181,7 @@ const envSchema = z.object({
     .enum(['true', 'false'])
     .default('false')
     .transform((v) => v === 'true'),
+  MEMORY_EXTRACTION_MODE: z.enum(['heuristic', 'llm', 'merged']).default('heuristic'),
   MEMORY_LLM_MODEL: optionalString,
   MEMORY_LLM_MAX_INPUT_CHARS: optionalNumber,
   MEMORY_LLM_ENTITY_ENABLED: z

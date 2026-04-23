@@ -10,6 +10,7 @@ import {
 } from '../services/embeddings/memory-chunks';
 import { EmbeddingRouter } from '../services/embeddings/router';
 import { getVettedEmbeddingModel } from '../services/embeddings/vetted-models';
+import { env } from '../config/env';
 
 type MemoryRow = Database['public']['Tables']['memories']['Row'];
 
@@ -97,11 +98,14 @@ async function main() {
 
     for (const row of rows) {
       processed += 1;
+      const force = ['1', 'true', 'yes', 'on'].includes(
+        (process.env.MEMORY_EMBEDDINGS_FORCE || '').toLowerCase()
+      );
       const hasCurrentChunks =
         row.embedding_chunks_version === MEMORY_EMBEDDING_CHUNKS_VERSION &&
         (row.embedding_chunk_count || 0) > 0;
 
-      if (hasCurrentChunks) {
+      if (hasCurrentChunks && !force) {
         skipped += 1;
         continue;
       }
@@ -114,6 +118,7 @@ async function main() {
         source: row.source,
         salience: row.salience,
         model: vettedModel,
+        extractionMode: env.MEMORY_EXTRACTION_MODE,
         llmExtractions:
           row.metadata && typeof row.metadata === 'object' && 'llm_extractions' in row.metadata
             ? (row.metadata.llm_extractions as Record<string, unknown>)
