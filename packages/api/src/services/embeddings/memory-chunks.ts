@@ -86,7 +86,7 @@ function buildContentChunks(
   maxChars: number,
   overlapChars: number
 ): MemoryEmbeddingChunk[] {
-  const normalized = text.trim();
+  const normalized = sanitizeChunkText(text.trim());
   if (!normalized) return [];
 
   const chunks: MemoryEmbeddingChunk[] = [];
@@ -117,7 +117,36 @@ function buildContentChunks(
 }
 
 function normalizeWhitespace(text: string): string {
-  return text.replace(/\s+/g, ' ').trim();
+  return replaceUnpairedSurrogates(text.replace(/\s+/g, ' ').trim());
+}
+
+function replaceUnpairedSurrogates(text: string): string {
+  let sanitized = '';
+
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    const isHighSurrogate = code >= 0xd800 && code <= 0xdbff;
+    const isLowSurrogate = code >= 0xdc00 && code <= 0xdfff;
+
+    if (isHighSurrogate) {
+      const next = text.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        sanitized += text[i] + text[i + 1];
+        i += 1;
+      } else {
+        sanitized += '�';
+      }
+      continue;
+    }
+
+    sanitized += isLowSurrogate ? '�' : text[i];
+  }
+
+  return sanitized;
+}
+
+function sanitizeChunkText(text: string): string {
+  return replaceUnpairedSurrogates(text);
 }
 
 function splitIntoSentences(text: string): string[] {
@@ -219,7 +248,7 @@ function buildTopicChunks(params: {
 
 function buildChunksFromTexts(chunkType: MemoryChunkType, texts: string[]): MemoryEmbeddingChunk[] {
   return texts
-    .map((text) => normalizeWhitespace(text))
+    .map((text) => sanitizeChunkText(normalizeWhitespace(text)))
     .filter(Boolean)
     .map((text, index) => ({
       chunkIndex: index,
@@ -425,7 +454,7 @@ export function buildChunkRows(params: {
     user_id: userId,
     chunk_index: chunk.chunkIndex,
     chunk_type: chunk.chunkType,
-    chunk_text: chunk.text,
+    chunk_text: sanitizeChunkText(chunk.text),
     embedding: formatVectorLiteral(chunk.embedding.vector),
     metadata: {
       embedding: {
