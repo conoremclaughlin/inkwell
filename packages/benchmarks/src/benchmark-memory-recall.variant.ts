@@ -4,6 +4,10 @@ import type { RecallMode } from './benchmark-memory-recall.types';
 export type BenchmarkRecallVariant =
   | 'default'
   | 'content-only'
+  | 'entity-only'
+  | 'fact-only'
+  | 'summary-only'
+  | 'current-state-only'
   | 'derived-only'
   | 'multiview-no-boost'
   | 'multiview-no-chrono';
@@ -14,6 +18,22 @@ const VARIANT_ALIASES: Record<string, BenchmarkRecallVariant> = {
   'content-only': 'content-only',
   content: 'content-only',
   raw: 'content-only',
+  'entity-only': 'entity-only',
+  entity: 'entity-only',
+  entities: 'entity-only',
+  'fact-only': 'fact-only',
+  fact: 'fact-only',
+  facts: 'fact-only',
+  'durable-fact': 'fact-only',
+  'durable-facts': 'fact-only',
+  'durable-fact-only': 'fact-only',
+  'durable-facts-only': 'fact-only',
+  'summary-only': 'summary-only',
+  summary: 'summary-only',
+  summaries: 'summary-only',
+  'current-state-only': 'current-state-only',
+  'current-state': 'current-state-only',
+  state: 'current-state-only',
   'derived-only': 'derived-only',
   derived: 'derived-only',
   'multiview-no-boost': 'multiview-no-boost',
@@ -42,6 +62,26 @@ function buildVariantSemanticOptions(
     case 'content-only':
       return {
         semanticChunkTypes: ['content'],
+        applyChunkTypeBoosts: false,
+      };
+    case 'entity-only':
+      return {
+        semanticChunkTypes: ['entity'],
+        applyChunkTypeBoosts: false,
+      };
+    case 'fact-only':
+      return {
+        semanticChunkTypes: ['fact'],
+        applyChunkTypeBoosts: false,
+      };
+    case 'summary-only':
+      return {
+        semanticChunkTypes: ['summary'],
+        applyChunkTypeBoosts: false,
+      };
+    case 'current-state-only':
+      return {
+        semanticChunkTypes: ['current_state'],
         applyChunkTypeBoosts: false,
       };
     case 'derived-only':
@@ -82,6 +122,16 @@ function buildVariantHybridOptions(
     case 'content-only':
       return {
         hybridChunkStrategy: 'content-only',
+        applyChunkTypeBoosts: false,
+        applyMultiViewBoost: false,
+        applyChronologyBoost: false,
+      };
+    case 'entity-only':
+    case 'fact-only':
+    case 'summary-only':
+    case 'current-state-only':
+      return {
+        hybridChunkStrategy: 'derived-only',
         applyChunkTypeBoosts: false,
         applyMultiViewBoost: false,
         applyChronologyBoost: false,
@@ -138,6 +188,7 @@ export function buildBenchmarkRecallOptions(params: {
   if (params.mode === 'hybrid') {
     return {
       ...base,
+      ...buildVariantSemanticOptions(params.variant),
       ...buildVariantHybridOptions(params.variant),
     };
   }

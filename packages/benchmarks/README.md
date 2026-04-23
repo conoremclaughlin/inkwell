@@ -13,6 +13,8 @@ This package is for experimental memory-system benchmarks only. It must not be b
 - **Embedding/backfill pass**: embeds source memory content plus any saved extraction views and writes vectors/chunks. This is separate from seeding and extraction.
 - **Recall pass**: runs benchmark queries against an already seeded and embedded corpus.
 
+Use `MEMORY_LLM_EXTRACT_MEMORY_ID=<memoryId>` or `BACKFILL_MEMORY_ID=<memoryId>` when an experiment should touch exactly one source memory. Use the seed/case topics when it should touch a whole corpus or case.
+
 ## Recall mode definitions
 
 - **text**: lexical/text search over memory rows.

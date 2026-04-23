@@ -447,6 +447,7 @@ export class MemoryRepository {
     );
     const chunkStrategy = options.hybridChunkStrategy || 'default';
     const isMultiViewRouter = chunkStrategy === 'multi-view';
+    const explicitChunkTypes = toMemoryChunkTypes(options.semanticChunkTypes);
     const applyChunkTypeBoosts = isMultiViewRouter && options.applyChunkTypeBoosts !== false;
     const applyMultiViewBoost = isMultiViewRouter && options.applyMultiViewBoost !== false;
     const applyChronologyBoost = isMultiViewRouter && options.applyChronologyBoost !== false;
@@ -477,11 +478,12 @@ export class MemoryRepository {
             options,
             candidatePool,
             0,
-            chunkStrategy === 'content-only'
-              ? CONTENT_CHUNK_TYPES
-              : chunkStrategy === 'derived-only'
-                ? DERIVED_CHUNK_TYPES
-                : toMemoryChunkTypes(options.semanticChunkTypes)
+            explicitChunkTypes ||
+              (chunkStrategy === 'content-only'
+                ? CONTENT_CHUNK_TYPES
+                : chunkStrategy === 'derived-only'
+                  ? DERIVED_CHUNK_TYPES
+                  : undefined)
           ),
         ];
 
