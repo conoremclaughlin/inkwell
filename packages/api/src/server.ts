@@ -498,12 +498,13 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       }
     }
 
-    // Resolve studioHint via cascade:
+    // Resolve studioHint + activeSessionId via cascade:
     //   1. reminder.studio_hint (direct override)
-    //   2. channel_routes.studio_hint (matched by delivery channel)
+    //   2. channel_routes.studio_hint + active_session_id (matched by delivery channel)
     //   3. agent_identities.studio_hint (agent's default studio)
     //   4. null → resolveStudioId() uses its own cascade (agent studio → main)
     let reminderStudioHint: string | null = null;
+    let routeActiveSessionId: string | null = null;
 
     // Check reminder-level override first
     if (reminder.studio_hint) {
@@ -514,8 +515,8 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       });
     }
 
-    // Fallback to channel_routes
-    if (!reminderStudioHint && dataComposer && reminder.delivery_channel) {
+    // Resolve channel_routes for both studioHint and activeSessionId
+    if (dataComposer && reminder.delivery_channel) {
       const route = await resolveRouteAgentId(
         dataComposer.getClient(),
         userId,
@@ -523,13 +524,23 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         undefined, // platformAccountId — not stored on reminders yet
         reminder.delivery_target || undefined
       );
-      if (route?.studioHint) {
-        reminderStudioHint = route.studioHint;
-        logger.debug(`[Heartbeat] Resolved studioHint from channel_route`, {
-          studioHint: reminderStudioHint,
-          deliveryChannel: reminder.delivery_channel,
-          deliveryTarget: reminder.delivery_target,
-        });
+      if (route) {
+        if (!reminderStudioHint && route.studioHint) {
+          reminderStudioHint = route.studioHint;
+          logger.debug(`[Heartbeat] Resolved studioHint from channel_route`, {
+            studioHint: reminderStudioHint,
+            deliveryChannel: reminder.delivery_channel,
+            deliveryTarget: reminder.delivery_target,
+          });
+        }
+        if (route.activeSessionId) {
+          routeActiveSessionId = route.activeSessionId;
+          logger.info(`[Heartbeat] Using active_session_id from channel_route`, {
+            activeSessionId: routeActiveSessionId,
+            deliveryChannel: reminder.delivery_channel,
+            reminderId: reminder.id,
+          });
+        }
       }
     }
 
@@ -579,6 +590,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         triggerType: 'heartbeat',
         chatType: 'direct',
         ...(reminderStudioHint ? { studioHint: reminderStudioHint } : {}),
+        ...(routeActiveSessionId ? { recipientSessionId: routeActiveSessionId } : {}),
       },
     };
 
