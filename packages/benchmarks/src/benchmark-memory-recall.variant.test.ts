@@ -56,9 +56,9 @@ describe('benchmark-memory-recall variants', () => {
       name: 'default',
       semanticChunkTypes: 'default',
       hybridChunkStrategy: 'default',
-      applyChunkTypeBoosts: true,
-      applyMultiViewBoost: true,
-      applyChronologyBoost: true,
+      applyChunkTypeBoosts: false,
+      applyMultiViewBoost: false,
+      applyChronologyBoost: false,
     });
   });
 
@@ -99,7 +99,7 @@ describe('benchmark-memory-recall variants', () => {
       })
     ).toMatchObject({
       recallMode: 'hybrid',
-      hybridChunkStrategy: 'default',
+      hybridChunkStrategy: 'multi-view',
       applyChunkTypeBoosts: false,
       applyMultiViewBoost: false,
       applyChronologyBoost: false,

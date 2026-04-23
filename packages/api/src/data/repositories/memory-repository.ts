@@ -392,43 +392,53 @@ export class MemoryRepository {
       (offset + limit) * Math.max(1, config.matchCountMultiplier)
     );
     const chunkStrategy = options.hybridChunkStrategy || 'default';
-    const includeDerived = chunkStrategy !== 'content-only';
-    const includeContent = chunkStrategy !== 'derived-only';
-    const applyChunkTypeBoosts = options.applyChunkTypeBoosts !== false;
-    const applyMultiViewBoost = options.applyMultiViewBoost !== false;
-    const applyChronologyBoost = options.applyChronologyBoost !== false;
+    const isMultiViewRouter = chunkStrategy === 'multi-view';
+    const applyChunkTypeBoosts = isMultiViewRouter && options.applyChunkTypeBoosts !== false;
+    const applyMultiViewBoost = isMultiViewRouter && options.applyMultiViewBoost !== false;
+    const applyChronologyBoost = isMultiViewRouter && options.applyChronologyBoost !== false;
 
-    const [derivedSemanticCandidates, contentSemanticCandidates, textCandidates] =
-      await Promise.all([
-        includeDerived
-          ? this.trySemanticRecallCandidates(
-              userId,
-              query,
-              options,
-              candidatePool,
-              0,
-              DERIVED_CHUNK_TYPES
-            )
-          : Promise.resolve(null),
-        includeContent
-          ? this.trySemanticRecallCandidates(
-              userId,
-              query,
-              options,
-              candidatePool,
-              0,
-              CONTENT_CHUNK_TYPES
-            )
-          : Promise.resolve(null),
-        this.textRecallCandidates(userId, query, options, candidatePool, 0),
-      ]);
+    const semanticRequests = isMultiViewRouter
+      ? [
+          this.trySemanticRecallCandidates(
+            userId,
+            query,
+            options,
+            candidatePool,
+            0,
+            DERIVED_CHUNK_TYPES
+          ),
+          this.trySemanticRecallCandidates(
+            userId,
+            query,
+            options,
+            candidatePool,
+            0,
+            CONTENT_CHUNK_TYPES
+          ),
+        ]
+      : [
+          this.trySemanticRecallCandidates(
+            userId,
+            query,
+            options,
+            candidatePool,
+            0,
+            chunkStrategy === 'content-only'
+              ? CONTENT_CHUNK_TYPES
+              : chunkStrategy === 'derived-only'
+                ? DERIVED_CHUNK_TYPES
+                : toMemoryChunkTypes(options.semanticChunkTypes)
+          ),
+        ];
+
+    const [semanticCandidateGroups, textCandidates] = await Promise.all([
+      Promise.all(semanticRequests),
+      this.textRecallCandidates(userId, query, options, candidatePool, 0),
+    ]);
 
     const byId = new Map<string, RecallCandidate>();
 
-    for (const candidate of [
-      ...(derivedSemanticCandidates || []),
-      ...(contentSemanticCandidates || []),
-    ]) {
+    for (const candidate of semanticCandidateGroups.flatMap((candidates) => candidates || [])) {
       const existing = byId.get(candidate.memory.id);
       byId.set(candidate.memory.id, {
         memory: candidate.memory,

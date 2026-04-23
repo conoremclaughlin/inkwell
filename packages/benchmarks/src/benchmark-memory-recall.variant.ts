@@ -73,9 +73,9 @@ function buildVariantHybridOptions(
     'hybridChunkStrategy' | 'applyChunkTypeBoosts' | 'applyMultiViewBoost' | 'applyChronologyBoost'
   > = {
     hybridChunkStrategy: 'default',
-    applyChunkTypeBoosts: true,
-    applyMultiViewBoost: true,
-    applyChronologyBoost: true,
+    applyChunkTypeBoosts: false,
+    applyMultiViewBoost: false,
+    applyChronologyBoost: false,
   };
 
   switch (variant) {
@@ -95,14 +95,16 @@ function buildVariantHybridOptions(
       };
     case 'multiview-no-boost':
       return {
-        hybridChunkStrategy: 'default',
+        hybridChunkStrategy: 'multi-view',
         applyChunkTypeBoosts: false,
         applyMultiViewBoost: false,
         applyChronologyBoost: false,
       };
     case 'multiview-no-chrono':
       return {
-        ...base,
+        hybridChunkStrategy: 'multi-view',
+        applyChunkTypeBoosts: true,
+        applyMultiViewBoost: true,
         applyChronologyBoost: false,
       };
     case 'default':

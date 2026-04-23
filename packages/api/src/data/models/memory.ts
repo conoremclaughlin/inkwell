@@ -71,7 +71,7 @@ export type MemorySearchChunkType =
   | 'entity'
   | 'current_state'
   | 'content';
-export type MemoryHybridChunkStrategy = 'default' | 'content-only' | 'derived-only';
+export type MemoryHybridChunkStrategy = 'default' | 'content-only' | 'derived-only' | 'multi-view';
 
 export interface MemorySearchOptions {
   recallMode?: 'auto' | 'text' | 'semantic' | 'hybrid';

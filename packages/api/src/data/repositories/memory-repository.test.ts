@@ -1669,6 +1669,7 @@ describe('MemoryRepository', () => {
 
       const results = await repo.recall('user-456', 'current override policy', {
         recallMode: 'hybrid',
+        hybridChunkStrategy: 'multi-view',
       });
 
       expect(rpc).toHaveBeenNthCalledWith(
@@ -1758,7 +1759,7 @@ describe('MemoryRepository', () => {
       const results = await (repo as any).hybridRecall(
         'user-456',
         'what is the current wound-care policy override',
-        {},
+        { hybridChunkStrategy: 'multi-view' },
         5,
         0
       );
