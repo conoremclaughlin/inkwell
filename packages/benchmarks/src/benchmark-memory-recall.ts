@@ -390,6 +390,7 @@ async function main() {
 
   try {
     for (const [index, benchCase] of benchmarkCases.entries()) {
+      const seedTopic = `${BENCHMARK_TOPIC}:${seedState.seedId}`;
       const caseTopic = `${BENCHMARK_TOPIC}:${seedState.seedId}:${benchCase.id}`;
       caseTopics[benchCase.id] = [caseTopic];
 
@@ -426,7 +427,7 @@ async function main() {
               source: 'observation',
               salience: 'low',
               topicKey: BENCHMARK_TOPIC,
-              topics: [BENCHMARK_TOPIC, caseTopic],
+              topics: [BENCHMARK_TOPIC, seedTopic, caseTopic],
             })
         );
         createdMemoryIds.push(target.id);
@@ -445,7 +446,7 @@ async function main() {
             source: 'observation',
             salience: 'low',
             topicKey: BENCHMARK_TOPIC,
-            topics: [BENCHMARK_TOPIC, caseTopic],
+            topics: [BENCHMARK_TOPIC, seedTopic, caseTopic],
           })
         );
         createdMemoryIds.push(distractor.id);
