@@ -9,6 +9,8 @@ describe('benchmark-memory-recall variants', () => {
   it('parses friendly aliases', () => {
     expect(parseBenchmarkRecallVariant(undefined)).toBe('default');
     expect(parseBenchmarkRecallVariant('raw')).toBe('content-only');
+    expect(parseBenchmarkRecallVariant('entities')).toBe('entity-only');
+    expect(parseBenchmarkRecallVariant('durable-facts')).toBe('fact-only');
     expect(parseBenchmarkRecallVariant('derived')).toBe('derived-only');
     expect(parseBenchmarkRecallVariant('no-chrono')).toBe('multiview-no-chrono');
     expect(parseBenchmarkRecallVariant('unknown')).toBe('default');
@@ -48,6 +50,39 @@ describe('benchmark-memory-recall variants', () => {
       recallMode: 'semantic',
       semanticChunkTypes: ['summary', 'fact', 'topic', 'entity'],
       applyChunkTypeBoosts: false,
+    });
+  });
+
+  it('builds explicit entity-only options for semantic and hybrid recall', () => {
+    expect(
+      buildBenchmarkRecallOptions({
+        mode: 'semantic',
+        variant: 'entity-only',
+        limit: 5,
+        agentId: 'lumen',
+        topics: ['benchmark:memory-recall:case-entity'],
+      })
+    ).toMatchObject({
+      recallMode: 'semantic',
+      semanticChunkTypes: ['entity'],
+      applyChunkTypeBoosts: false,
+    });
+
+    expect(
+      buildBenchmarkRecallOptions({
+        mode: 'hybrid',
+        variant: 'entity-only',
+        limit: 5,
+        agentId: 'lumen',
+        topics: ['benchmark:memory-recall:case-entity'],
+      })
+    ).toMatchObject({
+      recallMode: 'hybrid',
+      semanticChunkTypes: ['entity'],
+      hybridChunkStrategy: 'derived-only',
+      applyChunkTypeBoosts: false,
+      applyMultiViewBoost: false,
+      applyChronologyBoost: false,
     });
   });
 

@@ -37,6 +37,7 @@ async function main() {
 
   const agentId = process.env.BACKFILL_MEMORY_AGENT_ID;
   const topic = process.env.BACKFILL_MEMORY_TOPIC;
+  const memoryId = process.env.BACKFILL_MEMORY_ID;
   const batchSize = parsePositiveInt(process.env.BACKFILL_MEMORY_BATCH_SIZE, DEFAULT_BATCH_SIZE);
   const limit = process.env.BACKFILL_MEMORY_LIMIT
     ? parsePositiveInt(process.env.BACKFILL_MEMORY_LIMIT, batchSize)
@@ -61,7 +62,7 @@ async function main() {
   let scanned = 0;
 
   console.log(
-    `[memory-embedding-backfill] user=${userId} agent=${agentId || '*'} topic=${topic || '*'} ` +
+    `[memory-embedding-backfill] user=${userId} agent=${agentId || '*'} memory=${memoryId || '*'} topic=${topic || '*'} ` +
       `limit=${limit ?? 'all'} batchSize=${batchSize} force=${force} dryRun=${dryRun} ` +
       `mode=${env.MEMORY_EXTRACTION_MODE} chunkVersion=${MEMORY_EMBEDDING_CHUNKS_VERSION}`
   );
@@ -85,6 +86,10 @@ async function main() {
 
     if (topic?.trim()) {
       query = query.contains('topics', [topic.trim()]);
+    }
+
+    if (memoryId?.trim()) {
+      query = query.eq('id', memoryId.trim());
     }
 
     const { data, error } = await query;

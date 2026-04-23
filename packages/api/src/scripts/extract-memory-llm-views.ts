@@ -220,6 +220,7 @@ async function main() {
   const limit = parsePositiveInt(process.env.MEMORY_LLM_EXTRACT_LIMIT, 100);
   const offset = parsePositiveInt(process.env.MEMORY_LLM_EXTRACT_OFFSET, 0);
   const topic = process.env.MEMORY_LLM_EXTRACT_TOPIC;
+  const memoryId = process.env.MEMORY_LLM_EXTRACT_MEMORY_ID;
   const dryRun = parseBoolean(process.env.MEMORY_LLM_EXTRACT_DRY_RUN, false);
   const force = parseBoolean(process.env.MEMORY_LLM_EXTRACT_FORCE, false);
   const outputPath =
@@ -252,6 +253,7 @@ async function main() {
     `${JSON.stringify({
       type: 'config',
       userId,
+      memoryId: memoryId || null,
       topic: topic || null,
       limit,
       offset,
@@ -274,6 +276,10 @@ async function main() {
 
   if (topic?.trim()) {
     query = query.contains('topics', [topic.trim()]);
+  }
+
+  if (memoryId?.trim()) {
+    query = query.eq('id', memoryId.trim());
   }
 
   const { data, error } = await query;
