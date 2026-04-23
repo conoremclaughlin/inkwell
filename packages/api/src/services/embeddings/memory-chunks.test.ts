@@ -139,4 +139,14 @@ describe('memory chunk multi-view helpers', () => {
     expect(chunks.some((chunk) => chunk.chunkType === 'current_state')).toBe(false);
     expect(chunks.some((chunk) => chunk.chunkType === 'fact')).toBe(true);
   });
+
+  it('sanitizes unpaired unicode surrogates before chunk persistence', () => {
+    const chunks = buildMemoryEmbeddingChunks({
+      content: 'A benchmark transcript contained a broken low surrogate \udc00 in the text.',
+      model: { maxInputChars: 1200 } as { maxInputChars: number },
+    });
+
+    expect(chunks.some((chunk) => chunk.text.includes('\udc00'))).toBe(false);
+    expect(chunks.some((chunk) => chunk.text.includes('�'))).toBe(true);
+  });
 });

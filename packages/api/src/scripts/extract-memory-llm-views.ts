@@ -1,6 +1,15 @@
 import { createSupabaseClient } from '../data/supabase/client';
 import type { Database } from '../data/supabase/types';
-import { MemoryLlmExtractor } from '../services/memory-llm-extraction';
+import { appendFile, mkdir, writeFile } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
+import {
+  buildCurrentStateEmbeddingTexts,
+  buildDurableFactEmbeddingTexts,
+  buildEntityEmbeddingTexts,
+  buildSummaryEmbeddingTexts,
+  MemoryLlmExtractor,
+  type MemoryExtractions,
+} from '../services/memory-llm-extraction';
 
 type MemoryRow = Database['public']['Tables']['memories']['Row'];
 
@@ -15,6 +24,21 @@ function parsePositiveInt(raw: string | undefined, defaultValue: number): number
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : defaultValue;
 }
 
+function buildExtractionEmbeddingTexts(
+  llmExtractions: MemoryExtractions
+): Record<string, string[]> {
+  return {
+    entity: llmExtractions.entity ? buildEntityEmbeddingTexts(llmExtractions.entity) : [],
+    durable_fact: llmExtractions.durable_fact
+      ? buildDurableFactEmbeddingTexts(llmExtractions.durable_fact)
+      : [],
+    summary: llmExtractions.summary ? buildSummaryEmbeddingTexts(llmExtractions.summary) : [],
+    current_state: llmExtractions.current_state
+      ? buildCurrentStateEmbeddingTexts(llmExtractions.current_state)
+      : [],
+  };
+}
+
 async function main() {
   const userId = process.env.MEMORY_LLM_EXTRACT_USER_ID || process.env.BENCHMARK_USER_ID;
   if (!userId) {
@@ -26,6 +50,14 @@ async function main() {
   const topic = process.env.MEMORY_LLM_EXTRACT_TOPIC;
   const dryRun = parseBoolean(process.env.MEMORY_LLM_EXTRACT_DRY_RUN, false);
   const force = parseBoolean(process.env.MEMORY_LLM_EXTRACT_FORCE, false);
+  const outputPath =
+    process.env.MEMORY_LLM_EXTRACT_OUTPUT_PATH ||
+    resolve(
+      process.cwd(),
+      'output',
+      'memory-extractions',
+      `memory-llm-extract-${Date.now()}.jsonl`
+    );
 
   const extractor = new MemoryLlmExtractor();
   if (!extractor.isEnabled()) {
@@ -35,6 +67,24 @@ async function main() {
   }
 
   const supabase = createSupabaseClient();
+  await mkdir(dirname(outputPath), { recursive: true });
+  await writeFile(
+    outputPath,
+    `${JSON.stringify({
+      type: 'config',
+      userId,
+      topic: topic || null,
+      limit,
+      offset,
+      dryRun,
+      force,
+      enabledKinds: extractor.getEnabledKinds(),
+      startedAt: new Date().toISOString(),
+    })}\n`
+  );
+
+  console.log(`[memory-llm-extract] auditOutput=${outputPath}`);
+
   let query = supabase
     .from('memories')
     .select('id,user_id,content,summary,topic_key,topics,source,salience,metadata')
@@ -104,13 +154,43 @@ async function main() {
     }
 
     extracted += 1;
+    await appendFile(
+      outputPath,
+      `${JSON.stringify({
+        type: 'extraction',
+        memoryId: row.id,
+        topicKey: row.topic_key,
+        topics: row.topics,
+        source: row.source,
+        salience: row.salience,
+        summary: row.summary,
+        contentLength: row.content.length,
+        extractedKinds: extractor.getEnabledKinds(),
+        llmExtractions,
+        embeddingTexts: buildExtractionEmbeddingTexts(llmExtractions),
+        dryRun,
+        extractedAt: new Date().toISOString(),
+      })}\n`
+    );
     console.log(
       `[memory-llm-extract] ${dryRun ? 'dry-run ' : ''}extracted memory=${row.id} kinds=${extractor.getEnabledKinds().join(',')}`
     );
   }
 
+  await appendFile(
+    outputPath,
+    `${JSON.stringify({
+      type: 'summary',
+      loaded: rows.length,
+      extracted,
+      skipped,
+      dryRun,
+      completedAt: new Date().toISOString(),
+    })}\n`
+  );
+
   console.log(
-    `[memory-llm-extract] complete loaded=${rows.length} extracted=${extracted} skipped=${skipped} dryRun=${dryRun}`
+    `[memory-llm-extract] complete loaded=${rows.length} extracted=${extracted} skipped=${skipped} dryRun=${dryRun} auditOutput=${outputPath}`
   );
 }
 
