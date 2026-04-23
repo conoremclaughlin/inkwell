@@ -69,6 +69,7 @@ describe('resolveRouteAgentId', () => {
       identityId: 'id-1',
       routeId: 'route-1',
       studioHint: null,
+      activeSessionId: null,
     });
   });
 

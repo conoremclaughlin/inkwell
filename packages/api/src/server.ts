@@ -186,6 +186,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
     // If mention didn't match, try channel_routes specificity cascade
     let routeStudioHint: string | null = null;
+    let resolvedRouteId: string | null = null;
     if (routedAgentId === agentId) {
       const route = await resolveRouteAgentId(
         dataComposer!.getClient(),
@@ -198,6 +199,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         routedAgentId = route.agentId;
         routedIdentityId = route.identityId;
         routeStudioHint = route.studioHint;
+        resolvedRouteId = route.routeId;
         logger.debug(`[Route] Resolved agent from channel_routes`, {
           platform: channel,
           agentId: route.agentId,
@@ -297,6 +299,25 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
     // Process through SessionService
     const result = await sessionService!.handleMessage(request);
+
+    // Stamp active session on the channel route so we can verify where
+    // messages and heartbeats are landing. Fire-and-forget — don't block response.
+    if (resolvedRouteId && result.sessionId && dataComposer) {
+      dataComposer
+        .getClient()
+        .from('channel_routes')
+        .update({ active_session_id: result.sessionId })
+        .eq('id', resolvedRouteId)
+        .then(({ error: stampError }) => {
+          if (stampError) {
+            logger.warn('[Route] Failed to stamp active_session_id on channel_route', {
+              routeId: resolvedRouteId,
+              sessionId: result.sessionId,
+              error: stampError.message,
+            });
+          }
+        });
+    }
 
     // Route any explicit send_response calls
     if (result.responses && result.responses.length > 0) {
