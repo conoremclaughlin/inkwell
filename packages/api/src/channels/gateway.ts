@@ -915,8 +915,12 @@ export class ChannelGateway extends EventEmitter {
 
     logger.info(`Response sent via gateway to ${channel}:${conversationId}`);
 
-    // Check for pending messages that arrived while processing
-    await this.processPendingMessages(channel as GatewayChannel, conversationId);
+    // NOTE: Do NOT call processPendingMessages() here. sendResponse() can be
+    // called multiple times per turn (e.g., Myra sending calendar confirmations).
+    // Each call would flush the pending buffer and start a new session turn while
+    // the current turn's releaseConversation() hasn't fired yet — causing duplicate
+    // responses. The single release point is releaseConversation(), called from
+    // server.ts after the full message handler completes.
 
     // Return media delivery results so callers (send_response) can report them
     if (mediaResult) {

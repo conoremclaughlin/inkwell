@@ -186,6 +186,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
     // If mention didn't match, try channel_routes specificity cascade
     let routeStudioHint: string | null = null;
+    let resolvedRouteId: string | null = null;
     if (routedAgentId === agentId) {
       const route = await resolveRouteAgentId(
         dataComposer!.getClient(),
@@ -198,6 +199,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         routedAgentId = route.agentId;
         routedIdentityId = route.identityId;
         routeStudioHint = route.studioHint;
+        resolvedRouteId = route.routeId;
         logger.debug(`[Route] Resolved agent from channel_routes`, {
           platform: channel,
           agentId: route.agentId,
@@ -297,6 +299,25 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
     // Process through SessionService
     const result = await sessionService!.handleMessage(request);
+
+    // Stamp active session on the channel route so we can verify where
+    // messages and heartbeats are landing. Fire-and-forget — don't block response.
+    if (resolvedRouteId && result.sessionId && dataComposer) {
+      dataComposer
+        .getClient()
+        .from('channel_routes')
+        .update({ active_session_id: result.sessionId })
+        .eq('id', resolvedRouteId)
+        .then(({ error: stampError }) => {
+          if (stampError) {
+            logger.warn('[Route] Failed to stamp active_session_id on channel_route', {
+              routeId: resolvedRouteId,
+              sessionId: result.sessionId,
+              error: stampError.message,
+            });
+          }
+        });
+    }
 
     // Route any explicit send_response calls
     if (result.responses && result.responses.length > 0) {
@@ -477,12 +498,13 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       }
     }
 
-    // Resolve studioHint via cascade:
+    // Resolve studioHint + activeSessionId via cascade:
     //   1. reminder.studio_hint (direct override)
-    //   2. channel_routes.studio_hint (matched by delivery channel)
+    //   2. channel_routes.studio_hint + active_session_id (matched by delivery channel)
     //   3. agent_identities.studio_hint (agent's default studio)
     //   4. null → resolveStudioId() uses its own cascade (agent studio → main)
     let reminderStudioHint: string | null = null;
+    let routeActiveSessionId: string | null = null;
 
     // Check reminder-level override first
     if (reminder.studio_hint) {
@@ -493,8 +515,8 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       });
     }
 
-    // Fallback to channel_routes
-    if (!reminderStudioHint && dataComposer && reminder.delivery_channel) {
+    // Resolve channel_routes for both studioHint and activeSessionId
+    if (dataComposer && reminder.delivery_channel) {
       const route = await resolveRouteAgentId(
         dataComposer.getClient(),
         userId,
@@ -502,13 +524,23 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         undefined, // platformAccountId — not stored on reminders yet
         reminder.delivery_target || undefined
       );
-      if (route?.studioHint) {
-        reminderStudioHint = route.studioHint;
-        logger.debug(`[Heartbeat] Resolved studioHint from channel_route`, {
-          studioHint: reminderStudioHint,
-          deliveryChannel: reminder.delivery_channel,
-          deliveryTarget: reminder.delivery_target,
-        });
+      if (route) {
+        if (!reminderStudioHint && route.studioHint) {
+          reminderStudioHint = route.studioHint;
+          logger.debug(`[Heartbeat] Resolved studioHint from channel_route`, {
+            studioHint: reminderStudioHint,
+            deliveryChannel: reminder.delivery_channel,
+            deliveryTarget: reminder.delivery_target,
+          });
+        }
+        if (route.activeSessionId) {
+          routeActiveSessionId = route.activeSessionId;
+          logger.info(`[Heartbeat] Using active_session_id from channel_route`, {
+            activeSessionId: routeActiveSessionId,
+            deliveryChannel: reminder.delivery_channel,
+            reminderId: reminder.id,
+          });
+        }
       }
     }
 
@@ -550,7 +582,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     const request: SessionRequest = {
       userId,
       agentId: reminderAgentId,
-      channel: 'agent',
+      channel: 'heartbeat',
       conversationId: `heartbeat:${reminder.id}`,
       sender: { id: 'system', name: 'heartbeat' },
       content: reminderContent,
@@ -558,6 +590,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         triggerType: 'heartbeat',
         chatType: 'direct',
         ...(reminderStudioHint ? { studioHint: reminderStudioHint } : {}),
+        ...(routeActiveSessionId ? { recipientSessionId: routeActiveSessionId } : {}),
       },
     };
 

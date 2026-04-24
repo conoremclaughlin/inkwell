@@ -16,6 +16,7 @@ export type ChannelType =
   | 'http'
   | 'api'
   | 'agent'
+  | 'heartbeat'
   | 'web';
 export type BackendType = 'claude-code' | 'direct-api';
 export type ResponseFormat = 'text' | 'markdown' | 'code' | 'json';

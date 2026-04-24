@@ -233,10 +233,29 @@ export class SessionService implements ISessionService {
         repoRoot: metadata?.repoRoot,
       });
 
-      // 2. Build lock key - must be per agent + session to support sub-agents
+      // 2. Log session routing for external + heartbeat channels
+      // so we can verify messages and heartbeats land in the same session.
+      const isExternalChannel = ['telegram', 'whatsapp', 'discord', 'slack', 'heartbeat'].includes(
+        request.channel
+      );
+      if (isExternalChannel) {
+        logger.info('Session routing resolved', {
+          channel: request.channel,
+          conversationId: request.conversationId,
+          pcpSessionId: session.id,
+          backendSessionId: session.backendSessionId || null,
+          studioId: session.studioId || null,
+          agentId,
+          threadKey: session.threadKey || null,
+          lifecycle: session.lifecycle,
+          messageCount: session.messageCount,
+        });
+      }
+
+      // 3. Build lock key - must be per agent + session to support sub-agents
       const lockKey = `${agentId}:${session.id}`;
 
-      // 3. Check if session is already being processed
+      // 4. Check if session is already being processed
       if (this.processingLocks.has(lockKey)) {
         logger.info('Session is processing, queuing message', {
           lockKey,
@@ -252,7 +271,7 @@ export class SessionService implements ISessionService {
         });
       }
 
-      // 4. Acquire lock and process
+      // 5. Acquire lock and process
       this.processingLocks.add(lockKey);
       logger.debug('Acquired processing lock', { lockKey });
 
@@ -260,7 +279,7 @@ export class SessionService implements ISessionService {
         const result = await this.processMessage(request, session);
         return result;
       } finally {
-        // 5. Process queued messages or release lock
+        // 6. Process queued messages or release lock
         await this.processQueueOrReleaseLock(lockKey);
       }
     } catch (error) {

@@ -16,6 +16,7 @@ export type ChannelType =
   | 'http'
   | 'api'
   | 'agent'
+  | 'heartbeat'
   | 'web';
 
 export type ChatType = 'direct' | 'group' | 'supergroup' | 'channel';
