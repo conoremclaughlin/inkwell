@@ -484,13 +484,18 @@ function createThreadMockSupabase(
       eq: vi.fn().mockReturnValue({
         eq: vi.fn().mockReturnValue({
           maybeSingle: vi.fn().mockResolvedValue({
-            data: { agent_id: 'existing' },
+            data: { agent_id: 'existing', session_id: null },
             error: null,
           }),
         }),
       }),
     }),
     insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+    update: vi.fn().mockReturnValue({
+      eq: vi.fn().mockReturnValue({
+        eq: vi.fn().mockResolvedValue({ data: null, error: null }),
+      }),
+    }),
   };
 
   // inbox_thread_messages table mock
