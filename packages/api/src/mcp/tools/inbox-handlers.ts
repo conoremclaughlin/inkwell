@@ -1037,14 +1037,15 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
               created_by_agent_id: string;
               updated_at: string;
             }) => {
-              // Get participants
+              // Get participants (include joined_at for unread baseline)
               const { data: parts } = await threadTable(supabase, 'inbox_thread_participants')
-                .select('agent_id')
+                .select('agent_id, joined_at')
                 .eq('thread_id', t.id);
               const participants = (parts || []).map((p: { agent_id: string }) => p.agent_id);
 
               // Get last read timestamp (only meaningful with agentId)
               let lastReadAt: string | null = null;
+              let joinedAt: string | null = null;
               if (agentId) {
                 const { data: readStatus } = await threadTable(supabase, 'inbox_thread_read_status')
                   .select('last_read_at')
@@ -1052,15 +1053,29 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
                   .eq('agent_id', agentId)
                   .maybeSingle();
                 lastReadAt = readStatus?.last_read_at || null;
+
+                // If no read status exists, use the participant's joined_at as
+                // baseline so messages from before they joined don't count as
+                // unread. Without this, a participant who has never read a thread
+                // sees the entire history as "unread" on every poll — causing
+                // replay floods on session restart.
+                const callerPart = (parts || []).find(
+                  (p: { agent_id: string }) => p.agent_id === agentId
+                ) as { joined_at?: string } | undefined;
+                joinedAt = callerPart?.joined_at || null;
               }
 
-              // Count unread messages (after last read, or all if no read status)
+              // Count unread messages. Baseline priority:
+              //   1. last_read_at (explicit read pointer)
+              //   2. joined_at (participant join time — no replay of pre-join history)
+              //   3. no filter (shouldn't happen — agent is always a participant)
+              const unreadBaseline = lastReadAt || joinedAt;
               let countQuery = threadTable(supabase, 'inbox_thread_messages')
                 .select('*', { count: 'exact', head: true })
                 .eq('thread_id', t.id);
 
-              if (lastReadAt) {
-                countQuery = countQuery.gt('created_at', lastReadAt);
+              if (unreadBaseline) {
+                countQuery = countQuery.gt('created_at', unreadBaseline);
               }
 
               const { count } = await countQuery;
