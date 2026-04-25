@@ -394,12 +394,19 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           agent_id: participantAgentId,
           ...(participantSessionId ? { session_id: participantSessionId } : {}),
         });
-      } else if (participantSessionId && !existing.session_id) {
-        // Backfill session_id for existing participants that don't have one yet
-        await threadTable(supabase, 'inbox_thread_participants')
-          .update({ session_id: participantSessionId })
-          .eq('thread_id', thread.id)
-          .eq('agent_id', participantAgentId);
+      } else if (participantSessionId) {
+        // Sender's session is authoritative (they know their own session).
+        // Recipient's session is a hint — only backfill null; the trigger
+        // handler stamps the real session after getOrCreateSession().
+        const shouldUpdate = isSender
+          ? existing.session_id !== participantSessionId
+          : !existing.session_id;
+        if (shouldUpdate) {
+          await threadTable(supabase, 'inbox_thread_participants')
+            .update({ session_id: participantSessionId })
+            .eq('thread_id', thread.id)
+            .eq('agent_id', participantAgentId);
+        }
       }
     }
 
@@ -597,6 +604,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         const payload: AgentTriggerPayload = {
           fromAgentId: triggerSenderId,
           toAgentId,
+          threadId: thread.id,
           threadMessageId: threadMessage.id,
           triggerType: triggerType || 'message',
           summary:
