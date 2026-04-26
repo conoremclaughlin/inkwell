@@ -4,6 +4,7 @@ import type { RecallMode } from './benchmark-memory-recall.types';
 export type BenchmarkRecallVariant =
   | 'default'
   | 'content-only'
+  | 'content-plus-entity'
   | 'entity-only'
   | 'fact-only'
   | 'summary-only'
@@ -18,6 +19,10 @@ const VARIANT_ALIASES: Record<string, BenchmarkRecallVariant> = {
   'content-only': 'content-only',
   content: 'content-only',
   raw: 'content-only',
+  'content-plus-entity': 'content-plus-entity',
+  'content+entity': 'content-plus-entity',
+  'raw-plus-entity': 'content-plus-entity',
+  'content-entity': 'content-plus-entity',
   'entity-only': 'entity-only',
   entity: 'entity-only',
   entities: 'entity-only',
@@ -67,6 +72,11 @@ function buildVariantSemanticOptions(
     case 'entity-only':
       return {
         semanticChunkTypes: ['entity'],
+        applyChunkTypeBoosts: false,
+      };
+    case 'content-plus-entity':
+      return {
+        semanticChunkTypes: ['content', 'entity'],
         applyChunkTypeBoosts: false,
       };
     case 'fact-only':
@@ -122,6 +132,13 @@ function buildVariantHybridOptions(
     case 'content-only':
       return {
         hybridChunkStrategy: 'content-only',
+        applyChunkTypeBoosts: false,
+        applyMultiViewBoost: false,
+        applyChronologyBoost: false,
+      };
+    case 'content-plus-entity':
+      return {
+        hybridChunkStrategy: 'default',
         applyChunkTypeBoosts: false,
         applyMultiViewBoost: false,
         applyChronologyBoost: false,

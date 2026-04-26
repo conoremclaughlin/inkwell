@@ -9,6 +9,7 @@ describe('benchmark-memory-recall variants', () => {
   it('parses friendly aliases', () => {
     expect(parseBenchmarkRecallVariant(undefined)).toBe('default');
     expect(parseBenchmarkRecallVariant('raw')).toBe('content-only');
+    expect(parseBenchmarkRecallVariant('content+entity')).toBe('content-plus-entity');
     expect(parseBenchmarkRecallVariant('entities')).toBe('entity-only');
     expect(parseBenchmarkRecallVariant('durable-facts')).toBe('fact-only');
     expect(parseBenchmarkRecallVariant('derived')).toBe('derived-only');
@@ -80,6 +81,39 @@ describe('benchmark-memory-recall variants', () => {
       recallMode: 'hybrid',
       semanticChunkTypes: ['entity'],
       hybridChunkStrategy: 'derived-only',
+      applyChunkTypeBoosts: false,
+      applyMultiViewBoost: false,
+      applyChronologyBoost: false,
+    });
+  });
+
+  it('builds explicit content-plus-entity options for semantic and hybrid recall', () => {
+    expect(
+      buildBenchmarkRecallOptions({
+        mode: 'semantic',
+        variant: 'content-plus-entity',
+        limit: 5,
+        agentId: 'lumen',
+        topics: ['benchmark:memory-recall:case-content-entity'],
+      })
+    ).toMatchObject({
+      recallMode: 'semantic',
+      semanticChunkTypes: ['content', 'entity'],
+      applyChunkTypeBoosts: false,
+    });
+
+    expect(
+      buildBenchmarkRecallOptions({
+        mode: 'hybrid',
+        variant: 'content-plus-entity',
+        limit: 5,
+        agentId: 'lumen',
+        topics: ['benchmark:memory-recall:case-content-entity'],
+      })
+    ).toMatchObject({
+      recallMode: 'hybrid',
+      semanticChunkTypes: ['content', 'entity'],
+      hybridChunkStrategy: 'default',
       applyChunkTypeBoosts: false,
       applyMultiViewBoost: false,
       applyChronologyBoost: false,
