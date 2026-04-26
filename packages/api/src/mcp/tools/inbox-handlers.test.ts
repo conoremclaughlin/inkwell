@@ -1507,4 +1507,40 @@ describe('Session-scoped thread filtering', () => {
     const lastParticipantsChain = participantsFrom[participantsFrom.length - 1]?.value;
     expect(lastParticipantsChain?.update).toHaveBeenCalled();
   });
+
+  it('should skip session_id for cross-studio self-messages', async () => {
+    const mockSb = createThreadMockSupabase({
+      existingThread: { id: 'thread-pr210' },
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    const { getRequestContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue({
+      sessionId: 'wren-session-alpha',
+      studioId: 'studio-alpha',
+    } as ReturnType<typeof getRequestContext>);
+
+    // Wren sends to wren in a different studio — cross-studio self-message
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        senderAgentId: 'wren',
+        threadKey: 'pr:210',
+        content: 'Cross-studio self-delegation',
+        messageType: 'task_request',
+        recipientStudioSlug: 'wren-beta',
+      },
+      mockDc as never
+    );
+
+    // Participant mock returns session_id: null. For a cross-studio self-message,
+    // session_id should NOT be stamped — it would hide the thread from the other studio.
+    // Since participantSessionId is null, the update branch is never entered.
+    const participantsFrom = mockSb.from.mock.results.filter(
+      (_: unknown, i: number) => mockSb.from.mock.calls[i][0] === 'inbox_thread_participants'
+    );
+    const lastParticipantsChain = participantsFrom[participantsFrom.length - 1]?.value;
+    expect(lastParticipantsChain?.update).not.toHaveBeenCalled();
+  });
 });

@@ -920,7 +920,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
 
       // Stamp the resolved session on the recipient's thread participant record
       // so channel plugins can filter threads to their session.
-      if (payload.threadId && routedSession.id) {
+      // Skip for cross-studio self-messages: the PK is (thread_id, agent_id),
+      // so there's only one row — stamping would hide the thread from the
+      // sender's studio. Leave null so both sessions see it.
+      const isCrossStudioSelf =
+        payload.fromAgentId === targetAgentId && !!(payload.studioId || payload.studioHint);
+      if (payload.threadId && routedSession.id && !isCrossStudioSelf) {
         try {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           await (dataComposer!.getClient() as any)

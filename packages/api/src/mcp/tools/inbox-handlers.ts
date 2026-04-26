@@ -376,11 +376,26 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       ? [...new Set([senderAgentId, ...allRecipients])]
       : allRecipients;
 
+    // Cross-studio self-message: sender targets themselves in a different studio.
+    // The PK is (thread_id, agent_id) so there's only ONE participant row — stamping
+    // session_id would scope it to one studio and hide it from the other. Leave null
+    // so both sessions see the thread.
+    const isCrossStudioSelf = !!(
+      senderAgentId &&
+      senderAgentId === recipientAgentId &&
+      (recipientStudioId || recipientStudioSlugOrHint)
+    );
+
     // Ensure all participants are registered (recipients + sender for existing threads).
     // Stamp session_id so channel plugins can filter threads to their session.
     for (const participantAgentId of allParticipants) {
       const isSender = participantAgentId === senderAgentId;
-      const participantSessionId = isSender ? senderSessionId : recipientSessionId || null;
+      const participantSessionId =
+        isCrossStudioSelf && participantAgentId === senderAgentId
+          ? null
+          : isSender
+            ? senderSessionId
+            : recipientSessionId || null;
 
       const { data: existing } = await threadTable(supabase, 'inbox_thread_participants')
         .select('agent_id, session_id')
