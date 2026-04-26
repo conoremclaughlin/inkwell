@@ -1432,19 +1432,28 @@ export type Database = {
         Row: {
           agent_id: string;
           joined_at: string | null;
+          session_id: string | null;
           thread_id: string;
         };
         Insert: {
           agent_id: string;
           joined_at?: string | null;
+          session_id?: string | null;
           thread_id: string;
         };
         Update: {
           agent_id?: string;
           joined_at?: string | null;
+          session_id?: string | null;
           thread_id?: string;
         };
         Relationships: [
+          {
+            foreignKeyName: 'inbox_thread_participants_session_id_fkey';
+            columns: ['session_id'];
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
           {
             foreignKeyName: 'inbox_thread_participants_thread_id_fkey';
             columns: ['thread_id'];
