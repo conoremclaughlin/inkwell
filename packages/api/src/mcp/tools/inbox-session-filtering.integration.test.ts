@@ -226,3 +226,134 @@ describe('Session-scoped thread filtering (integration)', () => {
     await (supabase as any).from('sessions').delete().eq('id', newSessionId);
   });
 });
+
+describe('Cross-studio self-message filtering (integration)', () => {
+  let dataComposer: DataComposer;
+  let supabase: ReturnType<DataComposer['getClient']>;
+  let testUserId: string;
+  const sessionAlpha = '00000000-0000-4000-b000-000000000001';
+  const sessionBeta = '00000000-0000-4000-b000-000000000002';
+  let crossStudioThreadId: string;
+  const crossStudioThreadKey = `test:cross-studio-${Date.now()}`;
+
+  beforeAll(async () => {
+    dataComposer = await getDataComposer();
+    supabase = dataComposer.getClient();
+    const fixture = await ensureEchoIntegrationFixture(dataComposer);
+    testUserId = fixture.userId;
+
+    for (const sid of [sessionAlpha, sessionBeta]) {
+      await (supabase as any).from('sessions').upsert(
+        {
+          id: sid,
+          user_id: testUserId,
+          agent_id: 'echo',
+          status: 'active',
+          lifecycle: 'idle',
+        },
+        { onConflict: 'id' }
+      );
+    }
+
+    // Create thread for cross-studio self-messaging
+    const { data: thread, error } = await (supabase as any)
+      .from('inbox_threads')
+      .insert({
+        thread_key: crossStudioThreadKey,
+        user_id: testUserId,
+        created_by_agent_id: 'echo',
+        title: 'Cross-studio self-message test',
+      })
+      .select('id')
+      .single();
+
+    if (error) throw new Error(`Failed to create thread: ${error.message}`);
+    crossStudioThreadId = thread.id;
+  });
+
+  afterAll(async () => {
+    if (crossStudioThreadId) {
+      await (supabase as any)
+        .from('inbox_thread_messages')
+        .delete()
+        .eq('thread_id', crossStudioThreadId);
+      await (supabase as any)
+        .from('inbox_thread_participants')
+        .delete()
+        .eq('thread_id', crossStudioThreadId);
+      await (supabase as any).from('inbox_threads').delete().eq('id', crossStudioThreadId);
+    }
+    for (const sid of [sessionAlpha, sessionBeta]) {
+      await (supabase as any).from('sessions').delete().eq('id', sid);
+    }
+  });
+
+  it('cross-studio self-message participant has null session_id', async () => {
+    // For cross-studio self-messages, session_id must be null so both
+    // studios see the thread. Simulate by inserting participant without session_id.
+    await (supabase as any).from('inbox_thread_participants').insert({
+      thread_id: crossStudioThreadId,
+      agent_id: 'echo',
+      // no session_id — correct for cross-studio self-message
+    });
+
+    const { data: participant } = await (supabase as any)
+      .from('inbox_thread_participants')
+      .select('session_id')
+      .eq('thread_id', crossStudioThreadId)
+      .eq('agent_id', 'echo')
+      .single();
+
+    expect(participant.session_id).toBeNull();
+  });
+
+  it('both studio sessions can see the cross-studio thread', async () => {
+    // With session_id null, both sessions should find the thread via
+    // the OR filter: session_id.eq.X,session_id.is.null
+    for (const sid of [sessionAlpha, sessionBeta]) {
+      const { data: participants } = await (supabase as any)
+        .from('inbox_thread_participants')
+        .select('thread_id')
+        .eq('agent_id', 'echo')
+        .or(`session_id.eq.${sid},session_id.is.null`);
+
+      const hasThread = participants?.some((p: any) => p.thread_id === crossStudioThreadId);
+      expect(hasThread).toBe(true);
+    }
+  });
+
+  it('stamping session_id would hide thread from other studio', async () => {
+    // Demonstrate the problem that Option 2 prevents: if we stamped
+    // session_id = sessionAlpha, sessionBeta would lose visibility.
+    await (supabase as any)
+      .from('inbox_thread_participants')
+      .update({ session_id: sessionAlpha })
+      .eq('thread_id', crossStudioThreadId)
+      .eq('agent_id', 'echo');
+
+    // Session Alpha sees it
+    const { data: alphaResults } = await (supabase as any)
+      .from('inbox_thread_participants')
+      .select('thread_id')
+      .eq('agent_id', 'echo')
+      .or(`session_id.eq.${sessionAlpha},session_id.is.null`);
+
+    expect(alphaResults?.some((p: any) => p.thread_id === crossStudioThreadId)).toBe(true);
+
+    // Session Beta does NOT see it — this is the bug we're preventing
+    const { data: betaResults } = await (supabase as any)
+      .from('inbox_thread_participants')
+      .select('thread_id')
+      .eq('agent_id', 'echo')
+      .or(`session_id.eq.${sessionBeta},session_id.is.null`);
+
+    expect(betaResults?.some((p: any) => p.thread_id === crossStudioThreadId)).toBe(false);
+
+    // Restore null for cleanup consistency
+    await (supabase as any)
+      .from('inbox_thread_participants')
+      .update({ session_id: null })
+      .eq('thread_id', crossStudioThreadId)
+      .eq('agent_id', 'echo');
+  });
+});
