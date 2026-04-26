@@ -321,17 +321,27 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
       query = query.gt('created_at', cursor.created_at);
     }
   } else if (!beforeMessageId) {
-    // No explicit cursor — fall back to the caller's last_read_at as an
-    // implicit "start from where I left off" cursor. Without this, a client
-    // whose in-memory cursor was reset (e.g. channel plugin restart) would
-    // replay the full thread history and — combined with markRead — could
-    // regress the server-side read pointer to an older timestamp.
+    // No explicit cursor — fall back to stored read state so a client whose
+    // in-memory cursor was reset doesn't replay the full thread history.
+    // Baseline priority:
+    //   1. last_read_at (explicit read pointer from prior reads)
+    //   2. joined_at (participant join time — no replay of pre-join history)
     const { data: readStatus } = await threadTable(supabase, 'inbox_thread_read_status')
       .select('last_read_at')
       .eq('thread_id', thread.id)
       .eq('agent_id', agentId)
       .maybeSingle();
-    const cursorTs = (readStatus as { last_read_at?: string } | null)?.last_read_at;
+    let cursorTs = (readStatus as { last_read_at?: string } | null)?.last_read_at || null;
+
+    if (!cursorTs) {
+      const { data: participant } = await threadTable(supabase, 'inbox_thread_participants')
+        .select('joined_at')
+        .eq('thread_id', thread.id)
+        .eq('agent_id', agentId)
+        .maybeSingle();
+      cursorTs = (participant as { joined_at?: string } | null)?.joined_at || null;
+    }
+
     if (cursorTs) {
       query = query.gt('created_at', cursorTs);
     }

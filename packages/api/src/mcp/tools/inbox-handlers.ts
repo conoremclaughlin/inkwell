@@ -376,19 +376,52 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       ? [...new Set([senderAgentId, ...allRecipients])]
       : allRecipients;
 
-    // Ensure all participants are registered (recipients + sender for existing threads)
-    for (const agentId of allParticipants) {
+    // Cross-studio self-message: sender targets themselves in a different studio.
+    // The PK is (thread_id, agent_id) so there's only ONE participant row — stamping
+    // session_id would scope it to one studio and hide it from the other. Leave null
+    // so both sessions see the thread.
+    const isCrossStudioSelf = !!(
+      senderAgentId &&
+      senderAgentId === recipientAgentId &&
+      (recipientStudioId || recipientStudioSlugOrHint)
+    );
+
+    // Ensure all participants are registered (recipients + sender for existing threads).
+    // Stamp session_id so channel plugins can filter threads to their session.
+    for (const participantAgentId of allParticipants) {
+      const isSender = participantAgentId === senderAgentId;
+      const participantSessionId =
+        isCrossStudioSelf && participantAgentId === senderAgentId
+          ? null
+          : isSender
+            ? senderSessionId
+            : recipientSessionId || null;
+
       const { data: existing } = await threadTable(supabase, 'inbox_thread_participants')
-        .select('agent_id')
+        .select('agent_id, session_id')
         .eq('thread_id', thread.id)
-        .eq('agent_id', agentId)
+        .eq('agent_id', participantAgentId)
         .maybeSingle();
 
       if (!existing) {
         await threadTable(supabase, 'inbox_thread_participants').insert({
           thread_id: thread.id,
-          agent_id: agentId,
+          agent_id: participantAgentId,
+          ...(participantSessionId ? { session_id: participantSessionId } : {}),
         });
+      } else if (participantSessionId) {
+        // Sender's session is authoritative (they know their own session).
+        // Recipient's session is a hint — only backfill null; the trigger
+        // handler stamps the real session after getOrCreateSession().
+        const shouldUpdate = isSender
+          ? existing.session_id !== participantSessionId
+          : !existing.session_id;
+        if (shouldUpdate) {
+          await threadTable(supabase, 'inbox_thread_participants')
+            .update({ session_id: participantSessionId })
+            .eq('thread_id', thread.id)
+            .eq('agent_id', participantAgentId);
+        }
       }
     }
 
@@ -586,6 +619,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         const payload: AgentTriggerPayload = {
           fromAgentId: triggerSenderId,
           toAgentId,
+          threadId: thread.id,
           threadMessageId: threadMessage.id,
           triggerType: triggerType || 'message',
           summary:
@@ -1000,12 +1034,27 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   let threadsWithUnread: ThreadSummary[] = [];
   let threadUnreadCount = 0;
 
+  // Resolve caller's session ID for channelPoll session scoping
+  let callerSessionId: string | null = null;
+  if (channelPoll && agentId) {
+    const reqCtx = getRequestContext();
+    const sessCtx = getSessionContext();
+    callerSessionId = reqCtx?.sessionId || sessCtx?.sessionId || null;
+  }
+
   try {
     // Find thread IDs this agent (or any agent for this user) participates in
     let participantQuery = threadTable(supabase, 'inbox_thread_participants').select('thread_id');
     if (agentId) {
       participantQuery = participantQuery.eq('agent_id', agentId);
     }
+
+    // Session-scoped filtering: only return threads assigned to this session
+    // (or unassigned threads not yet claimed by any session).
+    if (callerSessionId) {
+      participantQuery = participantQuery.or(`session_id.eq.${callerSessionId},session_id.is.null`);
+    }
+
     const { data: participantRows } = await participantQuery;
 
     const threadIds = [
@@ -1037,14 +1086,15 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
               created_by_agent_id: string;
               updated_at: string;
             }) => {
-              // Get participants
+              // Get participants (include joined_at for unread baseline)
               const { data: parts } = await threadTable(supabase, 'inbox_thread_participants')
-                .select('agent_id')
+                .select('agent_id, joined_at')
                 .eq('thread_id', t.id);
               const participants = (parts || []).map((p: { agent_id: string }) => p.agent_id);
 
               // Get last read timestamp (only meaningful with agentId)
               let lastReadAt: string | null = null;
+              let joinedAt: string | null = null;
               if (agentId) {
                 const { data: readStatus } = await threadTable(supabase, 'inbox_thread_read_status')
                   .select('last_read_at')
@@ -1052,15 +1102,29 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
                   .eq('agent_id', agentId)
                   .maybeSingle();
                 lastReadAt = readStatus?.last_read_at || null;
+
+                // If no read status exists, use the participant's joined_at as
+                // baseline so messages from before they joined don't count as
+                // unread. Without this, a participant who has never read a thread
+                // sees the entire history as "unread" on every poll — causing
+                // replay floods on session restart.
+                const callerPart = (parts || []).find(
+                  (p: { agent_id: string }) => p.agent_id === agentId
+                ) as { joined_at?: string } | undefined;
+                joinedAt = callerPart?.joined_at || null;
               }
 
-              // Count unread messages (after last read, or all if no read status)
+              // Count unread messages. Baseline priority:
+              //   1. last_read_at (explicit read pointer)
+              //   2. joined_at (participant join time — no replay of pre-join history)
+              //   3. no filter (shouldn't happen — agent is always a participant)
+              const unreadBaseline = lastReadAt || joinedAt;
               let countQuery = threadTable(supabase, 'inbox_thread_messages')
                 .select('*', { count: 'exact', head: true })
                 .eq('thread_id', t.id);
 
-              if (lastReadAt) {
-                countQuery = countQuery.gt('created_at', lastReadAt);
+              if (unreadBaseline) {
+                countQuery = countQuery.gt('created_at', unreadBaseline);
               }
 
               const { count } = await countQuery;
@@ -1104,10 +1168,11 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         // Only include threads that actually have unread messages
         threadsWithUnread = threadsWithUnread.filter((t) => t.unreadCount > 0);
 
-        // Channel poll studio filtering: when channelPoll=true, filter threads
-        // to only those owned by the requesting studio. Uses the same sender
-        // metadata that the trigger system stamps on thread messages.
-        if (channelPoll && agentId) {
+        // Channel poll studio filtering (defense-in-depth): when channelPoll=true
+        // and no session_id filter was applied, fall back to message-metadata-based
+        // studio ownership check. When session filtering is active (callerSessionId
+        // is set), skip this — session_id on participants is the primary routing.
+        if (channelPoll && agentId && !callerSessionId) {
           const reqCtx = getRequestContext();
           const sessCtx = getSessionContext();
           const callerStudioId = reqCtx?.studioId || sessCtx?.studioId || null;

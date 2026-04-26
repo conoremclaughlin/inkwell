@@ -867,15 +867,6 @@ export function buildIdentityBlock(bootstrapResult: Record<string, unknown>): st
   return sections.join('\n\n---\n\n');
 }
 
-function buildInboxBlock(messages: Array<Record<string, unknown>> | undefined): string {
-  if (!messages || messages.length === 0) return '';
-  const lines = [`### Inbox (${messages.length} message${messages.length === 1 ? '' : 's'})`];
-  for (const msg of messages) {
-    lines.push(`- **${msg.from || 'unknown'}**: ${msg.content || msg.subject || '(no content)'}`);
-  }
-  return lines.join('\n');
-}
-
 /**
  * Check if the InkMail channel plugin is registered in .mcp.json.
  * When active, the channel handles real-time inbox delivery — hook-based
@@ -899,6 +890,15 @@ function buildInboxTag(messages: Array<Record<string, unknown>> | undefined): st
     lines.push(`- **${msg.from || 'unknown'}**: ${msg.content || msg.subject || '(no content)'}`);
   }
   lines.push('</inkmail>');
+  return lines.join('\n');
+}
+
+function buildInboxBlock(messages: Array<Record<string, unknown>> | undefined): string {
+  if (!messages || messages.length === 0) return '';
+  const lines = [`### Inbox (${messages.length} message${messages.length === 1 ? '' : 's'})`];
+  for (const msg of messages) {
+    lines.push(`- **${msg.from || 'unknown'}**: ${msg.content || msg.subject || '(no content)'}`);
+  }
   return lines.join('\n');
 }
 
@@ -1719,11 +1719,12 @@ async function postCompactHandler(): Promise<void> {
       '*FAILED: Could not reach Inkwell server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
   }
 
-  // Check inbox
+  // Check inbox — grab last 10 for orientation context, not delivery
   try {
     const inbox = await callPcpTool('get_inbox', {
       email: config?.email,
       agentId,
+      limit: 10,
     });
     inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
     writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
@@ -1858,11 +1859,12 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     }
   }
 
-  // Check inbox
+  // Check inbox — grab last 10 for orientation context, not delivery
   try {
     const inbox = await callPcpTool('get_inbox', {
       email: config?.email,
       agentId,
+      limit: 10,
     });
     inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
     writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
@@ -2253,30 +2255,28 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   }
 
   // Skip inbox injection when the channel plugin is active — it handles
-  // real-time delivery via the Channels API. Fall back to hook-based
-  // injection when the channel plugin is not present.
+  // real-time delivery via the Channels API.
   if (hasActiveChannelPlugin(cwd)) {
     return;
   }
 
-  // No channel plugin — use hook-based inbox polling as fallback.
-  // Check if inbox check is stale (> 5 minutes)
+  // No channel plugin (Codex, Gemini, etc.) — poll for new messages only.
+  // Use last-inbox-check as a `since` filter to avoid replaying old messages.
   const lastCheck = readRuntimeFile(cwd, 'last-inbox-check');
   const staleThresholdMs = 5 * 60 * 1000;
 
   if (lastCheck) {
-    const lastCheckTime = new Date(lastCheck).getTime();
-    const elapsed = Date.now() - lastCheckTime;
+    const elapsed = Date.now() - new Date(lastCheck).getTime();
     if (elapsed < staleThresholdMs) {
       return;
     }
   }
 
-  // Inbox is stale or never checked — poll
   try {
     const inbox = await callPcpTool('get_inbox', {
       email: config?.email,
       agentId,
+      since: lastCheck || undefined,
     });
 
     writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
@@ -2339,7 +2339,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
     return;
   }
 
-  // Check inbox if stale (fallback when no channel plugin)
+  // No channel plugin — poll for new messages only (use `since` to avoid replay).
   const lastCheck = readRuntimeFile(cwd, 'last-inbox-check');
   const staleThresholdMs = 5 * 60 * 1000;
   let shouldCheckInbox = !lastCheck;
@@ -2353,6 +2353,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
       const inbox = await callPcpTool('get_inbox', {
         email: config?.email,
         agentId,
+        since: lastCheck || undefined,
       });
 
       writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
