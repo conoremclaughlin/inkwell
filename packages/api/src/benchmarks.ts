@@ -7,6 +7,7 @@ export {
 } from './services/memory-llm-extraction';
 export type {
   MemoryHybridChunkStrategy,
+  MemorySemanticQueryStrategy,
   MemorySearchChunkType,
   MemorySearchOptions,
 } from './data/models/memory';

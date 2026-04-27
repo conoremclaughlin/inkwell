@@ -10,6 +10,9 @@ describe('benchmark-memory-recall variants', () => {
     expect(parseBenchmarkRecallVariant(undefined)).toBe('default');
     expect(parseBenchmarkRecallVariant('raw')).toBe('content-only');
     expect(parseBenchmarkRecallVariant('content+entity')).toBe('content-plus-entity');
+    expect(parseBenchmarkRecallVariant('parallel-content-entity')).toBe(
+      'content-plus-entity-parallel'
+    );
     expect(parseBenchmarkRecallVariant('entities')).toBe('entity-only');
     expect(parseBenchmarkRecallVariant('durable-facts')).toBe('fact-only');
     expect(parseBenchmarkRecallVariant('derived')).toBe('derived-only');
@@ -120,10 +123,46 @@ describe('benchmark-memory-recall variants', () => {
     });
   });
 
+  it('builds explicit content-plus-entity-parallel options for semantic and hybrid recall', () => {
+    expect(
+      buildBenchmarkRecallOptions({
+        mode: 'semantic',
+        variant: 'content-plus-entity-parallel',
+        limit: 5,
+        agentId: 'lumen',
+        topics: ['benchmark:memory-recall:case-content-entity-parallel'],
+      })
+    ).toMatchObject({
+      recallMode: 'semantic',
+      semanticChunkTypes: ['content', 'entity'],
+      semanticQueryStrategy: 'parallel-content-entity',
+      applyChunkTypeBoosts: false,
+    });
+
+    expect(
+      buildBenchmarkRecallOptions({
+        mode: 'hybrid',
+        variant: 'content-plus-entity-parallel',
+        limit: 5,
+        agentId: 'lumen',
+        topics: ['benchmark:memory-recall:case-content-entity-parallel'],
+      })
+    ).toMatchObject({
+      recallMode: 'hybrid',
+      semanticChunkTypes: ['content', 'entity'],
+      semanticQueryStrategy: 'parallel-content-entity',
+      hybridChunkStrategy: 'default',
+      applyChunkTypeBoosts: false,
+      applyMultiViewBoost: false,
+      applyChronologyBoost: false,
+    });
+  });
+
   it('describes the default variant explicitly', () => {
     expect(describeBenchmarkRecallVariant('default')).toEqual({
       name: 'default',
       semanticChunkTypes: 'default',
+      semanticQueryStrategy: undefined,
       hybridChunkStrategy: 'default',
       applyChunkTypeBoosts: false,
       applyMultiViewBoost: false,

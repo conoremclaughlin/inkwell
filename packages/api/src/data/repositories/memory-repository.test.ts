@@ -234,6 +234,97 @@ describe('MemoryRepository', () => {
       );
     });
 
+    it('supports parallel semantic(content) and semantic(entity) recall plans', async () => {
+      const contentMemory = {
+        id: 'mem-content',
+        userId: 'user-456',
+        content: 'daily commute takes 35 minutes by bus',
+        source: 'observation',
+        salience: 'medium',
+        topics: [],
+        metadata: {},
+        version: 1,
+        createdAt: new Date('2026-01-26T12:00:00Z'),
+      };
+      const entityMemory = {
+        id: 'mem-entity',
+        userId: 'user-456',
+        content: 'playlist named Neon Rain',
+        source: 'observation',
+        salience: 'medium',
+        topics: [],
+        metadata: {},
+        version: 1,
+        createdAt: new Date('2026-01-25T12:00:00Z'),
+      };
+
+      const semanticSpy = vi
+        .spyOn(repo as any, 'trySemanticRecallCandidates')
+        .mockImplementation(async (_userId, _query, _options, _limit, _offset, chunkTypes) => {
+          if (Array.isArray(chunkTypes) && chunkTypes.length === 1 && chunkTypes[0] === 'content') {
+            return [
+              {
+                memory: contentMemory,
+                semanticScore: 0.9,
+                matchedChunkType: 'content',
+                semanticEvidenceCount: 1,
+                finalScore: 0.9,
+              },
+            ];
+          }
+
+          if (Array.isArray(chunkTypes) && chunkTypes.length === 1 && chunkTypes[0] === 'entity') {
+            return [
+              {
+                memory: entityMemory,
+                semanticScore: 0.85,
+                matchedChunkType: 'entity',
+                semanticEvidenceCount: 1,
+                finalScore: 0.85,
+              },
+            ];
+          }
+
+          return [];
+        });
+
+      const results = await repo.recall('user-456', 'what is relevant?', {
+        recallMode: 'semantic',
+        semanticChunkTypes: ['content', 'entity'],
+        semanticQueryStrategy: 'parallel-content-entity',
+        applyChunkTypeBoosts: false,
+      });
+
+      expect(results.map((memory) => memory.id)).toEqual(['mem-content', 'mem-entity']);
+      expect(semanticSpy).toHaveBeenCalledTimes(2);
+      expect(semanticSpy).toHaveBeenNthCalledWith(
+        1,
+        'user-456',
+        'what is relevant?',
+        expect.objectContaining({
+          semanticChunkTypes: ['content', 'entity'],
+          semanticQueryStrategy: 'parallel-content-entity',
+          applyChunkTypeBoosts: false,
+        }),
+        20,
+        0,
+        ['content']
+      );
+      expect(semanticSpy).toHaveBeenNthCalledWith(
+        2,
+        'user-456',
+        'what is relevant?',
+        expect.objectContaining({
+          semanticChunkTypes: ['content', 'entity'],
+          semanticQueryStrategy: 'parallel-content-entity',
+          applyChunkTypeBoosts: false,
+        }),
+        20,
+        0,
+        ['entity']
+      );
+    });
+
     it('supports hybrid content-only ablations without derived semantic pass', async () => {
       const textMemory = {
         id: 'mem-text',
