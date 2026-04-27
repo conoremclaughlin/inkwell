@@ -7,6 +7,7 @@ import { loadLongMemEvalDataset } from './longmemeval-loader';
 describe('loadLongMemEvalDataset', () => {
   const oldPath = process.env.LONGMEMEVAL_DATASET_PATH;
   const oldLimit = process.env.LONGMEMEVAL_LIMIT;
+  const oldOffset = process.env.LONGMEMEVAL_OFFSET;
   const oldDistractors = process.env.LONGMEMEVAL_MAX_DISTRACTORS;
 
   beforeEach(() => {
@@ -14,6 +15,8 @@ describe('loadLongMemEvalDataset', () => {
     else process.env.LONGMEMEVAL_DATASET_PATH = oldPath;
     if (oldLimit === undefined) delete process.env.LONGMEMEVAL_LIMIT;
     else process.env.LONGMEMEVAL_LIMIT = oldLimit;
+    if (oldOffset === undefined) delete process.env.LONGMEMEVAL_OFFSET;
+    else process.env.LONGMEMEVAL_OFFSET = oldOffset;
     if (oldDistractors === undefined) delete process.env.LONGMEMEVAL_MAX_DISTRACTORS;
     else process.env.LONGMEMEVAL_MAX_DISTRACTORS = oldDistractors;
   });
@@ -98,5 +101,54 @@ describe('loadLongMemEvalDataset', () => {
     expect(loaded.cases).toHaveLength(1);
     expect(loaded.cases[0].distractors).toHaveLength(3);
     expect(loaded.cases[0].targetContents).toEqual([expect.stringContaining('session s4')]);
+  });
+
+  it('supports LONGMEMEVAL_OFFSET for batch seeding later windows', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'longmemeval-offset-'));
+    const file = join(dir, 'sample-offset.json');
+    await writeFile(
+      file,
+      JSON.stringify([
+        {
+          question_id: 'q1',
+          question_type: 'type-a',
+          question: 'first?',
+          question_date: '2025-01-01',
+          haystack_session_ids: ['s1', 's2'],
+          answer_session_ids: ['s2'],
+          haystack_sessions: [[{ role: 'user', content: 'd1' }], [{ role: 'user', content: 't1' }]],
+        },
+        {
+          question_id: 'q2',
+          question_type: 'type-b',
+          question: 'second?',
+          question_date: '2025-01-02',
+          haystack_session_ids: ['s3', 's4'],
+          answer_session_ids: ['s4'],
+          haystack_sessions: [[{ role: 'user', content: 'd2' }], [{ role: 'user', content: 't2' }]],
+        },
+        {
+          question_id: 'q3',
+          question_type: 'type-c',
+          question: 'third?',
+          question_date: '2025-01-03',
+          haystack_session_ids: ['s5', 's6'],
+          answer_session_ids: ['s6'],
+          haystack_sessions: [[{ role: 'user', content: 'd3' }], [{ role: 'user', content: 't3' }]],
+        },
+      ]),
+      'utf-8'
+    );
+
+    process.env.LONGMEMEVAL_DATASET_PATH = file;
+    process.env.LONGMEMEVAL_LIMIT = '1';
+    process.env.LONGMEMEVAL_OFFSET = '1';
+    delete process.env.LONGMEMEVAL_MAX_DISTRACTORS;
+
+    const loaded = await loadLongMemEvalDataset();
+
+    expect(loaded.cases).toHaveLength(1);
+    expect(loaded.cases[0].id).toBe('q2');
+    expect(loaded.cases[0].query).toBe('second?');
   });
 });
