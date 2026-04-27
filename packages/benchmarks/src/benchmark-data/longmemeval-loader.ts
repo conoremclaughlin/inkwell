@@ -35,6 +35,13 @@ function parseOptionalPositiveInt(raw: string | undefined): number | null {
   return Math.floor(parsed);
 }
 
+function parseNonNegativeInt(raw: string | undefined, fallback: number): number {
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.floor(parsed);
+}
+
 function clampArray<T>(items: T[], limit: number): T[] {
   return items.slice(0, Math.max(0, limit));
 }
@@ -101,12 +108,13 @@ function buildDistractors(instance: LongMemEvalInstance, maxDistractors: number)
 
 function mapInstancesToBenchmarkCases(
   instances: LongMemEvalInstance[],
+  offset: number,
   maxCases: number,
   maxDistractors: number
 ): BenchmarkCase[] {
   const cases: BenchmarkCase[] = [];
 
-  for (const instance of instances) {
+  for (const instance of instances.slice(offset)) {
     if (cases.length >= maxCases) break;
     const id = typeof instance.question_id === 'string' ? instance.question_id : null;
     const query = typeof instance.question === 'string' ? instance.question.trim() : null;
@@ -154,6 +162,7 @@ export async function loadLongMemEvalDataset(): Promise<{
   source: string;
 }> {
   const limit = parsePositiveInt(process.env.LONGMEMEVAL_LIMIT, 100);
+  const offset = parseNonNegativeInt(process.env.LONGMEMEVAL_OFFSET, 0);
   const maxDistractors =
     parseOptionalPositiveInt(process.env.LONGMEMEVAL_MAX_DISTRACTORS) ?? Number.MAX_SAFE_INTEGER;
   const raw = await loadSourceJson();
@@ -161,7 +170,12 @@ export async function loadLongMemEvalDataset(): Promise<{
     throw new Error('LongMemEval dataset must be a JSON array of evaluation instances.');
   }
 
-  const cases = mapInstancesToBenchmarkCases(raw as LongMemEvalInstance[], limit, maxDistractors);
+  const cases = mapInstancesToBenchmarkCases(
+    raw as LongMemEvalInstance[],
+    offset,
+    limit,
+    maxDistractors
+  );
   if (cases.length === 0) {
     throw new Error('LongMemEval dataset loaded but produced 0 benchmark cases.');
   }
