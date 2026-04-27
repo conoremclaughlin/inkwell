@@ -998,6 +998,14 @@ export class MemoryRepository {
         });
 
       if (!chunkError) {
+        if (attempt > 1) {
+          logger.info('Memory embedding chunk persistence recovered after retry', {
+            ...chunkContext,
+            stage: 'chunk_upsert',
+            attempt,
+            attempts: EMBEDDING_PERSIST_RETRY_ATTEMPTS,
+          });
+        }
         chunkErrorDetails = null;
         break;
       }
@@ -1056,6 +1064,14 @@ export class MemoryRepository {
         .eq('user_id', memory.userId);
 
       if (!error) {
+        if (attempt > 1) {
+          logger.info('Memory embedding metadata persistence recovered after retry', {
+            ...chunkContext,
+            stage: 'memory_update',
+            attempt,
+            attempts: EMBEDDING_PERSIST_RETRY_ATTEMPTS,
+          });
+        }
         memoryErrorDetails = null;
         break;
       }
