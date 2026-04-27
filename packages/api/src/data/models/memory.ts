@@ -72,6 +72,7 @@ export type MemorySearchChunkType =
   | 'current_state'
   | 'content';
 export type MemoryHybridChunkStrategy = 'default' | 'content-only' | 'derived-only' | 'multi-view';
+export type MemorySemanticQueryStrategy = 'single' | 'parallel-content-entity';
 
 export interface MemorySearchOptions {
   recallMode?: 'auto' | 'text' | 'semantic' | 'hybrid';
@@ -85,6 +86,7 @@ export interface MemorySearchOptions {
   includeShared?: boolean; // Include shared memories (agentId=null) when filtering. Default true.
   contactId?: string; // Filter by contact for per-sender isolation
   semanticChunkTypes?: MemorySearchChunkType[];
+  semanticQueryStrategy?: MemorySemanticQueryStrategy;
   hybridChunkStrategy?: MemoryHybridChunkStrategy;
   applyChunkTypeBoosts?: boolean;
   applyMultiViewBoost?: boolean;

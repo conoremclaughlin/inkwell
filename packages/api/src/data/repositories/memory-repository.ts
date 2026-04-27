@@ -26,6 +26,7 @@ import type {
   MemoryCreateInput,
   MemorySearchChunkType,
   MemoryRow,
+  MemorySemanticQueryStrategy,
   MemorySearchOptions,
   MemoryHistory,
   MemoryHistoryRow,
@@ -119,6 +120,59 @@ function computeChunkTypeBoost(chunkType?: MemoryChunkType | null): number {
     default:
       return 0;
   }
+}
+
+function mergeSemanticCandidateGroups(
+  candidateGroups: Array<RecallCandidate[] | null | undefined>,
+  offset: number,
+  limit: number
+): RecallCandidate[] {
+  const grouped = new Map<string, RecallCandidate>();
+
+  for (const candidates of candidateGroups) {
+    for (const candidate of candidates || []) {
+      const existing = grouped.get(candidate.memory.id);
+      if (!existing || (candidate.finalScore ?? 0) > (existing.finalScore ?? 0)) {
+        grouped.set(candidate.memory.id, {
+          memory: candidate.memory,
+          semanticScore: Math.max(existing?.semanticScore ?? 0, candidate.semanticScore ?? 0),
+          matchedChunkType:
+            computeChunkTypeBoost(candidate.matchedChunkType) >
+            computeChunkTypeBoost(existing?.matchedChunkType)
+              ? candidate.matchedChunkType
+              : (existing?.matchedChunkType ?? candidate.matchedChunkType),
+          semanticEvidenceCount: (existing?.semanticEvidenceCount ?? 0) + 1,
+          finalScore: Math.max(existing?.finalScore ?? 0, candidate.finalScore ?? 0),
+        });
+        continue;
+      }
+
+      grouped.set(candidate.memory.id, {
+        ...existing,
+        semanticScore: Math.max(existing.semanticScore ?? 0, candidate.semanticScore ?? 0),
+        semanticEvidenceCount: (existing.semanticEvidenceCount ?? 0) + 1,
+      });
+    }
+  }
+
+  return Array.from(grouped.values())
+    .sort(
+      (a, b) =>
+        (b.finalScore ?? 0) - (a.finalScore ?? 0) ||
+        b.memory.createdAt.getTime() - a.memory.createdAt.getTime()
+    )
+    .slice(offset, offset + limit);
+}
+
+function buildSemanticChunkPlans(
+  strategy: MemorySemanticQueryStrategy | undefined,
+  explicitChunkTypes: MemoryChunkType[] | undefined
+): Array<MemoryChunkType[] | undefined> {
+  if (strategy === 'parallel-content-entity') {
+    return [['content'], ['entity']];
+  }
+
+  return [explicitChunkTypes];
 }
 
 function parseEmbeddingValue(value: MemoryRow['embedding'] | string | null): number[] | undefined {
@@ -349,27 +403,31 @@ export class MemoryRepository {
     }
 
     if (recallMode === 'semantic') {
-      const semanticCandidates = await this.trySemanticRecallCandidates(
-        userId,
-        normalizedQuery,
-        options,
-        limit,
-        offset,
+      const semanticChunkPlans = buildSemanticChunkPlans(
+        options.semanticQueryStrategy,
         toMemoryChunkTypes(options.semanticChunkTypes)
       );
-      return semanticCandidates?.map((c) => c.memory) || [];
+      const semanticGroups = await Promise.all(
+        semanticChunkPlans.map((chunkTypes) =>
+          this.trySemanticRecallCandidates(userId, normalizedQuery, options, limit, 0, chunkTypes)
+        )
+      );
+      const semanticCandidates = mergeSemanticCandidateGroups(semanticGroups, offset, limit);
+      return semanticCandidates.map((c) => c.memory);
     }
 
     if (recallMode === 'auto') {
-      const semanticCandidates = await this.trySemanticRecallCandidates(
-        userId,
-        normalizedQuery,
-        options,
-        limit,
-        offset,
+      const semanticChunkPlans = buildSemanticChunkPlans(
+        options.semanticQueryStrategy,
         toMemoryChunkTypes(options.semanticChunkTypes)
       );
-      if (semanticCandidates && semanticCandidates.length > 0) {
+      const semanticGroups = await Promise.all(
+        semanticChunkPlans.map((chunkTypes) =>
+          this.trySemanticRecallCandidates(userId, normalizedQuery, options, limit, 0, chunkTypes)
+        )
+      );
+      const semanticCandidates = mergeSemanticCandidateGroups(semanticGroups, offset, limit);
+      if (semanticCandidates.length > 0) {
         return semanticCandidates.map((c) => c.memory);
       }
       return this.textRecall(userId, normalizedQuery, options, limit, offset);
@@ -417,21 +475,17 @@ export class MemoryRepository {
             CONTENT_CHUNK_TYPES
           ),
         ]
-      : [
-          this.trySemanticRecallCandidates(
-            userId,
-            query,
-            options,
-            candidatePool,
-            0,
-            explicitChunkTypes ||
-              (chunkStrategy === 'content-only'
-                ? CONTENT_CHUNK_TYPES
-                : chunkStrategy === 'derived-only'
-                  ? DERIVED_CHUNK_TYPES
-                  : undefined)
-          ),
-        ];
+      : buildSemanticChunkPlans(
+          options.semanticQueryStrategy,
+          explicitChunkTypes ||
+            (chunkStrategy === 'content-only'
+              ? CONTENT_CHUNK_TYPES
+              : chunkStrategy === 'derived-only'
+                ? DERIVED_CHUNK_TYPES
+                : undefined)
+        ).map((chunkTypes) =>
+          this.trySemanticRecallCandidates(userId, query, options, candidatePool, 0, chunkTypes)
+        );
 
     const [semanticCandidateGroups, textCandidates] = await Promise.all([
       Promise.all(semanticRequests),

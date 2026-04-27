@@ -5,6 +5,7 @@ export type BenchmarkRecallVariant =
   | 'default'
   | 'content-only'
   | 'content-plus-entity'
+  | 'content-plus-entity-parallel'
   | 'entity-only'
   | 'fact-only'
   | 'summary-only'
@@ -23,6 +24,9 @@ const VARIANT_ALIASES: Record<string, BenchmarkRecallVariant> = {
   'content+entity': 'content-plus-entity',
   'raw-plus-entity': 'content-plus-entity',
   'content-entity': 'content-plus-entity',
+  'content-plus-entity-parallel': 'content-plus-entity-parallel',
+  'content+entity-parallel': 'content-plus-entity-parallel',
+  'parallel-content-entity': 'content-plus-entity-parallel',
   'entity-only': 'entity-only',
   entity: 'entity-only',
   entities: 'entity-only',
@@ -77,6 +81,12 @@ function buildVariantSemanticOptions(
     case 'content-plus-entity':
       return {
         semanticChunkTypes: ['content', 'entity'],
+        applyChunkTypeBoosts: false,
+      };
+    case 'content-plus-entity-parallel':
+      return {
+        semanticChunkTypes: ['content', 'entity'],
+        semanticQueryStrategy: 'parallel-content-entity',
         applyChunkTypeBoosts: false,
       };
     case 'fact-only':
@@ -137,6 +147,7 @@ function buildVariantHybridOptions(
         applyChronologyBoost: false,
       };
     case 'content-plus-entity':
+    case 'content-plus-entity-parallel':
       return {
         hybridChunkStrategy: 'default',
         applyChunkTypeBoosts: false,
@@ -216,6 +227,7 @@ export function buildBenchmarkRecallOptions(params: {
 export function describeBenchmarkRecallVariant(variant: BenchmarkRecallVariant): {
   name: BenchmarkRecallVariant;
   semanticChunkTypes: MemorySearchOptions['semanticChunkTypes'] | 'default';
+  semanticQueryStrategy?: MemorySearchOptions['semanticQueryStrategy'];
   hybridChunkStrategy: MemoryHybridChunkStrategy;
   applyChunkTypeBoosts: boolean;
   applyMultiViewBoost: boolean;
@@ -227,6 +239,7 @@ export function describeBenchmarkRecallVariant(variant: BenchmarkRecallVariant):
   return {
     name: variant,
     semanticChunkTypes: semanticOptions.semanticChunkTypes || 'default',
+    semanticQueryStrategy: semanticOptions.semanticQueryStrategy,
     hybridChunkStrategy: hybridOptions.hybridChunkStrategy || 'default',
     applyChunkTypeBoosts: hybridOptions.applyChunkTypeBoosts !== false,
     applyMultiViewBoost: hybridOptions.applyMultiViewBoost !== false,
