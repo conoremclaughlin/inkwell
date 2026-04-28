@@ -874,19 +874,25 @@ export class StrategyService {
       return false;
     }
 
-    // Log every cron wakeup so we can trace heartbeat frequency in the activity stream
-    this.logStrategyEvent(group, 'watchdog_wakeup', `Watchdog cron fired for "${group.title}"`, {
-      groupStatus: group.status,
-      strategy: group.strategy,
-    }).catch(() => {});
+    // Log every cron wakeup so we can trace heartbeat frequency in the activity stream.
+    // Awaited on skip paths (cheap, early return); fire-and-forget on the trigger path.
+    await this.logStrategyEvent(
+      group,
+      'watchdog_wakeup',
+      `Watchdog cron fired for "${group.title}"`,
+      { groupStatus: group.status, strategy: group.strategy }
+    );
 
     if (group.status !== 'active' || !group.strategy) {
       logger.info(
         `Strategy watchdog: group ${groupId} is ${group.status} (strategy=${group.strategy ?? 'null'}), skipping`
       );
-      this.logStrategyEvent(group, 'watchdog_skip', `Watchdog skipped: group is ${group.status}`, {
-        reason: 'inactive_group',
-      }).catch(() => {});
+      await this.logStrategyEvent(
+        group,
+        'watchdog_skip',
+        `Watchdog skipped: group is ${group.status}`,
+        { reason: 'inactive_group' }
+      );
       return false;
     }
 
@@ -901,7 +907,7 @@ export class StrategyService {
       logger.info(
         `Strategy watchdog: group ${groupId} has no in_progress or pending task, skipping`
       );
-      this.logStrategyEvent(
+      await this.logStrategyEvent(
         group,
         'watchdog_skip',
         `Watchdog skipped: no pending/in-progress task`,
@@ -909,7 +915,7 @@ export class StrategyService {
           reason: 'no_current_task',
           currentTaskIndex: group.current_task_index,
         }
-      ).catch(() => {});
+      );
       return false;
     }
 
