@@ -894,6 +894,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         studioId: payload.studioId,
         studioHint: payload.studioHint,
         recipientSessionId: payload.recipientSessionId,
+        taskGroupId:
+          payload.metadata && typeof payload.metadata.groupId === 'string'
+            ? payload.metadata.groupId
+            : undefined,
       },
     };
 

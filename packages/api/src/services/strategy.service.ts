@@ -272,12 +272,22 @@ export class StrategyService {
     if (maxIterations && newIterations >= maxIterations) {
       const summary = await this.buildProgressSummary(group, newIndex);
 
-      // Pause for approval
+      // Pause for approval — set pauseReason so resumeStrategy can distinguish
+      // approval-gate pauses from manual pauses (Lumen review, PR #338)
       await this.dataComposer.repositories.taskGroups.update(groupId, {
         strategy_paused_at: new Date().toISOString(),
         status: 'paused',
         context_summary: summary,
+        metadata: { ...group.metadata, pauseReason: 'approval_gate' },
       });
+
+      // Notify dispatcher
+      const notified = await this.notifyDispatcher(
+        group,
+        config.approvalNotify,
+        `Approval needed: completed ${newIterations} tasks in "${group.title}". ${summary}`,
+        userId
+      );
 
       await this.logStrategyEvent(
         group,
@@ -286,15 +296,9 @@ export class StrategyService {
         {
           iterationsSinceApproval: newIterations,
           progressSummary: summary,
+          routedTo: config.approvalNotify || null,
+          notified,
         }
-      );
-
-      // Notify dispatcher
-      const notified = await this.notifyDispatcher(
-        group,
-        config.approvalNotify,
-        `Approval needed: completed ${newIterations} tasks in "${group.title}". ${summary}`,
-        userId
       );
 
       return {
@@ -483,16 +487,30 @@ export class StrategyService {
     if (group.status !== 'paused') throw new Error('Strategy is not paused');
     if (!group.strategy) throw new Error('No strategy set on this group');
 
+    const wasAwaitingApproval = group.metadata?.pauseReason === 'approval_gate';
+
+    // Clear pauseReason on resume so it doesn't persist into the next pause cycle
+    const cleanedMetadata = { ...group.metadata };
+    delete cleanedMetadata.pauseReason;
+
     await this.dataComposer.repositories.taskGroups.update(groupId, {
       status: 'active',
       strategy_paused_at: null,
       iterations_since_approval: 0,
+      metadata: cleanedMetadata,
     });
 
     // Re-create watchdog reminder
     await this.createWatchdogReminder(group, userId);
 
-    await this.logStrategyEvent(group, 'strategy_resumed', `Strategy resumed on "${group.title}"`);
+    await this.logStrategyEvent(
+      group,
+      wasAwaitingApproval ? 'approval_granted' : 'strategy_resumed',
+      wasAwaitingApproval
+        ? `Approval granted after ${group.iterations_since_approval} iterations on "${group.title}"`
+        : `Strategy resumed on "${group.title}"`,
+      wasAwaitingApproval ? { iterationsSinceApproval: group.iterations_since_approval } : undefined
+    );
 
     const nextTask = await this.getTaskByOrder(groupId, group.current_task_index);
 
@@ -797,12 +815,39 @@ export class StrategyService {
       logger.info(
         `Strategy trigger sent to ${group.owner_agent_id} for group ${group.id} (task ${task.id}, reason: ${reason}${studioId ? `, studio: ${studioId}` : studioSlug ? `, studioSlug: ${studioSlug}` : ''})`
       );
+
+      await this.logStrategyEvent(
+        group,
+        'strategy_trigger',
+        `Triggered ${group.owner_agent_id} for task: ${task.title}`,
+        {
+          reason,
+          taskId: task.id,
+          taskTitle: task.title,
+          studioId: studioId || studioSlug || null,
+          ownerAgentId: group.owner_agent_id,
+        }
+      );
+
       return true;
     } catch (err) {
       logger.warn(
         `Strategy triggerOwnerAgent failed for group ${group.id} (reason: ${reason}):`,
         err
       );
+
+      // Log trigger failure to activity stream too
+      this.logStrategyEvent(
+        group,
+        'strategy_trigger_failed',
+        `Failed to trigger ${group.owner_agent_id} for task: ${task.title}`,
+        {
+          reason,
+          taskId: task.id,
+          error: err instanceof Error ? err.message : String(err),
+        }
+      ).catch(() => {});
+
       return false;
     }
   }
@@ -828,10 +873,20 @@ export class StrategyService {
       logger.warn(`Strategy watchdog: group ${groupId} not found, skipping`);
       return false;
     }
+
+    // Log every cron wakeup so we can trace heartbeat frequency in the activity stream
+    this.logStrategyEvent(group, 'watchdog_wakeup', `Watchdog cron fired for "${group.title}"`, {
+      groupStatus: group.status,
+      strategy: group.strategy,
+    }).catch(() => {});
+
     if (group.status !== 'active' || !group.strategy) {
       logger.info(
         `Strategy watchdog: group ${groupId} is ${group.status} (strategy=${group.strategy ?? 'null'}), skipping`
       );
+      this.logStrategyEvent(group, 'watchdog_skip', `Watchdog skipped: group is ${group.status}`, {
+        reason: 'inactive_group',
+      }).catch(() => {});
       return false;
     }
 
@@ -846,6 +901,15 @@ export class StrategyService {
       logger.info(
         `Strategy watchdog: group ${groupId} has no in_progress or pending task, skipping`
       );
+      this.logStrategyEvent(
+        group,
+        'watchdog_skip',
+        `Watchdog skipped: no pending/in-progress task`,
+        {
+          reason: 'no_current_task',
+          currentTaskIndex: group.current_task_index,
+        }
+      ).catch(() => {});
       return false;
     }
 
