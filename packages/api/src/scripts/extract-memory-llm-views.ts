@@ -300,11 +300,17 @@ async function main() {
 
   let extracted = 0;
   let skipped = 0;
+  console.log(
+    `[memory-llm-extract] starting loaded=${rows.length} extracted=${extracted} skipped=${skipped} backend=${backend} kinds=${extractor.getEnabledKinds().join(',')}`
+  );
 
-  for (const row of rows) {
+  for (const [index, row] of rows.entries()) {
     const metadata = (row.metadata as Record<string, unknown> | null) || {};
     if (!force && metadata.llm_extractions) {
       skipped += 1;
+      console.log(
+        `[memory-llm-extract] progress processed=${index + 1}/${rows.length} extracted=${extracted} skipped=${skipped} backend=${backend} memory=${row.id} status=skip-existing`
+      );
       continue;
     }
 
@@ -319,6 +325,9 @@ async function main() {
 
     if (!llmExtractions) {
       skipped += 1;
+      console.log(
+        `[memory-llm-extract] progress processed=${index + 1}/${rows.length} extracted=${extracted} skipped=${skipped} backend=${backend} memory=${row.id} status=skip-no-output`
+      );
       continue;
     }
 
@@ -359,7 +368,7 @@ async function main() {
       })}\n`
     );
     console.log(
-      `[memory-llm-extract] ${dryRun ? 'dry-run ' : ''}extracted memory=${row.id} backend=${backend} kinds=${extractor.getEnabledKinds().join(',')}`
+      `[memory-llm-extract] progress processed=${index + 1}/${rows.length} extracted=${extracted} skipped=${skipped} backend=${backend} memory=${row.id} status=${dryRun ? 'dry-run-extract' : 'extracted'} kinds=${extractor.getEnabledKinds().join(',')}`
     );
   }
 
