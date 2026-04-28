@@ -1086,7 +1086,67 @@ describe('StrategyService', () => {
       // Verify task was started
       expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-3');
 
-      // Verify approval_granted event was logged (iterations_since_approval > 0)
+      // Verify strategy_resumed event was logged (no pauseReason in metadata = manual resume)
+      expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({
+          subtype: 'strategy_resumed',
+          taskGroupId: 'group-1',
+        })
+      );
+    });
+
+    it('should log approval_granted when resuming from approval gate pause', async () => {
+      const group = createMockGroup({
+        status: 'paused',
+        strategy: 'persistence',
+        current_task_index: 2,
+        iterations_since_approval: 5,
+        metadata: { pauseReason: 'approval_gate' },
+        strategy_paused_at: '2026-04-10T12:00:00Z',
+      });
+      const currentTask = createMockTask({
+        id: 'task-3',
+        title: 'Third task',
+        task_order: 2,
+        status: 'pending',
+      });
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        status: 'active',
+        strategy_paused_at: null,
+        iterations_since_approval: 0,
+        metadata: {},
+      });
+
+      const mockClient = dc.getClient();
+      const taskChain = {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: currentTask, error: null }),
+                }),
+              }),
+              limit: vi.fn().mockReturnValue({
+                single: vi.fn().mockResolvedValue({ data: null, error: null }),
+              }),
+            }),
+            single: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      };
+      mockClient.from.mockReturnValue(taskChain);
+
+      await service.resumeStrategy('group-1', 'user-123');
+
+      // Verify approval_granted event was logged (pauseReason = approval_gate)
       expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
         expect.objectContaining({
           subtype: 'approval_granted',

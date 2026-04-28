@@ -272,11 +272,13 @@ export class StrategyService {
     if (maxIterations && newIterations >= maxIterations) {
       const summary = await this.buildProgressSummary(group, newIndex);
 
-      // Pause for approval
+      // Pause for approval — set pauseReason so resumeStrategy can distinguish
+      // approval-gate pauses from manual pauses (Lumen review, PR #338)
       await this.dataComposer.repositories.taskGroups.update(groupId, {
         strategy_paused_at: new Date().toISOString(),
         status: 'paused',
         context_summary: summary,
+        metadata: { ...group.metadata, pauseReason: 'approval_gate' },
       });
 
       // Notify dispatcher
@@ -485,16 +487,22 @@ export class StrategyService {
     if (group.status !== 'paused') throw new Error('Strategy is not paused');
     if (!group.strategy) throw new Error('No strategy set on this group');
 
+    const wasAwaitingApproval = group.metadata?.pauseReason === 'approval_gate';
+
+    // Clear pauseReason on resume so it doesn't persist into the next pause cycle
+    const cleanedMetadata = { ...group.metadata };
+    delete cleanedMetadata.pauseReason;
+
     await this.dataComposer.repositories.taskGroups.update(groupId, {
       status: 'active',
       strategy_paused_at: null,
       iterations_since_approval: 0,
+      metadata: cleanedMetadata,
     });
 
     // Re-create watchdog reminder
     await this.createWatchdogReminder(group, userId);
 
-    const wasAwaitingApproval = group.iterations_since_approval > 0;
     await this.logStrategyEvent(
       group,
       wasAwaitingApproval ? 'approval_granted' : 'strategy_resumed',
