@@ -855,10 +855,20 @@ export class StrategyService {
       logger.warn(`Strategy watchdog: group ${groupId} not found, skipping`);
       return false;
     }
+
+    // Log every cron wakeup so we can trace heartbeat frequency in the activity stream
+    this.logStrategyEvent(group, 'watchdog_wakeup', `Watchdog cron fired for "${group.title}"`, {
+      groupStatus: group.status,
+      strategy: group.strategy,
+    }).catch(() => {});
+
     if (group.status !== 'active' || !group.strategy) {
       logger.info(
         `Strategy watchdog: group ${groupId} is ${group.status} (strategy=${group.strategy ?? 'null'}), skipping`
       );
+      this.logStrategyEvent(group, 'watchdog_skip', `Watchdog skipped: group is ${group.status}`, {
+        reason: 'inactive_group',
+      }).catch(() => {});
       return false;
     }
 
@@ -873,6 +883,15 @@ export class StrategyService {
       logger.info(
         `Strategy watchdog: group ${groupId} has no in_progress or pending task, skipping`
       );
+      this.logStrategyEvent(
+        group,
+        'watchdog_skip',
+        `Watchdog skipped: no pending/in-progress task`,
+        {
+          reason: 'no_current_task',
+          currentTaskIndex: group.current_task_index,
+        }
+      ).catch(() => {});
       return false;
     }
 

@@ -510,6 +510,32 @@ export class SessionService implements ISessionService {
           error: e,
         });
       });
+      this.activityStream
+        .logActivity({
+          userId,
+          agentId,
+          type: 'error',
+          subtype: `backend_crash:${resolvedBackend}`,
+          content:
+            `Backend crashed (${resolvedBackend}): ${runnerError instanceof Error ? runnerError.message : String(runnerError)}`.slice(
+              0,
+              500
+            ),
+          sessionId: session.id,
+          taskGroupId,
+          payload: {
+            backend: resolvedBackend,
+            durationMs: Date.now() - turnStartMs,
+            studioId: session.studioId,
+            ...(triggerSource ? { triggerSource } : {}),
+            ...(taskGroupId ? { taskGroupId } : {}),
+            error: (runnerError instanceof Error ? runnerError.message : String(runnerError)).slice(
+              0,
+              2000
+            ),
+          } as unknown as Json,
+        })
+        .catch(() => {});
       throw runnerError;
     }
 
