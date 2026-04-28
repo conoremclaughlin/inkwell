@@ -279,6 +279,14 @@ export class StrategyService {
         context_summary: summary,
       });
 
+      // Notify dispatcher
+      const notified = await this.notifyDispatcher(
+        group,
+        config.approvalNotify,
+        `Approval needed: completed ${newIterations} tasks in "${group.title}". ${summary}`,
+        userId
+      );
+
       await this.logStrategyEvent(
         group,
         'approval_required',
@@ -286,15 +294,9 @@ export class StrategyService {
         {
           iterationsSinceApproval: newIterations,
           progressSummary: summary,
+          routedTo: config.approvalNotify || null,
+          notified,
         }
-      );
-
-      // Notify dispatcher
-      const notified = await this.notifyDispatcher(
-        group,
-        config.approvalNotify,
-        `Approval needed: completed ${newIterations} tasks in "${group.title}". ${summary}`,
-        userId
       );
 
       return {
@@ -492,7 +494,15 @@ export class StrategyService {
     // Re-create watchdog reminder
     await this.createWatchdogReminder(group, userId);
 
-    await this.logStrategyEvent(group, 'strategy_resumed', `Strategy resumed on "${group.title}"`);
+    const wasAwaitingApproval = group.iterations_since_approval > 0;
+    await this.logStrategyEvent(
+      group,
+      wasAwaitingApproval ? 'approval_granted' : 'strategy_resumed',
+      wasAwaitingApproval
+        ? `Approval granted after ${group.iterations_since_approval} iterations on "${group.title}"`
+        : `Strategy resumed on "${group.title}"`,
+      wasAwaitingApproval ? { iterationsSinceApproval: group.iterations_since_approval } : undefined
+    );
 
     const nextTask = await this.getTaskByOrder(groupId, group.current_task_index);
 

@@ -1086,10 +1086,10 @@ describe('StrategyService', () => {
       // Verify task was started
       expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-3');
 
-      // Verify strategy_resumed event was logged
+      // Verify approval_granted event was logged (iterations_since_approval > 0)
       expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
         expect.objectContaining({
-          subtype: 'strategy_resumed',
+          subtype: 'approval_granted',
           taskGroupId: 'group-1',
         })
       );
