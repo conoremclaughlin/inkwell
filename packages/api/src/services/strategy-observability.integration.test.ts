@@ -494,3 +494,127 @@ describe.skipIf(!canRun)('strategy_trigger activity events (integration)', () =>
     }
   });
 });
+
+// ============================================================================
+// Test Suite 4: Runner crash → error activity entry (hybrid: real DB + mock runner)
+// ============================================================================
+
+describe.skipIf(!canRun)('Runner crash activity logging (integration)', () => {
+  let client: SupabaseClient;
+  let groupId: string;
+  let sessionId: string;
+
+  beforeAll(async () => {
+    client = createClient(SUPABASE_URL!, SUPABASE_KEY!, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    // Create a test task group for correlation
+    const { data: group } = await client
+      .from('task_groups')
+      .insert({
+        user_id: TEST_USER_ID!,
+        title: `__observability_crash_test_${Date.now()}`,
+        description: 'Integration test — safe to delete',
+        priority: 'low',
+        tags: ['__test'],
+      })
+      .select('id')
+      .single();
+    groupId = group!.id;
+
+    // Create a test session
+    const { data: session } = await client
+      .from('sessions')
+      .insert({
+        user_id: TEST_USER_ID!,
+        agent_id: 'integration-test',
+        status: 'active',
+        lifecycle: 'idle',
+      })
+      .select('id')
+      .single();
+    sessionId = session!.id;
+  }, 15_000);
+
+  afterAll(async () => {
+    if (!client) return;
+    if (groupId) {
+      await client.from('activity_stream').delete().eq('task_group_id', groupId);
+      await client.from('task_groups').delete().eq('id', groupId);
+    }
+    if (sessionId) {
+      await client.from('sessions').delete().eq('id', sessionId);
+    }
+  }, 10_000);
+
+  it('should write backend_crash error to real activity_stream with taskGroupId', async () => {
+    const { ActivityStreamRepository } =
+      await import('../data/repositories/activity-stream.repository');
+    const activityStream = new ActivityStreamRepository(client);
+
+    // Simulate what session-service does on runner crash
+    await activityStream.logActivity({
+      userId: TEST_USER_ID!,
+      agentId: 'integration-test',
+      type: 'error',
+      subtype: 'backend_crash:claude-code',
+      content: 'Backend crashed (claude-code): SIGTERM: process killed',
+      sessionId,
+      taskGroupId: groupId,
+      payload: {
+        backend: 'claude-code',
+        durationMs: 1234,
+        studioId: null,
+        taskGroupId: groupId,
+        error: 'SIGTERM: process killed',
+      } as any,
+    });
+
+    // Verify the entry exists in the real DB
+    const events = await getActivityEvents(client, groupId);
+    const crashEvents = events.filter((e) => e.subtype === 'backend_crash:claude-code');
+
+    expect(crashEvents).toHaveLength(1);
+    expect(crashEvents[0]).toMatchObject({
+      type: 'error',
+      subtype: 'backend_crash:claude-code',
+      content: expect.stringContaining('SIGTERM'),
+      payload: expect.objectContaining({
+        backend: 'claude-code',
+        taskGroupId: groupId,
+        error: 'SIGTERM: process killed',
+        durationMs: 1234,
+      }),
+    });
+  });
+
+  it('crash event is queryable by task_group_id alongside strategy events', async () => {
+    // Log a strategy event for the same group
+    const { ActivityStreamRepository } =
+      await import('../data/repositories/activity-stream.repository');
+    const activityStream = new ActivityStreamRepository(client);
+
+    await activityStream.logActivity({
+      userId: TEST_USER_ID!,
+      agentId: 'integration-test',
+      type: 'state_change',
+      subtype: 'strategy_started',
+      content: 'Strategy started for crash test group',
+      taskGroupId: groupId,
+    });
+
+    // Query all events for this group — should include both strategy and crash
+    const events = await getActivityEvents(client, groupId);
+    const subtypes = events.map((e) => e.subtype);
+
+    expect(subtypes).toContain('backend_crash:claude-code');
+    expect(subtypes).toContain('strategy_started');
+    expect(events.length).toBeGreaterThanOrEqual(2);
+
+    // Every event should carry the group ID
+    for (const event of events) {
+      expect((event as any).task_group_id).toBe(groupId);
+    }
+  });
+});

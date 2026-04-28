@@ -1382,4 +1382,136 @@ describe('SessionService', () => {
       expect(mockRepository.create).toHaveBeenCalled();
     });
   });
+
+  // ============================================================================
+  // Runner crash → activity stream logging
+  // ============================================================================
+
+  describe('Runner crash activity logging', () => {
+    it('should log backend_crash error to activity stream when runner throws', async () => {
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      vi.mocked(mockClaudeRunner.run).mockRejectedValue(new Error('SIGTERM: process killed'));
+
+      const result = await sessionService.handleMessage(createMockRequest());
+      expect(result.success).toBe(false);
+
+      // Should have logged the crash to activity stream
+      expect(mockActivityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'error',
+          subtype: expect.stringContaining('backend_crash'),
+          content: expect.stringContaining('SIGTERM: process killed'),
+          sessionId: session.id,
+        })
+      );
+    });
+
+    it('should include taskGroupId in crash activity when present in metadata', async () => {
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      vi.mocked(mockClaudeRunner.run).mockRejectedValue(new Error('OOM'));
+
+      const request = createMockRequest({
+        metadata: { taskGroupId: 'group-abc', triggerType: 'agent' },
+      });
+
+      const result = await sessionService.handleMessage(request);
+      expect(result.success).toBe(false);
+
+      expect(mockActivityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'error',
+          subtype: expect.stringContaining('backend_crash'),
+          taskGroupId: 'group-abc',
+          payload: expect.objectContaining({
+            taskGroupId: 'group-abc',
+          }),
+        })
+      );
+    });
+
+    it('should set session lifecycle to failed on runner crash', async () => {
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+      vi.mocked(mockClaudeRunner.run).mockRejectedValue(new Error('crash'));
+
+      const result = await sessionService.handleMessage(createMockRequest());
+      expect(result.success).toBe(false);
+
+      expect(mockRepository.update).toHaveBeenCalledWith(
+        session.id,
+        expect.objectContaining({ lifecycle: 'failed' })
+      );
+    });
+  });
+
+  // ============================================================================
+  // taskGroupId propagation to activity entries
+  // ============================================================================
+
+  describe('taskGroupId propagation', () => {
+    it('should pass taskGroupId to agent_spawn activity entry', async () => {
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      const request = createMockRequest({
+        metadata: { taskGroupId: 'group-xyz', triggerType: 'agent' },
+      });
+
+      await sessionService.handleMessage(request);
+
+      // Find the agent_spawn logActivity call
+      const spawnCall = vi
+        .mocked(mockActivityStream.logActivity)
+        .mock.calls.find((call) => call[0].type === 'agent_spawn');
+      expect(spawnCall).toBeDefined();
+      expect(spawnCall![0]).toMatchObject({
+        type: 'agent_spawn',
+        taskGroupId: 'group-xyz',
+        payload: expect.objectContaining({
+          taskGroupId: 'group-xyz',
+        }),
+      });
+    });
+
+    it('should pass taskGroupId to agent_complete activity entry', async () => {
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      const request = createMockRequest({
+        metadata: { taskGroupId: 'group-xyz', triggerType: 'agent' },
+      });
+
+      await sessionService.handleMessage(request);
+
+      // Find the agent_complete logActivity call
+      const completeCall = vi
+        .mocked(mockActivityStream.logActivity)
+        .mock.calls.find((call) => call[0].type === 'agent_complete');
+      expect(completeCall).toBeDefined();
+      expect(completeCall![0]).toMatchObject({
+        type: 'agent_complete',
+        taskGroupId: 'group-xyz',
+        payload: expect.objectContaining({
+          taskGroupId: 'group-xyz',
+        }),
+      });
+    });
+
+    it('should not include taskGroupId when not in metadata', async () => {
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      await sessionService.handleMessage(createMockRequest());
+
+      const spawnCall = vi
+        .mocked(mockActivityStream.logActivity)
+        .mock.calls.find((call) => call[0].type === 'agent_spawn');
+      expect(spawnCall).toBeDefined();
+      expect(spawnCall![0].taskGroupId).toBeUndefined();
+    });
+  });
 });
