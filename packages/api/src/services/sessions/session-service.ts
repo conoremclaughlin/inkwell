@@ -90,6 +90,7 @@ export interface IActivityStream {
     sessionId?: string;
     platform?: string;
     platformChatId?: string;
+    taskGroupId?: string;
   }): Promise<{ id: string }>;
 }
 
@@ -459,6 +460,7 @@ export class SessionService implements ISessionService {
 
     // 5a. Log backend spawn to activity stream (fire-and-forget)
     const triggerSource = metadata?.triggerType as string | undefined;
+    const taskGroupId = (metadata?.taskGroupId as string) || undefined;
     // Derive studio hint (worktree folder name) for mission display so it
     // doesn't depend on the session still being active when the feed renders.
     const worktreeFolder = resolvedWorkingDirectory
@@ -472,6 +474,7 @@ export class SessionService implements ISessionService {
         subtype: `backend_cli:${resolvedBackend}`,
         content: `Backend turn started (${resolvedBackend})`,
         sessionId: session.id,
+        taskGroupId,
         payload: {
           backend: resolvedBackend,
           studioId: session.studioId,
@@ -479,6 +482,7 @@ export class SessionService implements ISessionService {
           ...(triggerSource ? { triggerSource } : {}),
           ...(request.sender?.id ? { triggeredBy: request.sender.id } : {}),
           ...(metadata?.threadKey ? { threadKey: metadata.threadKey } : {}),
+          ...(taskGroupId ? { taskGroupId } : {}),
         } as unknown as Json,
       })
       .catch((err) => {
@@ -525,6 +529,7 @@ export class SessionService implements ISessionService {
           ? `Backend turn completed (${resolvedBackend}, ${Math.round(turnDurationMs / 1000)}s)`
           : `Backend turn failed (${resolvedBackend}): ${result.error?.slice(0, 500) || 'unknown error'}`,
         sessionId: session.id,
+        taskGroupId,
         payload: {
           backend: resolvedBackend,
           durationMs: turnDurationMs,
@@ -533,6 +538,7 @@ export class SessionService implements ISessionService {
           ...(triggerSource ? { triggerSource } : {}),
           ...(request.sender?.id ? { triggeredBy: request.sender.id } : {}),
           ...(metadata?.threadKey ? { threadKey: metadata.threadKey } : {}),
+          ...(taskGroupId ? { taskGroupId } : {}),
           ...(result.error ? { error: result.error.slice(0, 2000) } : {}),
           ...(errorClassification
             ? {

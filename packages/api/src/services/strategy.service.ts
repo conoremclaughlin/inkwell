@@ -797,12 +797,39 @@ export class StrategyService {
       logger.info(
         `Strategy trigger sent to ${group.owner_agent_id} for group ${group.id} (task ${task.id}, reason: ${reason}${studioId ? `, studio: ${studioId}` : studioSlug ? `, studioSlug: ${studioSlug}` : ''})`
       );
+
+      await this.logStrategyEvent(
+        group,
+        'strategy_trigger',
+        `Triggered ${group.owner_agent_id} for task: ${task.title}`,
+        {
+          reason,
+          taskId: task.id,
+          taskTitle: task.title,
+          studioId: studioId || studioSlug || null,
+          ownerAgentId: group.owner_agent_id,
+        }
+      );
+
       return true;
     } catch (err) {
       logger.warn(
         `Strategy triggerOwnerAgent failed for group ${group.id} (reason: ${reason}):`,
         err
       );
+
+      // Log trigger failure to activity stream too
+      this.logStrategyEvent(
+        group,
+        'strategy_trigger_failed',
+        `Failed to trigger ${group.owner_agent_id} for task: ${task.title}`,
+        {
+          reason,
+          taskId: task.id,
+          error: err instanceof Error ? err.message : String(err),
+        }
+      ).catch(() => {});
+
       return false;
     }
   }
