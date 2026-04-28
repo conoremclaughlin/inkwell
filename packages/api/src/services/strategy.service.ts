@@ -526,10 +526,14 @@ export class StrategyService {
     const updatedGroup = { ...group, status: 'active' as const } as TaskGroup;
     const prompt = STRATEGY_PROMPTS[group.strategy as StrategyPreset](updatedGroup, nextTask);
 
+    // Auto-trigger the owner agent so resume doesn't require a separate trigger call
+    const triggered = await this.triggerOwnerAgent(updatedGroup, nextTask, 'manual_resume');
+
     return {
       action: 'next_task',
       nextTask,
       prompt,
+      notified: triggered,
     };
   }
 

@@ -1093,6 +1093,21 @@ describe('StrategyService', () => {
           taskGroupId: 'group-1',
         })
       );
+
+      // Verify owner agent was auto-triggered
+      expect(result.notified).toBe(true);
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+      expect(sendMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          recipientAgentId: 'wren',
+          trigger: true,
+          metadata: expect.objectContaining({
+            reason: 'manual_resume',
+            groupId: 'group-1',
+          }),
+        }),
+        expect.anything()
+      );
     });
 
     it('should log approval_granted when resuming from approval gate pause', async () => {
