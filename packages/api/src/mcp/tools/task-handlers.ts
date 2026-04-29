@@ -277,6 +277,29 @@ export async function handleUpdateTask(
 
     const task = await dataComposer.repositories.tasks.update(args.taskId, updates);
 
+    if (args.status && args.status !== existing.status) {
+      try {
+        const agentId = getEffectiveAgentId(undefined) || 'system';
+        await dataComposer.repositories.activityStream.logActivity({
+          userId: resolved.user.id,
+          agentId,
+          type: 'state_change',
+          subtype: 'task_status_change',
+          content: `${task.title}: ${existing.status} → ${args.status}`,
+          taskGroupId: task.task_group_id || undefined,
+          payload: {
+            taskId: task.id,
+            taskTitle: task.title,
+            groupId: task.task_group_id || null,
+            from: existing.status,
+            to: args.status,
+          },
+        });
+      } catch (err) {
+        logger.warn('Failed to log task_status_change activity:', err);
+      }
+    }
+
     return mcpResponse({
       success: true,
       task: {
@@ -307,6 +330,13 @@ export async function handleUpdateTask(
 export const completeTaskSchema = z.object({
   ...userIdentifierSchema.shape,
   taskId: z.string().uuid().describe('Task ID to mark as completed'),
+  summary: z
+    .string()
+    .max(2000)
+    .optional()
+    .describe(
+      'Brief summary of what was accomplished (shown in mission feed and preserved in activity stream)'
+    ),
 });
 
 export async function handleCompleteTask(
@@ -351,6 +381,28 @@ export async function handleCompleteTask(
     } catch (err) {
       // Non-fatal — task completion is the primary action, memory is best-effort
       logger.warn('Failed to auto-remember task completion:', err);
+    }
+
+    // Log task_completed to activity stream for mission feed visibility
+    try {
+      const agentId = getEffectiveAgentId(undefined) || 'system';
+      const summaryText = args.summary || `Completed: ${task.title}`;
+      await dataComposer.repositories.activityStream.logActivity({
+        userId: resolved.user.id,
+        agentId,
+        type: 'state_change',
+        subtype: 'task_completed',
+        content: summaryText,
+        taskGroupId: task.task_group_id || undefined,
+        payload: {
+          taskId: task.id,
+          taskTitle: task.title,
+          groupId: task.task_group_id || null,
+          summary: args.summary || null,
+        },
+      });
+    } catch (err) {
+      logger.warn('Failed to log task_completed activity:', err);
     }
 
     // Strategy advancement: if task belongs to a group with an active strategy,
@@ -556,6 +608,26 @@ export async function handleAddTaskComment(
       content: string;
       created_at: string;
     };
+
+    try {
+      await dataComposer.repositories.activityStream.logActivity({
+        userId: resolved.user.id,
+        agentId: agentId || 'system',
+        type: 'state_change',
+        subtype: 'task_comment',
+        content: args.content.trim().slice(0, 200),
+        taskGroupId: existing.task_group_id || undefined,
+        payload: {
+          taskId: existing.id,
+          taskTitle: existing.title,
+          commentId: comment.id,
+          groupId: existing.task_group_id || null,
+          fullContent: args.content.trim(),
+        },
+      });
+    } catch (err) {
+      logger.warn('Failed to log task_comment activity:', err);
+    }
 
     return mcpResponse({
       success: true,

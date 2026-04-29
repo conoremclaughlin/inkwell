@@ -383,6 +383,33 @@ function formatStrategyEvent(activity: MissionActivity): string {
       const skipReason = typeof p?.skipReason === 'string' ? p.skipReason : reason;
       return skipReason ? `watchdog skipped (${skipReason})` : 'watchdog skipped';
     }
+    case 'task_completed': {
+      const summary = typeof p?.summary === 'string' ? p.summary : undefined;
+      const taskTitle = typeof p?.taskTitle === 'string' ? p.taskTitle : undefined;
+      if (summary) return `✓ ${summary}`;
+      if (taskTitle) return `✓ completed: ${taskTitle}`;
+      return activity.content || 'task completed';
+    }
+    case 'task_advanced': {
+      const taskTitle = typeof p?.taskTitle === 'string' ? p.taskTitle : undefined;
+      const taskIndex = typeof p?.taskIndex === 'number' ? p.taskIndex : undefined;
+      if (taskTitle && taskIndex !== undefined) return `→ task #${taskIndex + 1}: ${taskTitle}`;
+      if (taskTitle) return `→ next: ${taskTitle}`;
+      return activity.content || 'advanced to next task';
+    }
+    case 'task_comment': {
+      const taskTitle = typeof p?.taskTitle === 'string' ? p.taskTitle : undefined;
+      const fullContent = typeof p?.fullContent === 'string' ? p.fullContent : activity.content;
+      const preview = fullContent ? compactPreview(fullContent, 100) : 'comment';
+      return taskTitle ? `💬 ${taskTitle}: ${preview}` : `💬 ${preview}`;
+    }
+    case 'task_status_change': {
+      const taskTitle = typeof p?.taskTitle === 'string' ? p.taskTitle : undefined;
+      const from = typeof p?.from === 'string' ? p.from : undefined;
+      const to = typeof p?.to === 'string' ? p.to : undefined;
+      if (taskTitle && from && to) return `${taskTitle}: ${from} → ${to}`;
+      return activity.content || 'task status changed';
+    }
     default:
       if (subtype.startsWith('backend_crash:')) {
         const backend = subtype.replace('backend_crash:', '');
@@ -849,6 +876,10 @@ const STRATEGY_SUBTYPES = new Set([
   'watchdog_skip',
   'approval_required',
   'approval_granted',
+  'task_completed',
+  'task_advanced',
+  'task_comment',
+  'task_status_change',
 ]);
 
 function isStrategyEvent(activity: MissionActivity): boolean {
@@ -1037,9 +1068,15 @@ export function activityToFeedEvent(
     const groupId = typeof p?.groupId === 'string' ? p.groupId.slice(0, 8) : undefined;
     const strategy = typeof p?.strategy === 'string' ? p.strategy : undefined;
     const taskTitle = typeof p?.taskTitle === 'string' ? p.taskTitle : undefined;
+    const summary = typeof p?.summary === 'string' ? p.summary : undefined;
     if (groupId) detailParts.push(`group: ${groupId}`);
     if (strategy) detailParts.push(strategy);
-    if (taskTitle) detailParts.push(`task: ${taskTitle}`);
+    if (taskTitle && activity.subtype !== 'task_completed') detailParts.push(`task: ${taskTitle}`);
+    if (summary && taskTitle) detailParts.push(`task: ${taskTitle}`);
+    if (activity.subtype === 'task_comment') {
+      const fullContent = typeof p?.fullContent === 'string' ? p.fullContent : undefined;
+      if (fullContent && fullContent.length > 100) detailParts.push(fullContent);
+    }
     if (studioLabel && studioLabel !== '-') detailParts.push(`studio: ${studioLabel}`);
   } else {
     if (messageType && messageType !== 'message') detailParts.push(`type: ${messageType}`);
