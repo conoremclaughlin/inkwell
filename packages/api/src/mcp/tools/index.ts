@@ -26,9 +26,13 @@ import {
   handleCreateTaskGroup,
   handleListTaskGroups,
   handleUpdateTaskGroup,
+  handleAddTaskGroupComment,
+  handleListTaskGroupComments,
   createTaskGroupSchema,
   listTaskGroupsSchema,
   updateTaskGroupSchema,
+  addTaskGroupCommentSchema,
+  listTaskGroupCommentsSchema,
 } from './task-handlers';
 
 import { handleSendResponse, handleGetPendingMessages, handleMarkRead } from './response-handlers';
@@ -995,6 +999,66 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleAddTaskComment(args, dataComposer);
       } catch (error) {
         logger.error('Error in add_task_comment:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register add_task_group_comment tool
+  server.registerTool(
+    'add_task_group_comment',
+    {
+      description: `Add a comment to a task group. Comments are attributed to the calling agent. Use for progress updates, status changes, or conclusion summaries.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: addTaskGroupCommentSchema,
+    },
+    async (args) => {
+      try {
+        return await handleAddTaskGroupComment(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in add_task_group_comment:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register list_task_group_comments tool
+  server.registerTool(
+    'list_task_group_comments',
+    {
+      description: `List comments on a task group. Returns comments in chronological order. Filter by comment type (comment, conclusion, status_change).
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: listTaskGroupCommentsSchema,
+    },
+    async (args) => {
+      try {
+        return await handleListTaskGroupComments(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_task_group_comments:', error);
         return {
           content: [
             {

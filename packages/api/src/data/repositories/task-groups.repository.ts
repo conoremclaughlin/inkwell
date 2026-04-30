@@ -48,6 +48,10 @@ export interface TaskGroup {
   strategy_started_at: string | null;
   strategy_paused_at: string | null;
   owner_agent_id: string | null;
+  group_number: number;
+  slug: string | null;
+  outcome: string | null;
+  conclusion: string | null;
   created_at: string;
   updated_at: string;
 }

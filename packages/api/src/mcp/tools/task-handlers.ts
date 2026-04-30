@@ -651,6 +651,200 @@ export async function handleAddTaskComment(
 }
 
 // ============================================================================
+// TASK GROUP COMMENTS — ADD / LIST
+// ============================================================================
+
+export const addTaskGroupCommentSchema = z.object({
+  ...userIdentifierSchema.shape,
+  groupId: z.string().uuid().describe('Task group ID to comment on'),
+  content: z.string().min(1).max(5000).describe('Comment content'),
+  commentType: z
+    .enum(['comment', 'conclusion', 'status_change'])
+    .optional()
+    .default('comment')
+    .describe('Comment type (comment, conclusion, status_change)'),
+  agentId: z.string().optional().describe('Agent ID for identity attribution'),
+});
+
+export async function handleAddTaskGroupComment(
+  args: z.infer<typeof addTaskGroupCommentSchema>,
+  dataComposer: DataComposer
+): Promise<McpResponse> {
+  try {
+    const resolved = await resolveUser(args as UserIdentifier, dataComposer);
+    if (!resolved) {
+      return mcpResponse({ success: false, error: 'User not found' }, true);
+    }
+
+    const group = await dataComposer.repositories.taskGroups.findById(args.groupId);
+    if (!group) {
+      return mcpResponse({ success: false, error: 'Task group not found' }, true);
+    }
+    if (group.user_id !== resolved.user.id) {
+      return mcpResponse(
+        { success: false, error: 'Task group does not belong to this user' },
+        true
+      );
+    }
+
+    const agentId = getEffectiveAgentId(args.agentId);
+    const reqCtx = getRequestContext();
+    const workspaceId = reqCtx?.workspaceId;
+
+    const identityId = await resolveIdentityIdForAgent(
+      dataComposer,
+      resolved.user.id,
+      agentId,
+      workspaceId
+    );
+
+    const { data: rawComment, error } = await dataComposer
+      .getClient()
+      .from('task_group_comments' as never)
+      .insert({
+        task_group_id: args.groupId,
+        user_id: resolved.user.id,
+        content: args.content.trim(),
+        comment_type: args.commentType || 'comment',
+        agent_id: agentId || null,
+        created_by_identity_id: identityId,
+      } as never)
+      .select()
+      .single();
+
+    if (error) {
+      return mcpResponse(
+        { success: false, error: `Failed to add comment: ${error.message}` },
+        true
+      );
+    }
+
+    const comment = rawComment as unknown as {
+      id: string;
+      task_group_id: string;
+      content: string;
+      comment_type: string;
+      created_at: string;
+    };
+
+    try {
+      await dataComposer.repositories.activityStream.logActivity({
+        userId: resolved.user.id,
+        agentId: agentId || 'system',
+        type: 'state_change',
+        subtype: 'task_group_comment',
+        content: args.content.trim().slice(0, 200),
+        taskGroupId: args.groupId,
+        payload: {
+          groupId: args.groupId,
+          groupTitle: group.title,
+          commentId: comment.id,
+          commentType: args.commentType || 'comment',
+          fullContent: args.content.trim(),
+        },
+      });
+    } catch (err) {
+      logger.warn('Failed to log task_group_comment activity:', err);
+    }
+
+    return mcpResponse({
+      success: true,
+      comment: {
+        id: comment.id,
+        groupId: comment.task_group_id,
+        content: comment.content,
+        commentType: comment.comment_type,
+        authorAgentId: agentId || null,
+        createdAt: comment.created_at,
+      },
+    });
+  } catch (error) {
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to add task group comment',
+      },
+      true
+    );
+  }
+}
+
+export const listTaskGroupCommentsSchema = z.object({
+  ...userIdentifierSchema.shape,
+  groupId: z.string().uuid().describe('Task group ID to list comments for'),
+  commentType: z
+    .enum(['comment', 'conclusion', 'status_change'])
+    .optional()
+    .describe('Filter by comment type'),
+  limit: z.number().min(1).max(100).optional().default(50).describe('Max results'),
+});
+
+export async function handleListTaskGroupComments(
+  args: z.infer<typeof listTaskGroupCommentsSchema>,
+  dataComposer: DataComposer
+): Promise<McpResponse> {
+  try {
+    const resolved = await resolveUser(args as UserIdentifier, dataComposer);
+    if (!resolved) {
+      return mcpResponse({ success: false, error: 'User not found' }, true);
+    }
+
+    let query = dataComposer
+      .getClient()
+      .from('task_group_comments' as never)
+      .select('*')
+      .eq('task_group_id', args.groupId)
+      .eq('user_id', resolved.user.id)
+      .is('deleted_at', null)
+      .order('created_at', { ascending: true })
+      .limit(args.limit || 50);
+
+    if (args.commentType) {
+      query = query.eq('comment_type', args.commentType);
+    }
+
+    const { data, error } = await query;
+    if (error) {
+      return mcpResponse(
+        { success: false, error: `Failed to list comments: ${error.message}` },
+        true
+      );
+    }
+
+    const comments =
+      (data as unknown as Array<{
+        id: string;
+        task_group_id: string;
+        content: string;
+        comment_type: string;
+        agent_id: string | null;
+        created_at: string;
+      }>) || [];
+
+    return mcpResponse({
+      success: true,
+      count: comments.length,
+      comments: comments.map((c) => ({
+        id: c.id,
+        groupId: c.task_group_id,
+        content: c.content,
+        commentType: c.comment_type,
+        authorAgentId: c.agent_id,
+        createdAt: c.created_at,
+      })),
+    });
+  } catch (error) {
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to list task group comments',
+      },
+      true
+    );
+  }
+}
+
+// ============================================================================
 // TASK GROUPS — CREATE / LIST
 // ============================================================================
 

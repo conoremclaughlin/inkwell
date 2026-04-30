@@ -410,6 +410,14 @@ function formatStrategyEvent(activity: MissionActivity): string {
       if (taskTitle && from && to) return `${taskTitle}: ${from} → ${to}`;
       return activity.content || 'task status changed';
     }
+    case 'task_group_comment': {
+      const groupTitle = typeof p?.groupTitle === 'string' ? p.groupTitle : undefined;
+      const commentType = typeof p?.commentType === 'string' ? p.commentType : 'comment';
+      const fullContent = typeof p?.fullContent === 'string' ? p.fullContent : activity.content;
+      const icon = commentType === 'conclusion' ? '📋' : '💬';
+      const preview = fullContent ? compactPreview(fullContent, 100) : 'group comment';
+      return groupTitle ? `${icon} ${groupTitle}: ${preview}` : `${icon} ${preview}`;
+    }
     default:
       if (subtype.startsWith('backend_crash:')) {
         const backend = subtype.replace('backend_crash:', '');
@@ -880,6 +888,7 @@ const STRATEGY_SUBTYPES = new Set([
   'task_advanced',
   'task_comment',
   'task_status_change',
+  'task_group_comment',
 ]);
 
 function isStrategyEvent(activity: MissionActivity): boolean {

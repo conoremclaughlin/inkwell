@@ -28,6 +28,8 @@ export interface ProjectTask {
   task_order?: number | null;
   due_date?: string | null;
   metadata?: Record<string, unknown>;
+  outcome?: string | null;
+  outcome_reason?: string | null;
   created_at: string;
   updated_at: string;
 }
