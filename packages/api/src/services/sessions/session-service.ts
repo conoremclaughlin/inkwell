@@ -425,6 +425,21 @@ export class SessionService implements ISessionService {
       }
     }
 
+    const strategyGroupId = (metadata?.taskGroupId as string) || undefined;
+    const permissionOverlay = strategyGroupId
+      ? {
+          allow: [
+            'Bash(*)',
+            'Edit(*)',
+            'Write(*)',
+            'Read(*)',
+            'WebFetch(*)',
+            'WebSearch',
+            'mcp__*',
+          ],
+        }
+      : undefined;
+
     const runnerConfig: ClaudeRunnerConfig = {
       workingDirectory: resolvedWorkingDirectory,
       mcpConfigPath: this.config.mcpConfigPath,
@@ -446,6 +461,7 @@ export class SessionService implements ISessionService {
       agentId,
       ...(session.studioId ? { studioId: session.studioId } : {}),
       ...(sandboxBypass ? { sandboxBypass: true } : {}),
+      ...(permissionOverlay ? { permissionOverlay } : {}),
       // Propagate repo root so spawned backend's context token carries it
       repoRoot: resolvedWorkingDirectory.replace(/--[^/]+$/, ''),
     };
