@@ -1077,6 +1077,243 @@ describe('activityToFeedEvent state_change', () => {
   });
 });
 
+// ── task lifecycle events ──
+
+describe('activityToFeedEvent task lifecycle', () => {
+  const activity = (overrides: Partial<MissionActivity>): MissionActivity => ({
+    id: 'test-tl',
+    createdAt: '2026-04-29T10:00:00.000Z',
+    ...overrides,
+  });
+
+  describe('task_completed', () => {
+    it('formats completed task with summary', () => {
+      const event = activityToFeedEvent(
+        activity({
+          type: 'state_change',
+          subtype: 'task_completed',
+          agentId: 'wren',
+          content: '✓ Shipped the auth module',
+          payload: {
+            taskId: 'task-1',
+            taskTitle: 'Implement auth',
+            outcome: 'completed',
+            summary: 'Shipped the auth module',
+          },
+        })
+      );
+
+      expect(event.type).toBe('strategy');
+      expect(event.content).toContain('✓');
+      expect(event.content).toContain('Shipped the auth module');
+      expect(event.agent).toBe('wren');
+    });
+
+    it('falls back to task title when no summary', () => {
+      const event = activityToFeedEvent(
+        activity({
+          type: 'state_change',
+          subtype: 'task_completed',
+          agentId: 'wren',
+          content: '✓ Implement auth',
+          payload: { taskId: 'task-1', taskTitle: 'Implement auth', outcome: 'completed' },
+        })
+      );
+
+      expect(event.content).toContain('Implement auth');
+    });
+
+    it('does not include taskTitle in detail line (redundant)', () => {
+      const event = activityToFeedEvent(
+        activity({
+          type: 'state_change',
+          subtype: 'task_completed',
+          agentId: 'wren',
+          content: '✓ Done',
+          payload: {
+            groupId: '12345678-abcd-1234-5678-123456789abc',
+            taskTitle: 'Implement auth',
+            outcome: 'completed',
+          },
+        })
+      );
+
+      // detail includes groupId but not taskTitle for task_completed
+      expect(event.detail).toContain('group: 12345678');
+      // taskTitle NOT in detail for task_completed (special case in code)
+    });
+  });
+
+  describe('task_closed', () => {
+    it('formats skipped task with reason', () => {
+      const event = activityToFeedEvent(
+        activity({
+          type: 'state_change',
+          subtype: 'task_closed',
+          agentId: 'wren',
+          content: 'skipped: Optional cleanup — Not needed',
+          payload: {
+            taskId: 'task-2',
+            taskTitle: 'Optional cleanup',
+            outcome: 'skipped',
+            reason: 'Not needed after refactor',
+          },
+        })
+      );
+
+      expect(event.type).toBe('strategy');
+      expect(event.content).toContain('⏭');
+      expect(event.content).toContain('skipped');
+      expect(event.content).toContain('Optional cleanup');
+      expect(event.content).toContain('Not needed after refactor');
+    });
+
+    it('formats blocked task', () => {
+      const event = activityToFeedEvent(
+        activity({
+          type: 'state_change',
+          subtype: 'task_closed',
+          agentId: 'wren',
+          content: 'blocked: DB migration',
+          payload: {
+            taskId: 'task-3',
+            taskTitle: 'DB migration',
+            outcome: 'blocked',
+            reason: 'Waiting on DBA',
+          },
+        })
+      );
+
+      expect(event.content).toContain('🚫');
+      expect(event.content).toContain('blocked');
+      expect(event.content).toContain('DB migration');
+    });
+
+    it('formats failed task', () => {
+      const event = activityToFeedEvent(
+        activity({
+          type: 'state_change',
+          subtype: 'task_closed',
+          agentId: 'wren',
+          content: 'failed: Build pipeline',
+          payload: {
+            taskId: 'task-4',
+            taskTitle: 'Build pipeline',
+            outcome: 'failed',
+            reason: 'Dependency missing',
+          },
+        })
+      );
+
+      expect(event.content).toContain('✗');
+      expect(event.content).toContain('failed');
+      expect(event.content).toContain('Build pipeline');
+    });
+  });
+
+  describe('task_group_closed', () => {
+    it('formats completed group with conclusion', () => {
+      const event = activityToFeedEvent(
+        activity({
+          type: 'state_change',
+          subtype: 'task_group_closed',
+          agentId: 'wren',
+          content: 'Group closed (completed): 3/3 tasks completed.',
+          payload: {
+            groupId: 'group-1',
+            groupTitle: 'Feature rollout',
+            outcome: 'completed',
+            conclusion: '3/3 tasks completed.',
+          },
+        })
+      );
+
+      expect(event.type).toBe('strategy');
+      expect(event.content).toContain('📋');
+      expect(event.content).toContain('completed');
+      expect(event.content).toContain('Feature rollout');
+      expect(event.content).toContain('3/3 tasks completed');
+    });
+
+    it('formats abandoned group', () => {
+      const event = activityToFeedEvent(
+        activity({
+          type: 'state_change',
+          subtype: 'task_group_closed',
+          agentId: 'wren',
+          content: 'Group closed (abandoned): 1/5 tasks completed, 2 blocked.',
+          payload: {
+            groupId: 'group-2',
+            groupTitle: 'Legacy cleanup',
+            outcome: 'abandoned',
+            conclusion: '1/5 tasks completed, 2 blocked.',
+          },
+        })
+      );
+
+      expect(event.content).toContain('abandoned');
+      expect(event.content).toContain('Legacy cleanup');
+    });
+  });
+
+  describe('task_group_comment', () => {
+    it('formats group comment with title and preview', () => {
+      const event = activityToFeedEvent(
+        activity({
+          type: 'state_change',
+          subtype: 'task_group_comment',
+          agentId: 'wren',
+          content: 'Progress looking good',
+          payload: {
+            groupId: 'group-1',
+            groupTitle: 'Auth migration',
+            commentType: 'comment',
+            fullContent: 'Progress looking good',
+          },
+        })
+      );
+
+      expect(event.type).toBe('strategy');
+      expect(event.content).toContain('Auth migration');
+      expect(event.content).toContain('Progress looking good');
+    });
+  });
+
+  describe('detail line for task events', () => {
+    it('includes groupId prefix', () => {
+      const event = activityToFeedEvent(
+        activity({
+          type: 'state_change',
+          subtype: 'task_completed',
+          agentId: 'wren',
+          content: '✓ Done',
+          payload: {
+            groupId: 'abcdef12-1234-5678-9abc-def012345678',
+            taskTitle: 'Test task',
+            outcome: 'completed',
+          },
+        })
+      );
+
+      expect(event.detail).toContain('group: abcdef12');
+    });
+
+    it('includes strategy name when present', () => {
+      const event = activityToFeedEvent(
+        activity({
+          type: 'state_change',
+          subtype: 'strategy_started',
+          agentId: 'wren',
+          content: 'persistence strategy started',
+          payload: { groupId: 'group-1', strategy: 'persistence' },
+        })
+      );
+
+      expect(event.detail).toContain('persistence');
+    });
+  });
+});
+
 // ── estimateRows ──
 
 describe('estimateRows', () => {
