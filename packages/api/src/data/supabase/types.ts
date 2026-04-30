@@ -3131,13 +3131,76 @@ export type Database = {
           },
         ];
       };
+      task_group_comments: {
+        Row: {
+          agent_id: string | null;
+          comment_type: string;
+          content: string;
+          created_at: string;
+          created_by_identity_id: string | null;
+          deleted_at: string | null;
+          id: string;
+          metadata: Json;
+          task_group_id: string;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          agent_id?: string | null;
+          comment_type?: string;
+          content: string;
+          created_at?: string;
+          created_by_identity_id?: string | null;
+          deleted_at?: string | null;
+          id?: string;
+          metadata?: Json;
+          task_group_id: string;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          agent_id?: string | null;
+          comment_type?: string;
+          content?: string;
+          created_at?: string;
+          created_by_identity_id?: string | null;
+          deleted_at?: string | null;
+          id?: string;
+          metadata?: Json;
+          task_group_id?: string;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'task_group_comments_created_by_identity_id_fkey';
+            columns: ['created_by_identity_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_group_comments_task_group_id_fkey';
+            columns: ['task_group_id'];
+            referencedRelation: 'task_groups';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_group_comments_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       task_groups: {
         Row: {
           autonomous: boolean;
+          conclusion: string | null;
           context_summary: string | null;
           created_at: string;
           current_task_index: number;
           description: string | null;
+          group_number: number;
           id: string;
           identity_id: string | null;
           instructions: string | null;
@@ -3145,6 +3208,7 @@ export type Database = {
           max_sessions: number | null;
           metadata: Json;
           next_run_after: string | null;
+          outcome: string | null;
           output_status: string | null;
           output_target: string | null;
           owner_agent_id: string | null;
@@ -3152,6 +3216,7 @@ export type Database = {
           priority: string;
           project_id: string | null;
           sessions_used: number;
+          slug: string | null;
           status: string;
           strategy: string | null;
           strategy_config: Json;
@@ -3166,10 +3231,12 @@ export type Database = {
         };
         Insert: {
           autonomous?: boolean;
+          conclusion?: string | null;
           context_summary?: string | null;
           created_at?: string;
           current_task_index?: number;
           description?: string | null;
+          group_number: number;
           id?: string;
           identity_id?: string | null;
           instructions?: string | null;
@@ -3177,6 +3244,7 @@ export type Database = {
           max_sessions?: number | null;
           metadata?: Json;
           next_run_after?: string | null;
+          outcome?: string | null;
           output_status?: string | null;
           output_target?: string | null;
           owner_agent_id?: string | null;
@@ -3184,6 +3252,7 @@ export type Database = {
           priority?: string;
           project_id?: string | null;
           sessions_used?: number;
+          slug?: string | null;
           status?: string;
           strategy?: string | null;
           strategy_config?: Json;
@@ -3198,10 +3267,12 @@ export type Database = {
         };
         Update: {
           autonomous?: boolean;
+          conclusion?: string | null;
           context_summary?: string | null;
           created_at?: string;
           current_task_index?: number;
           description?: string | null;
+          group_number?: number;
           id?: string;
           identity_id?: string | null;
           instructions?: string | null;
@@ -3209,6 +3280,7 @@ export type Database = {
           max_sessions?: number | null;
           metadata?: Json;
           next_run_after?: string | null;
+          outcome?: string | null;
           output_status?: string | null;
           output_target?: string | null;
           owner_agent_id?: string | null;
@@ -3216,6 +3288,7 @@ export type Database = {
           priority?: string;
           project_id?: string | null;
           sessions_used?: number;
+          slug?: string | null;
           status?: string;
           strategy?: string | null;
           strategy_config?: Json;
@@ -3259,6 +3332,8 @@ export type Database = {
           due_date: string | null;
           id: string;
           metadata: Json;
+          outcome: string | null;
+          outcome_reason: string | null;
           priority: string | null;
           project_id: string | null;
           status: string;
@@ -3278,6 +3353,8 @@ export type Database = {
           due_date?: string | null;
           id?: string;
           metadata?: Json;
+          outcome?: string | null;
+          outcome_reason?: string | null;
           priority?: string | null;
           project_id?: string | null;
           status?: string;
@@ -3297,6 +3374,8 @@ export type Database = {
           due_date?: string | null;
           id?: string;
           metadata?: Json;
+          outcome?: string | null;
+          outcome_reason?: string | null;
           priority?: string | null;
           project_id?: string | null;
           status?: string;
