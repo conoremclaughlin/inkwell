@@ -344,26 +344,125 @@ export function formatWorktreeLabel(folder: string): string {
  * Format a state_change activity into a human-readable summary showing actual values.
  * Payload shape: { changedFields, before, after, ... }
  */
+function formatStrategyEvent(activity: MissionActivity): string {
+  const p = activity.payload;
+  const subtype = activity.subtype || '';
+  const groupTitle = typeof p?.groupTitle === 'string' ? p.groupTitle : undefined;
+  const reason = typeof p?.reason === 'string' ? p.reason : undefined;
+  const shortTitle = groupTitle
+    ? groupTitle.length > 50
+      ? groupTitle.slice(0, 47) + '...'
+      : groupTitle
+    : undefined;
+
+  switch (subtype) {
+    case 'strategy_started':
+      return shortTitle ? `strategy started: ${shortTitle}` : 'strategy started';
+    case 'strategy_paused':
+      return shortTitle ? `paused: ${shortTitle}` : 'strategy paused';
+    case 'strategy_resumed':
+      return shortTitle ? `resumed: ${shortTitle}` : 'strategy resumed';
+    case 'approval_required': {
+      const routedTo = typeof p?.routedTo === 'string' ? p.routedTo : undefined;
+      const base = shortTitle ? `approval needed: ${shortTitle}` : 'approval needed';
+      return routedTo ? `${base} → ${routedTo}` : base;
+    }
+    case 'approval_granted':
+      return shortTitle ? `approved: ${shortTitle}` : 'approval granted';
+    case 'strategy_completed':
+      return shortTitle ? `completed: ${shortTitle}` : 'strategy completed';
+    case 'strategy_cancelled':
+      return shortTitle ? `cancelled: ${shortTitle}` : 'strategy cancelled';
+    case 'strategy_trigger':
+      return reason ? `trigger (${reason})` : 'strategy trigger';
+    case 'strategy_trigger_failed':
+      return `trigger failed${reason ? `: ${reason}` : ''}`;
+    case 'watchdog_wakeup':
+      return shortTitle ? `watchdog check: ${shortTitle}` : 'watchdog wakeup';
+    case 'watchdog_skip': {
+      const skipReason = typeof p?.skipReason === 'string' ? p.skipReason : reason;
+      return skipReason ? `watchdog skipped (${skipReason})` : 'watchdog skipped';
+    }
+    case 'task_completed': {
+      const summary = typeof p?.summary === 'string' ? p.summary : undefined;
+      const taskTitle = typeof p?.taskTitle === 'string' ? p.taskTitle : undefined;
+      if (summary) return `✓ ${summary}`;
+      if (taskTitle) return `✓ completed: ${taskTitle}`;
+      return activity.content || 'task completed';
+    }
+    case 'task_advanced': {
+      const taskTitle = typeof p?.taskTitle === 'string' ? p.taskTitle : undefined;
+      const taskIndex = typeof p?.taskIndex === 'number' ? p.taskIndex : undefined;
+      if (taskTitle && taskIndex !== undefined) return `→ task #${taskIndex + 1}: ${taskTitle}`;
+      if (taskTitle) return `→ next: ${taskTitle}`;
+      return activity.content || 'advanced to next task';
+    }
+    case 'task_comment': {
+      const taskTitle = typeof p?.taskTitle === 'string' ? p.taskTitle : undefined;
+      const fullContent = typeof p?.fullContent === 'string' ? p.fullContent : activity.content;
+      const preview = fullContent ? compactPreview(fullContent, 100) : 'comment';
+      return taskTitle ? `💬 ${taskTitle}: ${preview}` : `💬 ${preview}`;
+    }
+    case 'task_status_change': {
+      const taskTitle = typeof p?.taskTitle === 'string' ? p.taskTitle : undefined;
+      const from = typeof p?.from === 'string' ? p.from : undefined;
+      const to = typeof p?.to === 'string' ? p.to : undefined;
+      if (taskTitle && from && to) return `${taskTitle}: ${from} → ${to}`;
+      return activity.content || 'task status changed';
+    }
+    case 'task_group_comment': {
+      const groupTitle = typeof p?.groupTitle === 'string' ? p.groupTitle : undefined;
+      const commentType = typeof p?.commentType === 'string' ? p.commentType : 'comment';
+      const fullContent = typeof p?.fullContent === 'string' ? p.fullContent : activity.content;
+      const icon = commentType === 'conclusion' ? '📋' : '💬';
+      const preview = fullContent ? compactPreview(fullContent, 100) : 'group comment';
+      return groupTitle ? `${icon} ${groupTitle}: ${preview}` : `${icon} ${preview}`;
+    }
+    case 'task_closed': {
+      const taskTitle = typeof p?.taskTitle === 'string' ? p.taskTitle : undefined;
+      const outcome = typeof p?.outcome === 'string' ? p.outcome : 'closed';
+      const reason = typeof p?.reason === 'string' ? p.reason : undefined;
+      const label = taskTitle || 'task';
+      if (outcome === 'skipped') return `⏭ skipped: ${label}${reason ? ` — ${reason}` : ''}`;
+      if (outcome === 'blocked') return `🚫 blocked: ${label}${reason ? ` — ${reason}` : ''}`;
+      if (outcome === 'failed') return `✗ failed: ${label}${reason ? ` — ${reason}` : ''}`;
+      return activity.content || `closed: ${label}`;
+    }
+    case 'task_group_closed': {
+      const groupTitle = typeof p?.groupTitle === 'string' ? p.groupTitle : undefined;
+      const outcome = typeof p?.outcome === 'string' ? p.outcome : 'closed';
+      const conclusion = typeof p?.conclusion === 'string' ? p.conclusion : undefined;
+      const label = groupTitle || 'group';
+      return `📋 ${outcome}: ${label}${conclusion ? ` — ${compactPreview(conclusion, 60)}` : ''}`;
+    }
+    default:
+      if (subtype.startsWith('backend_crash:')) {
+        const backend = subtype.replace('backend_crash:', '');
+        return `crash (${backend}): ${compactPreview(activity.content, 80)}`;
+      }
+      return activity.content || subtype || 'strategy event';
+  }
+}
+
 function formatStateChange(activity: MissionActivity): string {
+  if (isStrategyEvent(activity)) return formatStrategyEvent(activity);
+
   const p = activity.payload;
   const after = p?.after as Record<string, unknown> | undefined;
   const changedFields = p?.changedFields as string[] | undefined;
 
   if (!after || !changedFields?.length) {
-    // Fallback to raw content if payload is missing
     return (activity.content || 'session updated').replace(/\s+/g, ' ').trim();
   }
 
   const sessionId =
     typeof p?.sessionId === 'string' ? p.sessionId.slice(0, 8) : activity.sessionId?.slice(0, 8);
 
-  // Show the values that changed, not just the field names
   const parts: string[] = [];
   for (const field of changedFields) {
     const val = after[field];
     if (val == null || val === '') continue;
     const strVal = String(val);
-    // Skip very long values (like context blobs) in the summary line
     if (strVal.length > 80) continue;
     parts.push(`${field}: ${strVal}`);
   }
@@ -790,7 +889,36 @@ function printSnapshot(snapshot: MissionSnapshot): void {
   }
 }
 
+const STRATEGY_SUBTYPES = new Set([
+  'strategy_started',
+  'strategy_paused',
+  'strategy_resumed',
+  'strategy_completed',
+  'strategy_cancelled',
+  'strategy_trigger',
+  'strategy_trigger_failed',
+  'watchdog_wakeup',
+  'watchdog_skip',
+  'approval_required',
+  'approval_granted',
+  'task_completed',
+  'task_advanced',
+  'task_comment',
+  'task_status_change',
+  'task_group_comment',
+  'task_closed',
+  'task_group_closed',
+]);
+
+function isStrategyEvent(activity: MissionActivity): boolean {
+  return (
+    STRATEGY_SUBTYPES.has(activity.subtype || '') ||
+    activity.subtype?.startsWith('backend_crash:') === true
+  );
+}
+
 function mapActivityToFeedType(activity: MissionActivity): FeedEventType {
+  if (isStrategyEvent(activity)) return 'strategy';
   switch (activity.type) {
     case 'message_in':
       return 'inbox';
@@ -964,9 +1092,25 @@ export function activityToFeedEvent(
     '-';
 
   const detailParts: string[] = [];
-  if (messageType && messageType !== 'message') detailParts.push(`type: ${messageType}`);
-  if (threadKey) detailParts.push(`thread: ${threadKey}`);
-  if (studioLabel && studioLabel !== '-') detailParts.push(`studio: ${studioLabel}`);
+  if (isStrategyEvent(activity)) {
+    const groupId = typeof p?.groupId === 'string' ? p.groupId.slice(0, 8) : undefined;
+    const strategy = typeof p?.strategy === 'string' ? p.strategy : undefined;
+    const taskTitle = typeof p?.taskTitle === 'string' ? p.taskTitle : undefined;
+    const summary = typeof p?.summary === 'string' ? p.summary : undefined;
+    if (groupId) detailParts.push(`group: ${groupId}`);
+    if (strategy) detailParts.push(strategy);
+    if (taskTitle && activity.subtype !== 'task_completed') detailParts.push(`task: ${taskTitle}`);
+    if (summary && taskTitle) detailParts.push(`task: ${taskTitle}`);
+    if (activity.subtype === 'task_comment') {
+      const fullContent = typeof p?.fullContent === 'string' ? p.fullContent : undefined;
+      if (fullContent && fullContent.length > 100) detailParts.push(fullContent);
+    }
+    if (studioLabel && studioLabel !== '-') detailParts.push(`studio: ${studioLabel}`);
+  } else {
+    if (messageType && messageType !== 'message') detailParts.push(`type: ${messageType}`);
+    if (threadKey) detailParts.push(`thread: ${threadKey}`);
+    if (studioLabel && studioLabel !== '-') detailParts.push(`studio: ${studioLabel}`);
+  }
 
   return {
     id: activity.id,

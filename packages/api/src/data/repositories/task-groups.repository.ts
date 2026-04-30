@@ -48,6 +48,10 @@ export interface TaskGroup {
   strategy_started_at: string | null;
   strategy_paused_at: string | null;
   owner_agent_id: string | null;
+  group_number: number;
+  slug: string | null;
+  outcome: string | null;
+  conclusion: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -118,6 +122,8 @@ export interface UpdateTaskGroupInput {
   strategy_started_at?: string | null;
   strategy_paused_at?: string | null;
   owner_agent_id?: string | null;
+  outcome?: string | null;
+  conclusion?: string | null;
 }
 
 export interface ListTaskGroupsOptions {
@@ -264,6 +270,8 @@ export class TaskGroupsRepository {
     if (input.strategy_paused_at !== undefined)
       updates.strategy_paused_at = input.strategy_paused_at;
     if (input.owner_agent_id !== undefined) updates.owner_agent_id = input.owner_agent_id;
+    if (input.outcome !== undefined) updates.outcome = input.outcome;
+    if (input.conclusion !== undefined) updates.conclusion = input.conclusion;
 
     const { data, error } = await this.client
       .from('task_groups' as never)

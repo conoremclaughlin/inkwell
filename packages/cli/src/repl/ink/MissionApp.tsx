@@ -5,7 +5,14 @@ import { formatNow } from '../tui-components.js';
 
 // ── Feed event types ──
 
-export type FeedEventType = 'inbox' | 'activity' | 'task' | 'document' | 'session' | 'system';
+export type FeedEventType =
+  | 'inbox'
+  | 'activity'
+  | 'task'
+  | 'document'
+  | 'session'
+  | 'strategy'
+  | 'system';
 
 export interface FeedEvent {
   id: string;
@@ -57,6 +64,7 @@ const TYPE_COLORS: Record<FeedEventType, string> = {
   task: 'yellow',
   document: 'blue',
   session: 'green',
+  strategy: 'yellowBright',
   system: 'gray',
 };
 
@@ -66,6 +74,7 @@ const TYPE_ICONS: Record<FeedEventType, string> = {
   task: '✓',
   document: '📄',
   session: '🔄',
+  strategy: '🎯',
   system: '•',
 };
 

@@ -28,6 +28,8 @@ export interface ProjectTask {
   task_order?: number | null;
   due_date?: string | null;
   metadata?: Record<string, unknown>;
+  outcome?: string | null;
+  outcome_reason?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -53,6 +55,9 @@ export interface UpdateProjectTaskInput {
   priority?: TaskPriority;
   tags?: string[];
   blocked_by?: string[];
+  outcome?: string;
+  outcome_reason?: string;
+  completed_at?: string | null;
 }
 
 export class ProjectTasksRepository {
@@ -230,7 +235,21 @@ export class ProjectTasksRepository {
    * Mark task as completed
    */
   async completeTask(id: string): Promise<ProjectTask> {
-    return this.update(id, { status: 'completed' });
+    return this.update(id, { status: 'completed', outcome: 'completed' });
+  }
+
+  async closeTask(
+    id: string,
+    outcome: 'completed' | 'skipped' | 'blocked' | 'failed',
+    reason?: string
+  ): Promise<ProjectTask> {
+    const status = outcome === 'completed' ? 'completed' : 'blocked';
+    return this.update(id, {
+      status,
+      outcome,
+      outcome_reason: reason,
+      completed_at: new Date().toISOString(),
+    });
   }
 
   /**
@@ -245,6 +264,18 @@ export class ProjectTasksRepository {
    */
   async reopenTask(id: string): Promise<ProjectTask> {
     return this.update(id, { status: 'pending' });
+  }
+
+  async findByGroupId(groupId: string): Promise<ProjectTask[]> {
+    const { data, error } = await this.client
+      .from('tasks')
+      .select('*')
+      .eq('task_group_id', groupId)
+      .order('task_order', { ascending: true, nullsFirst: false })
+      .order('created_at', { ascending: true });
+
+    if (error) throw new Error(`Failed to get group tasks: ${error.message}`);
+    return (data || []) as unknown as ProjectTask[];
   }
 
   /**
