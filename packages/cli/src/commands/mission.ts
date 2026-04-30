@@ -418,6 +418,23 @@ function formatStrategyEvent(activity: MissionActivity): string {
       const preview = fullContent ? compactPreview(fullContent, 100) : 'group comment';
       return groupTitle ? `${icon} ${groupTitle}: ${preview}` : `${icon} ${preview}`;
     }
+    case 'task_closed': {
+      const taskTitle = typeof p?.taskTitle === 'string' ? p.taskTitle : undefined;
+      const outcome = typeof p?.outcome === 'string' ? p.outcome : 'closed';
+      const reason = typeof p?.reason === 'string' ? p.reason : undefined;
+      const label = taskTitle || 'task';
+      if (outcome === 'skipped') return `⏭ skipped: ${label}${reason ? ` — ${reason}` : ''}`;
+      if (outcome === 'blocked') return `🚫 blocked: ${label}${reason ? ` — ${reason}` : ''}`;
+      if (outcome === 'failed') return `✗ failed: ${label}${reason ? ` — ${reason}` : ''}`;
+      return activity.content || `closed: ${label}`;
+    }
+    case 'task_group_closed': {
+      const groupTitle = typeof p?.groupTitle === 'string' ? p.groupTitle : undefined;
+      const outcome = typeof p?.outcome === 'string' ? p.outcome : 'closed';
+      const conclusion = typeof p?.conclusion === 'string' ? p.conclusion : undefined;
+      const label = groupTitle || 'group';
+      return `📋 ${outcome}: ${label}${conclusion ? ` — ${compactPreview(conclusion, 60)}` : ''}`;
+    }
     default:
       if (subtype.startsWith('backend_crash:')) {
         const backend = subtype.replace('backend_crash:', '');
@@ -889,6 +906,8 @@ const STRATEGY_SUBTYPES = new Set([
   'task_comment',
   'task_status_change',
   'task_group_comment',
+  'task_closed',
+  'task_group_closed',
 ]);
 
 function isStrategyEvent(activity: MissionActivity): boolean {
