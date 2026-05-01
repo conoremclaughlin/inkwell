@@ -1013,6 +1013,15 @@ export class StrategyService {
   /**
    * Cancel the watchdog reminder for a strategy (on pause/complete).
    */
+  /**
+   * Clean up strategy resources (watchdog, etc.) without logging a
+   * strategy_cancelled event or changing group status. Use this when
+   * the caller manages its own status transition and activity logging.
+   */
+  async cleanupStrategyResources(groupId: string): Promise<void> {
+    await this.cancelWatchdogReminder(groupId);
+  }
+
   private async cancelWatchdogReminder(groupId: string): Promise<void> {
     try {
       await this.dataComposer

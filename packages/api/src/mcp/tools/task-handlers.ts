@@ -1038,14 +1038,15 @@ export async function handleCloseTaskGroup(
         .filter(Boolean)
         .join(', ') + '.';
 
-    // Cancel strategy BEFORE updating group status — cancelStrategy() rejects
-    // terminal statuses, so it must run while the group is still active/paused.
+    // Clean up strategy resources (watchdog reminders) without logging a
+    // misleading strategy_cancelled event — the task_group_closed event we
+    // log below carries the real outcome (completed/partial/abandoned/failed).
     if (group.strategy) {
       try {
         const strategyService = new StrategyService(dataComposer);
-        await strategyService.cancelStrategy(args.groupId, resolved.user.id);
+        await strategyService.cleanupStrategyResources(args.groupId);
       } catch (err) {
-        logger.warn('Failed to cancel strategy on group close:', err);
+        logger.warn('Failed to clean up strategy resources on group close:', err);
       }
     }
 
