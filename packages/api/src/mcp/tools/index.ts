@@ -26,9 +26,17 @@ import {
   handleCreateTaskGroup,
   handleListTaskGroups,
   handleUpdateTaskGroup,
+  handleAddTaskGroupComment,
+  handleListTaskGroupComments,
+  handleCloseTask,
+  handleCloseTaskGroup,
   createTaskGroupSchema,
   listTaskGroupsSchema,
   updateTaskGroupSchema,
+  addTaskGroupCommentSchema,
+  listTaskGroupCommentsSchema,
+  closeTaskSchema,
+  closeTaskGroupSchema,
 } from './task-handlers';
 
 import { handleSendResponse, handleGetPendingMessages, handleMarkRead } from './response-handlers';
@@ -995,6 +1003,130 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleAddTaskComment(args, dataComposer);
       } catch (error) {
         logger.error('Error in add_task_comment:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register add_task_group_comment tool
+  server.registerTool(
+    'add_task_group_comment',
+    {
+      description: `Add a comment to a task group. Comments are attributed to the calling agent. Use for progress updates, status changes, or conclusion summaries.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: addTaskGroupCommentSchema,
+    },
+    async (args) => {
+      try {
+        return await handleAddTaskGroupComment(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in add_task_group_comment:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register list_task_group_comments tool
+  server.registerTool(
+    'list_task_group_comments',
+    {
+      description: `List comments on a task group. Returns comments in chronological order. Filter by comment type (comment, conclusion, status_change).
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: listTaskGroupCommentsSchema,
+    },
+    async (args) => {
+      try {
+        return await handleListTaskGroupComments(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_task_group_comments:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register close_task tool
+  server.registerTool(
+    'close_task',
+    {
+      description: `Close a task with an outcome. Use instead of complete_task when the task wasn't simply completed — e.g., it was skipped, blocked, or failed. Advances the strategy if one is active.
+
+Outcomes: completed (done), skipped (not needed), blocked (cannot proceed), failed (attempted but failed).
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: closeTaskSchema,
+    },
+    async (args) => {
+      try {
+        return await handleCloseTask(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in close_task:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register close_task_group tool
+  server.registerTool(
+    'close_task_group',
+    {
+      description: `Close a task group with an outcome and conclusion. Posts a conclusion comment and sets the group outcome. Auto-generates a summary if no conclusion is provided. Cancels any active strategy.
+
+Outcomes: completed (all done), partial (some done), abandoned (gave up), failed (critical failure).
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: closeTaskGroupSchema,
+    },
+    async (args) => {
+      try {
+        return await handleCloseTaskGroup(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in close_task_group:', error);
         return {
           content: [
             {

@@ -526,10 +526,14 @@ export class StrategyService {
     const updatedGroup = { ...group, status: 'active' as const } as TaskGroup;
     const prompt = STRATEGY_PROMPTS[group.strategy as StrategyPreset](updatedGroup, nextTask);
 
+    // Auto-trigger the owner agent so resume doesn't require a separate trigger call
+    const triggered = await this.triggerOwnerAgent(updatedGroup, nextTask, 'manual_resume');
+
     return {
       action: 'next_task',
       nextTask,
       prompt,
+      notified: triggered,
     };
   }
 
@@ -1009,6 +1013,15 @@ export class StrategyService {
   /**
    * Cancel the watchdog reminder for a strategy (on pause/complete).
    */
+  /**
+   * Clean up strategy resources (watchdog, etc.) without logging a
+   * strategy_cancelled event or changing group status. Use this when
+   * the caller manages its own status transition and activity logging.
+   */
+  async cleanupStrategyResources(groupId: string): Promise<void> {
+    await this.cancelWatchdogReminder(groupId);
+  }
+
   private async cancelWatchdogReminder(groupId: string): Promise<void> {
     try {
       await this.dataComposer

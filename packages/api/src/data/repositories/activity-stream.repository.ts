@@ -45,6 +45,7 @@ export interface Activity {
   isDm: boolean;
   artifactId: string | null;
   childSessionId: string | null;
+  taskGroupId: string | null;
   createdAt: Date;
   completedAt: Date | null;
   durationMs: number | null;
@@ -451,6 +452,7 @@ export class ActivityStreamRepository {
       isDm: row.is_dm ?? true,
       artifactId: row.artifact_id,
       childSessionId: row.child_session_id,
+      taskGroupId: row.task_group_id ?? null,
       createdAt: new Date(row.created_at),
       completedAt: row.completed_at ? new Date(row.completed_at) : null,
       durationMs: row.duration_ms,

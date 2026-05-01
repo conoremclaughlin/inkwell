@@ -258,3 +258,250 @@ describe.skipIf(!canRun)('handleUpdateTaskGroup (integration)', () => {
     expect(data?.identity_id).toBe(identity.id);
   });
 });
+
+// =====================================================
+// handleCloseTask (integration)
+// =====================================================
+
+describe.skipIf(!canRun)('handleCloseTask (integration)', () => {
+  let client: SupabaseClient;
+  let dc: any;
+  const createdTaskIds: string[] = [];
+  const createdGroupIds: string[] = [];
+
+  beforeAll(async () => {
+    client = createClient(SUPABASE_URL!, SUPABASE_KEY!, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { ProjectTasksRepository } =
+      await import('../../data/repositories/project-tasks.repository');
+    const { TaskGroupsRepository } = await import('../../data/repositories/task-groups.repository');
+
+    dc = {
+      getClient: () => client,
+      repositories: {
+        tasks: new ProjectTasksRepository(client),
+        taskGroups: new TaskGroupsRepository(client),
+        projects: { findById: vi.fn().mockResolvedValue(null) },
+        memory: { remember: vi.fn().mockResolvedValue({ id: 'mem-1' }) },
+        activityStream: { logActivity: vi.fn().mockResolvedValue({ id: 'act-1' }) },
+      },
+    };
+  }, 15_000);
+
+  afterAll(async () => {
+    if (!client) return;
+    if (createdTaskIds.length > 0) await client.from('tasks').delete().in('id', createdTaskIds);
+    if (createdGroupIds.length > 0)
+      await client.from('task_groups').delete().in('id', createdGroupIds);
+  }, 10_000);
+
+  async function seedTask(overrides: Record<string, unknown> = {}): Promise<string> {
+    const task = await dc.repositories.tasks.create({
+      user_id: TEST_USER_ID!,
+      title: `__close_integration_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      description: 'Integration test — safe to delete',
+      status: 'in_progress',
+      priority: 'medium',
+      tags: ['__test'],
+      ...overrides,
+    });
+    createdTaskIds.push(task.id);
+    return task.id;
+  }
+
+  it('closes a task with completed outcome and persists to DB', async () => {
+    const { handleCloseTask } = await import('./task-handlers');
+    const taskId = await seedTask();
+
+    const response = await handleCloseTask(
+      { userId: TEST_USER_ID!, taskId, outcome: 'completed', summary: 'Shipped!' },
+      dc
+    );
+    expect(response.isError).toBeFalsy();
+
+    const body = JSON.parse(response.content[0].text);
+    expect(body.success).toBe(true);
+    expect(body.task.outcome).toBe('completed');
+
+    const { data } = await client
+      .from('tasks')
+      .select('status, outcome, outcome_reason, completed_at')
+      .eq('id', taskId)
+      .single();
+
+    expect(data?.status).toBe('completed');
+    expect(data?.outcome).toBe('completed');
+    expect(data?.completed_at).not.toBeNull();
+  });
+
+  it('closes a task with skipped outcome and reason', async () => {
+    const { handleCloseTask } = await import('./task-handlers');
+    const taskId = await seedTask();
+
+    const response = await handleCloseTask(
+      { userId: TEST_USER_ID!, taskId, outcome: 'skipped', reason: 'Not needed' },
+      dc
+    );
+    expect(response.isError).toBeFalsy();
+
+    const { data } = await client
+      .from('tasks')
+      .select('status, outcome, outcome_reason')
+      .eq('id', taskId)
+      .single();
+
+    expect(data?.status).toBe('blocked');
+    expect(data?.outcome).toBe('skipped');
+    expect(data?.outcome_reason).toBe('Not needed');
+  });
+
+  it('refuses to close a task owned by a different user', async () => {
+    const { handleCloseTask } = await import('./task-handlers');
+    const taskId = await seedTask();
+
+    const response = await handleCloseTask(
+      { userId: '00000000-0000-0000-0000-000000000999', taskId, outcome: 'completed' },
+      dc
+    );
+
+    expect(response.isError).toBe(true);
+    const body = JSON.parse(response.content[0].text);
+    expect(['User not found', 'Task does not belong to this user']).toContain(body.error);
+  });
+});
+
+// =====================================================
+// handleCloseTaskGroup (integration)
+// =====================================================
+
+describe.skipIf(!canRun)('handleCloseTaskGroup (integration)', () => {
+  let client: SupabaseClient;
+  let dc: any;
+  const createdGroupIds: string[] = [];
+  const createdTaskIds: string[] = [];
+
+  beforeAll(async () => {
+    client = createClient(SUPABASE_URL!, SUPABASE_KEY!, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { ProjectTasksRepository } =
+      await import('../../data/repositories/project-tasks.repository');
+    const { TaskGroupsRepository } = await import('../../data/repositories/task-groups.repository');
+
+    dc = {
+      getClient: () => client,
+      repositories: {
+        tasks: new ProjectTasksRepository(client),
+        taskGroups: new TaskGroupsRepository(client),
+        projects: { findById: vi.fn().mockResolvedValue(null) },
+        activityStream: { logActivity: vi.fn().mockResolvedValue({ id: 'act-1' }) },
+      },
+    };
+  }, 15_000);
+
+  afterAll(async () => {
+    if (!client) return;
+    if (createdTaskIds.length > 0) await client.from('tasks').delete().in('id', createdTaskIds);
+    if (createdGroupIds.length > 0) {
+      await client.from('task_group_comments').delete().in('task_group_id', createdGroupIds);
+      await client.from('task_groups').delete().in('id', createdGroupIds);
+    }
+  }, 10_000);
+
+  async function seedGroup(): Promise<string> {
+    const group = await dc.repositories.taskGroups.create({
+      user_id: TEST_USER_ID!,
+      title: `__close_group_integration_${Date.now()}`,
+      description: 'Integration test — safe to delete',
+      priority: 'low',
+      tags: ['__test'],
+    });
+    createdGroupIds.push(group.id);
+    return group.id;
+  }
+
+  async function seedTask(groupId: string, status = 'completed'): Promise<string> {
+    const task = await dc.repositories.tasks.create({
+      user_id: TEST_USER_ID!,
+      title: `__group_task_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      status,
+      priority: 'medium',
+      tags: ['__test'],
+      task_group_id: groupId,
+    });
+    createdTaskIds.push(task.id);
+    return task.id;
+  }
+
+  it('closes a group with auto-generated conclusion and persists to DB', async () => {
+    const { handleCloseTaskGroup } = await import('./task-handlers');
+    const groupId = await seedGroup();
+    await seedTask(groupId, 'completed');
+    await seedTask(groupId, 'completed');
+    await seedTask(groupId, 'pending');
+
+    const response = await handleCloseTaskGroup(
+      { userId: TEST_USER_ID!, groupId, outcome: 'completed' },
+      dc
+    );
+    expect(response.isError).toBeFalsy();
+
+    const body = JSON.parse(response.content[0].text);
+    expect(body.success).toBe(true);
+    expect(body.group.outcome).toBe('completed');
+    expect(body.group.conclusion).toContain('2/3 tasks completed');
+    expect(body.group.stats.total).toBe(3);
+    expect(body.group.stats.completed).toBe(2);
+
+    const { data } = await client
+      .from('task_groups')
+      .select('status, outcome, conclusion')
+      .eq('id', groupId)
+      .single();
+
+    expect(data?.status).toBe('completed');
+    expect(data?.outcome).toBe('completed');
+    expect(data?.conclusion).toContain('2/3 tasks completed');
+  });
+
+  it('posts a conclusion comment when closing', async () => {
+    const { handleCloseTaskGroup } = await import('./task-handlers');
+    const groupId = await seedGroup();
+    await seedTask(groupId, 'completed');
+
+    await handleCloseTaskGroup(
+      { userId: TEST_USER_ID!, groupId, outcome: 'completed', conclusion: 'All done!' },
+      dc
+    );
+
+    const { data: comments } = await client
+      .from('task_group_comments')
+      .select('content, comment_type')
+      .eq('task_group_id', groupId)
+      .eq('comment_type', 'conclusion');
+
+    expect(comments).toHaveLength(1);
+    expect(comments![0].content).toBe('All done!');
+  });
+
+  it('rejects closing an already-completed group', async () => {
+    const { handleCloseTaskGroup } = await import('./task-handlers');
+    const groupId = await seedGroup();
+
+    // Close it first
+    await handleCloseTaskGroup({ userId: TEST_USER_ID!, groupId, outcome: 'completed' }, dc);
+
+    // Try closing again
+    const response = await handleCloseTaskGroup(
+      { userId: TEST_USER_ID!, groupId, outcome: 'abandoned' },
+      dc
+    );
+
+    expect(response.isError).toBe(true);
+    const body = JSON.parse(response.content[0].text);
+    expect(body.error).toBe('Task group is already completed');
+  });
+});
