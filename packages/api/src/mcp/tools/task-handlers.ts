@@ -1038,6 +1038,17 @@ export async function handleCloseTaskGroup(
         .filter(Boolean)
         .join(', ') + '.';
 
+    // Cancel strategy BEFORE updating group status — cancelStrategy() rejects
+    // terminal statuses, so it must run while the group is still active/paused.
+    if (group.strategy) {
+      try {
+        const strategyService = new StrategyService(dataComposer);
+        await strategyService.cancelStrategy(args.groupId, resolved.user.id);
+      } catch (err) {
+        logger.warn('Failed to cancel strategy on group close:', err);
+      }
+    }
+
     await dataComposer.repositories.taskGroups.update(args.groupId, {
       status: args.outcome === 'completed' ? 'completed' : 'cancelled',
       outcome: args.outcome,
@@ -1088,15 +1099,6 @@ export async function handleCloseTaskGroup(
       });
     } catch (err) {
       logger.warn('Failed to log task_group_closed activity:', err);
-    }
-
-    if (group.strategy) {
-      try {
-        const strategyService = new StrategyService(dataComposer);
-        await strategyService.cancelStrategy(args.groupId, resolved.user.id);
-      } catch (err) {
-        logger.warn('Failed to cancel strategy on group close:', err);
-      }
     }
 
     return mcpResponse({
