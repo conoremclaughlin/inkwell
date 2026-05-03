@@ -664,11 +664,16 @@ function TaskGroupSection({
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <span
-              className={clsx('font-semibold text-sm', allDone ? 'text-gray-400' : 'text-gray-900')}
+            <Link
+              href={`/missions/${group.id}`}
+              onClick={(e) => e.stopPropagation()}
+              className={clsx(
+                'font-semibold text-sm hover:underline',
+                allDone ? 'text-gray-400' : 'text-gray-900'
+              )}
             >
               {group.title}
-            </span>
+            </Link>
             {group.autonomous && (
               <Badge className="text-[10px] font-medium border bg-violet-50 text-violet-700 border-violet-200 gap-1">
                 <Zap className="h-2.5 w-2.5" />
@@ -738,24 +743,31 @@ function TaskGroupSection({
         </div>
       )}
 
-      {/* Timeline toggle + panel */}
+      {/* Footer: timeline toggle + mission link */}
       {!collapsed && (
-        <div className="border-t border-gray-100">
+        <div className="border-t border-gray-100 flex items-center justify-between">
           <button
             onClick={(e) => {
               e.stopPropagation();
               setShowTimeline(!showTimeline);
             }}
-            className="flex items-center gap-2 px-5 py-2.5 text-[11px] text-gray-400 hover:text-gray-600 transition-colors w-full text-left"
+            className="flex items-center gap-2 px-5 py-2.5 text-[11px] text-gray-400 hover:text-gray-600 transition-colors text-left"
           >
             <Activity className="h-3 w-3" />
             {showTimeline ? 'Hide timeline' : 'Show timeline'}
           </button>
-          {showTimeline && (
-            <div className="px-5 pb-4">
-              <ActivityTimeline groupId={group.id} />
-            </div>
-          )}
+          <Link
+            href={`/missions/${group.id}`}
+            className="flex items-center gap-1.5 px-5 py-2.5 text-[11px] text-blue-500 hover:text-blue-700 transition-colors"
+          >
+            <ExternalLink className="h-3 w-3" />
+            Open mission
+          </Link>
+        </div>
+      )}
+      {!collapsed && showTimeline && (
+        <div className="px-5 pb-4 border-t border-gray-50">
+          <ActivityTimeline groupId={group.id} />
         </div>
       )}
     </div>
