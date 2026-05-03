@@ -98,6 +98,7 @@ export interface GetActivityOptions {
   platformChatId?: string;
   correlationId?: string;
   parentId?: string;
+  taskGroupId?: string;
   since?: Date;
   until?: Date;
   limit?: number;
@@ -283,6 +284,9 @@ export class ActivityStreamRepository {
     }
     if (options.parentId) {
       query = query.eq('parent_id', options.parentId);
+    }
+    if (options.taskGroupId) {
+      query = query.eq('task_group_id', options.taskGroupId);
     }
     if (options.since) {
       query = query.gte('created_at', options.since.toISOString());
