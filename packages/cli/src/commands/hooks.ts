@@ -1962,8 +1962,16 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     ]);
     const groups = groupsResult.groups as Array<Record<string, unknown>> | undefined;
     const allActiveTasks = standaloneResult.tasks as Array<Record<string, unknown>> | undefined;
-    // Standalone = assigned to this agent but not in any group
-    const standalone = allActiveTasks?.filter((t) => !t.taskGroupId && t.createdBy === agentId);
+    // Standalone = assigned to this agent but not in any group.
+    // Check metadata.assignment.agentId first (set by strategy service),
+    // fall back to createdBy for tasks predating assignment metadata.
+    const standalone = allActiveTasks?.filter((t) => {
+      if (t.taskGroupId) return false;
+      const meta = t.metadata as Record<string, unknown> | undefined;
+      const assignment = meta?.assignment as Record<string, unknown> | undefined;
+      if (assignment?.agentId) return assignment.agentId === agentId;
+      return t.createdBy === agentId;
+    });
     tasksBlock = buildTasksBlock(groups, standalone);
   } catch {
     // Non-fatal: tasks are a nice-to-have at session start
