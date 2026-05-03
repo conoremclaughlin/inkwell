@@ -285,7 +285,7 @@ function TaskProgressList({ tasks, currentIndex }: { tasks: Task[]; currentIndex
             <div
               key={task.id}
               className={clsx(
-                'flex items-start gap-2.5 px-3 py-2 rounded-lg transition-colors',
+                'flex items-center gap-2.5 px-3 py-2 rounded-lg transition-colors',
                 isCurrent && 'bg-emerald-50 border border-emerald-200',
                 isBlocked && 'bg-red-50/50',
                 !isCurrent && !isBlocked && 'hover:bg-gray-50'
@@ -293,7 +293,7 @@ function TaskProgressList({ tasks, currentIndex }: { tasks: Task[]; currentIndex
             >
               <Icon
                 className={clsx(
-                  'h-4 w-4 mt-0.5 shrink-0',
+                  'h-4 w-4 shrink-0',
                   isDone && 'text-gray-300',
                   isCurrent && 'text-emerald-600',
                   isBlocked && 'text-red-500',
