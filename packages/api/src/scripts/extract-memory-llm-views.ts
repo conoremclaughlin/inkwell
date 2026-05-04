@@ -51,6 +51,32 @@ function buildExtractionEmbeddingTexts(
   };
 }
 
+function hasAllEnabledKinds(
+  existing: MemoryExtractions | null,
+  enabledKinds: ExtractionKind[]
+): boolean {
+  if (!existing) return false;
+  return enabledKinds.every((kind) => Boolean(existing[kind]));
+}
+
+function mergeMemoryExtractions(
+  existing: MemoryExtractions | null,
+  next: MemoryExtractions
+): MemoryExtractions {
+  return normalizeMemoryExtractions({
+    ...(existing || {}),
+    ...next,
+    entity: next.entity ?? existing?.entity,
+    durable_fact: next.durable_fact ?? existing?.durable_fact,
+    summary: next.summary ?? existing?.summary,
+    current_state: next.current_state ?? existing?.current_state,
+    version: next.version,
+    provider: next.provider,
+    model: next.model,
+    extractedAt: next.extractedAt,
+  }) as MemoryExtractions;
+}
+
 function getEnabledKinds(): ExtractionKind[] {
   const enabledKinds: ExtractionKind[] = [];
   if (env.MEMORY_LLM_ENTITY_ENABLED) enabledKinds.push('entity');
@@ -306,7 +332,8 @@ async function main() {
 
   for (const [index, row] of rows.entries()) {
     const metadata = (row.metadata as Record<string, unknown> | null) || {};
-    if (!force && metadata.llm_extractions) {
+    const existingExtractions = normalizeMemoryExtractions(metadata.llm_extractions);
+    if (!force && hasAllEnabledKinds(existingExtractions, extractor.getEnabledKinds())) {
       skipped += 1;
       console.log(
         `[memory-llm-extract] progress processed=${index + 1}/${rows.length} extracted=${extracted} skipped=${skipped} backend=${backend} memory=${row.id} status=skip-existing`
@@ -331,13 +358,15 @@ async function main() {
       continue;
     }
 
+    const mergedExtractions = mergeMemoryExtractions(existingExtractions, llmExtractions);
+
     if (!dryRun) {
       const { error: updateError } = await supabase
         .from('memories')
         .update({
           metadata: {
             ...metadata,
-            llm_extractions: llmExtractions,
+            llm_extractions: mergedExtractions,
           } as Database['public']['Tables']['memories']['Update']['metadata'],
         })
         .eq('id', row.id)
@@ -361,8 +390,8 @@ async function main() {
         summary: row.summary,
         contentLength: row.content.length,
         extractedKinds: extractor.getEnabledKinds(),
-        llmExtractions,
-        embeddingTexts: buildExtractionEmbeddingTexts(llmExtractions),
+        llmExtractions: mergedExtractions,
+        embeddingTexts: buildExtractionEmbeddingTexts(mergedExtractions),
         dryRun,
         extractedAt: new Date().toISOString(),
       })}\n`
