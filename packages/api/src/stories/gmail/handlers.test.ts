@@ -12,6 +12,7 @@ import {
   ALLOWED_ADD_LABELS,
   ALLOWED_REMOVE_LABELS,
   BLOCKED_ADD_LABELS,
+  downloadAttachmentSchema,
 } from './handlers';
 
 describe('Gmail Label Whitelist', () => {
@@ -237,6 +238,51 @@ describe('validateLabelOperations', () => {
       const error = validateLabelOperations([], []);
       expect(error).toBeNull();
     });
+  });
+});
+
+describe('downloadAttachmentSchema', () => {
+  it('should accept valid params', () => {
+    const result = downloadAttachmentSchema.safeParse({
+      messageId: '19abc123',
+      attachmentId: 'ANGjdJ-abc123',
+      filename: 'document.pdf',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('should reject missing messageId', () => {
+    const result = downloadAttachmentSchema.safeParse({
+      attachmentId: 'ANGjdJ-abc123',
+      filename: 'document.pdf',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject missing attachmentId', () => {
+    const result = downloadAttachmentSchema.safeParse({
+      messageId: '19abc123',
+      filename: 'document.pdf',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('should reject missing filename', () => {
+    const result = downloadAttachmentSchema.safeParse({
+      messageId: '19abc123',
+      attachmentId: 'ANGjdJ-abc123',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('should accept optional user identifiers', () => {
+    const result = downloadAttachmentSchema.safeParse({
+      email: 'test@example.com',
+      messageId: '19abc123',
+      attachmentId: 'ANGjdJ-abc123',
+      filename: 'photo.jpg',
+    });
+    expect(result.success).toBe(true);
   });
 });
 
