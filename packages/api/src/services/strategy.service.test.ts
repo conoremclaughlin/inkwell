@@ -190,8 +190,11 @@ describe('StrategyService', () => {
       expect(result.prompt).toContain('complete_task');
       expect(result.prompt).toContain('task_request');
 
-      // Verify task was started
-      expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-1');
+      // Verify task was started with assignment metadata
+      expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-1', {
+        agentId: 'wren',
+        studioId: undefined,
+      });
 
       // Verify strategy event was logged
       expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
@@ -695,8 +698,11 @@ describe('StrategyService', () => {
         })
       );
 
-      // Verify task was started
-      expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-2');
+      // Verify task was started with assignment metadata
+      expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-2', {
+        agentId: 'wren',
+        studioId: undefined,
+      });
 
       // Verify task_advanced event was logged
       expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
@@ -1083,8 +1089,11 @@ describe('StrategyService', () => {
         })
       );
 
-      // Verify task was started
-      expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-3');
+      // Verify task was started with assignment metadata
+      expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-3', {
+        agentId: 'wren',
+        studioId: undefined,
+      });
 
       // Verify strategy_resumed event was logged (no pauseReason in metadata = manual resume)
       expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(

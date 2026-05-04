@@ -58,6 +58,14 @@ export interface UpdateProjectTaskInput {
   outcome?: string;
   outcome_reason?: string;
   completed_at?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface TaskAssignment {
+  sessionId?: string;
+  studioId?: string;
+  agentId?: string;
+  assignedAt?: string;
 }
 
 export class ProjectTasksRepository {
@@ -225,10 +233,22 @@ export class ProjectTasksRepository {
   }
 
   /**
-   * Mark task as in progress
+   * Mark task as in progress, optionally recording who is working on it
    */
-  async startTask(id: string): Promise<ProjectTask> {
-    return this.update(id, { status: 'in_progress' });
+  async startTask(id: string, assignment?: TaskAssignment): Promise<ProjectTask> {
+    const update: UpdateProjectTaskInput = { status: 'in_progress' };
+    if (assignment) {
+      const existing = await this.findById(id);
+      const existingMeta = (existing?.metadata as Record<string, unknown>) || {};
+      update.metadata = {
+        ...existingMeta,
+        assignment: {
+          ...assignment,
+          assignedAt: assignment.assignedAt || new Date().toISOString(),
+        },
+      };
+    }
+    return this.update(id, update);
   }
 
   /**

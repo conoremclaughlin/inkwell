@@ -206,7 +206,7 @@ program
     'Include all backend-local session sources in picker/json (debug mode)'
   )
   .option('--session-choice <choice>', 'Force session selection (new | pcp:<id> | local:<id>)')
-  .option('--sb-debug', 'Enable debug logging to ~/.inkwell/ink-debug.log')
+  .option('--sb-debug', 'Enable debug logging to ~/.ink/logs/sb-debug.log')
   .option('--sb-verbose', 'Verbose SB output')
   .option('--dangerous', 'Skip all permission prompts (maps to backend-native auto-approve)')
   .argument('[prompt...]', 'Prompt to send (omit for interactive)')

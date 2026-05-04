@@ -957,6 +957,68 @@ function buildSkillsBlock(skills: Array<Record<string, unknown>> | undefined): s
   return lines.join('\n');
 }
 
+interface TaskGroupSummary {
+  id: string;
+  title: string;
+  status: string;
+  strategy?: string;
+  groupNumber?: number;
+  taskCounts?: {
+    total: number;
+    pending: number;
+    in_progress: number;
+    completed: number;
+    blocked: number;
+  };
+  metadata?: Record<string, unknown>;
+}
+
+interface StandaloneTaskSummary {
+  id: string;
+  title: string;
+  status: string;
+}
+
+function buildTasksBlock(
+  groups: Array<Record<string, unknown>> | undefined,
+  standalone: Array<Record<string, unknown>> | undefined
+): string {
+  const hasGroups = groups && groups.length > 0;
+  const hasStandalone = standalone && standalone.length > 0;
+  if (!hasGroups && !hasStandalone) return '';
+
+  const lines: string[] = ['### Active Work'];
+
+  if (hasGroups) {
+    for (const raw of groups) {
+      const g = raw as unknown as TaskGroupSummary;
+      const counts = g.taskCounts;
+      const progress = counts ? `${counts.completed}/${counts.total} done` : '';
+      const statusTag = g.status === 'paused' ? ' (paused)' : '';
+      const label = g.groupNumber ? `Mission #${g.groupNumber}` : 'Mission';
+      const studioSlug = (g.metadata as Record<string, unknown>)?.studioSlug as string | undefined;
+      const studioLine = studioSlug ? ` · studio: ${studioSlug}` : '';
+
+      lines.push(`- **${label}: ${g.title}**${statusTag} — ${progress}${studioLine} · \`${g.id}\``);
+
+      if (counts && counts.in_progress > 0) {
+        lines.push(`  → ${counts.in_progress} task(s) in progress, ${counts.pending} pending`);
+      }
+    }
+  }
+
+  if (hasStandalone) {
+    lines.push('');
+    lines.push('**Standalone tasks:**');
+    for (const raw of standalone) {
+      const t = raw as unknown as StandaloneTaskSummary;
+      lines.push(`- ${t.title} [${t.status}] · \`${t.id}\``);
+    }
+  }
+
+  return lines.join('\n');
+}
+
 // ============================================================================
 // Install / Uninstall / Status
 // ============================================================================
@@ -1789,6 +1851,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   let sessionsBlock = '';
   let inboxBlock = '';
   let skillsBlock = '';
+  let tasksBlock = '';
   let roleBlock = '';
 
   // Load ROLE.md if present in this studio
@@ -1883,6 +1946,37 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     // Non-fatal: skills are a nice-to-have at session start
   }
 
+  // Load active task groups owned by this agent + standalone tasks assigned to this agent
+  try {
+    const [groupsResult, standaloneResult] = await Promise.all([
+      callPcpTool('list_task_groups', {
+        email: config?.email,
+        statuses: ['active', 'paused'],
+        ownerAgentId: agentId,
+        includeTaskCounts: true,
+      }),
+      callPcpTool('list_tasks', {
+        email: config?.email,
+        activeOnly: true,
+      }),
+    ]);
+    const groups = groupsResult.groups as Array<Record<string, unknown>> | undefined;
+    const allActiveTasks = standaloneResult.tasks as Array<Record<string, unknown>> | undefined;
+    // Standalone = assigned to this agent but not in any group.
+    // Check metadata.assignment.agentId first (set by strategy service),
+    // fall back to createdBy for tasks predating assignment metadata.
+    const standalone = allActiveTasks?.filter((t) => {
+      if (t.taskGroupId) return false;
+      const meta = t.metadata as Record<string, unknown> | undefined;
+      const assignment = meta?.assignment as Record<string, unknown> | undefined;
+      if (assignment?.agentId) return assignment.agentId === agentId;
+      return t.createdBy === agentId;
+    });
+    tasksBlock = buildTasksBlock(groups, standalone);
+  } catch {
+    // Non-fatal: tasks are a nice-to-have at session start
+  }
+
   // Register Inkwell session with detected backend
   const detectedBackend = resolveLifecycleBackend(cwd, options?.backend);
   const sessionBackend = normalizeSessionBackend(detectedBackend.name);
@@ -1972,6 +2066,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     SESSIONS_BLOCK: sessionsBlock,
     SKILLS_BLOCK: skillsBlock,
     INBOX_BLOCK: inboxBlock,
+    TASKS_BLOCK: tasksBlock,
   });
 
   sbDebugLog('hooks', 'on_session_start_output_emitted', {

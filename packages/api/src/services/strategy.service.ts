@@ -20,7 +20,7 @@ import type {
   StrategyConfig,
   VerificationMode,
 } from '../data/repositories/task-groups.repository';
-import type { ProjectTask } from '../data/repositories/project-tasks.repository';
+import type { ProjectTask, TaskAssignment } from '../data/repositories/project-tasks.repository';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
 import { logger } from '../utils/logger';
 
@@ -160,6 +160,14 @@ const STRATEGY_PROMPTS: Record<StrategyPreset, (group: TaskGroup, task: ProjectT
 export class StrategyService {
   constructor(private dataComposer: DataComposer) {}
 
+  private getAssignment(group: TaskGroup): TaskAssignment {
+    const meta = group.metadata as Record<string, unknown> | null;
+    return {
+      studioId: (meta?.studioId as string) || undefined,
+      agentId: group.owner_agent_id || undefined,
+    };
+  }
+
   /**
    * Activate a strategy on a task group.
    * Sets the group to active, records the strategy preset, and returns the first task.
@@ -207,8 +215,8 @@ export class StrategyService {
       };
     }
 
-    // Mark the first task as in_progress
-    await this.dataComposer.repositories.tasks.startTask(nextTask.id);
+    // Mark the first task as in_progress with assignment metadata
+    await this.dataComposer.repositories.tasks.startTask(nextTask.id, this.getAssignment(updated));
 
     // Create a watchdog reminder so the heartbeat checks progress periodically
     await this.createWatchdogReminder(updated, input.userId);
@@ -387,8 +395,8 @@ export class StrategyService {
       };
     }
 
-    // Mark next task as in_progress
-    await this.dataComposer.repositories.tasks.startTask(nextTask.id);
+    // Mark next task as in_progress with assignment metadata
+    await this.dataComposer.repositories.tasks.startTask(nextTask.id, this.getAssignment(group));
 
     // Log task advancement
     await this.logStrategyEvent(
@@ -520,7 +528,7 @@ export class StrategyService {
 
     // Mark as in_progress if not already
     if (nextTask.status !== 'in_progress') {
-      await this.dataComposer.repositories.tasks.startTask(nextTask.id);
+      await this.dataComposer.repositories.tasks.startTask(nextTask.id, this.getAssignment(group));
     }
 
     const updatedGroup = { ...group, status: 'active' as const } as TaskGroup;

@@ -6418,6 +6418,134 @@ router.get('/task-groups', async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /api/admin/task-groups/:id
+ * Returns a single task group by ID with its tasks
+ */
+router.get('/task-groups/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+    const userId = authReq.pcpUserId;
+
+    // Fetch the task group with joined agent identity and project
+    const { data: group, error: groupError } = await supabase
+      .from('task_groups')
+      .select('*, agent_identities(agent_id, name), projects(name)')
+      .eq('id', id)
+      .single();
+
+    if (groupError || !group) {
+      res.status(404).json(errorJson('Task group not found', groupError));
+      return;
+    }
+
+    // Verify ownership
+    if (group.user_id !== userId) {
+      res
+        .status(404)
+        .json(errorJson('Task group not found', 'No task group with this id for this user'));
+      return;
+    }
+
+    // Fetch tasks for this group
+    const { data: tasksData, error: tasksError } = await supabase
+      .from('tasks')
+      .select('*, projects(name), task_groups(title)')
+      .eq('task_group_id', id)
+      .eq('user_id', userId)
+      .order('task_order', { ascending: true, nullsFirst: false })
+      .order('created_at', { ascending: true });
+
+    if (tasksError) {
+      res.status(500).json(errorJson('Failed to fetch tasks for group', tasksError));
+      return;
+    }
+
+    // Resolve owner agent name if owner_agent_id is set
+    let ownerAgentName: string | null = null;
+    if (group.owner_agent_id) {
+      const { data: ownerData } = await supabase
+        .from('agent_identities')
+        .select('name')
+        .eq('user_id', userId)
+        .eq('agent_id', group.owner_agent_id)
+        .single();
+
+      if (ownerData?.name) {
+        ownerAgentName = ownerData.name;
+      }
+    }
+
+    const tasks = tasksData || [];
+
+    res.json({
+      group: {
+        id: group.id,
+        title: group.title,
+        description: group.description,
+        status: group.status,
+        priority: group.priority,
+        tags: group.tags,
+        autonomous: group.autonomous,
+        maxSessions: group.max_sessions,
+        sessionsUsed: group.sessions_used,
+        contextSummary: group.context_summary,
+        nextRunAfter: group.next_run_after,
+        outputTarget: group.output_target,
+        outputStatus: group.output_status,
+        threadKey: group.thread_key,
+        projectId: group.project_id,
+        projectName: (group.projects as { name: string } | null)?.name ?? null,
+        identityId: group.identity_id,
+        agentId:
+          (group.agent_identities as { agent_id: string; name: string } | null)?.agent_id ?? null,
+        agentName:
+          (group.agent_identities as { agent_id: string; name: string } | null)?.name ?? null,
+        taskCount: tasks.length,
+        strategy: group.strategy ?? null,
+        ownerAgentId: group.owner_agent_id ?? null,
+        ownerAgentName,
+        currentTaskIndex: group.current_task_index ?? 0,
+        strategyStartedAt: group.strategy_started_at ?? null,
+        strategyPausedAt: group.strategy_paused_at ?? null,
+        planUri: group.plan_uri ?? null,
+        metadata: group.metadata,
+        createdAt: group.created_at,
+        updatedAt: group.updated_at,
+      },
+      tasks: tasks.map((t) => ({
+        id: t.id,
+        title: t.title,
+        description: t.description,
+        status: t.status,
+        priority: t.priority,
+        tags: t.tags,
+        projectId: t.project_id,
+        projectName: (t.projects as { name: string } | null)?.name ?? null,
+        taskGroupId: t.task_group_id,
+        taskGroupTitle: (t.task_groups as { title: string } | null)?.title ?? null,
+        blockedBy: t.blocked_by,
+        createdBy: t.created_by,
+        completedAt: t.completed_at,
+        dueDate: t.due_date,
+        metadata: t.metadata,
+        outcome: t.outcome ?? null,
+        outcomeReason: t.outcome_reason ?? null,
+        taskOrder: t.task_order ?? null,
+        createdAt: t.created_at,
+        updatedAt: t.updated_at,
+      })),
+    });
+  } catch (error) {
+    logger.error('Failed to fetch task group:', error);
+    res.status(500).json(errorJson('Failed to fetch task group', error));
+  }
+});
+
+/**
  * GET /api/admin/task-groups/:id/activity
  * Returns activity stream events for a task group (strategy timeline).
  */

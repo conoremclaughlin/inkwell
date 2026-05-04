@@ -1422,6 +1422,11 @@ export const listTaskGroupsSchema = z.object({
     ),
   projectId: z.string().uuid().optional().describe('Filter by project'),
   identityId: z.string().uuid().optional().describe('Filter by agent identity UUID'),
+  ownerAgentId: z
+    .string()
+    .max(64)
+    .optional()
+    .describe('Filter by owner agent ID (e.g. "wren", "lumen")'),
   autonomousOnly: z.boolean().optional().default(false).describe('Only autonomous groups'),
   includeTaskCounts: z
     .boolean()
@@ -1448,6 +1453,7 @@ export async function handleListTaskGroups(
       status: statuses,
       projectId: args.projectId,
       identityId: args.identityId,
+      ownerAgentId: args.ownerAgentId,
       autonomousOnly: args.autonomousOnly,
       limit: args.limit,
     });
@@ -1497,6 +1503,7 @@ export async function handleListTaskGroups(
         identityId: g.identity_id,
         agentId: g.identity_id ? identityMap.get(g.identity_id)?.agentId || null : null,
         agentName: g.identity_id ? identityMap.get(g.identity_id)?.name || null : null,
+        ownerAgentId: g.owner_agent_id,
         autonomous: g.autonomous,
         maxSessions: g.max_sessions,
         sessionsUsed: g.sessions_used,
