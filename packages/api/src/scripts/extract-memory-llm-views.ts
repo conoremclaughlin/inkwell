@@ -10,13 +10,10 @@ import {
   buildEntityEmbeddingTexts,
   buildSummaryEmbeddingTexts,
   MemoryLlmExtractor,
-  durableFactExtractionSchema,
-  entityExtractionSchema,
-  currentStateExtractionSchema,
-  summaryExtractionSchema,
   normalizeMemoryExtractions,
   MEMORY_EXTRACTION_VERSION,
   batchMemoryExtractionResponseSchema,
+  coerceExtractionPayload,
   type ExtractionKind,
   type BatchMemoryExtractionSource,
   type MemoryExtractionSource,
@@ -401,16 +398,7 @@ function compactLogSnippet(text: string, maxChars = 500): string {
 }
 
 function parseKindPayload(kind: ExtractionKind, raw: unknown): MemoryExtractions[ExtractionKind] {
-  switch (kind) {
-    case 'entity':
-      return entityExtractionSchema.parse(raw);
-    case 'durable_fact':
-      return durableFactExtractionSchema.parse(raw);
-    case 'summary':
-      return summaryExtractionSchema.parse(raw);
-    case 'current_state':
-      return currentStateExtractionSchema.parse(raw);
-  }
+  return coerceExtractionPayload(kind, raw);
 }
 
 function assignExtractionPayload(
