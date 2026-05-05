@@ -72,7 +72,7 @@ export class DirectApiRunner implements IRunner {
     }
 
     // Load Pi coding tools scoped to the working directory
-    const tools = await this.getTools(config.workingDirectory);
+    const tools = await this.getTools(config.workingDirectory, config.sandboxBypass);
     const toolSchemas: Anthropic.Tool[] = tools.map((t) => t.schema);
     if (this.runnerConfig.extraTools) {
       toolSchemas.push(...this.runnerConfig.extraTools);
@@ -211,18 +211,20 @@ export class DirectApiRunner implements IRunner {
     this.client = new Anthropic({ apiKey });
   }
 
-  private async getTools(cwd: string): Promise<InkToolDefinition[]> {
-    if (this.toolsCache.has(cwd)) {
-      return this.toolsCache.get(cwd)!;
+  private async getTools(cwd: string, sandboxBypass?: boolean): Promise<InkToolDefinition[]> {
+    const cacheKey = `${cwd}:${sandboxBypass ? 'bypass' : 'sandbox'}`;
+    if (this.toolsCache.has(cacheKey)) {
+      return this.toolsCache.get(cacheKey)!;
     }
 
     const piConfig: PiCodingToolsConfig = {
       cwd,
+      bashSandboxBypass: sandboxBypass,
       ...this.runnerConfig.piToolsConfig,
     };
 
     const tools = await createInkCodingTools(piConfig);
-    this.toolsCache.set(cwd, tools);
+    this.toolsCache.set(cacheKey, tools);
     return tools;
   }
 
