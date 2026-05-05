@@ -195,6 +195,11 @@ describe('memory-llm-extraction', () => {
   });
 
   it('coerces common runner schema drift instead of failing whole batches', () => {
+    const rawSummary = {
+      summary: 'A memory about meal prep.',
+      keyPoints: ['a', 'b', 'c', 'd', 'e', 'f', 'g'],
+      actionRelevance: 'Helps answer food planning questions.',
+    };
     const entity = coerceExtractionPayload('entity', {
       entities: [
         {
@@ -214,15 +219,12 @@ describe('memory-llm-extraction', () => {
         },
       ],
     });
-    const summary = coerceExtractionPayload('summary', {
-      summary: 'A memory about meal prep.',
-      keyPoints: ['a', 'b', 'c', 'd', 'e', 'f', 'g'],
-      actionRelevance: 'Helps answer food planning questions.',
-    });
+    const summary = coerceExtractionPayload('summary', rawSummary);
 
     expect(entity?.entities[0]?.entityType).toBe('other');
     expect(entity?.entities[0]?.aliases).toHaveLength(6);
     expect(summary?.keyPoints).toHaveLength(6);
+    expect(rawSummary.keyPoints).toHaveLength(7);
   });
 
   it('runs enabled extraction kinds and returns typed metadata', async () => {
@@ -260,7 +262,15 @@ describe('memory-llm-extraction', () => {
                 message: {
                   content: JSON.stringify({
                     summary: 'Benchmark review covered feature flags.',
-                    keyPoints: ['feature flags', 'typed indexes'],
+                    keyPoints: [
+                      'feature flags',
+                      'typed indexes',
+                      'entity view',
+                      'durable fact view',
+                      'summary view',
+                      'current state view',
+                      'raw overflow should persist',
+                    ],
                     actionRelevance: 'Helps route future experiments.',
                   }),
                 },
@@ -286,6 +296,8 @@ describe('memory-llm-extraction', () => {
     expect(result?.provider).toBe('openai');
     expect(result?.entity?.entities[0]?.name).toBe('Wren');
     expect(result?.summary?.summary).toContain('Benchmark review');
+    expect(result?.summary?.keyPoints).toHaveLength(6);
+    expect((result?.raw?.summary as { keyPoints?: string[] })?.keyPoints).toHaveLength(7);
     expect(result?.durable_fact).toBeUndefined();
   });
 });
