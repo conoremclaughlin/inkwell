@@ -1417,6 +1417,7 @@ export class ChannelGateway extends EventEmitter {
         { id: senderId, name: message.sender.name },
         message.body,
         {
+          media: message.media,
           chatType: message.chatType,
           mentions: message.mentions,
           platformAccountId: message.accountId,

@@ -282,21 +282,37 @@ export class TelegramListener extends EventEmitter {
     const { join } = await import('path');
     const { homedir } = await import('os');
     const fs = await import('fs/promises');
+    const { writeFileSync, mkdirSync } = await import('fs');
     const crypto = await import('crypto');
 
     const tokenHash = crypto.createHash('sha256').update(this.token).digest('hex').slice(0, 12);
     const lockDir = join(homedir(), '.ink', 'locks');
-    await fs.mkdir(lockDir, { recursive: true });
+    mkdirSync(lockDir, { recursive: true });
     this.lockFilePath = join(lockDir, `telegram-${tokenHash}.lock`);
 
+    const lockData = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() });
+
+    // Try exclusive create — fails atomically if file already exists
+    try {
+      writeFileSync(this.lockFilePath, lockData, { flag: 'wx' });
+      return; // Lock acquired
+    } catch (err: unknown) {
+      if (
+        !(err instanceof Error) ||
+        !('code' in err) ||
+        (err as NodeJS.ErrnoException).code !== 'EEXIST'
+      ) {
+        throw err;
+      }
+    }
+
+    // Lock file exists — check if the owning process is still alive
     try {
       const existing = await fs.readFile(this.lockFilePath, 'utf-8');
       const { pid } = JSON.parse(existing);
 
-      // Check if the process is still alive
       try {
         process.kill(pid, 0);
-        // Process exists — another listener is running
         const msg = `Another Telegram listener is already running (PID ${pid}). Aborting to prevent message conflicts.`;
         logger.error(msg);
         throw new Error(msg);
@@ -312,24 +328,14 @@ export class TelegramListener extends EventEmitter {
         }
       }
     } catch (err: unknown) {
-      if (
-        err instanceof Error &&
-        'code' in err &&
-        (err as NodeJS.ErrnoException).code === 'ENOENT'
-      ) {
-        // No lock file — proceed
-      } else if (err instanceof Error && err.message.includes('Another Telegram listener')) {
+      if (err instanceof Error && err.message.includes('Another Telegram listener')) {
         throw err;
-      } else {
-        // JSON parse error or other — stale file, take over
-        logger.warn('Invalid Telegram lock file — taking over');
       }
+      logger.warn('Invalid Telegram lock file — taking over');
     }
 
-    await fs.writeFile(
-      this.lockFilePath,
-      JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })
-    );
+    // Stale or invalid lock — overwrite
+    await fs.writeFile(this.lockFilePath, lockData);
   }
 
   private async releaseLock(): Promise<void> {
