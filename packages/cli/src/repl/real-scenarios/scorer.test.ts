@@ -131,6 +131,47 @@ describe('scorer: must-assert and must-not-assert', () => {
     expect(r.failureReasons.some((f) => /high-criticality/.test(f))).toBe(true);
   });
 
+  it('high-criticality miss is a hard fail even when aggregate pass rate is above threshold', () => {
+    const scenario = makeScenario({
+      expectedSurfaced: [{ kind: 'memory', ref: 'uuid-1', reason: 'x' }],
+      mustAssert: [
+        { claim: 'uses merge commits', criticality: 'high', containsPhrases: ['merge commits'] },
+        { claim: 'docs say so', criticality: 'low', containsPhrases: ['docs'] },
+      ],
+      rubric: { mustAssertPassRate: 0.5 },
+    });
+    const surfaced: SurfacedMemory[] = [
+      { id: 'uuid-1', content: 'The docs mention our process.', summary: null },
+    ];
+    const r = scoreScenario(scenario, '', surfaced);
+    // Aggregate pass rate is 0.5 (1/2) which meets the threshold...
+    expect(r.metrics.mustAssertPassRate).toBe(0.5);
+    // ...but the high-crit miss should still cause a hard fail
+    expect(r.passed).toBe(false);
+    expect(r.failureReasons.some((f) => /high-criticality/.test(f))).toBe(true);
+  });
+
+  it('claimDerivable requires ALL containsPhrases (AND, not OR)', () => {
+    const scenario = makeScenario({
+      expectedSurfaced: [{ kind: 'memory', ref: 'uuid-1', reason: 'x' }],
+      mustAssert: [
+        {
+          claim: 'full PR process',
+          criticality: 'high',
+          containsPhrases: ['never push directly', 'feature branch', 'always use a pr'],
+        },
+      ],
+      rubric: { mustAssertPassRate: 1.0 },
+    });
+    const surfaced: SurfacedMemory[] = [
+      { id: 'uuid-1', content: 'We use a feature branch for all work.', summary: null },
+    ];
+    const r = scoreScenario(scenario, '', surfaced);
+    // Only 1 of 3 phrases present — should NOT pass
+    expect(r.metrics.mustAssertPassRate).toBe(0);
+    expect(r.passed).toBe(false);
+  });
+
   it('flags must-not-assert leaks', () => {
     const scenario = makeScenario({
       mustNotAssert: [{ claim: 'squash is fine', containsPhrases: ['squash is fine'] }],

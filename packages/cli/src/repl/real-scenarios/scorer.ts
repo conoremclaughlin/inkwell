@@ -47,7 +47,7 @@ function claimDerivable(claim: AssertClaim, surfaced: SurfacedMemory[]): boolean
     claim.containsPhrases && claim.containsPhrases.length > 0
       ? claim.containsPhrases
       : [claim.claim];
-  return phrases.some((p) => blob.includes(normalize(p)));
+  return phrases.every((p) => blob.includes(normalize(p)));
 }
 
 export function scoreScenario(
@@ -116,18 +116,23 @@ export function scoreScenario(
   if (rubric.recallFloor !== undefined && recall < rubric.recallFloor) {
     failureReasons.push(`recall ${recall.toFixed(2)} < floor ${rubric.recallFloor}`);
   }
+  // High-criticality must-assert misses are always a hard fail, independent
+  // of the aggregate pass rate threshold.
+  const highFailed = (mustAssertVerdicts ?? []).filter(
+    (v) => v.criticality === 'high' && !v.passed
+  );
+  if (highFailed.length > 0) {
+    failureReasons.push(
+      `${highFailed.length} high-criticality must-assert claim(s) missed: ${highFailed.map((v) => v.claim).join('; ')}`
+    );
+  }
   if (
     rubric.mustAssertPassRate !== undefined &&
     mustAssertPassRate !== undefined &&
     mustAssertPassRate < rubric.mustAssertPassRate
   ) {
-    // Additionally, any failed HIGH-criticality claim is a hard fail
-    const highFailed = (mustAssertVerdicts ?? []).filter(
-      (v) => v.criticality === 'high' && !v.passed
-    );
     failureReasons.push(
-      `must-assert pass rate ${mustAssertPassRate.toFixed(2)} < ${rubric.mustAssertPassRate}` +
-        (highFailed.length > 0 ? ` (${highFailed.length} high-criticality claim(s) missed)` : '')
+      `must-assert pass rate ${mustAssertPassRate.toFixed(2)} < ${rubric.mustAssertPassRate}`
     );
   }
   if (
