@@ -14,6 +14,14 @@ export type { ClaudeCodeConfig } from './backends/claude-code.backend';
 export { DirectApiBackend, createDirectApiBackend } from './backends/direct-api.backend';
 export type { DirectApiConfig } from './backends/direct-api.backend';
 
+// Tools
+export {
+  createInkCodingTools,
+  getPiToolSchemas,
+  createPiToolExecutor,
+} from './tools/pi-coding-tools';
+export type { InkToolDefinition, PiCodingToolsConfig } from './tools/pi-coding-tools';
+
 // Manager
 export { BackendManager, createBackendManager } from './backend-manager';
 export type { BackendManagerConfig } from './backend-manager';
