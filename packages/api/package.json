@@ -34,6 +34,8 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.71.2",
+    "@mariozechner/pi-agent-core": "0.71.1",
+    "@mariozechner/pi-coding-agent": "0.71.1",
     "@modelcontextprotocol/sdk": "^1.26.0",
     "@slack/bolt": "^4.6.0",
     "@supabase/supabase-js": "^2.39.3",

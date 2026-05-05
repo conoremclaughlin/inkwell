@@ -33,6 +33,7 @@ import { ContextBuilder } from './context-builder.js';
 import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 import { CodexRunner } from './codex-runner.js';
 import { GeminiRunner } from './gemini-runner.js';
+import { DirectApiRunner } from './direct-api-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import { resolveIdentityId } from '../../auth/resolve-identity.js';
 import { classifyError } from '@inklabs/shared';
@@ -134,6 +135,7 @@ export class SessionService implements ISessionService {
   private claudeRunner: IRunner;
   private codexRunner: IRunner;
   private geminiRunner: IRunner;
+  private directApiRunner: IRunner;
   private activityStream: IActivityStream;
   private config: SessionServiceConfig;
   private supabase: SupabaseClient<Database> | null;
@@ -166,13 +168,15 @@ export class SessionService implements ISessionService {
     config: Partial<SessionServiceConfig> = {},
     codexRunner?: IRunner,
     supabase?: SupabaseClient<Database>,
-    geminiRunner?: IRunner
+    geminiRunner?: IRunner,
+    directApiRunner?: IRunner
   ) {
     this.repository = repository;
     this.contextBuilder = contextBuilder;
     this.claudeRunner = claudeRunner;
     this.codexRunner = codexRunner || claudeRunner;
     this.geminiRunner = geminiRunner || claudeRunner;
+    this.directApiRunner = directApiRunner || new DirectApiRunner();
     this.activityStream = activityStream;
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.supabase = supabase || null;
@@ -456,7 +460,9 @@ export class SessionService implements ISessionService {
         ? this.codexRunner
         : resolvedBackend === 'gemini'
           ? this.geminiRunner
-          : this.claudeRunner;
+          : resolvedBackend === 'direct-api'
+            ? this.directApiRunner
+            : this.claudeRunner;
 
     // 5a. Log backend spawn to activity stream (fire-and-forget)
     const triggerSource = metadata?.triggerType as string | undefined;
@@ -1232,7 +1238,9 @@ This session will continue with a fresh context after compaction. Your identity,
           ? this.codexRunner
           : runtimeBackend === 'gemini'
             ? this.geminiRunner
-            : this.claudeRunner;
+            : runtimeBackend === 'direct-api'
+              ? this.directApiRunner
+              : this.claudeRunner;
 
       // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session
       const result = await runner.run(compactionPrompt, {
@@ -1271,10 +1279,13 @@ This session will continue with a fresh context after compaction. Your identity,
   /**
    * Normalize backend value to runtime backend IDs used by sessions.
    */
-  private normalizeBackend(raw: string | null | undefined): 'claude-code' | 'codex-cli' | 'gemini' {
+  private normalizeBackend(
+    raw: string | null | undefined
+  ): 'claude-code' | 'codex-cli' | 'gemini' | 'direct-api' {
     const value = (raw || '').toLowerCase().trim();
     if (value === 'codex' || value === 'codex-cli') return 'codex-cli';
     if (value === 'gemini' || value === 'gemini-cli') return 'gemini';
+    if (value === 'direct-api' || value === 'direct' || value === 'api') return 'direct-api';
     if (value === 'claude' || value === 'claude-code' || value === '') return 'claude-code';
     logger.warn('Unknown backend configured, falling back to claude-code', { raw });
     return 'claude-code';
@@ -1286,7 +1297,7 @@ This session will continue with a fresh context after compaction. Your identity,
   private async resolveAgentBackend(
     userId: string,
     agentId: string
-  ): Promise<'claude-code' | 'codex-cli' | 'gemini'> {
+  ): Promise<'claude-code' | 'codex-cli' | 'gemini' | 'direct-api'> {
     try {
       const identityBackend = await this.contextBuilder.getAgentBackend(userId, agentId);
       return this.normalizeBackend(identityBackend);
@@ -1306,7 +1317,7 @@ This session will continue with a fresh context after compaction. Your identity,
   private resolveRuntimeBackend(
     sessionBackend: string | null | undefined,
     identityBackend: string | null | undefined
-  ): 'claude-code' | 'codex-cli' | 'gemini' {
+  ): 'claude-code' | 'codex-cli' | 'gemini' | 'direct-api' {
     if (sessionBackend) return this.normalizeBackend(sessionBackend);
     return this.normalizeBackend(identityBackend);
   }
@@ -1577,6 +1588,7 @@ export function createSessionService(
     config,
     new CodexRunner(),
     supabase,
-    new GeminiRunner()
+    new GeminiRunner(),
+    new DirectApiRunner()
   );
 }

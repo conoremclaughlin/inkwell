@@ -25,6 +25,7 @@ export { ContextBuilder, formatInjectedContext } from './context-builder.js';
 export { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 export { CodexRunner } from './codex-runner.js';
 export { GeminiRunner } from './gemini-runner.js';
+export { DirectApiRunner } from './direct-api-runner.js';
 
 // Types
 export type {
