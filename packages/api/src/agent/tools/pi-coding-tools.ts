@@ -45,10 +45,8 @@ export interface PiCodingToolsConfig {
   exclude?: Array<'read' | 'write' | 'edit' | 'bash' | 'grep' | 'find' | 'ls'>;
   /** Enforce workspace root boundary — blocks access outside cwd (default: true) */
   enforceWorkspaceRoot?: boolean;
-  /** Default bash timeout in seconds (default: 120) */
+  /** Default bash timeout in seconds when model doesn't specify one (default: 120) */
   bashTimeoutSeconds?: number;
-  /** Bypass bash security checks (for sandbox_bypass studios) */
-  bashSandboxBypass?: boolean;
 }
 
 const TOOLS_WITH_PATH_PARAM = new Set(['read', 'write', 'edit', 'grep', 'find', 'ls']);
@@ -115,30 +113,7 @@ function formatToolResult(result: unknown): string {
   return JSON.stringify(result);
 }
 
-// ─── Bash Security Layer ───
-
 const DEFAULT_BASH_TIMEOUT_SECONDS = 120;
-
-const BLOCKED_COMMAND_PATTERNS = [
-  /\brm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+\/(?!\S*\/\S)/,
-  /\bshutdown\b/,
-  /\breboot\b/,
-  /\bmkfs\b/,
-  /\bdd\s+.*of=\/dev\//,
-  /\b:(){ :\|:& };:/,
-  />\s*\/dev\/sd[a-z]/,
-  /\bcurl\b.*\|\s*(?:sudo\s+)?(?:bash|sh|zsh)\b/,
-  /\bwget\b.*\|\s*(?:sudo\s+)?(?:bash|sh|zsh)\b/,
-];
-
-function isBashCommandBlocked(command: string): string | null {
-  for (const pattern of BLOCKED_COMMAND_PATTERNS) {
-    if (pattern.test(command)) {
-      return `Blocked: command matches dangerous pattern (${pattern.source})`;
-    }
-  }
-  return null;
-}
 
 /**
  * Create Pi coding tools adapted for Ink's direct-api backend.
@@ -178,7 +153,6 @@ export async function createInkCodingTools(
 
   const enforceRoot = config.enforceWorkspaceRoot !== false;
   const bashTimeout = config.bashTimeoutSeconds ?? DEFAULT_BASH_TIMEOUT_SECONDS;
-  const bashBypass = config.bashSandboxBypass === true;
 
   return tools.map((tool) => ({
     schema: {
@@ -195,24 +169,9 @@ export async function createInkCodingTools(
         }
       }
 
-      // Bash security layer
-      if (tool.name === 'bash') {
-        const command = (params.command as string) || '';
-
-        if (!bashBypass) {
-          const blocked = isBashCommandBlocked(command);
-          if (blocked) {
-            logger.warn('Bash command blocked by security policy', {
-              command: command.slice(0, 200),
-            });
-            return `Error: ${blocked}`;
-          }
-        }
-
-        // Inject default timeout if not specified by the model
-        if (!params.timeout) {
-          params = { ...params, timeout: bashTimeout };
-        }
+      // Inject default bash timeout if the model doesn't specify one
+      if (tool.name === 'bash' && !params.timeout) {
+        params = { ...params, timeout: bashTimeout };
       }
 
       const callId = `ink-${tool.name}-${Date.now()}`;
