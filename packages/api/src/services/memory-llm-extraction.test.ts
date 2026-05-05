@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  batchMemoryExtractionResponseSchema,
+  buildBatchExtractionPrompt,
   buildCurrentStateEmbeddingTexts,
   buildCurrentStateExtractionPrompt,
   buildDurableFactEmbeddingTexts,
@@ -60,6 +62,29 @@ describe('memory-llm-extraction', () => {
     expect(prompt.kind).toBe('current_state');
     expect(prompt.userPrompt).toContain('present or near-present operational state');
     expect(prompt.userPrompt).toContain('dev server auto-restarts');
+  });
+
+  it('builds a batch extraction prompt that keeps memories independent', () => {
+    const prompt = buildBatchExtractionPrompt(
+      [
+        { memoryId: 'memory-a', source },
+        {
+          memoryId: 'memory-b',
+          source: {
+            ...source,
+            content: 'A separate memory mentioned Conor and the benchmark plan.',
+          },
+        },
+      ],
+      ['entity', 'durable_fact', 'summary']
+    );
+
+    expect(prompt.systemPrompt).toContain('Treat each memory independently');
+    expect(prompt.userPrompt).toContain('memory-a');
+    expect(prompt.userPrompt).toContain('memory-b');
+    expect(prompt.userPrompt).toContain('summarize only that single source memory');
+    expect(prompt.schemaDescription).toContain('"results"');
+    expect(prompt.schemaDescription).toContain('"durable_fact"');
   });
 
   it('formats embedding texts from structured entity extraction', () => {
@@ -146,6 +171,26 @@ describe('memory-llm-extraction', () => {
         },
       })
     );
+  });
+
+  it('parses batched extraction responses', () => {
+    const parsed = batchMemoryExtractionResponseSchema.parse({
+      results: [
+        {
+          memoryId: 'memory-a',
+          entity: { entities: [] },
+          durable_fact: { durableFacts: [] },
+          summary: {
+            summary: 'A memory about benchmark architecture.',
+            keyPoints: ['benchmark architecture'],
+            actionRelevance: 'Helps retrieve the benchmark discussion later.',
+          },
+        },
+      ],
+    });
+
+    expect(parsed.results[0]?.memoryId).toBe('memory-a');
+    expect(parsed.results[0]?.summary?.summary).toContain('benchmark architecture');
   });
 
   it('runs enabled extraction kinds and returns typed metadata', async () => {

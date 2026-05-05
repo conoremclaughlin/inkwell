@@ -75,6 +75,18 @@ export const memoryExtractionsSchema = z.object({
 
 export type MemoryExtractions = z.infer<typeof memoryExtractionsSchema>;
 
+export const batchMemoryExtractionResultSchema = z.object({
+  memoryId: z.string().min(1),
+  entity: entityExtractionSchema.optional(),
+  durable_fact: durableFactExtractionSchema.optional(),
+  summary: summaryExtractionSchema.optional(),
+  current_state: currentStateExtractionSchema.optional(),
+});
+
+export const batchMemoryExtractionResponseSchema = z.object({
+  results: z.array(batchMemoryExtractionResultSchema),
+});
+
 export interface MemoryExtractionSource {
   summary?: string | null;
   content: string;
@@ -85,6 +97,11 @@ export interface MemoryExtractionSource {
 }
 
 export type ExtractionKind = 'entity' | 'durable_fact' | 'summary' | 'current_state';
+
+export interface BatchMemoryExtractionSource {
+  memoryId: string;
+  source: MemoryExtractionSource;
+}
 
 export interface ExtractionPromptBundle {
   kind: ExtractionKind;
@@ -235,6 +252,57 @@ export function buildExtractionPrompt(
   }
 }
 
+export function buildBatchExtractionPrompt(
+  items: BatchMemoryExtractionSource[],
+  kinds: ExtractionKind[]
+): Omit<ExtractionPromptBundle, 'kind'> {
+  const uniqueKinds = [...new Set(kinds)];
+  const requestedSchemas = uniqueKinds.map((kind) => {
+    switch (kind) {
+      case 'entity':
+        return '"entity": {"entities": [{"name": string, "aliases": string[], "entityType": "person"|"org"|"project"|"product"|"place"|"policy"|"service"|"file"|"other", "description": string, "evidence": string}]}';
+      case 'durable_fact':
+        return '"durable_fact": {"durableFacts": [{"fact": string, "category": "identity"|"preference"|"decision"|"constraint"|"process"|"status"|"ownership"|"relationship"|"other", "subject"?: string, "object"?: string, "evidence": string}]}';
+      case 'summary':
+        return '"summary": {"summary": string, "keyPoints": string[], "actionRelevance": string}';
+      case 'current_state':
+        return '"current_state": {"state": string, "scope": string, "status": string, "volatility": "volatile"|"semi-stable"|"stable", "evidence": string}';
+    }
+  });
+
+  return {
+    systemPrompt:
+      'You are a deterministic batched memory extraction worker. Return strict JSON only. Do not use tools. Treat each memory independently: do not synthesize across memories, do not infer from neighboring memories, and do not use benchmark labels. Each extracted item must be grounded in the memory it belongs to.',
+    schemaDescription: `JSON schema: {"results": [{"memoryId": string, ${requestedSchemas.join(', ')}}]}`,
+    userPrompt: [
+      `Extraction types: ${uniqueKinds.join(', ')}`,
+      'Task:',
+      '- Return exactly one result object for each input memoryId.',
+      '- Do not fill quotas. Extract only salient items likely to improve future retrieval or decision support.',
+      '- For entity extraction: extract at most 8 explicit people, orgs, projects, products, places, policies, services, or files per memory; prefer 2-5 high-signal entities and use an empty entities array if none are useful.',
+      '- For durable_fact extraction: extract at most 10 long-lived facts, decisions, constraints, process rules, status conditions, ownership facts, relationship facts, or preferences per memory; prefer 2-6 high-signal facts and use an empty durableFacts array if none are useful.',
+      '- For summary extraction: summarize only that single source memory. Do not aggregate across the batch. Optimize for future retrieval and decision support.',
+      '- For current_state extraction: include only present or near-present operational state supported by that memory.',
+      '- Evidence must quote or closely paraphrase text from the same memory.',
+      '',
+      'Input memories JSON:',
+      JSON.stringify(
+        items.map(({ memoryId, source }) => ({
+          memoryId,
+          summary: source.summary || null,
+          topicKey: source.topicKey || null,
+          topics: source.topics || [],
+          memorySource: source.source || null,
+          salience: source.salience || null,
+          content: source.content,
+        })),
+        null,
+        2
+      ),
+    ].join('\n'),
+  };
+}
+
 export function buildEntityEmbeddingTexts(
   payload: z.infer<typeof entityExtractionSchema>
 ): string[] {
@@ -278,6 +346,27 @@ export function buildCurrentStateEmbeddingTexts(
 export function normalizeMemoryExtractions(value: unknown): MemoryExtractions | null {
   const parsed = memoryExtractionsSchema.safeParse(value);
   return parsed.success ? parsed.data : null;
+}
+
+function assignExtractionPayload(
+  payload: Partial<MemoryExtractions>,
+  kind: ExtractionKind,
+  result: MemoryExtractions[ExtractionKind]
+) {
+  switch (kind) {
+    case 'entity':
+      payload.entity = result as MemoryExtractions['entity'];
+      break;
+    case 'durable_fact':
+      payload.durable_fact = result as MemoryExtractions['durable_fact'];
+      break;
+    case 'summary':
+      payload.summary = result as MemoryExtractions['summary'];
+      break;
+    case 'current_state':
+      payload.current_state = result as MemoryExtractions['current_state'];
+      break;
+  }
 }
 
 function buildRuntimeConfig(): ExtractionRuntimeConfig {
@@ -361,7 +450,7 @@ export class MemoryLlmExtractor {
     };
 
     for (const [kind, result] of entries) {
-      if (result) payload[kind] = result;
+      if (result) assignExtractionPayload(payload, kind, result);
     }
 
     const normalized = normalizeMemoryExtractions(payload);

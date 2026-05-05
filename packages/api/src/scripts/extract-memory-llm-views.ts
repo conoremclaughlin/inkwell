@@ -3,6 +3,7 @@ import type { Database } from '../data/supabase/types';
 import { appendFile, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import {
+  buildBatchExtractionPrompt,
   buildExtractionPrompt,
   buildCurrentStateEmbeddingTexts,
   buildDurableFactEmbeddingTexts,
@@ -15,7 +16,9 @@ import {
   summaryExtractionSchema,
   normalizeMemoryExtractions,
   MEMORY_EXTRACTION_VERSION,
+  batchMemoryExtractionResponseSchema,
   type ExtractionKind,
+  type BatchMemoryExtractionSource,
   type MemoryExtractionSource,
   type MemoryExtractions,
 } from '../services/memory-llm-extraction';
@@ -168,43 +171,63 @@ async function loadMemoryPage(
   return (data || []) as ExtractableMemoryRow[];
 }
 
-async function processMemoryRow(params: {
+type ExtractionStatus = 'extracted' | 'skip-existing' | 'skip-no-output';
+
+interface BatchItem {
   row: ExtractableMemoryRow;
   index: number;
-  total: number;
-  backend: string;
-  dryRun: boolean;
-  force: boolean;
-  extractor: RunnerBackedMemoryExtractor | MemoryLlmExtractor;
-  outputPath: string;
-  supabase: ReturnType<typeof createSupabaseClient>;
-}): Promise<'extracted' | 'skip-existing' | 'skip-no-output'> {
-  const { row, index, total, backend, dryRun, force, extractor, outputPath, supabase } = params;
-  const metadata = (row.metadata as Record<string, unknown> | null) || {};
-  const existingExtractions = normalizeMemoryExtractions(metadata.llm_extractions);
-  if (!force && hasAllEnabledKinds(existingExtractions, extractor.getEnabledKinds())) {
-    console.log(
-      `[memory-llm-extract] progress processed=${index}/${total} backend=${backend} memory=${row.id} status=skip-existing`
-    );
-    return 'skip-existing';
-  }
+  metadata: Record<string, unknown>;
+  existingExtractions: MemoryExtractions | null;
+}
 
-  const llmExtractions = await extractor.extract({
+interface BatchResultStatus {
+  index: number;
+  rowId: string;
+  status: ExtractionStatus;
+}
+
+function rowToExtractionSource(row: ExtractableMemoryRow): MemoryExtractionSource {
+  return {
     summary: row.summary,
     content: row.content,
     topicKey: row.topic_key,
     topics: row.topics,
     source: row.source,
     salience: row.salience,
-  });
+  };
+}
 
-  if (!llmExtractions) {
-    console.log(
-      `[memory-llm-extract] progress processed=${index}/${total} backend=${backend} memory=${row.id} status=skip-no-output`
-    );
-    return 'skip-no-output';
-  }
+function estimateBatchChars(row: ExtractableMemoryRow): number {
+  return (
+    Math.min(row.content.length, env.MEMORY_LLM_MAX_INPUT_CHARS) +
+    Math.min(row.summary?.length || 0, 2000) +
+    JSON.stringify(row.topics || []).length +
+    (row.topic_key?.length || 0) +
+    (row.source?.length || 0) +
+    400
+  );
+}
 
+async function writeExtractionResult(params: {
+  row: ExtractableMemoryRow;
+  metadata: Record<string, unknown>;
+  existingExtractions: MemoryExtractions | null;
+  llmExtractions: MemoryExtractions;
+  dryRun: boolean;
+  outputPath: string;
+  supabase: ReturnType<typeof createSupabaseClient>;
+  extractedKinds: ExtractionKind[];
+}) {
+  const {
+    row,
+    metadata,
+    existingExtractions,
+    llmExtractions,
+    dryRun,
+    outputPath,
+    supabase,
+    extractedKinds,
+  } = params;
   const mergedExtractions = mergeMemoryExtractions(existingExtractions, llmExtractions);
 
   if (!dryRun) {
@@ -235,20 +258,121 @@ async function processMemoryRow(params: {
       salience: row.salience,
       summary: row.summary,
       contentLength: row.content.length,
-      extractedKinds: extractor.getEnabledKinds(),
+      extractedKinds,
       llmExtractions: mergedExtractions,
       embeddingTexts: buildExtractionEmbeddingTexts(mergedExtractions),
       dryRun,
       extractedAt: new Date().toISOString(),
     })}\n`
   );
+}
+
+async function processMemoryRow(params: {
+  row: ExtractableMemoryRow;
+  index: number;
+  total: number;
+  backend: string;
+  dryRun: boolean;
+  force: boolean;
+  extractor: RunnerBackedMemoryExtractor | MemoryLlmExtractor;
+  outputPath: string;
+  supabase: ReturnType<typeof createSupabaseClient>;
+}): Promise<'extracted' | 'skip-existing' | 'skip-no-output'> {
+  const { row, index, total, backend, dryRun, force, extractor, outputPath, supabase } = params;
+  const metadata = (row.metadata as Record<string, unknown> | null) || {};
+  const existingExtractions = normalizeMemoryExtractions(metadata.llm_extractions);
+  if (!force && hasAllEnabledKinds(existingExtractions, extractor.getEnabledKinds())) {
+    console.log(
+      `[memory-llm-extract] progress processed=${index}/${total} backend=${backend} memory=${row.id} status=skip-existing`
+    );
+    return 'skip-existing';
+  }
+
+  const llmExtractions = await extractor.extract({
+    ...rowToExtractionSource(row),
+  });
+
+  if (!llmExtractions) {
+    console.log(
+      `[memory-llm-extract] progress processed=${index}/${total} backend=${backend} memory=${row.id} status=skip-no-output`
+    );
+    return 'skip-no-output';
+  }
+
+  await writeExtractionResult({
+    row,
+    metadata,
+    existingExtractions,
+    llmExtractions,
+    dryRun,
+    outputPath,
+    supabase,
+    extractedKinds: extractor.getEnabledKinds(),
+  });
   console.log(
     `[memory-llm-extract] progress processed=${index}/${total} backend=${backend} memory=${row.id} status=${dryRun ? 'dry-run-extract' : 'extracted'} kinds=${extractor.getEnabledKinds().join(',')}`
   );
   return 'extracted';
 }
 
-function getEnabledKinds(): ExtractionKind[] {
+async function processMemoryBatch(params: {
+  items: BatchItem[];
+  total: number;
+  backend: string;
+  dryRun: boolean;
+  extractor: RunnerBackedMemoryExtractor;
+  outputPath: string;
+  supabase: ReturnType<typeof createSupabaseClient>;
+}): Promise<BatchResultStatus[]> {
+  const { items, total, backend, dryRun, extractor, outputPath, supabase } = params;
+  if (items.length === 0) return [];
+  const batchChars = items.reduce((sum, item) => sum + estimateBatchChars(item.row), 0);
+  console.log(
+    `[memory-llm-extract] batch start size=${items.length} indexRange=${items[0]?.index}-${items[items.length - 1]?.index} approxChars=${batchChars} backend=${backend} kinds=${extractor.getEnabledKinds().join(',')}`
+  );
+
+  const extractionByMemoryId = await extractor.extractBatch(
+    items.map((item) => ({
+      memoryId: item.row.id,
+      source: rowToExtractionSource(item.row),
+    }))
+  );
+  const statuses: BatchResultStatus[] = [];
+
+  for (const item of items) {
+    const llmExtractions = extractionByMemoryId.get(item.row.id);
+    if (!llmExtractions) {
+      console.log(
+        `[memory-llm-extract] progress processed=${item.index}/${total} backend=${backend} memory=${item.row.id} status=skip-no-output batch=true`
+      );
+      statuses.push({ index: item.index, rowId: item.row.id, status: 'skip-no-output' });
+      continue;
+    }
+
+    await writeExtractionResult({
+      row: item.row,
+      metadata: item.metadata,
+      existingExtractions: item.existingExtractions,
+      llmExtractions,
+      dryRun,
+      outputPath,
+      supabase,
+      extractedKinds: extractor.getEnabledKinds(),
+    });
+    console.log(
+      `[memory-llm-extract] progress processed=${item.index}/${total} backend=${backend} memory=${item.row.id} status=${dryRun ? 'dry-run-extract' : 'extracted'} kinds=${extractor.getEnabledKinds().join(',')} batch=true`
+    );
+    statuses.push({ index: item.index, rowId: item.row.id, status: 'extracted' });
+  }
+
+  console.log(
+    `[memory-llm-extract] batch complete size=${items.length} extracted=${statuses.filter((status) => status.status === 'extracted').length} skipped=${statuses.filter((status) => status.status !== 'extracted').length} backend=${backend}`
+  );
+  return statuses;
+}
+
+function getEnabledKinds(options: { batchAllKinds?: boolean } = {}): ExtractionKind[] {
+  if (options.batchAllKinds) return ['entity', 'durable_fact', 'summary'];
   const enabledKinds: ExtractionKind[] = [];
   if (env.MEMORY_LLM_ENTITY_ENABLED) enabledKinds.push('entity');
   if (env.MEMORY_LLM_DURABLE_FACT_ENABLED) enabledKinds.push('durable_fact');
@@ -289,6 +413,27 @@ function parseKindPayload(kind: ExtractionKind, raw: unknown): MemoryExtractions
   }
 }
 
+function assignExtractionPayload(
+  payload: Partial<MemoryExtractions>,
+  kind: ExtractionKind,
+  result: MemoryExtractions[ExtractionKind]
+) {
+  switch (kind) {
+    case 'entity':
+      payload.entity = result as MemoryExtractions['entity'];
+      break;
+    case 'durable_fact':
+      payload.durable_fact = result as MemoryExtractions['durable_fact'];
+      break;
+    case 'summary':
+      payload.summary = result as MemoryExtractions['summary'];
+      break;
+    case 'current_state':
+      payload.current_state = result as MemoryExtractions['current_state'];
+      break;
+  }
+}
+
 function clampText(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
   return `${text.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
@@ -305,13 +450,14 @@ function sanitizeSourceForRunner(source: MemoryExtractionSource): MemoryExtracti
 }
 
 class RunnerBackedMemoryExtractor {
-  private readonly enabledKinds = getEnabledKinds();
+  private readonly enabledKinds: ExtractionKind[];
   private readonly runner: IRunner;
   private readonly backend: 'claude' | 'codex';
   private readonly config: ClaudeRunnerConfig;
 
-  constructor(backend: 'claude' | 'codex') {
+  constructor(backend: 'claude' | 'codex', enabledKinds: ExtractionKind[] = getEnabledKinds()) {
     this.backend = backend;
+    this.enabledKinds = enabledKinds;
     this.runner = backend === 'claude' ? new ClaudeRunner() : new CodexRunner();
     this.config = {
       workingDirectory: process.env.MEMORY_LLM_EXTRACT_WORKING_DIRECTORY || process.cwd(),
@@ -367,6 +513,49 @@ class RunnerBackedMemoryExtractor {
       )
       ? normalized
       : null;
+  }
+
+  async extractBatch(
+    items: BatchMemoryExtractionSource[]
+  ): Promise<Map<string, MemoryExtractions>> {
+    if (!this.isEnabled() || items.length === 0) return new Map();
+    if (items.length === 1) {
+      const extraction = await this.extract(items[0].source);
+      return extraction ? new Map([[items[0].memoryId, extraction]]) : new Map();
+    }
+
+    const sanitizedItems = items.map((item) => ({
+      memoryId: item.memoryId,
+      source: sanitizeSourceForRunner(item.source),
+    }));
+    const parsed = await this.extractBatchOnce(sanitizedItems);
+    if (!parsed) {
+      const midpoint = Math.ceil(items.length / 2);
+      console.warn(
+        `[memory-llm-extract] runner backend=${this.backend} batch parse failed; splitting size=${items.length} into ${midpoint}+${items.length - midpoint}`
+      );
+      const [left, right] = await Promise.all([
+        this.extractBatch(items.slice(0, midpoint)),
+        this.extractBatch(items.slice(midpoint)),
+      ]);
+      return new Map([...left, ...right]);
+    }
+
+    const output = new Map(parsed.extractions);
+    const retryIds = new Set([...parsed.invalidMemoryIds, ...parsed.missingMemoryIds]);
+    if (retryIds.size > 0) {
+      console.warn(
+        `[memory-llm-extract] runner backend=${this.backend} batch partial failure; retrying individually count=${retryIds.size}`
+      );
+    }
+
+    for (const item of items) {
+      if (!retryIds.has(item.memoryId)) continue;
+      const extraction = await this.extract(item.source);
+      if (extraction) output.set(item.memoryId, extraction);
+    }
+
+    return output;
   }
 
   private async extractKind(
@@ -425,6 +614,125 @@ class RunnerBackedMemoryExtractor {
       return null;
     }
   }
+
+  private async extractBatchOnce(items: BatchMemoryExtractionSource[]): Promise<{
+    extractions: Map<string, MemoryExtractions>;
+    invalidMemoryIds: Set<string>;
+    missingMemoryIds: Set<string>;
+  } | null> {
+    const prompt = buildBatchExtractionPrompt(items, this.enabledKinds);
+    const message = [
+      prompt.systemPrompt,
+      prompt.schemaDescription,
+      '',
+      'Return only the JSON object. Do not wrap it in Markdown. Do not call tools.',
+      '',
+      prompt.userPrompt,
+    ].join('\n');
+    const result = await this.runner.run(message, { config: this.config });
+    if (!result.success) {
+      const retryAtMatch = result.error?.match(/try again at ([^.]+)\./i);
+      console.warn(
+        `[memory-llm-extract] runner backend=${this.backend} batch failed: ${result.error || 'unknown error'}`
+      );
+      if (
+        result.error?.includes("You've hit your usage limit") ||
+        result.error?.toLowerCase().includes('usage limit')
+      ) {
+        console.warn(
+          `[memory-llm-extract] runner backend=${this.backend} appears rate-limited${
+            retryAtMatch?.[1] ? ` until ${retryAtMatch[1]}` : ''
+          }`
+        );
+      }
+      return null;
+    }
+
+    const content =
+      result.finalTextResponse ||
+      result.responses
+        .map((response) => response.content)
+        .filter(Boolean)
+        .join('\n');
+    if (!content.trim()) {
+      console.warn(`[memory-llm-extract] runner backend=${this.backend} batch returned no text`);
+      return null;
+    }
+
+    try {
+      const parsed = batchMemoryExtractionResponseSchema.parse(
+        JSON.parse(extractJsonObject(content))
+      );
+      const requestedMemoryIds = new Set(items.map((item) => item.memoryId));
+      const seenMemoryIds = new Set<string>();
+      const invalidMemoryIds = new Set<string>();
+      const extractions = new Map<string, MemoryExtractions>();
+
+      for (const resultItem of parsed.results) {
+        if (!requestedMemoryIds.has(resultItem.memoryId)) {
+          console.warn(
+            `[memory-llm-extract] runner backend=${this.backend} batch returned unknown memoryId=${resultItem.memoryId}`
+          );
+          continue;
+        }
+        seenMemoryIds.add(resultItem.memoryId);
+
+        const payload: Partial<MemoryExtractions> = {
+          version: MEMORY_EXTRACTION_VERSION,
+          provider: `runner:${this.backend}:batch`,
+          model: env.MEMORY_LLM_MODEL || this.backend,
+          extractedAt: new Date().toISOString(),
+        };
+        let invalid = false;
+        for (const kind of this.enabledKinds) {
+          const rawKindPayload = resultItem[kind];
+          if (rawKindPayload === undefined) {
+            invalid = true;
+            console.warn(
+              `[memory-llm-extract] runner backend=${this.backend} batch memory=${resultItem.memoryId} missing kind=${kind}`
+            );
+            break;
+          }
+          try {
+            assignExtractionPayload(payload, kind, parseKindPayload(kind, rawKindPayload));
+          } catch (error) {
+            invalid = true;
+            console.warn(
+              `[memory-llm-extract] runner backend=${this.backend} batch memory=${resultItem.memoryId} invalid kind=${kind}: ${
+                error instanceof Error ? error.message : String(error)
+              }`
+            );
+            break;
+          }
+        }
+
+        const normalized = normalizeMemoryExtractions(payload);
+        if (
+          invalid ||
+          !normalized ||
+          !Object.keys(normalized).some((key) =>
+            ['entity', 'durable_fact', 'summary', 'current_state'].includes(key)
+          )
+        ) {
+          invalidMemoryIds.add(resultItem.memoryId);
+          continue;
+        }
+        extractions.set(resultItem.memoryId, normalized);
+      }
+
+      const missingMemoryIds = new Set(
+        items.map((item) => item.memoryId).filter((memoryId) => !seenMemoryIds.has(memoryId))
+      );
+      return { extractions, invalidMemoryIds, missingMemoryIds };
+    } catch (error) {
+      console.warn(
+        `[memory-llm-extract] runner backend=${this.backend} batch returned invalid JSON: ${
+          error instanceof Error ? error.message : String(error)
+        }; contentSnippet=${JSON.stringify(compactLogSnippet(content))}`
+      );
+      return null;
+    }
+  }
 }
 
 async function main() {
@@ -436,6 +744,9 @@ async function main() {
   const limit = parsePositiveInt(process.env.MEMORY_LLM_EXTRACT_LIMIT, 100);
   const offset = parseNonNegativeInt(process.env.MEMORY_LLM_EXTRACT_OFFSET, 0);
   const pageSize = Math.min(parsePositiveInt(process.env.MEMORY_LLM_EXTRACT_PAGE_SIZE, 1000), 1000);
+  const batchAllKinds = parseBoolean(process.env.MEMORY_LLM_EXTRACT_BATCH_ALL_KINDS, false);
+  const batchSize = Math.min(parsePositiveInt(process.env.MEMORY_LLM_EXTRACT_BATCH_SIZE, 1), 50);
+  const batchMaxChars = parsePositiveInt(process.env.MEMORY_LLM_EXTRACT_BATCH_MAX_CHARS, 60_000);
   const maxConsecutiveFailures = parsePositiveInt(
     process.env.MEMORY_LLM_EXTRACT_MAX_CONSECUTIVE_FAILURES,
     10
@@ -457,10 +768,13 @@ async function main() {
   if (!['direct', 'claude', 'codex'].includes(backend)) {
     throw new Error('MEMORY_LLM_EXTRACT_BACKEND must be one of: direct, claude, codex');
   }
+  const enabledKinds = getEnabledKinds({ batchAllKinds });
   const extractor =
     backend === 'claude' || backend === 'codex'
-      ? new RunnerBackedMemoryExtractor(backend)
+      ? new RunnerBackedMemoryExtractor(backend, enabledKinds)
       : new MemoryLlmExtractor();
+  const batchExtractor = extractor instanceof RunnerBackedMemoryExtractor ? extractor : null;
+  const useBatchExtraction = Boolean(batchExtractor && batchSize > 1);
   if (!extractor.isEnabled()) {
     throw new Error(
       'Memory LLM extraction is disabled. Set MEMORY_LLM_EXTRACTION_ENABLED=true and at least one per-type flag.'
@@ -479,6 +793,10 @@ async function main() {
       limit,
       offset,
       pageSize,
+      batchAllKinds,
+      batchSize,
+      batchMaxChars,
+      useBatchExtraction,
       maxConsecutiveFailures,
       dryRun,
       force,
@@ -503,8 +821,30 @@ async function main() {
   const plannedTotal =
     matchingCount === null ? limit : Math.min(limit, Math.max(0, matchingCount - offset));
   console.log(
-    `[memory-llm-extract] starting total=${plannedTotal} offset=${offset} limit=${limit} pageSize=${pageSize} extracted=${extracted} skipped=${skipped} backend=${backend} kinds=${extractor.getEnabledKinds().join(',')}`
+    `[memory-llm-extract] starting total=${plannedTotal} offset=${offset} limit=${limit} pageSize=${pageSize} batchSize=${useBatchExtraction ? batchSize : 1} batchMaxChars=${useBatchExtraction ? batchMaxChars : 0} extracted=${extracted} skipped=${skipped} backend=${backend} kinds=${extractor.getEnabledKinds().join(',')}`
   );
+
+  const recordStatus = (status: ExtractionStatus, index: number) => {
+    if (status === 'extracted') {
+      extracted += 1;
+      consecutiveNoOutput = 0;
+    } else if (status === 'skip-existing') {
+      skipped += 1;
+    } else {
+      skipped += 1;
+      consecutiveNoOutput += 1;
+    }
+    console.log(
+      `[memory-llm-extract] counts processed=${index}/${plannedTotal} loaded=${loaded} extracted=${extracted} skipped=${skipped} consecutiveNoOutput=${consecutiveNoOutput} backend=${backend}`
+    );
+    if (consecutiveNoOutput >= maxConsecutiveFailures) {
+      console.warn(
+        `[memory-llm-extract] stopping early after ${consecutiveNoOutput} consecutive no-output rows; maxConsecutiveFailures=${maxConsecutiveFailures}`
+      );
+      return true;
+    }
+    return false;
+  };
 
   while (processed < limit) {
     const remaining = limit - processed;
@@ -522,37 +862,83 @@ async function main() {
       `[memory-llm-extract] page loaded=${rows.length} pageStart=${offset + processed} processed=${processed}/${plannedTotal} extracted=${extracted} skipped=${skipped}`
     );
 
-    for (const row of rows) {
-      processed += 1;
-      const result = await processMemoryRow({
-        row,
-        index: processed,
-        total: plannedTotal,
-        backend,
-        dryRun,
-        force,
-        extractor,
-        outputPath,
-        supabase,
-      });
-      if (result === 'extracted') {
-        extracted += 1;
-        consecutiveNoOutput = 0;
-      } else if (result === 'skip-existing') {
-        skipped += 1;
-      } else {
-        skipped += 1;
-        consecutiveNoOutput += 1;
+    if (useBatchExtraction) {
+      let batch: BatchItem[] = [];
+      let batchChars = 0;
+      let shouldStop = false;
+
+      const flushBatch = async () => {
+        if (batch.length === 0) return;
+        const statuses = await processMemoryBatch({
+          items: batch,
+          total: plannedTotal,
+          backend,
+          dryRun,
+          extractor: batchExtractor!,
+          outputPath,
+          supabase,
+        });
+        batch = [];
+        batchChars = 0;
+        for (const status of statuses) {
+          if (recordStatus(status.status, status.index)) {
+            shouldStop = true;
+            break;
+          }
+        }
+      };
+
+      for (const row of rows) {
+        processed += 1;
+        const metadata = (row.metadata as Record<string, unknown> | null) || {};
+        const existingExtractions = normalizeMemoryExtractions(metadata.llm_extractions);
+        if (!force && hasAllEnabledKinds(existingExtractions, extractor.getEnabledKinds())) {
+          console.log(
+            `[memory-llm-extract] progress processed=${processed}/${plannedTotal} backend=${backend} memory=${row.id} status=skip-existing`
+          );
+          shouldStop = recordStatus('skip-existing', processed);
+          if (shouldStop) break;
+          continue;
+        }
+
+        const rowChars = estimateBatchChars(row);
+        if (
+          batch.length > 0 &&
+          (batch.length >= batchSize || batchChars + rowChars > batchMaxChars)
+        ) {
+          await flushBatch();
+          if (shouldStop) break;
+        }
+        batch.push({ row, index: processed, metadata, existingExtractions });
+        batchChars += rowChars;
+        if (batch.length >= batchSize || batchChars >= batchMaxChars) {
+          await flushBatch();
+          if (shouldStop) break;
+        }
       }
-      console.log(
-        `[memory-llm-extract] counts processed=${processed}/${plannedTotal} loaded=${loaded} extracted=${extracted} skipped=${skipped} consecutiveNoOutput=${consecutiveNoOutput} backend=${backend}`
-      );
-      if (consecutiveNoOutput >= maxConsecutiveFailures) {
-        console.warn(
-          `[memory-llm-extract] stopping early after ${consecutiveNoOutput} consecutive no-output rows; maxConsecutiveFailures=${maxConsecutiveFailures}`
-        );
+      await flushBatch();
+      if (shouldStop) {
         processed = limit;
         break;
+      }
+    } else {
+      for (const row of rows) {
+        processed += 1;
+        const result = await processMemoryRow({
+          row,
+          index: processed,
+          total: plannedTotal,
+          backend,
+          dryRun,
+          force,
+          extractor,
+          outputPath,
+          supabase,
+        });
+        if (recordStatus(result, processed)) {
+          processed = limit;
+          break;
+        }
       }
     }
 
@@ -570,6 +956,9 @@ async function main() {
       skipped,
       dryRun,
       backend,
+      batchAllKinds,
+      batchSize: useBatchExtraction ? batchSize : 1,
+      batchMaxChars: useBatchExtraction ? batchMaxChars : null,
       completedAt: new Date().toISOString(),
     })}\n`
   );
