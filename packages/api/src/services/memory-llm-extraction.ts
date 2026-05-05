@@ -75,13 +75,11 @@ export const memoryExtractionsSchema = z.object({
 
 export type MemoryExtractions = z.infer<typeof memoryExtractionsSchema>;
 
-export const batchMemoryExtractionResultSchema = z.object({
-  memoryId: z.string().min(1),
-  entity: entityExtractionSchema.optional(),
-  durable_fact: durableFactExtractionSchema.optional(),
-  summary: summaryExtractionSchema.optional(),
-  current_state: currentStateExtractionSchema.optional(),
-});
+export const batchMemoryExtractionResultSchema = z
+  .object({
+    memoryId: z.string().min(1),
+  })
+  .passthrough();
 
 export const batchMemoryExtractionResponseSchema = z.object({
   results: z.array(batchMemoryExtractionResultSchema),
@@ -348,6 +346,124 @@ export function normalizeMemoryExtractions(value: unknown): MemoryExtractions | 
   return parsed.success ? parsed.data : null;
 }
 
+const ENTITY_TYPES = new Set(entityExtractionItemSchema.shape.entityType.options);
+const DURABLE_FACT_CATEGORIES = new Set(durableFactExtractionItemSchema.shape.category.options);
+const VOLATILITY_VALUES = new Set(currentStateExtractionSchema.shape.volatility.options);
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function asNonEmptyString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function asStringArray(value: unknown, maxItems: number): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => asNonEmptyString(item))
+    .filter((item): item is string => Boolean(item))
+    .slice(0, maxItems);
+}
+
+function coerceEntityExtraction(raw: unknown): z.infer<typeof entityExtractionSchema> {
+  const rawEntities = asRecord(raw).entities;
+  const entities = (Array.isArray(rawEntities) ? rawEntities : [])
+    .map((item) => {
+      const record = asRecord(item);
+      const name = asNonEmptyString(record.name);
+      const description = asNonEmptyString(record.description);
+      const evidence = asNonEmptyString(record.evidence);
+      if (!name || !description || !evidence) return null;
+      const rawType = asNonEmptyString(record.entityType);
+      return {
+        name,
+        aliases: asStringArray(record.aliases, 6),
+        entityType: rawType && ENTITY_TYPES.has(rawType as never) ? rawType : 'other',
+        description,
+        evidence,
+      };
+    })
+    .filter((item): item is z.infer<typeof entityExtractionItemSchema> => Boolean(item))
+    .slice(0, 8);
+  return entityExtractionSchema.parse({ entities });
+}
+
+function coerceDurableFactExtraction(raw: unknown): z.infer<typeof durableFactExtractionSchema> {
+  const rawFacts = asRecord(raw).durableFacts;
+  const durableFacts = (Array.isArray(rawFacts) ? rawFacts : [])
+    .map((item) => {
+      const record = asRecord(item);
+      const fact = asNonEmptyString(record.fact);
+      const evidence = asNonEmptyString(record.evidence);
+      if (!fact || !evidence) return null;
+      const rawCategory = asNonEmptyString(record.category);
+      return {
+        fact,
+        category:
+          rawCategory && DURABLE_FACT_CATEGORIES.has(rawCategory as never) ? rawCategory : 'other',
+        ...(asNonEmptyString(record.subject)
+          ? { subject: asNonEmptyString(record.subject) as string }
+          : {}),
+        ...(asNonEmptyString(record.object)
+          ? { object: asNonEmptyString(record.object) as string }
+          : {}),
+        evidence,
+      };
+    })
+    .filter((item): item is z.infer<typeof durableFactExtractionItemSchema> => Boolean(item))
+    .slice(0, 10);
+  return durableFactExtractionSchema.parse({ durableFacts });
+}
+
+function coerceSummaryExtraction(raw: unknown): z.infer<typeof summaryExtractionSchema> {
+  const record = asRecord(raw);
+  const summary = asNonEmptyString(record.summary) || 'No salient summary extracted.';
+  const actionRelevance =
+    asNonEmptyString(record.actionRelevance) || 'Useful for future retrieval and decision support.';
+  return summaryExtractionSchema.parse({
+    summary,
+    keyPoints: asStringArray(record.keyPoints, 6),
+    actionRelevance,
+  });
+}
+
+function coerceCurrentStateExtraction(raw: unknown): z.infer<typeof currentStateExtractionSchema> {
+  const record = asRecord(raw);
+  const state = asNonEmptyString(record.state) || 'No current state extracted.';
+  const scope = asNonEmptyString(record.scope) || 'unknown';
+  const status = asNonEmptyString(record.status) || 'unknown';
+  const rawVolatility = asNonEmptyString(record.volatility);
+  return currentStateExtractionSchema.parse({
+    state,
+    scope,
+    status,
+    volatility:
+      rawVolatility && VOLATILITY_VALUES.has(rawVolatility as never)
+        ? rawVolatility
+        : 'semi-stable',
+    evidence: asNonEmptyString(record.evidence) || state,
+  });
+}
+
+export function coerceExtractionPayload(
+  kind: ExtractionKind,
+  raw: unknown
+): MemoryExtractions[ExtractionKind] {
+  switch (kind) {
+    case 'entity':
+      return coerceEntityExtraction(raw);
+    case 'durable_fact':
+      return coerceDurableFactExtraction(raw);
+    case 'summary':
+      return coerceSummaryExtraction(raw);
+    case 'current_state':
+      return coerceCurrentStateExtraction(raw);
+  }
+}
+
 function assignExtractionPayload(
   payload: Partial<MemoryExtractions>,
   kind: ExtractionKind,
@@ -506,16 +622,7 @@ export class MemoryLlmExtractor {
       if (!content?.trim()) throw new Error('Memory LLM extraction returned empty content');
 
       const parsedJson = JSON.parse(extractJsonObject(content));
-      switch (kind) {
-        case 'entity':
-          return entityExtractionSchema.parse(parsedJson);
-        case 'durable_fact':
-          return durableFactExtractionSchema.parse(parsedJson);
-        case 'summary':
-          return summaryExtractionSchema.parse(parsedJson);
-        case 'current_state':
-          return currentStateExtractionSchema.parse(parsedJson);
-      }
+      return coerceExtractionPayload(kind, parsedJson);
     } catch (error) {
       logger.warn('Memory LLM extraction failed for kind', {
         kind,

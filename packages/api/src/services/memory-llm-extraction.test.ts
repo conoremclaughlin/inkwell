@@ -10,6 +10,7 @@ import {
   buildEntityExtractionPrompt,
   buildSummaryEmbeddingTexts,
   buildSummaryExtractionPrompt,
+  coerceExtractionPayload,
   currentStateExtractionSchema,
   durableFactExtractionSchema,
   entityExtractionSchema,
@@ -191,6 +192,37 @@ describe('memory-llm-extraction', () => {
 
     expect(parsed.results[0]?.memoryId).toBe('memory-a');
     expect(parsed.results[0]?.summary?.summary).toContain('benchmark architecture');
+  });
+
+  it('coerces common runner schema drift instead of failing whole batches', () => {
+    const entity = coerceExtractionPayload('entity', {
+      entities: [
+        {
+          name: 'Insurance underwriting process',
+          aliases: [
+            'underwriting',
+            'risk review',
+            'extra alias',
+            'another',
+            'fifth',
+            'sixth',
+            'seventh',
+          ],
+          entityType: 'process',
+          description: 'The insurer risk review flow.',
+          evidence: 'The insurer is completing underwriting.',
+        },
+      ],
+    });
+    const summary = coerceExtractionPayload('summary', {
+      summary: 'A memory about meal prep.',
+      keyPoints: ['a', 'b', 'c', 'd', 'e', 'f', 'g'],
+      actionRelevance: 'Helps answer food planning questions.',
+    });
+
+    expect(entity?.entities[0]?.entityType).toBe('other');
+    expect(entity?.entities[0]?.aliases).toHaveLength(6);
+    expect(summary?.keyPoints).toHaveLength(6);
   });
 
   it('runs enabled extraction kinds and returns typed metadata', async () => {
