@@ -71,6 +71,18 @@ export const memoryExtractionsSchema = z.object({
   durable_fact: durableFactExtractionSchema.optional(),
   summary: summaryExtractionSchema.optional(),
   current_state: currentStateExtractionSchema.optional(),
+  raw: z
+    .object({
+      provider: z.string().optional(),
+      model: z.string().optional(),
+      extractedAt: z.string().optional(),
+      entity: z.unknown().optional(),
+      durable_fact: z.unknown().optional(),
+      summary: z.unknown().optional(),
+      current_state: z.unknown().optional(),
+    })
+    .passthrough()
+    .optional(),
 });
 
 export type MemoryExtractions = z.infer<typeof memoryExtractionsSchema>;
@@ -485,6 +497,22 @@ function assignExtractionPayload(
   }
 }
 
+function assignRawExtractionPayload(
+  payload: Partial<MemoryExtractions>,
+  kind: ExtractionKind,
+  raw: unknown
+) {
+  payload.raw = {
+    ...(payload.raw || {}),
+    [kind]: raw,
+  };
+}
+
+interface ExtractionResult {
+  normalized: MemoryExtractions[ExtractionKind];
+  raw: unknown;
+}
+
 function buildRuntimeConfig(): ExtractionRuntimeConfig {
   const enabledKinds: ExtractionKind[] = [];
   if (env.MEMORY_LLM_ENTITY_ENABLED) enabledKinds.push('entity');
@@ -558,15 +586,23 @@ export class MemoryLlmExtractor {
       )
     );
 
+    const extractedAt = new Date().toISOString();
     const payload: Partial<MemoryExtractions> = {
       version: MEMORY_EXTRACTION_VERSION,
       provider: 'openai',
       model: this.config.model,
-      extractedAt: new Date().toISOString(),
+      extractedAt,
+      raw: {
+        provider: 'openai',
+        model: this.config.model,
+        extractedAt,
+      },
     };
 
     for (const [kind, result] of entries) {
-      if (result) assignExtractionPayload(payload, kind, result);
+      if (!result) continue;
+      assignExtractionPayload(payload, kind, result.normalized);
+      assignRawExtractionPayload(payload, kind, result.raw);
     }
 
     const normalized = normalizeMemoryExtractions(payload);
@@ -581,7 +617,7 @@ export class MemoryLlmExtractor {
   private async extractKind(
     kind: ExtractionKind,
     source: MemoryExtractionSource
-  ): Promise<MemoryExtractions[ExtractionKind] | null> {
+  ): Promise<ExtractionResult | null> {
     const prompt = buildExtractionPrompt(source, kind);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 20_000);
@@ -622,7 +658,10 @@ export class MemoryLlmExtractor {
       if (!content?.trim()) throw new Error('Memory LLM extraction returned empty content');
 
       const parsedJson = JSON.parse(extractJsonObject(content));
-      return coerceExtractionPayload(kind, parsedJson);
+      return {
+        normalized: coerceExtractionPayload(kind, parsedJson),
+        raw: parsedJson,
+      };
     } catch (error) {
       logger.warn('Memory LLM extraction failed for kind', {
         kind,

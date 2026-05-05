@@ -71,16 +71,26 @@ function buildExtractionEmbeddingTexts(
 
 function hasAllEnabledKinds(
   existing: MemoryExtractions | null,
-  enabledKinds: ExtractionKind[]
+  enabledKinds: ExtractionKind[],
+  options: { requireRaw?: boolean } = {}
 ): boolean {
   if (!existing) return false;
-  return enabledKinds.every((kind) => Boolean(existing[kind]));
+  return enabledKinds.every(
+    (kind) => Boolean(existing[kind]) && (!options.requireRaw || existing.raw?.[kind] !== undefined)
+  );
 }
 
 function mergeMemoryExtractions(
   existing: MemoryExtractions | null,
   next: MemoryExtractions
 ): MemoryExtractions {
+  const raw =
+    existing?.raw || next.raw
+      ? {
+          ...(existing?.raw || {}),
+          ...(next.raw || {}),
+        }
+      : undefined;
   return normalizeMemoryExtractions({
     ...(existing || {}),
     ...next,
@@ -92,6 +102,7 @@ function mergeMemoryExtractions(
     provider: next.provider,
     model: next.model,
     extractedAt: next.extractedAt,
+    raw,
   }) as MemoryExtractions;
 }
 
@@ -271,14 +282,19 @@ async function processMemoryRow(params: {
   backend: string;
   dryRun: boolean;
   force: boolean;
+  requireRaw: boolean;
   extractor: RunnerBackedMemoryExtractor | MemoryLlmExtractor;
   outputPath: string;
   supabase: ReturnType<typeof createSupabaseClient>;
 }): Promise<'extracted' | 'skip-existing' | 'skip-no-output'> {
-  const { row, index, total, backend, dryRun, force, extractor, outputPath, supabase } = params;
+  const { row, index, total, backend, dryRun, force, requireRaw, extractor, outputPath, supabase } =
+    params;
   const metadata = (row.metadata as Record<string, unknown> | null) || {};
   const existingExtractions = normalizeMemoryExtractions(metadata.llm_extractions);
-  if (!force && hasAllEnabledKinds(existingExtractions, extractor.getEnabledKinds())) {
+  if (
+    !force &&
+    hasAllEnabledKinds(existingExtractions, extractor.getEnabledKinds(), { requireRaw })
+  ) {
     console.log(
       `[memory-llm-extract] progress processed=${index}/${total} backend=${backend} memory=${row.id} status=skip-existing`
     );
@@ -422,6 +438,22 @@ function assignExtractionPayload(
   }
 }
 
+function assignRawExtractionPayload(
+  payload: Partial<MemoryExtractions>,
+  kind: ExtractionKind,
+  raw: unknown
+) {
+  payload.raw = {
+    ...(payload.raw || {}),
+    [kind]: raw,
+  };
+}
+
+interface RunnerExtractionResult {
+  normalized: MemoryExtractions[ExtractionKind];
+  raw: unknown;
+}
+
 function clampText(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
   return `${text.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
@@ -468,30 +500,24 @@ class RunnerBackedMemoryExtractor {
   async extract(source: MemoryExtractionSource): Promise<MemoryExtractions | null> {
     if (!this.isEnabled()) return null;
     const sanitizedSource = sanitizeSourceForRunner(source);
+    const extractedAt = new Date().toISOString();
     const payload: Partial<MemoryExtractions> = {
       version: MEMORY_EXTRACTION_VERSION,
       provider: `runner:${this.backend}`,
       model: env.MEMORY_LLM_MODEL || this.backend,
-      extractedAt: new Date().toISOString(),
+      extractedAt,
+      raw: {
+        provider: `runner:${this.backend}`,
+        model: env.MEMORY_LLM_MODEL || this.backend,
+        extractedAt,
+      },
     };
 
     for (const kind of this.enabledKinds) {
       const result = await this.extractKind(kind, sanitizedSource);
       if (!result) continue;
-      switch (kind) {
-        case 'entity':
-          payload.entity = result as MemoryExtractions['entity'];
-          break;
-        case 'durable_fact':
-          payload.durable_fact = result as MemoryExtractions['durable_fact'];
-          break;
-        case 'summary':
-          payload.summary = result as MemoryExtractions['summary'];
-          break;
-        case 'current_state':
-          payload.current_state = result as MemoryExtractions['current_state'];
-          break;
-      }
+      assignExtractionPayload(payload, kind, result.normalized);
+      assignRawExtractionPayload(payload, kind, result.raw);
     }
 
     const normalized = normalizeMemoryExtractions(payload);
@@ -549,7 +575,7 @@ class RunnerBackedMemoryExtractor {
   private async extractKind(
     kind: ExtractionKind,
     source: MemoryExtractionSource
-  ): Promise<MemoryExtractions[ExtractionKind] | null> {
+  ): Promise<RunnerExtractionResult | null> {
     const prompt = buildExtractionPrompt(source, kind);
     const message = [
       prompt.systemPrompt,
@@ -592,7 +618,11 @@ class RunnerBackedMemoryExtractor {
     }
 
     try {
-      return parseKindPayload(kind, JSON.parse(extractJsonObject(content)));
+      const parsedJson = JSON.parse(extractJsonObject(content));
+      return {
+        normalized: parseKindPayload(kind, parsedJson),
+        raw: parsedJson,
+      };
     } catch (error) {
       console.warn(
         `[memory-llm-extract] runner backend=${this.backend} kind=${kind} returned invalid JSON: ${
@@ -665,11 +695,17 @@ class RunnerBackedMemoryExtractor {
         }
         seenMemoryIds.add(resultItem.memoryId);
 
+        const extractedAt = new Date().toISOString();
         const payload: Partial<MemoryExtractions> = {
           version: MEMORY_EXTRACTION_VERSION,
           provider: `runner:${this.backend}:batch`,
           model: env.MEMORY_LLM_MODEL || this.backend,
-          extractedAt: new Date().toISOString(),
+          extractedAt,
+          raw: {
+            provider: `runner:${this.backend}:batch`,
+            model: env.MEMORY_LLM_MODEL || this.backend,
+            extractedAt,
+          },
         };
         let invalid = false;
         for (const kind of this.enabledKinds) {
@@ -683,6 +719,7 @@ class RunnerBackedMemoryExtractor {
           }
           try {
             assignExtractionPayload(payload, kind, parseKindPayload(kind, rawKindPayload));
+            assignRawExtractionPayload(payload, kind, rawKindPayload);
           } catch (error) {
             invalid = true;
             console.warn(
@@ -743,6 +780,7 @@ async function main() {
   const memoryId = process.env.MEMORY_LLM_EXTRACT_MEMORY_ID;
   const dryRun = parseBoolean(process.env.MEMORY_LLM_EXTRACT_DRY_RUN, false);
   const force = parseBoolean(process.env.MEMORY_LLM_EXTRACT_FORCE, false);
+  const requireRaw = parseBoolean(process.env.MEMORY_LLM_EXTRACT_REQUIRE_RAW, true);
   const outputPath =
     process.env.MEMORY_LLM_EXTRACT_OUTPUT_PATH ||
     resolve(
@@ -788,6 +826,7 @@ async function main() {
       maxConsecutiveFailures,
       dryRun,
       force,
+      requireRaw,
       backend,
       enabledKinds: extractor.getEnabledKinds(),
       startedAt: new Date().toISOString(),
@@ -880,7 +919,10 @@ async function main() {
         processed += 1;
         const metadata = (row.metadata as Record<string, unknown> | null) || {};
         const existingExtractions = normalizeMemoryExtractions(metadata.llm_extractions);
-        if (!force && hasAllEnabledKinds(existingExtractions, extractor.getEnabledKinds())) {
+        if (
+          !force &&
+          hasAllEnabledKinds(existingExtractions, extractor.getEnabledKinds(), { requireRaw })
+        ) {
           console.log(
             `[memory-llm-extract] progress processed=${processed}/${plannedTotal} backend=${backend} memory=${row.id} status=skip-existing`
           );
@@ -919,6 +961,7 @@ async function main() {
           backend,
           dryRun,
           force,
+          requireRaw,
           extractor,
           outputPath,
           supabase,
@@ -947,6 +990,7 @@ async function main() {
       batchAllKinds,
       batchSize: useBatchExtraction ? batchSize : 1,
       batchMaxChars: useBatchExtraction ? batchMaxChars : null,
+      requireRaw,
       completedAt: new Date().toISOString(),
     })}\n`
   );
