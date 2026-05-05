@@ -24,6 +24,18 @@ import type { ClaudeRunnerConfig, IRunner } from '../services/sessions/types';
 import { env } from '../config/env';
 
 type MemoryRow = Database['public']['Tables']['memories']['Row'];
+type ExtractableMemoryRow = Pick<
+  MemoryRow,
+  | 'id'
+  | 'user_id'
+  | 'content'
+  | 'summary'
+  | 'topic_key'
+  | 'topics'
+  | 'source'
+  | 'salience'
+  | 'metadata'
+>;
 
 function parseBoolean(raw: string | undefined, defaultValue: boolean): boolean {
   if (raw === undefined) return defaultValue;
@@ -34,6 +46,12 @@ function parsePositiveInt(raw: string | undefined, defaultValue: number): number
   if (!raw) return defaultValue;
   const parsed = Number(raw);
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : defaultValue;
+}
+
+function parseNonNegativeInt(raw: string | undefined, defaultValue: number): number {
+  if (!raw) return defaultValue;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : defaultValue;
 }
 
 function buildExtractionEmbeddingTexts(
@@ -77,6 +95,159 @@ function mergeMemoryExtractions(
   }) as MemoryExtractions;
 }
 
+function buildMemoryQuery(
+  supabase: ReturnType<typeof createSupabaseClient>,
+  params: {
+    userId: string;
+    topic?: string;
+    memoryId?: string;
+  }
+) {
+  let query = supabase
+    .from('memories')
+    .select('id,user_id,content,summary,topic_key,topics,source,salience,metadata')
+    .eq('user_id', params.userId)
+    .order('created_at', { ascending: true });
+
+  if (params.topic?.trim()) {
+    query = query.contains('topics', [params.topic.trim()]);
+  }
+
+  if (params.memoryId?.trim()) {
+    query = query.eq('id', params.memoryId.trim());
+  }
+
+  return query;
+}
+
+async function countMatchingMemories(
+  supabase: ReturnType<typeof createSupabaseClient>,
+  params: {
+    userId: string;
+    topic?: string;
+    memoryId?: string;
+  }
+): Promise<number | null> {
+  let query = supabase
+    .from('memories')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', params.userId);
+
+  if (params.topic?.trim()) {
+    query = query.contains('topics', [params.topic.trim()]);
+  }
+
+  if (params.memoryId?.trim()) {
+    query = query.eq('id', params.memoryId.trim());
+  }
+
+  const { count, error } = await query;
+  if (error) {
+    console.warn(`[memory-llm-extract] failed to count matching memories: ${error.message}`);
+    return null;
+  }
+
+  return count ?? 0;
+}
+
+async function loadMemoryPage(
+  supabase: ReturnType<typeof createSupabaseClient>,
+  params: {
+    userId: string;
+    topic?: string;
+    memoryId?: string;
+    offset: number;
+    limit: number;
+  }
+): Promise<ExtractableMemoryRow[]> {
+  const { data, error } = await buildMemoryQuery(supabase, params).range(
+    params.offset,
+    params.offset + params.limit - 1
+  );
+  if (error) throw new Error(`Failed to load memories: ${error.message}`);
+  return (data || []) as ExtractableMemoryRow[];
+}
+
+async function processMemoryRow(params: {
+  row: ExtractableMemoryRow;
+  index: number;
+  total: number;
+  backend: string;
+  dryRun: boolean;
+  force: boolean;
+  extractor: RunnerBackedMemoryExtractor | MemoryLlmExtractor;
+  outputPath: string;
+  supabase: ReturnType<typeof createSupabaseClient>;
+}): Promise<'extracted' | 'skip-existing' | 'skip-no-output'> {
+  const { row, index, total, backend, dryRun, force, extractor, outputPath, supabase } = params;
+  const metadata = (row.metadata as Record<string, unknown> | null) || {};
+  const existingExtractions = normalizeMemoryExtractions(metadata.llm_extractions);
+  if (!force && hasAllEnabledKinds(existingExtractions, extractor.getEnabledKinds())) {
+    console.log(
+      `[memory-llm-extract] progress processed=${index}/${total} backend=${backend} memory=${row.id} status=skip-existing`
+    );
+    return 'skip-existing';
+  }
+
+  const llmExtractions = await extractor.extract({
+    summary: row.summary,
+    content: row.content,
+    topicKey: row.topic_key,
+    topics: row.topics,
+    source: row.source,
+    salience: row.salience,
+  });
+
+  if (!llmExtractions) {
+    console.log(
+      `[memory-llm-extract] progress processed=${index}/${total} backend=${backend} memory=${row.id} status=skip-no-output`
+    );
+    return 'skip-no-output';
+  }
+
+  const mergedExtractions = mergeMemoryExtractions(existingExtractions, llmExtractions);
+
+  if (!dryRun) {
+    const { error: updateError } = await supabase
+      .from('memories')
+      .update({
+        metadata: {
+          ...metadata,
+          llm_extractions: mergedExtractions,
+        } as Database['public']['Tables']['memories']['Update']['metadata'],
+      })
+      .eq('id', row.id)
+      .eq('user_id', row.user_id);
+
+    if (updateError) {
+      throw new Error(`Failed to update memory ${row.id}: ${updateError.message}`);
+    }
+  }
+
+  await appendFile(
+    outputPath,
+    `${JSON.stringify({
+      type: 'extraction',
+      memoryId: row.id,
+      topicKey: row.topic_key,
+      topics: row.topics,
+      source: row.source,
+      salience: row.salience,
+      summary: row.summary,
+      contentLength: row.content.length,
+      extractedKinds: extractor.getEnabledKinds(),
+      llmExtractions: mergedExtractions,
+      embeddingTexts: buildExtractionEmbeddingTexts(mergedExtractions),
+      dryRun,
+      extractedAt: new Date().toISOString(),
+    })}\n`
+  );
+  console.log(
+    `[memory-llm-extract] progress processed=${index}/${total} backend=${backend} memory=${row.id} status=${dryRun ? 'dry-run-extract' : 'extracted'} kinds=${extractor.getEnabledKinds().join(',')}`
+  );
+  return 'extracted';
+}
+
 function getEnabledKinds(): ExtractionKind[] {
   const enabledKinds: ExtractionKind[] = [];
   if (env.MEMORY_LLM_ENTITY_ENABLED) enabledKinds.push('entity');
@@ -89,12 +260,20 @@ function getEnabledKinds(): ExtractionKind[] {
 function extractJsonObject(text: string): string {
   const trimmed = text.trim();
   if (trimmed.startsWith('{') && trimmed.endsWith('}')) return trimmed;
+  const fencedJson = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fencedJson?.[1]?.trim()) return extractJsonObject(fencedJson[1]);
   const firstBrace = trimmed.indexOf('{');
   const lastBrace = trimmed.lastIndexOf('}');
   if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
     throw new Error('runner extraction response did not contain a JSON object');
   }
   return trimmed.slice(firstBrace, lastBrace + 1);
+}
+
+function compactLogSnippet(text: string, maxChars = 500): string {
+  const compacted = text.replace(/\s+/g, ' ').trim();
+  if (compacted.length <= maxChars) return compacted;
+  return `${compacted.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
 }
 
 function parseKindPayload(kind: ExtractionKind, raw: unknown): MemoryExtractions[ExtractionKind] {
@@ -205,9 +384,20 @@ class RunnerBackedMemoryExtractor {
     ].join('\n');
     const result = await this.runner.run(message, { config: this.config });
     if (!result.success) {
+      const retryAtMatch = result.error?.match(/try again at ([^.]+)\./i);
       console.warn(
         `[memory-llm-extract] runner backend=${this.backend} kind=${kind} failed: ${result.error || 'unknown error'}`
       );
+      if (
+        result.error?.includes("You've hit your usage limit") ||
+        result.error?.toLowerCase().includes('usage limit')
+      ) {
+        console.warn(
+          `[memory-llm-extract] runner backend=${this.backend} appears rate-limited${
+            retryAtMatch?.[1] ? ` until ${retryAtMatch[1]}` : ''
+          }`
+        );
+      }
       return null;
     }
 
@@ -230,7 +420,7 @@ class RunnerBackedMemoryExtractor {
       console.warn(
         `[memory-llm-extract] runner backend=${this.backend} kind=${kind} returned invalid JSON: ${
           error instanceof Error ? error.message : String(error)
-        }`
+        }; contentSnippet=${JSON.stringify(compactLogSnippet(content))}`
       );
       return null;
     }
@@ -244,7 +434,12 @@ async function main() {
   }
 
   const limit = parsePositiveInt(process.env.MEMORY_LLM_EXTRACT_LIMIT, 100);
-  const offset = parsePositiveInt(process.env.MEMORY_LLM_EXTRACT_OFFSET, 0);
+  const offset = parseNonNegativeInt(process.env.MEMORY_LLM_EXTRACT_OFFSET, 0);
+  const pageSize = Math.min(parsePositiveInt(process.env.MEMORY_LLM_EXTRACT_PAGE_SIZE, 1000), 1000);
+  const maxConsecutiveFailures = parsePositiveInt(
+    process.env.MEMORY_LLM_EXTRACT_MAX_CONSECUTIVE_FAILURES,
+    10
+  );
   const topic = process.env.MEMORY_LLM_EXTRACT_TOPIC;
   const memoryId = process.env.MEMORY_LLM_EXTRACT_MEMORY_ID;
   const dryRun = parseBoolean(process.env.MEMORY_LLM_EXTRACT_DRY_RUN, false);
@@ -283,6 +478,8 @@ async function main() {
       topic: topic || null,
       limit,
       offset,
+      pageSize,
+      maxConsecutiveFailures,
       dryRun,
       force,
       backend,
@@ -293,119 +490,82 @@ async function main() {
 
   console.log(`[memory-llm-extract] auditOutput=${outputPath}`);
 
-  let query = supabase
-    .from('memories')
-    .select('id,user_id,content,summary,topic_key,topics,source,salience,metadata')
-    .eq('user_id', userId)
-    .order('created_at', { ascending: true })
-    .range(offset, offset + limit - 1);
-
-  if (topic?.trim()) {
-    query = query.contains('topics', [topic.trim()]);
-  }
-
-  if (memoryId?.trim()) {
-    query = query.eq('id', memoryId.trim());
-  }
-
-  const { data, error } = await query;
-  if (error) throw new Error(`Failed to load memories: ${error.message}`);
-
-  const rows = (data || []) as Pick<
-    MemoryRow,
-    | 'id'
-    | 'user_id'
-    | 'content'
-    | 'summary'
-    | 'topic_key'
-    | 'topics'
-    | 'source'
-    | 'salience'
-    | 'metadata'
-  >[];
-
   let extracted = 0;
   let skipped = 0;
+  let processed = 0;
+  let loaded = 0;
+  let consecutiveNoOutput = 0;
+  const matchingCount = await countMatchingMemories(supabase, {
+    userId,
+    topic,
+    memoryId,
+  });
+  const plannedTotal =
+    matchingCount === null ? limit : Math.min(limit, Math.max(0, matchingCount - offset));
   console.log(
-    `[memory-llm-extract] starting loaded=${rows.length} extracted=${extracted} skipped=${skipped} backend=${backend} kinds=${extractor.getEnabledKinds().join(',')}`
+    `[memory-llm-extract] starting total=${plannedTotal} offset=${offset} limit=${limit} pageSize=${pageSize} extracted=${extracted} skipped=${skipped} backend=${backend} kinds=${extractor.getEnabledKinds().join(',')}`
   );
 
-  for (const [index, row] of rows.entries()) {
-    const metadata = (row.metadata as Record<string, unknown> | null) || {};
-    const existingExtractions = normalizeMemoryExtractions(metadata.llm_extractions);
-    if (!force && hasAllEnabledKinds(existingExtractions, extractor.getEnabledKinds())) {
-      skipped += 1;
-      console.log(
-        `[memory-llm-extract] progress processed=${index + 1}/${rows.length} extracted=${extracted} skipped=${skipped} backend=${backend} memory=${row.id} status=skip-existing`
-      );
-      continue;
-    }
-
-    const llmExtractions = await extractor.extract({
-      summary: row.summary,
-      content: row.content,
-      topicKey: row.topic_key,
-      topics: row.topics,
-      source: row.source,
-      salience: row.salience,
+  while (processed < limit) {
+    const remaining = limit - processed;
+    const rows = await loadMemoryPage(supabase, {
+      userId,
+      topic,
+      memoryId,
+      offset: offset + processed,
+      limit: Math.min(pageSize, remaining),
     });
+    loaded += rows.length;
+    if (rows.length === 0) break;
 
-    if (!llmExtractions) {
-      skipped += 1;
+    console.log(
+      `[memory-llm-extract] page loaded=${rows.length} pageStart=${offset + processed} processed=${processed}/${plannedTotal} extracted=${extracted} skipped=${skipped}`
+    );
+
+    for (const row of rows) {
+      processed += 1;
+      const result = await processMemoryRow({
+        row,
+        index: processed,
+        total: plannedTotal,
+        backend,
+        dryRun,
+        force,
+        extractor,
+        outputPath,
+        supabase,
+      });
+      if (result === 'extracted') {
+        extracted += 1;
+        consecutiveNoOutput = 0;
+      } else if (result === 'skip-existing') {
+        skipped += 1;
+      } else {
+        skipped += 1;
+        consecutiveNoOutput += 1;
+      }
       console.log(
-        `[memory-llm-extract] progress processed=${index + 1}/${rows.length} extracted=${extracted} skipped=${skipped} backend=${backend} memory=${row.id} status=skip-no-output`
+        `[memory-llm-extract] counts processed=${processed}/${plannedTotal} loaded=${loaded} extracted=${extracted} skipped=${skipped} consecutiveNoOutput=${consecutiveNoOutput} backend=${backend}`
       );
-      continue;
-    }
-
-    const mergedExtractions = mergeMemoryExtractions(existingExtractions, llmExtractions);
-
-    if (!dryRun) {
-      const { error: updateError } = await supabase
-        .from('memories')
-        .update({
-          metadata: {
-            ...metadata,
-            llm_extractions: mergedExtractions,
-          } as Database['public']['Tables']['memories']['Update']['metadata'],
-        })
-        .eq('id', row.id)
-        .eq('user_id', row.user_id);
-
-      if (updateError) {
-        throw new Error(`Failed to update memory ${row.id}: ${updateError.message}`);
+      if (consecutiveNoOutput >= maxConsecutiveFailures) {
+        console.warn(
+          `[memory-llm-extract] stopping early after ${consecutiveNoOutput} consecutive no-output rows; maxConsecutiveFailures=${maxConsecutiveFailures}`
+        );
+        processed = limit;
+        break;
       }
     }
 
-    extracted += 1;
-    await appendFile(
-      outputPath,
-      `${JSON.stringify({
-        type: 'extraction',
-        memoryId: row.id,
-        topicKey: row.topic_key,
-        topics: row.topics,
-        source: row.source,
-        salience: row.salience,
-        summary: row.summary,
-        contentLength: row.content.length,
-        extractedKinds: extractor.getEnabledKinds(),
-        llmExtractions: mergedExtractions,
-        embeddingTexts: buildExtractionEmbeddingTexts(mergedExtractions),
-        dryRun,
-        extractedAt: new Date().toISOString(),
-      })}\n`
-    );
-    console.log(
-      `[memory-llm-extract] progress processed=${index + 1}/${rows.length} extracted=${extracted} skipped=${skipped} backend=${backend} memory=${row.id} status=${dryRun ? 'dry-run-extract' : 'extracted'} kinds=${extractor.getEnabledKinds().join(',')}`
-    );
+    if (rows.length < Math.min(pageSize, remaining)) break;
   }
 
   await appendFile(
     outputPath,
     `${JSON.stringify({
       type: 'summary',
-      loaded: rows.length,
+      loaded,
+      processed,
+      total: plannedTotal,
       extracted,
       skipped,
       dryRun,
@@ -415,7 +575,7 @@ async function main() {
   );
 
   console.log(
-    `[memory-llm-extract] complete loaded=${rows.length} extracted=${extracted} skipped=${skipped} dryRun=${dryRun} backend=${backend} auditOutput=${outputPath}`
+    `[memory-llm-extract] complete loaded=${loaded} processed=${processed}/${plannedTotal} extracted=${extracted} skipped=${skipped} dryRun=${dryRun} backend=${backend} auditOutput=${outputPath}`
   );
 }
 
