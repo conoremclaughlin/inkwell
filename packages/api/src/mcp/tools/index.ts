@@ -1988,12 +1988,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 
 Session resolution: sessionId (explicit) > studioId (scoped lookup) > most recent active session.
 For parallel worktrees, pass studioId to target the correct session.
+
 Phase: Communicates real-time work status to other agents.
 - Active work phases (no auto-memory): investigating, implementing, reviewing
 - Significant transitions (auto-creates memory): blocked:<reason>, waiting:<reason>, complete
 - Optional: paused
 
-Also sets: backendSessionId (for resume), status (active/paused/resumable/completed), context, workingDir.
+Context: The session context column is for **transient runtime state** — facts that are too ephemeral for a memory but too important to lose on compaction. Examples: "server running on port 4001", "vitest watching in background", "PR #341 open awaiting review". The real spine of continuity is memories ("completed X", "decided Y because Z") which flow through bootstrap. Context fills the gap for durable-right-now facts that don't warrant a memory. Use it as a scratch board for active state.
+
+Also sets: backendSessionId (for resume), status (active/paused/resumable/completed), workingDir.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
@@ -2036,7 +2039,12 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .enum(['active', 'paused', 'resumable', 'completed'])
           .optional()
           .describe('Session status'),
-        context: z.string().optional().describe('Brief context of current work state'),
+        context: z
+          .string()
+          .optional()
+          .describe(
+            'Transient runtime state — active facts too ephemeral for a memory but important to preserve across compaction. E.g. "server on :4001", "waiting on PR #341 review", "vitest running in background". Use as a scratch board; memories handle durable decisions.'
+          ),
         workingDir: z.string().optional().describe('Working directory'),
       },
     },
