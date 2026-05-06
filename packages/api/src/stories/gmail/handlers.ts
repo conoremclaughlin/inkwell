@@ -203,6 +203,14 @@ export const modifyEmailsSchema = userIdentifierBaseSchema.extend({
     .describe('Label IDs to remove (e.g., ["UNREAD", "INBOX"])'),
 });
 
+export const downloadAttachmentSchema = userIdentifierBaseSchema.extend({
+  messageId: z.string().describe('The email message ID containing the attachment'),
+  attachmentId: z
+    .string()
+    .describe('The attachment ID (from the attachments array returned by get_email)'),
+  filename: z.string().describe('Original filename of the attachment'),
+});
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -788,6 +796,79 @@ export async function handleModifyEmails(
               hint: message.includes('gmail.modify')
                 ? 'User needs to re-authorize Google with Gmail modify permissions'
                 : undefined,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+}
+
+/**
+ * Download an email attachment to disk
+ */
+export async function handleDownloadAttachment(
+  args: unknown,
+  dataComposer: DataComposer
+): Promise<ToolResult> {
+  const params = downloadAttachmentSchema.parse(args);
+  const { user } = await resolveUserOrThrow(params, dataComposer);
+
+  const gmailService = getGmailService();
+
+  try {
+    const result = await gmailService.downloadAttachment(
+      user.id,
+      params.messageId,
+      params.attachmentId,
+      params.filename
+    );
+
+    logger.info('Downloaded email attachment', {
+      userId: user.id,
+      messageId: params.messageId,
+      filename: result.filename,
+      path: result.path,
+    });
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            {
+              success: true,
+              path: result.path,
+              filename: result.filename,
+              size: result.size,
+              hint: 'Use this absolute path with send_response media or share with other agents',
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    logger.error('Failed to download attachment', {
+      userId: user.id,
+      messageId: params.messageId,
+      attachmentId: params.attachmentId,
+      error: message,
+    });
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            {
+              success: false,
+              error: message,
             },
             null,
             2

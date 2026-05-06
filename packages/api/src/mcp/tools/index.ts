@@ -213,6 +213,7 @@ import {
   handleDraftEmail,
   handleListLabels,
   handleModifyEmails,
+  handleDownloadAttachment,
   listEmailsSchema,
   getEmailSchema,
   sendEmailSchema,
@@ -220,6 +221,7 @@ import {
   draftEmailSchema,
   listLabelsSchema,
   modifyEmailsSchema,
+  downloadAttachmentSchema,
 } from '../../stories/gmail/handlers';
 
 import {
@@ -4692,6 +4694,41 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleModifyEmails(args, dataComposer);
       } catch (error) {
         logger.error('Error in modify_emails:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'download_email_attachment',
+    {
+      description: `Download an email attachment to disk (~/.ink/files/gmail/).
+
+Returns the absolute file path, which can be used with send_response media
+or shared with other agents. Attachment IDs come from the attachments array
+returned by get_email.
+
+User must have connected their Google account with Gmail permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: downloadAttachmentSchema,
+    },
+    async (args) => {
+      try {
+        return await handleDownloadAttachment(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in download_email_attachment:', error);
         return {
           content: [
             {
