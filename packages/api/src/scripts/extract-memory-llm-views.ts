@@ -2,6 +2,7 @@ import { createSupabaseClient } from '../data/supabase/client';
 import type { Database } from '../data/supabase/types';
 import { appendFile, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import {
   buildBatchExtractionPrompt,
   buildExtractionPrompt,
@@ -216,6 +217,64 @@ function estimateBatchChars(row: ExtractableMemoryRow): number {
   );
 }
 
+function isTransientPersistenceError(error: { message?: string; code?: string } | null): boolean {
+  const message = error?.message?.toLowerCase() || '';
+  const code = error?.code?.toLowerCase() || '';
+  return (
+    code === '57014' ||
+    message.includes('upstream') ||
+    message.includes('timeout') ||
+    message.includes('temporarily') ||
+    message.includes('connection') ||
+    message.includes('econnreset') ||
+    message.includes('fetch failed')
+  );
+}
+
+async function persistMemoryMetadataWithRetry(params: {
+  supabase: ReturnType<typeof createSupabaseClient>;
+  row: ExtractableMemoryRow;
+  metadata: Record<string, unknown>;
+  maxAttempts?: number;
+}) {
+  const { supabase, row, metadata, maxAttempts = 4 } = params;
+  let lastError: { message: string; code?: string } | null = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const { error } = await supabase
+      .from('memories')
+      .update({
+        metadata: metadata as Database['public']['Tables']['memories']['Update']['metadata'],
+      })
+      .eq('id', row.id)
+      .eq('user_id', row.user_id);
+
+    if (!error) {
+      if (attempt > 1) {
+        console.log(
+          `[memory-llm-extract] memory metadata update succeeded after retry memory=${row.id} attempt=${attempt}`
+        );
+      }
+      return;
+    }
+
+    lastError = { message: error.message, code: error.code };
+    if (attempt >= maxAttempts || !isTransientPersistenceError(lastError)) {
+      break;
+    }
+
+    const delayMs = 500 * 2 ** (attempt - 1);
+    console.warn(
+      `[memory-llm-extract] transient memory metadata update failed memory=${row.id} attempt=${attempt}/${maxAttempts} retryInMs=${delayMs}: ${error.message}`
+    );
+    await sleep(delayMs);
+  }
+
+  throw new Error(
+    `Failed to update memory ${row.id}: ${lastError?.message || 'unknown persistence error'}`
+  );
+}
+
 async function writeExtractionResult(params: {
   row: ExtractableMemoryRow;
   metadata: Record<string, unknown>;
@@ -239,20 +298,14 @@ async function writeExtractionResult(params: {
   const mergedExtractions = mergeMemoryExtractions(existingExtractions, llmExtractions);
 
   if (!dryRun) {
-    const { error: updateError } = await supabase
-      .from('memories')
-      .update({
-        metadata: {
-          ...metadata,
-          llm_extractions: mergedExtractions,
-        } as Database['public']['Tables']['memories']['Update']['metadata'],
-      })
-      .eq('id', row.id)
-      .eq('user_id', row.user_id);
-
-    if (updateError) {
-      throw new Error(`Failed to update memory ${row.id}: ${updateError.message}`);
-    }
+    await persistMemoryMetadataWithRetry({
+      supabase,
+      row,
+      metadata: {
+        ...metadata,
+        llm_extractions: mergedExtractions,
+      },
+    });
   }
 
   await appendFile(
