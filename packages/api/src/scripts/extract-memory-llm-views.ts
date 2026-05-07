@@ -197,13 +197,18 @@ interface BatchResultStatus {
 
 function rowToExtractionSource(row: ExtractableMemoryRow): MemoryExtractionSource {
   return {
-    summary: row.summary,
+    summary: sanitizeSyntheticBenchmarkSummary(row.summary),
     content: row.content,
     topicKey: row.topic_key,
     topics: row.topics,
     source: row.source,
     salience: row.salience,
   };
+}
+
+function sanitizeSyntheticBenchmarkSummary(summary: string | null): string | null {
+  if (!summary) return summary;
+  return /^benchmark\s+(target|distractor)\b/i.test(summary.trim()) ? null : summary;
 }
 
 function estimateBatchChars(row: ExtractableMemoryRow): number {
