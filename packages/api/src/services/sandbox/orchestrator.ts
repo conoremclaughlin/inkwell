@@ -166,39 +166,52 @@ export function buildMounts(request: SandboxSpinUpRequest): SandboxMount[] {
         readOnly: true,
       });
     }
+
+    // Claude Code also needs ~/.claude.json (config separate from ~/.claude/ dir)
+    if (backend === 'claude') {
+      const claudeJson = join(home, '.claude.json');
+      if (existsSync(claudeJson)) {
+        mounts.push({
+          source: claudeJson,
+          target: `${CONTAINER_HOME}/.claude.json`,
+          readOnly: true,
+        });
+      }
+    }
   }
 
   return mounts;
 }
 
-function patchMcpConfig(studioPath: string): string | undefined {
+/**
+ * Patch .mcp.json for Docker: rewrite loopback URLs to host.docker.internal
+ * and strip stdio/command-based servers (they can't spawn inside the container).
+ */
+export function patchMcpConfig(studioPath: string): string | undefined {
   const sourcePath = join(studioPath, '.mcp.json');
   if (!existsSync(sourcePath)) return undefined;
 
   try {
     const parsed = JSON.parse(readFileSync(sourcePath, 'utf-8')) as {
-      mcpServers?: Record<string, { type?: string; url?: string }>;
+      mcpServers?: Record<string, Record<string, unknown>>;
     };
     const servers = parsed.mcpServers;
     if (!servers) return undefined;
 
-    let modified = false;
-    for (const server of Object.values(servers)) {
+    const patched: Record<string, Record<string, unknown>> = {};
+    for (const [name, server] of Object.entries(servers)) {
+      // Only keep HTTP transport servers — stdio/command servers can't run in the container
       if (server?.type === 'http' && typeof server.url === 'string') {
-        const rewritten = rewriteLoopbackUrl(server.url);
-        if (rewritten !== server.url) {
-          server.url = rewritten;
-          modified = true;
-        }
+        patched[name] = { ...server, url: rewriteLoopbackUrl(server.url) };
       }
     }
 
-    if (!modified) return undefined;
+    if (Object.keys(patched).length === 0) return undefined;
 
     const runtimeDir = join(studioPath, '.ink', 'runtime', 'sandbox');
     mkdirSync(runtimeDir, { recursive: true });
     const targetPath = join(runtimeDir, 'mcp.docker.json');
-    writeFileSync(targetPath, JSON.stringify(parsed, null, 2) + '\n', 'utf-8');
+    writeFileSync(targetPath, JSON.stringify({ mcpServers: patched }, null, 2) + '\n', 'utf-8');
     return targetPath;
   } catch {
     return undefined;
