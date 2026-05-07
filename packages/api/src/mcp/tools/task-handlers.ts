@@ -9,6 +9,7 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import type { TaskStatus, TaskPriority } from '../../data/repositories/project-tasks.repository';
 import { StrategyService } from '../../services/strategy.service';
+import { getOrchestrator } from '../../services/sandbox/index.js';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { getRequestContext } from '../../utils/request-context';
@@ -360,7 +361,7 @@ export async function handleCompleteTask(
       try {
         const group = await dataComposer.repositories.taskGroups.findById(task.task_group_id);
         if (group && group.strategy && group.status === 'active') {
-          const strategyService = new StrategyService(dataComposer);
+          const strategyService = new StrategyService(dataComposer, getOrchestrator());
           strategyResult = await strategyService.advanceStrategy(
             task.task_group_id,
             task.id,
