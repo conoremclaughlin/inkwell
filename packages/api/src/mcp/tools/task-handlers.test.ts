@@ -19,6 +19,7 @@ import {
   handleCloseTaskGroup,
   handleAddTaskGroupComment,
   handleListTaskGroupComments,
+  updateTaskGroupSchema,
 } from './task-handlers';
 
 // =====================================================
@@ -1613,6 +1614,148 @@ describe('handleUpdateTaskGroup', () => {
     // then responsible for leaving the column alone.
     const call = (dc.repositories.taskGroups.update as any).mock.calls[0][1];
     expect(call.identity_id).toBeUndefined();
+  });
+
+  it('enables autonomous mode and sets maxSessions', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
+    dc.repositories.taskGroups.update.mockResolvedValue({
+      ...existingGroup,
+      autonomous: true,
+      max_sessions: 5,
+    });
+
+    const response = await handleUpdateTaskGroup(
+      {
+        userId: 'user-123',
+        groupId: '11111111-2222-3333-4444-555555555555',
+        autonomous: true,
+        maxSessions: 5,
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBeFalsy();
+    expect(data.success).toBe(true);
+    expect(data.group.autonomous).toBe(true);
+    expect(data.group.maxSessions).toBe(5);
+
+    expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+      '11111111-2222-3333-4444-555555555555',
+      expect.objectContaining({
+        autonomous: true,
+        max_sessions: 5,
+      })
+    );
+  });
+
+  it('clears maxSessions by passing null', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue({
+      ...existingGroup,
+      autonomous: true,
+      max_sessions: 5,
+    });
+    dc.repositories.taskGroups.update.mockResolvedValue({
+      ...existingGroup,
+      autonomous: true,
+      max_sessions: null,
+    });
+
+    const response = await handleUpdateTaskGroup(
+      {
+        userId: 'user-123',
+        groupId: '11111111-2222-3333-4444-555555555555',
+        maxSessions: null,
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(data.success).toBe(true);
+    expect(data.group.maxSessions).toBeNull();
+
+    expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+      '11111111-2222-3333-4444-555555555555',
+      expect.objectContaining({
+        max_sessions: null,
+      })
+    );
+  });
+
+  it('does not pass autonomous/max_sessions when not provided', async () => {
+    dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
+    dc.repositories.taskGroups.update.mockResolvedValue({
+      ...existingGroup,
+      title: 'Renamed',
+    });
+
+    await handleUpdateTaskGroup(
+      {
+        userId: 'user-123',
+        groupId: '11111111-2222-3333-4444-555555555555',
+        title: 'Renamed',
+      } as any,
+      dc as any
+    );
+
+    const call = (dc.repositories.taskGroups.update as any).mock.calls[0][1];
+    expect(call.autonomous).toBeUndefined();
+    expect(call.max_sessions).toBeUndefined();
+  });
+});
+
+// =====================================================
+// updateTaskGroupSchema — validation
+// =====================================================
+
+describe('updateTaskGroupSchema', () => {
+  it('accepts autonomous boolean', () => {
+    const result = updateTaskGroupSchema.safeParse({
+      groupId: '11111111-2222-3333-4444-555555555555',
+      autonomous: true,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.autonomous).toBe(true);
+  });
+
+  it('accepts maxSessions as positive integer', () => {
+    const result = updateTaskGroupSchema.safeParse({
+      groupId: '11111111-2222-3333-4444-555555555555',
+      maxSessions: 10,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.maxSessions).toBe(10);
+  });
+
+  it('accepts maxSessions as null (clearing)', () => {
+    const result = updateTaskGroupSchema.safeParse({
+      groupId: '11111111-2222-3333-4444-555555555555',
+      maxSessions: null,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.maxSessions).toBeNull();
+  });
+
+  it('rejects maxSessions as zero or negative', () => {
+    const zeroResult = updateTaskGroupSchema.safeParse({
+      groupId: '11111111-2222-3333-4444-555555555555',
+      maxSessions: 0,
+    });
+    expect(zeroResult.success).toBe(false);
+
+    const negResult = updateTaskGroupSchema.safeParse({
+      groupId: '11111111-2222-3333-4444-555555555555',
+      maxSessions: -1,
+    });
+    expect(negResult.success).toBe(false);
+  });
+
+  it('rejects maxSessions as non-integer', () => {
+    const result = updateTaskGroupSchema.safeParse({
+      groupId: '11111111-2222-3333-4444-555555555555',
+      maxSessions: 3.5,
+    });
+    expect(result.success).toBe(false);
   });
 });
 

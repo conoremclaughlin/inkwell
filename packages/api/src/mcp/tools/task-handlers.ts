@@ -1294,6 +1294,14 @@ export const updateTaskGroupSchema = z.object({
     .nullable()
     .optional()
     .describe('Agent identity UUID. Pass null to clear.'),
+  autonomous: z.boolean().optional().describe('Whether this group runs autonomously'),
+  maxSessions: z
+    .number()
+    .int()
+    .positive()
+    .nullable()
+    .optional()
+    .describe('Cap on autonomous sessions spent on this group'),
 });
 
 export async function handleUpdateTaskGroup(
@@ -1375,6 +1383,8 @@ export async function handleUpdateTaskGroup(
       thread_key: args.threadKey,
       owner_agent_id: args.ownerAgentId,
       identity_id: nextIdentityId,
+      autonomous: args.autonomous,
+      max_sessions: args.maxSessions,
     });
 
     return mcpResponse({

@@ -474,7 +474,7 @@ export const updateSessionPhaseSchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe(
-      'Work phase (agent-set). Core phases: investigating, implementing, reviewing, paused, complete. Use blocked:<reason> or waiting:<reason> for transitions that auto-create memories. Do NOT use runtime: prefix — use lifecycle instead.'
+      'Work phase (agent-set). Core phases: investigating, implementing, reviewing, paused, complete. Use waiting:<reason> when awaiting an async response within normal flow (review, merge, feedback). Use blocked:<reason> ONLY when extraordinary intervention is required outside normal process — something has gone wrong (permissions denied, infrastructure broken, unresolvable conflict). Both auto-create memories. Do NOT use runtime: prefix — use lifecycle instead.'
     ),
   note: z
     .string()
