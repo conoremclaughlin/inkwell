@@ -202,7 +202,7 @@ export class SessionRepository implements ISessionRepository {
       .eq('agent_id', agentId)
       .eq('thread_key', threadKey)
       .is('ended_at', null)
-      .neq('lifecycle', 'failed')
+      .not('lifecycle', 'in', '(completed,cancelled,failed)')
       .order('started_at', { ascending: false })
       .limit(1);
 

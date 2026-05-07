@@ -1119,6 +1119,70 @@ describe('handleUpdateSessionPhase', () => {
       expect(parsed.message).toContain('workingDir updated');
     });
 
+    it('should set endedAt when status is completed', async () => {
+      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue({
+        ...mockSession,
+        status: 'completed',
+        lifecycle: 'completed',
+        endedAt: new Date(),
+      });
+
+      await handleUpdateSessionPhase(
+        { email: 'test@test.com', phase: 'complete', status: 'completed' },
+        mockDataComposer as never
+      );
+
+      expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
+        'session-123',
+        expect.objectContaining({
+          endedAt: expect.any(Date),
+          status: 'completed',
+          lifecycle: 'completed',
+        })
+      );
+    });
+
+    it('should set endedAt when lifecycle is explicitly completed', async () => {
+      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue({
+        ...mockSession,
+        lifecycle: 'completed',
+        endedAt: new Date(),
+      });
+
+      await handleUpdateSessionPhase(
+        { email: 'test@test.com', phase: 'complete', lifecycle: 'completed' },
+        mockDataComposer as never
+      );
+
+      expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
+        'session-123',
+        expect.objectContaining({
+          endedAt: expect.any(Date),
+          lifecycle: 'completed',
+        })
+      );
+    });
+
+    it('should NOT set endedAt for non-completed status', async () => {
+      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue({
+        ...mockSession,
+        status: 'active',
+      });
+
+      await handleUpdateSessionPhase(
+        { email: 'test@test.com', phase: 'implementing', status: 'active' },
+        mockDataComposer as never
+      );
+
+      expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
+        'session-123',
+        expect.not.objectContaining({ endedAt: expect.anything() })
+      );
+    });
+
     it('should include session info in response', async () => {
       const sessionWithWorkspace = {
         ...mockSession,
