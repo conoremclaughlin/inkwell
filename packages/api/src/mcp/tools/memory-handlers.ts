@@ -1411,6 +1411,7 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
     context?: string;
     workingDir?: string;
     cliAttached?: boolean;
+    endedAt?: Date | null;
   } = {};
 
   // Map runtime: prefix phases to lifecycle (backward compat for old callers)
@@ -1441,6 +1442,9 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
   }
   if (params.status !== undefined) {
     updates.status = params.status;
+  }
+  if (params.status === 'completed' || updates.lifecycle === 'completed') {
+    updates.endedAt = new Date();
   }
   if (params.backendSessionId !== undefined) {
     updates.backendSessionId = params.backendSessionId;
