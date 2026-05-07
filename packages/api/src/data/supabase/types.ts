@@ -73,6 +73,7 @@ export type Database = {
           session_id: string | null;
           status: string | null;
           subtype: string | null;
+          task_group_id: string | null;
           type: Database['public']['Enums']['activity_type'];
           user_id: string;
         };
@@ -97,6 +98,7 @@ export type Database = {
           session_id?: string | null;
           status?: string | null;
           subtype?: string | null;
+          task_group_id?: string | null;
           type: Database['public']['Enums']['activity_type'];
           user_id: string;
         };
@@ -121,6 +123,7 @@ export type Database = {
           session_id?: string | null;
           status?: string | null;
           subtype?: string | null;
+          task_group_id?: string | null;
           type?: Database['public']['Enums']['activity_type'];
           user_id?: string;
         };
@@ -147,6 +150,12 @@ export type Database = {
             foreignKeyName: 'activity_stream_session_id_fkey';
             columns: ['session_id'];
             referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'activity_stream_task_group_id_fkey';
+            columns: ['task_group_id'];
+            referencedRelation: 'task_groups';
             referencedColumns: ['id'];
           },
           {
@@ -519,6 +528,88 @@ export type Database = {
           },
         ];
       };
+      approval_requests: {
+        Row: {
+          action: string | null;
+          args: string | null;
+          created_at: string | null;
+          expires_at: string;
+          granted_by: string | null;
+          granted_tools: string[] | null;
+          id: string;
+          metadata: Json | null;
+          reason: string | null;
+          requesting_agent_id: string;
+          resolved_at: string | null;
+          session_id: string | null;
+          status: string;
+          studio_id: string | null;
+          timeout_seconds: number;
+          tool: string;
+          updated_at: string | null;
+          user_id: string;
+        };
+        Insert: {
+          action?: string | null;
+          args?: string | null;
+          created_at?: string | null;
+          expires_at: string;
+          granted_by?: string | null;
+          granted_tools?: string[] | null;
+          id?: string;
+          metadata?: Json | null;
+          reason?: string | null;
+          requesting_agent_id: string;
+          resolved_at?: string | null;
+          session_id?: string | null;
+          status?: string;
+          studio_id?: string | null;
+          timeout_seconds?: number;
+          tool: string;
+          updated_at?: string | null;
+          user_id: string;
+        };
+        Update: {
+          action?: string | null;
+          args?: string | null;
+          created_at?: string | null;
+          expires_at?: string;
+          granted_by?: string | null;
+          granted_tools?: string[] | null;
+          id?: string;
+          metadata?: Json | null;
+          reason?: string | null;
+          requesting_agent_id?: string;
+          resolved_at?: string | null;
+          session_id?: string | null;
+          status?: string;
+          studio_id?: string | null;
+          timeout_seconds?: number;
+          tool?: string;
+          updated_at?: string | null;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'approval_requests_session_id_fkey';
+            columns: ['session_id'];
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'approval_requests_studio_id_fkey';
+            columns: ['studio_id'];
+            referencedRelation: 'studios';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'approval_requests_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       artifact_comments: {
         Row: {
           artifact_id: string;
@@ -871,6 +962,7 @@ export type Database = {
       };
       channel_routes: {
         Row: {
+          active_session_id: string | null;
           chat_id: string | null;
           created_at: string;
           id: string;
@@ -884,6 +976,7 @@ export type Database = {
           user_id: string;
         };
         Insert: {
+          active_session_id?: string | null;
           chat_id?: string | null;
           created_at?: string;
           id?: string;
@@ -897,6 +990,7 @@ export type Database = {
           user_id: string;
         };
         Update: {
+          active_session_id?: string | null;
           chat_id?: string | null;
           created_at?: string;
           id?: string;
@@ -910,6 +1004,12 @@ export type Database = {
           user_id?: string;
         };
         Relationships: [
+          {
+            foreignKeyName: 'channel_routes_active_session_id_fkey';
+            columns: ['active_session_id'];
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
           {
             foreignKeyName: 'channel_routes_identity_id_fkey';
             columns: ['identity_id'];
@@ -1332,19 +1432,28 @@ export type Database = {
         Row: {
           agent_id: string;
           joined_at: string | null;
+          session_id: string | null;
           thread_id: string;
         };
         Insert: {
           agent_id: string;
           joined_at?: string | null;
+          session_id?: string | null;
           thread_id: string;
         };
         Update: {
           agent_id?: string;
           joined_at?: string | null;
+          session_id?: string | null;
           thread_id?: string;
         };
         Relationships: [
+          {
+            foreignKeyName: 'inbox_thread_participants_session_id_fkey';
+            columns: ['session_id'];
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
           {
             foreignKeyName: 'inbox_thread_participants_thread_id_fkey';
             columns: ['thread_id'];
@@ -2218,6 +2327,67 @@ export type Database = {
           },
         ];
       };
+      recall_feedback: {
+        Row: {
+          agent_id: string | null;
+          created_at: string;
+          final_score: number | null;
+          id: string;
+          memory_id: string;
+          query: string;
+          semantic_score: number | null;
+          session_id: string | null;
+          text_score: number | null;
+          user_id: string;
+          verdict: string;
+        };
+        Insert: {
+          agent_id?: string | null;
+          created_at?: string;
+          final_score?: number | null;
+          id?: string;
+          memory_id: string;
+          query: string;
+          semantic_score?: number | null;
+          session_id?: string | null;
+          text_score?: number | null;
+          user_id: string;
+          verdict: string;
+        };
+        Update: {
+          agent_id?: string | null;
+          created_at?: string;
+          final_score?: number | null;
+          id?: string;
+          memory_id?: string;
+          query?: string;
+          semantic_score?: number | null;
+          session_id?: string | null;
+          text_score?: number | null;
+          user_id?: string;
+          verdict?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'recall_feedback_memory_id_fkey';
+            columns: ['memory_id'];
+            referencedRelation: 'memories';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'recall_feedback_session_id_fkey';
+            columns: ['session_id'];
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'recall_feedback_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       reminder_history: {
         Row: {
           delivered_at: string | null;
@@ -3022,19 +3192,84 @@ export type Database = {
           },
         ];
       };
+      task_group_comments: {
+        Row: {
+          agent_id: string | null;
+          comment_type: string;
+          content: string;
+          created_at: string;
+          created_by_identity_id: string | null;
+          deleted_at: string | null;
+          id: string;
+          metadata: Json;
+          task_group_id: string;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          agent_id?: string | null;
+          comment_type?: string;
+          content: string;
+          created_at?: string;
+          created_by_identity_id?: string | null;
+          deleted_at?: string | null;
+          id?: string;
+          metadata?: Json;
+          task_group_id: string;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          agent_id?: string | null;
+          comment_type?: string;
+          content?: string;
+          created_at?: string;
+          created_by_identity_id?: string | null;
+          deleted_at?: string | null;
+          id?: string;
+          metadata?: Json;
+          task_group_id?: string;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'task_group_comments_created_by_identity_id_fkey';
+            columns: ['created_by_identity_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_group_comments_task_group_id_fkey';
+            columns: ['task_group_id'];
+            referencedRelation: 'task_groups';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_group_comments_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       task_groups: {
         Row: {
           autonomous: boolean;
+          conclusion: string | null;
           context_summary: string | null;
           created_at: string;
           current_task_index: number;
           description: string | null;
+          group_number: number | null;
           id: string;
           identity_id: string | null;
+          instructions: string | null;
           iterations_since_approval: number;
           max_sessions: number | null;
           metadata: Json;
           next_run_after: string | null;
+          outcome: string | null;
           output_status: string | null;
           output_target: string | null;
           owner_agent_id: string | null;
@@ -3042,6 +3277,7 @@ export type Database = {
           priority: string;
           project_id: string | null;
           sessions_used: number;
+          slug: string | null;
           status: string;
           strategy: string | null;
           strategy_config: Json;
@@ -3056,16 +3292,20 @@ export type Database = {
         };
         Insert: {
           autonomous?: boolean;
+          conclusion?: string | null;
           context_summary?: string | null;
           created_at?: string;
           current_task_index?: number;
           description?: string | null;
+          group_number?: number | null;
           id?: string;
           identity_id?: string | null;
+          instructions?: string | null;
           iterations_since_approval?: number;
           max_sessions?: number | null;
           metadata?: Json;
           next_run_after?: string | null;
+          outcome?: string | null;
           output_status?: string | null;
           output_target?: string | null;
           owner_agent_id?: string | null;
@@ -3073,6 +3313,7 @@ export type Database = {
           priority?: string;
           project_id?: string | null;
           sessions_used?: number;
+          slug?: string | null;
           status?: string;
           strategy?: string | null;
           strategy_config?: Json;
@@ -3087,16 +3328,20 @@ export type Database = {
         };
         Update: {
           autonomous?: boolean;
+          conclusion?: string | null;
           context_summary?: string | null;
           created_at?: string;
           current_task_index?: number;
           description?: string | null;
+          group_number?: number | null;
           id?: string;
           identity_id?: string | null;
+          instructions?: string | null;
           iterations_since_approval?: number;
           max_sessions?: number | null;
           metadata?: Json;
           next_run_after?: string | null;
+          outcome?: string | null;
           output_status?: string | null;
           output_target?: string | null;
           owner_agent_id?: string | null;
@@ -3104,6 +3349,7 @@ export type Database = {
           priority?: string;
           project_id?: string | null;
           sessions_used?: number;
+          slug?: string | null;
           status?: string;
           strategy?: string | null;
           strategy_config?: Json;
@@ -3147,6 +3393,8 @@ export type Database = {
           due_date: string | null;
           id: string;
           metadata: Json;
+          outcome: string | null;
+          outcome_reason: string | null;
           priority: string | null;
           project_id: string | null;
           status: string;
@@ -3166,6 +3414,8 @@ export type Database = {
           due_date?: string | null;
           id?: string;
           metadata?: Json;
+          outcome?: string | null;
+          outcome_reason?: string | null;
           priority?: string | null;
           project_id?: string | null;
           status?: string;
@@ -3185,6 +3435,8 @@ export type Database = {
           due_date?: string | null;
           id?: string;
           metadata?: Json;
+          outcome?: string | null;
+          outcome_reason?: string | null;
           priority?: string | null;
           project_id?: string | null;
           status?: string;
@@ -3628,6 +3880,7 @@ export type Database = {
           match_count?: number;
           match_threshold?: number;
           p_agent_id?: string;
+          p_chunk_types?: string[];
           p_include_expired?: boolean;
           p_include_shared?: boolean;
           p_salience?: string;
@@ -3646,6 +3899,7 @@ export type Database = {
           identity_id: string;
           matched_chunk_index: number;
           matched_chunk_text: string;
+          matched_chunk_type: string;
           metadata: Json;
           salience: string;
           similarity: number;

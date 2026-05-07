@@ -18,30 +18,8 @@ export interface RecallFeedbackInput {
   entries: RecallFeedbackEntry[];
 }
 
-export interface RecallFeedbackRow {
-  id: string;
-  user_id: string;
-  agent_id: string | null;
-  query: string;
-  memory_id: string;
-  verdict: string;
-  semantic_score: number | null;
-  text_score: number | null;
-  final_score: number | null;
-  session_id: string | null;
-  created_at: string;
-}
-
-// Table not yet in generated types — cast through unknown until types are regenerated.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type AnySupabase = SupabaseClient<any>;
-
 export class RecallFeedbackRepository {
-  private client: AnySupabase;
-
-  constructor(supabase: SupabaseClient<Database>) {
-    this.client = supabase as unknown as AnySupabase;
-  }
+  constructor(private supabase: SupabaseClient<Database>) {}
 
   async saveFeedback(input: RecallFeedbackInput): Promise<number> {
     const rows = input.entries.map((e) => ({
@@ -56,7 +34,7 @@ export class RecallFeedbackRepository {
       session_id: input.sessionId ?? null,
     }));
 
-    const { error } = await this.client.from('recall_feedback').insert(rows);
+    const { error } = await this.supabase.from('recall_feedback').insert(rows);
 
     if (error) {
       logger.error('Failed to save recall feedback:', error);
@@ -67,7 +45,7 @@ export class RecallFeedbackRepository {
   }
 
   async getDismissalCount(memoryId: string, agentId?: string): Promise<number> {
-    let query = this.client
+    let query = this.supabase
       .from('recall_feedback')
       .select('id', { count: 'exact', head: true })
       .eq('memory_id', memoryId)
