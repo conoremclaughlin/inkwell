@@ -109,6 +109,21 @@ function resolveContactId(params: { contactId?: string }): string | undefined {
 }
 
 /**
+ * Check whether a fetched caller session should be merged into the active sessions list.
+ * Enforces user ownership AND agent identity boundary — a session belonging to a
+ * different agent must not be merged even if the sessionId matches.
+ */
+export function isCallerSessionEligible(
+  callerSession: { userId?: string; agentId?: string },
+  userId: string,
+  agentId: string | undefined
+): boolean {
+  if (callerSession.userId !== userId) return false;
+  if (agentId && callerSession.agentId !== agentId) return false;
+  return true;
+}
+
+/**
  * Map a Session to the bootstrap response shape.
  * context is only included for the caller's own session.
  */
@@ -1925,7 +1940,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   let mergedSessions = activeSessions;
   if (callerSessionId && !activeSessions.some((s) => s.id === callerSessionId)) {
     const callerSession = await dataComposer.repositories.memory.getSession(callerSessionId);
-    if (callerSession && callerSession.userId === user.id) {
+    if (callerSession && isCallerSessionEligible(callerSession, user.id, agentId)) {
       mergedSessions = [callerSession, ...activeSessions];
     }
   }

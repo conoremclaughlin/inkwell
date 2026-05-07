@@ -2354,6 +2354,26 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     });
   }
 
+  // Periodically remind the agent to keep session context up to date.
+  // Uses its own cadence file so it fires regardless of inbox/channel state.
+  const lastContextReminder = readRuntimeFile(cwd, 'last-context-reminder');
+  const contextReminderMs = 5 * 60 * 1000;
+  const shouldRemind =
+    !lastContextReminder ||
+    Date.now() - new Date(lastContextReminder).getTime() >= contextReminderMs;
+  if (shouldRemind) {
+    process.stdout.write(
+      '\n<ink-reminder>\n' +
+        'If your runtime state has changed since your last context update ' +
+        '(started/stopped a server, opened a PR, kicked off a build, changed ports, etc.), ' +
+        'update your session context via `update_session_phase(context: "...")` so it survives ' +
+        "compaction. Context is your scratch board for transient active state — what's running, " +
+        "what's pending, what port you're on.\n" +
+        '</ink-reminder>\n'
+    );
+    writeRuntimeFile(cwd, 'last-context-reminder', new Date().toISOString());
+  }
+
   // Skip inbox injection when the channel plugin is active — it handles
   // real-time delivery via the Channels API.
   if (hasActiveChannelPlugin(cwd)) {

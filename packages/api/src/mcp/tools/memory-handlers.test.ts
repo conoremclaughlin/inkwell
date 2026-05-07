@@ -13,6 +13,7 @@ import {
   handleUpdateSessionPhase,
   handleStartSession,
   mapSessionForBootstrap,
+  isCallerSessionEligible,
 } from './memory-handlers';
 
 // =====================================================
@@ -1850,5 +1851,43 @@ describe('mapSessionForBootstrap', () => {
     expect(result.currentPhase).toBe('implementing');
     expect(result.agentId).toBe('wren');
     expect(result.studioId).toBe('studio-1');
+  });
+});
+
+// =====================================================
+// isCallerSessionEligible — agent identity boundary
+// =====================================================
+
+describe('isCallerSessionEligible', () => {
+  it('allows same user + same agent', () => {
+    expect(isCallerSessionEligible({ userId: 'user-1', agentId: 'wren' }, 'user-1', 'wren')).toBe(
+      true
+    );
+  });
+
+  it('rejects different user', () => {
+    expect(isCallerSessionEligible({ userId: 'user-2', agentId: 'wren' }, 'user-1', 'wren')).toBe(
+      false
+    );
+  });
+
+  it('rejects cross-agent session even with same user', () => {
+    expect(isCallerSessionEligible({ userId: 'user-1', agentId: 'lumen' }, 'user-1', 'wren')).toBe(
+      false
+    );
+  });
+
+  it('allows when bootstrap agentId is undefined (no filter)', () => {
+    expect(
+      isCallerSessionEligible({ userId: 'user-1', agentId: 'lumen' }, 'user-1', undefined)
+    ).toBe(true);
+  });
+
+  it('allows when session has no agentId and bootstrap has agentId', () => {
+    expect(isCallerSessionEligible({ userId: 'user-1' }, 'user-1', 'wren')).toBe(false);
+  });
+
+  it('allows when neither has agentId', () => {
+    expect(isCallerSessionEligible({ userId: 'user-1' }, 'user-1', undefined)).toBe(true);
   });
 });
