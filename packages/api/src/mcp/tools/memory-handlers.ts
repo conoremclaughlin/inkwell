@@ -1897,41 +1897,57 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   // Fetch all context in parallel (including timezone and skills)
   const cloudSkillsService = getCloudSkillsService(dataComposer.getClient());
 
-  const [contexts, projects, focus, activeSessions, dbIdentity, userTimezone, userSkills] =
-    await Promise.all([
-      // Identity Core: all context summaries
-      dataComposer.repositories.context.findAllByUser(user.id),
-      // Active projects
-      dataComposer.repositories.projects.findAllByUser(user.id, 'active'),
-      // Current focus
-      dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
-      // All active sessions (filter by agentId if provided) — client picks the right one
-      dataComposer.repositories.memory.getActiveSessions(user.id, agentId),
-      // Database identity (for cloud agents, includes metadata, heartbeat, soul)
-      agentId
-        ? dataComposer
-            .getClient()
-            .from('agent_identities')
-            .select('*')
-            .eq('user_id', user.id)
-            .eq('agent_id', agentId)
-            .single()
-            .then(({ data }) => data)
-        : Promise.resolve(null),
-      // User timezone for timestamp conversion
-      dataComposer
-        .getClient()
-        .from('users')
-        .select('timezone')
-        .eq('id', user.id)
-        .single()
-        .then(({ data }) => data?.timezone || 'UTC'),
-      // User's installed skills (local + cloud merged)
-      cloudSkillsService.loadUserSkills(user.id).catch((err) => {
-        logger.warn('Failed to load user skills:', err);
-        return [];
-      }),
-    ]);
+  const [
+    contexts,
+    projects,
+    focus,
+    activeSessions,
+    dbIdentity,
+    userTimezone,
+    userSkills,
+    siblingIdentities,
+  ] = await Promise.all([
+    // Identity Core: all context summaries
+    dataComposer.repositories.context.findAllByUser(user.id),
+    // Active projects
+    dataComposer.repositories.projects.findAllByUser(user.id, 'active'),
+    // Current focus
+    dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
+    // All active sessions (filter by agentId if provided) — client picks the right one
+    dataComposer.repositories.memory.getActiveSessions(user.id, agentId),
+    // Database identity (for cloud agents, includes metadata, heartbeat, soul)
+    agentId
+      ? dataComposer
+          .getClient()
+          .from('agent_identities')
+          .select('*')
+          .eq('user_id', user.id)
+          .eq('agent_id', agentId)
+          .single()
+          .then(({ data }) => data)
+      : Promise.resolve(null),
+    // User timezone for timestamp conversion
+    dataComposer
+      .getClient()
+      .from('users')
+      .select('timezone')
+      .eq('id', user.id)
+      .single()
+      .then(({ data }) => data?.timezone || 'UTC'),
+    // User's installed skills (local + cloud merged)
+    cloudSkillsService.loadUserSkills(user.id).catch((err) => {
+      logger.warn('Failed to load user skills:', err);
+      return [];
+    }),
+    // Live sibling identities — structural facts for all agents under this user.
+    // Agents cross-reference this with their personal `relationships` notes.
+    supabase
+      .from('agent_identities')
+      .select('agent_id, name, role, backend, session_scope, capabilities, description')
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: true })
+      .then(({ data }) => data || []),
+  ]);
 
   // Ensure the caller's own session is always in the activeSessions list.
   // getActiveSessions is capped to 10 by started_at — a long-running session
@@ -2255,6 +2271,21 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
                   version: dbIdentity.version,
                 }
               : null,
+
+            // Live sibling data — current structural facts for all agents under this user.
+            // Cross-reference with dbIdentity.relationships (personal notes) to get the
+            // full picture. This ensures role/backend/scope changes propagate automatically
+            // without requiring each sibling to manually update their relationship entries.
+            siblings: siblingIdentities
+              .filter((s) => s.agent_id !== agentId)
+              .map((s) => ({
+                agentId: s.agent_id,
+                name: s.name,
+                role: s.role,
+                backend: s.backend,
+                sessionScope: s.session_scope,
+                capabilities: s.capabilities,
+              })),
 
             // Reflection status - prompt for periodic self-reflection
             reflectionStatus,
