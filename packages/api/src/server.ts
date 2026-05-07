@@ -40,6 +40,7 @@ import {
   type DueReminder,
 } from './services/heartbeat';
 import { StrategyService } from './services/strategy.service';
+import { getOrchestrator } from './services/sandbox/index.js';
 import { setResponseCallback, hasExplicitResponse } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
 import { resolveRouteAgentId } from './services/routing/resolve-route';
@@ -466,7 +467,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         return false;
       }
       try {
-        const strategyService = new StrategyService(dataComposer);
+        const strategyService = new StrategyService(dataComposer, getOrchestrator());
         const fired = await strategyService.triggerWatchdog(groupId);
         if (fired) {
           logger.info(

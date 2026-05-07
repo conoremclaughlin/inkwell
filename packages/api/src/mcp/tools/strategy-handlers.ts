@@ -12,6 +12,7 @@ import type {
   VerificationMode,
 } from '../../data/repositories/task-groups.repository';
 import { StrategyService } from '../../services/strategy.service';
+import { getOrchestrator } from '../../services/sandbox/index.js';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 
@@ -116,7 +117,7 @@ export async function handleStartStrategy(
 
     const agentId = getEffectiveAgentId(args.ownerAgentId);
 
-    const service = new StrategyService(dataComposer);
+    const service = new StrategyService(dataComposer, getOrchestrator());
     const result = await service.startStrategy({
       groupId: args.groupId,
       userId: resolved.user.id,
@@ -179,7 +180,7 @@ export async function handlePauseStrategy(
       return mcpResponse({ success: false, error: 'User not found' }, true);
     }
 
-    const service = new StrategyService(dataComposer);
+    const service = new StrategyService(dataComposer, getOrchestrator());
     const group = await service.pauseStrategy(args.groupId, resolved.user.id);
 
     return mcpResponse({
@@ -220,7 +221,7 @@ export async function handleResumeStrategy(
       return mcpResponse({ success: false, error: 'User not found' }, true);
     }
 
-    const service = new StrategyService(dataComposer);
+    const service = new StrategyService(dataComposer, getOrchestrator());
     const result = await service.resumeStrategy(args.groupId, resolved.user.id);
 
     return mcpResponse({
@@ -271,7 +272,7 @@ export async function handleCancelStrategy(
       return mcpResponse({ success: false, error: 'User not found' }, true);
     }
 
-    const service = new StrategyService(dataComposer);
+    const service = new StrategyService(dataComposer, getOrchestrator());
     const group = await service.cancelStrategy(args.groupId, resolved.user.id, args.reason);
 
     return mcpResponse({
@@ -312,7 +313,7 @@ export async function handleGetStrategyStatus(
       return mcpResponse({ success: false, error: 'User not found' }, true);
     }
 
-    const service = new StrategyService(dataComposer);
+    const service = new StrategyService(dataComposer, getOrchestrator());
     const status = await service.getStrategyStatus(args.groupId, resolved.user.id);
 
     return mcpResponse({ success: true, ...status });

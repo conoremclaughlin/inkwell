@@ -13,7 +13,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { createHash } from 'crypto';
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from 'fs';
-import { basename, join, resolve as resolvePath } from 'path';
+import { join } from 'path';
 import { homedir } from 'os';
 import { logger } from '../../utils/logger.js';
 
