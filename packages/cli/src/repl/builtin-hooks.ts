@@ -100,7 +100,7 @@ export interface PassiveRecallConfig {
 
 const DEFAULT_PASSIVE_RECALL_CONFIG: PassiveRecallConfig = {
   enabled: true,
-  maxInjectPerTurn: 2,
+  maxInjectPerTurn: 6,
   budgetCeiling: 0.8,
   cooldownTurns: 3,
   maxTokensPerInjection: 500,
@@ -170,26 +170,26 @@ export function registerPassiveRecallHook(
         evictedMemoryIds.delete(m.id); // allow re-injection
       }
       return true;
-      });
+    });
 
-      if (novel.length === 0) return;
+    if (novel.length === 0) return;
 
-      const toInject = novel.slice(0, cfg.maxInjectPerTurn);
-      turnsSinceLastInjection = 0;
-      totalInjected += toInject.length;
+    const toInject = novel.slice(0, cfg.maxInjectPerTurn);
+    turnsSinceLastInjection = 0;
+    totalInjected += toInject.length;
 
-      return {
-        inject: toInject.map((m) => {
-          injectedMemoryIds.add(m.id);
-          return {
-            role: 'system' as const,
-            content: `[passive-recall] ${m.summary || m.content.slice(0, cfg.maxTokensPerInjection)}`,
-            source: 'passive-recall',
-            hookName: 'passive-recall',
-            memoryId: m.id,
-          };
-        }),
-      };
+    return {
+      inject: toInject.map((m) => {
+        injectedMemoryIds.add(m.id);
+        return {
+          role: 'system' as const,
+          content: `[passive-recall] ${m.summary || m.content.slice(0, cfg.maxTokensPerInjection)}`,
+          source: 'passive-recall',
+          hookName: 'passive-recall',
+          memoryId: m.id,
+        };
+      }),
+    };
   };
 
   // Register on prompt_build — recall based on user input BEFORE the backend responds.

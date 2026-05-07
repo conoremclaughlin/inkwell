@@ -30,6 +30,7 @@ import { handleSendResponse, handleGetPendingMessages, handleMarkRead } from './
 import {
   handleRemember,
   handleRecall,
+  handleCurateRecall,
   handleForget,
   handleUpdateMemory,
   handleStartSession,
@@ -1438,6 +1439,66 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleRecall(args, dataComposer);
       } catch (error) {
         logger.error('Error in recall:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register curate_recall tool
+  server.registerTool(
+    'curate_recall',
+    {
+      description: `Submit curation feedback after reviewing recalled memories. Mark memories as
+accepted (relevant) or dismissed (noise). Dismissed memory IDs are returned so
+the client can evict them from the active context window. Feedback is stored
+durably for future recall ranking improvements.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+        query: z.string().describe('The recall query that produced these results'),
+        accepted: z
+          .array(
+            z.object({
+              memoryId: z.string().uuid().describe('ID of the accepted memory'),
+              semanticScore: z.number().optional().describe('Cosine similarity score from recall'),
+              textScore: z.number().optional().describe('Text match score from recall'),
+              finalScore: z.number().optional().describe('Blended final score from recall'),
+            })
+          )
+          .optional()
+          .describe('Memories the SB found relevant to the current task'),
+        dismissed: z
+          .array(
+            z.object({
+              memoryId: z.string().uuid().describe('ID of the dismissed memory'),
+              semanticScore: z.number().optional().describe('Cosine similarity score from recall'),
+              textScore: z.number().optional().describe('Text match score from recall'),
+              finalScore: z.number().optional().describe('Blended final score from recall'),
+            })
+          )
+          .optional()
+          .describe('Memories the SB found irrelevant — should be evicted from context'),
+        agentId: z.string().optional().describe('Agent identity (e.g., "wren")'),
+        sessionId: z.string().uuid().optional().describe('Current session ID for attribution'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleCurateRecall(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in curate_recall:', error);
         return {
           content: [
             {

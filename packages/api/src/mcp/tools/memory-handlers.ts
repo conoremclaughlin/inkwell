@@ -673,7 +673,7 @@ export async function handleRecall(args: unknown, dataComposer: DataComposer) {
 
   const contactId = resolveContactId(params);
 
-  const memories = await dataComposer.repositories.memory.recall(user.id, params.query, {
+  const searchOptions = {
     recallMode: params.recallMode,
     source: params.source as MemorySource,
     salience: params.salience as Salience,
@@ -683,9 +683,15 @@ export async function handleRecall(args: unknown, dataComposer: DataComposer) {
     agentId: params.agentId,
     includeShared: params.includeShared,
     contactId,
-  });
+  };
 
-  logger.info(`Recalled ${memories.length} memories for user ${user.id}`, {
+  const candidates = await dataComposer.repositories.memory.recallWithScores(
+    user.id,
+    params.query,
+    searchOptions
+  );
+
+  logger.info(`Recalled ${candidates.length} memories for user ${user.id}`, {
     agentId: params.agentId,
   });
 
@@ -697,20 +703,110 @@ export async function handleRecall(args: unknown, dataComposer: DataComposer) {
           {
             success: true,
             user: { id: user.id, resolvedBy },
-            count: memories.length,
-            memories: memories.map((m) => ({
-              id: m.id,
-              content: m.content,
-              summary: m.summary || null,
-              topicKey: m.topicKey || null,
-              source: m.source,
-              salience: m.salience,
-              topics: m.topics,
-              agentId: m.agentId,
-              metadata: m.metadata,
-              createdAt: m.createdAt.toISOString(),
-              expiresAt: m.expiresAt?.toISOString(),
+            count: candidates.length,
+            memories: candidates.map((c) => ({
+              id: c.memory.id,
+              content: c.memory.content,
+              summary: c.memory.summary || null,
+              topicKey: c.memory.topicKey || null,
+              source: c.memory.source,
+              salience: c.memory.salience,
+              topics: c.memory.topics,
+              agentId: c.memory.agentId,
+              metadata: c.memory.metadata,
+              createdAt: c.memory.createdAt.toISOString(),
+              expiresAt: c.memory.expiresAt?.toISOString(),
+              scores: {
+                semantic: c.semanticScore ?? null,
+                text: c.textScore ?? null,
+                final: c.finalScore,
+              },
             })),
+          },
+          null,
+          2
+        ),
+      },
+    ],
+  };
+}
+
+export const curateRecallSchema = userIdentifierBaseSchema.extend({
+  query: z.string().describe('The recall query that produced these results'),
+  accepted: z
+    .array(
+      z.object({
+        memoryId: z.string().uuid(),
+        semanticScore: z.number().optional(),
+        textScore: z.number().optional(),
+        finalScore: z.number().optional(),
+      })
+    )
+    .optional()
+    .default([])
+    .describe('Memories the SB found relevant'),
+  dismissed: z
+    .array(
+      z.object({
+        memoryId: z.string().uuid(),
+        semanticScore: z.number().optional(),
+        textScore: z.number().optional(),
+        finalScore: z.number().optional(),
+      })
+    )
+    .optional()
+    .default([])
+    .describe('Memories the SB found irrelevant — will be evicted from context'),
+  agentId: z.string().optional().describe('Agent identity (e.g., "wren")'),
+  sessionId: z.string().uuid().optional().describe('Current session ID for attribution'),
+});
+
+export async function handleCurateRecall(args: unknown, dataComposer: DataComposer) {
+  const params = curateRecallSchema.parse(args);
+  const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
+
+  const entries = [
+    ...params.accepted.map((a) => ({
+      memoryId: a.memoryId,
+      verdict: 'accepted' as const,
+      semanticScore: a.semanticScore,
+      textScore: a.textScore,
+      finalScore: a.finalScore,
+    })),
+    ...params.dismissed.map((d) => ({
+      memoryId: d.memoryId,
+      verdict: 'dismissed' as const,
+      semanticScore: d.semanticScore,
+      textScore: d.textScore,
+      finalScore: d.finalScore,
+    })),
+  ];
+
+  const saved = await dataComposer.repositories.recallFeedback.saveFeedback({
+    userId: user.id,
+    agentId: params.agentId,
+    query: params.query,
+    sessionId: params.sessionId,
+    entries,
+  });
+
+  const dismissedIds = params.dismissed.map((d) => d.memoryId);
+
+  logger.info(
+    `Recall curation: ${params.accepted.length} accepted, ${params.dismissed.length} dismissed for user ${user.id}`,
+    { agentId: params.agentId }
+  );
+
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify(
+          {
+            success: true,
+            user: { id: user.id, resolvedBy },
+            feedbackSaved: saved,
+            dismissedMemoryIds: dismissedIds,
           },
           null,
           2
