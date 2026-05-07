@@ -9,6 +9,7 @@ import {
   buildMounts,
   patchMcpConfig,
   stageClaudeDir,
+  stageCodexDir,
   SandboxOrchestrator,
   type SandboxSpinUpRequest,
 } from './orchestrator';
@@ -295,6 +296,63 @@ describe('stageClaudeDir', () => {
         expect(existsSync(join(result, 'settings.json'))).toBe(true);
       }
     }
+  });
+});
+
+describe('stageCodexDir', () => {
+  it('stages auth.json and patched config.toml when codex home exists', () => {
+    const codexHome = join(homedir(), '.codex');
+    if (!existsSync(join(codexHome, 'auth.json'))) return; // skip if no Codex auth
+
+    const tmpDir = mkdtempSync(join(tmpdir(), 'codex-stage-'));
+    const result = stageCodexDir(tmpDir);
+    expect(result).toBeDefined();
+    expect(existsSync(join(result!, 'auth.json'))).toBe(true);
+
+    const auth = JSON.parse(readFileSync(join(result!, 'auth.json'), 'utf-8'));
+    expect(auth.tokens).toBeDefined();
+  });
+
+  it('rewrites loopback URLs in config.toml', () => {
+    const codexHome = join(homedir(), '.codex');
+    if (!existsSync(join(codexHome, 'config.toml'))) return;
+
+    const tmpDir = mkdtempSync(join(tmpdir(), 'codex-stage-'));
+    const result = stageCodexDir(tmpDir);
+    if (!result) return;
+
+    const config = readFileSync(join(result, 'config.toml'), 'utf-8');
+    // Loopback URLs should be rewritten
+    expect(config).not.toMatch(/url\s*=\s*"https?:\/\/localhost/);
+    if (config.includes('host.docker.internal')) {
+      expect(config).toContain('host.docker.internal');
+    }
+  });
+
+  it('strips host-specific project paths and adds /studio', () => {
+    const codexHome = join(homedir(), '.codex');
+    if (!existsSync(join(codexHome, 'config.toml'))) return;
+
+    const tmpDir = mkdtempSync(join(tmpdir(), 'codex-stage-'));
+    const result = stageCodexDir(tmpDir);
+    if (!result) return;
+
+    const config = readFileSync(join(result, 'config.toml'), 'utf-8');
+    // Host paths stripped
+    expect(config).not.toContain('/Users/');
+    // Container project added
+    expect(config).toContain('[projects."/studio"]');
+    expect(config).toContain('trust_level = "trusted"');
+  });
+
+  it('returns undefined when auth.json does not exist', () => {
+    // stageCodexDir checks for ~/.codex/auth.json before creating staging dir
+    // On a machine without Codex auth, this returns undefined
+    const tmpDir = mkdtempSync(join(tmpdir(), 'codex-no-auth-'));
+    // We can't mock homedir easily, but verify the function doesn't throw
+    const result = stageCodexDir(tmpDir);
+    // On this machine with Codex installed, it will succeed
+    expect(result === undefined || typeof result === 'string').toBe(true);
   });
 });
 

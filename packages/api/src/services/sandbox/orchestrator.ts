@@ -201,6 +201,60 @@ export function stageClaudeDir(stagingDir: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Stage a Codex config directory for Docker mounting.
+ *
+ * Codex stores credentials in ~/.codex/auth.json (file-based, no keychain
+ * on macOS by default). The config.toml contains host-specific project
+ * paths and MCP server URLs that need rewriting for container use.
+ *
+ * Returns the path to the staged directory, or undefined if no auth exists.
+ */
+export function stageCodexDir(stagingDir: string): string | undefined {
+  const home = homedir();
+  const codexHome = join(home, '.codex');
+  if (!existsSync(codexHome)) return undefined;
+
+  const authFile = join(codexHome, 'auth.json');
+  if (!existsSync(authFile)) return undefined;
+
+  const stagedDir = join(stagingDir, 'codex-home');
+  mkdirSync(stagedDir, { recursive: true });
+
+  // Copy auth.json as-is
+  writeFileSync(join(stagedDir, 'auth.json'), readFileSync(authFile, 'utf-8'), { mode: 0o600 });
+
+  // Patch config.toml: rewrite loopback MCP URLs, strip host-specific project paths
+  const configFile = join(codexHome, 'config.toml');
+  if (existsSync(configFile)) {
+    let config = readFileSync(configFile, 'utf-8');
+
+    // Rewrite localhost/127.0.0.1 URLs to host.docker.internal
+    config = config.replace(
+      /url\s*=\s*"(https?:\/\/(?:localhost|127\.0\.0\.1|::1|\[::1\])(:\d+)?[^"]*)"/g,
+      (_match, url: string) => `url = "${rewriteLoopbackUrl(url)}"`
+    );
+
+    // Strip host-specific [projects.*] sections — they reference host paths
+    config = config.replace(/\[projects\."[^"]*"\]\s*\n(?:[^\[]*\n)*/g, '');
+
+    // Add container project as trusted
+    config += '\n[projects."/studio"]\ntrust_level = "trusted"\n';
+
+    writeFileSync(join(stagedDir, 'config.toml'), config, { mode: 0o600 });
+  }
+
+  // Copy installation_id if present
+  const installId = join(codexHome, 'installation_id');
+  if (existsSync(installId)) {
+    writeFileSync(join(stagedDir, 'installation_id'), readFileSync(installId, 'utf-8'), {
+      mode: 0o600,
+    });
+  }
+
+  return stagedDir;
+}
+
 export function buildMounts(request: SandboxSpinUpRequest): SandboxMount[] {
   const mounts: SandboxMount[] = [];
 
@@ -255,6 +309,26 @@ export function buildMounts(request: SandboxSpinUpRequest): SandboxMount[] {
           target: `${CONTAINER_HOME}/.claude.json`,
           readOnly: true,
         });
+      }
+    } else if (backend === 'codex') {
+      // Stage ~/.codex with patched config.toml (rewrite loopback URLs, strip host paths)
+      const runtimeDir = join(request.worktreePath, '.ink', 'runtime', 'sandbox');
+      const stagedCodexHome = stageCodexDir(runtimeDir);
+      if (stagedCodexHome) {
+        mounts.push({
+          source: stagedCodexHome,
+          target: `${CONTAINER_HOME}/.codex`,
+          readOnly: true,
+        });
+      } else {
+        const sourceDir = authDirs[backend];
+        if (existsSync(sourceDir)) {
+          mounts.push({
+            source: sourceDir,
+            target: `${CONTAINER_HOME}/.codex`,
+            readOnly: true,
+          });
+        }
       }
     } else {
       const sourceDir = authDirs[backend];
