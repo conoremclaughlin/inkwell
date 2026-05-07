@@ -297,6 +297,172 @@ export async function handleCancelStrategy(
 // GET STRATEGY STATUS
 // ============================================================================
 
+// ============================================================================
+// UPDATE STRATEGY
+// ============================================================================
+
+export const updateStrategySchema = z.object({
+  ...userIdentifierSchema.shape,
+  groupId: z.string().uuid().describe('Task group ID to update strategy config on'),
+  checkInInterval: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe('Post progress check-in every N tasks'),
+  checkInNotify: z.string().optional().describe('Agent ID to notify on check-ins'),
+  approvalNotify: z.string().optional().describe('Agent ID to notify when approval is needed'),
+  maxIterationsWithoutApproval: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe('Pause after N tasks without human approval'),
+  contextSummaryInterval: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe('Compact context every N tasks'),
+  verificationGates: z
+    .array(z.string())
+    .optional()
+    .describe('What must pass before advancing (e.g., ["tests", "build"])'),
+  verificationMode: z
+    .enum(['self', 'peer', 'architect'])
+    .optional()
+    .describe('How task completion is validated'),
+  supervisorId: z
+    .string()
+    .uuid()
+    .optional()
+    .nullable()
+    .describe('Supervisor agent identity ID (UUID). Pass null to clear.'),
+  watchdogIntervalMinutes: z
+    .number()
+    .int()
+    .min(1)
+    .max(1440)
+    .optional()
+    .describe('How often (minutes) the watchdog checks for stuck strategies'),
+});
+
+export async function handleUpdateStrategy(
+  args: z.infer<typeof updateStrategySchema>,
+  dataComposer: DataComposer
+): Promise<McpResponse> {
+  try {
+    const resolved = await resolveUser(args as UserIdentifier, dataComposer);
+    if (!resolved) {
+      return mcpResponse({ success: false, error: 'User not found' }, true);
+    }
+
+    const group = await dataComposer.repositories.taskGroups.findById(args.groupId);
+    if (!group) {
+      return mcpResponse({ success: false, error: 'Task group not found' }, true);
+    }
+    if (group.user_id !== resolved.user.id) {
+      return mcpResponse(
+        { success: false, error: 'Task group does not belong to this user' },
+        true
+      );
+    }
+    if (!group.strategy) {
+      return mcpResponse(
+        {
+          success: false,
+          error: 'No strategy configured on this task group. Use start_strategy first.',
+        },
+        true
+      );
+    }
+    if (group.status === 'completed' || group.status === 'cancelled') {
+      return mcpResponse(
+        { success: false, error: `Cannot update strategy on a ${group.status} group` },
+        true
+      );
+    }
+
+    const existingConfig = (group.strategy_config || {}) as Record<string, unknown>;
+    const configUpdates: Record<string, unknown> = {};
+
+    if (args.checkInInterval !== undefined) configUpdates.checkInInterval = args.checkInInterval;
+    if (args.checkInNotify !== undefined) configUpdates.checkInNotify = args.checkInNotify;
+    if (args.approvalNotify !== undefined) configUpdates.approvalNotify = args.approvalNotify;
+    if (args.maxIterationsWithoutApproval !== undefined)
+      configUpdates.maxIterationsWithoutApproval = args.maxIterationsWithoutApproval;
+    if (args.contextSummaryInterval !== undefined)
+      configUpdates.contextSummaryInterval = args.contextSummaryInterval;
+    if (args.verificationGates !== undefined)
+      configUpdates.verificationGates = args.verificationGates;
+    if (args.watchdogIntervalMinutes !== undefined)
+      configUpdates.watchdogIntervalMinutes = args.watchdogIntervalMinutes;
+    if (args.supervisorId !== undefined) configUpdates.supervisorId = args.supervisorId;
+
+    if (Object.keys(configUpdates).length === 0 && args.verificationMode === undefined) {
+      return mcpResponse(
+        { success: false, error: 'At least one config field must be provided' },
+        true
+      );
+    }
+
+    const mergedConfig = { ...existingConfig, ...configUpdates };
+
+    const updatePayload: Record<string, unknown> = {
+      strategy_config: mergedConfig,
+    };
+    if (args.verificationMode !== undefined) {
+      updatePayload.verification_mode = args.verificationMode;
+    }
+
+    await dataComposer.repositories.taskGroups.update(args.groupId, updatePayload as never);
+
+    const agentId = getEffectiveAgentId(undefined) || 'system';
+    try {
+      await dataComposer.repositories.activityStream.logActivity({
+        userId: resolved.user.id,
+        agentId,
+        type: 'state_change',
+        subtype: 'strategy_config_updated',
+        content: `Strategy config updated on "${group.title}"`,
+        taskGroupId: args.groupId,
+        payload: {
+          groupId: args.groupId,
+          groupTitle: group.title,
+          strategy: group.strategy,
+          configUpdates,
+          ...(args.verificationMode !== undefined
+            ? { verificationMode: args.verificationMode }
+            : {}),
+        },
+      });
+    } catch (err) {
+      // Non-fatal — don't fail the update
+    }
+
+    return mcpResponse({
+      success: true,
+      groupId: args.groupId,
+      title: group.title,
+      strategy: group.strategy,
+      config: mergedConfig,
+      ...(args.verificationMode !== undefined ? { verificationMode: args.verificationMode } : {}),
+    });
+  } catch (error) {
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to update strategy',
+      },
+      true
+    );
+  }
+}
+
+// ============================================================================
+// GET STRATEGY STATUS
+// ============================================================================
+
 export const getStrategyStatusSchema = z.object({
   ...userIdentifierSchema.shape,
   groupId: z.string().uuid().describe('Task group ID to get status for'),
