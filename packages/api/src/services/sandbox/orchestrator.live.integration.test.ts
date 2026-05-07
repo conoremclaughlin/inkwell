@@ -8,15 +8,22 @@
  * - Active Claude Code session (OAuth tokens staged from macOS keychain)
  * - Inkwell server running on localhost:3001 (for MCP connectivity test)
  *
- * Run with: INK_LIVE_TESTS=1 npx vitest run --config vitest.integration.config.ts src/services/sandbox/orchestrator.live.test.ts
+ * Container reuse:
+ *   A shared fixture container (ink-test-sandbox-live) is spun up once
+ *   with credentials mounted and reused across all tests. Set
+ *   INK_PERSIST_TEST_CONTAINER=1 to keep it alive after the run.
+ *
+ *   To tear it down manually: docker rm -f ink-test-sandbox-live
+ *
+ * Run with: INK_LIVE_TESTS=1 npx vitest run --config vitest.integration.config.ts src/services/sandbox/orchestrator.live.integration.test.ts
  */
 
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import { execFileSync, spawnSync } from 'child_process';
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'fs';
-import { homedir, tmpdir } from 'os';
+import { writeFileSync, mkdirSync, readFileSync, existsSync, rmSync } from 'fs';
+import { homedir } from 'os';
 import { join } from 'path';
-import { SandboxOrchestrator, buildContainerName, type SandboxSpinUpRequest } from './orchestrator';
+import { SandboxOrchestrator, type SandboxSpinUpRequest } from './orchestrator';
 
 function dockerAvailable(): boolean {
   try {
@@ -33,7 +40,6 @@ function imageExists(image: string): boolean {
 }
 
 function claudeCredentialsAvailable(): boolean {
-  // Sync check for skip conditions (can't use async stageClaudeDir with it.skipIf)
   const credFile = join(homedir(), '.claude', '.credentials.json');
   if (existsSync(credFile)) return true;
   if (process.platform === 'darwin') {
@@ -67,22 +73,32 @@ const SKIP =
   !dockerAvailable() ||
   !imageExists('inkwell:studio-sandbox');
 
+const PERSIST = process.env.INK_PERSIST_TEST_CONTAINER === '1';
+const FIXTURE_NAME = 'ink-test-sandbox-live';
+// Stable path so persisted containers' mounts match across runs
+const FIXTURE_DIR = join(homedir(), '.ink', 'test-fixtures', 'sandbox-live');
+
 describe.skipIf(SKIP)('SandboxOrchestrator (live)', () => {
   let orchestrator: SandboxOrchestrator;
   let testDir: string;
-  const containersToCleanup: string[] = [];
+  let fixtureWasPreExisting = false;
 
-  beforeAll(() => {
+  beforeAll(async () => {
     orchestrator = new SandboxOrchestrator();
-    testDir = mkdtempSync(join(tmpdir(), 'sandbox-live-'));
+    testDir = FIXTURE_DIR;
+    mkdirSync(testDir, { recursive: true });
 
-    // Create a minimal studio with files to manipulate
+    // Refresh test files each run (idempotent)
     writeFileSync(join(testDir, 'README.md'), '# Test Project\n\nThis is a sandbox live test.\n');
     mkdirSync(join(testDir, 'src'), { recursive: true });
     writeFileSync(
       join(testDir, 'src', 'hello.ts'),
       'export function greet() { return "hello"; }\n'
     );
+    // Clean up output files from prior runs
+    try {
+      rmSync(join(testDir, 'sandbox-output.txt'));
+    } catch {}
 
     // Create .mcp.json with inkwell (HTTP) + a stdio server to verify stripping
     writeFileSync(
@@ -98,64 +114,51 @@ describe.skipIf(SKIP)('SandboxOrchestrator (live)', () => {
         2
       )
     );
-  });
 
-  afterAll(async () => {
-    for (const name of containersToCleanup) {
-      await orchestrator.stop(name).catch(() => {});
+    // Spin up or reuse the shared fixture container (with credentials)
+    fixtureWasPreExisting = await orchestrator.isRunning(FIXTURE_NAME);
+    if (!fixtureWasPreExisting) {
+      const result = await orchestrator.spinUp({
+        userId: 'live-test-user',
+        agentId: 'live-test-agent',
+        studioId: 'studio-live-fixture',
+        studioSlug: 'live',
+        worktreePath: testDir,
+        repoRoot: testDir,
+        backendAuth: ['claude'],
+        containerName: FIXTURE_NAME,
+      });
+      expect(result.success).toBe(true);
     }
   });
 
-  function makeRequest(overrides: Partial<SandboxSpinUpRequest> = {}): SandboxSpinUpRequest {
-    return {
-      userId: 'live-test-user',
-      agentId: 'live-test-agent',
-      studioId: `studio-live-${Date.now()}`,
-      studioSlug: 'live',
-      worktreePath: testDir,
-      repoRoot: testDir,
-      backendAuth: ['claude'],
-      ...overrides,
-    };
-  }
+  afterAll(async () => {
+    if (!PERSIST && !fixtureWasPreExisting) {
+      await orchestrator.stop(FIXTURE_NAME).catch(() => {});
+    }
+  });
 
   describe('worktree manipulation', () => {
     it('agent can read and write files in the mounted studio', async () => {
-      const request = makeRequest({ studioSlug: 'live-worktree' });
-      const containerName = buildContainerName(request);
-      containersToCleanup.push(containerName);
-
-      await orchestrator.spinUp(request);
-
-      // Read existing file
-      const { stdout: readResult } = await orchestrator.exec(containerName, [
+      const { stdout: readResult } = await orchestrator.exec(FIXTURE_NAME, [
         'cat',
         '/studio/README.md',
       ]);
       expect(readResult).toContain('Test Project');
 
-      // Write a new file
-      await orchestrator.exec(containerName, [
+      await orchestrator.exec(FIXTURE_NAME, [
         'bash',
         '-c',
         'echo "created by sandbox" > /studio/sandbox-output.txt',
       ]);
 
-      // Verify file exists on the host (bind mount = shared filesystem)
       const hostPath = join(testDir, 'sandbox-output.txt');
       expect(existsSync(hostPath)).toBe(true);
       expect(readFileSync(hostPath, 'utf-8').trim()).toBe('created by sandbox');
-    }, 30_000);
+    }, 10_000);
 
     it('agent can modify existing source files', async () => {
-      const request = makeRequest({ studioSlug: 'live-modify' });
-      const containerName = buildContainerName(request);
-      containersToCleanup.push(containerName);
-
-      await orchestrator.spinUp(request);
-
-      // Append to an existing file
-      await orchestrator.exec(containerName, [
+      await orchestrator.exec(FIXTURE_NAME, [
         'bash',
         '-c',
         'echo \'export function farewell() { return "goodbye"; }\' >> /studio/src/hello.ts',
@@ -164,27 +167,18 @@ describe.skipIf(SKIP)('SandboxOrchestrator (live)', () => {
       const content = readFileSync(join(testDir, 'src', 'hello.ts'), 'utf-8');
       expect(content).toContain('farewell');
       expect(content).toContain('greet');
-    }, 30_000);
+    }, 10_000);
   });
 
   describe('MCP config patching', () => {
     it('patched config contains only HTTP servers with rewritten URLs', async () => {
-      const request = makeRequest({ studioSlug: 'live-mcp' });
-      const containerName = buildContainerName(request);
-      containersToCleanup.push(containerName);
-
-      await orchestrator.spinUp(request);
-
-      const { stdout } = await orchestrator.exec(containerName, ['cat', '/studio/.mcp.json']);
+      const { stdout } = await orchestrator.exec(FIXTURE_NAME, ['cat', '/studio/.mcp.json']);
       const config = JSON.parse(stdout);
 
-      // inkwell should be present with rewritten URL
       expect(config.mcpServers.inkwell).toBeDefined();
       expect(config.mcpServers.inkwell.url).toContain('host.docker.internal');
-
-      // stdio server should be stripped
       expect(config.mcpServers.playwright).toBeUndefined();
-    }, 30_000);
+    }, 10_000);
   });
 
   describe('LLM response', () => {
@@ -193,15 +187,7 @@ describe.skipIf(SKIP)('SandboxOrchestrator (live)', () => {
     it.skipIf(SKIP_LLM)(
       'gets a live Claude response inside the container',
       async () => {
-        const request = makeRequest({ studioSlug: 'live-llm' });
-        const containerName = buildContainerName(request);
-        containersToCleanup.push(containerName);
-
-        await orchestrator.spinUp(request);
-
-        // Use claude CLI with --print (non-interactive, single-shot)
-        // Just verify we get a non-empty response (the model is authenticated)
-        const { stdout } = await orchestrator.exec(containerName, [
+        const { stdout } = await orchestrator.exec(FIXTURE_NAME, [
           'claude',
           '--print',
           '--model',
@@ -218,14 +204,7 @@ describe.skipIf(SKIP)('SandboxOrchestrator (live)', () => {
     it.skipIf(SKIP_LLM)(
       'Claude can read workspace files via coding tools',
       async () => {
-        const request = makeRequest({ studioSlug: 'live-read' });
-        const containerName = buildContainerName(request);
-        containersToCleanup.push(containerName);
-
-        await orchestrator.spinUp(request);
-
-        // --allowedTools requires -p for the prompt
-        const { stdout } = await orchestrator.exec(containerName, [
+        const { stdout } = await orchestrator.exec(FIXTURE_NAME, [
           'claude',
           '--print',
           '--model',
@@ -248,23 +227,15 @@ describe.skipIf(SKIP)('SandboxOrchestrator (live)', () => {
     it.skipIf(SKIP_INKWELL)(
       'container can reach Inkwell server via host.docker.internal',
       async () => {
-        const request = makeRequest({ studioSlug: 'live-inkwell-reach' });
-        const containerName = buildContainerName(request);
-        containersToCleanup.push(containerName);
-
-        await orchestrator.spinUp(request);
-
-        // Verify HTTP connectivity to the Inkwell server
-        const { stdout } = await orchestrator.exec(containerName, [
+        const { stdout } = await orchestrator.exec(FIXTURE_NAME, [
           'curl',
           '-sf',
           'http://host.docker.internal:3001/health',
         ]);
 
-        // Health endpoint should return something (OK, JSON, etc.)
         expect(stdout.length).toBeGreaterThan(0);
       },
-      30_000
+      10_000
     );
   });
 });

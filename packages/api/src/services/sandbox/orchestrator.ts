@@ -54,6 +54,8 @@ export interface SandboxSpinUpRequest {
   backendAuth?: BackendAuthName[];
   networkMode?: 'default' | 'none';
   extraEnv?: Record<string, string>;
+  /** Override the computed container name (useful for test fixtures, named containers) */
+  containerName?: string;
 }
 
 export interface SandboxSpinUpResult {
@@ -72,6 +74,7 @@ export interface SandboxStatusResult {
 }
 
 export function buildContainerName(request: SandboxSpinUpRequest): string {
+  if (request.containerName) return request.containerName;
   const label = sanitizeSlug(request.studioSlug || request.agentId || 'studio');
   const parts = [request.worktreePath];
   if (request.taskGroupId) parts.push(request.taskGroupId);
@@ -553,6 +556,13 @@ export class SandboxOrchestrator {
 
     try {
       await execFileAsync(this.dockerCommand, args, { timeout: 30_000 });
+
+      // Wait for the container to be ready to accept exec calls
+      const ready = await this.waitReady(containerName);
+      if (!ready) {
+        logger.warn('Sandbox started but readiness check timed out', { containerName });
+      }
+
       logger.info('Sandbox container started', {
         containerName,
         agentId: request.agentId,
@@ -565,6 +575,24 @@ export class SandboxOrchestrator {
       logger.error('Sandbox spin-up failed', { containerName, error: message });
       return { containerName, success: false, error: message };
     }
+  }
+
+  /**
+   * Poll until the container can accept exec calls. Returns false on timeout.
+   */
+  async waitReady(containerName: string, timeoutMs = 5_000): Promise<boolean> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        await execFileAsync(this.dockerCommand, ['exec', containerName, 'true'], {
+          timeout: 2_000,
+        });
+        return true;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+    return false;
   }
 
   async stop(containerName: string): Promise<boolean> {
