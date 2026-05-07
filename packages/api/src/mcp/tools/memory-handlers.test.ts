@@ -12,6 +12,8 @@ import {
   updateSessionPhaseSchema,
   handleUpdateSessionPhase,
   handleStartSession,
+  mapSessionForBootstrap,
+  isCallerSessionEligible,
 } from './memory-handlers';
 
 // =====================================================
@@ -1801,5 +1803,91 @@ describe('buildKnowledgeSummary', () => {
 
     expect(result.topicIndex[0].topicKey).toBe('topic:new');
     expect(result.topicIndex[1].topicKey).toBe('topic:old');
+  });
+});
+
+// =====================================================
+// mapSessionForBootstrap — context injection
+// =====================================================
+
+describe('mapSessionForBootstrap', () => {
+  const baseSession = {
+    id: 'session-abc',
+    agentId: 'wren',
+    studioId: 'studio-1',
+    threadKey: 'pr:343',
+    lifecycle: 'idle',
+    currentPhase: 'implementing',
+    context: 'server running on :4001, vitest watching',
+    startedAt: new Date('2026-05-07T00:00:00Z'),
+  };
+
+  it('includes context for the caller session', () => {
+    const result = mapSessionForBootstrap(baseSession, 'session-abc');
+    expect(result.context).toBe('server running on :4001, vitest watching');
+    expect(result.currentPhase).toBe('implementing');
+  });
+
+  it('omits context for non-caller sessions', () => {
+    const result = mapSessionForBootstrap(baseSession, 'session-other');
+    expect(result).not.toHaveProperty('context');
+    expect(result.currentPhase).toBe('implementing');
+  });
+
+  it('omits context when callerSessionId is undefined', () => {
+    const result = mapSessionForBootstrap(baseSession, undefined);
+    expect(result).not.toHaveProperty('context');
+  });
+
+  it('omits context key entirely when caller session has no context set', () => {
+    const noContextSession = { ...baseSession, context: undefined };
+    const result = mapSessionForBootstrap(noContextSession, 'session-abc');
+    expect(result).not.toHaveProperty('context');
+  });
+
+  it('always includes phase and lifecycle for all sessions', () => {
+    const result = mapSessionForBootstrap(baseSession, 'session-other');
+    expect(result.lifecycle).toBe('idle');
+    expect(result.currentPhase).toBe('implementing');
+    expect(result.agentId).toBe('wren');
+    expect(result.studioId).toBe('studio-1');
+  });
+});
+
+// =====================================================
+// isCallerSessionEligible — agent identity boundary
+// =====================================================
+
+describe('isCallerSessionEligible', () => {
+  it('allows same user + same agent', () => {
+    expect(isCallerSessionEligible({ userId: 'user-1', agentId: 'wren' }, 'user-1', 'wren')).toBe(
+      true
+    );
+  });
+
+  it('rejects different user', () => {
+    expect(isCallerSessionEligible({ userId: 'user-2', agentId: 'wren' }, 'user-1', 'wren')).toBe(
+      false
+    );
+  });
+
+  it('rejects cross-agent session even with same user', () => {
+    expect(isCallerSessionEligible({ userId: 'user-1', agentId: 'lumen' }, 'user-1', 'wren')).toBe(
+      false
+    );
+  });
+
+  it('allows when bootstrap agentId is undefined (no filter)', () => {
+    expect(
+      isCallerSessionEligible({ userId: 'user-1', agentId: 'lumen' }, 'user-1', undefined)
+    ).toBe(true);
+  });
+
+  it('allows when session has no agentId and bootstrap has agentId', () => {
+    expect(isCallerSessionEligible({ userId: 'user-1' }, 'user-1', 'wren')).toBe(false);
+  });
+
+  it('allows when neither has agentId', () => {
+    expect(isCallerSessionEligible({ userId: 'user-1' }, 'user-1', undefined)).toBe(true);
   });
 });

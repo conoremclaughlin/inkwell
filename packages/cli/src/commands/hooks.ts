@@ -915,9 +915,14 @@ function buildSessionsBlock(sessions: Array<Record<string, unknown>> | undefined
   if (!sessions || sessions.length === 0) return '';
   const lines = ['### Active Sessions'];
   for (const s of sessions) {
-    lines.push(
-      `- ${(s.id as string)?.substring(0, 8) || 'unknown'}: ${s.summary || s.status || 'active'}`
-    );
+    const id = (s.id as string)?.substring(0, 8) || 'unknown';
+    const agent = s.agentId ? ` (${s.agentId})` : '';
+    const phase = s.currentPhase ? ` — phase: ${s.currentPhase}` : '';
+    const lifecycle = s.lifecycle ? ` [${s.lifecycle}]` : '';
+    lines.push(`- ${id}${agent}${lifecycle}${phase}`);
+    if (s.context) {
+      lines.push(`  > Context: ${s.context}`);
+    }
   }
   return lines.join('\n');
 }
@@ -2347,6 +2352,26 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
       reason: 'no pcpSessionId',
       backendSessionId: reconciled.backendSessionId || null,
     });
+  }
+
+  // Periodically remind the agent to keep session context up to date.
+  // Uses its own cadence file so it fires regardless of inbox/channel state.
+  const lastContextReminder = readRuntimeFile(cwd, 'last-context-reminder');
+  const contextReminderMs = 5 * 60 * 1000;
+  const shouldRemind =
+    !lastContextReminder ||
+    Date.now() - new Date(lastContextReminder).getTime() >= contextReminderMs;
+  if (shouldRemind) {
+    process.stdout.write(
+      '\n<ink-reminder>\n' +
+        'If your runtime state has changed since your last context update ' +
+        '(started/stopped a server, opened a PR, kicked off a build, changed ports, etc.), ' +
+        'update your session context via `update_session_phase(context: "...")` so it survives ' +
+        "compaction. Context is your scratch board for transient active state — what's running, " +
+        "what's pending, what port you're on.\n" +
+        '</ink-reminder>\n'
+    );
+    writeRuntimeFile(cwd, 'last-context-reminder', new Date().toISOString());
   }
 
   // Skip inbox injection when the channel plugin is active — it handles
