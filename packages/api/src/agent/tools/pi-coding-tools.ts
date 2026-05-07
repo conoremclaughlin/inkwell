@@ -10,6 +10,7 @@
 import path from 'path';
 import type Anthropic from '@anthropic-ai/sdk';
 import { logger } from '../../utils/logger';
+import { guardBashCommand, extractBackgroundPids, getProcessRegistry } from './bash-guard';
 
 // Pi tool types — widened to accept TypeBox TObject schemas
 interface PiAgentTool {
@@ -47,6 +48,15 @@ export interface PiCodingToolsConfig {
   enforceWorkspaceRoot?: boolean;
   /** Default bash timeout in seconds when model doesn't specify one (default: 120) */
   bashTimeoutSeconds?: number;
+  /** Agent identity — enables bash guard (dangerous command blocking + kill scope) */
+  agentId?: string;
+  /** Bash guard options (requires agentId to be set) */
+  bashGuard?: {
+    /** Block catastrophic commands before execution (default: true) */
+    blockDangerousCommands?: boolean;
+    /** Enforce kill targeting only agent-owned PIDs (default: true) */
+    enforceKillScope?: boolean;
+  };
 }
 
 const TOOLS_WITH_PATH_PARAM = new Set(['read', 'write', 'edit', 'grep', 'find', 'ls']);
@@ -153,6 +163,7 @@ export async function createInkCodingTools(
 
   const enforceRoot = config.enforceWorkspaceRoot !== false;
   const bashTimeout = config.bashTimeoutSeconds ?? DEFAULT_BASH_TIMEOUT_SECONDS;
+  const agentId = config.agentId;
 
   return tools.map((tool) => ({
     schema: {
@@ -169,6 +180,20 @@ export async function createInkCodingTools(
         }
       }
 
+      // Bash guard: block dangerous commands and enforce kill scope
+      if (tool.name === 'bash' && agentId) {
+        const command = params.command as string;
+        if (command) {
+          const guard = guardBashCommand(command, {
+            agentId,
+            ...config.bashGuard,
+          });
+          if (!guard.allowed) {
+            return `Error: ${guard.reason}`;
+          }
+        }
+      }
+
       // Inject default bash timeout if the model doesn't specify one
       if (tool.name === 'bash' && !params.timeout) {
         params = { ...params, timeout: bashTimeout };
@@ -177,7 +202,21 @@ export async function createInkCodingTools(
       const callId = `ink-${tool.name}-${Date.now()}`;
       try {
         const result = await tool.execute(callId, params, signal);
-        return formatToolResult(result);
+        const resultText = formatToolResult(result);
+
+        // Track background PIDs from bash output
+        if (tool.name === 'bash' && agentId) {
+          const bgPids = extractBackgroundPids(resultText);
+          if (bgPids.length > 0) {
+            const registry = getProcessRegistry();
+            for (const pid of bgPids) {
+              registry.register(agentId, pid, (params.command as string) || '');
+            }
+            logger.debug('Tracked background PIDs', { agentId, pids: bgPids });
+          }
+        }
+
+        return resultText;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         logger.error(`Pi tool ${tool.name} failed`, { error: message, params });
