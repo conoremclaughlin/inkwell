@@ -72,6 +72,11 @@ describe('buildContainerName', () => {
     // "ink-sandbox-" (12) + slug (max 24) + "-" (1) + digest (8) = max 45 chars
     expect(name.length).toBeLessThanOrEqual(50);
   });
+
+  it('uses containerName override when provided', () => {
+    const name = buildContainerName({ ...baseRequest, containerName: 'ink-test-my-fixture' });
+    expect(name).toBe('ink-test-my-fixture');
+  });
 });
 
 describe('buildEnvVars', () => {

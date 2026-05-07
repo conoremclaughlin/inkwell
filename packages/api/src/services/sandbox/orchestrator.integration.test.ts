@@ -5,13 +5,20 @@
  * - Docker daemon running
  * - The inkwell:studio-sandbox image built (`ink studio sandbox build`)
  *
+ * Container reuse:
+ *   A shared fixture container (ink-test-sandbox-integ) is spun up once
+ *   and reused across capability tests. Set INK_PERSIST_TEST_CONTAINER=1
+ *   to keep it alive after the run — saves ~20s on re-runs.
+ *
+ *   To tear it down manually: docker rm -f ink-test-sandbox-integ
+ *
  * Run with: npx vitest run --config vitest.integration.config.ts src/services/sandbox/orchestrator.integration.test.ts
  */
 
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import { execFileSync, spawnSync } from 'child_process';
-import { mkdtempSync, writeFileSync, mkdirSync } from 'fs';
-import { tmpdir } from 'os';
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'fs';
+import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 import { SandboxOrchestrator, buildContainerName, type SandboxSpinUpRequest } from './orchestrator';
 
@@ -30,23 +37,56 @@ function imageExists(image: string): boolean {
 }
 
 const SKIP = !dockerAvailable() || !imageExists('inkwell:studio-sandbox');
+const PERSIST = process.env.INK_PERSIST_TEST_CONTAINER === '1';
+const FIXTURE_NAME = 'ink-test-sandbox-integ';
+// Stable path so persisted containers' mounts match across runs
+const FIXTURE_DIR = join(homedir(), '.ink', 'test-fixtures', 'sandbox-integ');
 
 describe.skipIf(SKIP)('SandboxOrchestrator (integration)', () => {
   let orchestrator: SandboxOrchestrator;
   let testDir: string;
-  const containersToCleanup: string[] = [];
+  const ephemeralContainers: string[] = [];
+  let fixtureWasPreExisting = false;
 
-  beforeAll(() => {
+  beforeAll(async () => {
     orchestrator = new SandboxOrchestrator();
-    testDir = mkdtempSync(join(tmpdir(), 'sandbox-integ-'));
+
+    // Use a stable dir for fixture containers, temp dir for ephemeral
+    testDir = FIXTURE_DIR;
+    mkdirSync(testDir, { recursive: true });
+    // Refresh test files each run (idempotent)
     writeFileSync(join(testDir, 'hello.txt'), 'Integration test file\n');
     mkdirSync(join(testDir, 'src'), { recursive: true });
     writeFileSync(join(testDir, 'src', 'index.ts'), 'console.log("hello");\n');
+    // Clean up any output files from prior runs
+    try {
+      rmSync(join(testDir, 'fixture-output.txt'));
+    } catch {}
+
+    // Spin up or reuse the shared fixture container
+    fixtureWasPreExisting = await orchestrator.isRunning(FIXTURE_NAME);
+    if (!fixtureWasPreExisting) {
+      const result = await orchestrator.spinUp({
+        userId: 'test-user',
+        agentId: 'test-agent',
+        studioId: 'studio-integ-fixture',
+        studioSlug: 'integ',
+        worktreePath: testDir,
+        repoRoot: testDir,
+        containerName: FIXTURE_NAME,
+      });
+      expect(result.success).toBe(true);
+    }
   });
 
   afterAll(async () => {
-    for (const name of containersToCleanup) {
+    // Always clean up ephemeral containers
+    for (const name of ephemeralContainers) {
       await orchestrator.stop(name).catch(() => {});
+    }
+    // Only tear down fixture if not persisting and we created it this run
+    if (!PERSIST && !fixtureWasPreExisting) {
+      await orchestrator.stop(FIXTURE_NAME).catch(() => {});
     }
   });
 
@@ -62,147 +102,168 @@ describe.skipIf(SKIP)('SandboxOrchestrator (integration)', () => {
     };
   }
 
-  it('spins up a container and verifies it is running', async () => {
-    const request = makeRequest({ studioSlug: 'integ-spinup' });
-    const containerName = buildContainerName(request);
-    containersToCleanup.push(containerName);
+  // ── Shared fixture tests (fast — reuse one container) ───────────────
 
-    const result = await orchestrator.spinUp(request);
-    expect(result.success).toBe(true);
-    expect(result.containerName).toBe(containerName);
+  describe('shared fixture', () => {
+    it('can read files at /studio', async () => {
+      const { stdout } = await orchestrator.exec(FIXTURE_NAME, ['cat', '/studio/hello.txt']);
+      expect(stdout.trim()).toBe('Integration test file');
+    }, 10_000);
 
-    const running = await orchestrator.isRunning(containerName);
-    expect(running).toBe(true);
-  }, 30_000);
+    it('has node and claude cli available', async () => {
+      const { stdout: nodeVersion } = await orchestrator.exec(FIXTURE_NAME, ['node', '--version']);
+      expect(nodeVersion.trim()).toMatch(/^v22\./);
 
-  it('returns alreadyRunning when container exists', async () => {
-    const request = makeRequest({ studioSlug: 'integ-already' });
-    const containerName = buildContainerName(request);
-    containersToCleanup.push(containerName);
+      const { stdout: claudePath } = await orchestrator.exec(FIXTURE_NAME, ['which', 'claude']);
+      expect(claudePath.trim()).toBeTruthy();
+    }, 10_000);
 
-    const first = await orchestrator.spinUp(request);
-    expect(first.success).toBe(true);
+    it('has correct workdir', async () => {
+      const { stdout } = await orchestrator.exec(FIXTURE_NAME, ['pwd']);
+      expect(stdout.trim()).toBe('/studio');
+    }, 10_000);
 
-    const second = await orchestrator.spinUp(request);
-    expect(second.success).toBe(true);
-    expect(second.alreadyRunning).toBe(true);
-  }, 30_000);
+    it('can write files visible on the host', async () => {
+      await orchestrator.exec(FIXTURE_NAME, [
+        'bash',
+        '-c',
+        'echo "from-fixture" > /studio/fixture-output.txt',
+      ]);
+      const { readFileSync } = await import('fs');
+      const content = readFileSync(join(testDir, 'fixture-output.txt'), 'utf-8');
+      expect(content.trim()).toBe('from-fixture');
+    }, 10_000);
+  });
 
-  it('mounts studio at /studio and can read files', async () => {
-    const request = makeRequest({ studioSlug: 'integ-mount' });
-    const containerName = buildContainerName(request);
-    containersToCleanup.push(containerName);
+  // ── Per-container lifecycle tests (each spins up its own) ───────────
 
-    await orchestrator.spinUp(request);
+  describe('container lifecycle', () => {
+    it('spins up a container and verifies it is running', async () => {
+      const request = makeRequest({ studioSlug: 'integ-spinup' });
+      const containerName = buildContainerName(request);
+      ephemeralContainers.push(containerName);
 
-    const { stdout } = await orchestrator.exec(containerName, ['cat', '/studio/hello.txt']);
-    expect(stdout.trim()).toBe('Integration test file');
-  }, 30_000);
+      const result = await orchestrator.spinUp(request);
+      expect(result.success).toBe(true);
+      expect(result.containerName).toBe(containerName);
 
-  it('passes env vars into the container', async () => {
-    const request = makeRequest({
-      studioSlug: 'integ-env',
-      taskGroupId: 'tg-test-123',
-      taskGroupTitle: 'Test Group',
-    });
-    const containerName = buildContainerName(request);
-    containersToCleanup.push(containerName);
+      const running = await orchestrator.isRunning(containerName);
+      expect(running).toBe(true);
+    }, 30_000);
 
-    await orchestrator.spinUp(request);
+    it('returns alreadyRunning when container exists', async () => {
+      const request = makeRequest({ studioSlug: 'integ-already' });
+      const containerName = buildContainerName(request);
+      ephemeralContainers.push(containerName);
 
-    const { stdout: agentId } = await orchestrator.exec(containerName, [
-      'bash',
-      '-c',
-      'echo $AGENT_ID',
-    ]);
-    expect(agentId.trim()).toBe('test-agent');
+      const first = await orchestrator.spinUp(request);
+      expect(first.success).toBe(true);
 
-    const { stdout: tgId } = await orchestrator.exec(containerName, [
-      'bash',
-      '-c',
-      'echo $INK_TASK_GROUP_ID',
-    ]);
-    expect(tgId.trim()).toBe('tg-test-123');
+      const second = await orchestrator.spinUp(request);
+      expect(second.success).toBe(true);
+      expect(second.alreadyRunning).toBe(true);
+    }, 30_000);
 
-    const { stdout: sandbox } = await orchestrator.exec(containerName, [
-      'bash',
-      '-c',
-      'echo $INK_SANDBOX',
-    ]);
-    expect(sandbox.trim()).toBe('docker');
-  }, 30_000);
+    it('passes env vars into the container', async () => {
+      const request = makeRequest({
+        studioSlug: 'integ-env',
+        taskGroupId: 'tg-test-123',
+        taskGroupTitle: 'Test Group',
+      });
+      const containerName = buildContainerName(request);
+      ephemeralContainers.push(containerName);
 
-  it('stops a running container', async () => {
-    const request = makeRequest({ studioSlug: 'integ-stop' });
-    const containerName = buildContainerName(request);
-    // Don't add to cleanup — we're stopping it ourselves
+      await orchestrator.spinUp(request);
 
-    await orchestrator.spinUp(request);
-    expect(await orchestrator.isRunning(containerName)).toBe(true);
+      const { stdout: agentId } = await orchestrator.exec(containerName, [
+        'bash',
+        '-c',
+        'echo $AGENT_ID',
+      ]);
+      expect(agentId.trim()).toBe('test-agent');
 
-    const stopped = await orchestrator.stop(containerName);
-    expect(stopped).toBe(true);
-    expect(await orchestrator.isRunning(containerName)).toBe(false);
-  }, 30_000);
+      const { stdout: tgId } = await orchestrator.exec(containerName, [
+        'bash',
+        '-c',
+        'echo $INK_TASK_GROUP_ID',
+      ]);
+      expect(tgId.trim()).toBe('tg-test-123');
 
-  it('gets container status with labels', async () => {
-    const request = makeRequest({
-      studioSlug: 'integ-status',
-      taskGroupId: 'tg-status-test',
-    });
-    const containerName = buildContainerName(request);
-    containersToCleanup.push(containerName);
+      const { stdout: sandbox } = await orchestrator.exec(containerName, [
+        'bash',
+        '-c',
+        'echo $INK_SANDBOX',
+      ]);
+      expect(sandbox.trim()).toBe('docker');
+    }, 30_000);
 
-    await orchestrator.spinUp(request);
+    it('stops a running container', async () => {
+      const request = makeRequest({ studioSlug: 'integ-stop' });
+      const containerName = buildContainerName(request);
 
-    const status = await orchestrator.getStatus(containerName);
-    expect(status.running).toBe(true);
-    expect(status.labels?.['ink.sandbox']).toBe('true');
-    expect(status.labels?.['ink.agent-id']).toBe('test-agent');
-    expect(status.labels?.['ink.task-group-id']).toBe('tg-status-test');
-  }, 30_000);
+      await orchestrator.spinUp(request);
+      expect(await orchestrator.isRunning(containerName)).toBe(true);
 
-  it('lists active sandboxes', async () => {
-    const request = makeRequest({ studioSlug: 'integ-list' });
-    const containerName = buildContainerName(request);
-    containersToCleanup.push(containerName);
+      const stopped = await orchestrator.stop(containerName);
+      expect(stopped).toBe(true);
+      expect(await orchestrator.isRunning(containerName)).toBe(false);
+    }, 30_000);
 
-    await orchestrator.spinUp(request);
+    it('gets container status with labels', async () => {
+      const request = makeRequest({
+        studioSlug: 'integ-status',
+        taskGroupId: 'tg-status-test',
+      });
+      const containerName = buildContainerName(request);
+      ephemeralContainers.push(containerName);
 
-    const sandboxes = await orchestrator.listSandboxes();
-    const found = sandboxes.find((s) => s.containerName === containerName);
-    expect(found).toBeDefined();
-    expect(found?.running).toBe(true);
-  }, 30_000);
+      await orchestrator.spinUp(request);
 
-  it('container has node and claude cli available', async () => {
-    const request = makeRequest({ studioSlug: 'integ-tools' });
-    const containerName = buildContainerName(request);
-    containersToCleanup.push(containerName);
+      const status = await orchestrator.getStatus(containerName);
+      expect(status.running).toBe(true);
+      expect(status.labels?.['ink.sandbox']).toBe('true');
+      expect(status.labels?.['ink.agent-id']).toBe('test-agent');
+      expect(status.labels?.['ink.task-group-id']).toBe('tg-status-test');
+    }, 30_000);
 
-    await orchestrator.spinUp(request);
+    it('lists active sandboxes', async () => {
+      const request = makeRequest({ studioSlug: 'integ-list' });
+      const containerName = buildContainerName(request);
+      ephemeralContainers.push(containerName);
 
-    const { stdout: nodeVersion } = await orchestrator.exec(containerName, ['node', '--version']);
-    expect(nodeVersion.trim()).toMatch(/^v22\./);
+      await orchestrator.spinUp(request);
 
-    const { stdout: claudePath } = await orchestrator.exec(containerName, ['which', 'claude']);
-    expect(claudePath.trim()).toBeTruthy();
-  }, 30_000);
+      const sandboxes = await orchestrator.listSandboxes();
+      const found = sandboxes.find((s) => s.containerName === containerName);
+      expect(found).toBeDefined();
+      expect(found?.running).toBe(true);
+    }, 30_000);
 
-  it('container name includes task group context', async () => {
-    const request = makeRequest({
-      studioSlug: 'integ-naming',
-      taskGroupId: 'tg-naming-test',
-      taskGroupTitle: 'Auth Migration',
-    });
-    const containerName = buildContainerName(request);
-    containersToCleanup.push(containerName);
+    it('container name includes task group context', async () => {
+      const request = makeRequest({
+        studioSlug: 'integ-naming',
+        taskGroupId: 'tg-naming-test',
+        taskGroupTitle: 'Auth Migration',
+      });
+      const containerName = buildContainerName(request);
+      ephemeralContainers.push(containerName);
 
-    expect(containerName).toContain('integ-naming');
-    expect(containerName).toContain('auth-migration');
+      expect(containerName).toContain('integ-naming');
+      expect(containerName).toContain('auth-migration');
 
-    await orchestrator.spinUp(request);
-    const running = await orchestrator.isRunning(containerName);
-    expect(running).toBe(true);
-  }, 30_000);
+      await orchestrator.spinUp(request);
+      const running = await orchestrator.isRunning(containerName);
+      expect(running).toBe(true);
+    }, 30_000);
+
+    it('respects containerName override', async () => {
+      const customName = 'ink-test-custom-name';
+      const request = makeRequest({ containerName: customName });
+      ephemeralContainers.push(customName);
+
+      const result = await orchestrator.spinUp(request);
+      expect(result.containerName).toBe(customName);
+      expect(await orchestrator.isRunning(customName)).toBe(true);
+    }, 30_000);
+  });
 });
