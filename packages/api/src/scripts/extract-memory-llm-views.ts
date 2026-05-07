@@ -83,8 +83,10 @@ function hasAllEnabledKinds(
 
 function mergeMemoryExtractions(
   existing: MemoryExtractions | null,
-  next: MemoryExtractions
+  next: MemoryExtractions,
+  options: { replaceKinds?: ExtractionKind[] } = {}
 ): MemoryExtractions {
+  const replaceKinds = new Set(options.replaceKinds || []);
   const raw =
     existing?.raw || next.raw
       ? {
@@ -92,19 +94,75 @@ function mergeMemoryExtractions(
           ...(next.raw || {}),
         }
       : undefined;
+  if (raw) {
+    for (const kind of replaceKinds) {
+      if (!next.raw || next.raw[kind] === undefined) {
+        delete raw[kind];
+      }
+    }
+  }
   return normalizeMemoryExtractions({
     ...(existing || {}),
     ...next,
-    entity: next.entity ?? existing?.entity,
-    durable_fact: next.durable_fact ?? existing?.durable_fact,
-    summary: next.summary ?? existing?.summary,
-    current_state: next.current_state ?? existing?.current_state,
+    entity: replaceKinds.has('entity') ? next.entity : (next.entity ?? existing?.entity),
+    durable_fact: replaceKinds.has('durable_fact')
+      ? next.durable_fact
+      : (next.durable_fact ?? existing?.durable_fact),
+    summary: replaceKinds.has('summary') ? next.summary : (next.summary ?? existing?.summary),
+    current_state: replaceKinds.has('current_state')
+      ? next.current_state
+      : (next.current_state ?? existing?.current_state),
     version: next.version,
     provider: next.provider,
     model: next.model,
     extractedAt: next.extractedAt,
     raw,
   }) as MemoryExtractions;
+}
+
+function normalizeExtractionHistory(value: unknown): MemoryExtractions[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => normalizeMemoryExtractions(item))
+    .filter((item): item is MemoryExtractions => Boolean(item));
+}
+
+function sameExtractionIdentity(left: MemoryExtractions, right: MemoryExtractions): boolean {
+  return (
+    left.version === right.version &&
+    left.provider === right.provider &&
+    left.model === right.model &&
+    left.extractedAt === right.extractedAt
+  );
+}
+
+function buildMetadataWithExtraction(params: {
+  metadata: Record<string, unknown>;
+  existingExtractions: MemoryExtractions | null;
+  mergedExtractions: MemoryExtractions;
+  keepHistory: boolean;
+  historyLimit: number;
+}): Record<string, unknown> {
+  const { metadata, existingExtractions, mergedExtractions, keepHistory, historyLimit } = params;
+  if (
+    !keepHistory ||
+    !existingExtractions ||
+    sameExtractionIdentity(existingExtractions, mergedExtractions)
+  ) {
+    return {
+      ...metadata,
+      llm_extractions: mergedExtractions,
+    };
+  }
+
+  const history = normalizeExtractionHistory(metadata.llm_extraction_versions);
+  const alreadyStored = history.some((item) => sameExtractionIdentity(item, existingExtractions));
+  const nextHistory = alreadyStored ? history : [...history, existingExtractions];
+  return {
+    ...metadata,
+    llm_extractions: mergedExtractions,
+    llm_extraction_versions: nextHistory.slice(-historyLimit),
+  };
 }
 
 function buildMemoryQuery(
@@ -289,6 +347,9 @@ async function writeExtractionResult(params: {
   outputPath: string;
   supabase: ReturnType<typeof createSupabaseClient>;
   extractedKinds: ExtractionKind[];
+  replaceExistingKinds: boolean;
+  keepHistory: boolean;
+  historyLimit: number;
 }) {
   const {
     row,
@@ -299,17 +360,25 @@ async function writeExtractionResult(params: {
     outputPath,
     supabase,
     extractedKinds,
+    replaceExistingKinds,
+    keepHistory,
+    historyLimit,
   } = params;
-  const mergedExtractions = mergeMemoryExtractions(existingExtractions, llmExtractions);
+  const mergedExtractions = mergeMemoryExtractions(existingExtractions, llmExtractions, {
+    replaceKinds: replaceExistingKinds ? extractedKinds : undefined,
+  });
 
   if (!dryRun) {
     await persistMemoryMetadataWithRetry({
       supabase,
       row,
-      metadata: {
-        ...metadata,
-        llm_extractions: mergedExtractions,
-      },
+      metadata: buildMetadataWithExtraction({
+        metadata,
+        existingExtractions,
+        mergedExtractions,
+        keepHistory,
+        historyLimit,
+      }),
     });
   }
 
@@ -344,9 +413,23 @@ async function processMemoryRow(params: {
   extractor: RunnerBackedMemoryExtractor | MemoryLlmExtractor;
   outputPath: string;
   supabase: ReturnType<typeof createSupabaseClient>;
+  keepHistory: boolean;
+  historyLimit: number;
 }): Promise<'extracted' | 'skip-existing' | 'skip-no-output'> {
-  const { row, index, total, backend, dryRun, force, requireRaw, extractor, outputPath, supabase } =
-    params;
+  const {
+    row,
+    index,
+    total,
+    backend,
+    dryRun,
+    force,
+    requireRaw,
+    extractor,
+    outputPath,
+    supabase,
+    keepHistory,
+    historyLimit,
+  } = params;
   const metadata = (row.metadata as Record<string, unknown> | null) || {};
   const existingExtractions = normalizeMemoryExtractions(metadata.llm_extractions);
   if (
@@ -379,6 +462,9 @@ async function processMemoryRow(params: {
     outputPath,
     supabase,
     extractedKinds: extractor.getEnabledKinds(),
+    replaceExistingKinds: force,
+    keepHistory,
+    historyLimit,
   });
   console.log(
     `[memory-llm-extract] progress processed=${index}/${total} backend=${backend} memory=${row.id} status=${dryRun ? 'dry-run-extract' : 'extracted'} kinds=${extractor.getEnabledKinds().join(',')}`
@@ -394,8 +480,22 @@ async function processMemoryBatch(params: {
   extractor: RunnerBackedMemoryExtractor;
   outputPath: string;
   supabase: ReturnType<typeof createSupabaseClient>;
+  force: boolean;
+  keepHistory: boolean;
+  historyLimit: number;
 }): Promise<BatchResultStatus[]> {
-  const { items, total, backend, dryRun, extractor, outputPath, supabase } = params;
+  const {
+    items,
+    total,
+    backend,
+    dryRun,
+    extractor,
+    outputPath,
+    supabase,
+    force,
+    keepHistory,
+    historyLimit,
+  } = params;
   if (items.length === 0) return [];
   const batchChars = items.reduce((sum, item) => sum + estimateBatchChars(item.row), 0);
   console.log(
@@ -429,6 +529,9 @@ async function processMemoryBatch(params: {
       outputPath,
       supabase,
       extractedKinds: extractor.getEnabledKinds(),
+      replaceExistingKinds: force,
+      keepHistory,
+      historyLimit,
     });
     console.log(
       `[memory-llm-extract] progress processed=${item.index}/${total} backend=${backend} memory=${item.row.id} status=${dryRun ? 'dry-run-extract' : 'extracted'} kinds=${extractor.getEnabledKinds().join(',')} batch=true`
@@ -839,6 +942,8 @@ async function main() {
   const dryRun = parseBoolean(process.env.MEMORY_LLM_EXTRACT_DRY_RUN, false);
   const force = parseBoolean(process.env.MEMORY_LLM_EXTRACT_FORCE, false);
   const requireRaw = parseBoolean(process.env.MEMORY_LLM_EXTRACT_REQUIRE_RAW, true);
+  const keepHistory = parseBoolean(process.env.MEMORY_LLM_EXTRACT_KEEP_HISTORY, true);
+  const historyLimit = parsePositiveInt(process.env.MEMORY_LLM_EXTRACT_HISTORY_LIMIT, 10);
   const outputPath =
     process.env.MEMORY_LLM_EXTRACT_OUTPUT_PATH ||
     resolve(
@@ -885,6 +990,8 @@ async function main() {
       dryRun,
       force,
       requireRaw,
+      keepHistory,
+      historyLimit,
       backend,
       enabledKinds: extractor.getEnabledKinds(),
       startedAt: new Date().toISOString(),
@@ -962,6 +1069,9 @@ async function main() {
           extractor: batchExtractor!,
           outputPath,
           supabase,
+          force,
+          keepHistory,
+          historyLimit,
         });
         batch = [];
         batchChars = 0;
@@ -1023,6 +1133,8 @@ async function main() {
           extractor,
           outputPath,
           supabase,
+          keepHistory,
+          historyLimit,
         });
         if (recordStatus(result, processed)) {
           processed = limit;
@@ -1049,6 +1161,8 @@ async function main() {
       batchSize: useBatchExtraction ? batchSize : 1,
       batchMaxChars: useBatchExtraction ? batchMaxChars : null,
       requireRaw,
+      keepHistory,
+      historyLimit,
       completedAt: new Date().toISOString(),
     })}\n`
   );
