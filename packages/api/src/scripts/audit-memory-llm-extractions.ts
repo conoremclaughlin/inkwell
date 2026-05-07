@@ -106,6 +106,8 @@ interface AuditSummary {
   };
   entityTypeCounts: Record<string, number>;
   durableFactCategoryCounts: Record<string, number>;
+  extractionVersionCounts: Record<string, number>;
+  extractionProviderCounts: Record<string, number>;
   answerCoverage: {
     cases: number;
     targetContentHasAnswer: number;
@@ -361,6 +363,8 @@ function summarizeAudits(params: {
   const roleCounts: Record<CaseRole, number> = { target: 0, distractor: 0, unknown: 0 };
   const entityTypeCounts: Record<string, number> = {};
   const durableFactCategoryCounts: Record<string, number> = {};
+  const extractionVersionCounts: Record<string, number> = {};
+  const extractionProviderCounts: Record<string, number> = {};
   const normalizedPresence = {
     entity: 0,
     durableFact: 0,
@@ -400,6 +404,8 @@ function summarizeAudits(params: {
       continue;
     }
     const hasAllKinds = Boolean(extraction.entity && extraction.durable_fact && extraction.summary);
+    increment(extractionVersionCounts, String(extraction.version));
+    increment(extractionProviderCounts, extraction.provider);
     if (
       hasAllKinds &&
       extraction.raw?.entity &&
@@ -485,6 +491,8 @@ function summarizeAudits(params: {
     contentLimit,
     entityTypeCounts,
     durableFactCategoryCounts,
+    extractionVersionCounts,
+    extractionProviderCounts,
     answerCoverage: {
       cases: params.caseCoverage.length,
       targetContentHasAnswer: params.caseCoverage.filter((item) => item.targetContentHasAnswer)
@@ -540,6 +548,16 @@ function buildMarkdownReport(params: {
   );
   lines.push(
     `- Raw overflow preserved: entity=${params.summary.rawOverflowCounts.entity}, durable_fact=${params.summary.rawOverflowCounts.durableFact}, summary_key_points=${params.summary.rawOverflowCounts.summaryKeyPoints}`
+  );
+  lines.push(
+    `- Extraction versions: ${Object.entries(params.summary.extractionVersionCounts)
+      .map(([version, count]) => `v${version}=${count}`)
+      .join(', ')}`
+  );
+  lines.push(
+    `- Providers: ${Object.entries(params.summary.extractionProviderCounts)
+      .map(([provider, count]) => `${provider}=${count}`)
+      .join(', ')}`
   );
   lines.push('');
   lines.push('## Target-answer coverage heuristic');
