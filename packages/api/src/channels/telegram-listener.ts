@@ -13,6 +13,7 @@ import { MediaGroupBuffer } from './media-group-buffer';
 import { logger } from '../utils/logger';
 import { env } from '../config/env';
 import { getAuthorizationService, type AuthorizationService } from '../services/authorization';
+import { checkApprovalResponse } from './approval-interceptor';
 
 const TELEGRAM_API = 'https://api.telegram.org';
 
@@ -179,6 +180,7 @@ export class TelegramListener extends EventEmitter {
   private mediaGroupBuffer: MediaGroupBuffer | null = null;
   private authService: AuthorizationService;
   private botUsername: string | null = null;
+  private lockFilePath: string | null = null;
 
   // Ephemeral message cache - keyed by chatId, stores last N messages
   // Auto-cleaned periodically, never persisted to disk
@@ -220,6 +222,9 @@ export class TelegramListener extends EventEmitter {
       return;
     }
 
+    // Crash guard: prevent two listeners on the same bot token
+    await this.acquireLock();
+
     logger.info('Starting Telegram listener...');
     this.isRunning = true;
 
@@ -232,6 +237,7 @@ export class TelegramListener extends EventEmitter {
     } catch (error) {
       logger.error('Failed to connect to Telegram:', error);
       this.isRunning = false;
+      await this.releaseLock();
       throw error;
     }
 
@@ -262,8 +268,85 @@ export class TelegramListener extends EventEmitter {
     }
 
     this.mediaGroupBuffer?.destroy();
+    await this.releaseLock();
 
     this.emit('disconnected');
+  }
+
+  /**
+   * Acquire a lockfile to prevent duplicate listeners on the same bot token.
+   * The lock contains the PID — if the owning process is dead, the lock is stale
+   * and we take over.
+   */
+  private async acquireLock(): Promise<void> {
+    const { join } = await import('path');
+    const { homedir } = await import('os');
+    const fs = await import('fs/promises');
+    const { writeFileSync, mkdirSync } = await import('fs');
+    const crypto = await import('crypto');
+
+    const tokenHash = crypto.createHash('sha256').update(this.token).digest('hex').slice(0, 12);
+    const lockDir = join(homedir(), '.ink', 'locks');
+    mkdirSync(lockDir, { recursive: true });
+    this.lockFilePath = join(lockDir, `telegram-${tokenHash}.lock`);
+
+    const lockData = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() });
+
+    // Try exclusive create — fails atomically if file already exists
+    try {
+      writeFileSync(this.lockFilePath, lockData, { flag: 'wx' });
+      return; // Lock acquired
+    } catch (err: unknown) {
+      if (
+        !(err instanceof Error) ||
+        !('code' in err) ||
+        (err as NodeJS.ErrnoException).code !== 'EEXIST'
+      ) {
+        throw err;
+      }
+    }
+
+    // Lock file exists — check if the owning process is still alive
+    try {
+      const existing = await fs.readFile(this.lockFilePath, 'utf-8');
+      const { pid } = JSON.parse(existing);
+
+      try {
+        process.kill(pid, 0);
+        const msg = `Another Telegram listener is already running (PID ${pid}). Aborting to prevent message conflicts.`;
+        logger.error(msg);
+        throw new Error(msg);
+      } catch (killErr: unknown) {
+        if (
+          killErr instanceof Error &&
+          'code' in killErr &&
+          (killErr as NodeJS.ErrnoException).code === 'ESRCH'
+        ) {
+          logger.warn(`Stale Telegram lock from dead process ${pid} — taking over`);
+        } else {
+          throw killErr;
+        }
+      }
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message.includes('Another Telegram listener')) {
+        throw err;
+      }
+      logger.warn('Invalid Telegram lock file — taking over');
+    }
+
+    // Stale or invalid lock — overwrite
+    await fs.writeFile(this.lockFilePath, lockData);
+  }
+
+  private async releaseLock(): Promise<void> {
+    if (!this.lockFilePath) return;
+    try {
+      const fs = await import('fs/promises');
+      await fs.unlink(this.lockFilePath);
+    } catch {
+      // Best-effort cleanup
+    }
+    this.lockFilePath = null;
   }
 
   /**
@@ -335,6 +418,9 @@ export class TelegramListener extends EventEmitter {
 
     // ========== AUTHORIZATION CHECK (before any processing) ==========
 
+    // Hoist trustedUser so the approval intercept can use it without re-querying
+    let trustedUser: Awaited<ReturnType<AuthorizationService['isUserTrusted']>> = null;
+
     if (isGroupChat) {
       // For group chats: check if group is authorized
       const isAuthorized = await this.authService.isGroupAuthorized('telegram', chatId);
@@ -356,7 +442,7 @@ export class TelegramListener extends EventEmitter {
         return;
       }
 
-      const trustedUser = await this.authService.isUserTrusted('telegram', userId);
+      trustedUser = await this.authService.isUserTrusted('telegram', userId);
 
       if (!trustedUser) {
         // Complete silence for untrusted users in DMs
@@ -367,6 +453,31 @@ export class TelegramListener extends EventEmitter {
       // Handle DM commands for trusted users
       if (await this.handleTrustedUserCommand(telegramMessage, chatId, userId)) {
         return; // Command was handled
+      }
+    }
+
+    // ========== 2FA APPROVAL INTERCEPT (before agent routing) ==========
+    // Check if this DM is a response to a pending permission approval request.
+    // Only runs for trusted DM users (approval responses from groups are not supported).
+    // This runs BEFORE the message reaches any agent — only verified platform identity
+    // can resolve approval requests. See ink://specs/2fa-permission-grants.
+    if (text && trustedUser?.userId) {
+      const replyToId = telegramMessage.reply_to_message
+        ? String(telegramMessage.reply_to_message.message_id)
+        : undefined;
+      const result = await checkApprovalResponse(
+        trustedUser.userId,
+        `telegram:${userId}`,
+        text,
+        replyToId
+      );
+      if (result.intercepted) {
+        const emoji = result.action === 'deny' ? '🚫' : '✅';
+        await this.sendMessage(
+          chatId,
+          `${emoji} Permission ${result.action}: request ${result.requestId}`
+        );
+        return; // Do NOT forward to agent routing
       }
     }
 

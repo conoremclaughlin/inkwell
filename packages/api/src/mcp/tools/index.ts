@@ -23,6 +23,20 @@ import {
   handleCompleteTask,
   handleGetTaskStats,
   handleAddTaskComment,
+  handleCreateTaskGroup,
+  handleListTaskGroups,
+  handleUpdateTaskGroup,
+  handleAddTaskGroupComment,
+  handleListTaskGroupComments,
+  handleCloseTask,
+  handleCloseTaskGroup,
+  createTaskGroupSchema,
+  listTaskGroupsSchema,
+  updateTaskGroupSchema,
+  addTaskGroupCommentSchema,
+  listTaskGroupCommentsSchema,
+  closeTaskSchema,
+  closeTaskGroupSchema,
 } from './task-handlers';
 
 import { handleSendResponse, handleGetPendingMessages, handleMarkRead } from './response-handlers';
@@ -200,6 +214,7 @@ import {
   handleDraftEmail,
   handleListLabels,
   handleModifyEmails,
+  handleDownloadAttachment,
   listEmailsSchema,
   getEmailSchema,
   sendEmailSchema,
@@ -207,7 +222,43 @@ import {
   draftEmailSchema,
   listLabelsSchema,
   modifyEmailsSchema,
+  downloadAttachmentSchema,
 } from '../../stories/gmail/handlers';
+
+import {
+  handleCreateSpreadsheet,
+  handleAppendSheetRows,
+  handleGetSheetValues,
+  handleUpdateSheetValues,
+  handleGetSpreadsheet,
+  createSpreadsheetSchema,
+  appendSheetRowsSchema,
+  getSheetValuesSchema,
+  updateSheetValuesSchema,
+  getSpreadsheetSchema,
+} from '../../stories/google-sheets/handlers';
+
+import {
+  handleCreateDocument,
+  handleGetDocument,
+  handleAppendText,
+  handleReplaceText,
+  createDocumentSchema,
+  getDocumentSchema,
+  appendTextSchema,
+  replaceTextSchema,
+} from '../../stories/google-docs/handlers';
+
+import {
+  handleListDriveFiles,
+  handleGetDriveFile,
+  handleCreateDriveFolder,
+  handleMoveDriveFile,
+  listDriveFilesSchema,
+  getDriveFileSchema,
+  createDriveFolderSchema,
+  moveDriveFileSchema,
+} from '../../stories/google-drive/handlers';
 
 import {
   handleLogActivity,
@@ -248,20 +299,15 @@ import {
 import { handleCreateKindleToken, createKindleTokenSchema } from './kindle-handlers';
 
 import {
-  handleCreateTaskGroup,
-  handleListTaskGroups,
-  createTaskGroupSchema,
-  listTaskGroupsSchema,
-} from './task-group-handlers';
-
-import {
   handleStartStrategy,
   handlePauseStrategy,
   handleResumeStrategy,
+  handleCancelStrategy,
   handleGetStrategyStatus,
   startStrategySchema,
   pauseStrategySchema,
   resumeStrategySchema,
+  cancelStrategySchema,
   getStrategyStatusSchema,
 } from './strategy-handlers';
 
@@ -272,8 +318,10 @@ import {
   getIntegrationHealthSchema,
 } from './integration-health-handlers';
 
+import { handleDebugRequestContext } from './debug-handlers';
+
 // Re-export for external use
-export { setResponseCallback, addPendingMessage } from './response-handlers';
+export { setResponseCallback } from './response-handlers';
 export { setTelegramListener, registerChannelListener } from './chat-context-handlers';
 export { setMiniAppsRegistry } from './skill-handlers';
 
@@ -974,6 +1022,130 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     }
   );
 
+  // Register add_task_group_comment tool
+  server.registerTool(
+    'add_task_group_comment',
+    {
+      description: `Add a comment to a task group. Comments are attributed to the calling agent. Use for progress updates, status changes, or conclusion summaries.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: addTaskGroupCommentSchema,
+    },
+    async (args) => {
+      try {
+        return await handleAddTaskGroupComment(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in add_task_group_comment:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register list_task_group_comments tool
+  server.registerTool(
+    'list_task_group_comments',
+    {
+      description: `List comments on a task group. Returns comments in chronological order. Filter by comment type (comment, conclusion, status_change).
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: listTaskGroupCommentsSchema,
+    },
+    async (args) => {
+      try {
+        return await handleListTaskGroupComments(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_task_group_comments:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register close_task tool
+  server.registerTool(
+    'close_task',
+    {
+      description: `Close a task with an outcome. Use instead of complete_task when the task wasn't simply completed — e.g., it was skipped, blocked, or failed. Advances the strategy if one is active.
+
+Outcomes: completed (done), skipped (not needed), blocked (cannot proceed), failed (attempted but failed).
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: closeTaskSchema,
+    },
+    async (args) => {
+      try {
+        return await handleCloseTask(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in close_task:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register close_task_group tool
+  server.registerTool(
+    'close_task_group',
+    {
+      description: `Close a task group with an outcome and conclusion. Posts a conclusion comment and sets the group outcome. Auto-generates a summary if no conclusion is provided. Cancels any active strategy.
+
+Outcomes: completed (all done), partial (some done), abandoned (gave up), failed (critical failure).
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: closeTaskGroupSchema,
+    },
+    async (args) => {
+      try {
+        return await handleCloseTaskGroup(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in close_task_group:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
   // =====================================================
   // TASK GROUP TOOLS
   // =====================================================
@@ -981,7 +1153,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'create_task_group',
     {
-      description: `Create a task group — a collection of ordered tasks for strategy execution. Add tasks with create_task(taskGroupId, taskOrder) after creating the group. Then activate with start_strategy.
+      description: `Create a task group — a container for related tasks that share a title, strategy/description, priority, and optionally an autonomous execution plan or output target (spec/pr/report/proposal). Add tasks with create_task(taskGroupId, taskOrder) after creating the group, then activate with start_strategy. Returns the created group with its UUID.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: createTaskGroupSchema.shape,
@@ -1008,9 +1180,42 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   );
 
   server.registerTool(
+    'update_task_group',
+    {
+      description: `Update a task group — change its status (active/paused/completed/cancelled), title, description, priority, tags, metadata, thread key, or owner. Use this to close a group when its work ships (status: completed) or is abandoned (status: cancelled), or to reassign ownership.
+
+Pass \`closedReason\` as a shorthand to record why a group was closed — it's stored under \`metadata.closed_reason\`.
+
+Metadata is merged into existing metadata by default. Pass \`mergeMetadata: false\` to replace wholesale.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: updateTaskGroupSchema.shape,
+    },
+    async (args) => {
+      try {
+        return await handleUpdateTaskGroup(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in update_task_group:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
     'list_task_groups',
     {
-      description: `List task groups for a user, optionally filtered by status, strategy, or owner agent.
+      description: `List task groups for a user with per-status task counts per group. Omit \`statuses\` (or pass an empty array) to include all statuses. Pass a multi-select array to narrow (e.g. statuses: ["active","paused"]). Also supports projectId, identityId, autonomousOnly, strategy, and ownerAgentId filters.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: listTaskGroupsSchema.shape,
@@ -1122,6 +1327,35 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleResumeStrategy(args, dataComposer);
       } catch (error) {
         logger.error('Error in resume_strategy:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'cancel_strategy',
+    {
+      description: `Cancel an active or paused strategy on a task group. Transitions the group to the terminal 'cancelled' state, cancels the watchdog reminder, and logs the optional reason to the activity stream. Cannot be called on groups that are already completed or cancelled. Tasks themselves are not modified — cancelling the strategy stops autonomous progression but leaves task records intact for audit.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: cancelStrategySchema.shape,
+    },
+    async (args) => {
+      try {
+        return await handleCancelStrategy(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in cancel_strategy:', error);
         return {
           content: [
             {
@@ -1815,12 +2049,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 
 Session resolution: sessionId (explicit) > studioId (scoped lookup) > most recent active session.
 For parallel worktrees, pass studioId to target the correct session.
+
 Phase: Communicates real-time work status to other agents.
 - Active work phases (no auto-memory): investigating, implementing, reviewing
 - Significant transitions (auto-creates memory): blocked:<reason>, waiting:<reason>, complete
 - Optional: paused
 
-Also sets: backendSessionId (for resume), status (active/paused/resumable/completed), context, workingDir.
+Context: The session context column is for **transient runtime state** — facts that are too ephemeral for a memory but too important to lose on compaction. Examples: "server running on port 4001", "vitest watching in background", "PR #341 open awaiting review". The real spine of continuity is memories ("completed X", "decided Y because Z") which flow through bootstrap. Context fills the gap for durable-right-now facts that don't warrant a memory. Use it as a scratch board for active state.
+
+Also sets: backendSessionId (for resume), status (active/paused/resumable/completed), workingDir.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
@@ -1841,7 +2078,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         phase: z
           .string()
           .optional()
-          .describe('Work phase (e.g., "implementing", "blocked:awaiting-input", "waiting:build")'),
+          .describe(
+            'Work phase (agent-set). Core phases: investigating, implementing, reviewing, paused, complete. Use waiting:<reason> when awaiting an async response within normal flow (review, merge, feedback). Use blocked:<reason> ONLY when extraordinary intervention is required outside normal process — something has gone wrong (permissions denied, infrastructure broken, unresolvable conflict). Both auto-create memories. Do NOT use runtime: prefix — use lifecycle instead.'
+          ),
         note: z
           .string()
           .optional()
@@ -1863,7 +2102,12 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .enum(['active', 'paused', 'resumable', 'completed'])
           .optional()
           .describe('Session status'),
-        context: z.string().optional().describe('Brief context of current work state'),
+        context: z
+          .string()
+          .optional()
+          .describe(
+            'Transient runtime state — active facts too ephemeral for a memory but important to preserve across compaction. E.g. "server on :4001", "waiting on PR #341 review", "vitest running in background". Use as a scratch board; memories handle durable decisions.'
+          ),
         workingDir: z.string().optional().describe('Working directory'),
       },
     },
@@ -3380,6 +3624,55 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   );
 
   // =====================================================
+  // DEBUG TOOLS (reflects server state — used by .live.test.ts)
+  // Only registered when NODE_ENV !== 'production' so prod servers
+  // don't expose reflection endpoints. Opt out in dev by setting
+  // INK_DISABLE_DEBUG_TOOLS=1.
+  // =====================================================
+
+  const debugToolsEnabled =
+    process.env.NODE_ENV !== 'production' && process.env.INK_DISABLE_DEBUG_TOOLS !== '1';
+
+  if (debugToolsEnabled) {
+    server.registerTool(
+      'debug_request',
+      {
+        description: `Reflect the server-side request/session context back to the caller.
+
+Used by backend reflection tests (\`*.live.test.ts\`) to verify that CLI adapters
+are injecting \`x-ink-context\` and related headers correctly end-to-end. Not
+intended for agent use — calling it leaks no privileged data, it just reports
+what the server saw for the current call.
+
+Only registered when NODE_ENV !== 'production'.`,
+        inputSchema: {},
+      },
+      async () => {
+        try {
+          const result = await handleDebugRequestContext({});
+          return {
+            content: [{ type: 'text' as const, text: JSON.stringify(result) }],
+          };
+        } catch (error) {
+          logger.error('Error in debug_request:', error);
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  success: false,
+                  error: error instanceof Error ? error.message : 'Unknown error',
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+  }
+
+  // =====================================================
   // ARTIFACT TOOLS (shared documents, specs, designs)
   // =====================================================
 
@@ -4472,6 +4765,492 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleModifyEmails(args, dataComposer);
       } catch (error) {
         logger.error('Error in modify_emails:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'download_email_attachment',
+    {
+      description: `Download an email attachment to disk (~/.ink/files/gmail/).
+
+Returns the absolute file path, which can be used with send_response media
+or shared with other agents. Attachment IDs come from the attachments array
+returned by get_email.
+
+User must have connected their Google account with Gmail permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: downloadAttachmentSchema,
+    },
+    async (args) => {
+      try {
+        return await handleDownloadAttachment(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in download_email_attachment:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // GOOGLE SHEETS TOOLS (stories/google-sheets)
+  // =====================================================
+
+  server.registerTool(
+    'create_spreadsheet',
+    {
+      description: `Create a new Google Spreadsheet.
+
+Returns the new spreadsheet's ID, URL, and the metadata of its initial sheet/tab.
+
+User must have connected their Google account with Sheets permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: createSpreadsheetSchema,
+    },
+    async (args) => {
+      try {
+        return await handleCreateSpreadsheet(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in create_spreadsheet:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'append_sheet_rows',
+    {
+      description: `Append rows of data to a Google Spreadsheet.
+
+Pass a 2D array in "values": each inner array is one row of cells. Cell values can be strings, numbers, booleans, or null.
+
+valueInputOption:
+- "USER_ENTERED" (default) — values are parsed as if typed in the Sheets UI (formulas, dates, currencies)
+- "RAW" — values are inserted exactly as provided
+
+User must have connected their Google account with Sheets write permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: appendSheetRowsSchema,
+    },
+    async (args) => {
+      try {
+        return await handleAppendSheetRows(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in append_sheet_rows:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_sheet_values',
+    {
+      description: `Read cell values from a Google Spreadsheet range.
+
+Range uses A1 notation, e.g. "Sheet1!A1:C10" or "Sheet1" (entire sheet).
+
+valueRenderOption:
+- "FORMATTED_VALUE" (default) — strings as displayed in the UI
+- "UNFORMATTED_VALUE" — native types (dates as serial numbers)
+- "FORMULA" — formula text instead of computed value
+
+User must have connected their Google account with Sheets permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getSheetValuesSchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetSheetValues(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_sheet_values:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'update_sheet_values',
+    {
+      description: `Overwrite a range of cells in a Google Spreadsheet.
+
+Pass a 2D array in "values" matching the shape of the target range. Existing values in that range will be replaced.
+
+User must have connected their Google account with Sheets write permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: updateSheetValuesSchema,
+    },
+    async (args) => {
+      try {
+        return await handleUpdateSheetValues(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in update_sheet_values:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_spreadsheet',
+    {
+      description: `Get metadata for a Google Spreadsheet — title, URL, and the list of sheet/tab names with row/column counts. Does NOT return cell data; use get_sheet_values for that.
+
+User must have connected their Google account with Sheets permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getSpreadsheetSchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetSpreadsheet(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_spreadsheet:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // GOOGLE DOCS TOOLS (stories/google-docs)
+  // =====================================================
+
+  server.registerTool(
+    'create_document',
+    {
+      description: `Create a new Google Doc.
+
+Optionally pass "initialContent" to seed the body with text on creation.
+
+User must have connected their Google account with Docs permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: createDocumentSchema,
+    },
+    async (args) => {
+      try {
+        return await handleCreateDocument(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in create_document:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_document',
+    {
+      description: `Read a Google Doc's body as plain text. Tables are flattened (cells separated by tabs); formatting is dropped. Suitable for AI consumption, not exact reproduction.
+
+User must have connected their Google account with Docs permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getDocumentSchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetDocument(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_document:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'append_document_text',
+    {
+      description: `Append text to the end of a Google Doc.
+
+By default a leading newline is inserted so the appended text starts on a new line. Set separateWithNewline=false to append inline.
+
+User must have connected their Google account with Docs write permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: appendTextSchema,
+    },
+    async (args) => {
+      try {
+        return await handleAppendText(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in append_document_text:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'replace_document_text',
+    {
+      description: `Find-and-replace within a Google Doc. Replaces ALL occurrences of "find" with "replaceWith". Set matchCase=false for case-insensitive matching.
+
+Returns the number of occurrences changed.
+
+User must have connected their Google account with Docs write permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: replaceTextSchema,
+    },
+    async (args) => {
+      try {
+        return await handleReplaceText(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in replace_document_text:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // =====================================================
+  // GOOGLE DRIVE TOOLS (stories/google-drive)
+  // =====================================================
+
+  server.registerTool(
+    'list_drive_files',
+    {
+      description: `List or search files in the user's Google Drive.
+
+Use the "query" parameter to filter using Google Drive's query syntax:
+- "name contains 'Tax'"
+- "mimeType='application/vnd.google-apps.spreadsheet'"
+- "modifiedTime > '2026-01-01T00:00:00'"
+- "'<folderId>' in parents"
+- "trashed = false"
+
+Returns up to pageSize files (default 25, max 100). Use nextPageToken to paginate.
+
+User must have connected their Google account with Drive permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: listDriveFilesSchema,
+    },
+    async (args) => {
+      try {
+        return await handleListDriveFiles(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_drive_files:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_drive_file',
+    {
+      description: `Get metadata for a Google Drive file by ID — name, mimeType, parents, owners, web view link, and modification times.
+
+User must have connected their Google account with Drive permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getDriveFileSchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetDriveFile(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in get_drive_file:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'create_drive_folder',
+    {
+      description: `Create a new folder in Google Drive.
+
+Pass parentFolderId to nest within an existing folder; omit it to create at the root of My Drive.
+
+User must have connected their Google account with Drive write permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: createDriveFolderSchema,
+    },
+    async (args) => {
+      try {
+        return await handleCreateDriveFolder(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in create_drive_folder:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'move_drive_file',
+    {
+      description: `Move a file or folder in Google Drive into a different parent folder. Removes the file from any current parents.
+
+NOTE: This tool does not delete or trash files — those operations are blocked for safety.
+
+User must have connected their Google account with Drive write permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: moveDriveFileSchema,
+    },
+    async (args) => {
+      try {
+        return await handleMoveDriveFile(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in move_drive_file:', error);
         return {
           content: [
             {

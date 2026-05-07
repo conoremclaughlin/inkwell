@@ -247,7 +247,8 @@ export class WhatsAppListener extends EventEmitter {
 
     // Extract text content
     const text = this.extractMessageText(msg);
-    if (!text) return;
+    const hasMedia = this.hasMediaContent(msg);
+    if (!text && !hasMedia) return;
 
     // Normalize sender ID to E.164
     const senderE164 = this.jidToE164(senderId);
@@ -260,7 +261,7 @@ export class WhatsAppListener extends EventEmitter {
 
       if (!isAuthorized) {
         // Only respond to /authorize command
-        if (this.isAuthorizeCommand(text)) {
+        if (text && this.isAuthorizeCommand(text)) {
           await this.handleAuthorizeCommand(msg, chatId, text);
           return;
         }
@@ -281,7 +282,7 @@ export class WhatsAppListener extends EventEmitter {
       }
 
       // Handle DM commands for trusted users
-      if (await this.handleTrustedUserCommand(msg, chatId, senderE164, text)) {
+      if (text && (await this.handleTrustedUserCommand(msg, chatId, senderE164, text))) {
         return;
       }
     }
@@ -317,6 +318,15 @@ export class WhatsAppListener extends EventEmitter {
         this.emit('error', error);
       }
     }
+  }
+
+  /**
+   * Check if message contains downloadable media
+   */
+  private hasMediaContent(msg: WAMessage): boolean {
+    const m = msg.message;
+    if (!m) return false;
+    return !!(m.imageMessage || m.videoMessage || m.documentMessage || m.audioMessage);
   }
 
   /**
@@ -638,6 +648,34 @@ export class WhatsAppListener extends EventEmitter {
       };
     }
 
+    // Download media attachments
+    if (this.hasMediaContent(msg)) {
+      const m = msg.message!;
+      const mediaType = m.imageMessage
+        ? 'image'
+        : m.videoMessage
+          ? 'video'
+          : m.documentMessage
+            ? 'document'
+            : 'audio';
+
+      const localPath = await this.downloadMedia(
+        msg,
+        mediaType as 'image' | 'video' | 'document' | 'audio'
+      );
+      if (localPath) {
+        const mediaMsg = m.imageMessage || m.videoMessage || m.documentMessage || m.audioMessage;
+        message.media = [
+          {
+            type: mediaType as 'image' | 'video' | 'audio' | 'document',
+            path: localPath,
+            contentType: mediaMsg?.mimetype || undefined,
+            filename: m.documentMessage?.fileName || undefined,
+          },
+        ];
+      }
+    }
+
     message.raw = msg;
 
     return message;
@@ -749,6 +787,52 @@ export class WhatsAppListener extends EventEmitter {
     });
 
     logger.info(`Sent video to WhatsApp chat ${jid}`, { size: bytes.byteLength });
+  }
+
+  /**
+   * Download media from a WhatsApp message.
+   * Uses Baileys' downloadMediaMessage which handles decryption.
+   */
+  async downloadMedia(
+    msg: WAMessage,
+    mediaType: 'image' | 'video' | 'document' | 'audio'
+  ): Promise<string | null> {
+    try {
+      const baileys = await import('@whiskeysockets/baileys');
+      const buffer: Buffer = await baileys.downloadMediaMessage(msg, 'buffer', {});
+
+      const fs = await import('fs/promises');
+      const path = await import('path');
+      const os = await import('os');
+
+      const dir = path.join(os.homedir(), '.ink', 'files', 'whatsapp');
+      await fs.mkdir(dir, { recursive: true });
+
+      const m = msg.message!;
+      const mediaMsg = m.imageMessage || m.videoMessage || m.documentMessage || m.audioMessage;
+      const mimetype: string = mediaMsg?.mimetype || 'application/octet-stream';
+      const ext = mimetype.split('/')[1]?.split(';')[0] || 'bin';
+      const originalName: string | undefined = m.documentMessage?.fileName;
+      const sanitized = originalName
+        ? originalName.replace(/[^a-zA-Z0-9._-]/g, '_')
+        : `${mediaType}_${Date.now()}`;
+      const filename = originalName ? `${Date.now()}_${sanitized}` : `${sanitized}.${ext}`;
+      const filePath = path.join(dir, filename);
+
+      await fs.writeFile(filePath, buffer);
+
+      logger.info('Downloaded WhatsApp media', {
+        mediaType,
+        filePath,
+        size: buffer.byteLength,
+        mimetype,
+      });
+
+      return filePath;
+    } catch (error) {
+      logger.error('Failed to download WhatsApp media:', error);
+      return null;
+    }
   }
 
   /**

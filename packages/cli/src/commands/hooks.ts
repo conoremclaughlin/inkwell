@@ -11,6 +11,7 @@
  *   hooks pre-compact         Hook: pre-compaction reminder
  *   hooks post-compact        Hook: post-compaction bootstrap
  *   hooks on-session-start    Hook: session start bootstrap
+ *   hooks on-tool-approval    Hook: 2FA approval check (PreToolUse)
  *   hooks on-prompt           Hook: periodic inbox check
  *   hooks on-stop             Hook: session nudge + inbox check
  */
@@ -452,6 +453,23 @@ function writeRuntimeFile(cwd: string, filename: string, content: string): void 
   writeFileSync(join(dir, filename), content);
 }
 
+/**
+ * Check whether this process is a headless/autonomous spawn (not a human at the REPL).
+ * Decodes the INK_CONTEXT token set by the runner at spawn time — if cliAttached is
+ * explicitly false, this is a triggered session that should NOT mark itself CLI-attached.
+ * When there's no INK_CONTEXT (interactive `claude` invocation), defaults to true (attached).
+ */
+export function isHeadlessSession(): boolean {
+  const raw = process.env.INK_CONTEXT?.trim();
+  if (!raw) return false;
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString());
+    return parsed.cliAttached === false;
+  } catch {
+    return false;
+  }
+}
+
 function normalizeSessionBackend(backendName: string): string {
   // Hook backend names and session/backend adapter names differ for Claude:
   // - hooks backend: "claude-code"
@@ -866,15 +884,6 @@ export function buildIdentityBlock(bootstrapResult: Record<string, unknown>): st
   return sections.join('\n\n---\n\n');
 }
 
-function buildInboxBlock(messages: Array<Record<string, unknown>> | undefined): string {
-  if (!messages || messages.length === 0) return '';
-  const lines = [`### Inbox (${messages.length} message${messages.length === 1 ? '' : 's'})`];
-  for (const msg of messages) {
-    lines.push(`- **${msg.from || 'unknown'}**: ${msg.content || msg.subject || '(no content)'}`);
-  }
-  return lines.join('\n');
-}
-
 /**
  * Check if the InkMail channel plugin is registered in .mcp.json.
  * When active, the channel handles real-time inbox delivery — hook-based
@@ -901,6 +910,15 @@ function buildInboxTag(messages: Array<Record<string, unknown>> | undefined): st
   return lines.join('\n');
 }
 
+function buildInboxBlock(messages: Array<Record<string, unknown>> | undefined): string {
+  if (!messages || messages.length === 0) return '';
+  const lines = [`### Inbox (${messages.length} message${messages.length === 1 ? '' : 's'})`];
+  for (const msg of messages) {
+    lines.push(`- **${msg.from || 'unknown'}**: ${msg.content || msg.subject || '(no content)'}`);
+  }
+  return lines.join('\n');
+}
+
 function buildMemoriesBlock(memories: Array<Record<string, unknown>> | undefined): string {
   if (!memories || memories.length === 0) return '';
   const lines = ['### Recent Memories'];
@@ -914,9 +932,14 @@ function buildSessionsBlock(sessions: Array<Record<string, unknown>> | undefined
   if (!sessions || sessions.length === 0) return '';
   const lines = ['### Active Sessions'];
   for (const s of sessions) {
-    lines.push(
-      `- ${(s.id as string)?.substring(0, 8) || 'unknown'}: ${s.summary || s.status || 'active'}`
-    );
+    const id = (s.id as string)?.substring(0, 8) || 'unknown';
+    const agent = s.agentId ? ` (${s.agentId})` : '';
+    const phase = s.currentPhase ? ` — phase: ${s.currentPhase}` : '';
+    const lifecycle = s.lifecycle ? ` [${s.lifecycle}]` : '';
+    lines.push(`- ${id}${agent}${lifecycle}${phase}`);
+    if (s.context) {
+      lines.push(`  > Context: ${s.context}`);
+    }
   }
   return lines.join('\n');
 }
@@ -951,6 +974,68 @@ function buildSkillsBlock(skills: Array<Record<string, unknown>> | undefined): s
   if (guideContents.length > 0) {
     lines.push('');
     lines.push(...guideContents);
+  }
+
+  return lines.join('\n');
+}
+
+interface TaskGroupSummary {
+  id: string;
+  title: string;
+  status: string;
+  strategy?: string;
+  groupNumber?: number;
+  taskCounts?: {
+    total: number;
+    pending: number;
+    in_progress: number;
+    completed: number;
+    blocked: number;
+  };
+  metadata?: Record<string, unknown>;
+}
+
+interface StandaloneTaskSummary {
+  id: string;
+  title: string;
+  status: string;
+}
+
+function buildTasksBlock(
+  groups: Array<Record<string, unknown>> | undefined,
+  standalone: Array<Record<string, unknown>> | undefined
+): string {
+  const hasGroups = groups && groups.length > 0;
+  const hasStandalone = standalone && standalone.length > 0;
+  if (!hasGroups && !hasStandalone) return '';
+
+  const lines: string[] = ['### Active Work'];
+
+  if (hasGroups) {
+    for (const raw of groups) {
+      const g = raw as unknown as TaskGroupSummary;
+      const counts = g.taskCounts;
+      const progress = counts ? `${counts.completed}/${counts.total} done` : '';
+      const statusTag = g.status === 'paused' ? ' (paused)' : '';
+      const label = g.groupNumber ? `Mission #${g.groupNumber}` : 'Mission';
+      const studioSlug = (g.metadata as Record<string, unknown>)?.studioSlug as string | undefined;
+      const studioLine = studioSlug ? ` · studio: ${studioSlug}` : '';
+
+      lines.push(`- **${label}: ${g.title}**${statusTag} — ${progress}${studioLine} · \`${g.id}\``);
+
+      if (counts && counts.in_progress > 0) {
+        lines.push(`  → ${counts.in_progress} task(s) in progress, ${counts.pending} pending`);
+      }
+    }
+  }
+
+  if (hasStandalone) {
+    lines.push('');
+    lines.push('**Standalone tasks:**');
+    for (const raw of standalone) {
+      const t = raw as unknown as StandaloneTaskSummary;
+      lines.push(`- ${t.title} [${t.status}] · \`${t.id}\``);
+    }
   }
 
   return lines.join('\n');
@@ -1075,6 +1160,16 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
             {
               type: 'command',
               command: buildManagedHookCommand(sbPath, 'on-session-start', CLAUDE_CODE.name),
+            },
+          ],
+        },
+      ],
+      PreToolUse: [
+        {
+          hooks: [
+            {
+              type: 'command',
+              command: buildManagedHookCommand(sbPath, 'on-tool-approval', CLAUDE_CODE.name),
             },
           ],
         },
@@ -1708,11 +1803,12 @@ async function postCompactHandler(): Promise<void> {
       '*FAILED: Could not reach Inkwell server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
   }
 
-  // Check inbox
+  // Check inbox — grab last 10 for orientation context, not delivery
   try {
     const inbox = await callPcpTool('get_inbox', {
       email: config?.email,
       agentId,
+      limit: 10,
     });
     inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
     writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
@@ -1760,7 +1856,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   hookLog('on_session_start', {
     agentId,
     backend: resolvedBackend.name,
-    hasInkContextToken: !!process.env.INK_CONTEXT_TOKEN,
+    hasInkContextToken: !!process.env.INK_CONTEXT,
     hasInkSessionId: !!process.env.INK_SESSION_ID,
     hasInkStudioId: !!process.env.INK_STUDIO_ID,
   });
@@ -1777,6 +1873,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   let sessionsBlock = '';
   let inboxBlock = '';
   let skillsBlock = '';
+  let tasksBlock = '';
   let roleBlock = '';
 
   // Load ROLE.md if present in this studio
@@ -1847,11 +1944,12 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     }
   }
 
-  // Check inbox
+  // Check inbox — grab last 10 for orientation context, not delivery
   try {
     const inbox = await callPcpTool('get_inbox', {
       email: config?.email,
       agentId,
+      limit: 10,
     });
     inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
     writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
@@ -1868,6 +1966,37 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     );
   } catch {
     // Non-fatal: skills are a nice-to-have at session start
+  }
+
+  // Load active task groups owned by this agent + standalone tasks assigned to this agent
+  try {
+    const [groupsResult, standaloneResult] = await Promise.all([
+      callPcpTool('list_task_groups', {
+        email: config?.email,
+        statuses: ['active', 'paused'],
+        ownerAgentId: agentId,
+        includeTaskCounts: true,
+      }),
+      callPcpTool('list_tasks', {
+        email: config?.email,
+        activeOnly: true,
+      }),
+    ]);
+    const groups = groupsResult.groups as Array<Record<string, unknown>> | undefined;
+    const allActiveTasks = standaloneResult.tasks as Array<Record<string, unknown>> | undefined;
+    // Standalone = assigned to this agent but not in any group.
+    // Check metadata.assignment.agentId first (set by strategy service),
+    // fall back to createdBy for tasks predating assignment metadata.
+    const standalone = allActiveTasks?.filter((t) => {
+      if (t.taskGroupId) return false;
+      const meta = t.metadata as Record<string, unknown> | undefined;
+      const assignment = meta?.assignment as Record<string, unknown> | undefined;
+      if (assignment?.agentId) return assignment.agentId === agentId;
+      return t.createdBy === agentId;
+    });
+    tasksBlock = buildTasksBlock(groups, standalone);
+  } catch {
+    // Non-fatal: tasks are a nice-to-have at session start
   }
 
   // Register Inkwell session with detected backend
@@ -1959,6 +2088,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     SESSIONS_BLOCK: sessionsBlock,
     SKILLS_BLOCK: skillsBlock,
     INBOX_BLOCK: inboxBlock,
+    TASKS_BLOCK: tasksBlock,
   });
 
   sbDebugLog('hooks', 'on_session_start_output_emitted', {
@@ -1977,6 +2107,190 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   });
 
   process.stdout.write(output);
+}
+
+// ============================================================================
+// on-tool-approval — PreToolUse intercept for 2FA permission grants
+// ============================================================================
+
+/**
+ * Load the approval-required tool patterns from studio settings.
+ * Falls back to empty array if no config exists.
+ */
+export function loadApprovalSet(cwd: string): string[] {
+  try {
+    const settingsPath = join(cwd, '.claude', 'settings.local.json');
+    if (!existsSync(settingsPath)) return [];
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    // Claude Code rejects unknown top-level fields; nest under `permissions`
+    // which accepts additionalProperties. Fall back to top-level for
+    // backcompat with any config written before this fix.
+    return settings.permissions?.approvalRequired || settings.approvalRequired || [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Check if a tool call matches any pattern in the approval set.
+ * Supports glob-style patterns: "Bash(docker push *)", "mcp__supabase__apply_migration"
+ */
+export function matchesApprovalSet(
+  toolName: string,
+  toolInput: string,
+  patterns: string[]
+): boolean {
+  for (const pattern of patterns) {
+    // Exact tool match (no args pattern)
+    if (pattern === toolName) return true;
+
+    // Pattern with args: "Bash(docker push *)"
+    const parenIdx = pattern.indexOf('(');
+    if (parenIdx === -1) continue;
+
+    const patternTool = pattern.substring(0, parenIdx);
+    if (patternTool !== toolName) continue;
+
+    const argsPattern = pattern.substring(parenIdx + 1, pattern.length - 1); // strip parens
+    // Simple glob: convert * to regex .*
+    const regex = new RegExp(
+      '^' + argsPattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*') + '$'
+    );
+    if (regex.test(toolInput)) return true;
+  }
+  return false;
+}
+
+async function onToolApprovalHandler(options?: { backend?: string }): Promise<void> {
+  const stdin = await readStdin();
+  const cwd = process.cwd();
+
+  // Claude Code PreToolUse passes: { tool_name, tool_input }
+  // For Bash, tool_input is { command, description } — match against command
+  // so patterns like `Bash(docker push *)` work (Claude Code native syntax).
+  // For other tools, fall back to JSON so patterns can still inspect the full
+  // input shape if ever needed.
+  const toolName = (stdin.tool_name as string) || '';
+  const rawInput = stdin.tool_input;
+  let toolInput: string;
+  if (typeof rawInput === 'string') {
+    toolInput = rawInput;
+  } else if (rawInput && typeof (rawInput as { command?: unknown }).command === 'string') {
+    toolInput = (rawInput as { command: string }).command;
+  } else {
+    toolInput = JSON.stringify(rawInput || '');
+  }
+
+  hookLog('on_tool_approval', { toolName, toolInputPreview: toolInput.substring(0, 100) });
+
+  // Check against approval set
+  const approvalSet = loadApprovalSet(cwd);
+  if (approvalSet.length === 0 || !matchesApprovalSet(toolName, toolInput, approvalSet)) {
+    // Not in the approval set — allow through
+    process.exit(0);
+  }
+
+  hookLog('on_tool_approval_match', { toolName, toolInput: toolInput.substring(0, 200) });
+
+  // Create an approval request on the server
+  const serverUrl = getPcpServerUrl();
+  const token = await getValidAccessToken(serverUrl);
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  // Forward context header so server knows the agent/studio
+  const contextToken = process.env.INK_CONTEXT?.trim();
+  if (contextToken) headers['x-ink-context'] = contextToken;
+
+  const sessionId = process.env.INK_SESSION_ID?.trim() || undefined;
+  const studioId = process.env.INK_STUDIO_ID?.trim() || undefined;
+
+  let requestId: string;
+  try {
+    const resp = await fetch(`${serverUrl}/api/admin/approval-requests`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        tool: toolName,
+        args: toolInput,
+        reason: `Tool requires 2FA approval`,
+        studioId,
+        sessionId,
+        timeoutSeconds: 300,
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!resp.ok) {
+      hookLog('on_tool_approval_create_failed', { status: resp.status });
+      // Fail closed — this is a security gate, don't allow through on errors
+      process.stdout.write(
+        `\n⚠️ Permission blocked: could not create approval request (server returned ${resp.status}).\n`
+      );
+      process.exit(1);
+    }
+
+    const body = (await resp.json()) as { requestId: string };
+    requestId = body.requestId;
+    hookLog('on_tool_approval_created', { requestId });
+  } catch (err) {
+    hookLog('on_tool_approval_create_error', { error: String(err) });
+    // Fail closed — security gate must not silently bypass on errors
+    process.stdout.write(
+      `\n⚠️ Permission blocked: could not reach approval server (${String(err)}).\n`
+    );
+    process.exit(1);
+  }
+
+  // Poll for resolution (up to 5 min, check every 3s)
+  const pollInterval = 3000;
+  const maxPollTime = 300_000;
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < maxPollTime) {
+    await new Promise((r) => setTimeout(r, pollInterval));
+
+    try {
+      const statusResp = await fetch(
+        `${serverUrl}/api/admin/approval-requests/${requestId}/status`,
+        { headers, signal: AbortSignal.timeout(5000) }
+      );
+
+      if (!statusResp.ok) continue;
+
+      const status = (await statusResp.json()) as {
+        status: string;
+        action?: string;
+        grantedTools?: string[];
+      };
+
+      if (status.status === 'pending') continue;
+
+      if (status.status === 'granted') {
+        hookLog('on_tool_approval_granted', { requestId, action: status.action });
+        // TODO: Apply permission overlay for grant-session/allow actions
+        process.exit(0); // Allow the tool
+      }
+
+      // denied, expired, or cancelled
+      hookLog('on_tool_approval_denied', { requestId, status: status.status });
+      // Output a message explaining the denial
+      process.stdout.write(
+        `\n⚠️ Permission denied: ${toolName} requires approval. ` +
+          `Request ${requestId} was ${status.status}.\n`
+      );
+      process.exit(1); // Block the tool
+    } catch {
+      // Transient error, keep polling
+    }
+  }
+
+  // Timeout — deny
+  hookLog('on_tool_approval_timeout', { requestId });
+  process.stdout.write(
+    `\n⚠️ Permission timeout: ${toolName} approval request expired after 5 minutes.\n`
+  );
+  process.exit(1);
 }
 
 async function onPromptHandler(options?: { backend?: string }): Promise<void> {
@@ -2018,7 +2332,19 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   // Uses the REST lifecycle endpoint, NOT MCP — cliAttached is a runtime
   // signal that must bypass MCP schema validation (additionalProperties: false
   // strips it). The REST endpoint is purpose-built for hook-managed state.
-  if (reconciled.pcpSessionId) {
+  //
+  // IMPORTANT: headless/autonomous spawns set cliAttached=false in INK_CONTEXT.
+  // Respect that — unconditionally setting true blocks all future strategy
+  // triggers for the session (they see "CLI-attached" and skip spawn).
+  const isHeadlessSpawn = isHeadlessSession();
+  if (isHeadlessSpawn) {
+    hookLog('cli_attached_skipped', {
+      agentId,
+      backend: lifecycleBackend.name,
+      reason: 'headless spawn (cliAttached=false in INK_CONTEXT)',
+      sessionId: reconciled.pcpSessionId || null,
+    });
+  } else if (reconciled.pcpSessionId) {
     try {
       const serverUrl = getPcpServerUrl();
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -2057,60 +2383,49 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     });
   }
 
+  // Periodically remind the agent to keep session context up to date.
+  // Uses its own cadence file so it fires regardless of inbox/channel state.
+  const lastContextReminder = readRuntimeFile(cwd, 'last-context-reminder');
+  const contextReminderMs = 5 * 60 * 1000;
+  const shouldRemind =
+    !lastContextReminder ||
+    Date.now() - new Date(lastContextReminder).getTime() >= contextReminderMs;
+  if (shouldRemind) {
+    process.stdout.write(
+      '\n<ink-reminder>\n' +
+        'If your runtime state has changed since your last context update ' +
+        '(started/stopped a server, opened a PR, kicked off a build, changed ports, etc.), ' +
+        'update your session context via `update_session_phase(context: "...")` so it survives ' +
+        "compaction. Context is your scratch board for transient active state — what's running, " +
+        "what's pending, what port you're on.\n" +
+        '</ink-reminder>\n'
+    );
+    writeRuntimeFile(cwd, 'last-context-reminder', new Date().toISOString());
+  }
+
   // Skip inbox injection when the channel plugin is active — it handles
-  // real-time delivery via the Channels API. Fall back to hook-based
-  // injection when the channel plugin is not present.
+  // real-time delivery via the Channels API.
   if (hasActiveChannelPlugin(cwd)) {
     return;
   }
 
-  // No channel plugin — use hook-based inbox injection as fallback.
-  // Drain pending message queue first — these are trigger messages
-  // routed here because cli_attached=true.
-  try {
-    const pending = await callPcpTool('get_pending_messages', {
-      channel: 'agent',
-    });
-    const pendingMessages = pending.messages as Array<Record<string, unknown>> | undefined;
-    if (pendingMessages?.length) {
-      const pendingTag = buildInboxTag(
-        pendingMessages.map((m) => ({
-          ...m,
-          senderAgentId:
-            typeof m.sender === 'object' ? (m.sender as Record<string, unknown>).id : m.sender,
-          messageType: 'trigger',
-        }))
-      );
-      if (pendingTag) {
-        process.stdout.write(pendingTag);
-      }
-      // Mark as read so they don't replay on next prompt
-      const messageIds = pendingMessages.map((m) => m.id as string).filter(Boolean);
-      if (messageIds.length) {
-        await callPcpTool('mark_messages_read', { messageIds }).catch(() => {});
-      }
-    }
-  } catch {
-    // Silent — pending queue may not have messages
-  }
-
-  // Check if inbox check is stale (> 5 minutes)
+  // No channel plugin (Codex, Gemini, etc.) — poll for new messages only.
+  // Use last-inbox-check as a `since` filter to avoid replaying old messages.
   const lastCheck = readRuntimeFile(cwd, 'last-inbox-check');
   const staleThresholdMs = 5 * 60 * 1000;
 
   if (lastCheck) {
-    const lastCheckTime = new Date(lastCheck).getTime();
-    const elapsed = Date.now() - lastCheckTime;
+    const elapsed = Date.now() - new Date(lastCheck).getTime();
     if (elapsed < staleThresholdMs) {
       return;
     }
   }
 
-  // Inbox is stale or never checked — poll
   try {
     const inbox = await callPcpTool('get_inbox', {
       email: config?.email,
       agentId,
+      since: lastCheck || undefined,
     });
 
     writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
@@ -2173,7 +2488,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
     return;
   }
 
-  // Check inbox if stale (fallback when no channel plugin)
+  // No channel plugin — poll for new messages only (use `since` to avoid replay).
   const lastCheck = readRuntimeFile(cwd, 'last-inbox-check');
   const staleThresholdMs = 5 * 60 * 1000;
   let shouldCheckInbox = !lastCheck;
@@ -2187,6 +2502,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
       const inbox = await callPcpTool('get_inbox', {
         email: config?.email,
         agentId,
+        since: lastCheck || undefined,
       });
 
       writeRuntimeFile(cwd, 'last-inbox-check', new Date().toISOString());
@@ -2252,6 +2568,12 @@ export function registerHooksCommands(program: Command): void {
     .description('Hook: bootstrap identity and context at session start')
     .option('--backend <name>', 'Backend context for this hook invocation')
     .action((opts) => onSessionStartHandler(opts));
+
+  hooks
+    .command('on-tool-approval')
+    .description('Hook: 2FA approval check before tool execution (PreToolUse)')
+    .option('--backend <name>', 'Backend context for this hook invocation')
+    .action((opts) => onToolApprovalHandler(opts));
 
   hooks
     .command('on-prompt')

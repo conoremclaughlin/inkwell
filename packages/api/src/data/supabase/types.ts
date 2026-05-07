@@ -3261,7 +3261,7 @@ export type Database = {
           created_at: string;
           current_task_index: number;
           description: string | null;
-          group_number: number | null;
+          group_number: number;
           id: string;
           identity_id: string | null;
           instructions: string | null;
@@ -3297,7 +3297,7 @@ export type Database = {
           created_at?: string;
           current_task_index?: number;
           description?: string | null;
-          group_number?: number | null;
+          group_number: number;
           id?: string;
           identity_id?: string | null;
           instructions?: string | null;
@@ -3333,7 +3333,8 @@ export type Database = {
           created_at?: string;
           current_task_index?: number;
           description?: string | null;
-          group_number?: number | null;
+          group_number?: number;
+
           id?: string;
           identity_id?: string | null;
           instructions?: string | null;

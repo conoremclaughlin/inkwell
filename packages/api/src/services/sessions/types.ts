@@ -16,6 +16,7 @@ export type ChannelType =
   | 'http'
   | 'api'
   | 'agent'
+  | 'heartbeat'
   | 'web';
 
 export type ChatType = 'direct' | 'group' | 'supergroup' | 'channel';
@@ -135,6 +136,8 @@ export interface SessionRequest {
     parentSessionId?: string;
     // Root repo path for cross-project 'main' studio resolution
     repoRoot?: string;
+    // Task group ID for strategy lifecycle correlation
+    taskGroupId?: string;
   };
 }
 

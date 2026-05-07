@@ -190,8 +190,11 @@ describe('StrategyService', () => {
       expect(result.prompt).toContain('complete_task');
       expect(result.prompt).toContain('task_request');
 
-      // Verify task was started
-      expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-1');
+      // Verify task was started with assignment metadata
+      expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-1', {
+        agentId: 'wren',
+        studioId: undefined,
+      });
 
       // Verify strategy event was logged
       expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
@@ -304,6 +307,87 @@ describe('StrategyService', () => {
       dc.repositories.taskGroups.findById.mockResolvedValue(group);
 
       await expect(service.pauseStrategy('group-1', 'user-123')).rejects.toThrow('not active');
+    });
+  });
+
+  describe('cancelStrategy', () => {
+    it('should cancel an active strategy, log reason, and set status=cancelled', async () => {
+      const group = createMockGroup({ status: 'active' });
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({ ...group, status: 'cancelled' });
+
+      const result = await service.cancelStrategy('group-1', 'user-123', 'blocked by upstream');
+
+      expect(result.status).toBe('cancelled');
+      expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith('group-1', {
+        status: 'cancelled',
+        strategy_paused_at: null,
+      });
+      expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({
+          subtype: 'strategy_cancelled',
+          taskGroupId: 'group-1',
+          content: expect.stringContaining('blocked by upstream'),
+          payload: expect.objectContaining({
+            reason: 'blocked by upstream',
+            previousStatus: 'active',
+          }),
+        })
+      );
+    });
+
+    it('should cancel a paused strategy without a reason', async () => {
+      const group = createMockGroup({ status: 'paused' });
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({ ...group, status: 'cancelled' });
+
+      const result = await service.cancelStrategy('group-1', 'user-123');
+
+      expect(result.status).toBe('cancelled');
+      expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({
+          subtype: 'strategy_cancelled',
+          payload: expect.objectContaining({
+            reason: null,
+            previousStatus: 'paused',
+          }),
+        })
+      );
+    });
+
+    it('should reject if already completed', async () => {
+      const group = createMockGroup({ status: 'completed' });
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+
+      await expect(service.cancelStrategy('group-1', 'user-123')).rejects.toThrow(
+        'already completed'
+      );
+      expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
+    });
+
+    it('should reject if already cancelled', async () => {
+      const group = createMockGroup({ status: 'cancelled' });
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+
+      await expect(service.cancelStrategy('group-1', 'user-123')).rejects.toThrow(
+        'already cancelled'
+      );
+      expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
+    });
+
+    it('should reject if group not found', async () => {
+      dc.repositories.taskGroups.findById.mockResolvedValue(null);
+
+      await expect(service.cancelStrategy('group-1', 'user-123')).rejects.toThrow('not found');
+    });
+
+    it('should reject if user does not own the group', async () => {
+      const group = createMockGroup({ status: 'active', user_id: 'someone-else' });
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+
+      await expect(service.cancelStrategy('group-1', 'user-123')).rejects.toThrow(
+        'does not belong'
+      );
     });
   });
 
@@ -614,8 +698,11 @@ describe('StrategyService', () => {
         })
       );
 
-      // Verify task was started
-      expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-2');
+      // Verify task was started with assignment metadata
+      expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-2', {
+        agentId: 'wren',
+        studioId: undefined,
+      });
 
       // Verify task_advanced event was logged
       expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
@@ -1002,13 +1089,91 @@ describe('StrategyService', () => {
         })
       );
 
-      // Verify task was started
-      expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-3');
+      // Verify task was started with assignment metadata
+      expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-3', {
+        agentId: 'wren',
+        studioId: undefined,
+      });
 
-      // Verify strategy_resumed event was logged
+      // Verify strategy_resumed event was logged (no pauseReason in metadata = manual resume)
       expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
         expect.objectContaining({
           subtype: 'strategy_resumed',
+          taskGroupId: 'group-1',
+        })
+      );
+
+      // Verify owner agent was auto-triggered
+      expect(result.notified).toBe(true);
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+      expect(sendMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          recipientAgentId: 'wren',
+          trigger: true,
+          metadata: expect.objectContaining({
+            reason: 'manual_resume',
+            groupId: 'group-1',
+          }),
+        }),
+        expect.anything()
+      );
+    });
+
+    it('should log approval_granted when resuming from approval gate pause', async () => {
+      const group = createMockGroup({
+        status: 'paused',
+        strategy: 'persistence',
+        current_task_index: 2,
+        iterations_since_approval: 5,
+        metadata: { pauseReason: 'approval_gate' },
+        strategy_paused_at: '2026-04-10T12:00:00Z',
+      });
+      const currentTask = createMockTask({
+        id: 'task-3',
+        title: 'Third task',
+        task_order: 2,
+        status: 'pending',
+      });
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        status: 'active',
+        strategy_paused_at: null,
+        iterations_since_approval: 0,
+        metadata: {},
+      });
+
+      const mockClient = dc.getClient();
+      const taskChain = {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: currentTask, error: null }),
+                }),
+              }),
+              limit: vi.fn().mockReturnValue({
+                single: vi.fn().mockResolvedValue({ data: null, error: null }),
+              }),
+            }),
+            single: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      };
+      mockClient.from.mockReturnValue(taskChain);
+
+      await service.resumeStrategy('group-1', 'user-123');
+
+      // Verify approval_granted event was logged (pauseReason = approval_gate)
+      expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({
+          subtype: 'approval_granted',
           taskGroupId: 'group-1',
         })
       );
@@ -1083,6 +1248,257 @@ describe('StrategyService', () => {
       await expect(service.resumeStrategy('group-1', 'user-123')).rejects.toThrow(
         'does not belong'
       );
+    });
+  });
+
+  // ============================================================================
+  // triggerOwnerAgent (via startStrategy) and triggerWatchdog
+  // ============================================================================
+
+  describe('owner agent trigger routing', () => {
+    // Reuse getTaskByOrder-found chain pattern
+    function chainTaskFound(task: ProjectTask) {
+      return {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                }),
+              }),
+            }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      };
+    }
+
+    function chainGroupTasks(tasks: ProjectTask[]) {
+      return {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            order: vi.fn().mockReturnValue({
+              order: vi.fn().mockResolvedValue({ data: tasks, error: null }),
+            }),
+          }),
+        }),
+      };
+    }
+
+    function chainNoop() {
+      return {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              limit: vi.fn().mockReturnValue({
+                single: vi.fn().mockResolvedValue({ data: null, error: null }),
+              }),
+            }),
+            single: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      };
+    }
+
+    function setupChains(mockDc: ReturnType<typeof createMockDataComposer>, chains: object[]) {
+      let idx = 0;
+      const client = mockDc.getClient();
+      client.from.mockImplementation(() => chains[idx++] || chainNoop());
+    }
+
+    it('startStrategy fires a session_resume trigger to the owner agent with studioId', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+
+      const group = createMockGroup({
+        strategy: null,
+        owner_agent_id: 'wren',
+        thread_key: 'strategy:group-1',
+        metadata: { studioId: 'studio-uuid-omega', studioSlug: 'wren-omega' },
+      });
+      const updatedGroup = {
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+      };
+      const task = createMockTask({ id: 'task-1', title: 'Ship the migration' });
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
+      setupChains(dc, [chainTaskFound(task)]);
+
+      await service.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        ownerAgentId: 'wren',
+      });
+
+      expect(sendMock).toHaveBeenCalledTimes(1);
+      const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
+      const payload = call[0] as Record<string, unknown>;
+      expect(payload.recipientAgentId).toBe('wren');
+      expect(payload.senderAgentId).toBe('system');
+      expect(payload.messageType).toBe('session_resume');
+      expect(payload.trigger).toBe(true);
+      expect(payload.recipientStudioId).toBe('studio-uuid-omega');
+      expect(payload.recipientStudioSlug).toBeUndefined();
+      expect(payload.threadKey).toBe('strategy:group-1');
+      expect(payload.content).toContain('persistence strategy');
+      expect(payload.content).toContain('Ship the migration');
+      expect((payload.metadata as Record<string, unknown>).strategyTrigger).toBe(true);
+      expect((payload.metadata as Record<string, unknown>).reason).toBe('strategy_kickoff');
+    });
+
+    it('startStrategy falls back to studioSlug when no studioId is set', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+
+      const group = createMockGroup({
+        strategy: null,
+        owner_agent_id: 'wren',
+        metadata: { studioSlug: 'wren-omega' },
+      });
+      const updatedGroup = { ...group, strategy: 'persistence', status: 'active' };
+      const task = createMockTask();
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
+      setupChains(dc, [chainTaskFound(task)]);
+
+      await service.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        ownerAgentId: 'wren',
+      });
+
+      const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
+      const payload = call[0] as Record<string, unknown>;
+      expect(payload.recipientStudioId).toBeUndefined();
+      expect(payload.recipientStudioSlug).toBe('wren-omega');
+    });
+
+    it('startStrategy skips trigger when group has no owner_agent_id', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+
+      const group = createMockGroup({ strategy: null, owner_agent_id: null });
+      const updatedGroup = {
+        ...group,
+        strategy: 'persistence',
+        // owner_agent_id stays null because startStrategy passes ownerAgentId but
+        // for this test we're validating the triggerOwnerAgent no-op path; the
+        // service writes owner_agent_id=input.ownerAgentId. Force it back to null
+        // on the updated group to exercise the early-return.
+        owner_agent_id: null,
+        status: 'active',
+      };
+      const task = createMockTask();
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
+      setupChains(dc, [chainTaskFound(task)]);
+
+      await service.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        ownerAgentId: 'wren',
+      });
+
+      expect(sendMock).not.toHaveBeenCalled();
+    });
+
+    it('triggerWatchdog fires a trigger for an active strategy with an in-progress task', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+
+      const group = createMockGroup({
+        strategy: 'persistence',
+        status: 'active',
+        owner_agent_id: 'wren',
+        metadata: { studioId: 'studio-uuid-omega' },
+      });
+      const tasks = [
+        createMockTask({ id: 't1', status: 'completed', task_order: 0 }),
+        createMockTask({
+          id: 't2',
+          title: 'Current work',
+          status: 'in_progress',
+          task_order: 1,
+        }),
+        createMockTask({ id: 't3', status: 'pending', task_order: 2 }),
+      ];
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      setupChains(dc, [chainGroupTasks(tasks)]);
+
+      const fired = await service.triggerWatchdog('group-1');
+
+      expect(fired).toBe(true);
+      expect(sendMock).toHaveBeenCalledTimes(1);
+      const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
+      const payload = call[0] as Record<string, unknown>;
+      expect(payload.recipientAgentId).toBe('wren');
+      expect(payload.messageType).toBe('session_resume');
+      expect(payload.content).toContain('Current work');
+      expect((payload.metadata as Record<string, unknown>).reason).toBe('watchdog');
+    });
+
+    it('triggerWatchdog returns false when group is not active', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+
+      const group = createMockGroup({ strategy: 'persistence', status: 'paused' });
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+
+      const fired = await service.triggerWatchdog('group-1');
+
+      expect(fired).toBe(false);
+      expect(sendMock).not.toHaveBeenCalled();
+    });
+
+    it('triggerWatchdog returns false when group is not found', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(null);
+
+      const fired = await service.triggerWatchdog('group-missing');
+
+      expect(fired).toBe(false);
+      expect(sendMock).not.toHaveBeenCalled();
+    });
+
+    it('triggerWatchdog falls back to current_task_index when no in-progress task', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+
+      const group = createMockGroup({
+        strategy: 'persistence',
+        status: 'active',
+        owner_agent_id: 'wren',
+        current_task_index: 1,
+      });
+      const tasks = [
+        createMockTask({ id: 't1', status: 'completed', task_order: 0 }),
+        createMockTask({ id: 't2', status: 'pending', task_order: 1 }),
+      ];
+      const pendingTask = tasks[1];
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      // triggerWatchdog calls getGroupTasks first (no in_progress), then
+      // getTaskByOrder fallback which returns the pending task.
+      setupChains(dc, [chainGroupTasks(tasks), chainTaskFound(pendingTask)]);
+
+      const fired = await service.triggerWatchdog('group-1');
+
+      expect(fired).toBe(true);
+      const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
+      const payload = call[0] as Record<string, unknown>;
+      expect(payload.content).toContain(pendingTask.title);
     });
   });
 });

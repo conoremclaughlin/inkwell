@@ -20,7 +20,7 @@ import type {
   StrategyConfig,
   VerificationMode,
 } from '../data/repositories/task-groups.repository';
-import type { ProjectTask } from '../data/repositories/project-tasks.repository';
+import type { ProjectTask, TaskAssignment } from '../data/repositories/project-tasks.repository';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
 import { logger } from '../utils/logger';
 
@@ -160,6 +160,14 @@ const STRATEGY_PROMPTS: Record<StrategyPreset, (group: TaskGroup, task: ProjectT
 export class StrategyService {
   constructor(private dataComposer: DataComposer) {}
 
+  private getAssignment(group: TaskGroup): TaskAssignment {
+    const meta = group.metadata as Record<string, unknown> | null;
+    return {
+      studioId: (meta?.studioId as string) || undefined,
+      agentId: group.owner_agent_id || undefined,
+    };
+  }
+
   /**
    * Activate a strategy on a task group.
    * Sets the group to active, records the strategy preset, and returns the first task.
@@ -207,11 +215,18 @@ export class StrategyService {
       };
     }
 
-    // Mark the first task as in_progress
-    await this.dataComposer.repositories.tasks.startTask(nextTask.id);
+    // Mark the first task as in_progress with assignment metadata
+    await this.dataComposer.repositories.tasks.startTask(nextTask.id, this.getAssignment(updated));
 
     // Create a watchdog reminder so the heartbeat checks progress periodically
     await this.createWatchdogReminder(updated, input.userId);
+
+    // Kick off the owner agent in the assigned studio. Without this trigger,
+    // start_strategy only returns a prompt to the caller's session — which
+    // is useless when the caller is delegating to a different studio/agent.
+    // The trigger spawns (or resumes) a session in the target studio so work
+    // actually begins, matching how heartbeats/reminders already deliver.
+    const triggered = await this.triggerOwnerAgent(updated, nextTask, 'strategy_kickoff');
 
     // Log strategy start
     await this.logStrategyEvent(
@@ -221,6 +236,7 @@ export class StrategyService {
       {
         firstTaskId: nextTask.id,
         firstTaskTitle: nextTask.title,
+        ownerTriggered: triggered,
       }
     );
 
@@ -230,6 +246,7 @@ export class StrategyService {
       action: 'next_task',
       nextTask,
       prompt,
+      notified: triggered,
     };
   }
 
@@ -263,12 +280,22 @@ export class StrategyService {
     if (maxIterations && newIterations >= maxIterations) {
       const summary = await this.buildProgressSummary(group, newIndex);
 
-      // Pause for approval
+      // Pause for approval — set pauseReason so resumeStrategy can distinguish
+      // approval-gate pauses from manual pauses (Lumen review, PR #338)
       await this.dataComposer.repositories.taskGroups.update(groupId, {
         strategy_paused_at: new Date().toISOString(),
         status: 'paused',
         context_summary: summary,
+        metadata: { ...group.metadata, pauseReason: 'approval_gate' },
       });
+
+      // Notify dispatcher
+      const notified = await this.notifyDispatcher(
+        group,
+        config.approvalNotify,
+        `Approval needed: completed ${newIterations} tasks in "${group.title}". ${summary}`,
+        userId
+      );
 
       await this.logStrategyEvent(
         group,
@@ -277,15 +304,9 @@ export class StrategyService {
         {
           iterationsSinceApproval: newIterations,
           progressSummary: summary,
+          routedTo: config.approvalNotify || null,
+          notified,
         }
-      );
-
-      // Notify dispatcher
-      const notified = await this.notifyDispatcher(
-        group,
-        config.approvalNotify,
-        `Approval needed: completed ${newIterations} tasks in "${group.title}". ${summary}`,
-        userId
       );
 
       return {
@@ -374,8 +395,8 @@ export class StrategyService {
       };
     }
 
-    // Mark next task as in_progress
-    await this.dataComposer.repositories.tasks.startTask(nextTask.id);
+    // Mark next task as in_progress with assignment metadata
+    await this.dataComposer.repositories.tasks.startTask(nextTask.id, this.getAssignment(group));
 
     // Log task advancement
     await this.logStrategyEvent(
@@ -474,16 +495,30 @@ export class StrategyService {
     if (group.status !== 'paused') throw new Error('Strategy is not paused');
     if (!group.strategy) throw new Error('No strategy set on this group');
 
+    const wasAwaitingApproval = group.metadata?.pauseReason === 'approval_gate';
+
+    // Clear pauseReason on resume so it doesn't persist into the next pause cycle
+    const cleanedMetadata = { ...group.metadata };
+    delete cleanedMetadata.pauseReason;
+
     await this.dataComposer.repositories.taskGroups.update(groupId, {
       status: 'active',
       strategy_paused_at: null,
       iterations_since_approval: 0,
+      metadata: cleanedMetadata,
     });
 
     // Re-create watchdog reminder
     await this.createWatchdogReminder(group, userId);
 
-    await this.logStrategyEvent(group, 'strategy_resumed', `Strategy resumed on "${group.title}"`);
+    await this.logStrategyEvent(
+      group,
+      wasAwaitingApproval ? 'approval_granted' : 'strategy_resumed',
+      wasAwaitingApproval
+        ? `Approval granted after ${group.iterations_since_approval} iterations on "${group.title}"`
+        : `Strategy resumed on "${group.title}"`,
+      wasAwaitingApproval ? { iterationsSinceApproval: group.iterations_since_approval } : undefined
+    );
 
     const nextTask = await this.getTaskByOrder(groupId, group.current_task_index);
 
@@ -493,17 +528,50 @@ export class StrategyService {
 
     // Mark as in_progress if not already
     if (nextTask.status !== 'in_progress') {
-      await this.dataComposer.repositories.tasks.startTask(nextTask.id);
+      await this.dataComposer.repositories.tasks.startTask(nextTask.id, this.getAssignment(group));
     }
 
     const updatedGroup = { ...group, status: 'active' as const } as TaskGroup;
     const prompt = STRATEGY_PROMPTS[group.strategy as StrategyPreset](updatedGroup, nextTask);
 
+    // Auto-trigger the owner agent so resume doesn't require a separate trigger call
+    const triggered = await this.triggerOwnerAgent(updatedGroup, nextTask, 'manual_resume');
+
     return {
       action: 'next_task',
       nextTask,
       prompt,
+      notified: triggered,
     };
+  }
+
+  /**
+   * Cancel a strategy. Transitions a non-terminal group to the `cancelled`
+   * terminal state, cancels the watchdog, and logs a reason. Idempotent-adjacent:
+   * already-cancelled groups throw; completed groups throw (they're terminal).
+   */
+  async cancelStrategy(groupId: string, userId: string, reason?: string): Promise<TaskGroup> {
+    const group = await this.dataComposer.repositories.taskGroups.findById(groupId);
+    if (!group) throw new Error('Task group not found');
+    if (group.user_id !== userId) throw new Error('Task group does not belong to this user');
+    if (group.status === 'completed') throw new Error('Strategy is already completed');
+    if (group.status === 'cancelled') throw new Error('Strategy is already cancelled');
+
+    await this.cancelWatchdogReminder(groupId);
+
+    const summary = reason
+      ? `Strategy cancelled on "${group.title}": ${reason}`
+      : `Strategy cancelled on "${group.title}"`;
+
+    await this.logStrategyEvent(group, 'strategy_cancelled', summary, {
+      reason: reason || null,
+      previousStatus: group.status,
+    });
+
+    return this.dataComposer.repositories.taskGroups.update(groupId, {
+      status: 'cancelled',
+      strategy_paused_at: null,
+    });
   }
 
   /**
@@ -693,6 +761,180 @@ export class StrategyService {
   }
 
   /**
+   * Trigger the strategy's owner agent with a task-aware prompt, routed to the
+   * studio the group is assigned to. Used for:
+   *   - startStrategy kickoff (spawn a session in the target studio so the agent
+   *     starts working without the user having to manually attach)
+   *   - watchdog re-triggers (wake a stuck session on the heartbeat)
+   *
+   * No-ops with a warn log if the group has no owner_agent_id. Non-fatal on
+   * send failure — returns false so callers can decide whether to escalate.
+   */
+  private async triggerOwnerAgent(
+    group: TaskGroup,
+    task: ProjectTask,
+    reason: 'strategy_kickoff' | 'watchdog' | 'manual_resume'
+  ): Promise<boolean> {
+    if (!group.owner_agent_id) {
+      logger.warn(
+        `Strategy triggerOwnerAgent: group ${group.id} has no owner_agent_id — cannot route trigger`
+      );
+      return false;
+    }
+    if (!group.strategy) {
+      logger.warn(
+        `Strategy triggerOwnerAgent: group ${group.id} has no strategy set — cannot build prompt`
+      );
+      return false;
+    }
+
+    try {
+      const threadKey = group.thread_key || `strategy:${group.id}`;
+      const metadata = (group.metadata || {}) as Record<string, unknown>;
+      const rawStudioId = metadata.studioId;
+      const rawStudioSlug = metadata.studioSlug;
+      const studioId = typeof rawStudioId === 'string' ? rawStudioId : undefined;
+      const studioSlug = typeof rawStudioSlug === 'string' ? rawStudioSlug : undefined;
+      const content = STRATEGY_PROMPTS[group.strategy as StrategyPreset](group, task);
+
+      await handleSendToInbox(
+        {
+          userId: group.user_id,
+          recipientAgentId: group.owner_agent_id,
+          senderAgentId: 'system',
+          // Prefer studioId (UUID); fall back to slug only when UUID is absent.
+          recipientStudioId: studioId,
+          recipientStudioSlug: studioId ? undefined : studioSlug,
+          content,
+          messageType: 'session_resume',
+          priority: 'high',
+          threadKey,
+          trigger: true,
+          triggerType: 'message',
+          triggerSummary: `Strategy "${group.strategy}" — ${reason === 'strategy_kickoff' ? 'start' : 'continue'}: ${task.title}`,
+          metadata: {
+            source: 'strategy_service',
+            strategyTrigger: true,
+            reason,
+            groupId: group.id,
+            taskId: task.id,
+            strategy: group.strategy,
+          },
+        },
+        this.dataComposer
+      );
+
+      logger.info(
+        `Strategy trigger sent to ${group.owner_agent_id} for group ${group.id} (task ${task.id}, reason: ${reason}${studioId ? `, studio: ${studioId}` : studioSlug ? `, studioSlug: ${studioSlug}` : ''})`
+      );
+
+      await this.logStrategyEvent(
+        group,
+        'strategy_trigger',
+        `Triggered ${group.owner_agent_id} for task: ${task.title}`,
+        {
+          reason,
+          taskId: task.id,
+          taskTitle: task.title,
+          studioId: studioId || studioSlug || null,
+          ownerAgentId: group.owner_agent_id,
+        }
+      );
+
+      return true;
+    } catch (err) {
+      logger.warn(
+        `Strategy triggerOwnerAgent failed for group ${group.id} (reason: ${reason}):`,
+        err
+      );
+
+      // Log trigger failure to activity stream too
+      this.logStrategyEvent(
+        group,
+        'strategy_trigger_failed',
+        `Failed to trigger ${group.owner_agent_id} for task: ${task.title}`,
+        {
+          reason,
+          taskId: task.id,
+          error: err instanceof Error ? err.message : String(err),
+        }
+      ).catch(() => {});
+
+      return false;
+    }
+  }
+
+  /**
+   * Public entry point for watchdog-driven triggers. Called from the heartbeat
+   * reminder-delivery path when a scheduled_reminder has
+   * metadata.strategyWatchdog === true.
+   *
+   * Loads the referenced group + its current in-progress task, skips if the
+   * strategy is no longer active or there is no pending work, then routes a
+   * task-aware prompt to the owner agent in the assigned studio.
+   *
+   * Returns true on successful trigger (reminder should be marked delivered).
+   * Returns false when the watchdog decides no action is needed — the heartbeat
+   * treats this as a failed delivery today, which re-runs the cron next tick.
+   * That's acceptable for now; the strategy will either become active again
+   * (next tick triggers) or be cancelled (watchdog reminder is cancelled).
+   */
+  async triggerWatchdog(groupId: string): Promise<boolean> {
+    const group = await this.dataComposer.repositories.taskGroups.findById(groupId);
+    if (!group) {
+      logger.warn(`Strategy watchdog: group ${groupId} not found, skipping`);
+      return false;
+    }
+
+    // Log every cron wakeup so we can trace heartbeat frequency in the activity stream.
+    // Awaited on skip paths (cheap, early return); fire-and-forget on the trigger path.
+    await this.logStrategyEvent(
+      group,
+      'watchdog_wakeup',
+      `Watchdog cron fired for "${group.title}"`,
+      { groupStatus: group.status, strategy: group.strategy }
+    );
+
+    if (group.status !== 'active' || !group.strategy) {
+      logger.info(
+        `Strategy watchdog: group ${groupId} is ${group.status} (strategy=${group.strategy ?? 'null'}), skipping`
+      );
+      await this.logStrategyEvent(
+        group,
+        'watchdog_skip',
+        `Watchdog skipped: group is ${group.status}`,
+        { reason: 'inactive_group' }
+      );
+      return false;
+    }
+
+    // Find the current in-progress task. If none, fall back to the next
+    // pending task at current_task_index.
+    const tasks = await this.getGroupTasks(groupId);
+    let currentTask = tasks.find((t) => t.status === 'in_progress') || null;
+    if (!currentTask) {
+      currentTask = await this.getTaskByOrder(groupId, group.current_task_index);
+    }
+    if (!currentTask) {
+      logger.info(
+        `Strategy watchdog: group ${groupId} has no in_progress or pending task, skipping`
+      );
+      await this.logStrategyEvent(
+        group,
+        'watchdog_skip',
+        `Watchdog skipped: no pending/in-progress task`,
+        {
+          reason: 'no_current_task',
+          currentTaskIndex: group.current_task_index,
+        }
+      );
+      return false;
+    }
+
+    return this.triggerOwnerAgent(group, currentTask, 'watchdog');
+  }
+
+  /**
    * Create a recurring watchdog reminder linked to the strategy.
    * The heartbeat picks this up periodically and checks if the strategy is stuck.
    */
@@ -779,6 +1021,15 @@ export class StrategyService {
   /**
    * Cancel the watchdog reminder for a strategy (on pause/complete).
    */
+  /**
+   * Clean up strategy resources (watchdog, etc.) without logging a
+   * strategy_cancelled event or changing group status. Use this when
+   * the caller manages its own status transition and activity logging.
+   */
+  async cleanupStrategyResources(groupId: string): Promise<void> {
+    await this.cancelWatchdogReminder(groupId);
+  }
+
   private async cancelWatchdogReminder(groupId: string): Promise<void> {
     try {
       await this.dataComposer

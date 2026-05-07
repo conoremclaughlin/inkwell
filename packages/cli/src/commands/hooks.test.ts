@@ -9,7 +9,14 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { installHooks, callPcpTool, buildIdentityBlock } from './hooks.js';
+import {
+  installHooks,
+  callPcpTool,
+  buildIdentityBlock,
+  loadApprovalSet,
+  matchesApprovalSet,
+  isHeadlessSession,
+} from './hooks.js';
 
 const TEST_DIR = join(tmpdir(), 'ink-hooks-test-' + Date.now());
 
@@ -926,5 +933,174 @@ describe('buildIdentityBlock', () => {
 
     const result = buildIdentityBlock(bootstrap);
     expect(result).toContain('---');
+  });
+});
+
+// ============================================================================
+// 2FA approval set — pattern matching for on-tool-approval hook
+// ============================================================================
+
+describe('loadApprovalSet', () => {
+  it('returns empty array when settings file is missing', () => {
+    expect(loadApprovalSet(TEST_DIR)).toEqual([]);
+  });
+
+  it('returns permissions.approvalRequired array from settings.local.json', () => {
+    const configDir = join(TEST_DIR, '.claude');
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      join(configDir, 'settings.local.json'),
+      JSON.stringify({
+        permissions: {
+          approvalRequired: ['Bash(docker push *)', 'mcp__supabase__apply_migration'],
+        },
+      })
+    );
+    expect(loadApprovalSet(TEST_DIR)).toEqual([
+      'Bash(docker push *)',
+      'mcp__supabase__apply_migration',
+    ]);
+  });
+
+  it('falls back to top-level approvalRequired for backcompat', () => {
+    const configDir = join(TEST_DIR, '.claude');
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      join(configDir, 'settings.local.json'),
+      JSON.stringify({
+        approvalRequired: ['Bash(docker push *)'],
+      })
+    );
+    expect(loadApprovalSet(TEST_DIR)).toEqual(['Bash(docker push *)']);
+  });
+
+  it('returns empty array when approvalRequired key is absent', () => {
+    const configDir = join(TEST_DIR, '.claude');
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      join(configDir, 'settings.local.json'),
+      JSON.stringify({ permissions: { allow: [] } })
+    );
+    expect(loadApprovalSet(TEST_DIR)).toEqual([]);
+  });
+
+  it('returns empty array when settings.local.json is malformed', () => {
+    const configDir = join(TEST_DIR, '.claude');
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(join(configDir, 'settings.local.json'), '{ not json');
+    expect(loadApprovalSet(TEST_DIR)).toEqual([]);
+  });
+});
+
+describe('matchesApprovalSet', () => {
+  it('returns false for empty pattern set', () => {
+    expect(matchesApprovalSet('Bash', 'ls', [])).toBe(false);
+  });
+
+  it('returns false when tool name is not in pattern set', () => {
+    expect(matchesApprovalSet('Read', '/tmp/x', ['Bash(docker push *)'])).toBe(false);
+  });
+
+  it('matches a bare tool name exactly', () => {
+    expect(
+      matchesApprovalSet('mcp__supabase__apply_migration', '{}', ['mcp__supabase__apply_migration'])
+    ).toBe(true);
+  });
+
+  it('does not match a different bare tool name', () => {
+    expect(
+      matchesApprovalSet('mcp__supabase__execute_sql', '{}', ['mcp__supabase__apply_migration'])
+    ).toBe(false);
+  });
+
+  it('matches glob pattern "Bash(docker push *)" against a docker push command', () => {
+    expect(matchesApprovalSet('Bash', 'docker push registry/app', ['Bash(docker push *)'])).toBe(
+      true
+    );
+  });
+
+  it('does not match "Bash(docker push *)" against a git push command', () => {
+    expect(matchesApprovalSet('Bash', 'git push origin main', ['Bash(docker push *)'])).toBe(false);
+  });
+
+  it('escapes regex special characters in args pattern', () => {
+    // Pattern contains regex-special chars (dots, parens) that must be literal
+    expect(
+      matchesApprovalSet('Bash', 'curl https://example.com/api', ['Bash(curl https://*)'])
+    ).toBe(true);
+  });
+
+  it('checks all patterns in the list (first match wins)', () => {
+    const patterns = ['Read', 'Bash(rm -rf *)', 'mcp__supabase__apply_migration'];
+    expect(matchesApprovalSet('Bash', 'rm -rf /', patterns)).toBe(true);
+    expect(matchesApprovalSet('mcp__supabase__apply_migration', '{}', patterns)).toBe(true);
+    expect(matchesApprovalSet('Write', 'hello', patterns)).toBe(false);
+  });
+
+  it('requires full-match on args pattern (anchored)', () => {
+    // Pattern "Bash(ls)" should NOT match "ls -la" because it's anchored
+    expect(matchesApprovalSet('Bash', 'ls -la', ['Bash(ls)'])).toBe(false);
+    expect(matchesApprovalSet('Bash', 'ls', ['Bash(ls)'])).toBe(true);
+  });
+});
+
+// =====================================================
+// isHeadlessSession — CLI-attached vs headless spawn
+// =====================================================
+
+describe('isHeadlessSession', () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  it('returns false when INK_CONTEXT is not set (interactive session)', () => {
+    delete process.env.INK_CONTEXT;
+    expect(isHeadlessSession()).toBe(false);
+  });
+
+  it('returns true when INK_CONTEXT has cliAttached=false (headless spawn)', () => {
+    const token = {
+      sessionId: 's1',
+      agentId: 'wren',
+      studioId: 'x',
+      cliAttached: false,
+      runtime: 'claude',
+    };
+    process.env.INK_CONTEXT = Buffer.from(JSON.stringify(token)).toString('base64url');
+    expect(isHeadlessSession()).toBe(true);
+  });
+
+  it('returns false when INK_CONTEXT has cliAttached=true', () => {
+    const token = {
+      sessionId: 's1',
+      agentId: 'wren',
+      studioId: 'x',
+      cliAttached: true,
+      runtime: 'claude',
+    };
+    process.env.INK_CONTEXT = Buffer.from(JSON.stringify(token)).toString('base64url');
+    expect(isHeadlessSession()).toBe(false);
+  });
+
+  it('returns false when INK_CONTEXT is malformed', () => {
+    process.env.INK_CONTEXT = 'not-valid-base64url-json!!!';
+    expect(isHeadlessSession()).toBe(false);
+  });
+
+  it('returns false when INK_CONTEXT is empty string', () => {
+    process.env.INK_CONTEXT = '';
+    expect(isHeadlessSession()).toBe(false);
+  });
+
+  it('returns false when cliAttached is missing from token', () => {
+    const token = { sessionId: 's1', agentId: 'wren', studioId: 'x', runtime: 'claude' };
+    process.env.INK_CONTEXT = Buffer.from(JSON.stringify(token)).toString('base64url');
+    expect(isHeadlessSession()).toBe(false);
   });
 });

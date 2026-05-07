@@ -70,6 +70,31 @@ function isStudioUuid(studioId: string | undefined): studioId is string {
 }
 
 /**
+ * Resolve a raw studioId into a DB scope value for session lookups and inserts.
+ *
+ * Returns:
+ * - `null` when the raw value is the literal "main" — match sessions with NULL studio_id
+ *   (root-repo sessions, where no studio row exists)
+ * - a UUID string when the raw value is a valid UUID — match that exact studio
+ * - `undefined` when the raw value is absent or is a non-UUID non-"main" string —
+ *   no studio filter (backward-compat for callers without studio context)
+ *
+ * TODO(slugs): non-UUID, non-"main" strings ("wren", "wren-omega", etc.) should
+ * eventually resolve via studios.findBySlug() to a UUID. Filed as follow-up so
+ * this PR stays scoped to the reattach bug.
+ *
+ * Session handlers must use this rather than `isStudioUuid(...) ? raw : undefined` —
+ * the older form silently dropped "main" to `undefined`, letting attach to
+ * root-repo collide with any active studio session for the same agent.
+ */
+function resolveStudioScope(rawStudioId: string | undefined): string | null | undefined {
+  if (rawStudioId === undefined) return undefined;
+  if (rawStudioId === 'main') return null;
+  if (isStudioUuid(rawStudioId)) return rawStudioId;
+  return undefined;
+}
+
+/**
  * Resolve contactId from explicit param or session context.
  * This is the auto-inheritance mechanism: once a contact-scoped session
  * is started, all memory tools in that session automatically scope to
@@ -81,6 +106,50 @@ function resolveContactId(params: { contactId?: string }): string | undefined {
   if (reqCtx?.contactId) return reqCtx.contactId;
   const sessCtx = getSessionContext();
   return sessCtx?.contactId;
+}
+
+/**
+ * Check whether a fetched caller session should be merged into the active sessions list.
+ * Enforces user ownership AND agent identity boundary — a session belonging to a
+ * different agent must not be merged even if the sessionId matches.
+ */
+export function isCallerSessionEligible(
+  callerSession: { userId?: string; agentId?: string },
+  userId: string,
+  agentId: string | undefined
+): boolean {
+  if (callerSession.userId !== userId) return false;
+  if (agentId && callerSession.agentId !== agentId) return false;
+  return true;
+}
+
+/**
+ * Map a Session to the bootstrap response shape.
+ * context is only included for the caller's own session.
+ */
+export function mapSessionForBootstrap(
+  s: {
+    id: string;
+    agentId?: string;
+    studioId?: string;
+    threadKey?: string;
+    lifecycle?: string;
+    currentPhase?: string;
+    context?: string;
+    startedAt: Date;
+  },
+  callerSessionId: string | undefined
+) {
+  return {
+    id: s.id,
+    agentId: s.agentId,
+    studioId: s.studioId || null,
+    threadKey: s.threadKey || null,
+    lifecycle: s.lifecycle || null,
+    currentPhase: s.currentPhase || null,
+    ...(callerSessionId && s.id === callerSessionId && s.context ? { context: s.context } : {}),
+    startedAt: s.startedAt.toISOString(),
+  };
 }
 
 /** Coerce a comma-separated string into a string array so callers can pass either format. */
@@ -285,7 +354,6 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
     ),
   studioId: z
     .string()
-    .uuid()
     .optional()
     .describe(
       'Studio ID — preferred session scope for parallel worktree scenarios. Stored in metadata, not as a first-class field.'
@@ -349,7 +417,6 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
     .describe('Identifier for the agent (e.g., "claude-code", "telegram-myra")'),
   studioId: z
     .string()
-    .uuid()
     .optional()
     .describe(
       'Studio ID to scope this session to. Allows multiple active sessions per agent (one per studio).'
@@ -391,7 +458,6 @@ export const endSessionSchema = userIdentifierBaseSchema.extend({
     .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
   studioId: z
     .string()
-    .uuid()
     .optional()
     .describe('Studio ID for session resolution when sessionId not provided'),
   summary: z.string().optional().describe('End-of-session summary'),
@@ -409,7 +475,6 @@ export const getSessionSchema = userIdentifierBaseSchema.extend({
     .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
   studioId: z
     .string()
-    .uuid()
     .optional()
     .describe('Studio ID for session resolution when sessionId not provided'),
   includeLogs: z.boolean().optional().describe('Include session logs (default: false)'),
@@ -445,7 +510,6 @@ export const updateSessionPhaseSchema = userIdentifierBaseSchema.extend({
     ),
   studioId: z
     .string()
-    .uuid()
     .optional()
     .describe(
       'Studio ID for session resolution. When sessionId is not provided, finds the active session in this studio. Useful for parallel worktree scenarios.'
@@ -454,7 +518,7 @@ export const updateSessionPhaseSchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe(
-      'Work phase (agent-set). Core phases: investigating, implementing, reviewing, paused, complete. Use blocked:<reason> or waiting:<reason> for transitions that auto-create memories. Do NOT use runtime: prefix — use lifecycle instead.'
+      'Work phase (agent-set). Core phases: investigating, implementing, reviewing, paused, complete. Use waiting:<reason> when awaiting an async response within normal flow (review, merge, feedback). Use blocked:<reason> ONLY when extraordinary intervention is required outside normal process — something has gone wrong (permissions denied, infrastructure broken, unresolvable conflict). Both auto-create memories. Do NOT use runtime: prefix — use lifecycle instead.'
     ),
   note: z
     .string()
@@ -571,7 +635,6 @@ export const compactSessionSchema = userIdentifierBaseSchema.extend({
     .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
   studioId: z
     .string()
-    .uuid()
     .optional()
     .describe('Studio ID for session resolution when sessionId not provided'),
   groupByTopics: z.boolean().optional().describe('Group logs by inferred topics (default: true)'),
@@ -591,6 +654,7 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
   const params = rememberSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
+  const studioScope = resolveStudioScope(rawStudioId);
   const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
   const agentId = getEffectiveAgentId(params.agentId);
 
@@ -601,7 +665,7 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
     const activeSession = await dataComposer.repositories.memory.getActiveSession(
       user.id,
       agentId,
-      studioId
+      studioScope
     );
     sessionId = activeSession?.id;
   } catch {
@@ -765,6 +829,32 @@ export async function handleCurateRecall(args: unknown, dataComposer: DataCompos
   const params = curateRecallSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
+  const allMemoryIds = [
+    ...params.accepted.map((a) => a.memoryId),
+    ...params.dismissed.map((d) => d.memoryId),
+  ];
+
+  if (allMemoryIds.length > 0) {
+    const ownedMemories = await dataComposer.repositories.memory.verifyOwnership(
+      allMemoryIds,
+      user.id
+    );
+    const unowned = allMemoryIds.filter((id) => !ownedMemories.has(id));
+    if (unowned.length > 0) {
+      throw new Error(`Memory IDs not found or not owned by user: ${unowned.join(', ')}`);
+    }
+  }
+
+  if (params.sessionId) {
+    const session = await dataComposer.repositories.memory.verifySessionOwnership(
+      params.sessionId,
+      user.id
+    );
+    if (!session) {
+      throw new Error(`Session ${params.sessionId} not found or not owned by user`);
+    }
+  }
+
   const entries = [
     ...params.accepted.map((a) => ({
       memoryId: a.memoryId,
@@ -895,7 +985,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
   const params = startSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
-  const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
+  const studioScope = resolveStudioScope(rawStudioId);
   const agentId = getEffectiveAgentId(params.agentId);
 
   // Session matching priority:
@@ -908,7 +998,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
       user.id,
       agentId,
       params.threadKey,
-      studioId,
+      studioScope,
       params.contactId
     );
   }
@@ -917,7 +1007,7 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
     existingSession = await dataComposer.repositories.memory.getActiveSession(
       user.id,
       agentId,
-      studioId,
+      studioScope,
       params.contactId
     );
   }
@@ -956,11 +1046,13 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
     };
   }
 
+  // Pass studioScope directly: "main" → null writes studio_id=NULL explicitly,
+  // UUID → writes the UUID, undefined → column omitted (DB default NULL).
   const session = await dataComposer.repositories.memory.startSession({
     id: params.sessionId,
     userId: user.id,
     agentId,
-    studioId,
+    studioId: studioScope,
     threadKey: params.threadKey,
     backend: params.backend,
     model: params.model,
@@ -1038,7 +1130,7 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
   const params = endSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
-  const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
+  const studioScope = resolveStudioScope(rawStudioId);
   const agentId = getEffectiveAgentId(params.agentId);
 
   // Get session ID (use provided or find active, scoped by agent+studio)
@@ -1047,7 +1139,7 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
     const activeSession = await dataComposer.repositories.memory.getActiveSession(
       user.id,
       agentId,
-      studioId
+      studioScope
     );
     if (!activeSession) {
       return {
@@ -1138,7 +1230,7 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
   const params = getSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
-  const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
+  const studioScope = resolveStudioScope(rawStudioId);
 
   let session;
   if (params.sessionId) {
@@ -1147,7 +1239,7 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
     session = await dataComposer.repositories.memory.getActiveSession(
       user.id,
       params.agentId,
-      studioId
+      studioScope
     );
   }
 
@@ -1209,14 +1301,10 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
   const params = listSessionsSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
-  let studioId: string | undefined;
-  let filterNullStudio = false;
-  if (rawStudioId === 'main') {
-    // Root repo sessions have no studio_id
-    filterNullStudio = true;
-  } else {
-    studioId = rawStudioId;
-  }
+  const scope = resolveStudioScope(rawStudioId);
+  // listSessions uses a two-field shape (UUID + boolean flag). Map from scope.
+  const studioId = typeof scope === 'string' ? scope : undefined;
+  const filterNullStudio = scope === null;
 
   const sessions = await dataComposer.repositories.memory.listSessions(user.id, {
     agentId: params.agentId,
@@ -1371,7 +1459,7 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
   const params = updateSessionPhaseSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
-  const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
+  const studioScope = resolveStudioScope(rawStudioId);
 
   // Require at least one field to update
   if (
@@ -1407,7 +1495,7 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
     const session = await dataComposer.repositories.memory.getActiveSession(
       user.id,
       params.agentId,
-      studioId // undefined = no studio/workspace filter (backward compat)
+      studioScope // null → match NULL studio_id (main), UUID → exact match, undefined → no filter
     );
     if (!session) {
       return {
@@ -1967,8 +2055,20 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
       }),
     ]);
 
+  // Ensure the caller's own session is always in the activeSessions list.
+  // getActiveSessions is capped to 10 by started_at — a long-running session
+  // can fall off behind newer ones, losing its context on compaction recovery.
+  const callerSessionId = getRequestContext()?.sessionId;
+  let mergedSessions = activeSessions;
+  if (callerSessionId && !activeSessions.some((s) => s.id === callerSessionId)) {
+    const callerSession = await dataComposer.repositories.memory.getSession(callerSessionId);
+    if (callerSession && isCallerSessionEligible(callerSession, user.id, agentId)) {
+      mergedSessions = [callerSession, ...activeSessions];
+    }
+  }
+
   const inferredThreadKey =
-    params.threadKey || activeSessions.find((session) => !!session.threadKey)?.threadKey;
+    params.threadKey || mergedSessions.find((session) => !!session.threadKey)?.threadKey;
   const focusText = params.focusText || focus?.focus_summary || undefined;
 
   const knowledgeMemoriesBase = includeMemories
@@ -2160,7 +2260,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
       memoryLimit,
     },
     skillCount: userSkills.length,
-    activeSessionCount: activeSessions.length,
+    activeSessionCount: mergedSessions.length,
     hasIdentityFiles: !!identityFiles,
     hasDbIdentity: !!dbIdentity,
     identitySource: dbIdentity?.description ? 'supabase' : identityFiles?.self ? 'local' : 'none',
@@ -2235,17 +2335,26 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
                 : null,
             },
 
-            // Recent active sessions (most recent 10) — use studioId to pick yours
-            // Match against .ink/identity.json studioId in your local environment
-            activeSessions: activeSessions.map((s) => ({
-              id: s.id,
-              agentId: s.agentId,
-              studioId: s.studioId || null,
-              threadKey: s.threadKey || null,
-              lifecycle: s.lifecycle || null,
-              currentPhase: s.currentPhase || null,
-              startedAt: s.startedAt.toISOString(),
-            })),
+            // Caller's own session IDs — surfaced at top level so they survive compaction.
+            // Without this, the agent loses its own session identity after context eviction.
+            callerSession: callerSessionId
+              ? (() => {
+                  const cs = mergedSessions.find((s) => s.id === callerSessionId);
+                  return cs
+                    ? {
+                        id: cs.id,
+                        backendSessionId: cs.backendSessionId || null,
+                        studioId: cs.studioId || null,
+                        agentId: cs.agentId || null,
+                        context: cs.context || null,
+                      }
+                    : null;
+                })()
+              : null,
+
+            // Active sessions — caller's own session always included (even if it fell off the top-10 list).
+            // context is only included for the caller's own session.
+            activeSessions: mergedSessions.map((s) => mapSessionForBootstrap(s, callerSessionId)),
 
             // Knowledge summary: budget-constrained, grouped by topic (critical + high salience)
             // This is the MEMORY.md equivalent — read this first for what you know
@@ -2313,7 +2422,7 @@ export async function handleCompactSession(args: unknown, dataComposer: DataComp
   const params = compactSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
-  const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
+  const studioScope = resolveStudioScope(rawStudioId);
 
   const minSalience = params.minSalience || 'medium';
   const preserveLogs = params.preserveLogs ?? false;
@@ -2328,7 +2437,7 @@ export async function handleCompactSession(args: unknown, dataComposer: DataComp
     session = await dataComposer.repositories.memory.getActiveSession(
       user.id,
       params.agentId,
-      studioId
+      studioScope
     );
     sessionId = session?.id;
   }

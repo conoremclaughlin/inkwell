@@ -32,8 +32,8 @@ interface McpJsonConfig {
 export interface InjectSessionHeadersOptions {
   /** Path to the .mcp.json file to read as base config */
   mcpConfigPath: string;
-  /** PCP session ID to inject */
-  pcpSessionId: string;
+  /** PCP session ID to inject. Optional — other headers still get injected without it. */
+  pcpSessionId?: string;
   /** Optional studio ID to inject */
   studioId?: string;
   /** Optional access token — injected as Authorization header for triggered sessions */
@@ -67,10 +67,13 @@ export interface InjectSessionHeadersResult {
 export function injectSessionHeaders(
   options: InjectSessionHeadersOptions
 ): InjectSessionHeadersResult {
-  const { mcpConfigPath, studioId, accessToken } = options;
+  const { mcpConfigPath, pcpSessionId, studioId, accessToken } = options;
 
-  // No config path or session — nothing to inject
-  if (!mcpConfigPath || !existsSync(mcpConfigPath) || !options.pcpSessionId) {
+  // Missing config file — nothing to inject into. Note: we still inject the
+  // other headers (studio, context, authorization) when pcpSessionId is
+  // absent — x-ink-context carries agentId/studioId/runtime which are useful
+  // independently of session identity.
+  if (!mcpConfigPath || !existsSync(mcpConfigPath)) {
     return { mcpConfigPath, cleanup: () => {}, modified: false };
   }
 
@@ -90,8 +93,10 @@ export function injectSessionHeaders(
 
   let modified = false;
 
-  // Inject session ID header (uses ${VAR} interpolation — Claude Code resolves at runtime)
-  if (!config.mcpServers[serverKey].headers?.['x-ink-session-id']) {
+  // Inject session ID header (uses ${VAR} interpolation — Claude Code resolves at runtime).
+  // Only when we actually have a session — otherwise the rendered header
+  // would be an empty string which muddies server-side logs.
+  if (pcpSessionId && !config.mcpServers[serverKey].headers?.['x-ink-session-id']) {
     config.mcpServers[serverKey].headers = {
       ...config.mcpServers[serverKey].headers,
       'x-ink-session-id': '${INK_SESSION_ID}',
@@ -123,7 +128,7 @@ export function injectSessionHeaders(
   if (!config.mcpServers[serverKey].headers?.['x-ink-context']) {
     config.mcpServers[serverKey].headers = {
       ...config.mcpServers[serverKey].headers,
-      'x-ink-context': '${INK_CONTEXT_TOKEN}',
+      'x-ink-context': '${INK_CONTEXT}',
     };
     modified = true;
   }
@@ -197,7 +202,7 @@ export function decodeContextToken(header: string | undefined | null): PcpContex
  * Build the session-related env vars for a spawned backend process.
  *
  * Sets both:
- * - INK_CONTEXT_TOKEN: consolidated context token for x-ink-context header
+ * - INK_CONTEXT: consolidated context token for x-ink-context header
  * - Legacy individual env vars (INK_SESSION_ID, INK_STUDIO_ID, etc.)
  *   for backward compat during Phase 1 migration
  */
@@ -231,7 +236,7 @@ export function buildSessionEnv(options: {
 
   // Consolidated context token (new — Phase 1)
   if (options.pcpSessionId && options.agentId) {
-    env.INK_CONTEXT_TOKEN = encodeContextToken({
+    env.INK_CONTEXT = encodeContextToken({
       sessionId: options.pcpSessionId,
       studioId: options.studioId || '',
       agentId: options.agentId,

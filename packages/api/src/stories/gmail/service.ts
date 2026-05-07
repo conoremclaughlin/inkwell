@@ -566,6 +566,53 @@ export class GmailService {
   }
 
   /**
+   * Download an email attachment to ~/.ink/files/gmail/
+   */
+  async downloadAttachment(
+    userId: string,
+    messageId: string,
+    attachmentId: string,
+    filename: string
+  ): Promise<{ path: string; filename: string; size: number }> {
+    const gmail = await this.getClient(userId);
+
+    const response = await gmail.users.messages.attachments.get({
+      userId: 'me',
+      messageId,
+      id: attachmentId,
+    });
+
+    if (!response.data.data) {
+      throw new Error('Attachment data is empty');
+    }
+
+    const buffer = Buffer.from(response.data.data, 'base64url');
+
+    const { join } = await import('path');
+    const { mkdir, writeFile } = await import('fs/promises');
+    const { homedir } = await import('os');
+
+    const dir = join(homedir(), '.ink', 'files', 'gmail');
+    await mkdir(dir, { recursive: true });
+
+    const sanitized = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const destFilename = `${Date.now()}_${sanitized}`;
+    const filePath = join(dir, destFilename);
+
+    await writeFile(filePath, buffer);
+
+    logger.info('Downloaded Gmail attachment', {
+      userId,
+      messageId,
+      filename: sanitized,
+      filePath,
+      size: buffer.byteLength,
+    });
+
+    return { path: filePath, filename: sanitized, size: buffer.byteLength };
+  }
+
+  /**
    * Extract attachments from message payload
    */
   private extractAttachments(payload?: gmail_v1.Schema$MessagePart): EmailAttachment[] {

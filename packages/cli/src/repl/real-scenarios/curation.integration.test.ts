@@ -2,17 +2,18 @@
  * Recall curation — live PCP integration.
  *
  * Exercises the full recall → score → curate_recall pipeline:
- * 1. Run recall (with scores) for each scenario
+ * 1. Run scenario (which calls recall internally with its topicSignal)
  * 2. Score the results against the scenario rubric
  * 3. Programmatically accept/dismiss based on scoring
- * 4. Call curate_recall to persist the feedback
+ * 4. Optionally call curate_recall to persist the feedback
  * 5. Print a curation report with score distribution
  *
- * This is a LIVE test — it hits the running PCP server and writes
- * real recall_feedback rows. Run against an isolated server if you
- * don't want feedback in prod.
+ * Persistence is OPT-IN: set CURATE_PERSIST=true to write recall_feedback
+ * rows. Without it, the test scores and reports but does not persist.
  *
- * Run with: INK_SERVER_URL=http://localhost:3001 npx vitest run src/repl/real-scenarios/curation.integration.test.ts
+ * Run with:
+ *   INK_SERVER_URL=http://localhost:3001 npx vitest run src/repl/real-scenarios/curation.integration.test.ts
+ *   CURATE_PERSIST=true INK_SERVER_URL=http://localhost:3001 npx vitest run src/repl/real-scenarios/curation.integration.test.ts
  */
 
 import { describe, expect, it } from 'vitest';
@@ -20,11 +21,11 @@ import { execSync } from 'child_process';
 import { readFileSync } from 'fs';
 import { runScenario, type RecallFn } from './runner.js';
 import { loadScenariosFromDir, defaultFixturesDir } from './loader.js';
-import type { SurfacedMemory } from './scorer.js';
 import type { ScenarioResult } from './types.js';
 
 const PCP_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 const AGENT_ID = process.env.AGENT_ID || 'wren';
+const PERSIST_ENABLED = process.env.CURATE_PERSIST === 'true';
 
 let serverAvailable = false;
 let curateToolAvailable = false;
@@ -35,7 +36,7 @@ try {
   serverAvailable = false;
 }
 
-if (serverAvailable) {
+if (serverAvailable && PERSIST_ENABLED) {
   try {
     const authPath = `${process.env.HOME}/.ink/auth.json`;
     const auth = JSON.parse(readFileSync(authPath, 'utf-8'));
@@ -140,13 +141,9 @@ async function pcpCurateRecall(
   });
 }
 
-const recallFn: RecallFn = async (query, limit) => {
-  const memories = await pcpRecallWithScores(query, limit);
-  return memories.map((m) => ({ id: m.id, content: m.content, summary: m.summary }));
-};
-
 interface CurationStats {
   scenarioId: string;
+  topicSignal: string;
   totalSurfaced: number;
   accepted: number;
   dismissed: number;
@@ -200,33 +197,38 @@ describe('real-scenarios: recall curation (live PCP)', () => {
       const allStats: CurationStats[] = [];
 
       for (const scenario of supported) {
-        // 1. Run recall with scores
-        const scored = await pcpRecallWithScores(
-          scenario.context + ' ' + scenario.impliedQuestion,
-          10
-        );
+        // 1. Score against rubric — runner calls recallFn internally with its topicSignal
+        const lastScoredResults: ScoredRecallMemory[] = [];
+        let lastQuery = '';
 
-        // 2. Score against rubric (uses the runner's topic signal extraction)
-        const result = await runScenario(scenario, recallFn);
+        const scoredRecallFn: RecallFn = async (query, limit) => {
+          lastQuery = query;
+          const memories = await pcpRecallWithScores(query, limit);
+          lastScoredResults.length = 0;
+          lastScoredResults.push(...memories);
+          return memories.map((m) => ({ id: m.id, content: m.content, summary: m.summary }));
+        };
 
-        // 3. Classify: accepted = matched expected, dismissed = noise
-        const { accepted, dismissed } = classifyMemories(result, scored);
+        const result = await runScenario(scenario, scoredRecallFn);
 
-        // 4. Call curate_recall (when the server has the tool deployed)
+        // 2. Classify using the same recall results the scorer used
+        const { accepted, dismissed } = classifyMemories(result, lastScoredResults);
+
+        // 3. Optionally persist via curate_recall (same query the runner used)
         let feedbackSaved = 0;
-        if (curateToolAvailable && accepted.length + dismissed.length > 0) {
-          const query = scenario.context.trim();
-          const curationResult = await pcpCurateRecall(query, accepted, dismissed);
+        if (PERSIST_ENABLED && curateToolAvailable && accepted.length + dismissed.length > 0) {
+          const curationResult = await pcpCurateRecall(lastQuery, accepted, dismissed);
           expect(curationResult.success).toBe(true);
           expect(curationResult.dismissedMemoryIds).toHaveLength(dismissed.length);
           feedbackSaved = curationResult.feedbackSaved;
         }
 
-        const hasScores = scored.some((m) => m.scores !== undefined);
+        const hasScores = lastScoredResults.some((m) => m.scores !== undefined);
 
         allStats.push({
           scenarioId: scenario.id,
-          totalSurfaced: scored.length,
+          topicSignal: lastQuery,
+          totalSurfaced: lastScoredResults.length,
           accepted: accepted.length,
           dismissed: dismissed.length,
           acceptedScores: hasScores ? accepted.map((a) => a.finalScore ?? 0) : [],
@@ -237,9 +239,11 @@ describe('real-scenarios: recall curation (live PCP)', () => {
       }
 
       // Print curation report
-      if (!curateToolAvailable) {
+      if (!PERSIST_ENABLED) {
+        console.log('\n(dry run — set CURATE_PERSIST=true to write recall_feedback rows)\n');
+      } else if (!curateToolAvailable) {
         console.log(
-          '\n⚠ curate_recall tool not available on server — scoring only, no feedback persisted\n'
+          '\ncurate_recall tool not available on server — scoring only, no feedback persisted\n'
         );
       }
       console.log('\n## Recall Curation Report\n');
@@ -263,7 +267,7 @@ describe('real-scenarios: recall curation (live PCP)', () => {
         );
       }
 
-      // Score distribution: are accepted scores consistently higher than dismissed?
+      // Score distribution
       const allAccepted = allStats.flatMap((s) => s.acceptedScores);
       const allDismissed = allStats.flatMap((s) => s.dismissedScores);
       const meanAccepted =
@@ -284,7 +288,7 @@ describe('real-scenarios: recall curation (live PCP)', () => {
       for (const s of allStats) {
         expect(s.totalSurfaced, `${s.scenarioId} surfaced zero memories`).toBeGreaterThan(0);
       }
-      if (curateToolAvailable) {
+      if (PERSIST_ENABLED && curateToolAvailable) {
         for (const s of allStats) {
           expect(s.feedbackSaved, `${s.scenarioId} feedback not saved`).toBeGreaterThan(0);
         }

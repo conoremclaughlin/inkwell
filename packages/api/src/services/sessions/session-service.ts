@@ -90,6 +90,7 @@ export interface IActivityStream {
     sessionId?: string;
     platform?: string;
     platformChatId?: string;
+    taskGroupId?: string;
   }): Promise<{ id: string }>;
 }
 
@@ -233,10 +234,29 @@ export class SessionService implements ISessionService {
         repoRoot: metadata?.repoRoot,
       });
 
-      // 2. Build lock key - must be per agent + session to support sub-agents
+      // 2. Log session routing for external + heartbeat channels
+      // so we can verify messages and heartbeats land in the same session.
+      const isExternalChannel = ['telegram', 'whatsapp', 'discord', 'slack', 'heartbeat'].includes(
+        request.channel
+      );
+      if (isExternalChannel) {
+        logger.info('Session routing resolved', {
+          channel: request.channel,
+          conversationId: request.conversationId,
+          pcpSessionId: session.id,
+          backendSessionId: session.backendSessionId || null,
+          studioId: session.studioId || null,
+          agentId,
+          threadKey: session.threadKey || null,
+          lifecycle: session.lifecycle,
+          messageCount: session.messageCount,
+        });
+      }
+
+      // 3. Build lock key - must be per agent + session to support sub-agents
       const lockKey = `${agentId}:${session.id}`;
 
-      // 3. Check if session is already being processed
+      // 4. Check if session is already being processed
       if (this.processingLocks.has(lockKey)) {
         logger.info('Session is processing, queuing message', {
           lockKey,
@@ -252,7 +272,7 @@ export class SessionService implements ISessionService {
         });
       }
 
-      // 4. Acquire lock and process
+      // 5. Acquire lock and process
       this.processingLocks.add(lockKey);
       logger.debug('Acquired processing lock', { lockKey });
 
@@ -260,7 +280,7 @@ export class SessionService implements ISessionService {
         const result = await this.processMessage(request, session);
         return result;
       } finally {
-        // 5. Process queued messages or release lock
+        // 6. Process queued messages or release lock
         await this.processQueueOrReleaseLock(lockKey);
       }
     } catch (error) {
@@ -405,6 +425,21 @@ export class SessionService implements ISessionService {
       }
     }
 
+    const strategyGroupId = (metadata?.taskGroupId as string) || undefined;
+    const permissionOverlay = strategyGroupId
+      ? {
+          allow: [
+            'Bash(*)',
+            'Edit(*)',
+            'Write(*)',
+            'Read(*)',
+            'WebFetch(*)',
+            'WebSearch',
+            'mcp__*',
+          ],
+        }
+      : undefined;
+
     const runnerConfig: ClaudeRunnerConfig = {
       workingDirectory: resolvedWorkingDirectory,
       mcpConfigPath: this.config.mcpConfigPath,
@@ -426,6 +461,7 @@ export class SessionService implements ISessionService {
       agentId,
       ...(session.studioId ? { studioId: session.studioId } : {}),
       ...(sandboxBypass ? { sandboxBypass: true } : {}),
+      ...(permissionOverlay ? { permissionOverlay } : {}),
       // Propagate repo root so spawned backend's context token carries it
       repoRoot: resolvedWorkingDirectory.replace(/--[^/]+$/, ''),
     };
@@ -440,6 +476,7 @@ export class SessionService implements ISessionService {
 
     // 5a. Log backend spawn to activity stream (fire-and-forget)
     const triggerSource = metadata?.triggerType as string | undefined;
+    const taskGroupId = (metadata?.taskGroupId as string) || undefined;
     // Derive studio hint (worktree folder name) for mission display so it
     // doesn't depend on the session still being active when the feed renders.
     const worktreeFolder = resolvedWorkingDirectory
@@ -453,6 +490,7 @@ export class SessionService implements ISessionService {
         subtype: `backend_cli:${resolvedBackend}`,
         content: `Backend turn started (${resolvedBackend})`,
         sessionId: session.id,
+        taskGroupId,
         payload: {
           backend: resolvedBackend,
           studioId: session.studioId,
@@ -460,6 +498,7 @@ export class SessionService implements ISessionService {
           ...(triggerSource ? { triggerSource } : {}),
           ...(request.sender?.id ? { triggeredBy: request.sender.id } : {}),
           ...(metadata?.threadKey ? { threadKey: metadata.threadKey } : {}),
+          ...(taskGroupId ? { taskGroupId } : {}),
         } as unknown as Json,
       })
       .catch((err) => {
@@ -487,6 +526,32 @@ export class SessionService implements ISessionService {
           error: e,
         });
       });
+      this.activityStream
+        .logActivity({
+          userId,
+          agentId,
+          type: 'error',
+          subtype: `backend_crash:${resolvedBackend}`,
+          content:
+            `Backend crashed (${resolvedBackend}): ${runnerError instanceof Error ? runnerError.message : String(runnerError)}`.slice(
+              0,
+              500
+            ),
+          sessionId: session.id,
+          taskGroupId,
+          payload: {
+            backend: resolvedBackend,
+            durationMs: Date.now() - turnStartMs,
+            studioId: session.studioId,
+            ...(triggerSource ? { triggerSource } : {}),
+            ...(taskGroupId ? { taskGroupId } : {}),
+            error: (runnerError instanceof Error ? runnerError.message : String(runnerError)).slice(
+              0,
+              2000
+            ),
+          } as unknown as Json,
+        })
+        .catch(() => {});
       throw runnerError;
     }
 
@@ -506,6 +571,7 @@ export class SessionService implements ISessionService {
           ? `Backend turn completed (${resolvedBackend}, ${Math.round(turnDurationMs / 1000)}s)`
           : `Backend turn failed (${resolvedBackend}): ${result.error?.slice(0, 500) || 'unknown error'}`,
         sessionId: session.id,
+        taskGroupId,
         payload: {
           backend: resolvedBackend,
           durationMs: turnDurationMs,
@@ -514,6 +580,7 @@ export class SessionService implements ISessionService {
           ...(triggerSource ? { triggerSource } : {}),
           ...(request.sender?.id ? { triggeredBy: request.sender.id } : {}),
           ...(metadata?.threadKey ? { threadKey: metadata.threadKey } : {}),
+          ...(taskGroupId ? { taskGroupId } : {}),
           ...(result.error ? { error: result.error.slice(0, 2000) } : {}),
           ...(errorClassification
             ? {
@@ -943,7 +1010,25 @@ export class SessionService implements ISessionService {
             agentId,
             matchCount: matches.length,
           });
+        } else {
+          // matches.length === 0 — the common silent fall-through case: studios
+          // exist for this agent but none of their patterns match this threadKey.
+          // Previously invisible; now log so dispatch-routing failures are
+          // traceable (see thread:pcp-to-ink-rename 2026-04-17 post-mortem).
+          logger.warn('[StudioResolve] No studio pattern matched threadKey, falling through', {
+            threadKey: options.threadKey,
+            agentId,
+            candidateStudios: patternStudios.map((s) => ({
+              id: s.id,
+              patterns: s.route_patterns,
+            })),
+          });
         }
+      } else {
+        logger.debug('[StudioResolve] No studios with route_patterns for agent', {
+          threadKey: options.threadKey,
+          agentId,
+        });
       }
     }
 
@@ -959,6 +1044,11 @@ export class SessionService implements ISessionService {
       .maybeSingle();
 
     if (agentStudio?.id) {
+      logger.debug("[StudioResolve] Fell back to agent's most recent studio", {
+        threadKey: options.threadKey || null,
+        agentId,
+        studioId: agentStudio.id,
+      });
       return agentStudio.id;
     }
 
@@ -968,7 +1058,14 @@ export class SessionService implements ISessionService {
 
     // 5) Shared per-user main studio fallback
     const mainStudioId = await this.resolveMainStudioId(userId, options.repoRoot, agentId);
-    if (mainStudioId) return mainStudioId;
+    if (mainStudioId) {
+      logger.debug('[StudioResolve] Fell back to main studio', {
+        threadKey: options.threadKey || null,
+        agentId,
+        studioId: mainStudioId,
+      });
+      return mainStudioId;
+    }
 
     // Codex is worktree-sensitive: keep a deterministic warning when no studio could be resolved.
     if (options.backend === 'codex-cli') {

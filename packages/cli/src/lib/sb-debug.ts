@@ -20,7 +20,7 @@ export function resolveSbDebugFile(explicitPath?: string): string {
   if (fromArg) return fromArg;
   const fromEnv = process.env.SB_DEBUG_FILE?.trim();
   if (fromEnv) return fromEnv;
-  return join(homedir(), '.pcp', 'sb-debug.log');
+  return join(homedir(), '.ink', 'logs', 'sb-debug.log');
 }
 
 export function sbDebugLog(

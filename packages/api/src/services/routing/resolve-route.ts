@@ -18,6 +18,7 @@ export interface ResolvedRoute {
   identityId: string;
   routeId: string;
   studioHint: string | null;
+  activeSessionId: string | null;
 }
 
 /**
@@ -43,6 +44,7 @@ export async function resolveRouteAgentId(
       chat_id,
       identity_id,
       studio_hint,
+      active_session_id,
       agent_identities!inner ( agent_id )
     `
     )
@@ -116,5 +118,7 @@ export async function resolveRouteAgentId(
     identityId: bestMatch.identity_id,
     routeId: bestMatch.id,
     studioHint: (bestMatch as unknown as { studio_hint: string | null }).studio_hint ?? null,
+    activeSessionId:
+      (bestMatch as unknown as { active_session_id: string | null }).active_session_id ?? null,
   };
 }

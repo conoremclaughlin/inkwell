@@ -976,6 +976,35 @@ export class MemoryRepository {
     }
   }
 
+  async verifyOwnership(memoryIds: string[], userId: string): Promise<Set<string>> {
+    const { data, error } = await this.supabase
+      .from('memories')
+      .select('id')
+      .in('id', memoryIds)
+      .eq('user_id', userId);
+
+    if (error) {
+      throw new Error(`Failed to verify memory ownership: ${error.message}`);
+    }
+
+    return new Set((data ?? []).map((row) => row.id));
+  }
+
+  async verifySessionOwnership(sessionId: string, userId: string): Promise<boolean> {
+    const { data, error } = await this.supabase
+      .from('sessions')
+      .select('id')
+      .eq('id', sessionId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to verify session ownership: ${error.message}`);
+    }
+
+    return data !== null;
+  }
+
   /**
    * Get a specific memory by ID
    */

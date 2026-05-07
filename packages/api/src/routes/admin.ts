@@ -17,6 +17,7 @@ import { env, isDevelopment } from '../config/env';
 import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
 import { runWithRequestContext } from '../utils/request-context';
 import { getDataComposer } from '../data/composer';
+import { notifyPlatformOfApprovalRequest } from '../channels/approval-interceptor';
 
 /**
  * Build a JSON error response. In development mode, includes the real error
@@ -93,6 +94,7 @@ const ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS = 3600; // 1 hour
 const ADMIN_REFRESH_TOKEN_LIFETIME_DAYS = 90;
 const ADMIN_CLIENT_ID = 'dashboard';
 const MCP_CLI_TRANSCRIPT_ROUTE = /^\/sessions(?:\/synced|\/[^/]+\/(?:sync-transcript|transcript))$/;
+const MCP_CLI_APPROVAL_ROUTE = /^\/approval-requests(?:\/[^/]+\/status)?$/;
 const DEFAULT_SESSION_LOG_LIMIT = 50;
 const MAX_SESSION_LOG_LIMIT = 200;
 const ACTIVITY_PREVIEW_LIMIT_PER_SESSION = 3;
@@ -962,12 +964,13 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       userEmail = payload.email;
     }
 
-    // Convenience path: allow standard MCP access tokens for transcript sync,
-    // so CLI users can run sync without dashboard cookie auth.
+    // Convenience path: allow standard MCP access tokens for CLI-driven flows
+    // (transcript sync, 2FA approval requests) so CLI users can operate without
+    // dashboard cookie auth.
     if (
       !pcpUserId &&
       (req.method === 'POST' || req.method === 'GET') &&
-      MCP_CLI_TRANSCRIPT_ROUTE.test(req.path)
+      (MCP_CLI_TRANSCRIPT_ROUTE.test(req.path) || MCP_CLI_APPROVAL_ROUTE.test(req.path))
     ) {
       const mcpPayload = verifyPcpAccessToken(token, 'mcp_access');
       if (mcpPayload) {
@@ -6415,6 +6418,134 @@ router.get('/task-groups', async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /api/admin/task-groups/:id
+ * Returns a single task group by ID with its tasks
+ */
+router.get('/task-groups/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+    const userId = authReq.pcpUserId;
+
+    // Fetch the task group with joined agent identity and project
+    const { data: group, error: groupError } = await supabase
+      .from('task_groups')
+      .select('*, agent_identities(agent_id, name), projects(name)')
+      .eq('id', id)
+      .single();
+
+    if (groupError || !group) {
+      res.status(404).json(errorJson('Task group not found', groupError));
+      return;
+    }
+
+    // Verify ownership
+    if (group.user_id !== userId) {
+      res
+        .status(404)
+        .json(errorJson('Task group not found', 'No task group with this id for this user'));
+      return;
+    }
+
+    // Fetch tasks for this group
+    const { data: tasksData, error: tasksError } = await supabase
+      .from('tasks')
+      .select('*, projects(name), task_groups(title)')
+      .eq('task_group_id', id)
+      .eq('user_id', userId)
+      .order('task_order', { ascending: true, nullsFirst: false })
+      .order('created_at', { ascending: true });
+
+    if (tasksError) {
+      res.status(500).json(errorJson('Failed to fetch tasks for group', tasksError));
+      return;
+    }
+
+    // Resolve owner agent name if owner_agent_id is set
+    let ownerAgentName: string | null = null;
+    if (group.owner_agent_id) {
+      const { data: ownerData } = await supabase
+        .from('agent_identities')
+        .select('name')
+        .eq('user_id', userId)
+        .eq('agent_id', group.owner_agent_id)
+        .single();
+
+      if (ownerData?.name) {
+        ownerAgentName = ownerData.name;
+      }
+    }
+
+    const tasks = tasksData || [];
+
+    res.json({
+      group: {
+        id: group.id,
+        title: group.title,
+        description: group.description,
+        status: group.status,
+        priority: group.priority,
+        tags: group.tags,
+        autonomous: group.autonomous,
+        maxSessions: group.max_sessions,
+        sessionsUsed: group.sessions_used,
+        contextSummary: group.context_summary,
+        nextRunAfter: group.next_run_after,
+        outputTarget: group.output_target,
+        outputStatus: group.output_status,
+        threadKey: group.thread_key,
+        projectId: group.project_id,
+        projectName: (group.projects as { name: string } | null)?.name ?? null,
+        identityId: group.identity_id,
+        agentId:
+          (group.agent_identities as { agent_id: string; name: string } | null)?.agent_id ?? null,
+        agentName:
+          (group.agent_identities as { agent_id: string; name: string } | null)?.name ?? null,
+        taskCount: tasks.length,
+        strategy: group.strategy ?? null,
+        ownerAgentId: group.owner_agent_id ?? null,
+        ownerAgentName,
+        currentTaskIndex: group.current_task_index ?? 0,
+        strategyStartedAt: group.strategy_started_at ?? null,
+        strategyPausedAt: group.strategy_paused_at ?? null,
+        planUri: group.plan_uri ?? null,
+        metadata: group.metadata,
+        createdAt: group.created_at,
+        updatedAt: group.updated_at,
+      },
+      tasks: tasks.map((t) => ({
+        id: t.id,
+        title: t.title,
+        description: t.description,
+        status: t.status,
+        priority: t.priority,
+        tags: t.tags,
+        projectId: t.project_id,
+        projectName: (t.projects as { name: string } | null)?.name ?? null,
+        taskGroupId: t.task_group_id,
+        taskGroupTitle: (t.task_groups as { title: string } | null)?.title ?? null,
+        blockedBy: t.blocked_by,
+        createdBy: t.created_by,
+        completedAt: t.completed_at,
+        dueDate: t.due_date,
+        metadata: t.metadata,
+        outcome: t.outcome ?? null,
+        outcomeReason: t.outcome_reason ?? null,
+        taskOrder: t.task_order ?? null,
+        createdAt: t.created_at,
+        updatedAt: t.updated_at,
+      })),
+    });
+  } catch (error) {
+    logger.error('Failed to fetch task group:', error);
+    res.status(500).json(errorJson('Failed to fetch task group', error));
+  }
+});
+
+/**
  * GET /api/admin/task-groups/:id/activity
  * Returns activity stream events for a task group (strategy timeline).
  */
@@ -6708,5 +6839,180 @@ router.post('/contacts/resolve', async (req: Request, res: Response) => {
     res.status(500).json(errorJson('Failed to resolve contact', error));
   }
 });
+
+// ============== 2FA Approval Requests ==============
+
+/**
+ * Create an approval request for elevated permissions.
+ * Called by the CLI hook when a tool in the approval-required set is encountered.
+ * The server generates the request ID, sends to connected platforms, and returns
+ * the ID for polling.
+ */
+router.post('/approval-requests', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    const { tool, args, reason, studioId, sessionId, timeoutSeconds = 300 } = req.body;
+
+    if (!tool) {
+      res.status(400).json({ error: 'tool is required' });
+      return;
+    }
+
+    const expiresAt = new Date(Date.now() + timeoutSeconds * 1000).toISOString();
+
+    // Resolve requesting agent from session context header
+    const contextHeader = req.headers['x-ink-context'] as string | undefined;
+    let requestingAgentId = 'unknown';
+    if (contextHeader) {
+      try {
+        const decoded = JSON.parse(Buffer.from(contextHeader, 'base64url').toString());
+        requestingAgentId = decoded.agentId || 'unknown';
+      } catch {
+        // fall through
+      }
+    }
+
+    // studio_id is a UUID column. The CLI sends the literal string "main"
+    // for the root repo (see .ink/identity.json), which would fail insert —
+    // coerce non-UUID values to null.
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const studioIdForInsert = studioId && UUID_RE.test(studioId) ? studioId : null;
+    const sessionIdForInsert = sessionId && UUID_RE.test(sessionId) ? sessionId : null;
+
+    const { data, error } = await supabase
+      .from('approval_requests')
+      .insert({
+        user_id: authReq.pcpUserId,
+        studio_id: studioIdForInsert,
+        session_id: sessionIdForInsert,
+        requesting_agent_id: requestingAgentId,
+        tool,
+        args: args || null,
+        reason: reason || null,
+        timeout_seconds: timeoutSeconds,
+        expires_at: expiresAt,
+      })
+      .select('id, status, expires_at')
+      .single();
+
+    if (error) {
+      logger.error('Failed to insert approval request', {
+        error: error.message,
+        code: error.code,
+        studioId,
+        sessionId,
+        tool,
+      });
+      res.status(500).json(errorJson('Failed to create approval request', error));
+      return;
+    }
+
+    logger.info('Approval request created', {
+      requestId: data.id,
+      tool,
+      args,
+      requestingAgentId,
+      studioId,
+      expiresAt,
+    });
+
+    // Send notification to connected platforms (non-blocking)
+    notifyPlatformOfApprovalRequest({
+      id: data.id,
+      userId: authReq.pcpUserId,
+      tool,
+      args,
+      reason: req.body.reason,
+      requestingAgentId,
+      studioId,
+      sessionId,
+      expiresAt,
+    }).catch((err) => {
+      logger.error('Failed to send platform notification for approval request', {
+        requestId: data.id,
+        error: String(err),
+      });
+    });
+
+    res.status(201).json({
+      requestId: data.id,
+      status: data.status,
+      expiresAt: data.expires_at,
+    });
+  } catch (error) {
+    logger.error('Failed to create approval request:', error);
+    res.status(500).json(errorJson('Failed to create approval request', error));
+  }
+});
+
+/**
+ * Poll an approval request's status.
+ * Called by the CLI hook while waiting for human response.
+ * Returns current status + resolution details when resolved.
+ */
+router.get('/approval-requests/:requestId/status', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+    const { requestId } = req.params;
+
+    const { data, error } = await supabase
+      .from('approval_requests')
+      .select('id, status, action, granted_tools, granted_by, expires_at, resolved_at, created_at')
+      .eq('id', requestId)
+      .eq('user_id', authReq.pcpUserId)
+      .single();
+
+    if (error || !data) {
+      res.status(404).json({ error: 'Approval request not found' });
+      return;
+    }
+
+    // Auto-expire if past deadline and still pending
+    if (data.status === 'pending' && new Date(data.expires_at) < new Date()) {
+      await supabase
+        .from('approval_requests')
+        .update({ status: 'expired', resolved_at: new Date().toISOString() })
+        .eq('id', requestId);
+
+      res.json({
+        requestId: data.id,
+        status: 'expired',
+        action: null,
+        grantedTools: null,
+        grantedBy: null,
+        expiresAt: data.expires_at,
+        resolvedAt: new Date().toISOString(),
+      });
+      return;
+    }
+
+    res.json({
+      requestId: data.id,
+      status: data.status,
+      action: data.action,
+      grantedTools: data.granted_tools,
+      grantedBy: data.granted_by,
+      expiresAt: data.expires_at,
+      resolvedAt: data.resolved_at,
+    });
+  } catch (error) {
+    logger.error('Failed to get approval request status:', error);
+    res.status(500).json(errorJson('Failed to get approval request status', error));
+  }
+});
+
+// NOTE: There is intentionally NO HTTP endpoint for resolving approval requests.
+// Resolution happens ONLY through the in-process approval interceptor
+// (approval-interceptor.ts → checkApprovalResponse), which runs inside
+// platform listeners. This ensures grants can only come from verified
+// platform identity — no HTTP endpoint means no client-asserted trust boundary.
+// See ink://specs/2fa-permission-grants for the security invariant.
 
 export default router;

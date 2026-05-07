@@ -63,10 +63,20 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .uuid()
     .optional()
     .describe('Recipient studio ID hint for session routing'),
+  recipientStudioSlug: z
+    .string()
+    .min(1)
+    .max(100)
+    .optional()
+    .describe(
+      'Recipient studio slug for routing (matches studios.slug). Pass "main" to target the user\'s root-repo studio. Preferred over recipientStudioHint — accepts any studio slug, not just "main".'
+    ),
   recipientStudioHint: z
     .enum(['main'])
     .optional()
-    .describe('Recipient studio routing hint (e.g., "main")'),
+    .describe(
+      'DEPRECATED — use recipientStudioSlug instead. Kept for backward compatibility with callers that pass the literal string "main".'
+    ),
   relatedArtifactUri: z.string().optional().describe('Related artifact URI'),
   metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
   expiresAt: z.string().datetime().optional().describe('When this message expires'),
@@ -217,6 +227,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     priority = 'normal',
     recipientSessionId,
     recipientStudioId,
+    recipientStudioSlug,
     recipientStudioHint,
     relatedArtifactUri,
     metadata = {},
@@ -228,6 +239,12 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     triggerAgents,
   } = parsed;
 
+  // Merge recipientStudioSlug (preferred) and recipientStudioHint (legacy alias).
+  // Downstream code treats these uniformly — both resolve via resolveStudioHint,
+  // which does isMainStudio + slug lookup. If both are provided, slug wins.
+  const recipientStudioSlugOrHint: string | undefined =
+    recipientStudioSlug || recipientStudioHint || undefined;
+
   // Validate: exactly one of recipientAgentId or recipients
   const hasSingle = !!recipientAgentId;
   const hasMany = !!recipients?.length;
@@ -237,15 +254,24 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   if (hasMany && !threadKey) {
     throw new Error('threadKey is required when using recipients[]');
   }
-  if (recipients && (recipientSessionId || recipientStudioId || recipientStudioHint)) {
+  if (recipients && (recipientSessionId || recipientStudioId || recipientStudioSlugOrHint)) {
     throw new Error(
-      'recipientSessionId/recipientStudioId/recipientStudioHint are only valid for single-recipient sends'
+      'recipientSessionId/recipientStudioId/recipientStudioSlug/recipientStudioHint are only valid for single-recipient sends'
     );
   }
 
   // Enforce identity on sender (who is performing the action), not recipient (target)
   const senderAgentId = getEffectiveAgentId(parsed.senderAgentId);
   const triggerSenderId = senderAgentId || 'system';
+
+  // SECURITY: permission_grant messages can only originate from the system layer
+  // (platform listeners verifying human identity), never from agents.
+  // See ink://specs/2fa-permission-grants for the full design.
+  if (messageType === 'permission_grant' && senderAgentId) {
+    throw new Error(
+      'permission_grant messages cannot be sent by agents — must originate from platform verification'
+    );
+  }
   const effectiveRecipientSessionId = recipientSessionId;
 
   // Default trigger behavior:
@@ -263,7 +289,8 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   const senderStudioId = reqCtx?.studioId || sessCtx?.studioId || null;
 
   // When the caller's session ID wasn't provided via request context headers
-  // (x-ink-session-id), try threadKey-scoped lookup as a deterministic fallback.
+  // (x-ink-context token, or legacy x-ink-session-id), try threadKey-scoped
+  // lookup as a deterministic fallback.
   // We intentionally do NOT fall back to "most recent active session" — that's
   // non-deterministic and can route replies to the wrong worktree/studio.
   if (!senderSessionId && senderAgentId && threadKey) {
@@ -294,7 +321,14 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   // Track whether session context is missing — used to suppress triggers
   // and warn the sender. Without session context, reply routing is broken
   // (recipients can't auto-resolve back to the sender's session/studio).
-  const missingSenderSession = !senderSessionId && !!senderAgentId;
+  //
+  // 'system' is exempt: it is the canonical sender for heartbeat/watchdog/
+  // platform-originated sends, which by design run outside a request context
+  // (no x-ink-context token, no session). Suppressing those triggers silently
+  // broke the strategy watchdog — it inserted thread messages but never woke
+  // the owner agent. Since 'system' has no reply session anyway, the routing
+  // concerns that justify the suppression don't apply.
+  const missingSenderSession = !senderSessionId && !!senderAgentId && senderAgentId !== 'system';
 
   // ── Thread-first path: when threadKey is provided, route to thread tables ──
   // Unified handler for both new thread creation and replies to existing threads.
@@ -342,19 +376,52 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       ? [...new Set([senderAgentId, ...allRecipients])]
       : allRecipients;
 
-    // Ensure all participants are registered (recipients + sender for existing threads)
-    for (const agentId of allParticipants) {
+    // Cross-studio self-message: sender targets themselves in a different studio.
+    // The PK is (thread_id, agent_id) so there's only ONE participant row — stamping
+    // session_id would scope it to one studio and hide it from the other. Leave null
+    // so both sessions see the thread.
+    const isCrossStudioSelf = !!(
+      senderAgentId &&
+      senderAgentId === recipientAgentId &&
+      (recipientStudioId || recipientStudioSlugOrHint)
+    );
+
+    // Ensure all participants are registered (recipients + sender for existing threads).
+    // Stamp session_id so channel plugins can filter threads to their session.
+    for (const participantAgentId of allParticipants) {
+      const isSender = participantAgentId === senderAgentId;
+      const participantSessionId =
+        isCrossStudioSelf && participantAgentId === senderAgentId
+          ? null
+          : isSender
+            ? senderSessionId
+            : recipientSessionId || null;
+
       const { data: existing } = await threadTable(supabase, 'inbox_thread_participants')
-        .select('agent_id')
+        .select('agent_id, session_id')
         .eq('thread_id', thread.id)
-        .eq('agent_id', agentId)
+        .eq('agent_id', participantAgentId)
         .maybeSingle();
 
       if (!existing) {
         await threadTable(supabase, 'inbox_thread_participants').insert({
           thread_id: thread.id,
-          agent_id: agentId,
+          agent_id: participantAgentId,
+          ...(participantSessionId ? { session_id: participantSessionId } : {}),
         });
+      } else if (participantSessionId) {
+        // Sender's session is authoritative (they know their own session).
+        // Recipient's session is a hint — only backfill null; the trigger
+        // handler stamps the real session after getOrCreateSession().
+        const shouldUpdate = isSender
+          ? existing.session_id !== participantSessionId
+          : !existing.session_id;
+        if (shouldUpdate) {
+          await threadTable(supabase, 'inbox_thread_participants')
+            .update({ session_id: participantSessionId })
+            .eq('thread_id', thread.id)
+            .eq('agent_id', participantAgentId);
+        }
       }
     }
 
@@ -368,9 +435,9 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         : {};
     // Cross-studio self-messaging: stamp recipient studio on the message
     // so the channelPoll filter can recognize the target studio as an owner.
-    // Resolve recipientStudioHint to a studioId if needed.
+    // Resolve recipientStudioSlug/Hint to a studioId if needed.
     let resolvedRecipientStudioId: string | undefined = recipientStudioId || undefined;
-    if (!resolvedRecipientStudioId && recipientStudioHint && senderAgentId) {
+    if (!resolvedRecipientStudioId && recipientStudioSlugOrHint && senderAgentId) {
       try {
         // Reuse the shared resolution function (worktree path → branch fallback
         // for 'main', slug match for named hints).
@@ -378,7 +445,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         resolvedRecipientStudioId = await resolveStudioHint(
           supabase,
           resolved.user.id,
-          recipientStudioHint,
+          recipientStudioSlugOrHint,
           senderAgentId,
           reqCtxForHint?.repoRoot
         );
@@ -452,7 +519,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // exclude self from trigger resolution.
     const selfStudioTarget = !!(
       senderAgentId &&
-      (recipientStudioId || recipientStudioHint) &&
+      (recipientStudioId || recipientStudioSlugOrHint) &&
       allRecipients.includes(senderAgentId)
     );
 
@@ -484,6 +551,10 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       type: messageType,
       isNewThread: thread.isNew,
       triggering: agentsToTrigger,
+      recipientStudioId: recipientStudioId || null,
+      recipientStudioHint: recipientStudioHint || null,
+      resolvedRecipientStudioId: resolvedRecipientStudioId || null,
+      effectiveRecipientSessionId: effectiveRecipientSessionId || null,
     });
 
     // Dispatch triggers with session routing from thread history
@@ -533,9 +604,22 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           }
         }
 
+        // Targeted studio routing: propagate studioId/Hint to the trigger
+        // payload for the agent the caller specifically addressed. Covers
+        // both self-studio sends (sender == recipient, different worktree)
+        // and cross-agent delegation (e.g., strategy service → owner agent
+        // in group.metadata.studioId). Incidental trigger participants —
+        // like a thread creator auto-woken on reply — do NOT inherit the
+        // routing, since the caller only explicitly targeted recipientAgentId.
+        //
+        // Before this fix, studio was only forwarded when `isSelfStudioMessage`
+        // was true, so system/human → owner delegation lost the assigned
+        // studio and fell back to route patterns / default studio.
+        const isAddressedRecipient = !recipients && toAgentId === recipientAgentId;
         const payload: AgentTriggerPayload = {
           fromAgentId: triggerSenderId,
           toAgentId,
+          threadId: thread.id,
           threadMessageId: threadMessage.id,
           triggerType: triggerType || 'message',
           summary:
@@ -545,12 +629,11 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           priority,
           threadKey,
           recipientSessionId: resolvedRecipientSessionId,
-          // Cross-studio self-message: route to the target studio explicitly
-          ...(isSelfStudioMessage && resolvedRecipientStudioId
+          ...(isAddressedRecipient && resolvedRecipientStudioId
             ? { studioId: resolvedRecipientStudioId }
             : {}),
-          ...(isSelfStudioMessage && !resolvedRecipientStudioId && recipientStudioHint
-            ? { studioHint: recipientStudioHint }
+          ...(isAddressedRecipient && !resolvedRecipientStudioId && recipientStudioSlugOrHint
+            ? { studioHint: recipientStudioSlugOrHint }
             : {}),
         };
         const result = gateway.dispatchTrigger(payload);
@@ -580,7 +663,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
             ...(missingSenderSession
               ? {
                   warning:
-                    'Session context missing (no x-ink-session-id header). Triggers suppressed — recipients will not be woken. They will see this message on their next inbox check. To fix: set the x-ink-session-id header on your MCP connection (the sb CLI does this automatically). For unsupported runtimes, use a heartbeat cron to periodically call get_inbox and process pending messages.',
+                    'Session context missing (no x-ink-context token or x-ink-session-id header). Triggers suppressed — recipients will not be woken. They will see this message on their next inbox check. To fix: set the x-ink-context header on your MCP connection (the ink CLI does this automatically). For unsupported runtimes, use a heartbeat cron to periodically call get_inbox and process pending messages.',
                 }
               : {}),
           }),
@@ -591,7 +674,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
 
   // ── Legacy path: simple inbox message (no threadKey) ──
   const hasRoutingAnchor = Boolean(
-    effectiveRecipientSessionId || recipientStudioId || recipientStudioHint
+    effectiveRecipientSessionId || recipientStudioId || recipientStudioSlugOrHint
   );
   const requiresRoutingAnchor = Boolean(senderAgentId) && messageType !== 'message';
   const missingRoutingAnchor = requiresRoutingAnchor && !hasRoutingAnchor;
@@ -622,7 +705,10 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       recipient: {
         sessionId: effectiveRecipientSessionId || null,
         studioId: recipientStudioId || null,
-        studioHint: recipientStudioHint || null,
+        // Metadata field is `studioHint` for backward compat with mission.ts
+        // and other consumers that read this blob. recipientStudioSlug feeds
+        // into the same slot since both resolve via resolveStudioHint.
+        studioHint: recipientStudioSlugOrHint || null,
       },
     },
   };
@@ -695,7 +781,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       priority,
       recipientSessionId: effectiveRecipientSessionId,
       studioId: recipientStudioId,
-      studioHint: recipientStudioHint,
+      studioHint: recipientStudioSlugOrHint,
     };
 
     logger.info('Inbox message trigger dispatched (async)', {
@@ -736,19 +822,19 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           threadKey: null,
           recipientSessionId: effectiveRecipientSessionId || null,
           recipientStudioId: recipientStudioId || null,
-          recipientStudioHint: recipientStudioHint || null,
+          recipientStudioSlug: recipientStudioSlugOrHint || null,
           createdAt: message.created_at,
           trigger: triggerResult,
           ...(missingRoutingAnchor
             ? {
                 routingHint:
-                  'Actionable handoff is missing a routing anchor. Add one of: threadKey, recipientSessionId, recipientStudioId, or recipientStudioHint.',
+                  'Actionable handoff is missing a routing anchor. Add one of: threadKey, recipientSessionId, recipientStudioId, or recipientStudioSlug.',
               }
             : {}),
           ...(missingSenderSession
             ? {
                 warning:
-                  'Session context missing (no x-ink-session-id header). Triggers suppressed — recipient will not be woken. They will see this message on their next inbox check. To fix: set the x-ink-session-id header on your MCP connection (the sb CLI does this automatically). For unsupported runtimes, use a heartbeat cron to periodically call get_inbox and process pending messages.',
+                  'Session context missing (no x-ink-context token or x-ink-session-id header). Triggers suppressed — recipient will not be woken. They will see this message on their next inbox check. To fix: set the x-ink-context header on your MCP connection (the ink CLI does this automatically). For unsupported runtimes, use a heartbeat cron to periodically call get_inbox and process pending messages.',
               }
             : {}),
           hint: 'Consider adding a threadKey (e.g., "pr:32", "spec:cli-hooks") to route this message to a group thread.',
@@ -948,12 +1034,27 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   let threadsWithUnread: ThreadSummary[] = [];
   let threadUnreadCount = 0;
 
+  // Resolve caller's session ID for channelPoll session scoping
+  let callerSessionId: string | null = null;
+  if (channelPoll && agentId) {
+    const reqCtx = getRequestContext();
+    const sessCtx = getSessionContext();
+    callerSessionId = reqCtx?.sessionId || sessCtx?.sessionId || null;
+  }
+
   try {
     // Find thread IDs this agent (or any agent for this user) participates in
     let participantQuery = threadTable(supabase, 'inbox_thread_participants').select('thread_id');
     if (agentId) {
       participantQuery = participantQuery.eq('agent_id', agentId);
     }
+
+    // Session-scoped filtering: only return threads assigned to this session
+    // (or unassigned threads not yet claimed by any session).
+    if (callerSessionId) {
+      participantQuery = participantQuery.or(`session_id.eq.${callerSessionId},session_id.is.null`);
+    }
+
     const { data: participantRows } = await participantQuery;
 
     const threadIds = [
@@ -985,14 +1086,15 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
               created_by_agent_id: string;
               updated_at: string;
             }) => {
-              // Get participants
+              // Get participants (include joined_at for unread baseline)
               const { data: parts } = await threadTable(supabase, 'inbox_thread_participants')
-                .select('agent_id')
+                .select('agent_id, joined_at')
                 .eq('thread_id', t.id);
               const participants = (parts || []).map((p: { agent_id: string }) => p.agent_id);
 
               // Get last read timestamp (only meaningful with agentId)
               let lastReadAt: string | null = null;
+              let joinedAt: string | null = null;
               if (agentId) {
                 const { data: readStatus } = await threadTable(supabase, 'inbox_thread_read_status')
                   .select('last_read_at')
@@ -1000,15 +1102,29 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
                   .eq('agent_id', agentId)
                   .maybeSingle();
                 lastReadAt = readStatus?.last_read_at || null;
+
+                // If no read status exists, use the participant's joined_at as
+                // baseline so messages from before they joined don't count as
+                // unread. Without this, a participant who has never read a thread
+                // sees the entire history as "unread" on every poll — causing
+                // replay floods on session restart.
+                const callerPart = (parts || []).find(
+                  (p: { agent_id: string }) => p.agent_id === agentId
+                ) as { joined_at?: string } | undefined;
+                joinedAt = callerPart?.joined_at || null;
               }
 
-              // Count unread messages (after last read, or all if no read status)
+              // Count unread messages. Baseline priority:
+              //   1. last_read_at (explicit read pointer)
+              //   2. joined_at (participant join time — no replay of pre-join history)
+              //   3. no filter (shouldn't happen — agent is always a participant)
+              const unreadBaseline = lastReadAt || joinedAt;
               let countQuery = threadTable(supabase, 'inbox_thread_messages')
                 .select('*', { count: 'exact', head: true })
                 .eq('thread_id', t.id);
 
-              if (lastReadAt) {
-                countQuery = countQuery.gt('created_at', lastReadAt);
+              if (unreadBaseline) {
+                countQuery = countQuery.gt('created_at', unreadBaseline);
               }
 
               const { count } = await countQuery;
@@ -1052,10 +1168,11 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         // Only include threads that actually have unread messages
         threadsWithUnread = threadsWithUnread.filter((t) => t.unreadCount > 0);
 
-        // Channel poll studio filtering: when channelPoll=true, filter threads
-        // to only those owned by the requesting studio. Uses the same sender
-        // metadata that the trigger system stamps on thread messages.
-        if (channelPoll && agentId) {
+        // Channel poll studio filtering (defense-in-depth): when channelPoll=true
+        // and no session_id filter was applied, fall back to message-metadata-based
+        // studio ownership check. When session filtering is active (callerSessionId
+        // is set), skip this — session_id on participants is the primary routing.
+        if (channelPoll && agentId && !callerSessionId) {
           const reqCtx = getRequestContext();
           const sessCtx = getSessionContext();
           const callerStudioId = reqCtx?.studioId || sessCtx?.studioId || null;
