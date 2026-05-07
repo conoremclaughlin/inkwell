@@ -1,0 +1,66 @@
+# Scenario: pr-review-required
+#
+# Tests convention-recall: when asked "can I merge this myself?", does
+# memory surface the hard review rule and the PR #281 incident where
+# we violated it?
+#
+# Source of truth: AGENTS.md PR section, memory of PR #281 violation.
+
+id: pr-review-required
+shape: convention-recall
+capability:
+  - recall
+  - correction
+
+context: |
+  Reviews are in on PR #350 and it looks good. Can I just merge it
+  myself, or do I need to wait for someone else?
+
+impliedQuestion: |
+  Can I merge my own PR, or is sibling review required?
+
+expectedSurfaced:
+  - kind: memory
+    ref: "memory:pr-281-violation"
+    reason: Incident where we merged without review — strongest signal
+    containsPhrases:
+      - without sibling review
+      - never skip
+  - kind: doc_section
+    ref: AGENTS.md#pull-requests
+    reason: Canonical rule — ALL PRs require sibling review
+    containsPhrases:
+      - sibling review
+      - before merge
+
+mustAssert:
+  - claim: All PRs require a sibling review before merge — no exceptions
+    criticality: high
+    containsPhrases:
+      - always get review
+      - before merge
+  - claim: This rule was violated once (PR #281) and caught by Conor
+    criticality: medium
+    containsPhrases:
+      - merged
+      - without
+      - review
+
+mustNotAssert:
+  - claim: Self-merge is fine when you're confident
+    containsPhrases:
+      - self-merge is fine
+      - confident in the code
+  - claim: Small PRs can skip review
+    containsPhrases:
+      - skip review
+      - small prs
+
+rubric:
+  sufficiencyBar: >
+    Can the SB correctly refuse to self-merge and cite the review
+    requirement, ideally referencing the PR #281 incident?
+  precisionFloor: 0.15
+  recallFloor: 0.3
+  mustAssertPassRate: 0.5
+  mustNotAssertLeakRate: 0.0
