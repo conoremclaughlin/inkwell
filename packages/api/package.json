@@ -50,7 +50,7 @@
     "googleapis": "^171.0.0",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
-    "link-preview-js": "^3.2.0",
+    "link-preview-js": "^4.0.1",
     "node-cron": "^4.2.1",
     "node-diff3": "^3.2.0",
     "qrcode": "^1.5.4",
