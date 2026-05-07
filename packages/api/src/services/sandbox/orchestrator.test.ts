@@ -1,9 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import {
   buildContainerName,
   buildEnvVars,
   buildDockerRunArgs,
   buildMounts,
+  patchMcpConfig,
   SandboxOrchestrator,
   type SandboxSpinUpRequest,
 } from './orchestrator';
@@ -178,6 +182,91 @@ describe('buildMounts', () => {
   it('returns empty array when worktree path does not exist', () => {
     const mounts = buildMounts({ ...baseRequest, worktreePath: '/nonexistent/path' });
     expect(mounts.filter((m) => m.target === '/studio')).toHaveLength(0);
+  });
+});
+
+describe('patchMcpConfig', () => {
+  it('rewrites localhost URLs to host.docker.internal', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'mcp-patch-'));
+    writeFileSync(
+      join(tmpDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          inkwell: { type: 'http', url: 'http://localhost:3001/mcp' },
+        },
+      })
+    );
+
+    const result = patchMcpConfig(tmpDir);
+    expect(result).toBeTruthy();
+    const patched = JSON.parse(readFileSync(result!, 'utf-8'));
+    expect(patched.mcpServers.inkwell.url).toBe('http://host.docker.internal:3001/mcp');
+  });
+
+  it('strips stdio/command-based servers', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'mcp-patch-'));
+    writeFileSync(
+      join(tmpDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          inkwell: { type: 'http', url: 'http://localhost:3001/mcp' },
+          inkmail: { command: 'npx', args: ['tsx', 'packages/channel-plugin/index.ts'] },
+          playwright: { type: 'stdio', command: 'npx', args: ['@playwright/mcp'] },
+        },
+      })
+    );
+
+    const result = patchMcpConfig(tmpDir);
+    expect(result).toBeTruthy();
+    const patched = JSON.parse(readFileSync(result!, 'utf-8'));
+    expect(Object.keys(patched.mcpServers)).toEqual(['inkwell']);
+    expect(patched.mcpServers.inkmail).toBeUndefined();
+    expect(patched.mcpServers.playwright).toBeUndefined();
+  });
+
+  it('preserves remote HTTP servers without rewriting', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'mcp-patch-'));
+    writeFileSync(
+      join(tmpDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          github: {
+            type: 'http',
+            url: 'https://api.githubcopilot.com/mcp/',
+            headers: { Authorization: 'Bearer token' },
+          },
+          inkwell: { type: 'http', url: 'http://localhost:3001/mcp' },
+        },
+      })
+    );
+
+    const result = patchMcpConfig(tmpDir);
+    expect(result).toBeTruthy();
+    const patched = JSON.parse(readFileSync(result!, 'utf-8'));
+    expect(patched.mcpServers.github.url).toBe('https://api.githubcopilot.com/mcp/');
+    expect(patched.mcpServers.github.headers).toEqual({ Authorization: 'Bearer token' });
+    expect(patched.mcpServers.inkwell.url).toBe('http://host.docker.internal:3001/mcp');
+  });
+
+  it('returns undefined when no HTTP servers exist', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'mcp-patch-'));
+    writeFileSync(
+      join(tmpDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          playwright: { type: 'stdio', command: 'npx', args: ['@playwright/mcp'] },
+        },
+      })
+    );
+
+    const result = patchMcpConfig(tmpDir);
+    expect(result).toBeUndefined();
+  });
+
+  it('returns undefined when .mcp.json does not exist', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'mcp-patch-'));
+    const result = patchMcpConfig(tmpDir);
+    expect(result).toBeUndefined();
   });
 });
 
