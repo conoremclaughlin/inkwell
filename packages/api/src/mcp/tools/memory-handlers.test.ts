@@ -12,6 +12,7 @@ import {
   updateSessionPhaseSchema,
   handleUpdateSessionPhase,
   handleStartSession,
+  mapSessionForBootstrap,
 } from './memory-handlers';
 
 // =====================================================
@@ -1801,5 +1802,53 @@ describe('buildKnowledgeSummary', () => {
 
     expect(result.topicIndex[0].topicKey).toBe('topic:new');
     expect(result.topicIndex[1].topicKey).toBe('topic:old');
+  });
+});
+
+// =====================================================
+// mapSessionForBootstrap — context injection
+// =====================================================
+
+describe('mapSessionForBootstrap', () => {
+  const baseSession = {
+    id: 'session-abc',
+    agentId: 'wren',
+    studioId: 'studio-1',
+    threadKey: 'pr:343',
+    lifecycle: 'idle',
+    currentPhase: 'implementing',
+    context: 'server running on :4001, vitest watching',
+    startedAt: new Date('2026-05-07T00:00:00Z'),
+  };
+
+  it('includes context for the caller session', () => {
+    const result = mapSessionForBootstrap(baseSession, 'session-abc');
+    expect(result.context).toBe('server running on :4001, vitest watching');
+    expect(result.currentPhase).toBe('implementing');
+  });
+
+  it('omits context for non-caller sessions', () => {
+    const result = mapSessionForBootstrap(baseSession, 'session-other');
+    expect(result).not.toHaveProperty('context');
+    expect(result.currentPhase).toBe('implementing');
+  });
+
+  it('omits context when callerSessionId is undefined', () => {
+    const result = mapSessionForBootstrap(baseSession, undefined);
+    expect(result).not.toHaveProperty('context');
+  });
+
+  it('omits context key entirely when caller session has no context set', () => {
+    const noContextSession = { ...baseSession, context: undefined };
+    const result = mapSessionForBootstrap(noContextSession, 'session-abc');
+    expect(result).not.toHaveProperty('context');
+  });
+
+  it('always includes phase and lifecycle for all sessions', () => {
+    const result = mapSessionForBootstrap(baseSession, 'session-other');
+    expect(result.lifecycle).toBe('idle');
+    expect(result.currentPhase).toBe('implementing');
+    expect(result.agentId).toBe('wren');
+    expect(result.studioId).toBe('studio-1');
   });
 });

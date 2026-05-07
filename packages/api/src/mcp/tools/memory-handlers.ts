@@ -108,6 +108,35 @@ function resolveContactId(params: { contactId?: string }): string | undefined {
   return sessCtx?.contactId;
 }
 
+/**
+ * Map a Session to the bootstrap response shape.
+ * context is only included for the caller's own session.
+ */
+export function mapSessionForBootstrap(
+  s: {
+    id: string;
+    agentId?: string;
+    studioId?: string;
+    threadKey?: string;
+    lifecycle?: string;
+    currentPhase?: string;
+    context?: string;
+    startedAt: Date;
+  },
+  callerSessionId: string | undefined
+) {
+  return {
+    id: s.id,
+    agentId: s.agentId,
+    studioId: s.studioId || null,
+    threadKey: s.threadKey || null,
+    lifecycle: s.lifecycle || null,
+    currentPhase: s.currentPhase || null,
+    ...(callerSessionId && s.id === callerSessionId && s.context ? { context: s.context } : {}),
+    startedAt: s.startedAt.toISOString(),
+  };
+}
+
 /** Coerce a comma-separated string into a string array so callers can pass either format. */
 const topicsSchema = z
   .preprocess(
@@ -1889,8 +1918,20 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
       }),
     ]);
 
+  // Ensure the caller's own session is always in the activeSessions list.
+  // getActiveSessions is capped to 10 by started_at — a long-running session
+  // can fall off behind newer ones, losing its context on compaction recovery.
+  const callerSessionId = getRequestContext()?.sessionId;
+  let mergedSessions = activeSessions;
+  if (callerSessionId && !activeSessions.some((s) => s.id === callerSessionId)) {
+    const callerSession = await dataComposer.repositories.memory.getSession(callerSessionId);
+    if (callerSession && callerSession.userId === user.id) {
+      mergedSessions = [callerSession, ...activeSessions];
+    }
+  }
+
   const inferredThreadKey =
-    params.threadKey || activeSessions.find((session) => !!session.threadKey)?.threadKey;
+    params.threadKey || mergedSessions.find((session) => !!session.threadKey)?.threadKey;
   const focusText = params.focusText || focus?.focus_summary || undefined;
 
   const knowledgeMemoriesBase = includeMemories
@@ -2082,7 +2123,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
       memoryLimit,
     },
     skillCount: userSkills.length,
-    activeSessionCount: activeSessions.length,
+    activeSessionCount: mergedSessions.length,
     hasIdentityFiles: !!identityFiles,
     hasDbIdentity: !!dbIdentity,
     identitySource: dbIdentity?.description ? 'supabase' : identityFiles?.self ? 'local' : 'none',
@@ -2157,23 +2198,9 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
                 : null,
             },
 
-            // Recent active sessions (most recent 10) — use studioId to pick yours
-            // context is only included for the caller's own session (matched by sessionId from request context)
-            activeSessions: (() => {
-              const callerSessionId = getRequestContext()?.sessionId;
-              return activeSessions.map((s) => ({
-                id: s.id,
-                agentId: s.agentId,
-                studioId: s.studioId || null,
-                threadKey: s.threadKey || null,
-                lifecycle: s.lifecycle || null,
-                currentPhase: s.currentPhase || null,
-                ...(callerSessionId && s.id === callerSessionId && s.context
-                  ? { context: s.context }
-                  : {}),
-                startedAt: s.startedAt.toISOString(),
-              }));
-            })(),
+            // Active sessions — caller's own session always included (even if it fell off the top-10 list).
+            // context is only included for the caller's own session.
+            activeSessions: mergedSessions.map((s) => mapSessionForBootstrap(s, callerSessionId)),
 
             // Knowledge summary: budget-constrained, grouped by topic (critical + high salience)
             // This is the MEMORY.md equivalent — read this first for what you know
