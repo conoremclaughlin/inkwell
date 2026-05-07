@@ -23,6 +23,7 @@ import type {
 import type { ProjectTask, TaskAssignment } from '../data/repositories/project-tasks.repository';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
 import { logger } from '../utils/logger';
+import type { SandboxOrchestrator, SandboxSpinUpResult } from './sandbox/orchestrator';
 
 // ============================================================================
 // Types
@@ -51,6 +52,8 @@ export interface StrategyAdvanceResult {
   notified?: boolean;
   /** Completion stats when group is done */
   stats?: { total: number; completed: number };
+  /** Sandbox container info (when sandbox mode is active) */
+  sandbox?: SandboxSpinUpResult;
 }
 
 export interface StrategyStatus {
@@ -158,7 +161,15 @@ const STRATEGY_PROMPTS: Record<StrategyPreset, (group: TaskGroup, task: ProjectT
 // ============================================================================
 
 export class StrategyService {
-  constructor(private dataComposer: DataComposer) {}
+  private sandboxOrchestrator?: SandboxOrchestrator;
+
+  constructor(dataComposer: DataComposer, sandboxOrchestrator?: SandboxOrchestrator);
+  constructor(
+    private dataComposer: DataComposer,
+    orchestrator?: SandboxOrchestrator
+  ) {
+    this.sandboxOrchestrator = orchestrator;
+  }
 
   private getAssignment(group: TaskGroup): TaskAssignment {
     const meta = group.metadata as Record<string, unknown> | null;
@@ -228,6 +239,9 @@ export class StrategyService {
     // actually begins, matching how heartbeats/reminders already deliver.
     const triggered = await this.triggerOwnerAgent(updated, nextTask, 'strategy_kickoff');
 
+    // Spin up sandbox container if configured
+    const sandboxResult = await this.maybeSpinUpSandbox(updated);
+
     // Log strategy start
     await this.logStrategyEvent(
       updated,
@@ -237,6 +251,9 @@ export class StrategyService {
         firstTaskId: nextTask.id,
         firstTaskTitle: nextTask.title,
         ownerTriggered: triggered,
+        sandbox: sandboxResult
+          ? { containerName: sandboxResult.containerName, success: sandboxResult.success }
+          : undefined,
       }
     );
 
@@ -247,6 +264,7 @@ export class StrategyService {
       nextTask,
       prompt,
       notified: triggered,
+      sandbox: sandboxResult || undefined,
     };
   }
 
@@ -862,6 +880,73 @@ export class StrategyService {
 
       return false;
     }
+  }
+
+  /**
+   * Spin up a sandbox Docker container for the strategy's owner agent.
+   * Resolves the studio from DB metadata, builds a SandboxSpinUpRequest,
+   * and delegates to the orchestrator. Returns null if sandbox mode is
+   * not enabled or no orchestrator is configured.
+   */
+  private async maybeSpinUpSandbox(group: TaskGroup): Promise<SandboxSpinUpResult | null> {
+    const config = group.strategy_config as StrategyConfig;
+    if (!config.sandbox) return null;
+    if (!this.sandboxOrchestrator) {
+      logger.warn(
+        `Strategy group ${group.id} has sandbox enabled but no SandboxOrchestrator configured`
+      );
+      return null;
+    }
+
+    const metadata = (group.metadata || {}) as Record<string, unknown>;
+    const studioId = typeof metadata.studioId === 'string' ? metadata.studioId : undefined;
+    if (!studioId) {
+      logger.warn(`Strategy group ${group.id}: sandbox requested but no studioId in metadata`);
+      return null;
+    }
+
+    const studio = await this.dataComposer.repositories.studios.findById(studioId);
+    if (!studio) {
+      logger.warn(`Strategy group ${group.id}: studio ${studioId} not found`);
+      return null;
+    }
+
+    const result = await this.sandboxOrchestrator.spinUp({
+      userId: group.user_id,
+      agentId: group.owner_agent_id || studio.agentId || 'unknown',
+      studioId: studio.id,
+      studioSlug: studio.slug || undefined,
+      worktreePath: studio.worktreePath,
+      repoRoot: studio.repoRoot,
+      branch: studio.branch,
+      taskGroupId: group.id,
+      taskGroupTitle: group.title,
+      taskGroupContext: group.context_summary || undefined,
+      taskGroupThreadKey: group.thread_key || `strategy:${group.id}`,
+      backendAuth: (config.sandboxBackendAuth as any) || ['claude'],
+    });
+
+    if (result.success) {
+      await this.logStrategyEvent(
+        group,
+        'sandbox_started',
+        `Sandbox container started: ${result.containerName}`,
+        {
+          containerName: result.containerName,
+          studioId: studio.id,
+          alreadyRunning: result.alreadyRunning,
+        }
+      );
+    } else {
+      await this.logStrategyEvent(
+        group,
+        'sandbox_failed',
+        `Sandbox spin-up failed: ${result.error}`,
+        { containerName: result.containerName, error: result.error }
+      );
+    }
+
+    return result;
   }
 
   /**
