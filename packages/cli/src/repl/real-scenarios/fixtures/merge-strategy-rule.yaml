@@ -38,14 +38,12 @@ mustAssert:
     criticality: high
     containsPhrases:
       - merge commit
-      - not squash
       - never squash
   - claim: Individual commits should be preserved (rebase loses this nuance)
     criticality: medium
     containsPhrases:
       - individual commits
       - clearer story
-      - commits tell a
 
 mustNotAssert:
   - claim: Squash merge is our default

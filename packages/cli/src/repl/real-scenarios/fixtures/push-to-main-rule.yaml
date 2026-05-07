@@ -40,13 +40,11 @@ mustAssert:
     containsPhrases:
       - never push directly
       - feature branch
-      - always use a pr
       - even for small
   - claim: The rule applies even for small/docs changes
     criticality: medium
     containsPhrases:
       - even for small
-      - even for docs
       - small docs
 
 mustNotAssert:

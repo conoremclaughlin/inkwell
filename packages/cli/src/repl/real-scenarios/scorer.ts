@@ -14,9 +14,14 @@ export interface SurfacedMemory {
   summary: string | null;
 }
 
-/** Normalize content for matching: lowercase + collapse whitespace */
+/** Normalize content for matching: strip markdown, collapse punctuation */
 function normalize(s: string): string {
-  return s.toLowerCase().replace(/\s+/g, ' ').trim();
+  return s
+    .toLowerCase()
+    .replace(/[`*_~]/g, '')
+    .replace(/[—–]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 /** Does the combined surfaced content support this expected item? */
