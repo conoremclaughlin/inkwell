@@ -2,7 +2,7 @@ import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import { z } from 'zod';
 
-export const MEMORY_EXTRACTION_VERSION = 1;
+export const MEMORY_EXTRACTION_VERSION = 2;
 
 export const entityExtractionItemSchema = z.object({
   name: z.string().min(1),
