@@ -127,6 +127,14 @@ function parsePositiveInt(raw: string | undefined, defaultValue: number): number
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : defaultValue;
 }
 
+function parseList(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(/[,\n]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -300,11 +308,13 @@ function auditCaseCoverage(params: {
   seed: SeedFile;
   dataset: LongMemCase[];
   memoryById: Map<string, AuditedMemory>;
+  caseIds?: Set<string>;
 }): CaseCoverage[] {
   const datasetById = new Map(params.dataset.map((item) => [item.question_id, item]));
   const cases: CaseCoverage[] = [];
 
   for (const [caseId, seededCase] of Object.entries(params.seed.seededCases)) {
+    if (params.caseIds && !params.caseIds.has(caseId)) continue;
     const benchmarkCase = datasetById.get(caseId);
     if (!benchmarkCase) continue;
     const targetMemories = seededCase.targetMemoryIds
@@ -674,6 +684,7 @@ async function main() {
     process.env.MEMORY_LLM_AUDIT_MARKDOWN_PATH || outputPath.replace(/\.json$/i, '.md');
   const seedPath = process.env.MEMORY_LLM_AUDIT_SEED_PATH;
   const datasetPath = process.env.MEMORY_LLM_AUDIT_DATASET_PATH;
+  const caseIds = new Set(parseList(process.env.MEMORY_LLM_AUDIT_CASE_IDS));
 
   const [seed, dataset, rows] = await Promise.all([
     seedPath ? loadJsonFile<SeedFile>(seedPath) : Promise.resolve(null),
@@ -691,15 +702,20 @@ async function main() {
       role: roleMap.get(row.id) || { caseId: 'unknown', role: 'unknown' },
     };
   });
+  const filteredAudited =
+    caseIds.size > 0
+      ? audited.filter((item) => item.role.caseId !== 'unknown' && caseIds.has(item.role.caseId))
+      : audited;
   const memoryById = new Map(audited.map((item) => [item.row.id, item]));
   const caseCoverage = seed
     ? auditCaseCoverage({
         seed,
         dataset,
         memoryById,
+        caseIds: caseIds.size > 0 ? caseIds : undefined,
       })
     : [];
-  const summary = summarizeAudits({ topic, seed, audited, caseCoverage });
+  const summary = summarizeAudits({ topic, seed, audited: filteredAudited, caseCoverage });
   const misses = caseCoverage
     .filter((item) => item.targetContentHasAnswer && !item.derivedHasAnswer)
     .sort((a, b) => a.maxDerivedAnswerTokenCoverage - b.maxDerivedAnswerTokenCoverage)
@@ -716,6 +732,7 @@ async function main() {
     `${JSON.stringify(
       {
         summary,
+        caseIds: [...caseIds],
         misses,
         lowCoverage,
         samples,
