@@ -126,6 +126,9 @@ function createMockDataComposer() {
       activityStream: {
         logActivity: vi.fn().mockResolvedValue({ id: 'activity-1' }),
       },
+      studios: {
+        findById: vi.fn().mockResolvedValue(null),
+      },
     },
   };
 }
@@ -1475,6 +1478,238 @@ describe('StrategyService', () => {
       const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
       const payload = call[0] as Record<string, unknown>;
       expect(payload.content).toContain(pendingTask.title);
+    });
+  });
+
+  describe('sandbox integration', () => {
+    it('does not spin up sandbox when config.sandbox is not set', async () => {
+      const group = createMockGroup({ strategy: null, status: 'active' });
+      const task = createMockTask();
+      const mockOrchestrator = { spinUp: vi.fn(), isRunning: vi.fn() };
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: {},
+      });
+
+      const mockClient = dc.getClient();
+      mockClient.from.mockReturnValue({
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                }),
+              }),
+            }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      });
+
+      const serviceWithSandbox = new StrategyService(dc as any, mockOrchestrator as any);
+      const result = await serviceWithSandbox.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        ownerAgentId: 'wren',
+      });
+
+      expect(mockOrchestrator.spinUp).not.toHaveBeenCalled();
+      expect(result.sandbox).toBeUndefined();
+    });
+
+    it('spins up sandbox when config.sandbox is true and studio exists', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: { studioId: 'studio-abc' },
+      });
+      const task = createMockTask();
+      const mockOrchestrator = {
+        spinUp: vi.fn().mockResolvedValue({
+          containerName: 'ink-sandbox-wren-test-12345678',
+          success: true,
+        }),
+        isRunning: vi.fn(),
+      };
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: { sandbox: true },
+      });
+      dc.repositories.studios.findById.mockResolvedValue({
+        id: 'studio-abc',
+        userId: 'user-123',
+        agentId: 'wren',
+        worktreePath: '/tmp/test-studio',
+        repoRoot: '/tmp/test-repo',
+        branch: 'wren/feat/test',
+        slug: 'wren',
+      });
+
+      const mockClient = dc.getClient();
+      mockClient.from.mockReturnValue({
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                }),
+              }),
+            }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      });
+
+      const serviceWithSandbox = new StrategyService(dc as any, mockOrchestrator as any);
+      const result = await serviceWithSandbox.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        ownerAgentId: 'wren',
+      });
+
+      expect(mockOrchestrator.spinUp).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agentId: 'wren',
+          studioId: 'studio-abc',
+          worktreePath: '/tmp/test-studio',
+          taskGroupId: 'group-1',
+          taskGroupTitle: 'Test Strategy Group',
+        })
+      );
+      expect(result.sandbox).toBeDefined();
+      expect(result.sandbox?.success).toBe(true);
+    });
+
+    it('handles sandbox spin-up failure gracefully', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: { studioId: 'studio-abc' },
+      });
+      const task = createMockTask();
+      const mockOrchestrator = {
+        spinUp: vi.fn().mockResolvedValue({
+          containerName: 'ink-sandbox-wren-test-12345678',
+          success: false,
+          error: 'Docker daemon not running',
+        }),
+        isRunning: vi.fn(),
+      };
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: { sandbox: true },
+      });
+      dc.repositories.studios.findById.mockResolvedValue({
+        id: 'studio-abc',
+        userId: 'user-123',
+        agentId: 'wren',
+        worktreePath: '/tmp/test-studio',
+        repoRoot: '/tmp/test-repo',
+        branch: 'wren/feat/test',
+        slug: 'wren',
+      });
+
+      const mockClient = dc.getClient();
+      mockClient.from.mockReturnValue({
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                }),
+              }),
+            }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      });
+
+      const serviceWithSandbox = new StrategyService(dc as any, mockOrchestrator as any);
+      const result = await serviceWithSandbox.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        ownerAgentId: 'wren',
+      });
+
+      // Strategy still starts — sandbox failure is non-fatal
+      expect(result.action).toBe('next_task');
+      expect(result.sandbox?.success).toBe(false);
+      expect(result.sandbox?.error).toContain('Docker daemon');
+    });
+
+    it('skips sandbox when no studioId in metadata', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: {},
+      });
+      const task = createMockTask();
+      const mockOrchestrator = { spinUp: vi.fn(), isRunning: vi.fn() };
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: { sandbox: true },
+      });
+
+      const mockClient = dc.getClient();
+      mockClient.from.mockReturnValue({
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                }),
+              }),
+            }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      });
+
+      const serviceWithSandbox = new StrategyService(dc as any, mockOrchestrator as any);
+      const result = await serviceWithSandbox.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        ownerAgentId: 'wren',
+      });
+
+      expect(mockOrchestrator.spinUp).not.toHaveBeenCalled();
+      expect(result.sandbox).toBeUndefined();
     });
   });
 });
