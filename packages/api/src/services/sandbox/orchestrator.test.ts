@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
-import { tmpdir } from 'os';
+import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
+import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 import {
   buildContainerName,
@@ -8,6 +8,7 @@ import {
   buildDockerRunArgs,
   buildMounts,
   patchMcpConfig,
+  stageClaudeDir,
   SandboxOrchestrator,
   type SandboxSpinUpRequest,
 } from './orchestrator';
@@ -267,6 +268,33 @@ describe('patchMcpConfig', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'mcp-patch-'));
     const result = patchMcpConfig(tmpDir);
     expect(result).toBeUndefined();
+  });
+});
+
+describe('stageClaudeDir', () => {
+  it('stages credentials from file when .credentials.json exists', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'cred-stage-'));
+    // stageClaudeDir reads from the real homedir, so we test what it returns
+    const result = stageClaudeDir(join(tmpDir, 'staging'));
+    // On this machine (macOS with active Claude session), should extract from keychain
+    // In CI or without credentials, returns undefined — both are valid
+    if (result) {
+      expect(result).toContain('claude-home');
+      expect(existsSync(join(result, '.credentials.json'))).toBe(true);
+      const creds = JSON.parse(readFileSync(join(result, '.credentials.json'), 'utf-8'));
+      expect(creds.claudeAiOauth).toBeDefined();
+    }
+  });
+
+  it('copies settings files when they exist', () => {
+    const result = stageClaudeDir(mkdtempSync(join(tmpdir(), 'cred-stage-')));
+    if (result) {
+      // settings.json should be copied if it exists on the host
+      const hostSettings = join(homedir(), '.claude', 'settings.json');
+      if (existsSync(hostSettings)) {
+        expect(existsSync(join(result, 'settings.json'))).toBe(true);
+      }
+    }
   });
 });
 

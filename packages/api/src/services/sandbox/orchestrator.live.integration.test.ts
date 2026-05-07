@@ -5,8 +5,8 @@
  * They require:
  * - Docker daemon running
  * - The inkwell:studio-sandbox image built
- * - ANTHROPIC_API_KEY set (for Claude calls)
- * - Inkwell server running on localhost:3001 (for MCP tests)
+ * - Active Claude Code session (OAuth tokens staged from macOS keychain)
+ * - Inkwell server running on localhost:3001 (for MCP connectivity test)
  *
  * Run with: INK_LIVE_TESTS=1 npx vitest run --config vitest.integration.config.ts src/services/sandbox/orchestrator.live.test.ts
  */
@@ -16,7 +16,12 @@ import { execFileSync, spawnSync } from 'child_process';
 import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { SandboxOrchestrator, buildContainerName, type SandboxSpinUpRequest } from './orchestrator';
+import {
+  SandboxOrchestrator,
+  buildContainerName,
+  stageClaudeDir,
+  type SandboxSpinUpRequest,
+} from './orchestrator';
 
 function dockerAvailable(): boolean {
   try {
@@ -30,6 +35,17 @@ function dockerAvailable(): boolean {
 function imageExists(image: string): boolean {
   const result = spawnSync('docker', ['image', 'inspect', image], { stdio: 'ignore' });
   return result.status === 0;
+}
+
+function claudeCredentialsAvailable(): boolean {
+  try {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'cred-check-'));
+    const result = stageClaudeDir(tmpDir);
+    if (!result) return false;
+    return existsSync(join(result, '.credentials.json'));
+  } catch {
+    return false;
+  }
 }
 
 function inkwellReachable(): boolean {
@@ -96,12 +112,6 @@ describe.skipIf(SKIP)('SandboxOrchestrator (live)', () => {
       worktreePath: testDir,
       repoRoot: testDir,
       backendAuth: ['claude'],
-      extraEnv: {
-        // Pass API key into the container for Claude calls
-        ...(process.env.ANTHROPIC_API_KEY
-          ? { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY }
-          : {}),
-      },
       ...overrides,
     };
   }
@@ -175,7 +185,7 @@ describe.skipIf(SKIP)('SandboxOrchestrator (live)', () => {
   });
 
   describe('LLM response', () => {
-    const SKIP_LLM = !process.env.ANTHROPIC_API_KEY;
+    const SKIP_LLM = !claudeCredentialsAvailable();
 
     it.skipIf(SKIP_LLM)(
       'gets a live Claude response inside the container',
@@ -187,16 +197,17 @@ describe.skipIf(SKIP)('SandboxOrchestrator (live)', () => {
         await orchestrator.spinUp(request);
 
         // Use claude CLI with --print (non-interactive, single-shot)
-        // Ask a trivially answerable question to minimize cost
+        // Just verify we get a non-empty response (the model is authenticated)
         const { stdout } = await orchestrator.exec(containerName, [
           'claude',
           '--print',
           '--model',
           'claude-haiku-4-5-20251001',
-          'Reply with exactly the word SANDBOX and nothing else.',
+          'What is 2+2? Reply with just the number.',
         ]);
 
-        expect(stdout.toUpperCase()).toContain('SANDBOX');
+        expect(stdout.trim().length).toBeGreaterThan(0);
+        expect(stdout).toContain('4');
       },
       120_000
     );
@@ -210,6 +221,7 @@ describe.skipIf(SKIP)('SandboxOrchestrator (live)', () => {
 
         await orchestrator.spinUp(request);
 
+        // --allowedTools requires -p for the prompt
         const { stdout } = await orchestrator.exec(containerName, [
           'claude',
           '--print',
@@ -217,6 +229,7 @@ describe.skipIf(SKIP)('SandboxOrchestrator (live)', () => {
           'claude-haiku-4-5-20251001',
           '--allowedTools',
           'Read',
+          '-p',
           'Read the file src/hello.ts and tell me what function it exports. Reply with just the function name.',
         ]);
 
@@ -227,7 +240,7 @@ describe.skipIf(SKIP)('SandboxOrchestrator (live)', () => {
   });
 
   describe('Inkwell MCP access', () => {
-    const SKIP_INKWELL = !inkwellReachable() || !process.env.ANTHROPIC_API_KEY;
+    const SKIP_INKWELL = !inkwellReachable();
 
     it.skipIf(SKIP_INKWELL)(
       'container can reach Inkwell server via host.docker.internal',
