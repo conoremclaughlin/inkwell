@@ -2327,6 +2327,67 @@ export type Database = {
           },
         ];
       };
+      recall_feedback: {
+        Row: {
+          agent_id: string | null;
+          created_at: string;
+          final_score: number | null;
+          id: string;
+          memory_id: string;
+          query: string;
+          semantic_score: number | null;
+          session_id: string | null;
+          text_score: number | null;
+          user_id: string;
+          verdict: string;
+        };
+        Insert: {
+          agent_id?: string | null;
+          created_at?: string;
+          final_score?: number | null;
+          id?: string;
+          memory_id: string;
+          query: string;
+          semantic_score?: number | null;
+          session_id?: string | null;
+          text_score?: number | null;
+          user_id: string;
+          verdict: string;
+        };
+        Update: {
+          agent_id?: string | null;
+          created_at?: string;
+          final_score?: number | null;
+          id?: string;
+          memory_id?: string;
+          query?: string;
+          semantic_score?: number | null;
+          session_id?: string | null;
+          text_score?: number | null;
+          user_id?: string;
+          verdict?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'recall_feedback_memory_id_fkey';
+            columns: ['memory_id'];
+            referencedRelation: 'memories';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'recall_feedback_session_id_fkey';
+            columns: ['session_id'];
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'recall_feedback_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       reminder_history: {
         Row: {
           delivered_at: string | null;
@@ -3273,6 +3334,7 @@ export type Database = {
           current_task_index?: number;
           description?: string | null;
           group_number?: number;
+
           id?: string;
           identity_id?: string | null;
           instructions?: string | null;

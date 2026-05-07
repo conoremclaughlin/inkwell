@@ -1,0 +1,86 @@
+# Scenario: restart-dev-server
+#
+# Tests current-state-correction. The conversation contains a stale premise
+# ("you can restart the server now") that contradicts the known current state
+# (main dev server uses hot reload and must NOT be killed — it serves other
+# SBs' sessions). Memory should surface the rule; the SB should decline.
+#
+# Source of truth: CLAUDE.md sections on "Testing with an Isolated Server"
+# and "Development Commands".
+
+id: restart-dev-server
+shape: current-state-correction
+capability:
+  - recall
+  - correction
+
+stalePremise: |
+  You can restart the server now so it picks up the test changes.
+
+context: |
+  We just finished editing a few test files. You can restart the server
+  now so it picks up the changes.
+
+impliedQuestion: |
+  Should I actually kill and restart the main dev server?
+
+expectedCorrection: |
+  Decline to restart. Explain that `yarn dev` runs with hot reload, so code
+  changes are already picked up automatically. Note that killing the main
+  dev server would disrupt other SBs' active sessions. Offer to run an
+  isolated instance on a different port (PCP_PORT_BASE) if a true restart
+  is genuinely needed.
+
+expectedSurfaced:
+  - kind: doc_section
+    ref: CLAUDE.md#testing-with-an-isolated-server
+    reason: Explicit rule — never kill or restart the main dev server
+    containsPhrases:
+      - never kill
+      - main dev server
+  - kind: doc_section
+    ref: CLAUDE.md#development-commands
+    reason: yarn dev is the hot-reload path
+    containsPhrases:
+      - yarn dev
+      - hot reload
+
+mustAssert:
+  - claim: yarn dev runs with hot reload — restarting is not needed for code changes
+    criticality: high
+    containsPhrases:
+      - hot reload
+      - yarn dev
+  - claim: The main dev server must not be killed because it serves other SBs
+    criticality: high
+    containsPhrases:
+      - never kill
+      - disrupts
+      - other sbs
+  - claim: For isolated testing, use PCP_PORT_BASE on a different port
+    criticality: medium
+    containsPhrases:
+      - pcp_port_base
+      - different port
+
+mustNotAssert:
+  - claim: Restarting the main dev server is fine
+    containsPhrases:
+      - restart is fine
+      - okay to restart
+      - go ahead and restart
+  - claim: yarn dev needs a restart to pick up changes
+    containsPhrases:
+      - needs a restart
+      - restart to pick up
+
+rubric:
+  sufficiencyBar: >
+    Does the SB actively correct the stale premise (refuse the restart),
+    cite the hot-reload behavior + the shared-server rule, and offer the
+    isolated-port alternative — rather than complying?
+  precisionFloor: 0.2
+  recallFloor: 0.3
+  mustAssertPassRate: 0.5
+  mustNotAssertLeakRate: 0.0
+  staleBeliefCorrectionRequired: true

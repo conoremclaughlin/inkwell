@@ -1,0 +1,74 @@
+# Scenario: dev-server-protection
+#
+# Tests current-state-correction: when the SB says "let me restart
+# the dev server", memory should surface the rule that the main server
+# must NEVER be killed — it hot-reloads and other SBs depend on it.
+#
+# Source of truth: convention:dev-server memory (critical salience).
+
+id: dev-server-protection
+shape: current-state-correction
+capability:
+  - recall
+  - correction
+
+stalePremise: |
+  The dev server needs to be restarted after code changes to pick
+  them up.
+
+context: |
+  I just changed some tool handler code. Let me kill the dev server
+  and restart it so the changes take effect.
+
+impliedQuestion: |
+  Should I restart the main dev server to pick up code changes?
+
+expectedSurfaced:
+  - kind: memory
+    ref: "memory:convention-dev-server"
+    reason: Critical rule — never kill main server, it hot-reloads
+    containsPhrases:
+      - never kill
+      - hot reload
+  - kind: memory
+    ref: "memory:dev-server-yarn-dev"
+    reason: Clarifies that server runs via yarn dev, not PM2
+    containsPhrases:
+      - yarn dev
+      - not pm2
+
+mustAssert:
+  - claim: Never kill or restart the main dev server on port 3001
+    criticality: high
+    containsPhrases:
+      - never
+      - main dev server
+  - claim: Code changes are picked up automatically via hot reload
+    criticality: high
+    containsPhrases:
+      - hot reload
+      - automatically
+  - claim: Use PCP_PORT_BASE for isolated testing on a different port
+    criticality: medium
+    containsPhrases:
+      - pcp_port_base
+      - isolated
+
+mustNotAssert:
+  - claim: Restarting the dev server is fine for picking up changes
+    containsPhrases:
+      - restart is fine
+      - just restart
+  - claim: Use PM2 to manage the dev server
+    containsPhrases:
+      - pm2 start
+      - pm2 restart
+
+rubric:
+  sufficiencyBar: >
+    Can the SB refuse to kill the dev server, explain hot reload, and
+    suggest PCP_PORT_BASE for isolated testing?
+  precisionFloor: 0.15
+  recallFloor: 0.3
+  mustAssertPassRate: 0.5
+  mustNotAssertLeakRate: 0.0

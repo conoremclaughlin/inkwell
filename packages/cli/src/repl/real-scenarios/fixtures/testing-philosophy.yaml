@@ -1,0 +1,63 @@
+# Scenario: testing-philosophy
+#
+# Tests convention-recall: when asked "should I mock the database?",
+# does memory surface the testing philosophy (prefer live e2e over
+# mocks) and the fork bomb incident lesson?
+#
+# Source of truth: convention:testing-philosophy memory, fork bomb
+# incident memory, AGENTS.md testing section.
+
+id: testing-philosophy
+shape: convention-recall
+capability:
+  - recall
+  - correction
+
+context: |
+  I'm writing tests for the new recall feedback repository. Should I
+  mock the Supabase client, or should I set up a real database?
+
+impliedQuestion: |
+  What is our testing philosophy — mocks vs real services?
+
+expectedSurfaced:
+  - kind: memory
+    ref: "memory:convention-testing-philosophy"
+    reason: Core testing stance — prefer live e2e over mocks
+    containsPhrases:
+      - prefer
+      - integration
+      - mocks
+  - kind: memory
+    ref: "memory:fork-bomb-incident"
+    reason: Safety constraint on destructive test commands
+    containsPhrases:
+      - destructive
+      - real executor
+
+mustAssert:
+  - claim: Prefer live integration and e2e tests over mocks
+    criticality: high
+    containsPhrases:
+      - prefer
+      - integration
+  - claim: Mocks are the fallback, not the default
+    criticality: medium
+    containsPhrases:
+      - mocks
+      - fallback
+
+mustNotAssert:
+  - claim: Always mock external services
+    containsPhrases:
+      - always mock
+      - mock everything
+
+rubric:
+  sufficiencyBar: >
+    Can the SB recommend real integration tests over mocks and cite
+    the team's testing philosophy?
+  precisionFloor: 0.15
+  recallFloor: 0.3
+  mustAssertPassRate: 0.5
+  mustNotAssertLeakRate: 0.0
