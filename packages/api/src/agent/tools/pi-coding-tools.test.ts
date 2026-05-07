@@ -1,8 +1,9 @@
-import { describe, it, expect, vi, beforeAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest';
 import path from 'path';
 import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { createInkCodingTools, type InkToolDefinition } from './pi-coding-tools';
+import { resetProcessRegistry, getProcessRegistry } from './bash-guard';
 
 vi.mock('../../utils/logger', () => ({
   logger: {
@@ -167,6 +168,79 @@ describe('Pi Coding Tools Adapter', () => {
       const names = filtered.map((t) => t.schema.name);
       expect(names).not.toContain('bash');
       expect(names.length).toBe(6);
+    });
+  });
+
+  describe('bash guard integration', () => {
+    let guardedTools: InkToolDefinition[];
+
+    beforeAll(async () => {
+      guardedTools = await createInkCodingTools({
+        cwd: testDir,
+        agentId: 'test-agent',
+      });
+    });
+
+    afterEach(() => {
+      resetProcessRegistry();
+    });
+
+    it('blocks fork bombs before execution', async () => {
+      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
+      const result = await bash.execute({ command: ':(){ :|:& };:' });
+      expect(result).toContain('Error');
+      expect(result).toContain('fork bomb');
+    });
+
+    it('blocks rm -rf / before execution', async () => {
+      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
+      const result = await bash.execute({ command: 'rm -rf /' });
+      expect(result).toContain('Error');
+      expect(result).toContain('recursive delete');
+    });
+
+    it('blocks shutdown before execution', async () => {
+      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
+      const result = await bash.execute({ command: 'shutdown -h now' });
+      expect(result).toContain('Error');
+      expect(result).toContain('shutdown');
+    });
+
+    it('blocks kill targeting unregistered PIDs', async () => {
+      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
+      const result = await bash.execute({ command: 'kill 99999' });
+      expect(result).toContain('Error');
+      expect(result).toContain('not owned by this agent');
+    });
+
+    it('allows kill targeting own registered PIDs', async () => {
+      const registry = getProcessRegistry();
+      registry.register('test-agent', 99999999, 'sleep 100');
+
+      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
+      // The kill will execute but fail (PID doesn't exist) — that's fine,
+      // the point is the guard lets it through
+      const result = await bash.execute({ command: 'kill 99999999' });
+      expect(result).not.toContain('not owned by this agent');
+    });
+
+    it('allows safe commands with guard enabled', async () => {
+      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
+      const result = await bash.execute({ command: 'echo guarded-hello' });
+      expect(result).toContain('guarded-hello');
+    });
+
+    it('does not guard when agentId is not set', async () => {
+      // The original tools (no agentId) should work normally
+      const bash = tools.find((t) => t.schema.name === 'bash')!;
+      const result = await bash.execute({ command: 'echo unguarded' });
+      expect(result).toContain('unguarded');
+    });
+
+    it('guard does not interfere with non-bash tools', async () => {
+      const readTool = guardedTools.find((t) => t.schema.name === 'read')!;
+      const result = await readTool.execute({ path: 'hello.txt' });
+      expect(result).toContain('Hello, world!');
     });
   });
 });
