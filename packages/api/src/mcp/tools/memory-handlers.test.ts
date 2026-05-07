@@ -1891,3 +1891,74 @@ describe('isCallerSessionEligible', () => {
     expect(isCallerSessionEligible({ userId: 'user-1' }, 'user-1', undefined)).toBe(true);
   });
 });
+
+// =====================================================
+// callerSession extraction pattern (bootstrap response)
+// =====================================================
+
+describe('callerSession extraction from mergedSessions', () => {
+  const sessions = [
+    {
+      id: 'session-abc',
+      agentId: 'wren',
+      studioId: 'studio-1',
+      backendSessionId: 'backend-xyz',
+      context: 'server on :4001',
+      startedAt: new Date('2026-05-07T00:00:00Z'),
+    },
+    {
+      id: 'session-def',
+      agentId: 'lumen',
+      studioId: 'studio-2',
+      backendSessionId: 'backend-uvw',
+      context: null,
+      startedAt: new Date('2026-05-07T01:00:00Z'),
+    },
+  ];
+
+  function extractCallerSession(
+    mergedSessions: typeof sessions,
+    callerSessionId: string | undefined
+  ) {
+    if (!callerSessionId) return null;
+    const cs = mergedSessions.find((s) => s.id === callerSessionId);
+    return cs
+      ? {
+          id: cs.id,
+          backendSessionId: cs.backendSessionId || null,
+          studioId: cs.studioId || null,
+          agentId: cs.agentId || null,
+          context: cs.context || null,
+        }
+      : null;
+  }
+
+  it('returns full session IDs for the caller', () => {
+    const result = extractCallerSession(sessions, 'session-abc');
+    expect(result).toEqual({
+      id: 'session-abc',
+      backendSessionId: 'backend-xyz',
+      studioId: 'studio-1',
+      agentId: 'wren',
+      context: 'server on :4001',
+    });
+  });
+
+  it('returns null when callerSessionId is undefined', () => {
+    expect(extractCallerSession(sessions, undefined)).toBeNull();
+  });
+
+  it('returns null when callerSessionId is not in the list', () => {
+    expect(extractCallerSession(sessions, 'session-unknown')).toBeNull();
+  });
+
+  it('includes backendSessionId for session resumption', () => {
+    const result = extractCallerSession(sessions, 'session-abc');
+    expect(result?.backendSessionId).toBe('backend-xyz');
+  });
+
+  it('returns null context when session has no context', () => {
+    const result = extractCallerSession(sessions, 'session-def');
+    expect(result?.context).toBeNull();
+  });
+});
