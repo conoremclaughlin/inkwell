@@ -915,9 +915,14 @@ function buildSessionsBlock(sessions: Array<Record<string, unknown>> | undefined
   if (!sessions || sessions.length === 0) return '';
   const lines = ['### Active Sessions'];
   for (const s of sessions) {
-    lines.push(
-      `- ${(s.id as string)?.substring(0, 8) || 'unknown'}: ${s.summary || s.status || 'active'}`
-    );
+    const id = (s.id as string)?.substring(0, 8) || 'unknown';
+    const agent = s.agentId ? ` (${s.agentId})` : '';
+    const phase = s.currentPhase ? ` — phase: ${s.currentPhase}` : '';
+    const lifecycle = s.lifecycle ? ` [${s.lifecycle}]` : '';
+    lines.push(`- ${id}${agent}${lifecycle}${phase}`);
+    if (s.context) {
+      lines.push(`  > Context: ${s.context}`);
+    }
   }
   return lines.join('\n');
 }

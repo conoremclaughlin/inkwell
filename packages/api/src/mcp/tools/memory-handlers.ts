@@ -2158,16 +2158,22 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
             },
 
             // Recent active sessions (most recent 10) — use studioId to pick yours
-            // Match against .ink/identity.json studioId in your local environment
-            activeSessions: activeSessions.map((s) => ({
-              id: s.id,
-              agentId: s.agentId,
-              studioId: s.studioId || null,
-              threadKey: s.threadKey || null,
-              lifecycle: s.lifecycle || null,
-              currentPhase: s.currentPhase || null,
-              startedAt: s.startedAt.toISOString(),
-            })),
+            // context is only included for the caller's own session (matched by sessionId from request context)
+            activeSessions: (() => {
+              const callerSessionId = getRequestContext()?.sessionId;
+              return activeSessions.map((s) => ({
+                id: s.id,
+                agentId: s.agentId,
+                studioId: s.studioId || null,
+                threadKey: s.threadKey || null,
+                lifecycle: s.lifecycle || null,
+                currentPhase: s.currentPhase || null,
+                ...(callerSessionId && s.id === callerSessionId && s.context
+                  ? { context: s.context }
+                  : {}),
+                startedAt: s.startedAt.toISOString(),
+              }));
+            })(),
 
             // Knowledge summary: budget-constrained, grouped by topic (critical + high salience)
             // This is the MEMORY.md equivalent — read this first for what you know
