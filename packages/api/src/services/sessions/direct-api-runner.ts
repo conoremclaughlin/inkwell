@@ -43,7 +43,7 @@ export interface DirectApiRunnerConfig {
 export class DirectApiRunner implements IRunner {
   private client: Anthropic | null = null;
   private runnerConfig: DirectApiRunnerConfig;
-  private toolsCache: Map<string, InkToolDefinition[]> = new Map();
+  private toolsCache = new Map<string, InkToolDefinition[]>();
 
   constructor(config: DirectApiRunnerConfig = {}) {
     this.runnerConfig = config;
@@ -72,7 +72,7 @@ export class DirectApiRunner implements IRunner {
     }
 
     // Load Pi coding tools scoped to the working directory
-    const tools = await this.getTools(config.workingDirectory);
+    const tools = await this.getTools(config.workingDirectory, config.agentId);
     const toolSchemas: Anthropic.Tool[] = tools.map((t) => t.schema);
     if (this.runnerConfig.extraTools) {
       toolSchemas.push(...this.runnerConfig.extraTools);
@@ -211,18 +211,20 @@ export class DirectApiRunner implements IRunner {
     this.client = new Anthropic({ apiKey });
   }
 
-  private async getTools(cwd: string): Promise<InkToolDefinition[]> {
-    if (this.toolsCache.has(cwd)) {
-      return this.toolsCache.get(cwd)!;
+  private async getTools(cwd: string, agentId?: string): Promise<InkToolDefinition[]> {
+    const cacheKey = `${cwd}:${agentId ?? ''}`;
+    if (this.toolsCache.has(cacheKey)) {
+      return this.toolsCache.get(cacheKey)!;
     }
 
     const piConfig: PiCodingToolsConfig = {
       cwd,
       ...this.runnerConfig.piToolsConfig,
+      ...(agentId && { agentId }),
     };
 
     const tools = await createInkCodingTools(piConfig);
-    this.toolsCache.set(cwd, tools);
+    this.toolsCache.set(cacheKey, tools);
     return tools;
   }
 

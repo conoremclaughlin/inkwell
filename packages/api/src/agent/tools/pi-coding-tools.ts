@@ -10,7 +10,7 @@
 import path from 'path';
 import type Anthropic from '@anthropic-ai/sdk';
 import { logger } from '../../utils/logger';
-import { guardBashCommand, extractBackgroundPids, getProcessRegistry } from './bash-guard';
+import { guardBashCommand } from './bash-guard';
 
 // Pi tool types — widened to accept TypeBox TObject schemas
 interface PiAgentTool {
@@ -202,21 +202,7 @@ export async function createInkCodingTools(
       const callId = `ink-${tool.name}-${Date.now()}`;
       try {
         const result = await tool.execute(callId, params, signal);
-        const resultText = formatToolResult(result);
-
-        // Track background PIDs from bash output
-        if (tool.name === 'bash' && agentId) {
-          const bgPids = extractBackgroundPids(resultText);
-          if (bgPids.length > 0) {
-            const registry = getProcessRegistry();
-            for (const pid of bgPids) {
-              registry.register(agentId, pid, (params.command as string) || '');
-            }
-            logger.debug('Tracked background PIDs', { agentId, pids: bgPids });
-          }
-        }
-
-        return resultText;
+        return formatToolResult(result);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         logger.error(`Pi tool ${tool.name} failed`, { error: message, params });

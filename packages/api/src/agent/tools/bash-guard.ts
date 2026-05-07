@@ -77,9 +77,18 @@ function analyzeKillCommands(command: string): {
   found: boolean;
   allProcesses: boolean;
   initProcess: boolean;
+  processGroup: boolean;
+  hasUnresolvableTargets: boolean;
   pids: number[];
 } {
-  const result = { found: false, allProcesses: false, initProcess: false, pids: [] as number[] };
+  const result = {
+    found: false,
+    allProcesses: false,
+    initProcess: false,
+    processGroup: false,
+    hasUnresolvableTargets: false,
+    pids: [] as number[],
+  };
 
   const matches = [...command.matchAll(/\bkill\s+([^;|&\n]+)/g)];
   if (matches.length === 0) return result;
@@ -101,8 +110,29 @@ function analyzeKillCommands(command: string): {
       dashDashIdx >= 0 ? tokens.slice(dashDashIdx + 1) : tokens.filter((t) => !t.startsWith('-'));
 
     for (const t of candidates) {
+      // Variable expansion or command substitution — can't resolve statically
+      if (/\$/.test(t) || /`/.test(t)) {
+        result.hasUnresolvableTargets = true;
+        continue;
+      }
       const n = parseInt(t, 10);
-      if (!isNaN(n) && n > 0) result.pids.push(n);
+      if (isNaN(n)) continue;
+      if (n === 0) {
+        result.processGroup = true;
+      } else if (n < 0) {
+        result.processGroup = true;
+      } else {
+        result.pids.push(n);
+      }
+    }
+
+    // Also check for negative PIDs after -- (process group targets)
+    if (dashDashIdx >= 0) {
+      for (const t of tokens.slice(dashDashIdx + 1)) {
+        if (/^-\d+$/.test(t) && t !== '-1') {
+          result.processGroup = true;
+        }
+      }
     }
   }
 
@@ -146,9 +176,36 @@ export function analyzeCommand(command: string): CommandAnalysis {
     };
   }
 
+  if (kill.processGroup) {
+    return {
+      blocked: true,
+      reason: 'Blocked: kill targeting process group (PID 0 or negative PID)',
+      isKillCommand: true,
+      killPidTargets: kill.pids,
+    };
+  }
+
+  if (kill.hasUnresolvableTargets) {
+    return {
+      blocked: true,
+      reason: 'Blocked: kill with variable/dynamic PID target — cannot verify ownership',
+      isKillCommand: true,
+      killPidTargets: kill.pids,
+    };
+  }
+
+  if (hasPkillKillall) {
+    return {
+      blocked: true,
+      reason: 'Blocked: pkill/killall target by name — cannot verify process ownership',
+      isKillCommand: true,
+      killPidTargets: [],
+    };
+  }
+
   return {
     blocked: false,
-    isKillCommand: kill.found || hasPkillKillall,
+    isKillCommand: kill.found,
     killPidTargets: kill.pids,
   };
 }
