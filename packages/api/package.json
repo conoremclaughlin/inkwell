@@ -31,6 +31,7 @@
     "benchmark:memory-recall": "yarn workspace @inklabs/benchmarks benchmark:memory-recall",
     "benchmark:bootstrap-relevance": "yarn workspace @inklabs/benchmarks benchmark:bootstrap-relevance",
     "backfill:memory-embeddings": "tsx src/scripts/backfill-memory-embeddings.ts",
+    "audit:memory-llm-extractions": "tsx src/scripts/audit-memory-llm-extractions.ts",
     "extract:memory-llm-views": "tsx src/scripts/extract-memory-llm-views.ts",
     "lint": "eslint src --ext .ts",
     "type-check": "yarn workspace @inklabs/shared build && tsc --noEmit",
