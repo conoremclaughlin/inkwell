@@ -15,12 +15,14 @@
  * Run with: npx vitest run --config vitest.integration.config.ts src/services/sandbox/orchestrator.integration.test.ts
  */
 
-import { describe, it, expect, afterAll, beforeAll } from 'vitest';
+import { describe, it, expect, afterAll, afterEach, beforeAll } from 'vitest';
 import { execFileSync, spawnSync } from 'child_process';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'fs';
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 import { SandboxOrchestrator, buildContainerName, type SandboxSpinUpRequest } from './orchestrator';
+import { createInkCodingTools, type InkToolDefinition } from '../../agent/tools/pi-coding-tools';
+import { getProcessRegistry, resetProcessRegistry } from '../../agent/tools/bash-guard';
 
 function dockerAvailable(): boolean {
   try {
@@ -265,5 +267,97 @@ describe.skipIf(SKIP)('SandboxOrchestrator (integration)', () => {
       expect(result.containerName).toBe(customName);
       expect(await orchestrator.isRunning(customName)).toBe(true);
     }, 30_000);
+  });
+
+  // ── Bash guard in container context ────────────────────────────────
+
+  describe('bash guard (container context)', () => {
+    let guardedTools: InkToolDefinition[];
+
+    beforeAll(async () => {
+      guardedTools = await createInkCodingTools({
+        cwd: testDir,
+        agentId: 'integ-guard-agent',
+      });
+    });
+
+    afterEach(() => {
+      resetProcessRegistry();
+    });
+
+    it('blocks fork bomb — container stays healthy', async () => {
+      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
+      const result = await bash.execute({ command: ':(){ :|:& };:' });
+      expect(result).toContain('Blocked');
+      expect(result).toContain('fork bomb');
+
+      // Container is still alive — the fork bomb never executed
+      const { stdout } = await orchestrator.exec(FIXTURE_NAME, ['echo', 'still-alive']);
+      expect(stdout.trim()).toBe('still-alive');
+    }, 10_000);
+
+    it('blocks rm -rf / — workspace files intact', async () => {
+      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
+      const result = await bash.execute({ command: 'rm -rf /' });
+      expect(result).toContain('Blocked');
+      expect(result).toContain('recursive delete');
+
+      // Workspace files still exist inside the container
+      const { stdout } = await orchestrator.exec(FIXTURE_NAME, ['cat', '/studio/hello.txt']);
+      expect(stdout).toContain('Integration test file');
+    }, 10_000);
+
+    it('blocks shutdown — container unaffected', async () => {
+      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
+      const result = await bash.execute({ command: 'shutdown -h now' });
+      expect(result).toContain('Blocked');
+      expect(result).toContain('shutdown');
+
+      const { stdout } = await orchestrator.exec(FIXTURE_NAME, ['echo', 'not-shut-down']);
+      expect(stdout.trim()).toBe('not-shut-down');
+    }, 10_000);
+
+    it('blocks kill of unregistered PIDs', async () => {
+      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
+      const result = await bash.execute({ command: 'kill 12345' });
+      expect(result).toContain('Blocked');
+      expect(result).toContain('not owned by this agent');
+    }, 10_000);
+
+    it('allows safe commands — result visible in container', async () => {
+      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
+      const result = await bash.execute({
+        command: 'echo "guard-allowed" > guard-test-output.txt',
+      });
+      // No error from guard
+      expect(result).not.toContain('Blocked');
+
+      // File created on host is visible inside the container
+      const { stdout } = await orchestrator.exec(FIXTURE_NAME, [
+        'cat',
+        '/studio/guard-test-output.txt',
+      ]);
+      expect(stdout.trim()).toBe('guard-allowed');
+    }, 10_000);
+
+    it('allows kill of agent-owned PIDs', async () => {
+      const registry = getProcessRegistry();
+      registry.register('integ-guard-agent', 99999999, 'test-process');
+
+      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
+      // Guard lets it through — actual kill fails (PID doesn't exist) but that's expected
+      const result = await bash.execute({ command: 'kill 99999999' });
+      expect(result).not.toContain('not owned by this agent');
+    }, 10_000);
+
+    it('cross-agent kill blocked — other agent PID protected', async () => {
+      const registry = getProcessRegistry();
+      registry.register('other-agent', 88888, 'other-process');
+
+      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
+      const result = await bash.execute({ command: 'kill 88888' });
+      expect(result).toContain('Blocked');
+      expect(result).toContain('88888');
+    }, 10_000);
   });
 });
