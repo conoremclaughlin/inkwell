@@ -14,14 +14,9 @@
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import { execFileSync, spawnSync } from 'child_process';
 import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'fs';
-import { tmpdir } from 'os';
+import { homedir, tmpdir } from 'os';
 import { join } from 'path';
-import {
-  SandboxOrchestrator,
-  buildContainerName,
-  stageClaudeDir,
-  type SandboxSpinUpRequest,
-} from './orchestrator';
+import { SandboxOrchestrator, buildContainerName, type SandboxSpinUpRequest } from './orchestrator';
 
 function dockerAvailable(): boolean {
   try {
@@ -38,14 +33,22 @@ function imageExists(image: string): boolean {
 }
 
 function claudeCredentialsAvailable(): boolean {
-  try {
-    const tmpDir = mkdtempSync(join(tmpdir(), 'cred-check-'));
-    const result = stageClaudeDir(tmpDir);
-    if (!result) return false;
-    return existsSync(join(result, '.credentials.json'));
-  } catch {
-    return false;
+  // Sync check for skip conditions (can't use async stageClaudeDir with it.skipIf)
+  const credFile = join(homedir(), '.claude', '.credentials.json');
+  if (existsSync(credFile)) return true;
+  if (process.platform === 'darwin') {
+    try {
+      execFileSync('security', ['find-generic-password', '-s', 'Claude Code-credentials', '-w'], {
+        encoding: 'utf-8',
+        timeout: 5_000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
+  return false;
 }
 
 function inkwellReachable(): boolean {
