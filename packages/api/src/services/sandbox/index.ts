@@ -4,6 +4,7 @@ export {
   buildEnvVars,
   buildDockerRunArgs,
   buildMounts,
+  stageClaudeDir,
   type SandboxSpinUpRequest,
   type SandboxSpinUpResult,
   type SandboxStatusResult,

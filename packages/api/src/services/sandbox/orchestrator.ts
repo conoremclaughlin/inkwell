@@ -9,12 +9,12 @@
  * dependency for planning). Shells out to Docker via child_process.
  */
 
-import { execFile } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import { promisify } from 'util';
 import { createHash } from 'crypto';
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
+import { homedir, platform } from 'os';
 import { logger } from '../../utils/logger.js';
 
 const execFileAsync = promisify(execFile);
@@ -136,6 +136,71 @@ function rewriteLoopbackUrl(rawUrl: string): string {
   return rawUrl;
 }
 
+const CLAUDE_KEYCHAIN_SERVICE = 'Claude Code-credentials';
+const CLAUDE_CREDENTIALS_RELATIVE = '.claude/.credentials.json';
+
+/**
+ * Stage a Claude config directory for Docker mounting.
+ *
+ * Claude Code stores OAuth tokens in the macOS keychain (primary) with a
+ * file fallback at ~/.claude/.credentials.json. Docker containers can't
+ * access the keychain, so we build a staging directory with extracted
+ * credentials plus the config files Claude Code needs (settings, etc.).
+ *
+ * This replaces mounting ~/.claude directly — Docker can't overlay a file
+ * inside a read-only directory mount, so we stage everything into one dir.
+ *
+ * Returns the path to the staged directory, or undefined if credentials
+ * aren't available.
+ */
+export function stageClaudeDir(stagingDir: string): string | undefined {
+  const home = homedir();
+  const claudeHome = join(home, '.claude');
+  const stagedDir = join(stagingDir, 'claude-home');
+  mkdirSync(stagedDir, { recursive: true });
+
+  // Copy config files Claude Code needs
+  const filesToCopy = ['settings.json', 'settings.local.json'];
+  for (const file of filesToCopy) {
+    const src = join(claudeHome, file);
+    if (existsSync(src)) {
+      writeFileSync(join(stagedDir, file), readFileSync(src, 'utf-8'), { mode: 0o600 });
+    }
+  }
+
+  // Stage credentials: file fallback first, then keychain extraction
+  const credFile = join(claudeHome, '.credentials.json');
+  if (existsSync(credFile)) {
+    writeFileSync(join(stagedDir, '.credentials.json'), readFileSync(credFile, 'utf-8'), {
+      mode: 0o600,
+    });
+    return stagedDir;
+  }
+
+  if (platform() === 'darwin') {
+    try {
+      const raw = execFileSync(
+        'security',
+        ['find-generic-password', '-s', CLAUDE_KEYCHAIN_SERVICE, '-w'],
+        { encoding: 'utf-8', timeout: 5_000, stdio: ['pipe', 'pipe', 'pipe'] }
+      ).trim();
+
+      const data = JSON.parse(raw);
+      if (!data?.claudeAiOauth?.accessToken) return undefined;
+
+      writeFileSync(join(stagedDir, '.credentials.json'), JSON.stringify(data, null, 2) + '\n', {
+        mode: 0o600,
+      });
+      return stagedDir;
+    } catch {
+      logger.debug('Could not extract Claude credentials from keychain');
+      return undefined;
+    }
+  }
+
+  return undefined;
+}
+
 export function buildMounts(request: SandboxSpinUpRequest): SandboxMount[] {
   const mounts: SandboxMount[] = [];
 
@@ -158,22 +223,45 @@ export function buildMounts(request: SandboxSpinUpRequest): SandboxMount[] {
   };
 
   for (const backend of request.backendAuth || []) {
-    const sourceDir = authDirs[backend];
-    if (existsSync(sourceDir)) {
-      mounts.push({
-        source: sourceDir,
-        target: `${CONTAINER_HOME}/.${backend}`,
-        readOnly: true,
-      });
-    }
-
-    // Claude Code also needs ~/.claude.json (config separate from ~/.claude/ dir)
     if (backend === 'claude') {
+      // Stage ~/.claude with credentials extracted from keychain.
+      // We can't mount ~/.claude read-only and then overlay a file inside it,
+      // so we stage everything into one directory.
+      const runtimeDir = join(request.worktreePath, '.ink', 'runtime', 'sandbox');
+      const stagedClaudeHome = stageClaudeDir(runtimeDir);
+      if (stagedClaudeHome) {
+        mounts.push({
+          source: stagedClaudeHome,
+          target: `${CONTAINER_HOME}/.claude`,
+          readOnly: true,
+        });
+      } else {
+        // Fallback: mount ~/.claude directly (no credentials, but settings work)
+        const sourceDir = authDirs[backend];
+        if (existsSync(sourceDir)) {
+          mounts.push({
+            source: sourceDir,
+            target: `${CONTAINER_HOME}/.claude`,
+            readOnly: true,
+          });
+        }
+      }
+
+      // Claude Code also needs ~/.claude.json (config separate from ~/.claude/ dir)
       const claudeJson = join(home, '.claude.json');
       if (existsSync(claudeJson)) {
         mounts.push({
           source: claudeJson,
           target: `${CONTAINER_HOME}/.claude.json`,
+          readOnly: true,
+        });
+      }
+    } else {
+      const sourceDir = authDirs[backend];
+      if (existsSync(sourceDir)) {
+        mounts.push({
+          source: sourceDir,
+          target: `${CONTAINER_HOME}/.${backend}`,
           readOnly: true,
         });
       }

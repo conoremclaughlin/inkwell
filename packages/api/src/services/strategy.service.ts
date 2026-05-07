@@ -899,11 +899,6 @@ export class StrategyService {
       return null;
     }
 
-    const extraEnv: Record<string, string> = {};
-    if (process.env.ANTHROPIC_API_KEY) {
-      extraEnv.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-    }
-
     const result = await this.sandboxOrchestrator.spinUp({
       userId: group.user_id,
       agentId: group.owner_agent_id || studio.agentId || 'unknown',
@@ -917,7 +912,6 @@ export class StrategyService {
       taskGroupContext: group.context_summary || undefined,
       taskGroupThreadKey: group.thread_key || `strategy:${group.id}`,
       backendAuth: (config.sandboxBackendAuth as any) || ['claude'],
-      extraEnv,
     });
 
     if (result.success) {
