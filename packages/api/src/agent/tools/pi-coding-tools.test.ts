@@ -237,6 +237,20 @@ describe('Pi Coding Tools Adapter', () => {
       expect(result).toContain('unguarded');
     });
 
+    it('blocks pkill (fail-closed, name-based)', async () => {
+      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
+      const result = await bash.execute({ command: 'pkill -f node' });
+      expect(result).toContain('Error');
+      expect(result).toContain('pkill/killall');
+    });
+
+    it('blocks kill with variable target (fail-closed)', async () => {
+      const bash = guardedTools.find((t) => t.schema.name === 'bash')!;
+      const result = await bash.execute({ command: 'kill $PPID' });
+      expect(result).toContain('Error');
+      expect(result).toContain('variable/dynamic');
+    });
+
     it('guard does not interfere with non-bash tools', async () => {
       const readTool = guardedTools.find((t) => t.schema.name === 'read')!;
       const result = await readTool.execute({ path: 'hello.txt' });

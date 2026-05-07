@@ -163,20 +163,52 @@ describe('Bash Guard', () => {
         expect(result.killPidTargets).toEqual([4567]);
       });
 
-      it('detects pkill as a kill command', () => {
+      it('blocks pkill (name-based, cannot verify ownership)', () => {
         const result = analyzeCommand('pkill -f node');
-        expect(result.isKillCommand).toBe(true);
+        expect(result.blocked).toBe(true);
+        expect(result.reason).toContain('pkill/killall');
       });
 
-      it('detects killall as a kill command', () => {
+      it('blocks killall (name-based, cannot verify ownership)', () => {
         const result = analyzeCommand('killall node');
-        expect(result.isKillCommand).toBe(true);
+        expect(result.blocked).toBe(true);
+        expect(result.reason).toContain('pkill/killall');
       });
 
       it('handles multiple kill commands in one line', () => {
         const result = analyzeCommand('kill 100; kill 200');
         expect(result.killPidTargets).toContain(100);
         expect(result.killPidTargets).toContain(200);
+      });
+
+      it('blocks kill 0 (current process group)', () => {
+        const result = analyzeCommand('kill 0');
+        expect(result.blocked).toBe(true);
+        expect(result.reason).toContain('process group');
+      });
+
+      it('blocks kill with negative PID (process group target)', () => {
+        const result = analyzeCommand('kill -- -1234');
+        expect(result.blocked).toBe(true);
+        expect(result.reason).toContain('process group');
+      });
+
+      it('blocks kill $PPID (unresolvable variable target)', () => {
+        const result = analyzeCommand('kill $PPID');
+        expect(result.blocked).toBe(true);
+        expect(result.reason).toContain('variable/dynamic');
+      });
+
+      it('blocks kill $(cat /tmp/pid) (unresolvable command substitution)', () => {
+        const result = analyzeCommand('kill $(cat /tmp/pid)');
+        expect(result.blocked).toBe(true);
+        expect(result.reason).toContain('variable/dynamic');
+      });
+
+      it('blocks kill with backtick substitution', () => {
+        const result = analyzeCommand('kill `pgrep node`');
+        expect(result.blocked).toBe(true);
+        expect(result.reason).toContain('variable/dynamic');
       });
     });
 
@@ -389,9 +421,22 @@ describe('Bash Guard', () => {
         expect(result.reason).toContain('200');
       });
 
-      it('allows pkill/killall (no PID targets to check)', () => {
+      it('blocks pkill (name-based, fail-closed)', () => {
         const result = guardBashCommand('pkill -f "old-server"', { agentId: 'wren' });
-        expect(result.allowed).toBe(true);
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toContain('pkill/killall');
+      });
+
+      it('blocks kill with variable expansion', () => {
+        const result = guardBashCommand('kill $PPID', { agentId: 'wren' });
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toContain('variable/dynamic');
+      });
+
+      it('blocks kill 0 (process group)', () => {
+        const result = guardBashCommand('kill 0', { agentId: 'wren' });
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toContain('process group');
       });
 
       it('can be disabled', () => {
