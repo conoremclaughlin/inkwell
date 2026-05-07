@@ -453,6 +453,23 @@ function writeRuntimeFile(cwd: string, filename: string, content: string): void 
   writeFileSync(join(dir, filename), content);
 }
 
+/**
+ * Check whether this process is a headless/autonomous spawn (not a human at the REPL).
+ * Decodes the INK_CONTEXT token set by the runner at spawn time — if cliAttached is
+ * explicitly false, this is a triggered session that should NOT mark itself CLI-attached.
+ * When there's no INK_CONTEXT (interactive `claude` invocation), defaults to true (attached).
+ */
+export function isHeadlessSession(): boolean {
+  const raw = process.env.INK_CONTEXT?.trim();
+  if (!raw) return false;
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString());
+    return parsed.cliAttached === false;
+  } catch {
+    return false;
+  }
+}
+
 function normalizeSessionBackend(backendName: string): string {
   // Hook backend names and session/backend adapter names differ for Claude:
   // - hooks backend: "claude-code"
@@ -2315,7 +2332,19 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   // Uses the REST lifecycle endpoint, NOT MCP — cliAttached is a runtime
   // signal that must bypass MCP schema validation (additionalProperties: false
   // strips it). The REST endpoint is purpose-built for hook-managed state.
-  if (reconciled.pcpSessionId) {
+  //
+  // IMPORTANT: headless/autonomous spawns set cliAttached=false in INK_CONTEXT.
+  // Respect that — unconditionally setting true blocks all future strategy
+  // triggers for the session (they see "CLI-attached" and skip spawn).
+  const isHeadlessSpawn = isHeadlessSession();
+  if (isHeadlessSpawn) {
+    hookLog('cli_attached_skipped', {
+      agentId,
+      backend: lifecycleBackend.name,
+      reason: 'headless spawn (cliAttached=false in INK_CONTEXT)',
+      sessionId: reconciled.pcpSessionId || null,
+    });
+  } else if (reconciled.pcpSessionId) {
     try {
       const serverUrl = getPcpServerUrl();
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };

@@ -2213,6 +2213,23 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
                 : null,
             },
 
+            // Caller's own session IDs — surfaced at top level so they survive compaction.
+            // Without this, the agent loses its own session identity after context eviction.
+            callerSession: callerSessionId
+              ? (() => {
+                  const cs = mergedSessions.find((s) => s.id === callerSessionId);
+                  return cs
+                    ? {
+                        id: cs.id,
+                        backendSessionId: cs.backendSessionId || null,
+                        studioId: cs.studioId || null,
+                        agentId: cs.agentId || null,
+                        context: cs.context || null,
+                      }
+                    : null;
+                })()
+              : null,
+
             // Active sessions — caller's own session always included (even if it fell off the top-10 list).
             // context is only included for the caller's own session.
             activeSessions: mergedSessions.map((s) => mapSessionForBootstrap(s, callerSessionId)),
