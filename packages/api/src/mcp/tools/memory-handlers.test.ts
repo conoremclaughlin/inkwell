@@ -12,6 +12,8 @@ import {
   updateSessionPhaseSchema,
   handleUpdateSessionPhase,
   handleStartSession,
+  curateRecallSchema,
+  handleCurateRecall,
 } from './memory-handlers';
 
 // =====================================================
@@ -91,6 +93,11 @@ function createMockDataComposer() {
     }),
   };
 
+  const mockRecallFeedbackRepo = {
+    saveFeedback: vi.fn().mockResolvedValue(0),
+    getDismissalCount: vi.fn().mockResolvedValue(0),
+  };
+
   return {
     getClient: vi.fn(),
     repositories: {
@@ -98,6 +105,7 @@ function createMockDataComposer() {
       projects: mockProjectsRepo,
       tasks: mockProjectTasksRepo,
       activityStream: mockActivityStreamRepo,
+      recallFeedback: mockRecallFeedbackRepo,
     },
   };
 }
@@ -1678,5 +1686,113 @@ describe('buildKnowledgeSummary', () => {
 
     expect(result.topicIndex[0].topicKey).toBe('topic:new');
     expect(result.topicIndex[1].topicKey).toBe('topic:old');
+  });
+});
+
+// =====================================================
+// CURATE RECALL TESTS
+// =====================================================
+
+describe('curateRecallSchema', () => {
+  it('accepts accepted + dismissed arrays with scores', () => {
+    const result = curateRecallSchema.safeParse({
+      email: 'test@test.com',
+      query: 'merge strategy',
+      accepted: [{ memoryId: '550e8400-e29b-41d4-a716-446655440000', finalScore: 0.85 }],
+      dismissed: [
+        {
+          memoryId: '550e8400-e29b-41d4-a716-446655440001',
+          semanticScore: 0.2,
+          textScore: 0.1,
+          finalScore: 0.17,
+        },
+      ],
+      agentId: 'wren',
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.accepted).toHaveLength(1);
+      expect(result.data.dismissed).toHaveLength(1);
+    }
+  });
+
+  it('defaults accepted and dismissed to empty arrays', () => {
+    const result = curateRecallSchema.safeParse({
+      email: 'test@test.com',
+      query: 'test',
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.accepted).toEqual([]);
+      expect(result.data.dismissed).toEqual([]);
+    }
+  });
+
+  it('rejects non-UUID memoryId', () => {
+    const result = curateRecallSchema.safeParse({
+      email: 'test@test.com',
+      query: 'test',
+      dismissed: [{ memoryId: 'not-a-uuid' }],
+    });
+
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('handleCurateRecall', () => {
+  it('saves feedback and returns dismissed IDs', async () => {
+    const composer = createMockDataComposer();
+    composer.repositories.recallFeedback.saveFeedback.mockResolvedValue(3);
+
+    const result = await handleCurateRecall(
+      {
+        email: 'test@test.com',
+        query: 'merge strategy',
+        accepted: [
+          {
+            memoryId: '550e8400-e29b-41d4-a716-446655440000',
+            semanticScore: 0.9,
+            finalScore: 0.85,
+          },
+        ],
+        dismissed: [
+          { memoryId: '550e8400-e29b-41d4-a716-446655440001', finalScore: 0.1 },
+          { memoryId: '550e8400-e29b-41d4-a716-446655440002', finalScore: 0.05 },
+        ],
+        agentId: 'wren',
+      },
+      composer as any
+    );
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body.success).toBe(true);
+    expect(body.feedbackSaved).toBe(3);
+    expect(body.dismissedMemoryIds).toEqual([
+      '550e8400-e29b-41d4-a716-446655440001',
+      '550e8400-e29b-41d4-a716-446655440002',
+    ]);
+
+    const feedbackCall = composer.repositories.recallFeedback.saveFeedback.mock.calls[0][0];
+    expect(feedbackCall.entries).toHaveLength(3);
+    expect(feedbackCall.entries[0].verdict).toBe('accepted');
+    expect(feedbackCall.entries[1].verdict).toBe('dismissed');
+    expect(feedbackCall.entries[2].verdict).toBe('dismissed');
+  });
+
+  it('handles empty curation (no accepted, no dismissed)', async () => {
+    const composer = createMockDataComposer();
+    composer.repositories.recallFeedback.saveFeedback.mockResolvedValue(0);
+
+    const result = await handleCurateRecall(
+      { email: 'test@test.com', query: 'anything' },
+      composer as any
+    );
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body.success).toBe(true);
+    expect(body.feedbackSaved).toBe(0);
+    expect(body.dismissedMemoryIds).toEqual([]);
   });
 });
