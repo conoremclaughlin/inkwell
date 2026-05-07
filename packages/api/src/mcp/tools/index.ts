@@ -2017,7 +2017,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         phase: z
           .string()
           .optional()
-          .describe('Work phase (e.g., "implementing", "blocked:awaiting-input", "waiting:build")'),
+          .describe(
+            'Work phase (agent-set). Core phases: investigating, implementing, reviewing, paused, complete. Use waiting:<reason> when awaiting an async response within normal flow (review, merge, feedback). Use blocked:<reason> ONLY when extraordinary intervention is required outside normal process — something has gone wrong (permissions denied, infrastructure broken, unresolvable conflict). Both auto-create memories. Do NOT use runtime: prefix — use lifecycle instead.'
+          ),
         note: z
           .string()
           .optional()
