@@ -899,6 +899,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           payload.metadata && typeof payload.metadata.groupId === 'string'
             ? payload.metadata.groupId
             : undefined,
+        // Forward sandbox container name so the session service routes CLI execution into it
+        ...(payload.metadata?.sandboxContainerName
+          ? { sandboxContainerName: payload.metadata.sandboxContainerName }
+          : {}),
       },
     };
 
