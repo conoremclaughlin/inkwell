@@ -224,15 +224,40 @@ export class StrategyService {
     // Create a watchdog reminder so the heartbeat checks progress periodically
     await this.createWatchdogReminder(updated, input.userId);
 
-    // Kick off the owner agent in the assigned studio. Without this trigger,
-    // start_strategy only returns a prompt to the caller's session — which
-    // is useless when the caller is delegating to a different studio/agent.
-    // The trigger spawns (or resumes) a session in the target studio so work
-    // actually begins, matching how heartbeats/reminders already deliver.
-    const triggered = await this.triggerOwnerAgent(updated, nextTask, 'strategy_kickoff');
-
-    // Spin up sandbox container if configured
+    // Spin up sandbox BEFORE triggering the agent — if sandboxPolicy is
+    // 'required' (default), a failed sandbox aborts the strategy instead
+    // of silently degrading to host execution.
+    const config = updated.strategy_config as StrategyConfig;
     const sandboxResult = await this.maybeSpinUpSandbox(updated);
+    const sandboxPolicy = config.sandboxPolicy || 'required';
+
+    if (config.sandbox && sandboxResult && !sandboxResult.success && sandboxPolicy === 'required') {
+      // Fail-closed: revert the strategy to paused and report the failure
+      await this.dataComposer.repositories.taskGroups.update(input.groupId, {
+        status: 'paused',
+        strategy_paused_at: new Date().toISOString(),
+      });
+      await this.logStrategyEvent(
+        updated,
+        'sandbox_failed',
+        `Strategy aborted: sandbox required but spin-up failed — ${sandboxResult.error}`,
+        {
+          containerName: sandboxResult.containerName,
+          error: sandboxResult.error,
+          policy: 'required',
+        }
+      );
+      return {
+        action: 'group_complete',
+        stats: { total: 0, completed: 0 },
+        prompt: `Sandbox spin-up failed (policy: required). Error: ${sandboxResult.error}. Strategy has been paused — fix the sandbox configuration and retry.`,
+        sandbox: sandboxResult,
+      };
+    }
+
+    // Trigger the owner agent in the assigned studio. The trigger spawns
+    // (or resumes) a session in the target studio so work actually begins.
+    const triggered = await this.triggerOwnerAgent(updated, nextTask, 'strategy_kickoff');
 
     // Log strategy start
     await this.logStrategyEvent(
@@ -879,24 +904,26 @@ export class StrategyService {
   private async maybeSpinUpSandbox(group: TaskGroup): Promise<SandboxSpinUpResult | null> {
     const config = group.strategy_config as StrategyConfig;
     if (!config.sandbox) return null;
+
     if (!this.sandboxOrchestrator) {
-      logger.warn(
-        `Strategy group ${group.id} has sandbox enabled but no SandboxOrchestrator configured`
-      );
-      return null;
+      const msg = `Sandbox enabled but no SandboxOrchestrator configured`;
+      logger.warn(`Strategy group ${group.id}: ${msg}`);
+      return { containerName: '', success: false, error: msg };
     }
 
     const metadata = (group.metadata || {}) as Record<string, unknown>;
     const studioId = typeof metadata.studioId === 'string' ? metadata.studioId : undefined;
     if (!studioId) {
-      logger.warn(`Strategy group ${group.id}: sandbox requested but no studioId in metadata`);
-      return null;
+      const msg = `Sandbox requested but no studioId in metadata`;
+      logger.warn(`Strategy group ${group.id}: ${msg}`);
+      return { containerName: '', success: false, error: msg };
     }
 
     const studio = await this.dataComposer.repositories.studios.findById(studioId);
     if (!studio) {
-      logger.warn(`Strategy group ${group.id}: studio ${studioId} not found`);
-      return null;
+      const msg = `Studio ${studioId} not found`;
+      logger.warn(`Strategy group ${group.id}: ${msg}`);
+      return { containerName: '', success: false, error: msg };
     }
 
     const result = await this.sandboxOrchestrator.spinUp({
