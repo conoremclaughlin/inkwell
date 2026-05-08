@@ -178,6 +178,10 @@ $function$;
 -- =====================================================================
 -- Part E: Update semantic search functions (return sb_id, not identity_id)
 -- =====================================================================
+-- Must DROP first because CREATE OR REPLACE cannot change return type.
+
+DROP FUNCTION IF EXISTS public.match_memories(vector, double precision, integer, uuid, text, text, text[], text, boolean, boolean);
+DROP FUNCTION IF EXISTS public.match_memory_embedding_chunks(vector, double precision, integer, uuid, text, text, text[], text, boolean, boolean, text[]);
 
 CREATE OR REPLACE FUNCTION public.match_memories(
   query_embedding vector,
