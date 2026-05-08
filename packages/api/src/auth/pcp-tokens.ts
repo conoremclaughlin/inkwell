@@ -24,6 +24,7 @@ export interface PcpTokenPayload {
   scope: string;
   agentId?: string; // Bound agent identity label (absent for human users)
   identityId?: string; // Canonical agent_identities UUID (JWT claim — kept as identityId for token compat)
+  sbId?: string; // New-style alias for identityId in runner tokens
 }
 
 // ============================================================================
