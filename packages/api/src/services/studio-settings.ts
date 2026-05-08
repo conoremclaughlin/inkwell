@@ -29,17 +29,23 @@ const DEFAULT_DENY_RULES: string[] = [
 
 /**
  * Default allow rules — broad permissions for automated development work.
- * Matches the CLI's `ink permissions auto` defaults plus mcp__* for all MCP
- * servers (not just inkwell/github/supabase individually).
+ * Uses server-scoped MCP wildcards (mcp__inkwell__*, mcp__supabase__*, etc.)
+ * because the cross-server glob mcp__* doesn't match in Claude Code's
+ * permission system — it requires the server namespace to be explicit.
  */
 const DEFAULT_ALLOW_RULES: string[] = [
   'Bash(*)',
   'Edit(*)',
   'Write(*)',
   'Read(*)',
+  'Update(*)',
   'WebFetch(*)',
   'WebSearch',
-  'mcp__*',
+  'mcp__inkwell__*',
+  'mcp__supabase__*',
+  'mcp__github__*',
+  'mcp__playwright__*',
+  'mcp__inkmail__*',
 ];
 
 interface ClaudeSettings {
@@ -89,6 +95,7 @@ function buildHooks(inkPath: string): Record<string, unknown> {
       { matcher: 'compact', hooks: [{ type: 'command', command: cmd('post-compact') }] },
       { matcher: 'startup', hooks: [{ type: 'command', command: cmd('on-session-start') }] },
     ],
+    PreToolUse: [{ hooks: [{ type: 'command', command: cmd('on-tool-approval') }] }],
     UserPromptSubmit: [{ hooks: [{ type: 'command', command: cmd('on-prompt') }] }],
     Stop: [{ hooks: [{ type: 'command', command: cmd('on-stop') }] }],
   };
