@@ -1,7 +1,7 @@
 /**
- * Direct API Runner
+ * Ink Runner
  *
- * Implements IRunner using the Anthropic API directly with Pi coding tools.
+ * Implements IRunner using the Anthropic API directly with Ink coding tools.
  * Unlike CLI runners (Claude/Codex/Gemini), this calls the API in-process
  * with a proper tool execution loop — tool results are fed back to continue
  * the conversation until the model emits end_turn.
@@ -30,7 +30,7 @@ const MAX_TOOL_ITERATIONS = 50;
 const DEFAULT_MODEL = 'claude-sonnet-4-20250514';
 const DEFAULT_MAX_TOKENS = 16384;
 
-export interface DirectApiRunnerConfig {
+export interface InkRunnerConfig {
   apiKey?: string;
   model?: string;
   maxTokens?: number;
@@ -40,12 +40,12 @@ export interface DirectApiRunnerConfig {
   extraTools?: Anthropic.Tool[];
 }
 
-export class DirectApiRunner implements IRunner {
+export class InkRunner implements IRunner {
   private client: Anthropic | null = null;
-  private runnerConfig: DirectApiRunnerConfig;
+  private runnerConfig: InkRunnerConfig;
   private toolsCache = new Map<string, InkToolDefinition[]>();
 
-  constructor(config: DirectApiRunnerConfig = {}) {
+  constructor(config: InkRunnerConfig = {}) {
     this.runnerConfig = config;
   }
 
@@ -91,7 +91,7 @@ export class DirectApiRunner implements IRunner {
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
     let finalTextResponse = '';
-    let backendSessionId = options.backendSessionId || `direct-api-${Date.now()}`;
+    let backendSessionId = options.backendSessionId || `ink-${Date.now()}`;
 
     for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
       const response = await this.client!.messages.create({
@@ -164,12 +164,12 @@ export class DirectApiRunner implements IRunner {
             resultText = await executor(toolUse.input as Record<string, unknown>);
           } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err);
-            logger.error(`Direct API runner: tool ${toolUse.name} threw`, { error: errMsg });
+            logger.error(`Ink runner: tool ${toolUse.name} threw`, { error: errMsg });
             resultText = `Error: ${errMsg}`;
           }
         } else {
           resultText = `Error: Tool "${toolUse.name}" not available in this runtime. Available tools: ${Array.from(executorMap.keys()).join(', ')}`;
-          logger.warn(`Direct API runner: unknown tool "${toolUse.name}" requested`);
+          logger.warn(`Ink runner: unknown tool "${toolUse.name}" requested`);
         }
 
         toolResults.push({
@@ -182,7 +182,7 @@ export class DirectApiRunner implements IRunner {
       // Add tool results as user turn
       messages.push({ role: 'user', content: toolResults });
 
-      logger.debug('Direct API runner: tool iteration complete', {
+      logger.debug('Ink runner: tool iteration complete', {
         iteration,
         toolsExecuted: toolUseBlocks.map((t) => t.name),
       });
@@ -206,7 +206,7 @@ export class DirectApiRunner implements IRunner {
     if (this.client) return;
     const apiKey = this.runnerConfig.apiKey || process.env.ANTHROPIC_API_KEY;
     if (!apiKey) {
-      throw new Error('ANTHROPIC_API_KEY is required for Direct API runner');
+      throw new Error('ANTHROPIC_API_KEY is required for Ink runner');
     }
     this.client = new Anthropic({ apiKey });
   }

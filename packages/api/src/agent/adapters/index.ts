@@ -45,7 +45,7 @@ export function getAdapterRegistry(): AdapterRegistry {
     registryInstance.register(getClaudeCodeAdapter());
 
     // Future adapters would be registered here:
-    // registryInstance.register(getDirectApiAdapter());
+    // registryInstance.register(getInkAdapter());
     // registryInstance.register(getOpenAiAdapter());
   }
   return registryInstance;

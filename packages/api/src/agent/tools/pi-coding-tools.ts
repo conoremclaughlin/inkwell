@@ -2,7 +2,7 @@
  * Pi Coding Tools Adapter
  *
  * Bridges @mariozechner/pi-coding-agent's tool factories into Ink's
- * direct-api backend tool format (Anthropic.Tool + execution).
+ * Ink backend tool format (Anthropic.Tool + execution).
  *
  * Pi packages are ESM-only, so we use dynamic import().
  */
@@ -126,7 +126,7 @@ function formatToolResult(result: unknown): string {
 const DEFAULT_BASH_TIMEOUT_SECONDS = 120;
 
 /**
- * Create Pi coding tools adapted for Ink's direct-api backend.
+ * Create Pi coding tools adapted for the Ink backend.
  *
  * Returns both the Anthropic.Tool schemas (for the API call) and
  * execute functions (for handling tool_use responses).

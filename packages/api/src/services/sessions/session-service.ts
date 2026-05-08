@@ -33,7 +33,7 @@ import { ContextBuilder } from './context-builder.js';
 import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 import { CodexRunner } from './codex-runner.js';
 import { GeminiRunner } from './gemini-runner.js';
-import { DirectApiRunner } from './direct-api-runner.js';
+import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import { resolveIdentityId } from '../../auth/resolve-identity.js';
 import { classifyError } from '@inklabs/shared';
@@ -135,7 +135,7 @@ export class SessionService implements ISessionService {
   private claudeRunner: IRunner;
   private codexRunner: IRunner;
   private geminiRunner: IRunner;
-  private directApiRunner: IRunner;
+  private inkRunner: IRunner;
   private activityStream: IActivityStream;
   private config: SessionServiceConfig;
   private supabase: SupabaseClient<Database> | null;
@@ -169,14 +169,14 @@ export class SessionService implements ISessionService {
     codexRunner?: IRunner,
     supabase?: SupabaseClient<Database>,
     geminiRunner?: IRunner,
-    directApiRunner?: IRunner
+    inkRunner?: IRunner
   ) {
     this.repository = repository;
     this.contextBuilder = contextBuilder;
     this.claudeRunner = claudeRunner;
     this.codexRunner = codexRunner || claudeRunner;
     this.geminiRunner = geminiRunner || claudeRunner;
-    this.directApiRunner = directApiRunner || new DirectApiRunner();
+    this.inkRunner = inkRunner || new InkRunner();
     this.activityStream = activityStream;
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.supabase = supabase || null;
@@ -478,12 +478,12 @@ export class SessionService implements ISessionService {
     };
 
     // 5. Run with selected backend
-    // Direct-api runners execute tools in-process against the host filesystem —
-    // they cannot route to a Docker container. Reject the combination so a
+    // Ink runner executes tools in-process against the host filesystem —
+    // it cannot route to a Docker container. Reject the combination so a
     // sandboxed strategy doesn't silently bypass containment.
-    if (resolvedBackend === 'direct-api' && runnerConfig.container) {
+    if (resolvedBackend === 'ink' && runnerConfig.container) {
       throw new Error(
-        'direct-api backend cannot run inside a sandbox container. ' +
+        'ink backend cannot run inside a sandbox container. ' +
           'Use a CLI backend (claude-code, codex-cli, gemini) for sandboxed strategies.'
       );
     }
@@ -493,8 +493,8 @@ export class SessionService implements ISessionService {
         ? this.codexRunner
         : resolvedBackend === 'gemini'
           ? this.geminiRunner
-          : resolvedBackend === 'direct-api'
-            ? this.directApiRunner
+          : resolvedBackend === 'ink'
+            ? this.inkRunner
             : this.claudeRunner;
 
     // 5a. Log backend spawn to activity stream (fire-and-forget)
@@ -1271,8 +1271,8 @@ This session will continue with a fresh context after compaction. Your identity,
           ? this.codexRunner
           : runtimeBackend === 'gemini'
             ? this.geminiRunner
-            : runtimeBackend === 'direct-api'
-              ? this.directApiRunner
+            : runtimeBackend === 'ink'
+              ? this.inkRunner
               : this.claudeRunner;
 
       // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session
@@ -1314,11 +1314,12 @@ This session will continue with a fresh context after compaction. Your identity,
    */
   private normalizeBackend(
     raw: string | null | undefined
-  ): 'claude-code' | 'codex-cli' | 'gemini' | 'direct-api' {
+  ): 'claude-code' | 'codex-cli' | 'gemini' | 'ink' {
     const value = (raw || '').toLowerCase().trim();
     if (value === 'codex' || value === 'codex-cli') return 'codex-cli';
     if (value === 'gemini' || value === 'gemini-cli') return 'gemini';
-    if (value === 'direct-api' || value === 'direct' || value === 'api') return 'direct-api';
+    if (value === 'ink' || value === 'direct-api' || value === 'direct' || value === 'api')
+      return 'ink';
     if (value === 'claude' || value === 'claude-code' || value === '') return 'claude-code';
     logger.warn('Unknown backend configured, falling back to claude-code', { raw });
     return 'claude-code';
@@ -1330,7 +1331,7 @@ This session will continue with a fresh context after compaction. Your identity,
   private async resolveAgentBackend(
     userId: string,
     agentId: string
-  ): Promise<'claude-code' | 'codex-cli' | 'gemini' | 'direct-api'> {
+  ): Promise<'claude-code' | 'codex-cli' | 'gemini' | 'ink'> {
     try {
       const identityBackend = await this.contextBuilder.getAgentBackend(userId, agentId);
       return this.normalizeBackend(identityBackend);
@@ -1350,7 +1351,7 @@ This session will continue with a fresh context after compaction. Your identity,
   private resolveRuntimeBackend(
     sessionBackend: string | null | undefined,
     identityBackend: string | null | undefined
-  ): 'claude-code' | 'codex-cli' | 'gemini' | 'direct-api' {
+  ): 'claude-code' | 'codex-cli' | 'gemini' | 'ink' {
     if (sessionBackend) return this.normalizeBackend(sessionBackend);
     return this.normalizeBackend(identityBackend);
   }
@@ -1622,6 +1623,6 @@ export function createSessionService(
     new CodexRunner(),
     supabase,
     new GeminiRunner(),
-    new DirectApiRunner()
+    new InkRunner()
   );
 }

@@ -30,7 +30,7 @@ export interface BackendPermissionConfig {
  * Implement this for each backend to translate PCP permissions
  */
 export interface PermissionAdapter {
-  /** Backend identifier (e.g., 'claude-code', 'direct-api') */
+  /** Backend identifier (e.g., 'claude-code', 'ink') */
   readonly backendId: string;
 
   /**

@@ -1,15 +1,15 @@
 import { describe, it, expect, vi } from 'vitest';
-import { DirectApiRunner } from './direct-api-runner';
+import { InkRunner } from './ink-runner';
 import type { InkToolDefinition } from '../../agent/tools/pi-coding-tools';
 
 vi.mock('../../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-describe('DirectApiRunner', () => {
+describe('InkRunner', () => {
   describe('agentId propagation', () => {
     it('creates guarded bash tools when agentId is provided', async () => {
-      const runner = new DirectApiRunner({ apiKey: 'test-key' });
+      const runner = new InkRunner({ apiKey: 'test-key' });
 
       // Access private getTools to verify agentId propagation
       const tools: InkToolDefinition[] = await (runner as any).getTools('/tmp', 'wren');
@@ -21,7 +21,7 @@ describe('DirectApiRunner', () => {
     });
 
     it('creates unguarded bash tools when agentId is absent', async () => {
-      const runner = new DirectApiRunner({ apiKey: 'test-key' });
+      const runner = new InkRunner({ apiKey: 'test-key' });
 
       const tools: InkToolDefinition[] = await (runner as any).getTools('/tmp');
       const bash = tools.find((t) => t.schema.name === 'bash')!;
@@ -33,7 +33,7 @@ describe('DirectApiRunner', () => {
     });
 
     it('caches tools by cwd+agentId combination', async () => {
-      const runner = new DirectApiRunner({ apiKey: 'test-key' });
+      const runner = new InkRunner({ apiKey: 'test-key' });
 
       const tools1 = await (runner as any).getTools('/tmp', 'wren');
       const tools2 = await (runner as any).getTools('/tmp', 'wren');
