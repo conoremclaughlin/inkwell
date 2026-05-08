@@ -22,7 +22,7 @@ import type {
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
-import { buildSessionEnv, writeRuntimeSessionHint } from '@inklabs/shared';
+import { buildSessionEnv, writeRuntimeSessionHint, resolveSpawnTarget } from '@inklabs/shared';
 
 /** Maximum time (ms) to wait for a Codex CLI subprocess before killing it.
  *  Override with CODEX_PROCESS_TIMEOUT_MS env var. */
@@ -184,23 +184,32 @@ export class CodexRunner implements IRunner {
     return new Promise((resolve, reject) => {
       // Strip CLAUDECODE to prevent env leaking into subprocess
       const { CLAUDECODE, ...cleanEnv } = process.env;
-      const proc = spawn(codexBin, args, {
+      const spawnEnv: Record<string, string> = {
+        HOME: process.env.HOME || '',
+        PATH: buildSpawnPath(codexBin),
+        ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
+        ...buildSessionEnv({
+          pcpSessionId: config.pcpSessionId,
+          runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,
+          studioId: config.studioId,
+          accessToken: config.pcpAccessToken,
+          agentId: config.agentId,
+          runtime: 'codex',
+          repoRoot: config.repoRoot,
+        }),
+      };
+
+      const target = resolveSpawnTarget({
+        binary: codexBin,
+        args,
         cwd: config.workingDirectory,
-        env: {
-          ...cleanEnv,
-          HOME: process.env.HOME,
-          PATH: buildSpawnPath(codexBin),
-          ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
-          ...buildSessionEnv({
-            pcpSessionId: config.pcpSessionId,
-            runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,
-            studioId: config.studioId,
-            accessToken: config.pcpAccessToken,
-            agentId: config.agentId,
-            runtime: 'codex',
-            repoRoot: config.repoRoot,
-          }),
-        },
+        env: spawnEnv,
+        container: config.container,
+      });
+
+      const proc = spawn(target.binary, target.args, {
+        cwd: target.cwd,
+        env: config.container ? target.env : { ...cleanEnv, ...spawnEnv },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
 
