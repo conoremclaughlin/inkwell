@@ -73,9 +73,10 @@ function buildExtractionEmbeddingTexts(
 function hasAllEnabledKinds(
   existing: MemoryExtractions | null,
   enabledKinds: ExtractionKind[],
-  options: { requireRaw?: boolean } = {}
+  options: { requireRaw?: boolean; requireVersion?: number } = {}
 ): boolean {
   if (!existing) return false;
+  if (options.requireVersion && existing.version !== options.requireVersion) return false;
   return enabledKinds.every(
     (kind) => Boolean(existing[kind]) && (!options.requireRaw || existing.raw?.[kind] !== undefined)
   );
@@ -410,6 +411,7 @@ async function processMemoryRow(params: {
   dryRun: boolean;
   force: boolean;
   requireRaw: boolean;
+  requireVersion: number;
   extractor: RunnerBackedMemoryExtractor | MemoryLlmExtractor;
   outputPath: string;
   supabase: ReturnType<typeof createSupabaseClient>;
@@ -424,6 +426,7 @@ async function processMemoryRow(params: {
     dryRun,
     force,
     requireRaw,
+    requireVersion,
     extractor,
     outputPath,
     supabase,
@@ -434,7 +437,10 @@ async function processMemoryRow(params: {
   const existingExtractions = normalizeMemoryExtractions(metadata.llm_extractions);
   if (
     !force &&
-    hasAllEnabledKinds(existingExtractions, extractor.getEnabledKinds(), { requireRaw })
+    hasAllEnabledKinds(existingExtractions, extractor.getEnabledKinds(), {
+      requireRaw,
+      requireVersion,
+    })
   ) {
     console.log(
       `[memory-llm-extract] progress processed=${index}/${total} backend=${backend} memory=${row.id} status=skip-existing`
@@ -942,6 +948,7 @@ async function main() {
   const dryRun = parseBoolean(process.env.MEMORY_LLM_EXTRACT_DRY_RUN, false);
   const force = parseBoolean(process.env.MEMORY_LLM_EXTRACT_FORCE, false);
   const requireRaw = parseBoolean(process.env.MEMORY_LLM_EXTRACT_REQUIRE_RAW, true);
+  const requireVersion = parseNonNegativeInt(process.env.MEMORY_LLM_EXTRACT_REQUIRE_VERSION, 0);
   const keepHistory = parseBoolean(process.env.MEMORY_LLM_EXTRACT_KEEP_HISTORY, true);
   const historyLimit = parsePositiveInt(process.env.MEMORY_LLM_EXTRACT_HISTORY_LIMIT, 10);
   const outputPath =
@@ -990,6 +997,7 @@ async function main() {
       dryRun,
       force,
       requireRaw,
+      requireVersion,
       keepHistory,
       historyLimit,
       backend,
@@ -1089,7 +1097,10 @@ async function main() {
         const existingExtractions = normalizeMemoryExtractions(metadata.llm_extractions);
         if (
           !force &&
-          hasAllEnabledKinds(existingExtractions, extractor.getEnabledKinds(), { requireRaw })
+          hasAllEnabledKinds(existingExtractions, extractor.getEnabledKinds(), {
+            requireRaw,
+            requireVersion,
+          })
         ) {
           console.log(
             `[memory-llm-extract] progress processed=${processed}/${plannedTotal} backend=${backend} memory=${row.id} status=skip-existing`
@@ -1130,6 +1141,7 @@ async function main() {
           dryRun,
           force,
           requireRaw,
+          requireVersion,
           extractor,
           outputPath,
           supabase,
@@ -1161,6 +1173,7 @@ async function main() {
       batchSize: useBatchExtraction ? batchSize : 1,
       batchMaxChars: useBatchExtraction ? batchMaxChars : null,
       requireRaw,
+      requireVersion,
       keepHistory,
       historyLimit,
       completedAt: new Date().toISOString(),
