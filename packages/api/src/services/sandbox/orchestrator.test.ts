@@ -7,6 +7,7 @@ import {
   buildEnvVars,
   buildDockerRunArgs,
   buildMounts,
+  getRunnerFilesDir,
   patchMcpConfig,
   stageClaudeDir,
   stageCodexDir,
@@ -185,7 +186,32 @@ describe('buildDockerRunArgs', () => {
   });
 });
 
+describe('getRunnerFilesDir', () => {
+  it('returns expected path pattern under ~/.ink/runtime/sandbox/<containerName>/runner-files', () => {
+    const dir = getRunnerFilesDir('ink-sandbox-wren-abc12345');
+    expect(dir).toBe(
+      join(homedir(), '.ink', 'runtime', 'sandbox', 'ink-sandbox-wren-abc12345', 'runner-files')
+    );
+  });
+
+  it('returns distinct paths for different container names', () => {
+    const dir1 = getRunnerFilesDir('ink-sandbox-wren-aaaa1111');
+    const dir2 = getRunnerFilesDir('ink-sandbox-lumen-bbbb2222');
+    expect(dir1).not.toBe(dir2);
+  });
+});
+
 describe('buildMounts', () => {
+  it('includes a mount with target /run/ink for runner temp files', async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'mount-ink-'));
+    const mounts = await buildMounts({ ...baseRequest, worktreePath: tmpDir, repoRoot: tmpDir });
+    const runInkMount = mounts.find((m) => m.target === '/run/ink');
+    expect(runInkMount).toBeDefined();
+    expect(runInkMount!.readOnly).toBe(false);
+    // Source should end with 'runner-files'
+    expect(runInkMount!.source).toMatch(/runner-files$/);
+  });
+
   it('returns empty array when worktree path does not exist', async () => {
     const mounts = await buildMounts({ ...baseRequest, worktreePath: '/nonexistent/path' });
     expect(mounts.filter((m) => m.target === '/studio')).toHaveLength(0);
