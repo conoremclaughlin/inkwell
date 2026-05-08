@@ -303,11 +303,13 @@ import {
   handleResumeStrategy,
   handleCancelStrategy,
   handleGetStrategyStatus,
+  handleUpdateStrategy,
   startStrategySchema,
   pauseStrategySchema,
   resumeStrategySchema,
   cancelStrategySchema,
   getStrategyStatusSchema,
+  updateStrategySchema,
 } from './strategy-handlers';
 
 import {
@@ -1384,6 +1386,37 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleGetStrategyStatus(args, dataComposer);
       } catch (error) {
         logger.error('Error in get_strategy_status:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'update_strategy',
+    {
+      description: `Modify strategy configuration on a running or paused strategy without tearing it down. Avoids cancel + start which loses session continuity.
+
+Mutable: checkInInterval, verificationGates, maxIterationsWithoutApproval, verificationMode, supervisorId, watchdogIntervalMinutes, contextSummaryInterval, approvalNotify, checkInNotify.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: updateStrategySchema.shape,
+    },
+    async (args) => {
+      try {
+        return await handleUpdateStrategy(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in update_strategy:', error);
         return {
           content: [
             {

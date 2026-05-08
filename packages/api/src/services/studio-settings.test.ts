@@ -22,12 +22,15 @@ describe('ensureStudioSettings', () => {
     const raw = await readFile(join(tempDir, '.claude', 'settings.local.json'), 'utf-8');
     const settings = JSON.parse(raw);
 
-    expect(settings.permissions.allow).toContain('mcp__*');
+    expect(settings.permissions.allow).toContain('mcp__inkwell__*');
+    expect(settings.permissions.allow).toContain('mcp__supabase__*');
+    expect(settings.permissions.allow).toContain('mcp__github__*');
     expect(settings.permissions.allow).toContain('Bash(*)');
     expect(settings.permissions.deny).toContain('Bash(rm -rf *)');
     expect(settings.enableAllProjectMcpServers).toBe(true);
     expect(settings.hooks).toBeDefined();
     expect(settings.hooks.PreCompact).toBeDefined();
+    expect(settings.hooks.PreToolUse).toBeDefined();
     expect(settings.hooks.Stop).toBeDefined();
   });
 
@@ -64,7 +67,7 @@ describe('ensureStudioSettings', () => {
     const settings = JSON.parse(raw);
 
     // New permissions added
-    expect(settings.permissions.allow).toContain('mcp__*');
+    expect(settings.permissions.allow).toContain('mcp__inkwell__*');
     // Existing settings preserved
     expect(settings.enabledMcpjsonServers).toEqual(['supabase', 'inkstand']);
     // Existing hooks preserved (not overwritten with generated ones)
@@ -94,17 +97,17 @@ describe('applyPermissionOverlay', () => {
     await ensureStudioSettings(tempDir);
 
     const restore = await applyPermissionOverlay(tempDir, {
-      allow: ['mcp__playwright__*', 'Bash(docker *)'],
+      allow: ['mcp__custom_server__*', 'Bash(docker *)'],
     });
 
     const raw = await readFile(join(tempDir, '.claude', 'settings.local.json'), 'utf-8');
     const settings = JSON.parse(raw);
 
     // Original rules still present
-    expect(settings.permissions.allow).toContain('mcp__*');
+    expect(settings.permissions.allow).toContain('mcp__inkwell__*');
     expect(settings.permissions.allow).toContain('Bash(*)');
     // Overlay rules added
-    expect(settings.permissions.allow).toContain('mcp__playwright__*');
+    expect(settings.permissions.allow).toContain('mcp__custom_server__*');
     expect(settings.permissions.allow).toContain('Bash(docker *)');
 
     // Restore original
@@ -113,7 +116,7 @@ describe('applyPermissionOverlay', () => {
     const restored = JSON.parse(
       await readFile(join(tempDir, '.claude', 'settings.local.json'), 'utf-8')
     );
-    expect(restored.permissions.allow).not.toContain('mcp__playwright__*');
+    expect(restored.permissions.allow).not.toContain('mcp__custom_server__*');
     expect(restored.permissions.allow).not.toContain('Bash(docker *)');
   });
 
@@ -121,14 +124,16 @@ describe('applyPermissionOverlay', () => {
     await ensureStudioSettings(tempDir);
 
     await applyPermissionOverlay(tempDir, {
-      allow: ['mcp__*', 'Bash(*)'], // already in defaults
+      allow: ['mcp__inkwell__*', 'Bash(*)'], // already in defaults
     });
 
     const raw = await readFile(join(tempDir, '.claude', 'settings.local.json'), 'utf-8');
     const settings = JSON.parse(raw);
 
     // No duplicates
-    const mcpCount = settings.permissions.allow.filter((r: string) => r === 'mcp__*').length;
+    const mcpCount = settings.permissions.allow.filter(
+      (r: string) => r === 'mcp__inkwell__*'
+    ).length;
     expect(mcpCount).toBe(1);
   });
 
