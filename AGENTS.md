@@ -616,6 +616,20 @@ Optional:
 
 ## Testing
 
+### Test tiers
+
+| Tier            | What it tests                                    | Server needed? | LLM called? | Example                                   |
+| --------------- | ------------------------------------------------ | -------------- | ----------- | ----------------------------------------- |
+| **Unit**        | Pure logic: scorers, loaders, schemas, repos     | No             | No          | `scorer.test.ts`, `*.repository.test.ts`  |
+| **Integration** | Tool handlers + DB/server round-trips            | Yes (PCP)      | No          | `runner.integration.test.ts`              |
+| **Live**        | End-to-end with an LLM backend generating output | Yes (PCP+LLM)  | **Yes**     | Future: live eval where SB curates recall |
+
+**Unit tests** use mocks (mock Supabase client, stubbed recall functions) and run in CI with no external dependencies. **Integration tests** hit the running PCP server (default `http://localhost:3001`) and require valid auth (`~/.ink/auth.json`). They skip automatically when the server is unavailable. **Live tests** are the only tier where an LLM actually generates responses — they measure whether the full pipeline (recall → injection → LLM response → curation) produces correct behavior, not just whether individual components work.
+
+When adding a new feature, write unit tests for the logic and integration tests for the server round-trip. Live tests are reserved for eval harnesses where the LLM's judgment is part of what's being measured.
+
+### Commands
+
 ```bash
 # Run all tests
 npx vitest run
