@@ -194,6 +194,40 @@ describe('resolveSpawnTarget', () => {
     expect(target.binary).toBe('podman');
   });
 
+  it('converts host binary path to basename for container execution', () => {
+    const target = resolveSpawnTarget({
+      binary: '/Users/conor/.local/bin/claude',
+      args: ['--print'],
+      container: { containerName: 'test-container' },
+    });
+    expect(target.binary).toBe('docker');
+    const containerIdx = target.args.indexOf('test-container');
+    expect(target.args[containerIdx + 1]).toBe('claude');
+  });
+
+  it('maps host cwd to container workDir (default /studio)', () => {
+    const target = resolveSpawnTarget({
+      binary: 'claude',
+      args: [],
+      cwd: '/Users/conor/ws/pcp/personal-context-protocol--wren',
+      container: { containerName: 'test-container' },
+    });
+    const workdirIdx = target.args.indexOf('--workdir');
+    expect(target.args[workdirIdx + 1]).toBe('/studio');
+    expect(target.cwd).toBeUndefined();
+  });
+
+  it('respects custom container workDir', () => {
+    const target = resolveSpawnTarget({
+      binary: 'claude',
+      args: [],
+      cwd: '/Users/conor/ws/project',
+      container: { containerName: 'test-container', workDir: '/workspace' },
+    });
+    const workdirIdx = target.args.indexOf('--workdir');
+    expect(target.args[workdirIdx + 1]).toBe('/workspace');
+  });
+
   it('preserves argument order: docker exec [flags] container binary args', () => {
     const target = resolveSpawnTarget({
       binary: 'claude',
