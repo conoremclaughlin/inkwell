@@ -26,7 +26,7 @@ import type {
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
-import { buildSessionEnv } from '@inklabs/shared';
+import { buildSessionEnv, resolveSpawnTarget } from '@inklabs/shared';
 
 /** Maximum time (ms) to wait for a Gemini CLI subprocess before killing it.
  *  Override with GEMINI_PROCESS_TIMEOUT_MS env var. */
@@ -204,23 +204,32 @@ export class GeminiRunner implements IRunner {
     return new Promise((resolve, reject) => {
       // Strip CLAUDECODE to prevent env leaking into subprocess
       const { CLAUDECODE, ...cleanEnv } = process.env;
-      const proc = spawn(geminiBin, args, {
+      const spawnEnv: Record<string, string> = {
+        HOME: process.env.HOME || '',
+        PATH: buildSpawnPath(geminiBin),
+        ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
+        ...(extraEnv || {}),
+        ...buildSessionEnv({
+          pcpSessionId: config.pcpSessionId,
+          studioId: config.studioId,
+          accessToken: config.pcpAccessToken,
+          agentId: config.agentId,
+          runtime: 'gemini',
+          repoRoot: config.repoRoot,
+        }),
+      };
+
+      const target = resolveSpawnTarget({
+        binary: geminiBin,
+        args,
         cwd: config.workingDirectory,
-        env: {
-          ...cleanEnv,
-          HOME: process.env.HOME,
-          PATH: buildSpawnPath(geminiBin),
-          ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
-          ...(extraEnv || {}),
-          ...buildSessionEnv({
-            pcpSessionId: config.pcpSessionId,
-            studioId: config.studioId,
-            accessToken: config.pcpAccessToken,
-            agentId: config.agentId,
-            runtime: 'gemini',
-            repoRoot: config.repoRoot,
-          }),
-        },
+        env: spawnEnv,
+        container: config.container,
+      });
+
+      const proc = spawn(target.binary, target.args, {
+        cwd: target.cwd,
+        env: config.container ? target.env : { ...cleanEnv, ...spawnEnv },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
 

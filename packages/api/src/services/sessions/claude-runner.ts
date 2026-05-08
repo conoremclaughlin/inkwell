@@ -19,7 +19,12 @@ import type {
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
-import { injectSessionHeaders, buildSessionEnv, writeRuntimeSessionHint } from '@inklabs/shared';
+import {
+  injectSessionHeaders,
+  buildSessionEnv,
+  writeRuntimeSessionHint,
+  resolveSpawnTarget,
+} from '@inklabs/shared';
 import { ensureStudioSettings, applyPermissionOverlay } from '../studio-settings.js';
 
 /** Maximum time (ms) to wait for a Claude Code subprocess before killing it.
@@ -238,30 +243,38 @@ export class ClaudeRunner implements IRunner {
       // Strip CLAUDECODE to prevent "nested session" detection when PCP is
       // launched from inside a Claude Code session (e.g., via PM2).
       const { CLAUDECODE, ...cleanEnv } = process.env;
-      const proc = spawn(claudeBin, args, {
+      const spawnEnv: Record<string, string> = {
+        // Ensure Claude Code uses correct paths
+        HOME: process.env.HOME || '',
+        PATH: buildSpawnPath(claudeBin),
+        // Agent identity — hooks resolve identity from $AGENT_ID.
+        ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
+        // Session env vars
+        ...buildSessionEnv({
+          pcpSessionId: config.pcpSessionId,
+          runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,
+          studioId: config.studioId,
+          accessToken: config.pcpAccessToken,
+          agentId: config.agentId,
+          runtime: 'claude',
+          repoRoot: config.repoRoot,
+        }),
+      };
+
+      // Route through container or host — resolveSpawnTarget handles the
+      // docker exec wrapping transparently.
+      const target = resolveSpawnTarget({
+        binary: claudeBin,
+        args,
         cwd: config.workingDirectory,
-        env: {
-          ...cleanEnv,
-          // Ensure Claude Code uses correct paths
-          HOME: process.env.HOME,
-          PATH: buildSpawnPath(claudeBin),
-          // Agent identity — hooks resolve identity from $AGENT_ID.
-          // Without this, hooks in cross-agent studios (e.g., Myra triggered
-          // in Wren's worktree) fall back to .ink/identity.json and get the
-          // wrong agent ID.
-          ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
-          // Session env vars: INK_SESSION_ID for ${VAR} interpolation in
-          // .mcp.json headers, INK_RUNTIME_LINK_ID for hook hint matching.
-          ...buildSessionEnv({
-            pcpSessionId: config.pcpSessionId,
-            runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,
-            studioId: config.studioId,
-            accessToken: config.pcpAccessToken,
-            agentId: config.agentId,
-            runtime: 'claude',
-            repoRoot: config.repoRoot,
-          }),
-        },
+        env: spawnEnv,
+        pipeStdin: true,
+        container: config.container,
+      });
+
+      const proc = spawn(target.binary, target.args, {
+        cwd: target.cwd,
+        env: config.container ? target.env : { ...cleanEnv, ...spawnEnv },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
 

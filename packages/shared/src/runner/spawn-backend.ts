@@ -16,6 +16,13 @@ import { spawn, type ChildProcess } from 'child_process';
 
 // ─── Types ──────────────────────────────────────────────────────
 
+export interface ContainerTarget {
+  /** Docker container name or ID to exec into */
+  containerName: string;
+  /** Docker binary (default: 'docker') */
+  dockerBinary?: string;
+}
+
 export interface SpawnBackendOptions {
   /** Absolute or PATH-relative binary name */
   binary: string;
@@ -35,6 +42,8 @@ export interface SpawnBackendOptions {
   onStdout?: (chunk: string) => void;
   /** Called on each stderr chunk */
   onStderr?: (chunk: string) => void;
+  /** Run the binary inside a Docker container instead of on the host */
+  container?: ContainerTarget;
 }
 
 export interface SpawnBackendResult {
@@ -68,22 +77,79 @@ export function buildCleanEnv(
 }
 
 /**
+ * Build the actual binary + args for spawning, handling container routing.
+ *
+ * When `container` is set, wraps the command in `docker exec` so the
+ * binary runs inside the container. Env vars are passed via `-e` flags
+ * and cwd via `--workdir`. The caller sees the same interface regardless
+ * of execution target.
+ */
+export function resolveSpawnTarget(options: SpawnBackendOptions): {
+  binary: string;
+  args: string[];
+  cwd?: string;
+  env: Record<string, string | undefined>;
+} {
+  if (!options.container) {
+    return {
+      binary: options.binary,
+      args: options.args,
+      cwd: options.cwd,
+      env: buildCleanEnv(options.env),
+    };
+  }
+
+  const docker = options.container.dockerBinary || 'docker';
+  const execArgs = ['exec'];
+
+  if (options.pipeStdin) {
+    execArgs.push('-i');
+  }
+
+  if (options.cwd) {
+    execArgs.push('--workdir', options.cwd);
+  }
+
+  if (options.env) {
+    for (const [key, value] of Object.entries(options.env)) {
+      execArgs.push('-e', `${key}=${value}`);
+    }
+  }
+
+  execArgs.push(options.container.containerName, options.binary, ...options.args);
+
+  return {
+    binary: docker,
+    args: execArgs,
+    // cwd is inside the container (passed via --workdir), not on the host
+    cwd: undefined,
+    // Host env is clean but doesn't need the extra vars (they're inside the container)
+    env: buildCleanEnv(),
+  };
+}
+
+/**
  * Spawn a backend process with timeout management, output accumulation,
  * and CLAUDECODE env stripping.
  *
  * This is the canonical spawn function for all backend process invocations.
  * Both API server runners and CLI backend-runner should use this.
+ *
+ * When `options.container` is set, the binary runs inside the specified
+ * Docker container via `docker exec`. The interface is identical — callers
+ * don't need to know whether they're targeting host or container.
  */
 export function spawnBackend(options: SpawnBackendOptions): {
   child: ChildProcess;
   result: Promise<SpawnBackendResult>;
 } {
   const started = Date.now();
+  const target = resolveSpawnTarget(options);
 
-  const child = spawn(options.binary, options.args, {
+  const child = spawn(target.binary, target.args, {
     stdio: [options.pipeStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
-    cwd: options.cwd,
-    env: buildCleanEnv(options.env),
+    cwd: target.cwd,
+    env: target.env,
   });
 
   let stdout = '';

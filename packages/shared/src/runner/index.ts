@@ -1,7 +1,9 @@
 export {
   buildCleanEnv,
+  resolveSpawnTarget,
   spawnBackend,
   LineBuffer,
+  type ContainerTarget,
   type SpawnBackendOptions,
   type SpawnBackendResult,
 } from './spawn-backend.js';

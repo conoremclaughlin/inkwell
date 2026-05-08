@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildCleanEnv, spawnBackend, LineBuffer } from './spawn-backend.js';
+import { buildCleanEnv, spawnBackend, resolveSpawnTarget, LineBuffer } from './spawn-backend.js';
 
 describe('buildCleanEnv', () => {
   it('strips CLAUDECODE from process.env', () => {
@@ -104,6 +104,112 @@ describe('spawnBackend', () => {
     });
     const res = await result;
     expect(res.stdout).toBe('wren-test');
+  });
+});
+
+describe('resolveSpawnTarget', () => {
+  it('passes through binary and args for host execution', () => {
+    const target = resolveSpawnTarget({
+      binary: 'claude',
+      args: ['--print', '--verbose'],
+      cwd: '/tmp/studio',
+      env: { AGENT_ID: 'wren' },
+    });
+    expect(target.binary).toBe('claude');
+    expect(target.args).toEqual(['--print', '--verbose']);
+    expect(target.cwd).toBe('/tmp/studio');
+    expect(target.env.AGENT_ID).toBe('wren');
+  });
+
+  it('wraps binary in docker exec for container execution', () => {
+    const target = resolveSpawnTarget({
+      binary: 'claude',
+      args: ['--print', '--verbose'],
+      container: { containerName: 'ink-sandbox-wren-abc123' },
+    });
+    expect(target.binary).toBe('docker');
+    expect(target.args[0]).toBe('exec');
+    expect(target.args).toContain('ink-sandbox-wren-abc123');
+    expect(target.args).toContain('claude');
+    expect(target.args).toContain('--print');
+    expect(target.args).toContain('--verbose');
+  });
+
+  it('passes cwd as --workdir to docker exec', () => {
+    const target = resolveSpawnTarget({
+      binary: 'claude',
+      args: [],
+      cwd: '/studio',
+      container: { containerName: 'test-container' },
+    });
+    const workdirIdx = target.args.indexOf('--workdir');
+    expect(workdirIdx).toBeGreaterThan(-1);
+    expect(target.args[workdirIdx + 1]).toBe('/studio');
+    // Host cwd should be undefined (cwd is inside the container)
+    expect(target.cwd).toBeUndefined();
+  });
+
+  it('passes env vars as -e flags to docker exec', () => {
+    const target = resolveSpawnTarget({
+      binary: 'claude',
+      args: [],
+      env: { AGENT_ID: 'wren', INK_SANDBOX: 'docker' },
+      container: { containerName: 'test-container' },
+    });
+    expect(target.args).toContain('-e');
+    expect(target.args).toContain('AGENT_ID=wren');
+    expect(target.args).toContain('INK_SANDBOX=docker');
+  });
+
+  it('adds -i flag when pipeStdin is true for container', () => {
+    const target = resolveSpawnTarget({
+      binary: 'claude',
+      args: [],
+      pipeStdin: true,
+      container: { containerName: 'test-container' },
+    });
+    expect(target.args).toContain('-i');
+  });
+
+  it('does not add -i flag when pipeStdin is false for container', () => {
+    const target = resolveSpawnTarget({
+      binary: 'claude',
+      args: [],
+      pipeStdin: false,
+      container: { containerName: 'test-container' },
+    });
+    const execIdx = target.args.indexOf('exec');
+    const containerIdx = target.args.indexOf('test-container');
+    // No -i between exec and container name
+    const sliceBetween = target.args.slice(execIdx + 1, containerIdx);
+    expect(sliceBetween).not.toContain('-i');
+  });
+
+  it('uses custom docker binary when specified', () => {
+    const target = resolveSpawnTarget({
+      binary: 'claude',
+      args: [],
+      container: { containerName: 'test', dockerBinary: 'podman' },
+    });
+    expect(target.binary).toBe('podman');
+  });
+
+  it('preserves argument order: docker exec [flags] container binary args', () => {
+    const target = resolveSpawnTarget({
+      binary: 'claude',
+      args: ['--print', '-m', 'sonnet'],
+      cwd: '/studio',
+      env: { KEY: 'val' },
+      pipeStdin: true,
+      container: { containerName: 'my-sandbox' },
+    });
+    // Structure: docker exec -i --workdir /studio -e KEY=val my-sandbox claude --print -m sonnet
+    const containerIdx = target.args.indexOf('my-sandbox');
+    expect(containerIdx).toBeGreaterThan(0);
+    expect(target.args[containerIdx + 1]).toBe('claude');
+    expect(target.args[containerIdx + 2]).toBe('--print');
+    expect(target.args[containerIdx + 3]).toBe('-m');
+    expect(target.args[containerIdx + 4]).toBe('sonnet');
   });
 });
 

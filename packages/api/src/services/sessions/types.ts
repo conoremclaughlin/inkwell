@@ -432,6 +432,11 @@ export interface ClaudeRunnerConfig {
     allow?: string[];
     deny?: string[];
   };
+  /** Run the backend CLI inside a Docker container instead of on the host */
+  container?: {
+    containerName: string;
+    dockerBinary?: string;
+  };
 }
 
 export interface RunnerResult {
