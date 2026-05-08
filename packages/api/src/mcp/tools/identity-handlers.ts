@@ -264,7 +264,7 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
   if (data.version === 1) {
     ensureDefaultReminders({
       userId: user.id,
-      identityId: data.id,
+      sbId: data.id,
       agentId,
       deliveryChannel: user.telegram_id ? 'telegram' : user.whatsapp_id ? 'whatsapp' : undefined,
       deliveryTarget: user.telegram_id?.toString() ?? user.whatsapp_id ?? undefined,
@@ -517,10 +517,7 @@ export async function handleGetIdentityHistory(args: unknown, dataComposer: Data
   }
 
   // Get history entries
-  let historyQuery = supabase
-    .from('agent_identity_history')
-    .select('*')
-    .eq('identity_id', current.id);
+  let historyQuery = supabase.from('agent_identity_history').select('*').eq('sb_id', current.id);
 
   historyQuery = withWorkspaceFilter(historyQuery, params.workspaceId);
   const { data, error } = await historyQuery
@@ -592,7 +589,7 @@ export async function handleRestoreIdentity(args: unknown, dataComposer: DataCom
   let restoreQuery = supabase
     .from('agent_identity_history')
     .select('*')
-    .eq('identity_id', current.id)
+    .eq('sb_id', current.id)
     .eq('version', params.version);
 
   restoreQuery = withWorkspaceFilter(restoreQuery, params.workspaceId);
@@ -824,7 +821,7 @@ export async function handleChooseName(args: unknown, dataComposer: DataComposer
   // Seed default reminders (best-effort, non-blocking)
   ensureDefaultReminders({
     userId: user.id,
-    identityId: data.id,
+    sbId: data.id,
     agentId,
     deliveryChannel: user.telegram_id ? 'telegram' : user.whatsapp_id ? 'whatsapp' : undefined,
     deliveryTarget: user.telegram_id?.toString() ?? user.whatsapp_id ?? undefined,

@@ -383,7 +383,7 @@ export class SessionService implements ISessionService {
       userId,
       agentId,
       injectedContext.user.email,
-      session.identityId
+      session.sbId
     );
 
     // 4. Select runtime backend and model
@@ -671,7 +671,7 @@ export class SessionService implements ISessionService {
     userId: string,
     agentId: string,
     email?: string,
-    identityId?: string
+    sbId?: string
   ): string | undefined {
     if (!email) {
       logger.warn('Cannot inject PCP access token for backend runner: missing user email', {
@@ -697,7 +697,7 @@ export class SessionService implements ISessionService {
         email,
         scope: 'mcp:tools',
         ...(agentId ? { agentId } : {}),
-        ...(identityId ? { identityId } : {}),
+        ...(sbId ? { sbId } : {}),
       },
       jwtSecret,
       { expiresIn: 60 * 60 }
@@ -816,16 +816,16 @@ export class SessionService implements ISessionService {
     }
 
     // Resolve canonical identity UUID
-    let identityId: string | undefined;
+    let sbId: string | undefined;
     if (this.supabase) {
-      identityId = (await resolveIdentityId(this.supabase, userId, agentId)) || undefined;
+      sbId = (await resolveIdentityId(this.supabase, userId, agentId)) || undefined;
     }
 
     // Create new session
     const session = await this.repository.create({
       userId,
       agentId,
-      identityId,
+      sbId,
       backendSessionId: null,
       type,
       lifecycle: 'idle',
@@ -1217,7 +1217,7 @@ This session will continue with a fresh context after compaction. Your identity,
         session.userId,
         session.agentId,
         fullContext.user.email,
-        session.identityId
+        session.sbId
       );
 
       const runtimeBackend = this.resolveRuntimeBackend(session.backend, context.agent.backend);

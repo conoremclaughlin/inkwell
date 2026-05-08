@@ -31,7 +31,7 @@ function createMockGroup(overrides: Partial<TaskGroup> = {}): TaskGroup {
   return {
     id: 'group-1',
     user_id: 'user-123',
-    identity_id: null,
+    sb_id: null,
     project_id: null,
     title: 'Test Strategy Group',
     description: null,

@@ -1214,7 +1214,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'list_task_groups',
     {
-      description: `List task groups for a user with per-status task counts per group. Omit \`statuses\` (or pass an empty array) to include all statuses. Pass a multi-select array to narrow (e.g. statuses: ["active","paused"]). Also supports projectId, identityId, autonomousOnly, strategy, and ownerAgentId filters.
+      description: `List task groups for a user with per-status task counts per group. Omit \`statuses\` (or pass an empty array) to include all statuses. Pass a multi-select array to narrow (e.g. statuses: ["active","paused"]). Also supports projectId, sbId, autonomousOnly, strategy, and ownerAgentId filters.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: listTaskGroupsSchema.shape,

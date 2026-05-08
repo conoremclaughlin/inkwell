@@ -996,7 +996,7 @@ export class StrategyService {
           ]
             .filter(Boolean)
             .join(' '),
-          identity_id: identityId,
+          sb_id: identityId,
           cron_expression: `*/${intervalMinutes} * * * *`,
           next_run_at: nextRunAt.toISOString(),
           status: 'active',

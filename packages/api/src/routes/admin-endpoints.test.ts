@@ -571,7 +571,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
             return createQueryChain([
               {
                 id: 'session-identity',
-                identity_id: 'identity-1',
+                sb_id: 'identity-1',
                 agent_id: 'wren',
                 status: 'active',
                 current_phase: 'runtime:generating',
@@ -592,11 +592,11 @@ describe('admin endpoint handlers (no-500 regression)', () => {
           }
 
           if (sessionsQueryCount === 2) {
-            // Legacy rows without identity_id, still in same workspace via agent_id
+            // Legacy rows without sb_id, still in same workspace via agent_id
             return createQueryChain([
               {
                 id: 'session-legacy',
-                identity_id: null,
+                sb_id: null,
                 agent_id: 'wren',
                 status: 'active',
                 current_phase: 'runtime:idle',
@@ -683,7 +683,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
           return createQueryChain([
             {
               id: 'session-in-workspace',
-              identity_id: 'identity-1',
+              sb_id: 'identity-1',
               agent_id: 'wren',
               backend: 'claude',
               backend_session_id: 'backend-1',
@@ -697,7 +697,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
             },
             {
               id: 'session-outside-workspace',
-              identity_id: 'identity-other',
+              sb_id: 'identity-other',
               agent_id: 'wren',
               backend: 'claude',
               backend_session_id: 'backend-2',
@@ -777,7 +777,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
           return createQueryChain([
             {
               id: 'session-123',
-              identity_id: 'identity-1',
+              sb_id: 'identity-1',
               agent_id: 'wren',
             },
           ]);
@@ -838,7 +838,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
           return createQueryChain([
             {
               id: 'session-other-workspace',
-              identity_id: 'identity-other',
+              sb_id: 'identity-other',
               agent_id: 'wren',
               backend: 'claude',
               backend_session_id: 'backend-2',
@@ -880,7 +880,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
           return createQueryChain([
             {
               id: 'session-legacy',
-              identity_id: null,
+              sb_id: null,
               agent_id: 'wren',
               status: 'active',
               current_phase: 'runtime:idle',
@@ -923,7 +923,7 @@ describe('admin endpoint handlers (no-500 regression)', () => {
           return createQueryChain([
             {
               id: 'session-other-workspace',
-              identity_id: 'identity-other',
+              sb_id: 'identity-other',
               agent_id: 'wren',
               status: 'active',
               current_phase: 'runtime:idle',

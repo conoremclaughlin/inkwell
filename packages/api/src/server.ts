@@ -175,11 +175,11 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       );
       if (mentionMatch) {
         routedAgentId = mentionMatch.agentId;
-        routedIdentityId = mentionMatch.identityId;
+        routedIdentityId = mentionMatch.sbId;
         logger.debug(`[Route] Resolved agent from @mention`, {
           platform: channel,
           agentId: mentionMatch.agentId,
-          identityId: mentionMatch.identityId,
+          sbId: mentionMatch.sbId,
         });
       }
     }
@@ -197,13 +197,13 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       );
       if (route) {
         routedAgentId = route.agentId;
-        routedIdentityId = route.identityId;
+        routedIdentityId = route.sbId;
         routeStudioHint = route.studioHint;
         resolvedRouteId = route.routeId;
         logger.debug(`[Route] Resolved agent from channel_routes`, {
           platform: channel,
           agentId: route.agentId,
-          identityId: route.identityId,
+          sbId: route.sbId,
           routeId: route.routeId,
           studioHint: route.studioHint,
         });
@@ -483,18 +483,18 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       }
     }
 
-    // Resolve agent from reminder's identity_id, fall back to server default
+    // Resolve agent from reminder's sb_id, fall back to server default
     let reminderAgentId = agentId;
-    if (reminder.identity_id && dataComposer) {
+    if (reminder.sb_id && dataComposer) {
       const { data: identity } = await dataComposer
         .getClient()
         .from('agent_identities')
         .select('agent_id')
-        .eq('id', reminder.identity_id)
+        .eq('id', reminder.sb_id)
         .single();
       if (identity?.agent_id) {
         reminderAgentId = identity.agent_id;
-        logger.debug(`[Heartbeat] Resolved agent from identity_id: ${reminderAgentId}`);
+        logger.debug(`[Heartbeat] Resolved agent from sb_id: ${reminderAgentId}`);
       }
     }
 
@@ -545,18 +545,18 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     }
 
     // Fallback to agent identity's default studio
-    if (!reminderStudioHint && reminder.identity_id && dataComposer) {
+    if (!reminderStudioHint && reminder.sb_id && dataComposer) {
       const { data: identity } = await dataComposer
         .getClient()
         .from('agent_identities')
         .select('studio_hint')
-        .eq('id', reminder.identity_id)
+        .eq('id', reminder.sb_id)
         .single();
       if (identity?.studio_hint) {
         reminderStudioHint = identity.studio_hint;
         logger.debug(`[Heartbeat] Using agent default studio`, {
           studioHint: reminderStudioHint,
-          identityId: reminder.identity_id,
+          sbId: reminder.sb_id,
         });
       }
     }
@@ -653,7 +653,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     // trying to trigger another user's agent via a known inbox message ID — this
     // is blocked and logged as a security warning.
     let userId: string | undefined;
-    let recipientIdentityId: string | undefined;
+    let recipientSbId: string | undefined;
 
     const authUser = getUserFromContext();
     const authUserId = authUser?.userId;
@@ -662,7 +662,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       const { data: inboxMsg, error: inboxError } = await dataComposer!
         .getClient()
         .from('agent_inbox')
-        .select('recipient_user_id, recipient_identity_id')
+        .select('recipient_user_id, recipient_sb_id')
         .eq('id', payload.inboxMessageId)
         .single();
       if (inboxError) {
@@ -689,7 +689,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       }
 
       userId = inboxMsg?.recipient_user_id;
-      recipientIdentityId = inboxMsg?.recipient_identity_id || undefined;
+      recipientSbId = inboxMsg?.recipient_sb_id || undefined;
     } else if (payload.threadMessageId) {
       // Thread message: resolve user_id via inbox_thread_messages → inbox_threads
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -774,8 +774,8 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     }
 
     // 2. Resolve and verify target identity for this user
-    // Prefer recipient_identity_id from inbox; fallback to user+agent_id with disambiguation.
-    let resolvedIdentityId = recipientIdentityId;
+    // Prefer recipient_sb_id from inbox; fallback to user+agent_id with disambiguation.
+    let resolvedIdentityId = recipientSbId;
     let resolvedWorkspaceId: string | undefined;
     const metadataWorkspaceId =
       payload.metadata &&
@@ -795,13 +795,13 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
 
       if (!identityRow) {
         throw new Error(
-          `Inbox recipient_identity_id is invalid for this user (${targetAgentId}). Re-send inbox message.`
+          `Inbox recipient_sb_id is invalid for this user (${targetAgentId}). Re-send inbox message.`
         );
       }
 
       if (identityRow.agent_id !== targetAgentId) {
         throw new Error(
-          `Inbox recipient_identity_id targets "${identityRow.agent_id}", not "${targetAgentId}".`
+          `Inbox recipient_sb_id targets "${identityRow.agent_id}", not "${targetAgentId}".`
         );
       }
 
@@ -848,7 +848,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
           );
         } else {
           throw new Error(
-            `Ambiguous identity for agent "${targetAgentId}" (${identityRows.length} identities, ${workspaceScoped.length} workspace-scoped). Include inboxMessageId with recipient_identity_id or pass metadata.workspaceId.`
+            `Ambiguous identity for agent "${targetAgentId}" (${identityRows.length} identities, ${workspaceScoped.length} workspace-scoped). Include inboxMessageId with recipient_sb_id or pass metadata.workspaceId.`
           );
         }
       } else {
@@ -904,7 +904,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     logger.info('[Trigger] Resolved target identity', {
       userId,
       agentId: targetAgentId,
-      identityId: resolvedIdentityId,
+      sbId: resolvedIdentityId,
       workspaceId: resolvedWorkspaceId || null,
     });
 

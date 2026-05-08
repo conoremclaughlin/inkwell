@@ -40,7 +40,7 @@ export interface Studio {
 export interface CreateStudioInput {
   userId: string;
   agentId?: string;
-  identityId?: string;
+  sbId?: string;
   sessionId?: string;
   repoRoot: string;
   worktreePath: string;
@@ -105,14 +105,14 @@ export class StudiosRepository {
   }
 
   async create(input: CreateStudioInput): Promise<Studio> {
-    const identityId =
-      input.identityId ||
+    const sbId =
+      input.sbId ||
       (input.agentId ? await resolveIdentityId(this.client, input.userId, input.agentId) : null);
 
     const insertData: StudiosTable['Insert'] = {
       user_id: input.userId,
       agent_id: input.agentId,
-      identity_id: identityId,
+      sb_id: sbId,
       session_id: input.sessionId,
       repo_root: input.repoRoot,
       worktree_path: input.worktreePath,

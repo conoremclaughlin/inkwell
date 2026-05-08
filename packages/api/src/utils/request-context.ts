@@ -32,7 +32,7 @@ export interface RequestContextData {
   /** Agent ID if known (text label) */
   agentId?: string;
   /** Canonical agent_identities UUID (strongest identity binding) */
-  identityId?: string;
+  sbId?: string;
   /** Session ID if in a session */
   sessionId?: string;
   /** Active product workspace ID (parent-level, contains all documents and SBs) */

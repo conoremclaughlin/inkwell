@@ -23,7 +23,7 @@ export interface PcpTokenPayload {
   email: string;
   scope: string;
   agentId?: string; // Bound agent identity label (absent for human users)
-  identityId?: string; // Canonical agent_identities UUID (strongest binding)
+  identityId?: string; // Canonical agent_identities UUID (JWT claim — kept as identityId for token compat)
 }
 
 // ============================================================================
@@ -85,7 +85,7 @@ export async function createRefreshToken(
   scopes: string[],
   lifetimeDays: number,
   agentId?: string,
-  identityId?: string
+  sbId?: string
 ): Promise<{ refreshToken: string; expiresAt: Date }> {
   const refreshToken = `pcp-rt-${crypto.randomBytes(32).toString('hex')}`;
   const expiresAt = new Date(Date.now() + lifetimeDays * 24 * 60 * 60 * 1000);
@@ -98,7 +98,7 @@ export async function createRefreshToken(
     scopes,
     expires_at: expiresAt.toISOString(),
     ...(agentId ? { agent_id: agentId } : {}),
-    ...(identityId ? { identity_id: identityId } : {}),
+    ...(sbId ? { sb_id: sbId } : {}),
   });
 
   if (error) {
@@ -158,7 +158,7 @@ export async function exchangeRefreshToken(
   const scope = tokenRecord.scopes?.join(' ') || 'mcp:tools';
   const tokenAny = tokenRecord as Record<string, unknown>;
   const agentId = tokenAny.agent_id as string | null;
-  const identityId = tokenAny.identity_id as string | null;
+  const sbId = tokenAny.sb_id as string | null;
 
   const accessToken = signPcpAccessToken(
     {
@@ -167,7 +167,7 @@ export async function exchangeRefreshToken(
       email: userEmail,
       scope,
       ...(agentId ? { agentId } : {}),
-      ...(identityId ? { identityId } : {}),
+      ...(sbId ? { identityId: sbId } : {}),
     },
     accessTokenLifetimeSeconds
   );
@@ -183,6 +183,6 @@ export async function exchangeRefreshToken(
     userId: tokenRecord.user_id,
     email: userEmail,
     ...(agentId ? { agentId } : {}),
-    ...(identityId ? { identityId } : {}),
+    ...(sbId ? { identityId: sbId } : {}),
   };
 }
