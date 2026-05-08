@@ -1041,7 +1041,35 @@ export class StrategyService {
       return false;
     }
 
-    return this.triggerOwnerAgent(group, currentTask, 'watchdog');
+    // If the strategy uses a sandbox, spin up (or reuse) the container before
+    // triggering. The orchestrator short-circuits if the container is already
+    // running, so this is safe to call on every watchdog tick.
+    const config = group.strategy_config as StrategyConfig;
+    let sandboxContainerName: string | undefined;
+    if (config.sandbox) {
+      const sandboxResult = await this.maybeSpinUpSandbox(group);
+      const sandboxPolicy = config.sandboxPolicy || 'required';
+
+      if (sandboxResult && !sandboxResult.success && sandboxPolicy === 'required') {
+        await this.logStrategyEvent(
+          group,
+          'sandbox_failed',
+          `Watchdog aborted: sandbox required but spin-up failed — ${sandboxResult.error}`,
+          { error: sandboxResult.error, policy: 'required', trigger: 'watchdog' }
+        );
+        await this.dataComposer.repositories.taskGroups.update(groupId, {
+          status: 'paused',
+          strategy_paused_at: new Date().toISOString(),
+        });
+        return false;
+      }
+
+      if (sandboxResult?.success) {
+        sandboxContainerName = sandboxResult.containerName;
+      }
+    }
+
+    return this.triggerOwnerAgent(group, currentTask, 'watchdog', sandboxContainerName);
   }
 
   /**

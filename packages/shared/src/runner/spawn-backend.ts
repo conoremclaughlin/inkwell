@@ -13,6 +13,7 @@
  */
 
 import { spawn, type ChildProcess } from 'child_process';
+import path from 'path';
 
 // ─── Types ──────────────────────────────────────────────────────
 
@@ -21,6 +22,8 @@ export interface ContainerTarget {
   containerName: string;
   /** Docker binary (default: 'docker') */
   dockerBinary?: string;
+  /** Working directory inside the container (default: '/studio') */
+  workDir?: string;
 }
 
 export interface SpawnBackendOptions {
@@ -106,8 +109,9 @@ export function resolveSpawnTarget(options: SpawnBackendOptions): {
     execArgs.push('-i');
   }
 
+  const containerWorkDir = options.container.workDir || '/studio';
   if (options.cwd) {
-    execArgs.push('--workdir', options.cwd);
+    execArgs.push('--workdir', containerWorkDir);
   }
 
   if (options.env) {
@@ -116,7 +120,9 @@ export function resolveSpawnTarget(options: SpawnBackendOptions): {
     }
   }
 
-  execArgs.push(options.container.containerName, options.binary, ...options.args);
+  // Use basename — the container has CLI tools on its PATH, not at host-resolved absolute paths
+  const containerBinary = path.basename(options.binary);
+  execArgs.push(options.container.containerName, containerBinary, ...options.args);
 
   return {
     binary: docker,

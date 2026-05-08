@@ -103,6 +103,17 @@ export const startStrategySchema = z.object({
     .describe(
       'Supervisor agent identity ID (UUID). Gets check-in notifications and a final audit on completion.'
     ),
+  sandbox: z.boolean().optional().describe('Run the strategy in a sandboxed Docker container'),
+  sandboxPolicy: z
+    .enum(['required', 'preferred'])
+    .optional()
+    .describe(
+      "Sandbox failure policy: 'required' aborts if sandbox can't start (default), 'preferred' falls back to host"
+    ),
+  sandboxBackendAuth: z
+    .array(z.enum(['claude', 'codex', 'gemini']))
+    .optional()
+    .describe("Backend auth dirs to mount in the sandbox (default: ['claude'])"),
 });
 
 export async function handleStartStrategy(
@@ -134,6 +145,9 @@ export async function handleStartStrategy(
         contextSummaryInterval: args.contextSummaryInterval,
         verificationGates: args.verificationGates,
         supervisorId: args.supervisorId,
+        sandbox: args.sandbox,
+        sandboxPolicy: args.sandboxPolicy,
+        sandboxBackendAuth: args.sandboxBackendAuth,
       },
     });
 

@@ -459,6 +459,16 @@ export class SessionService implements ISessionService {
     };
 
     // 5. Run with selected backend
+    // Direct-api runners execute tools in-process against the host filesystem —
+    // they cannot route to a Docker container. Reject the combination so a
+    // sandboxed strategy doesn't silently bypass containment.
+    if (resolvedBackend === 'direct-api' && runnerConfig.container) {
+      throw new Error(
+        'direct-api backend cannot run inside a sandbox container. ' +
+          'Use a CLI backend (claude-code, codex-cli, gemini) for sandboxed strategies.'
+      );
+    }
+
     const runner =
       resolvedBackend === 'codex-cli'
         ? this.codexRunner
