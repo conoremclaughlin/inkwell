@@ -68,6 +68,12 @@ export interface StrategyConfig {
   watchdogIntervalMinutes?: number;
   /** Supervisor agent identity ID — gets check-in notifications and a final audit on completion */
   supervisorId?: string;
+  /** Run the strategy in a sandboxed Docker container */
+  sandbox?: boolean;
+  /** Sandbox failure policy: 'required' fails the strategy if sandbox can't start, 'preferred' falls back to host (default: 'required') */
+  sandboxPolicy?: 'required' | 'preferred';
+  /** Backend auth dirs to mount in the sandbox (default: ['claude']) */
+  sandboxBackendAuth?: Array<'claude' | 'codex' | 'gemini'>;
 }
 
 export interface CreateTaskGroupInput {

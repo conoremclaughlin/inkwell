@@ -38,6 +38,8 @@ export interface InjectSessionHeadersOptions {
   studioId?: string;
   /** Optional access token — injected as Authorization header for triggered sessions */
   accessToken?: string;
+  /** Directory to write the modified config to (default: system tmpdir/sb-mcp). Use this for container execution where temp files must be in a mounted directory. */
+  outputDir?: string;
 }
 
 export interface InjectSessionHeadersResult {
@@ -137,8 +139,8 @@ export function injectSessionHeaders(
     return { mcpConfigPath, cleanup: () => {}, modified: false };
   }
 
-  // Write modified config to temp file
-  const tmpDir = join(tmpdir(), 'sb-mcp');
+  // Write modified config to temp file (or outputDir for container execution)
+  const tmpDir = options.outputDir || join(tmpdir(), 'sb-mcp');
   mkdirSync(tmpDir, { recursive: true });
   const tmpPath = join(tmpDir, `mcp-server-${process.pid}-${Date.now()}.json`);
   writeFileSync(tmpPath, JSON.stringify(config, null, 2));

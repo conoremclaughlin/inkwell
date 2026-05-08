@@ -11,8 +11,16 @@ export * from './types';
 export { ClaudeCodeBackend, createClaudeCodeBackend } from './backends/claude-code.backend';
 export type { ClaudeCodeConfig } from './backends/claude-code.backend';
 
-export { DirectApiBackend, createDirectApiBackend } from './backends/direct-api.backend';
-export type { DirectApiConfig } from './backends/direct-api.backend';
+export { InkBackend, createInkBackend } from './backends/ink.backend';
+export type { InkConfig } from './backends/ink.backend';
+
+// Tools
+export {
+  createInkCodingTools,
+  getPiToolSchemas,
+  createPiToolExecutor,
+} from './tools/pi-coding-tools';
+export type { InkToolDefinition, PiCodingToolsConfig } from './tools/pi-coding-tools';
 
 // Manager
 export { BackendManager, createBackendManager } from './backend-manager';

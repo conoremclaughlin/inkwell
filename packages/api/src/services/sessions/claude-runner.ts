@@ -19,7 +19,13 @@ import type {
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
-import { injectSessionHeaders, buildSessionEnv, writeRuntimeSessionHint } from '@inklabs/shared';
+import {
+  injectSessionHeaders,
+  buildSessionEnv,
+  writeRuntimeSessionHint,
+  resolveSpawnTarget,
+  CONTAINER_RUNNER_FILES,
+} from '@inklabs/shared';
 import { ensureStudioSettings, applyPermissionOverlay } from '../studio-settings.js';
 
 /** Maximum time (ms) to wait for a Claude Code subprocess before killing it.
@@ -193,6 +199,7 @@ export class ClaudeRunner implements IRunner {
             pcpSessionId: config.pcpSessionId,
             studioId: config.studioId,
             accessToken: config.pcpAccessToken,
+            outputDir: config.container?.runtimeDir,
           })
         : null;
 
@@ -226,11 +233,17 @@ export class ClaudeRunner implements IRunner {
       }
     }
 
-    // If headers were injected, patch the --mcp-config arg to point to the temp file
+    // If headers were injected, patch the --mcp-config arg to point to the temp file.
+    // When containerized, translate host path to the container-side mount point.
     if (mcpInjection?.modified) {
       const mcpIdx = args.indexOf('--mcp-config');
       if (mcpIdx !== -1 && args[mcpIdx + 1]) {
-        args[mcpIdx + 1] = mcpInjection.mcpConfigPath;
+        if (config.container?.runtimeDir) {
+          const filename = mcpInjection.mcpConfigPath.split('/').pop()!;
+          args[mcpIdx + 1] = `${CONTAINER_RUNNER_FILES}/${filename}`;
+        } else {
+          args[mcpIdx + 1] = mcpInjection.mcpConfigPath;
+        }
       }
     }
 
@@ -238,30 +251,38 @@ export class ClaudeRunner implements IRunner {
       // Strip CLAUDECODE to prevent "nested session" detection when PCP is
       // launched from inside a Claude Code session (e.g., via PM2).
       const { CLAUDECODE, ...cleanEnv } = process.env;
-      const proc = spawn(claudeBin, args, {
+      const spawnEnv: Record<string, string> = {
+        // Ensure Claude Code uses correct paths
+        HOME: process.env.HOME || '',
+        PATH: buildSpawnPath(claudeBin),
+        // Agent identity — hooks resolve identity from $AGENT_ID.
+        ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
+        // Session env vars
+        ...buildSessionEnv({
+          pcpSessionId: config.pcpSessionId,
+          runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,
+          studioId: config.studioId,
+          accessToken: config.pcpAccessToken,
+          agentId: config.agentId,
+          runtime: 'claude',
+          repoRoot: config.repoRoot,
+        }),
+      };
+
+      // Route through container or host — resolveSpawnTarget handles the
+      // docker exec wrapping transparently.
+      const target = resolveSpawnTarget({
+        binary: claudeBin,
+        args,
         cwd: config.workingDirectory,
-        env: {
-          ...cleanEnv,
-          // Ensure Claude Code uses correct paths
-          HOME: process.env.HOME,
-          PATH: buildSpawnPath(claudeBin),
-          // Agent identity — hooks resolve identity from $AGENT_ID.
-          // Without this, hooks in cross-agent studios (e.g., Myra triggered
-          // in Wren's worktree) fall back to .ink/identity.json and get the
-          // wrong agent ID.
-          ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
-          // Session env vars: INK_SESSION_ID for ${VAR} interpolation in
-          // .mcp.json headers, INK_RUNTIME_LINK_ID for hook hint matching.
-          ...buildSessionEnv({
-            pcpSessionId: config.pcpSessionId,
-            runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,
-            studioId: config.studioId,
-            accessToken: config.pcpAccessToken,
-            agentId: config.agentId,
-            runtime: 'claude',
-            repoRoot: config.repoRoot,
-          }),
-        },
+        env: spawnEnv,
+        pipeStdin: true,
+        container: config.container,
+      });
+
+      const proc = spawn(target.binary, target.args, {
+        cwd: target.cwd,
+        env: config.container ? target.env : { ...cleanEnv, ...spawnEnv },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
 

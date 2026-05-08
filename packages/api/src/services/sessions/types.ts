@@ -138,6 +138,8 @@ export interface SessionRequest {
     repoRoot?: string;
     // Task group ID for strategy lifecycle correlation
     taskGroupId?: string;
+    // Docker container name for sandboxed strategy execution
+    sandboxContainerName?: string;
   };
 }
 
@@ -431,6 +433,13 @@ export interface ClaudeRunnerConfig {
   permissionOverlay?: {
     allow?: string[];
     deny?: string[];
+  };
+  /** Run the backend CLI inside a Docker container instead of on the host */
+  container?: {
+    containerName: string;
+    dockerBinary?: string;
+    /** Host-side directory for runner temp files; bind-mounted as /run/ink inside the container */
+    runtimeDir?: string;
   };
 }
 
