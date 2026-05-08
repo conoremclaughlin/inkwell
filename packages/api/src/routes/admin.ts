@@ -214,6 +214,7 @@ function toRoutingRoute(
   return {
     id: route.id,
     sbId: route.sb_id,
+    identityId: route.sb_id,
     agentId: identity?.agent_id ?? null,
     agentName: identity?.name ?? null,
     agentRole: identity?.role ?? null,
@@ -2378,7 +2379,7 @@ router.post('/routing/routes', async (req: Request, res: Response) => {
     });
     const body = (req.body || {}) as Record<string, unknown>;
 
-    const sbId = normalizeNullableText(body.sbId);
+    const sbId = normalizeNullableText(body.sbId) || normalizeNullableText(body.identityId);
     const platform = normalizeNullableText(body.platform)?.toLowerCase();
     const platformAccountId = normalizeNullableText(body.platformAccountId);
     const chatId = normalizeNullableText(body.chatId);
@@ -2387,7 +2388,7 @@ router.post('/routing/routes', async (req: Request, res: Response) => {
     const metadata = parseRouteMetadata(body.metadata);
 
     if (!sbId || !platform) {
-      res.status(400).json({ error: 'sbId and platform are required' });
+      res.status(400).json({ error: 'sbId (or identityId) and platform are required' });
       return;
     }
 
@@ -2499,8 +2500,8 @@ router.patch('/routing/routes/:routeId', async (req: Request, res: Response) => 
     const body = (req.body || {}) as Record<string, unknown>;
     const updates: Record<string, unknown> = {};
 
-    if ('sbId' in body) {
-      const sbId = normalizeNullableText(body.sbId);
+    if ('sbId' in body || 'identityId' in body) {
+      const sbId = normalizeNullableText(body.sbId) || normalizeNullableText(body.identityId);
       if (!sbId) {
         res.status(400).json({ error: 'sbId cannot be empty' });
         return;
@@ -2707,7 +2708,7 @@ router.patch('/routing/identities/:sbId', async (req: Request, res: Response) =>
       return;
     }
 
-    res.json({ success: true, sbId, studioHint: studioHint.trim() });
+    res.json({ success: true, sbId, identityId: sbId, studioHint: studioHint.trim() });
   } catch (error) {
     logger.error('Failed to update identity studio_hint:', error);
     res.status(500).json(errorJson('Failed to update identity', error));
@@ -2910,7 +2911,7 @@ router.get('/user-identity/history', async (req: Request, res: Response) => {
     const { data, error } = await supabase
       .from('user_identity_history')
       .select('*')
-      .eq('sb_id', identity.id)
+      .eq('identity_id', identity.id)
       .eq('workspace_id', authReq.pcpWorkspaceId)
       .order('archived_at', { ascending: false })
       .limit(20);
@@ -3485,8 +3486,10 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       status: string;
       senderAgentId: string | null;
       senderSbId: string | null;
+      senderIdentityId: string | null;
       recipientAgentId: string;
       recipientSbId: string | null;
+      recipientIdentityId: string | null;
       threadKey: string | null;
       recipientSessionId: string | null;
       relatedArtifactUri: string | null;
@@ -3506,8 +3509,10 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       status: m.status,
       senderAgentId: m.sender_agent_id,
       senderSbId: m.sender_sb_id,
+      senderIdentityId: m.sender_sb_id,
       recipientAgentId: m.recipient_agent_id,
       recipientSbId: m.recipient_sb_id,
+      recipientIdentityId: m.recipient_sb_id,
       threadKey: m.thread_key,
       recipientSessionId: m.recipient_session_id,
       relatedArtifactUri: m.related_artifact_uri,
@@ -3661,8 +3666,10 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
               status: 'unread', // computed below
               senderAgentId: m.sender_agent_id,
               senderSbId: null,
+              senderIdentityId: null,
               recipientAgentId: agentId, // thread messages don't have a single recipient
               recipientSbId: null,
+              recipientIdentityId: null,
               threadKey: t.thread_key,
               recipientSessionId: null,
               relatedArtifactUri: null,

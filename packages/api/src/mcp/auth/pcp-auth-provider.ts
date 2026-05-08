@@ -407,7 +407,11 @@ export class PcpAuthProvider {
       userId: payload.sub,
       email: payload.email,
       ...(payload.agentId ? { agentId: payload.agentId } : {}),
-      ...(payload.identityId ? { sbId: payload.identityId } : {}),
+      ...(payload.sbId
+        ? { sbId: payload.sbId }
+        : payload.identityId
+          ? { sbId: payload.identityId }
+          : {}),
     };
   }
 

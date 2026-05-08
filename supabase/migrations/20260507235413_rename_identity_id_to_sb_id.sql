@@ -59,6 +59,7 @@ ALTER INDEX IF EXISTS idx_mcp_tokens_identity_id RENAME TO idx_mcp_tokens_sb_id;
 ALTER INDEX IF EXISTS idx_task_groups_identity_id RENAME TO idx_task_groups_sb_id;
 ALTER INDEX IF EXISTS idx_artifact_comments_created_by_identity_id RENAME TO idx_artifact_comments_created_by_sb_id;
 ALTER INDEX IF EXISTS idx_agent_identity_history_identity_id RENAME TO idx_agent_identity_history_sb_id;
+ALTER INDEX IF EXISTS idx_task_group_comments_created_by_identity_id RENAME TO idx_task_group_comments_created_by_sb_id;
 
 -- =====================================================================
 -- Part C: Rename FK constraints
@@ -132,17 +133,18 @@ BEGIN
      OR OLD.metadata IS DISTINCT FROM NEW.metadata
      OR OLD.soul IS DISTINCT FROM NEW.soul
      OR OLD.heartbeat IS DISTINCT FROM NEW.heartbeat
-     OR OLD.backend IS DISTINCT FROM NEW.backend THEN
+     OR OLD.backend IS DISTINCT FROM NEW.backend
+     OR OLD.permissions IS DISTINCT FROM NEW.permissions THEN
 
     INSERT INTO agent_identity_history (
       sb_id, user_id, agent_id,
       name, role, description, values, relationships, capabilities, metadata,
-      soul, heartbeat, backend,
+      soul, heartbeat, backend, permissions,
       version, created_at, archived_at, change_type
     ) VALUES (
       OLD.id, OLD.user_id, OLD.agent_id,
       OLD.name, OLD.role, OLD.description, OLD.values, OLD.relationships, OLD.capabilities, OLD.metadata,
-      OLD.soul, OLD.heartbeat, OLD.backend,
+      OLD.soul, OLD.heartbeat, OLD.backend, OLD.permissions,
       OLD.version, OLD.created_at, NOW(), 'update'
     );
 
@@ -162,12 +164,12 @@ BEGIN
   INSERT INTO agent_identity_history (
     sb_id, user_id, agent_id,
     name, role, description, values, relationships, capabilities, metadata,
-    soul, heartbeat, backend,
+    soul, heartbeat, backend, permissions,
     version, created_at, change_type
   ) VALUES (
     OLD.id, OLD.user_id, OLD.agent_id,
     OLD.name, OLD.role, OLD.description, OLD.values, OLD.relationships, OLD.capabilities, OLD.metadata,
-    OLD.soul, OLD.heartbeat, OLD.backend,
+    OLD.soul, OLD.heartbeat, OLD.backend, OLD.permissions,
     OLD.version, OLD.created_at, 'delete'
   );
 
@@ -181,6 +183,7 @@ $function$;
 -- Must DROP first because CREATE OR REPLACE cannot change return type.
 
 DROP FUNCTION IF EXISTS public.match_memories(vector, double precision, integer, uuid, text, text, text[], text, boolean, boolean);
+DROP FUNCTION IF EXISTS public.match_memory_embedding_chunks(vector, double precision, integer, uuid, text, text, text[], text, boolean, boolean);
 DROP FUNCTION IF EXISTS public.match_memory_embedding_chunks(vector, double precision, integer, uuid, text, text, text[], text, boolean, boolean, text[]);
 
 CREATE OR REPLACE FUNCTION public.match_memories(
@@ -292,6 +295,7 @@ RETURNS TABLE (
   sb_id uuid,
   matched_chunk_text text,
   matched_chunk_index integer,
+  matched_chunk_type text,
   similarity double precision
 )
 LANGUAGE sql
@@ -316,6 +320,7 @@ AS $$
       m.sb_id,
       c.chunk_text AS matched_chunk_text,
       c.chunk_index AS matched_chunk_index,
+      c.chunk_type AS matched_chunk_type,
       1 - (c.embedding <=> query_embedding) AS similarity,
       row_number() OVER (
         PARTITION BY m.id
@@ -365,6 +370,7 @@ AS $$
     sb_id,
     matched_chunk_text,
     matched_chunk_index,
+    matched_chunk_type,
     similarity
   FROM ranked_matches
   WHERE rank_within_memory = 1
