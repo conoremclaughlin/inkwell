@@ -435,7 +435,10 @@ export class SessionService implements ISessionService {
             'Read(*)',
             'WebFetch(*)',
             'WebSearch',
-            'mcp__*',
+            'mcp__inkwell__*',
+            'mcp__supabase__*',
+            'mcp__github__*',
+            'mcp__playwright__*',
           ],
         }
       : undefined;
