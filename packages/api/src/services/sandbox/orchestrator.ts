@@ -26,6 +26,7 @@ const execFileAsync = promisify(execFile);
 
 const DEFAULT_IMAGE = 'inkwell:studio-sandbox';
 const CONTAINER_HOME = '/home/sb';
+const CONTAINER_RUNNER_FILES = '/run/ink';
 const CONTAINER_LABEL = 'ink.sandbox=true';
 const CLAUDE_KEYCHAIN_SERVICE = 'Claude Code-credentials';
 
@@ -71,6 +72,14 @@ export interface SandboxStatusResult {
   image?: string;
   startedAt?: string;
   labels?: Record<string, string>;
+}
+
+/**
+ * Derive the host-side runner-files directory from a container name.
+ * Runners write temp files here; the orchestrator bind-mounts it as /run/ink.
+ */
+export function getRunnerFilesDir(containerName: string): string {
+  return join(homedir(), '.ink', 'runtime', 'sandbox', containerName, 'runner-files');
 }
 
 export function buildContainerName(request: SandboxSpinUpRequest): string {
@@ -397,6 +406,11 @@ export async function buildMounts(
   if (await fileExists(request.worktreePath)) {
     mounts.push({ source: request.worktreePath, target: '/studio', readOnly: false });
   }
+
+  // Runner temp files — runners write here on the host, visible at /run/ink inside the container
+  const runnerFilesDir = join(effectiveDir, 'runner-files');
+  await mkdir(runnerFilesDir, { recursive: true });
+  mounts.push({ source: runnerFilesDir, target: CONTAINER_RUNNER_FILES, readOnly: false });
 
   // Mount patched MCP config if it exists
   const patchedMcpPath = await patchMcpConfig(request.worktreePath, effectiveDir);

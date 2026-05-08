@@ -22,7 +22,12 @@ import type {
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
-import { buildSessionEnv, writeRuntimeSessionHint, resolveSpawnTarget } from '@inklabs/shared';
+import {
+  buildSessionEnv,
+  writeRuntimeSessionHint,
+  resolveSpawnTarget,
+  CONTAINER_RUNNER_FILES,
+} from '@inklabs/shared';
 
 /** Maximum time (ms) to wait for a Codex CLI subprocess before killing it.
  *  Override with CODEX_PROCESS_TIMEOUT_MS env var. */
@@ -55,15 +60,22 @@ export class CodexRunner implements IRunner {
       fullMessage = `${contextBlock}\n\n---\n\n${message}`;
     }
 
-    const { promptPath, cleanup } = this.createIdentityPromptTempFile(
-      config.appendSystemPrompt || config.systemPrompt || ''
+    const { promptPath, containerPath, cleanup } = this.createIdentityPromptTempFile(
+      config.appendSystemPrompt || config.systemPrompt || '',
+      config.container?.runtimeDir
     );
 
     try {
       // Only pass a session ID to buildArgs when resuming a known backend session.
       // For fresh runs, Codex assigns its own session UUID — we extract it from stdout.
       const argsSessionId = isResume ? backendSessionId! : undefined;
-      const args = this.buildArgs(argsSessionId, isResume, fullMessage, config, promptPath);
+      const args = this.buildArgs(
+        argsSessionId,
+        isResume,
+        fullMessage,
+        config,
+        containerPath || promptPath
+      );
       logger.info('Spawning Codex CLI', {
         resumeSessionId: argsSessionId || null,
         isResume,
@@ -439,20 +451,28 @@ export class CodexRunner implements IRunner {
     }
   }
 
-  private createIdentityPromptTempFile(content: string): {
+  private createIdentityPromptTempFile(
+    content: string,
+    runtimeDir?: string
+  ): {
     promptPath: string;
+    containerPath?: string;
     cleanup: () => void;
   } {
-    const dir = mkdtempSync(join(tmpdir(), 'pcp-codex-'));
-    const promptPath = join(dir, 'identity.md');
+    const dir = runtimeDir || mkdtempSync(join(tmpdir(), 'pcp-codex-'));
+    const filename = `identity-${process.pid}-${Date.now()}.md`;
+    const promptPath = join(dir, filename);
     writeFileSync(promptPath, content || 'Follow system identity instructions.');
     return {
       promptPath,
+      containerPath: runtimeDir ? `${CONTAINER_RUNNER_FILES}/${filename}` : undefined,
       cleanup: () => {
-        try {
-          rmSync(dir, { recursive: true, force: true });
-        } catch {
-          // ignore cleanup errors
+        if (!runtimeDir) {
+          try {
+            rmSync(dir, { recursive: true, force: true });
+          } catch {
+            // ignore cleanup errors
+          }
         }
       },
     };

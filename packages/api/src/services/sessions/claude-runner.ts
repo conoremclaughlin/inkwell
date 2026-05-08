@@ -24,6 +24,7 @@ import {
   buildSessionEnv,
   writeRuntimeSessionHint,
   resolveSpawnTarget,
+  CONTAINER_RUNNER_FILES,
 } from '@inklabs/shared';
 import { ensureStudioSettings, applyPermissionOverlay } from '../studio-settings.js';
 
@@ -198,6 +199,7 @@ export class ClaudeRunner implements IRunner {
             pcpSessionId: config.pcpSessionId,
             studioId: config.studioId,
             accessToken: config.pcpAccessToken,
+            outputDir: config.container?.runtimeDir,
           })
         : null;
 
@@ -231,11 +233,17 @@ export class ClaudeRunner implements IRunner {
       }
     }
 
-    // If headers were injected, patch the --mcp-config arg to point to the temp file
+    // If headers were injected, patch the --mcp-config arg to point to the temp file.
+    // When containerized, translate host path to the container-side mount point.
     if (mcpInjection?.modified) {
       const mcpIdx = args.indexOf('--mcp-config');
       if (mcpIdx !== -1 && args[mcpIdx + 1]) {
-        args[mcpIdx + 1] = mcpInjection.mcpConfigPath;
+        if (config.container?.runtimeDir) {
+          const filename = mcpInjection.mcpConfigPath.split('/').pop()!;
+          args[mcpIdx + 1] = `${CONTAINER_RUNNER_FILES}/${filename}`;
+        } else {
+          args[mcpIdx + 1] = mcpInjection.mcpConfigPath;
+        }
       }
     }
 

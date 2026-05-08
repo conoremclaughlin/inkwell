@@ -15,6 +15,9 @@
 import { spawn, type ChildProcess } from 'child_process';
 import path from 'path';
 
+/** Container-side path for runner temp files, bind-mounted from the host staging dir */
+export const CONTAINER_RUNNER_FILES = '/run/ink';
+
 // ─── Types ──────────────────────────────────────────────────────
 
 export interface ContainerTarget {

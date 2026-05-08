@@ -37,6 +37,7 @@ import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import { resolveIdentityId } from '../../auth/resolve-identity.js';
 import { classifyError } from '@inklabs/shared';
+import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -473,7 +474,12 @@ export class SessionService implements ISessionService {
       repoRoot: resolvedWorkingDirectory.replace(/--[^/]+$/, ''),
       // Route CLI execution into sandbox container when triggered by a sandboxed strategy
       ...(metadata?.sandboxContainerName
-        ? { container: { containerName: metadata.sandboxContainerName as string } }
+        ? {
+            container: {
+              containerName: metadata.sandboxContainerName,
+              runtimeDir: getRunnerFilesDir(metadata.sandboxContainerName),
+            },
+          }
         : {}),
     };
 
