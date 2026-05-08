@@ -208,6 +208,184 @@ describe('MemoryRepository', () => {
 
       expect(mockSupabase._queryBuilder.overlaps).toHaveBeenCalledWith('topics', ['work', 'ai']);
     });
+
+    it('passes semantic chunk type filters through to chunked semantic recall', async () => {
+      const semanticSpy = vi
+        .spyOn(repo as any, 'trySemanticRecallCandidates')
+        .mockResolvedValue([]);
+
+      await repo.recall('user-456', 'latest policy', {
+        recallMode: 'semantic',
+        semanticChunkTypes: ['content'],
+        applyChunkTypeBoosts: false,
+      });
+
+      expect(semanticSpy).toHaveBeenCalledWith(
+        'user-456',
+        'latest policy',
+        expect.objectContaining({
+          recallMode: 'semantic',
+          semanticChunkTypes: ['content'],
+          applyChunkTypeBoosts: false,
+        }),
+        20,
+        0,
+        ['content']
+      );
+    });
+
+    it('supports parallel semantic(content) and semantic(entity) recall plans', async () => {
+      const contentMemory = {
+        id: 'mem-content',
+        userId: 'user-456',
+        content: 'daily commute takes 35 minutes by bus',
+        source: 'observation',
+        salience: 'medium',
+        topics: [],
+        metadata: {},
+        version: 1,
+        createdAt: new Date('2026-01-26T12:00:00Z'),
+      };
+      const entityMemory = {
+        id: 'mem-entity',
+        userId: 'user-456',
+        content: 'playlist named Neon Rain',
+        source: 'observation',
+        salience: 'medium',
+        topics: [],
+        metadata: {},
+        version: 1,
+        createdAt: new Date('2026-01-25T12:00:00Z'),
+      };
+
+      const semanticSpy = vi
+        .spyOn(repo as any, 'trySemanticRecallCandidates')
+        .mockImplementation(async (_userId, _query, _options, _limit, _offset, chunkTypes) => {
+          if (Array.isArray(chunkTypes) && chunkTypes.length === 1 && chunkTypes[0] === 'content') {
+            return [
+              {
+                memory: contentMemory,
+                semanticScore: 0.9,
+                matchedChunkType: 'content',
+                semanticEvidenceCount: 1,
+                finalScore: 0.9,
+              },
+            ];
+          }
+
+          if (Array.isArray(chunkTypes) && chunkTypes.length === 1 && chunkTypes[0] === 'entity') {
+            return [
+              {
+                memory: entityMemory,
+                semanticScore: 0.85,
+                matchedChunkType: 'entity',
+                semanticEvidenceCount: 1,
+                finalScore: 0.85,
+              },
+            ];
+          }
+
+          return [];
+        });
+
+      const results = await repo.recall('user-456', 'what is relevant?', {
+        recallMode: 'semantic',
+        semanticChunkTypes: ['content', 'entity'],
+        semanticQueryStrategy: 'parallel-content-entity',
+        applyChunkTypeBoosts: false,
+      });
+
+      expect(results.map((memory) => memory.id)).toEqual(['mem-content', 'mem-entity']);
+      expect(semanticSpy).toHaveBeenCalledTimes(2);
+      expect(semanticSpy).toHaveBeenNthCalledWith(
+        1,
+        'user-456',
+        'what is relevant?',
+        expect.objectContaining({
+          semanticChunkTypes: ['content', 'entity'],
+          semanticQueryStrategy: 'parallel-content-entity',
+          applyChunkTypeBoosts: false,
+        }),
+        20,
+        0,
+        ['content']
+      );
+      expect(semanticSpy).toHaveBeenNthCalledWith(
+        2,
+        'user-456',
+        'what is relevant?',
+        expect.objectContaining({
+          semanticChunkTypes: ['content', 'entity'],
+          semanticQueryStrategy: 'parallel-content-entity',
+          applyChunkTypeBoosts: false,
+        }),
+        20,
+        0,
+        ['entity']
+      );
+    });
+
+    it('supports hybrid content-only ablations without derived semantic pass', async () => {
+      const textMemory = {
+        id: 'mem-text',
+        userId: 'user-456',
+        content: 'latest policy',
+        source: 'observation',
+        salience: 'medium',
+        topics: [],
+        metadata: {},
+        version: 1,
+        createdAt: new Date('2026-01-26T12:00:00Z'),
+      };
+
+      const semanticSpy = vi
+        .spyOn(repo as any, 'trySemanticRecallCandidates')
+        .mockImplementation(async (_userId, _query, _options, _limit, _offset, chunkTypes) => {
+          if (Array.isArray(chunkTypes) && chunkTypes.includes('content')) {
+            return [
+              {
+                memory: textMemory,
+                semanticScore: 0.8,
+                matchedChunkType: 'content',
+                finalScore: 0.8,
+              },
+            ];
+          }
+
+          return [];
+        });
+      vi.spyOn(repo as any, 'textRecallCandidates').mockResolvedValue([
+        {
+          memory: textMemory,
+          textScore: 1,
+          finalScore: 1,
+        },
+      ]);
+
+      const results = await repo.recall('user-456', 'latest policy', {
+        recallMode: 'hybrid',
+        hybridChunkStrategy: 'content-only',
+        applyChunkTypeBoosts: false,
+        applyMultiViewBoost: false,
+        applyChronologyBoost: false,
+      });
+
+      expect(results).toHaveLength(1);
+      expect(semanticSpy).toHaveBeenCalledTimes(1);
+      expect(semanticSpy).toHaveBeenCalledWith(
+        'user-456',
+        'latest policy',
+        expect.objectContaining({
+          hybridChunkStrategy: 'content-only',
+          applyChunkTypeBoosts: false,
+          applyMultiViewBoost: false,
+          applyChronologyBoost: false,
+        }),
+        expect.any(Number),
+        0,
+        ['content']
+      );
+    });
   });
 
   describe('forget', () => {
@@ -1056,22 +1234,22 @@ describe('MemoryRepository', () => {
             chunk_index: 0,
             chunk_text: 'Chunked summary',
           }),
-          expect.objectContaining({
-            memory_id: 'mem-hm-5',
-            chunk_type: 'content',
-            chunk_index: 1,
-          }),
         ]),
         expect.objectContaining({ onConflict: 'memory_id,chunk_index' })
       );
+      expect(chunkRows.some((row) => row.chunk_type === 'content')).toBe(true);
+      expect(chunkRows.some((row) => row.chunk_type === 'topic')).toBe(true);
       expect(mockSupabase._queryBuilder.update).toHaveBeenCalledWith(
         expect.objectContaining({
-          embedding_chunks_version: 1,
+          embedding_chunks_version: 2,
           embedding_chunk_count: chunkRows.length,
           metadata: expect.objectContaining({
             embedding_chunks: expect.objectContaining({
               chunkCount: chunkRows.length,
-              version: 1,
+              version: 2,
+              viewCounts: expect.objectContaining({
+                summary: 1,
+              }),
             }),
             embedding: expect.objectContaining({
               provider: 'ollama',
@@ -1344,13 +1522,25 @@ describe('MemoryRepository', () => {
             topics: ['pr:214'],
             agent_id: 'lumen',
             embedding: '[0.1,0.2,0.3]',
-            metadata: {},
+            metadata: {
+              embedding_chunks: {
+                version: 2,
+                viewCounts: {
+                  summary: 1,
+                  fact: 1,
+                  topic: 1,
+                  entity: 0,
+                  content: 1,
+                },
+              },
+            },
             version: 1,
             created_at: '2026-03-16T00:00:00Z',
             expires_at: null,
             identity_id: null,
             matched_chunk_index: 0,
             matched_chunk_text: 'Semantic memory',
+            matched_chunk_type: 'summary',
             similarity: 0.9,
           },
         ],
@@ -1488,6 +1678,186 @@ describe('MemoryRepository', () => {
 
       expect(rpc).not.toHaveBeenCalled();
       expect(results).toEqual([]);
+    });
+
+    it('hybrid recall queries derived and raw chunk views separately', async () => {
+      const rpc = vi
+        .fn()
+        .mockResolvedValueOnce({
+          data: [
+            {
+              id: 'mem-derived-1',
+              user_id: 'user-456',
+              content: 'Current policy override note',
+              summary: 'Current policy override note',
+              topic_key: 'policy:wound-care',
+              source: 'observation',
+              salience: 'high',
+              topics: ['policy:wound-care'],
+              agent_id: 'lumen',
+              embedding: '[0.1,0.2,0.3]',
+              metadata: {},
+              version: 1,
+              created_at: '2026-03-16T00:00:00Z',
+              expires_at: null,
+              identity_id: null,
+              matched_chunk_index: 1,
+              matched_chunk_text: 'Current policy override note',
+              matched_chunk_type: 'fact',
+              similarity: 0.88,
+            },
+          ],
+          error: null,
+        })
+        .mockResolvedValueOnce({
+          data: [
+            {
+              id: 'mem-derived-1',
+              user_id: 'user-456',
+              content: 'Current policy override note',
+              summary: 'Current policy override note',
+              topic_key: 'policy:wound-care',
+              source: 'observation',
+              salience: 'high',
+              topics: ['policy:wound-care'],
+              agent_id: 'lumen',
+              embedding: '[0.1,0.2,0.3]',
+              metadata: {},
+              version: 1,
+              created_at: '2026-03-16T00:00:00Z',
+              expires_at: null,
+              identity_id: null,
+              matched_chunk_index: 4,
+              matched_chunk_text: 'Current policy override note',
+              matched_chunk_type: 'content',
+              similarity: 0.81,
+            },
+          ],
+          error: null,
+        });
+
+      (mockSupabase as any).rpc = rpc;
+      (repo as any).embeddingRouter = {
+        embedQuery: vi.fn().mockResolvedValue({
+          vector: [0.1, 0.2, 0.3],
+          provider: 'openai',
+          model: 'text-embedding-3-small',
+          dimensions: 1024,
+        }),
+        getRuntimeConfig: vi.fn().mockReturnValue({
+          enabled: true,
+          provider: 'openai',
+          model: 'text-embedding-3-small',
+          dimensions: 1024,
+          queryThreshold: 0.2,
+          matchCountMultiplier: 5,
+          ollamaBaseUrl: 'http://localhost:11434',
+          openaiBaseUrl: 'https://api.openai.com',
+          hasOpenAIKey: true,
+        }),
+      };
+      (repo as any).textRecallCandidates = vi.fn().mockResolvedValue([]);
+
+      const results = await repo.recall('user-456', 'current override policy', {
+        recallMode: 'hybrid',
+        hybridChunkStrategy: 'multi-view',
+      });
+
+      expect(rpc).toHaveBeenNthCalledWith(
+        1,
+        'match_memory_embedding_chunks',
+        expect.objectContaining({
+          p_chunk_types: ['summary', 'fact', 'topic', 'entity', 'current_state'],
+        })
+      );
+      expect(rpc).toHaveBeenNthCalledWith(
+        2,
+        'match_memory_embedding_chunks',
+        expect.objectContaining({
+          p_chunk_types: ['content'],
+        })
+      );
+      expect(results).toHaveLength(1);
+      expect(results[0].id).toBe('mem-derived-1');
+    });
+
+    it('chronology-aware reranking prefers newer override memories for current-policy queries', async () => {
+      const olderMemory = {
+        id: 'mem-old',
+        userId: 'user-456',
+        content: 'Wound-care escalation policy. Notify the old triage lead on call.',
+        summary: 'Old escalation policy',
+        topicKey: 'policy:wound-care',
+        source: 'observation',
+        salience: 'high',
+        topics: ['policy:wound-care'],
+        metadata: {},
+        version: 1,
+        createdAt: new Date('2026-03-01T00:00:00Z'),
+      };
+      const newerMemory = {
+        id: 'mem-new',
+        userId: 'user-456',
+        content:
+          'Current wound-care escalation policy now uses the inpatient lead and overrides the previous protocol.',
+        summary: 'Current escalation policy overrides previous protocol',
+        topicKey: 'policy:wound-care',
+        source: 'observation',
+        salience: 'high',
+        topics: ['policy:wound-care'],
+        metadata: {},
+        version: 1,
+        createdAt: new Date('2026-03-20T00:00:00Z'),
+      };
+
+      (repo as any).trySemanticRecallCandidates = vi
+        .fn()
+        .mockResolvedValueOnce([
+          {
+            memory: olderMemory,
+            semanticScore: 0.95,
+            matchedChunkType: 'summary',
+            finalScore: 0.95,
+          },
+          {
+            memory: newerMemory,
+            semanticScore: 0.9,
+            matchedChunkType: 'fact',
+            finalScore: 0.9,
+          },
+        ])
+        .mockResolvedValueOnce([
+          {
+            memory: olderMemory,
+            semanticScore: 0.9,
+            matchedChunkType: 'content',
+            finalScore: 0.9,
+          },
+          {
+            memory: newerMemory,
+            semanticScore: 0.88,
+            matchedChunkType: 'content',
+            finalScore: 0.88,
+          },
+        ]);
+      (repo as any).textRecallCandidates = vi.fn().mockResolvedValue([]);
+      (repo as any).embeddingRouter = {
+        getRuntimeConfig: vi.fn().mockReturnValue({
+          matchCountMultiplier: 5,
+        }),
+      };
+
+      const results = await (repo as any).hybridRecall(
+        'user-456',
+        'what is the current wound-care policy override',
+        { hybridChunkStrategy: 'multi-view' },
+        5,
+        0
+      );
+
+      expect(results).toHaveLength(2);
+      expect(results[0].id).toBe('mem-new');
+      expect(results[1].id).toBe('mem-old');
     });
   });
 
