@@ -452,6 +452,10 @@ export class SessionService implements ISessionService {
       ...(sandboxBypass ? { sandboxBypass: true } : {}),
       // Propagate repo root so spawned backend's context token carries it
       repoRoot: resolvedWorkingDirectory.replace(/--[^/]+$/, ''),
+      // Route CLI execution into sandbox container when triggered by a sandboxed strategy
+      ...(metadata?.sandboxContainerName
+        ? { container: { containerName: metadata.sandboxContainerName as string } }
+        : {}),
     };
 
     // 5. Run with selected backend

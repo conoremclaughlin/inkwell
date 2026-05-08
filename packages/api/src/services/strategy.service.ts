@@ -257,7 +257,15 @@ export class StrategyService {
 
     // Trigger the owner agent in the assigned studio. The trigger spawns
     // (or resumes) a session in the target studio so work actually begins.
-    const triggered = await this.triggerOwnerAgent(updated, nextTask, 'strategy_kickoff');
+    // Pass the sandbox container name so the triggered session routes
+    // CLI execution into the container.
+    const sandboxContainer = sandboxResult?.success ? sandboxResult.containerName : undefined;
+    const triggered = await this.triggerOwnerAgent(
+      updated,
+      nextTask,
+      'strategy_kickoff',
+      sandboxContainer
+    );
 
     // Log strategy start
     await this.logStrategyEvent(
@@ -804,7 +812,8 @@ export class StrategyService {
   private async triggerOwnerAgent(
     group: TaskGroup,
     task: ProjectTask,
-    reason: 'strategy_kickoff' | 'watchdog' | 'manual_resume'
+    reason: 'strategy_kickoff' | 'watchdog' | 'manual_resume',
+    sandboxContainerName?: string
   ): Promise<boolean> {
     if (!group.owner_agent_id) {
       logger.warn(
@@ -850,6 +859,7 @@ export class StrategyService {
             groupId: group.id,
             taskId: task.id,
             strategy: group.strategy,
+            ...(sandboxContainerName ? { sandboxContainerName } : {}),
           },
         },
         this.dataComposer
