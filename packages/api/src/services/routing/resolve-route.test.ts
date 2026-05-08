@@ -7,7 +7,7 @@ function createMockSupabase(
     id: string;
     platform_account_id: string | null;
     chat_id: string | null;
-    identity_id: string;
+    sb_id: string;
     agent_identities: { agent_id: string };
   }>
 ) {
@@ -57,7 +57,7 @@ describe('resolveRouteAgentId', () => {
         id: 'route-1',
         platform_account_id: null,
         chat_id: null,
-        identity_id: 'id-1',
+        sb_id: 'id-1',
         agent_identities: { agent_id: 'myra' },
       },
     ];
@@ -66,7 +66,7 @@ describe('resolveRouteAgentId', () => {
 
     expect(result).toEqual({
       agentId: 'myra',
-      identityId: 'id-1',
+      sbId: 'id-1',
       routeId: 'route-1',
       studioHint: null,
       activeSessionId: null,
@@ -79,14 +79,14 @@ describe('resolveRouteAgentId', () => {
         id: 'route-platform',
         platform_account_id: null,
         chat_id: null,
-        identity_id: 'id-myra',
+        sb_id: 'id-myra',
         agent_identities: { agent_id: 'myra' },
       },
       {
         id: 'route-account',
         platform_account_id: 'myra_help_bot',
         chat_id: null,
-        identity_id: 'id-benson',
+        sb_id: 'id-benson',
         agent_identities: { agent_id: 'benson' },
       },
     ];
@@ -103,14 +103,14 @@ describe('resolveRouteAgentId', () => {
         id: 'route-account',
         platform_account_id: 'myra_help_bot',
         chat_id: null,
-        identity_id: 'id-myra',
+        sb_id: 'id-myra',
         agent_identities: { agent_id: 'myra' },
       },
       {
         id: 'route-chat',
         platform_account_id: 'myra_help_bot',
         chat_id: 'chat-123',
-        identity_id: 'id-wren',
+        sb_id: 'id-wren',
         agent_identities: { agent_id: 'wren' },
       },
     ];
@@ -133,14 +133,14 @@ describe('resolveRouteAgentId', () => {
         id: 'route-other-bot',
         platform_account_id: 'other_bot',
         chat_id: null,
-        identity_id: 'id-benson',
+        sb_id: 'id-benson',
         agent_identities: { agent_id: 'benson' },
       },
       {
         id: 'route-platform',
         platform_account_id: null,
         chat_id: null,
-        identity_id: 'id-myra',
+        sb_id: 'id-myra',
         agent_identities: { agent_id: 'myra' },
       },
     ];
@@ -158,14 +158,14 @@ describe('resolveRouteAgentId', () => {
         id: 'route-chat-specific',
         platform_account_id: null,
         chat_id: 'chat-999',
-        identity_id: 'id-wren',
+        sb_id: 'id-wren',
         agent_identities: { agent_id: 'wren' },
       },
       {
         id: 'route-platform',
         platform_account_id: null,
         chat_id: null,
-        identity_id: 'id-myra',
+        sb_id: 'id-myra',
         agent_identities: { agent_id: 'myra' },
       },
     ];

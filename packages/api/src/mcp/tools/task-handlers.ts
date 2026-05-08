@@ -700,7 +700,7 @@ export async function handleAddTaskComment(
     const reqCtx = getRequestContext();
     const workspaceId = reqCtx?.workspaceId;
 
-    const identityId = await resolveIdentityIdForAgent(
+    const sbId = await resolveIdentityIdForAgent(
       dataComposer,
       resolved.user.id,
       agentId,
@@ -716,7 +716,7 @@ export async function handleAddTaskComment(
         content: args.content.trim(),
         parent_comment_id: args.parentCommentId || null,
         created_by_agent_id: agentId || null,
-        created_by_identity_id: identityId,
+        created_by_sb_id: sbId,
       } as never)
       .select()
       .single();
@@ -833,7 +833,7 @@ export async function handleAddTaskGroupComment(
         content: args.content.trim(),
         comment_type: args.commentType || 'comment',
         agent_id: agentId || null,
-        created_by_identity_id: identityId,
+        created_by_sb_id: identityId,
       } as never)
       .select()
       .single();
@@ -1075,7 +1075,7 @@ export async function handleCloseTaskGroup(
         content: autoConclusion,
         comment_type: 'conclusion',
         agent_id: agentId || null,
-        created_by_identity_id: identityId,
+        created_by_sb_id: identityId,
       } as never);
 
     if (commentError) {
@@ -1188,7 +1188,7 @@ export async function handleCreateTaskGroup(
 
     const agentId = getEffectiveAgentId(args.agentId);
     const reqCtx = getRequestContext();
-    const identityId = await resolveIdentityIdForAgent(
+    const sbId = await resolveIdentityIdForAgent(
       dataComposer,
       resolved.user.id,
       agentId,
@@ -1197,7 +1197,7 @@ export async function handleCreateTaskGroup(
 
     const group = await dataComposer.repositories.taskGroups.create({
       user_id: resolved.user.id,
-      identity_id: identityId,
+      sb_id: sbId,
       project_id: args.projectId ?? null,
       title: args.title,
       description: args.description,
@@ -1223,7 +1223,7 @@ export async function handleCreateTaskGroup(
         priority: group.priority,
         tags: group.tags,
         projectId: group.project_id,
-        identityId: group.identity_id,
+        sbId: group.sb_id,
         agentId: agentId || null,
         autonomous: group.autonomous,
         maxSessions: group.max_sessions,
@@ -1288,7 +1288,7 @@ export const updateTaskGroupSchema = z.object({
     .nullable()
     .optional()
     .describe('Agent slug owning this group (e.g. "wren"). Pass null to clear.'),
-  identityId: z
+  sbId: z
     .string()
     .uuid()
     .nullable()
@@ -1338,21 +1338,21 @@ export async function handleUpdateTaskGroup(
       nextMetadata = base;
     }
 
-    // Security: service-role DB access bypasses RLS, so a direct `identityId`
+    // Security: service-role DB access bypasses RLS, so a direct `sbId`
     // must be validated against the caller's user (and workspace, when known)
     // before it's written. Without this, any caller who knows another
     // agent_identities.id could rebind a task group across workspace boundaries.
     // `undefined` means "don't touch"; `null` means "explicitly detach" and is
     // allowed without a lookup.
-    let nextIdentityId: string | null | undefined = args.identityId;
-    if (typeof args.identityId === 'string') {
+    let nextSbId: string | null | undefined = args.sbId;
+    if (typeof args.sbId === 'string') {
       const reqCtx = getRequestContext();
       const workspaceId = reqCtx?.workspaceId;
       let q = dataComposer
         .getClient()
         .from('agent_identities')
         .select('id')
-        .eq('id', args.identityId)
+        .eq('id', args.sbId)
         .eq('user_id', resolved.user.id);
       if (workspaceId) {
         q = q.eq('workspace_id', workspaceId);
@@ -1362,12 +1362,12 @@ export async function handleUpdateTaskGroup(
         return mcpResponse(
           {
             success: false,
-            error: 'identityId not found or does not belong to this user/workspace.',
+            error: 'sbId not found or does not belong to this user/workspace.',
           },
           true
         );
       }
-      nextIdentityId = args.identityId;
+      nextSbId = args.sbId;
     }
 
     const updated = await dataComposer.repositories.taskGroups.update(args.groupId, {
@@ -1382,7 +1382,7 @@ export async function handleUpdateTaskGroup(
       output_status: args.outputStatus,
       thread_key: args.threadKey,
       owner_agent_id: args.ownerAgentId,
-      identity_id: nextIdentityId,
+      sb_id: nextSbId,
       autonomous: args.autonomous,
       max_sessions: args.maxSessions,
     });
@@ -1398,7 +1398,7 @@ export async function handleUpdateTaskGroup(
         tags: updated.tags,
         metadata: updated.metadata,
         projectId: updated.project_id,
-        identityId: updated.identity_id,
+        sbId: updated.sb_id,
         ownerAgentId: updated.owner_agent_id,
         autonomous: updated.autonomous,
         maxSessions: updated.max_sessions,
@@ -1431,7 +1431,7 @@ export const listTaskGroupsSchema = z.object({
       'Filter by one or more statuses: active, paused, completed, cancelled. Omit or pass empty array to include all statuses.'
     ),
   projectId: z.string().uuid().optional().describe('Filter by project'),
-  identityId: z.string().uuid().optional().describe('Filter by agent identity UUID'),
+  sbId: z.string().uuid().optional().describe('Filter by agent identity UUID'),
   ownerAgentId: z
     .string()
     .max(64)
@@ -1462,7 +1462,7 @@ export async function handleListTaskGroups(
     const groups = await dataComposer.repositories.taskGroups.listByUser(resolved.user.id, {
       status: statuses,
       projectId: args.projectId,
-      identityId: args.identityId,
+      sbId: args.sbId,
       ownerAgentId: args.ownerAgentId,
       autonomousOnly: args.autonomousOnly,
       limit: args.limit,
@@ -1482,14 +1482,14 @@ export async function handleListTaskGroups(
     );
     const projectMap = new Map(projects.filter(Boolean).map((p) => [p!.id, p!.name]));
 
-    const identityIds = [...new Set(groups.map((g) => g.identity_id).filter(Boolean))] as string[];
+    const sbIds = [...new Set(groups.map((g) => g.sb_id).filter(Boolean))] as string[];
     const identityMap = new Map<string, { agentId: string; name: string | null }>();
-    if (identityIds.length > 0) {
+    if (sbIds.length > 0) {
       const { data: identities } = await dataComposer
         .getClient()
         .from('agent_identities')
         .select('id, agent_id, name')
-        .in('id', identityIds);
+        .in('id', sbIds);
       for (const row of (identities || []) as Array<{
         id: string;
         agent_id: string;
@@ -1510,9 +1510,9 @@ export async function handleListTaskGroups(
         tags: g.tags,
         projectId: g.project_id,
         projectName: g.project_id ? projectMap.get(g.project_id) || null : null,
-        identityId: g.identity_id,
-        agentId: g.identity_id ? identityMap.get(g.identity_id)?.agentId || null : null,
-        agentName: g.identity_id ? identityMap.get(g.identity_id)?.name || null : null,
+        sbId: g.sb_id,
+        agentId: g.sb_id ? identityMap.get(g.sb_id)?.agentId || null : null,
+        agentName: g.sb_id ? identityMap.get(g.sb_id)?.name || null : null,
         ownerAgentId: g.owner_agent_id,
         autonomous: g.autonomous,
         maxSessions: g.max_sessions,

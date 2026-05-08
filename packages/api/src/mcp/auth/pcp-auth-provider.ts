@@ -286,7 +286,7 @@ export class PcpAuthProvider {
     }
 
     // Resolve canonical identity UUID when agent_id is provided
-    let identityId: string | undefined;
+    let sbId: string | undefined;
     if (codeData.agentId) {
       const { data: identity } = await this.supabase
         .from('agent_identities')
@@ -294,8 +294,8 @@ export class PcpAuthProvider {
         .eq('user_id', codeData.userId)
         .eq('agent_id', codeData.agentId)
         .maybeSingle();
-      identityId = identity?.id;
-      if (!identityId) {
+      sbId = identity?.id;
+      if (!sbId) {
         logger.warn('No agent_identities record found for token binding', {
           userId: codeData.userId,
           agentId: codeData.agentId,
@@ -314,7 +314,7 @@ export class PcpAuthProvider {
         ['mcp:tools'],
         REFRESH_TOKEN_LIFETIME_DAYS,
         codeData.agentId,
-        identityId
+        sbId
       );
       refreshToken = result.refreshToken;
       expiresAt = result.expiresAt;
@@ -333,7 +333,7 @@ export class PcpAuthProvider {
         email: codeData.userEmail,
         scope: 'mcp:tools',
         ...(codeData.agentId ? { agentId: codeData.agentId } : {}),
-        ...(identityId ? { identityId } : {}),
+        ...(sbId ? { identityId: sbId } : {}),
       },
       ACCESS_TOKEN_LIFETIME_SECONDS
     );
@@ -343,7 +343,7 @@ export class PcpAuthProvider {
       email: codeData.userEmail,
       clientId,
       agentId: codeData.agentId || 'none',
-      identityId: identityId || 'none',
+      sbId: sbId || 'none',
       refreshTokenExpires: expiresAt.toISOString(),
     });
 
@@ -396,7 +396,7 @@ export class PcpAuthProvider {
 
   verifyAccessToken(
     authHeader: string | undefined
-  ): { userId: string; email: string; agentId?: string; identityId?: string } | null {
+  ): { userId: string; email: string; agentId?: string; sbId?: string } | null {
     if (!authHeader?.startsWith('Bearer ')) return null;
     const token = authHeader.substring(7);
 
@@ -407,7 +407,11 @@ export class PcpAuthProvider {
       userId: payload.sub,
       email: payload.email,
       ...(payload.agentId ? { agentId: payload.agentId } : {}),
-      ...(payload.identityId ? { identityId: payload.identityId } : {}),
+      ...(payload.sbId
+        ? { sbId: payload.sbId }
+        : payload.identityId
+          ? { sbId: payload.identityId }
+          : {}),
     };
   }
 

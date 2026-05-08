@@ -50,7 +50,7 @@ export interface Session {
   id: string;
   userId: string;
   agentId: string;
-  identityId?: string;
+  sbId?: string;
   /** Studio/worktree scope for this session */
   studioId?: string;
   /** Contact scope for per-sender session isolation */

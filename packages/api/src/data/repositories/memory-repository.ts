@@ -196,7 +196,7 @@ export class MemoryRepository {
    * Create a new memory
    */
   async remember(input: MemoryCreateInput): Promise<Memory> {
-    const identityId =
+    const sbId =
       input.agentId && input.userId
         ? await resolveIdentityId(this.supabase, input.userId, input.agentId)
         : null;
@@ -221,7 +221,7 @@ export class MemoryRepository {
         expires_at: input.expiresAt?.toISOString(),
         agent_id: input.agentId || null,
         contact_id: input.contactId || null,
-        identity_id: identityId,
+        sb_id: sbId,
       })
       .select()
       .single();
@@ -991,7 +991,7 @@ export class MemoryRepository {
    * Start a new session
    */
   async startSession(input: SessionCreateInput): Promise<Session> {
-    const identityId =
+    const sbId =
       input.agentId && input.userId
         ? await resolveIdentityId(this.supabase, input.userId, input.agentId)
         : null;
@@ -1000,7 +1000,7 @@ export class MemoryRepository {
       ...(input.id ? { id: input.id } : {}),
       user_id: input.userId,
       agent_id: input.agentId,
-      identity_id: identityId,
+      sb_id: sbId,
       metadata: input.metadata || {},
     };
     if (input.backend) insertData.backend = input.backend;

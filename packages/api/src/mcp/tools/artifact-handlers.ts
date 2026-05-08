@@ -341,7 +341,7 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
       uri,
       user_id: resolved.user.id,
       workspace_id: workspaceScope,
-      created_by_identity_id: authorIdentity?.id || null,
+      created_by_sb_id: authorIdentity?.id || null,
       title,
       content,
       artifact_type: artifactType,
@@ -367,7 +367,7 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
     version: 1,
     title,
     content,
-    changed_by_identity_id: authorIdentity?.id || null,
+    changed_by_sb_id: authorIdentity?.id || null,
     changed_by_user_id: agentId ? null : resolved.user.id,
     change_type: 'create',
     change_summary: 'Initial creation',
@@ -444,7 +444,7 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
       username: string | null;
       email: string | null;
     } | null;
-    createdByIdentityId: string | null;
+    createdBySbId: string | null;
     createdByIdentity: { id: string; agentId: string; name: string; backend: string | null } | null;
     createdAt: string | null;
     updatedAt: string | null;
@@ -464,8 +464,8 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
       throw new Error(`Failed to get artifact comments: ${commentsError.message}`);
     }
 
-    const identityIds = Array.from(
-      new Set((commentRows || []).map((c) => c.created_by_identity_id).filter(Boolean) as string[])
+    const sbIds = Array.from(
+      new Set((commentRows || []).map((c) => c.created_by_sb_id).filter(Boolean) as string[])
     );
     const commentAuthorUserIds = Array.from(
       new Set(
@@ -480,11 +480,11 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
       { id: string; agent_id: string; name: string; backend: string | null }
     >();
     let commentUsersById = new Map<string, ArtifactCommentAuthorUser>();
-    if (identityIds.length > 0) {
+    if (sbIds.length > 0) {
       const { data: identities, error: identitiesError } = await supabase
         .from('agent_identities')
         .select('id, agent_id, name, backend')
-        .in('id', identityIds);
+        .in('id', sbIds);
 
       if (identitiesError) {
         throw new Error(
@@ -511,8 +511,8 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
     }
 
     comments = (commentRows || []).map((comment) => {
-      const identity = comment.created_by_identity_id
-        ? (identitiesById.get(comment.created_by_identity_id) ?? null)
+      const identity = comment.created_by_sb_id
+        ? (identitiesById.get(comment.created_by_sb_id) ?? null)
         : null;
       const commentAuthorUserId = comment.created_by_user_id || comment.user_id || null;
       const commentAuthorUser = commentAuthorUserId
@@ -534,7 +534,7 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
               email: commentAuthorUser.email,
             }
           : null,
-        createdByIdentityId: comment.created_by_identity_id,
+        createdBySbId: comment.created_by_sb_id,
         createdByIdentity: identity
           ? {
               id: identity.id,
@@ -562,7 +562,7 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
             content: artifact.content,
             contentType: artifact.content_type,
             artifactType: artifact.artifact_type,
-            createdByIdentityId: artifact.created_by_identity_id,
+            createdBySbId: artifact.created_by_sb_id,
             collaborators: artifact.collaborators,
             editMode: normalizeEditMode(artifact.edit_mode),
             editors: artifact.collaborators || [],
@@ -637,7 +637,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     const currentEditMode = normalizeEditMode(current.edit_mode);
     const currentEditors = current.collaborators || [];
     const editorIdentityId = editorIdentity?.id || null;
-    const isCreator = editorIdentity && current.created_by_identity_id === editorIdentity.id;
+    const isCreator = editorIdentity && current.created_by_sb_id === editorIdentity.id;
     const hasEditorAccess =
       currentEditMode === 'workspace' ||
       (!!editorIdentityId && currentEditors.includes(editorIdentityId)) ||
@@ -829,7 +829,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     version: newVersion,
     title: updated.title,
     content: updated.content,
-    changed_by_identity_id: editorIdentity?.id || null,
+    changed_by_sb_id: editorIdentity?.id || null,
     changed_by_user_id: agentId ? null : resolved.user.id,
     change_type: changeType,
     change_summary: mergeSummary,
@@ -969,7 +969,7 @@ export async function handleGetArtifactHistory(args: unknown, dataComposer: Data
             id: h.id,
             version: h.version,
             title: h.title,
-            changedByIdentityId: h.changed_by_identity_id,
+            changedBySbId: h.changed_by_sb_id,
             changedByUserId: h.changed_by_user_id,
             changeType: h.change_type,
             changeSummary: h.change_summary,
@@ -1048,7 +1048,7 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
       user_id: resolved.user.id,
       created_by_user_id: resolved.user.id,
       workspace_id: workspaceScope,
-      created_by_identity_id: authorIdentity?.id || null,
+      created_by_sb_id: authorIdentity?.id || null,
       parent_comment_id: parentCommentId || null,
       content: trimmed,
       metadata: metadata as Json,
@@ -1064,7 +1064,7 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
     artifactId: artifact.id,
     commentId: created.id,
     agentId: effectiveAgentId || null,
-    identityId: authorIdentity?.id || null,
+    sbId: authorIdentity?.id || null,
   });
 
   return {
@@ -1088,7 +1088,7 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
               username: resolved.user.username,
               email: resolved.user.email,
             },
-            createdByIdentityId: created.created_by_identity_id,
+            createdBySbId: created.created_by_sb_id,
             createdByIdentity: authorIdentity
               ? {
                   id: authorIdentity.id,
@@ -1139,8 +1139,8 @@ export async function handleListArtifactComments(args: unknown, dataComposer: Da
     throw new Error(`Failed to list artifact comments: ${error.message}`);
   }
 
-  const identityIds = Array.from(
-    new Set((comments || []).map((c) => c.created_by_identity_id).filter(Boolean) as string[])
+  const sbIds = Array.from(
+    new Set((comments || []).map((c) => c.created_by_sb_id).filter(Boolean) as string[])
   );
   const commentAuthorUserIds = Array.from(
     new Set(
@@ -1155,11 +1155,11 @@ export async function handleListArtifactComments(args: unknown, dataComposer: Da
     { id: string; agent_id: string; name: string; backend: string | null }
   >();
   let commentUsersById = new Map<string, ArtifactCommentAuthorUser>();
-  if (identityIds.length > 0) {
+  if (sbIds.length > 0) {
     let identitiesQuery = supabase
       .from('agent_identities')
       .select('id, agent_id, name, backend')
-      .in('id', identityIds);
+      .in('id', sbIds);
     identitiesQuery = withWorkspaceFilter(identitiesQuery, workspaceId);
     const { data: identities, error: identitiesError } = await identitiesQuery;
 
@@ -1195,8 +1195,8 @@ export async function handleListArtifactComments(args: unknown, dataComposer: Da
           artifactUri: artifact.uri,
           count: comments?.length || 0,
           comments: (comments || []).map((comment) => {
-            const identity = comment.created_by_identity_id
-              ? (identitiesById.get(comment.created_by_identity_id) ?? null)
+            const identity = comment.created_by_sb_id
+              ? (identitiesById.get(comment.created_by_sb_id) ?? null)
               : null;
             const commentAuthorUserId = comment.created_by_user_id || comment.user_id || null;
             const commentAuthorUser = commentAuthorUserId
@@ -1218,7 +1218,7 @@ export async function handleListArtifactComments(args: unknown, dataComposer: Da
                     email: commentAuthorUser.email,
                   }
                 : null,
-              createdByIdentityId: comment.created_by_identity_id,
+              createdBySbId: comment.created_by_sb_id,
               createdByIdentity: identity
                 ? {
                     id: identity.id,
@@ -1276,7 +1276,7 @@ export const artifactToolDefinitions = [
   {
     name: 'add_artifact_comment',
     description:
-      'Add a comment to an artifact without modifying artifact content. Uses identity_id UUID as canonical author reference.',
+      'Add a comment to an artifact without modifying artifact content. Uses sb_id UUID as canonical author reference.',
     schema: addArtifactCommentSchema,
     handler: handleAddArtifactComment,
   },

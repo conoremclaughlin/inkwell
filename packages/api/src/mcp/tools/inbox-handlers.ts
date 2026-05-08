@@ -714,12 +714,8 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   };
 
   // Resolve canonical identity UUIDs for sender and recipient
-  const recipientIdentityId = await resolveIdentityId(
-    supabase,
-    resolved.user.id,
-    recipientAgentId!
-  );
-  const senderIdentityId = senderAgentId
+  const recipientSbId = await resolveIdentityId(supabase, resolved.user.id, recipientAgentId!);
+  const senderSbId = senderAgentId
     ? await resolveIdentityId(supabase, resolved.user.id, senderAgentId)
     : null;
 
@@ -728,10 +724,10 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     .insert({
       recipient_user_id: resolved.user.id,
       recipient_agent_id: recipientAgentId!,
-      recipient_identity_id: recipientIdentityId,
+      recipient_sb_id: recipientSbId,
       sender_user_id: senderAgentId ? null : resolved.user.id,
       sender_agent_id: senderAgentId || null,
-      sender_identity_id: senderIdentityId,
+      sender_sb_id: senderSbId,
       subject,
       content,
       message_type: messageType,

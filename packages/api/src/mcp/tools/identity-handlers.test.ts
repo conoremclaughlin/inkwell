@@ -571,7 +571,7 @@ describe('Identity Handlers', () => {
       const mockHistory = [
         {
           id: 'history-1',
-          identity_id: 'identity-123',
+          sb_id: 'identity-123',
           version: 1,
           name: 'Wren v1',
           role: 'Development collaborator',
@@ -621,7 +621,7 @@ describe('Identity Handlers', () => {
       const mockHistory = [
         {
           id: 'history-1',
-          identity_id: 'identity-123',
+          sb_id: 'identity-123',
           version: 2,
           name: 'Wren v2',
           role: 'Development collaborator',
@@ -638,7 +638,7 @@ describe('Identity Handlers', () => {
         },
         {
           id: 'history-2',
-          identity_id: 'identity-123',
+          sb_id: 'identity-123',
           version: 1,
           name: 'Wren v1',
           role: 'Development collaborator',

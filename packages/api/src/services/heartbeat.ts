@@ -27,7 +27,7 @@ export interface DueReminder {
   description: string | null;
   delivery_channel: string;
   delivery_target: string | null;
-  identity_id: string | null;
+  sb_id: string | null;
   cron_expression: string | null;
   next_run_at: string;
   run_count: number;
@@ -318,7 +318,7 @@ export async function createReminder(params: {
   cronExpression?: string;
   runAt?: Date;
   maxRuns?: number;
-  identityId?: string;
+  sbId?: string;
   studioHint?: string;
   metadata?: Json;
 }): Promise<{ id: string } | null> {
@@ -346,7 +346,7 @@ export async function createReminder(params: {
       cron_expression: params.cronExpression || null,
       next_run_at: nextRunAt.toISOString(),
       max_runs: params.maxRuns || null,
-      identity_id: params.identityId || null,
+      sb_id: params.sbId || null,
       studio_hint: params.studioHint || null,
       metadata: params.metadata ?? {},
     })
@@ -369,7 +369,7 @@ export async function createReminder(params: {
  */
 export async function ensureDefaultReminders(params: {
   userId: string;
-  identityId: string;
+  sbId: string;
   agentId: string;
   deliveryChannel?: string;
   deliveryTarget?: string;
@@ -417,14 +417,14 @@ export async function ensureDefaultReminders(params: {
       .from('scheduled_reminders')
       .select('id')
       .eq('user_id', params.userId)
-      .eq('identity_id', params.identityId)
+      .eq('sb_id', params.sbId)
       .in('status', ['active', 'paused'])
       .filter('metadata->>reminderType', 'eq', 'daily-checkin')
       .limit(1);
 
     if (existing && existing.length > 0) {
       logger.debug('ensureDefaultReminders: daily-checkin already exists, skipping', {
-        identityId: params.identityId,
+        sbId: params.sbId,
         existingReminderId: existing[0].id,
       });
       return;
@@ -437,14 +437,14 @@ export async function ensureDefaultReminders(params: {
       deliveryChannel,
       deliveryTarget,
       cronExpression: '0 9 * * *',
-      identityId: params.identityId,
+      sbId: params.sbId,
       metadata: { autoCreated: true, reminderType: 'daily-checkin' },
     });
 
     if (result) {
       logger.info('ensureDefaultReminders: created daily check-in', {
         reminderId: result.id,
-        identityId: params.identityId,
+        sbId: params.sbId,
         agentId: params.agentId,
       });
     }
@@ -452,7 +452,7 @@ export async function ensureDefaultReminders(params: {
     logger.error('ensureDefaultReminders: failed (non-fatal)', {
       error: error instanceof Error ? error.message : error,
       userId: params.userId,
-      identityId: params.identityId,
+      sbId: params.sbId,
     });
   }
 }

@@ -29,8 +29,9 @@ const DEFAULT_DENY_RULES: string[] = [
 
 /**
  * Default allow rules — broad permissions for automated development work.
- * Matches the CLI's `ink permissions auto` defaults plus mcp__* for all MCP
- * servers (not just inkwell/github/supabase individually).
+ * Each MCP server is listed explicitly because Claude Code does not support
+ * cross-server wildcards like `mcp__*` — only server-scoped patterns
+ * (e.g. `mcp__inkwell__*`) are matched by the permission engine.
  */
 const DEFAULT_ALLOW_RULES: string[] = [
   'Bash(*)',
@@ -39,7 +40,10 @@ const DEFAULT_ALLOW_RULES: string[] = [
   'Read(*)',
   'WebFetch(*)',
   'WebSearch',
-  'mcp__*',
+  'mcp__inkwell__*',
+  'mcp__supabase__*',
+  'mcp__github__*',
+  'mcp__playwright__*',
 ];
 
 interface ClaudeSettings {

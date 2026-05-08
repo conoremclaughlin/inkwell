@@ -2,7 +2,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { resolveAgentFromMention } from './resolve-mention';
 
 // Mock Supabase client
-function createMockSupabase(identities: Array<{ id: string; agent_id: string; name: string | null }>) {
+function createMockSupabase(
+  identities: Array<{ id: string; agent_id: string; name: string | null }>
+) {
   return {
     from: vi.fn().mockReturnValue({
       select: vi.fn().mockReturnValue({
@@ -38,25 +40,25 @@ describe('resolveAgentFromMention', () => {
   it('matches by mentioned username against agent_id', async () => {
     const supabase = createMockSupabase(TEST_IDENTITIES);
     const result = await resolveAgentFromMention(supabase, 'user-1', 'hello', ['wren']);
-    expect(result).toEqual({ agentId: 'wren', identityId: 'id-wren' });
+    expect(result).toEqual({ agentId: 'wren', sbId: 'id-wren' });
   });
 
   it('matches by mentioned username against name', async () => {
     const supabase = createMockSupabase(TEST_IDENTITIES);
     const result = await resolveAgentFromMention(supabase, 'user-1', 'hello', ['Myra']);
-    expect(result).toEqual({ agentId: 'myra', identityId: 'id-myra' });
+    expect(result).toEqual({ agentId: 'myra', sbId: 'id-myra' });
   });
 
   it('matches case-insensitively', async () => {
     const supabase = createMockSupabase(TEST_IDENTITIES);
     const result = await resolveAgentFromMention(supabase, 'user-1', 'hello', ['BENSON']);
-    expect(result).toEqual({ agentId: 'benson', identityId: 'id-benson' });
+    expect(result).toEqual({ agentId: 'benson', sbId: 'id-benson' });
   });
 
   it('matches by text mention when no username match', async () => {
     const supabase = createMockSupabase(TEST_IDENTITIES);
     const result = await resolveAgentFromMention(supabase, 'user-1', 'hey wren, can you help?', []);
-    expect(result).toEqual({ agentId: 'wren', identityId: 'id-wren' });
+    expect(result).toEqual({ agentId: 'wren', sbId: 'id-wren' });
   });
 
   it('uses word boundaries for text matching', async () => {
@@ -88,7 +90,7 @@ describe('resolveAgentFromMention', () => {
     const supabase = createMockSupabase(TEST_IDENTITIES);
     // Mentions say "myra" but text says "wren" — mention should win
     const result = await resolveAgentFromMention(supabase, 'user-1', 'wren should help', ['myra']);
-    expect(result).toEqual({ agentId: 'myra', identityId: 'id-myra' });
+    expect(result).toEqual({ agentId: 'myra', sbId: 'id-myra' });
   });
 
   it('matches text with agent name (identity name, not agent_id)', async () => {
@@ -96,6 +98,6 @@ describe('resolveAgentFromMention', () => {
       { id: 'id-custom', agent_id: 'custom-agent', name: 'Nova' },
     ]);
     const result = await resolveAgentFromMention(supabase, 'user-1', 'hey Nova!', []);
-    expect(result).toEqual({ agentId: 'custom-agent', identityId: 'id-custom' });
+    expect(result).toEqual({ agentId: 'custom-agent', sbId: 'id-custom' });
   });
 });

@@ -3,7 +3,7 @@
  *
  * Resolves an agent's canonical UUID from the agent_identities table
  * given a (user_id, agent_id) pair.  Used across all write paths
- * that store identity_id alongside the text agent_id slug.
+ * that store sb_id alongside the text agent_id slug.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -37,11 +37,14 @@ export async function resolveIdentityId(
     // Prefer workspace-scoped identities over legacy null workspace rows.
     const scoped = data.find((row) => row.workspace_id !== null);
     if (scoped) {
-      logger.warn('Resolved identity UUID from multiple candidates (preferred workspace-scoped row)', {
-        userId,
-        agentId,
-        chosenIdentityId: scoped.id,
-      });
+      logger.warn(
+        'Resolved identity UUID from multiple candidates (preferred workspace-scoped row)',
+        {
+          userId,
+          agentId,
+          chosenIdentityId: scoped.id,
+        }
+      );
       return scoped.id;
     }
   }

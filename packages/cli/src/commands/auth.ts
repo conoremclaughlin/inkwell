@@ -340,7 +340,7 @@ async function delegateCommand(options: { agent: string }): Promise<void> {
     expires_in?: number;
     scope?: string;
     delegated_agent_id?: string;
-    identity_id?: string;
+    sb_id?: string;
   };
 
   if (!payload.access_token || typeof payload.expires_in !== 'number') {
@@ -355,7 +355,7 @@ async function delegateCommand(options: { agent: string }): Promise<void> {
     issued_at: Date.now(),
     scope: payload.scope,
     agent_id: payload.delegated_agent_id || agentId,
-    identity_id: payload.identity_id,
+    sb_id: payload.sb_id,
   });
 
   const expiresAt = new Date(Date.now() + payload.expires_in * 1000);

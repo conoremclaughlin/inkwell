@@ -118,10 +118,8 @@ export const createReminderSchema = z.object({
   agentId: z
     .string()
     .optional()
-    .describe(
-      'Agent that should handle this reminder (e.g., "myra", "lumen"). Resolved to identity_id.'
-    ),
-  identityId: z
+    .describe('Agent that should handle this reminder (e.g., "myra", "lumen"). Resolved to sb_id.'),
+  sbId: z
     .string()
     .uuid()
     .optional()
@@ -214,19 +212,19 @@ export async function handleCreateReminder(
       );
     }
 
-    // Resolve identity_id from agentId or direct identityId (always scoped to user)
-    let identityId: string | null = args.identityId || null;
-    if (identityId) {
-      // Validate direct identityId belongs to this user
+    // Resolve sb_id from agentId or direct sbId (always scoped to user)
+    let sbId: string | null = args.sbId || null;
+    if (sbId) {
+      // Validate direct sbId belongs to this user
       const { data: owned } = await supabase
         .from('agent_identities')
         .select('id')
-        .eq('id', identityId)
+        .eq('id', sbId)
         .eq('user_id', resolved.user.id)
         .single();
       if (!owned) {
         return mcpResponse(
-          { success: false, error: 'identityId not found or does not belong to this user.' },
+          { success: false, error: 'sbId not found or does not belong to this user.' },
           true
         );
       }
@@ -239,7 +237,7 @@ export async function handleCreateReminder(
         .limit(1)
         .single();
       if (identity) {
-        identityId = identity.id;
+        sbId = identity.id;
       } else {
         return mcpResponse(
           {
@@ -271,7 +269,7 @@ export async function handleCreateReminder(
         description: args.description || null,
         delivery_channel: deliveryChannel,
         delivery_target: deliveryTarget,
-        identity_id: identityId,
+        sb_id: sbId,
         cron_expression: args.cronExpression || null,
         next_run_at: nextRunAt.toISOString(),
         max_runs: args.maxRuns || null,
@@ -292,7 +290,7 @@ export async function handleCreateReminder(
         title: data.title,
         description: data.description,
         agentId: args.agentId || null,
-        identityId: data.identity_id,
+        sbId: data.sb_id,
         deliveryChannel: data.delivery_channel,
         deliveryTarget: data.delivery_target,
         cronExpression: data.cron_expression,
@@ -301,7 +299,7 @@ export async function handleCreateReminder(
         status: data.status,
         isRecurring: !!data.cron_expression,
       },
-      ...(!identityId
+      ...(!sbId
         ? {
             hint: 'Consider adding agentId (e.g., "myra") to route this reminder to a specific agent.',
           }
@@ -348,8 +346,8 @@ export async function handleListReminders(
 
     const supabase = getSupabase();
 
-    // Resolve identity_id filter if agentId provided (scoped to user)
-    let identityIdFilter: string | undefined;
+    // Resolve sb_id filter if agentId provided (scoped to user)
+    let sbIdFilter: string | undefined;
     if (args.agentId) {
       const { data: identity } = await supabase
         .from('agent_identities')
@@ -359,7 +357,7 @@ export async function handleListReminders(
         .limit(1)
         .single();
       if (identity) {
-        identityIdFilter = identity.id;
+        sbIdFilter = identity.id;
       } else {
         // Unknown agent requested — return empty rather than silently ignoring the filter
         return mcpResponse({
@@ -377,8 +375,8 @@ export async function handleListReminders(
       .eq('user_id', resolved.user.id)
       .limit(args.limit || 20);
 
-    if (identityIdFilter) {
-      query = query.eq('identity_id', identityIdFilter);
+    if (sbIdFilter) {
+      query = query.eq('sb_id', sbIdFilter);
     }
 
     if (args.status) {
@@ -397,7 +395,7 @@ export async function handleListReminders(
       id: r.id,
       title: r.title,
       description: r.description,
-      identityId: r.identity_id,
+      sbId: r.sb_id,
       deliveryChannel: r.delivery_channel,
       cronExpression: r.cron_expression,
       nextRunAt: r.next_run_at,
@@ -513,7 +511,7 @@ export async function handleUpdateReminder(
         .limit(1)
         .single();
       if (identity) {
-        updates.identity_id = identity.id;
+        updates.sb_id = identity.id;
       } else {
         return mcpResponse(
           { success: false, error: `Unknown agent "${args.agentId}" for this user.` },

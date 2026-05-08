@@ -35,7 +35,7 @@ function mapDbToSession(row: DbSession): Session {
     id: row.id,
     userId: row.user_id,
     agentId: row.agent_id || '',
-    identityId: row.identity_id || undefined,
+    sbId: row.sb_id || undefined,
     studioId: row.studio_id || undefined,
     contactId: row.contact_id || undefined,
     backendSessionId: row.backend_session_id || row.claude_session_id,
@@ -87,7 +87,7 @@ function mapSessionToDb(
   return {
     user_id: session.userId,
     agent_id: session.agentId,
-    identity_id: session.identityId || null,
+    sb_id: session.sbId || null,
     claude_session_id: session.backendSessionId,
     backend_session_id: session.backendSessionId,
     lifecycle: session.lifecycle,
