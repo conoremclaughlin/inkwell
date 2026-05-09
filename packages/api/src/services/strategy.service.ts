@@ -12,6 +12,10 @@
  * New sessions are only created by heartbeat recovery if one dies.
  */
 
+import path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import { existsSync } from 'fs';
 import type { DataComposer } from '../data/composer';
 import { getRequestContext } from '../utils/request-context';
 import type {
@@ -23,7 +27,10 @@ import type {
 import type { ProjectTask, TaskAssignment } from '../data/repositories/project-tasks.repository';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
 import { logger } from '../utils/logger';
+import { ensureStudioSettings } from './studio-settings';
 import type { SandboxOrchestrator, SandboxSpinUpResult } from './sandbox/orchestrator';
+
+const execFileAsync = promisify(execFile);
 
 // ============================================================================
 // Types
@@ -403,8 +410,8 @@ export class StrategyService {
           : `Strategy complete. ${completed}/${tasks.length} tasks done.`,
       });
 
-      // Cancel watchdog — strategy is done
-      await this.cancelWatchdogReminder(group.id);
+      // Clean up strategy resources (watchdog, ephemeral studio, sandbox)
+      await this.cleanupStrategyResources(group.id);
 
       await this.logStrategyEvent(
         group,
@@ -608,7 +615,7 @@ export class StrategyService {
     if (group.status === 'completed') throw new Error('Strategy is already completed');
     if (group.status === 'cancelled') throw new Error('Strategy is already cancelled');
 
-    await this.cancelWatchdogReminder(groupId);
+    await this.cleanupStrategyResources(groupId);
 
     const summary = reason
       ? `Strategy cancelled on "${group.title}": ${reason}`
@@ -918,10 +925,179 @@ export class StrategyService {
   }
 
   /**
+   * Create an ephemeral git worktree + studio for sandbox work.
+   * Returns the studio record or null on failure.
+   */
+  private async createEphemeralStudio(
+    group: TaskGroup,
+    repoRoot: string
+  ): Promise<{ studioId: string; worktreePath: string; branch: string } | null> {
+    const agentId = group.owner_agent_id || 'agent';
+    const slugBase = (group.title || 'task')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, 30);
+    const slug = `ephemeral-${slugBase}`;
+    const branch = `${agentId}/sandbox/${slug}`;
+
+    // Resolve to the main worktree root
+    let mainRoot = repoRoot;
+    try {
+      const { stdout } = await execFileAsync('git', ['worktree', 'list', '--porcelain'], {
+        cwd: repoRoot,
+      });
+      const match = stdout.match(/^worktree\s+(.+)$/m);
+      if (match) mainRoot = match[1];
+    } catch {
+      // Fall through with original repoRoot
+    }
+
+    const worktreePath = path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
+
+    // Create git worktree
+    try {
+      await execFileAsync('git', ['worktree', 'add', '-b', branch, worktreePath, 'main'], {
+        cwd: mainRoot,
+      });
+      logger.info('Ephemeral studio worktree created', { branch, worktreePath, groupId: group.id });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error('Ephemeral studio worktree creation failed', {
+        error: msg,
+        branch,
+        worktreePath,
+      });
+      return null;
+    }
+
+    // Install dependencies (non-blocking on failure)
+    if (existsSync(path.join(worktreePath, 'package.json'))) {
+      try {
+        await execFileAsync('yarn', ['install'], { cwd: worktreePath, timeout: 120_000 });
+      } catch (err) {
+        logger.warn('Ephemeral studio yarn install failed (non-fatal)', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // Generate studio settings
+    try {
+      await ensureStudioSettings(worktreePath);
+    } catch {
+      // Non-fatal
+    }
+
+    // Insert studio record
+    try {
+      const studio = await this.dataComposer.repositories.studios.create({
+        userId: group.user_id,
+        agentId,
+        repoRoot: mainRoot,
+        worktreePath,
+        branch,
+        baseBranch: 'main',
+        purpose: `Ephemeral sandbox for: ${group.title}`,
+        workType: 'feature',
+        metadata: { ephemeral: true, taskGroupId: group.id },
+      });
+
+      // Update the task group metadata with the new studioId
+      const existingMeta = (group.metadata || {}) as Record<string, unknown>;
+      await this.dataComposer.repositories.taskGroups.update(group.id, {
+        metadata: {
+          ...existingMeta,
+          studioId: studio.id,
+          studioSlug: slug,
+          ephemeralStudioId: studio.id,
+        },
+      });
+
+      await this.logStrategyEvent(
+        group,
+        'ephemeral_studio_created',
+        `Ephemeral studio created: ${worktreePath}`,
+        { studioId: studio.id, branch, worktreePath }
+      );
+
+      return { studioId: studio.id, worktreePath, branch };
+    } catch (err) {
+      // DB failed — clean up the worktree
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error('Ephemeral studio DB insert failed, cleaning up worktree', { error: msg });
+      try {
+        await execFileAsync('git', ['worktree', 'remove', worktreePath], { cwd: mainRoot });
+      } catch {
+        // Best-effort
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Tear down an ephemeral studio: stop sandbox container, remove worktree, mark cleaned.
+   */
+  private async teardownEphemeralStudio(group: TaskGroup): Promise<void> {
+    const metadata = (group.metadata || {}) as Record<string, unknown>;
+    const ephemeralStudioId =
+      typeof metadata.ephemeralStudioId === 'string' ? metadata.ephemeralStudioId : undefined;
+    if (!ephemeralStudioId) return;
+
+    const studio = await this.dataComposer.repositories.studios.findById(ephemeralStudioId);
+    if (!studio) return;
+
+    // Stop sandbox container if running
+    if (this.sandboxOrchestrator) {
+      const sandboxes = await this.sandboxOrchestrator.listSandboxes();
+      const match = sandboxes.find(
+        (s) => s.running && s.labels?.['ink.studio-id'] === ephemeralStudioId
+      );
+      if (match) {
+        await this.sandboxOrchestrator.stop(match.containerName).catch((err) => {
+          logger.warn('Failed to stop ephemeral sandbox container', {
+            containerName: match.containerName,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
+    }
+
+    // Remove git worktree
+    try {
+      await execFileAsync('git', ['worktree', 'remove', studio.worktreePath], {
+        cwd: studio.repoRoot,
+      });
+    } catch (err) {
+      logger.warn('Failed to remove ephemeral worktree (may already be gone)', {
+        worktreePath: studio.worktreePath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    // Mark studio as cleaned in DB
+    try {
+      await this.dataComposer.repositories.studios.markCleaned(ephemeralStudioId);
+    } catch {
+      // Best-effort
+    }
+
+    await this.logStrategyEvent(
+      group,
+      'ephemeral_studio_cleaned',
+      `Ephemeral studio cleaned: ${studio.worktreePath}`,
+      { studioId: ephemeralStudioId, worktreePath: studio.worktreePath }
+    );
+  }
+
+  /**
    * Spin up a sandbox Docker container for the strategy's owner agent.
    * Resolves the studio from DB metadata, builds a SandboxSpinUpRequest,
    * and delegates to the orchestrator. Returns null if sandbox mode is
    * not enabled or no orchestrator is configured.
+   *
+   * When ephemeralStudio is true and no studioId exists in metadata,
+   * automatically creates a fresh git worktree + studio for the work.
    */
   private async maybeSpinUpSandbox(group: TaskGroup): Promise<SandboxSpinUpResult | null> {
     const config = group.strategy_config as StrategyConfig;
@@ -933,10 +1109,34 @@ export class StrategyService {
       return { containerName: '', success: false, error: msg };
     }
 
-    const metadata = (group.metadata || {}) as Record<string, unknown>;
-    const studioId = typeof metadata.studioId === 'string' ? metadata.studioId : undefined;
+    let metadata = (group.metadata || {}) as Record<string, unknown>;
+    let studioId = typeof metadata.studioId === 'string' ? metadata.studioId : undefined;
+
+    // Ephemeral studio: auto-create if none assigned
+    if (!studioId && config.ephemeralStudio) {
+      const repoRoot = typeof metadata.repoRoot === 'string' ? metadata.repoRoot : undefined;
+      if (!repoRoot) {
+        const msg = `Ephemeral studio requested but no repoRoot in metadata`;
+        logger.warn(`Strategy group ${group.id}: ${msg}`);
+        return { containerName: '', success: false, error: msg };
+      }
+
+      const ephemeral = await this.createEphemeralStudio(group, repoRoot);
+      if (!ephemeral) {
+        const msg = `Failed to create ephemeral studio`;
+        return { containerName: '', success: false, error: msg };
+      }
+
+      studioId = ephemeral.studioId;
+      // Re-read metadata since createEphemeralStudio updated it
+      const refreshed = await this.dataComposer.repositories.taskGroups.findById(group.id);
+      if (refreshed) {
+        metadata = (refreshed.metadata || {}) as Record<string, unknown>;
+      }
+    }
+
     if (!studioId) {
-      const msg = `Sandbox requested but no studioId in metadata`;
+      const msg = `Sandbox requested but no studioId in metadata (set ephemeralStudio: true in strategy config to auto-create)`;
       logger.warn(`Strategy group ${group.id}: ${msg}`);
       return { containerName: '', success: false, error: msg };
     }
@@ -1178,6 +1378,17 @@ export class StrategyService {
    */
   async cleanupStrategyResources(groupId: string): Promise<void> {
     await this.cancelWatchdogReminder(groupId);
+
+    // Tear down ephemeral studio + sandbox if present
+    const group = await this.dataComposer.repositories.taskGroups.findById(groupId);
+    if (group) {
+      await this.teardownEphemeralStudio(group).catch((err) => {
+        logger.warn('Ephemeral studio teardown failed (non-fatal)', {
+          groupId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
   }
 
   private async cancelWatchdogReminder(groupId: string): Promise<void> {
