@@ -23,6 +23,20 @@ vi.mock('../mcp/tools/inbox-handlers', () => ({
   handleSendToInbox: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('child_process', () => ({
+  execFile: vi.fn((_cmd: string, _args: string[], _opts: unknown, cb?: Function) => {
+    if (cb) cb(null, 'worktree /repo\n', '');
+  }),
+}));
+
+vi.mock('fs', () => ({
+  existsSync: vi.fn().mockReturnValue(false),
+}));
+
+vi.mock('./studio-settings', () => ({
+  ensureStudioSettings: vi.fn().mockResolvedValue(true),
+}));
+
 // ============================================================================
 // Mock Helpers
 // ============================================================================
@@ -128,6 +142,19 @@ function createMockDataComposer() {
       },
       studios: {
         findById: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockResolvedValue({
+          id: 'studio-ephemeral-1',
+          userId: 'user-123',
+          agentId: 'wren',
+          repoRoot: '/repo',
+          worktreePath: '/repo--ephemeral-test',
+          branch: 'wren/sandbox/ephemeral-test',
+          baseBranch: 'main',
+          status: 'active',
+          slug: 'ephemeral-test',
+          metadata: { ephemeral: true },
+        }),
+        markCleaned: vi.fn().mockResolvedValue({}),
       },
     },
   };
@@ -517,13 +544,14 @@ describe('StrategyService', () => {
 
     it('should include planUri when set', async () => {
       const group = createMockGroup({ strategy: null });
+      const updatedGroup = { ...group, plan_uri: 'ink://specs/my-plan' };
       const task = createMockTask();
 
-      dc.repositories.taskGroups.findById.mockResolvedValue(group);
-      dc.repositories.taskGroups.update.mockResolvedValue({
-        ...group,
-        plan_uri: 'ink://specs/my-plan',
-      });
+      // findById called twice: initial load + re-read after sandbox setup
+      dc.repositories.taskGroups.findById
+        .mockResolvedValueOnce(group)
+        .mockResolvedValueOnce(updatedGroup);
+      dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
 
       const mockClient = dc.getClient();
       mockClient.from.mockReturnValue({
@@ -1333,7 +1361,10 @@ describe('StrategyService', () => {
       };
       const task = createMockTask({ id: 'task-1', title: 'Ship the migration' });
 
-      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      // findById called twice: initial load + re-read after sandbox setup
+      dc.repositories.taskGroups.findById
+        .mockResolvedValueOnce(group)
+        .mockResolvedValueOnce(updatedGroup);
       dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
       setupChains(dc, [chainTaskFound(task)]);
 
@@ -1371,7 +1402,10 @@ describe('StrategyService', () => {
       const updatedGroup = { ...group, strategy: 'persistence', status: 'active' };
       const task = createMockTask();
 
-      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      // findById called twice: initial load + re-read after sandbox setup
+      dc.repositories.taskGroups.findById
+        .mockResolvedValueOnce(group)
+        .mockResolvedValueOnce(updatedGroup);
       dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
       setupChains(dc, [chainTaskFound(task)]);
 
@@ -1404,7 +1438,10 @@ describe('StrategyService', () => {
       };
       const task = createMockTask();
 
-      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      // findById called twice: initial load + re-read after sandbox setup
+      dc.repositories.taskGroups.findById
+        .mockResolvedValueOnce(group)
+        .mockResolvedValueOnce(updatedGroup);
       dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
       setupChains(dc, [chainTaskFound(task)]);
 
@@ -1804,6 +1841,233 @@ describe('StrategyService', () => {
       expect(result.action).toBe('group_complete');
       expect(result.sandbox?.success).toBe(false);
       expect(result.prompt).toContain('Sandbox spin-up failed');
+    });
+  });
+
+  describe('ephemeral studio', () => {
+    it('creates ephemeral studio when ephemeralStudio + sandbox are true and no studioId', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: { repoRoot: '/repo' },
+      });
+      const task = createMockTask();
+      const mockOrchestrator = {
+        spinUp: vi.fn().mockResolvedValue({
+          containerName: 'ink-sandbox-wren-ephemeral-12345678',
+          success: true,
+        }),
+        isRunning: vi.fn(),
+      };
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockImplementation(async (_id: string, data: any) => ({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: { sandbox: true, ephemeralStudio: true },
+        metadata: { ...group.metadata, ...data.metadata },
+        ...data,
+      }));
+
+      const mockTasks = {
+        findById: vi.fn(),
+        startTask: vi.fn().mockResolvedValue({}),
+      };
+      dc.repositories.tasks = mockTasks as any;
+
+      // Mock getTaskByOrder via the supabase chain
+      dc.getClient.mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          select: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                in: vi.fn().mockReturnValue({
+                  limit: vi.fn().mockReturnValue({
+                    single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                  }),
+                }),
+                order: vi.fn().mockReturnValue({
+                  order: vi.fn().mockReturnValue({
+                    limit: vi.fn().mockResolvedValue({ data: [task], error: null }),
+                  }),
+                }),
+                single: vi.fn().mockResolvedValue({ data: task, error: null }),
+              }),
+            }),
+          }),
+          insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+          update: vi.fn().mockReturnValue({
+            contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+      });
+
+      // Studio created by createEphemeralStudio
+      dc.repositories.studios.findById.mockResolvedValue({
+        id: 'studio-ephemeral-1',
+        userId: 'user-123',
+        agentId: 'wren',
+        repoRoot: '/repo',
+        worktreePath: '/repo--ephemeral-test-strategy-group',
+        branch: 'wren/sandbox/ephemeral-test-strategy-group',
+        baseBranch: 'main',
+        status: 'active',
+        slug: 'ephemeral-test-strategy-group',
+      });
+
+      const serviceWithSandbox = new StrategyService(dc as any, mockOrchestrator as any);
+      const result = await serviceWithSandbox.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        ownerAgentId: 'wren',
+        config: { sandbox: true, ephemeralStudio: true },
+      });
+
+      // Should have created the studio via repository
+      expect(dc.repositories.studios.create).toHaveBeenCalled();
+      const createCall = dc.repositories.studios.create.mock.calls[0][0];
+      expect(createCall.userId).toBe('user-123');
+      expect(createCall.agentId).toBe('wren');
+      expect(createCall.metadata).toEqual(
+        expect.objectContaining({ ephemeral: true, taskGroupId: 'group-1' })
+      );
+
+      // Should have updated group metadata with ephemeralStudioId
+      const updateCalls = dc.repositories.taskGroups.update.mock.calls;
+      const metadataUpdate = updateCalls.find((c: any) => c[1]?.metadata?.ephemeralStudioId);
+      expect(metadataUpdate).toBeDefined();
+
+      // Should have spun up sandbox
+      expect(mockOrchestrator.spinUp).toHaveBeenCalled();
+      expect(result.action).not.toBe('group_complete');
+    });
+
+    it('fails when ephemeralStudio is true but no repoRoot in metadata', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: {}, // no repoRoot
+      });
+      const task = createMockTask();
+      const mockOrchestrator = {
+        spinUp: vi.fn(),
+        isRunning: vi.fn(),
+      };
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: { sandbox: true, ephemeralStudio: true },
+      });
+
+      dc.getClient.mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          select: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                in: vi.fn().mockReturnValue({
+                  limit: vi.fn().mockReturnValue({
+                    single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                  }),
+                }),
+                order: vi.fn().mockReturnValue({
+                  order: vi.fn().mockReturnValue({
+                    limit: vi.fn().mockResolvedValue({ data: [task], error: null }),
+                  }),
+                }),
+                single: vi.fn().mockResolvedValue({ data: task, error: null }),
+              }),
+            }),
+          }),
+          insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+          update: vi.fn().mockReturnValue({
+            contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+      });
+
+      const serviceWithSandbox = new StrategyService(dc as any, mockOrchestrator as any);
+      const result = await serviceWithSandbox.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        ownerAgentId: 'wren',
+        config: { sandbox: true, ephemeralStudio: true },
+      });
+
+      expect(mockOrchestrator.spinUp).not.toHaveBeenCalled();
+      expect(result.action).toBe('group_complete');
+      expect(result.sandbox?.success).toBe(false);
+      expect(result.sandbox?.error).toContain('repoRoot');
+    });
+
+    it('cleans up ephemeral studio on strategy completion', async () => {
+      const group = createMockGroup({
+        metadata: {
+          ephemeralStudioId: 'studio-ephemeral-1',
+          studioId: 'studio-ephemeral-1',
+        },
+      });
+
+      dc.repositories.studios.findById.mockResolvedValue({
+        id: 'studio-ephemeral-1',
+        worktreePath: '/repo--ephemeral-test',
+        repoRoot: '/repo',
+      });
+
+      const mockOrchestrator = {
+        spinUp: vi.fn(),
+        isRunning: vi.fn(),
+        listSandboxes: vi.fn().mockResolvedValue([]),
+        stop: vi.fn().mockResolvedValue(true),
+      };
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+
+      const serviceWithSandbox = new StrategyService(dc as any, mockOrchestrator as any);
+      await serviceWithSandbox.cleanupStrategyResources('group-1');
+
+      expect(dc.repositories.studios.markCleaned).toHaveBeenCalledWith('studio-ephemeral-1');
+    });
+
+    it('stops sandbox container during ephemeral teardown', async () => {
+      const group = createMockGroup({
+        metadata: {
+          ephemeralStudioId: 'studio-ephemeral-1',
+          studioId: 'studio-ephemeral-1',
+        },
+      });
+
+      dc.repositories.studios.findById.mockResolvedValue({
+        id: 'studio-ephemeral-1',
+        worktreePath: '/repo--ephemeral-test',
+        repoRoot: '/repo',
+      });
+
+      const mockOrchestrator = {
+        spinUp: vi.fn(),
+        isRunning: vi.fn(),
+        listSandboxes: vi.fn().mockResolvedValue([
+          {
+            containerName: 'ink-sandbox-test',
+            running: true,
+            labels: { 'ink.studio-id': 'studio-ephemeral-1' },
+          },
+        ]),
+        stop: vi.fn().mockResolvedValue(true),
+      };
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+
+      const serviceWithSandbox = new StrategyService(dc as any, mockOrchestrator as any);
+      await serviceWithSandbox.cleanupStrategyResources('group-1');
+
+      expect(mockOrchestrator.stop).toHaveBeenCalledWith('ink-sandbox-test');
+      expect(dc.repositories.studios.markCleaned).toHaveBeenCalledWith('studio-ephemeral-1');
     });
   });
 });

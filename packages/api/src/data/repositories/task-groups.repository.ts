@@ -74,6 +74,9 @@ export interface StrategyConfig {
   sandboxPolicy?: 'required' | 'preferred';
   /** Backend auth dirs to mount in the sandbox (default: ['claude']) */
   sandboxBackendAuth?: Array<'claude' | 'codex' | 'gemini'>;
+  /** Automatically create an ephemeral git worktree + studio for sandbox work (default: false).
+   *  When true + sandbox: true, strategy creates a fresh studio at startup and cleans it up on completion. */
+  ephemeralStudio?: boolean;
 }
 
 export interface CreateTaskGroupInput {
