@@ -125,6 +125,19 @@ const webEnv = {
 const { result } = concurrently(
   [
     {
+      command: 'yarn workspace @inklabs/shared tsc --watch --preserveWatchOutput',
+      name: 'shared:esm',
+      prefixColor: 'cyan',
+      env: { ...process.env, PATH: envPATH },
+    },
+    {
+      command:
+        'yarn workspace @inklabs/shared tsc -p tsconfig.cjs.json --watch --preserveWatchOutput',
+      name: 'shared:cjs',
+      prefixColor: 'cyan',
+      env: { ...process.env, PATH: envPATH },
+    },
+    {
       command: 'yarn workspace @inklabs/api server:dev',
       name: 'api',
       prefixColor: 'blue',
