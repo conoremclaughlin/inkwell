@@ -233,15 +233,14 @@ export class StrategyService {
       };
     }
 
-    // Mark the first task as in_progress with assignment metadata
-    await this.dataComposer.repositories.tasks.startTask(nextTask.id, this.getAssignment(updated));
-
     // Create a watchdog reminder so the heartbeat checks progress periodically
     await this.createWatchdogReminder(updated, input.userId);
 
     // Spin up sandbox BEFORE triggering the agent — if sandboxPolicy is
     // 'required' (default), a failed sandbox aborts the strategy instead
     // of silently degrading to host execution.
+    // Note: maybeSpinUpSandbox may create an ephemeral studio and update
+    // group metadata in the DB, so we re-read the group afterward.
     const config = updated.strategy_config as StrategyConfig;
     const sandboxResult = await this.maybeSpinUpSandbox(updated);
     const sandboxPolicy = config.sandboxPolicy || 'required';
@@ -270,13 +269,26 @@ export class StrategyService {
       };
     }
 
+    // Re-read group after sandbox setup — createEphemeralStudio may have
+    // written studioId/studioSlug to metadata that triggerOwnerAgent needs
+    // for correct studio routing.
+    const currentGroup =
+      (await this.dataComposer.repositories.taskGroups.findById(input.groupId)) || updated;
+
+    // Mark the first task as in_progress with assignment metadata.
+    // Done after sandbox setup so the assignment reflects the ephemeral studioId.
+    await this.dataComposer.repositories.tasks.startTask(
+      nextTask.id,
+      this.getAssignment(currentGroup)
+    );
+
     // Trigger the owner agent in the assigned studio. The trigger spawns
     // (or resumes) a session in the target studio so work actually begins.
     // Pass the sandbox container name so the triggered session routes
     // CLI execution into the container.
     const sandboxContainer = sandboxResult?.success ? sandboxResult.containerName : undefined;
     const triggered = await this.triggerOwnerAgent(
-      updated,
+      currentGroup,
       nextTask,
       'strategy_kickoff',
       sandboxContainer
@@ -284,9 +296,9 @@ export class StrategyService {
 
     // Log strategy start
     await this.logStrategyEvent(
-      updated,
+      currentGroup,
       'strategy_started',
-      `Strategy "${input.strategy}" started on "${updated.title}"`,
+      `Strategy "${input.strategy}" started on "${currentGroup.title}"`,
       {
         firstTaskId: nextTask.id,
         firstTaskTitle: nextTask.title,
@@ -297,7 +309,7 @@ export class StrategyService {
       }
     );
 
-    const prompt = STRATEGY_PROMPTS[input.strategy](updated, nextTask);
+    const prompt = STRATEGY_PROMPTS[input.strategy](currentGroup, nextTask);
 
     return {
       action: 'next_task',
@@ -938,7 +950,8 @@ export class StrategyService {
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/^-|-$/g, '')
       .slice(0, 30);
-    const slug = `ephemeral-${slugBase}`;
+    const uniqueSuffix = Date.now().toString(36).slice(-6);
+    const slug = `ephemeral-${slugBase}-${uniqueSuffix}`;
     const branch = `${agentId}/sandbox/${slug}`;
 
     // Resolve to the main worktree root
@@ -1073,6 +1086,20 @@ export class StrategyService {
         worktreePath: studio.worktreePath,
         error: err instanceof Error ? err.message : String(err),
       });
+    }
+
+    // Delete the ephemeral branch (prevents collisions on retry)
+    if (studio.branch) {
+      try {
+        await execFileAsync('git', ['branch', '-d', studio.branch], {
+          cwd: studio.repoRoot,
+        });
+      } catch (err) {
+        logger.warn('Failed to delete ephemeral branch (may have unmerged changes)', {
+          branch: studio.branch,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
 
     // Mark studio as cleaned in DB

@@ -544,13 +544,14 @@ describe('StrategyService', () => {
 
     it('should include planUri when set', async () => {
       const group = createMockGroup({ strategy: null });
+      const updatedGroup = { ...group, plan_uri: 'ink://specs/my-plan' };
       const task = createMockTask();
 
-      dc.repositories.taskGroups.findById.mockResolvedValue(group);
-      dc.repositories.taskGroups.update.mockResolvedValue({
-        ...group,
-        plan_uri: 'ink://specs/my-plan',
-      });
+      // findById called twice: initial load + re-read after sandbox setup
+      dc.repositories.taskGroups.findById
+        .mockResolvedValueOnce(group)
+        .mockResolvedValueOnce(updatedGroup);
+      dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
 
       const mockClient = dc.getClient();
       mockClient.from.mockReturnValue({
@@ -1360,7 +1361,10 @@ describe('StrategyService', () => {
       };
       const task = createMockTask({ id: 'task-1', title: 'Ship the migration' });
 
-      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      // findById called twice: initial load + re-read after sandbox setup
+      dc.repositories.taskGroups.findById
+        .mockResolvedValueOnce(group)
+        .mockResolvedValueOnce(updatedGroup);
       dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
       setupChains(dc, [chainTaskFound(task)]);
 
@@ -1398,7 +1402,10 @@ describe('StrategyService', () => {
       const updatedGroup = { ...group, strategy: 'persistence', status: 'active' };
       const task = createMockTask();
 
-      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      // findById called twice: initial load + re-read after sandbox setup
+      dc.repositories.taskGroups.findById
+        .mockResolvedValueOnce(group)
+        .mockResolvedValueOnce(updatedGroup);
       dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
       setupChains(dc, [chainTaskFound(task)]);
 
@@ -1431,7 +1438,10 @@ describe('StrategyService', () => {
       };
       const task = createMockTask();
 
-      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      // findById called twice: initial load + re-read after sandbox setup
+      dc.repositories.taskGroups.findById
+        .mockResolvedValueOnce(group)
+        .mockResolvedValueOnce(updatedGroup);
       dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
       setupChains(dc, [chainTaskFound(task)]);
 
