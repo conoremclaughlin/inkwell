@@ -16,9 +16,9 @@ import type {
   ResponseHandler,
 } from './types';
 import type { ClaudeCodeConfig } from './backends/claude-code.backend';
-import type { DirectApiConfig } from './backends/direct-api.backend';
+import type { InkConfig } from './backends/ink.backend';
 import { ClaudeCodeBackend, createClaudeCodeBackend } from './backends/claude-code.backend';
-import { DirectApiBackend, createDirectApiBackend } from './backends/direct-api.backend';
+import { InkBackend, createInkBackend } from './backends/ink.backend';
 
 export interface BackendManagerConfig {
   /** Primary backend to use */
@@ -28,7 +28,7 @@ export interface BackendManagerConfig {
   /** Backend-specific configurations */
   backends: {
     'claude-code'?: Partial<ClaudeCodeConfig>;
-    'direct-api'?: Partial<DirectApiConfig>;
+    ink?: Partial<InkConfig>;
   };
   /** Enable automatic failover */
   enableFailover?: boolean;
@@ -138,10 +138,9 @@ export class BackendManager extends EventEmitter {
   setResponseHandler(handler: ResponseHandler): void {
     this.responseHandler = handler;
 
-    // Pass to direct API backend if it exists
-    const directApi = this.backends.get('direct-api') as DirectApiBackend | undefined;
-    if (directApi) {
-      directApi.setResponseHandler(handler);
+    const inkBackend = this.backends.get('ink') as InkBackend | undefined;
+    if (inkBackend) {
+      inkBackend.setResponseHandler(handler);
     }
   }
 
@@ -228,14 +227,14 @@ export class BackendManager extends EventEmitter {
       this.backends.set('claude-code', backend);
     }
 
-    // Create Direct API backend
-    if (this.config.backends['direct-api'] || this.config.primaryBackend === 'direct-api') {
-      const backend = createDirectApiBackend(this.config.backends['direct-api']);
+    // Create Ink backend
+    if (this.config.backends.ink || this.config.primaryBackend === 'ink') {
+      const backend = createInkBackend(this.config.backends.ink);
       this.setupBackendEvents(backend);
       if (this.responseHandler) {
         backend.setResponseHandler(this.responseHandler);
       }
-      this.backends.set('direct-api', backend);
+      this.backends.set('ink', backend);
     }
   }
 

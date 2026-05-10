@@ -28,7 +28,7 @@ export interface StoredDelegatedAuth {
   issued_at: number; // Date.now() at storage time
   scope?: string;
   agent_id: string;
-  identity_id?: string;
+  sb_id?: string;
 }
 
 type ExpiringToken = {

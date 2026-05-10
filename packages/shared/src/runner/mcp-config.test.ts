@@ -104,6 +104,48 @@ describe('injectSessionHeaders', () => {
     unlinkSync(configPath);
   });
 
+  it('writes modified config to outputDir when set', () => {
+    const configPath = writeTempConfig({
+      mcpServers: { inkwell: { type: 'http', url: 'http://localhost:3001/mcp' } },
+    });
+
+    const outputDir = join(testDir, `output-${Date.now()}`);
+    mkdirSync(outputDir, { recursive: true });
+
+    const result = injectSessionHeaders({
+      mcpConfigPath: configPath,
+      pcpSessionId: 'test-session-id',
+      studioId: 'test-studio-id',
+      outputDir,
+    });
+
+    expect(result.modified).toBe(true);
+    // The returned mcpConfigPath should be inside the outputDir, not the default /tmp/sb-mcp
+    expect(result.mcpConfigPath.startsWith(outputDir)).toBe(true);
+    expect(existsSync(result.mcpConfigPath)).toBe(true);
+
+    // Verify the config was written correctly
+    const config = JSON.parse(readFileSync(result.mcpConfigPath, 'utf-8'));
+    expect(config.mcpServers.inkwell.headers['x-ink-session-id']).toBe('${INK_SESSION_ID}');
+    result.cleanup();
+  });
+
+  it('uses default sb-mcp dir when outputDir is not set', () => {
+    const configPath = writeTempConfig({
+      mcpServers: { inkwell: { type: 'http', url: 'http://localhost:3001/mcp' } },
+    });
+
+    const result = injectSessionHeaders({
+      mcpConfigPath: configPath,
+      pcpSessionId: 'test-session-id',
+    });
+
+    expect(result.modified).toBe(true);
+    // Without outputDir, should use the default tmpdir/sb-mcp path
+    expect(result.mcpConfigPath).toContain('sb-mcp');
+    result.cleanup();
+  });
+
   it('returns original path when headers already present', () => {
     const configPath = writeTempConfig({
       mcpServers: {

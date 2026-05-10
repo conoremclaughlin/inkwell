@@ -15,6 +15,7 @@ import {
   buildIdentityBlock,
   loadApprovalSet,
   matchesApprovalSet,
+  isHeadlessSession,
 } from './hooks.js';
 
 const TEST_DIR = join(tmpdir(), 'ink-hooks-test-' + Date.now());
@@ -1040,5 +1041,66 @@ describe('matchesApprovalSet', () => {
     // Pattern "Bash(ls)" should NOT match "ls -la" because it's anchored
     expect(matchesApprovalSet('Bash', 'ls -la', ['Bash(ls)'])).toBe(false);
     expect(matchesApprovalSet('Bash', 'ls', ['Bash(ls)'])).toBe(true);
+  });
+});
+
+// =====================================================
+// isHeadlessSession — CLI-attached vs headless spawn
+// =====================================================
+
+describe('isHeadlessSession', () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  it('returns false when INK_CONTEXT is not set (interactive session)', () => {
+    delete process.env.INK_CONTEXT;
+    expect(isHeadlessSession()).toBe(false);
+  });
+
+  it('returns true when INK_CONTEXT has cliAttached=false (headless spawn)', () => {
+    const token = {
+      sessionId: 's1',
+      agentId: 'wren',
+      studioId: 'x',
+      cliAttached: false,
+      runtime: 'claude',
+    };
+    process.env.INK_CONTEXT = Buffer.from(JSON.stringify(token)).toString('base64url');
+    expect(isHeadlessSession()).toBe(true);
+  });
+
+  it('returns false when INK_CONTEXT has cliAttached=true', () => {
+    const token = {
+      sessionId: 's1',
+      agentId: 'wren',
+      studioId: 'x',
+      cliAttached: true,
+      runtime: 'claude',
+    };
+    process.env.INK_CONTEXT = Buffer.from(JSON.stringify(token)).toString('base64url');
+    expect(isHeadlessSession()).toBe(false);
+  });
+
+  it('returns false when INK_CONTEXT is malformed', () => {
+    process.env.INK_CONTEXT = 'not-valid-base64url-json!!!';
+    expect(isHeadlessSession()).toBe(false);
+  });
+
+  it('returns false when INK_CONTEXT is empty string', () => {
+    process.env.INK_CONTEXT = '';
+    expect(isHeadlessSession()).toBe(false);
+  });
+
+  it('returns false when cliAttached is missing from token', () => {
+    const token = { sessionId: 's1', agentId: 'wren', studioId: 'x', runtime: 'claude' };
+    process.env.INK_CONTEXT = Buffer.from(JSON.stringify(token)).toString('base64url');
+    expect(isHeadlessSession()).toBe(false);
   });
 });

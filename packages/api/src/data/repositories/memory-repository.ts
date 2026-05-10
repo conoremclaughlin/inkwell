@@ -38,7 +38,7 @@ export interface KnowledgeMemoryContext {
   focusText?: string;
 }
 
-interface RecallCandidate {
+export interface RecallCandidate {
   memory: Memory;
   semanticScore?: number;
   textScore?: number;
@@ -196,7 +196,7 @@ export class MemoryRepository {
    * Create a new memory
    */
   async remember(input: MemoryCreateInput): Promise<Memory> {
-    const identityId =
+    const sbId =
       input.agentId && input.userId
         ? await resolveIdentityId(this.supabase, input.userId, input.agentId)
         : null;
@@ -221,7 +221,7 @@ export class MemoryRepository {
         expires_at: input.expiresAt?.toISOString(),
         agent_id: input.agentId || null,
         contact_id: input.contactId || null,
-        identity_id: identityId,
+        sb_id: sbId,
       })
       .select()
       .single();
@@ -292,6 +292,49 @@ export class MemoryRepository {
     return this.hybridRecall(userId, normalizedQuery, options, limit, offset);
   }
 
+  async recallWithScores(
+    userId: string,
+    query?: string,
+    options: MemorySearchOptions = {}
+  ): Promise<RecallCandidate[]> {
+    const limit = options.limit || 20;
+    const offset = options.offset || 0;
+    const recallMode: RecallMode = options.recallMode || 'hybrid';
+
+    if (!query?.trim()) {
+      return this.textRecallCandidates(userId, undefined, options, limit, offset);
+    }
+
+    const normalizedQuery = query.trim();
+
+    if (recallMode === 'text') {
+      return this.textRecallCandidates(userId, normalizedQuery, options, limit, offset);
+    }
+
+    if (recallMode === 'semantic') {
+      return (
+        (await this.trySemanticRecallCandidates(userId, normalizedQuery, options, limit, offset)) ||
+        []
+      );
+    }
+
+    if (recallMode === 'auto') {
+      const semanticCandidates = await this.trySemanticRecallCandidates(
+        userId,
+        normalizedQuery,
+        options,
+        limit,
+        offset
+      );
+      if (semanticCandidates && semanticCandidates.length > 0) {
+        return semanticCandidates;
+      }
+      return this.textRecallCandidates(userId, normalizedQuery, options, limit, offset);
+    }
+
+    return this.hybridRecallCandidates(userId, normalizedQuery, options, limit, offset);
+  }
+
   private async hybridRecall(
     userId: string,
     query: string,
@@ -299,6 +342,17 @@ export class MemoryRepository {
     limit: number,
     offset: number
   ): Promise<Memory[]> {
+    const candidates = await this.hybridRecallCandidates(userId, query, options, limit, offset);
+    return candidates.map((c) => c.memory);
+  }
+
+  private async hybridRecallCandidates(
+    userId: string,
+    query: string,
+    options: MemorySearchOptions,
+    limit: number,
+    offset: number
+  ): Promise<RecallCandidate[]> {
     const config = this.embeddingRouter.getRuntimeConfig();
     const candidatePool = Math.max(
       limit,
@@ -342,7 +396,7 @@ export class MemoryRepository {
         b.finalScore - a.finalScore || b.memory.createdAt.getTime() - a.memory.createdAt.getTime()
     );
 
-    return merged.slice(offset, offset + limit).map((c) => c.memory);
+    return merged.slice(offset, offset + limit);
   }
 
   private computeHybridScore(semanticScore?: number, textScore?: number): number {
@@ -922,6 +976,35 @@ export class MemoryRepository {
     }
   }
 
+  async verifyOwnership(memoryIds: string[], userId: string): Promise<Set<string>> {
+    const { data, error } = await this.supabase
+      .from('memories')
+      .select('id')
+      .in('id', memoryIds)
+      .eq('user_id', userId);
+
+    if (error) {
+      throw new Error(`Failed to verify memory ownership: ${error.message}`);
+    }
+
+    return new Set((data ?? []).map((row) => row.id));
+  }
+
+  async verifySessionOwnership(sessionId: string, userId: string): Promise<boolean> {
+    const { data, error } = await this.supabase
+      .from('sessions')
+      .select('id')
+      .eq('id', sessionId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to verify session ownership: ${error.message}`);
+    }
+
+    return data !== null;
+  }
+
   /**
    * Get a specific memory by ID
    */
@@ -991,7 +1074,7 @@ export class MemoryRepository {
    * Start a new session
    */
   async startSession(input: SessionCreateInput): Promise<Session> {
-    const identityId =
+    const sbId =
       input.agentId && input.userId
         ? await resolveIdentityId(this.supabase, input.userId, input.agentId)
         : null;
@@ -1000,7 +1083,7 @@ export class MemoryRepository {
       ...(input.id ? { id: input.id } : {}),
       user_id: input.userId,
       agent_id: input.agentId,
-      identity_id: identityId,
+      sb_id: sbId,
       metadata: input.metadata || {},
     };
     if (input.backend) insertData.backend = input.backend;

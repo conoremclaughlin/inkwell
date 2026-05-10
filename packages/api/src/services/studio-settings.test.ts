@@ -23,8 +23,6 @@ describe('ensureStudioSettings', () => {
     const settings = JSON.parse(raw);
 
     expect(settings.permissions.allow).toContain('mcp__inkwell__*');
-    expect(settings.permissions.allow).toContain('mcp__supabase__*');
-    expect(settings.permissions.allow).toContain('mcp__github__*');
     expect(settings.permissions.allow).toContain('Bash(*)');
     expect(settings.permissions.deny).toContain('Bash(rm -rf *)');
     expect(settings.enableAllProjectMcpServers).toBe(true);

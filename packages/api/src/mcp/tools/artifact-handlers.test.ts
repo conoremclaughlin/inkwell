@@ -60,7 +60,7 @@ function createMockSupabase(
     version: 1,
     metadata: {},
     collaborators: ['wren'],
-    created_by_identity_id: null,
+    created_by_sb_id: null,
     created_at: '2026-01-01',
     updated_at: '2026-01-01',
   };
@@ -232,7 +232,7 @@ describe('handleUpdateArtifact', () => {
           version: 2,
           metadata: {},
           collaborators: ['wren', 'myra'],
-          created_by_identity_id: null,
+          created_by_sb_id: null,
           created_at: '2026-01-01',
           updated_at: '2026-01-01',
         },
@@ -274,7 +274,7 @@ describe('handleUpdateArtifact', () => {
           version: 2,
           metadata: {},
           collaborators: ['wren', 'myra'],
-          created_by_identity_id: null,
+          created_by_sb_id: null,
           created_at: '2026-01-01',
           updated_at: '2026-01-01',
         },
@@ -315,7 +315,7 @@ describe('handleUpdateArtifact', () => {
           version: 2,
           metadata: {},
           collaborators: ['wren'],
-          created_by_identity_id: null,
+          created_by_sb_id: null,
           created_at: '2026-01-01',
           updated_at: '2026-01-01',
         },
@@ -348,7 +348,7 @@ describe('handleUpdateArtifact', () => {
           version: 5,
           metadata: {},
           collaborators: ['wren'],
-          created_by_identity_id: null,
+          created_by_sb_id: null,
           created_at: '2026-01-01',
           updated_at: '2026-01-01',
         },
@@ -407,7 +407,7 @@ describe('handleUpdateArtifact', () => {
           metadata: {},
           edit_mode: 'workspace',
           collaborators: ['wren'],
-          created_by_identity_id: null,
+          created_by_sb_id: null,
           created_at: '2026-01-01',
           updated_at: '2026-01-01',
         },
@@ -439,7 +439,7 @@ describe('handleUpdateArtifact', () => {
           metadata: {},
           edit_mode: 'editors',
           collaborators: ['wren'],
-          created_by_identity_id: null,
+          created_by_sb_id: null,
           created_at: '2026-01-01',
           updated_at: '2026-01-01',
         },
@@ -470,7 +470,7 @@ describe('handleUpdateArtifact', () => {
           metadata: {},
           edit_mode: 'workspace',
           collaborators: [],
-          created_by_identity_id: null,
+          created_by_sb_id: null,
           created_at: '2026-01-01',
           updated_at: '2026-01-01',
         },
@@ -502,7 +502,7 @@ describe('handleUpdateArtifact', () => {
           metadata: {},
           edit_mode: 'editors',
           collaborators: ['identity-wren', 'identity-lumen'],
-          created_by_identity_id: null,
+          created_by_sb_id: null,
           created_at: '2026-01-01',
           updated_at: '2026-01-01',
         },
@@ -534,7 +534,7 @@ describe('handleUpdateArtifact', () => {
           version: 3,
           metadata: {},
           collaborators: ['wren'],
-          created_by_identity_id: null,
+          created_by_sb_id: null,
           created_at: '2026-01-01',
           updated_at: '2026-01-01',
         },
@@ -596,7 +596,7 @@ describe('artifact comment + identity UUID flows', () => {
                 content: '# Spec',
                 content_type: 'text/markdown',
                 artifact_type: 'spec',
-                created_by_identity_id: null,
+                created_by_sb_id: null,
                 collaborators: ['wren', 'lumen'],
                 visibility: 'shared',
                 version: 2,
@@ -621,7 +621,7 @@ describe('artifact comment + identity UUID flows', () => {
                 content: 'Love this direction',
                 metadata: {},
                 created_by_user_id: '00000000-0000-0000-0000-000000000001',
-                created_by_identity_id: 'identity-1',
+                created_by_sb_id: 'identity-1',
                 created_at: '2026-02-11T02:00:00Z',
                 updated_at: '2026-02-11T02:00:00Z',
                 user_id: '00000000-0000-0000-0000-000000000001',
@@ -693,7 +693,7 @@ describe('artifact comment + identity UUID flows', () => {
                 content: '# Spec',
                 content_type: 'text/markdown',
                 artifact_type: 'spec',
-                created_by_identity_id: null,
+                created_by_sb_id: null,
                 collaborators: ['wren', 'lumen'],
                 visibility: 'shared',
                 version: 2,
@@ -723,7 +723,7 @@ describe('artifact comment + identity UUID flows', () => {
     expect(parsed.artifact.commentCount).toBeUndefined();
   });
 
-  it('handleCreateArtifact stores created_by_identity_id and history changed_by_identity_id', async () => {
+  it('handleCreateArtifact stores created_by_sb_id and history changed_by_sb_id', async () => {
     const supabase = createTableAwareSupabaseMock({
       agent_identities: [
         {
@@ -789,12 +789,12 @@ describe('artifact comment + identity UUID flows', () => {
     expect(
       (artifactInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
     ).toMatchObject({
-      created_by_identity_id: 'identity-1',
+      created_by_sb_id: 'identity-1',
     });
     expect(
       (historyInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
     ).toMatchObject({
-      changed_by_identity_id: 'identity-1',
+      changed_by_sb_id: 'identity-1',
     });
   });
 
@@ -886,12 +886,12 @@ describe('artifact comment + identity UUID flows', () => {
     expect(
       (artifactInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
     ).toMatchObject({
-      created_by_identity_id: null,
+      created_by_sb_id: null,
     });
     expect(
       (historyInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
     ).toMatchObject({
-      changed_by_identity_id: null,
+      changed_by_sb_id: null,
     });
   });
 
@@ -1161,7 +1161,7 @@ describe('artifact comment + identity UUID flows', () => {
       (artifactInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
     ).toMatchObject({
       workspace_id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
-      created_by_identity_id: 'identity-derive-2',
+      created_by_sb_id: 'identity-derive-2',
     });
   });
 
@@ -1228,7 +1228,7 @@ describe('artifact comment + identity UUID flows', () => {
       (artifactInsertBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]
     ).toMatchObject({
       workspace_id: '55555555-5555-5555-5555-555555555555',
-      created_by_identity_id: 'identity-derive-1',
+      created_by_sb_id: 'identity-derive-1',
     });
   });
 
@@ -1288,7 +1288,7 @@ describe('artifact comment + identity UUID flows', () => {
                 parent_comment_id: null,
                 content: 'Great point.',
                 metadata: {},
-                created_by_identity_id: 'identity-1',
+                created_by_sb_id: 'identity-1',
                 created_at: '2026-02-11T00:00:00Z',
                 updated_at: '2026-02-11T00:00:00Z',
               },
@@ -1311,13 +1311,13 @@ describe('artifact comment + identity UUID flows', () => {
 
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.success).toBe(true);
-    expect(parsed.comment.createdByIdentityId).toBe('identity-1');
+    expect(parsed.comment.createdBySbId).toBe('identity-1');
     expect(parsed.comment.createdByIdentity.agentId).toBe('lumen');
 
     const commentsBuilder = supabase.calls.find((c) => c.table === 'artifact_comments')?.builder;
     expect((commentsBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
       created_by_user_id: '00000000-0000-0000-0000-000000000001',
-      created_by_identity_id: 'identity-1',
+      created_by_sb_id: 'identity-1',
       content: 'Great point.',
     });
   });
@@ -1388,7 +1388,7 @@ describe('artifact comment + identity UUID flows', () => {
                 content: 'From Lumen',
                 metadata: {},
                 created_by_user_id: '00000000-0000-0000-0000-000000000001',
-                created_by_identity_id: 'identity-1',
+                created_by_sb_id: 'identity-1',
                 created_at: '2026-02-11T00:00:00Z',
                 updated_at: '2026-02-11T00:00:00Z',
                 user_id: '00000000-0000-0000-0000-000000000001',
@@ -1401,7 +1401,7 @@ describe('artifact comment + identity UUID flows', () => {
                 content: 'Anonymous note',
                 metadata: {},
                 created_by_user_id: '00000000-0000-0000-0000-000000000001',
-                created_by_identity_id: null,
+                created_by_sb_id: null,
                 created_at: '2026-02-11T00:05:00Z',
                 updated_at: '2026-02-11T00:05:00Z',
                 user_id: '00000000-0000-0000-0000-000000000001',

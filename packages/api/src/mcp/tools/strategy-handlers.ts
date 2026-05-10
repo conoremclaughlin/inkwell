@@ -12,6 +12,7 @@ import type {
   VerificationMode,
 } from '../../data/repositories/task-groups.repository';
 import { StrategyService } from '../../services/strategy.service';
+import { getOrchestrator } from '../../services/sandbox/index.js';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 
@@ -102,6 +103,17 @@ export const startStrategySchema = z.object({
     .describe(
       'Supervisor agent identity ID (UUID). Gets check-in notifications and a final audit on completion.'
     ),
+  sandbox: z.boolean().optional().describe('Run the strategy in a sandboxed Docker container'),
+  sandboxPolicy: z
+    .enum(['required', 'preferred'])
+    .optional()
+    .describe(
+      "Sandbox failure policy: 'required' aborts if sandbox can't start (default), 'preferred' falls back to host"
+    ),
+  sandboxBackendAuth: z
+    .array(z.enum(['claude', 'codex', 'gemini']))
+    .optional()
+    .describe("Backend auth dirs to mount in the sandbox (default: ['claude'])"),
 });
 
 export async function handleStartStrategy(
@@ -116,7 +128,7 @@ export async function handleStartStrategy(
 
     const agentId = getEffectiveAgentId(args.ownerAgentId);
 
-    const service = new StrategyService(dataComposer);
+    const service = new StrategyService(dataComposer, getOrchestrator());
     const result = await service.startStrategy({
       groupId: args.groupId,
       userId: resolved.user.id,
@@ -133,6 +145,9 @@ export async function handleStartStrategy(
         contextSummaryInterval: args.contextSummaryInterval,
         verificationGates: args.verificationGates,
         supervisorId: args.supervisorId,
+        sandbox: args.sandbox,
+        sandboxPolicy: args.sandboxPolicy,
+        sandboxBackendAuth: args.sandboxBackendAuth,
       },
     });
 
@@ -179,7 +194,7 @@ export async function handlePauseStrategy(
       return mcpResponse({ success: false, error: 'User not found' }, true);
     }
 
-    const service = new StrategyService(dataComposer);
+    const service = new StrategyService(dataComposer, getOrchestrator());
     const group = await service.pauseStrategy(args.groupId, resolved.user.id);
 
     return mcpResponse({
@@ -220,7 +235,7 @@ export async function handleResumeStrategy(
       return mcpResponse({ success: false, error: 'User not found' }, true);
     }
 
-    const service = new StrategyService(dataComposer);
+    const service = new StrategyService(dataComposer, getOrchestrator());
     const result = await service.resumeStrategy(args.groupId, resolved.user.id);
 
     return mcpResponse({
@@ -271,7 +286,7 @@ export async function handleCancelStrategy(
       return mcpResponse({ success: false, error: 'User not found' }, true);
     }
 
-    const service = new StrategyService(dataComposer);
+    const service = new StrategyService(dataComposer, getOrchestrator());
     const group = await service.cancelStrategy(args.groupId, resolved.user.id, args.reason);
 
     return mcpResponse({
@@ -478,7 +493,7 @@ export async function handleGetStrategyStatus(
       return mcpResponse({ success: false, error: 'User not found' }, true);
     }
 
-    const service = new StrategyService(dataComposer);
+    const service = new StrategyService(dataComposer, getOrchestrator());
     const status = await service.getStrategyStatus(args.groupId, resolved.user.id);
 
     return mcpResponse({ success: true, ...status });

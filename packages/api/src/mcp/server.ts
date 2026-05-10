@@ -131,7 +131,7 @@ export class MCPServer {
 
   private async resolveWorkspaceContextForMcpRequest(
     req: express.Request,
-    userData: { userId: string; email: string; agentId?: string; identityId?: string }
+    userData: { userId: string; email: string; agentId?: string; sbId?: string }
   ): Promise<{ workspaceId?: string; workspaceSource?: 'header' | 'derived' }> {
     const requestedWorkspaceId = req.header('x-ink-workspace-id')?.trim();
 
@@ -279,7 +279,7 @@ export class MCPServer {
             userId: userData.userId,
             email: userData.email,
             agentId: userData.agentId,
-            identityId: userData.identityId,
+            sbId: userData.sbId,
           }
         : {};
       const callerProfileHeader = req.header('x-ink-caller-profile')?.trim().toLowerCase();
@@ -700,7 +700,7 @@ export class MCPServer {
         expires_in: DELEGATED_ACCESS_TOKEN_LIFETIME_SECONDS,
         scope: 'mcp:tools',
         delegated_agent_id: identity.agent_id,
-        identity_id: identity.id,
+        sb_id: identity.id,
       });
     });
 

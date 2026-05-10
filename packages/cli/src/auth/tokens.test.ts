@@ -232,7 +232,7 @@ describe('delegated auth storage', () => {
       expires_in: 3600,
       issued_at: Date.now(),
       agent_id: 'wren',
-      identity_id: 'identity-123',
+      sb_id: 'identity-123',
       scope: 'mcp:tools',
     });
 
@@ -240,7 +240,7 @@ describe('delegated auth storage', () => {
     expect(loaded).not.toBeNull();
     expect(loaded!.access_token).toBe('delegated-token');
     expect(loaded!.agent_id).toBe('wren');
-    expect(loaded!.identity_id).toBe('identity-123');
+    expect(loaded!.sb_id).toBe('identity-123');
   });
 
   it('returns delegated token only when not expired', () => {

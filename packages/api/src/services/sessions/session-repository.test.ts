@@ -19,7 +19,7 @@ function createMockSupabase() {
   const fakeRow = {
     id: 'sess-1',
     user_id: 'user-1',
-    identity_id: null,
+    sb_id: null,
     agent_id: 'lumen',
     studio_id: null,
     workspace_id: null,

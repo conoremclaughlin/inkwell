@@ -55,7 +55,7 @@ export interface Activity {
 export interface LogActivityInput {
   userId: string;
   agentId: string;
-  identityId?: string;
+  sbId?: string;
   type: ActivityType;
   content: string;
   sessionId?: string;
@@ -126,8 +126,8 @@ export class ActivityStreamRepository {
    * Log any activity event
    */
   async logActivity(input: LogActivityInput): Promise<Activity> {
-    const identityId = input.identityId
-      ? input.identityId
+    const sbId = input.sbId
+      ? input.sbId
       : await resolveIdentityId(this.supabase, input.userId, input.agentId);
 
     const { data, error } = await this.supabase
@@ -135,7 +135,7 @@ export class ActivityStreamRepository {
       .insert({
         user_id: input.userId,
         agent_id: input.agentId,
-        identity_id: identityId,
+        sb_id: sbId,
         type: input.type,
         content: input.content,
         session_id: input.sessionId,

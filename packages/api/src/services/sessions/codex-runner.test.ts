@@ -1,5 +1,8 @@
-import { describe, it, expect, vi, beforeEach, type Mock } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import { EventEmitter } from 'events';
+import { mkdtempSync, existsSync, readdirSync, rmSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 
 vi.mock('child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('child_process')>();
@@ -404,6 +407,124 @@ describe('CodexRunner', () => {
     const result = await runPromise;
     // session_meta was first — later session_id must not overwrite it
     expect(result.backendSessionId).toBe(codexSessionId);
+  });
+
+  describe('container path translation', () => {
+    let runtimeDir: string;
+
+    beforeEach(() => {
+      runtimeDir = mkdtempSync(join(tmpdir(), 'codex-container-test-'));
+    });
+
+    afterEach(() => {
+      try {
+        rmSync(runtimeDir, { recursive: true, force: true });
+      } catch {
+        // best effort
+      }
+    });
+
+    it('uses /run/ink/ container path when config.container.runtimeDir is set', async () => {
+      const mockProc = createMockProcess();
+      (spawn as Mock).mockReturnValue(mockProc);
+
+      const runner = new CodexRunner();
+      const runPromise = runner.run('hello', {
+        config: {
+          workingDirectory: process.cwd(),
+          mcpConfigPath: '',
+          model: 'gpt-5-codex',
+          appendSystemPrompt: 'test identity prompt',
+          container: {
+            containerName: 'ink-sandbox-test-abc',
+            runtimeDir,
+          },
+        },
+      });
+
+      setTimeout(() => {
+        mockProc.stdout.emit('data', Buffer.from(`${JSON.stringify({ result: 'ok' })}\n`));
+        mockProc.emit('close', 0);
+      }, 5);
+
+      await runPromise;
+
+      expect(spawn).toHaveBeenCalledTimes(1);
+      const [, args] = (spawn as Mock).mock.calls[0] as [string, string[]];
+
+      // The model_instructions_file arg should point to /run/ink/ (container path)
+      const configArg = args.find(
+        (a: string) => typeof a === 'string' && a.startsWith('model_instructions_file=')
+      );
+      expect(configArg).toBeDefined();
+      expect(configArg).toMatch(/^model_instructions_file=\/run\/ink\//);
+    });
+
+    it('writes the identity prompt file to runtimeDir on the host', async () => {
+      const mockProc = createMockProcess();
+      (spawn as Mock).mockReturnValue(mockProc);
+
+      const runner = new CodexRunner();
+      const runPromise = runner.run('hello', {
+        config: {
+          workingDirectory: process.cwd(),
+          mcpConfigPath: '',
+          model: 'gpt-5-codex',
+          appendSystemPrompt: 'host-side identity content',
+          container: {
+            containerName: 'ink-sandbox-test-abc',
+            runtimeDir,
+          },
+        },
+      });
+
+      setTimeout(() => {
+        mockProc.stdout.emit('data', Buffer.from(`${JSON.stringify({ result: 'ok' })}\n`));
+        mockProc.emit('close', 0);
+      }, 5);
+
+      await runPromise;
+
+      // Verify the file was written to the runtimeDir (host-side)
+      const files = readdirSync(runtimeDir);
+      const identityFile = files.find((f) => f.startsWith('identity-'));
+      expect(identityFile).toBeDefined();
+    });
+
+    it('uses /tmp/ path when runtimeDir is NOT set', async () => {
+      const mockProc = createMockProcess();
+      (spawn as Mock).mockReturnValue(mockProc);
+
+      const runner = new CodexRunner();
+      const runPromise = runner.run('hello', {
+        config: {
+          workingDirectory: process.cwd(),
+          mcpConfigPath: '',
+          model: 'gpt-5-codex',
+          appendSystemPrompt: 'test identity prompt',
+          // No container config
+        },
+      });
+
+      setTimeout(() => {
+        mockProc.stdout.emit('data', Buffer.from(`${JSON.stringify({ result: 'ok' })}\n`));
+        mockProc.emit('close', 0);
+      }, 5);
+
+      await runPromise;
+
+      expect(spawn).toHaveBeenCalledTimes(1);
+      const [, args] = (spawn as Mock).mock.calls[0] as [string, string[]];
+
+      // Without container, the model_instructions_file should NOT use /run/ink/
+      const configArg = args.find(
+        (a: string) => typeof a === 'string' && a.startsWith('model_instructions_file=')
+      );
+      expect(configArg).toBeDefined();
+      expect(configArg).not.toMatch(/\/run\/ink\//);
+      // Should be a host-side tmp path
+      expect(configArg).toMatch(/model_instructions_file=\//);
+    });
   });
 
   it('includes parsed startup events in diagnostics when codex exits non-zero without stderr', async () => {

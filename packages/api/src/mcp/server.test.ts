@@ -377,7 +377,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.delegated_agent_id).toBe('wren');
-    expect(body.identity_id).toBe('identity-abc');
+    expect(body.sb_id).toBe('identity-abc');
     expect(body.expires_in).toBe(3600);
 
     const token = body.access_token as string;

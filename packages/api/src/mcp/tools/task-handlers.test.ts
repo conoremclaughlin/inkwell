@@ -1227,7 +1227,7 @@ describe('handleCreateTaskGroup', () => {
     dc.repositories.taskGroups.create.mockResolvedValue({
       id: 'grp-1',
       user_id: 'user-123',
-      identity_id: null,
+      sb_id: null,
       project_id: null,
       title: 'Ship feature X',
       description: 'Multi-PR rollout',
@@ -1346,7 +1346,7 @@ describe('handleUpdateTaskGroup', () => {
   const existingGroup = {
     id: '11111111-2222-3333-4444-555555555555',
     user_id: 'user-123',
-    identity_id: null,
+    sb_id: null,
     project_id: null,
     title: 'Feature X',
     description: null,
@@ -1488,7 +1488,7 @@ describe('handleUpdateTaskGroup', () => {
     expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
   });
 
-  it('rejects identityId that does not belong to this user', async () => {
+  it('rejects sbId that does not belong to this user', async () => {
     dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
     // Identity lookup returns nothing — not owned by this user
     (dc.getClient() as any).from().single.mockResolvedValueOnce({ data: null, error: null });
@@ -1497,18 +1497,18 @@ describe('handleUpdateTaskGroup', () => {
       {
         userId: 'user-123',
         groupId: '11111111-2222-3333-4444-555555555555',
-        identityId: '99999999-9999-9999-9999-999999999999',
+        sbId: '99999999-9999-9999-9999-999999999999',
       } as any,
       dc as any
     );
 
     const data = parseResponse(response);
     expect(response.isError).toBe(true);
-    expect(data.error).toBe('identityId not found or does not belong to this user/workspace.');
+    expect(data.error).toBe('sbId not found or does not belong to this user/workspace.');
     expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
   });
 
-  it('scopes identityId lookup to the workspace when request context supplies one', async () => {
+  it('scopes sbId lookup to the workspace when request context supplies one', async () => {
     dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
     const { getRequestContext } = await import('../../utils/request-context');
     (getRequestContext as any).mockReturnValueOnce({
@@ -1522,19 +1522,19 @@ describe('handleUpdateTaskGroup', () => {
       {
         userId: 'user-123',
         groupId: '11111111-2222-3333-4444-555555555555',
-        identityId: '77777777-7777-7777-7777-777777777777',
+        sbId: '77777777-7777-7777-7777-777777777777',
       } as any,
       dc as any
     );
 
     const data = parseResponse(response);
     expect(response.isError).toBe(true);
-    expect(data.error).toBe('identityId not found or does not belong to this user/workspace.');
+    expect(data.error).toBe('sbId not found or does not belong to this user/workspace.');
     expect(chain.eq).toHaveBeenCalledWith('workspace_id', 'ws-match');
     expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
   });
 
-  it('accepts identityId that belongs to this user', async () => {
+  it('accepts sbId that belongs to this user', async () => {
     dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
     (dc.getClient() as any).from().single.mockResolvedValueOnce({
       data: { id: '77777777-7777-7777-7777-777777777777' },
@@ -1542,14 +1542,14 @@ describe('handleUpdateTaskGroup', () => {
     });
     dc.repositories.taskGroups.update.mockResolvedValue({
       ...existingGroup,
-      identity_id: '77777777-7777-7777-7777-777777777777',
+      sb_id: '77777777-7777-7777-7777-777777777777',
     });
 
     const response = await handleUpdateTaskGroup(
       {
         userId: 'user-123',
         groupId: '11111111-2222-3333-4444-555555555555',
-        identityId: '77777777-7777-7777-7777-777777777777',
+        sbId: '77777777-7777-7777-7777-777777777777',
       } as any,
       dc as any
     );
@@ -1560,23 +1560,23 @@ describe('handleUpdateTaskGroup', () => {
     expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
       '11111111-2222-3333-4444-555555555555',
       expect.objectContaining({
-        identity_id: '77777777-7777-7777-7777-777777777777',
+        sb_id: '77777777-7777-7777-7777-777777777777',
       })
     );
   });
 
-  it('accepts explicit null identityId as a clear without a lookup', async () => {
+  it('accepts explicit null sbId as a clear without a lookup', async () => {
     dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
     dc.repositories.taskGroups.update.mockResolvedValue({
       ...existingGroup,
-      identity_id: null,
+      sb_id: null,
     });
 
     await handleUpdateTaskGroup(
       {
         userId: 'user-123',
         groupId: '11111111-2222-3333-4444-555555555555',
-        identityId: null,
+        sbId: null,
       } as any,
       dc as any
     );
@@ -1587,12 +1587,12 @@ describe('handleUpdateTaskGroup', () => {
     expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
       '11111111-2222-3333-4444-555555555555',
       expect.objectContaining({
-        identity_id: null,
+        sb_id: null,
       })
     );
   });
 
-  it('does not touch identity_id when identityId is not provided', async () => {
+  it('does not touch sb_id when sbId is not provided', async () => {
     dc.repositories.taskGroups.findById.mockResolvedValue(existingGroup);
     dc.repositories.taskGroups.update.mockResolvedValue({
       ...existingGroup,
@@ -1610,10 +1610,10 @@ describe('handleUpdateTaskGroup', () => {
 
     const fromMock = (dc.getClient() as any).from;
     expect(fromMock).not.toHaveBeenCalledWith('agent_identities');
-    // Repository sees undefined for identity_id — repository's upsert logic is
+    // Repository sees undefined for sb_id — repository's upsert logic is
     // then responsible for leaving the column alone.
     const call = (dc.repositories.taskGroups.update as any).mock.calls[0][1];
-    expect(call.identity_id).toBeUndefined();
+    expect(call.sb_id).toBeUndefined();
   });
 
   it('enables autonomous mode and sets maxSessions', async () => {
@@ -1855,7 +1855,7 @@ describe('handleListTaskGroups', () => {
     {
       id: 'grp-1',
       user_id: 'user-123',
-      identity_id: null,
+      sb_id: null,
       project_id: null,
       title: 'Active group',
       description: null,
@@ -1877,7 +1877,7 @@ describe('handleListTaskGroups', () => {
     {
       id: 'grp-2',
       user_id: 'user-123',
-      identity_id: null,
+      sb_id: null,
       project_id: null,
       title: 'Completed group',
       description: null,

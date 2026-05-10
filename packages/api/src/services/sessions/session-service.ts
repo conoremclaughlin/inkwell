@@ -33,9 +33,11 @@ import { ContextBuilder } from './context-builder.js';
 import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 import { CodexRunner } from './codex-runner.js';
 import { GeminiRunner } from './gemini-runner.js';
+import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import { resolveIdentityId } from '../../auth/resolve-identity.js';
 import { classifyError } from '@inklabs/shared';
+import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -134,6 +136,7 @@ export class SessionService implements ISessionService {
   private claudeRunner: IRunner;
   private codexRunner: IRunner;
   private geminiRunner: IRunner;
+  private inkRunner: IRunner;
   private activityStream: IActivityStream;
   private config: SessionServiceConfig;
   private supabase: SupabaseClient<Database> | null;
@@ -166,13 +169,15 @@ export class SessionService implements ISessionService {
     config: Partial<SessionServiceConfig> = {},
     codexRunner?: IRunner,
     supabase?: SupabaseClient<Database>,
-    geminiRunner?: IRunner
+    geminiRunner?: IRunner,
+    inkRunner?: IRunner
   ) {
     this.repository = repository;
     this.contextBuilder = contextBuilder;
     this.claudeRunner = claudeRunner;
     this.codexRunner = codexRunner || claudeRunner;
     this.geminiRunner = geminiRunner || claudeRunner;
+    this.inkRunner = inkRunner || new InkRunner();
     this.activityStream = activityStream;
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.supabase = supabase || null;
@@ -383,7 +388,7 @@ export class SessionService implements ISessionService {
       userId,
       agentId,
       injectedContext.user.email,
-      session.identityId
+      session.sbId
     );
 
     // 4. Select runtime backend and model
@@ -435,7 +440,10 @@ export class SessionService implements ISessionService {
             'Read(*)',
             'WebFetch(*)',
             'WebSearch',
-            'mcp__*',
+            'mcp__inkwell__*',
+            'mcp__supabase__*',
+            'mcp__github__*',
+            'mcp__playwright__*',
           ],
         }
       : undefined;
@@ -464,15 +472,36 @@ export class SessionService implements ISessionService {
       ...(permissionOverlay ? { permissionOverlay } : {}),
       // Propagate repo root so spawned backend's context token carries it
       repoRoot: resolvedWorkingDirectory.replace(/--[^/]+$/, ''),
+      // Route CLI execution into sandbox container when triggered by a sandboxed strategy
+      ...(metadata?.sandboxContainerName
+        ? {
+            container: {
+              containerName: metadata.sandboxContainerName,
+              runtimeDir: getRunnerFilesDir(metadata.sandboxContainerName),
+            },
+          }
+        : {}),
     };
 
     // 5. Run with selected backend
+    // Ink runner executes tools in-process against the host filesystem —
+    // it cannot route to a Docker container. Reject the combination so a
+    // sandboxed strategy doesn't silently bypass containment.
+    if (resolvedBackend === 'ink' && runnerConfig.container) {
+      throw new Error(
+        'ink backend cannot run inside a sandbox container. ' +
+          'Use a CLI backend (claude-code, codex-cli, gemini) for sandboxed strategies.'
+      );
+    }
+
     const runner =
       resolvedBackend === 'codex-cli'
         ? this.codexRunner
         : resolvedBackend === 'gemini'
           ? this.geminiRunner
-          : this.claudeRunner;
+          : resolvedBackend === 'ink'
+            ? this.inkRunner
+            : this.claudeRunner;
 
     // 5a. Log backend spawn to activity stream (fire-and-forget)
     const triggerSource = metadata?.triggerType as string | undefined;
@@ -671,7 +700,7 @@ export class SessionService implements ISessionService {
     userId: string,
     agentId: string,
     email?: string,
-    identityId?: string
+    sbId?: string
   ): string | undefined {
     if (!email) {
       logger.warn('Cannot inject PCP access token for backend runner: missing user email', {
@@ -697,7 +726,7 @@ export class SessionService implements ISessionService {
         email,
         scope: 'mcp:tools',
         ...(agentId ? { agentId } : {}),
-        ...(identityId ? { identityId } : {}),
+        ...(sbId ? { sbId } : {}),
       },
       jwtSecret,
       { expiresIn: 60 * 60 }
@@ -816,16 +845,16 @@ export class SessionService implements ISessionService {
     }
 
     // Resolve canonical identity UUID
-    let identityId: string | undefined;
+    let sbId: string | undefined;
     if (this.supabase) {
-      identityId = (await resolveIdentityId(this.supabase, userId, agentId)) || undefined;
+      sbId = (await resolveIdentityId(this.supabase, userId, agentId)) || undefined;
     }
 
     // Create new session
     const session = await this.repository.create({
       userId,
       agentId,
-      identityId,
+      sbId,
       backendSessionId: null,
       type,
       lifecycle: 'idle',
@@ -1217,7 +1246,7 @@ This session will continue with a fresh context after compaction. Your identity,
         session.userId,
         session.agentId,
         fullContext.user.email,
-        session.identityId
+        session.sbId
       );
 
       const runtimeBackend = this.resolveRuntimeBackend(session.backend, context.agent.backend);
@@ -1248,7 +1277,9 @@ This session will continue with a fresh context after compaction. Your identity,
           ? this.codexRunner
           : runtimeBackend === 'gemini'
             ? this.geminiRunner
-            : this.claudeRunner;
+            : runtimeBackend === 'ink'
+              ? this.inkRunner
+              : this.claudeRunner;
 
       // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session
       const result = await runner.run(compactionPrompt, {
@@ -1287,10 +1318,14 @@ This session will continue with a fresh context after compaction. Your identity,
   /**
    * Normalize backend value to runtime backend IDs used by sessions.
    */
-  private normalizeBackend(raw: string | null | undefined): 'claude-code' | 'codex-cli' | 'gemini' {
+  private normalizeBackend(
+    raw: string | null | undefined
+  ): 'claude-code' | 'codex-cli' | 'gemini' | 'ink' {
     const value = (raw || '').toLowerCase().trim();
     if (value === 'codex' || value === 'codex-cli') return 'codex-cli';
     if (value === 'gemini' || value === 'gemini-cli') return 'gemini';
+    if (value === 'ink' || value === 'direct-api' || value === 'direct' || value === 'api')
+      return 'ink';
     if (value === 'claude' || value === 'claude-code' || value === '') return 'claude-code';
     logger.warn('Unknown backend configured, falling back to claude-code', { raw });
     return 'claude-code';
@@ -1302,7 +1337,7 @@ This session will continue with a fresh context after compaction. Your identity,
   private async resolveAgentBackend(
     userId: string,
     agentId: string
-  ): Promise<'claude-code' | 'codex-cli' | 'gemini'> {
+  ): Promise<'claude-code' | 'codex-cli' | 'gemini' | 'ink'> {
     try {
       const identityBackend = await this.contextBuilder.getAgentBackend(userId, agentId);
       return this.normalizeBackend(identityBackend);
@@ -1322,7 +1357,7 @@ This session will continue with a fresh context after compaction. Your identity,
   private resolveRuntimeBackend(
     sessionBackend: string | null | undefined,
     identityBackend: string | null | undefined
-  ): 'claude-code' | 'codex-cli' | 'gemini' {
+  ): 'claude-code' | 'codex-cli' | 'gemini' | 'ink' {
     if (sessionBackend) return this.normalizeBackend(sessionBackend);
     return this.normalizeBackend(identityBackend);
   }
@@ -1593,6 +1628,7 @@ export function createSessionService(
     config,
     new CodexRunner(),
     supabase,
-    new GeminiRunner()
+    new GeminiRunner(),
+    new InkRunner()
   );
 }
