@@ -511,7 +511,8 @@ export async function buildDockerRunArgs(request: SandboxSpinUpRequest): Promise
   const args = ['run', '--rm', '-d', '--name', containerName];
   args.push('--workdir', '/studio');
   args.push('--add-host', 'host.docker.internal:host-gateway');
-  args.push('--hostname', containerName);
+  // Linux hostname limit is 63 chars (POSIX portable); container name can be longer
+  args.push('--hostname', containerName.slice(0, 63));
 
   // Labels for discovery and lifecycle management
   args.push('--label', CONTAINER_LABEL);
