@@ -114,6 +114,12 @@ export const startStrategySchema = z.object({
     .array(z.enum(['claude', 'codex', 'gemini']))
     .optional()
     .describe("Backend auth dirs to mount in the sandbox (default: ['claude'])"),
+  ephemeralStudio: z
+    .boolean()
+    .optional()
+    .describe(
+      'Auto-create an ephemeral git worktree + studio for sandbox work. Requires sandbox: true and repoRoot in group metadata.'
+    ),
 });
 
 export async function handleStartStrategy(
@@ -148,6 +154,7 @@ export async function handleStartStrategy(
         sandbox: args.sandbox,
         sandboxPolicy: args.sandboxPolicy,
         sandboxBackendAuth: args.sandboxBackendAuth,
+        ephemeralStudio: args.ephemeralStudio,
       },
     });
 
