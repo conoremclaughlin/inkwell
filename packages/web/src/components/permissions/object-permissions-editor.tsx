@@ -64,8 +64,8 @@ export function ObjectPermissionsEditor({
     setNextEditorId('');
   };
 
-  const removeEditor = (identityId: string) => {
-    onEditorIdentityIdsChange(editorIdentityIds.filter((current) => current !== identityId));
+  const removeEditor = (sbId: string) => {
+    onEditorIdentityIdsChange(editorIdentityIds.filter((current) => current !== sbId));
   };
 
   const submitDisabled = isActionPending || (mode === 'editors' && editorIdentityIds.length === 0);
@@ -120,19 +120,19 @@ export function ObjectPermissionsEditor({
               <p className="text-sm text-red-700">Select at least one editor.</p>
             ) : (
               <div className="space-y-2">
-                {editorIdentityIds.map((identityId) => {
-                  const identity = identitiesById.get(identityId);
+                {editorIdentityIds.map((sbId) => {
+                  const identity = identitiesById.get(sbId);
                   return (
                     <div
-                      key={identityId}
+                      key={sbId}
                       className="flex items-center justify-between rounded-md border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800"
                     >
                       <span>{identity?.name || 'Unknown identity'}</span>
                       <button
                         type="button"
-                        onClick={() => removeEditor(identityId)}
+                        onClick={() => removeEditor(sbId)}
                         className="rounded p-1 text-gray-500 hover:bg-gray-100 hover:text-gray-700"
-                        aria-label={`Remove ${identity ? identity.name : identityId}`}
+                        aria-label={`Remove ${identity ? identity.name : sbId}`}
                       >
                         <X className="h-3 w-3" />
                       </button>

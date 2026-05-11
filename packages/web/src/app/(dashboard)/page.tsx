@@ -35,7 +35,7 @@ interface AgentWithStudios {
   agentName: string;
   agentRole: string | null;
   backend: string | null;
-  identityId: string;
+  sbId: string;
   latestSession: AgentLatestSession | null;
   studios: StudioInfo[];
 }

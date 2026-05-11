@@ -36,9 +36,9 @@ interface InboxMessage {
   priority: string;
   status: string;
   senderAgentId: string | null;
-  senderIdentityId: string | null;
+  senderSbId: string | null;
   recipientAgentId: string;
-  recipientIdentityId: string | null;
+  recipientSbId: string | null;
   threadKey: string | null;
   recipientSessionId: string | null;
   relatedArtifactUri: string | null;
@@ -868,11 +868,7 @@ export default function InboxPage() {
                   </h3>
                   <div className="space-y-3">
                     <RoutingField label="Agent ID" value={routingMessage.senderAgentId} />
-                    <RoutingField
-                      label="Identity ID"
-                      value={routingMessage.senderIdentityId}
-                      mono
-                    />
+                    <RoutingField label="Identity ID" value={routingMessage.senderSbId} mono />
                   </div>
                 </div>
 
@@ -882,11 +878,7 @@ export default function InboxPage() {
                   </h3>
                   <div className="space-y-3">
                     <RoutingField label="Agent ID" value={routingMessage.recipientAgentId} />
-                    <RoutingField
-                      label="Identity ID"
-                      value={routingMessage.recipientIdentityId}
-                      mono
-                    />
+                    <RoutingField label="Identity ID" value={routingMessage.recipientSbId} mono />
                   </div>
                 </div>
 
