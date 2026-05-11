@@ -167,6 +167,23 @@ const listArtifactCommentsSchema = workspaceScopedUserIdentifierSchema.extend({
   limit: z.number().min(1).max(200).optional().default(100).describe('Max comments to return'),
 });
 
+const searchArtifactsSchema = workspaceScopedUserIdentifierSchema.extend({
+  query: z.string().describe('Search query text'),
+  mode: z
+    .enum(['text', 'semantic', 'hybrid', 'auto'])
+    .optional()
+    .default('auto')
+    .describe(
+      'Search mode: text (keyword/trigram), semantic (embedding similarity), hybrid (blended), auto (hybrid if embeddings enabled, else text)'
+    ),
+  artifactType: z
+    .enum(['spec', 'design', 'decision', 'document', 'note'])
+    .optional()
+    .describe('Filter by artifact type'),
+  tags: z.array(z.string()).optional().describe('Filter by tags (any match)'),
+  limit: z.number().min(1).max(50).optional().default(10).describe('Max results to return'),
+});
+
 // ============== Helpers ==============
 
 function withWorkspaceFilter<T>(query: T, workspaceId?: string): T {
@@ -1302,6 +1319,54 @@ export async function handleListArtifactComments(args: unknown, dataComposer: Da
   };
 }
 
+export async function handleSearchArtifacts(args: unknown, dataComposer: DataComposer) {
+  const parsed = parseWithContext(searchArtifactsSchema, args);
+  const resolved = await resolveUserOrThrow(parsed, dataComposer);
+
+  const { query, mode = 'auto', artifactType, tags, limit = 10, workspaceId } = parsed;
+
+  const results = await dataComposer.repositories.artifactSearch.search(
+    resolved.user.id,
+    query,
+    mode,
+    {
+      artifactType,
+      tags,
+      workspaceId,
+      limit,
+    }
+  );
+
+  const SNIPPET_LENGTH = 200;
+
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify({
+          success: true,
+          query,
+          mode,
+          resultCount: results.length,
+          results: results.map((r) => ({
+            title: r.title,
+            uri: r.uri,
+            artifactType: r.artifactType,
+            snippet:
+              r.content.length > SNIPPET_LENGTH
+                ? r.content.slice(0, SNIPPET_LENGTH) + '...'
+                : r.content,
+            relevanceScore: Math.round(r.finalScore * 1000) / 1000,
+            tags: r.tags,
+            version: r.version,
+            updatedAt: r.updatedAt,
+          })),
+        }),
+      },
+    ],
+  };
+}
+
 // ============== Tool Registration ==============
 
 export const artifactToolDefinitions = [
@@ -1351,5 +1416,12 @@ export const artifactToolDefinitions = [
       'List comments for an artifact, including canonical identity UUID author metadata.',
     schema: listArtifactCommentsSchema,
     handler: handleListArtifactComments,
+  },
+  {
+    name: 'search_artifacts',
+    description:
+      'Search artifacts using text (keyword/trigram), semantic (embedding similarity), or hybrid (blended) modes. Returns matching artifacts with title, URI, snippet, relevance score, and metadata.',
+    schema: searchArtifactsSchema,
+    handler: handleSearchArtifacts,
   },
 ];
