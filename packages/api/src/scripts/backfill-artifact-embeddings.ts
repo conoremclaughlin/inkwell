@@ -46,6 +46,8 @@ async function main() {
   let updated = 0;
   let skipped = 0;
   let scanned = 0;
+  let cursorCreatedAt: string | null = null;
+  let cursorId: string | null = null;
 
   while (limit === null || scanned < limit) {
     const remaining = limit === null ? batchSize : Math.min(batchSize, limit - scanned);
@@ -53,14 +55,21 @@ async function main() {
 
     let query = supabase
       .from('artifacts')
-      .select('id,user_id,title,content,artifact_type,metadata,embedding')
+      .select('id,user_id,title,content,artifact_type,metadata,embedding,created_at')
       .eq('user_id', userId)
-      .is('embedding', null)
       .order('created_at', { ascending: true })
-      .range(0, remaining - 1);
+      .order('id', { ascending: true })
+      .limit(remaining);
 
     if (artifactType) {
       query = query.eq('artifact_type', artifactType);
+    }
+
+    // Keyset pagination: advance past last seen (created_at, id)
+    if (cursorCreatedAt && cursorId) {
+      query = query.or(
+        `created_at.gt.${cursorCreatedAt},and(created_at.eq.${cursorCreatedAt},id.gt.${cursorId})`
+      );
     }
 
     const { data, error } = await query;
@@ -68,13 +77,18 @@ async function main() {
       throw new Error(`Failed to fetch artifacts for backfill: ${error.message}`);
     }
 
-    const rows = (data || []) as Pick<
+    const rows = (data || []) as (Pick<
       ArtifactRow,
       'id' | 'user_id' | 'title' | 'content' | 'artifact_type' | 'metadata' | 'embedding'
-    >[];
+    > & { created_at: string })[];
 
     if (rows.length === 0) break;
     scanned += rows.length;
+
+    // Advance cursor to last row in batch
+    const lastRow = rows[rows.length - 1];
+    cursorCreatedAt = lastRow.created_at;
+    cursorId = lastRow.id;
 
     for (const row of rows) {
       processed += 1;
