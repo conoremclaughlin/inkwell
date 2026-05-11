@@ -474,15 +474,17 @@ export function buildChunkMetadataUpdate(params: {
   model: string;
   chunkCount: number;
   viewCounts: MemoryChunkViewCounts;
+  extractionMode?: MemoryExtractionChunkMode;
   existingMetadata?: Record<string, unknown> | null;
 }): Record<string, unknown> {
-  const { provider, model, chunkCount, viewCounts, existingMetadata } = params;
+  const { provider, model, chunkCount, viewCounts, extractionMode, existingMetadata } = params;
   return {
     ...(existingMetadata || {}),
     embedding_chunks: {
       provider,
       model,
       version: MEMORY_EMBEDDING_CHUNKS_VERSION,
+      ...(extractionMode ? { extractionMode } : {}),
       chunkCount,
       viewCounts,
       updatedAt: new Date().toISOString(),

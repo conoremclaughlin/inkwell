@@ -1044,6 +1044,7 @@ export class MemoryRepository {
           model: primaryEmbedding.model,
           chunkCount: embeddedChunks.length,
           viewCounts: countChunkViews(embeddedChunks.map(({ chunk }) => chunk)),
+          extractionMode: env.MEMORY_EXTRACTION_MODE,
           existingMetadata: memory.metadata || {},
         }),
         embedding: {
@@ -1107,6 +1108,7 @@ export class MemoryRepository {
         model: primaryEmbedding.model,
         chunkCount: embeddedChunks.length,
         viewCounts: countChunkViews(embeddedChunks.map(({ chunk }) => chunk)),
+        extractionMode: env.MEMORY_EXTRACTION_MODE,
         existingMetadata: memory.metadata || {},
       }),
       embedding: {
