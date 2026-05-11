@@ -7,7 +7,8 @@
   "scripts": {
     "benchmark:memory-recall": "tsx src/benchmark-memory-recall.ts",
     "benchmark:bootstrap-relevance": "tsx src/benchmark-bootstrap-relevance.ts",
-    "test": "vitest run --config vitest.config.ts"
+    "test": "vitest run --config vitest.config.ts",
+    "benchmark:memory-answer": "tsx src/benchmark-memory-answer.ts"
   },
   "dependencies": {
     "@inklabs/api": "workspace:*"
