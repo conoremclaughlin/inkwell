@@ -6605,6 +6605,102 @@ router.get('/task-groups/:id/activity', async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /api/admin/task-groups/:id/comments
+ * List comments for a task group
+ */
+router.get('/task-groups/:id/comments', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    const { data: group } = await supabase
+      .from('task_groups')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', authReq.pcpUserId)
+      .single();
+
+    if (!group) {
+      res.status(404).json({ error: 'Task group not found' });
+      return;
+    }
+
+    const { data: comments, error } = await supabase
+      .from('task_group_comments')
+      .select('*')
+      .eq('task_group_id', id)
+      .is('deleted_at', null)
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      logger.error('Failed to list task group comments:', error);
+      res.status(500).json(errorJson('Failed to list task group comments', error));
+      return;
+    }
+
+    const sbIds = Array.from(
+      new Set((comments || []).map((c) => c.created_by_sb_id).filter(Boolean) as string[])
+    );
+
+    const identitiesById = new Map<
+      string,
+      { id: string; agent_id: string; name: string; backend: string | null }
+    >();
+
+    if (sbIds.length > 0) {
+      const { data: identities, error: identitiesError } = await supabase
+        .from('agent_identities')
+        .select('id, agent_id, name, backend')
+        .in('id', sbIds);
+
+      if (identitiesError) {
+        logger.error('Failed to resolve task group comment identities:', identitiesError);
+        res.status(500).json(errorJson('Failed to resolve comment identities', identitiesError));
+        return;
+      }
+
+      for (const identity of identities || []) {
+        identitiesById.set(identity.id, identity);
+      }
+    }
+
+    res.json({
+      groupId: id,
+      comments: (comments || []).map((comment) => {
+        const identity = comment.created_by_sb_id
+          ? (identitiesById.get(comment.created_by_sb_id) ?? null)
+          : null;
+        return {
+          id: comment.id,
+          taskGroupId: comment.task_group_id,
+          commentType: comment.comment_type,
+          content: comment.content,
+          agentId: comment.agent_id,
+          metadata: comment.metadata,
+          createdBySbId: comment.created_by_sb_id,
+          createdByIdentity: identity
+            ? {
+                id: identity.id,
+                agentId: identity.agent_id,
+                name: identity.name,
+                backend: identity.backend,
+              }
+            : null,
+          createdAt: comment.created_at,
+          updatedAt: comment.updated_at,
+        };
+      }),
+    });
+  } catch (error) {
+    logger.error('Failed to list task group comments:', error);
+    res.status(500).json(errorJson('Failed to list task group comments', error));
+  }
+});
+
+/**
  * GET /api/admin/tasks/:id/comments
  * List comments for a task
  */

@@ -28,6 +28,8 @@ import {
   Target,
   Hash,
   Timer,
+  MessageSquare,
+  FileCheck,
 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { useApiQuery } from '@/lib/api';
@@ -92,6 +94,31 @@ interface ActivityEvent {
 
 interface ActivityResponse {
   events: ActivityEvent[];
+}
+
+interface CommentIdentity {
+  id: string;
+  agentId: string;
+  name: string;
+  backend: string | null;
+}
+
+interface TaskGroupComment {
+  id: string;
+  taskGroupId: string;
+  commentType: 'comment' | 'conclusion' | 'status_change';
+  content: string;
+  agentId: string | null;
+  metadata: Record<string, unknown>;
+  createdBySbId: string | null;
+  createdByIdentity: CommentIdentity | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface CommentsResponse {
+  groupId: string;
+  comments: TaskGroupComment[];
 }
 
 // ─── Constants ───
@@ -482,6 +509,109 @@ function LiveTimeline({ groupId, isActive }: { groupId: string; isActive: boolea
   );
 }
 
+// ─── Comments Thread ───
+
+function CommentsThread({ groupId }: { groupId: string }) {
+  const { data, isLoading } = useApiQuery<CommentsResponse>(
+    ['mission-comments', groupId],
+    `/api/admin/task-groups/${groupId}/comments`
+  );
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center gap-2 text-sm text-gray-400 py-6 justify-center">
+        <Loader2 className="h-4 w-4 animate-spin" />
+        Loading comments...
+      </div>
+    );
+  }
+
+  const comments = data?.comments ?? [];
+  if (comments.length === 0) {
+    return (
+      <div className="text-center py-6">
+        <MessageSquare className="h-8 w-8 mx-auto text-gray-200 mb-2" />
+        <p className="text-sm text-gray-400">No comments yet.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      {comments.map((comment) => {
+        const isConclusion = comment.commentType === 'conclusion';
+        const isStatusChange = comment.commentType === 'status_change';
+        const authorName =
+          comment.createdByIdentity?.name ||
+          comment.createdByIdentity?.agentId ||
+          comment.agentId ||
+          'Unknown';
+        const agentBadge = comment.agentId
+          ? (AGENT_BADGE_COLORS[comment.agentId] ?? 'bg-gray-100 text-gray-600')
+          : null;
+
+        if (isStatusChange) {
+          return (
+            <div key={comment.id} className="flex items-center gap-2 py-1">
+              <div className="flex-1 h-px bg-gray-100" />
+              <span className="text-[11px] text-gray-400 italic">{comment.content}</span>
+              <div className="flex-1 h-px bg-gray-100" />
+            </div>
+          );
+        }
+
+        return (
+          <div
+            key={comment.id}
+            className={clsx(
+              'rounded-lg border p-4',
+              isConclusion ? 'bg-emerald-50/50 border-emerald-200' : 'bg-white border-gray-200'
+            )}
+          >
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2">
+                {isConclusion && <FileCheck className="h-3.5 w-3.5 text-emerald-600" />}
+                {agentBadge && (
+                  <span
+                    className={clsx(
+                      'text-[11px] font-medium px-1.5 py-0.5 rounded-full',
+                      agentBadge
+                    )}
+                  >
+                    {authorName}
+                  </span>
+                )}
+                {!agentBadge && (
+                  <span className="text-xs font-medium text-gray-700">{authorName}</span>
+                )}
+                {isConclusion && (
+                  <span className="text-[10px] font-medium text-emerald-600 uppercase tracking-wider">
+                    Conclusion
+                  </span>
+                )}
+                {comment.createdByIdentity?.backend && (
+                  <span className="text-[10px] text-gray-400">
+                    via {comment.createdByIdentity.backend}
+                  </span>
+                )}
+              </div>
+              <span className="text-[11px] text-gray-400">{formatDateTime(comment.createdAt)}</span>
+            </div>
+            <p
+              className={clsx(
+                'text-sm whitespace-pre-wrap',
+                isConclusion ? 'text-emerald-900' : 'text-gray-700'
+              )}
+            >
+              {comment.content}
+            </p>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // ─── Main Page ───
 
 export default function MissionDetailPage() {
@@ -671,6 +801,17 @@ export default function MissionDetailPage() {
             </div>
             <LiveTimeline groupId={groupId} isActive={isActive} />
           </div>
+        </div>
+      </div>
+
+      {/* Comments Thread */}
+      <div className="mt-6">
+        <div className="rounded-xl border bg-white p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <MessageSquare className="h-4 w-4 text-gray-400" />
+            <h2 className="text-sm font-semibold text-gray-700">Comments</h2>
+          </div>
+          <CommentsThread groupId={groupId} />
         </div>
       </div>
     </div>
