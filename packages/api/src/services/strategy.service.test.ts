@@ -1379,7 +1379,7 @@ describe('StrategyService', () => {
       const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
       const payload = call[0] as Record<string, unknown>;
       expect(payload.recipientAgentId).toBe('wren');
-      expect(payload.senderAgentId).toBe('system');
+      expect(payload.senderAgentId).toBe('wren');
       expect(payload.messageType).toBe('session_resume');
       expect(payload.trigger).toBe(true);
       expect(payload.recipientStudioId).toBe('studio-uuid-omega');

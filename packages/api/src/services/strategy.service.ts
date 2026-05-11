@@ -872,7 +872,7 @@ export class StrategyService {
         {
           userId: group.user_id,
           recipientAgentId: group.owner_agent_id,
-          senderAgentId: 'system',
+          senderAgentId: group.owner_agent_id,
           // Prefer studioId (UUID); fall back to slug only when UUID is absent.
           recipientStudioId: studioId,
           recipientStudioSlug: studioId ? undefined : studioSlug,
