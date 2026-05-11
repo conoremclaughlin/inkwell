@@ -104,6 +104,12 @@ export const startStrategySchema = z.object({
       'Supervisor agent identity ID (UUID). Gets check-in notifications and a final audit on completion.'
     ),
   sandbox: z.boolean().optional().describe('Run the strategy in a sandboxed Docker container'),
+  ephemeralStudio: z
+    .boolean()
+    .optional()
+    .describe(
+      'Auto-create an ephemeral git worktree + studio for the sandbox. Requires repoRoot in task group metadata. Cleaned up on completion/cancellation.'
+    ),
   sandboxPolicy: z
     .enum(['required', 'preferred'])
     .optional()
@@ -146,6 +152,7 @@ export async function handleStartStrategy(
         verificationGates: args.verificationGates,
         supervisorId: args.supervisorId,
         sandbox: args.sandbox,
+        ephemeralStudio: args.ephemeralStudio,
         sandboxPolicy: args.sandboxPolicy,
         sandboxBackendAuth: args.sandboxBackendAuth,
       },
