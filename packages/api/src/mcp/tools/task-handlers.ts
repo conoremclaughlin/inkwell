@@ -818,7 +818,7 @@ export async function handleAddTaskGroupComment(
     const reqCtx = getRequestContext();
     const workspaceId = reqCtx?.workspaceId;
 
-    const identityId = await resolveIdentityIdForAgent(
+    const sbId = await resolveIdentityIdForAgent(
       dataComposer,
       resolved.user.id,
       agentId,
@@ -834,7 +834,7 @@ export async function handleAddTaskGroupComment(
         content: args.content.trim(),
         comment_type: args.commentType || 'comment',
         agent_id: agentId || null,
-        created_by_sb_id: identityId,
+        created_by_sb_id: sbId,
       } as never)
       .select()
       .single();
@@ -1060,7 +1060,7 @@ export async function handleCloseTaskGroup(
     const agentId = getEffectiveAgentId(args.agentId);
     const reqCtx = getRequestContext();
     const workspaceId = reqCtx?.workspaceId;
-    const identityId = await resolveIdentityIdForAgent(
+    const sbId = await resolveIdentityIdForAgent(
       dataComposer,
       resolved.user.id,
       agentId,
@@ -1076,7 +1076,7 @@ export async function handleCloseTaskGroup(
         content: autoConclusion,
         comment_type: 'conclusion',
         agent_id: agentId || null,
-        created_by_sb_id: identityId,
+        created_by_sb_id: sbId,
       } as never);
 
     if (commentError) {

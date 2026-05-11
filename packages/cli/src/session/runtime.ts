@@ -5,7 +5,7 @@ export interface RuntimeSessionRecord {
   pcpSessionId: string;
   backend: string;
   agentId?: string;
-  identityId?: string;
+  sbId?: string;
   studioId?: string;
   threadKey?: string;
   gitBranch?: string;
@@ -22,7 +22,7 @@ interface RuntimeSessionState {
     pcpSessionId: string;
     backend: string;
     agentId?: string;
-    identityId?: string;
+    sbId?: string;
     studioId?: string;
     updatedAt: string;
   };
@@ -161,14 +161,14 @@ export function setCurrentRuntimeSession(
   cwd: string,
   pcpSessionId: string,
   backend: string,
-  options?: { agentId?: string; identityId?: string; studioId?: string }
+  options?: { agentId?: string; sbId?: string; studioId?: string }
 ): void {
   const state = readRuntimeState(cwd);
   state.current = {
     pcpSessionId,
     backend,
     ...(options?.agentId ? { agentId: options.agentId } : {}),
-    ...(options?.identityId ? { identityId: options.identityId } : {}),
+    ...(options?.sbId ? { sbId: options.sbId } : {}),
     ...(options?.studioId ? { studioId: options.studioId } : {}),
     updatedAt: new Date().toISOString(),
   };
@@ -209,7 +209,7 @@ export function getCurrentRuntimeSession(
         s.pcpSessionId === state.current!.pcpSessionId &&
         s.backend === state.current!.backend &&
         (!state.current!.agentId || s.agentId === state.current!.agentId) &&
-        (!state.current!.identityId || s.identityId === state.current!.identityId) &&
+        (!state.current!.sbId || s.sbId === state.current!.sbId) &&
         (!state.current!.studioId || s.studioId === state.current!.studioId) &&
         (!backend || s.backend === backend)
     );

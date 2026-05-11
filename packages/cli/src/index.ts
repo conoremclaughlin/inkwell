@@ -7,7 +7,7 @@
 
 export interface StudioIdentity {
   agentId: string;
-  identityId?: string;
+  sbId?: string;
   context: string;
   description: string;
   studioId?: string;

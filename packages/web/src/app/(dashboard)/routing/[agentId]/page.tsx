@@ -25,7 +25,7 @@ import { Input } from '@/components/ui/input';
 
 interface AgentRoute {
   id: string;
-  identityId: string;
+  sbId: string;
   agentId: string | null;
   agentName: string | null;
   agentRole: string | null;
@@ -54,7 +54,7 @@ interface AgentReminder {
   status: 'active' | 'paused' | 'completed' | 'cancelled' | 'failed';
   runCount: number;
   maxRuns: number | null;
-  identityId: string | null;
+  sbId: string | null;
   studioHint: string | null;
 }
 
@@ -164,8 +164,8 @@ export default function AgentRoutingPage() {
   const [homeStudioValue, setHomeStudioValue] = useState('');
 
   const updateHomeStudioMutation = useMutation({
-    mutationFn: ({ identityId, studioHint }: { identityId: string; studioHint: string }) =>
-      apiPatch(`/api/admin/routing/identities/${identityId}`, { studioHint }),
+    mutationFn: ({ sbId, studioHint }: { sbId: string; studioHint: string }) =>
+      apiPatch(`/api/admin/routing/identities/${sbId}`, { studioHint }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['routing'] });
       queryClient.invalidateQueries({ queryKey: ['routing-agent', agentId] });
@@ -413,7 +413,7 @@ export default function AgentRoutingPage() {
                       disabled={updateHomeStudioMutation.isPending}
                       onClick={() =>
                         updateHomeStudioMutation.mutate({
-                          identityId: data.agent.id,
+                          sbId: data.agent.id,
                           studioHint: homeStudioValue,
                         })
                       }
@@ -883,7 +883,7 @@ export default function AgentRoutingPage() {
               event.preventDefault();
               if (!data?.agent?.id) return;
               createRouteMutation.mutate({
-                identityId: data.agent.id,
+                sbId: data.agent.id,
                 platform: newRoute.platform,
                 platformAccountId: newRoute.platformAccountId || null,
                 chatId: newRoute.chatId || null,

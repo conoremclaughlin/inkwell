@@ -202,8 +202,8 @@ async function statusCommand(options: { backend?: string }): Promise<void> {
   console.log(chalk.bold('\nSB Status\n'));
   console.log(`  ${chalk.bold('Agent:')}   ${agentId}`);
   console.log(`  ${chalk.bold('Backend:')} ${backend}`);
-  if (identity?.identityId) {
-    console.log(`  ${chalk.bold('Identity:')} ${chalk.dim(identity.identityId)}`);
+  if (identity?.sbId) {
+    console.log(`  ${chalk.bold('Identity:')} ${chalk.dim(identity.sbId)}`);
   }
   if (identity?.studio) {
     console.log(`  ${chalk.bold('Studio:')}  ${identity.studio}`);
