@@ -17,6 +17,7 @@ import { StudiosRepository } from './repositories/studios.repository';
 import { WorkspacesRepository } from './repositories/workspaces.repository';
 import { ContactsRepository } from './repositories/contacts-repository';
 import { RecallFeedbackRepository } from './repositories/recall-feedback.repository';
+import { ArtifactSearchRepository } from './repositories/artifact-search.repository';
 import { logger } from '../utils/logger';
 
 export class DataComposer {
@@ -39,6 +40,7 @@ export class DataComposer {
     workspaces: WorkspacesRepository;
     contacts: ContactsRepository;
     recallFeedback: RecallFeedbackRepository;
+    artifactSearch: ArtifactSearchRepository;
   };
 
   private constructor(supabaseClient: SupabaseClient<Database>) {
@@ -62,6 +64,7 @@ export class DataComposer {
       workspaces: new WorkspacesRepository(supabaseClient),
       contacts: new ContactsRepository(supabaseClient),
       recallFeedback: new RecallFeedbackRepository(supabaseClient),
+      artifactSearch: new ArtifactSearchRepository(supabaseClient),
     };
 
     logger.info('Data composer initialized with all repositories');

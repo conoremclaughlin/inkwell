@@ -768,6 +768,7 @@ export type Database = {
           created_at: string | null;
           created_by_sb_id: string | null;
           edit_mode: string;
+          embedding: string | null;
           id: string;
           metadata: Json | null;
           tags: string[] | null;
@@ -787,6 +788,7 @@ export type Database = {
           created_at?: string | null;
           created_by_sb_id?: string | null;
           edit_mode?: string;
+          embedding?: string | null;
           id?: string;
           metadata?: Json | null;
           tags?: string[] | null;
@@ -806,6 +808,7 @@ export type Database = {
           created_at?: string | null;
           created_by_sb_id?: string | null;
           edit_mode?: string;
+          embedding?: string | null;
           id?: string;
           metadata?: Json | null;
           tags?: string[] | null;
@@ -3828,6 +3831,38 @@ export type Database = {
       [_ in never]: never;
     };
     Functions: {
+      match_artifacts: {
+        Args: {
+          match_count?: number;
+          match_threshold?: number;
+          p_artifact_type?: string;
+          p_tags?: string[];
+          p_user_id?: string;
+          p_visibility?: string;
+          p_workspace_id?: string;
+          query_embedding: string;
+        };
+        Returns: {
+          artifact_type: string;
+          collaborators: string[];
+          content: string;
+          content_type: string;
+          created_at: string;
+          created_by_sb_id: string;
+          edit_mode: string;
+          id: string;
+          metadata: Json;
+          similarity: number;
+          tags: string[];
+          title: string;
+          updated_at: string;
+          uri: string;
+          user_id: string;
+          version: number;
+          visibility: string;
+          workspace_id: string;
+        }[];
+      };
       match_links: {
         Args: {
           match_count?: number;

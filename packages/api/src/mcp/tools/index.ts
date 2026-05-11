@@ -162,6 +162,7 @@ import {
   handleGetArtifactHistory,
   handleAddArtifactComment,
   handleListArtifactComments,
+  handleSearchArtifacts,
   artifactToolDefinitions,
 } from './artifact-handlers';
 
@@ -3872,6 +3873,35 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleListArtifactComments(args, dataComposer);
       } catch (error) {
         logger.error('Error in list_artifact_comments:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'search_artifacts',
+    {
+      description: `Search artifacts using text (keyword/trigram), semantic (embedding similarity), or hybrid (blended) modes. Returns matching artifacts with title, URI, snippet, relevance score, and metadata. Use mode "auto" (default) to automatically pick the best available mode.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getArtifactToolSchema('search_artifacts'),
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleSearchArtifacts(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in search_artifacts:', error);
         return {
           content: [
             {
