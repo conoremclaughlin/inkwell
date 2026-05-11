@@ -1343,7 +1343,7 @@ export class StrategyService {
       }
 
       // Resolve the owner agent's identity for reminder routing
-      let identityId: string | null = null;
+      let sbId: string | null = null;
       if (group.owner_agent_id) {
         const { data: identity } = await this.dataComposer
           .getClient()
@@ -1353,7 +1353,7 @@ export class StrategyService {
           .eq('user_id', userId)
           .limit(1)
           .single();
-        if (identity) identityId = identity.id;
+        if (identity) sbId = identity.id;
       }
 
       await this.dataComposer
@@ -1373,7 +1373,7 @@ export class StrategyService {
           ]
             .filter(Boolean)
             .join(' '),
-          sb_id: identityId,
+          sb_id: sbId,
           cron_expression: `*/${intervalMinutes} * * * *`,
           next_run_at: nextRunAt.toISOString(),
           status: 'active',
@@ -1436,13 +1436,13 @@ export class StrategyService {
    * Resolve an identity UUID to an agent_id slug for notification routing.
    * notifyDispatcher/handleSendToInbox accept slugs, but we store identity UUIDs.
    */
-  private async resolveAgentSlug(identityId: string): Promise<string | null> {
+  private async resolveAgentSlug(sbId: string): Promise<string | null> {
     try {
       const { data } = await this.dataComposer
         .getClient()
         .from('agent_identities')
         .select('agent_id')
-        .eq('id', identityId)
+        .eq('id', sbId)
         .single();
       return data ? (data as { agent_id: string }).agent_id : null;
     } catch {
