@@ -6632,6 +6632,7 @@ router.get('/task-groups/:id/comments', async (req: Request, res: Response) => {
       .from('task_group_comments')
       .select('*')
       .eq('task_group_id', id)
+      .eq('user_id', authReq.pcpUserId)
       .is('deleted_at', null)
       .order('created_at', { ascending: true });
 
