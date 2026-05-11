@@ -768,6 +768,7 @@ export type Database = {
           created_at: string | null;
           created_by_sb_id: string | null;
           edit_mode: string;
+          embedding: string | null;
           id: string;
           metadata: Json | null;
           tags: string[] | null;
@@ -787,6 +788,7 @@ export type Database = {
           created_at?: string | null;
           created_by_sb_id?: string | null;
           edit_mode?: string;
+          embedding?: string | null;
           id?: string;
           metadata?: Json | null;
           tags?: string[] | null;
@@ -806,6 +808,7 @@ export type Database = {
           created_at?: string | null;
           created_by_sb_id?: string | null;
           edit_mode?: string;
+          embedding?: string | null;
           id?: string;
           metadata?: Json | null;
           tags?: string[] | null;

@@ -19,6 +19,51 @@ import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import type { Database, Json } from '../../data/supabase/types';
 import { mergeWithContext } from '../../utils/request-context';
 import { resolveWorkspaceScopeForWrite } from '../../utils/workspace-scope';
+import { EmbeddingRouter } from '../../services/embeddings/router';
+import { formatVectorLiteral } from '../../services/embeddings/memory-chunks';
+
+const embeddingRouter = new EmbeddingRouter();
+
+async function tryEmbedArtifact(
+  supabase: SupabaseClient<Database>,
+  artifactId: string,
+  title: string,
+  content: string,
+  existingMetadata: Record<string, unknown>
+): Promise<void> {
+  if (!embeddingRouter.isEnabled()) return;
+
+  try {
+    const textToEmbed = `${title}\n\n${content}`;
+    const result = await embeddingRouter.embedDocument(textToEmbed);
+    if (!result) return;
+
+    const { error } = await supabase
+      .from('artifacts')
+      .update({
+        embedding: formatVectorLiteral(result.vector),
+        metadata: {
+          ...existingMetadata,
+          embedding: {
+            provider: result.provider,
+            model: result.model,
+            dimensions: result.dimensions,
+            updatedAt: new Date().toISOString(),
+          },
+        } as Json,
+      })
+      .eq('id', artifactId);
+
+    if (error) {
+      logger.warn('Failed to persist artifact embedding', { artifactId, error: error.message });
+    }
+  } catch (err) {
+    logger.warn('Artifact embedding failed', {
+      artifactId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
 
 // ============== Schemas ==============
 
@@ -374,6 +419,15 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
   });
 
   logger.info('Artifact created', { uri, type: artifactType, agentId });
+
+  // Best-effort embedding — don't block the response
+  tryEmbedArtifact(
+    supabase,
+    artifact.id,
+    title,
+    content,
+    (metadata || {}) as Record<string, unknown>
+  );
 
   return {
     content: [
@@ -841,6 +895,17 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     agentId,
     mergePerformed,
   });
+
+  // Re-embed when content or title changed
+  if (finalContent !== undefined || title !== undefined) {
+    tryEmbedArtifact(
+      supabase,
+      updated.id,
+      updated.title,
+      updated.content,
+      (updated.metadata || {}) as Record<string, unknown>
+    );
+  }
 
   return {
     content: [
