@@ -24,7 +24,7 @@ export interface RuntimePreferences {
 
 export interface IdentityJson {
   agentId: string;
-  identityId?: string;
+  sbId?: string;
   context?: string;
   backend?: string;
   role?: string;

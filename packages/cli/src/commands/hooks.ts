@@ -507,7 +507,7 @@ function resolveActivePcpSessionId(cwd: string): string | undefined {
 
 function getIdentitySessionContext(cwd: string): {
   studioId?: string;
-  identityId?: string;
+  sbId?: string;
   studioName?: string;
   role?: string;
 } {
@@ -517,13 +517,13 @@ function getIdentitySessionContext(cwd: string): {
   try {
     const identity = JSON.parse(readFileSync(identityPath, 'utf-8')) as {
       studioId?: string;
-      identityId?: string;
+      sbId?: string;
       studio?: string;
       role?: string;
     };
     return {
       studioId: identity.studioId,
-      identityId: identity.identityId,
+      sbId: identity.sbId,
       studioName: identity.studio,
       role: identity.role,
     };
@@ -610,7 +610,7 @@ async function reconcileBackendSignal(
     runtimeLinkId: runtimeLinkId || null,
     stdinKeys: Object.keys(stdin),
   });
-  const { studioId, identityId } = getIdentitySessionContext(cwd);
+  const { studioId, sbId } = getIdentitySessionContext(cwd);
 
   let pcpSessionId = options?.initialPcpSessionId || resolveActivePcpSessionId(cwd);
   let threadKey = options?.initialThreadKey;
@@ -697,7 +697,7 @@ async function reconcileBackendSignal(
       threadKey: threadKey || null,
       backendSessionId: backendSessionId || null,
       studioId: studioId || null,
-      identityId: identityId || null,
+      sbId: sbId || null,
     });
     return {
       ...(backendSessionId ? { backendSessionId } : {}),
@@ -709,7 +709,7 @@ async function reconcileBackendSignal(
     pcpSessionId,
     backend: sessionBackend,
     agentId,
-    ...(identityId ? { identityId } : {}),
+    ...(sbId ? { sbId } : {}),
     ...(studioId ? { studioId } : {}),
     ...(threadKey ? { threadKey } : {}),
     ...(runtimeLinkId ? { runtimeLinkId } : {}),
@@ -719,7 +719,7 @@ async function reconcileBackendSignal(
   });
   setCurrentRuntimeSession(cwd, pcpSessionId, sessionBackend, {
     agentId,
-    ...(identityId ? { identityId } : {}),
+    ...(sbId ? { sbId } : {}),
     ...(studioId ? { studioId } : {}),
   });
   sbDebugLog('hooks', 'reconcile_result', {
@@ -728,7 +728,7 @@ async function reconcileBackendSignal(
     threadKey: threadKey || null,
     backendSessionId: backendSessionId || null,
     studioId: studioId || null,
-    identityId: identityId || null,
+    sbId: sbId || null,
   });
 
   return {

@@ -50,7 +50,7 @@ const __dirname = dirname(__filename);
 
 interface StudioIdentity {
   agentId: string;
-  identityId?: string;
+  sbId?: string;
   context: string;
   backend?: string;
   role?: string;
@@ -967,18 +967,18 @@ async function createStudioInner(
   const pcpDir = join(wsPath, '.ink');
   mkdirSync(pcpDir, { recursive: true });
 
-  let identityId: string | undefined;
+  let sbId: string | undefined;
   const auth = loadAuth();
   if (auth && !isTokenExpired(auth)) {
     const payload = decodeJwtPayload(auth.access_token);
     if (payload?.identityId) {
-      identityId = payload.identityId;
+      sbId = payload.identityId;
     }
   }
 
   const identity: StudioIdentity = {
     agentId,
-    ...(identityId ? { identityId } : {}),
+    ...(sbId ? { sbId } : {}),
     context: `studio-${name}`,
     ...(options.backend ? { backend: options.backend } : {}),
     ...(options.template ? { role: options.template } : {}),
