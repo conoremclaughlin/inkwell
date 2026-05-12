@@ -38,7 +38,6 @@ const DEFAULT_ALLOW_RULES: string[] = [
   'Edit(*)',
   'Write(*)',
   'Read(*)',
-  'Update(*)',
   'WebFetch(*)',
   'WebSearch',
   'mcp__inkwell__*',

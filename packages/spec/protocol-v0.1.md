@@ -333,11 +333,46 @@ Ending a session:
 2. SHOULD accept an optional `summary` (auto-saved as high-salience memory)
 3. MUST NOT delete the session record (sessions are soft-closed, queryable after end)
 
-### 4.3 Resumability
+**Detach (`on-detach`)**
+
+A detach event signals that the CLI process (or channel plugin) is no longer connected to the session. This is distinct from `end_session` — the session remains active and resumable, but no interactive process is listening.
+
+Detach MUST:
+
+1. Clear the `cliAttached` flag on the session
+2. Fire automatically when the host process exits (stdio pipe close, SIGTERM, terminal close)
+
+Detach SHOULD:
+
+3. Be best-effort (fire-and-forget) — a failed detach call MUST NOT block process exit
+4. Use a timeout (≤2s) to avoid hanging on network issues during shutdown
+
+Without a detach event, `cliAttached` becomes a sticky flag that causes the trigger handler to skip spawning new processes (it assumes a channel plugin will deliver, but no plugin is running). This is the primary cause of "messages not reaching agent" routing failures.
+
+Implementations that support a real-time channel plugin (e.g., Claude Code's InkMail plugin) SHOULD fire detach from the plugin's stdio close handler, as this is the most reliable signal. Implementations without a channel plugin SHOULD use a `process.on('exit')` handler.
+
+### 4.3 Session Aliasing
+
+Sessions MAY have a human-readable `alias` that enables explicit routing without relying on threadKey matching or studio resolution heuristics.
+
+| Field   | Type   | Description                                        |
+| ------- | ------ | -------------------------------------------------- |
+| `alias` | string | Short human-readable name (e.g., "main", "review") |
+
+**Alias rules:**
+
+1. Aliases MUST be unique per `(userId, agentId)` among active sessions
+2. Aliases are case-insensitive
+3. The alias `"main"` is reserved for the agent's primary interactive session
+4. When `send_to_inbox` includes a `sessionAlias`, routing MUST match by alias before falling through to threadKey or studio resolution
+
+**Use case:** Cross-agent explicit routing. Instead of relying on black-box session resolution, an agent can say "route to wren's main session in main studio." This is especially valuable when the routing cascade would otherwise create a new thread-scoped session.
+
+### 4.4 Resumability
 
 A session with `status: resumable` indicates it can be continued later. Implementations SHOULD store enough context (`backendSessionId`, `context`, `workingDir`) for another agent or orchestrator to resume the work.
 
-### 4.4 Heartbeat and Periodic Wake
+### 4.5 Heartbeat and Periodic Wake
 
 Agents MAY be configured for **periodic wake-up** (heartbeat). A heartbeat is a scheduled trigger that invokes the agent's session handler at regular intervals, enabling proactive work such as:
 

@@ -93,6 +93,9 @@ export interface Session {
   // Thread key for topic-scoped session matching (e.g., "pr:43")
   threadKey?: string;
 
+  // Whether a CLI process with a channel plugin is attached to this session
+  cliAttached?: boolean;
+
   // Flexible metadata
   metadata: Record<string, unknown>;
 }

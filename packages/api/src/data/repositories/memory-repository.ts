@@ -1150,6 +1150,7 @@ export class MemoryRepository {
       context?: string;
       workingDir?: string;
       cliAttached?: boolean;
+      cliPollAt?: string;
     }
   ): Promise<Session | null> {
     const dbUpdates: Record<string, unknown> = {};
@@ -1177,6 +1178,9 @@ export class MemoryRepository {
     }
     if (updates.cliAttached !== undefined) {
       dbUpdates.cli_attached = updates.cliAttached;
+    }
+    if (updates.cliPollAt !== undefined) {
+      (dbUpdates as Record<string, unknown>).cli_poll_at = updates.cliPollAt;
     }
 
     const { data, error } = await this.supabase

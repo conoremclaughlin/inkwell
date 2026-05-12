@@ -634,6 +634,10 @@ export class SessionService implements ISessionService {
 
     // 7. Update session with new Claude session ID, usage, message count, and lifecycle
     // idle (not completed) after success — session stays reusable. completed only via end_session.
+    // Clear cli_attached: processMessage runs headless spawns — the CLI process
+    // exits when this method returns, so the session is no longer attached.
+    // Leaving it true causes future triggers to skip spawning (they expect a
+    // channel plugin to deliver, but none runs for headless sessions).
     const postRunLifecycle = result.success ? 'idle' : 'failed';
     if (result.backendSessionId !== session.backendSessionId) {
       logger.info('Backend session ID linked to PCP session', {
@@ -648,12 +652,14 @@ export class SessionService implements ISessionService {
         messageCount: session.messageCount + 1,
         backend: resolvedBackend,
         lifecycle: postRunLifecycle as Session['lifecycle'],
+        cliAttached: false,
       });
     } else {
       await this.repository.update(session.id, {
         messageCount: session.messageCount + 1,
         backend: resolvedBackend,
         lifecycle: postRunLifecycle as Session['lifecycle'],
+        cliAttached: false,
       });
     }
 

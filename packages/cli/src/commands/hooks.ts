@@ -2337,12 +2337,44 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   // Respect that — unconditionally setting true blocks all future strategy
   // triggers for the session (they see "CLI-attached" and skip spawn).
   const isHeadlessSpawn = isHeadlessSession();
-  if (isHeadlessSpawn) {
+  if (isHeadlessSpawn && reconciled.pcpSessionId) {
+    // Explicitly clear cli_attached for headless spawns. A previous interactive
+    // session may have set it to true on this same PCP session; if we just skip,
+    // the stale flag causes triggers to think a channel plugin is delivering.
+    try {
+      const serverUrl = getPcpServerUrl();
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      const token = await getValidAccessToken(serverUrl);
+      if (token) headers.Authorization = `Bearer ${token}`;
+      await fetch(`${serverUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          sessionId: reconciled.pcpSessionId,
+          cliAttached: false,
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
+      hookLog('cli_attached_cleared', {
+        agentId,
+        backend: lifecycleBackend.name,
+        reason: 'headless spawn (cliAttached=false in INK_CONTEXT)',
+        sessionId: reconciled.pcpSessionId,
+      });
+    } catch (err) {
+      hookLog('cli_attached_clear_failed', {
+        agentId,
+        backend: lifecycleBackend.name,
+        sessionId: reconciled.pcpSessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  } else if (isHeadlessSpawn) {
     hookLog('cli_attached_skipped', {
       agentId,
       backend: lifecycleBackend.name,
-      reason: 'headless spawn (cliAttached=false in INK_CONTEXT)',
-      sessionId: reconciled.pcpSessionId || null,
+      reason: 'headless spawn, no pcpSessionId',
+      sessionId: null,
     });
   } else if (reconciled.pcpSessionId) {
     try {

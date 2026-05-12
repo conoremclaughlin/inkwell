@@ -243,8 +243,28 @@ const seenMessageIds = new Set<string>(); // belt-and-suspenders dedup
 const lastThreadTimestamps = new Map<string, string>(); // threadKey → last seen created_at
 const lastThreadMessageId = new Map<string, string>(); // threadKey → id of last delivered message (cursor)
 
+async function stampCliPollAt(): Promise<void> {
+  if (!sessionId || !accessToken) return;
+  try {
+    await fetch(`${INK_SERVER_URL}/api/hooks/lifecycle`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({ sessionId, cliPollAt: new Date().toISOString() }),
+      signal: AbortSignal.timeout(3000),
+    });
+  } catch {
+    // Non-fatal — next poll will try again
+  }
+}
+
 async function pollInbox(): Promise<void> {
   if (!email) return;
+
+  // Stamp cli_poll_at so the trigger handler knows we're alive
+  stampCliPollAt().catch(() => {});
 
   try {
     const result = await callPcp('get_inbox', {
@@ -391,10 +411,50 @@ async function pollInbox(): Promise<void> {
 
 // ─── Start ──────────────────────────────────────────────────
 
+async function clearCliAttached(): Promise<void> {
+  if (!sessionId || !accessToken) return;
+  try {
+    await fetch(`${INK_SERVER_URL}/api/hooks/lifecycle`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({ sessionId, cliAttached: false }),
+      signal: AbortSignal.timeout(2000),
+    });
+    log('info', 'Detach: cleared cli_attached', { sessionId });
+  } catch (err) {
+    log('warn', 'Detach: failed to clear cli_attached', {
+      sessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 async function main(): Promise<void> {
   log('info', 'Connecting MCP stdio transport');
   await mcp.connect(new StdioServerTransport());
   log('info', 'MCP connected, starting poll loop');
+
+  // Fire detach cleanup when the host process exits (stdio pipe breaks).
+  // This clears cli_attached so future triggers don't skip spawning.
+  process.on('exit', () => {
+    // Synchronous — can't await, but the fetch is fire-and-forget.
+    // Use a sync log and kick off the async call (it may or may not complete).
+    log('info', 'Detach: process exiting, clearing cli_attached');
+  });
+  process.on('SIGTERM', () => {
+    clearCliAttached().finally(() => process.exit(0));
+  });
+  process.on('SIGINT', () => {
+    clearCliAttached().finally(() => process.exit(0));
+  });
+  // Stdio close = Claude Code exited (most reliable signal)
+  process.stdin.on('close', () => {
+    log('info', 'Detach: stdin closed (host exited)');
+    clearCliAttached().finally(() => process.exit(0));
+  });
 
   // Start polling loop
   setInterval(pollInbox, POLL_INTERVAL_MS);
@@ -407,5 +467,5 @@ async function main(): Promise<void> {
 
 main().catch((err) => {
   log('error', 'Channel plugin crashed', { error: err.message });
-  process.exit(1);
+  clearCliAttached().finally(() => process.exit(1));
 });

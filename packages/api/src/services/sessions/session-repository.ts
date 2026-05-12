@@ -339,6 +339,10 @@ export class SessionRepository implements ISessionRepository {
       dbUpdates.studio_id = updates.studioId || null;
     }
 
+    if (updates.cliAttached !== undefined) {
+      dbUpdates.cli_attached = updates.cliAttached;
+    }
+
     // Merge metadata updates
     const newMetadata: SessionMetadata = { ...(current.metadata as SessionMetadata) };
 
