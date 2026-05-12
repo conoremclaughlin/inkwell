@@ -77,6 +77,14 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .describe(
       'DEPRECATED — use recipientStudioSlug instead. Kept for backward compatibility with callers that pass the literal string "main".'
     ),
+  sessionAlias: z
+    .string()
+    .min(1)
+    .max(64)
+    .optional()
+    .describe(
+      'Target a recipient session by alias (e.g., "main", "review"). The recipient agent must have an active session with this alias.'
+    ),
   relatedArtifactUri: z.string().optional().describe('Related artifact URI'),
   metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
   expiresAt: z.string().datetime().optional().describe('When this message expires'),
@@ -237,6 +245,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     threadKey,
     triggerAll,
     triggerAgents,
+    sessionAlias,
   } = parsed;
 
   // Merge recipientStudioSlug (preferred) and recipientStudioHint (legacy alias).
@@ -629,6 +638,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           priority,
           threadKey,
           recipientSessionId: resolvedRecipientSessionId,
+          ...(isAddressedRecipient && sessionAlias ? { sessionAlias } : {}),
           ...(isAddressedRecipient && resolvedRecipientStudioId
             ? { studioId: resolvedRecipientStudioId }
             : {}),
@@ -776,6 +786,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       summary: triggerSummary || subject || `New ${messageType} from ${triggerSenderId}`,
       priority,
       recipientSessionId: effectiveRecipientSessionId,
+      sessionAlias,
       studioId: recipientStudioId,
       studioHint: recipientStudioSlugOrHint,
     };

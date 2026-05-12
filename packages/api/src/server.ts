@@ -895,6 +895,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         studioId: payload.studioId,
         studioHint: payload.studioHint,
         recipientSessionId: payload.recipientSessionId,
+        sessionAlias: payload.sessionAlias,
         taskGroupId:
           payload.metadata && typeof payload.metadata.groupId === 'string'
             ? payload.metadata.groupId
@@ -923,6 +924,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     try {
       const routedSession = await sessionService!.getOrCreateSession(userId, targetAgentId, {
         threadKey: payload.threadKey,
+        alias: payload.sessionAlias,
         studioId: payload.studioId,
         studioHint: payload.studioHint,
         recipientSessionId: payload.recipientSessionId,
@@ -953,42 +955,69 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         }
       }
 
-      // Check cli_attached from the DB (not on the Session type yet)
-      const { data: sessionRow } = (await dataComposer!
-        .getClient()
+      // Check if the routed session has a channel plugin actively polling.
+      // cli_poll_at is stamped by the channel plugin on every poll (~10s).
+      // Only skip spawn when the *routed* session is polling — if a different
+      // session is polling, it won't see threads stamped to this session
+      // (get_inbox channelPoll filters by session_id).
+      const CLI_POLL_FRESH_MS = 30_000; // 3 missed polls = stale
+      // cli_poll_at is not yet in generated Supabase types — cast result
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: routedSessionPoll } = (await (dataComposer!.getClient() as any)
         .from('sessions')
-        .select('cli_attached, updated_at')
+        .select('id, cli_poll_at, studio_id')
         .eq('id', routedSession.id)
-        .single()) as { data: { cli_attached: boolean; updated_at: string } | null };
+        .maybeSingle()) as {
+        data: { id: string; cli_poll_at: string; studio_id: string | null } | null;
+      };
 
-      const CLI_STALE_MS = 10 * 60 * 1000;
-      const isCliAttached = sessionRow?.cli_attached === true;
-      const isCliStale =
-        isCliAttached &&
-        sessionRow?.updated_at &&
-        Date.now() - new Date(sessionRow.updated_at).getTime() > CLI_STALE_MS;
+      const hasFreshPoll =
+        routedSessionPoll?.cli_poll_at &&
+        Date.now() - new Date(routedSessionPoll.cli_poll_at).getTime() < CLI_POLL_FRESH_MS;
 
-      if (isCliStale) {
-        logger.warn('[Trigger] CLI-attached session is stale, clearing flag', {
-          sessionId: routedSession.id,
-          updatedAt: sessionRow?.updated_at,
-        });
-        await dataComposer!
+      // Legacy fallback: check cli_attached on the routed session for
+      // backends without a channel plugin (Codex, Gemini) where on-prompt
+      // still sets cli_attached=true.
+      let isLegacyCliAttached = false;
+      if (!hasFreshPoll) {
+        const { data: sessionRow } = (await dataComposer!
           .getClient()
           .from('sessions')
-          .update({ cli_attached: false } as never)
-          .eq('id', routedSession.id);
+          .select('cli_attached, updated_at')
+          .eq('id', routedSession.id)
+          .single()) as { data: { cli_attached: boolean; updated_at: string } | null };
+
+        const CLI_STALE_MS = 10 * 60 * 1000;
+        const isCliAttached = sessionRow?.cli_attached === true;
+        const isCliStale =
+          isCliAttached &&
+          sessionRow?.updated_at &&
+          Date.now() - new Date(sessionRow.updated_at).getTime() > CLI_STALE_MS;
+
+        if (isCliStale) {
+          logger.warn('[Trigger] CLI-attached session is stale, clearing flag', {
+            sessionId: routedSession.id,
+            updatedAt: sessionRow?.updated_at,
+          });
+          await dataComposer!
+            .getClient()
+            .from('sessions')
+            .update({ cli_attached: false } as never)
+            .eq('id', routedSession.id);
+        }
+
+        isLegacyCliAttached = isCliAttached && !isCliStale;
       }
 
-      if (isCliAttached && !isCliStale) {
-        // CLI-attached: don't spawn a new session. The inbox message is
-        // already in the DB (written by send_to_inbox before trigger fires).
-        // The channel plugin will pick it up on its next poll cycle.
+      if (hasFreshPoll || isLegacyCliAttached) {
+        const source = hasFreshPoll ? 'cli_poll_at' : 'cli_attached (legacy)';
+        const attachedSessionId = hasFreshPoll ? routedSessionPoll!.id : routedSession.id;
         logger.info(
-          '[Trigger] CLI-attached session — skipping spawn, channel plugin will deliver',
+          `[Trigger] CLI-attached (${source}) — skipping spawn, channel plugin will deliver`,
           {
             targetAgentId,
-            sessionId: routedSession.id,
+            attachedSessionId,
+            routedSessionId: routedSession.id,
             studioId: routedSession.studioId,
             threadKey: payload.threadKey,
           }

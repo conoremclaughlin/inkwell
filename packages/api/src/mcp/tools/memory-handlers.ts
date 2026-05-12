@@ -554,6 +554,12 @@ export const updateSessionPhaseSchema = userIdentifierBaseSchema.extend({
     .boolean()
     .optional()
     .describe('Whether a human is attached to the CLI session (interactive REPL)'),
+  alias: z
+    .string()
+    .optional()
+    .describe(
+      'Human-readable session alias for explicit routing (e.g., "main", "review"). Unique per agent among active sessions. Use to name a session so messages can be routed to it by alias.'
+    ),
 });
 
 // ==============================================// MEMORY HISTORY SCHEMAS
@@ -1469,7 +1475,8 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
     !params.status &&
     !params.context &&
     !params.workingDir &&
-    params.cliAttached === undefined
+    params.cliAttached === undefined &&
+    params.alias === undefined
   ) {
     return {
       content: [
@@ -1533,6 +1540,7 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
     context?: string;
     workingDir?: string;
     cliAttached?: boolean;
+    alias?: string | null;
   } = {};
 
   // Map runtime: prefix phases to lifecycle (backward compat for old callers)
@@ -1576,6 +1584,9 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
   if (params.workingDir !== undefined) {
     updates.workingDir = params.workingDir;
   }
+  if (params.alias !== undefined) {
+    updates.alias = params.alias || null;
+  }
 
   const updated = await dataComposer.repositories.memory.updateSession(sessionId, updates);
 
@@ -1597,6 +1608,7 @@ export async function handleUpdateSessionPhase(args: unknown, dataComposer: Data
   if (params.backendSessionId) messageParts.push('backendSessionId set');
   if (params.context) messageParts.push('context updated');
   if (params.workingDir) messageParts.push('workingDir updated');
+  if (params.alias !== undefined) messageParts.push(`alias → ${params.alias || '(cleared)'}`);
 
   const result: Record<string, unknown> = {
     success: true,

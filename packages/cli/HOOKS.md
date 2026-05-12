@@ -160,6 +160,34 @@ You have completed ~{count} tool calls this session. Consider using
 </inkmail>
 ```
 
+---
+
+### `on-detach`
+
+**When:** CLI session is detaching — the terminal is closing, the user pressed Ctrl+C, or the Claude Code process is exiting. For channel-plugin sessions, this fires when the stdio pipe breaks (Claude Code exited). For non-plugin sessions, this fires from a `process.on('exit')` handler in the CLI hooks.
+
+**What it does:**
+
+1. Clears `cli_attached` on the session via `POST /api/hooks/lifecycle` with `{ sessionId, cliAttached: false }`
+2. Optionally marks the session lifecycle as `idle` (if it was `running`)
+
+**Why this matters:**
+
+Without a detach event, `cli_attached` becomes a sticky flag. The trigger handler checks this flag to decide whether to spawn a new process or let the channel plugin deliver. A stale `cli_attached=true` on a detached session causes all future triggers to be silently dropped — the handler skips spawning, expecting a channel plugin that no longer exists.
+
+**Backend support:**
+
+| Backend     | Detach signal                        | Notes                                              |
+| ----------- | ------------------------------------ | -------------------------------------------------- |
+| Claude Code | Channel plugin stdio pipe close      | Reliable — MCP transport breaks when host exits    |
+| Claude Code | `process.on('exit')` in hook process | Fallback when channel plugin is not loaded         |
+| Codex       | `process.on('exit')` in hook process | No channel plugin; exit handler is the only signal |
+| Gemini      | `process.on('exit')` in hook process | No channel plugin; exit handler is the only signal |
+
+**Output:** None (fire-and-forget cleanup).
+
+---
+
 ## Runtime State
 
 Hooks store ephemeral state in `.ink/runtime/` (gitignored):

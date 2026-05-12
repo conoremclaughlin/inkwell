@@ -42,6 +42,8 @@ export interface AgentTriggerPayload {
   studioHint?: string;
   /** Recipient session to inherit studio scope from */
   recipientSessionId?: string;
+  /** Target a session by alias (e.g., "main", "review") */
+  sessionAlias?: string;
   /** Additional metadata */
   metadata?: Record<string, unknown>;
 }

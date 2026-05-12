@@ -93,6 +93,7 @@ function buildHooks(inkPath: string): Record<string, unknown> {
       { matcher: 'compact', hooks: [{ type: 'command', command: cmd('post-compact') }] },
       { matcher: 'startup', hooks: [{ type: 'command', command: cmd('on-session-start') }] },
     ],
+    PreToolUse: [{ hooks: [{ type: 'command', command: cmd('on-tool-approval') }] }],
     UserPromptSubmit: [{ hooks: [{ type: 'command', command: cmd('on-prompt') }] }],
     Stop: [{ hooks: [{ type: 'command', command: cmd('on-stop') }] }],
   };

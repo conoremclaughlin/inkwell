@@ -28,6 +28,7 @@ describe('ensureStudioSettings', () => {
     expect(settings.enableAllProjectMcpServers).toBe(true);
     expect(settings.hooks).toBeDefined();
     expect(settings.hooks.PreCompact).toBeDefined();
+    expect(settings.hooks.PreToolUse).toBeDefined();
     expect(settings.hooks.Stop).toBeDefined();
   });
 

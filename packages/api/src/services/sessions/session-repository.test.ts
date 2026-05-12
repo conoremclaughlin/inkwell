@@ -138,4 +138,59 @@ describe('SessionRepository', () => {
     expect(updateCall.lifecycle).toBe('idle');
     expect(updateCall.message_count).toBe(5);
   });
+
+  it('should write alias to DB when updating', async () => {
+    const { supabase, builder } = createMockSupabase();
+    const repo = new SessionRepository(supabase as never);
+
+    await repo.update('sess-1', { alias: 'primary' });
+
+    const updateCall = builder.update.mock.calls[0][0] as Record<string, unknown>;
+    expect(updateCall.alias).toBe('primary');
+  });
+
+  it('should clear alias by writing null when alias is empty string', async () => {
+    const { supabase, builder } = createMockSupabase();
+    const repo = new SessionRepository(supabase as never);
+
+    await repo.update('sess-1', { alias: '' });
+
+    const updateCall = builder.update.mock.calls[0][0] as Record<string, unknown>;
+    expect(updateCall.alias).toBeNull();
+  });
+
+  it('should include alias in create when provided', async () => {
+    const { supabase, builder, fakeRow } = createMockSupabase();
+    // Mock insert chain
+    builder.insert = vi.fn().mockReturnValue({
+      select: vi.fn().mockReturnValue({
+        single: vi.fn().mockResolvedValue({ data: { ...fakeRow, alias: 'review' }, error: null }),
+      }),
+    });
+    const repo = new SessionRepository(supabase as never);
+
+    const session = await repo.create({
+      userId: 'user-1',
+      agentId: 'wren',
+      backendSessionId: null,
+      type: 'primary',
+      lifecycle: 'idle',
+      status: 'active',
+      contextTokens: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      messageCount: 0,
+      tokenCount: 0,
+      backend: 'claude-code',
+      model: null,
+      lastCompactionAt: null,
+      compactionCount: 0,
+      endedAt: null,
+      metadata: {},
+      alias: 'review',
+    });
+
+    const insertCall = builder.insert.mock.calls[0][0] as Record<string, unknown>;
+    expect(insertCall.alias).toBe('review');
+  });
 });
