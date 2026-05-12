@@ -5,6 +5,7 @@ import {
   buildBenchmarkRecallOptions,
   parseBenchmarkRecallVariant,
 } from './benchmark-memory-recall.variant';
+import { answerTokenCoverage, hasAnswer, snippetAroundAnswer } from './benchmark-answer-coverage';
 import type { RecallMode } from './benchmark-memory-recall.types';
 
 type LongMemEvalTurn = {
@@ -34,44 +35,6 @@ const TOP_K = 5;
 const DEFAULT_LONGMEMEVAL_PATH = resolve(process.cwd(), '.cache', 'longmemeval_s_cleaned.json');
 const BENCHMARK_AGENT_ID = 'lumen';
 
-const ANSWER_STOPWORDS = new Set([
-  'a',
-  'an',
-  'and',
-  'are',
-  'as',
-  'at',
-  'be',
-  'by',
-  'for',
-  'from',
-  'had',
-  'has',
-  'have',
-  'he',
-  'her',
-  'his',
-  'i',
-  'in',
-  'is',
-  'it',
-  'my',
-  'of',
-  'on',
-  'or',
-  'our',
-  'she',
-  'that',
-  'the',
-  'their',
-  'they',
-  'to',
-  'was',
-  'were',
-  'with',
-  'you',
-]);
-
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
   if (!raw) return fallback;
   const parsed = Number(raw);
@@ -89,55 +52,6 @@ function parseNonNegativeInt(raw: string | undefined, fallback: number): number 
 function parseMode(raw?: string): RecallMode {
   if (raw === 'text' || raw === 'semantic' || raw === 'hybrid' || raw === 'auto') return raw;
   return 'semantic';
-}
-
-function normalizeText(text: string | number): string {
-  return String(text)
-    .toLowerCase()
-    .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function answerTokenCoverage(text: string, answer: string | number): number {
-  const normalizedText = normalizeText(text);
-  const normalizedAnswer = normalizeText(answer);
-  if (!normalizedAnswer) return 0;
-  if (normalizedText.includes(normalizedAnswer)) return 1;
-  const tokens = normalizedAnswer
-    .split(' ')
-    .filter((token) => token.length >= 3 || /^\d+$/.test(token))
-    .filter((token) => !ANSWER_STOPWORDS.has(token));
-  if (tokens.length === 0) return 0;
-  const hitCount = tokens.filter((token) => normalizedText.includes(token)).length;
-  return hitCount / tokens.length;
-}
-
-function hasAnswer(text: string, answer: string | number): boolean {
-  const coverage = answerTokenCoverage(text, answer);
-  if (coverage >= 0.8) return true;
-  const normalizedAnswer = normalizeText(answer);
-  return normalizedAnswer.length >= 4 && normalizeText(text).includes(normalizedAnswer);
-}
-
-function compact(text: string, maxChars = 500): string {
-  const oneLine = text.replace(/\s+/g, ' ').trim();
-  if (oneLine.length <= maxChars) return oneLine;
-  return `${oneLine.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
-}
-
-function snippetAroundAnswer(text: string, answer: string | number, maxChars = 700): string {
-  const normalizedAnswer = normalizeText(answer);
-  const normalizedText = normalizeText(text);
-  const index = normalizedAnswer ? normalizedText.indexOf(normalizedAnswer) : -1;
-  if (index < 0) return compact(text, maxChars);
-
-  const ratio = index / Math.max(normalizedText.length, 1);
-  const sourceIndex = Math.floor(text.length * ratio);
-  const start = Math.max(0, sourceIndex - Math.floor(maxChars / 2));
-  return compact(text.slice(start, start + maxChars), maxChars);
 }
 
 async function readJson<T>(path: string): Promise<T> {

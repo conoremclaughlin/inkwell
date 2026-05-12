@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { hasOptionalAnswer } from './benchmark-answer-coverage';
 import {
   applyLocalDreamUpdate,
   buildOnlineDreamPrompt,
@@ -6,7 +7,6 @@ import {
   createInitialDreamState,
   parseLongMemSessionId,
   renderDreamStateForAnswerCheck,
-  textContainsAnswer,
   type DreamMemoryRow,
 } from './benchmark-memory-dream.logic';
 import type { LongMemEvalDreamCase } from './benchmark-data/longmemeval-loader';
@@ -116,7 +116,118 @@ describe('benchmark-memory-dream logic', () => {
     expect(updated.sessionCount).toBe(1);
     expect(updated.durableFacts).toHaveLength(1);
     expect(updated.durableFacts[0].evidenceMemoryIds).toEqual(['mem-s1']);
-    expect(textContainsAnswer(rendered, '38')).toBe(true);
+    expect(hasOptionalAnswer(rendered, '38')).toBe(true);
+  });
+
+  it('keeps richer entity descriptions when later mentions are terse', () => {
+    const state = createInitialDreamState('case-entity', 'online');
+    const [detailed, terse] = buildOrderedDreamSessions(
+      {
+        id: 'case-entity',
+        query: 'Who is Riley?',
+        answerSessionIds: ['s2'],
+        sessions: [
+          {
+            sessionId: 's1',
+            content: 'session s1\nuser: Riley is my neighbor who restores vintage bikes.',
+            hasAnswer: false,
+            isAnswerSession: false,
+            turnCount: 1,
+          },
+          {
+            sessionId: 's2',
+            content: 'session s2\nuser: Riley stopped by.',
+            hasAnswer: true,
+            isAnswerSession: true,
+            turnCount: 1,
+          },
+        ],
+      },
+      [
+        {
+          id: 'mem-s1',
+          content: 'session s1\nuser: Riley is my neighbor who restores vintage bikes.',
+          summary: null,
+          created_at: '2026-01-01T00:00:00Z',
+          metadata: {
+            llm_extractions: {
+              entity: {
+                entities: [
+                  {
+                    name: 'Riley',
+                    entityType: 'person',
+                    description: 'Neighbor who restores vintage bikes.',
+                    aliases: [],
+                    evidence: 'Riley is my neighbor who restores vintage bikes.',
+                  },
+                ],
+              },
+            },
+          },
+        },
+        {
+          id: 'mem-s2',
+          content: 'session s2\nuser: Riley stopped by.',
+          summary: null,
+          created_at: '2026-01-02T00:00:00Z',
+          metadata: {
+            llm_extractions: {
+              entity: {
+                entities: [
+                  {
+                    name: 'Riley',
+                    entityType: 'person',
+                    description: 'Riley stopped by.',
+                    aliases: [],
+                    evidence: 'Riley stopped by.',
+                  },
+                ],
+              },
+            },
+          },
+        },
+      ]
+    ).sessions;
+
+    const updated = applyLocalDreamUpdate(applyLocalDreamUpdate(state, detailed), terse);
+
+    expect(updated.entities).toHaveLength(1);
+    expect(updated.entities[0].description).toBe('Neighbor who restores vintage bikes.');
+    expect(updated.entities[0].evidenceSessionIds).toEqual(['s1', 's2']);
+  });
+
+  it('does not count lineage metadata as answer evidence when rendering for coverage', () => {
+    const state = createInitialDreamState('case-38', 'online');
+    const rendered = renderDreamStateForAnswerCheck({
+      ...state,
+      evidenceSessionIds: ['38'],
+      evidenceMemoryIds: ['mem-38'],
+      entities: [
+        {
+          name: 'Coin collection',
+          entityType: 'collection',
+          description: 'A vintage collection.',
+          aliases: [],
+          evidence: 'A vintage collection was mentioned.',
+          evidenceMemoryIds: ['mem-38'],
+          evidenceSessionIds: ['38'],
+          firstSeenSessionId: '38',
+          lastSeenSessionId: '38',
+        },
+      ],
+      temporalEvents: [
+        {
+          sessionId: '38',
+          memoryId: 'mem-38',
+          orderIndex: 38,
+          summary: 'The user discussed a collection.',
+          isAnswerSession: false,
+        },
+      ],
+    });
+
+    expect(rendered).not.toContain('mem-38');
+    expect(hasOptionalAnswer(rendered, '38')).toBe(false);
   });
 
   it('builds an online dream prompt that uses prior state plus one new episode', () => {

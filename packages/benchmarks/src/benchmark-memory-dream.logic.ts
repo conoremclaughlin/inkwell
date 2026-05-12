@@ -167,6 +167,10 @@ function clampText(text: string, maxChars: number): string {
   return `${compacted.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
 }
 
+function stripSessionHeader(content: string): string {
+  return content.replace(/^session\s+[^\r\n]+[\r\n]+/i, '');
+}
+
 function normalizeKey(text: string): string {
   return compactWhitespace(text).toLowerCase();
 }
@@ -326,6 +330,10 @@ export function createInitialDreamState(caseId: string, mode: DreamMode): DreamS
 }
 
 function factKey(fact: ExtractedDurableFact): string {
+  // Local dreams are intentionally heuristic accumulators: including the fact
+  // text keeps differently worded observations distinct, so this reducer does
+  // not infer semantic supersession across "37 coins" -> "38 coins" updates.
+  // Real supersession is deferred to the future LLM dream updater.
   return normalizeKey(
     [fact.category, fact.subject || 'unknown-subject', fact.object || 'unknown-object', fact.fact]
       .filter(Boolean)
@@ -344,11 +352,28 @@ function updateStateSummary(params: {
 }): string {
   const sessionSummary = params.session.extractions.summary;
   const nextLine = sessionSummary
-    ? `session ${params.session.sessionId}: ${sessionSummary.summary}`
-    : `session ${params.session.sessionId}: ${clampText(params.session.content, 260)}`;
+    ? `summary: ${sessionSummary.summary}`
+    : `summary: ${clampText(stripSessionHeader(params.session.content), 260)}`;
   const combined = [params.previousSummary, nextLine].filter(Boolean).join('\n');
   if (combined.length <= params.limits.maxStateSummaryChars) return combined;
+  // Keep the tail deliberately: the local online reducer is recency-biased for
+  // "current state" questions, while raw evidence links preserve chronology.
   return combined.slice(combined.length - params.limits.maxStateSummaryChars).trimStart();
+}
+
+function chooseEntityDescription(
+  existing: DreamEntity | undefined,
+  nextDescription: string
+): string {
+  if (!existing) return nextDescription;
+  return nextDescription.length > existing.description.length
+    ? nextDescription
+    : existing.description;
+}
+
+function moveToEnd<TKey, TValue>(map: Map<TKey, TValue>, key: TKey, value: TValue): void {
+  map.delete(key);
+  map.set(key, value);
 }
 
 export function applyLocalDreamUpdate(
@@ -364,10 +389,10 @@ export function applyLocalDreamUpdate(
   for (const entity of session.extractions.entities) {
     const key = normalizeKey(entity.name);
     const existing = entityMap.get(key);
-    entityMap.set(key, {
+    moveToEnd(entityMap, key, {
       name: entity.name,
       entityType: entity.entityType || existing?.entityType,
-      description: entity.description,
+      description: chooseEntityDescription(existing, entity.description),
       aliases: uniqueStrings([...(existing?.aliases || []), ...entity.aliases]),
       evidence: entity.evidence,
       evidenceMemoryIds: mergeEvidenceIds(existing?.evidenceMemoryIds || [], session.memoryId),
@@ -380,7 +405,7 @@ export function applyLocalDreamUpdate(
   for (const fact of session.extractions.durableFacts) {
     const key = factKey(fact);
     const existing = factMap.get(key);
-    factMap.set(key, {
+    moveToEnd(factMap, key, {
       key,
       fact: fact.fact,
       category: fact.category,
@@ -399,7 +424,7 @@ export function applyLocalDreamUpdate(
     const currentState = session.extractions.currentState;
     const key = currentStateKey(currentState);
     const existing = currentStateMap.get(key);
-    currentStateMap.set(key, {
+    moveToEnd(currentStateMap, key, {
       key,
       state: currentState.state,
       scope: currentState.scope,
@@ -415,7 +440,7 @@ export function applyLocalDreamUpdate(
   const summary = session.extractions.summary;
   const eventSummary = summary
     ? [summary.summary, ...summary.keyPoints.slice(0, 3)].join(' | ')
-    : clampText(session.content, 400);
+    : clampText(stripSessionHeader(session.content), 400);
 
   const temporalEvents = [
     ...state.temporalEvents,
@@ -448,40 +473,26 @@ export function applyLocalDreamUpdate(
 }
 
 export function renderDreamStateForAnswerCheck(state: DreamState): string {
+  // Render only semantic content for answer checks. Evidence ids, session ids,
+  // and counters are intentionally omitted so short answers like "38" do not
+  // get credit from lineage metadata instead of remembered content.
   return [
     state.stateSummary,
     ...state.entities.map(
-      (entity) =>
-        `${entity.name}: ${entity.description}; evidence: ${entity.evidence}; sessions: ${entity.evidenceSessionIds.join(', ')}`
+      (entity) => `${entity.name}: ${entity.description}; evidence: ${entity.evidence}`
     ),
     ...state.durableFacts.map(
       (fact) =>
         `${fact.fact}; category: ${fact.category}; subject: ${fact.subject || ''}; object: ${
           fact.object || ''
-        }; evidence: ${fact.evidence}; sessions: ${fact.evidenceSessionIds.join(', ')}`
+        }; evidence: ${fact.evidence}`
     ),
     ...state.currentStates.map(
       (item) =>
-        `${item.state}; scope: ${item.scope}; status: ${item.status}; evidence: ${item.evidence}; sessions: ${item.evidenceSessionIds.join(', ')}`
+        `${item.state}; scope: ${item.scope}; status: ${item.status}; evidence: ${item.evidence}`
     ),
-    ...state.temporalEvents.map((event) => `${event.sessionId}: ${event.summary}`),
+    ...state.temporalEvents.map((event) => event.summary),
   ].join('\n');
-}
-
-export function normalizeForCoverage(text: string): string {
-  return text
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-export function textContainsAnswer(text: string, answer: string | undefined): boolean | null {
-  if (!answer?.trim()) return null;
-  const normalizedText = normalizeForCoverage(text);
-  const normalizedAnswer = normalizeForCoverage(answer);
-  if (!normalizedAnswer) return null;
-  return normalizedText.includes(normalizedAnswer);
 }
 
 export function buildOnlineDreamPrompt(params: {

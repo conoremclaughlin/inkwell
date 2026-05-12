@@ -3,13 +3,13 @@ import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createSupabaseClient } from '@inklabs/api/benchmarks';
 import { loadLongMemEvalDreamDataset } from './benchmark-data/longmemeval-loader';
+import { hasOptionalAnswer } from './benchmark-answer-coverage';
 import { loadBenchmarkSeedState } from './benchmark-memory-recall.state';
 import {
   applyLocalDreamUpdate,
   buildOrderedDreamSessions,
   createInitialDreamState,
   renderDreamStateForAnswerCheck,
-  textContainsAnswer,
   type DreamMemoryRow,
   type DreamMode,
   type DreamState,
@@ -74,6 +74,7 @@ async function loadCaseMemories(params: {
   supabase: ReturnType<typeof createSupabaseClient>;
   userId: string;
   topic: string;
+  limit: number;
 }): Promise<DreamMemoryRow[]> {
   const { data, error } = await params.supabase
     .from('memories')
@@ -81,14 +82,16 @@ async function loadCaseMemories(params: {
     .eq('user_id', params.userId)
     .contains('topics', [params.topic])
     .order('created_at', { ascending: true })
-    .limit(1000);
+    .limit(params.limit);
 
   if (error) throw new Error(`Failed to load dream memories for ${params.topic}: ${error.message}`);
   return (data || []) as DreamMemoryRow[];
 }
 
 function buildSourceText(sessions: { content: string }[]): string {
-  return sessions.map((session) => session.content).join('\n\n');
+  return sessions
+    .map((session) => session.content.replace(/^session\s+[^\r\n]+[\r\n]+/i, ''))
+    .join('\n\n');
 }
 
 function logProgress(params: {
@@ -111,8 +114,14 @@ async function main() {
   }
 
   const mode = parseDreamMode(process.env.MEMORY_DREAM_MODE);
+  if (mode === 'batch') {
+    console.warn(
+      '[memory-dream] MEMORY_DREAM_MODE=batch is reserved for a future batch reducer; current runner still applies the online local reducer'
+    );
+  }
   const strictSeed = parseBoolean(process.env.MEMORY_DREAM_STRICT_SEED, true);
   const writeSteps = parseBoolean(process.env.MEMORY_DREAM_WRITE_STEPS, true);
+  const memoryLoadLimit = parsePositiveInt(process.env.MEMORY_DREAM_MEMORY_LOAD_LIMIT, 1000);
   const progressEvery = parsePositiveInt(
     process.env.MEMORY_DREAM_PROGRESS_EVERY,
     DEFAULT_PROGRESS_EVERY
@@ -155,6 +164,7 @@ async function main() {
       supabase,
       userId,
       topic: seededCase.topic || `${BENCHMARK_TOPIC}:${seedState.seedId}:${dreamCase.id}`,
+      limit: memoryLoadLimit,
     });
     const ordered = buildOrderedDreamSessions(dreamCase, rows);
     if (strictSeed && ordered.missingSessionIds.length > 0) {
@@ -197,8 +207,8 @@ async function main() {
       processedSessionCount: ordered.sessions.length,
       missingSessionIds: ordered.missingSessionIds,
       extraMemoryIds: ordered.extraMemoryIds,
-      answerInDream: textContainsAnswer(renderedDream, dreamCase.answer),
-      answerInSource: textContainsAnswer(sourceText, dreamCase.answer),
+      answerInDream: hasOptionalAnswer(renderedDream, dreamCase.answer),
+      answerInSource: hasOptionalAnswer(sourceText, dreamCase.answer),
       finalState: state,
       steps,
     });
@@ -227,7 +237,8 @@ async function main() {
       caseCount: cases.length,
       strictSeed,
       writeSteps,
-      note: 'First-pass dream run uses existing per-memory LLM extraction views and a local online reducer. It does not write new DB memories or embeddings.',
+      memoryLoadLimit,
+      note: 'First-pass dream run uses existing per-memory LLM extraction views and a local online reducer. It does not write new DB memories or embeddings. Batch mode is accepted for future experiments but currently uses the same online reducer.',
     },
     summary: {
       cases: results.length,
