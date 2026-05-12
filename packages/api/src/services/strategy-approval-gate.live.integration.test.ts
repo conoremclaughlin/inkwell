@@ -111,6 +111,9 @@ const canRun =
   claudeCredentialsAvailable() &&
   inkwellReachable();
 
+// Mock for in-process advanceStrategy calls (suite 2 setup). The external
+// MCP server has its own un-mocked handler — those side effects are cleaned
+// up in afterAll via the cleanup() helper.
 vi.mock('../mcp/tools/inbox-handlers', () => ({
   handleSendToInbox: vi.fn().mockResolvedValue(undefined),
 }));
@@ -137,12 +140,43 @@ function writeMcpConfig(dir: string): string {
 }
 
 async function cleanup(client: SupabaseClient, groupId: string, taskIds: string[]): Promise<void> {
+  // Core test data
   await client.from('tasks').delete().in('id', taskIds);
   await client
     .from('scheduled_reminders')
     .delete()
     .contains('metadata' as any, { groupId } as any);
   await client.from('activity_stream').delete().eq('task_group_id', groupId);
+
+  // Memories auto-created by handleCompleteTask (topics contain task:<id>)
+  for (const taskId of taskIds) {
+    await client
+      .from('memories')
+      .delete()
+      .contains('metadata' as any, { taskId } as any);
+  }
+
+  // Inbox/thread records created by notifyDispatcher (threadKey = strategy:<groupId>)
+  const threadKey = `strategy:${groupId}`;
+  const { data: thread } = await client
+    .from('inbox_threads')
+    .select('id')
+    .eq('thread_key', threadKey)
+    .maybeSingle();
+
+  if (thread) {
+    await client.from('inbox_thread_messages').delete().eq('thread_id', thread.id);
+    await client.from('agent_inbox_read_status').delete().eq('thread_id', thread.id);
+    await client.from('inbox_threads').delete().eq('id', thread.id);
+  }
+
+  // Legacy agent_inbox entries (if notifyDispatcher fell through to non-thread path)
+  await client
+    .from('agent_inbox')
+    .delete()
+    .contains('metadata' as any, { groupId } as any);
+
+  // Task group last (FK references)
   await client.from('task_groups').delete().eq('id', groupId);
 }
 
