@@ -150,6 +150,17 @@ function parseSSEResult(body: string): unknown {
   return JSON.parse(match[1]);
 }
 
+/** Encode a PCP context token as a base64url header value. */
+function encodeContextHeader(token: {
+  sessionId: string;
+  studioId: string;
+  agentId: string;
+  cliAttached: boolean;
+  runtime: string;
+}): string {
+  return Buffer.from(JSON.stringify(token)).toString('base64url');
+}
+
 // ---------------------------------------------------------------------------
 // Test suite
 // ---------------------------------------------------------------------------
@@ -160,14 +171,25 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
   let serverUnavailableError: Error | null = null;
   let delegatedIdentity: { id: string; agent_id: string } | null = null;
 
+  // Identity resolved by context-based auth fallback (resolveUserFromAgentId)
+  let contextIdentity: {
+    id: string;
+    user_id: string;
+    users: { email: string };
+  } | null = null;
+
   // Minimal DataComposer stub
   const mockDataComposer = {
     getClient: () => ({
       from: (table: string) => {
         if (table === 'agent_identities') {
           const filters: Record<string, string> = {};
+          let selectedColumns = '';
           const query = {
-            select: () => query,
+            select: (cols?: string) => {
+              if (cols) selectedColumns = cols;
+              return query;
+            },
             eq: (field: string, value: string) => {
               filters[field] = value;
               return query;
@@ -179,8 +201,14 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
                 filters.agent_id === delegatedIdentity.agent_id;
               return { data: matches ? delegatedIdentity : null, error: null };
             },
-            single: async () => ({ data: null, error: null }),
-            limit: () => ({ error: null }),
+            single: async () => {
+              // resolveUserFromAgentId joins users and filters by agent_id only
+              if (selectedColumns.includes('users') && filters.agent_id && contextIdentity) {
+                return { data: contextIdentity, error: null };
+              }
+              return { data: null, error: { message: 'not found' } };
+            },
+            limit: (_n: number) => query,
           };
           return query;
         }
@@ -192,6 +220,10 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
         };
       },
     }),
+    repositories: {
+      memory: { getSession: vi.fn(async () => null) },
+      workspaces: { findById: vi.fn(async () => null) },
+    },
   } as any;
 
   beforeAll(async () => {
@@ -228,6 +260,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
   beforeEach(() => {
     mockVerifyAccessToken.mockReset();
     delegatedIdentity = null;
+    contextIdentity = null;
   });
 
   // =========================================================================
@@ -412,5 +445,85 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     });
 
     expect(res.status).toBe(403);
+  });
+
+  // =========================================================================
+  // Context-based auth fallback (x-ink-context without OAuth)
+  // =========================================================================
+
+  it('should resolve identity from x-ink-context when no OAuth token is present', async () => {
+    if (serverUnavailableError) return;
+    mockVerifyAccessToken.mockResolvedValue(null);
+    contextIdentity = {
+      id: 'sb-uuid-123',
+      user_id: 'user-456',
+      users: { email: 'test@example.com' },
+    };
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'sess-1',
+      studioId: 'studio-1',
+      agentId: 'wren',
+      cliAttached: true,
+      runtime: 'claude',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      'x-ink-context': contextHeader,
+    });
+
+    expect(res.status).toBe(200);
+  });
+
+  it('should challenge when both OAuth and context-based auth fail and MCP_REQUIRE_OAUTH is true', async () => {
+    if (serverUnavailableError) return;
+    (env as any).MCP_REQUIRE_OAUTH = true;
+    mockVerifyAccessToken.mockResolvedValue(null);
+    contextIdentity = null;
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'sess-1',
+      studioId: 'studio-1',
+      agentId: 'unknown-agent',
+      cliAttached: true,
+      runtime: 'claude',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      'x-ink-context': contextHeader,
+    });
+
+    expect(res.status).toBe(401);
+    (env as any).MCP_REQUIRE_OAUTH = false;
+  });
+
+  it('should prefer OAuth identity over context-based fallback', async () => {
+    if (serverUnavailableError) return;
+    mockVerifyAccessToken.mockResolvedValue({
+      userId: 'oauth-user',
+      email: 'oauth@example.com',
+      agentId: 'wren',
+      sbId: 'oauth-sb',
+    });
+    contextIdentity = {
+      id: 'context-sb',
+      user_id: 'context-user',
+      users: { email: 'context@example.com' },
+    };
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'sess-1',
+      studioId: 'studio-1',
+      agentId: 'wren',
+      cliAttached: true,
+      runtime: 'claude',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      Authorization: 'Bearer valid-token',
+      'x-ink-context': contextHeader,
+    });
+
+    expect(res.status).toBe(200);
   });
 });
