@@ -2265,6 +2265,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
                 agentId: s.agent_id,
                 name: s.name,
                 role: s.role,
+                description: s.description,
                 backend: s.backend,
                 sessionScope: s.session_scope,
                 capabilities: s.capabilities,
