@@ -120,6 +120,18 @@ export const startStrategySchema = z.object({
     .describe(
       'Auto-create an ephemeral git worktree + studio for sandbox work. Requires sandbox: true and repoRoot in group metadata.'
     ),
+  requireFinalApproval: z
+    .boolean()
+    .optional()
+    .describe(
+      'Require human approval before finalizing. Pauses when all tasks are done and sends approval criteria to the approver.'
+    ),
+  approvalCriteria: z
+    .array(z.string())
+    .optional()
+    .describe(
+      'Acceptance criteria the approver should verify (e.g., ["tests pass", "PR reviewed", "visual review via Playwright"])'
+    ),
 });
 
 export async function handleStartStrategy(
@@ -155,6 +167,8 @@ export async function handleStartStrategy(
         sandboxPolicy: args.sandboxPolicy,
         sandboxBackendAuth: args.sandboxBackendAuth,
         ephemeralStudio: args.ephemeralStudio,
+        requireFinalApproval: args.requireFinalApproval,
+        approvalCriteria: args.approvalCriteria,
       },
     });
 

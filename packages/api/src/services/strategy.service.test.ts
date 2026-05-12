@@ -1046,6 +1046,91 @@ describe('StrategyService', () => {
       expect(result.action).toBe('group_complete');
       expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
     });
+
+    it('should pause for final approval when requireFinalApproval is set', async () => {
+      const group = createMockGroup({
+        current_task_index: 2,
+        iterations_since_approval: 2,
+        strategy_config: {
+          requireFinalApproval: true,
+          approvalCriteria: ['tests pass', 'PR reviewed by Lumen'],
+          checkInNotify: 'myra',
+        },
+      });
+      const groupTasks = [
+        createMockTask({ status: 'completed', task_order: 0 }),
+        createMockTask({ status: 'completed', task_order: 1 }),
+        createMockTask({ status: 'completed', task_order: 2 }),
+      ];
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        status: 'paused',
+      });
+
+      const notFoundChain = chainTaskNotFound();
+      // Chain: getTaskByOrder (not found), getGroupTasks (for stats), buildProgressSummary (getGroupTasks again), activity log
+      setupChains(dc, [
+        notFoundChain,
+        notFoundChain,
+        chainGroupTasks(groupTasks),
+        chainGroupTasks(groupTasks),
+        chainNoop(),
+      ]);
+
+      const result = await service.advanceStrategy('group-1', 'task-3', 'user-123');
+
+      expect(result.action).toBe('approval_required');
+      expect(result.progressSummary).toContain('tests pass');
+      expect(result.progressSummary).toContain('PR reviewed by Lumen');
+      expect(result.progressSummary).toContain('Awaiting final approval');
+
+      // Should pause, not complete
+      expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+        'group-1',
+        expect.objectContaining({
+          status: 'paused',
+          metadata: expect.objectContaining({ pauseReason: 'final_review' }),
+        })
+      );
+
+      // Should NOT have been marked completed
+      const updateCalls = dc.repositories.taskGroups.update.mock.calls;
+      const completedCall = updateCalls.find(
+        (c: unknown[]) => (c[1] as Record<string, unknown>).status === 'completed'
+      );
+      expect(completedCall).toBeUndefined();
+    });
+
+    it('should auto-complete when requireFinalApproval is not set', async () => {
+      const group = createMockGroup({
+        current_task_index: 2,
+        iterations_since_approval: 2,
+      });
+      const groupTasks = [
+        createMockTask({ status: 'completed', task_order: 0 }),
+        createMockTask({ status: 'completed', task_order: 1 }),
+        createMockTask({ status: 'completed', task_order: 2 }),
+      ];
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        status: 'completed',
+      });
+
+      const notFoundChain = chainTaskNotFound();
+      setupChains(dc, [notFoundChain, notFoundChain, chainGroupTasks(groupTasks), chainNoop()]);
+
+      const result = await service.advanceStrategy('group-1', 'task-3', 'user-123');
+
+      expect(result.action).toBe('group_complete');
+      expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+        'group-1',
+        expect.objectContaining({ status: 'completed' })
+      );
+    });
   });
 
   // ============================================================================
@@ -1278,6 +1363,72 @@ describe('StrategyService', () => {
 
       await expect(service.resumeStrategy('group-1', 'user-123')).rejects.toThrow(
         'does not belong'
+      );
+    });
+
+    it('should finalize strategy when resuming from final_review pause', async () => {
+      const group = createMockGroup({
+        status: 'paused',
+        strategy: 'persistence',
+        current_task_index: 3,
+        metadata: { pauseReason: 'final_review' },
+        strategy_paused_at: '2026-04-10T12:00:00Z',
+        strategy_config: { requireFinalApproval: true, approvalCriteria: ['tests pass'] },
+      });
+      const groupTasks = [
+        createMockTask({ status: 'completed', task_order: 0 }),
+        createMockTask({ status: 'completed', task_order: 1 }),
+        createMockTask({ status: 'completed', task_order: 2 }),
+      ];
+
+      dc.repositories.taskGroups.findById.mockResolvedValueOnce(group);
+      // Second findById call from cleanupStrategyResources
+      dc.repositories.taskGroups.findById.mockResolvedValueOnce(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        status: 'completed',
+      });
+
+      const mockClient = dc.getClient();
+      const groupTasksChain = {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            order: vi.fn().mockReturnValue({
+              order: vi.fn().mockResolvedValue({ data: groupTasks, error: null }),
+            }),
+          }),
+        }),
+      };
+      const noopChain = {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: null, error: null }),
+                }),
+              }),
+            }),
+            single: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      };
+      mockClient.from.mockReturnValueOnce(groupTasksChain).mockReturnValue(noopChain);
+
+      const result = await service.resumeStrategy('group-1', 'user-123');
+
+      expect(result.action).toBe('group_complete');
+      expect(result.stats).toEqual({ total: 3, completed: 3 });
+
+      expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({ subtype: 'final_review_approved' })
+      );
+      expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({ subtype: 'strategy_completed' })
       );
     });
   });
