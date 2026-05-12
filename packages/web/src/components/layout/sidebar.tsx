@@ -21,6 +21,7 @@ import {
   Route,
   MessageSquare,
   ListTodo,
+  Swords,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useRouter } from 'next/navigation';
@@ -52,7 +53,10 @@ interface NavGroup {
 
 const mainNav: NavGroup[] = [
   {
-    items: [{ name: 'Dashboard', href: '/', icon: Home }],
+    items: [
+      { name: 'Dashboard', href: '/', icon: Home },
+      { name: 'Command', href: '/command', icon: Swords },
+    ],
   },
   {
     label: 'Team',
