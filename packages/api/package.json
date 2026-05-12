@@ -7,7 +7,8 @@
     "access": "public"
   },
   "exports": {
-    "./benchmarks": "./src/benchmarks.ts"
+    "./benchmarks": "./src/benchmarks.ts",
+    "./benchmark-constants": "./src/services/memory-benchmark-constants.ts"
   },
   "description": "Inkwell API server with MCP, Telegram bot, and REST API",
   "main": "dist/index.js",

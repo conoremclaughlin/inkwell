@@ -2,7 +2,7 @@ import {
   DEFAULT_MEMORY_LLM_MODEL,
   MEMORY_EMBEDDING_CHUNKS_VERSION,
   MEMORY_EXTRACTION_VERSION,
-} from '@inklabs/api/benchmarks';
+} from '@inklabs/api/benchmark-constants';
 
 export type BenchmarkPhase = 'all' | 'seed' | 'recall';
 

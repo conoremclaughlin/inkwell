@@ -1,8 +1,9 @@
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import { z } from 'zod';
+import { DEFAULT_MEMORY_LLM_MODEL, MEMORY_EXTRACTION_VERSION } from './memory-benchmark-constants';
 
-export const MEMORY_EXTRACTION_VERSION = 2;
+export { DEFAULT_MEMORY_LLM_MODEL, MEMORY_EXTRACTION_VERSION };
 
 export const entityExtractionItemSchema = z.object({
   name: z.string().min(1),
@@ -130,7 +131,6 @@ export interface ExtractionRuntimeConfig {
 }
 
 const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com';
-export const DEFAULT_MEMORY_LLM_MODEL = 'gpt-4.1-mini';
 
 function buildSourceBlock(source: MemoryExtractionSource): string {
   const parts: string[] = [];

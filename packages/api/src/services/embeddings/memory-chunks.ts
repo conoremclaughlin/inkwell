@@ -1,4 +1,5 @@
 import type { Json, TablesInsert } from '../../data/supabase/types';
+import { MEMORY_EMBEDDING_CHUNKS_VERSION } from '../memory-benchmark-constants';
 import {
   buildCurrentStateEmbeddingTexts,
   buildDurableFactEmbeddingTexts,
@@ -10,7 +11,7 @@ import {
 import type { EmbeddingResult } from './router';
 import { type VettedEmbeddingModel } from './vetted-models';
 
-export const MEMORY_EMBEDDING_CHUNKS_VERSION = 2;
+export { MEMORY_EMBEDDING_CHUNKS_VERSION };
 const DEFAULT_MAX_CHARS = 1000;
 const DEFAULT_OVERLAP_CHARS = 150;
 const MAX_FACT_CHUNKS = 3;
