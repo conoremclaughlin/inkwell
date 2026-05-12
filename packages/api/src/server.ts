@@ -955,31 +955,25 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         }
       }
 
-      // Check if a channel plugin is actively polling for this agent.
+      // Check if the routed session has a channel plugin actively polling.
       // cli_poll_at is stamped by the channel plugin on every poll (~10s).
-      // If ANY active session for this agent has a fresh poll timestamp,
-      // the plugin will deliver the message — skip spawning.
-      // This replaces the old cli_attached boolean which was sticky and
-      // only checked the routed session (missing cross-thread delivery).
+      // Only skip spawn when the *routed* session is polling — if a different
+      // session is polling, it won't see threads stamped to this session
+      // (get_inbox channelPoll filters by session_id).
       const CLI_POLL_FRESH_MS = 30_000; // 3 missed polls = stale
       // cli_poll_at is not yet in generated Supabase types — cast result
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { data: freshPollSession } = (await (dataComposer!.getClient() as any)
+      const { data: routedSessionPoll } = (await (dataComposer!.getClient() as any)
         .from('sessions')
         .select('id, cli_poll_at, studio_id')
-        .eq('user_id', userId)
-        .eq('agent_id', targetAgentId)
-        .is('ended_at', null)
-        .not('cli_poll_at', 'is', null)
-        .order('cli_poll_at', { ascending: false })
-        .limit(1)
+        .eq('id', routedSession.id)
         .maybeSingle()) as {
         data: { id: string; cli_poll_at: string; studio_id: string | null } | null;
       };
 
       const hasFreshPoll =
-        freshPollSession?.cli_poll_at &&
-        Date.now() - new Date(freshPollSession.cli_poll_at).getTime() < CLI_POLL_FRESH_MS;
+        routedSessionPoll?.cli_poll_at &&
+        Date.now() - new Date(routedSessionPoll.cli_poll_at).getTime() < CLI_POLL_FRESH_MS;
 
       // Legacy fallback: check cli_attached on the routed session for
       // backends without a channel plugin (Codex, Gemini) where on-prompt
@@ -1017,7 +1011,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
 
       if (hasFreshPoll || isLegacyCliAttached) {
         const source = hasFreshPoll ? 'cli_poll_at' : 'cli_attached (legacy)';
-        const attachedSessionId = hasFreshPoll ? freshPollSession!.id : routedSession.id;
+        const attachedSessionId = hasFreshPoll ? routedSessionPoll!.id : routedSession.id;
         logger.info(
           `[Trigger] CLI-attached (${source}) — skipping spawn, channel plugin will deliver`,
           {

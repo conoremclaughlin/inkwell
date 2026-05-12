@@ -11,6 +11,7 @@ import type {
   StrategyPreset,
   VerificationMode,
 } from '../../data/repositories/task-groups.repository';
+import type { Json } from '../../data/repositories/activity-stream.repository';
 import { StrategyService } from '../../services/strategy.service';
 import { getOrchestrator } from '../../services/sandbox/index.js';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
@@ -445,11 +446,11 @@ export async function handleUpdateStrategy(
           groupId: args.groupId,
           groupTitle: group.title,
           strategy: group.strategy,
-          configUpdates,
+          configUpdates: configUpdates as Record<string, Json>,
           ...(args.verificationMode !== undefined
             ? { verificationMode: args.verificationMode }
             : {}),
-        },
+        } as Json,
       });
     } catch (err) {
       // Non-fatal — don't fail the update
