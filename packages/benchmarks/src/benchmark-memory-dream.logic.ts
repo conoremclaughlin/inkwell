@@ -189,6 +189,17 @@ function stripSessionHeader(content: string): string {
   return content.replace(/^session\s+[^\r\n]+[\r\n]+/i, '');
 }
 
+const EXACT_DETAIL_RULES = [
+  '- Preserve exact small details as durableFacts/currentStates even when they seem mundane: counts, quantities, durations, dates, ordinals, yes/no completion or possession, locations, materials, tools, titles, names, quoted wording, and unsupported/conflicting premises.',
+  '- User-authored exact details outrank generic assistant advice. For visible user turns, preserve every explicit personal count, amount, duration, date, quantity, possession, location, and completion/status value unless it is clearly not about the user/case state.',
+  '- Do not let assistant numbered advice lists crowd out user-state numbers. Generic list numbering from advice is low priority; user statements like "I have 37 coins" are high priority.',
+  '- Use precise durableFact categories when helpful: quantity_count, state_transition, possession_location, list_entry, exact_span, negative_or_premise, decision, constraint, process, status.',
+  '- For list/table/enumeration content, preserve numbered or ordinal items as durableFacts using the ordinal/key and exact item text when visible.',
+  '- For location or possession updates, write the latest active currentStates record and mark older conflicting facts superseded when evidence supports a change.',
+  '- For absence or premise-mismatch evidence, write what the source actually states and what remains unsupported; do not invent the missing premise.',
+  '- Prefer preserving exact values over broad topical summaries. A compact ledger can omit generic advice before it omits source-grounded values, counts, locations, or exact spans.',
+];
+
 function queryTokens(query: string): string[] {
   return uniqueStrings(
     query
@@ -600,6 +611,7 @@ export function buildOnlineDreamPrompt(params: {
       'Integration rules:',
       '- Treat episodes as chronological within this case.',
       '- Preserve current state updates, quantities, decisions, constraints, process rules, list/table mappings, and exact values when evidence supports them.',
+      ...EXACT_DETAIL_RULES,
       '- If a new episode updates an old value, mark the old fact superseded and write the new active value with evidence links.',
       '- If a value requires arithmetic or accumulation, perform the update and keep both evidence session ids.',
       '- Explicit aggregate/count statements are authoritative state. Do not replace an explicit total with a smaller count of named examples.',
@@ -857,6 +869,7 @@ export function buildBatchDreamPrompt(params: {
       'Reconciliation rules:',
       '- Treat episodes as chronological within this case.',
       '- Preserve current state updates, quantities, decisions, constraints, process rules, list/table mappings, and exact values when evidence supports them.',
+      ...EXACT_DETAIL_RULES,
       '- If a later episode updates an earlier value, mark the older fact superseded and keep the latest active value with evidence links.',
       '- If a value requires arithmetic or accumulation, perform the update and keep all supporting evidence session ids.',
       '- Explicit aggregate/count statements are authoritative state. Do not replace an explicit total with a smaller count of named examples.',

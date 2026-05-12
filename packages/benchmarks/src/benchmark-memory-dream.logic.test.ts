@@ -272,6 +272,8 @@ describe('benchmark-memory-dream logic', () => {
     expect(prompt.userPrompt).toContain('\"sessionId\": \"s1\"');
     expect(prompt.userPrompt).toContain('No future evaluation question is available');
     expect(prompt.userPrompt).not.toContain('question for later evaluation only');
+    expect(prompt.userPrompt).toContain('quantity_count');
+    expect(prompt.userPrompt).toContain('negative_or_premise');
   });
 
   it('coerces runner dream JSON into evidence-linked state without trusting metadata as answer text', () => {
