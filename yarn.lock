@@ -2027,7 +2027,7 @@ __metadata:
     markdown-it: "npm:^14.1.1"
     next: "npm:^16.2.3"
     pixi.js: "npm:^8.18.1"
-    postcss: "npm:^8.4.49"
+    postcss: "npm:^8.5.10"
     react: "npm:^19.0.0"
     react-dom: "npm:^19.0.0"
     react-markdown: "npm:^9.0.1"
@@ -12903,7 +12903,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"postcss@npm:^8.4.47, postcss@npm:^8.4.49, postcss@npm:^8.5.8":
+"postcss@npm:^8.4.47, postcss@npm:^8.5.8":
   version: 8.5.8
   resolution: "postcss@npm:8.5.8"
   dependencies:
@@ -12914,7 +12914,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"postcss@npm:^8.5.14":
+"postcss@npm:^8.5.10, postcss@npm:^8.5.14":
   version: 8.5.14
   resolution: "postcss@npm:8.5.14"
   dependencies:
