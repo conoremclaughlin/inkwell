@@ -837,6 +837,7 @@ describe('StrategyService', () => {
           approvalNotify: 'myra',
         } as StrategyConfig,
       });
+      const nextTask = createMockTask({ id: 'task-6', title: 'Sixth task', task_order: 5 });
       const groupTasks = [
         createMockTask({ status: 'completed', task_order: 0 }),
         createMockTask({ status: 'completed', task_order: 1 }),
@@ -852,8 +853,8 @@ describe('StrategyService', () => {
         status: 'paused',
       });
 
-      // from() calls: getGroupTasks (for buildProgressSummary in approval gate)
-      setupChains(dc, [chainGroupTasks(groupTasks)]);
+      // from() calls: getTaskByOrder (found — more tasks remain), getGroupTasks (for summary)
+      setupChains(dc, [chainTaskFound(nextTask), chainGroupTasks(groupTasks)]);
 
       const result = await service.advanceStrategy('group-1', 'task-5', 'user-123');
 
@@ -1101,6 +1102,106 @@ describe('StrategyService', () => {
         (c: unknown[]) => (c[1] as Record<string, unknown>).status === 'completed'
       );
       expect(completedCall).toBeUndefined();
+    });
+
+    it('should finalize (not pause for periodic approval) when final task hits approval boundary', async () => {
+      // Regression: when maxIterationsWithoutApproval and the last task land on
+      // the same boundary, final-task handling must win (Lumen review, PR #362)
+      const group = createMockGroup({
+        current_task_index: 4,
+        iterations_since_approval: 4,
+        strategy_config: {
+          maxIterationsWithoutApproval: 5,
+          approvalNotify: 'myra',
+        } as StrategyConfig,
+      });
+      const groupTasks = [
+        createMockTask({ status: 'completed', task_order: 0 }),
+        createMockTask({ status: 'completed', task_order: 1 }),
+        createMockTask({ status: 'completed', task_order: 2 }),
+        createMockTask({ status: 'completed', task_order: 3 }),
+        createMockTask({ status: 'completed', task_order: 4 }),
+      ];
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        status: 'completed',
+      });
+
+      // from() calls: getTaskByOrder not found (both paths), getGroupTasks, cancelWatchdog
+      const notFoundChain = chainTaskNotFound();
+      setupChains(dc, [notFoundChain, notFoundChain, chainGroupTasks(groupTasks), chainNoop()]);
+
+      const result = await service.advanceStrategy('group-1', 'task-5', 'user-123');
+
+      expect(result.action).toBe('group_complete');
+      expect(result.stats).toEqual({ total: 5, completed: 5 });
+
+      // Should NOT have paused for periodic approval
+      const pauseCall = dc.repositories.taskGroups.update.mock.calls.find(
+        (c: unknown[]) =>
+          (c[1] as Record<string, unknown>).status === 'paused' &&
+          ((c[1] as Record<string, unknown>).metadata as Record<string, unknown>)?.pauseReason ===
+            'approval_gate'
+      );
+      expect(pauseCall).toBeUndefined();
+
+      // Should be marked completed
+      expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+        'group-1',
+        expect.objectContaining({ status: 'completed' })
+      );
+    });
+
+    it('should pause for final review (not periodic approval) when final task hits approval boundary with requireFinalApproval', async () => {
+      const group = createMockGroup({
+        current_task_index: 4,
+        iterations_since_approval: 4,
+        strategy_config: {
+          maxIterationsWithoutApproval: 5,
+          requireFinalApproval: true,
+          approvalCriteria: ['tests pass'],
+          approvalNotify: 'myra',
+        } as StrategyConfig,
+      });
+      const groupTasks = [
+        createMockTask({ status: 'completed', task_order: 0 }),
+        createMockTask({ status: 'completed', task_order: 1 }),
+        createMockTask({ status: 'completed', task_order: 2 }),
+        createMockTask({ status: 'completed', task_order: 3 }),
+        createMockTask({ status: 'completed', task_order: 4 }),
+      ];
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        status: 'paused',
+      });
+
+      const notFoundChain = chainTaskNotFound();
+      setupChains(dc, [
+        notFoundChain,
+        notFoundChain,
+        chainGroupTasks(groupTasks),
+        chainGroupTasks(groupTasks),
+        chainNoop(),
+      ]);
+
+      const result = await service.advanceStrategy('group-1', 'task-5', 'user-123');
+
+      expect(result.action).toBe('approval_required');
+      expect(result.progressSummary).toContain('Awaiting final approval');
+      expect(result.progressSummary).toContain('tests pass');
+
+      // Should be paused with final_review, NOT approval_gate
+      expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+        'group-1',
+        expect.objectContaining({
+          status: 'paused',
+          metadata: expect.objectContaining({ pauseReason: 'final_review' }),
+        })
+      );
     });
 
     it('should auto-complete when requireFinalApproval is not set', async () => {
@@ -1363,6 +1464,119 @@ describe('StrategyService', () => {
 
       await expect(service.resumeStrategy('group-1', 'user-123')).rejects.toThrow(
         'does not belong'
+      );
+    });
+
+    it('should finalize strategy when resuming from approval_gate with no remaining tasks', async () => {
+      // Regression: periodic approval_gate fires on the final task (before the
+      // ordering fix). On resume, no tasks remain — must finalize, not return
+      // group_complete with 0/0 stats (Lumen review, PR #362)
+      const group = createMockGroup({
+        status: 'paused',
+        strategy: 'persistence',
+        current_task_index: 5,
+        iterations_since_approval: 5,
+        metadata: { pauseReason: 'approval_gate' },
+        strategy_paused_at: '2026-04-10T12:00:00Z',
+      });
+      const groupTasks = [
+        createMockTask({ status: 'completed', task_order: 0 }),
+        createMockTask({ status: 'completed', task_order: 1 }),
+        createMockTask({ status: 'completed', task_order: 2 }),
+        createMockTask({ status: 'completed', task_order: 3 }),
+        createMockTask({ status: 'completed', task_order: 4 }),
+      ];
+
+      dc.repositories.taskGroups.findById.mockResolvedValueOnce(group);
+      // cleanupStrategyResources re-reads group
+      dc.repositories.taskGroups.findById.mockResolvedValueOnce(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        status: 'completed',
+      });
+
+      const mockClient = dc.getClient();
+
+      // Build chains for from() calls:
+      // 1. createWatchdogReminder (sessions, identity, insert) — various from() calls
+      // 2. getTaskByOrder — not found (exact match fails, fallback empty)
+      // 3. getGroupTasks (for finalization stats)
+      // 4. cancelWatchdog
+      const inChain = vi.fn().mockReturnValue({
+        limit: vi.fn().mockReturnValue({
+          single: vi.fn().mockResolvedValue({ data: null, error: { code: 'PGRST116' } }),
+        }),
+        order: vi.fn().mockReturnValue({
+          order: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue({ data: [], error: null }),
+          }),
+        }),
+      });
+      const taskNotFoundChain = {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({ in: inChain }),
+            in: inChain,
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      };
+      const groupTasksChain = {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            order: vi.fn().mockReturnValue({
+              order: vi.fn().mockResolvedValue({ data: groupTasks, error: null }),
+            }),
+          }),
+        }),
+      };
+      const noopChain = {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              limit: vi.fn().mockReturnValue({
+                single: vi.fn().mockResolvedValue({ data: null, error: null }),
+              }),
+            }),
+            single: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      };
+
+      // Watchdog chains, then getTaskByOrder (not found), getGroupTasks, cleanup
+      let idx = 0;
+      const chains = [
+        noopChain, // watchdog: sessions
+        noopChain, // watchdog: identity
+        noopChain, // watchdog: insert
+        taskNotFoundChain, // getTaskByOrder: exact match (fails)
+        taskNotFoundChain, // getTaskByOrder: fallback (empty)
+        groupTasksChain, // getGroupTasks for finalization
+        noopChain, // cancelWatchdog
+      ];
+      mockClient.from.mockImplementation(() => chains[idx++] || noopChain);
+
+      const result = await service.resumeStrategy('group-1', 'user-123');
+
+      expect(result.action).toBe('group_complete');
+      expect(result.stats).toEqual({ total: 5, completed: 5 });
+
+      // Should have been marked completed
+      expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+        'group-1',
+        expect.objectContaining({ status: 'completed' })
+      );
+
+      // Should log strategy_completed
+      expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({ subtype: 'strategy_completed' })
       );
     });
 

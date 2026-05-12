@@ -345,48 +345,8 @@ export class StrategyService {
       iterations_since_approval: newIterations,
     });
 
-    // Check approval gate
-    const maxIterations = config.maxIterationsWithoutApproval;
-    if (maxIterations && newIterations >= maxIterations) {
-      const summary = await this.buildProgressSummary(group, newIndex);
-
-      // Pause for approval — set pauseReason so resumeStrategy can distinguish
-      // approval-gate pauses from manual pauses (Lumen review, PR #338)
-      await this.dataComposer.repositories.taskGroups.update(groupId, {
-        strategy_paused_at: new Date().toISOString(),
-        status: 'paused',
-        context_summary: summary,
-        metadata: { ...group.metadata, pauseReason: 'approval_gate' },
-      });
-
-      // Notify dispatcher
-      const notified = await this.notifyDispatcher(
-        group,
-        config.approvalNotify,
-        `Approval needed: completed ${newIterations} tasks in "${group.title}". ${summary}`,
-        userId
-      );
-
-      await this.logStrategyEvent(
-        group,
-        'approval_required',
-        `Approval gate: ${newIterations} tasks completed without approval`,
-        {
-          iterationsSinceApproval: newIterations,
-          progressSummary: summary,
-          routedTo: config.approvalNotify || null,
-          notified,
-        }
-      );
-
-      return {
-        action: 'approval_required',
-        progressSummary: summary,
-        notified,
-      };
-    }
-
-    // Get next task
+    // Check for completion BEFORE the periodic approval gate — final-task
+    // handling must win over maxIterationsWithoutApproval (Lumen review, PR #362)
     const nextTask = await this.getTaskByOrder(groupId, newIndex);
 
     if (!nextTask) {
@@ -487,6 +447,47 @@ export class StrategyService {
       return {
         action: 'group_complete',
         stats: { total: tasks.length, completed },
+      };
+    }
+
+    // Check periodic approval gate (only when there ARE more tasks to do)
+    const maxIterations = config.maxIterationsWithoutApproval;
+    if (maxIterations && newIterations >= maxIterations) {
+      const summary = await this.buildProgressSummary(group, newIndex);
+
+      // Pause for approval — set pauseReason so resumeStrategy can distinguish
+      // approval-gate pauses from manual pauses (Lumen review, PR #338)
+      await this.dataComposer.repositories.taskGroups.update(groupId, {
+        strategy_paused_at: new Date().toISOString(),
+        status: 'paused',
+        context_summary: summary,
+        metadata: { ...group.metadata, pauseReason: 'approval_gate' },
+      });
+
+      // Notify dispatcher
+      const notified = await this.notifyDispatcher(
+        group,
+        config.approvalNotify,
+        `Approval needed: completed ${newIterations} tasks in "${group.title}". ${summary}`,
+        userId
+      );
+
+      await this.logStrategyEvent(
+        group,
+        'approval_required',
+        `Approval gate: ${newIterations} tasks completed without approval`,
+        {
+          iterationsSinceApproval: newIterations,
+          progressSummary: summary,
+          routedTo: config.approvalNotify || null,
+          notified,
+        }
+      );
+
+      return {
+        action: 'approval_required',
+        progressSummary: summary,
+        notified,
       };
     }
 
@@ -653,7 +654,54 @@ export class StrategyService {
     const nextTask = await this.getTaskByOrder(groupId, group.current_task_index);
 
     if (!nextTask) {
-      return { action: 'group_complete', stats: { total: 0, completed: 0 } };
+      // No more tasks — finalize the strategy (handles the case where the
+      // periodic approval gate fired on the final task, Lumen review PR #362)
+      const config = group.strategy_config as StrategyConfig;
+      const tasks = await this.getGroupTasks(groupId);
+      const completed = tasks.filter((t) => t.status === 'completed').length;
+      const pending = tasks.filter((t) => t.status === 'pending').length;
+      const blocked = tasks.filter((t) => t.status === 'blocked').length;
+      const hasIncomplete = pending > 0 || blocked > 0;
+
+      if (config.requireFinalApproval) {
+        // Still need final review — re-pause with final_review reason
+        const summary = await this.buildProgressSummary(group, group.current_task_index);
+        const criteria = config.approvalCriteria || [];
+        const criteriaList =
+          criteria.length > 0
+            ? `\n\nAcceptance criteria:\n${criteria.map((c) => `• ${c}`).join('\n')}`
+            : '';
+
+        await this.dataComposer.repositories.taskGroups.update(groupId, {
+          strategy_paused_at: new Date().toISOString(),
+          status: 'paused',
+          context_summary: summary,
+          metadata: { ...cleanedMetadata, pauseReason: 'final_review' },
+        });
+
+        const approvalMessage =
+          `All tasks complete on "${group.title}" (${completed}/${tasks.length}).` +
+          `${hasIncomplete ? ` WARNING: ${pending} pending, ${blocked} blocked tasks remain.` : ''}` +
+          ` Awaiting final approval before closing.${criteriaList}\n\n${summary}`;
+
+        const notified = await this.notifyDispatcher(
+          group,
+          config.approvalNotify || config.checkInNotify,
+          approvalMessage,
+          group.user_id
+        );
+
+        return { action: 'approval_required', progressSummary: approvalMessage, notified };
+      }
+
+      await this.finalizeStrategy(
+        { ...group, metadata: cleanedMetadata },
+        { total: tasks.length, completed, pending, blocked, hasIncomplete },
+        config,
+        group.user_id
+      );
+
+      return { action: 'group_complete', stats: { total: tasks.length, completed } };
     }
 
     // Mark as in_progress if not already
