@@ -4,21 +4,27 @@
  * Runs the bundled fixtures against the running PCP server's `recall` tool
  * and asserts that the curated memory set supports each scenario's rubric.
  *
- * This is the actual signal: does passive recall surface the memories we
- * expect when the SB is working on a real task?
+ * Two query modes:
+ * - keyword: extractTopicSignal bag-of-words (current passive recall)
+ * - llm: LLM-constructed natural language query (experiment)
  *
- * Run with: INK_SERVER_URL=http://localhost:3001 npx vitest run src/repl/real-scenarios/runner.integration.test.ts
+ * Run with:
+ *   INK_SERVER_URL=http://localhost:3001 npx vitest run src/repl/real-scenarios/runner.integration.test.ts
+ *   ANTHROPIC_API_KEY=... INK_SERVER_URL=http://localhost:3001 npx vitest run src/repl/real-scenarios/runner.integration.test.ts
  */
 
 import { describe, expect, it } from 'vitest';
 import { execSync } from 'child_process';
 import { readFileSync } from 'fs';
-import { runScenario, type RecallFn } from './runner.js';
+import { runScenario, type RecallFn, type QueryMode } from './runner.js';
 import { loadScenariosFromDir, defaultFixturesDir } from './loader.js';
 import { writeMarkdownReport } from './report.js';
+import { createLlmQueryFn } from './llm-query.js';
 import type { SurfacedMemory } from './scorer.js';
+import type { ScenarioResult } from './types.js';
 
 const PCP_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
+const HAS_ANTHROPIC_KEY = Boolean(process.env.ANTHROPIC_API_KEY);
 
 let serverAvailable = false;
 try {
@@ -85,9 +91,85 @@ async function pcpRecall(query: string, limit: number): Promise<SurfacedMemory[]
 
 const recall: RecallFn = (query, limit) => pcpRecall(query, limit);
 
+function printComparisonTable(
+  keywordResults: ScenarioResult[],
+  llmResults: ScenarioResult[]
+): void {
+  console.log('\n## Query Mode Comparison: keyword vs LLM\n');
+  console.log('| Scenario | KW Prec | KW Rec | KW Pass | LLM Prec | LLM Rec | LLM Pass | Winner |');
+  console.log('|---|---|---|---|---|---|---|---|');
+
+  let kwWins = 0;
+  let llmWins = 0;
+  let ties = 0;
+
+  for (let i = 0; i < keywordResults.length; i++) {
+    const kw = keywordResults[i];
+    const llm = llmResults[i];
+
+    const kwF1 =
+      kw.metrics.precision + kw.metrics.recall > 0
+        ? (2 * kw.metrics.precision * kw.metrics.recall) /
+          (kw.metrics.precision + kw.metrics.recall)
+        : 0;
+    const llmF1 =
+      llm.metrics.precision + llm.metrics.recall > 0
+        ? (2 * llm.metrics.precision * llm.metrics.recall) /
+          (llm.metrics.precision + llm.metrics.recall)
+        : 0;
+
+    let winner: string;
+    if (llmF1 > kwF1 + 0.01) {
+      winner = 'LLM';
+      llmWins++;
+    } else if (kwF1 > llmF1 + 0.01) {
+      winner = 'KW';
+      kwWins++;
+    } else {
+      winner = 'TIE';
+      ties++;
+    }
+
+    console.log(
+      `| ${kw.scenarioId} | ${pct(kw.metrics.precision)} | ${pct(kw.metrics.recall)} | ${kw.passed ? 'Y' : 'N'} | ${pct(llm.metrics.precision)} | ${pct(llm.metrics.recall)} | ${llm.passed ? 'Y' : 'N'} | ${winner} |`
+    );
+  }
+
+  const avgKwP = avg(keywordResults.map((r) => r.metrics.precision));
+  const avgKwR = avg(keywordResults.map((r) => r.metrics.recall));
+  const avgLlmP = avg(llmResults.map((r) => r.metrics.precision));
+  const avgLlmR = avg(llmResults.map((r) => r.metrics.recall));
+  const kwPassRate = keywordResults.filter((r) => r.passed).length;
+  const llmPassRate = llmResults.filter((r) => r.passed).length;
+
+  console.log(`\n**Aggregates:**`);
+  console.log(
+    `- Keyword: precision=${pct(avgKwP)}, recall=${pct(avgKwR)}, passed=${kwPassRate}/${keywordResults.length}`
+  );
+  console.log(
+    `- LLM:     precision=${pct(avgLlmP)}, recall=${pct(avgLlmR)}, passed=${llmPassRate}/${llmResults.length}`
+  );
+  console.log(`- Wins: KW=${kwWins}, LLM=${llmWins}, TIE=${ties}`);
+
+  console.log('\n### Query Comparison\n');
+  for (let i = 0; i < keywordResults.length; i++) {
+    console.log(`**${keywordResults[i].scenarioId}**`);
+    console.log(`  KW:  "${keywordResults[i].topicSignal}"`);
+    console.log(`  LLM: "${llmResults[i].topicSignal}"`);
+  }
+}
+
+function pct(n: number): string {
+  return `${Math.round(n * 100)}%`;
+}
+
+function avg(nums: number[]): number {
+  return nums.length === 0 ? 0 : nums.reduce((a, b) => a + b, 0) / nums.length;
+}
+
 describe('real-scenarios: live PCP', () => {
   it.skipIf(!serverAvailable)(
-    'runs all bundled fixtures and reports results',
+    'keyword mode — runs all bundled fixtures and reports results',
     { timeout: 60_000 },
     async () => {
       const scenarios = loadScenariosFromDir(defaultFixturesDir());
@@ -99,17 +181,11 @@ describe('real-scenarios: live PCP', () => {
         results.push(result);
       }
 
-      const report = writeMarkdownReport(results, { title: 'Real-Scenario Eval (live PCP)' });
+      const report = writeMarkdownReport(results, {
+        title: 'Real-Scenario Eval — keyword mode (live PCP)',
+      });
       console.log('\n' + report + '\n');
 
-      // This is a REPORTING test, not a rubric gate. The point is to measure
-      // how well recall works against curated scenarios and print the numbers.
-      // Rubric misses usually mean memories haven't been seeded yet (e.g. no
-      // memory exists yet for "NEVER squash merge") — that's a finding, not a
-      // test failure. The harness just needs to run end-to-end.
-      //
-      // The only hard assertion: every supported scenario should get SOMETHING
-      // back. Zero memories means the integration layer is broken.
       const supported = results.filter(
         (r) => !r.failureReasons.some((f) => /not yet implemented/.test(f))
       );
@@ -121,6 +197,47 @@ describe('real-scenarios: live PCP', () => {
       const passed = supported.filter((r) => r.passed).length;
       const passRate = supported.length === 0 ? 0 : passed / supported.length;
       console.log(`Pass rate: ${passed}/${supported.length} (${(passRate * 100).toFixed(0)}%)`);
+    }
+  );
+
+  it.skipIf(!serverAvailable || !HAS_ANTHROPIC_KEY)(
+    'keyword vs LLM comparison benchmark',
+    { timeout: 120_000 },
+    async () => {
+      const scenarios = loadScenariosFromDir(defaultFixturesDir());
+      const supported = scenarios.filter(
+        (s) =>
+          !['topic-shift', 're-entry', 'concurrent-threads', 'post-compaction-continuity'].includes(
+            s.shape
+          )
+      );
+      expect(supported.length).toBeGreaterThan(0);
+
+      const llmQueryFn = createLlmQueryFn();
+
+      const keywordResults: ScenarioResult[] = [];
+      const llmResults: ScenarioResult[] = [];
+
+      for (const scenario of supported) {
+        const kwResult = await runScenario(scenario, recall, { queryMode: 'keyword' });
+        keywordResults.push(kwResult);
+
+        const llmResult = await runScenario(scenario, recall, {
+          queryMode: 'llm',
+          llmQueryFn,
+        });
+        llmResults.push(llmResult);
+      }
+
+      printComparisonTable(keywordResults, llmResults);
+
+      // Both modes should surface something for each scenario
+      for (const r of keywordResults) {
+        expect(r.surfacedCount, `keyword: ${r.scenarioId} surfaced zero`).toBeGreaterThan(0);
+      }
+      for (const r of llmResults) {
+        expect(r.surfacedCount, `llm: ${r.scenarioId} surfaced zero`).toBeGreaterThan(0);
+      }
     }
   );
 });
