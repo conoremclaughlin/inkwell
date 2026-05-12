@@ -86,6 +86,31 @@ export class MCPServer {
     logger.info('MCP Server initialized');
   }
 
+  private async resolveUserFromAgentId(
+    agentId: string
+  ): Promise<{ userId: string; email: string; agentId: string; sbId: string } | null> {
+    const { data, error } = await this.dataComposer
+      .getClient()
+      .from('agent_identities')
+      .select('id, user_id, users!inner(email)')
+      .eq('agent_id', agentId)
+      .limit(1)
+      .single();
+
+    if (error || !data) {
+      logger.debug('Context-based auth: no identity found for agentId', { agentId });
+      return null;
+    }
+
+    const email = (data.users as unknown as { email: string })?.email ?? '';
+    return {
+      userId: data.user_id,
+      email,
+      agentId,
+      sbId: data.id,
+    };
+  }
+
   private async deriveWorkspaceIdFromAgent(
     userId: string,
     agentId: string
@@ -237,10 +262,31 @@ export class MCPServer {
     // ============================================================================
     const handleMcpRequest = async (req: express.Request, res: express.Response) => {
       const authHeader = req.headers.authorization;
-      const userData = await this.authProvider.verifyAccessToken(authHeader);
+      let userData = await this.authProvider.verifyAccessToken(authHeader);
+
+      // Parse x-ink-context early so we can use it for auth fallback.
+      const contextHeader = req.header('x-ink-context')?.trim();
+      let contextToken: import('@inklabs/shared').PcpContextToken | null = null;
+      if (contextHeader) {
+        const { decodeContextToken } = await import('@inklabs/shared');
+        contextToken = decodeContextToken(contextHeader);
+      }
+
+      // Context-based auth fallback: when no OAuth token is present but the
+      // request carries an x-ink-context header with an agentId (injected by
+      // the `ink` CLI wrapper), resolve identity from agent_identities.
+      if (!userData && contextToken?.agentId) {
+        userData = await this.resolveUserFromAgentId(contextToken.agentId);
+        if (userData) {
+          logger.debug('Context-based auth: resolved identity from x-ink-context', {
+            agentId: contextToken.agentId,
+            userId: userData.userId,
+          });
+        }
+      }
 
       // OAuth challenge for MCP clients (e.g. Gemini) when auth is required.
-      const isMissingAuth = !authHeader;
+      const isMissingAuth = !authHeader && !userData;
       const isInvalidAuth = !!authHeader && !userData;
       const shouldChallenge = isInvalidAuth || (env.MCP_REQUIRE_OAUTH && isMissingAuth);
 
@@ -283,20 +329,6 @@ export class MCPServer {
           }
         : {};
       const callerProfileHeader = req.header('x-ink-caller-profile')?.trim().toLowerCase();
-      // Trust boundary note:
-      // `x-ink-caller-profile`, `x-ink-session-id`, and `x-ink-studio-id` are only consumed
-      // on the MCP transport entrypoint. Supported MCP clients in our stack do not expose
-      // arbitrary header injection to model prompts, so these remain runtime/server-controlled
-      // signals rather than LLM-controlled parameters.
-      // Parse consolidated context token first (Phase 1 — preferred source).
-      // Falls back to individual headers for backward compat.
-      const contextHeader = req.header('x-ink-context')?.trim();
-      let contextToken: import('@inklabs/shared').PcpContextToken | null = null;
-      if (contextHeader) {
-        const { decodeContextToken } = await import('@inklabs/shared');
-        contextToken = decodeContextToken(contextHeader);
-      }
-
       const callerProfile: 'agent' | 'runtime' =
         callerProfileHeader === 'runtime' ? 'runtime' : 'agent';
       const sessionIdHeader = contextToken?.sessionId || req.header('x-ink-session-id')?.trim();
