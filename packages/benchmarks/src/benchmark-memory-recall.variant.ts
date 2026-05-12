@@ -6,6 +6,11 @@ export type BenchmarkRecallVariant =
   | 'content-only'
   | 'content-plus-entity'
   | 'content-plus-entity-parallel'
+  | 'content-plus-fact'
+  | 'content-plus-summary'
+  | 'content-plus-summary-fact'
+  | 'content-plus-entity-fact'
+  | 'content-plus-derived'
   | 'entity-only'
   | 'fact-only'
   | 'summary-only'
@@ -27,6 +32,20 @@ const VARIANT_ALIASES: Record<string, BenchmarkRecallVariant> = {
   'content-plus-entity-parallel': 'content-plus-entity-parallel',
   'content+entity-parallel': 'content-plus-entity-parallel',
   'parallel-content-entity': 'content-plus-entity-parallel',
+  'content-plus-fact': 'content-plus-fact',
+  'content+fact': 'content-plus-fact',
+  'raw-plus-fact': 'content-plus-fact',
+  'content-plus-summary': 'content-plus-summary',
+  'content+summary': 'content-plus-summary',
+  'raw-plus-summary': 'content-plus-summary',
+  'content-plus-summary-fact': 'content-plus-summary-fact',
+  'content+summary+fact': 'content-plus-summary-fact',
+  'content-plus-entity-fact': 'content-plus-entity-fact',
+  'content+entity+fact': 'content-plus-entity-fact',
+  'content-plus-derived': 'content-plus-derived',
+  'content+derived': 'content-plus-derived',
+  'raw-plus-derived': 'content-plus-derived',
+  'all-views': 'content-plus-derived',
   'entity-only': 'entity-only',
   entity: 'entity-only',
   entities: 'entity-only',
@@ -89,6 +108,31 @@ function buildVariantSemanticOptions(
         semanticQueryStrategy: 'parallel-content-entity',
         applyChunkTypeBoosts: false,
       };
+    case 'content-plus-fact':
+      return {
+        semanticChunkTypes: ['content', 'fact'],
+        applyChunkTypeBoosts: false,
+      };
+    case 'content-plus-summary':
+      return {
+        semanticChunkTypes: ['content', 'summary'],
+        applyChunkTypeBoosts: false,
+      };
+    case 'content-plus-summary-fact':
+      return {
+        semanticChunkTypes: ['content', 'summary', 'fact'],
+        applyChunkTypeBoosts: false,
+      };
+    case 'content-plus-entity-fact':
+      return {
+        semanticChunkTypes: ['content', 'entity', 'fact'],
+        applyChunkTypeBoosts: false,
+      };
+    case 'content-plus-derived':
+      return {
+        semanticChunkTypes: ['content', 'summary', 'fact', 'topic', 'entity', 'current_state'],
+        applyChunkTypeBoosts: false,
+      };
     case 'fact-only':
       return {
         semanticChunkTypes: ['fact'],
@@ -148,6 +192,11 @@ function buildVariantHybridOptions(
       };
     case 'content-plus-entity':
     case 'content-plus-entity-parallel':
+    case 'content-plus-fact':
+    case 'content-plus-summary':
+    case 'content-plus-summary-fact':
+    case 'content-plus-entity-fact':
+    case 'content-plus-derived':
       return {
         hybridChunkStrategy: 'default',
         applyChunkTypeBoosts: false,

@@ -13,6 +13,8 @@ describe('benchmark-memory-recall variants', () => {
     expect(parseBenchmarkRecallVariant('parallel-content-entity')).toBe(
       'content-plus-entity-parallel'
     );
+    expect(parseBenchmarkRecallVariant('content+entity+fact')).toBe('content-plus-entity-fact');
+    expect(parseBenchmarkRecallVariant('content+derived')).toBe('content-plus-derived');
     expect(parseBenchmarkRecallVariant('entities')).toBe('entity-only');
     expect(parseBenchmarkRecallVariant('durable-facts')).toBe('fact-only');
     expect(parseBenchmarkRecallVariant('derived')).toBe('derived-only');
@@ -155,6 +157,22 @@ describe('benchmark-memory-recall variants', () => {
       applyChunkTypeBoosts: false,
       applyMultiViewBoost: false,
       applyChronologyBoost: false,
+    });
+  });
+
+  it('builds explicit content-plus-derived semantic options', () => {
+    expect(
+      buildBenchmarkRecallOptions({
+        mode: 'semantic',
+        variant: 'content-plus-derived',
+        limit: 5,
+        agentId: 'lumen',
+        topics: ['benchmark:memory-recall:case-content-derived'],
+      })
+    ).toMatchObject({
+      recallMode: 'semantic',
+      semanticChunkTypes: ['content', 'summary', 'fact', 'topic', 'entity', 'current_state'],
+      applyChunkTypeBoosts: false,
     });
   });
 
