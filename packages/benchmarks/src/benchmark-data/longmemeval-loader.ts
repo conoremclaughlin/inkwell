@@ -17,9 +17,29 @@ type LongMemEvalInstance = {
   answer?: string;
   question_date?: string;
   haystack_session_ids?: string[];
+  haystack_dates?: string[];
   haystack_sessions?: LongMemEvalTurn[][];
   answer_session_ids?: string[];
 };
+
+export interface LongMemEvalOrderedSession {
+  sessionId: string;
+  date?: string;
+  content: string;
+  hasAnswer: boolean;
+  isAnswerSession: boolean;
+  turnCount: number;
+}
+
+export interface LongMemEvalDreamCase {
+  id: string;
+  query: string;
+  answer?: string;
+  questionType?: string;
+  questionDate?: string;
+  answerSessionIds: string[];
+  sessions: LongMemEvalOrderedSession[];
+}
 
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
   if (!raw) return fallback;
@@ -46,7 +66,7 @@ function clampArray<T>(items: T[], limit: number): T[] {
   return items.slice(0, Math.max(0, limit));
 }
 
-function formatSession(turns: LongMemEvalTurn[]): string {
+export function formatLongMemEvalSession(turns: LongMemEvalTurn[]): string {
   return turns
     .map((turn) => {
       const role = typeof turn.role === 'string' ? turn.role : 'unknown';
@@ -74,7 +94,7 @@ function buildTargetContents(instance: LongMemEvalInstance): string[] {
     }))
     .filter(({ sessionId }) => answerIds.has(sessionId))
     .map(({ sessionId, turns }) => {
-      const formatted = formatSession(turns);
+      const formatted = formatLongMemEvalSession(turns);
       return formatted ? `session ${sessionId}\n${formatted}` : null;
     })
     .filter((text): text is string => !!text);
@@ -98,7 +118,7 @@ function buildDistractors(instance: LongMemEvalInstance, maxDistractors: number)
     }))
     .filter(({ sessionId }) => !answerIds.has(sessionId))
     .map(({ sessionId, turns }) => {
-      const formatted = formatSession(turns);
+      const formatted = formatLongMemEvalSession(turns);
       return formatted ? `session ${sessionId}\n${formatted}` : null;
     })
     .filter((text): text is string => !!text);
@@ -132,6 +152,62 @@ function mapInstancesToBenchmarkCases(
       targetContents,
       distractors,
       provenance: `longmemeval:${instance.question_type || 'unknown'}:${instance.question_date || 'unknown-date'}`,
+    });
+  }
+
+  return cases;
+}
+
+function mapInstancesToDreamCases(
+  instances: LongMemEvalInstance[],
+  offset: number,
+  maxCases: number
+): LongMemEvalDreamCase[] {
+  const cases: LongMemEvalDreamCase[] = [];
+
+  for (const instance of instances.slice(offset)) {
+    if (cases.length >= maxCases) break;
+
+    const id = typeof instance.question_id === 'string' ? instance.question_id : null;
+    const query = typeof instance.question === 'string' ? instance.question.trim() : null;
+    if (!id || !query) continue;
+
+    const sessionIds = Array.isArray(instance.haystack_session_ids)
+      ? instance.haystack_session_ids
+      : [];
+    const sessions = Array.isArray(instance.haystack_sessions) ? instance.haystack_sessions : [];
+    const dates = Array.isArray(instance.haystack_dates) ? instance.haystack_dates : [];
+    const answerSessionIds = Array.isArray(instance.answer_session_ids)
+      ? instance.answer_session_ids
+      : [];
+    const answerIds = new Set(answerSessionIds);
+
+    const orderedSessions = sessionIds
+      .map((sessionId, idx) => {
+        const turns = sessions[idx] || [];
+        const formatted = formatLongMemEvalSession(turns);
+        if (!formatted.trim()) return null;
+        return {
+          sessionId,
+          date: typeof dates[idx] === 'string' ? dates[idx] : undefined,
+          content: `session ${sessionId}\n${formatted}`,
+          hasAnswer: turns.some((turn) => turn.has_answer === true),
+          isAnswerSession: answerIds.has(sessionId),
+          turnCount: turns.length,
+        };
+      })
+      .filter((session): session is LongMemEvalOrderedSession => Boolean(session));
+
+    if (orderedSessions.length === 0) continue;
+
+    cases.push({
+      id,
+      query,
+      answer: typeof instance.answer === 'string' ? instance.answer : undefined,
+      questionType: typeof instance.question_type === 'string' ? instance.question_type : undefined,
+      questionDate: typeof instance.question_date === 'string' ? instance.question_date : undefined,
+      answerSessionIds,
+      sessions: orderedSessions,
     });
   }
 
@@ -178,6 +254,30 @@ export async function loadLongMemEvalDataset(): Promise<{
   );
   if (cases.length === 0) {
     throw new Error('LongMemEval dataset loaded but produced 0 benchmark cases.');
+  }
+
+  return {
+    cases,
+    source: process.env.LONGMEMEVAL_DATASET_PATH
+      ? `file:${process.env.LONGMEMEVAL_DATASET_PATH}`
+      : `url:${process.env.LONGMEMEVAL_DATASET_URL || DEFAULT_LONGMEMEVAL_URL}`,
+  };
+}
+
+export async function loadLongMemEvalDreamDataset(): Promise<{
+  cases: LongMemEvalDreamCase[];
+  source: string;
+}> {
+  const limit = parsePositiveInt(process.env.LONGMEMEVAL_LIMIT, 100);
+  const offset = parseNonNegativeInt(process.env.LONGMEMEVAL_OFFSET, 0);
+  const raw = await loadSourceJson();
+  if (!Array.isArray(raw)) {
+    throw new Error('LongMemEval dataset must be a JSON array of evaluation instances.');
+  }
+
+  const cases = mapInstancesToDreamCases(raw as LongMemEvalInstance[], offset, limit);
+  if (cases.length === 0) {
+    throw new Error('LongMemEval dataset loaded but produced 0 dream cases.');
   }
 
   return {

@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadLongMemEvalDataset } from './longmemeval-loader';
+import { loadLongMemEvalDataset, loadLongMemEvalDreamDataset } from './longmemeval-loader';
 
 describe('loadLongMemEvalDataset', () => {
   const oldPath = process.env.LONGMEMEVAL_DATASET_PATH;
@@ -150,5 +150,56 @@ describe('loadLongMemEvalDataset', () => {
     expect(loaded.cases).toHaveLength(1);
     expect(loaded.cases[0].id).toBe('q2');
     expect(loaded.cases[0].query).toBe('second?');
+  });
+
+  it('loads dream cases in chronological haystack order without splitting targets first', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'longmemeval-dream-'));
+    const file = join(dir, 'sample-dream.json');
+    await writeFile(
+      file,
+      JSON.stringify([
+        {
+          question_id: 'q-dream',
+          question_type: 'knowledge-update',
+          question: 'How many coins do I have?',
+          answer: '38',
+          question_date: '2025-01-12',
+          haystack_session_ids: ['older', 'newer'],
+          haystack_dates: ['2025-01-01', '2025-01-05'],
+          answer_session_ids: ['older', 'newer'],
+          haystack_sessions: [
+            [{ role: 'user', content: 'I have 37 pre-1920 coins.', has_answer: true }],
+            [
+              {
+                role: 'user',
+                content: 'I added one more 1915-S Barber quarter.',
+                has_answer: true,
+              },
+            ],
+          ],
+        },
+      ]),
+      'utf-8'
+    );
+
+    process.env.LONGMEMEVAL_DATASET_PATH = file;
+    process.env.LONGMEMEVAL_LIMIT = '10';
+    delete process.env.LONGMEMEVAL_MAX_DISTRACTORS;
+
+    const loaded = await loadLongMemEvalDreamDataset();
+
+    expect(loaded.cases).toHaveLength(1);
+    expect(loaded.cases[0].id).toBe('q-dream');
+    expect(loaded.cases[0].answer).toBe('38');
+    expect(loaded.cases[0].sessions.map((session) => session.sessionId)).toEqual([
+      'older',
+      'newer',
+    ]);
+    expect(loaded.cases[0].sessions[0]).toMatchObject({
+      date: '2025-01-01',
+      hasAnswer: true,
+      isAnswerSession: true,
+    });
+    expect(loaded.cases[0].sessions[1].content).toContain('session newer');
   });
 });
