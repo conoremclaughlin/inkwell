@@ -58,6 +58,8 @@ const accessToken: string | null = existsSync(authPath)
   ? JSON.parse(readFileSync(authPath, 'utf-8')).access_token
   : null;
 
+const INKWELL_URL = process.env.PCP_SERVER_URL || 'http://localhost:3001';
+
 // ============================================================================
 // Prerequisite checks (same pattern as sandbox live test)
 // ============================================================================
@@ -87,7 +89,7 @@ function claudeCredentialsAvailable(): boolean {
 
 function inkwellReachable(): boolean {
   try {
-    execFileSync('curl', ['-sf', '-o', '/dev/null', 'http://localhost:3001/health'], {
+    execFileSync('curl', ['-sf', '-o', '/dev/null', `${INKWELL_URL}/health`], {
       timeout: 3_000,
     });
     return true;
@@ -214,7 +216,7 @@ describe.skipIf(!canRun)('Strategy Approval Gate — LLM live test', () => {
         mcpServers: {
           inkwell: {
             type: 'http',
-            url: 'http://localhost:3001/mcp',
+            url: `${INKWELL_URL}/mcp`,
             headers: {
               Authorization: `Bearer ${accessToken}`,
             },
