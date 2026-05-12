@@ -1576,39 +1576,37 @@ describe('SessionService', () => {
     });
   });
 
-  describe('Single-Session Routing (session_scope=single)', () => {
-    // These tests need a supabase mock to resolve session_scope from agent_identities.
-    // The SessionService constructor accepts supabase as the 7th arg.
+  describe('Default Session Routing (default_session_id)', () => {
+    // Helper: chainable Supabase mock — every method returns `this` except terminal ones
+    function createChainableMock(terminalResult: unknown) {
+      const chain: Record<string, unknown> = {};
+      const chainMethods = ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit'];
+      for (const m of chainMethods) {
+        chain[m] = vi.fn().mockReturnValue(chain);
+      }
+      chain.maybeSingle = vi.fn().mockResolvedValue(terminalResult);
+      chain.single = vi.fn().mockResolvedValue(terminalResult);
+      return chain;
+    }
 
-    it('should consolidate into active session when session_scope=single and threadKey has no match', async () => {
-      const activeSession = createMockSession({ id: 'active-primary' });
+    it('should route to default_session_id when threadKey has no match', async () => {
+      const defaultSession = createMockSession({ id: 'default-session' });
       const mockFindByThreadKey = vi.fn().mockResolvedValue(null);
       (mockRepository as Record<string, unknown>).findByThreadKey = mockFindByThreadKey;
-      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(activeSession);
-
-      // Chainable Supabase mock — every method returns `this` except terminal ones
-      function createChainableMock(terminalResult: unknown) {
-        const chain: Record<string, unknown> = {};
-        const chainMethods = ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit'];
-        for (const m of chainMethods) {
-          chain[m] = vi.fn().mockReturnValue(chain);
-        }
-        chain.maybeSingle = vi.fn().mockResolvedValue(terminalResult);
-        chain.single = vi.fn().mockResolvedValue(terminalResult);
-        return chain;
-      }
+      vi.mocked(mockRepository.findById).mockResolvedValue(defaultSession);
 
       const mockSupabase = {
         from: vi.fn().mockImplementation((table: string) => {
           if (table === 'agent_identities') {
-            return createChainableMock({ data: { session_scope: 'single' } });
+            return createChainableMock({
+              data: { default_session_id: 'default-session' },
+            });
           }
-          // Studios, sessions, etc. — return empty results
           return createChainableMock({ data: null });
         }),
       };
 
-      const singleSessionService = new SessionService(
+      const serviceWithDefault = new SessionService(
         mockRepository,
         mockContextBuilder,
         mockClaudeRunner,
@@ -1618,13 +1616,13 @@ describe('SessionService', () => {
         mockSupabase as never
       );
 
-      await singleSessionService.handleMessage(
+      await serviceWithDefault.handleMessage(
         createMockRequest({
           metadata: { threadKey: 'pr:99' },
         })
       );
 
-      // threadKey lookup should be attempted
+      // threadKey lookup attempted, then fell back to default session
       expect(mockFindByThreadKey).toHaveBeenCalledWith(
         'user-456',
         'myra',
@@ -1632,24 +1630,62 @@ describe('SessionService', () => {
         undefined,
         undefined
       );
-      // Should fall back to findByUserAndAgent (the active session) instead of creating
-      expect(mockRepository.findByUserAndAgent).toHaveBeenCalled();
+      expect(mockRepository.findById).toHaveBeenCalledWith('default-session');
       expect(mockRepository.create).not.toHaveBeenCalled();
     });
 
-    it('should create new thread-scoped session when session_scope is not single', async () => {
+    it('should create new thread-scoped session when no default_session_id', async () => {
       const mockFindByThreadKey = vi.fn().mockResolvedValue(null);
       (mockRepository as Record<string, unknown>).findByThreadKey = mockFindByThreadKey;
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
 
-      // No supabase → resolvePreferSingleSession returns false
+      // No supabase → resolveDefaultSessionId returns null
       await sessionService.handleMessage(
         createMockRequest({
           metadata: { threadKey: 'pr:99' },
         })
       );
 
-      // Should NOT fall back to findByUserAndAgent — should create a new session
+      expect(mockRepository.create).toHaveBeenCalled();
+    });
+
+    it('should create new session when default_session_id points to ended session', async () => {
+      const endedSession = createMockSession({
+        id: 'ended-session',
+        endedAt: new Date(),
+      });
+      const mockFindByThreadKey = vi.fn().mockResolvedValue(null);
+      (mockRepository as Record<string, unknown>).findByThreadKey = mockFindByThreadKey;
+      vi.mocked(mockRepository.findById).mockResolvedValue(endedSession);
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          if (table === 'agent_identities') {
+            return createChainableMock({
+              data: { default_session_id: 'ended-session' },
+            });
+          }
+          return createChainableMock({ data: null });
+        }),
+      };
+
+      const serviceWithDefault = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        mockSupabase as never
+      );
+
+      await serviceWithDefault.handleMessage(
+        createMockRequest({
+          metadata: { threadKey: 'pr:99' },
+        })
+      );
+
+      // Default session was ended, so a new session should be created
       expect(mockRepository.create).toHaveBeenCalled();
     });
   });

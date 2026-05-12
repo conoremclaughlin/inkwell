@@ -768,9 +768,9 @@ export class SessionService implements ISessionService {
       backend,
     });
 
-    // Resolve session_scope from agent identity. "single" means the agent
-    // prefers all messages consolidated into one session (Myra, etc.).
-    const preferSingleSession = await this.resolvePreferSingleSession(userId, agentId);
+    // Resolve default_session_id from agent identity. When set, threadKey
+    // misses route to this session instead of creating new ones.
+    const defaultSessionId = await this.resolveDefaultSessionId(userId, agentId);
 
     // For primary sessions, try to find existing active session
     if (type === 'primary') {
@@ -839,18 +839,23 @@ export class SessionService implements ISessionService {
           return threadMatch;
         }
 
-        // Thread-scoped request with no match. Behavior depends on session_scope:
-        //   "single" → consolidate into active session (Myra, etc.)
-        //   default  → create a dedicated session per thread
-        if (preferSingleSession) {
-          logger.debug(
-            'No thread match; session_scope=single — falling through to active session',
-            {
+        // Thread-scoped request with no match. If the agent has a default
+        // session, route there instead of creating a new one.
+        if (defaultSessionId) {
+          const defaultSession = await this.repository.findById(defaultSessionId);
+          if (defaultSession && !defaultSession.endedAt) {
+            logger.debug('No thread match; routing to default_session_id', {
               userId,
               agentId,
               threadKey: options.threadKey,
-            }
-          );
+              defaultSessionId,
+            });
+            return defaultSession;
+          }
+          logger.debug('default_session_id is set but session is ended/missing; creating new', {
+            defaultSessionId,
+            agentId,
+          });
         } else {
           logger.debug('No thread match; creating new thread-scoped session', {
             userId,
@@ -868,11 +873,8 @@ export class SessionService implements ISessionService {
         });
       }
 
-      // Fall back to general active session when:
-      //   a) no threadKey was provided, OR
-      //   b) threadKey was provided but agent prefers single session (session_scope=single)
-      const shouldFallBackToActive = !options?.threadKey || preferSingleSession;
-      if (shouldFallBackToActive) {
+      if (!options?.threadKey) {
+        // Fall back to general active session for non-threaded requests.
         const existing = await this.repository.findByUserAndAgent(userId, agentId, {
           type: 'primary',
           ...(resolvedStudioId ? { studioId: resolvedStudioId } : {}),
@@ -884,7 +886,6 @@ export class SessionService implements ISessionService {
             sessionId: existing.id,
             backendSessionId: existing.backendSessionId,
             studioId: existing.studioId || null,
-            singleSessionFallback: preferSingleSession && !!options?.threadKey,
           });
           return existing;
         }
@@ -1381,26 +1382,26 @@ This session will continue with a fresh context after compaction. Your identity,
   }
 
   /**
-   * Check if the agent prefers single-session routing (session_scope = 'single').
-   * When true, threadKey misses fall back to the active session instead of
-   * creating a new one. Used by Myra, etc. to prevent session proliferation.
+   * Resolve default_session_id from agent identity. When set, threadKey
+   * misses route to this session instead of creating new ones (Myra, etc.).
+   * Returns the session UUID or null.
    */
-  private async resolvePreferSingleSession(userId: string, agentId: string): Promise<boolean> {
-    if (!this.supabase) return false;
+  private async resolveDefaultSessionId(userId: string, agentId: string): Promise<string | null> {
+    if (!this.supabase) return null;
     try {
-      // session_scope not yet in generated types — cast result
+      // default_session_id not yet in generated types — cast result
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { data } = (await (this.supabase as any)
         .from('agent_identities')
-        .select('session_scope')
+        .select('default_session_id')
         .eq('user_id', userId)
         .eq('agent_id', agentId)
         .not('workspace_id', 'is', null)
         .limit(1)
-        .maybeSingle()) as { data: { session_scope: string | null } | null };
-      return data?.session_scope === 'single';
+        .maybeSingle()) as { data: { default_session_id: string | null } | null };
+      return data?.default_session_id || null;
     } catch {
-      return false;
+      return null;
     }
   }
 
