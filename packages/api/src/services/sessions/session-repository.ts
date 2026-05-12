@@ -74,6 +74,9 @@ function mapDbToSession(row: DbSession): Session {
     // Thread key
     threadKey: row.thread_key || undefined,
 
+    // Session alias
+    alias: (row as Record<string, unknown>).alias as string | undefined,
+
     metadata: metadata,
   };
 }
@@ -100,6 +103,7 @@ function mapSessionToDb(
     studio_id: session.studioId || null,
     contact_id: session.contactId || null,
     thread_key: session.threadKey || null,
+    ...(session.alias ? { alias: session.alias } : {}),
     metadata: {
       type: session.type,
       taskDescription: session.taskDescription,
@@ -186,6 +190,28 @@ export class SessionRepository implements ISessionRepository {
     }
 
     return session;
+  }
+
+  async findByAlias(userId: string, agentId: string, alias: string): Promise<Session | null> {
+    // alias column not yet in generated Supabase types — cast
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data, error } = (await (this.supabase as any)
+      .from('sessions')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('agent_id', agentId)
+      .eq('alias', alias)
+      .is('ended_at', null)
+      .neq('lifecycle', 'failed')
+      .order('started_at', { ascending: false })
+      .limit(1)) as { data: DbSession[] | null; error: { message: string; code?: string } | null };
+
+    if (error) {
+      logger.error('Error finding session by alias', { userId, agentId, alias, error });
+      throw error;
+    }
+
+    return data && data.length > 0 ? mapDbToSession(data[0]) : null;
   }
 
   async findByThreadKey(
@@ -341,6 +367,10 @@ export class SessionRepository implements ISessionRepository {
 
     if (updates.cliAttached !== undefined) {
       dbUpdates.cli_attached = updates.cliAttached;
+    }
+
+    if (updates.alias !== undefined) {
+      (dbUpdates as Record<string, unknown>).alias = updates.alias || null;
     }
 
     // Merge metadata updates

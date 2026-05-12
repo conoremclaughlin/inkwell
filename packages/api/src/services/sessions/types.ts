@@ -93,6 +93,9 @@ export interface Session {
   // Thread key for topic-scoped session matching (e.g., "pr:43")
   threadKey?: string;
 
+  // Human-readable alias for explicit routing (e.g., "main", "review")
+  alias?: string;
+
   // Whether a CLI process with a channel plugin is attached to this session
   cliAttached?: boolean;
 
@@ -133,6 +136,8 @@ export interface SessionRequest {
     contactId?: string;
     // Recipient session to inherit studio scope from
     recipientSessionId?: string;
+    // Target a session by alias (e.g., "main", "review")
+    sessionAlias?: string;
     // For task sessions
     sessionType?: SessionType;
     taskDescription?: string;

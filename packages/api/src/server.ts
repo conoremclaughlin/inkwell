@@ -895,6 +895,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         studioId: payload.studioId,
         studioHint: payload.studioHint,
         recipientSessionId: payload.recipientSessionId,
+        sessionAlias: payload.sessionAlias,
         taskGroupId:
           payload.metadata && typeof payload.metadata.groupId === 'string'
             ? payload.metadata.groupId
@@ -923,6 +924,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     try {
       const routedSession = await sessionService!.getOrCreateSession(userId, targetAgentId, {
         threadKey: payload.threadKey,
+        alias: payload.sessionAlias,
         studioId: payload.studioId,
         studioHint: payload.studioHint,
         recipientSessionId: payload.recipientSessionId,

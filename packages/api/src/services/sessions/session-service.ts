@@ -232,6 +232,7 @@ export class SessionService implements ISessionService {
         taskDescription: metadata?.taskDescription,
         parentSessionId: metadata?.parentSessionId,
         threadKey: metadata?.threadKey,
+        alias: metadata?.sessionAlias,
         studioId: metadata?.studioId,
         studioHint: metadata?.studioHint,
         recipientSessionId: metadata?.recipientSessionId,
@@ -747,6 +748,7 @@ export class SessionService implements ISessionService {
       taskDescription?: string;
       parentSessionId?: string;
       threadKey?: string;
+      alias?: string;
       studioId?: string;
       studioHint?: string;
       recipientSessionId?: string;
@@ -785,7 +787,28 @@ export class SessionService implements ISessionService {
         }
       }
 
-      // ThreadKey match takes priority — find session scoped to this topic
+      // Alias match — explicit named routing (e.g., "main", "review").
+      // Takes priority over threadKey because alias is an explicit user intent.
+      if (options?.alias && 'findByAlias' in this.repository) {
+        const aliasRepo = this.repository as {
+          findByAlias: (u: string, a: string, alias: string) => Promise<Session | null>;
+        };
+        const aliasMatch = await aliasRepo.findByAlias(userId, agentId, options.alias);
+        if (aliasMatch) {
+          logger.debug('Found existing session by alias', {
+            sessionId: aliasMatch.id,
+            alias: options.alias,
+            studioId: aliasMatch.studioId || null,
+          });
+          return aliasMatch;
+        }
+        logger.debug('No session found for alias', {
+          alias: options.alias,
+          agentId,
+        });
+      }
+
+      // ThreadKey match — find session scoped to this topic
       if (options?.threadKey && 'findByThreadKey' in this.repository) {
         const threadRepo = this.repository as {
           findByThreadKey: (
@@ -812,14 +835,24 @@ export class SessionService implements ISessionService {
           return threadMatch;
         }
 
-        // Thread-scoped request with no match => create a dedicated new session.
-        // Do NOT reuse the generic active session; that would collapse distinct threads.
-        logger.debug('No existing thread-scoped session found; creating a new one', {
-          userId,
-          agentId,
-          threadKey: options.threadKey,
-          studioId: resolvedStudioId || null,
-        });
+        // Thread-scoped request with no match. For studio-based agents, create a
+        // dedicated session per thread. For agents without studios (Myra, Benson),
+        // consolidate into the existing active session — proliferating sessions
+        // per threadKey breaks their single-session model.
+        if (resolvedStudioId) {
+          logger.debug('No existing thread-scoped session; creating new one (has studio)', {
+            userId,
+            agentId,
+            threadKey: options.threadKey,
+            studioId: resolvedStudioId,
+          });
+        } else {
+          logger.debug('No thread match, no studio — falling through to active session', {
+            userId,
+            agentId,
+            threadKey: options.threadKey,
+          });
+        }
       } else if (options?.threadKey) {
         logger.debug('Repository lacks threadKey lookup support; creating a new thread session', {
           userId,
@@ -829,10 +862,11 @@ export class SessionService implements ISessionService {
         });
       }
 
-      if (!options?.threadKey) {
-        // Fall back to general active session match only for non-threaded requests.
-        // Always pass contactId to enforce isolation: contact sessions match their
-        // contact, owner sessions (contactId=undefined) match only NULL rows.
+      // Fall back to general active session when:
+      //   a) no threadKey was provided, OR
+      //   b) threadKey was provided but agent has no studio (single-session agent)
+      const shouldFallBackToActive = !options?.threadKey || !resolvedStudioId;
+      if (shouldFallBackToActive) {
         const existing = await this.repository.findByUserAndAgent(userId, agentId, {
           type: 'primary',
           ...(resolvedStudioId ? { studioId: resolvedStudioId } : {}),
@@ -840,10 +874,11 @@ export class SessionService implements ISessionService {
         });
 
         if (existing) {
-          logger.debug('Found existing session', {
+          logger.debug('Found existing active session', {
             sessionId: existing.id,
             backendSessionId: existing.backendSessionId,
             studioId: existing.studioId || null,
+            singleSessionFallback: !!options?.threadKey,
           });
           return existing;
         }
@@ -868,6 +903,7 @@ export class SessionService implements ISessionService {
       taskDescription: options?.taskDescription,
       parentSessionId: options?.parentSessionId,
       threadKey: options?.threadKey,
+      alias: options?.alias,
       studioId: resolvedStudioId,
       contactId: options?.contactId,
       contextTokens: 0,
@@ -888,6 +924,7 @@ export class SessionService implements ISessionService {
       userId,
       agentId,
       type,
+      alias: options?.alias || null,
       studioId: resolvedStudioId || null,
     });
 
