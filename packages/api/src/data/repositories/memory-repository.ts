@@ -29,6 +29,7 @@ import type {
   SessionLogCreateInput,
   SessionLogRow,
   Salience,
+  RecallIntent,
 } from '../models/memory';
 
 type RecallMode = NonNullable<MemorySearchOptions['recallMode']>;
@@ -388,7 +389,11 @@ export class MemoryRepository {
 
     const merged = Array.from(byId.values()).map((candidate) => ({
       ...candidate,
-      finalScore: this.computeHybridScore(candidate.semanticScore, candidate.textScore),
+      finalScore: this.computeHybridScore(
+        candidate.semanticScore,
+        candidate.textScore,
+        this.computeIntentMultiplier(candidate.memory, options.recallIntent)
+      ),
     }));
 
     merged.sort(
@@ -399,11 +404,30 @@ export class MemoryRepository {
     return merged.slice(offset, offset + limit);
   }
 
-  private computeHybridScore(semanticScore?: number, textScore?: number): number {
+  private computeHybridScore(
+    semanticScore?: number,
+    textScore?: number,
+    intentMultiplier: number = 1
+  ): number {
     const s = semanticScore ?? 0;
     const t = textScore ?? 0;
-    // Blend with heavier semantic weighting, but allow lexical key matches to lift ranking.
-    return s * 0.7 + t * 0.3;
+    return (s * 0.7 + t * 0.3) * intentMultiplier;
+  }
+
+  private computeIntentMultiplier(memory: Memory, intent?: RecallIntent): number {
+    if (!intent) return 1;
+    if (intent === 'activity') return 1;
+
+    const content = memory.content.toLowerCase();
+    const isSessionPhase =
+      memory.source === 'session' ||
+      content.startsWith('[complete]') ||
+      content.startsWith('[waiting:') ||
+      content.startsWith('[blocked:') ||
+      content.startsWith('completed:') ||
+      /^completed\b/.test(content);
+
+    return isSessionPhase ? 0.4 : 1;
   }
 
   private buildTextScore(query: string, memory: Memory): number {

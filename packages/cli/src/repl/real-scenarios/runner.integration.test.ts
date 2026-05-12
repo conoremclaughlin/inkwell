@@ -46,7 +46,11 @@ interface RecallResponse {
   memories: RecallMemory[];
 }
 
-async function pcpRecall(query: string, limit: number): Promise<SurfacedMemory[]> {
+async function pcpRecall(
+  query: string,
+  limit: number,
+  extraArgs: Record<string, unknown> = {}
+): Promise<SurfacedMemory[]> {
   const authPath = `${process.env.HOME}/.ink/auth.json`;
   const auth = JSON.parse(readFileSync(authPath, 'utf-8'));
   const accessToken = auth.accessToken || auth.access_token;
@@ -71,6 +75,7 @@ async function pcpRecall(query: string, limit: number): Promise<SurfacedMemory[]
           includeShared: true,
           limit,
           recallMode: 'hybrid',
+          ...extraArgs,
         },
       },
     }),
@@ -90,6 +95,8 @@ async function pcpRecall(query: string, limit: number): Promise<SurfacedMemory[]
 }
 
 const recall: RecallFn = (query, limit) => pcpRecall(query, limit);
+const recallWithIntent: (intent: string) => RecallFn = (intent) => (query, limit) =>
+  pcpRecall(query, limit, { recallIntent: intent });
 
 function printComparisonTable(
   keywordResults: ScenarioResult[],
@@ -237,6 +244,97 @@ describe('real-scenarios: live PCP', () => {
       }
       for (const r of llmResults) {
         expect(r.surfacedCount, `llm: ${r.scenarioId} surfaced zero`).toBeGreaterThan(0);
+      }
+    }
+  );
+
+  it.skipIf(!serverAvailable)(
+    'recallIntent comparison: default vs knowledge',
+    { timeout: 120_000 },
+    async () => {
+      const scenarios = loadScenariosFromDir(defaultFixturesDir());
+      const supported = scenarios.filter(
+        (s) =>
+          !['topic-shift', 're-entry', 'concurrent-threads', 'post-compaction-continuity'].includes(
+            s.shape
+          )
+      );
+      expect(supported.length).toBeGreaterThan(0);
+
+      const defaultResults: ScenarioResult[] = [];
+      const knowledgeResults: ScenarioResult[] = [];
+
+      for (const scenario of supported) {
+        const defaultResult = await runScenario(scenario, recall);
+        defaultResults.push(defaultResult);
+
+        const knowledgeResult = await runScenario(scenario, recallWithIntent('knowledge'));
+        knowledgeResults.push(knowledgeResult);
+      }
+
+      console.log('\n## recallIntent Comparison: default vs knowledge\n');
+      console.log(
+        '| Scenario | Def Prec | Def Rec | Def Pass | Know Prec | Know Rec | Know Pass | Winner |'
+      );
+      console.log('|---|---|---|---|---|---|---|---|');
+
+      let defWins = 0;
+      let knowWins = 0;
+      let ties = 0;
+
+      for (let i = 0; i < defaultResults.length; i++) {
+        const def = defaultResults[i];
+        const know = knowledgeResults[i];
+
+        const defF1 =
+          def.metrics.precision + def.metrics.recall > 0
+            ? (2 * def.metrics.precision * def.metrics.recall) /
+              (def.metrics.precision + def.metrics.recall)
+            : 0;
+        const knowF1 =
+          know.metrics.precision + know.metrics.recall > 0
+            ? (2 * know.metrics.precision * know.metrics.recall) /
+              (know.metrics.precision + know.metrics.recall)
+            : 0;
+
+        let winner: string;
+        if (knowF1 > defF1 + 0.01) {
+          winner = 'KNOW';
+          knowWins++;
+        } else if (defF1 > knowF1 + 0.01) {
+          winner = 'DEF';
+          defWins++;
+        } else {
+          winner = 'TIE';
+          ties++;
+        }
+
+        console.log(
+          `| ${def.scenarioId} | ${pct(def.metrics.precision)} | ${pct(def.metrics.recall)} | ${def.passed ? 'Y' : 'N'} | ${pct(know.metrics.precision)} | ${pct(know.metrics.recall)} | ${know.passed ? 'Y' : 'N'} | ${winner} |`
+        );
+      }
+
+      const avgDefP = avg(defaultResults.map((r) => r.metrics.precision));
+      const avgDefR = avg(defaultResults.map((r) => r.metrics.recall));
+      const avgKnowP = avg(knowledgeResults.map((r) => r.metrics.precision));
+      const avgKnowR = avg(knowledgeResults.map((r) => r.metrics.recall));
+      const defPassRate = defaultResults.filter((r) => r.passed).length;
+      const knowPassRate = knowledgeResults.filter((r) => r.passed).length;
+
+      console.log(`\n**Aggregates:**`);
+      console.log(
+        `- Default:   precision=${pct(avgDefP)}, recall=${pct(avgDefR)}, passed=${defPassRate}/${defaultResults.length}`
+      );
+      console.log(
+        `- Knowledge: precision=${pct(avgKnowP)}, recall=${pct(avgKnowR)}, passed=${knowPassRate}/${knowledgeResults.length}`
+      );
+      console.log(`- Wins: DEF=${defWins}, KNOW=${knowWins}, TIE=${ties}`);
+
+      for (const r of defaultResults) {
+        expect(r.surfacedCount, `default: ${r.scenarioId} surfaced zero`).toBeGreaterThan(0);
+      }
+      for (const r of knowledgeResults) {
+        expect(r.surfacedCount, `knowledge: ${r.scenarioId} surfaced zero`).toBeGreaterThan(0);
       }
     }
   );

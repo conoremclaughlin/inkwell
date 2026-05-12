@@ -368,6 +368,12 @@ export const recallSchema = userIdentifierBaseSchema.extend({
     .describe(
       'Recall strategy: text (keyword only), semantic (embeddings only), hybrid (blend both), auto (semantic then fallback to text). Default: hybrid.'
     ),
+  recallIntent: z
+    .enum(['knowledge', 'activity'])
+    .optional()
+    .describe(
+      'Query intent hint for scoring adjustment. "knowledge" de-ranks session-phase noise (task completions, phase transitions) to surface conventions and decisions. "activity" preserves session-phase entries for "what have I done" queries. Omit for default scoring.'
+    ),
   source: memorySourceSchema.optional().describe('Filter by source'),
   salience: salienceSchema.optional().describe('Filter by salience'),
   topics: topicsSchema.describe('Filter by topics (any match)'),
@@ -739,6 +745,7 @@ export async function handleRecall(args: unknown, dataComposer: DataComposer) {
 
   const searchOptions = {
     recallMode: params.recallMode,
+    recallIntent: params.recallIntent,
     source: params.source as MemorySource,
     salience: params.salience as Salience,
     topics: params.topics,
