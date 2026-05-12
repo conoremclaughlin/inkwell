@@ -345,7 +345,112 @@ export class StrategyService {
       iterations_since_approval: newIterations,
     });
 
-    // Check approval gate
+    // Check for completion BEFORE the periodic approval gate — final-task
+    // handling must win over maxIterationsWithoutApproval (Lumen review, PR #362)
+    const nextTask = await this.getTaskByOrder(groupId, newIndex);
+
+    if (!nextTask) {
+      // No more pending/in_progress tasks — strategy is done (or needs final approval)
+      const tasks = await this.getGroupTasks(groupId);
+      const completed = tasks.filter((t) => t.status === 'completed').length;
+      const pending = tasks.filter((t) => t.status === 'pending').length;
+      const blocked = tasks.filter((t) => t.status === 'blocked').length;
+
+      // Integrity check: flag if tasks are still pending/blocked
+      const hasIncomplete = pending > 0 || blocked > 0;
+      if (hasIncomplete) {
+        await this.logStrategyEvent(
+          group,
+          'process_violation',
+          `Strategy completing with ${pending} pending and ${blocked} blocked tasks out of ${tasks.length} total`,
+          {
+            totalTasks: tasks.length,
+            completedTasks: completed,
+            pendingTasks: pending,
+            blockedTasks: blocked,
+            skippedTasks: tasks
+              .filter((t) => t.status === 'pending' || t.status === 'blocked')
+              .map((t) => ({ id: t.id, title: t.title, status: t.status })),
+          }
+        );
+      }
+
+      // Final approval gate — pause for human review instead of auto-completing
+      if (config.requireFinalApproval) {
+        const summary = await this.buildProgressSummary(group, newIndex);
+        const criteria = config.approvalCriteria || [];
+        const criteriaList =
+          criteria.length > 0
+            ? `\n\nAcceptance criteria:\n${criteria.map((c) => `• ${c}`).join('\n')}`
+            : '';
+
+        await this.dataComposer.repositories.taskGroups.update(groupId, {
+          strategy_paused_at: new Date().toISOString(),
+          status: 'paused',
+          context_summary: summary,
+          metadata: { ...group.metadata, pauseReason: 'final_review' },
+        });
+
+        const approvalMessage =
+          `All tasks complete on "${group.title}" (${completed}/${tasks.length}).` +
+          `${hasIncomplete ? ` WARNING: ${pending} pending, ${blocked} blocked tasks remain.` : ''}` +
+          ` Awaiting final approval before closing.${criteriaList}\n\n${summary}`;
+
+        const notified = await this.notifyDispatcher(
+          group,
+          config.approvalNotify || config.checkInNotify,
+          approvalMessage,
+          userId
+        );
+
+        // Notify supervisor too if configured
+        if (config.supervisorId) {
+          const supervisorSlug = await this.resolveAgentSlug(config.supervisorId);
+          if (supervisorSlug) {
+            await this.notifyDispatcher(
+              group,
+              supervisorSlug,
+              `[Supervisor] Final review requested on "${group.title}". ${completed}/${tasks.length} tasks done.${criteriaList}`,
+              userId
+            );
+          }
+        }
+
+        await this.logStrategyEvent(
+          group,
+          'final_review_requested',
+          `All tasks done — paused for final approval`,
+          {
+            totalTasks: tasks.length,
+            completedTasks: completed,
+            approvalCriteria: criteria,
+            notified,
+            routedTo: config.approvalNotify || config.checkInNotify || null,
+          }
+        );
+
+        return {
+          action: 'approval_required',
+          progressSummary: approvalMessage,
+          notified,
+        };
+      }
+
+      // No final approval needed — complete immediately
+      await this.finalizeStrategy(
+        group,
+        { total: tasks.length, completed, pending, blocked, hasIncomplete },
+        config,
+        userId
+      );
+
+      return {
+        action: 'group_complete',
+        stats: { total: tasks.length, completed },
+      };
+    }
+
+    // Check periodic approval gate (only when there ARE more tasks to do)
     const maxIterations = config.maxIterationsWithoutApproval;
     if (maxIterations && newIterations >= maxIterations) {
       const summary = await this.buildProgressSummary(group, newIndex);
@@ -383,85 +488,6 @@ export class StrategyService {
         action: 'approval_required',
         progressSummary: summary,
         notified,
-      };
-    }
-
-    // Get next task
-    const nextTask = await this.getTaskByOrder(groupId, newIndex);
-
-    if (!nextTask) {
-      // No more pending/in_progress tasks — strategy is done
-      const tasks = await this.getGroupTasks(groupId);
-      const completed = tasks.filter((t) => t.status === 'completed').length;
-      const pending = tasks.filter((t) => t.status === 'pending').length;
-      const blocked = tasks.filter((t) => t.status === 'blocked').length;
-
-      // Integrity check: flag if tasks are still pending/blocked
-      const hasIncomplete = pending > 0 || blocked > 0;
-      if (hasIncomplete) {
-        await this.logStrategyEvent(
-          group,
-          'process_violation',
-          `Strategy completing with ${pending} pending and ${blocked} blocked tasks out of ${tasks.length} total`,
-          {
-            totalTasks: tasks.length,
-            completedTasks: completed,
-            pendingTasks: pending,
-            blockedTasks: blocked,
-            skippedTasks: tasks
-              .filter((t) => t.status === 'pending' || t.status === 'blocked')
-              .map((t) => ({ id: t.id, title: t.title, status: t.status })),
-          }
-        );
-      }
-
-      await this.dataComposer.repositories.taskGroups.update(groupId, {
-        status: 'completed',
-        context_summary: hasIncomplete
-          ? `Strategy complete with issues: ${completed}/${tasks.length} done, ${pending} pending, ${blocked} blocked.`
-          : `Strategy complete. ${completed}/${tasks.length} tasks done.`,
-      });
-
-      // Clean up strategy resources (watchdog, ephemeral studio, sandbox)
-      await this.cleanupStrategyResources(group.id);
-
-      await this.logStrategyEvent(
-        group,
-        'strategy_completed',
-        `Strategy complete: ${completed}/${tasks.length} tasks done`,
-        {
-          totalTasks: tasks.length,
-          completedTasks: completed,
-          pendingTasks: pending,
-          blockedTasks: blocked,
-          hasIncomplete,
-        }
-      );
-
-      // Notify dispatcher of completion
-      await this.notifyDispatcher(
-        group,
-        config.checkInNotify || config.approvalNotify,
-        `Strategy "${group.strategy}" complete on "${group.title}": ${completed}/${tasks.length} tasks finished.${hasIncomplete ? ` WARNING: ${pending} pending, ${blocked} blocked tasks remain.` : ''}`,
-        userId
-      );
-
-      // Notify supervisor for final audit (if configured)
-      if (config.supervisorId) {
-        const supervisorSlug = await this.resolveAgentSlug(config.supervisorId);
-        if (supervisorSlug) {
-          await this.notifyDispatcher(
-            group,
-            supervisorSlug,
-            `[Supervisor audit] Strategy "${group.strategy}" on "${group.title}" is complete. ${completed}/${tasks.length} tasks done.${hasIncomplete ? ` PROCESS VIOLATION: ${pending} pending, ${blocked} blocked tasks were not completed.` : ''} Review the activity stream for task_group_id ${group.id}.`,
-            userId
-          );
-        }
-      }
-
-      return {
-        action: 'group_complete',
-        stats: { total: tasks.length, completed },
       };
     }
 
@@ -565,11 +591,46 @@ export class StrategyService {
     if (group.status !== 'paused') throw new Error('Strategy is not paused');
     if (!group.strategy) throw new Error('No strategy set on this group');
 
-    const wasAwaitingApproval = group.metadata?.pauseReason === 'approval_gate';
+    const pauseReason = (group.metadata as Record<string, unknown>)?.pauseReason;
+    const wasAwaitingApproval = pauseReason === 'approval_gate';
+    const wasFinalReview = pauseReason === 'final_review';
 
     // Clear pauseReason on resume so it doesn't persist into the next pause cycle
-    const cleanedMetadata = { ...group.metadata };
+    const cleanedMetadata = { ...group.metadata } as Record<string, unknown>;
     delete cleanedMetadata.pauseReason;
+
+    // Final review approval — all tasks done, finalize the strategy
+    if (wasFinalReview) {
+      const config = group.strategy_config as StrategyConfig;
+      const tasks = await this.getGroupTasks(groupId);
+      const completed = tasks.filter((t) => t.status === 'completed').length;
+      const pending = tasks.filter((t) => t.status === 'pending').length;
+      const blocked = tasks.filter((t) => t.status === 'blocked').length;
+      const hasIncomplete = pending > 0 || blocked > 0;
+
+      await this.logStrategyEvent(
+        group,
+        'final_review_approved',
+        `Final review approved on "${group.title}" — finalizing strategy`,
+        { completedTasks: completed, totalTasks: tasks.length }
+      );
+
+      // Set back to active briefly so finalizeStrategy can complete it cleanly
+      await this.dataComposer.repositories.taskGroups.update(groupId, {
+        status: 'active',
+        strategy_paused_at: null,
+        metadata: cleanedMetadata,
+      });
+
+      await this.finalizeStrategy(
+        { ...group, metadata: cleanedMetadata },
+        { total: tasks.length, completed, pending, blocked, hasIncomplete },
+        config,
+        userId
+      );
+
+      return { action: 'group_complete', stats: { total: tasks.length, completed } };
+    }
 
     await this.dataComposer.repositories.taskGroups.update(groupId, {
       status: 'active',
@@ -593,7 +654,54 @@ export class StrategyService {
     const nextTask = await this.getTaskByOrder(groupId, group.current_task_index);
 
     if (!nextTask) {
-      return { action: 'group_complete', stats: { total: 0, completed: 0 } };
+      // No more tasks — finalize the strategy (handles the case where the
+      // periodic approval gate fired on the final task, Lumen review PR #362)
+      const config = group.strategy_config as StrategyConfig;
+      const tasks = await this.getGroupTasks(groupId);
+      const completed = tasks.filter((t) => t.status === 'completed').length;
+      const pending = tasks.filter((t) => t.status === 'pending').length;
+      const blocked = tasks.filter((t) => t.status === 'blocked').length;
+      const hasIncomplete = pending > 0 || blocked > 0;
+
+      if (config.requireFinalApproval) {
+        // Still need final review — re-pause with final_review reason
+        const summary = await this.buildProgressSummary(group, group.current_task_index);
+        const criteria = config.approvalCriteria || [];
+        const criteriaList =
+          criteria.length > 0
+            ? `\n\nAcceptance criteria:\n${criteria.map((c) => `• ${c}`).join('\n')}`
+            : '';
+
+        await this.dataComposer.repositories.taskGroups.update(groupId, {
+          strategy_paused_at: new Date().toISOString(),
+          status: 'paused',
+          context_summary: summary,
+          metadata: { ...cleanedMetadata, pauseReason: 'final_review' },
+        });
+
+        const approvalMessage =
+          `All tasks complete on "${group.title}" (${completed}/${tasks.length}).` +
+          `${hasIncomplete ? ` WARNING: ${pending} pending, ${blocked} blocked tasks remain.` : ''}` +
+          ` Awaiting final approval before closing.${criteriaList}\n\n${summary}`;
+
+        const notified = await this.notifyDispatcher(
+          group,
+          config.approvalNotify || config.checkInNotify,
+          approvalMessage,
+          group.user_id
+        );
+
+        return { action: 'approval_required', progressSummary: approvalMessage, notified };
+      }
+
+      await this.finalizeStrategy(
+        { ...group, metadata: cleanedMetadata },
+        { total: tasks.length, completed, pending, blocked, hasIncomplete },
+        config,
+        group.user_id
+      );
+
+      return { action: 'group_complete', stats: { total: tasks.length, completed } };
     }
 
     // Mark as in_progress if not already
@@ -1398,6 +1506,60 @@ export class StrategyService {
   /**
    * Cancel the watchdog reminder for a strategy (on pause/complete).
    */
+  private async finalizeStrategy(
+    group: TaskGroup,
+    stats: {
+      total: number;
+      completed: number;
+      pending: number;
+      blocked: number;
+      hasIncomplete: boolean;
+    },
+    config: StrategyConfig,
+    userId: string
+  ): Promise<void> {
+    await this.dataComposer.repositories.taskGroups.update(group.id, {
+      status: 'completed',
+      context_summary: stats.hasIncomplete
+        ? `Strategy complete with issues: ${stats.completed}/${stats.total} done, ${stats.pending} pending, ${stats.blocked} blocked.`
+        : `Strategy complete. ${stats.completed}/${stats.total} tasks done.`,
+    });
+
+    await this.cleanupStrategyResources(group.id);
+
+    await this.logStrategyEvent(
+      group,
+      'strategy_completed',
+      `Strategy complete: ${stats.completed}/${stats.total} tasks done`,
+      {
+        totalTasks: stats.total,
+        completedTasks: stats.completed,
+        pendingTasks: stats.pending,
+        blockedTasks: stats.blocked,
+        hasIncomplete: stats.hasIncomplete,
+      }
+    );
+
+    await this.notifyDispatcher(
+      group,
+      config.checkInNotify || config.approvalNotify,
+      `Strategy "${group.strategy}" complete on "${group.title}": ${stats.completed}/${stats.total} tasks finished.${stats.hasIncomplete ? ` WARNING: ${stats.pending} pending, ${stats.blocked} blocked tasks remain.` : ''}`,
+      userId
+    );
+
+    if (config.supervisorId) {
+      const supervisorSlug = await this.resolveAgentSlug(config.supervisorId);
+      if (supervisorSlug) {
+        await this.notifyDispatcher(
+          group,
+          supervisorSlug,
+          `[Supervisor audit] Strategy "${group.strategy}" on "${group.title}" is complete. ${stats.completed}/${stats.total} tasks done.${stats.hasIncomplete ? ` PROCESS VIOLATION: ${stats.pending} pending, ${stats.blocked} blocked tasks were not completed.` : ''} Review the activity stream for task_group_id ${group.id}.`,
+          userId
+        );
+      }
+    }
+  }
+
   /**
    * Clean up strategy resources (watchdog, etc.) without logging a
    * strategy_cancelled event or changing group status. Use this when
