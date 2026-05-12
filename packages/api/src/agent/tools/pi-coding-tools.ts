@@ -8,6 +8,7 @@
  */
 
 import path from 'path';
+import { readdir, readFile, stat } from 'fs/promises';
 import type Anthropic from '@anthropic-ai/sdk';
 import { logger } from '../../utils/logger';
 import { guardBashCommand } from './bash-guard';
@@ -124,6 +125,107 @@ function formatToolResult(result: unknown): string {
 }
 
 const DEFAULT_BASH_TIMEOUT_SECONDS = 120;
+const MAX_PORTABLE_SEARCH_FILES = 2000;
+
+function relativeToolPath(cwd: string, filePath: string): string {
+  const relative = path.relative(cwd, filePath);
+  return relative || '.';
+}
+
+async function collectFiles(root: string, files: string[] = []): Promise<string[]> {
+  if (files.length >= MAX_PORTABLE_SEARCH_FILES) return files;
+
+  const entries = await readdir(root, { withFileTypes: true });
+  for (const entry of entries) {
+    if (files.length >= MAX_PORTABLE_SEARCH_FILES) break;
+    if (entry.name === 'node_modules' || entry.name === '.git') continue;
+
+    const entryPath = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      await collectFiles(entryPath, files);
+    } else if (entry.isFile()) {
+      files.push(entryPath);
+    }
+  }
+
+  return files;
+}
+
+function globToRegExp(pattern: string): RegExp {
+  const escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*/g, '.*')
+    .replace(/\?/g, '.');
+  return new RegExp(`^${escaped}$`);
+}
+
+async function portableGrep(params: Record<string, unknown>, cwd: string): Promise<string> {
+  const pattern = typeof params.pattern === 'string' ? params.pattern : '';
+  if (!pattern) return 'Error: pattern is required';
+
+  const searchPath = typeof params.path === 'string' && params.path ? params.path : '.';
+  const root = path.resolve(cwd, searchPath);
+  const rootStat = await stat(root);
+  const files = rootStat.isDirectory() ? await collectFiles(root) : [root];
+  const matches: string[] = [];
+
+  for (const file of files) {
+    let content: string;
+    try {
+      content = await readFile(file, 'utf-8');
+    } catch {
+      continue;
+    }
+
+    const lines = content.split(/\r?\n/);
+    for (const [index, line] of lines.entries()) {
+      if (line.includes(pattern)) {
+        matches.push(`${relativeToolPath(cwd, file)}:${index + 1}:${line}`);
+      }
+    }
+  }
+
+  return matches.length ? matches.join('\n') : '(no matches)';
+}
+
+async function portableFind(params: Record<string, unknown>, cwd: string): Promise<string> {
+  const pattern = typeof params.pattern === 'string' && params.pattern ? params.pattern : '*';
+  const searchPath = typeof params.path === 'string' && params.path ? params.path : '.';
+  const root = path.resolve(cwd, searchPath);
+  const matcher = globToRegExp(pattern);
+  const rootStat = await stat(root);
+  const files = rootStat.isDirectory() ? await collectFiles(root) : [root];
+  const matches = files
+    .map((file) => relativeToolPath(cwd, file))
+    .filter((file) => matcher.test(path.basename(file)));
+
+  return matches.length ? matches.join('\n') : '(no matches)';
+}
+
+async function maybePortableSearchFallback(
+  toolName: string,
+  formattedResult: string,
+  params: Record<string, unknown>,
+  cwd: string
+): Promise<string | null> {
+  if (
+    toolName === 'grep' &&
+    formattedResult.includes('ripgrep (rg) is not available and could not be downloaded')
+  ) {
+    logger.warn('Pi grep unavailable; using portable grep fallback');
+    return portableGrep(params, cwd);
+  }
+
+  if (
+    toolName === 'find' &&
+    formattedResult.includes('fd is not available and could not be downloaded')
+  ) {
+    logger.warn('Pi find unavailable; using portable find fallback');
+    return portableFind(params, cwd);
+  }
+
+  return null;
+}
 
 /**
  * Create Pi coding tools adapted for the Ink backend.
@@ -202,9 +304,19 @@ export async function createInkCodingTools(
       const callId = `ink-${tool.name}-${Date.now()}`;
       try {
         const result = await tool.execute(callId, params, signal);
-        return formatToolResult(result);
+        const formatted = formatToolResult(result);
+        return (
+          (await maybePortableSearchFallback(tool.name, formatted, params, config.cwd)) ?? formatted
+        );
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        const fallback = await maybePortableSearchFallback(
+          tool.name,
+          `Error: ${message}`,
+          params,
+          config.cwd
+        );
+        if (fallback !== null) return fallback;
         logger.error(`Pi tool ${tool.name} failed`, { error: message, params });
         return `Error: ${message}`;
       }
