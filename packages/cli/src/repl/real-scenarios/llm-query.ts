@@ -1,16 +1,18 @@
 /**
  * LLM-based query constructor for recall experiments.
  *
- * Given a scenario's conversation context, asks an LLM to construct the
- * natural language query it would use to search a memory system — as
- * opposed to the keyword bag-of-words approach in extractTopicSignal.
+ * Spawns `ink --dangerous -b claude -p` to construct natural language
+ * recall queries from scenario context. Uses the same auth/backend chain
+ * as live tests — no separate API key needed.
  */
 
-import Anthropic from '@anthropic-ai/sdk';
+import { spawn } from 'child_process';
 import type { Scenario } from './types.js';
 import type { LlmQueryFn } from './runner.js';
 
-const SYSTEM_PROMPT = `You are an AI agent's memory retrieval subsystem. Given a conversation turn (what the user said, what you're about to respond to, and your internal question), construct a concise natural language search query to find relevant memories.
+const RESULT_MARKER = 'RECALL_QUERY:';
+
+const SYSTEM_INSTRUCTIONS = `You are an AI agent's memory retrieval subsystem. Given a conversation turn, construct a concise natural language search query to find relevant memories.
 
 Your query should:
 - Be 1-3 sentences that capture the core information need
@@ -18,37 +20,75 @@ Your query should:
 - Focus on WHAT you need to know, not the conversational context
 - Be written as if searching a personal knowledge base
 
-Respond with ONLY the query text, no explanation or formatting.`;
+Output the marker "${RESULT_MARKER}" followed by ONLY the query text on one line. No explanation, no formatting, no code fences.`;
 
-function buildUserPrompt(scenario: Scenario): string {
-  const parts: string[] = [];
+function buildPrompt(scenario: Scenario): string {
+  const parts: string[] = [SYSTEM_INSTRUCTIONS, ''];
   if (scenario.stalePremise) {
     parts.push(`Previous belief/context: ${scenario.stalePremise}`);
   }
   parts.push(`Current conversation: ${scenario.context}`);
   parts.push(`What I need to know: ${scenario.impliedQuestion}`);
-  return parts.join('\n\n');
+  parts.push('', `Output "${RESULT_MARKER}" followed by your query on one line.`);
+  return parts.join('\n');
 }
 
-export function createLlmQueryFn(opts?: { model?: string }): LlmQueryFn {
-  const client = new Anthropic();
-  const model = opts?.model ?? 'claude-haiku-4-5-20251001';
+async function spawnInkQuery(prompt: string, timeoutMs: number): Promise<string> {
+  const inkBin = process.env.INK_LIVE_BACKEND_CLI ?? 'ink';
+  const args = ['--dangerous', '-b', 'claude', '-p', prompt];
+
+  const child = spawn(inkBin, args, {
+    cwd: process.env.HOME,
+    env: { ...process.env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let stdout = '';
+  let stderr = '';
+  child.stdout?.setEncoding('utf-8');
+  child.stdout?.on('data', (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr?.setEncoding('utf-8');
+  child.stderr?.on('data', (chunk: string) => {
+    stderr += chunk;
+  });
+
+  const exitCode = await new Promise<number | null>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`ink query timed out after ${timeoutMs}ms. stderr: ${stderr.slice(-200)}`));
+    }, timeoutMs);
+    child.once('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.once('exit', (code) => {
+      clearTimeout(timer);
+      resolve(code);
+    });
+  });
+
+  if (exitCode !== 0) {
+    throw new Error(`ink exited ${exitCode}. stderr: ${stderr.slice(-300)}`);
+  }
+
+  const markerLine = stdout
+    .split(/\r?\n/)
+    .find((line) => line.trimStart().startsWith(RESULT_MARKER));
+  if (!markerLine) {
+    throw new Error(`Query marker not found in output. Last 300 chars: ${stdout.slice(-300)}`);
+  }
+
+  const query = markerLine.trimStart().slice(RESULT_MARKER.length).trim();
+  if (!query) throw new Error('LLM returned empty query after marker');
+  return query;
+}
+
+export function createLlmQueryFn(opts?: { timeoutMs?: number }): LlmQueryFn {
+  const timeoutMs = opts?.timeoutMs ?? 60_000;
 
   return async (scenario: Scenario): Promise<string> => {
-    const response = await client.messages.create({
-      model,
-      max_tokens: 200,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: buildUserPrompt(scenario) }],
-    });
-
-    const text = response.content
-      .filter((b): b is Anthropic.TextBlock => b.type === 'text')
-      .map((b) => b.text)
-      .join('')
-      .trim();
-
-    if (!text) throw new Error('LLM returned empty query');
-    return text;
+    return spawnInkQuery(buildPrompt(scenario), timeoutMs);
   };
 }
