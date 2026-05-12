@@ -171,12 +171,15 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
   let serverUnavailableError: Error | null = null;
   let delegatedIdentity: { id: string; agent_id: string } | null = null;
 
-  // Identity resolved by context-based auth fallback (resolveUserFromAgentId)
+  // Identity record returned when session-validated context auth resolves
   let contextIdentity: {
     id: string;
     user_id: string;
     users: { email: string };
   } | null = null;
+
+  // Mock session returned by getSession (for context-based auth validation)
+  const mockGetSession = vi.fn(async () => null);
 
   // Minimal DataComposer stub
   const mockDataComposer = {
@@ -202,8 +205,14 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
               return { data: matches ? delegatedIdentity : null, error: null };
             },
             single: async () => {
-              // resolveUserFromAgentId joins users and filters by agent_id only
-              if (selectedColumns.includes('users') && filters.agent_id && contextIdentity) {
+              // resolveUserFromContextSession joins users and filters by agent_id + user_id
+              if (
+                selectedColumns.includes('users') &&
+                filters.agent_id &&
+                filters.user_id &&
+                contextIdentity &&
+                contextIdentity.user_id === filters.user_id
+              ) {
                 return { data: contextIdentity, error: null };
               }
               return { data: null, error: { message: 'not found' } };
@@ -221,7 +230,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
       },
     }),
     repositories: {
-      memory: { getSession: vi.fn(async () => null) },
+      memory: { getSession: mockGetSession },
       workspaces: { findById: vi.fn(async () => null) },
     },
   } as any;
@@ -259,6 +268,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
 
   beforeEach(() => {
     mockVerifyAccessToken.mockReset();
+    mockGetSession.mockReset().mockResolvedValue(null);
     delegatedIdentity = null;
     contextIdentity = null;
   });
@@ -448,12 +458,21 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
   });
 
   // =========================================================================
-  // Context-based auth fallback (x-ink-context without OAuth)
+  // Session-validated context auth (x-ink-context without OAuth)
   // =========================================================================
 
-  it('should resolve identity from x-ink-context when no OAuth token is present', async () => {
+  it('should resolve identity from verified session in x-ink-context', async () => {
     if (serverUnavailableError) return;
     mockVerifyAccessToken.mockResolvedValue(null);
+    mockGetSession.mockResolvedValue({
+      id: 'sess-active',
+      userId: 'user-456',
+      agentId: 'wren',
+      lifecycle: 'running',
+      startedAt: new Date(),
+      endedAt: undefined,
+      metadata: {},
+    });
     contextIdentity = {
       id: 'sb-uuid-123',
       user_id: 'user-456',
@@ -461,7 +480,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     };
 
     const contextHeader = encodeContextHeader({
-      sessionId: 'sess-1',
+      sessionId: 'sess-active',
       studioId: 'studio-1',
       agentId: 'wren',
       cliAttached: true,
@@ -473,18 +492,19 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     });
 
     expect(res.status).toBe(200);
+    expect(mockGetSession).toHaveBeenCalledWith('sess-active');
   });
 
-  it('should challenge when both OAuth and context-based auth fail and MCP_REQUIRE_OAUTH is true', async () => {
+  it('should reject forged context with no matching session', async () => {
     if (serverUnavailableError) return;
     (env as any).MCP_REQUIRE_OAUTH = true;
     mockVerifyAccessToken.mockResolvedValue(null);
-    contextIdentity = null;
+    mockGetSession.mockResolvedValue(null);
 
     const contextHeader = encodeContextHeader({
-      sessionId: 'sess-1',
+      sessionId: 'forged-session-id',
       studioId: 'studio-1',
-      agentId: 'unknown-agent',
+      agentId: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -497,6 +517,103 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     (env as any).MCP_REQUIRE_OAUTH = false;
   });
 
+  it('should reject context when session agentId does not match', async () => {
+    if (serverUnavailableError) return;
+    (env as any).MCP_REQUIRE_OAUTH = true;
+    mockVerifyAccessToken.mockResolvedValue(null);
+    mockGetSession.mockResolvedValue({
+      id: 'sess-other',
+      userId: 'user-456',
+      agentId: 'lumen',
+      lifecycle: 'running',
+      startedAt: new Date(),
+      endedAt: undefined,
+      metadata: {},
+    });
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'sess-other',
+      studioId: 'studio-1',
+      agentId: 'wren',
+      cliAttached: true,
+      runtime: 'claude',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      'x-ink-context': contextHeader,
+    });
+
+    expect(res.status).toBe(401);
+    (env as any).MCP_REQUIRE_OAUTH = false;
+  });
+
+  it('should reject context when session is already ended', async () => {
+    if (serverUnavailableError) return;
+    (env as any).MCP_REQUIRE_OAUTH = true;
+    mockVerifyAccessToken.mockResolvedValue(null);
+    mockGetSession.mockResolvedValue({
+      id: 'sess-ended',
+      userId: 'user-456',
+      agentId: 'wren',
+      lifecycle: 'completed',
+      startedAt: new Date('2026-01-01'),
+      endedAt: new Date('2026-01-02'),
+      metadata: {},
+    });
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'sess-ended',
+      studioId: 'studio-1',
+      agentId: 'wren',
+      cliAttached: true,
+      runtime: 'claude',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      'x-ink-context': contextHeader,
+    });
+
+    expect(res.status).toBe(401);
+    (env as any).MCP_REQUIRE_OAUTH = false;
+  });
+
+  it('should NOT fall back to context auth when Authorization header is present but invalid', async () => {
+    if (serverUnavailableError) return;
+    mockVerifyAccessToken.mockResolvedValue(null);
+    mockGetSession.mockResolvedValue({
+      id: 'sess-active',
+      userId: 'user-456',
+      agentId: 'wren',
+      lifecycle: 'running',
+      startedAt: new Date(),
+      endedAt: undefined,
+      metadata: {},
+    });
+    contextIdentity = {
+      id: 'sb-uuid-123',
+      user_id: 'user-456',
+      users: { email: 'test@example.com' },
+    };
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'sess-active',
+      studioId: 'studio-1',
+      agentId: 'wren',
+      cliAttached: true,
+      runtime: 'claude',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      Authorization: 'Bearer expired-or-invalid-token',
+      'x-ink-context': contextHeader,
+    });
+
+    // Invalid Authorization header = hard 401, context is not a fallback
+    expect(res.status).toBe(401);
+    const body = JSON.parse(res.body);
+    expect(body.error.message).toContain('Invalid or expired');
+  });
+
   it('should prefer OAuth identity over context-based fallback', async () => {
     if (serverUnavailableError) return;
     mockVerifyAccessToken.mockResolvedValue({
@@ -505,11 +622,6 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
       agentId: 'wren',
       sbId: 'oauth-sb',
     });
-    contextIdentity = {
-      id: 'context-sb',
-      user_id: 'context-user',
-      users: { email: 'context@example.com' },
-    };
 
     const contextHeader = encodeContextHeader({
       sessionId: 'sess-1',
@@ -525,5 +637,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     });
 
     expect(res.status).toBe(200);
+    // Session lookup should NOT have been called — OAuth was sufficient
+    expect(mockGetSession).not.toHaveBeenCalled();
   });
 });

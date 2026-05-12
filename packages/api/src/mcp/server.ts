@@ -86,25 +86,55 @@ export class MCPServer {
     logger.info('MCP Server initialized');
   }
 
-  private async resolveUserFromAgentId(
+  /**
+   * Validate a context token by verifying the sessionId against the database.
+   * The session was created via an authenticated start_session call, so a
+   * matching active session proves the caller owns the identity. We also
+   * verify the agentId matches to prevent session-id reuse across agents.
+   */
+  private async resolveUserFromContextSession(
+    sessionId: string,
     agentId: string
   ): Promise<{ userId: string; email: string; agentId: string; sbId: string } | null> {
+    const session = await this.dataComposer.repositories.memory.getSession(sessionId);
+    if (!session) {
+      logger.debug('Context-based auth: session not found', { sessionId });
+      return null;
+    }
+
+    if (session.endedAt) {
+      logger.debug('Context-based auth: session already ended', { sessionId });
+      return null;
+    }
+
+    if (session.agentId !== agentId) {
+      logger.warn('Context-based auth: agentId mismatch', {
+        sessionId,
+        sessionAgentId: session.agentId,
+        contextAgentId: agentId,
+      });
+      return null;
+    }
+
     const { data, error } = await this.dataComposer
       .getClient()
       .from('agent_identities')
       .select('id, user_id, users!inner(email)')
       .eq('agent_id', agentId)
-      .limit(1)
+      .eq('user_id', session.userId)
       .single();
 
     if (error || !data) {
-      logger.debug('Context-based auth: no identity found for agentId', { agentId });
+      logger.debug('Context-based auth: no identity found for session user+agent', {
+        agentId,
+        userId: session.userId,
+      });
       return null;
     }
 
     const email = (data.users as unknown as { email: string })?.email ?? '';
     return {
-      userId: data.user_id,
+      userId: session.userId,
       email,
       agentId,
       sbId: data.id,
@@ -272,13 +302,22 @@ export class MCPServer {
         contextToken = decodeContextToken(contextHeader);
       }
 
-      // Context-based auth fallback: when no OAuth token is present but the
-      // request carries an x-ink-context header with an agentId (injected by
-      // the `ink` CLI wrapper), resolve identity from agent_identities.
-      if (!userData && contextToken?.agentId) {
-        userData = await this.resolveUserFromAgentId(contextToken.agentId);
+      // Session-validated context auth: when NO Authorization header is present
+      // but the request carries an x-ink-context with a sessionId + agentId,
+      // verify the session exists and is active in the database. The session was
+      // created through an authenticated start_session call, so a matching
+      // active session proves the caller owns the identity.
+      //
+      // This is NOT attempted when an Authorization header IS present but
+      // invalid — that's a hard auth failure, not a fallback scenario.
+      if (!userData && !authHeader && contextToken?.sessionId && contextToken?.agentId) {
+        userData = await this.resolveUserFromContextSession(
+          contextToken.sessionId,
+          contextToken.agentId
+        );
         if (userData) {
-          logger.debug('Context-based auth: resolved identity from x-ink-context', {
+          logger.debug('Context-based auth: resolved identity from verified session', {
+            sessionId: contextToken.sessionId,
             agentId: contextToken.agentId,
             userId: userData.userId,
           });
