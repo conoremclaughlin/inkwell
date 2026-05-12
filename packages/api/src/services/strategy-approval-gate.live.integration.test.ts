@@ -1,13 +1,19 @@
 /**
  * Strategy Approval Gate — Live LLM Tests
  *
- * End-to-end test with a real LLM (Haiku) completing tasks and hitting
- * the approval gate. Uses the Anthropic API directly with custom tools
- * (list_tasks, complete_task) wired to StrategyService.
+ * End-to-end test with a real LLM (Haiku via Claude Code) completing tasks
+ * via MCP tools on the running Inkwell server, exercising the full approval
+ * gate lifecycle.
+ *
+ * Uses ClaudeRunner (the same infra as production strategy execution) — no
+ * separate ANTHROPIC_API_KEY required. Claude Code's existing OAuth
+ * credentials handle LLM auth.
  *
  * Requires:
  * - INK_LIVE_TESTS=1
- * - ANTHROPIC_API_KEY set
+ * - claude CLI installed with valid credentials
+ * - Inkwell server running on localhost:3001
+ * - Valid access token in ~/.ink/auth.json
  * - Supabase credentials (.env.local or env vars)
  *
  * Run:
@@ -18,11 +24,12 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
-import Anthropic from '@anthropic-ai/sdk';
 import dotenv from 'dotenv';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
-import { readFileSync, existsSync } from 'fs';
-import { resolve } from 'path';
+import { execFileSync, spawnSync } from 'child_process';
+import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync } from 'fs';
+import { resolve, join } from 'path';
+import { homedir, tmpdir } from 'os';
 
 // ============================================================================
 // Environment setup
@@ -41,57 +48,67 @@ if (!process.env.PCP_PORT_BASE) process.env.PCP_PORT_BASE = '9998';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
-const configPath = resolve(process.env.HOME || '', '.ink/config.json');
+const configPath = resolve(homedir(), '.ink/config.json');
 const inkConfig = existsSync(configPath) ? JSON.parse(readFileSync(configPath, 'utf-8')) : {};
 const TEST_USER_ID: string | undefined = inkConfig.userId;
+
+const authPath = resolve(homedir(), '.ink/auth.json');
+const accessToken: string | null = existsSync(authPath)
+  ? JSON.parse(readFileSync(authPath, 'utf-8')).access_token
+  : null;
+
+// ============================================================================
+// Prerequisite checks (same pattern as sandbox live test)
+// ============================================================================
+
+function claudeAvailable(): boolean {
+  const result = spawnSync('which', ['claude'], { stdio: 'ignore', timeout: 5_000 });
+  return result.status === 0;
+}
+
+function claudeCredentialsAvailable(): boolean {
+  const credFile = join(homedir(), '.claude', '.credentials.json');
+  if (existsSync(credFile)) return true;
+  if (process.platform === 'darwin') {
+    try {
+      execFileSync('security', ['find-generic-password', '-s', 'Claude Code-credentials', '-w'], {
+        encoding: 'utf-8',
+        timeout: 5_000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+function inkwellReachable(): boolean {
+  try {
+    execFileSync('curl', ['-sf', '-o', '/dev/null', 'http://localhost:3001/health'], {
+      timeout: 3_000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const canRun =
   process.env.INK_LIVE_TESTS === '1' &&
   !!SUPABASE_URL &&
   !!SUPABASE_KEY &&
-  !!ANTHROPIC_API_KEY &&
-  !!TEST_USER_ID;
+  !!TEST_USER_ID &&
+  !!accessToken &&
+  claudeAvailable() &&
+  claudeCredentialsAvailable() &&
+  inkwellReachable();
 
 vi.mock('../mcp/tools/inbox-handlers', () => ({
   handleSendToInbox: vi.fn().mockResolvedValue(undefined),
 }));
-
-// ============================================================================
-// Anthropic tool schemas for the LLM
-// ============================================================================
-
-const TOOL_SCHEMAS: Anthropic.Tool[] = [
-  {
-    name: 'list_tasks',
-    description:
-      'List all tasks in the strategy group with their IDs and statuses. Call this first to see what needs to be done.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {},
-      required: [],
-    },
-  },
-  {
-    name: 'complete_task',
-    description:
-      'Mark a task as completed by its ID. This advances the strategy. Call this for each pending task.',
-    input_schema: {
-      type: 'object' as const,
-      properties: {
-        taskId: {
-          type: 'string',
-          description: 'The UUID of the task to complete',
-        },
-      },
-      required: ['taskId'],
-    },
-  },
-];
-
-const MODEL = 'claude-haiku-4-5-20251001';
-const MAX_ITERATIONS = 15;
 
 // ============================================================================
 // Helpers
@@ -118,21 +135,20 @@ async function getActivitySubtypes(client: SupabaseClient, groupId: string): Pro
 }
 
 // ============================================================================
-// Test: LLM-driven approval gate
+// Test: LLM-driven approval gate via ClaudeRunner + MCP
 // ============================================================================
 
 describe.skipIf(!canRun)('Strategy Approval Gate — LLM live test', () => {
   let client: SupabaseClient;
-  let anthropic: Anthropic;
   let dc: any;
   let groupId: string;
   let taskIds: string[];
+  let tmpDir: string;
 
   beforeAll(async () => {
     client = createClient(SUPABASE_URL!, SUPABASE_KEY!, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
-    anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
     const { TaskGroupsRepository } = await import('../data/repositories/task-groups.repository');
     const { ProjectTasksRepository } =
@@ -187,105 +203,54 @@ describe.skipIf(!canRun)('Strategy Approval Gate — LLM live test', () => {
         watchdogIntervalMinutes: 60,
       },
     });
+
+    // Write temp MCP config with inkwell server + auth
+    tmpDir = join(tmpdir(), `approval-gate-live-${Date.now()}`);
+    mkdirSync(tmpDir, { recursive: true });
+
+    writeFileSync(
+      join(tmpDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          inkwell: {
+            type: 'http',
+            url: 'http://localhost:3001/mcp',
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+            },
+          },
+        },
+      })
+    );
   }, 30_000);
 
   afterAll(async () => {
     if (client && groupId) await cleanup(client, groupId, taskIds);
+    if (tmpDir && existsSync(tmpDir)) rmSync(tmpDir, { recursive: true, force: true });
   }, 10_000);
 
-  it('LLM completes all tasks and strategy pauses for final_review', async () => {
-    const { StrategyService } = await import('./strategy.service');
-    const service = new StrategyService(dc);
+  it('LLM completes all tasks via MCP and strategy pauses for final_review', async () => {
+    const { ClaudeRunner } = await import('./sessions/claude-runner');
+    const runner = new ClaudeRunner();
 
-    // Tool executors — called when the LLM uses tools
-    async function executeTool(name: string, input: Record<string, unknown>): Promise<string> {
-      if (name === 'list_tasks') {
-        const tasks = await dc.repositories.tasks.findByGroupId(groupId);
-        return JSON.stringify(
-          tasks.map((t: any) => ({
-            id: t.id,
-            title: t.title,
-            status: t.status,
-            taskOrder: t.task_order,
-          }))
-        );
-      }
-
-      if (name === 'complete_task') {
-        const taskId = input.taskId as string;
-        await dc.repositories.tasks.completeTask(taskId);
-        const result = await service.advanceStrategy(groupId, taskId, TEST_USER_ID!);
-        return JSON.stringify({
-          action: result.action,
-          progressSummary: result.progressSummary || null,
-          nextTask: result.nextTask
-            ? { id: result.nextTask.id, title: result.nextTask.title }
-            : null,
-        });
-      }
-
-      return `Error: Unknown tool "${name}"`;
-    }
-
-    // Agentic loop — LLM sees the tasks and completes them
-    const messages: Anthropic.MessageParam[] = [
+    const result = await runner.run(
+      `You have a task group with ID ${groupId}. ` +
+        `Use mcp__inkwell__list_tasks with groupId="${groupId}" to see the tasks, ` +
+        `then call mcp__inkwell__complete_task with each task's ID in task_order. ` +
+        `Do NOT write any code — just call the MCP tools. ` +
+        `Stop when all tasks are done or you receive an approval_required response.`,
       {
-        role: 'user',
-        content: [
-          {
-            type: 'text',
-            text: `You are completing tasks in a work strategy. Use list_tasks to see the tasks, then call complete_task for each pending task in order (by taskOrder). After each completion, check the response — if the action is "approval_required", stop. Do not write any code; just call the tools.`,
-          },
-        ],
-      },
-    ];
-
-    let lastStrategyAction: string | null = null;
-
-    for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
-      const response = await anthropic.messages.create({
-        model: MODEL,
-        max_tokens: 2048,
-        messages,
-        tools: TOOL_SCHEMAS,
-      });
-
-      const toolUseBlocks = response.content.filter(
-        (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use'
-      );
-
-      if (toolUseBlocks.length === 0 || response.stop_reason === 'end_turn') {
-        break;
+        config: {
+          workingDirectory: tmpDir,
+          mcpConfigPath: join(tmpDir, '.mcp.json'),
+          model: 'claude-haiku-4-5-20251001',
+        },
       }
+    );
 
-      // Add assistant response
-      messages.push({ role: 'assistant', content: response.content });
-
-      // Execute tools
-      const toolResults: Anthropic.ToolResultBlockParam[] = [];
-      for (const toolUse of toolUseBlocks) {
-        const result = await executeTool(toolUse.name, toolUse.input as Record<string, unknown>);
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: toolUse.id,
-          content: result,
-        });
-
-        // Track complete_task results
-        if (toolUse.name === 'complete_task') {
-          try {
-            const parsed = JSON.parse(result);
-            lastStrategyAction = parsed.action;
-          } catch {}
-        }
-      }
-
-      messages.push({ role: 'user', content: toolResults });
-    }
+    expect(result.success).toBe(true);
 
     // Verify: strategy should have paused for final_review
-    expect(lastStrategyAction).toBe('approval_required');
-
     const group = await dc.repositories.taskGroups.findById(groupId);
     expect(group.status).toBe('paused');
     expect((group.metadata as Record<string, unknown>).pauseReason).toBe('final_review');
@@ -295,7 +260,7 @@ describe.skipIf(!canRun)('Strategy Approval Gate — LLM live test', () => {
       const task = await dc.repositories.tasks.findById(taskId);
       expect(task.status).toBe('completed');
     }
-  }, 120_000);
+  }, 180_000);
 
   it('resume from final_review finalizes the strategy', async () => {
     const { StrategyService } = await import('./strategy.service');
