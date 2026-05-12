@@ -1514,4 +1514,143 @@ describe('SessionService', () => {
       expect(spawnCall![0].taskGroupId).toBeUndefined();
     });
   });
+
+  describe('Session Alias Routing', () => {
+    it('should route to session by alias when alias option is provided', async () => {
+      const aliasSession = createMockSession({ id: 'alias-session', alias: 'main' });
+      const mockFindByAlias = vi.fn().mockResolvedValue(aliasSession);
+      (mockRepository as Record<string, unknown>).findByAlias = mockFindByAlias;
+
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+
+      await sessionService.handleMessage(
+        createMockRequest({
+          metadata: { sessionAlias: 'main' },
+        })
+      );
+
+      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'main');
+      expect(mockRepository.findByUserAndAgent).not.toHaveBeenCalled();
+    });
+
+    it('should fall through to threadKey when alias has no match', async () => {
+      const threadSession = createMockSession({ id: 'thread-session', threadKey: 'pr:42' });
+      const mockFindByAlias = vi.fn().mockResolvedValue(null);
+      const mockFindByThreadKey = vi.fn().mockResolvedValue(threadSession);
+      (mockRepository as Record<string, unknown>).findByAlias = mockFindByAlias;
+      (mockRepository as Record<string, unknown>).findByThreadKey = mockFindByThreadKey;
+
+      await sessionService.handleMessage(
+        createMockRequest({
+          metadata: { sessionAlias: 'nonexistent', threadKey: 'pr:42' },
+        })
+      );
+
+      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'nonexistent');
+      expect(mockFindByThreadKey).toHaveBeenCalledWith(
+        'user-456',
+        'myra',
+        'pr:42',
+        undefined,
+        undefined
+      );
+    });
+
+    it('should prefer alias over threadKey when both match', async () => {
+      const aliasSession = createMockSession({ id: 'alias-session', alias: 'main' });
+      const threadSession = createMockSession({ id: 'thread-session', threadKey: 'pr:42' });
+      const mockFindByAlias = vi.fn().mockResolvedValue(aliasSession);
+      const mockFindByThreadKey = vi.fn().mockResolvedValue(threadSession);
+      (mockRepository as Record<string, unknown>).findByAlias = mockFindByAlias;
+      (mockRepository as Record<string, unknown>).findByThreadKey = mockFindByThreadKey;
+
+      await sessionService.handleMessage(
+        createMockRequest({
+          metadata: { sessionAlias: 'main', threadKey: 'pr:42' },
+        })
+      );
+
+      expect(mockFindByAlias).toHaveBeenCalled();
+      // threadKey lookup should NOT be called because alias matched
+      expect(mockFindByThreadKey).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Single-Session Routing (session_scope=single)', () => {
+    // These tests need a supabase mock to resolve session_scope from agent_identities.
+    // The SessionService constructor accepts supabase as the 7th arg.
+
+    it('should consolidate into active session when session_scope=single and threadKey has no match', async () => {
+      const activeSession = createMockSession({ id: 'active-primary' });
+      const mockFindByThreadKey = vi.fn().mockResolvedValue(null);
+      (mockRepository as Record<string, unknown>).findByThreadKey = mockFindByThreadKey;
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(activeSession);
+
+      // Chainable Supabase mock — every method returns `this` except terminal ones
+      function createChainableMock(terminalResult: unknown) {
+        const chain: Record<string, unknown> = {};
+        const chainMethods = ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit'];
+        for (const m of chainMethods) {
+          chain[m] = vi.fn().mockReturnValue(chain);
+        }
+        chain.maybeSingle = vi.fn().mockResolvedValue(terminalResult);
+        chain.single = vi.fn().mockResolvedValue(terminalResult);
+        return chain;
+      }
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          if (table === 'agent_identities') {
+            return createChainableMock({ data: { session_scope: 'single' } });
+          }
+          // Studios, sessions, etc. — return empty results
+          return createChainableMock({ data: null });
+        }),
+      };
+
+      const singleSessionService = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        mockSupabase as never
+      );
+
+      await singleSessionService.handleMessage(
+        createMockRequest({
+          metadata: { threadKey: 'pr:99' },
+        })
+      );
+
+      // threadKey lookup should be attempted
+      expect(mockFindByThreadKey).toHaveBeenCalledWith(
+        'user-456',
+        'myra',
+        'pr:99',
+        undefined,
+        undefined
+      );
+      // Should fall back to findByUserAndAgent (the active session) instead of creating
+      expect(mockRepository.findByUserAndAgent).toHaveBeenCalled();
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('should create new thread-scoped session when session_scope is not single', async () => {
+      const mockFindByThreadKey = vi.fn().mockResolvedValue(null);
+      (mockRepository as Record<string, unknown>).findByThreadKey = mockFindByThreadKey;
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+
+      // No supabase → resolvePreferSingleSession returns false
+      await sessionService.handleMessage(
+        createMockRequest({
+          metadata: { threadKey: 'pr:99' },
+        })
+      );
+
+      // Should NOT fall back to findByUserAndAgent — should create a new session
+      expect(mockRepository.create).toHaveBeenCalled();
+    });
+  });
 });
