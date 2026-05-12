@@ -135,7 +135,7 @@ export interface DreamLimits {
   maxStateSummaryChars: number;
 }
 
-const DEFAULT_LIMITS: DreamLimits = {
+export const DEFAULT_DREAM_LIMITS: DreamLimits = {
   maxEntities: 80,
   maxDurableFacts: 160,
   maxCurrentStates: 60,
@@ -167,8 +167,90 @@ function clampText(text: string, maxChars: number): string {
   return `${compacted.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
 }
 
+const QUERY_STOPWORDS = new Set([
+  'about',
+  'after',
+  'again',
+  'does',
+  'have',
+  'how',
+  'many',
+  'much',
+  'what',
+  'when',
+  'where',
+  'which',
+  'while',
+  'with',
+  'your',
+]);
+
 function stripSessionHeader(content: string): string {
   return content.replace(/^session\s+[^\r\n]+[\r\n]+/i, '');
+}
+
+function queryTokens(query: string): string[] {
+  return uniqueStrings(
+    query
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .split(/\s+/)
+      .filter((token) => token.length >= 3 || /^\d+$/.test(token))
+      .filter((token) => !QUERY_STOPWORDS.has(token))
+  );
+}
+
+function paragraphScore(paragraph: string, tokens: string[]): number {
+  const normalized = paragraph.toLowerCase().replace(/[^a-z0-9]+/g, ' ');
+  const tokenScore = tokens.filter((token) => normalized.includes(token)).length;
+  const numberScore = /\d/.test(paragraph) ? 1 : 0;
+  return tokenScore * 3 + numberScore;
+}
+
+function buildContentEdgeExcerpt(content: string, maxChars: number): string {
+  const stripped = stripSessionHeader(content).trim();
+  if (stripped.length <= maxChars) return stripped;
+  const edgeChars = Math.max(200, Math.floor((maxChars - 20) / 2));
+  return `${stripped.slice(0, edgeChars).trimEnd()}\n...\n${stripped.slice(-edgeChars).trimStart()}`;
+}
+
+function buildRelevantContentExcerpt(
+  content: string,
+  query: string | null,
+  maxChars: number
+): string {
+  const stripped = stripSessionHeader(content).trim();
+  if (stripped.length <= maxChars) return stripped;
+  if (!query?.trim()) return buildContentEdgeExcerpt(content, maxChars);
+
+  const tokens = queryTokens(query);
+  const paragraphs = stripped
+    .split(/\n(?=(?:user|assistant):)|\n{2,}/i)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+  const scored = paragraphs
+    .map((paragraph, index) => ({
+      paragraph,
+      index,
+      score: paragraphScore(paragraph, tokens),
+    }))
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score || a.index - b.index);
+
+  if (scored.length === 0) {
+    return buildContentEdgeExcerpt(content, maxChars);
+  }
+
+  const selected = scored.slice(0, 4).sort((a, b) => a.index - b.index);
+  const separatorBudget = Math.max(0, selected.length - 1) * 5;
+  const perParagraphChars = Math.max(
+    120,
+    Math.floor((maxChars - separatorBudget) / Math.max(1, selected.length))
+  );
+  return (
+    selected.map((entry) => clampText(entry.paragraph, perParagraphChars)).join('\n...\n') ||
+    clampText(stripped, maxChars)
+  );
 }
 
 function normalizeKey(text: string): string {
@@ -381,7 +463,7 @@ export function applyLocalDreamUpdate(
   session: OrderedDreamSession,
   limits: Partial<DreamLimits> = {}
 ): DreamState {
-  const resolvedLimits = { ...DEFAULT_LIMITS, ...limits };
+  const resolvedLimits = { ...DEFAULT_DREAM_LIMITS, ...limits };
   const entityMap = new Map(state.entities.map((entity) => [normalizeKey(entity.name), entity]));
   const factMap = new Map(state.durableFacts.map((fact) => [fact.key, fact]));
   const currentStateMap = new Map(state.currentStates.map((item) => [item.key, item]));
@@ -500,21 +582,28 @@ export function buildOnlineDreamPrompt(params: {
   question: string;
   previousState: DreamState;
   nextSession: OrderedDreamSession;
+  maxContentExcerptChars?: number;
+  useQuestionHints?: boolean;
 }): { systemPrompt: string; userPrompt: string; schemaDescription: string } {
+  const questionHint = params.useQuestionHints
+    ? `question for later evaluation only, not a label: ${params.question}`
+    : 'No future evaluation question is available to the dream worker.';
   return {
     systemPrompt:
       'You are an online memory-dream worker. Integrate one new chronological episode into a compact, evidence-grounded state ledger. Return strict JSON only. Do not use benchmark answer labels. Do not review all past raw episodes; use the prior compact state plus this one new episode.',
     schemaDescription:
-      'JSON schema: {"stateSummary": string, "entities": [{"name": string, "entityType"?: string, "description": string, "aliases": string[], "evidenceMemoryIds": string[], "evidenceSessionIds": string[]}], "durableFacts": [{"key": string, "fact": string, "category": string, "subject"?: string, "object"?: string, "status": "active"|"superseded"|"uncertain", "evidenceMemoryIds": string[], "evidenceSessionIds": string[]}], "currentStates": [{"key": string, "state": string, "scope": string, "status": string, "volatility": string, "evidenceMemoryIds": string[], "evidenceSessionIds": string[]}], "temporalEvents": [{"sessionId": string, "memoryId": string, "date"?: string, "summary": string}], "notes": string[]}',
+      'JSON schema: {"stateSummary": string, "entities": [{"name": string, "entityType"?: string, "description": string, "aliases": string[], "evidence": string, "evidenceMemoryIds": string[], "evidenceSessionIds": string[]}], "durableFacts": [{"key": string, "fact": string, "category": string, "subject"?: string, "object"?: string, "evidence": string, "status": "active"|"superseded"|"uncertain", "evidenceMemoryIds": string[], "evidenceSessionIds": string[]}], "currentStates": [{"key": string, "state": string, "scope": string, "status": string, "volatility": string, "evidence": string, "evidenceMemoryIds": string[], "evidenceSessionIds": string[]}], "temporalEvents": [{"sessionId": string, "memoryId": string, "date"?: string, "summary": string}], "notes": string[]}',
     userPrompt: [
       `caseId: ${params.caseId}`,
-      `question for later evaluation only, not a label: ${params.question}`,
+      questionHint,
       '',
       'Integration rules:',
       '- Treat episodes as chronological within this case.',
       '- Preserve current state updates, quantities, decisions, constraints, process rules, list/table mappings, and exact values when evidence supports them.',
       '- If a new episode updates an old value, mark the old fact superseded and write the new active value with evidence links.',
       '- If a value requires arithmetic or accumulation, perform the update and keep both evidence session ids.',
+      '- Explicit aggregate/count statements are authoritative state. Do not replace an explicit total with a smaller count of named examples.',
+      '- If an earlier episode says a collection has total N and a later episode adds one item to that collection, write the active total as N+1 with both evidence links.',
       '- Keep the ledger compact. Do not copy the full transcript.',
       '- Keep cases isolated: never infer from other cases.',
       '',
@@ -528,9 +617,267 @@ export function buildOnlineDreamPrompt(params: {
           memoryId: params.nextSession.memoryId,
           date: params.nextSession.date || null,
           sourceSummary: params.nextSession.sourceSummary,
-          extractedViews: params.nextSession.extractions,
-          content: params.nextSession.content,
+          extractedViews: compactDreamExtractionViews(params.nextSession.extractions),
+          contentExcerpt: buildRelevantContentExcerpt(
+            params.nextSession.content,
+            params.useQuestionHints ? params.question : null,
+            params.maxContentExcerptChars || 4000
+          ),
         },
+        null,
+        2
+      ),
+    ].join('\n'),
+  };
+}
+
+function compactDreamExtractionViews(views: DreamExtractionViews): DreamExtractionViews {
+  return {
+    entities: views.entities.slice(0, 6).map((entity) => ({
+      ...entity,
+      description: clampText(entity.description, 220),
+      evidence: clampText(entity.evidence, 180),
+    })),
+    durableFacts: views.durableFacts.slice(0, 8).map((fact) => ({
+      ...fact,
+      fact: clampText(fact.fact, 260),
+      evidence: clampText(fact.evidence, 180),
+    })),
+    summary: views.summary
+      ? {
+          summary: clampText(views.summary.summary, 500),
+          keyPoints: views.summary.keyPoints.slice(0, 6).map((point) => clampText(point, 220)),
+          actionRelevance: clampText(views.summary.actionRelevance, 260),
+        }
+      : null,
+    currentState: views.currentState
+      ? {
+          ...views.currentState,
+          state: clampText(views.currentState.state, 240),
+          evidence: clampText(views.currentState.evidence, 180),
+        }
+      : null,
+  };
+}
+
+function statusFromRaw(raw: unknown): DreamDurableFact['status'] {
+  const status = asString(raw);
+  return status === 'active' || status === 'superseded' || status === 'uncertain'
+    ? status
+    : 'active';
+}
+
+function evidenceIdsFromRaw(raw: unknown, fallback: string): string[] {
+  const ids = asArray(raw)
+    .map(asString)
+    .filter((id): id is string => Boolean(id));
+  return uniqueStrings(ids.length > 0 ? ids : [fallback]);
+}
+
+function clampDreamState(state: DreamState, limits: DreamLimits): DreamState {
+  return {
+    ...state,
+    stateSummary: clampText(state.stateSummary, limits.maxStateSummaryChars),
+    entities: state.entities.slice(-limits.maxEntities),
+    durableFacts: state.durableFacts.slice(-limits.maxDurableFacts),
+    currentStates: state.currentStates.slice(-limits.maxCurrentStates),
+    temporalEvents: state.temporalEvents.slice(-limits.maxTemporalEvents),
+  };
+}
+
+export function coerceDreamStateUpdate(
+  raw: unknown,
+  params: {
+    previousState: DreamState;
+    currentSession: OrderedDreamSession;
+    limits?: Partial<DreamLimits>;
+  }
+): DreamState {
+  const record = asRecord(raw);
+  if (!record) {
+    throw new Error('Dream update response must be a JSON object.');
+  }
+
+  const limits = { ...DEFAULT_DREAM_LIMITS, ...params.limits };
+  const currentSessionId = params.currentSession.sessionId;
+  const currentMemoryId = params.currentSession.memoryId;
+  const stateSummary = asString(record.stateSummary) || params.previousState.stateSummary;
+
+  const entities = asArray(record.entities)
+    .map((item) => {
+      const entity = asRecord(item);
+      const name = asString(entity?.name);
+      const description = asString(entity?.description);
+      if (!name || !description) return null;
+      const evidenceMemoryIds = evidenceIdsFromRaw(entity?.evidenceMemoryIds, currentMemoryId);
+      const evidenceSessionIds = evidenceIdsFromRaw(entity?.evidenceSessionIds, currentSessionId);
+      return {
+        name,
+        entityType: asString(entity?.entityType) || undefined,
+        description,
+        aliases: asArray(entity?.aliases)
+          .map(asString)
+          .filter((alias): alias is string => Boolean(alias)),
+        evidence: asString(entity?.evidence) || description,
+        evidenceMemoryIds,
+        evidenceSessionIds,
+        firstSeenSessionId: evidenceSessionIds[0] || currentSessionId,
+        lastSeenSessionId: evidenceSessionIds[evidenceSessionIds.length - 1] || currentSessionId,
+      };
+    })
+    .filter((entity): entity is DreamEntity => Boolean(entity));
+
+  const durableFacts = asArray(record.durableFacts)
+    .map((item) => {
+      const fact = asRecord(item);
+      const factText = asString(fact?.fact);
+      if (!factText) return null;
+      const category = asString(fact?.category) || 'other';
+      const subject = asString(fact?.subject) || undefined;
+      const object = asString(fact?.object) || undefined;
+      const key =
+        asString(fact?.key) || normalizeKey([category, subject, object, factText].join('|'));
+      const evidenceMemoryIds = evidenceIdsFromRaw(fact?.evidenceMemoryIds, currentMemoryId);
+      const evidenceSessionIds = evidenceIdsFromRaw(fact?.evidenceSessionIds, currentSessionId);
+      return {
+        key,
+        fact: factText,
+        category,
+        subject,
+        object,
+        evidence: asString(fact?.evidence) || factText,
+        status: statusFromRaw(fact?.status),
+        evidenceMemoryIds,
+        evidenceSessionIds,
+        firstSeenSessionId: evidenceSessionIds[0] || currentSessionId,
+        lastSeenSessionId: evidenceSessionIds[evidenceSessionIds.length - 1] || currentSessionId,
+      };
+    })
+    .filter((fact): fact is DreamDurableFact => Boolean(fact));
+
+  const currentStates = asArray(record.currentStates)
+    .map((item) => {
+      const state = asRecord(item);
+      const stateText = asString(state?.state);
+      const scope = asString(state?.scope);
+      const status = asString(state?.status);
+      if (!stateText || !scope || !status) return null;
+      const key = asString(state?.key) || normalizeKey([scope, status, stateText].join('|'));
+      const evidenceMemoryIds = evidenceIdsFromRaw(state?.evidenceMemoryIds, currentMemoryId);
+      const evidenceSessionIds = evidenceIdsFromRaw(state?.evidenceSessionIds, currentSessionId);
+      return {
+        key,
+        state: stateText,
+        scope,
+        status,
+        volatility: asString(state?.volatility) || 'semi-stable',
+        evidence: asString(state?.evidence) || stateText,
+        evidenceMemoryIds,
+        evidenceSessionIds,
+        lastSeenSessionId: evidenceSessionIds[evidenceSessionIds.length - 1] || currentSessionId,
+      };
+    })
+    .filter((state): state is DreamCurrentState => Boolean(state));
+
+  const temporalEvents = asArray(record.temporalEvents)
+    .map((item, index) => {
+      const event = asRecord(item);
+      const sessionId = asString(event?.sessionId);
+      const memoryId = asString(event?.memoryId);
+      const summary = asString(event?.summary);
+      if (!sessionId || !memoryId || !summary) return null;
+      const rawOrderIndex = typeof event?.orderIndex === 'number' ? event.orderIndex : index;
+      return {
+        sessionId,
+        memoryId,
+        date: asString(event?.date) || undefined,
+        orderIndex: rawOrderIndex,
+        summary,
+        isAnswerSession: Boolean(event?.isAnswerSession),
+      };
+    })
+    .filter((event): event is DreamTemporalEvent => Boolean(event));
+
+  const evidenceMemoryIds = uniqueStrings([
+    ...params.previousState.evidenceMemoryIds,
+    ...entities.flatMap((entity) => entity.evidenceMemoryIds),
+    ...durableFacts.flatMap((fact) => fact.evidenceMemoryIds),
+    ...currentStates.flatMap((state) => state.evidenceMemoryIds),
+    ...temporalEvents.map((event) => event.memoryId),
+    currentMemoryId,
+  ]);
+  const evidenceSessionIds = uniqueStrings([
+    ...params.previousState.evidenceSessionIds,
+    ...entities.flatMap((entity) => entity.evidenceSessionIds),
+    ...durableFacts.flatMap((fact) => fact.evidenceSessionIds),
+    ...currentStates.flatMap((state) => state.evidenceSessionIds),
+    ...temporalEvents.map((event) => event.sessionId),
+    currentSessionId,
+  ]);
+
+  return clampDreamState(
+    {
+      caseId: params.previousState.caseId,
+      mode: params.previousState.mode,
+      sessionCount: Math.max(params.previousState.sessionCount + 1, temporalEvents.length),
+      stateSummary,
+      entities,
+      durableFacts,
+      currentStates,
+      temporalEvents,
+      evidenceMemoryIds,
+      evidenceSessionIds,
+      updatedAt: new Date().toISOString(),
+    },
+    limits
+  );
+}
+
+export function buildBatchDreamPrompt(params: {
+  caseId: string;
+  question: string;
+  sessions: OrderedDreamSession[];
+  mode: DreamMode;
+  maxContentExcerptChars: number;
+  useQuestionHints?: boolean;
+}): { systemPrompt: string; userPrompt: string; schemaDescription: string } {
+  const questionHint = params.useQuestionHints
+    ? `question for later evaluation only, not a label: ${params.question}`
+    : 'No future evaluation question is available to the dream worker.';
+  return {
+    systemPrompt:
+      'You are a batch memory-dream worker. Reconcile a chronological case history into a compact, evidence-grounded state ledger. Return strict JSON only. Do not use benchmark answer labels. Keep cases isolated.',
+    schemaDescription:
+      'JSON schema: {"stateSummary": string, "entities": [{"name": string, "entityType"?: string, "description": string, "aliases": string[], "evidence": string, "evidenceMemoryIds": string[], "evidenceSessionIds": string[]}], "durableFacts": [{"key": string, "fact": string, "category": string, "subject"?: string, "object"?: string, "evidence": string, "status": "active"|"superseded"|"uncertain", "evidenceMemoryIds": string[], "evidenceSessionIds": string[]}], "currentStates": [{"key": string, "state": string, "scope": string, "status": string, "volatility": string, "evidence": string, "evidenceMemoryIds": string[], "evidenceSessionIds": string[]}], "temporalEvents": [{"sessionId": string, "memoryId": string, "date"?: string, "summary": string}], "notes": string[]}',
+    userPrompt: [
+      `caseId: ${params.caseId}`,
+      questionHint,
+      `dream mode: ${params.mode}`,
+      '',
+      'Reconciliation rules:',
+      '- Treat episodes as chronological within this case.',
+      '- Preserve current state updates, quantities, decisions, constraints, process rules, list/table mappings, and exact values when evidence supports them.',
+      '- If a later episode updates an earlier value, mark the older fact superseded and keep the latest active value with evidence links.',
+      '- If a value requires arithmetic or accumulation, perform the update and keep all supporting evidence session ids.',
+      '- Explicit aggregate/count statements are authoritative state. Do not replace an explicit total with a smaller count of named examples.',
+      '- If an earlier episode says a collection has total N and a later episode adds one item to that collection, write the active total as N+1 with both evidence links.',
+      '- Keep the ledger compact. Do not copy full transcripts.',
+      '- Use memoryId/sessionId exactly as supplied for evidence links.',
+      '',
+      'Chronological episodes JSON:',
+      JSON.stringify(
+        params.sessions.map((session) => ({
+          sessionId: session.sessionId,
+          memoryId: session.memoryId,
+          date: session.date || null,
+          sourceSummary: session.sourceSummary,
+          extractedViews: compactDreamExtractionViews(session.extractions),
+          contentExcerpt: buildRelevantContentExcerpt(
+            session.content,
+            params.useQuestionHints ? params.question : null,
+            params.maxContentExcerptChars
+          ),
+        })),
         null,
         2
       ),

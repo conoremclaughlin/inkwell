@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { hasOptionalAnswer } from './benchmark-answer-coverage';
 import {
   applyLocalDreamUpdate,
+  buildBatchDreamPrompt,
   buildOnlineDreamPrompt,
   buildOrderedDreamSessions,
+  coerceDreamStateUpdate,
   createInitialDreamState,
   parseLongMemSessionId,
   renderDreamStateForAnswerCheck,
@@ -267,6 +269,163 @@ describe('benchmark-memory-dream logic', () => {
 
     expect(prompt.systemPrompt).toContain('one new chronological episode');
     expect(prompt.userPrompt).toContain('Previous compact dream state JSON');
-    expect(prompt.userPrompt).toContain('session s1');
+    expect(prompt.userPrompt).toContain('\"sessionId\": \"s1\"');
+    expect(prompt.userPrompt).toContain('No future evaluation question is available');
+    expect(prompt.userPrompt).not.toContain('question for later evaluation only');
+  });
+
+  it('coerces runner dream JSON into evidence-linked state without trusting metadata as answer text', () => {
+    const initial = createInitialDreamState('case-coin', 'online');
+    const [session] = buildOrderedDreamSessions(
+      {
+        id: 'case-coin',
+        query: 'How many pre-1920 coins do I have?',
+        answerSessionIds: ['s2'],
+        sessions: [
+          {
+            sessionId: 's2',
+            content: 'session s2\nuser: I added one more quarter after having 37 coins.',
+            hasAnswer: true,
+            isAnswerSession: true,
+            turnCount: 1,
+          },
+        ],
+      },
+      [
+        {
+          id: 'mem-s2',
+          content: 'session s2\nuser: I added one more quarter after having 37 coins.',
+          summary: null,
+          metadata: null,
+          created_at: '2026-01-02T00:00:00Z',
+        },
+      ]
+    ).sessions;
+
+    const updated = coerceDreamStateUpdate(
+      {
+        stateSummary: 'The user now has 38 pre-1920 American coins.',
+        durableFacts: [
+          {
+            key: 'coin-count',
+            fact: 'The user has 38 pre-1920 American coins.',
+            category: 'status',
+            subject: 'user',
+            object: 'pre-1920 American coin count',
+            evidence: '37 coins plus one more quarter.',
+            status: 'active',
+          },
+        ],
+        entities: [],
+        currentStates: [],
+        temporalEvents: [
+          {
+            sessionId: 's2',
+            memoryId: 'mem-s2',
+            summary: 'The user added one quarter.',
+          },
+        ],
+      },
+      {
+        previousState: initial,
+        currentSession: session,
+      }
+    );
+
+    expect(updated.sessionCount).toBe(1);
+    expect(updated.durableFacts[0]).toMatchObject({
+      key: 'coin-count',
+      status: 'active',
+      evidenceMemoryIds: ['mem-s2'],
+      evidenceSessionIds: ['s2'],
+    });
+    expect(renderDreamStateForAnswerCheck(updated)).toContain('38 pre-1920 American coins');
+  });
+
+  it('builds a batch dream prompt with chronological extracted views and clamped excerpts', () => {
+    const dreamCase = {
+      id: 'case-1',
+      query: 'What changed?',
+      answerSessionIds: ['s1'],
+      sessions: [
+        {
+          sessionId: 's1',
+          content: 'session s1\nuser: ' + 'hello '.repeat(100),
+          hasAnswer: true,
+          isAnswerSession: true,
+          turnCount: 1,
+        },
+      ],
+    };
+    const [session] = buildOrderedDreamSessions(dreamCase, [
+      {
+        id: 'mem-s1',
+        content: dreamCase.sessions[0].content,
+        summary: null,
+        metadata: null,
+        created_at: '2026-01-01T00:00:00Z',
+      },
+    ]).sessions;
+
+    const prompt = buildBatchDreamPrompt({
+      caseId: 'case-1',
+      question: 'What changed?',
+      sessions: [session],
+      mode: 'batch',
+      maxContentExcerptChars: 80,
+    });
+
+    expect(prompt.systemPrompt).toContain('batch memory-dream worker');
+    expect(prompt.userPrompt).toContain('Chronological episodes JSON');
+    expect(prompt.userPrompt).toContain('contentExcerpt');
+    expect(prompt.userPrompt).toContain('No future evaluation question is available');
+    expect(prompt.userPrompt.length).toBeLessThan(4000);
+  });
+
+  it('can build a query-hinted diagnostic batch prompt that selects relevant middle text', () => {
+    const middle = 'user: The coin collection currently has a total of 37 pre-1920 coins.';
+    const content = [
+      'session s1',
+      'user: irrelevant opening '.repeat(30),
+      middle,
+      'assistant: irrelevant ending '.repeat(30),
+    ].join('\n');
+    const [session] = buildOrderedDreamSessions(
+      {
+        id: 'case-coin',
+        query: 'How many pre-1920 coins?',
+        answerSessionIds: ['s1'],
+        sessions: [
+          {
+            sessionId: 's1',
+            content,
+            hasAnswer: true,
+            isAnswerSession: true,
+            turnCount: 3,
+          },
+        ],
+      },
+      [
+        {
+          id: 'mem-s1',
+          content,
+          summary: null,
+          metadata: null,
+          created_at: '2026-01-01T00:00:00Z',
+        },
+      ]
+    ).sessions;
+
+    const prompt = buildBatchDreamPrompt({
+      caseId: 'case-coin',
+      question: 'How many pre-1920 coins?',
+      sessions: [session],
+      mode: 'batch',
+      maxContentExcerptChars: 140,
+      useQuestionHints: true,
+    });
+
+    expect(prompt.userPrompt).toContain('question for later evaluation only');
+    expect(prompt.userPrompt).toContain('37 pre-1920 coins');
   });
 });
