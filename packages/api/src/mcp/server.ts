@@ -86,6 +86,76 @@ export class MCPServer {
     logger.info('MCP Server initialized');
   }
 
+  /**
+   * Validate a context token by verifying the sessionId against the database.
+   * The session was created via an authenticated start_session call, so a
+   * matching active session proves the caller owns the identity. We also
+   * verify the agentId matches to prevent session-id reuse across agents.
+   */
+  private async resolveUserFromContextSession(
+    sessionId: string,
+    agentId: string
+  ): Promise<{ userId: string; email: string; agentId: string; sbId: string } | null> {
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!UUID_RE.test(sessionId)) {
+      logger.debug('Context-based auth: malformed sessionId', { sessionId });
+      return null;
+    }
+
+    let session;
+    try {
+      session = await this.dataComposer.repositories.memory.getSession(sessionId);
+    } catch (error) {
+      logger.debug('Context-based auth: session lookup failed', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+    if (!session) {
+      logger.debug('Context-based auth: session not found', { sessionId });
+      return null;
+    }
+
+    if (session.endedAt) {
+      logger.debug('Context-based auth: session already ended', { sessionId });
+      return null;
+    }
+
+    if (session.agentId !== agentId) {
+      logger.warn('Context-based auth: agentId mismatch', {
+        sessionId,
+        sessionAgentId: session.agentId,
+        contextAgentId: agentId,
+      });
+      return null;
+    }
+
+    const { data, error } = await this.dataComposer
+      .getClient()
+      .from('agent_identities')
+      .select('id, user_id, users!inner(email)')
+      .eq('agent_id', agentId)
+      .eq('user_id', session.userId)
+      .single();
+
+    if (error || !data) {
+      logger.debug('Context-based auth: no identity found for session user+agent', {
+        agentId,
+        userId: session.userId,
+      });
+      return null;
+    }
+
+    const email = (data.users as unknown as { email: string })?.email ?? '';
+    return {
+      userId: session.userId,
+      email,
+      agentId,
+      sbId: data.id,
+    };
+  }
+
   private async deriveWorkspaceIdFromAgent(
     userId: string,
     agentId: string
@@ -237,10 +307,40 @@ export class MCPServer {
     // ============================================================================
     const handleMcpRequest = async (req: express.Request, res: express.Response) => {
       const authHeader = req.headers.authorization;
-      const userData = await this.authProvider.verifyAccessToken(authHeader);
+      let userData = await this.authProvider.verifyAccessToken(authHeader);
+
+      // Parse x-ink-context early so we can use it for auth fallback.
+      const contextHeader = req.header('x-ink-context')?.trim();
+      let contextToken: import('@inklabs/shared').PcpContextToken | null = null;
+      if (contextHeader) {
+        const { decodeContextToken } = await import('@inklabs/shared');
+        contextToken = decodeContextToken(contextHeader);
+      }
+
+      // Session-validated context auth: when NO Authorization header is present
+      // but the request carries an x-ink-context with a sessionId + agentId,
+      // verify the session exists and is active in the database. The session was
+      // created through an authenticated start_session call, so a matching
+      // active session proves the caller owns the identity.
+      //
+      // This is NOT attempted when an Authorization header IS present but
+      // invalid — that's a hard auth failure, not a fallback scenario.
+      if (!userData && !authHeader && contextToken?.sessionId && contextToken?.agentId) {
+        userData = await this.resolveUserFromContextSession(
+          contextToken.sessionId,
+          contextToken.agentId
+        );
+        if (userData) {
+          logger.debug('Context-based auth: resolved identity from verified session', {
+            sessionId: contextToken.sessionId,
+            agentId: contextToken.agentId,
+            userId: userData.userId,
+          });
+        }
+      }
 
       // OAuth challenge for MCP clients (e.g. Gemini) when auth is required.
-      const isMissingAuth = !authHeader;
+      const isMissingAuth = !authHeader && !userData;
       const isInvalidAuth = !!authHeader && !userData;
       const shouldChallenge = isInvalidAuth || (env.MCP_REQUIRE_OAUTH && isMissingAuth);
 
@@ -283,20 +383,6 @@ export class MCPServer {
           }
         : {};
       const callerProfileHeader = req.header('x-ink-caller-profile')?.trim().toLowerCase();
-      // Trust boundary note:
-      // `x-ink-caller-profile`, `x-ink-session-id`, and `x-ink-studio-id` are only consumed
-      // on the MCP transport entrypoint. Supported MCP clients in our stack do not expose
-      // arbitrary header injection to model prompts, so these remain runtime/server-controlled
-      // signals rather than LLM-controlled parameters.
-      // Parse consolidated context token first (Phase 1 — preferred source).
-      // Falls back to individual headers for backward compat.
-      const contextHeader = req.header('x-ink-context')?.trim();
-      let contextToken: import('@inklabs/shared').PcpContextToken | null = null;
-      if (contextHeader) {
-        const { decodeContextToken } = await import('@inklabs/shared');
-        contextToken = decodeContextToken(contextHeader);
-      }
-
       const callerProfile: 'agent' | 'runtime' =
         callerProfileHeader === 'runtime' ? 'runtime' : 'agent';
       const sessionIdHeader = contextToken?.sessionId || req.header('x-ink-session-id')?.trim();
