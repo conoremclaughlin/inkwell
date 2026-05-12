@@ -768,6 +768,10 @@ export class SessionService implements ISessionService {
       backend,
     });
 
+    // Resolve session_scope from agent identity. "single" means the agent
+    // prefers all messages consolidated into one session (Myra, etc.).
+    const preferSingleSession = await this.resolvePreferSingleSession(userId, agentId);
+
     // For primary sessions, try to find existing active session
     if (type === 'primary') {
       // recipientSessionId takes highest priority — this is an explicit "route
@@ -835,22 +839,24 @@ export class SessionService implements ISessionService {
           return threadMatch;
         }
 
-        // Thread-scoped request with no match. For studio-based agents, create a
-        // dedicated session per thread. For agents without studios (Myra, Benson),
-        // consolidate into the existing active session — proliferating sessions
-        // per threadKey breaks their single-session model.
-        if (resolvedStudioId) {
-          logger.debug('No existing thread-scoped session; creating new one (has studio)', {
-            userId,
-            agentId,
-            threadKey: options.threadKey,
-            studioId: resolvedStudioId,
-          });
+        // Thread-scoped request with no match. Behavior depends on session_scope:
+        //   "single" → consolidate into active session (Myra, etc.)
+        //   default  → create a dedicated session per thread
+        if (preferSingleSession) {
+          logger.debug(
+            'No thread match; session_scope=single — falling through to active session',
+            {
+              userId,
+              agentId,
+              threadKey: options.threadKey,
+            }
+          );
         } else {
-          logger.debug('No thread match, no studio — falling through to active session', {
+          logger.debug('No thread match; creating new thread-scoped session', {
             userId,
             agentId,
             threadKey: options.threadKey,
+            studioId: resolvedStudioId || null,
           });
         }
       } else if (options?.threadKey) {
@@ -864,8 +870,8 @@ export class SessionService implements ISessionService {
 
       // Fall back to general active session when:
       //   a) no threadKey was provided, OR
-      //   b) threadKey was provided but agent has no studio (single-session agent)
-      const shouldFallBackToActive = !options?.threadKey || !resolvedStudioId;
+      //   b) threadKey was provided but agent prefers single session (session_scope=single)
+      const shouldFallBackToActive = !options?.threadKey || preferSingleSession;
       if (shouldFallBackToActive) {
         const existing = await this.repository.findByUserAndAgent(userId, agentId, {
           type: 'primary',
@@ -878,7 +884,7 @@ export class SessionService implements ISessionService {
             sessionId: existing.id,
             backendSessionId: existing.backendSessionId,
             studioId: existing.studioId || null,
-            singleSessionFallback: !!options?.threadKey,
+            singleSessionFallback: preferSingleSession && !!options?.threadKey,
           });
           return existing;
         }
@@ -1372,6 +1378,30 @@ This session will continue with a fresh context after compaction. Your identity,
     if (value === 'claude' || value === 'claude-code' || value === '') return 'claude-code';
     logger.warn('Unknown backend configured, falling back to claude-code', { raw });
     return 'claude-code';
+  }
+
+  /**
+   * Check if the agent prefers single-session routing (session_scope = 'single').
+   * When true, threadKey misses fall back to the active session instead of
+   * creating a new one. Used by Myra, etc. to prevent session proliferation.
+   */
+  private async resolvePreferSingleSession(userId: string, agentId: string): Promise<boolean> {
+    if (!this.supabase) return false;
+    try {
+      // session_scope not yet in generated types — cast result
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data } = (await (this.supabase as any)
+        .from('agent_identities')
+        .select('session_scope')
+        .eq('user_id', userId)
+        .eq('agent_id', agentId)
+        .not('workspace_id', 'is', null)
+        .limit(1)
+        .maybeSingle()) as { data: { session_scope: string | null } | null };
+      return data?.session_scope === 'single';
+    } catch {
+      return false;
+    }
   }
 
   /**
