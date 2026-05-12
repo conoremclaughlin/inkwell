@@ -96,7 +96,22 @@ export class MCPServer {
     sessionId: string,
     agentId: string
   ): Promise<{ userId: string; email: string; agentId: string; sbId: string } | null> {
-    const session = await this.dataComposer.repositories.memory.getSession(sessionId);
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!UUID_RE.test(sessionId)) {
+      logger.debug('Context-based auth: malformed sessionId', { sessionId });
+      return null;
+    }
+
+    let session;
+    try {
+      session = await this.dataComposer.repositories.memory.getSession(sessionId);
+    } catch (error) {
+      logger.debug('Context-based auth: session lookup failed', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
     if (!session) {
       logger.debug('Context-based auth: session not found', { sessionId });
       return null;

@@ -465,7 +465,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     if (serverUnavailableError) return;
     mockVerifyAccessToken.mockResolvedValue(null);
     mockGetSession.mockResolvedValue({
-      id: 'sess-active',
+      id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       userId: 'user-456',
       agentId: 'wren',
       lifecycle: 'running',
@@ -480,7 +480,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     };
 
     const contextHeader = encodeContextHeader({
-      sessionId: 'sess-active',
+      sessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       studioId: 'studio-1',
       agentId: 'wren',
       cliAttached: true,
@@ -492,7 +492,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     });
 
     expect(res.status).toBe(200);
-    expect(mockGetSession).toHaveBeenCalledWith('sess-active');
+    expect(mockGetSession).toHaveBeenCalledWith('a1b2c3d4-e5f6-7890-abcd-ef1234567890');
   });
 
   it('should reject forged context with no matching session', async () => {
@@ -517,12 +517,34 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     (env as any).MCP_REQUIRE_OAUTH = false;
   });
 
+  it('should reject context with malformed (non-UUID) sessionId without hitting DB', async () => {
+    if (serverUnavailableError) return;
+    (env as any).MCP_REQUIRE_OAUTH = true;
+    mockVerifyAccessToken.mockResolvedValue(null);
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'not-a-uuid',
+      studioId: 'studio-1',
+      agentId: 'wren',
+      cliAttached: true,
+      runtime: 'claude',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      'x-ink-context': contextHeader,
+    });
+
+    expect(res.status).toBe(401);
+    expect(mockGetSession).not.toHaveBeenCalled();
+    (env as any).MCP_REQUIRE_OAUTH = false;
+  });
+
   it('should reject context when session agentId does not match', async () => {
     if (serverUnavailableError) return;
     (env as any).MCP_REQUIRE_OAUTH = true;
     mockVerifyAccessToken.mockResolvedValue(null);
     mockGetSession.mockResolvedValue({
-      id: 'sess-other',
+      id: 'b2c3d4e5-f6a7-8901-bcde-f12345678901',
       userId: 'user-456',
       agentId: 'lumen',
       lifecycle: 'running',
@@ -532,7 +554,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     });
 
     const contextHeader = encodeContextHeader({
-      sessionId: 'sess-other',
+      sessionId: 'b2c3d4e5-f6a7-8901-bcde-f12345678901',
       studioId: 'studio-1',
       agentId: 'wren',
       cliAttached: true,
@@ -552,7 +574,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     (env as any).MCP_REQUIRE_OAUTH = true;
     mockVerifyAccessToken.mockResolvedValue(null);
     mockGetSession.mockResolvedValue({
-      id: 'sess-ended',
+      id: 'c3d4e5f6-a7b8-9012-cdef-123456789012',
       userId: 'user-456',
       agentId: 'wren',
       lifecycle: 'completed',
@@ -562,7 +584,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     });
 
     const contextHeader = encodeContextHeader({
-      sessionId: 'sess-ended',
+      sessionId: 'c3d4e5f6-a7b8-9012-cdef-123456789012',
       studioId: 'studio-1',
       agentId: 'wren',
       cliAttached: true,
@@ -581,7 +603,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     if (serverUnavailableError) return;
     mockVerifyAccessToken.mockResolvedValue(null);
     mockGetSession.mockResolvedValue({
-      id: 'sess-active',
+      id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       userId: 'user-456',
       agentId: 'wren',
       lifecycle: 'running',
@@ -596,7 +618,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     };
 
     const contextHeader = encodeContextHeader({
-      sessionId: 'sess-active',
+      sessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       studioId: 'studio-1',
       agentId: 'wren',
       cliAttached: true,
@@ -624,7 +646,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     });
 
     const contextHeader = encodeContextHeader({
-      sessionId: 'sess-1',
+      sessionId: 'd4e5f6a7-b8c9-0123-defa-234567890123',
       studioId: 'studio-1',
       agentId: 'wren',
       cliAttached: true,
