@@ -190,7 +190,7 @@ export function buildIdentityPrompt(agentId: string, startupContextBlock?: strin
 
 **You are ${agentId}. Your agent ID is \`${agentId}\`.**
 
-When calling PCP tools (bootstrap, remember, recall, update_session_phase, etc.), use \`agentId: "${agentId}"\`.
+When calling PCP tools (bootstrap, remember, recall, update_session_state, etc.), use \`agentId: "${agentId}"\`.
 Do NOT read \`.ink/identity.json\` — your identity is set by this system prompt.
 Do NOT run \`echo $AGENT_ID\` — use the agentId provided above.`;
 
@@ -200,7 +200,7 @@ Always use **PCP cloud tools** (mcp__inkwell__*) over file reads or Claude Code 
 - Identity: use mcp__inkwell__bootstrap, not file reads
 - Tasks: use mcp__inkwell__create_task, not TaskCreate
 - Memory: use mcp__inkwell__remember, not local notes
-- Sessions: use mcp__inkwell__update_session_phase/get_session/list_sessions
+- Sessions: use mcp__inkwell__update_session_state/get_session/list_sessions
 
 PCP tools persist across sessions and are shared with the user and other agents.`;
 

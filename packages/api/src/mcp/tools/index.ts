@@ -12,8 +12,6 @@ import {
   handleSaveProject,
   handleListProjects,
   handleGetProject,
-  handleSetFocus,
-  handleGetFocus,
 } from './context-handlers';
 
 import {
@@ -51,7 +49,7 @@ import {
   handleEndSession,
   handleGetSession,
   handleListSessions,
-  handleUpdateSessionPhase,
+  handleUpdateSessionState,
   handleGetMemoryHistory,
   handleGetUserHistory,
   handleRestoreMemory,
@@ -721,76 +719,6 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   // =====================================================
   // SESSION FOCUS TOOLS
   // =====================================================
-
-  // Register set_focus tool
-  server.registerTool(
-    'set_focus',
-    {
-      description: `Set the current focus/context for a session. Tracks what project and task we're working on.
-
-User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        sessionId: z.string().optional().describe('Session ID'),
-        projectName: z.string().optional().describe('Project name to focus on'),
-        projectId: z.string().uuid().optional().describe('Project UUID to focus on'),
-        focusSummary: z.string().optional().describe('What we are currently working on'),
-        contextSnapshot: z.record(z.unknown()).optional().describe('Context snapshot'),
-      },
-    },
-    async (args) => {
-      try {
-        return await handleSetFocus(args, dataComposer);
-      } catch (error) {
-        logger.error('Error in set_focus:', error);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  // Register get_focus tool
-  server.registerTool(
-    'get_focus',
-    {
-      description: `Get the current focus/context for a session or the user's most recent focus.
-
-User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        sessionId: z.string().optional().describe('Specific session ID'),
-      },
-    },
-    async (args) => {
-      try {
-        return await handleGetFocus(args, dataComposer);
-      } catch (error) {
-        logger.error('Error in get_focus:', error);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-  );
 
   // =====================================================
   // PROJECT TASK TOOLS
@@ -2075,9 +2003,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     }
   );
 
-  // Register update_session_phase tool
+  // Register update_session_state tool
   server.registerTool(
-    'update_session_phase',
+    'update_session_state',
     {
       description: `Update your session state — work phase, status, backend session ID, context. This is the primary tool for managing session state.
 
@@ -2147,9 +2075,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     },
     async (args) => {
       try {
-        return await handleUpdateSessionPhase(args, dataComposer);
+        return await handleUpdateSessionState(args, dataComposer);
       } catch (error) {
-        logger.error('Error in update_session_phase:', error);
+        logger.error('Error in update_session_state:', error);
         return {
           content: [
             {
@@ -2283,7 +2211,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 Returns:
 - Identity Files: shared values/user/process docs and agent-specific identity docs from ~/.pcp
 - Identity Core: user profile, assistant role, relationship context from DB
-- Active Context: current projects, focus, project-specific context
+- Active Context: current projects, session context, project-specific context
 - Active Session: current session if any
 - Recent Memories: high-salience memories (filtered by agent if provided)
 
