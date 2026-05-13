@@ -55,12 +55,44 @@ export const currentStateExtractionSchema = z.object({
   evidence: z.string().min(1),
 });
 
+const exactDetailKindSchema = z.enum([
+  'quantity',
+  'date_time',
+  'state',
+  'location',
+  'possession',
+  'completion',
+  'list_item',
+  'identifier',
+  'relationship',
+  'constraint',
+  'other',
+]);
+
+const exactDetailStatusSchema = z.enum(['active', 'historical', 'superseded', 'uncertain']);
+
+export const exactDetailExtractionItemSchema = z.object({
+  kind: exactDetailKindSchema,
+  subject: z.string().min(1),
+  predicate: z.string().min(1),
+  value: z.string().min(1),
+  unit: z.string().optional(),
+  qualifier: z.string().optional(),
+  timeScope: z.string().optional(),
+  status: exactDetailStatusSchema.default('active'),
+  evidence: z.string().min(1),
+});
+
 export const entityExtractionSchema = z.object({
   entities: z.array(entityExtractionItemSchema).max(8),
 });
 
 export const durableFactExtractionSchema = z.object({
   durableFacts: z.array(durableFactExtractionItemSchema).max(10),
+});
+
+export const exactDetailsExtractionSchema = z.object({
+  exactDetails: z.array(exactDetailExtractionItemSchema).max(24),
 });
 
 export const memoryExtractionsSchema = z.object({
@@ -72,6 +104,7 @@ export const memoryExtractionsSchema = z.object({
   durable_fact: durableFactExtractionSchema.optional(),
   summary: summaryExtractionSchema.optional(),
   current_state: currentStateExtractionSchema.optional(),
+  exact_details: exactDetailsExtractionSchema.optional(),
   raw: z
     .object({
       provider: z.string().optional(),
@@ -81,6 +114,7 @@ export const memoryExtractionsSchema = z.object({
       durable_fact: z.unknown().optional(),
       summary: z.unknown().optional(),
       current_state: z.unknown().optional(),
+      exact_details: z.unknown().optional(),
     })
     .passthrough()
     .optional(),
@@ -107,7 +141,20 @@ export interface MemoryExtractionSource {
   salience?: string | null;
 }
 
-export type ExtractionKind = 'entity' | 'durable_fact' | 'summary' | 'current_state';
+export type ExtractionKind =
+  | 'entity'
+  | 'durable_fact'
+  | 'summary'
+  | 'current_state'
+  | 'exact_details';
+
+const EXTRACTION_KINDS: ExtractionKind[] = [
+  'entity',
+  'durable_fact',
+  'summary',
+  'current_state',
+  'exact_details',
+];
 
 export interface BatchMemoryExtractionSource {
   memoryId: string;
@@ -248,6 +295,30 @@ export function buildCurrentStateExtractionPrompt(
   };
 }
 
+export function buildExactDetailsExtractionPrompt(
+  source: MemoryExtractionSource
+): ExtractionPromptBundle {
+  return {
+    kind: 'exact_details',
+    systemPrompt:
+      'You extract exact retrieval-critical details from a single memory record. Return strict JSON only. Exact details are small atomic values that generic summaries often lose: counts, dates, durations, list-item mappings, names, IDs, paths, URLs, yes/no states, possession/location facts, and source-stated corrections or unsupported premises. Do not speculate. Each detail must include direct evidence from the memory.',
+    schemaDescription:
+      'JSON schema: {"exactDetails": [{"kind": "quantity"|"date_time"|"state"|"location"|"possession"|"completion"|"list_item"|"identifier"|"relationship"|"constraint"|"other", "subject": string, "predicate": string, "value": string, "unit"?: string, "qualifier"?: string, "timeScope"?: string, "status": "active"|"historical"|"superseded"|"uncertain", "evidence": string}]}',
+    userPrompt: [
+      'Extraction type: exact_details',
+      'Task:',
+      '- Extract source-grounded atomic details likely to be needed for exact answer questions or operational decisions.',
+      '- Preserve numbers/counts, dates/times/durations, names/IDs/URLs/paths, list-item mappings, materials/tools, quantities, colors, yes/no states, possession/location facts, completion states, ordering/comparison facts, and explicit corrections/overrides.',
+      '- Include assistant-response details when a future question could ask what the assistant said, recommended, listed, or calculated.',
+      '- If the memory says a premise is false or unsupported, record the stated correction as an exact detail with kind "state" or "other".',
+      '- Use subject / predicate / value so the fact can later behave like structured metadata. Keep value exact, including units when present.',
+      '- Prefer 4-8 high-signal details; use an empty exactDetails array if none are useful. The normalized store supports up to 24 details and preserves raw overflow separately.',
+      '',
+      buildSourceBlock(source),
+    ].join('\n'),
+  };
+}
+
 export function buildExtractionPrompt(
   source: MemoryExtractionSource,
   kind: ExtractionKind
@@ -261,6 +332,8 @@ export function buildExtractionPrompt(
       return buildSummaryExtractionPrompt(source);
     case 'current_state':
       return buildCurrentStateExtractionPrompt(source);
+    case 'exact_details':
+      return buildExactDetailsExtractionPrompt(source);
   }
 }
 
@@ -279,6 +352,8 @@ export function buildBatchExtractionPrompt(
         return '"summary": {"summary": string, "keyPoints": string[], "actionRelevance": string}';
       case 'current_state':
         return '"current_state": {"state": string, "scope": string, "status": string, "volatility": "volatile"|"semi-stable"|"stable", "evidence": string}';
+      case 'exact_details':
+        return '"exact_details": {"exactDetails": [{"kind": "quantity"|"date_time"|"state"|"location"|"possession"|"completion"|"list_item"|"identifier"|"relationship"|"constraint"|"other", "subject": string, "predicate": string, "value": string, "unit"?: string, "qualifier"?: string, "timeScope"?: string, "status": "active"|"historical"|"superseded"|"uncertain", "evidence": string}]}';
     }
   });
 
@@ -298,6 +373,7 @@ export function buildBatchExtractionPrompt(
       '- For summary extraction: summarize only that single source memory. Do not aggregate across the batch. Optimize for future retrieval and decision support.',
       '- Summary keyPoints should include exact values, names, durations, URLs, or list-item mappings when those are likely future follow-up targets.',
       '- For current_state extraction: include only present or near-present operational state supported by that memory.',
+      '- For exact_details extraction: extract precise atomic metadata that summaries lose: counts, dates/times/durations, names/IDs/URLs/paths, list-item mappings, materials/tools, yes/no states, possession/location facts, completion states, and explicit corrections/overrides. Prefer 4-8 high-signal details; return an empty exactDetails array if none are useful.',
       '- Evidence must quote or closely paraphrase text from the same memory.',
       '',
       'Input memories JSON:',
@@ -358,6 +434,28 @@ export function buildCurrentStateEmbeddingTexts(
   ];
 }
 
+export function buildExactDetailsEmbeddingTexts(
+  payload: z.infer<typeof exactDetailsExtractionSchema>
+): string[] {
+  return payload.exactDetails.map((detail) =>
+    compactWhitespace(
+      [
+        `exact detail: ${detail.kind}`,
+        `subject: ${detail.subject}`,
+        `predicate: ${detail.predicate}`,
+        `value: ${detail.value}`,
+        detail.unit ? `unit: ${detail.unit}` : null,
+        detail.qualifier ? `qualifier: ${detail.qualifier}` : null,
+        detail.timeScope ? `time scope: ${detail.timeScope}` : null,
+        `status: ${detail.status}`,
+        `evidence: ${quote(detail.evidence)}`,
+      ]
+        .filter(Boolean)
+        .join('; ')
+    )
+  );
+}
+
 export function normalizeMemoryExtractions(value: unknown): MemoryExtractions | null {
   const parsed = memoryExtractionsSchema.safeParse(value);
   return parsed.success ? parsed.data : null;
@@ -366,6 +464,8 @@ export function normalizeMemoryExtractions(value: unknown): MemoryExtractions | 
 const ENTITY_TYPES = new Set(entityExtractionItemSchema.shape.entityType.options);
 const DURABLE_FACT_CATEGORIES = new Set(durableFactExtractionItemSchema.shape.category.options);
 const VOLATILITY_VALUES = new Set(currentStateExtractionSchema.shape.volatility.options);
+const EXACT_DETAIL_KINDS = new Set(exactDetailKindSchema.options);
+const EXACT_DETAIL_STATUSES = new Set(exactDetailStatusSchema.options);
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -465,6 +565,57 @@ function coerceCurrentStateExtraction(raw: unknown): z.infer<typeof currentState
   });
 }
 
+function coerceExactDetailsExtraction(raw: unknown): z.infer<typeof exactDetailsExtractionSchema> {
+  const record = asRecord(raw);
+  const rawDetails =
+    record.exactDetails ?? record.exact_details ?? record.details ?? record.exact_details_list;
+  const exactDetails = (Array.isArray(rawDetails) ? rawDetails : [])
+    .map((item) => {
+      const detail = asRecord(item);
+      const subject =
+        asNonEmptyString(detail.subject) ||
+        asNonEmptyString(detail.entity) ||
+        asNonEmptyString(detail.name);
+      const predicate =
+        asNonEmptyString(detail.predicate) ||
+        asNonEmptyString(detail.attribute) ||
+        asNonEmptyString(detail.relation) ||
+        asNonEmptyString(detail.field) ||
+        'has exact detail';
+      const value =
+        asNonEmptyString(detail.value) ||
+        asNonEmptyString(detail.object) ||
+        asNonEmptyString(detail.detail) ||
+        asNonEmptyString(detail.exactText);
+      const evidence =
+        asNonEmptyString(detail.evidence) ||
+        asNonEmptyString(detail.quote) ||
+        asNonEmptyString(detail.sourceText) ||
+        value;
+      if (!subject || !value || !evidence) return null;
+      const rawKind = asNonEmptyString(detail.kind);
+      const rawStatus = asNonEmptyString(detail.status);
+      return {
+        kind: rawKind && EXACT_DETAIL_KINDS.has(rawKind as never) ? rawKind : 'other',
+        subject,
+        predicate,
+        value,
+        ...(asNonEmptyString(detail.unit) ? { unit: asNonEmptyString(detail.unit) as string } : {}),
+        ...(asNonEmptyString(detail.qualifier)
+          ? { qualifier: asNonEmptyString(detail.qualifier) as string }
+          : {}),
+        ...(asNonEmptyString(detail.timeScope)
+          ? { timeScope: asNonEmptyString(detail.timeScope) as string }
+          : {}),
+        status: rawStatus && EXACT_DETAIL_STATUSES.has(rawStatus as never) ? rawStatus : 'active',
+        evidence,
+      };
+    })
+    .filter((item): item is z.infer<typeof exactDetailExtractionItemSchema> => Boolean(item))
+    .slice(0, 24);
+  return exactDetailsExtractionSchema.parse({ exactDetails });
+}
+
 export function coerceExtractionPayload(
   kind: ExtractionKind,
   raw: unknown
@@ -478,6 +629,8 @@ export function coerceExtractionPayload(
       return coerceSummaryExtraction(raw);
     case 'current_state':
       return coerceCurrentStateExtraction(raw);
+    case 'exact_details':
+      return coerceExactDetailsExtraction(raw);
   }
 }
 
@@ -498,6 +651,9 @@ function assignExtractionPayload(
       break;
     case 'current_state':
       payload.current_state = result as MemoryExtractions['current_state'];
+      break;
+    case 'exact_details':
+      payload.exact_details = result as MemoryExtractions['exact_details'];
       break;
   }
 }
@@ -524,6 +680,7 @@ function buildRuntimeConfig(): ExtractionRuntimeConfig {
   if (env.MEMORY_LLM_DURABLE_FACT_ENABLED) enabledKinds.push('durable_fact');
   if (env.MEMORY_LLM_SUMMARY_ENABLED) enabledKinds.push('summary');
   if (env.MEMORY_LLM_CURRENT_STATE_ENABLED) enabledKinds.push('current_state');
+  if (env.MEMORY_LLM_EXACT_DETAILS_ENABLED) enabledKinds.push('exact_details');
 
   return {
     enabled: env.MEMORY_LLM_EXTRACTION_ENABLED,
@@ -612,9 +769,7 @@ export class MemoryLlmExtractor {
 
     const normalized = normalizeMemoryExtractions(payload);
     return normalized &&
-      Object.keys(normalized).some((key) =>
-        ['entity', 'durable_fact', 'summary', 'current_state'].includes(key)
-      )
+      Object.keys(normalized).some((key) => EXTRACTION_KINDS.includes(key as ExtractionKind))
       ? normalized
       : null;
   }

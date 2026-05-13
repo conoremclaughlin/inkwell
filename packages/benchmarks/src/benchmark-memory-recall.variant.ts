@@ -7,12 +7,14 @@ export type BenchmarkRecallVariant =
   | 'content-plus-entity'
   | 'content-plus-entity-parallel'
   | 'content-plus-fact'
+  | 'content-plus-exact'
   | 'content-plus-summary'
   | 'content-plus-summary-fact'
   | 'content-plus-entity-fact'
   | 'content-plus-derived'
   | 'entity-only'
   | 'fact-only'
+  | 'exact-only'
   | 'summary-only'
   | 'current-state-only'
   | 'derived-only'
@@ -35,6 +37,11 @@ const VARIANT_ALIASES: Record<string, BenchmarkRecallVariant> = {
   'content-plus-fact': 'content-plus-fact',
   'content+fact': 'content-plus-fact',
   'raw-plus-fact': 'content-plus-fact',
+  'content-plus-exact': 'content-plus-exact',
+  'content+exact': 'content-plus-exact',
+  'content-plus-exact-detail': 'content-plus-exact',
+  'content+exact-detail': 'content-plus-exact',
+  'raw-plus-exact': 'content-plus-exact',
   'content-plus-summary': 'content-plus-summary',
   'content+summary': 'content-plus-summary',
   'raw-plus-summary': 'content-plus-summary',
@@ -56,6 +63,12 @@ const VARIANT_ALIASES: Record<string, BenchmarkRecallVariant> = {
   'durable-facts': 'fact-only',
   'durable-fact-only': 'fact-only',
   'durable-facts-only': 'fact-only',
+  'exact-only': 'exact-only',
+  exact: 'exact-only',
+  'exact-detail': 'exact-only',
+  'exact-details': 'exact-only',
+  'exact-detail-only': 'exact-only',
+  'exact-details-only': 'exact-only',
   'summary-only': 'summary-only',
   summary: 'summary-only',
   summaries: 'summary-only',
@@ -113,6 +126,11 @@ function buildVariantSemanticOptions(
         semanticChunkTypes: ['content', 'fact'],
         applyChunkTypeBoosts: false,
       };
+    case 'content-plus-exact':
+      return {
+        semanticChunkTypes: ['content', 'exact_detail'],
+        applyChunkTypeBoosts: false,
+      };
     case 'content-plus-summary':
       return {
         semanticChunkTypes: ['content', 'summary'],
@@ -130,12 +148,25 @@ function buildVariantSemanticOptions(
       };
     case 'content-plus-derived':
       return {
-        semanticChunkTypes: ['content', 'summary', 'fact', 'topic', 'entity', 'current_state'],
+        semanticChunkTypes: [
+          'content',
+          'summary',
+          'fact',
+          'exact_detail',
+          'topic',
+          'entity',
+          'current_state',
+        ],
         applyChunkTypeBoosts: false,
       };
     case 'fact-only':
       return {
         semanticChunkTypes: ['fact'],
+        applyChunkTypeBoosts: false,
+      };
+    case 'exact-only':
+      return {
+        semanticChunkTypes: ['exact_detail'],
         applyChunkTypeBoosts: false,
       };
     case 'summary-only':
@@ -150,12 +181,12 @@ function buildVariantSemanticOptions(
       };
     case 'derived-only':
       return {
-        semanticChunkTypes: ['summary', 'fact', 'topic', 'entity'],
+        semanticChunkTypes: ['summary', 'fact', 'exact_detail', 'topic', 'entity'],
         applyChunkTypeBoosts: false,
       };
     case 'multiview-no-boost':
       return {
-        semanticChunkTypes: ['summary', 'fact', 'topic', 'entity', 'content'],
+        semanticChunkTypes: ['summary', 'fact', 'exact_detail', 'topic', 'entity', 'content'],
         applyChunkTypeBoosts: false,
       };
     case 'multiview-no-chrono':
@@ -193,6 +224,7 @@ function buildVariantHybridOptions(
     case 'content-plus-entity':
     case 'content-plus-entity-parallel':
     case 'content-plus-fact':
+    case 'content-plus-exact':
     case 'content-plus-summary':
     case 'content-plus-summary-fact':
     case 'content-plus-entity-fact':
@@ -205,6 +237,7 @@ function buildVariantHybridOptions(
       };
     case 'entity-only':
     case 'fact-only':
+    case 'exact-only':
     case 'summary-only':
     case 'current-state-only':
       return {

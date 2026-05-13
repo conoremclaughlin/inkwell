@@ -87,6 +87,7 @@ export interface OrderedDreamSession {
 export interface DreamExtractionViews {
   entities: ExtractedEntity[];
   durableFacts: ExtractedDurableFact[];
+  exactDetails: ExtractedExactDetail[];
   summary: ExtractedSummary | null;
   currentState: ExtractedCurrentState | null;
 }
@@ -104,6 +105,18 @@ export interface ExtractedDurableFact {
   category: string;
   subject?: string;
   object?: string;
+  evidence: string;
+}
+
+export interface ExtractedExactDetail {
+  kind: string;
+  subject: string;
+  predicate: string;
+  value: string;
+  unit?: string;
+  qualifier?: string;
+  timeScope?: string;
+  status: 'active' | 'historical' | 'superseded' | 'uncertain';
   evidence: string;
 }
 
@@ -347,6 +360,35 @@ function extractCurrentState(raw: unknown): ExtractedCurrentState | null {
   };
 }
 
+function extractExactDetails(raw: unknown): ExtractedExactDetail[] {
+  const record = asRecord(raw);
+  return asArray(record?.exactDetails)
+    .map((item) => {
+      const detail = asRecord(item);
+      const subject = asString(detail?.subject);
+      const predicate = asString(detail?.predicate);
+      const value = asString(detail?.value);
+      const evidence = asString(detail?.evidence);
+      if (!subject || !predicate || !value || !evidence) return null;
+      const rawStatus = asString(detail?.status);
+      return {
+        kind: asString(detail?.kind) || 'other',
+        subject,
+        predicate,
+        value,
+        unit: asString(detail?.unit) || undefined,
+        qualifier: asString(detail?.qualifier) || undefined,
+        timeScope: asString(detail?.timeScope) || undefined,
+        status:
+          rawStatus === 'historical' || rawStatus === 'superseded' || rawStatus === 'uncertain'
+            ? rawStatus
+            : 'active',
+        evidence,
+      };
+    })
+    .filter((detail): detail is ExtractedExactDetail => Boolean(detail));
+}
+
 export function parseLongMemSessionId(content: string): string | null {
   const match = content.match(/^session\s+([^\r\n]+)[\r\n]+/i);
   return match?.[1]?.trim() || null;
@@ -357,6 +399,7 @@ export function extractDreamViews(metadata: Record<string, unknown> | null): Dre
   return {
     entities: extractEntities(llmExtractions?.entity),
     durableFacts: extractDurableFacts(llmExtractions?.durable_fact),
+    exactDetails: extractExactDetails(llmExtractions?.exact_details),
     summary: extractSummary(llmExtractions?.summary),
     currentState: extractCurrentState(llmExtractions?.current_state),
   };
@@ -513,6 +556,49 @@ export function applyLocalDreamUpdate(
     });
   }
 
+  for (const detail of session.extractions.exactDetails) {
+    const valueWithUnit = [detail.value, detail.unit].filter(Boolean).join(' ');
+    const factText = [
+      `${detail.subject} ${detail.predicate} ${valueWithUnit}`.trim(),
+      detail.qualifier ? `(${detail.qualifier})` : '',
+      detail.timeScope ? `[${detail.timeScope}]` : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
+    const fact: ExtractedDurableFact = {
+      fact: factText,
+      category: `exact_${detail.kind}`,
+      subject: detail.subject,
+      object: valueWithUnit || detail.value,
+      evidence: detail.evidence,
+    };
+    const key = normalizeKey(
+      ['exact', detail.kind, detail.subject, detail.predicate, valueWithUnit || detail.value]
+        .filter(Boolean)
+        .join('|')
+    );
+    const existing = factMap.get(key);
+    const status =
+      detail.status === 'superseded'
+        ? 'superseded'
+        : detail.status === 'uncertain'
+          ? 'uncertain'
+          : (existing?.status ?? 'active');
+    moveToEnd(factMap, key, {
+      key,
+      fact: fact.fact,
+      category: fact.category,
+      subject: fact.subject,
+      object: fact.object,
+      evidence: fact.evidence,
+      status,
+      evidenceMemoryIds: mergeEvidenceIds(existing?.evidenceMemoryIds || [], session.memoryId),
+      evidenceSessionIds: mergeEvidenceIds(existing?.evidenceSessionIds || [], session.sessionId),
+      firstSeenSessionId: existing?.firstSeenSessionId || session.sessionId,
+      lastSeenSessionId: session.sessionId,
+    });
+  }
+
   if (session.extractions.currentState) {
     const currentState = session.extractions.currentState;
     const key = currentStateKey(currentState);
@@ -654,6 +740,11 @@ function compactDreamExtractionViews(views: DreamExtractionViews): DreamExtracti
       ...fact,
       fact: clampText(fact.fact, 260),
       evidence: clampText(fact.evidence, 180),
+    })),
+    exactDetails: views.exactDetails.slice(0, 12).map((detail) => ({
+      ...detail,
+      value: clampText(detail.value, 160),
+      evidence: clampText(detail.evidence, 180),
     })),
     summary: views.summary
       ? {

@@ -14,9 +14,11 @@ describe('benchmark-memory-recall variants', () => {
       'content-plus-entity-parallel'
     );
     expect(parseBenchmarkRecallVariant('content+entity+fact')).toBe('content-plus-entity-fact');
+    expect(parseBenchmarkRecallVariant('content+exact')).toBe('content-plus-exact');
     expect(parseBenchmarkRecallVariant('content+derived')).toBe('content-plus-derived');
     expect(parseBenchmarkRecallVariant('entities')).toBe('entity-only');
     expect(parseBenchmarkRecallVariant('durable-facts')).toBe('fact-only');
+    expect(parseBenchmarkRecallVariant('exact-details')).toBe('exact-only');
     expect(parseBenchmarkRecallVariant('derived')).toBe('derived-only');
     expect(parseBenchmarkRecallVariant('no-chrono')).toBe('multiview-no-chrono');
     expect(parseBenchmarkRecallVariant('unknown')).toBe('default');
@@ -54,7 +56,7 @@ describe('benchmark-memory-recall variants', () => {
       })
     ).toMatchObject({
       recallMode: 'semantic',
-      semanticChunkTypes: ['summary', 'fact', 'topic', 'entity'],
+      semanticChunkTypes: ['summary', 'fact', 'exact_detail', 'topic', 'entity'],
       applyChunkTypeBoosts: false,
     });
   });
@@ -160,6 +162,36 @@ describe('benchmark-memory-recall variants', () => {
     });
   });
 
+  it('builds explicit exact-detail options for semantic recall', () => {
+    expect(
+      buildBenchmarkRecallOptions({
+        mode: 'semantic',
+        variant: 'exact-only',
+        limit: 5,
+        agentId: 'lumen',
+        topics: ['benchmark:memory-recall:case-exact'],
+      })
+    ).toMatchObject({
+      recallMode: 'semantic',
+      semanticChunkTypes: ['exact_detail'],
+      applyChunkTypeBoosts: false,
+    });
+
+    expect(
+      buildBenchmarkRecallOptions({
+        mode: 'semantic',
+        variant: 'content-plus-exact',
+        limit: 5,
+        agentId: 'lumen',
+        topics: ['benchmark:memory-recall:case-content-exact'],
+      })
+    ).toMatchObject({
+      recallMode: 'semantic',
+      semanticChunkTypes: ['content', 'exact_detail'],
+      applyChunkTypeBoosts: false,
+    });
+  });
+
   it('builds explicit content-plus-derived semantic options', () => {
     expect(
       buildBenchmarkRecallOptions({
@@ -171,7 +203,15 @@ describe('benchmark-memory-recall variants', () => {
       })
     ).toMatchObject({
       recallMode: 'semantic',
-      semanticChunkTypes: ['content', 'summary', 'fact', 'topic', 'entity', 'current_state'],
+      semanticChunkTypes: [
+        'content',
+        'summary',
+        'fact',
+        'exact_detail',
+        'topic',
+        'entity',
+        'current_state',
+      ],
       applyChunkTypeBoosts: false,
     });
   });

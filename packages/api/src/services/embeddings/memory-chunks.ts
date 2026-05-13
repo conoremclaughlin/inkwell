@@ -4,6 +4,7 @@ import {
   buildCurrentStateEmbeddingTexts,
   buildDurableFactEmbeddingTexts,
   buildEntityEmbeddingTexts,
+  buildExactDetailsEmbeddingTexts,
   buildSummaryEmbeddingTexts,
   normalizeMemoryExtractions,
   type MemoryExtractions,
@@ -19,11 +20,19 @@ const MAX_ENTITY_CHUNKS = 2;
 const MIN_FACT_SENTENCE_CHARS = 48;
 const MAX_FACT_SENTENCE_CHARS = 280;
 
-export type MemoryChunkType = 'summary' | 'fact' | 'topic' | 'entity' | 'current_state' | 'content';
+export type MemoryChunkType =
+  | 'summary'
+  | 'fact'
+  | 'exact_detail'
+  | 'topic'
+  | 'entity'
+  | 'current_state'
+  | 'content';
 export type MemoryExtractionChunkMode = 'heuristic' | 'llm' | 'merged';
 const CHUNK_TYPE_ORDER: MemoryChunkType[] = [
   'summary',
   'fact',
+  'exact_detail',
   'topic',
   'entity',
   'current_state',
@@ -45,6 +54,7 @@ export interface EmbeddedMemoryChunk extends MemoryEmbeddingChunk {
 export interface MemoryChunkViewCounts {
   summary: number;
   fact: number;
+  exact_detail: number;
   topic: number;
   entity: number;
   current_state: number;
@@ -55,6 +65,7 @@ function emptyViewCounts(): MemoryChunkViewCounts {
   return {
     summary: 0,
     fact: 0,
+    exact_detail: 0,
     topic: 0,
     entity: 0,
     current_state: 0,
@@ -411,6 +422,16 @@ export function buildMemoryEmbeddingChunks(params: {
     ...(includeHeuristic ? buildFactChunks(`${normalizedSummary || ''}\n${content}`) : []),
   ];
   chunks.push(...reindexChunks(factChunks, chunks.length));
+
+  const exactDetailTexts = llmExtractions?.exact_details
+    ? buildExactDetailsEmbeddingTexts(llmExtractions.exact_details)
+    : [];
+  if (includeLlm) {
+    chunks.push(
+      ...reindexChunks(buildChunksFromTexts('exact_detail', exactDetailTexts), chunks.length)
+    );
+  }
+
   chunks.push(
     ...reindexChunks(buildTopicChunks({ topicKey, topics, source, salience }), chunks.length)
   );

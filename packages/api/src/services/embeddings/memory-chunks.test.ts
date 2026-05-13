@@ -29,6 +29,7 @@ describe('memory chunk multi-view helpers', () => {
     const viewCounts = countChunkViews(chunks);
     expect(viewCounts.summary).toBe(1);
     expect(viewCounts.current_state).toBe(0);
+    expect(viewCounts.exact_detail).toBe(0);
     expect(viewCounts.content).toBeGreaterThan(0);
 
     const metadata = {
@@ -41,7 +42,7 @@ describe('memory chunk multi-view helpers', () => {
     expect(inferChunkTypeFromMetadata(0, metadata)).toBe('summary');
   });
 
-  it('prefers llm-derived summary, durable fact, entity, and current state chunks when provided', () => {
+  it('prefers llm-derived summary, durable fact, exact detail, entity, and current state chunks when provided', () => {
     const llmExtractions = memoryExtractionsSchema.parse({
       version: 1,
       provider: 'openai',
@@ -61,6 +62,19 @@ describe('memory chunk multi-view helpers', () => {
             object: 'durable_fact index',
             evidence:
               'Current state should stay separate from durable facts because it is volatile.',
+          },
+        ],
+      },
+      exact_details: {
+        exactDetails: [
+          {
+            kind: 'state',
+            subject: 'dev server',
+            predicate: 'restart behavior',
+            value: 'auto-restarts on file change',
+            status: 'active',
+            evidence:
+              'Current state is also important: like the currently running dev server will autorestart.',
           },
         ],
       },
@@ -102,6 +116,9 @@ describe('memory chunk multi-view helpers', () => {
       'action relevance'
     );
     expect(chunks.find((chunk) => chunk.chunkType === 'fact')?.text).toContain('durable fact:');
+    expect(chunks.find((chunk) => chunk.chunkType === 'exact_detail')?.text).toContain(
+      'exact detail: state'
+    );
     expect(chunks.find((chunk) => chunk.chunkType === 'entity')?.text).toContain('entity: Wren');
     expect(chunks.find((chunk) => chunk.chunkType === 'current_state')?.text).toContain(
       'current state:'
@@ -110,6 +127,7 @@ describe('memory chunk multi-view helpers', () => {
     const viewCounts = countChunkViews(chunks);
     expect(viewCounts.summary).toBe(1);
     expect(viewCounts.fact).toBe(1);
+    expect(viewCounts.exact_detail).toBe(1);
     expect(viewCounts.entity).toBe(1);
     expect(viewCounts.current_state).toBe(1);
   });
