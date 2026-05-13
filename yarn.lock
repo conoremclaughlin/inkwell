@@ -15,6 +15,16 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@alcalzone/ansi-tokenize@npm:^0.3.0":
+  version: 0.3.0
+  resolution: "@alcalzone/ansi-tokenize@npm:0.3.0"
+  dependencies:
+    ansi-styles: "npm:^6.2.1"
+    is-fullwidth-code-point: "npm:^5.0.0"
+  checksum: 10/fb83e6c2f30efebf3476d48c81e28f5d0da5c929e18fb415e83b2bcdda3cd4b31a2c0d2258abc1e4afec2d3f387ca63dc44c00431a14896a9a2205e2d06b7c65
+  languageName: node
+  linkType: hard
+
 "@alloc/quick-lru@npm:^5.2.0":
   version: 5.2.0
   resolution: "@alloc/quick-lru@npm:5.2.0"
@@ -1900,6 +1910,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@inklabs/cli@workspace:packages/cli"
   dependencies:
+    "@alcalzone/ansi-tokenize": "npm:^0.3.0"
     "@inklabs/shared": "workspace:*"
     "@inquirer/prompts": "npm:^8.2.0"
     "@types/node": "npm:^20.10.0"
