@@ -120,7 +120,7 @@ export function renderInkChat(options: {
       onUserInput={onUserInput}
       onExit={onExit}
     />,
-    { alternateBuffer: fullscreen, incrementalRendering: true }
+    { alternateScreen: fullscreen, incrementalRendering: true }
   );
 
   // Get the handle (available synchronously after render)
