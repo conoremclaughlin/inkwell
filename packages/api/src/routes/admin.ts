@@ -5089,6 +5089,7 @@ router.get('/studios', async (req: Request, res: Response) => {
         lifecycle: string | null;
         currentPhase: string | null;
         status: string | null;
+        activeThreadKey: string | null;
         updatedAt: string;
       }
     >();
@@ -5096,7 +5097,7 @@ router.get('/studios', async (req: Request, res: Response) => {
     if (agentIds.length > 0) {
       const { data: sessions } = await supabase
         .from('sessions')
-        .select('agent_id, lifecycle, current_phase, status, updated_at')
+        .select('agent_id, lifecycle, current_phase, status, active_thread_key, updated_at')
         .eq('user_id', authReq.pcpUserId)
         .in('agent_id', agentIds)
         .is('ended_at', null)
@@ -5109,6 +5110,7 @@ router.get('/studios', async (req: Request, res: Response) => {
             lifecycle: session.lifecycle,
             currentPhase: session.current_phase,
             status: session.status,
+            activeThreadKey: session.active_thread_key,
             updatedAt: session.updated_at,
           });
         }
@@ -5139,6 +5141,7 @@ router.get('/studios', async (req: Request, res: Response) => {
               lifecycle: latestSession.lifecycle,
               currentPhase: latestSession.currentPhase,
               status: latestSession.status,
+              activeThreadKey: latestSession.activeThreadKey,
               updatedAt: latestSession.updatedAt,
             }
           : null,

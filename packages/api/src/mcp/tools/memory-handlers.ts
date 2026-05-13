@@ -560,6 +560,12 @@ export const updateSessionStateSchema = userIdentifierBaseSchema.extend({
     .describe(
       'Human-readable session alias for explicit routing (e.g., "main", "review"). Unique per agent among active sessions. Use to name a session so messages can be routed to it by alias.'
     ),
+  activeThreadKey: z
+    .string()
+    .optional()
+    .describe(
+      'The thread key the session is currently working on (e.g., "pr:350", "spec:auth-refactor"). Mutable — updates as the session shifts focus. Set to empty string to clear.'
+    ),
 });
 
 // ==============================================// MEMORY HISTORY SCHEMAS
@@ -1407,7 +1413,8 @@ type SessionTraceField =
   | 'status'
   | 'backendSessionId'
   | 'workingDir'
-  | 'context';
+  | 'context'
+  | 'activeThreadKey';
 
 interface SessionTraceSnapshot {
   agentId: string | null;
@@ -1417,6 +1424,7 @@ interface SessionTraceSnapshot {
   backendSessionId: string | null;
   workingDir: string | null;
   context: string | null;
+  activeThreadKey: string | null;
 }
 
 const SESSION_TRACE_FIELDS: SessionTraceField[] = [
@@ -1427,6 +1435,7 @@ const SESSION_TRACE_FIELDS: SessionTraceField[] = [
   'backendSessionId',
   'workingDir',
   'context',
+  'activeThreadKey',
 ];
 
 function normalizeTraceString(value: string | null | undefined, truncateAt = 240): string | null {
@@ -1445,6 +1454,7 @@ function toSessionTraceSnapshot(session: Session | null | undefined): SessionTra
     backendSessionId: normalizeTraceString(session?.backendSessionId || session?.claudeSessionId),
     workingDir: normalizeTraceString(session?.workingDir),
     context: normalizeTraceString(session?.context),
+    activeThreadKey: normalizeTraceString(session?.activeThreadKey),
   };
 }
 
@@ -1476,7 +1486,8 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     !params.context &&
     !params.workingDir &&
     params.cliAttached === undefined &&
-    params.alias === undefined
+    params.alias === undefined &&
+    params.activeThreadKey === undefined
   ) {
     return {
       content: [
@@ -1541,6 +1552,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     workingDir?: string;
     cliAttached?: boolean;
     alias?: string | null;
+    activeThreadKey?: string | null;
   } = {};
 
   // Map runtime: prefix phases to lifecycle (backward compat for old callers)
@@ -1587,6 +1599,9 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
   if (params.alias !== undefined) {
     updates.alias = params.alias || null;
   }
+  if (params.activeThreadKey !== undefined) {
+    updates.activeThreadKey = params.activeThreadKey || null;
+  }
 
   const updated = await dataComposer.repositories.memory.updateSession(sessionId, updates);
 
@@ -1609,6 +1624,8 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
   if (params.context) messageParts.push('context updated');
   if (params.workingDir) messageParts.push('workingDir updated');
   if (params.alias !== undefined) messageParts.push(`alias → ${params.alias || '(cleared)'}`);
+  if (params.activeThreadKey !== undefined)
+    messageParts.push(`activeThreadKey → ${params.activeThreadKey || '(cleared)'}`);
 
   const result: Record<string, unknown> = {
     success: true,

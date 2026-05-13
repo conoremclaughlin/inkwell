@@ -2071,6 +2071,12 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
             'Transient runtime state — active facts too ephemeral for a memory but important to preserve across compaction. E.g. "server on :4001", "waiting on PR #341 review", "vitest running in background". Use as a scratch board; memories handle durable decisions.'
           ),
         workingDir: z.string().optional().describe('Working directory'),
+        activeThreadKey: z
+          .string()
+          .optional()
+          .describe(
+            'The thread key the session is currently working on (e.g., "pr:350", "spec:auth-refactor"). Mutable — updates as the session shifts focus. The original thread_key (set at session creation) remains the immutable routing anchor. Set to empty string to clear.'
+          ),
       },
     },
     async (args) => {

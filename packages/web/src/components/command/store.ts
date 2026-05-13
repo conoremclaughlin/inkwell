@@ -13,6 +13,7 @@ export interface AgentState {
   studioSlug: string | null;
   lifecycle: string | null;
   phase: string | null;
+  activeThreadKey: string | null;
   updatedAt: string | null;
   position: { x: number; y: number };
   targetPosition: { x: number; y: number } | null;

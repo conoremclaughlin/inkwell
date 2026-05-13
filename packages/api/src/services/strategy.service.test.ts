@@ -2493,7 +2493,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
         config: { studioSlug: 'auth-refactor' },
       });
 
@@ -2528,7 +2528,7 @@ describe('StrategyService', () => {
           groupId: 'group-1',
           userId: 'user-123',
           strategy: 'persistence',
-          ownerAgentId: 'wren',
+          sbId: 'sb-wren-uuid',
           config: { studioSlug: 'auth-refactor' },
         })
       ).rejects.toThrow('Failed to create persistent studio');
@@ -2552,7 +2552,7 @@ describe('StrategyService', () => {
           groupId: 'group-1',
           userId: 'user-123',
           strategy: 'persistence',
-          ownerAgentId: 'wren',
+          sbId: 'sb-wren-uuid',
           config: { studioSlug: 'auth-refactor', ephemeralStudio: true },
         })
       ).rejects.toThrow('mutually exclusive');
@@ -2615,7 +2615,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
         config: { studioSlug: 'auth-refactor' },
       });
 
@@ -2623,11 +2623,11 @@ describe('StrategyService', () => {
       expect(dc.repositories.studios.create).not.toHaveBeenCalled();
     });
 
-    it('uses input.ownerAgentId for branch/studio even when group.owner_agent_id is null', async () => {
+    it('uses input.sbId for branch/studio even when group.sb_id is null', async () => {
       const group = createMockGroup({
         strategy: null,
         status: 'active',
-        owner_agent_id: null,
+        sb_id: null,
         metadata: { repoRoot: '/repo' },
       });
       const task = createMockTask();
@@ -2679,7 +2679,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
         config: { studioSlug: 'auth-refactor' },
       });
 
