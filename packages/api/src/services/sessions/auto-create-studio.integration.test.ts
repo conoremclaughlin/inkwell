@@ -10,12 +10,11 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { getDataComposer, type DataComposer } from '../../data/composer';
-import { handleStartSession, startSessionSchema } from '../../mcp/tools/memory-handlers';
+import { handleStartSession } from '../../mcp/tools/memory-handlers';
 import {
   ensureEchoIntegrationFixture,
   INTEGRATION_TEST_USER_ID,
   INTEGRATION_TEST_AGENT_ID,
-  INTEGRATION_TEST_USER_EMAIL,
 } from '../../test/integration-fixtures';
 
 const TEST_REPO_ROOT = `/tmp/pcp-test-repo-${Date.now()}`;
@@ -48,7 +47,7 @@ describe('Auto-Create Main Studio Integration', () => {
   it('auto-creates a studio row when studioId="main" and repoRoot is provided', async () => {
     const result = await handleStartSession(
       {
-        email: INTEGRATION_TEST_USER_EMAIL,
+        userId: INTEGRATION_TEST_USER_ID,
         agentId: INTEGRATION_TEST_AGENT_ID,
         studioId: 'main',
         repoRoot: TEST_REPO_ROOT,
@@ -90,7 +89,7 @@ describe('Auto-Create Main Studio Integration', () => {
     // Call start_session again with the same repoRoot
     const result = await handleStartSession(
       {
-        email: INTEGRATION_TEST_USER_EMAIL,
+        userId: INTEGRATION_TEST_USER_ID,
         agentId: INTEGRATION_TEST_AGENT_ID,
         studioId: 'main',
         repoRoot: TEST_REPO_ROOT,
@@ -125,7 +124,7 @@ describe('Auto-Create Main Studio Integration', () => {
   it('falls back to NULL studio when repoRoot is not provided', async () => {
     const result = await handleStartSession(
       {
-        email: INTEGRATION_TEST_USER_EMAIL,
+        userId: INTEGRATION_TEST_USER_ID,
         agentId: INTEGRATION_TEST_AGENT_ID,
         studioId: 'main',
         // No repoRoot — can't auto-create
@@ -149,7 +148,7 @@ describe('Auto-Create Main Studio Integration', () => {
 
     const result = await handleStartSession(
       {
-        email: INTEGRATION_TEST_USER_EMAIL,
+        userId: INTEGRATION_TEST_USER_ID,
         agentId: INTEGRATION_TEST_AGENT_ID,
         studioId: 'main',
         repoRoot: otherRepoRoot,
