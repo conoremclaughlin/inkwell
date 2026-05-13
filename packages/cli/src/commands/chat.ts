@@ -2290,7 +2290,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   if (runtime.sessionId && !attachedToExistingSession) {
     await pcp
-      .callTool('update_session_phase', {
+      .callTool('update_session_state', {
         agentId,
         sessionId: runtime.sessionId,
         phase: 'investigating',
@@ -2719,7 +2719,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     if (runtime.sessionId) {
       await pcp
-        .callTool('update_session_phase', {
+        .callTool('update_session_state', {
           agentId,
           sessionId: runtime.sessionId,
           phase: 'implementing',
@@ -3449,7 +3449,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     if (runtime.sessionId) {
       await pcp
-        .callTool('update_session_phase', {
+        .callTool('update_session_state', {
           agentId,
           sessionId: runtime.sessionId,
           phase,

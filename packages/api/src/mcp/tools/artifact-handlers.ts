@@ -19,6 +19,51 @@ import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import type { Database, Json } from '../../data/supabase/types';
 import { mergeWithContext } from '../../utils/request-context';
 import { resolveWorkspaceScopeForWrite } from '../../utils/workspace-scope';
+import { EmbeddingRouter } from '../../services/embeddings/router';
+import { formatVectorLiteral } from '../../services/embeddings/memory-chunks';
+
+const embeddingRouter = new EmbeddingRouter();
+
+async function tryEmbedArtifact(
+  supabase: SupabaseClient<Database>,
+  artifactId: string,
+  title: string,
+  content: string,
+  existingMetadata: Record<string, unknown>
+): Promise<void> {
+  if (!embeddingRouter.isEnabled()) return;
+
+  try {
+    const textToEmbed = `${title}\n\n${content}`;
+    const result = await embeddingRouter.embedDocument(textToEmbed);
+    if (!result) return;
+
+    const { error } = await supabase
+      .from('artifacts')
+      .update({
+        embedding: formatVectorLiteral(result.vector),
+        metadata: {
+          ...existingMetadata,
+          embedding: {
+            provider: result.provider,
+            model: result.model,
+            dimensions: result.dimensions,
+            updatedAt: new Date().toISOString(),
+          },
+        } as Json,
+      })
+      .eq('id', artifactId);
+
+    if (error) {
+      logger.warn('Failed to persist artifact embedding', { artifactId, error: error.message });
+    }
+  } catch (err) {
+    logger.warn('Artifact embedding failed', {
+      artifactId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
 
 // ============== Schemas ==============
 
@@ -120,6 +165,23 @@ const listArtifactCommentsSchema = workspaceScopedUserIdentifierSchema.extend({
   uri: z.string().optional().describe('URI of the artifact'),
   artifactId: z.string().uuid().optional().describe('ID of the artifact'),
   limit: z.number().min(1).max(200).optional().default(100).describe('Max comments to return'),
+});
+
+const searchArtifactsSchema = workspaceScopedUserIdentifierSchema.extend({
+  query: z.string().describe('Search query text'),
+  mode: z
+    .enum(['text', 'semantic', 'hybrid', 'auto'])
+    .optional()
+    .default('auto')
+    .describe(
+      'Search mode: text (keyword/trigram), semantic (embedding similarity), hybrid (blended), auto (hybrid if embeddings enabled, else text)'
+    ),
+  artifactType: z
+    .enum(['spec', 'design', 'decision', 'document', 'note'])
+    .optional()
+    .describe('Filter by artifact type'),
+  tags: z.array(z.string()).optional().describe('Filter by tags (any match)'),
+  limit: z.number().min(1).max(50).optional().default(10).describe('Max results to return'),
 });
 
 // ============== Helpers ==============
@@ -341,7 +403,7 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
       uri,
       user_id: resolved.user.id,
       workspace_id: workspaceScope,
-      created_by_identity_id: authorIdentity?.id || null,
+      created_by_sb_id: authorIdentity?.id || null,
       title,
       content,
       artifact_type: artifactType,
@@ -367,13 +429,22 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
     version: 1,
     title,
     content,
-    changed_by_identity_id: authorIdentity?.id || null,
+    changed_by_sb_id: authorIdentity?.id || null,
     changed_by_user_id: agentId ? null : resolved.user.id,
     change_type: 'create',
     change_summary: 'Initial creation',
   });
 
   logger.info('Artifact created', { uri, type: artifactType, agentId });
+
+  // Best-effort embedding — don't block the response
+  tryEmbedArtifact(
+    supabase,
+    artifact.id,
+    title,
+    content,
+    (metadata || {}) as Record<string, unknown>
+  );
 
   return {
     content: [
@@ -444,7 +515,7 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
       username: string | null;
       email: string | null;
     } | null;
-    createdByIdentityId: string | null;
+    createdBySbId: string | null;
     createdByIdentity: { id: string; agentId: string; name: string; backend: string | null } | null;
     createdAt: string | null;
     updatedAt: string | null;
@@ -464,8 +535,8 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
       throw new Error(`Failed to get artifact comments: ${commentsError.message}`);
     }
 
-    const identityIds = Array.from(
-      new Set((commentRows || []).map((c) => c.created_by_identity_id).filter(Boolean) as string[])
+    const sbIds = Array.from(
+      new Set((commentRows || []).map((c) => c.created_by_sb_id).filter(Boolean) as string[])
     );
     const commentAuthorUserIds = Array.from(
       new Set(
@@ -480,11 +551,11 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
       { id: string; agent_id: string; name: string; backend: string | null }
     >();
     let commentUsersById = new Map<string, ArtifactCommentAuthorUser>();
-    if (identityIds.length > 0) {
+    if (sbIds.length > 0) {
       const { data: identities, error: identitiesError } = await supabase
         .from('agent_identities')
         .select('id, agent_id, name, backend')
-        .in('id', identityIds);
+        .in('id', sbIds);
 
       if (identitiesError) {
         throw new Error(
@@ -511,8 +582,8 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
     }
 
     comments = (commentRows || []).map((comment) => {
-      const identity = comment.created_by_identity_id
-        ? (identitiesById.get(comment.created_by_identity_id) ?? null)
+      const identity = comment.created_by_sb_id
+        ? (identitiesById.get(comment.created_by_sb_id) ?? null)
         : null;
       const commentAuthorUserId = comment.created_by_user_id || comment.user_id || null;
       const commentAuthorUser = commentAuthorUserId
@@ -534,7 +605,7 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
               email: commentAuthorUser.email,
             }
           : null,
-        createdByIdentityId: comment.created_by_identity_id,
+        createdBySbId: comment.created_by_sb_id,
         createdByIdentity: identity
           ? {
               id: identity.id,
@@ -562,7 +633,7 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
             content: artifact.content,
             contentType: artifact.content_type,
             artifactType: artifact.artifact_type,
-            createdByIdentityId: artifact.created_by_identity_id,
+            createdBySbId: artifact.created_by_sb_id,
             collaborators: artifact.collaborators,
             editMode: normalizeEditMode(artifact.edit_mode),
             editors: artifact.collaborators || [],
@@ -637,7 +708,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     const currentEditMode = normalizeEditMode(current.edit_mode);
     const currentEditors = current.collaborators || [];
     const editorIdentityId = editorIdentity?.id || null;
-    const isCreator = editorIdentity && current.created_by_identity_id === editorIdentity.id;
+    const isCreator = editorIdentity && current.created_by_sb_id === editorIdentity.id;
     const hasEditorAccess =
       currentEditMode === 'workspace' ||
       (!!editorIdentityId && currentEditors.includes(editorIdentityId)) ||
@@ -829,7 +900,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     version: newVersion,
     title: updated.title,
     content: updated.content,
-    changed_by_identity_id: editorIdentity?.id || null,
+    changed_by_sb_id: editorIdentity?.id || null,
     changed_by_user_id: agentId ? null : resolved.user.id,
     change_type: changeType,
     change_summary: mergeSummary,
@@ -841,6 +912,17 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     agentId,
     mergePerformed,
   });
+
+  // Re-embed when content or title changed
+  if (finalContent !== undefined || title !== undefined) {
+    tryEmbedArtifact(
+      supabase,
+      updated.id,
+      updated.title,
+      updated.content,
+      (updated.metadata || {}) as Record<string, unknown>
+    );
+  }
 
   return {
     content: [
@@ -969,7 +1051,7 @@ export async function handleGetArtifactHistory(args: unknown, dataComposer: Data
             id: h.id,
             version: h.version,
             title: h.title,
-            changedByIdentityId: h.changed_by_identity_id,
+            changedBySbId: h.changed_by_sb_id,
             changedByUserId: h.changed_by_user_id,
             changeType: h.change_type,
             changeSummary: h.change_summary,
@@ -1048,7 +1130,7 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
       user_id: resolved.user.id,
       created_by_user_id: resolved.user.id,
       workspace_id: workspaceScope,
-      created_by_identity_id: authorIdentity?.id || null,
+      created_by_sb_id: authorIdentity?.id || null,
       parent_comment_id: parentCommentId || null,
       content: trimmed,
       metadata: metadata as Json,
@@ -1064,7 +1146,7 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
     artifactId: artifact.id,
     commentId: created.id,
     agentId: effectiveAgentId || null,
-    identityId: authorIdentity?.id || null,
+    sbId: authorIdentity?.id || null,
   });
 
   return {
@@ -1088,7 +1170,7 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
               username: resolved.user.username,
               email: resolved.user.email,
             },
-            createdByIdentityId: created.created_by_identity_id,
+            createdBySbId: created.created_by_sb_id,
             createdByIdentity: authorIdentity
               ? {
                   id: authorIdentity.id,
@@ -1139,8 +1221,8 @@ export async function handleListArtifactComments(args: unknown, dataComposer: Da
     throw new Error(`Failed to list artifact comments: ${error.message}`);
   }
 
-  const identityIds = Array.from(
-    new Set((comments || []).map((c) => c.created_by_identity_id).filter(Boolean) as string[])
+  const sbIds = Array.from(
+    new Set((comments || []).map((c) => c.created_by_sb_id).filter(Boolean) as string[])
   );
   const commentAuthorUserIds = Array.from(
     new Set(
@@ -1155,11 +1237,11 @@ export async function handleListArtifactComments(args: unknown, dataComposer: Da
     { id: string; agent_id: string; name: string; backend: string | null }
   >();
   let commentUsersById = new Map<string, ArtifactCommentAuthorUser>();
-  if (identityIds.length > 0) {
+  if (sbIds.length > 0) {
     let identitiesQuery = supabase
       .from('agent_identities')
       .select('id, agent_id, name, backend')
-      .in('id', identityIds);
+      .in('id', sbIds);
     identitiesQuery = withWorkspaceFilter(identitiesQuery, workspaceId);
     const { data: identities, error: identitiesError } = await identitiesQuery;
 
@@ -1195,8 +1277,8 @@ export async function handleListArtifactComments(args: unknown, dataComposer: Da
           artifactUri: artifact.uri,
           count: comments?.length || 0,
           comments: (comments || []).map((comment) => {
-            const identity = comment.created_by_identity_id
-              ? (identitiesById.get(comment.created_by_identity_id) ?? null)
+            const identity = comment.created_by_sb_id
+              ? (identitiesById.get(comment.created_by_sb_id) ?? null)
               : null;
             const commentAuthorUserId = comment.created_by_user_id || comment.user_id || null;
             const commentAuthorUser = commentAuthorUserId
@@ -1218,7 +1300,7 @@ export async function handleListArtifactComments(args: unknown, dataComposer: Da
                     email: commentAuthorUser.email,
                   }
                 : null,
-              createdByIdentityId: comment.created_by_identity_id,
+              createdBySbId: comment.created_by_sb_id,
               createdByIdentity: identity
                 ? {
                     id: identity.id,
@@ -1231,6 +1313,54 @@ export async function handleListArtifactComments(args: unknown, dataComposer: Da
               updatedAt: comment.updated_at,
             };
           }),
+        }),
+      },
+    ],
+  };
+}
+
+export async function handleSearchArtifacts(args: unknown, dataComposer: DataComposer) {
+  const parsed = parseWithContext(searchArtifactsSchema, args);
+  const resolved = await resolveUserOrThrow(parsed, dataComposer);
+
+  const { query, mode = 'auto', artifactType, tags, limit = 10, workspaceId } = parsed;
+
+  const results = await dataComposer.repositories.artifactSearch.search(
+    resolved.user.id,
+    query,
+    mode,
+    {
+      artifactType,
+      tags,
+      workspaceId,
+      limit,
+    }
+  );
+
+  const SNIPPET_LENGTH = 200;
+
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify({
+          success: true,
+          query,
+          mode,
+          resultCount: results.length,
+          results: results.map((r) => ({
+            title: r.title,
+            uri: r.uri,
+            artifactType: r.artifactType,
+            snippet:
+              r.content.length > SNIPPET_LENGTH
+                ? r.content.slice(0, SNIPPET_LENGTH) + '...'
+                : r.content,
+            relevanceScore: Math.round(r.finalScore * 1000) / 1000,
+            tags: r.tags,
+            version: r.version,
+            updatedAt: r.updatedAt,
+          })),
         }),
       },
     ],
@@ -1276,7 +1406,7 @@ export const artifactToolDefinitions = [
   {
     name: 'add_artifact_comment',
     description:
-      'Add a comment to an artifact without modifying artifact content. Uses identity_id UUID as canonical author reference.',
+      'Add a comment to an artifact without modifying artifact content. Uses sb_id UUID as canonical author reference.',
     schema: addArtifactCommentSchema,
     handler: handleAddArtifactComment,
   },
@@ -1286,5 +1416,12 @@ export const artifactToolDefinitions = [
       'List comments for an artifact, including canonical identity UUID author metadata.',
     schema: listArtifactCommentsSchema,
     handler: handleListArtifactComments,
+  },
+  {
+    name: 'search_artifacts',
+    description:
+      'Search artifacts using text (keyword/trigram), semantic (embedding similarity), or hybrid (blended) modes. Returns matching artifacts with title, URI, snippet, relevance score, and metadata.',
+    schema: searchArtifactsSchema,
+    handler: handleSearchArtifacts,
   },
 ];

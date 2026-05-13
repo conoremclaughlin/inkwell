@@ -205,7 +205,7 @@ export default function ArtifactDetailPage() {
     () => new Map(identityOptions.map((identity) => [identity.id, identity.name] as const)),
     [identityOptions]
   );
-  const identityIdByAgentId = useMemo(
+  const sbIdByAgentId = useMemo(
     () =>
       new Map(
         (identitiesData?.individuals ?? []).map(
@@ -222,14 +222,12 @@ export default function ArtifactDetailPage() {
         (artifact.editors || [])
           .map((value) => value.trim())
           .filter((value) => value.length > 0)
-          .map((value) =>
-            identityNameById.get(value) ? value : identityIdByAgentId.get(value) || value
-          )
+          .map((value) => (identityNameById.get(value) ? value : sbIdByAgentId.get(value) || value))
       )
     );
     setPermissionEditMode(artifact.editMode || 'workspace');
     setPermissionEditorIdentityIds(normalizedEditorIds);
-  }, [artifact, identityNameById, identityIdByAgentId]);
+  }, [artifact, identityNameById, sbIdByAgentId]);
 
   useEffect(() => {
     if (!permissionSuccess) return;
@@ -470,12 +468,12 @@ export default function ArtifactDetailPage() {
             <span>
               Editors:{' '}
               {artifact.editors
-                .map((identityId) => {
-                  const identityName = identityNameById.get(identityId);
+                .map((sbId) => {
+                  const identityName = identityNameById.get(sbId);
                   if (identityName) return identityName;
-                  const remappedId = identityIdByAgentId.get(identityId);
+                  const remappedId = sbIdByAgentId.get(sbId);
                   const remappedIdentityName = remappedId ? identityNameById.get(remappedId) : null;
-                  return remappedIdentityName || identityId;
+                  return remappedIdentityName || sbId;
                 })
                 .join(', ')}
             </span>

@@ -16,7 +16,7 @@ import { logger } from '../../utils/logger';
 
 export interface MentionResolvedAgent {
   agentId: string;
-  identityId: string;
+  sbId: string;
 }
 
 /**
@@ -60,18 +60,18 @@ export async function resolveAgentFromMention(
     if (mentionedLower.includes(agentIdLower)) {
       logger.debug('[Mention] Matched by mentioned username → agent_id', {
         agentId: identity.agent_id,
-        identityId: identity.id,
+        sbId: identity.id,
       });
-      return { agentId: identity.agent_id, identityId: identity.id };
+      return { agentId: identity.agent_id, sbId: identity.id };
     }
 
     if (nameLower && mentionedLower.includes(nameLower)) {
       logger.debug('[Mention] Matched by mentioned username → name', {
         agentId: identity.agent_id,
         name: identity.name,
-        identityId: identity.id,
+        sbId: identity.id,
       });
-      return { agentId: identity.agent_id, identityId: identity.id };
+      return { agentId: identity.agent_id, sbId: identity.id };
     }
   }
 
@@ -85,9 +85,9 @@ export async function resolveAgentFromMention(
     if (new RegExp(`\\b${escapeRegex(agentId)}\\b`, 'i').test(textLower)) {
       logger.debug('[Mention] Matched by text mention → agent_id', {
         agentId: identity.agent_id,
-        identityId: identity.id,
+        sbId: identity.id,
       });
-      return { agentId: identity.agent_id, identityId: identity.id };
+      return { agentId: identity.agent_id, sbId: identity.id };
     }
 
     // Match identity name as word boundary
@@ -95,9 +95,9 @@ export async function resolveAgentFromMention(
       logger.debug('[Mention] Matched by text mention → name', {
         agentId: identity.agent_id,
         name,
-        identityId: identity.id,
+        sbId: identity.id,
       });
-      return { agentId: identity.agent_id, identityId: identity.id };
+      return { agentId: identity.agent_id, sbId: identity.id };
     }
   }
 

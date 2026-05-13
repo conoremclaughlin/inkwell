@@ -50,7 +50,7 @@ export interface Session {
   id: string;
   userId: string;
   agentId: string;
-  identityId?: string;
+  sbId?: string;
   /** Studio/worktree scope for this session */
   studioId?: string;
   /** Contact scope for per-sender session isolation */
@@ -93,6 +93,12 @@ export interface Session {
   // Thread key for topic-scoped session matching (e.g., "pr:43")
   threadKey?: string;
 
+  // Human-readable alias for explicit routing (e.g., "main", "review")
+  alias?: string;
+
+  // Whether a CLI process with a channel plugin is attached to this session
+  cliAttached?: boolean;
+
   // Flexible metadata
   metadata: Record<string, unknown>;
 }
@@ -130,6 +136,8 @@ export interface SessionRequest {
     contactId?: string;
     // Recipient session to inherit studio scope from
     recipientSessionId?: string;
+    // Target a session by alias (e.g., "main", "review")
+    sessionAlias?: string;
     // For task sessions
     sessionType?: SessionType;
     taskDescription?: string;
@@ -138,6 +146,8 @@ export interface SessionRequest {
     repoRoot?: string;
     // Task group ID for strategy lifecycle correlation
     taskGroupId?: string;
+    // Docker container name for sandboxed strategy execution
+    sandboxContainerName?: string;
   };
 }
 
@@ -431,6 +441,13 @@ export interface ClaudeRunnerConfig {
   permissionOverlay?: {
     allow?: string[];
     deny?: string[];
+  };
+  /** Run the backend CLI inside a Docker container instead of on the host */
+  container?: {
+    containerName: string;
+    dockerBinary?: string;
+    /** Host-side directory for runner temp files; bind-mounted as /run/ink inside the container */
+    runtimeDir?: string;
   };
 }
 

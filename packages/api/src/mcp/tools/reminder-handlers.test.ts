@@ -4,7 +4,7 @@
  * Regression tests for:
  * - User-scoped identity resolution (cross-tenant safety)
  * - Unknown agentId handling in list_reminders
- * - Direct identityId validation
+ * - Direct sbId validation
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
@@ -66,9 +66,24 @@ function createChainableQueryBuilder(table: string) {
   const builder: Record<string, unknown> = {};
 
   const chainable = [
-    'select', 'insert', 'update', 'delete', 'upsert',
-    'neq', 'lte', 'gte', 'lt', 'gt', 'in', 'is',
-    'or', 'order', 'limit', 'range', 'ilike', 'like',
+    'select',
+    'insert',
+    'update',
+    'delete',
+    'upsert',
+    'neq',
+    'lte',
+    'gte',
+    'lt',
+    'gt',
+    'in',
+    'is',
+    'or',
+    'order',
+    'limit',
+    'range',
+    'ilike',
+    'like',
   ];
 
   for (const method of chainable) {
@@ -152,7 +167,7 @@ describe('Reminder Handlers', () => {
         id: 'rem-001',
         title: 'Test',
         description: null,
-        identity_id: MYRA_IDENTITY_ID,
+        sb_id: MYRA_IDENTITY_ID,
         delivery_channel: 'telegram',
         delivery_target: '123456789',
         cron_expression: null,
@@ -170,9 +185,7 @@ describe('Reminder Handlers', () => {
       );
 
       // Verify the agent_identities lookup included user_id scope
-      const identityEqs = eqCalls.filter(
-        (c) => c.table === 'agent_identities'
-      );
+      const identityEqs = eqCalls.filter((c) => c.table === 'agent_identities');
       expect(identityEqs).toContainEqual({
         table: 'agent_identities',
         column: 'user_id',
@@ -204,15 +217,15 @@ describe('Reminder Handlers', () => {
       expect(parsed.error).toContain('for this user');
     });
 
-    it('create_reminder: validates direct identityId belongs to user', async () => {
-      // identityId ownership check returns null (not owned)
+    it('create_reminder: validates direct sbId belongs to user', async () => {
+      // sbId ownership check returns null (not owned)
       setQueryResult('agent_identities', null);
 
       const result = await handleCreateReminder(
         {
           userId: TEST_USER_ID,
           title: 'Test reminder',
-          identityId: OTHER_IDENTITY_ID,
+          sbId: OTHER_IDENTITY_ID,
         },
         mockDataComposer
       );
@@ -222,9 +235,7 @@ describe('Reminder Handlers', () => {
       expect(parsed.error).toContain('does not belong to this user');
 
       // Verify lookup was scoped to user
-      const identityEqs = eqCalls.filter(
-        (c) => c.table === 'agent_identities'
-      );
+      const identityEqs = eqCalls.filter((c) => c.table === 'agent_identities');
       expect(identityEqs).toContainEqual({
         table: 'agent_identities',
         column: 'id',
@@ -237,15 +248,15 @@ describe('Reminder Handlers', () => {
       });
     });
 
-    it('create_reminder: accepts valid direct identityId owned by user', async () => {
-      // identityId ownership check passes
+    it('create_reminder: accepts valid direct sbId owned by user', async () => {
+      // sbId ownership check passes
       setQueryResult('agent_identities', { id: MYRA_IDENTITY_ID });
       // Insert succeeds
       setQueryResult('scheduled_reminders', {
         id: 'rem-001',
         title: 'Test',
         description: null,
-        identity_id: MYRA_IDENTITY_ID,
+        sb_id: MYRA_IDENTITY_ID,
         delivery_channel: 'telegram',
         delivery_target: '123456789',
         cron_expression: null,
@@ -257,7 +268,7 @@ describe('Reminder Handlers', () => {
         {
           userId: TEST_USER_ID,
           title: 'Test reminder',
-          identityId: MYRA_IDENTITY_ID,
+          sbId: MYRA_IDENTITY_ID,
         },
         mockDataComposer
       );
@@ -281,9 +292,7 @@ describe('Reminder Handlers', () => {
       );
 
       // Verify the agent_identities lookup included user_id scope
-      const identityEqs = eqCalls.filter(
-        (c) => c.table === 'agent_identities'
-      );
+      const identityEqs = eqCalls.filter((c) => c.table === 'agent_identities');
       expect(identityEqs).toContainEqual({
         table: 'agent_identities',
         column: 'user_id',
@@ -305,7 +314,7 @@ describe('Reminder Handlers', () => {
       setQueryResult('scheduled_reminders', {
         id: 'rem-001',
         title: 'Existing',
-        identity_id: MYRA_IDENTITY_ID,
+        sb_id: MYRA_IDENTITY_ID,
         cron_expression: null,
         next_run_at: new Date().toISOString(),
         status: 'active',
@@ -321,9 +330,7 @@ describe('Reminder Handlers', () => {
       );
 
       // Verify the agent_identities lookup included user_id scope
-      const identityEqs = eqCalls.filter(
-        (c) => c.table === 'agent_identities'
-      );
+      const identityEqs = eqCalls.filter((c) => c.table === 'agent_identities');
       expect(identityEqs).toContainEqual({
         table: 'agent_identities',
         column: 'user_id',

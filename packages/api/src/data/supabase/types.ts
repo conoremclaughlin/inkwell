@@ -63,13 +63,13 @@ export type Database = {
           created_at: string;
           duration_ms: number | null;
           id: string;
-          identity_id: string | null;
           is_dm: boolean | null;
           parent_id: string | null;
           payload: Json;
           platform: string | null;
           platform_chat_id: string | null;
           platform_message_id: string | null;
+          sb_id: string | null;
           session_id: string | null;
           status: string | null;
           subtype: string | null;
@@ -88,13 +88,13 @@ export type Database = {
           created_at?: string;
           duration_ms?: number | null;
           id?: string;
-          identity_id?: string | null;
           is_dm?: boolean | null;
           parent_id?: string | null;
           payload?: Json;
           platform?: string | null;
           platform_chat_id?: string | null;
           platform_message_id?: string | null;
+          sb_id?: string | null;
           session_id?: string | null;
           status?: string | null;
           subtype?: string | null;
@@ -113,13 +113,13 @@ export type Database = {
           created_at?: string;
           duration_ms?: number | null;
           id?: string;
-          identity_id?: string | null;
           is_dm?: boolean | null;
           parent_id?: string | null;
           payload?: Json;
           platform?: string | null;
           platform_chat_id?: string | null;
           platform_message_id?: string | null;
+          sb_id?: string | null;
           session_id?: string | null;
           status?: string | null;
           subtype?: string | null;
@@ -135,15 +135,15 @@ export type Database = {
             referencedColumns: ['id'];
           },
           {
-            foreignKeyName: 'activity_stream_identity_id_fkey';
-            columns: ['identity_id'];
-            referencedRelation: 'agent_identities';
-            referencedColumns: ['id'];
-          },
-          {
             foreignKeyName: 'activity_stream_parent_id_fkey';
             columns: ['parent_id'];
             referencedRelation: 'activity_stream';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'activity_stream_sb_id_fkey';
+            columns: ['sb_id'];
+            referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
           {
@@ -172,6 +172,7 @@ export type Database = {
           backend: string | null;
           capabilities: Json | null;
           created_at: string | null;
+          default_session_id: string | null;
           description: string | null;
           heartbeat: string | null;
           id: string;
@@ -195,6 +196,7 @@ export type Database = {
           backend?: string | null;
           capabilities?: Json | null;
           created_at?: string | null;
+          default_session_id?: string | null;
           description?: string | null;
           heartbeat?: string | null;
           id?: string;
@@ -218,6 +220,7 @@ export type Database = {
           backend?: string | null;
           capabilities?: Json | null;
           created_at?: string | null;
+          default_session_id?: string | null;
           description?: string | null;
           heartbeat?: string | null;
           id?: string;
@@ -237,6 +240,12 @@ export type Database = {
           workspace_id?: string | null;
         };
         Relationships: [
+          {
+            foreignKeyName: 'agent_identities_default_session_id_fkey';
+            columns: ['default_session_id'];
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
           {
             foreignKeyName: 'agent_identities_user_id_fkey';
             columns: ['user_id'];
@@ -262,12 +271,12 @@ export type Database = {
           description: string | null;
           heartbeat: string | null;
           id: string;
-          identity_id: string;
           metadata: Json | null;
           name: string;
           permissions: Json;
           relationships: Json | null;
           role: string;
+          sb_id: string;
           soul: string | null;
           user_id: string;
           values: Json | null;
@@ -284,12 +293,12 @@ export type Database = {
           description?: string | null;
           heartbeat?: string | null;
           id?: string;
-          identity_id: string;
           metadata?: Json | null;
           name: string;
           permissions?: Json;
           relationships?: Json | null;
           role: string;
+          sb_id: string;
           soul?: string | null;
           user_id: string;
           values?: Json | null;
@@ -306,12 +315,12 @@ export type Database = {
           description?: string | null;
           heartbeat?: string | null;
           id?: string;
-          identity_id?: string;
           metadata?: Json | null;
           name?: string;
           permissions?: Json;
           relationships?: Json | null;
           role?: string;
+          sb_id?: string;
           soul?: string | null;
           user_id?: string;
           values?: Json | null;
@@ -345,12 +354,12 @@ export type Database = {
           priority: string;
           read_at: string | null;
           recipient_agent_id: string;
-          recipient_identity_id: string | null;
+          recipient_sb_id: string | null;
           recipient_session_id: string | null;
           recipient_user_id: string;
           related_artifact_uri: string | null;
           sender_agent_id: string | null;
-          sender_identity_id: string | null;
+          sender_sb_id: string | null;
           sender_user_id: string | null;
           status: string;
           subject: string | null;
@@ -367,12 +376,12 @@ export type Database = {
           priority?: string;
           read_at?: string | null;
           recipient_agent_id: string;
-          recipient_identity_id?: string | null;
+          recipient_sb_id?: string | null;
           recipient_session_id?: string | null;
           recipient_user_id: string;
           related_artifact_uri?: string | null;
           sender_agent_id?: string | null;
-          sender_identity_id?: string | null;
+          sender_sb_id?: string | null;
           sender_user_id?: string | null;
           status?: string;
           subject?: string | null;
@@ -389,12 +398,12 @@ export type Database = {
           priority?: string;
           read_at?: string | null;
           recipient_agent_id?: string;
-          recipient_identity_id?: string | null;
+          recipient_sb_id?: string | null;
           recipient_session_id?: string | null;
           recipient_user_id?: string;
           related_artifact_uri?: string | null;
           sender_agent_id?: string | null;
-          sender_identity_id?: string | null;
+          sender_sb_id?: string | null;
           sender_user_id?: string | null;
           status?: string;
           subject?: string | null;
@@ -402,8 +411,8 @@ export type Database = {
         };
         Relationships: [
           {
-            foreignKeyName: 'agent_inbox_recipient_identity_id_fkey';
-            columns: ['recipient_identity_id'];
+            foreignKeyName: 'agent_inbox_recipient_sb_id_fkey';
+            columns: ['recipient_sb_id'];
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
@@ -420,8 +429,8 @@ export type Database = {
             referencedColumns: ['id'];
           },
           {
-            foreignKeyName: 'agent_inbox_sender_identity_id_fkey';
-            columns: ['sender_identity_id'];
+            foreignKeyName: 'agent_inbox_sender_sb_id_fkey';
+            columns: ['sender_sb_id'];
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
@@ -615,7 +624,7 @@ export type Database = {
           artifact_id: string;
           content: string;
           created_at: string | null;
-          created_by_identity_id: string | null;
+          created_by_sb_id: string | null;
           created_by_user_id: string | null;
           deleted_at: string | null;
           id: string;
@@ -629,7 +638,7 @@ export type Database = {
           artifact_id: string;
           content: string;
           created_at?: string | null;
-          created_by_identity_id?: string | null;
+          created_by_sb_id?: string | null;
           created_by_user_id?: string | null;
           deleted_at?: string | null;
           id?: string;
@@ -643,7 +652,7 @@ export type Database = {
           artifact_id?: string;
           content?: string;
           created_at?: string | null;
-          created_by_identity_id?: string | null;
+          created_by_sb_id?: string | null;
           created_by_user_id?: string | null;
           deleted_at?: string | null;
           id?: string;
@@ -661,8 +670,8 @@ export type Database = {
             referencedColumns: ['id'];
           },
           {
-            foreignKeyName: 'artifact_comments_created_by_identity_id_fkey';
-            columns: ['created_by_identity_id'];
+            foreignKeyName: 'artifact_comments_created_by_sb_id_fkey';
+            columns: ['created_by_sb_id'];
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
@@ -697,7 +706,7 @@ export type Database = {
           artifact_id: string;
           change_summary: string | null;
           change_type: string | null;
-          changed_by_identity_id: string | null;
+          changed_by_sb_id: string | null;
           changed_by_user_id: string | null;
           content: string;
           created_at: string | null;
@@ -710,7 +719,7 @@ export type Database = {
           artifact_id: string;
           change_summary?: string | null;
           change_type?: string | null;
-          changed_by_identity_id?: string | null;
+          changed_by_sb_id?: string | null;
           changed_by_user_id?: string | null;
           content: string;
           created_at?: string | null;
@@ -723,7 +732,7 @@ export type Database = {
           artifact_id?: string;
           change_summary?: string | null;
           change_type?: string | null;
-          changed_by_identity_id?: string | null;
+          changed_by_sb_id?: string | null;
           changed_by_user_id?: string | null;
           content?: string;
           created_at?: string | null;
@@ -740,8 +749,8 @@ export type Database = {
             referencedColumns: ['id'];
           },
           {
-            foreignKeyName: 'artifact_history_changed_by_identity_id_fkey';
-            columns: ['changed_by_identity_id'];
+            foreignKeyName: 'artifact_history_changed_by_sb_id_fkey';
+            columns: ['changed_by_sb_id'];
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
@@ -766,8 +775,9 @@ export type Database = {
           content: string;
           content_type: string | null;
           created_at: string | null;
-          created_by_identity_id: string | null;
+          created_by_sb_id: string | null;
           edit_mode: string;
+          embedding: string | null;
           id: string;
           metadata: Json | null;
           tags: string[] | null;
@@ -785,8 +795,9 @@ export type Database = {
           content: string;
           content_type?: string | null;
           created_at?: string | null;
-          created_by_identity_id?: string | null;
+          created_by_sb_id?: string | null;
           edit_mode?: string;
+          embedding?: string | null;
           id?: string;
           metadata?: Json | null;
           tags?: string[] | null;
@@ -804,8 +815,9 @@ export type Database = {
           content?: string;
           content_type?: string | null;
           created_at?: string | null;
-          created_by_identity_id?: string | null;
+          created_by_sb_id?: string | null;
           edit_mode?: string;
+          embedding?: string | null;
           id?: string;
           metadata?: Json | null;
           tags?: string[] | null;
@@ -819,8 +831,8 @@ export type Database = {
         };
         Relationships: [
           {
-            foreignKeyName: 'artifacts_created_by_identity_id_fkey';
-            columns: ['created_by_identity_id'];
+            foreignKeyName: 'artifacts_created_by_sb_id_fkey';
+            columns: ['created_by_sb_id'];
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
@@ -966,11 +978,11 @@ export type Database = {
           chat_id: string | null;
           created_at: string;
           id: string;
-          identity_id: string;
           is_active: boolean;
           metadata: Json;
           platform: string;
           platform_account_id: string | null;
+          sb_id: string;
           studio_hint: string | null;
           updated_at: string;
           user_id: string;
@@ -980,11 +992,11 @@ export type Database = {
           chat_id?: string | null;
           created_at?: string;
           id?: string;
-          identity_id: string;
           is_active?: boolean;
           metadata?: Json;
           platform: string;
           platform_account_id?: string | null;
+          sb_id: string;
           studio_hint?: string | null;
           updated_at?: string;
           user_id: string;
@@ -994,11 +1006,11 @@ export type Database = {
           chat_id?: string | null;
           created_at?: string;
           id?: string;
-          identity_id?: string;
           is_active?: boolean;
           metadata?: Json;
           platform?: string;
           platform_account_id?: string | null;
+          sb_id?: string;
           studio_hint?: string | null;
           updated_at?: string;
           user_id?: string;
@@ -1011,8 +1023,8 @@ export type Database = {
             referencedColumns: ['id'];
           },
           {
-            foreignKeyName: 'channel_routes_identity_id_fkey';
-            columns: ['identity_id'];
+            foreignKeyName: 'channel_routes_sb_id_fkey';
+            columns: ['sb_id'];
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
@@ -1644,9 +1656,9 @@ export type Database = {
           created_at: string | null;
           expires_at: string;
           id: string;
-          identity_id: string | null;
           last_used_at: string | null;
           refresh_token: string;
+          sb_id: string | null;
           scopes: string[] | null;
           supabase_refresh_token: string | null;
           updated_at: string | null;
@@ -1658,9 +1670,9 @@ export type Database = {
           created_at?: string | null;
           expires_at: string;
           id?: string;
-          identity_id?: string | null;
           last_used_at?: string | null;
           refresh_token: string;
+          sb_id?: string | null;
           scopes?: string[] | null;
           supabase_refresh_token?: string | null;
           updated_at?: string | null;
@@ -1672,9 +1684,9 @@ export type Database = {
           created_at?: string | null;
           expires_at?: string;
           id?: string;
-          identity_id?: string | null;
           last_used_at?: string | null;
           refresh_token?: string;
+          sb_id?: string | null;
           scopes?: string[] | null;
           supabase_refresh_token?: string | null;
           updated_at?: string | null;
@@ -1682,8 +1694,8 @@ export type Database = {
         };
         Relationships: [
           {
-            foreignKeyName: 'mcp_tokens_identity_id_fkey';
-            columns: ['identity_id'];
+            foreignKeyName: 'mcp_tokens_sb_id_fkey';
+            columns: ['sb_id'];
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
@@ -1706,9 +1718,9 @@ export type Database = {
           embedding_chunks_version: number | null;
           expires_at: string | null;
           id: string;
-          identity_id: string | null;
           metadata: Json | null;
           salience: string;
+          sb_id: string | null;
           source: string;
           summary: string | null;
           topic_key: string | null;
@@ -1726,9 +1738,9 @@ export type Database = {
           embedding_chunks_version?: number | null;
           expires_at?: string | null;
           id?: string;
-          identity_id?: string | null;
           metadata?: Json | null;
           salience?: string;
+          sb_id?: string | null;
           source?: string;
           summary?: string | null;
           topic_key?: string | null;
@@ -1746,9 +1758,9 @@ export type Database = {
           embedding_chunks_version?: number | null;
           expires_at?: string | null;
           id?: string;
-          identity_id?: string | null;
           metadata?: Json | null;
           salience?: string;
+          sb_id?: string | null;
           source?: string;
           summary?: string | null;
           topic_key?: string | null;
@@ -1764,8 +1776,8 @@ export type Database = {
             referencedColumns: ['id'];
           },
           {
-            foreignKeyName: 'memories_identity_id_fkey';
-            columns: ['identity_id'];
+            foreignKeyName: 'memories_sb_id_fkey';
+            columns: ['sb_id'];
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
@@ -2488,12 +2500,12 @@ export type Database = {
           delivery_target: string | null;
           description: string | null;
           id: string;
-          identity_id: string | null;
           last_run_at: string | null;
           max_runs: number | null;
           metadata: Json | null;
           next_run_at: string;
           run_count: number | null;
+          sb_id: string | null;
           status: string;
           studio_hint: string | null;
           title: string;
@@ -2507,12 +2519,12 @@ export type Database = {
           delivery_target?: string | null;
           description?: string | null;
           id?: string;
-          identity_id?: string | null;
           last_run_at?: string | null;
           max_runs?: number | null;
           metadata?: Json | null;
           next_run_at: string;
           run_count?: number | null;
+          sb_id?: string | null;
           status?: string;
           studio_hint?: string | null;
           title: string;
@@ -2526,12 +2538,12 @@ export type Database = {
           delivery_target?: string | null;
           description?: string | null;
           id?: string;
-          identity_id?: string | null;
           last_run_at?: string | null;
           max_runs?: number | null;
           metadata?: Json | null;
           next_run_at?: string;
           run_count?: number | null;
+          sb_id?: string | null;
           status?: string;
           studio_hint?: string | null;
           title?: string;
@@ -2540,8 +2552,8 @@ export type Database = {
         };
         Relationships: [
           {
-            foreignKeyName: 'scheduled_reminders_identity_id_fkey';
-            columns: ['identity_id'];
+            foreignKeyName: 'scheduled_reminders_sb_id_fkey';
+            columns: ['sb_id'];
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
@@ -2703,21 +2715,23 @@ export type Database = {
       sessions: {
         Row: {
           agent_id: string | null;
+          alias: string | null;
           backend: string | null;
           backend_session_id: string | null;
           claude_session_id: string | null;
           cli_attached: boolean | null;
+          cli_poll_at: string | null;
           compacting_since: string | null;
           contact_id: string | null;
           context: string | null;
           current_phase: string | null;
           ended_at: string | null;
           id: string;
-          identity_id: string | null;
           lifecycle: string | null;
           message_count: number | null;
           metadata: Json | null;
           model: string | null;
+          sb_id: string | null;
           started_at: string | null;
           status: string | null;
           studio_id: string | null;
@@ -2730,21 +2744,23 @@ export type Database = {
         };
         Insert: {
           agent_id?: string | null;
+          alias?: string | null;
           backend?: string | null;
           backend_session_id?: string | null;
           claude_session_id?: string | null;
           cli_attached?: boolean | null;
+          cli_poll_at?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
           context?: string | null;
           current_phase?: string | null;
           ended_at?: string | null;
           id?: string;
-          identity_id?: string | null;
           lifecycle?: string | null;
           message_count?: number | null;
           metadata?: Json | null;
           model?: string | null;
+          sb_id?: string | null;
           started_at?: string | null;
           status?: string | null;
           studio_id?: string | null;
@@ -2757,21 +2773,23 @@ export type Database = {
         };
         Update: {
           agent_id?: string | null;
+          alias?: string | null;
           backend?: string | null;
           backend_session_id?: string | null;
           claude_session_id?: string | null;
           cli_attached?: boolean | null;
+          cli_poll_at?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
           context?: string | null;
           current_phase?: string | null;
           ended_at?: string | null;
           id?: string;
-          identity_id?: string | null;
           lifecycle?: string | null;
           message_count?: number | null;
           metadata?: Json | null;
           model?: string | null;
+          sb_id?: string | null;
           started_at?: string | null;
           status?: string | null;
           studio_id?: string | null;
@@ -2790,8 +2808,8 @@ export type Database = {
             referencedColumns: ['id'];
           },
           {
-            foreignKeyName: 'sessions_identity_id_fkey';
-            columns: ['identity_id'];
+            foreignKeyName: 'sessions_sb_id_fkey';
+            columns: ['sb_id'];
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
@@ -3031,7 +3049,6 @@ export type Database = {
           cleaned_at: string | null;
           created_at: string | null;
           id: string;
-          identity_id: string | null;
           metadata: Json | null;
           permissions: Json;
           purpose: string | null;
@@ -3039,6 +3056,7 @@ export type Database = {
           role_template: string | null;
           route_patterns: string[] | null;
           sandbox_bypass: boolean | null;
+          sb_id: string | null;
           session_id: string | null;
           slug: string | null;
           status: string;
@@ -3055,7 +3073,6 @@ export type Database = {
           cleaned_at?: string | null;
           created_at?: string | null;
           id?: string;
-          identity_id?: string | null;
           metadata?: Json | null;
           permissions?: Json;
           purpose?: string | null;
@@ -3063,6 +3080,7 @@ export type Database = {
           role_template?: string | null;
           route_patterns?: string[] | null;
           sandbox_bypass?: boolean | null;
+          sb_id?: string | null;
           session_id?: string | null;
           slug?: string | null;
           status?: string;
@@ -3079,7 +3097,6 @@ export type Database = {
           cleaned_at?: string | null;
           created_at?: string | null;
           id?: string;
-          identity_id?: string | null;
           metadata?: Json | null;
           permissions?: Json;
           purpose?: string | null;
@@ -3087,6 +3104,7 @@ export type Database = {
           role_template?: string | null;
           route_patterns?: string[] | null;
           sandbox_bypass?: boolean | null;
+          sb_id?: string | null;
           session_id?: string | null;
           slug?: string | null;
           status?: string;
@@ -3097,8 +3115,8 @@ export type Database = {
         };
         Relationships: [
           {
-            foreignKeyName: 'studios_identity_id_fkey';
-            columns: ['identity_id'];
+            foreignKeyName: 'studios_sb_id_fkey';
+            columns: ['sb_id'];
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
@@ -3121,7 +3139,7 @@ export type Database = {
           content: string;
           created_at: string | null;
           created_by_agent_id: string | null;
-          created_by_identity_id: string | null;
+          created_by_sb_id: string | null;
           deleted_at: string | null;
           id: string;
           metadata: Json | null;
@@ -3135,7 +3153,7 @@ export type Database = {
           content: string;
           created_at?: string | null;
           created_by_agent_id?: string | null;
-          created_by_identity_id?: string | null;
+          created_by_sb_id?: string | null;
           deleted_at?: string | null;
           id?: string;
           metadata?: Json | null;
@@ -3149,7 +3167,7 @@ export type Database = {
           content?: string;
           created_at?: string | null;
           created_by_agent_id?: string | null;
-          created_by_identity_id?: string | null;
+          created_by_sb_id?: string | null;
           deleted_at?: string | null;
           id?: string;
           metadata?: Json | null;
@@ -3161,8 +3179,8 @@ export type Database = {
         };
         Relationships: [
           {
-            foreignKeyName: 'task_comments_created_by_identity_id_fkey';
-            columns: ['created_by_identity_id'];
+            foreignKeyName: 'task_comments_created_by_sb_id_fkey';
+            columns: ['created_by_sb_id'];
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
@@ -3198,7 +3216,7 @@ export type Database = {
           comment_type: string;
           content: string;
           created_at: string;
-          created_by_identity_id: string | null;
+          created_by_sb_id: string | null;
           deleted_at: string | null;
           id: string;
           metadata: Json;
@@ -3211,7 +3229,7 @@ export type Database = {
           comment_type?: string;
           content: string;
           created_at?: string;
-          created_by_identity_id?: string | null;
+          created_by_sb_id?: string | null;
           deleted_at?: string | null;
           id?: string;
           metadata?: Json;
@@ -3224,7 +3242,7 @@ export type Database = {
           comment_type?: string;
           content?: string;
           created_at?: string;
-          created_by_identity_id?: string | null;
+          created_by_sb_id?: string | null;
           deleted_at?: string | null;
           id?: string;
           metadata?: Json;
@@ -3234,8 +3252,8 @@ export type Database = {
         };
         Relationships: [
           {
-            foreignKeyName: 'task_group_comments_created_by_identity_id_fkey';
-            columns: ['created_by_identity_id'];
+            foreignKeyName: 'task_group_comments_created_by_sb_id_fkey';
+            columns: ['created_by_sb_id'];
             referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
@@ -3261,9 +3279,8 @@ export type Database = {
           created_at: string;
           current_task_index: number;
           description: string | null;
-          group_number: number;
+          group_number: number | null;
           id: string;
-          identity_id: string | null;
           instructions: string | null;
           iterations_since_approval: number;
           max_sessions: number | null;
@@ -3272,10 +3289,10 @@ export type Database = {
           outcome: string | null;
           output_status: string | null;
           output_target: string | null;
-          owner_agent_id: string | null;
           plan_uri: string | null;
           priority: string;
           project_id: string | null;
+          sb_id: string | null;
           sessions_used: number;
           slug: string | null;
           status: string;
@@ -3297,9 +3314,8 @@ export type Database = {
           created_at?: string;
           current_task_index?: number;
           description?: string | null;
-          group_number: number;
+          group_number?: number | null;
           id?: string;
-          identity_id?: string | null;
           instructions?: string | null;
           iterations_since_approval?: number;
           max_sessions?: number | null;
@@ -3308,10 +3324,10 @@ export type Database = {
           outcome?: string | null;
           output_status?: string | null;
           output_target?: string | null;
-          owner_agent_id?: string | null;
           plan_uri?: string | null;
           priority?: string;
           project_id?: string | null;
+          sb_id?: string | null;
           sessions_used?: number;
           slug?: string | null;
           status?: string;
@@ -3333,10 +3349,8 @@ export type Database = {
           created_at?: string;
           current_task_index?: number;
           description?: string | null;
-          group_number?: number;
-
+          group_number?: number | null;
           id?: string;
-          identity_id?: string | null;
           instructions?: string | null;
           iterations_since_approval?: number;
           max_sessions?: number | null;
@@ -3345,10 +3359,10 @@ export type Database = {
           outcome?: string | null;
           output_status?: string | null;
           output_target?: string | null;
-          owner_agent_id?: string | null;
           plan_uri?: string | null;
           priority?: string;
           project_id?: string | null;
+          sb_id?: string | null;
           sessions_used?: number;
           slug?: string | null;
           status?: string;
@@ -3365,15 +3379,15 @@ export type Database = {
         };
         Relationships: [
           {
-            foreignKeyName: 'task_groups_identity_id_fkey';
-            columns: ['identity_id'];
-            referencedRelation: 'agent_identities';
-            referencedColumns: ['id'];
-          },
-          {
             foreignKeyName: 'task_groups_project_id_fkey';
             columns: ['project_id'];
             referencedRelation: 'projects';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_groups_sb_id_fkey';
+            columns: ['sb_id'];
+            referencedRelation: 'agent_identities';
             referencedColumns: ['id'];
           },
           {
@@ -3828,6 +3842,38 @@ export type Database = {
       [_ in never]: never;
     };
     Functions: {
+      match_artifacts: {
+        Args: {
+          match_count?: number;
+          match_threshold?: number;
+          p_artifact_type?: string;
+          p_tags?: string[];
+          p_user_id?: string;
+          p_visibility?: string;
+          p_workspace_id?: string;
+          query_embedding: string;
+        };
+        Returns: {
+          artifact_type: string;
+          collaborators: string[];
+          content: string;
+          content_type: string;
+          created_at: string;
+          created_by_sb_id: string;
+          edit_mode: string;
+          id: string;
+          metadata: Json;
+          similarity: number;
+          tags: string[];
+          title: string;
+          updated_at: string;
+          uri: string;
+          user_id: string;
+          version: number;
+          visibility: string;
+          workspace_id: string;
+        }[];
+      };
       match_links: {
         Args: {
           match_count?: number;
@@ -3864,9 +3910,9 @@ export type Database = {
           embedding: string;
           expires_at: string;
           id: string;
-          identity_id: string;
           metadata: Json;
           salience: string;
+          sb_id: string;
           similarity: number;
           source: string;
           summary: string;
@@ -3897,12 +3943,12 @@ export type Database = {
           embedding: string;
           expires_at: string;
           id: string;
-          identity_id: string;
           matched_chunk_index: number;
           matched_chunk_text: string;
           matched_chunk_type: string;
           metadata: Json;
           salience: string;
+          sb_id: string;
           similarity: number;
           source: string;
           summary: string;

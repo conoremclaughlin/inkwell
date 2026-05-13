@@ -166,7 +166,6 @@ export const DEFAULT_SAFE_PCP_TOOLS = new Set<string>([
   'get_workspace',
   'get_studio',
   'get_timezone',
-  'get_focus',
 ]);
 
 export const TOOL_GROUPS: ToolGroupMap = {
@@ -175,7 +174,7 @@ export const TOOL_GROUPS: ToolGroupMap = {
   'group:ink-memory': ['remember', 'recall', 'forget', 'update_memory', 'restore_memory'],
   'group:ink-session': [
     'start_session',
-    'update_session_phase',
+    'update_session_state',
     'get_session',
     'list_sessions',
     'end_session',

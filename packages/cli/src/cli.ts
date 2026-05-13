@@ -27,7 +27,7 @@ import { registerAwakenCommand } from './commands/awaken.js';
 import { registerHooksCommands } from './commands/hooks.js';
 import { registerInitCommand } from './commands/init.js';
 import { registerAuthCommands } from './commands/auth.js';
-import { registerChatCommand } from './commands/chat.js';
+import { registerChatCommand, runChat } from './commands/chat.js';
 import { registerDoctorCommand } from './commands/doctor.js';
 import { registerMissionCommand } from './commands/mission.js';
 import { registerStatusCommand } from './commands/status.js';
@@ -193,7 +193,7 @@ program
   .allowUnknownOption(true)
   .allowExcessArguments(true)
   .option('-a, --agent <id>', 'Agent identity to use')
-  .option('-b, --backend <name>', 'AI backend (claude, codex, gemini)', 'claude')
+  .option('-b, --backend <name>', 'AI backend (claude, codex, gemini, ink)', 'claude')
   .option('-m, --model <model>', 'Model to use (defaults to backend-specific)')
   .option('--no-session', 'Disable session tracking')
   .option(
@@ -243,6 +243,19 @@ program
       promptParts,
       hasPrompt: Boolean(prompt),
     });
+
+    // -b ink redirects to the first-class Ink chat runtime
+    if (resolvedOptions.backend === 'ink') {
+      sbDebugLog('sb', 'ink_backend_redirect', { agent: resolvedOptions.agent });
+      await runChat({
+        agent: resolvedOptions.agent,
+        model: resolvedOptions.model,
+        message: prompt || undefined,
+        sbDebug: resolvedOptions.sbDebug || undefined,
+        verbose: resolvedOptions.verbose || undefined,
+      });
+      return;
+    }
 
     const isInteractiveSubcommand = isBackendInteractiveSubcommand(
       resolvedOptions.backend,

@@ -12,8 +12,6 @@ import {
   handleSaveProject,
   handleListProjects,
   handleGetProject,
-  handleSetFocus,
-  handleGetFocus,
 } from './context-handlers';
 
 import {
@@ -51,7 +49,7 @@ import {
   handleEndSession,
   handleGetSession,
   handleListSessions,
-  handleUpdateSessionPhase,
+  handleUpdateSessionState,
   handleGetMemoryHistory,
   handleGetUserHistory,
   handleRestoreMemory,
@@ -162,6 +160,7 @@ import {
   handleGetArtifactHistory,
   handleAddArtifactComment,
   handleListArtifactComments,
+  handleSearchArtifacts,
   artifactToolDefinitions,
 } from './artifact-handlers';
 
@@ -304,11 +303,13 @@ import {
   handleResumeStrategy,
   handleCancelStrategy,
   handleGetStrategyStatus,
+  handleUpdateStrategy,
   startStrategySchema,
   pauseStrategySchema,
   resumeStrategySchema,
   cancelStrategySchema,
   getStrategyStatusSchema,
+  updateStrategySchema,
 } from './strategy-handlers';
 
 import {
@@ -718,76 +719,6 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   // =====================================================
   // SESSION FOCUS TOOLS
   // =====================================================
-
-  // Register set_focus tool
-  server.registerTool(
-    'set_focus',
-    {
-      description: `Set the current focus/context for a session. Tracks what project and task we're working on.
-
-User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        sessionId: z.string().optional().describe('Session ID'),
-        projectName: z.string().optional().describe('Project name to focus on'),
-        projectId: z.string().uuid().optional().describe('Project UUID to focus on'),
-        focusSummary: z.string().optional().describe('What we are currently working on'),
-        contextSnapshot: z.record(z.unknown()).optional().describe('Context snapshot'),
-      },
-    },
-    async (args) => {
-      try {
-        return await handleSetFocus(args, dataComposer);
-      } catch (error) {
-        logger.error('Error in set_focus:', error);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  // Register get_focus tool
-  server.registerTool(
-    'get_focus',
-    {
-      description: `Get the current focus/context for a session or the user's most recent focus.
-
-User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        sessionId: z.string().optional().describe('Specific session ID'),
-      },
-    },
-    async (args) => {
-      try {
-        return await handleGetFocus(args, dataComposer);
-      } catch (error) {
-        logger.error('Error in get_focus:', error);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-  );
 
   // =====================================================
   // PROJECT TASK TOOLS
@@ -1215,7 +1146,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'list_task_groups',
     {
-      description: `List task groups for a user with per-status task counts per group. Omit \`statuses\` (or pass an empty array) to include all statuses. Pass a multi-select array to narrow (e.g. statuses: ["active","paused"]). Also supports projectId, identityId, autonomousOnly, strategy, and ownerAgentId filters.
+      description: `List task groups for a user with per-status task counts per group. Omit \`statuses\` (or pass an empty array) to include all statuses. Pass a multi-select array to narrow (e.g. statuses: ["active","paused"]). Also supports projectId, sbId, autonomousOnly, and strategy filters.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: listTaskGroupsSchema.shape,
@@ -1385,6 +1316,37 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleGetStrategyStatus(args, dataComposer);
       } catch (error) {
         logger.error('Error in get_strategy_status:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'update_strategy',
+    {
+      description: `Modify strategy configuration on a running or paused strategy without tearing it down. Avoids cancel + start which loses session continuity.
+
+Mutable: checkInInterval, verificationGates, maxIterationsWithoutApproval, verificationMode, supervisorId, watchdogIntervalMinutes, contextSummaryInterval, approvalNotify, checkInNotify.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: updateStrategySchema.shape,
+    },
+    async (args) => {
+      try {
+        return await handleUpdateStrategy(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in update_strategy:', error);
         return {
           content: [
             {
@@ -2047,9 +2009,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     }
   );
 
-  // Register update_session_phase tool
+  // Register update_session_state tool
   server.registerTool(
-    'update_session_phase',
+    'update_session_state',
     {
       description: `Update your session state — work phase, status, backend session ID, context. This is the primary tool for managing session state.
 
@@ -2119,9 +2081,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     },
     async (args) => {
       try {
-        return await handleUpdateSessionPhase(args, dataComposer);
+        return await handleUpdateSessionState(args, dataComposer);
       } catch (error) {
-        logger.error('Error in update_session_phase:', error);
+        logger.error('Error in update_session_state:', error);
         return {
           content: [
             {
@@ -2255,7 +2217,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 Returns:
 - Identity Files: shared values/user/process docs and agent-specific identity docs from ~/.pcp
 - Identity Core: user profile, assistant role, relationship context from DB
-- Active Context: current projects, focus, project-specific context
+- Active Context: current projects, session context, project-specific context
 - Active Session: current session if any
 - Recent Memories: high-salience memories (filtered by agent if provided)
 
@@ -3878,6 +3840,35 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleListArtifactComments(args, dataComposer);
       } catch (error) {
         logger.error('Error in list_artifact_comments:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'search_artifacts',
+    {
+      description: `Search artifacts using text (keyword/trigram), semantic (embedding similarity), or hybrid (blended) modes. Returns matching artifacts with title, URI, snippet, relevance score, and metadata. Use mode "auto" (default) to automatically pick the best available mode.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getArtifactToolSchema('search_artifacts'),
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleSearchArtifacts(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in search_artifacts:', error);
         return {
           content: [
             {

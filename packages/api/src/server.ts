@@ -40,6 +40,7 @@ import {
   type DueReminder,
 } from './services/heartbeat';
 import { StrategyService } from './services/strategy.service';
+import { getOrchestrator } from './services/sandbox/index.js';
 import { setResponseCallback, hasExplicitResponse } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
 import { resolveRouteAgentId } from './services/routing/resolve-route';
@@ -49,6 +50,11 @@ import { classifyError } from '@inklabs/shared';
 import { logger } from './utils/logger';
 import { getUserFromContext } from './utils/request-context';
 import { env } from './config/env';
+import {
+  shouldSkipSpawn,
+  type SessionPollRow,
+  type SessionAttachedRow,
+} from './services/sessions/trigger-delivery';
 
 // Server configuration
 interface ServerConfig {
@@ -175,11 +181,11 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       );
       if (mentionMatch) {
         routedAgentId = mentionMatch.agentId;
-        routedIdentityId = mentionMatch.identityId;
+        routedIdentityId = mentionMatch.sbId;
         logger.debug(`[Route] Resolved agent from @mention`, {
           platform: channel,
           agentId: mentionMatch.agentId,
-          identityId: mentionMatch.identityId,
+          sbId: mentionMatch.sbId,
         });
       }
     }
@@ -197,13 +203,13 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       );
       if (route) {
         routedAgentId = route.agentId;
-        routedIdentityId = route.identityId;
+        routedIdentityId = route.sbId;
         routeStudioHint = route.studioHint;
         resolvedRouteId = route.routeId;
         logger.debug(`[Route] Resolved agent from channel_routes`, {
           platform: channel,
           agentId: route.agentId,
-          identityId: route.identityId,
+          sbId: route.sbId,
           routeId: route.routeId,
           studioHint: route.studioHint,
         });
@@ -466,7 +472,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         return false;
       }
       try {
-        const strategyService = new StrategyService(dataComposer);
+        const strategyService = new StrategyService(dataComposer, getOrchestrator());
         const fired = await strategyService.triggerWatchdog(groupId);
         if (fired) {
           logger.info(
@@ -483,18 +489,18 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       }
     }
 
-    // Resolve agent from reminder's identity_id, fall back to server default
+    // Resolve agent from reminder's sb_id, fall back to server default
     let reminderAgentId = agentId;
-    if (reminder.identity_id && dataComposer) {
+    if (reminder.sb_id && dataComposer) {
       const { data: identity } = await dataComposer
         .getClient()
         .from('agent_identities')
         .select('agent_id')
-        .eq('id', reminder.identity_id)
+        .eq('id', reminder.sb_id)
         .single();
       if (identity?.agent_id) {
         reminderAgentId = identity.agent_id;
-        logger.debug(`[Heartbeat] Resolved agent from identity_id: ${reminderAgentId}`);
+        logger.debug(`[Heartbeat] Resolved agent from sb_id: ${reminderAgentId}`);
       }
     }
 
@@ -545,18 +551,18 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     }
 
     // Fallback to agent identity's default studio
-    if (!reminderStudioHint && reminder.identity_id && dataComposer) {
+    if (!reminderStudioHint && reminder.sb_id && dataComposer) {
       const { data: identity } = await dataComposer
         .getClient()
         .from('agent_identities')
         .select('studio_hint')
-        .eq('id', reminder.identity_id)
+        .eq('id', reminder.sb_id)
         .single();
       if (identity?.studio_hint) {
         reminderStudioHint = identity.studio_hint;
         logger.debug(`[Heartbeat] Using agent default studio`, {
           studioHint: reminderStudioHint,
-          identityId: reminder.identity_id,
+          sbId: reminder.sb_id,
         });
       }
     }
@@ -653,7 +659,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     // trying to trigger another user's agent via a known inbox message ID — this
     // is blocked and logged as a security warning.
     let userId: string | undefined;
-    let recipientIdentityId: string | undefined;
+    let recipientSbId: string | undefined;
 
     const authUser = getUserFromContext();
     const authUserId = authUser?.userId;
@@ -662,7 +668,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       const { data: inboxMsg, error: inboxError } = await dataComposer!
         .getClient()
         .from('agent_inbox')
-        .select('recipient_user_id, recipient_identity_id')
+        .select('recipient_user_id, recipient_sb_id')
         .eq('id', payload.inboxMessageId)
         .single();
       if (inboxError) {
@@ -689,7 +695,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       }
 
       userId = inboxMsg?.recipient_user_id;
-      recipientIdentityId = inboxMsg?.recipient_identity_id || undefined;
+      recipientSbId = inboxMsg?.recipient_sb_id || undefined;
     } else if (payload.threadMessageId) {
       // Thread message: resolve user_id via inbox_thread_messages → inbox_threads
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -774,8 +780,8 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     }
 
     // 2. Resolve and verify target identity for this user
-    // Prefer recipient_identity_id from inbox; fallback to user+agent_id with disambiguation.
-    let resolvedIdentityId = recipientIdentityId;
+    // Prefer recipient_sb_id from inbox; fallback to user+agent_id with disambiguation.
+    let resolvedIdentityId = recipientSbId;
     let resolvedWorkspaceId: string | undefined;
     const metadataWorkspaceId =
       payload.metadata &&
@@ -795,13 +801,13 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
 
       if (!identityRow) {
         throw new Error(
-          `Inbox recipient_identity_id is invalid for this user (${targetAgentId}). Re-send inbox message.`
+          `Inbox recipient_sb_id is invalid for this user (${targetAgentId}). Re-send inbox message.`
         );
       }
 
       if (identityRow.agent_id !== targetAgentId) {
         throw new Error(
-          `Inbox recipient_identity_id targets "${identityRow.agent_id}", not "${targetAgentId}".`
+          `Inbox recipient_sb_id targets "${identityRow.agent_id}", not "${targetAgentId}".`
         );
       }
 
@@ -848,7 +854,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
           );
         } else {
           throw new Error(
-            `Ambiguous identity for agent "${targetAgentId}" (${identityRows.length} identities, ${workspaceScoped.length} workspace-scoped). Include inboxMessageId with recipient_identity_id or pass metadata.workspaceId.`
+            `Ambiguous identity for agent "${targetAgentId}" (${identityRows.length} identities, ${workspaceScoped.length} workspace-scoped). Include inboxMessageId with recipient_sb_id or pass metadata.workspaceId.`
           );
         }
       } else {
@@ -894,17 +900,23 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         studioId: payload.studioId,
         studioHint: payload.studioHint,
         recipientSessionId: payload.recipientSessionId,
+        sessionAlias: payload.sessionAlias,
         taskGroupId:
           payload.metadata && typeof payload.metadata.groupId === 'string'
             ? payload.metadata.groupId
             : undefined,
+        // Forward sandbox container name so the session service routes CLI execution into it
+        ...(payload.metadata?.sandboxContainerName &&
+        typeof payload.metadata.sandboxContainerName === 'string'
+          ? { sandboxContainerName: payload.metadata.sandboxContainerName }
+          : {}),
       },
     };
 
     logger.info('[Trigger] Resolved target identity', {
       userId,
       agentId: targetAgentId,
-      identityId: resolvedIdentityId,
+      sbId: resolvedIdentityId,
       workspaceId: resolvedWorkspaceId || null,
     });
 
@@ -917,6 +929,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     try {
       const routedSession = await sessionService!.getOrCreateSession(userId, targetAgentId, {
         threadKey: payload.threadKey,
+        alias: payload.sessionAlias,
         studioId: payload.studioId,
         studioHint: payload.studioHint,
         recipientSessionId: payload.recipientSessionId,
@@ -947,42 +960,50 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         }
       }
 
-      // Check cli_attached from the DB (not on the Session type yet)
-      const { data: sessionRow } = (await dataComposer!
-        .getClient()
+      // Check if the routed session has a CLI actively polling or attached.
+      // Only the routed session matters — a different session polling can't
+      // see threads stamped to this one (get_inbox channelPoll filters by session_id).
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: pollRow } = (await (dataComposer!.getClient() as any)
+        .from('sessions')
+        .select('id, cli_poll_at, studio_id')
+        .eq('id', routedSession.id)
+        .maybeSingle()) as { data: SessionPollRow | null };
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: attachedRow } = (await (dataComposer!.getClient() as any)
         .from('sessions')
         .select('cli_attached, updated_at')
         .eq('id', routedSession.id)
-        .single()) as { data: { cli_attached: boolean; updated_at: string } | null };
+        .maybeSingle()) as { data: SessionAttachedRow | null };
 
-      const CLI_STALE_MS = 10 * 60 * 1000;
-      const isCliAttached = sessionRow?.cli_attached === true;
-      const isCliStale =
-        isCliAttached &&
-        sessionRow?.updated_at &&
-        Date.now() - new Date(sessionRow.updated_at).getTime() > CLI_STALE_MS;
-
-      if (isCliStale) {
+      // Clear stale cli_attached flag as a side effect (before the skip decision)
+      if (
+        attachedRow?.cli_attached &&
+        attachedRow.updated_at &&
+        Date.now() - new Date(attachedRow.updated_at).getTime() > 10 * 60 * 1000
+      ) {
         logger.warn('[Trigger] CLI-attached session is stale, clearing flag', {
           sessionId: routedSession.id,
-          updatedAt: sessionRow?.updated_at,
+          updatedAt: attachedRow.updated_at,
         });
         await dataComposer!
           .getClient()
           .from('sessions')
           .update({ cli_attached: false } as never)
           .eq('id', routedSession.id);
+        attachedRow.cli_attached = false;
       }
 
-      if (isCliAttached && !isCliStale) {
-        // CLI-attached: don't spawn a new session. The inbox message is
-        // already in the DB (written by send_to_inbox before trigger fires).
-        // The channel plugin will pick it up on its next poll cycle.
+      const delivery = shouldSkipSpawn(pollRow, attachedRow);
+
+      if (delivery.skip) {
         logger.info(
-          '[Trigger] CLI-attached session — skipping spawn, channel plugin will deliver',
+          `[Trigger] CLI-attached (${delivery.source}) — skipping spawn, channel plugin will deliver`,
           {
             targetAgentId,
-            sessionId: routedSession.id,
+            attachedSessionId: delivery.sessionId || routedSession.id,
+            routedSessionId: routedSession.id,
             studioId: routedSession.studioId,
             threadKey: payload.threadKey,
           }

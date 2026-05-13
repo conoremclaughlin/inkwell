@@ -3,7 +3,7 @@
  *
  * Resolves an agent's canonical UUID from the agent_identities table
  * given a (user_id, agent_id) pair.  Used across all write paths
- * that store identity_id alongside the text agent_id slug.
+ * that store sb_id alongside the text agent_id slug.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -37,14 +37,41 @@ export async function resolveIdentityId(
     // Prefer workspace-scoped identities over legacy null workspace rows.
     const scoped = data.find((row) => row.workspace_id !== null);
     if (scoped) {
-      logger.warn('Resolved identity UUID from multiple candidates (preferred workspace-scoped row)', {
-        userId,
-        agentId,
-        chosenIdentityId: scoped.id,
-      });
+      logger.warn(
+        'Resolved identity UUID from multiple candidates (preferred workspace-scoped row)',
+        {
+          userId,
+          agentId,
+          chosenIdentityId: scoped.id,
+        }
+      );
       return scoped.id;
     }
   }
 
   return data[0]?.id ?? null;
+}
+
+/**
+ * Reverse lookup: resolve an agent slug from a canonical identity UUID.
+ */
+export async function resolveAgentSlug(
+  supabase: SupabaseClient<Database>,
+  sbId: string
+): Promise<string | null> {
+  const { data, error } = await supabase
+    .from('agent_identities')
+    .select('agent_id')
+    .eq('id', sbId)
+    .single();
+
+  if (error) {
+    logger.warn('Failed to resolve agent slug from identity UUID', {
+      sbId,
+      error: error.message,
+    });
+    return null;
+  }
+
+  return (data as { agent_id: string } | null)?.agent_id ?? null;
 }

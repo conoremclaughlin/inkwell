@@ -33,9 +33,11 @@ import { ContextBuilder } from './context-builder.js';
 import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 import { CodexRunner } from './codex-runner.js';
 import { GeminiRunner } from './gemini-runner.js';
+import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import { resolveIdentityId } from '../../auth/resolve-identity.js';
 import { classifyError } from '@inklabs/shared';
+import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -134,6 +136,7 @@ export class SessionService implements ISessionService {
   private claudeRunner: IRunner;
   private codexRunner: IRunner;
   private geminiRunner: IRunner;
+  private inkRunner: IRunner;
   private activityStream: IActivityStream;
   private config: SessionServiceConfig;
   private supabase: SupabaseClient<Database> | null;
@@ -166,13 +169,15 @@ export class SessionService implements ISessionService {
     config: Partial<SessionServiceConfig> = {},
     codexRunner?: IRunner,
     supabase?: SupabaseClient<Database>,
-    geminiRunner?: IRunner
+    geminiRunner?: IRunner,
+    inkRunner?: IRunner
   ) {
     this.repository = repository;
     this.contextBuilder = contextBuilder;
     this.claudeRunner = claudeRunner;
     this.codexRunner = codexRunner || claudeRunner;
     this.geminiRunner = geminiRunner || claudeRunner;
+    this.inkRunner = inkRunner || new InkRunner();
     this.activityStream = activityStream;
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.supabase = supabase || null;
@@ -227,6 +232,7 @@ export class SessionService implements ISessionService {
         taskDescription: metadata?.taskDescription,
         parentSessionId: metadata?.parentSessionId,
         threadKey: metadata?.threadKey,
+        alias: metadata?.sessionAlias,
         studioId: metadata?.studioId,
         studioHint: metadata?.studioHint,
         recipientSessionId: metadata?.recipientSessionId,
@@ -383,7 +389,7 @@ export class SessionService implements ISessionService {
       userId,
       agentId,
       injectedContext.user.email,
-      session.identityId
+      session.sbId
     );
 
     // 4. Select runtime backend and model
@@ -435,7 +441,10 @@ export class SessionService implements ISessionService {
             'Read(*)',
             'WebFetch(*)',
             'WebSearch',
-            'mcp__*',
+            'mcp__inkwell__*',
+            'mcp__supabase__*',
+            'mcp__github__*',
+            'mcp__playwright__*',
           ],
         }
       : undefined;
@@ -464,15 +473,36 @@ export class SessionService implements ISessionService {
       ...(permissionOverlay ? { permissionOverlay } : {}),
       // Propagate repo root so spawned backend's context token carries it
       repoRoot: resolvedWorkingDirectory.replace(/--[^/]+$/, ''),
+      // Route CLI execution into sandbox container when triggered by a sandboxed strategy
+      ...(metadata?.sandboxContainerName
+        ? {
+            container: {
+              containerName: metadata.sandboxContainerName,
+              runtimeDir: getRunnerFilesDir(metadata.sandboxContainerName),
+            },
+          }
+        : {}),
     };
 
     // 5. Run with selected backend
+    // Ink runner executes tools in-process against the host filesystem —
+    // it cannot route to a Docker container. Reject the combination so a
+    // sandboxed strategy doesn't silently bypass containment.
+    if (resolvedBackend === 'ink' && runnerConfig.container) {
+      throw new Error(
+        'ink backend cannot run inside a sandbox container. ' +
+          'Use a CLI backend (claude-code, codex-cli, gemini) for sandboxed strategies.'
+      );
+    }
+
     const runner =
       resolvedBackend === 'codex-cli'
         ? this.codexRunner
         : resolvedBackend === 'gemini'
           ? this.geminiRunner
-          : this.claudeRunner;
+          : resolvedBackend === 'ink'
+            ? this.inkRunner
+            : this.claudeRunner;
 
     // 5a. Log backend spawn to activity stream (fire-and-forget)
     const triggerSource = metadata?.triggerType as string | undefined;
@@ -605,6 +635,10 @@ export class SessionService implements ISessionService {
 
     // 7. Update session with new Claude session ID, usage, message count, and lifecycle
     // idle (not completed) after success — session stays reusable. completed only via end_session.
+    // Clear cli_attached: processMessage runs headless spawns — the CLI process
+    // exits when this method returns, so the session is no longer attached.
+    // Leaving it true causes future triggers to skip spawning (they expect a
+    // channel plugin to deliver, but none runs for headless sessions).
     const postRunLifecycle = result.success ? 'idle' : 'failed';
     if (result.backendSessionId !== session.backendSessionId) {
       logger.info('Backend session ID linked to PCP session', {
@@ -619,12 +653,14 @@ export class SessionService implements ISessionService {
         messageCount: session.messageCount + 1,
         backend: resolvedBackend,
         lifecycle: postRunLifecycle as Session['lifecycle'],
+        cliAttached: false,
       });
     } else {
       await this.repository.update(session.id, {
         messageCount: session.messageCount + 1,
         backend: resolvedBackend,
         lifecycle: postRunLifecycle as Session['lifecycle'],
+        cliAttached: false,
       });
     }
 
@@ -671,7 +707,7 @@ export class SessionService implements ISessionService {
     userId: string,
     agentId: string,
     email?: string,
-    identityId?: string
+    sbId?: string
   ): string | undefined {
     if (!email) {
       logger.warn('Cannot inject PCP access token for backend runner: missing user email', {
@@ -697,7 +733,7 @@ export class SessionService implements ISessionService {
         email,
         scope: 'mcp:tools',
         ...(agentId ? { agentId } : {}),
-        ...(identityId ? { identityId } : {}),
+        ...(sbId ? { sbId } : {}),
       },
       jwtSecret,
       { expiresIn: 60 * 60 }
@@ -712,6 +748,7 @@ export class SessionService implements ISessionService {
       taskDescription?: string;
       parentSessionId?: string;
       threadKey?: string;
+      alias?: string;
       studioId?: string;
       studioHint?: string;
       recipientSessionId?: string;
@@ -730,6 +767,10 @@ export class SessionService implements ISessionService {
       repoRoot: options?.repoRoot,
       backend,
     });
+
+    // Resolve default_session_id from agent identity. When set, threadKey
+    // misses route to this session instead of creating new ones.
+    const defaultSessionId = await this.resolveDefaultSessionId(userId, agentId);
 
     // For primary sessions, try to find existing active session
     if (type === 'primary') {
@@ -750,7 +791,28 @@ export class SessionService implements ISessionService {
         }
       }
 
-      // ThreadKey match takes priority — find session scoped to this topic
+      // Alias match — explicit named routing (e.g., "main", "review").
+      // Takes priority over threadKey because alias is an explicit user intent.
+      if (options?.alias && 'findByAlias' in this.repository) {
+        const aliasRepo = this.repository as {
+          findByAlias: (u: string, a: string, alias: string) => Promise<Session | null>;
+        };
+        const aliasMatch = await aliasRepo.findByAlias(userId, agentId, options.alias);
+        if (aliasMatch) {
+          logger.debug('Found existing session by alias', {
+            sessionId: aliasMatch.id,
+            alias: options.alias,
+            studioId: aliasMatch.studioId || null,
+          });
+          return aliasMatch;
+        }
+        logger.debug('No session found for alias', {
+          alias: options.alias,
+          agentId,
+        });
+      }
+
+      // ThreadKey match — find session scoped to this topic
       if (options?.threadKey && 'findByThreadKey' in this.repository) {
         const threadRepo = this.repository as {
           findByThreadKey: (
@@ -777,14 +839,31 @@ export class SessionService implements ISessionService {
           return threadMatch;
         }
 
-        // Thread-scoped request with no match => create a dedicated new session.
-        // Do NOT reuse the generic active session; that would collapse distinct threads.
-        logger.debug('No existing thread-scoped session found; creating a new one', {
-          userId,
-          agentId,
-          threadKey: options.threadKey,
-          studioId: resolvedStudioId || null,
-        });
+        // Thread-scoped request with no match. If the agent has a default
+        // session, route there instead of creating a new one.
+        if (defaultSessionId) {
+          const defaultSession = await this.repository.findById(defaultSessionId);
+          if (defaultSession && !defaultSession.endedAt) {
+            logger.debug('No thread match; routing to default_session_id', {
+              userId,
+              agentId,
+              threadKey: options.threadKey,
+              defaultSessionId,
+            });
+            return defaultSession;
+          }
+          logger.debug('default_session_id is set but session is ended/missing; creating new', {
+            defaultSessionId,
+            agentId,
+          });
+        } else {
+          logger.debug('No thread match; creating new thread-scoped session', {
+            userId,
+            agentId,
+            threadKey: options.threadKey,
+            studioId: resolvedStudioId || null,
+          });
+        }
       } else if (options?.threadKey) {
         logger.debug('Repository lacks threadKey lookup support; creating a new thread session', {
           userId,
@@ -795,9 +874,7 @@ export class SessionService implements ISessionService {
       }
 
       if (!options?.threadKey) {
-        // Fall back to general active session match only for non-threaded requests.
-        // Always pass contactId to enforce isolation: contact sessions match their
-        // contact, owner sessions (contactId=undefined) match only NULL rows.
+        // Fall back to general active session for non-threaded requests.
         const existing = await this.repository.findByUserAndAgent(userId, agentId, {
           type: 'primary',
           ...(resolvedStudioId ? { studioId: resolvedStudioId } : {}),
@@ -805,7 +882,7 @@ export class SessionService implements ISessionService {
         });
 
         if (existing) {
-          logger.debug('Found existing session', {
+          logger.debug('Found existing active session', {
             sessionId: existing.id,
             backendSessionId: existing.backendSessionId,
             studioId: existing.studioId || null,
@@ -816,16 +893,16 @@ export class SessionService implements ISessionService {
     }
 
     // Resolve canonical identity UUID
-    let identityId: string | undefined;
+    let sbId: string | undefined;
     if (this.supabase) {
-      identityId = (await resolveIdentityId(this.supabase, userId, agentId)) || undefined;
+      sbId = (await resolveIdentityId(this.supabase, userId, agentId)) || undefined;
     }
 
     // Create new session
     const session = await this.repository.create({
       userId,
       agentId,
-      identityId,
+      sbId,
       backendSessionId: null,
       type,
       lifecycle: 'idle',
@@ -833,6 +910,7 @@ export class SessionService implements ISessionService {
       taskDescription: options?.taskDescription,
       parentSessionId: options?.parentSessionId,
       threadKey: options?.threadKey,
+      alias: options?.alias,
       studioId: resolvedStudioId,
       contactId: options?.contactId,
       contextTokens: 0,
@@ -853,6 +931,7 @@ export class SessionService implements ISessionService {
       userId,
       agentId,
       type,
+      alias: options?.alias || null,
       studioId: resolvedStudioId || null,
     });
 
@@ -1217,7 +1296,7 @@ This session will continue with a fresh context after compaction. Your identity,
         session.userId,
         session.agentId,
         fullContext.user.email,
-        session.identityId
+        session.sbId
       );
 
       const runtimeBackend = this.resolveRuntimeBackend(session.backend, context.agent.backend);
@@ -1248,7 +1327,9 @@ This session will continue with a fresh context after compaction. Your identity,
           ? this.codexRunner
           : runtimeBackend === 'gemini'
             ? this.geminiRunner
-            : this.claudeRunner;
+            : runtimeBackend === 'ink'
+              ? this.inkRunner
+              : this.claudeRunner;
 
       // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session
       const result = await runner.run(compactionPrompt, {
@@ -1287,13 +1368,41 @@ This session will continue with a fresh context after compaction. Your identity,
   /**
    * Normalize backend value to runtime backend IDs used by sessions.
    */
-  private normalizeBackend(raw: string | null | undefined): 'claude-code' | 'codex-cli' | 'gemini' {
+  private normalizeBackend(
+    raw: string | null | undefined
+  ): 'claude-code' | 'codex-cli' | 'gemini' | 'ink' {
     const value = (raw || '').toLowerCase().trim();
     if (value === 'codex' || value === 'codex-cli') return 'codex-cli';
     if (value === 'gemini' || value === 'gemini-cli') return 'gemini';
+    if (value === 'ink' || value === 'direct-api' || value === 'direct' || value === 'api')
+      return 'ink';
     if (value === 'claude' || value === 'claude-code' || value === '') return 'claude-code';
     logger.warn('Unknown backend configured, falling back to claude-code', { raw });
     return 'claude-code';
+  }
+
+  /**
+   * Resolve default_session_id from agent identity. When set, threadKey
+   * misses route to this session instead of creating new ones (Myra, etc.).
+   * Returns the session UUID or null.
+   */
+  private async resolveDefaultSessionId(userId: string, agentId: string): Promise<string | null> {
+    if (!this.supabase) return null;
+    try {
+      // default_session_id not yet in generated types — cast result
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data } = (await (this.supabase as any)
+        .from('agent_identities')
+        .select('default_session_id')
+        .eq('user_id', userId)
+        .eq('agent_id', agentId)
+        .not('workspace_id', 'is', null)
+        .limit(1)
+        .maybeSingle()) as { data: { default_session_id: string | null } | null };
+      return data?.default_session_id || null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -1302,7 +1411,7 @@ This session will continue with a fresh context after compaction. Your identity,
   private async resolveAgentBackend(
     userId: string,
     agentId: string
-  ): Promise<'claude-code' | 'codex-cli' | 'gemini'> {
+  ): Promise<'claude-code' | 'codex-cli' | 'gemini' | 'ink'> {
     try {
       const identityBackend = await this.contextBuilder.getAgentBackend(userId, agentId);
       return this.normalizeBackend(identityBackend);
@@ -1322,7 +1431,7 @@ This session will continue with a fresh context after compaction. Your identity,
   private resolveRuntimeBackend(
     sessionBackend: string | null | undefined,
     identityBackend: string | null | undefined
-  ): 'claude-code' | 'codex-cli' | 'gemini' {
+  ): 'claude-code' | 'codex-cli' | 'gemini' | 'ink' {
     if (sessionBackend) return this.normalizeBackend(sessionBackend);
     return this.normalizeBackend(identityBackend);
   }
@@ -1593,6 +1702,7 @@ export function createSessionService(
     config,
     new CodexRunner(),
     supabase,
-    new GeminiRunner()
+    new GeminiRunner(),
+    new InkRunner()
   );
 }

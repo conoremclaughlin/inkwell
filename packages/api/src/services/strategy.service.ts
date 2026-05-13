@@ -12,6 +12,10 @@
  * New sessions are only created by heartbeat recovery if one dies.
  */
 
+import path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import { existsSync } from 'fs';
 import type { DataComposer } from '../data/composer';
 import { getRequestContext } from '../utils/request-context';
 import type {
@@ -22,7 +26,12 @@ import type {
 } from '../data/repositories/task-groups.repository';
 import type { ProjectTask, TaskAssignment } from '../data/repositories/project-tasks.repository';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
+import { resolveAgentSlug } from '../auth/resolve-identity';
 import { logger } from '../utils/logger';
+import { ensureStudioSettings } from './studio-settings';
+import type { SandboxOrchestrator, SandboxSpinUpResult } from './sandbox/orchestrator';
+
+const execFileAsync = promisify(execFile);
 
 // ============================================================================
 // Types
@@ -32,7 +41,7 @@ export interface StartStrategyInput {
   groupId: string;
   userId: string;
   strategy: StrategyPreset;
-  ownerAgentId: string;
+  sbId: string;
   config?: StrategyConfig;
   verificationMode?: VerificationMode;
   planUri?: string;
@@ -51,6 +60,8 @@ export interface StrategyAdvanceResult {
   notified?: boolean;
   /** Completion stats when group is done */
   stats?: { total: number; completed: number };
+  /** Sandbox container info (when sandbox mode is active) */
+  sandbox?: SandboxSpinUpResult;
 }
 
 export interface StrategyStatus {
@@ -58,7 +69,7 @@ export interface StrategyStatus {
   title: string;
   strategy: StrategyPreset;
   status: string;
-  ownerAgentId: string | null;
+  sbId: string | null;
   planUri: string | null;
   verificationMode: VerificationMode;
   currentTaskIndex: number;
@@ -158,14 +169,26 @@ const STRATEGY_PROMPTS: Record<StrategyPreset, (group: TaskGroup, task: ProjectT
 // ============================================================================
 
 export class StrategyService {
-  constructor(private dataComposer: DataComposer) {}
+  private sandboxOrchestrator?: SandboxOrchestrator;
+
+  constructor(dataComposer: DataComposer, sandboxOrchestrator?: SandboxOrchestrator);
+  constructor(
+    private dataComposer: DataComposer,
+    orchestrator?: SandboxOrchestrator
+  ) {
+    this.sandboxOrchestrator = orchestrator;
+  }
 
   private getAssignment(group: TaskGroup): TaskAssignment {
     const meta = group.metadata as Record<string, unknown> | null;
     return {
       studioId: (meta?.studioId as string) || undefined,
-      agentId: group.owner_agent_id || undefined,
     };
+  }
+
+  private async resolveOwnerSlug(group: TaskGroup): Promise<string | null> {
+    if (!group.sb_id) return null;
+    return resolveAgentSlug(this.dataComposer.getClient(), group.sb_id);
   }
 
   /**
@@ -183,13 +206,38 @@ export class StrategyService {
       );
     }
 
+    // Validate mutual exclusivity before any side effects
+    const inputConfig = input.config || (group.strategy_config as StrategyConfig);
+    if (inputConfig?.studioSlug && inputConfig?.ephemeralStudio) {
+      throw new Error('studioSlug and ephemeralStudio are mutually exclusive');
+    }
+
+    // Persistent studio: create BEFORE activating the strategy so (a) failure
+    // doesn't leave an active group in a broken state, and (b) the group update
+    // below returns metadata that includes the new studioId for sandbox routing.
+    if (inputConfig?.studioSlug) {
+      const metadata = (group.metadata || {}) as Record<string, unknown>;
+      if (!metadata.studioId) {
+        const created = await this.createPersistentStudio(
+          group,
+          inputConfig.studioSlug,
+          input.ownerAgentId
+        );
+        if (!created) {
+          throw new Error(
+            `Failed to create persistent studio "${inputConfig.studioSlug}" — check repoRoot in group metadata`
+          );
+        }
+      }
+    }
+
     // Update the group with strategy config
     const updated = await this.dataComposer.repositories.taskGroups.update(input.groupId, {
       strategy: input.strategy,
       strategy_config: input.config || (group.strategy_config as StrategyConfig),
       verification_mode: input.verificationMode || group.verification_mode,
       plan_uri: input.planUri || group.plan_uri || undefined,
-      owner_agent_id: input.ownerAgentId,
+      sb_id: input.sbId,
       status: 'active',
       autonomous: true,
       current_task_index: 0,
@@ -215,38 +263,90 @@ export class StrategyService {
       };
     }
 
-    // Mark the first task as in_progress with assignment metadata
-    await this.dataComposer.repositories.tasks.startTask(nextTask.id, this.getAssignment(updated));
-
     // Create a watchdog reminder so the heartbeat checks progress periodically
     await this.createWatchdogReminder(updated, input.userId);
 
-    // Kick off the owner agent in the assigned studio. Without this trigger,
-    // start_strategy only returns a prompt to the caller's session — which
-    // is useless when the caller is delegating to a different studio/agent.
-    // The trigger spawns (or resumes) a session in the target studio so work
-    // actually begins, matching how heartbeats/reminders already deliver.
-    const triggered = await this.triggerOwnerAgent(updated, nextTask, 'strategy_kickoff');
+    // Spin up sandbox BEFORE triggering the agent — if sandboxPolicy is
+    // 'required' (default), a failed sandbox aborts the strategy instead
+    // of silently degrading to host execution.
+    // Note: maybeSpinUpSandbox may create an ephemeral studio and update
+    // group metadata in the DB, so we re-read the group afterward.
+    const config = updated.strategy_config as StrategyConfig;
+    const sandboxResult = await this.maybeSpinUpSandbox(updated);
+    const sandboxPolicy = config.sandboxPolicy || 'required';
+
+    if (config.sandbox && sandboxResult && !sandboxResult.success && sandboxPolicy === 'required') {
+      // Fail-closed: revert the strategy to paused and report the failure
+      await this.dataComposer.repositories.taskGroups.update(input.groupId, {
+        status: 'paused',
+        strategy_paused_at: new Date().toISOString(),
+      });
+      await this.logStrategyEvent(
+        updated,
+        'sandbox_failed',
+        `Strategy aborted: sandbox required but spin-up failed — ${sandboxResult.error}`,
+        {
+          containerName: sandboxResult.containerName,
+          error: sandboxResult.error,
+          policy: 'required',
+        }
+      );
+      return {
+        action: 'group_complete',
+        stats: { total: 0, completed: 0 },
+        prompt: `Sandbox spin-up failed (policy: required). Error: ${sandboxResult.error}. Strategy has been paused — fix the sandbox configuration and retry.`,
+        sandbox: sandboxResult,
+      };
+    }
+
+    // Re-read group after sandbox setup — createEphemeralStudio may have
+    // written studioId/studioSlug to metadata that triggerOwnerAgent needs
+    // for correct studio routing.
+    const currentGroup =
+      (await this.dataComposer.repositories.taskGroups.findById(input.groupId)) || updated;
+
+    // Mark the first task as in_progress with assignment metadata.
+    // Done after sandbox setup so the assignment reflects the ephemeral studioId.
+    await this.dataComposer.repositories.tasks.startTask(
+      nextTask.id,
+      this.getAssignment(currentGroup)
+    );
+
+    // Trigger the owner agent in the assigned studio. The trigger spawns
+    // (or resumes) a session in the target studio so work actually begins.
+    // Pass the sandbox container name so the triggered session routes
+    // CLI execution into the container.
+    const sandboxContainer = sandboxResult?.success ? sandboxResult.containerName : undefined;
+    const triggered = await this.triggerOwnerAgent(
+      currentGroup,
+      nextTask,
+      'strategy_kickoff',
+      sandboxContainer
+    );
 
     // Log strategy start
     await this.logStrategyEvent(
-      updated,
+      currentGroup,
       'strategy_started',
-      `Strategy "${input.strategy}" started on "${updated.title}"`,
+      `Strategy "${input.strategy}" started on "${currentGroup.title}"`,
       {
         firstTaskId: nextTask.id,
         firstTaskTitle: nextTask.title,
         ownerTriggered: triggered,
+        sandbox: sandboxResult
+          ? { containerName: sandboxResult.containerName, success: sandboxResult.success }
+          : undefined,
       }
     );
 
-    const prompt = STRATEGY_PROMPTS[input.strategy](updated, nextTask);
+    const prompt = STRATEGY_PROMPTS[input.strategy](currentGroup, nextTask);
 
     return {
       action: 'next_task',
       nextTask,
       prompt,
       notified: triggered,
+      sandbox: sandboxResult || undefined,
     };
   }
 
@@ -275,7 +375,115 @@ export class StrategyService {
       iterations_since_approval: newIterations,
     });
 
-    // Check approval gate
+    // Check for completion BEFORE the periodic approval gate — final-task
+    // handling must win over maxIterationsWithoutApproval (Lumen review, PR #362)
+    const nextTask = await this.getTaskByOrder(groupId, newIndex);
+
+    if (!nextTask) {
+      // No more pending/in_progress tasks — strategy is done (or needs final approval)
+      const tasks = await this.getGroupTasks(groupId);
+      const completed = tasks.filter((t) => t.status === 'completed').length;
+      const pending = tasks.filter((t) => t.status === 'pending').length;
+      const blocked = tasks.filter((t) => t.status === 'blocked').length;
+
+      // Integrity check: flag if tasks are still pending/blocked
+      const hasIncomplete = pending > 0 || blocked > 0;
+      if (hasIncomplete) {
+        await this.logStrategyEvent(
+          group,
+          'process_violation',
+          `Strategy completing with ${pending} pending and ${blocked} blocked tasks out of ${tasks.length} total`,
+          {
+            totalTasks: tasks.length,
+            completedTasks: completed,
+            pendingTasks: pending,
+            blockedTasks: blocked,
+            skippedTasks: tasks
+              .filter((t) => t.status === 'pending' || t.status === 'blocked')
+              .map((t) => ({ id: t.id, title: t.title, status: t.status })),
+          }
+        );
+      }
+
+      // Final approval gate — pause for human review instead of auto-completing
+      if (config.requireFinalApproval) {
+        const summary = await this.buildProgressSummary(group, newIndex);
+        const criteria = config.approvalCriteria || [];
+        const criteriaList =
+          criteria.length > 0
+            ? `\n\nAcceptance criteria:\n${criteria.map((c) => `• ${c}`).join('\n')}`
+            : '';
+
+        await this.dataComposer.repositories.taskGroups.update(groupId, {
+          strategy_paused_at: new Date().toISOString(),
+          status: 'paused',
+          context_summary: summary,
+          metadata: { ...group.metadata, pauseReason: 'final_review' },
+        });
+
+        const approvalMessage =
+          `All tasks complete on "${group.title}" (${completed}/${tasks.length}).` +
+          `${hasIncomplete ? ` WARNING: ${pending} pending, ${blocked} blocked tasks remain.` : ''}` +
+          ` Awaiting final approval before closing.${criteriaList}\n\n${summary}`;
+
+        const notified = await this.notifyDispatcher(
+          group,
+          config.approvalNotify || config.checkInNotify,
+          approvalMessage,
+          userId
+        );
+
+        // Notify supervisor too if configured
+        if (config.supervisorId) {
+          const supervisorSlug = await resolveAgentSlug(
+            this.dataComposer.getClient(),
+            config.supervisorId
+          );
+          if (supervisorSlug) {
+            await this.notifyDispatcher(
+              group,
+              supervisorSlug,
+              `[Supervisor] Final review requested on "${group.title}". ${completed}/${tasks.length} tasks done.${criteriaList}`,
+              userId
+            );
+          }
+        }
+
+        await this.logStrategyEvent(
+          group,
+          'final_review_requested',
+          `All tasks done — paused for final approval`,
+          {
+            totalTasks: tasks.length,
+            completedTasks: completed,
+            approvalCriteria: criteria,
+            notified,
+            routedTo: config.approvalNotify || config.checkInNotify || null,
+          }
+        );
+
+        return {
+          action: 'approval_required',
+          progressSummary: approvalMessage,
+          notified,
+        };
+      }
+
+      // No final approval needed — complete immediately
+      await this.finalizeStrategy(
+        group,
+        { total: tasks.length, completed, pending, blocked, hasIncomplete },
+        config,
+        userId
+      );
+
+      return {
+        action: 'group_complete',
+        stats: { total: tasks.length, completed },
+      };
+    }
+
+    // Check periodic approval gate (only when there ARE more tasks to do)
     const maxIterations = config.maxIterationsWithoutApproval;
     if (maxIterations && newIterations >= maxIterations) {
       const summary = await this.buildProgressSummary(group, newIndex);
@@ -316,85 +524,6 @@ export class StrategyService {
       };
     }
 
-    // Get next task
-    const nextTask = await this.getTaskByOrder(groupId, newIndex);
-
-    if (!nextTask) {
-      // No more pending/in_progress tasks — strategy is done
-      const tasks = await this.getGroupTasks(groupId);
-      const completed = tasks.filter((t) => t.status === 'completed').length;
-      const pending = tasks.filter((t) => t.status === 'pending').length;
-      const blocked = tasks.filter((t) => t.status === 'blocked').length;
-
-      // Integrity check: flag if tasks are still pending/blocked
-      const hasIncomplete = pending > 0 || blocked > 0;
-      if (hasIncomplete) {
-        await this.logStrategyEvent(
-          group,
-          'process_violation',
-          `Strategy completing with ${pending} pending and ${blocked} blocked tasks out of ${tasks.length} total`,
-          {
-            totalTasks: tasks.length,
-            completedTasks: completed,
-            pendingTasks: pending,
-            blockedTasks: blocked,
-            skippedTasks: tasks
-              .filter((t) => t.status === 'pending' || t.status === 'blocked')
-              .map((t) => ({ id: t.id, title: t.title, status: t.status })),
-          }
-        );
-      }
-
-      await this.dataComposer.repositories.taskGroups.update(groupId, {
-        status: 'completed',
-        context_summary: hasIncomplete
-          ? `Strategy complete with issues: ${completed}/${tasks.length} done, ${pending} pending, ${blocked} blocked.`
-          : `Strategy complete. ${completed}/${tasks.length} tasks done.`,
-      });
-
-      // Cancel watchdog — strategy is done
-      await this.cancelWatchdogReminder(group.id);
-
-      await this.logStrategyEvent(
-        group,
-        'strategy_completed',
-        `Strategy complete: ${completed}/${tasks.length} tasks done`,
-        {
-          totalTasks: tasks.length,
-          completedTasks: completed,
-          pendingTasks: pending,
-          blockedTasks: blocked,
-          hasIncomplete,
-        }
-      );
-
-      // Notify dispatcher of completion
-      await this.notifyDispatcher(
-        group,
-        config.checkInNotify || config.approvalNotify,
-        `Strategy "${group.strategy}" complete on "${group.title}": ${completed}/${tasks.length} tasks finished.${hasIncomplete ? ` WARNING: ${pending} pending, ${blocked} blocked tasks remain.` : ''}`,
-        userId
-      );
-
-      // Notify supervisor for final audit (if configured)
-      if (config.supervisorId) {
-        const supervisorSlug = await this.resolveAgentSlug(config.supervisorId);
-        if (supervisorSlug) {
-          await this.notifyDispatcher(
-            group,
-            supervisorSlug,
-            `[Supervisor audit] Strategy "${group.strategy}" on "${group.title}" is complete. ${completed}/${tasks.length} tasks done.${hasIncomplete ? ` PROCESS VIOLATION: ${pending} pending, ${blocked} blocked tasks were not completed.` : ''} Review the activity stream for task_group_id ${group.id}.`,
-            userId
-          );
-        }
-      }
-
-      return {
-        action: 'group_complete',
-        stats: { total: tasks.length, completed },
-      };
-    }
-
     // Mark next task as in_progress with assignment metadata
     await this.dataComposer.repositories.tasks.startTask(nextTask.id, this.getAssignment(group));
 
@@ -429,7 +558,10 @@ export class StrategyService {
 
       // Notify supervisor at check-in points too
       if (config.supervisorId) {
-        const supervisorSlug = await this.resolveAgentSlug(config.supervisorId);
+        const supervisorSlug = await resolveAgentSlug(
+          this.dataComposer.getClient(),
+          config.supervisorId
+        );
         if (supervisorSlug) {
           await this.notifyDispatcher(
             group,
@@ -495,11 +627,46 @@ export class StrategyService {
     if (group.status !== 'paused') throw new Error('Strategy is not paused');
     if (!group.strategy) throw new Error('No strategy set on this group');
 
-    const wasAwaitingApproval = group.metadata?.pauseReason === 'approval_gate';
+    const pauseReason = (group.metadata as Record<string, unknown>)?.pauseReason;
+    const wasAwaitingApproval = pauseReason === 'approval_gate';
+    const wasFinalReview = pauseReason === 'final_review';
 
     // Clear pauseReason on resume so it doesn't persist into the next pause cycle
-    const cleanedMetadata = { ...group.metadata };
+    const cleanedMetadata = { ...group.metadata } as Record<string, unknown>;
     delete cleanedMetadata.pauseReason;
+
+    // Final review approval — all tasks done, finalize the strategy
+    if (wasFinalReview) {
+      const config = group.strategy_config as StrategyConfig;
+      const tasks = await this.getGroupTasks(groupId);
+      const completed = tasks.filter((t) => t.status === 'completed').length;
+      const pending = tasks.filter((t) => t.status === 'pending').length;
+      const blocked = tasks.filter((t) => t.status === 'blocked').length;
+      const hasIncomplete = pending > 0 || blocked > 0;
+
+      await this.logStrategyEvent(
+        group,
+        'final_review_approved',
+        `Final review approved on "${group.title}" — finalizing strategy`,
+        { completedTasks: completed, totalTasks: tasks.length }
+      );
+
+      // Set back to active briefly so finalizeStrategy can complete it cleanly
+      await this.dataComposer.repositories.taskGroups.update(groupId, {
+        status: 'active',
+        strategy_paused_at: null,
+        metadata: cleanedMetadata,
+      });
+
+      await this.finalizeStrategy(
+        { ...group, metadata: cleanedMetadata },
+        { total: tasks.length, completed, pending, blocked, hasIncomplete },
+        config,
+        userId
+      );
+
+      return { action: 'group_complete', stats: { total: tasks.length, completed } };
+    }
 
     await this.dataComposer.repositories.taskGroups.update(groupId, {
       status: 'active',
@@ -523,7 +690,54 @@ export class StrategyService {
     const nextTask = await this.getTaskByOrder(groupId, group.current_task_index);
 
     if (!nextTask) {
-      return { action: 'group_complete', stats: { total: 0, completed: 0 } };
+      // No more tasks — finalize the strategy (handles the case where the
+      // periodic approval gate fired on the final task, Lumen review PR #362)
+      const config = group.strategy_config as StrategyConfig;
+      const tasks = await this.getGroupTasks(groupId);
+      const completed = tasks.filter((t) => t.status === 'completed').length;
+      const pending = tasks.filter((t) => t.status === 'pending').length;
+      const blocked = tasks.filter((t) => t.status === 'blocked').length;
+      const hasIncomplete = pending > 0 || blocked > 0;
+
+      if (config.requireFinalApproval) {
+        // Still need final review — re-pause with final_review reason
+        const summary = await this.buildProgressSummary(group, group.current_task_index);
+        const criteria = config.approvalCriteria || [];
+        const criteriaList =
+          criteria.length > 0
+            ? `\n\nAcceptance criteria:\n${criteria.map((c) => `• ${c}`).join('\n')}`
+            : '';
+
+        await this.dataComposer.repositories.taskGroups.update(groupId, {
+          strategy_paused_at: new Date().toISOString(),
+          status: 'paused',
+          context_summary: summary,
+          metadata: { ...cleanedMetadata, pauseReason: 'final_review' },
+        });
+
+        const approvalMessage =
+          `All tasks complete on "${group.title}" (${completed}/${tasks.length}).` +
+          `${hasIncomplete ? ` WARNING: ${pending} pending, ${blocked} blocked tasks remain.` : ''}` +
+          ` Awaiting final approval before closing.${criteriaList}\n\n${summary}`;
+
+        const notified = await this.notifyDispatcher(
+          group,
+          config.approvalNotify || config.checkInNotify,
+          approvalMessage,
+          group.user_id
+        );
+
+        return { action: 'approval_required', progressSummary: approvalMessage, notified };
+      }
+
+      await this.finalizeStrategy(
+        { ...group, metadata: cleanedMetadata },
+        { total: tasks.length, completed, pending, blocked, hasIncomplete },
+        config,
+        group.user_id
+      );
+
+      return { action: 'group_complete', stats: { total: tasks.length, completed } };
     }
 
     // Mark as in_progress if not already
@@ -557,7 +771,7 @@ export class StrategyService {
     if (group.status === 'completed') throw new Error('Strategy is already completed');
     if (group.status === 'cancelled') throw new Error('Strategy is already cancelled');
 
-    await this.cancelWatchdogReminder(groupId);
+    await this.cleanupStrategyResources(groupId);
 
     const summary = reason
       ? `Strategy cancelled on "${group.title}": ${reason}`
@@ -613,7 +827,7 @@ export class StrategyService {
       title: group.title,
       strategy: group.strategy as StrategyPreset,
       status: group.status,
-      ownerAgentId: group.owner_agent_id,
+      sbId: group.sb_id,
       planUri: group.plan_uri,
       verificationMode: group.verification_mode,
       currentTaskIndex: group.current_task_index,
@@ -730,12 +944,13 @@ export class StrategyService {
 
     try {
       const threadKey = group.thread_key || `strategy:${group.id}`;
+      const senderSlug = (await this.resolveOwnerSlug(group)) || 'system';
 
       await handleSendToInbox(
         {
           userId,
           recipientAgentId: notifyAgentId,
-          senderAgentId: group.owner_agent_id || 'system',
+          senderAgentId: senderSlug,
           content: message,
           messageType: 'notification',
           priority: 'high',
@@ -767,17 +982,18 @@ export class StrategyService {
    *     starts working without the user having to manually attach)
    *   - watchdog re-triggers (wake a stuck session on the heartbeat)
    *
-   * No-ops with a warn log if the group has no owner_agent_id. Non-fatal on
+   * No-ops with a warn log if the group has no sb_id. Non-fatal on
    * send failure — returns false so callers can decide whether to escalate.
    */
   private async triggerOwnerAgent(
     group: TaskGroup,
     task: ProjectTask,
-    reason: 'strategy_kickoff' | 'watchdog' | 'manual_resume'
+    reason: 'strategy_kickoff' | 'watchdog' | 'manual_resume',
+    sandboxContainerName?: string
   ): Promise<boolean> {
-    if (!group.owner_agent_id) {
+    if (!group.sb_id) {
       logger.warn(
-        `Strategy triggerOwnerAgent: group ${group.id} has no owner_agent_id — cannot route trigger`
+        `Strategy triggerOwnerAgent: group ${group.id} has no sb_id — cannot route trigger`
       );
       return false;
     }
@@ -789,6 +1005,12 @@ export class StrategyService {
     }
 
     try {
+      const ownerSlug = await this.resolveOwnerSlug(group);
+      if (!ownerSlug) {
+        logger.warn(`Strategy triggerOwnerAgent: could not resolve slug for sb_id ${group.sb_id}`);
+        return false;
+      }
+
       const threadKey = group.thread_key || `strategy:${group.id}`;
       const metadata = (group.metadata || {}) as Record<string, unknown>;
       const rawStudioId = metadata.studioId;
@@ -800,8 +1022,8 @@ export class StrategyService {
       await handleSendToInbox(
         {
           userId: group.user_id,
-          recipientAgentId: group.owner_agent_id,
-          senderAgentId: 'system',
+          recipientAgentId: ownerSlug,
+          senderAgentId: ownerSlug,
           // Prefer studioId (UUID); fall back to slug only when UUID is absent.
           recipientStudioId: studioId,
           recipientStudioSlug: studioId ? undefined : studioSlug,
@@ -819,25 +1041,26 @@ export class StrategyService {
             groupId: group.id,
             taskId: task.id,
             strategy: group.strategy,
+            ...(sandboxContainerName ? { sandboxContainerName } : {}),
           },
         },
         this.dataComposer
       );
 
       logger.info(
-        `Strategy trigger sent to ${group.owner_agent_id} for group ${group.id} (task ${task.id}, reason: ${reason}${studioId ? `, studio: ${studioId}` : studioSlug ? `, studioSlug: ${studioSlug}` : ''})`
+        `Strategy trigger sent to ${ownerSlug} for group ${group.id} (task ${task.id}, reason: ${reason}${studioId ? `, studio: ${studioId}` : studioSlug ? `, studioSlug: ${studioSlug}` : ''})`
       );
 
       await this.logStrategyEvent(
         group,
         'strategy_trigger',
-        `Triggered ${group.owner_agent_id} for task: ${task.title}`,
+        `Triggered ${ownerSlug} for task: ${task.title}`,
         {
           reason,
           taskId: task.id,
           taskTitle: task.title,
           studioId: studioId || studioSlug || null,
-          ownerAgentId: group.owner_agent_id,
+          sbId: group.sb_id,
         }
       );
 
@@ -852,7 +1075,7 @@ export class StrategyService {
       this.logStrategyEvent(
         group,
         'strategy_trigger_failed',
-        `Failed to trigger ${group.owner_agent_id} for task: ${task.title}`,
+        `Failed to trigger ${group.sb_id} for task: ${task.title}`,
         {
           reason,
           taskId: task.id,
@@ -862,6 +1085,395 @@ export class StrategyService {
 
       return false;
     }
+  }
+
+  /**
+   * Create an ephemeral git worktree + studio for sandbox work.
+   * Returns the studio record or null on failure.
+   */
+  private async createEphemeralStudio(
+    group: TaskGroup,
+    repoRoot: string
+  ): Promise<{ studioId: string; worktreePath: string; branch: string } | null> {
+    const ownerSlug = (await this.resolveOwnerSlug(group)) || 'agent';
+    const slugBase = (group.title || 'task')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, 30);
+    const uniqueSuffix = Date.now().toString(36).slice(-6);
+    const slug = `ephemeral-${slugBase}-${uniqueSuffix}`;
+    const branch = `${ownerSlug}/sandbox/${slug}`;
+
+    // Resolve to the main worktree root
+    let mainRoot = repoRoot;
+    try {
+      const { stdout } = await execFileAsync('git', ['worktree', 'list', '--porcelain'], {
+        cwd: repoRoot,
+      });
+      const match = stdout.match(/^worktree\s+(.+)$/m);
+      if (match) mainRoot = match[1];
+    } catch {
+      // Fall through with original repoRoot
+    }
+
+    const worktreePath = path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
+
+    // Create git worktree
+    try {
+      await execFileAsync('git', ['worktree', 'add', '-b', branch, worktreePath, 'main'], {
+        cwd: mainRoot,
+      });
+      logger.info('Ephemeral studio worktree created', { branch, worktreePath, groupId: group.id });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error('Ephemeral studio worktree creation failed', {
+        error: msg,
+        branch,
+        worktreePath,
+      });
+      return null;
+    }
+
+    // Install dependencies (non-blocking on failure)
+    if (existsSync(path.join(worktreePath, 'package.json'))) {
+      try {
+        await execFileAsync('yarn', ['install'], { cwd: worktreePath, timeout: 120_000 });
+      } catch (err) {
+        logger.warn('Ephemeral studio yarn install failed (non-fatal)', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // Generate studio settings
+    try {
+      await ensureStudioSettings(worktreePath);
+    } catch {
+      // Non-fatal
+    }
+
+    // Insert studio record
+    try {
+      const studio = await this.dataComposer.repositories.studios.create({
+        userId: group.user_id,
+        agentId: ownerSlug,
+        repoRoot: mainRoot,
+        worktreePath,
+        branch,
+        baseBranch: 'main',
+        purpose: `Ephemeral sandbox for: ${group.title}`,
+        workType: 'feature',
+        metadata: { ephemeral: true, taskGroupId: group.id },
+      });
+
+      // Update the task group metadata with the new studioId
+      const existingMeta = (group.metadata || {}) as Record<string, unknown>;
+      await this.dataComposer.repositories.taskGroups.update(group.id, {
+        metadata: {
+          ...existingMeta,
+          studioId: studio.id,
+          studioSlug: slug,
+          ephemeralStudioId: studio.id,
+        },
+      });
+
+      await this.logStrategyEvent(
+        group,
+        'ephemeral_studio_created',
+        `Ephemeral studio created: ${worktreePath}`,
+        { studioId: studio.id, branch, worktreePath }
+      );
+
+      return { studioId: studio.id, worktreePath, branch };
+    } catch (err) {
+      // DB failed — clean up the worktree
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error('Ephemeral studio DB insert failed, cleaning up worktree', { error: msg });
+      try {
+        await execFileAsync('git', ['worktree', 'remove', worktreePath], { cwd: mainRoot });
+      } catch {
+        // Best-effort
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Create a persistent git worktree + studio for a strategy.
+   * Unlike ephemeral studios, these survive strategy completion.
+   */
+  private async createPersistentStudio(
+    group: TaskGroup,
+    slug: string,
+    ownerAgentId: string
+  ): Promise<{ studioId: string; worktreePath: string; branch: string } | null> {
+    const metadata = (group.metadata || {}) as Record<string, unknown>;
+    const repoRoot = typeof metadata.repoRoot === 'string' ? metadata.repoRoot : undefined;
+    if (!repoRoot) {
+      logger.warn(
+        `Strategy group ${group.id}: persistent studio requested but no repoRoot in metadata`
+      );
+      return null;
+    }
+
+    const agentId = ownerAgentId;
+    const branch = `${agentId}/${slug}`;
+
+    let mainRoot = repoRoot;
+    try {
+      const { stdout } = await execFileAsync('git', ['worktree', 'list', '--porcelain'], {
+        cwd: repoRoot,
+      });
+      const match = stdout.match(/^worktree\s+(.+)$/m);
+      if (match) mainRoot = match[1];
+    } catch {
+      // Fall through with original repoRoot
+    }
+
+    const worktreePath = path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
+
+    try {
+      await execFileAsync('git', ['worktree', 'add', '-b', branch, worktreePath, 'main'], {
+        cwd: mainRoot,
+      });
+      logger.info('Persistent studio worktree created', {
+        branch,
+        worktreePath,
+        groupId: group.id,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error('Persistent studio worktree creation failed', {
+        error: msg,
+        branch,
+        worktreePath,
+      });
+      return null;
+    }
+
+    if (existsSync(path.join(worktreePath, 'package.json'))) {
+      try {
+        await execFileAsync('yarn', ['install'], { cwd: worktreePath, timeout: 120_000 });
+      } catch (err) {
+        logger.warn('Persistent studio yarn install failed (non-fatal)', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    try {
+      await ensureStudioSettings(worktreePath);
+    } catch {
+      // Non-fatal
+    }
+
+    try {
+      const studio = await this.dataComposer.repositories.studios.create({
+        userId: group.user_id,
+        agentId,
+        repoRoot: mainRoot,
+        worktreePath,
+        branch,
+        baseBranch: 'main',
+        purpose: `Strategy studio for: ${group.title}`,
+        workType: 'feature',
+        metadata: { ephemeral: false, taskGroupId: group.id },
+      });
+
+      const existingMeta = (group.metadata || {}) as Record<string, unknown>;
+      await this.dataComposer.repositories.taskGroups.update(group.id, {
+        metadata: {
+          ...existingMeta,
+          studioId: studio.id,
+          studioSlug: slug,
+        },
+      });
+
+      await this.logStrategyEvent(
+        group,
+        'persistent_studio_created',
+        `Persistent studio created: ${worktreePath}`,
+        { studioId: studio.id, branch, worktreePath, slug }
+      );
+
+      return { studioId: studio.id, worktreePath, branch };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error('Persistent studio DB insert failed, cleaning up worktree', { error: msg });
+      try {
+        await execFileAsync('git', ['worktree', 'remove', worktreePath], { cwd: mainRoot });
+      } catch {
+        // Best-effort
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Tear down an ephemeral studio: stop sandbox container, remove worktree, mark cleaned.
+   */
+  private async teardownEphemeralStudio(group: TaskGroup): Promise<void> {
+    const metadata = (group.metadata || {}) as Record<string, unknown>;
+    const ephemeralStudioId =
+      typeof metadata.ephemeralStudioId === 'string' ? metadata.ephemeralStudioId : undefined;
+    if (!ephemeralStudioId) return;
+
+    const studio = await this.dataComposer.repositories.studios.findById(ephemeralStudioId);
+    if (!studio) return;
+
+    // Stop sandbox container if running
+    if (this.sandboxOrchestrator) {
+      const sandboxes = await this.sandboxOrchestrator.listSandboxes();
+      const match = sandboxes.find(
+        (s) => s.running && s.labels?.['ink.studio-id'] === ephemeralStudioId
+      );
+      if (match) {
+        await this.sandboxOrchestrator.stop(match.containerName).catch((err) => {
+          logger.warn('Failed to stop ephemeral sandbox container', {
+            containerName: match.containerName,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
+    }
+
+    // Remove git worktree
+    try {
+      await execFileAsync('git', ['worktree', 'remove', studio.worktreePath], {
+        cwd: studio.repoRoot,
+      });
+    } catch (err) {
+      logger.warn('Failed to remove ephemeral worktree (may already be gone)', {
+        worktreePath: studio.worktreePath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    // Delete the ephemeral branch (prevents collisions on retry)
+    if (studio.branch) {
+      try {
+        await execFileAsync('git', ['branch', '-d', studio.branch], {
+          cwd: studio.repoRoot,
+        });
+      } catch (err) {
+        logger.warn('Failed to delete ephemeral branch (may have unmerged changes)', {
+          branch: studio.branch,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // Mark studio as cleaned in DB
+    try {
+      await this.dataComposer.repositories.studios.markCleaned(ephemeralStudioId);
+    } catch {
+      // Best-effort
+    }
+
+    await this.logStrategyEvent(
+      group,
+      'ephemeral_studio_cleaned',
+      `Ephemeral studio cleaned: ${studio.worktreePath}`,
+      { studioId: ephemeralStudioId, worktreePath: studio.worktreePath }
+    );
+  }
+
+  /**
+   * Spin up a sandbox Docker container for the strategy's owner agent.
+   * Resolves the studio from DB metadata, builds a SandboxSpinUpRequest,
+   * and delegates to the orchestrator. Returns null if sandbox mode is
+   * not enabled or no orchestrator is configured.
+   *
+   * When ephemeralStudio is true and no studioId exists in metadata,
+   * automatically creates a fresh git worktree + studio for the work.
+   */
+  private async maybeSpinUpSandbox(group: TaskGroup): Promise<SandboxSpinUpResult | null> {
+    const config = group.strategy_config as StrategyConfig;
+    if (!config.sandbox) return null;
+
+    if (!this.sandboxOrchestrator) {
+      const msg = `Sandbox enabled but no SandboxOrchestrator configured`;
+      logger.warn(`Strategy group ${group.id}: ${msg}`);
+      return { containerName: '', success: false, error: msg };
+    }
+
+    let metadata = (group.metadata || {}) as Record<string, unknown>;
+    let studioId = typeof metadata.studioId === 'string' ? metadata.studioId : undefined;
+
+    // Ephemeral studio: auto-create if none assigned
+    if (!studioId && config.ephemeralStudio) {
+      const repoRoot = typeof metadata.repoRoot === 'string' ? metadata.repoRoot : undefined;
+      if (!repoRoot) {
+        const msg = `Ephemeral studio requested but no repoRoot in metadata`;
+        logger.warn(`Strategy group ${group.id}: ${msg}`);
+        return { containerName: '', success: false, error: msg };
+      }
+
+      const ephemeral = await this.createEphemeralStudio(group, repoRoot);
+      if (!ephemeral) {
+        const msg = `Failed to create ephemeral studio`;
+        return { containerName: '', success: false, error: msg };
+      }
+
+      studioId = ephemeral.studioId;
+      // Re-read metadata since createEphemeralStudio updated it
+      const refreshed = await this.dataComposer.repositories.taskGroups.findById(group.id);
+      if (refreshed) {
+        metadata = (refreshed.metadata || {}) as Record<string, unknown>;
+      }
+    }
+
+    if (!studioId) {
+      const msg = `Sandbox requested but no studioId in metadata (set ephemeralStudio: true in strategy config to auto-create)`;
+      logger.warn(`Strategy group ${group.id}: ${msg}`);
+      return { containerName: '', success: false, error: msg };
+    }
+
+    const studio = await this.dataComposer.repositories.studios.findById(studioId);
+    if (!studio) {
+      const msg = `Studio ${studioId} not found`;
+      logger.warn(`Strategy group ${group.id}: ${msg}`);
+      return { containerName: '', success: false, error: msg };
+    }
+
+    const ownerSlug = (await this.resolveOwnerSlug(group)) || studio.agentId || 'unknown';
+    const result = await this.sandboxOrchestrator.spinUp({
+      userId: group.user_id,
+      agentId: ownerSlug,
+      studioId: studio.id,
+      studioSlug: studio.slug || undefined,
+      worktreePath: studio.worktreePath,
+      repoRoot: studio.repoRoot,
+      branch: studio.branch,
+      taskGroupId: group.id,
+      taskGroupTitle: group.title,
+      taskGroupContext: group.context_summary || undefined,
+      taskGroupThreadKey: group.thread_key || `strategy:${group.id}`,
+      backendAuth: (config.sandboxBackendAuth as any) || ['claude'],
+    });
+
+    if (result.success) {
+      await this.logStrategyEvent(
+        group,
+        'sandbox_started',
+        `Sandbox container started: ${result.containerName}`,
+        {
+          containerName: result.containerName,
+          studioId: studio.id,
+          alreadyRunning: result.alreadyRunning,
+        }
+      );
+    } else {
+      await this.logStrategyEvent(
+        group,
+        'sandbox_failed',
+        `Sandbox spin-up failed: ${result.error}`,
+        { containerName: result.containerName, error: result.error }
+      );
+    }
+
+    return result;
   }
 
   /**
@@ -931,7 +1543,35 @@ export class StrategyService {
       return false;
     }
 
-    return this.triggerOwnerAgent(group, currentTask, 'watchdog');
+    // If the strategy uses a sandbox, spin up (or reuse) the container before
+    // triggering. The orchestrator short-circuits if the container is already
+    // running, so this is safe to call on every watchdog tick.
+    const config = group.strategy_config as StrategyConfig;
+    let sandboxContainerName: string | undefined;
+    if (config.sandbox) {
+      const sandboxResult = await this.maybeSpinUpSandbox(group);
+      const sandboxPolicy = config.sandboxPolicy || 'required';
+
+      if (sandboxResult && !sandboxResult.success && sandboxPolicy === 'required') {
+        await this.logStrategyEvent(
+          group,
+          'sandbox_failed',
+          `Watchdog aborted: sandbox required but spin-up failed — ${sandboxResult.error}`,
+          { error: sandboxResult.error, policy: 'required', trigger: 'watchdog' }
+        );
+        await this.dataComposer.repositories.taskGroups.update(groupId, {
+          status: 'paused',
+          strategy_paused_at: new Date().toISOString(),
+        });
+        return false;
+      }
+
+      if (sandboxResult?.success) {
+        sandboxContainerName = sandboxResult.containerName;
+      }
+    }
+
+    return this.triggerOwnerAgent(group, currentTask, 'watchdog', sandboxContainerName);
   }
 
   /**
@@ -965,20 +1605,6 @@ export class StrategyService {
           backendSessionId = (session as { backend_session_id: string | null }).backend_session_id;
       }
 
-      // Resolve the owner agent's identity for reminder routing
-      let identityId: string | null = null;
-      if (group.owner_agent_id) {
-        const { data: identity } = await this.dataComposer
-          .getClient()
-          .from('agent_identities')
-          .select('id')
-          .eq('agent_id', group.owner_agent_id)
-          .eq('user_id', userId)
-          .limit(1)
-          .single();
-        if (identity) identityId = identity.id;
-      }
-
       await this.dataComposer
         .getClient()
         .from('scheduled_reminders')
@@ -996,7 +1622,7 @@ export class StrategyService {
           ]
             .filter(Boolean)
             .join(' '),
-          identity_id: identityId,
+          sb_id: group.sb_id,
           cron_expression: `*/${intervalMinutes} * * * *`,
           next_run_at: nextRunAt.toISOString(),
           status: 'active',
@@ -1004,7 +1630,7 @@ export class StrategyService {
             strategyWatchdog: true,
             groupId: group.id,
             strategy: group.strategy,
-            ownerAgentId: group.owner_agent_id,
+            sbId: group.sb_id,
             threadKey: group.thread_key,
             inkSessionId,
             backendSessionId,
@@ -1021,6 +1647,63 @@ export class StrategyService {
   /**
    * Cancel the watchdog reminder for a strategy (on pause/complete).
    */
+  private async finalizeStrategy(
+    group: TaskGroup,
+    stats: {
+      total: number;
+      completed: number;
+      pending: number;
+      blocked: number;
+      hasIncomplete: boolean;
+    },
+    config: StrategyConfig,
+    userId: string
+  ): Promise<void> {
+    await this.dataComposer.repositories.taskGroups.update(group.id, {
+      status: 'completed',
+      context_summary: stats.hasIncomplete
+        ? `Strategy complete with issues: ${stats.completed}/${stats.total} done, ${stats.pending} pending, ${stats.blocked} blocked.`
+        : `Strategy complete. ${stats.completed}/${stats.total} tasks done.`,
+    });
+
+    await this.cleanupStrategyResources(group.id);
+
+    await this.logStrategyEvent(
+      group,
+      'strategy_completed',
+      `Strategy complete: ${stats.completed}/${stats.total} tasks done`,
+      {
+        totalTasks: stats.total,
+        completedTasks: stats.completed,
+        pendingTasks: stats.pending,
+        blockedTasks: stats.blocked,
+        hasIncomplete: stats.hasIncomplete,
+      }
+    );
+
+    await this.notifyDispatcher(
+      group,
+      config.checkInNotify || config.approvalNotify,
+      `Strategy "${group.strategy}" complete on "${group.title}": ${stats.completed}/${stats.total} tasks finished.${stats.hasIncomplete ? ` WARNING: ${stats.pending} pending, ${stats.blocked} blocked tasks remain.` : ''}`,
+      userId
+    );
+
+    if (config.supervisorId) {
+      const supervisorSlug = await resolveAgentSlug(
+        this.dataComposer.getClient(),
+        config.supervisorId
+      );
+      if (supervisorSlug) {
+        await this.notifyDispatcher(
+          group,
+          supervisorSlug,
+          `[Supervisor audit] Strategy "${group.strategy}" on "${group.title}" is complete. ${stats.completed}/${stats.total} tasks done.${stats.hasIncomplete ? ` PROCESS VIOLATION: ${stats.pending} pending, ${stats.blocked} blocked tasks were not completed.` : ''} Review the activity stream for task_group_id ${group.id}.`,
+          userId
+        );
+      }
+    }
+  }
+
   /**
    * Clean up strategy resources (watchdog, etc.) without logging a
    * strategy_cancelled event or changing group status. Use this when
@@ -1028,6 +1711,17 @@ export class StrategyService {
    */
   async cleanupStrategyResources(groupId: string): Promise<void> {
     await this.cancelWatchdogReminder(groupId);
+
+    // Tear down ephemeral studio + sandbox if present
+    const group = await this.dataComposer.repositories.taskGroups.findById(groupId);
+    if (group) {
+      await this.teardownEphemeralStudio(group).catch((err) => {
+        logger.warn('Ephemeral studio teardown failed (non-fatal)', {
+          groupId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
   }
 
   private async cancelWatchdogReminder(groupId: string): Promise<void> {
@@ -1045,24 +1739,6 @@ export class StrategyService {
   }
 
   /**
-   * Resolve an identity UUID to an agent_id slug for notification routing.
-   * notifyDispatcher/handleSendToInbox accept slugs, but we store identity UUIDs.
-   */
-  private async resolveAgentSlug(identityId: string): Promise<string | null> {
-    try {
-      const { data } = await this.dataComposer
-        .getClient()
-        .from('agent_identities')
-        .select('agent_id')
-        .eq('id', identityId)
-        .single();
-      return data ? (data as { agent_id: string }).agent_id : null;
-    } catch {
-      return null;
-    }
-  }
-
-  /**
    * Log a strategy event to the activity stream.
    * Links to the task group via task_group_id for dashboard correlation.
    */
@@ -1074,9 +1750,10 @@ export class StrategyService {
   ): Promise<void> {
     try {
       const reqCtx = getRequestContext();
+      const agentSlug = (await this.resolveOwnerSlug(group)) || 'system';
       await this.dataComposer.repositories.activityStream.logActivity({
         userId: group.user_id,
-        agentId: group.owner_agent_id || 'system',
+        agentId: agentSlug,
         type: 'state_change',
         subtype,
         content,
@@ -1086,6 +1763,7 @@ export class StrategyService {
           groupId: group.id,
           groupTitle: group.title,
           strategy: group.strategy,
+          sbId: group.sb_id || undefined,
           ...payload,
         } as unknown as import('../data/repositories/activity-stream.repository').Json,
         status: 'completed',

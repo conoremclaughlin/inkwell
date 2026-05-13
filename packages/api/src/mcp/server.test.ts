@@ -150,6 +150,17 @@ function parseSSEResult(body: string): unknown {
   return JSON.parse(match[1]);
 }
 
+/** Encode a PCP context token as a base64url header value. */
+function encodeContextHeader(token: {
+  sessionId: string;
+  studioId: string;
+  agentId: string;
+  cliAttached: boolean;
+  runtime: string;
+}): string {
+  return Buffer.from(JSON.stringify(token)).toString('base64url');
+}
+
 // ---------------------------------------------------------------------------
 // Test suite
 // ---------------------------------------------------------------------------
@@ -160,14 +171,28 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
   let serverUnavailableError: Error | null = null;
   let delegatedIdentity: { id: string; agent_id: string } | null = null;
 
+  // Identity record returned when session-validated context auth resolves
+  let contextIdentity: {
+    id: string;
+    user_id: string;
+    users: { email: string };
+  } | null = null;
+
+  // Mock session returned by getSession (for context-based auth validation)
+  const mockGetSession = vi.fn(async () => null);
+
   // Minimal DataComposer stub
   const mockDataComposer = {
     getClient: () => ({
       from: (table: string) => {
         if (table === 'agent_identities') {
           const filters: Record<string, string> = {};
+          let selectedColumns = '';
           const query = {
-            select: () => query,
+            select: (cols?: string) => {
+              if (cols) selectedColumns = cols;
+              return query;
+            },
             eq: (field: string, value: string) => {
               filters[field] = value;
               return query;
@@ -179,8 +204,20 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
                 filters.agent_id === delegatedIdentity.agent_id;
               return { data: matches ? delegatedIdentity : null, error: null };
             },
-            single: async () => ({ data: null, error: null }),
-            limit: () => ({ error: null }),
+            single: async () => {
+              // resolveUserFromContextSession joins users and filters by agent_id + user_id
+              if (
+                selectedColumns.includes('users') &&
+                filters.agent_id &&
+                filters.user_id &&
+                contextIdentity &&
+                contextIdentity.user_id === filters.user_id
+              ) {
+                return { data: contextIdentity, error: null };
+              }
+              return { data: null, error: { message: 'not found' } };
+            },
+            limit: (_n: number) => query,
           };
           return query;
         }
@@ -192,6 +229,10 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
         };
       },
     }),
+    repositories: {
+      memory: { getSession: mockGetSession },
+      workspaces: { findById: vi.fn(async () => null) },
+    },
   } as any;
 
   beforeAll(async () => {
@@ -227,7 +268,9 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
 
   beforeEach(() => {
     mockVerifyAccessToken.mockReset();
+    mockGetSession.mockReset().mockResolvedValue(null);
     delegatedIdentity = null;
+    contextIdentity = null;
   });
 
   // =========================================================================
@@ -377,7 +420,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.delegated_agent_id).toBe('wren');
-    expect(body.identity_id).toBe('identity-abc');
+    expect(body.sb_id).toBe('identity-abc');
     expect(body.expires_in).toBe(3600);
 
     const token = body.access_token as string;
@@ -412,5 +455,211 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     });
 
     expect(res.status).toBe(403);
+  });
+
+  // =========================================================================
+  // Session-validated context auth (x-ink-context without OAuth)
+  // =========================================================================
+
+  it('should resolve identity from verified session in x-ink-context', async () => {
+    if (serverUnavailableError) return;
+    mockVerifyAccessToken.mockResolvedValue(null);
+    mockGetSession.mockResolvedValue({
+      id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+      userId: 'user-456',
+      agentId: 'wren',
+      lifecycle: 'running',
+      startedAt: new Date(),
+      endedAt: undefined,
+      metadata: {},
+    });
+    contextIdentity = {
+      id: 'sb-uuid-123',
+      user_id: 'user-456',
+      users: { email: 'test@example.com' },
+    };
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+      studioId: 'studio-1',
+      agentId: 'wren',
+      cliAttached: true,
+      runtime: 'claude',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      'x-ink-context': contextHeader,
+    });
+
+    expect(res.status).toBe(200);
+    expect(mockGetSession).toHaveBeenCalledWith('a1b2c3d4-e5f6-7890-abcd-ef1234567890');
+  });
+
+  it('should reject forged context with no matching session', async () => {
+    if (serverUnavailableError) return;
+    (env as any).MCP_REQUIRE_OAUTH = true;
+    mockVerifyAccessToken.mockResolvedValue(null);
+    mockGetSession.mockResolvedValue(null);
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'forged-session-id',
+      studioId: 'studio-1',
+      agentId: 'wren',
+      cliAttached: true,
+      runtime: 'claude',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      'x-ink-context': contextHeader,
+    });
+
+    expect(res.status).toBe(401);
+    (env as any).MCP_REQUIRE_OAUTH = false;
+  });
+
+  it('should reject context with malformed (non-UUID) sessionId without hitting DB', async () => {
+    if (serverUnavailableError) return;
+    (env as any).MCP_REQUIRE_OAUTH = true;
+    mockVerifyAccessToken.mockResolvedValue(null);
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'not-a-uuid',
+      studioId: 'studio-1',
+      agentId: 'wren',
+      cliAttached: true,
+      runtime: 'claude',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      'x-ink-context': contextHeader,
+    });
+
+    expect(res.status).toBe(401);
+    expect(mockGetSession).not.toHaveBeenCalled();
+    (env as any).MCP_REQUIRE_OAUTH = false;
+  });
+
+  it('should reject context when session agentId does not match', async () => {
+    if (serverUnavailableError) return;
+    (env as any).MCP_REQUIRE_OAUTH = true;
+    mockVerifyAccessToken.mockResolvedValue(null);
+    mockGetSession.mockResolvedValue({
+      id: 'b2c3d4e5-f6a7-8901-bcde-f12345678901',
+      userId: 'user-456',
+      agentId: 'lumen',
+      lifecycle: 'running',
+      startedAt: new Date(),
+      endedAt: undefined,
+      metadata: {},
+    });
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'b2c3d4e5-f6a7-8901-bcde-f12345678901',
+      studioId: 'studio-1',
+      agentId: 'wren',
+      cliAttached: true,
+      runtime: 'claude',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      'x-ink-context': contextHeader,
+    });
+
+    expect(res.status).toBe(401);
+    (env as any).MCP_REQUIRE_OAUTH = false;
+  });
+
+  it('should reject context when session is already ended', async () => {
+    if (serverUnavailableError) return;
+    (env as any).MCP_REQUIRE_OAUTH = true;
+    mockVerifyAccessToken.mockResolvedValue(null);
+    mockGetSession.mockResolvedValue({
+      id: 'c3d4e5f6-a7b8-9012-cdef-123456789012',
+      userId: 'user-456',
+      agentId: 'wren',
+      lifecycle: 'completed',
+      startedAt: new Date('2026-01-01'),
+      endedAt: new Date('2026-01-02'),
+      metadata: {},
+    });
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'c3d4e5f6-a7b8-9012-cdef-123456789012',
+      studioId: 'studio-1',
+      agentId: 'wren',
+      cliAttached: true,
+      runtime: 'claude',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      'x-ink-context': contextHeader,
+    });
+
+    expect(res.status).toBe(401);
+    (env as any).MCP_REQUIRE_OAUTH = false;
+  });
+
+  it('should NOT fall back to context auth when Authorization header is present but invalid', async () => {
+    if (serverUnavailableError) return;
+    mockVerifyAccessToken.mockResolvedValue(null);
+    mockGetSession.mockResolvedValue({
+      id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+      userId: 'user-456',
+      agentId: 'wren',
+      lifecycle: 'running',
+      startedAt: new Date(),
+      endedAt: undefined,
+      metadata: {},
+    });
+    contextIdentity = {
+      id: 'sb-uuid-123',
+      user_id: 'user-456',
+      users: { email: 'test@example.com' },
+    };
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+      studioId: 'studio-1',
+      agentId: 'wren',
+      cliAttached: true,
+      runtime: 'claude',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      Authorization: 'Bearer expired-or-invalid-token',
+      'x-ink-context': contextHeader,
+    });
+
+    // Invalid Authorization header = hard 401, context is not a fallback
+    expect(res.status).toBe(401);
+    const body = JSON.parse(res.body);
+    expect(body.error.message).toContain('Invalid or expired');
+  });
+
+  it('should prefer OAuth identity over context-based fallback', async () => {
+    if (serverUnavailableError) return;
+    mockVerifyAccessToken.mockResolvedValue({
+      userId: 'oauth-user',
+      email: 'oauth@example.com',
+      agentId: 'wren',
+      sbId: 'oauth-sb',
+    });
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'd4e5f6a7-b8c9-0123-defa-234567890123',
+      studioId: 'studio-1',
+      agentId: 'wren',
+      cliAttached: true,
+      runtime: 'claude',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      Authorization: 'Bearer valid-token',
+      'x-ink-context': contextHeader,
+    });
+
+    expect(res.status).toBe(200);
+    // Session lookup should NOT have been called — OAuth was sufficient
+    expect(mockGetSession).not.toHaveBeenCalled();
   });
 });

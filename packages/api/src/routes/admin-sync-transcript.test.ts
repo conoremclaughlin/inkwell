@@ -219,7 +219,7 @@ describe('POST /sessions/:id/sync-transcript', () => {
         return createQueryChain([
           {
             id: 'session-1',
-            identity_id: 'identity-1',
+            sb_id: 'identity-1',
             agent_id: 'lumen',
             backend: 'pcp',
             backend_session_id: 'backend-1',

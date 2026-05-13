@@ -1,5 +1,5 @@
 /**
- * Direct API Backend
+ * Ink Backend
  *
  * Uses the Anthropic API directly instead of Claude Code CLI.
  * Useful for cloud deployments where CLI isn't available.
@@ -17,8 +17,8 @@ import type {
   ResponseHandler,
 } from '../types';
 
-export interface DirectApiConfig extends BackendConfig {
-  type: 'direct-api';
+export interface InkConfig extends BackendConfig {
+  type: 'ink';
   apiKey?: string;
   model?: string;
   maxTokens?: number;
@@ -30,15 +30,15 @@ interface ConversationMessage {
   content: string;
 }
 
-const DEFAULT_CONFIG: Partial<DirectApiConfig> = {
+const DEFAULT_CONFIG: Partial<InkConfig> = {
   model: 'claude-sonnet-4-20250514',
   maxTokens: 4096,
 };
 
-export class DirectApiBackend extends EventEmitter implements AgentBackend {
-  readonly type: BackendType = 'direct-api';
+export class InkBackend extends EventEmitter implements AgentBackend {
+  readonly type: BackendType = 'ink';
 
-  private config: DirectApiConfig;
+  private config: InkConfig;
   private client: Anthropic | null = null;
   private ready = false;
   private messageCount = 0;
@@ -55,9 +55,9 @@ export class DirectApiBackend extends EventEmitter implements AgentBackend {
   // MCP tools definition (simplified for API calls)
   private tools: Anthropic.Tool[] = [];
 
-  constructor(config: Partial<DirectApiConfig> = {}) {
+  constructor(config: Partial<InkConfig> = {}) {
     super();
-    this.config = { ...DEFAULT_CONFIG, ...config, type: 'direct-api' } as DirectApiConfig;
+    this.config = { ...DEFAULT_CONFIG, ...config, type: 'ink' } as InkConfig;
   }
 
   /**
@@ -76,28 +76,28 @@ export class DirectApiBackend extends EventEmitter implements AgentBackend {
 
   async initialize(): Promise<void> {
     if (this.client) {
-      logger.warn('Direct API backend already initialized');
+      logger.warn('Ink backend already initialized');
       return;
     }
 
-    logger.info('Initializing Direct API backend...');
+    logger.info('Initializing Ink backend...');
 
     const apiKey = this.config.apiKey || process.env.ANTHROPIC_API_KEY;
     if (!apiKey) {
-      throw new Error('ANTHROPIC_API_KEY is required for Direct API backend');
+      throw new Error('ANTHROPIC_API_KEY is required for Ink backend');
     }
 
     this.client = new Anthropic({ apiKey });
-    this.sessionId = `direct-api-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    this.sessionId = `ink-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     this.startTime = new Date();
     this.ready = true;
 
     this.emit('ready');
-    logger.info('Direct API backend ready', { sessionId: this.sessionId });
+    logger.info('Ink backend ready', { sessionId: this.sessionId });
   }
 
   async shutdown(): Promise<void> {
-    logger.info('Shutting down Direct API backend...');
+    logger.info('Shutting down Ink backend...');
     this.client = null;
     this.ready = false;
     this.conversationHistory.clear();
@@ -106,7 +106,7 @@ export class DirectApiBackend extends EventEmitter implements AgentBackend {
 
   async sendMessage(message: AgentMessage): Promise<void> {
     if (!this.client || !this.ready) {
-      throw new Error('Direct API backend not ready');
+      throw new Error('Ink backend not ready');
     }
 
     this.messageCount++;
@@ -121,7 +121,7 @@ export class DirectApiBackend extends EventEmitter implements AgentBackend {
     });
 
     logger.info(
-      `Sending message via Direct API [${message.channel}]: ${message.content.substring(0, 100)}...`
+      `Sending message via Ink [${message.channel}]: ${message.content.substring(0, 100)}...`
     );
 
     try {
@@ -138,7 +138,7 @@ export class DirectApiBackend extends EventEmitter implements AgentBackend {
       await this.processResponse(response, message);
     } catch (error) {
       this.lastError = error instanceof Error ? error.message : 'Unknown error';
-      logger.error('Direct API error:', error);
+      logger.error('Ink error:', error);
       this.emit('error', error);
       throw error;
     }
@@ -164,7 +164,7 @@ export class DirectApiBackend extends EventEmitter implements AgentBackend {
   }
 
   async resumeSession(sessionId: string): Promise<boolean> {
-    // Direct API doesn't have true session resumption
+    // Ink doesn't have true session resumption
     // but we can set the session ID for tracking
     this.sessionId = sessionId;
     return true;
@@ -293,8 +293,8 @@ export class DirectApiBackend extends EventEmitter implements AgentBackend {
 }
 
 /**
- * Create a Direct API backend instance
+ * Create a Ink backend instance
  */
-export function createDirectApiBackend(config?: Partial<DirectApiConfig>): DirectApiBackend {
-  return new DirectApiBackend(config);
+export function createInkBackend(config?: Partial<InkConfig>): InkBackend {
+  return new InkBackend(config);
 }

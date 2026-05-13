@@ -133,7 +133,7 @@ export class ContextBuilder implements IContextBuilder {
   async buildContext(userId: string, agentId: string, session: Session): Promise<InjectedContext> {
     // Fetch all required data in parallel
     const [agentIdentity, user, contacts, recentMemories, activeProjects] = await Promise.all([
-      this.getAgentIdentity(userId, agentId, session.identityId),
+      this.getAgentIdentity(userId, agentId, session.sbId),
       this.getUser(userId),
       this.getContacts(userId),
       this.getRecentMemories(userId, agentId, 10, session.contactId),
@@ -213,7 +213,7 @@ export class ContextBuilder implements IContextBuilder {
     session?: Session
   ): Promise<Pick<InjectedContext, 'temporal' | 'agent'>> {
     const [agentIdentity, user] = await Promise.all([
-      this.getAgentIdentity(userId, agentId, session?.identityId),
+      this.getAgentIdentity(userId, agentId, session?.sbId),
       this.getUser(userId),
     ]);
 
@@ -250,22 +250,22 @@ export class ContextBuilder implements IContextBuilder {
   private async getAgentIdentity(
     userId: string,
     agentId: string,
-    identityId?: string
+    sbId?: string
   ): Promise<AgentIdentity | null> {
-    if (identityId) {
+    if (sbId) {
       const { data: byId, error: byIdError } = await this.supabase
         .from('agent_identities')
         .select('*')
-        .eq('id', identityId)
+        .eq('id', sbId)
         .eq('user_id', userId)
         .eq('agent_id', agentId)
         .maybeSingle();
 
       if (byIdError) {
-        logger.error('Error fetching agent identity by identityId', {
+        logger.error('Error fetching agent identity by sbId', {
           userId,
           agentId,
-          identityId,
+          sbId,
           error: byIdError,
         });
         throw byIdError;
@@ -275,10 +275,10 @@ export class ContextBuilder implements IContextBuilder {
         return mapAgentIdentity(byId);
       }
 
-      logger.warn('Session identityId did not resolve; falling back to slug lookup', {
+      logger.warn('Session sbId did not resolve; falling back to slug lookup', {
         userId,
         agentId,
-        identityId,
+        sbId,
       });
     }
 

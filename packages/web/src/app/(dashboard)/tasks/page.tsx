@@ -83,8 +83,6 @@ interface TaskGroupData {
   outputStatus: string | null;
   threadKey: string | null;
   strategy: string | null;
-  ownerAgentId: string | null;
-  ownerAgentName: string | null;
   currentTaskIndex: number;
   strategyStartedAt: string | null;
   strategyPausedAt: string | null;
@@ -688,10 +686,10 @@ function TaskGroupSection({
             )}
           </div>
           <div className="flex items-center gap-2 mt-0.5 text-[11px] text-gray-400">
-            {(group.strategy ? group.ownerAgentName : group.agentName) && (
+            {group.agentName && (
               <span className="flex items-center gap-1">
                 <Bot className="h-3 w-3" />
-                {group.strategy ? group.ownerAgentName : group.agentName}
+                {group.agentName}
               </span>
             )}
             {group.projectName && (

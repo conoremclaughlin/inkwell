@@ -11,9 +11,12 @@ import type {
   StrategyPreset,
   VerificationMode,
 } from '../../data/repositories/task-groups.repository';
+import type { Json } from '../../data/repositories/activity-stream.repository';
 import { StrategyService } from '../../services/strategy.service';
+import { getOrchestrator } from '../../services/sandbox/index.js';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
+import { resolveIdentityId } from '../../auth/resolve-identity';
 
 const userIdentifierSchema = z.object({
   userId: z
@@ -58,10 +61,6 @@ export const startStrategySchema = z.object({
   strategy: z
     .enum(['persistence', 'review', 'architect', 'parallel', 'swarm'])
     .describe('Strategy preset to use'),
-  ownerAgentId: z
-    .string()
-    .optional()
-    .describe('Agent ID that will execute the strategy. Defaults to calling agent.'),
   planUri: z
     .string()
     .optional()
@@ -102,6 +101,42 @@ export const startStrategySchema = z.object({
     .describe(
       'Supervisor agent identity ID (UUID). Gets check-in notifications and a final audit on completion.'
     ),
+  sandbox: z.boolean().optional().describe('Run the strategy in a sandboxed Docker container'),
+  sandboxPolicy: z
+    .enum(['required', 'preferred'])
+    .optional()
+    .describe(
+      "Sandbox failure policy: 'required' aborts if sandbox can't start (default), 'preferred' falls back to host"
+    ),
+  sandboxBackendAuth: z
+    .array(z.enum(['claude', 'codex', 'gemini']))
+    .optional()
+    .describe("Backend auth dirs to mount in the sandbox (default: ['claude'])"),
+  ephemeralStudio: z
+    .boolean()
+    .optional()
+    .describe(
+      'Auto-create an ephemeral git worktree + studio for sandbox work. Requires sandbox: true and repoRoot in group metadata.'
+    ),
+  studioSlug: z
+    .string()
+    .regex(/^[a-z0-9][a-z0-9-]*[a-z0-9]$/)
+    .optional()
+    .describe(
+      'Create a persistent git worktree + studio for this strategy. The slug becomes the studio name and branch suffix. Requires repoRoot in group metadata. Mutually exclusive with ephemeralStudio.'
+    ),
+  requireFinalApproval: z
+    .boolean()
+    .optional()
+    .describe(
+      'Require human approval before finalizing. Pauses when all tasks are done and sends approval criteria to the approver.'
+    ),
+  approvalCriteria: z
+    .array(z.string())
+    .optional()
+    .describe(
+      'Acceptance criteria the approver should verify (e.g., ["tests pass", "PR reviewed", "visual review via Playwright"])'
+    ),
 });
 
 export async function handleStartStrategy(
@@ -114,14 +149,28 @@ export async function handleStartStrategy(
       return mcpResponse({ success: false, error: 'User not found' }, true);
     }
 
-    const agentId = getEffectiveAgentId(args.ownerAgentId);
+    const agentId = getEffectiveAgentId();
 
-    const service = new StrategyService(dataComposer);
+    const sbId = agentId
+      ? await resolveIdentityId(dataComposer.getClient(), resolved.user.id, agentId)
+      : null;
+    if (!sbId) {
+      return mcpResponse(
+        {
+          success: false,
+          error:
+            'Could not resolve agent identity — ensure the calling agent has an identity record.',
+        },
+        true
+      );
+    }
+
+    const service = new StrategyService(dataComposer, getOrchestrator());
     const result = await service.startStrategy({
       groupId: args.groupId,
       userId: resolved.user.id,
       strategy: args.strategy as StrategyPreset,
-      ownerAgentId: agentId || args.ownerAgentId || 'unknown',
+      sbId,
       verificationMode: args.verificationMode as VerificationMode,
       planUri: args.planUri,
       config: {
@@ -133,6 +182,13 @@ export async function handleStartStrategy(
         contextSummaryInterval: args.contextSummaryInterval,
         verificationGates: args.verificationGates,
         supervisorId: args.supervisorId,
+        sandbox: args.sandbox,
+        sandboxPolicy: args.sandboxPolicy,
+        sandboxBackendAuth: args.sandboxBackendAuth,
+        ephemeralStudio: args.ephemeralStudio,
+        studioSlug: args.studioSlug,
+        requireFinalApproval: args.requireFinalApproval,
+        approvalCriteria: args.approvalCriteria,
       },
     });
 
@@ -179,7 +235,7 @@ export async function handlePauseStrategy(
       return mcpResponse({ success: false, error: 'User not found' }, true);
     }
 
-    const service = new StrategyService(dataComposer);
+    const service = new StrategyService(dataComposer, getOrchestrator());
     const group = await service.pauseStrategy(args.groupId, resolved.user.id);
 
     return mcpResponse({
@@ -220,7 +276,7 @@ export async function handleResumeStrategy(
       return mcpResponse({ success: false, error: 'User not found' }, true);
     }
 
-    const service = new StrategyService(dataComposer);
+    const service = new StrategyService(dataComposer, getOrchestrator());
     const result = await service.resumeStrategy(args.groupId, resolved.user.id);
 
     return mcpResponse({
@@ -271,7 +327,7 @@ export async function handleCancelStrategy(
       return mcpResponse({ success: false, error: 'User not found' }, true);
     }
 
-    const service = new StrategyService(dataComposer);
+    const service = new StrategyService(dataComposer, getOrchestrator());
     const group = await service.cancelStrategy(args.groupId, resolved.user.id, args.reason);
 
     return mcpResponse({
@@ -297,6 +353,172 @@ export async function handleCancelStrategy(
 // GET STRATEGY STATUS
 // ============================================================================
 
+// ============================================================================
+// UPDATE STRATEGY
+// ============================================================================
+
+export const updateStrategySchema = z.object({
+  ...userIdentifierSchema.shape,
+  groupId: z.string().uuid().describe('Task group ID to update strategy config on'),
+  checkInInterval: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe('Post progress check-in every N tasks'),
+  checkInNotify: z.string().optional().describe('Agent ID to notify on check-ins'),
+  approvalNotify: z.string().optional().describe('Agent ID to notify when approval is needed'),
+  maxIterationsWithoutApproval: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe('Pause after N tasks without human approval'),
+  contextSummaryInterval: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe('Compact context every N tasks'),
+  verificationGates: z
+    .array(z.string())
+    .optional()
+    .describe('What must pass before advancing (e.g., ["tests", "build"])'),
+  verificationMode: z
+    .enum(['self', 'peer', 'architect'])
+    .optional()
+    .describe('How task completion is validated'),
+  supervisorId: z
+    .string()
+    .uuid()
+    .optional()
+    .nullable()
+    .describe('Supervisor agent identity ID (UUID). Pass null to clear.'),
+  watchdogIntervalMinutes: z
+    .number()
+    .int()
+    .min(1)
+    .max(1440)
+    .optional()
+    .describe('How often (minutes) the watchdog checks for stuck strategies'),
+});
+
+export async function handleUpdateStrategy(
+  args: z.infer<typeof updateStrategySchema>,
+  dataComposer: DataComposer
+): Promise<McpResponse> {
+  try {
+    const resolved = await resolveUser(args as UserIdentifier, dataComposer);
+    if (!resolved) {
+      return mcpResponse({ success: false, error: 'User not found' }, true);
+    }
+
+    const group = await dataComposer.repositories.taskGroups.findById(args.groupId);
+    if (!group) {
+      return mcpResponse({ success: false, error: 'Task group not found' }, true);
+    }
+    if (group.user_id !== resolved.user.id) {
+      return mcpResponse(
+        { success: false, error: 'Task group does not belong to this user' },
+        true
+      );
+    }
+    if (!group.strategy) {
+      return mcpResponse(
+        {
+          success: false,
+          error: 'No strategy configured on this task group. Use start_strategy first.',
+        },
+        true
+      );
+    }
+    if (group.status === 'completed' || group.status === 'cancelled') {
+      return mcpResponse(
+        { success: false, error: `Cannot update strategy on a ${group.status} group` },
+        true
+      );
+    }
+
+    const existingConfig = (group.strategy_config || {}) as Record<string, unknown>;
+    const configUpdates: Record<string, unknown> = {};
+
+    if (args.checkInInterval !== undefined) configUpdates.checkInInterval = args.checkInInterval;
+    if (args.checkInNotify !== undefined) configUpdates.checkInNotify = args.checkInNotify;
+    if (args.approvalNotify !== undefined) configUpdates.approvalNotify = args.approvalNotify;
+    if (args.maxIterationsWithoutApproval !== undefined)
+      configUpdates.maxIterationsWithoutApproval = args.maxIterationsWithoutApproval;
+    if (args.contextSummaryInterval !== undefined)
+      configUpdates.contextSummaryInterval = args.contextSummaryInterval;
+    if (args.verificationGates !== undefined)
+      configUpdates.verificationGates = args.verificationGates;
+    if (args.watchdogIntervalMinutes !== undefined)
+      configUpdates.watchdogIntervalMinutes = args.watchdogIntervalMinutes;
+    if (args.supervisorId !== undefined) configUpdates.supervisorId = args.supervisorId;
+
+    if (Object.keys(configUpdates).length === 0 && args.verificationMode === undefined) {
+      return mcpResponse(
+        { success: false, error: 'At least one config field must be provided' },
+        true
+      );
+    }
+
+    const mergedConfig = { ...existingConfig, ...configUpdates };
+
+    const updatePayload: Record<string, unknown> = {
+      strategy_config: mergedConfig,
+    };
+    if (args.verificationMode !== undefined) {
+      updatePayload.verification_mode = args.verificationMode;
+    }
+
+    await dataComposer.repositories.taskGroups.update(args.groupId, updatePayload as never);
+
+    const agentId = getEffectiveAgentId(undefined) || 'system';
+    try {
+      await dataComposer.repositories.activityStream.logActivity({
+        userId: resolved.user.id,
+        agentId,
+        type: 'state_change',
+        subtype: 'strategy_config_updated',
+        content: `Strategy config updated on "${group.title}"`,
+        taskGroupId: args.groupId,
+        payload: {
+          groupId: args.groupId,
+          groupTitle: group.title,
+          strategy: group.strategy,
+          configUpdates: configUpdates as Record<string, Json>,
+          ...(args.verificationMode !== undefined
+            ? { verificationMode: args.verificationMode }
+            : {}),
+        } as Json,
+      });
+    } catch (err) {
+      // Non-fatal — don't fail the update
+    }
+
+    return mcpResponse({
+      success: true,
+      groupId: args.groupId,
+      title: group.title,
+      strategy: group.strategy,
+      config: mergedConfig,
+      ...(args.verificationMode !== undefined ? { verificationMode: args.verificationMode } : {}),
+    });
+  } catch (error) {
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to update strategy',
+      },
+      true
+    );
+  }
+}
+
+// ============================================================================
+// GET STRATEGY STATUS
+// ============================================================================
+
 export const getStrategyStatusSchema = z.object({
   ...userIdentifierSchema.shape,
   groupId: z.string().uuid().describe('Task group ID to get status for'),
@@ -312,7 +534,7 @@ export async function handleGetStrategyStatus(
       return mcpResponse({ success: false, error: 'User not found' }, true);
     }
 
-    const service = new StrategyService(dataComposer);
+    const service = new StrategyService(dataComposer, getOrchestrator());
     const status = await service.getStrategyStatus(args.groupId, resolved.user.id);
 
     return mcpResponse({ success: true, ...status });

@@ -2,15 +2,15 @@
  * Memory Handler Tests
  *
  * Tests for MCP tool schemas and handlers related to sessions,
- * session phases, and the unified update_session_phase tool.
+ * session phases, and the unified update_session_state tool.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   startSessionSchema,
   listSessionsSchema,
-  updateSessionPhaseSchema,
-  handleUpdateSessionPhase,
+  updateSessionStateSchema,
+  handleUpdateSessionState,
   handleStartSession,
   curateRecallSchema,
   handleCurateRecall,
@@ -237,9 +237,9 @@ describe('listSessionsSchema', () => {
   });
 });
 
-describe('updateSessionPhaseSchema', () => {
+describe('updateSessionStateSchema', () => {
   it('should accept phase only', () => {
-    const result = updateSessionPhaseSchema.safeParse({
+    const result = updateSessionStateSchema.safeParse({
       email: 'test@test.com',
       phase: 'implementing',
     });
@@ -251,7 +251,7 @@ describe('updateSessionPhaseSchema', () => {
   });
 
   it('should accept blocked phase with note', () => {
-    const result = updateSessionPhaseSchema.safeParse({
+    const result = updateSessionStateSchema.safeParse({
       email: 'test@test.com',
       phase: 'blocked:awaiting-user-approval',
       note: 'Need approval on approach C before proceeding',
@@ -267,7 +267,7 @@ describe('updateSessionPhaseSchema', () => {
   });
 
   it('should accept backendSessionId without phase (metadata-only update)', () => {
-    const result = updateSessionPhaseSchema.safeParse({
+    const result = updateSessionStateSchema.safeParse({
       email: 'test@test.com',
       backendSessionId: 'claude-session-abc123',
     });
@@ -280,7 +280,7 @@ describe('updateSessionPhaseSchema', () => {
   });
 
   it('should accept all unified fields together', () => {
-    const result = updateSessionPhaseSchema.safeParse({
+    const result = updateSessionStateSchema.safeParse({
       email: 'test@test.com',
       phase: 'implementing',
       backendSessionId: 'claude-session-abc123',
@@ -303,7 +303,7 @@ describe('updateSessionPhaseSchema', () => {
 
   it('should accept status enum values', () => {
     for (const status of ['active', 'paused', 'resumable', 'completed']) {
-      const result = updateSessionPhaseSchema.safeParse({
+      const result = updateSessionStateSchema.safeParse({
         email: 'test@test.com',
         status,
       });
@@ -312,7 +312,7 @@ describe('updateSessionPhaseSchema', () => {
   });
 
   it('should reject invalid status enum values', () => {
-    const result = updateSessionPhaseSchema.safeParse({
+    const result = updateSessionStateSchema.safeParse({
       email: 'test@test.com',
       status: 'invalid-status',
     });
@@ -320,7 +320,7 @@ describe('updateSessionPhaseSchema', () => {
   });
 
   it('should accept sessionId as optional UUID', () => {
-    const result = updateSessionPhaseSchema.safeParse({
+    const result = updateSessionStateSchema.safeParse({
       email: 'test@test.com',
       sessionId: '550e8400-e29b-41d4-a716-446655440000',
       phase: 'reviewing',
@@ -333,7 +333,7 @@ describe('updateSessionPhaseSchema', () => {
   });
 
   it('should reject non-UUID sessionId', () => {
-    const result = updateSessionPhaseSchema.safeParse({
+    const result = updateSessionStateSchema.safeParse({
       email: 'test@test.com',
       sessionId: 'not-a-uuid',
       phase: 'implementing',
@@ -342,7 +342,7 @@ describe('updateSessionPhaseSchema', () => {
   });
 
   it('should accept free-text phase values (extensible)', () => {
-    const result = updateSessionPhaseSchema.safeParse({
+    const result = updateSessionStateSchema.safeParse({
       email: 'test@test.com',
       phase: 'waiting:ci-pipeline-completion',
     });
@@ -358,7 +358,7 @@ describe('updateSessionPhaseSchema', () => {
 // HANDLER TESTS
 // =====================================================
 
-describe('handleUpdateSessionPhase', () => {
+describe('handleUpdateSessionState', () => {
   let mockDataComposer: ReturnType<typeof createMockDataComposer>;
 
   const mockSession = {
@@ -392,7 +392,7 @@ describe('handleUpdateSessionPhase', () => {
       mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockUpdatedSession);
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         { email: 'test@test.com', phase: 'implementing' },
         mockDataComposer as never
       );
@@ -417,7 +417,7 @@ describe('handleUpdateSessionPhase', () => {
     it('should update phase on explicitly specified session', async () => {
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockUpdatedSession);
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         {
           email: 'test@test.com',
           sessionId: '550e8400-e29b-41d4-a716-446655440000',
@@ -437,7 +437,7 @@ describe('handleUpdateSessionPhase', () => {
       mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockUpdatedSession);
 
-      await handleUpdateSessionPhase(
+      await handleUpdateSessionState(
         { email: 'test@test.com', phase: 'investigating', agentId: 'wren' },
         mockDataComposer as never
       );
@@ -468,7 +468,7 @@ describe('handleUpdateSessionPhase', () => {
       mockDataComposer.repositories.memory.getSession.mockResolvedValue(before);
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(after);
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         {
           email: 'test@test.com',
           phase: 'implementing',
@@ -501,7 +501,7 @@ describe('handleUpdateSessionPhase', () => {
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockUpdatedSession);
 
       const studioId = '550e8400-e29b-41d4-a716-446655440099';
-      await handleUpdateSessionPhase(
+      await handleUpdateSessionState(
         { email: 'test@test.com', phase: 'implementing', agentId: 'wren', studioId },
         mockDataComposer as never
       );
@@ -518,7 +518,7 @@ describe('handleUpdateSessionPhase', () => {
 
       const sessionId = '550e8400-e29b-41d4-a716-446655440000';
       const studioId = '550e8400-e29b-41d4-a716-446655440099';
-      await handleUpdateSessionPhase(
+      await handleUpdateSessionState(
         { email: 'test@test.com', phase: 'reviewing', sessionId, studioId },
         mockDataComposer as never
       );
@@ -536,7 +536,7 @@ describe('handleUpdateSessionPhase', () => {
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockUpdatedSession);
 
       const studioId = '550e8400-e29b-41d4-a716-446655440099';
-      await handleUpdateSessionPhase(
+      await handleUpdateSessionState(
         { email: 'test@test.com', phase: 'implementing', agentId: 'wren', studioId },
         mockDataComposer as never
       );
@@ -559,7 +559,7 @@ describe('handleUpdateSessionPhase', () => {
       mockDataComposer.repositories.memory.listSessions.mockResolvedValue([mockSession]);
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockSession);
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         { email: 'test@test.com', backendSessionId: 'claude-abc123' },
         mockDataComposer as never
       );
@@ -591,7 +591,7 @@ describe('handleUpdateSessionPhase', () => {
         backendSessionId: 'claude-abc123',
       });
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         { email: 'test@test.com', backendSessionId: 'claude-abc123', agentId: 'wren' },
         mockDataComposer as never
       );
@@ -618,7 +618,7 @@ describe('handleUpdateSessionPhase', () => {
       mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockSession);
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         { email: 'test@test.com', status: 'resumable' },
         mockDataComposer as never
       );
@@ -632,7 +632,7 @@ describe('handleUpdateSessionPhase', () => {
       mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockSession);
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         {
           email: 'test@test.com',
           context: 'Writing tests for session phase',
@@ -654,7 +654,7 @@ describe('handleUpdateSessionPhase', () => {
         currentPhase: 'implementing',
       });
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         {
           email: 'test@test.com',
           phase: 'implementing',
@@ -696,7 +696,7 @@ describe('handleUpdateSessionPhase', () => {
         content: '[blocked:awaiting-approval] Need user approval on design',
       });
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         {
           email: 'test@test.com',
           phase: 'blocked:awaiting-approval',
@@ -736,7 +736,7 @@ describe('handleUpdateSessionPhase', () => {
         content: '[waiting:ci-pipeline] CI pipeline running for PR #42',
       });
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         {
           email: 'test@test.com',
           phase: 'waiting:ci-pipeline',
@@ -764,7 +764,7 @@ describe('handleUpdateSessionPhase', () => {
         currentPhase: 'complete',
       });
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         { email: 'test@test.com', phase: 'complete' },
         mockDataComposer as never
       );
@@ -785,7 +785,7 @@ describe('handleUpdateSessionPhase', () => {
         content: '[complete] Merged PR #214 after resolving sender-metadata propagation bug.',
       });
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         {
           email: 'test@test.com',
           phase: 'complete',
@@ -810,7 +810,7 @@ describe('handleUpdateSessionPhase', () => {
         currentPhase: 'blocked:unknown-issue',
       });
 
-      await handleUpdateSessionPhase(
+      await handleUpdateSessionState(
         { email: 'test@test.com', phase: 'blocked:unknown-issue' },
         mockDataComposer as never
       );
@@ -830,7 +830,7 @@ describe('handleUpdateSessionPhase', () => {
           currentPhase: phase,
         });
 
-        const result = await handleUpdateSessionPhase(
+        const result = await handleUpdateSessionState(
           { email: 'test@test.com', phase },
           mockDataComposer as never
         );
@@ -845,7 +845,7 @@ describe('handleUpdateSessionPhase', () => {
       mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockSession);
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         { email: 'test@test.com', backendSessionId: 'abc123', status: 'active' },
         mockDataComposer as never
       );
@@ -866,7 +866,7 @@ describe('handleUpdateSessionPhase', () => {
         content: '[blocked:test] Awaiting review from Wren.',
       });
 
-      await handleUpdateSessionPhase(
+      await handleUpdateSessionState(
         {
           email: 'test@test.com',
           phase: 'blocked:test',
@@ -907,7 +907,7 @@ describe('handleUpdateSessionPhase', () => {
         title: '[blocked:awaiting-input] Need user feedback',
       });
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         {
           email: 'test@test.com',
           phase: 'blocked:awaiting-input',
@@ -952,7 +952,7 @@ describe('handleUpdateSessionPhase', () => {
         title: '[waiting:ci-build] CI running',
       });
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         {
           email: 'test@test.com',
           phase: 'waiting:ci-build',
@@ -977,7 +977,7 @@ describe('handleUpdateSessionPhase', () => {
         content: 'test',
       });
 
-      await handleUpdateSessionPhase(
+      await handleUpdateSessionState(
         { email: 'test@test.com', phase: 'blocked:test', createTask: false },
         mockDataComposer as never
       );
@@ -990,7 +990,7 @@ describe('handleUpdateSessionPhase', () => {
       mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockUpdatedSession);
 
-      await handleUpdateSessionPhase(
+      await handleUpdateSessionState(
         { email: 'test@test.com', phase: 'implementing', createTask: true },
         mockDataComposer as never
       );
@@ -1015,7 +1015,7 @@ describe('handleUpdateSessionPhase', () => {
         new Error('Database constraint violation')
       );
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         { email: 'test@test.com', phase: 'blocked:test', createTask: true },
         mockDataComposer as never
       );
@@ -1038,7 +1038,7 @@ describe('handleUpdateSessionPhase', () => {
       });
       mockDataComposer.repositories.projects.findAllByUser.mockResolvedValue([]);
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         { email: 'test@test.com', phase: 'blocked:test', createTask: true },
         mockDataComposer as never
       );
@@ -1056,7 +1056,7 @@ describe('handleUpdateSessionPhase', () => {
 
   describe('error handling', () => {
     it('should error when no fields provided', async () => {
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         { email: 'test@test.com' },
         mockDataComposer as never
       );
@@ -1069,7 +1069,7 @@ describe('handleUpdateSessionPhase', () => {
     it('should error when no active session found', async () => {
       mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(null);
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         { email: 'test@test.com', phase: 'implementing' },
         mockDataComposer as never
       );
@@ -1082,7 +1082,7 @@ describe('handleUpdateSessionPhase', () => {
     it('should error when session not found by ID', async () => {
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(null);
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         {
           email: 'test@test.com',
           sessionId: '00000000-0000-0000-0000-000000000000',
@@ -1109,7 +1109,7 @@ describe('handleUpdateSessionPhase', () => {
         currentPhase: 'reviewing',
       });
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         {
           email: 'test@test.com',
           phase: 'reviewing',
@@ -1138,7 +1138,7 @@ describe('handleUpdateSessionPhase', () => {
       mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(sessionWithWorkspace);
 
-      const result = await handleUpdateSessionPhase(
+      const result = await handleUpdateSessionState(
         { email: 'test@test.com', phase: 'implementing' },
         mockDataComposer as never
       );

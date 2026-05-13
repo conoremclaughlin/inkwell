@@ -23,6 +23,30 @@ vi.mock('../mcp/tools/inbox-handlers', () => ({
   handleSendToInbox: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('child_process', () => ({
+  execFile: vi.fn((_cmd: string, _args: string[], _opts: unknown, cb?: Function) => {
+    if (cb) cb(null, 'worktree /repo\n', '');
+  }),
+}));
+
+vi.mock('fs', () => ({
+  existsSync: vi.fn().mockReturnValue(false),
+}));
+
+vi.mock('./studio-settings', () => ({
+  ensureStudioSettings: vi.fn().mockResolvedValue(true),
+}));
+
+vi.mock('../auth/resolve-identity', () => ({
+  resolveAgentSlug: vi.fn().mockImplementation((_client: unknown, sbId: string) => {
+    if (sbId === 'sb-wren-uuid') return Promise.resolve('wren');
+    if (sbId === 'supervisor-uuid-123' || sbId === 'supervisor-uuid-456')
+      return Promise.resolve('lumen');
+    return Promise.resolve(null);
+  }),
+  resolveIdentityId: vi.fn().mockResolvedValue('sb-wren-uuid'),
+}));
+
 // ============================================================================
 // Mock Helpers
 // ============================================================================
@@ -31,7 +55,7 @@ function createMockGroup(overrides: Partial<TaskGroup> = {}): TaskGroup {
   return {
     id: 'group-1',
     user_id: 'user-123',
-    identity_id: null,
+    sb_id: null,
     project_id: null,
     title: 'Test Strategy Group',
     description: null,
@@ -55,7 +79,7 @@ function createMockGroup(overrides: Partial<TaskGroup> = {}): TaskGroup {
     iterations_since_approval: 0,
     strategy_started_at: null,
     strategy_paused_at: null,
-    owner_agent_id: 'wren',
+    sb_id: 'sb-wren-uuid',
     created_at: '2026-04-10T00:00:00Z',
     updated_at: '2026-04-10T00:00:00Z',
     ...overrides,
@@ -126,6 +150,22 @@ function createMockDataComposer() {
       activityStream: {
         logActivity: vi.fn().mockResolvedValue({ id: 'activity-1' }),
       },
+      studios: {
+        findById: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockResolvedValue({
+          id: 'studio-ephemeral-1',
+          userId: 'user-123',
+          agentId: 'wren',
+          repoRoot: '/repo',
+          worktreePath: '/repo--ephemeral-test',
+          branch: 'wren/sandbox/ephemeral-test',
+          baseBranch: 'main',
+          status: 'active',
+          slug: 'ephemeral-test',
+          metadata: { ephemeral: true },
+        }),
+        markCleaned: vi.fn().mockResolvedValue({}),
+      },
     },
   };
 }
@@ -180,7 +220,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
       });
 
       expect(result.action).toBe('next_task');
@@ -192,7 +232,6 @@ describe('StrategyService', () => {
 
       // Verify task was started with assignment metadata
       expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-1', {
-        agentId: 'wren',
         studioId: undefined,
       });
 
@@ -215,7 +254,7 @@ describe('StrategyService', () => {
           groupId: 'group-1',
           userId: 'user-123',
           strategy: 'persistence',
-          ownerAgentId: 'wren',
+          sbId: 'sb-wren-uuid',
         })
       ).rejects.toThrow('already active');
     });
@@ -229,7 +268,7 @@ describe('StrategyService', () => {
           groupId: 'group-1',
           userId: 'user-123',
           strategy: 'persistence',
-          ownerAgentId: 'wren',
+          sbId: 'sb-wren-uuid',
         })
       ).rejects.toThrow('does not belong');
     });
@@ -275,7 +314,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
         planUri: 'ink://specs/test',
       });
 
@@ -463,7 +502,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
       });
 
       expect(result.prompt).toContain('CONTRIBUTING.md');
@@ -505,7 +544,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
         config: { verificationGates: ['tests', 'type-check'] },
       });
 
@@ -514,13 +553,14 @@ describe('StrategyService', () => {
 
     it('should include planUri when set', async () => {
       const group = createMockGroup({ strategy: null });
+      const updatedGroup = { ...group, plan_uri: 'ink://specs/my-plan' };
       const task = createMockTask();
 
-      dc.repositories.taskGroups.findById.mockResolvedValue(group);
-      dc.repositories.taskGroups.update.mockResolvedValue({
-        ...group,
-        plan_uri: 'ink://specs/my-plan',
-      });
+      // findById called twice: initial load + re-read after sandbox setup
+      dc.repositories.taskGroups.findById
+        .mockResolvedValueOnce(group)
+        .mockResolvedValueOnce(updatedGroup);
+      dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
 
       const mockClient = dc.getClient();
       mockClient.from.mockReturnValue({
@@ -545,7 +585,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
         planUri: 'ink://specs/my-plan',
       });
 
@@ -700,7 +740,6 @@ describe('StrategyService', () => {
 
       // Verify task was started with assignment metadata
       expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-2', {
-        agentId: 'wren',
         studioId: undefined,
       });
 
@@ -773,12 +812,8 @@ describe('StrategyService', () => {
       dc.repositories.taskGroups.findById.mockResolvedValue(group);
       dc.repositories.taskGroups.update.mockResolvedValue(group);
 
-      // from() calls: getTaskByOrder, getGroupTasks, resolveAgentSlug
-      setupChains(dc, [
-        chainTaskFound(nextTask),
-        chainGroupTasks(groupTasks),
-        chainResolveSlug('lumen'),
-      ]);
+      // from() calls: getTaskByOrder, getGroupTasks
+      setupChains(dc, [chainTaskFound(nextTask), chainGroupTasks(groupTasks)]);
 
       const result = await service.advanceStrategy('group-1', 'task-3', 'user-123');
 
@@ -806,6 +841,7 @@ describe('StrategyService', () => {
           approvalNotify: 'myra',
         } as StrategyConfig,
       });
+      const nextTask = createMockTask({ id: 'task-6', title: 'Sixth task', task_order: 5 });
       const groupTasks = [
         createMockTask({ status: 'completed', task_order: 0 }),
         createMockTask({ status: 'completed', task_order: 1 }),
@@ -821,8 +857,8 @@ describe('StrategyService', () => {
         status: 'paused',
       });
 
-      // from() calls: getGroupTasks (for buildProgressSummary in approval gate)
-      setupChains(dc, [chainGroupTasks(groupTasks)]);
+      // from() calls: getTaskByOrder (found — more tasks remain), getGroupTasks (for summary)
+      setupChains(dc, [chainTaskFound(nextTask), chainGroupTasks(groupTasks)]);
 
       const result = await service.advanceStrategy('group-1', 'task-5', 'user-123');
 
@@ -973,7 +1009,6 @@ describe('StrategyService', () => {
         notFoundChain,
         chainGroupTasks(groupTasks),
         chainNoop(), // cancelWatchdog
-        chainResolveSlug('lumen'), // resolve supervisor UUID → slug
       ]);
 
       await service.advanceStrategy('group-1', 'task-2', 'user-123');
@@ -1014,6 +1049,191 @@ describe('StrategyService', () => {
 
       expect(result.action).toBe('group_complete');
       expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
+    });
+
+    it('should pause for final approval when requireFinalApproval is set', async () => {
+      const group = createMockGroup({
+        current_task_index: 2,
+        iterations_since_approval: 2,
+        strategy_config: {
+          requireFinalApproval: true,
+          approvalCriteria: ['tests pass', 'PR reviewed by Lumen'],
+          checkInNotify: 'myra',
+        },
+      });
+      const groupTasks = [
+        createMockTask({ status: 'completed', task_order: 0 }),
+        createMockTask({ status: 'completed', task_order: 1 }),
+        createMockTask({ status: 'completed', task_order: 2 }),
+      ];
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        status: 'paused',
+      });
+
+      const notFoundChain = chainTaskNotFound();
+      // Chain: getTaskByOrder (not found), getGroupTasks (for stats), buildProgressSummary (getGroupTasks again), activity log
+      setupChains(dc, [
+        notFoundChain,
+        notFoundChain,
+        chainGroupTasks(groupTasks),
+        chainGroupTasks(groupTasks),
+        chainNoop(),
+      ]);
+
+      const result = await service.advanceStrategy('group-1', 'task-3', 'user-123');
+
+      expect(result.action).toBe('approval_required');
+      expect(result.progressSummary).toContain('tests pass');
+      expect(result.progressSummary).toContain('PR reviewed by Lumen');
+      expect(result.progressSummary).toContain('Awaiting final approval');
+
+      // Should pause, not complete
+      expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+        'group-1',
+        expect.objectContaining({
+          status: 'paused',
+          metadata: expect.objectContaining({ pauseReason: 'final_review' }),
+        })
+      );
+
+      // Should NOT have been marked completed
+      const updateCalls = dc.repositories.taskGroups.update.mock.calls;
+      const completedCall = updateCalls.find(
+        (c: unknown[]) => (c[1] as Record<string, unknown>).status === 'completed'
+      );
+      expect(completedCall).toBeUndefined();
+    });
+
+    it('should finalize (not pause for periodic approval) when final task hits approval boundary', async () => {
+      // Regression: when maxIterationsWithoutApproval and the last task land on
+      // the same boundary, final-task handling must win (Lumen review, PR #362)
+      const group = createMockGroup({
+        current_task_index: 4,
+        iterations_since_approval: 4,
+        strategy_config: {
+          maxIterationsWithoutApproval: 5,
+          approvalNotify: 'myra',
+        } as StrategyConfig,
+      });
+      const groupTasks = [
+        createMockTask({ status: 'completed', task_order: 0 }),
+        createMockTask({ status: 'completed', task_order: 1 }),
+        createMockTask({ status: 'completed', task_order: 2 }),
+        createMockTask({ status: 'completed', task_order: 3 }),
+        createMockTask({ status: 'completed', task_order: 4 }),
+      ];
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        status: 'completed',
+      });
+
+      // from() calls: getTaskByOrder not found (both paths), getGroupTasks, cancelWatchdog
+      const notFoundChain = chainTaskNotFound();
+      setupChains(dc, [notFoundChain, notFoundChain, chainGroupTasks(groupTasks), chainNoop()]);
+
+      const result = await service.advanceStrategy('group-1', 'task-5', 'user-123');
+
+      expect(result.action).toBe('group_complete');
+      expect(result.stats).toEqual({ total: 5, completed: 5 });
+
+      // Should NOT have paused for periodic approval
+      const pauseCall = dc.repositories.taskGroups.update.mock.calls.find(
+        (c: unknown[]) =>
+          (c[1] as Record<string, unknown>).status === 'paused' &&
+          ((c[1] as Record<string, unknown>).metadata as Record<string, unknown>)?.pauseReason ===
+            'approval_gate'
+      );
+      expect(pauseCall).toBeUndefined();
+
+      // Should be marked completed
+      expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+        'group-1',
+        expect.objectContaining({ status: 'completed' })
+      );
+    });
+
+    it('should pause for final review (not periodic approval) when final task hits approval boundary with requireFinalApproval', async () => {
+      const group = createMockGroup({
+        current_task_index: 4,
+        iterations_since_approval: 4,
+        strategy_config: {
+          maxIterationsWithoutApproval: 5,
+          requireFinalApproval: true,
+          approvalCriteria: ['tests pass'],
+          approvalNotify: 'myra',
+        } as StrategyConfig,
+      });
+      const groupTasks = [
+        createMockTask({ status: 'completed', task_order: 0 }),
+        createMockTask({ status: 'completed', task_order: 1 }),
+        createMockTask({ status: 'completed', task_order: 2 }),
+        createMockTask({ status: 'completed', task_order: 3 }),
+        createMockTask({ status: 'completed', task_order: 4 }),
+      ];
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        status: 'paused',
+      });
+
+      const notFoundChain = chainTaskNotFound();
+      setupChains(dc, [
+        notFoundChain,
+        notFoundChain,
+        chainGroupTasks(groupTasks),
+        chainGroupTasks(groupTasks),
+        chainNoop(),
+      ]);
+
+      const result = await service.advanceStrategy('group-1', 'task-5', 'user-123');
+
+      expect(result.action).toBe('approval_required');
+      expect(result.progressSummary).toContain('Awaiting final approval');
+      expect(result.progressSummary).toContain('tests pass');
+
+      // Should be paused with final_review, NOT approval_gate
+      expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+        'group-1',
+        expect.objectContaining({
+          status: 'paused',
+          metadata: expect.objectContaining({ pauseReason: 'final_review' }),
+        })
+      );
+    });
+
+    it('should auto-complete when requireFinalApproval is not set', async () => {
+      const group = createMockGroup({
+        current_task_index: 2,
+        iterations_since_approval: 2,
+      });
+      const groupTasks = [
+        createMockTask({ status: 'completed', task_order: 0 }),
+        createMockTask({ status: 'completed', task_order: 1 }),
+        createMockTask({ status: 'completed', task_order: 2 }),
+      ];
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        status: 'completed',
+      });
+
+      const notFoundChain = chainTaskNotFound();
+      setupChains(dc, [notFoundChain, notFoundChain, chainGroupTasks(groupTasks), chainNoop()]);
+
+      const result = await service.advanceStrategy('group-1', 'task-3', 'user-123');
+
+      expect(result.action).toBe('group_complete');
+      expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+        'group-1',
+        expect.objectContaining({ status: 'completed' })
+      );
     });
   });
 
@@ -1091,7 +1311,6 @@ describe('StrategyService', () => {
 
       // Verify task was started with assignment metadata
       expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-3', {
-        agentId: 'wren',
         studioId: undefined,
       });
 
@@ -1249,6 +1468,184 @@ describe('StrategyService', () => {
         'does not belong'
       );
     });
+
+    it('should finalize strategy when resuming from approval_gate with no remaining tasks', async () => {
+      // Regression: periodic approval_gate fires on the final task (before the
+      // ordering fix). On resume, no tasks remain — must finalize, not return
+      // group_complete with 0/0 stats (Lumen review, PR #362)
+      const group = createMockGroup({
+        status: 'paused',
+        strategy: 'persistence',
+        current_task_index: 5,
+        iterations_since_approval: 5,
+        metadata: { pauseReason: 'approval_gate' },
+        strategy_paused_at: '2026-04-10T12:00:00Z',
+      });
+      const groupTasks = [
+        createMockTask({ status: 'completed', task_order: 0 }),
+        createMockTask({ status: 'completed', task_order: 1 }),
+        createMockTask({ status: 'completed', task_order: 2 }),
+        createMockTask({ status: 'completed', task_order: 3 }),
+        createMockTask({ status: 'completed', task_order: 4 }),
+      ];
+
+      dc.repositories.taskGroups.findById.mockResolvedValueOnce(group);
+      // cleanupStrategyResources re-reads group
+      dc.repositories.taskGroups.findById.mockResolvedValueOnce(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        status: 'completed',
+      });
+
+      const mockClient = dc.getClient();
+
+      // Build chains for from() calls:
+      // 1. createWatchdogReminder (sessions, identity, insert) — various from() calls
+      // 2. getTaskByOrder — not found (exact match fails, fallback empty)
+      // 3. getGroupTasks (for finalization stats)
+      // 4. cancelWatchdog
+      const inChain = vi.fn().mockReturnValue({
+        limit: vi.fn().mockReturnValue({
+          single: vi.fn().mockResolvedValue({ data: null, error: { code: 'PGRST116' } }),
+        }),
+        order: vi.fn().mockReturnValue({
+          order: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue({ data: [], error: null }),
+          }),
+        }),
+      });
+      const taskNotFoundChain = {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({ in: inChain }),
+            in: inChain,
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      };
+      const groupTasksChain = {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            order: vi.fn().mockReturnValue({
+              order: vi.fn().mockResolvedValue({ data: groupTasks, error: null }),
+            }),
+          }),
+        }),
+      };
+      const noopChain = {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              limit: vi.fn().mockReturnValue({
+                single: vi.fn().mockResolvedValue({ data: null, error: null }),
+              }),
+            }),
+            single: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      };
+
+      // Watchdog chains, then getTaskByOrder (not found), getGroupTasks, cleanup
+      let idx = 0;
+      const chains = [
+        noopChain, // watchdog: sessions
+        noopChain, // watchdog: insert (sb_id resolved directly, no identity lookup)
+        taskNotFoundChain, // getTaskByOrder: exact match (fails)
+        taskNotFoundChain, // getTaskByOrder: fallback (empty)
+        groupTasksChain, // getGroupTasks for finalization
+        noopChain, // cancelWatchdog
+      ];
+      mockClient.from.mockImplementation(() => chains[idx++] || noopChain);
+
+      const result = await service.resumeStrategy('group-1', 'user-123');
+
+      expect(result.action).toBe('group_complete');
+      expect(result.stats).toEqual({ total: 5, completed: 5 });
+
+      // Should have been marked completed
+      expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+        'group-1',
+        expect.objectContaining({ status: 'completed' })
+      );
+
+      // Should log strategy_completed
+      expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({ subtype: 'strategy_completed' })
+      );
+    });
+
+    it('should finalize strategy when resuming from final_review pause', async () => {
+      const group = createMockGroup({
+        status: 'paused',
+        strategy: 'persistence',
+        current_task_index: 3,
+        metadata: { pauseReason: 'final_review' },
+        strategy_paused_at: '2026-04-10T12:00:00Z',
+        strategy_config: { requireFinalApproval: true, approvalCriteria: ['tests pass'] },
+      });
+      const groupTasks = [
+        createMockTask({ status: 'completed', task_order: 0 }),
+        createMockTask({ status: 'completed', task_order: 1 }),
+        createMockTask({ status: 'completed', task_order: 2 }),
+      ];
+
+      dc.repositories.taskGroups.findById.mockResolvedValueOnce(group);
+      // Second findById call from cleanupStrategyResources
+      dc.repositories.taskGroups.findById.mockResolvedValueOnce(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        status: 'completed',
+      });
+
+      const mockClient = dc.getClient();
+      const groupTasksChain = {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            order: vi.fn().mockReturnValue({
+              order: vi.fn().mockResolvedValue({ data: groupTasks, error: null }),
+            }),
+          }),
+        }),
+      };
+      const noopChain = {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: null, error: null }),
+                }),
+              }),
+            }),
+            single: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      };
+      mockClient.from.mockReturnValueOnce(groupTasksChain).mockReturnValue(noopChain);
+
+      const result = await service.resumeStrategy('group-1', 'user-123');
+
+      expect(result.action).toBe('group_complete');
+      expect(result.stats).toEqual({ total: 3, completed: 3 });
+
+      expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({ subtype: 'final_review_approved' })
+      );
+      expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
+        expect.objectContaining({ subtype: 'strategy_completed' })
+      );
+    });
   });
 
   // ============================================================================
@@ -1319,7 +1716,7 @@ describe('StrategyService', () => {
 
       const group = createMockGroup({
         strategy: null,
-        owner_agent_id: 'wren',
+        sb_id: 'sb-wren-uuid',
         thread_key: 'strategy:group-1',
         metadata: { studioId: 'studio-uuid-omega', studioSlug: 'wren-omega' },
       });
@@ -1330,7 +1727,10 @@ describe('StrategyService', () => {
       };
       const task = createMockTask({ id: 'task-1', title: 'Ship the migration' });
 
-      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      // findById called twice: initial load + re-read after sandbox setup
+      dc.repositories.taskGroups.findById
+        .mockResolvedValueOnce(group)
+        .mockResolvedValueOnce(updatedGroup);
       dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
       setupChains(dc, [chainTaskFound(task)]);
 
@@ -1338,14 +1738,14 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
       });
 
       expect(sendMock).toHaveBeenCalledTimes(1);
       const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
       const payload = call[0] as Record<string, unknown>;
       expect(payload.recipientAgentId).toBe('wren');
-      expect(payload.senderAgentId).toBe('system');
+      expect(payload.senderAgentId).toBe('wren');
       expect(payload.messageType).toBe('session_resume');
       expect(payload.trigger).toBe(true);
       expect(payload.recipientStudioId).toBe('studio-uuid-omega');
@@ -1362,13 +1762,16 @@ describe('StrategyService', () => {
 
       const group = createMockGroup({
         strategy: null,
-        owner_agent_id: 'wren',
+        sb_id: 'sb-wren-uuid',
         metadata: { studioSlug: 'wren-omega' },
       });
       const updatedGroup = { ...group, strategy: 'persistence', status: 'active' };
       const task = createMockTask();
 
-      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      // findById called twice: initial load + re-read after sandbox setup
+      dc.repositories.taskGroups.findById
+        .mockResolvedValueOnce(group)
+        .mockResolvedValueOnce(updatedGroup);
       dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
       setupChains(dc, [chainTaskFound(task)]);
 
@@ -1376,7 +1779,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
       });
 
       const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
@@ -1385,23 +1788,26 @@ describe('StrategyService', () => {
       expect(payload.recipientStudioSlug).toBe('wren-omega');
     });
 
-    it('startStrategy skips trigger when group has no owner_agent_id', async () => {
+    it('startStrategy skips trigger when group has no sb_id', async () => {
       const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
 
-      const group = createMockGroup({ strategy: null, owner_agent_id: null });
+      const group = createMockGroup({ strategy: null, sb_id: null });
       const updatedGroup = {
         ...group,
         strategy: 'persistence',
-        // owner_agent_id stays null because startStrategy passes ownerAgentId but
+        // sb_id stays null because startStrategy passes sbId but
         // for this test we're validating the triggerOwnerAgent no-op path; the
-        // service writes owner_agent_id=input.ownerAgentId. Force it back to null
+        // service writes sb_id=input.sbId. Force it back to null
         // on the updated group to exercise the early-return.
-        owner_agent_id: null,
+        sb_id: null,
         status: 'active',
       };
       const task = createMockTask();
 
-      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      // findById called twice: initial load + re-read after sandbox setup
+      dc.repositories.taskGroups.findById
+        .mockResolvedValueOnce(group)
+        .mockResolvedValueOnce(updatedGroup);
       dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
       setupChains(dc, [chainTaskFound(task)]);
 
@@ -1409,7 +1815,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
       });
 
       expect(sendMock).not.toHaveBeenCalled();
@@ -1421,7 +1827,7 @@ describe('StrategyService', () => {
       const group = createMockGroup({
         strategy: 'persistence',
         status: 'active',
-        owner_agent_id: 'wren',
+        sb_id: 'sb-wren-uuid',
         metadata: { studioId: 'studio-uuid-omega' },
       });
       const tasks = [
@@ -1479,7 +1885,7 @@ describe('StrategyService', () => {
       const group = createMockGroup({
         strategy: 'persistence',
         status: 'active',
-        owner_agent_id: 'wren',
+        sb_id: 'sb-wren-uuid',
         current_task_index: 1,
       });
       const tasks = [
@@ -1499,6 +1905,805 @@ describe('StrategyService', () => {
       const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
       const payload = call[0] as Record<string, unknown>;
       expect(payload.content).toContain(pendingTask.title);
+    });
+  });
+
+  describe('sandbox integration', () => {
+    it('does not spin up sandbox when config.sandbox is not set', async () => {
+      const group = createMockGroup({ strategy: null, status: 'active' });
+      const task = createMockTask();
+      const mockOrchestrator = { spinUp: vi.fn(), isRunning: vi.fn() };
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: {},
+      });
+
+      const mockClient = dc.getClient();
+      mockClient.from.mockReturnValue({
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                }),
+              }),
+            }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      });
+
+      const serviceWithSandbox = new StrategyService(dc as any, mockOrchestrator as any);
+      const result = await serviceWithSandbox.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        sbId: 'sb-wren-uuid',
+      });
+
+      expect(mockOrchestrator.spinUp).not.toHaveBeenCalled();
+      expect(result.sandbox).toBeUndefined();
+    });
+
+    it('spins up sandbox when config.sandbox is true and studio exists', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: { studioId: 'studio-abc' },
+      });
+      const task = createMockTask();
+      const mockOrchestrator = {
+        spinUp: vi.fn().mockResolvedValue({
+          containerName: 'ink-sandbox-wren-test-12345678',
+          success: true,
+        }),
+        isRunning: vi.fn(),
+      };
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: { sandbox: true },
+      });
+      dc.repositories.studios.findById.mockResolvedValue({
+        id: 'studio-abc',
+        userId: 'user-123',
+        agentId: 'wren',
+        worktreePath: '/tmp/test-studio',
+        repoRoot: '/tmp/test-repo',
+        branch: 'wren/feat/test',
+        slug: 'wren',
+      });
+
+      const mockClient = dc.getClient();
+      mockClient.from.mockReturnValue({
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                }),
+              }),
+            }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      });
+
+      const serviceWithSandbox = new StrategyService(dc as any, mockOrchestrator as any);
+      const result = await serviceWithSandbox.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        sbId: 'sb-wren-uuid',
+      });
+
+      expect(mockOrchestrator.spinUp).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agentId: 'wren',
+          studioId: 'studio-abc',
+          worktreePath: '/tmp/test-studio',
+          taskGroupId: 'group-1',
+          taskGroupTitle: 'Test Strategy Group',
+        })
+      );
+      expect(result.sandbox).toBeDefined();
+      expect(result.sandbox?.success).toBe(true);
+    });
+
+    it('aborts strategy when sandbox fails and policy is required (default)', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: { studioId: 'studio-abc' },
+      });
+      const task = createMockTask();
+      const mockOrchestrator = {
+        spinUp: vi.fn().mockResolvedValue({
+          containerName: 'ink-sandbox-wren-test-12345678',
+          success: false,
+          error: 'Docker daemon not running',
+        }),
+        isRunning: vi.fn(),
+      };
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: { sandbox: true },
+      });
+      dc.repositories.studios.findById.mockResolvedValue({
+        id: 'studio-abc',
+        userId: 'user-123',
+        agentId: 'wren',
+        worktreePath: '/tmp/test-studio',
+        repoRoot: '/tmp/test-repo',
+        branch: 'wren/feat/test',
+        slug: 'wren',
+      });
+
+      const mockClient = dc.getClient();
+      mockClient.from.mockReturnValue({
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                }),
+              }),
+            }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      });
+
+      const serviceWithSandbox = new StrategyService(dc as any, mockOrchestrator as any);
+      const result = await serviceWithSandbox.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        sbId: 'sb-wren-uuid',
+      });
+
+      // Fail-closed: strategy aborts, group is paused
+      expect(result.action).toBe('group_complete');
+      expect(result.sandbox?.success).toBe(false);
+      expect(result.sandbox?.error).toContain('Docker daemon');
+      expect(result.prompt).toContain('Sandbox spin-up failed');
+    });
+
+    it('continues strategy when sandbox fails and policy is preferred', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: { studioId: 'studio-abc' },
+      });
+      const task = createMockTask();
+      const mockOrchestrator = {
+        spinUp: vi.fn().mockResolvedValue({
+          containerName: 'ink-sandbox-wren-test-12345678',
+          success: false,
+          error: 'Docker daemon not running',
+        }),
+        isRunning: vi.fn(),
+      };
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: { sandbox: true, sandboxPolicy: 'preferred' },
+      });
+      dc.repositories.studios.findById.mockResolvedValue({
+        id: 'studio-abc',
+        userId: 'user-123',
+        agentId: 'wren',
+        worktreePath: '/tmp/test-studio',
+        repoRoot: '/tmp/test-repo',
+        branch: 'wren/feat/test',
+        slug: 'wren',
+      });
+
+      const mockClient = dc.getClient();
+      mockClient.from.mockReturnValue({
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                }),
+              }),
+            }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      });
+
+      const serviceWithSandbox = new StrategyService(dc as any, mockOrchestrator as any);
+      const result = await serviceWithSandbox.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        sbId: 'sb-wren-uuid',
+      });
+
+      // Preferred: strategy continues on host despite sandbox failure
+      expect(result.action).toBe('next_task');
+      expect(result.sandbox?.success).toBe(false);
+      expect(result.sandbox?.error).toContain('Docker daemon');
+    });
+
+    it('aborts when sandbox requested but no studioId in metadata', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: {},
+      });
+      const task = createMockTask();
+      const mockOrchestrator = { spinUp: vi.fn(), isRunning: vi.fn() };
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: { sandbox: true },
+      });
+
+      const mockClient = dc.getClient();
+      mockClient.from.mockReturnValue({
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                }),
+              }),
+            }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      });
+
+      const serviceWithSandbox = new StrategyService(dc as any, mockOrchestrator as any);
+      const result = await serviceWithSandbox.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        sbId: 'sb-wren-uuid',
+      });
+
+      // Fail-closed: no studioId means sandbox can't start
+      expect(mockOrchestrator.spinUp).not.toHaveBeenCalled();
+      expect(result.action).toBe('group_complete');
+      expect(result.sandbox?.success).toBe(false);
+      expect(result.prompt).toContain('Sandbox spin-up failed');
+    });
+  });
+
+  describe('ephemeral studio', () => {
+    it('creates ephemeral studio when ephemeralStudio + sandbox are true and no studioId', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: { repoRoot: '/repo' },
+      });
+      const task = createMockTask();
+      const mockOrchestrator = {
+        spinUp: vi.fn().mockResolvedValue({
+          containerName: 'ink-sandbox-wren-ephemeral-12345678',
+          success: true,
+        }),
+        isRunning: vi.fn(),
+      };
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockImplementation(async (_id: string, data: any) => ({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: { sandbox: true, ephemeralStudio: true },
+        metadata: { ...group.metadata, ...data.metadata },
+        ...data,
+      }));
+
+      const mockTasks = {
+        findById: vi.fn(),
+        startTask: vi.fn().mockResolvedValue({}),
+      };
+      dc.repositories.tasks = mockTasks as any;
+
+      // Mock getTaskByOrder via the supabase chain
+      dc.getClient.mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          select: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                in: vi.fn().mockReturnValue({
+                  limit: vi.fn().mockReturnValue({
+                    single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                  }),
+                }),
+                order: vi.fn().mockReturnValue({
+                  order: vi.fn().mockReturnValue({
+                    limit: vi.fn().mockResolvedValue({ data: [task], error: null }),
+                  }),
+                }),
+                single: vi.fn().mockResolvedValue({ data: task, error: null }),
+              }),
+            }),
+          }),
+          insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+          update: vi.fn().mockReturnValue({
+            contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+      });
+
+      // Studio created by createEphemeralStudio
+      dc.repositories.studios.findById.mockResolvedValue({
+        id: 'studio-ephemeral-1',
+        userId: 'user-123',
+        agentId: 'wren',
+        repoRoot: '/repo',
+        worktreePath: '/repo--ephemeral-test-strategy-group',
+        branch: 'wren/sandbox/ephemeral-test-strategy-group',
+        baseBranch: 'main',
+        status: 'active',
+        slug: 'ephemeral-test-strategy-group',
+      });
+
+      const serviceWithSandbox = new StrategyService(dc as any, mockOrchestrator as any);
+      const result = await serviceWithSandbox.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        sbId: 'sb-wren-uuid',
+        config: { sandbox: true, ephemeralStudio: true },
+      });
+
+      // Should have created the studio via repository
+      expect(dc.repositories.studios.create).toHaveBeenCalled();
+      const createCall = dc.repositories.studios.create.mock.calls[0][0];
+      expect(createCall.userId).toBe('user-123');
+      expect(createCall.agentId).toBe('wren');
+      expect(createCall.metadata).toEqual(
+        expect.objectContaining({ ephemeral: true, taskGroupId: 'group-1' })
+      );
+
+      // Should have updated group metadata with ephemeralStudioId
+      const updateCalls = dc.repositories.taskGroups.update.mock.calls;
+      const metadataUpdate = updateCalls.find((c: any) => c[1]?.metadata?.ephemeralStudioId);
+      expect(metadataUpdate).toBeDefined();
+
+      // Should have spun up sandbox
+      expect(mockOrchestrator.spinUp).toHaveBeenCalled();
+      expect(result.action).not.toBe('group_complete');
+    });
+
+    it('fails when ephemeralStudio is true but no repoRoot in metadata', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: {}, // no repoRoot
+      });
+      const task = createMockTask();
+      const mockOrchestrator = {
+        spinUp: vi.fn(),
+        isRunning: vi.fn(),
+      };
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: { sandbox: true, ephemeralStudio: true },
+      });
+
+      dc.getClient.mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          select: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                in: vi.fn().mockReturnValue({
+                  limit: vi.fn().mockReturnValue({
+                    single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                  }),
+                }),
+                order: vi.fn().mockReturnValue({
+                  order: vi.fn().mockReturnValue({
+                    limit: vi.fn().mockResolvedValue({ data: [task], error: null }),
+                  }),
+                }),
+                single: vi.fn().mockResolvedValue({ data: task, error: null }),
+              }),
+            }),
+          }),
+          insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+          update: vi.fn().mockReturnValue({
+            contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+      });
+
+      const serviceWithSandbox = new StrategyService(dc as any, mockOrchestrator as any);
+      const result = await serviceWithSandbox.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        sbId: 'sb-wren-uuid',
+        config: { sandbox: true, ephemeralStudio: true },
+      });
+
+      expect(mockOrchestrator.spinUp).not.toHaveBeenCalled();
+      expect(result.action).toBe('group_complete');
+      expect(result.sandbox?.success).toBe(false);
+      expect(result.sandbox?.error).toContain('repoRoot');
+    });
+
+    it('cleans up ephemeral studio on strategy completion', async () => {
+      const group = createMockGroup({
+        metadata: {
+          ephemeralStudioId: 'studio-ephemeral-1',
+          studioId: 'studio-ephemeral-1',
+        },
+      });
+
+      dc.repositories.studios.findById.mockResolvedValue({
+        id: 'studio-ephemeral-1',
+        worktreePath: '/repo--ephemeral-test',
+        repoRoot: '/repo',
+      });
+
+      const mockOrchestrator = {
+        spinUp: vi.fn(),
+        isRunning: vi.fn(),
+        listSandboxes: vi.fn().mockResolvedValue([]),
+        stop: vi.fn().mockResolvedValue(true),
+      };
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+
+      const serviceWithSandbox = new StrategyService(dc as any, mockOrchestrator as any);
+      await serviceWithSandbox.cleanupStrategyResources('group-1');
+
+      expect(dc.repositories.studios.markCleaned).toHaveBeenCalledWith('studio-ephemeral-1');
+    });
+
+    it('stops sandbox container during ephemeral teardown', async () => {
+      const group = createMockGroup({
+        metadata: {
+          ephemeralStudioId: 'studio-ephemeral-1',
+          studioId: 'studio-ephemeral-1',
+        },
+      });
+
+      dc.repositories.studios.findById.mockResolvedValue({
+        id: 'studio-ephemeral-1',
+        worktreePath: '/repo--ephemeral-test',
+        repoRoot: '/repo',
+      });
+
+      const mockOrchestrator = {
+        spinUp: vi.fn(),
+        isRunning: vi.fn(),
+        listSandboxes: vi.fn().mockResolvedValue([
+          {
+            containerName: 'ink-sandbox-test',
+            running: true,
+            labels: { 'ink.studio-id': 'studio-ephemeral-1' },
+          },
+        ]),
+        stop: vi.fn().mockResolvedValue(true),
+      };
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+
+      const serviceWithSandbox = new StrategyService(dc as any, mockOrchestrator as any);
+      await serviceWithSandbox.cleanupStrategyResources('group-1');
+
+      expect(mockOrchestrator.stop).toHaveBeenCalledWith('ink-sandbox-test');
+      expect(dc.repositories.studios.markCleaned).toHaveBeenCalledWith('studio-ephemeral-1');
+    });
+  });
+
+  describe('persistent studio (studioSlug)', () => {
+    it('creates persistent studio when studioSlug is set and no studioId in metadata', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: { repoRoot: '/repo' },
+      });
+      const task = createMockTask();
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockImplementation(async (_id: string, data: any) => ({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: { studioSlug: 'auth-refactor' },
+        metadata: { ...group.metadata, ...data.metadata },
+        ...data,
+      }));
+
+      const mockTasks = {
+        findById: vi.fn(),
+        startTask: vi.fn().mockResolvedValue({}),
+      };
+      dc.repositories.tasks = mockTasks as any;
+
+      dc.getClient.mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          select: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                in: vi.fn().mockReturnValue({
+                  limit: vi.fn().mockReturnValue({
+                    single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                  }),
+                }),
+                order: vi.fn().mockReturnValue({
+                  order: vi.fn().mockReturnValue({
+                    limit: vi.fn().mockResolvedValue({ data: [task], error: null }),
+                  }),
+                }),
+                single: vi.fn().mockResolvedValue({ data: task, error: null }),
+              }),
+            }),
+          }),
+          insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+          update: vi.fn().mockReturnValue({
+            contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+      });
+
+      const service = new StrategyService(dc as any);
+      const result = await service.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        ownerAgentId: 'wren',
+        config: { studioSlug: 'auth-refactor' },
+      });
+
+      expect(dc.repositories.studios.create).toHaveBeenCalled();
+      const createCall = dc.repositories.studios.create.mock.calls[0][0];
+      expect(createCall.metadata).toEqual(
+        expect.objectContaining({ ephemeral: false, taskGroupId: 'group-1' })
+      );
+      expect(createCall.branch).toBe('wren/auth-refactor');
+
+      // Should NOT set ephemeralStudioId — persistent studios survive completion
+      const updateCalls = dc.repositories.taskGroups.update.mock.calls;
+      const metadataUpdate = updateCalls.find((c: any) => c[1]?.metadata?.studioId);
+      expect(metadataUpdate).toBeDefined();
+      expect(metadataUpdate![1].metadata.ephemeralStudioId).toBeUndefined();
+
+      expect(result.action).toBe('next_task');
+    });
+
+    it('throws when studioSlug is set but no repoRoot in metadata', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: {},
+      });
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+
+      const service = new StrategyService(dc as any);
+      await expect(
+        service.startStrategy({
+          groupId: 'group-1',
+          userId: 'user-123',
+          strategy: 'persistence',
+          ownerAgentId: 'wren',
+          config: { studioSlug: 'auth-refactor' },
+        })
+      ).rejects.toThrow('Failed to create persistent studio');
+
+      // Group should NOT have been activated — failure happens before update
+      expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
+    });
+
+    it('rejects when both studioSlug and ephemeralStudio are set', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: { repoRoot: '/repo' },
+      });
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+
+      const service = new StrategyService(dc as any);
+      await expect(
+        service.startStrategy({
+          groupId: 'group-1',
+          userId: 'user-123',
+          strategy: 'persistence',
+          ownerAgentId: 'wren',
+          config: { studioSlug: 'auth-refactor', ephemeralStudio: true },
+        })
+      ).rejects.toThrow('mutually exclusive');
+
+      expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
+    });
+
+    it('skips creation when studioId already exists in metadata', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: { repoRoot: '/repo', studioId: 'existing-studio-id' },
+      });
+      const task = createMockTask();
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockImplementation(async (_id: string, data: any) => ({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: { studioSlug: 'auth-refactor' },
+        metadata: { ...group.metadata, ...data.metadata },
+        ...data,
+      }));
+
+      const mockTasks = {
+        findById: vi.fn(),
+        startTask: vi.fn().mockResolvedValue({}),
+      };
+      dc.repositories.tasks = mockTasks as any;
+
+      dc.getClient.mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          select: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                in: vi.fn().mockReturnValue({
+                  limit: vi.fn().mockReturnValue({
+                    single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                  }),
+                }),
+                order: vi.fn().mockReturnValue({
+                  order: vi.fn().mockReturnValue({
+                    limit: vi.fn().mockResolvedValue({ data: [task], error: null }),
+                  }),
+                }),
+                single: vi.fn().mockResolvedValue({ data: task, error: null }),
+              }),
+            }),
+          }),
+          insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+          update: vi.fn().mockReturnValue({
+            contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+      });
+
+      const service = new StrategyService(dc as any);
+      await service.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        ownerAgentId: 'wren',
+        config: { studioSlug: 'auth-refactor' },
+      });
+
+      // Should NOT create a new studio — one already exists
+      expect(dc.repositories.studios.create).not.toHaveBeenCalled();
+    });
+
+    it('uses input.ownerAgentId for branch/studio even when group.owner_agent_id is null', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        owner_agent_id: null,
+        metadata: { repoRoot: '/repo' },
+      });
+      const task = createMockTask();
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockImplementation(async (_id: string, data: any) => ({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: { studioSlug: 'auth-refactor' },
+        metadata: { ...group.metadata, ...data.metadata },
+        ...data,
+      }));
+
+      const mockTasks = {
+        findById: vi.fn(),
+        startTask: vi.fn().mockResolvedValue({}),
+      };
+      dc.repositories.tasks = mockTasks as any;
+
+      dc.getClient.mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          select: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                in: vi.fn().mockReturnValue({
+                  limit: vi.fn().mockReturnValue({
+                    single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                  }),
+                }),
+                order: vi.fn().mockReturnValue({
+                  order: vi.fn().mockReturnValue({
+                    limit: vi.fn().mockResolvedValue({ data: [task], error: null }),
+                  }),
+                }),
+                single: vi.fn().mockResolvedValue({ data: task, error: null }),
+              }),
+            }),
+          }),
+          insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+          update: vi.fn().mockReturnValue({
+            contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+      });
+
+      const service = new StrategyService(dc as any);
+      await service.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        ownerAgentId: 'wren',
+        config: { studioSlug: 'auth-refactor' },
+      });
+
+      const createCall = dc.repositories.studios.create.mock.calls[0][0];
+      expect(createCall.agentId).toBe('wren');
+      expect(createCall.branch).toBe('wren/auth-refactor');
+    });
+
+    it('does not tear down persistent studio on strategy completion', async () => {
+      const group = createMockGroup({
+        metadata: {
+          studioId: 'studio-persistent-1',
+          studioSlug: 'auth-refactor',
+          // No ephemeralStudioId — this is a persistent studio
+        },
+      });
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+
+      const service = new StrategyService(dc as any);
+      await service.cleanupStrategyResources('group-1');
+
+      // Should NOT attempt to tear down — no ephemeralStudioId
+      expect(dc.repositories.studios.markCleaned).not.toHaveBeenCalled();
     });
   });
 });

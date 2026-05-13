@@ -62,10 +62,10 @@ To find your session from bootstrap's `activeSessions` array, match by `studioId
 const mySession = activeSessions.find((s) => s.studioId === identityJson.studioId);
 ```
 
-Throughout the session, use `update_session_phase` for structural status changes:
+Throughout the session, use `update_session_state` for structural status changes:
 
 ```
-update_session_phase(userId: "...", phase: "active:implementing", studioId: "...")
+update_session_state(userId: "...", phase: "active:implementing", studioId: "...")
 ```
 
 Use `remember` for decisions, insights, and important events:
@@ -74,7 +74,7 @@ Use `remember` for decisions, insights, and important events:
 remember(userId: "...", content: "Decided to use X approach because...", agentId: "wren")
 ```
 
-**Note**: Session lifecycle (`start_session`, `end_session`) is managed automatically by hooks — SBs should not call these manually. Use `remember()` for important context and `update_session_phase()` for work status.
+**Note**: Session lifecycle (`start_session`, `end_session`) is managed automatically by hooks — SBs should not call these manually. Use `remember()` for important context and `update_session_state()` for work status.
 
 **Note**: Never commit PII (emails, user IDs) to the repository. Always read from config files.
 
@@ -490,7 +490,7 @@ The MCP server exposes 60+ tools. Key categories:
 
 - `bootstrap` - **Call first!** Loads identity, context, and recent memories
 - `start_session` / `end_session` - Managed automatically by hooks (do not call manually)
-- `update_session_phase` - Update work phase (investigating, implementing, reviewing, etc.)
+- `update_session_state` - Update work phase (investigating, implementing, reviewing, etc.)
 - `get_session` - Get session details and logs
 - `list_sessions` - List past sessions
 

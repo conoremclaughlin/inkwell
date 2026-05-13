@@ -19,7 +19,7 @@ describe('registerAllTools lifecycle visibility', () => {
 
     expect(server.registeredTools).not.toContain('start_session');
     expect(server.registeredTools).not.toContain('end_session');
-    expect(server.registeredTools).toContain('update_session_phase');
+    expect(server.registeredTools).toContain('update_session_state');
   });
 
   it('includes lifecycle tools when includeInternalLifecycleTools=true', () => {
@@ -32,7 +32,7 @@ describe('registerAllTools lifecycle visibility', () => {
     expect(server.registeredTools).toContain('start_session');
     expect(server.registeredTools).toContain('end_session');
     expect(server.registeredTools).not.toContain('log_session');
-    expect(server.registeredTools).toContain('update_session_phase');
+    expect(server.registeredTools).toContain('update_session_state');
     expect(server.registeredTools).toContain('get_agent_summaries');
   });
 });

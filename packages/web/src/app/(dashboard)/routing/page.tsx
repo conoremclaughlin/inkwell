@@ -38,7 +38,7 @@ interface RoutingIdentity {
 
 interface RoutingRoute {
   id: string;
-  identityId: string;
+  sbId: string;
   agentId: string | null;
   agentName: string | null;
   agentRole: string | null;
@@ -69,7 +69,7 @@ interface RoutingResponse {
 }
 
 interface CreateRouteInput {
-  identityId: string;
+  sbId: string;
   platform: string;
   platformAccountId?: string | null;
   chatId?: string | null;
@@ -80,7 +80,7 @@ interface SBGroup {
   agentId: string;
   agentName: string;
   agentRole: string | null;
-  identityId: string;
+  sbId: string;
   studioHint: string;
   routes: RoutingRoute[];
   totalReminders: number;
@@ -150,7 +150,7 @@ export default function RoutingPage() {
   const queryClient = useQueryClient();
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [newRoute, setNewRoute] = useState<CreateRouteInput>({
-    identityId: '',
+    sbId: '',
     platform: 'telegram',
     platformAccountId: '',
     chatId: '',
@@ -169,7 +169,7 @@ export default function RoutingPage() {
         queryClient.invalidateQueries({ queryKey: ['routing'] });
         setShowCreateForm(false);
         setNewRoute({
-          identityId: '',
+          sbId: '',
           platform: 'telegram',
           platformAccountId: '',
           chatId: '',
@@ -208,14 +208,14 @@ export default function RoutingPage() {
   const sbGroups = useMemo<SBGroup[]>(() => {
     const groups = new Map<string, SBGroup>();
     for (const route of routes) {
-      const key = route.agentId || route.identityId;
+      const key = route.agentId || route.sbId;
       if (!groups.has(key)) {
-        const identity = identityMap.get(route.identityId);
+        const identity = identityMap.get(route.sbId);
         groups.set(key, {
           agentId: route.agentId || 'unknown',
           agentName: route.agentName || route.agentId || 'Unknown agent',
           agentRole: route.agentRole || null,
-          identityId: route.identityId,
+          sbId: route.sbId,
           studioHint: identity?.studioHint || 'home',
           routes: [],
           totalReminders: 0,
@@ -300,7 +300,7 @@ export default function RoutingPage() {
               onSubmit={(e) => {
                 e.preventDefault();
                 createRouteMutation.mutate({
-                  identityId: newRoute.identityId,
+                  sbId: newRoute.sbId,
                   platform: newRoute.platform,
                   platformAccountId: newRoute.platformAccountId || null,
                   chatId: newRoute.chatId || null,
@@ -313,8 +313,8 @@ export default function RoutingPage() {
                   <label className="text-sm font-medium text-gray-700">SB</label>
                   <select
                     className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
-                    value={newRoute.identityId}
-                    onChange={(e) => setNewRoute((p) => ({ ...p, identityId: e.target.value }))}
+                    value={newRoute.sbId}
+                    onChange={(e) => setNewRoute((p) => ({ ...p, sbId: e.target.value }))}
                     required
                   >
                     <option value="">Select an SB...</option>

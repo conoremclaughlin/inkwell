@@ -32,7 +32,7 @@ Inkwell hooks bridge coding agents (Claude Code, Codex, Gemini) with Inkwell's s
 5. Reconciles Inkwell/backend session linkage when backend session ID is available (prefers existing server-side backend-session match)
 6. Stores runtime session state in `.ink/runtime/sessions.json` (multi-session list + current pointer + correlation link)
 7. Stores backend session ID in `.ink/runtime/session-id` (legacy compatibility)
-8. Links backend session ID to Inkwell session via `update_session_phase(sessionId, backendSessionId)`
+8. Links backend session ID to Inkwell session via `update_session_state(sessionId, backendSessionId)`
 
 **Output:**
 
@@ -75,7 +75,7 @@ Context is about to be compacted. Before compaction completes:
 
 1. **Save critical decisions** — Use `mcp__inkwell__remember` to persist any
    important reasoning, decisions, or context that should survive compaction.
-2. **Note current task state** — Use `mcp__inkwell__update_session_phase` to record
+2. **Note current task state** — Use `mcp__inkwell__update_session_state` to record
    where you are in the current task so you can resume smoothly after compaction.
 
 This context will be lost after compaction unless you save it now.
@@ -115,7 +115,7 @@ Agent: {agentId}
 
 **What it does:**
 
-1. Marks runtime phase as `runtime:generating` via `update_session_phase(sessionId, phase)`
+1. Marks runtime phase as `runtime:generating` via `update_session_state(sessionId, phase)`
 2. Reconciles backend session ID linkage if the hook payload includes a session ID
    - short-circuits on local `sessions.json` if linkage is already known
 3. Checks if inbox was polled within the last 5 minutes — if so, exits silently
@@ -139,7 +139,7 @@ Agent: {agentId}
 
 **What it does:**
 
-1. Marks runtime phase as `runtime:idle` via `update_session_phase(sessionId, phase)`
+1. Marks runtime phase as `runtime:idle` via `update_session_state(sessionId, phase)`
 2. Reconciles backend session ID linkage if the hook payload includes a session ID
    - short-circuits on local `sessions.json` if linkage is already known
 3. Increments tool call counter in `.ink/runtime/tool-count`
@@ -159,6 +159,34 @@ You have completed ~{count} tool calls this session. Consider using
 ...
 </inkmail>
 ```
+
+---
+
+### `on-detach`
+
+**When:** CLI session is detaching — the terminal is closing, the user pressed Ctrl+C, or the Claude Code process is exiting. For channel-plugin sessions, this fires when the stdio pipe breaks (Claude Code exited). For non-plugin sessions, this fires from a `process.on('exit')` handler in the CLI hooks.
+
+**What it does:**
+
+1. Clears `cli_attached` on the session via `POST /api/hooks/lifecycle` with `{ sessionId, cliAttached: false }`
+2. Optionally marks the session lifecycle as `idle` (if it was `running`)
+
+**Why this matters:**
+
+Without a detach event, `cli_attached` becomes a sticky flag. The trigger handler checks this flag to decide whether to spawn a new process or let the channel plugin deliver. A stale `cli_attached=true` on a detached session causes all future triggers to be silently dropped — the handler skips spawning, expecting a channel plugin that no longer exists.
+
+**Backend support:**
+
+| Backend     | Detach signal                        | Notes                                              |
+| ----------- | ------------------------------------ | -------------------------------------------------- |
+| Claude Code | Channel plugin stdio pipe close      | Reliable — MCP transport breaks when host exits    |
+| Claude Code | `process.on('exit')` in hook process | Fallback when channel plugin is not loaded         |
+| Codex       | `process.on('exit')` in hook process | No channel plugin; exit handler is the only signal |
+| Gemini      | `process.on('exit')` in hook process | No channel plugin; exit handler is the only signal |
+
+**Output:** None (fire-and-forget cleanup).
+
+---
 
 ## Runtime State
 

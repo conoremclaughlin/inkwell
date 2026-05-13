@@ -18,7 +18,7 @@ const PERMISSION_MAPPING: Record<PermissionId, string[]> = {
   bash_general: ['Bash'], // General bash access
   file_read: ['Read', 'Glob', 'Grep'],
   file_write: ['Write', 'Edit'],
-  mcp_tools: ['mcp__*'], // All MCP tools
+  mcp_tools: ['mcp__inkwell__*', 'mcp__supabase__*', 'mcp__github__*', 'mcp__playwright__*'],
 };
 
 /**

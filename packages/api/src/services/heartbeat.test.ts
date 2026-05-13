@@ -401,7 +401,7 @@ describe('Heartbeat Service', () => {
 
       await ensureDefaultReminders({
         userId: TEST_USER_ID,
-        identityId: 'identity-001',
+        sbId: 'identity-001',
         agentId: 'wren',
         deliveryChannel: 'telegram',
         deliveryTarget: '123456789',
@@ -411,7 +411,7 @@ describe('Heartbeat Service', () => {
       expect(builder.insert).toHaveBeenCalledWith(
         expect.objectContaining({
           title: 'Daily check-in',
-          identity_id: 'identity-001',
+          sb_id: 'identity-001',
           cron_expression: '0 9 * * *',
           delivery_channel: 'telegram',
           delivery_target: '123456789',
@@ -426,7 +426,7 @@ describe('Heartbeat Service', () => {
 
       await ensureDefaultReminders({
         userId: TEST_USER_ID,
-        identityId: 'identity-001',
+        sbId: 'identity-001',
         agentId: 'wren',
         deliveryChannel: 'telegram',
         deliveryTarget: '123456789',
@@ -448,7 +448,7 @@ describe('Heartbeat Service', () => {
 
       await ensureDefaultReminders({
         userId: TEST_USER_ID,
-        identityId: 'identity-002',
+        sbId: 'identity-002',
         agentId: 'myra',
         // No deliveryChannel/deliveryTarget — should resolve from user
       });
@@ -468,7 +468,7 @@ describe('Heartbeat Service', () => {
 
       await ensureDefaultReminders({
         userId: TEST_USER_ID,
-        identityId: 'identity-003',
+        sbId: 'identity-003',
         agentId: 'wren',
       });
 
@@ -484,7 +484,7 @@ describe('Heartbeat Service', () => {
       await expect(
         ensureDefaultReminders({
           userId: TEST_USER_ID,
-          identityId: 'identity-004',
+          sbId: 'identity-004',
           agentId: 'wren',
         })
       ).resolves.toBeUndefined();

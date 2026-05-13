@@ -21,7 +21,7 @@ export type VerificationMode = 'self' | 'peer' | 'architect';
 export interface TaskGroup {
   id: string;
   user_id: string;
-  identity_id: string | null;
+  sb_id: string | null;
   project_id: string | null;
   title: string;
   description: string | null;
@@ -47,7 +47,6 @@ export interface TaskGroup {
   iterations_since_approval: number;
   strategy_started_at: string | null;
   strategy_paused_at: string | null;
-  owner_agent_id: string | null;
   group_number: number;
   slug: string | null;
   outcome: string | null;
@@ -68,11 +67,27 @@ export interface StrategyConfig {
   watchdogIntervalMinutes?: number;
   /** Supervisor agent identity ID — gets check-in notifications and a final audit on completion */
   supervisorId?: string;
+  /** Run the strategy in a sandboxed Docker container */
+  sandbox?: boolean;
+  /** Sandbox failure policy: 'required' fails the strategy if sandbox can't start, 'preferred' falls back to host (default: 'required') */
+  sandboxPolicy?: 'required' | 'preferred';
+  /** Backend auth dirs to mount in the sandbox (default: ['claude']) */
+  sandboxBackendAuth?: Array<'claude' | 'codex' | 'gemini'>;
+  /** Automatically create an ephemeral git worktree + studio for sandbox work (default: false).
+   *  When true + sandbox: true, strategy creates a fresh studio at startup and cleans it up on completion. */
+  ephemeralStudio?: boolean;
+  /** Create a persistent git worktree + studio for the strategy. Unlike ephemeralStudio, the studio
+   *  survives strategy completion. Sessions dispatch to it automatically. Mutually exclusive with ephemeralStudio. */
+  studioSlug?: string;
+  /** Require human approval before finalizing a completed strategy. Pauses with the criteria checklist instead of auto-completing. */
+  requireFinalApproval?: boolean;
+  /** Human-readable acceptance criteria the approver should verify before approving. Sent in the approval message. */
+  approvalCriteria?: string[];
 }
 
 export interface CreateTaskGroupInput {
   user_id: string;
-  identity_id?: string | null;
+  sb_id?: string | null;
   project_id?: string | null;
   title: string;
   description?: string;
@@ -92,7 +107,6 @@ export interface CreateTaskGroupInput {
   strategy_config?: StrategyConfig;
   verification_mode?: VerificationMode;
   plan_uri?: string;
-  owner_agent_id?: string;
 }
 
 export interface UpdateTaskGroupInput {
@@ -111,7 +125,7 @@ export interface UpdateTaskGroupInput {
   output_target?: TaskGroupOutputTarget | null;
   output_status?: TaskGroupOutputStatus | null;
   thread_key?: string | null;
-  identity_id?: string | null;
+  sb_id?: string | null;
   project_id?: string | null;
   strategy?: StrategyPreset | null;
   strategy_config?: StrategyConfig;
@@ -121,7 +135,6 @@ export interface UpdateTaskGroupInput {
   iterations_since_approval?: number;
   strategy_started_at?: string | null;
   strategy_paused_at?: string | null;
-  owner_agent_id?: string | null;
   outcome?: string | null;
   conclusion?: string | null;
 }
@@ -129,10 +142,9 @@ export interface UpdateTaskGroupInput {
 export interface ListTaskGroupsOptions {
   status?: TaskGroupStatus | TaskGroupStatus[];
   projectId?: string;
-  identityId?: string;
+  sbId?: string;
   autonomousOnly?: boolean;
   strategy?: StrategyPreset;
-  ownerAgentId?: string;
   limit?: number;
 }
 
@@ -144,7 +156,7 @@ export class TaskGroupsRepository {
       .from('task_groups' as never)
       .insert({
         user_id: input.user_id,
-        identity_id: input.identity_id ?? null,
+        sb_id: input.sb_id ?? null,
         project_id: input.project_id ?? null,
         title: input.title,
         description: input.description,
@@ -164,7 +176,6 @@ export class TaskGroupsRepository {
         strategy_config: input.strategy_config ?? {},
         verification_mode: input.verification_mode ?? 'self',
         plan_uri: input.plan_uri ?? null,
-        owner_agent_id: input.owner_agent_id ?? null,
       } as never)
       .select()
       .single();
@@ -209,8 +220,8 @@ export class TaskGroupsRepository {
       query = query.eq('project_id', options.projectId);
     }
 
-    if (options?.identityId) {
-      query = query.eq('identity_id', options.identityId);
+    if (options?.sbId) {
+      query = query.eq('sb_id', options.sbId);
     }
 
     if (options?.autonomousOnly) {
@@ -219,10 +230,6 @@ export class TaskGroupsRepository {
 
     if (options?.strategy) {
       query = query.eq('strategy', options.strategy);
-    }
-
-    if (options?.ownerAgentId) {
-      query = query.eq('owner_agent_id', options.ownerAgentId);
     }
 
     if (options?.limit) {
@@ -255,7 +262,7 @@ export class TaskGroupsRepository {
     if (input.output_target !== undefined) updates.output_target = input.output_target;
     if (input.output_status !== undefined) updates.output_status = input.output_status;
     if (input.thread_key !== undefined) updates.thread_key = input.thread_key;
-    if (input.identity_id !== undefined) updates.identity_id = input.identity_id;
+    if (input.sb_id !== undefined) updates.sb_id = input.sb_id;
     if (input.project_id !== undefined) updates.project_id = input.project_id;
     if (input.strategy !== undefined) updates.strategy = input.strategy;
     if (input.strategy_config !== undefined) updates.strategy_config = input.strategy_config;
@@ -269,7 +276,6 @@ export class TaskGroupsRepository {
       updates.strategy_started_at = input.strategy_started_at;
     if (input.strategy_paused_at !== undefined)
       updates.strategy_paused_at = input.strategy_paused_at;
-    if (input.owner_agent_id !== undefined) updates.owner_agent_id = input.owner_agent_id;
     if (input.outcome !== undefined) updates.outcome = input.outcome;
     if (input.conclusion !== undefined) updates.conclusion = input.conclusion;
 
@@ -305,7 +311,7 @@ export class TaskGroupsRepository {
   /**
    * Find active strategies for an agent — used by heartbeat recovery
    */
-  async findActiveStrategies(userId: string, ownerAgentId?: string): Promise<TaskGroup[]> {
+  async findActiveStrategies(userId: string, sbId?: string): Promise<TaskGroup[]> {
     let query = this.client
       .from('task_groups' as never)
       .select('*')
@@ -313,8 +319,8 @@ export class TaskGroupsRepository {
       .eq('status', 'active')
       .not('strategy', 'is', null);
 
-    if (ownerAgentId) {
-      query = query.eq('owner_agent_id', ownerAgentId);
+    if (sbId) {
+      query = query.eq('sb_id', sbId);
     }
 
     const { data, error } = await query;

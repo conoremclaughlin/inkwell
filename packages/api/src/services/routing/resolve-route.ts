@@ -15,7 +15,7 @@ import { logger } from '../../utils/logger';
 
 export interface ResolvedRoute {
   agentId: string;
-  identityId: string;
+  sbId: string;
   routeId: string;
   studioHint: string | null;
   activeSessionId: string | null;
@@ -42,7 +42,7 @@ export async function resolveRouteAgentId(
       id,
       platform_account_id,
       chat_id,
-      identity_id,
+      sb_id,
       studio_hint,
       active_session_id,
       agent_identities!inner ( agent_id )
@@ -108,14 +108,14 @@ export async function resolveRouteAgentId(
   if (!agentId) {
     logger.warn('[Route] Matched route but could not resolve agent_id from identity', {
       routeId: bestMatch.id,
-      identityId: bestMatch.identity_id,
+      sbId: bestMatch.sb_id,
     });
     return null;
   }
 
   return {
     agentId,
-    identityId: bestMatch.identity_id,
+    sbId: bestMatch.sb_id,
     routeId: bestMatch.id,
     studioHint: (bestMatch as unknown as { studio_hint: string | null }).studio_hint ?? null,
     activeSessionId:

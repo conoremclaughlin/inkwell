@@ -94,7 +94,7 @@ describe('admin artifact comments routes', () => {
                 parent_comment_id: null,
                 content: 'Looks good',
                 metadata: {},
-                created_by_identity_id: 'identity-1',
+                created_by_sb_id: 'identity-1',
                 created_at: '2026-02-11T00:00:00Z',
                 updated_at: '2026-02-11T00:00:00Z',
                 user_id: '550e8400-e29b-41d4-a716-446655440000',
@@ -169,7 +169,7 @@ describe('admin artifact comments routes', () => {
                 content: 'Adding a review comment',
                 metadata: {},
                 created_by_user_id: '550e8400-e29b-41d4-a716-446655440000',
-                created_by_identity_id: 'identity-1',
+                created_by_sb_id: 'identity-1',
                 created_at: '2026-02-11T00:00:00Z',
                 updated_at: '2026-02-11T00:00:00Z',
               },
@@ -207,9 +207,9 @@ describe('admin artifact comments routes', () => {
 
     expect(res._status).toBe(200);
     const payload = res._json as {
-      comment: { createdByIdentityId: string; createdByIdentity: { agentId: string } };
+      comment: { createdBySbId: string; createdByIdentity: { agentId: string } };
     };
-    expect(payload.comment.createdByIdentityId).toBe('identity-1');
+    expect(payload.comment.createdBySbId).toBe('identity-1');
     expect(payload.comment.createdByIdentity.agentId).toBe('lumen');
 
     const commentsBuilder = currentSupabaseMock.calls.find(
@@ -218,7 +218,7 @@ describe('admin artifact comments routes', () => {
     expect(commentsBuilder).toBeDefined();
     expect((commentsBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
       created_by_user_id: '550e8400-e29b-41d4-a716-446655440000',
-      created_by_identity_id: 'identity-1',
+      created_by_sb_id: 'identity-1',
       content: 'Adding a review comment',
     });
   });

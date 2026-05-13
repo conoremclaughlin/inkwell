@@ -588,7 +588,7 @@ function getPcpConfig(): PcpConfig | null {
 
 function getIdentityContextFromIdentityJson(cwd = process.cwd()): {
   studioId?: string;
-  identityId?: string;
+  sbId?: string;
   studioName?: string;
 } {
   const identityPath = join(cwd, '.ink', 'identity.json');
@@ -596,12 +596,12 @@ function getIdentityContextFromIdentityJson(cwd = process.cwd()): {
   try {
     const identity = JSON.parse(readFileSync(identityPath, 'utf-8')) as {
       studioId?: string;
-      identityId?: string;
+      sbId?: string;
       studio?: string;
     };
     return {
       studioId: identity.studioId,
-      identityId: identity.identityId,
+      sbId: identity.sbId,
       studioName: identity.studio,
     };
   } catch {
@@ -615,7 +615,7 @@ function getIdentityContextFromIdentityJson(cwd = process.cwd()): {
  */
 async function resolveStudioId(cwd: string): Promise<{
   studioId?: string;
-  identityId?: string;
+  sbId?: string;
   studioName?: string;
 }> {
   const local = getIdentityContextFromIdentityJson(cwd);
@@ -2394,7 +2394,7 @@ async function persistBackendSessionLink(options: {
   agentId: string;
   runtimeLinkId?: string;
   studioId?: string;
-  identityId?: string;
+  sbId?: string;
   email?: string;
 }): Promise<void> {
   if (!options.pcpSessionId || !options.backendSessionId) return;
@@ -2404,7 +2404,7 @@ async function persistBackendSessionLink(options: {
     pcpSessionId: options.pcpSessionId,
     backend: options.backend,
     agentId: options.agentId,
-    ...(options.identityId ? { identityId: options.identityId } : {}),
+    ...(options.sbId ? { sbId: options.sbId } : {}),
     ...(options.studioId ? { studioId: options.studioId } : {}),
     ...(options.runtimeLinkId ? { runtimeLinkId: options.runtimeLinkId } : {}),
     backendSessionId: options.backendSessionId,
@@ -2420,7 +2420,7 @@ async function persistBackendSessionLink(options: {
         conflictingAgentId?: string;
       };
       sessionTrace?: { changedFields?: string[] };
-    }>('update_session_phase', {
+    }>('update_session_state', {
       email: options.email,
       agentId: options.agentId,
       sessionId: options.pcpSessionId,
@@ -2477,7 +2477,7 @@ async function ensurePcpSessionContext(
   const config = getPcpConfig();
   const email = config?.email;
   const cwd = process.cwd();
-  const { studioId, identityId } = await resolveStudioId(cwd);
+  const { studioId, sbId } = await resolveStudioId(cwd);
   const currentGitBranch = getCurrentGitBranch(cwd);
   const localSessionLimit = options.listCandidates || options.listCandidatesJson ? 120 : 40;
   const pcpSessionLimit = options.listCandidates || options.listCandidatesJson ? 80 : 40;
@@ -2827,7 +2827,7 @@ async function ensurePcpSessionContext(
         backend,
         agentId,
         studioId,
-        identityId,
+        sbId,
         email,
       });
       sbDebugLog('claude', 'ensure_context_override_linked', {
@@ -2868,13 +2868,13 @@ async function ensurePcpSessionContext(
         ),
         linkedLocalSession?.fileSizeBytes
       );
-      const ownerAgentId = session.agentId || null;
+      const sessionAgentId = session.agentId || null;
       const sortTimestamp = linkedLocalSession?.latestPromptAt || linkedLocalSession?.modified;
       const sortMs = toEpochMs(sortTimestamp || session.startedAt) ?? 0;
       return {
         type: 'pcp' as const,
         id: session.id,
-        ownerAgentId,
+        sessionAgentId,
         threadKey: session.threadKey || null,
         phase: getSessionPhaseLabel(session) || null,
         contextPreview: session.context || null,
@@ -2972,12 +2972,12 @@ async function ensurePcpSessionContext(
         ...interleavedCandidates.map((entry) => {
           if (entry.kind === 'pcp') {
             const session = entry.candidate;
-            const showOwner = Boolean(session.ownerAgentId && session.ownerAgentId !== agentId);
+            const showOwner = Boolean(session.sessionAgentId && session.sessionAgentId !== agentId);
             const ownerPhase = showOwner
-              ? `${session.ownerAgentId} · ${session.phase || '-'}`
+              ? `${session.sessionAgentId} · ${session.phase || '-'}`
               : session.phase || '-';
             return {
-              type: showOwner ? `pcp:${session.ownerAgentId}` : 'pcp',
+              type: showOwner ? `pcp:${session.sessionAgentId}` : 'pcp',
               choice: `pcp:${session.id.slice(0, 8)}`,
               updated: formatCandidateTimestamp(session.linkedLocalModified || session.startedAt),
               phase: ownerPhase,
@@ -3349,7 +3349,7 @@ async function ensurePcpSessionContext(
     pcpSessionId: chosen.id,
     backend,
     agentId,
-    ...(identityId ? { identityId } : {}),
+    ...(sbId ? { sbId } : {}),
     ...(studioId ? { studioId } : {}),
     ...(chosen.threadKey ? { threadKey: chosen.threadKey } : {}),
     ...(effectiveBackendSessionId ? { backendSessionId: effectiveBackendSessionId } : {}),
@@ -3358,7 +3358,7 @@ async function ensurePcpSessionContext(
   });
   setCurrentRuntimeSession(cwd, chosen.id, backend, {
     agentId,
-    ...(identityId ? { identityId } : {}),
+    ...(sbId ? { sbId } : {}),
     ...(studioId ? { studioId } : {}),
   });
 
@@ -3371,7 +3371,7 @@ async function ensurePcpSessionContext(
 
   if (email) {
     try {
-      await callPcpTool('update_session_phase', {
+      await callPcpTool('update_session_state', {
         email,
         agentId,
         sessionId: chosen.id,
@@ -3441,14 +3441,14 @@ export async function runClaude(
     : {};
   const runtimeLinkId = options.session ? randomUUID() : undefined;
   const currentGitBranch = getCurrentGitBranch(process.cwd());
-  const { studioId, identityId } = await resolveStudioId(process.cwd());
+  const { studioId, sbId } = await resolveStudioId(process.cwd());
 
   if (sessionContext.pcpSessionId && runtimeLinkId) {
     upsertRuntimeSession(process.cwd(), {
       pcpSessionId: sessionContext.pcpSessionId,
       backend: options.backend,
       agentId,
-      ...(identityId ? { identityId } : {}),
+      ...(sbId ? { sbId } : {}),
       ...(studioId ? { studioId } : {}),
       runtimeLinkId,
       ...(sessionContext.backendSessionId
@@ -3603,7 +3603,7 @@ export async function runClaude(
       agentId,
       runtimeLinkId,
       studioId,
-      identityId,
+      sbId,
       email: pcpConfig?.email,
     });
     await finalizeExecution(code ?? null);
@@ -3657,14 +3657,14 @@ export async function runClaudeInteractive(
     : {};
   const runtimeLinkId = options.session ? randomUUID() : undefined;
   const currentGitBranch = getCurrentGitBranch(process.cwd());
-  const { studioId, identityId } = await resolveStudioId(process.cwd());
+  const { studioId, sbId } = await resolveStudioId(process.cwd());
 
   if (sessionContext.pcpSessionId && runtimeLinkId) {
     upsertRuntimeSession(process.cwd(), {
       pcpSessionId: sessionContext.pcpSessionId,
       backend: options.backend,
       agentId,
-      ...(identityId ? { identityId } : {}),
+      ...(sbId ? { sbId } : {}),
       ...(studioId ? { studioId } : {}),
       runtimeLinkId,
       ...(sessionContext.backendSessionId
@@ -3833,7 +3833,7 @@ export async function runClaudeInteractive(
       agentId,
       runtimeLinkId,
       studioId,
-      identityId,
+      sbId,
       email: pcpConfig?.email,
     });
 

@@ -104,7 +104,7 @@ describe('runChat integration', () => {
           return { session: { id: 'sess-1' } };
         case 'get_inbox':
           return { messages: [] };
-        case 'update_session_phase':
+        case 'update_session_state':
         case 'end_session':
           return { success: true };
         default:
@@ -191,8 +191,8 @@ describe('runChat integration', () => {
     };
     expect(backendRequest.backend).toBe('gemini');
     expect(backendRequest.prompt).toContain('Latest user message:\nheartbeat pulse');
-    // Non-interactive sessions are left resumable (update_session_phase, not end_session).
-    expect(testState.pcpCalls.some((call) => call.tool === 'update_session_phase')).toBe(true);
+    // Non-interactive sessions are left resumable (update_session_state, not end_session).
+    expect(testState.pcpCalls.some((call) => call.tool === 'update_session_state')).toBe(true);
   });
 
   it('attaches to provided session id and does not end attached session', async () => {
@@ -485,7 +485,7 @@ describe('runChat integration', () => {
           return { session: { id: 'sess-fallback' } };
         case 'get_inbox':
           return { messages: [] };
-        case 'update_session_phase':
+        case 'update_session_state':
         case 'end_session':
           return { success: true };
         default:
@@ -729,7 +729,7 @@ describe('runChat integration', () => {
             };
           }
           return { messages: [] };
-        case 'update_session_phase':
+        case 'update_session_state':
         case 'end_session':
           return { success: true };
         default:
@@ -780,7 +780,7 @@ describe('runChat integration', () => {
             };
           }
           return { messages: [] };
-        case 'update_session_phase':
+        case 'update_session_state':
         case 'end_session':
           return { success: true };
         default:
@@ -827,7 +827,7 @@ describe('runChat integration', () => {
             };
           }
           return { messages: [] };
-        case 'update_session_phase':
+        case 'update_session_state':
         case 'end_session':
           return { success: true };
         default:
@@ -897,7 +897,7 @@ describe('runChat integration', () => {
             };
           }
           return { messages: [] };
-        case 'update_session_phase':
+        case 'update_session_state':
         case 'end_session':
           return { success: true };
         default:
@@ -957,7 +957,7 @@ describe('runChat integration', () => {
             };
           }
           return { messages: [] };
-        case 'update_session_phase':
+        case 'update_session_state':
         case 'end_session':
           return { success: true };
         default:
@@ -1268,7 +1268,7 @@ describe('runChat integration', () => {
             return { session: { id: 'sess-1' } };
           case 'get_inbox':
             return { messages: [], echo: args || {} };
-          case 'update_session_phase':
+          case 'update_session_state':
           case 'end_session':
             return { success: true };
           default:
@@ -1317,7 +1317,7 @@ describe('runChat integration', () => {
             return { session: { id: 'sess-1' } };
           case 'get_inbox':
             return { messages: [], echo: args || {} };
-          case 'update_session_phase':
+          case 'update_session_state':
           case 'end_session':
             return { success: true };
           default:
@@ -1363,7 +1363,7 @@ describe('runChat integration', () => {
             return { session: { id: 'sess-1' } };
           case 'get_inbox':
             return { messages: [], echo: args || {} };
-          case 'update_session_phase':
+          case 'update_session_state':
           case 'end_session':
             return { success: true };
           default:
@@ -1480,7 +1480,7 @@ describe('runChat integration', () => {
             return { session: { id: 'sess-1' } };
           case 'get_inbox':
             return { messages: [{ from: 'myra', subject: 'test' }], echo: args || {} };
-          case 'update_session_phase':
+          case 'update_session_state':
           case 'end_session':
           case 'log_activity':
             return { success: true };
@@ -1535,7 +1535,7 @@ describe('runChat integration', () => {
             return { session: { id: 'sess-1' } };
           case 'get_inbox':
             return { messages: [], echo: args || {} };
-          case 'update_session_phase':
+          case 'update_session_state':
           case 'end_session':
           case 'log_activity':
             return { success: true };
@@ -1626,7 +1626,7 @@ describe('runChat integration', () => {
             return { session: { id: 'sess-1' } };
           case 'get_inbox':
             return { messages: [{ id: 'm1', content: 'test message' }], echo: args || {} };
-          case 'update_session_phase':
+          case 'update_session_state':
           case 'end_session':
           case 'log_activity':
             return { success: true };

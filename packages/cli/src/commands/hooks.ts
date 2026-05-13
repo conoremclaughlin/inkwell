@@ -507,7 +507,7 @@ function resolveActivePcpSessionId(cwd: string): string | undefined {
 
 function getIdentitySessionContext(cwd: string): {
   studioId?: string;
-  identityId?: string;
+  sbId?: string;
   studioName?: string;
   role?: string;
 } {
@@ -517,13 +517,13 @@ function getIdentitySessionContext(cwd: string): {
   try {
     const identity = JSON.parse(readFileSync(identityPath, 'utf-8')) as {
       studioId?: string;
-      identityId?: string;
+      sbId?: string;
       studio?: string;
       role?: string;
     };
     return {
       studioId: identity.studioId,
-      identityId: identity.identityId,
+      sbId: identity.sbId,
       studioName: identity.studio,
       role: identity.role,
     };
@@ -610,7 +610,7 @@ async function reconcileBackendSignal(
     runtimeLinkId: runtimeLinkId || null,
     stdinKeys: Object.keys(stdin),
   });
-  const { studioId, identityId } = getIdentitySessionContext(cwd);
+  const { studioId, sbId } = getIdentitySessionContext(cwd);
 
   let pcpSessionId = options?.initialPcpSessionId || resolveActivePcpSessionId(cwd);
   let threadKey = options?.initialThreadKey;
@@ -697,7 +697,7 @@ async function reconcileBackendSignal(
       threadKey: threadKey || null,
       backendSessionId: backendSessionId || null,
       studioId: studioId || null,
-      identityId: identityId || null,
+      sbId: sbId || null,
     });
     return {
       ...(backendSessionId ? { backendSessionId } : {}),
@@ -709,7 +709,7 @@ async function reconcileBackendSignal(
     pcpSessionId,
     backend: sessionBackend,
     agentId,
-    ...(identityId ? { identityId } : {}),
+    ...(sbId ? { sbId } : {}),
     ...(studioId ? { studioId } : {}),
     ...(threadKey ? { threadKey } : {}),
     ...(runtimeLinkId ? { runtimeLinkId } : {}),
@@ -719,7 +719,7 @@ async function reconcileBackendSignal(
   });
   setCurrentRuntimeSession(cwd, pcpSessionId, sessionBackend, {
     agentId,
-    ...(identityId ? { identityId } : {}),
+    ...(sbId ? { sbId } : {}),
     ...(studioId ? { studioId } : {}),
   });
   sbDebugLog('hooks', 'reconcile_result', {
@@ -728,7 +728,7 @@ async function reconcileBackendSignal(
     threadKey: threadKey || null,
     backendSessionId: backendSessionId || null,
     studioId: studioId || null,
-    identityId: identityId || null,
+    sbId: sbId || null,
   });
 
   return {
@@ -1865,7 +1865,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     hookBackendOverride: options?.backend || process.env.INK_HOOK_BACKEND || null,
   });
 
-  let { studioId, studioName, role } = getIdentitySessionContext(cwd);
+  let { studioId, sbId, studioName, role } = getIdentitySessionContext(cwd);
   const studioLine = studioName ? `Studio: ${studioName}` : '';
 
   let identityBlock = '';
@@ -1974,7 +1974,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
       callPcpTool('list_task_groups', {
         email: config?.email,
         statuses: ['active', 'paused'],
-        ownerAgentId: agentId,
+        ...(sbId ? { sbId } : {}),
         includeTaskCounts: true,
       }),
       callPcpTool('list_tasks', {
@@ -2059,7 +2059,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
         workingDir: cwd,
       };
       if (backendSessionId) updateArgs.backendSessionId = backendSessionId;
-      await callPcpTool('update_session_phase', updateArgs);
+      await callPcpTool('update_session_state', updateArgs);
     } catch {
       // Non-fatal; startup should continue even if linkage fails.
     }
@@ -2337,12 +2337,44 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   // Respect that — unconditionally setting true blocks all future strategy
   // triggers for the session (they see "CLI-attached" and skip spawn).
   const isHeadlessSpawn = isHeadlessSession();
-  if (isHeadlessSpawn) {
+  if (isHeadlessSpawn && reconciled.pcpSessionId) {
+    // Explicitly clear cli_attached for headless spawns. A previous interactive
+    // session may have set it to true on this same PCP session; if we just skip,
+    // the stale flag causes triggers to think a channel plugin is delivering.
+    try {
+      const serverUrl = getPcpServerUrl();
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      const token = await getValidAccessToken(serverUrl);
+      if (token) headers.Authorization = `Bearer ${token}`;
+      await fetch(`${serverUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          sessionId: reconciled.pcpSessionId,
+          cliAttached: false,
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
+      hookLog('cli_attached_cleared', {
+        agentId,
+        backend: lifecycleBackend.name,
+        reason: 'headless spawn (cliAttached=false in INK_CONTEXT)',
+        sessionId: reconciled.pcpSessionId,
+      });
+    } catch (err) {
+      hookLog('cli_attached_clear_failed', {
+        agentId,
+        backend: lifecycleBackend.name,
+        sessionId: reconciled.pcpSessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  } else if (isHeadlessSpawn) {
     hookLog('cli_attached_skipped', {
       agentId,
       backend: lifecycleBackend.name,
-      reason: 'headless spawn (cliAttached=false in INK_CONTEXT)',
-      sessionId: reconciled.pcpSessionId || null,
+      reason: 'headless spawn, no pcpSessionId',
+      sessionId: null,
     });
   } else if (reconciled.pcpSessionId) {
     try {
@@ -2395,7 +2427,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
       '\n<ink-reminder>\n' +
         'If your runtime state has changed since your last context update ' +
         '(started/stopped a server, opened a PR, kicked off a build, changed ports, etc.), ' +
-        'update your session context via `update_session_phase(context: "...")` so it survives ' +
+        'update your session context via `update_session_state(context: "...")` so it survives ' +
         "compaction. Context is your scratch board for transient active state — what's running, " +
         "what's pending, what port you're on.\n" +
         '</ink-reminder>\n'

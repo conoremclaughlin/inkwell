@@ -129,12 +129,12 @@ describe('resolveAgentFromMention (integration)', () => {
     expect(result!.agentId).toBe('test-kira');
   });
 
-  it('returns a valid identityId that exists in the database', async () => {
+  it('returns a valid sbId that exists in the database', async () => {
     const result = await resolveAgentFromMention(dataComposer.getClient(), testUserId, 'hello', [
       'test-zephyr',
     ]);
 
     expect(result).not.toBeNull();
-    expect(createdIdentityIds).toContain(result!.identityId);
+    expect(createdIdentityIds).toContain(result!.sbId);
   });
 });

@@ -42,23 +42,28 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         return;
       }
 
-      const { sessionId, lifecycle, agentId, workingDir, cliAttached } = req.body as {
-        sessionId?: string;
-        lifecycle?: string;
-        agentId?: string;
-        workingDir?: string;
-        cliAttached?: boolean;
-      };
+      const { sessionId, lifecycle, agentId, workingDir, cliAttached, cliPollAt, alias } =
+        req.body as {
+          sessionId?: string;
+          lifecycle?: string;
+          agentId?: string;
+          workingDir?: string;
+          cliAttached?: boolean;
+          cliPollAt?: string;
+          alias?: string;
+        };
 
       if (!sessionId) {
         res.status(400).json({ success: false, error: 'sessionId is required' });
         return;
       }
 
-      // lifecycle is required unless cliAttached is the only update
+      // lifecycle is required unless cliAttached, cliPollAt, or alias is the only update
       if (
         (!lifecycle || !VALID_LIFECYCLES.includes(lifecycle as Lifecycle)) &&
-        cliAttached === undefined
+        cliAttached === undefined &&
+        cliPollAt === undefined &&
+        alias === undefined
       ) {
         res.status(400).json({
           success: false,
@@ -78,10 +83,18 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         return;
       }
 
-      const updates: { lifecycle?: string; workingDir?: string; cliAttached?: boolean } = {};
+      const updates: {
+        lifecycle?: string;
+        workingDir?: string;
+        cliAttached?: boolean;
+        cliPollAt?: string;
+        alias?: string | null;
+      } = {};
       if (lifecycle) updates.lifecycle = lifecycle;
       if (workingDir) updates.workingDir = workingDir;
       if (cliAttached !== undefined) updates.cliAttached = cliAttached;
+      if (cliPollAt) updates.cliPollAt = cliPollAt;
+      if (alias !== undefined) updates.alias = alias || null;
 
       const updated = await dataComposer.repositories.memory.updateSession(sessionId, updates);
 
