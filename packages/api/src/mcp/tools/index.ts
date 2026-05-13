@@ -279,6 +279,7 @@ import {
   handleUpdateStudio,
   handleCloseStudio,
   handleAdoptStudio,
+  handleRegisterStudio,
   studioToolDefinitions,
 } from './studio-handlers';
 
@@ -5755,6 +5756,33 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleAdoptStudio(args, dataComposer);
       } catch (error) {
         logger.error('Error in adopt_studio:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'register_studio',
+    {
+      description: `Register an existing repository as a studio. Creates a studio row for the root repo if one does not exist, or returns the existing one.`,
+      inputSchema: studioToolDefinitions[6].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleRegisterStudio(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in register_studio:', error);
         return {
           content: [
             {

@@ -615,13 +615,19 @@ export async function handleRegisterStudio(args: unknown, dataComposer: DataComp
   const parsed = registerStudioSchema.parse(args);
   const { user } = await resolveUserOrThrow(parsed, dataComposer);
 
-  const studioId = await resolveMainStudio(
+  // Check if studio already exists before auto-create
+  const existingId = await resolveMainStudio(
     dataComposer.getClient(),
     user.id,
     parsed.repoRoot,
-    parsed.agentId,
-    { autoCreate: true }
+    parsed.agentId
   );
+
+  const studioId =
+    existingId ??
+    (await resolveMainStudio(dataComposer.getClient(), user.id, parsed.repoRoot, parsed.agentId, {
+      autoCreate: true,
+    }));
 
   if (!studioId) {
     return errorResponse('Failed to register studio — could not create or find studio row');
@@ -631,8 +637,6 @@ export async function handleRegisterStudio(args: unknown, dataComposer: DataComp
   if (!studio) {
     return errorResponse('Studio was created but could not be retrieved');
   }
-
-  const wasCreated = !!(studio.metadata as Record<string, unknown>)?.autoCreated;
 
   return successResponse({
     studio: {
@@ -644,7 +648,7 @@ export async function handleRegisterStudio(args: unknown, dataComposer: DataComp
       agentId: studio.agentId,
       status: studio.status,
     },
-    created: wasCreated,
+    created: !existingId,
   });
 }
 
