@@ -41,6 +41,8 @@ const configPath = resolve(process.env.HOME || '', '.ink/config.json');
 const inkConfig = existsSync(configPath) ? JSON.parse(readFileSync(configPath, 'utf-8')) : {};
 const TEST_USER_ID: string | undefined = inkConfig.userId;
 
+let TEST_SB_ID: string | undefined;
+
 const canRun = !!SUPABASE_URL && !!SUPABASE_KEY && !!TEST_USER_ID;
 
 vi.mock('../mcp/tools/inbox-handlers', () => ({
@@ -130,6 +132,14 @@ describe.skipIf(!canRun)('Strategy Final Approval Gate (integration)', () => {
       },
     };
 
+    const { data: identity } = await client
+      .from('agent_identities')
+      .select('id')
+      .eq('user_id', TEST_USER_ID!)
+      .limit(1)
+      .single();
+    TEST_SB_ID = identity?.id;
+
     const created = await createTestGroup(dc, 'final_review', {});
     groupId = created.groupId;
     taskIds = created.taskIds;
@@ -147,7 +157,7 @@ describe.skipIf(!canRun)('Strategy Final Approval Gate (integration)', () => {
       groupId,
       userId: TEST_USER_ID!,
       strategy: 'persistence',
-      ownerAgentId: 'integration-test',
+      sbId: TEST_SB_ID!,
       config: {
         requireFinalApproval: true,
         approvalCriteria: ['tests pass', 'visual review'],
@@ -251,6 +261,16 @@ describe.skipIf(!canRun)(
         },
       };
 
+      if (!TEST_SB_ID) {
+        const { data: identity } = await client
+          .from('agent_identities')
+          .select('id')
+          .eq('user_id', TEST_USER_ID!)
+          .limit(1)
+          .single();
+        TEST_SB_ID = identity?.id;
+      }
+
       // Create group with exactly 2 tasks + maxIterationsWithoutApproval=2
       // so the periodic gate would fire on task 2 if ordering were wrong
       const group = await dc.repositories.taskGroups.create({
@@ -289,7 +309,7 @@ describe.skipIf(!canRun)(
         groupId,
         userId: TEST_USER_ID!,
         strategy: 'persistence',
-        ownerAgentId: 'integration-test',
+        sbId: TEST_SB_ID!,
         config: {
           maxIterationsWithoutApproval: 2,
           watchdogIntervalMinutes: 60,
@@ -352,6 +372,16 @@ describe.skipIf(!canRun)('Strategy Both Gates on Final Task (integration)', () =
       },
     };
 
+    if (!TEST_SB_ID) {
+      const { data: identity } = await client
+        .from('agent_identities')
+        .select('id')
+        .eq('user_id', TEST_USER_ID!)
+        .limit(1)
+        .single();
+      TEST_SB_ID = identity?.id;
+    }
+
     const group = await dc.repositories.taskGroups.create({
       user_id: TEST_USER_ID,
       title: `__both_gates_test_${Date.now()}`,
@@ -387,7 +417,7 @@ describe.skipIf(!canRun)('Strategy Both Gates on Final Task (integration)', () =
       groupId,
       userId: TEST_USER_ID!,
       strategy: 'persistence',
-      ownerAgentId: 'integration-test',
+      sbId: TEST_SB_ID!,
       config: {
         maxIterationsWithoutApproval: 2,
         requireFinalApproval: true,

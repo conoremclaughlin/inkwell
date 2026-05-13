@@ -61,8 +61,6 @@ interface TaskGroupDetail {
   tags: string[];
   autonomous: boolean;
   strategy: string | null;
-  ownerAgentId: string | null;
-  ownerAgentName: string | null;
   agentName: string | null;
   projectName: string | null;
   currentTaskIndex: number;
@@ -664,7 +662,7 @@ export default function MissionDetailPage() {
   const isPaused = group.status === 'paused';
   const statusCfg =
     STATUS_CONFIG[group.status as keyof typeof STATUS_CONFIG] ?? STATUS_CONFIG.draft;
-  const ownerName = group.strategy ? group.ownerAgentName : group.agentName;
+  const ownerName = group.agentName;
   const elapsed = computeElapsed(group.strategyStartedAt);
   const completed = tasks.filter((t) => t.status === 'completed').length;
   const agentColors = ownerName ? (AGENT_COLORS[ownerName.toLowerCase()] ?? null) : null;

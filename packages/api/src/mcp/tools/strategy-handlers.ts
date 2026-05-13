@@ -16,6 +16,7 @@ import { StrategyService } from '../../services/strategy.service';
 import { getOrchestrator } from '../../services/sandbox/index.js';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
+import { resolveIdentityId } from '../../auth/resolve-identity';
 
 const userIdentifierSchema = z.object({
   userId: z
@@ -60,10 +61,6 @@ export const startStrategySchema = z.object({
   strategy: z
     .enum(['persistence', 'review', 'architect', 'parallel', 'swarm'])
     .describe('Strategy preset to use'),
-  ownerAgentId: z
-    .string()
-    .optional()
-    .describe('Agent ID that will execute the strategy. Defaults to calling agent.'),
   planUri: z
     .string()
     .optional()
@@ -145,14 +142,28 @@ export async function handleStartStrategy(
       return mcpResponse({ success: false, error: 'User not found' }, true);
     }
 
-    const agentId = getEffectiveAgentId(args.ownerAgentId);
+    const agentId = getEffectiveAgentId();
+
+    const sbId = agentId
+      ? await resolveIdentityId(dataComposer.getClient(), resolved.user.id, agentId)
+      : null;
+    if (!sbId) {
+      return mcpResponse(
+        {
+          success: false,
+          error:
+            'Could not resolve agent identity — ensure the calling agent has an identity record.',
+        },
+        true
+      );
+    }
 
     const service = new StrategyService(dataComposer, getOrchestrator());
     const result = await service.startStrategy({
       groupId: args.groupId,
       userId: resolved.user.id,
       strategy: args.strategy as StrategyPreset,
-      ownerAgentId: agentId || args.ownerAgentId || 'unknown',
+      sbId,
       verificationMode: args.verificationMode as VerificationMode,
       planUri: args.planUri,
       config: {

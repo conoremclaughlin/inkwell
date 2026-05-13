@@ -51,3 +51,27 @@ export async function resolveIdentityId(
 
   return data[0]?.id ?? null;
 }
+
+/**
+ * Reverse lookup: resolve an agent slug from a canonical identity UUID.
+ */
+export async function resolveAgentSlug(
+  supabase: SupabaseClient<Database>,
+  sbId: string
+): Promise<string | null> {
+  const { data, error } = await supabase
+    .from('agent_identities')
+    .select('agent_id')
+    .eq('id', sbId)
+    .single();
+
+  if (error) {
+    logger.warn('Failed to resolve agent slug from identity UUID', {
+      sbId,
+      error: error.message,
+    });
+    return null;
+  }
+
+  return (data as { agent_id: string } | null)?.agent_id ?? null;
+}

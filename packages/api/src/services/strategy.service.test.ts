@@ -37,6 +37,16 @@ vi.mock('./studio-settings', () => ({
   ensureStudioSettings: vi.fn().mockResolvedValue(true),
 }));
 
+vi.mock('../auth/resolve-identity', () => ({
+  resolveAgentSlug: vi.fn().mockImplementation((_client: unknown, sbId: string) => {
+    if (sbId === 'sb-wren-uuid') return Promise.resolve('wren');
+    if (sbId === 'supervisor-uuid-123' || sbId === 'supervisor-uuid-456')
+      return Promise.resolve('lumen');
+    return Promise.resolve(null);
+  }),
+  resolveIdentityId: vi.fn().mockResolvedValue('sb-wren-uuid'),
+}));
+
 // ============================================================================
 // Mock Helpers
 // ============================================================================
@@ -69,7 +79,7 @@ function createMockGroup(overrides: Partial<TaskGroup> = {}): TaskGroup {
     iterations_since_approval: 0,
     strategy_started_at: null,
     strategy_paused_at: null,
-    owner_agent_id: 'wren',
+    sb_id: 'sb-wren-uuid',
     created_at: '2026-04-10T00:00:00Z',
     updated_at: '2026-04-10T00:00:00Z',
     ...overrides,
@@ -210,7 +220,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
       });
 
       expect(result.action).toBe('next_task');
@@ -222,7 +232,6 @@ describe('StrategyService', () => {
 
       // Verify task was started with assignment metadata
       expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-1', {
-        agentId: 'wren',
         studioId: undefined,
       });
 
@@ -245,7 +254,7 @@ describe('StrategyService', () => {
           groupId: 'group-1',
           userId: 'user-123',
           strategy: 'persistence',
-          ownerAgentId: 'wren',
+          sbId: 'sb-wren-uuid',
         })
       ).rejects.toThrow('already active');
     });
@@ -259,7 +268,7 @@ describe('StrategyService', () => {
           groupId: 'group-1',
           userId: 'user-123',
           strategy: 'persistence',
-          ownerAgentId: 'wren',
+          sbId: 'sb-wren-uuid',
         })
       ).rejects.toThrow('does not belong');
     });
@@ -305,7 +314,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
         planUri: 'ink://specs/test',
       });
 
@@ -493,7 +502,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
       });
 
       expect(result.prompt).toContain('CONTRIBUTING.md');
@@ -535,7 +544,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
         config: { verificationGates: ['tests', 'type-check'] },
       });
 
@@ -576,7 +585,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
         planUri: 'ink://specs/my-plan',
       });
 
@@ -731,7 +740,6 @@ describe('StrategyService', () => {
 
       // Verify task was started with assignment metadata
       expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-2', {
-        agentId: 'wren',
         studioId: undefined,
       });
 
@@ -804,12 +812,8 @@ describe('StrategyService', () => {
       dc.repositories.taskGroups.findById.mockResolvedValue(group);
       dc.repositories.taskGroups.update.mockResolvedValue(group);
 
-      // from() calls: getTaskByOrder, getGroupTasks, resolveAgentSlug
-      setupChains(dc, [
-        chainTaskFound(nextTask),
-        chainGroupTasks(groupTasks),
-        chainResolveSlug('lumen'),
-      ]);
+      // from() calls: getTaskByOrder, getGroupTasks
+      setupChains(dc, [chainTaskFound(nextTask), chainGroupTasks(groupTasks)]);
 
       const result = await service.advanceStrategy('group-1', 'task-3', 'user-123');
 
@@ -1005,7 +1009,6 @@ describe('StrategyService', () => {
         notFoundChain,
         chainGroupTasks(groupTasks),
         chainNoop(), // cancelWatchdog
-        chainResolveSlug('lumen'), // resolve supervisor UUID → slug
       ]);
 
       await service.advanceStrategy('group-1', 'task-2', 'user-123');
@@ -1308,7 +1311,6 @@ describe('StrategyService', () => {
 
       // Verify task was started with assignment metadata
       expect(dc.repositories.tasks.startTask).toHaveBeenCalledWith('task-3', {
-        agentId: 'wren',
         studioId: undefined,
       });
 
@@ -1554,8 +1556,7 @@ describe('StrategyService', () => {
       let idx = 0;
       const chains = [
         noopChain, // watchdog: sessions
-        noopChain, // watchdog: identity
-        noopChain, // watchdog: insert
+        noopChain, // watchdog: insert (sb_id resolved directly, no identity lookup)
         taskNotFoundChain, // getTaskByOrder: exact match (fails)
         taskNotFoundChain, // getTaskByOrder: fallback (empty)
         groupTasksChain, // getGroupTasks for finalization
@@ -1715,7 +1716,7 @@ describe('StrategyService', () => {
 
       const group = createMockGroup({
         strategy: null,
-        owner_agent_id: 'wren',
+        sb_id: 'sb-wren-uuid',
         thread_key: 'strategy:group-1',
         metadata: { studioId: 'studio-uuid-omega', studioSlug: 'wren-omega' },
       });
@@ -1737,7 +1738,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
       });
 
       expect(sendMock).toHaveBeenCalledTimes(1);
@@ -1761,7 +1762,7 @@ describe('StrategyService', () => {
 
       const group = createMockGroup({
         strategy: null,
-        owner_agent_id: 'wren',
+        sb_id: 'sb-wren-uuid',
         metadata: { studioSlug: 'wren-omega' },
       });
       const updatedGroup = { ...group, strategy: 'persistence', status: 'active' };
@@ -1778,7 +1779,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
       });
 
       const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
@@ -1787,18 +1788,18 @@ describe('StrategyService', () => {
       expect(payload.recipientStudioSlug).toBe('wren-omega');
     });
 
-    it('startStrategy skips trigger when group has no owner_agent_id', async () => {
+    it('startStrategy skips trigger when group has no sb_id', async () => {
       const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
 
-      const group = createMockGroup({ strategy: null, owner_agent_id: null });
+      const group = createMockGroup({ strategy: null, sb_id: null });
       const updatedGroup = {
         ...group,
         strategy: 'persistence',
-        // owner_agent_id stays null because startStrategy passes ownerAgentId but
+        // sb_id stays null because startStrategy passes sbId but
         // for this test we're validating the triggerOwnerAgent no-op path; the
-        // service writes owner_agent_id=input.ownerAgentId. Force it back to null
+        // service writes sb_id=input.sbId. Force it back to null
         // on the updated group to exercise the early-return.
-        owner_agent_id: null,
+        sb_id: null,
         status: 'active',
       };
       const task = createMockTask();
@@ -1814,7 +1815,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
       });
 
       expect(sendMock).not.toHaveBeenCalled();
@@ -1826,7 +1827,7 @@ describe('StrategyService', () => {
       const group = createMockGroup({
         strategy: 'persistence',
         status: 'active',
-        owner_agent_id: 'wren',
+        sb_id: 'sb-wren-uuid',
         metadata: { studioId: 'studio-uuid-omega' },
       });
       const tasks = [
@@ -1884,7 +1885,7 @@ describe('StrategyService', () => {
       const group = createMockGroup({
         strategy: 'persistence',
         status: 'active',
-        owner_agent_id: 'wren',
+        sb_id: 'sb-wren-uuid',
         current_task_index: 1,
       });
       const tasks = [
@@ -1945,7 +1946,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
       });
 
       expect(mockOrchestrator.spinUp).not.toHaveBeenCalled();
@@ -2008,7 +2009,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
       });
 
       expect(mockOrchestrator.spinUp).toHaveBeenCalledWith(
@@ -2081,7 +2082,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
       });
 
       // Fail-closed: strategy aborts, group is paused
@@ -2148,7 +2149,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
       });
 
       // Preferred: strategy continues on host despite sandbox failure
@@ -2198,7 +2199,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
       });
 
       // Fail-closed: no studioId means sandbox can't start
@@ -2286,7 +2287,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
         config: { sandbox: true, ephemeralStudio: true },
       });
 
@@ -2360,7 +2361,7 @@ describe('StrategyService', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
-        ownerAgentId: 'wren',
+        sbId: 'sb-wren-uuid',
         config: { sandbox: true, ephemeralStudio: true },
       });
 

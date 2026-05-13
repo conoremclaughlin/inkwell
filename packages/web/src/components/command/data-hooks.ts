@@ -53,7 +53,8 @@ interface TaskItem {
 interface TaskGroupItem {
   id: string;
   title: string;
-  ownerAgentId: string | null;
+  agentId: string | null;
+  agentName: string | null;
 }
 
 interface TasksResponse {

@@ -2868,13 +2868,13 @@ async function ensurePcpSessionContext(
         ),
         linkedLocalSession?.fileSizeBytes
       );
-      const ownerAgentId = session.agentId || null;
+      const sessionAgentId = session.agentId || null;
       const sortTimestamp = linkedLocalSession?.latestPromptAt || linkedLocalSession?.modified;
       const sortMs = toEpochMs(sortTimestamp || session.startedAt) ?? 0;
       return {
         type: 'pcp' as const,
         id: session.id,
-        ownerAgentId,
+        sessionAgentId,
         threadKey: session.threadKey || null,
         phase: getSessionPhaseLabel(session) || null,
         contextPreview: session.context || null,
@@ -2972,12 +2972,12 @@ async function ensurePcpSessionContext(
         ...interleavedCandidates.map((entry) => {
           if (entry.kind === 'pcp') {
             const session = entry.candidate;
-            const showOwner = Boolean(session.ownerAgentId && session.ownerAgentId !== agentId);
+            const showOwner = Boolean(session.sessionAgentId && session.sessionAgentId !== agentId);
             const ownerPhase = showOwner
-              ? `${session.ownerAgentId} · ${session.phase || '-'}`
+              ? `${session.sessionAgentId} · ${session.phase || '-'}`
               : session.phase || '-';
             return {
-              type: showOwner ? `pcp:${session.ownerAgentId}` : 'pcp',
+              type: showOwner ? `pcp:${session.sessionAgentId}` : 'pcp',
               choice: `pcp:${session.id.slice(0, 8)}`,
               updated: formatCandidateTimestamp(session.linkedLocalModified || session.startedAt),
               phase: ownerPhase,

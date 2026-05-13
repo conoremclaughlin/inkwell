@@ -101,6 +101,8 @@ function inkwellReachable(): boolean {
   }
 }
 
+let TEST_SB_ID: string | undefined;
+
 const canRun =
   process.env.INK_LIVE_TESTS === '1' &&
   !!SUPABASE_URL &&
@@ -226,6 +228,14 @@ describe.skipIf(!canRun)('Strategy Approval Gate — worker phase (LLM live)', (
       },
     };
 
+    const { data: identity } = await client
+      .from('agent_identities')
+      .select('id')
+      .eq('user_id', TEST_USER_ID!)
+      .limit(1)
+      .single();
+    TEST_SB_ID = identity?.id;
+
     const group = await dc.repositories.taskGroups.create({
       user_id: TEST_USER_ID,
       title: `__llm_approval_gate_live_${Date.now()}`,
@@ -255,7 +265,7 @@ describe.skipIf(!canRun)('Strategy Approval Gate — worker phase (LLM live)', (
       groupId,
       userId: TEST_USER_ID!,
       strategy: 'persistence',
-      ownerAgentId: 'live-test',
+      sbId: TEST_SB_ID!,
       config: {
         requireFinalApproval: true,
         approvalCriteria: ['all tasks completed', 'no errors during execution'],
@@ -351,6 +361,16 @@ describe.skipIf(!canRun)('Strategy Approval Gate — supervisor review (LLM live
       },
     };
 
+    if (!TEST_SB_ID) {
+      const { data: identity } = await client
+        .from('agent_identities')
+        .select('id')
+        .eq('user_id', TEST_USER_ID!)
+        .limit(1)
+        .single();
+      TEST_SB_ID = identity?.id;
+    }
+
     // Create group, complete all tasks, start strategy so it's already in final_review
     const group = await dc.repositories.taskGroups.create({
       user_id: TEST_USER_ID,
@@ -382,7 +402,7 @@ describe.skipIf(!canRun)('Strategy Approval Gate — supervisor review (LLM live
       groupId,
       userId: TEST_USER_ID!,
       strategy: 'persistence',
-      ownerAgentId: 'live-test',
+      sbId: TEST_SB_ID!,
       config: {
         requireFinalApproval: true,
         approvalCriteria: ['CI passes', 'no regressions in test suite', 'code review approved'],
