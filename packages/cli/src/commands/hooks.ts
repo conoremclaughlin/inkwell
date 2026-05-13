@@ -2059,7 +2059,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
         workingDir: cwd,
       };
       if (backendSessionId) updateArgs.backendSessionId = backendSessionId;
-      await callPcpTool('update_session_phase', updateArgs);
+      await callPcpTool('update_session_state', updateArgs);
     } catch {
       // Non-fatal; startup should continue even if linkage fails.
     }
@@ -2427,7 +2427,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
       '\n<ink-reminder>\n' +
         'If your runtime state has changed since your last context update ' +
         '(started/stopped a server, opened a PR, kicked off a build, changed ports, etc.), ' +
-        'update your session context via `update_session_phase(context: "...")` so it survives ' +
+        'update your session context via `update_session_state(context: "...")` so it survives ' +
         "compaction. Context is your scratch board for transient active state — what's running, " +
         "what's pending, what port you're on.\n" +
         '</ink-reminder>\n'

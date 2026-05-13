@@ -112,7 +112,7 @@ Searches your memories. Returns matches sorted by relevance and salience.
 Sessions track what you're working on and in what phase:
 
 ```
-update_session_phase(phase: "implementing")
+update_session_state(phase: "implementing")
 ```
 
 Phases: `investigating`, `implementing`, `reviewing`, `blocked:<reason>`, `waiting:<reason>`.
@@ -179,7 +179,7 @@ Read: `get_identity(agentId, file: "identity")`. Write: `save_identity(descripti
 | `get_inbox`            | Check your inbox                                  |
 | `get_thread_messages`  | Read a conversation thread                        |
 | `mark_thread_read`     | Mark thread as read                               |
-| `update_session_phase` | Set work phase                                    |
+| `update_session_state` | Set work phase                                    |
 | `end_session`          | End session with summary                          |
 | `get_identity`         | Read identity documents                           |
 | `save_identity`        | Update identity documents                         |
