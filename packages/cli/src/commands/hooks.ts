@@ -1905,18 +1905,24 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
       '*FAILED: Could not reach Inkwell server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
   }
 
+  // Resolve repo root for studio auto-creation and session routing.
+  let repoRoot: string | undefined;
+  try {
+    repoRoot = execSync('git rev-parse --show-toplevel', {
+      cwd,
+      encoding: 'utf-8',
+    }).trim();
+  } catch {
+    // Not a git repo — repoRoot stays undefined
+  }
+
   // Auto-register CLI-created studio in the cloud if not yet tracked
   if (studioName && !studioId) {
     try {
-      const gitRoot = execSync('git rev-parse --show-toplevel', {
-        cwd,
-        encoding: 'utf-8',
-      }).trim();
-
       const createArgs: Record<string, unknown> = {
         email: config?.email,
         agentId,
-        repoRoot: gitRoot,
+        repoRoot: repoRoot || cwd,
         slug: studioName,
         skipGitOperations: true,
       };
@@ -2017,6 +2023,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
         backend: sessionBackend,
       };
       if (studioId) startArgs.studioId = studioId;
+      if (repoRoot) startArgs.repoRoot = repoRoot;
       const started = await callPcpTool('start_session', startArgs);
       const startedSession = started.session as Record<string, unknown> | undefined;
       if (startedSession && typeof startedSession.id === 'string') {
