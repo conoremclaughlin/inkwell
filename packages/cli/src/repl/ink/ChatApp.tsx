@@ -54,8 +54,6 @@ export interface ChatAppHandle {
  *
  * Uses <Static> for completed messages (written once to terminal scrollback).
  * Only the dock (status | prompt | info) is dynamic (~6 lines).
- * On terminal resize, the Static remount key increments to force a full
- * re-render of all static content at the new width.
  */
 export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function ChatApp(
   { agentId, timezone, infoItems: initialInfoItems, fullscreen = false, onUserInput, onExit },
@@ -70,25 +68,7 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
   const [ctrlCCount, setCtrlCCount] = useState(0);
   const [ctrlCTimer, setCtrlCTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
 
-  // Remount key — incremented on resize to force <Static> to re-render all items
-  const [remountKey, setRemountKey] = useState(0);
-
-  // Terminal resize tracking
   const { stdout } = useStdout();
-  useEffect(() => {
-    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-    const onResize = () => {
-      if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => {
-        setRemountKey((k) => k + 1);
-      }, 150);
-    };
-    stdout?.on('resize', onResize);
-    return () => {
-      stdout?.off('resize', onResize);
-      if (debounceTimer) clearTimeout(debounceTimer);
-    };
-  }, [stdout]);
 
   // Waiting indicator state — verb rotates every 3s
   const [waitingVerb, setWaitingVerb] = useState('');
@@ -155,9 +135,7 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
 
   return (
     <Box flexDirection="column">
-      {/* Messages — written once to terminal scrollback via <Static>.
-          key={remountKey} forces full re-render on terminal resize. */}
-      <Static key={remountKey} items={messages}>
+      <Static items={messages}>
         {(msg) => (
           <MessageLine
             key={msg.id}
