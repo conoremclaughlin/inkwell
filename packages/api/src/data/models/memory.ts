@@ -109,6 +109,7 @@ export interface Session {
   agentId?: string;
   studioId?: string;
   threadKey?: string;
+  activeThreadKey?: string;
   /** Runtime lifecycle state: running, idle, completed, failed */
   lifecycle?: SessionLifecycle;
   /** @deprecated Use lifecycle. Kept for backward compat. */
@@ -203,6 +204,7 @@ export interface SessionRow {
   agent_id: string | null;
   studio_id: string | null;
   thread_key: string | null;
+  active_thread_key?: string | null;
   lifecycle?: string | null;
   status?: string | null;
   current_phase: string | null;

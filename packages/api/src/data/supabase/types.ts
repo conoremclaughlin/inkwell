@@ -2714,6 +2714,7 @@ export type Database = {
       };
       sessions: {
         Row: {
+          active_thread_key: string | null;
           agent_id: string | null;
           alias: string | null;
           backend: string | null;
@@ -2743,6 +2744,7 @@ export type Database = {
           working_dir: string | null;
         };
         Insert: {
+          active_thread_key?: string | null;
           agent_id?: string | null;
           alias?: string | null;
           backend?: string | null;
@@ -2772,6 +2774,7 @@ export type Database = {
           working_dir?: string | null;
         };
         Update: {
+          active_thread_key?: string | null;
           agent_id?: string | null;
           alias?: string | null;
           backend?: string | null;

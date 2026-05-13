@@ -1493,6 +1493,7 @@ export class MemoryRepository {
       cliAttached?: boolean;
       cliPollAt?: string;
       alias?: string | null;
+      activeThreadKey?: string | null;
     }
   ): Promise<Session | null> {
     const dbUpdates: Record<string, unknown> = {};
@@ -1526,6 +1527,9 @@ export class MemoryRepository {
     }
     if (updates.alias !== undefined) {
       (dbUpdates as Record<string, unknown>).alias = updates.alias;
+    }
+    if (updates.activeThreadKey !== undefined) {
+      (dbUpdates as Record<string, unknown>).active_thread_key = updates.activeThreadKey;
     }
 
     const { data, error } = await this.supabase
@@ -2035,6 +2039,7 @@ export class MemoryRepository {
       agentId: row.agent_id || undefined,
       studioId,
       threadKey: row.thread_key || undefined,
+      activeThreadKey: row.active_thread_key || undefined,
       lifecycle: (row.lifecycle as Session['lifecycle']) || undefined,
       status: row.status || undefined,
       currentPhase: row.current_phase || undefined,

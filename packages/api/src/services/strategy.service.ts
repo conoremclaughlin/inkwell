@@ -218,11 +218,13 @@ export class StrategyService {
     if (inputConfig?.studioSlug) {
       const metadata = (group.metadata || {}) as Record<string, unknown>;
       if (!metadata.studioId) {
-        const created = await this.createPersistentStudio(
-          group,
-          inputConfig.studioSlug,
-          input.ownerAgentId
-        );
+        const ownerSlug = input.sbId
+          ? await resolveAgentSlug(this.dataComposer.getClient(), input.sbId)
+          : null;
+        if (!ownerSlug) {
+          throw new Error('Could not resolve agent slug for persistent studio branch naming');
+        }
+        const created = await this.createPersistentStudio(group, inputConfig.studioSlug, ownerSlug);
         if (!created) {
           throw new Error(
             `Failed to create persistent studio "${inputConfig.studioSlug}" — check repoRoot in group metadata`

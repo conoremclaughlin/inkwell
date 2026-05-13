@@ -22,6 +22,7 @@ interface AgentLatestSession {
   lifecycle: string | null;
   currentPhase: string | null;
   status: string | null;
+  activeThreadKey: string | null;
   updatedAt: string;
   studioId: string | null;
 }
@@ -148,6 +149,7 @@ export function useCommandData() {
         studioSlug: activeStudio?.slug ?? null,
         lifecycle: agent.latestSession?.lifecycle ?? null,
         phase: agent.latestSession?.currentPhase ?? null,
+        activeThreadKey: agent.latestSession?.activeThreadKey ?? null,
         updatedAt: agent.latestSession?.updatedAt ?? null,
         position: { x: centerX, y: centerY },
         targetPosition: null,
