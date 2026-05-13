@@ -64,7 +64,7 @@ describe('TextToSpeechService', () => {
   });
 
   it('returns synthesized audio from provider chain', async () => {
-    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'pcp-tts-test-'));
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'ink-tts-test-'));
     const filePath = path.join(tmpDir, 'reply.ogg');
     await writeFile(filePath, Buffer.from('audio-bytes'));
 

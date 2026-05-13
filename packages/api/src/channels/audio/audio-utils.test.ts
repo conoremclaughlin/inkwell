@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { createTempAudioPath, removeTempAudioDir } from './audio-utils';
 
 describe('removeTempAudioDir', () => {
-  it('removes a pcp-tts-* directory under os.tmpdir()', async () => {
+  it('removes a ink-tts-* directory under os.tmpdir()', async () => {
     const filePath = await createTempAudioPath('mp3');
     await writeFile(filePath, 'test');
 
@@ -17,7 +17,7 @@ describe('removeTempAudioDir', () => {
     await expect(stat(dir)).rejects.toThrow();
   });
 
-  it('does not remove a non-pcp-tts directory', async () => {
+  it('does not remove a non-ink-tts directory', async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), 'other-prefix-'));
     const filePath = path.join(dir, 'audio.mp3');
     await writeFile(filePath, 'test');

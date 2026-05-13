@@ -42,7 +42,7 @@ describe('AudioTranscriptionService', () => {
   });
 
   it('transcribes audio file via OpenAI endpoint', async () => {
-    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'pcp-audio-test-'));
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'ink-audio-test-'));
     const filePath = path.join(tmpDir, 'note.ogg');
     await writeFile(filePath, Buffer.from('test-audio-bytes'));
 
@@ -79,7 +79,7 @@ describe('AudioTranscriptionService', () => {
   });
 
   it('falls back to CLI provider when OpenAI transcription fails', async () => {
-    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'pcp-audio-cli-test-'));
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'ink-audio-cli-test-'));
     const filePath = path.join(tmpDir, 'note.ogg');
     await writeFile(filePath, Buffer.from('transcript from cli provider'));
 

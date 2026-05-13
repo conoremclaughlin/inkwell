@@ -38,11 +38,11 @@ export function contentTypeForFormat(format: string): string {
 }
 
 export async function createTempAudioPath(extension: string): Promise<string> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'pcp-tts-'));
+  const dir = await mkdtemp(path.join(os.tmpdir(), TMP_PREFIX));
   return path.join(dir, `${randomUUID()}.${extension}`);
 }
 
-const TMP_PREFIX = 'pcp-tts-';
+const TMP_PREFIX = 'ink-tts-';
 
 export async function removeTempAudioDir(filePath: string): Promise<void> {
   const dir = path.dirname(filePath);
