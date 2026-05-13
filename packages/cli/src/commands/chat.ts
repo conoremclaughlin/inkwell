@@ -107,6 +107,7 @@ type ChatOptions = {
   verbose?: boolean;
   fullscreen?: boolean;
   approvalMode?: string;
+  showMemories?: boolean;
 };
 
 interface InboxMessage {
@@ -149,6 +150,7 @@ interface ChatRuntime {
   backendTurnTimeoutMs?: number;
   approvalMode: 'interactive' | 'jsonl' | 'auto-deny' | 'auto-approve';
   approvalChannel?: ApprovalChannel;
+  showMemories: boolean;
 }
 
 interface SessionSummary {
@@ -387,11 +389,16 @@ const LEDGER_COMPACT_CHARS = 420;
 const AUTO_TRIM_KEEP_RECENT_ENTRIES = 6;
 const DEFAULT_TRIM_TARGET_PCT = 70;
 const CTRL_C_EXIT_WINDOW_MS = 3000;
-const DEFAULT_BACKEND_TOKEN_WINDOW = 1_000_000;
 const HISTORY_PREVIEW_MAX = 200;
-function resolveBackendTokenWindow(_backend: string, _model?: string): number {
-  // Current policy: claude/codex/gemini all default to 1M effective context window.
-  return DEFAULT_BACKEND_TOKEN_WINDOW;
+
+const BACKEND_TOKEN_WINDOWS: Record<string, number> = {
+  claude: 200_000,
+  codex: 200_000,
+  gemini: 1_000_000,
+};
+
+function resolveBackendTokenWindow(backend: string, _model?: string): number {
+  return BACKEND_TOKEN_WINDOWS[backend] ?? 200_000;
 }
 
 function formatTokenCount(value: number): string {
@@ -1879,6 +1886,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               ? 'auto-approve' // --profile full + non-interactive = trust all tools
               : 'auto-deny'
             : 'interactive',
+    showMemories: options.showMemories ?? false,
   };
   // Resolve --sender or --contact-id for per-sender session isolation
   if (options.contactId) {
@@ -2293,11 +2301,20 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   // ── Banner (prints before Ink mounts, goes to terminal scrollback) ──
   {
-    const bannerWidth = Math.min(process.stdout.columns || 80, 60);
-    const bar = '━'.repeat(Math.max(0, bannerWidth - 2));
-    console.log(chalk.magentaBright(`\n✦${bar}✦`));
-    console.log(chalk.bold.white('  SB Chat'));
-    console.log(chalk.magentaBright(`✦${bar}✦`));
+    const w = Math.min(process.stdout.columns || 80, 72);
+    const thin = chalk.dim('─');
+    const rule = thin.repeat(w);
+    console.log('');
+    console.log(rule);
+    console.log('');
+    console.log(
+      chalk.bold.white('     ') +
+        chalk.hex('#B48EAD')('ɪ') +
+        chalk.hex('#A3BE8C')('ɴ') +
+        chalk.hex('#EBCB8B')('ᴋ')
+    );
+    console.log('');
+    console.log(rule);
   }
   // Use studio slug/name where available, fall back to short ID
   const studioSlug =
@@ -2749,12 +2766,20 @@ export async function runChat(options: ChatOptions): Promise<void> {
         .slice(-promptHookResult.injected);
 
       for (const entry of recallEntries) {
-        const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
-        printLine(
-          chalk.dim(
-            `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`
-          )
-        );
+        const cleaned = entry.content.replace(/^\[passive-recall\]\s*/, '');
+        if (runtime.showMemories) {
+          printLine(chalk.dim(`  💡 memory surfaced (${entry.approxTokens} tok):`));
+          for (const line of cleaned.split('\n')) {
+            printLine(chalk.dim(`     ${line}`));
+          }
+        } else {
+          const preview = cleaned.slice(0, 120);
+          printLine(
+            chalk.dim(
+              `  💡 memory surfaced: "${preview}${cleaned.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`
+            )
+          );
+        }
       }
 
       if (budgetEntries.length > 0) {
@@ -3242,13 +3267,20 @@ export async function runChat(options: ChatOptions): Promise<void> {
             .slice(-hookResult.injected);
 
           for (const entry of recallEntries) {
-            const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
-            const tokens = entry.approxTokens;
-            printLine(
-              chalk.dim(
-                `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${tokens} tok)`
-              )
-            );
+            const cleaned = entry.content.replace(/^\[passive-recall\]\s*/, '');
+            if (runtime.showMemories) {
+              printLine(chalk.dim(`  💡 memory surfaced (${entry.approxTokens} tok):`));
+              for (const line of cleaned.split('\n')) {
+                printLine(chalk.dim(`     ${line}`));
+              }
+            } else {
+              const preview = cleaned.slice(0, 120);
+              printLine(
+                chalk.dim(
+                  `  💡 memory surfaced: "${preview}${cleaned.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`
+                )
+              );
+            }
           }
         }
         if (hookResult.evicted > 0) {
@@ -3646,6 +3678,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '/inbox full                Show all unread messages expanded',
               '/events [now|on|off]       Poll/toggle merged activity stream',
               '/session                   Show active session info',
+              '/memories [on|off]         Toggle full memory content display',
               '/autorun [on|off]          Toggle inbox auto-run execution',
               '/away [on|off]             Toggle remote approval mode (approvals via inbox)',
               '/tool-routing [backend|local]  Toggle backend tools vs local ink-tool routing',
@@ -3784,6 +3817,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
             );
           }
           break;
+        case 'memories':
+        case 'show-memories': {
+          const mode = (slash.args[0] || '').toLowerCase();
+          if (!mode) {
+            runtime.showMemories = !runtime.showMemories;
+          } else {
+            runtime.showMemories = mode === 'on';
+          }
+          console.log(
+            chalk.green(
+              `Memory detail ${runtime.showMemories ? 'on — full content will be shown' : 'off — showing previews'}`
+            )
+          );
+          break;
+        }
         case 'autorun':
         case 'auto-run': {
           const mode = (slash.args[0] || '').toLowerCase();
@@ -4927,6 +4975,7 @@ export function registerChatCommand(program: Command): void {
         'Approval mode: interactive (TUI prompt), jsonl (structured I/O on stderr/stdin)',
         'interactive'
       )
+      .option('--show-memories', 'Show full content of passively injected memories')
       .option('-v, --verbose', 'Verbose backend passthrough output')
       .option('--fullscreen', 'Fullscreen alternate buffer mode (app-controlled scrolling)')
       .action((options: ChatOptions) => runChat(options));
