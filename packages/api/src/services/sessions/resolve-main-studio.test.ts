@@ -96,6 +96,18 @@ describe('resolveMainStudio', () => {
     expect(mockSupabase.from).toHaveBeenCalledTimes(1);
   });
 
+  it('scopes lookup by worktree_path to avoid matching feature studios', async () => {
+    const chain = createChainableMock({ data: null });
+    const mockSupabase = { from: vi.fn().mockReturnValue(chain) };
+
+    await resolveMainStudio(mockSupabase as never, userId, repoRoot, agentId);
+
+    // Verify worktree_path filter is applied (prevents returning a feature
+    // studio that shares repo_root but has a different worktree_path)
+    expect(chain.eq).toHaveBeenCalledWith('worktree_path', repoRoot);
+    expect(chain.eq).toHaveBeenCalledWith('repo_root', repoRoot);
+  });
+
   it('handles unique constraint race (23505) with retry', async () => {
     const racedId = 'studio-uuid-raced';
     let callCount = 0;

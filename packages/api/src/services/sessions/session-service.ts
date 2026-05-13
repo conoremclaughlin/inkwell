@@ -1645,6 +1645,7 @@ export async function resolveMainStudio(
       .select('id, updated_at')
       .eq('user_id', userId)
       .eq('repo_root', targetRoot)
+      .eq('worktree_path', targetRoot)
       .in('status', ['active', 'idle', 'archived'])
       .order('updated_at', { ascending: false })
       .limit(1);
