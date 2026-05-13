@@ -236,12 +236,26 @@ export class StrategyService {
     // Create a watchdog reminder so the heartbeat checks progress periodically
     await this.createWatchdogReminder(updated, input.userId);
 
+    // Persistent studio: create a durable worktree + studio for the strategy.
+    // Runs before sandbox setup so the studio is available for sandbox routing.
+    const config = updated.strategy_config as StrategyConfig;
+    if (config.studioSlug) {
+      const metadata = (updated.metadata || {}) as Record<string, unknown>;
+      if (!metadata.studioId) {
+        const created = await this.createPersistentStudio(updated, config.studioSlug);
+        if (!created) {
+          throw new Error(
+            `Failed to create persistent studio "${config.studioSlug}" — check repoRoot in group metadata`
+          );
+        }
+      }
+    }
+
     // Spin up sandbox BEFORE triggering the agent — if sandboxPolicy is
     // 'required' (default), a failed sandbox aborts the strategy instead
     // of silently degrading to host execution.
     // Note: maybeSpinUpSandbox may create an ephemeral studio and update
     // group metadata in the DB, so we re-read the group afterward.
-    const config = updated.strategy_config as StrategyConfig;
     const sandboxResult = await this.maybeSpinUpSandbox(updated);
     const sandboxPolicy = config.sandboxPolicy || 'required';
 
@@ -1147,6 +1161,116 @@ export class StrategyService {
       // DB failed — clean up the worktree
       const msg = err instanceof Error ? err.message : String(err);
       logger.error('Ephemeral studio DB insert failed, cleaning up worktree', { error: msg });
+      try {
+        await execFileAsync('git', ['worktree', 'remove', worktreePath], { cwd: mainRoot });
+      } catch {
+        // Best-effort
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Create a persistent git worktree + studio for a strategy.
+   * Unlike ephemeral studios, these survive strategy completion.
+   */
+  private async createPersistentStudio(
+    group: TaskGroup,
+    slug: string
+  ): Promise<{ studioId: string; worktreePath: string; branch: string } | null> {
+    const metadata = (group.metadata || {}) as Record<string, unknown>;
+    const repoRoot = typeof metadata.repoRoot === 'string' ? metadata.repoRoot : undefined;
+    if (!repoRoot) {
+      logger.warn(
+        `Strategy group ${group.id}: persistent studio requested but no repoRoot in metadata`
+      );
+      return null;
+    }
+
+    const agentId = group.owner_agent_id || 'agent';
+    const branch = `${agentId}/${slug}`;
+
+    let mainRoot = repoRoot;
+    try {
+      const { stdout } = await execFileAsync('git', ['worktree', 'list', '--porcelain'], {
+        cwd: repoRoot,
+      });
+      const match = stdout.match(/^worktree\s+(.+)$/m);
+      if (match) mainRoot = match[1];
+    } catch {
+      // Fall through with original repoRoot
+    }
+
+    const worktreePath = path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
+
+    try {
+      await execFileAsync('git', ['worktree', 'add', '-b', branch, worktreePath, 'main'], {
+        cwd: mainRoot,
+      });
+      logger.info('Persistent studio worktree created', {
+        branch,
+        worktreePath,
+        groupId: group.id,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error('Persistent studio worktree creation failed', {
+        error: msg,
+        branch,
+        worktreePath,
+      });
+      return null;
+    }
+
+    if (existsSync(path.join(worktreePath, 'package.json'))) {
+      try {
+        await execFileAsync('yarn', ['install'], { cwd: worktreePath, timeout: 120_000 });
+      } catch (err) {
+        logger.warn('Persistent studio yarn install failed (non-fatal)', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    try {
+      await ensureStudioSettings(worktreePath);
+    } catch {
+      // Non-fatal
+    }
+
+    try {
+      const studio = await this.dataComposer.repositories.studios.create({
+        userId: group.user_id,
+        agentId,
+        repoRoot: mainRoot,
+        worktreePath,
+        branch,
+        baseBranch: 'main',
+        purpose: `Strategy studio for: ${group.title}`,
+        workType: 'feature',
+        metadata: { ephemeral: false, taskGroupId: group.id },
+      });
+
+      const existingMeta = (group.metadata || {}) as Record<string, unknown>;
+      await this.dataComposer.repositories.taskGroups.update(group.id, {
+        metadata: {
+          ...existingMeta,
+          studioId: studio.id,
+          studioSlug: slug,
+        },
+      });
+
+      await this.logStrategyEvent(
+        group,
+        'persistent_studio_created',
+        `Persistent studio created: ${worktreePath}`,
+        { studioId: studio.id, branch, worktreePath, slug }
+      );
+
+      return { studioId: studio.id, worktreePath, branch };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error('Persistent studio DB insert failed, cleaning up worktree', { error: msg });
       try {
         await execFileAsync('git', ['worktree', 'remove', worktreePath], { cwd: mainRoot });
       } catch {

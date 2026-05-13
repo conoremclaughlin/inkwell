@@ -77,6 +77,9 @@ export interface StrategyConfig {
   /** Automatically create an ephemeral git worktree + studio for sandbox work (default: false).
    *  When true + sandbox: true, strategy creates a fresh studio at startup and cleans it up on completion. */
   ephemeralStudio?: boolean;
+  /** Create a persistent git worktree + studio for the strategy. Unlike ephemeralStudio, the studio
+   *  survives strategy completion. Sessions dispatch to it automatically. Mutually exclusive with ephemeralStudio. */
+  studioSlug?: string;
   /** Require human approval before finalizing a completed strategy. Pauses with the criteria checklist instead of auto-completing. */
   requireFinalApproval?: boolean;
   /** Human-readable acceptance criteria the approver should verify before approving. Sent in the approval message. */

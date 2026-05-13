@@ -2435,4 +2435,217 @@ describe('StrategyService', () => {
       expect(dc.repositories.studios.markCleaned).toHaveBeenCalledWith('studio-ephemeral-1');
     });
   });
+
+  describe('persistent studio (studioSlug)', () => {
+    it('creates persistent studio when studioSlug is set and no studioId in metadata', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: { repoRoot: '/repo' },
+      });
+      const task = createMockTask();
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockImplementation(async (_id: string, data: any) => ({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: { studioSlug: 'auth-refactor' },
+        metadata: { ...group.metadata, ...data.metadata },
+        ...data,
+      }));
+
+      const mockTasks = {
+        findById: vi.fn(),
+        startTask: vi.fn().mockResolvedValue({}),
+      };
+      dc.repositories.tasks = mockTasks as any;
+
+      dc.getClient.mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          select: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                in: vi.fn().mockReturnValue({
+                  limit: vi.fn().mockReturnValue({
+                    single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                  }),
+                }),
+                order: vi.fn().mockReturnValue({
+                  order: vi.fn().mockReturnValue({
+                    limit: vi.fn().mockResolvedValue({ data: [task], error: null }),
+                  }),
+                }),
+                single: vi.fn().mockResolvedValue({ data: task, error: null }),
+              }),
+            }),
+          }),
+          insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+          update: vi.fn().mockReturnValue({
+            contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+      });
+
+      const service = new StrategyService(dc as any);
+      const result = await service.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        ownerAgentId: 'wren',
+        config: { studioSlug: 'auth-refactor' },
+      });
+
+      expect(dc.repositories.studios.create).toHaveBeenCalled();
+      const createCall = dc.repositories.studios.create.mock.calls[0][0];
+      expect(createCall.metadata).toEqual(
+        expect.objectContaining({ ephemeral: false, taskGroupId: 'group-1' })
+      );
+      expect(createCall.branch).toBe('wren/auth-refactor');
+
+      // Should NOT set ephemeralStudioId — persistent studios survive completion
+      const updateCalls = dc.repositories.taskGroups.update.mock.calls;
+      const metadataUpdate = updateCalls.find((c: any) => c[1]?.metadata?.studioId);
+      expect(metadataUpdate).toBeDefined();
+      expect(metadataUpdate![1].metadata.ephemeralStudioId).toBeUndefined();
+
+      expect(result.action).toBe('next_task');
+    });
+
+    it('throws when studioSlug is set but no repoRoot in metadata', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: {},
+      });
+      const task = createMockTask();
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: { studioSlug: 'auth-refactor' },
+        metadata: {},
+      });
+
+      dc.getClient.mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          select: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                in: vi.fn().mockReturnValue({
+                  limit: vi.fn().mockReturnValue({
+                    single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                  }),
+                }),
+                order: vi.fn().mockReturnValue({
+                  order: vi.fn().mockReturnValue({
+                    limit: vi.fn().mockResolvedValue({ data: [task], error: null }),
+                  }),
+                }),
+                single: vi.fn().mockResolvedValue({ data: task, error: null }),
+              }),
+            }),
+          }),
+          insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+          update: vi.fn().mockReturnValue({
+            contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+      });
+
+      const service = new StrategyService(dc as any);
+      await expect(
+        service.startStrategy({
+          groupId: 'group-1',
+          userId: 'user-123',
+          strategy: 'persistence',
+          ownerAgentId: 'wren',
+          config: { studioSlug: 'auth-refactor' },
+        })
+      ).rejects.toThrow('Failed to create persistent studio');
+    });
+
+    it('skips creation when studioId already exists in metadata', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: { repoRoot: '/repo', studioId: 'existing-studio-id' },
+      });
+      const task = createMockTask();
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockImplementation(async (_id: string, data: any) => ({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: { studioSlug: 'auth-refactor' },
+        metadata: { ...group.metadata, ...data.metadata },
+        ...data,
+      }));
+
+      const mockTasks = {
+        findById: vi.fn(),
+        startTask: vi.fn().mockResolvedValue({}),
+      };
+      dc.repositories.tasks = mockTasks as any;
+
+      dc.getClient.mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          select: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                in: vi.fn().mockReturnValue({
+                  limit: vi.fn().mockReturnValue({
+                    single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                  }),
+                }),
+                order: vi.fn().mockReturnValue({
+                  order: vi.fn().mockReturnValue({
+                    limit: vi.fn().mockResolvedValue({ data: [task], error: null }),
+                  }),
+                }),
+                single: vi.fn().mockResolvedValue({ data: task, error: null }),
+              }),
+            }),
+          }),
+          insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+          update: vi.fn().mockReturnValue({
+            contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+      });
+
+      const service = new StrategyService(dc as any);
+      await service.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        ownerAgentId: 'wren',
+        config: { studioSlug: 'auth-refactor' },
+      });
+
+      // Should NOT create a new studio — one already exists
+      expect(dc.repositories.studios.create).not.toHaveBeenCalled();
+    });
+
+    it('does not tear down persistent studio on strategy completion', async () => {
+      const group = createMockGroup({
+        metadata: {
+          studioId: 'studio-persistent-1',
+          studioSlug: 'auth-refactor',
+          // No ephemeralStudioId — this is a persistent studio
+        },
+      });
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+
+      const service = new StrategyService(dc as any);
+      await service.cleanupStrategyResources('group-1');
+
+      // Should NOT attempt to tear down — no ephemeralStudioId
+      expect(dc.repositories.studios.markCleaned).not.toHaveBeenCalled();
+    });
+  });
 });
