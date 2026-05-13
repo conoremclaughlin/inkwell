@@ -54,6 +54,10 @@ vi.mock('../../auth/enforce-identity', () => ({
   getEffectiveAgentId: vi.fn().mockReturnValue('wren'),
 }));
 
+vi.mock('../../auth/resolve-identity', () => ({
+  resolveIdentityId: vi.fn().mockResolvedValue('sb-wren-uuid'),
+}));
+
 vi.mock('../../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
@@ -127,6 +131,7 @@ describe('handleStartStrategy', () => {
         groupId: 'group-1',
         userId: 'user-123',
         strategy: 'persistence',
+        sbId: 'sb-wren-uuid',
       })
     );
   });

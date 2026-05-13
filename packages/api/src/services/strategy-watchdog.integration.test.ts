@@ -43,6 +43,8 @@ const configPath = resolve(process.env.HOME || '', '.ink/config.json');
 const inkConfig = existsSync(configPath) ? JSON.parse(readFileSync(configPath, 'utf-8')) : {};
 const TEST_USER_ID: string | undefined = inkConfig.userId;
 
+let TEST_SB_ID: string | undefined;
+
 const canRun = !!SUPABASE_URL && !!SUPABASE_KEY && !!TEST_USER_ID;
 
 // Mock notifications so we don't send real inbox messages
@@ -83,6 +85,14 @@ describe.skipIf(!canRun)('Strategy Watchdog (integration)', () => {
         activityStream: new ActivityStreamRepository(client),
       },
     };
+
+    const { data: identity } = await client
+      .from('agent_identities')
+      .select('id')
+      .eq('user_id', TEST_USER_ID!)
+      .limit(1)
+      .single();
+    TEST_SB_ID = identity?.id;
 
     // Create test task group
     const group = await dc.repositories.taskGroups.create({
@@ -169,7 +179,7 @@ describe.skipIf(!canRun)('Strategy Watchdog (integration)', () => {
       groupId,
       userId: TEST_USER_ID!,
       strategy: 'persistence',
-      ownerAgentId: 'integration-test',
+      sbId: TEST_SB_ID!,
       config: { watchdogIntervalMinutes: 1 },
     });
 
@@ -181,7 +191,7 @@ describe.skipIf(!canRun)('Strategy Watchdog (integration)', () => {
     expect(meta.strategyWatchdog).toBe(true);
     expect(meta.groupId).toBe(groupId);
     expect(meta.strategy).toBe('persistence');
-    expect(meta.ownerAgentId).toBe('integration-test');
+    expect(meta.sbId).toBe(TEST_SB_ID);
     expect(watchdog.cron_expression).toBe('*/1 * * * *');
     expect(watchdog.status).toBe('active');
 

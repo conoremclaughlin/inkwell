@@ -26,6 +26,7 @@ import type {
 } from '../data/repositories/task-groups.repository';
 import type { ProjectTask, TaskAssignment } from '../data/repositories/project-tasks.repository';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
+import { resolveAgentSlug } from '../auth/resolve-identity';
 import { logger } from '../utils/logger';
 import { ensureStudioSettings } from './studio-settings';
 import type { SandboxOrchestrator, SandboxSpinUpResult } from './sandbox/orchestrator';
@@ -40,7 +41,7 @@ export interface StartStrategyInput {
   groupId: string;
   userId: string;
   strategy: StrategyPreset;
-  ownerAgentId: string;
+  sbId: string;
   config?: StrategyConfig;
   verificationMode?: VerificationMode;
   planUri?: string;
@@ -68,7 +69,7 @@ export interface StrategyStatus {
   title: string;
   strategy: StrategyPreset;
   status: string;
-  ownerAgentId: string | null;
+  sbId: string | null;
   planUri: string | null;
   verificationMode: VerificationMode;
   currentTaskIndex: number;
@@ -182,8 +183,12 @@ export class StrategyService {
     const meta = group.metadata as Record<string, unknown> | null;
     return {
       studioId: (meta?.studioId as string) || undefined,
-      agentId: group.owner_agent_id || undefined,
     };
+  }
+
+  private async resolveOwnerSlug(group: TaskGroup): Promise<string | null> {
+    if (!group.sb_id) return null;
+    return resolveAgentSlug(this.dataComposer.getClient(), group.sb_id);
   }
 
   /**
@@ -207,7 +212,7 @@ export class StrategyService {
       strategy_config: input.config || (group.strategy_config as StrategyConfig),
       verification_mode: input.verificationMode || group.verification_mode,
       plan_uri: input.planUri || group.plan_uri || undefined,
-      owner_agent_id: input.ownerAgentId,
+      sb_id: input.sbId,
       status: 'active',
       autonomous: true,
       current_task_index: 0,
@@ -405,7 +410,10 @@ export class StrategyService {
 
         // Notify supervisor too if configured
         if (config.supervisorId) {
-          const supervisorSlug = await this.resolveAgentSlug(config.supervisorId);
+          const supervisorSlug = await resolveAgentSlug(
+            this.dataComposer.getClient(),
+            config.supervisorId
+          );
           if (supervisorSlug) {
             await this.notifyDispatcher(
               group,
@@ -525,7 +533,10 @@ export class StrategyService {
 
       // Notify supervisor at check-in points too
       if (config.supervisorId) {
-        const supervisorSlug = await this.resolveAgentSlug(config.supervisorId);
+        const supervisorSlug = await resolveAgentSlug(
+          this.dataComposer.getClient(),
+          config.supervisorId
+        );
         if (supervisorSlug) {
           await this.notifyDispatcher(
             group,
@@ -791,7 +802,7 @@ export class StrategyService {
       title: group.title,
       strategy: group.strategy as StrategyPreset,
       status: group.status,
-      ownerAgentId: group.owner_agent_id,
+      sbId: group.sb_id,
       planUri: group.plan_uri,
       verificationMode: group.verification_mode,
       currentTaskIndex: group.current_task_index,
@@ -908,12 +919,13 @@ export class StrategyService {
 
     try {
       const threadKey = group.thread_key || `strategy:${group.id}`;
+      const senderSlug = (await this.resolveOwnerSlug(group)) || 'system';
 
       await handleSendToInbox(
         {
           userId,
           recipientAgentId: notifyAgentId,
-          senderAgentId: group.owner_agent_id || 'system',
+          senderAgentId: senderSlug,
           content: message,
           messageType: 'notification',
           priority: 'high',
@@ -945,7 +957,7 @@ export class StrategyService {
    *     starts working without the user having to manually attach)
    *   - watchdog re-triggers (wake a stuck session on the heartbeat)
    *
-   * No-ops with a warn log if the group has no owner_agent_id. Non-fatal on
+   * No-ops with a warn log if the group has no sb_id. Non-fatal on
    * send failure — returns false so callers can decide whether to escalate.
    */
   private async triggerOwnerAgent(
@@ -954,9 +966,9 @@ export class StrategyService {
     reason: 'strategy_kickoff' | 'watchdog' | 'manual_resume',
     sandboxContainerName?: string
   ): Promise<boolean> {
-    if (!group.owner_agent_id) {
+    if (!group.sb_id) {
       logger.warn(
-        `Strategy triggerOwnerAgent: group ${group.id} has no owner_agent_id — cannot route trigger`
+        `Strategy triggerOwnerAgent: group ${group.id} has no sb_id — cannot route trigger`
       );
       return false;
     }
@@ -968,6 +980,12 @@ export class StrategyService {
     }
 
     try {
+      const ownerSlug = await this.resolveOwnerSlug(group);
+      if (!ownerSlug) {
+        logger.warn(`Strategy triggerOwnerAgent: could not resolve slug for sb_id ${group.sb_id}`);
+        return false;
+      }
+
       const threadKey = group.thread_key || `strategy:${group.id}`;
       const metadata = (group.metadata || {}) as Record<string, unknown>;
       const rawStudioId = metadata.studioId;
@@ -979,8 +997,8 @@ export class StrategyService {
       await handleSendToInbox(
         {
           userId: group.user_id,
-          recipientAgentId: group.owner_agent_id,
-          senderAgentId: group.owner_agent_id,
+          recipientAgentId: ownerSlug,
+          senderAgentId: ownerSlug,
           // Prefer studioId (UUID); fall back to slug only when UUID is absent.
           recipientStudioId: studioId,
           recipientStudioSlug: studioId ? undefined : studioSlug,
@@ -1005,19 +1023,19 @@ export class StrategyService {
       );
 
       logger.info(
-        `Strategy trigger sent to ${group.owner_agent_id} for group ${group.id} (task ${task.id}, reason: ${reason}${studioId ? `, studio: ${studioId}` : studioSlug ? `, studioSlug: ${studioSlug}` : ''})`
+        `Strategy trigger sent to ${ownerSlug} for group ${group.id} (task ${task.id}, reason: ${reason}${studioId ? `, studio: ${studioId}` : studioSlug ? `, studioSlug: ${studioSlug}` : ''})`
       );
 
       await this.logStrategyEvent(
         group,
         'strategy_trigger',
-        `Triggered ${group.owner_agent_id} for task: ${task.title}`,
+        `Triggered ${ownerSlug} for task: ${task.title}`,
         {
           reason,
           taskId: task.id,
           taskTitle: task.title,
           studioId: studioId || studioSlug || null,
-          ownerAgentId: group.owner_agent_id,
+          sbId: group.sb_id,
         }
       );
 
@@ -1032,7 +1050,7 @@ export class StrategyService {
       this.logStrategyEvent(
         group,
         'strategy_trigger_failed',
-        `Failed to trigger ${group.owner_agent_id} for task: ${task.title}`,
+        `Failed to trigger ${group.sb_id} for task: ${task.title}`,
         {
           reason,
           taskId: task.id,
@@ -1052,7 +1070,7 @@ export class StrategyService {
     group: TaskGroup,
     repoRoot: string
   ): Promise<{ studioId: string; worktreePath: string; branch: string } | null> {
-    const agentId = group.owner_agent_id || 'agent';
+    const ownerSlug = (await this.resolveOwnerSlug(group)) || 'agent';
     const slugBase = (group.title || 'task')
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
@@ -1060,7 +1078,7 @@ export class StrategyService {
       .slice(0, 30);
     const uniqueSuffix = Date.now().toString(36).slice(-6);
     const slug = `ephemeral-${slugBase}-${uniqueSuffix}`;
-    const branch = `${agentId}/sandbox/${slug}`;
+    const branch = `${ownerSlug}/sandbox/${slug}`;
 
     // Resolve to the main worktree root
     let mainRoot = repoRoot;
@@ -1114,7 +1132,7 @@ export class StrategyService {
     try {
       const studio = await this.dataComposer.repositories.studios.create({
         userId: group.user_id,
-        agentId,
+        agentId: ownerSlug,
         repoRoot: mainRoot,
         worktreePath,
         branch,
@@ -1283,9 +1301,10 @@ export class StrategyService {
       return { containerName: '', success: false, error: msg };
     }
 
+    const ownerSlug = (await this.resolveOwnerSlug(group)) || studio.agentId || 'unknown';
     const result = await this.sandboxOrchestrator.spinUp({
       userId: group.user_id,
-      agentId: group.owner_agent_id || studio.agentId || 'unknown',
+      agentId: ownerSlug,
       studioId: studio.id,
       studioSlug: studio.slug || undefined,
       worktreePath: studio.worktreePath,
@@ -1450,20 +1469,6 @@ export class StrategyService {
           backendSessionId = (session as { backend_session_id: string | null }).backend_session_id;
       }
 
-      // Resolve the owner agent's identity for reminder routing
-      let sbId: string | null = null;
-      if (group.owner_agent_id) {
-        const { data: identity } = await this.dataComposer
-          .getClient()
-          .from('agent_identities')
-          .select('id')
-          .eq('agent_id', group.owner_agent_id)
-          .eq('user_id', userId)
-          .limit(1)
-          .single();
-        if (identity) sbId = identity.id;
-      }
-
       await this.dataComposer
         .getClient()
         .from('scheduled_reminders')
@@ -1481,7 +1486,7 @@ export class StrategyService {
           ]
             .filter(Boolean)
             .join(' '),
-          sb_id: sbId,
+          sb_id: group.sb_id,
           cron_expression: `*/${intervalMinutes} * * * *`,
           next_run_at: nextRunAt.toISOString(),
           status: 'active',
@@ -1489,7 +1494,7 @@ export class StrategyService {
             strategyWatchdog: true,
             groupId: group.id,
             strategy: group.strategy,
-            ownerAgentId: group.owner_agent_id,
+            sbId: group.sb_id,
             threadKey: group.thread_key,
             inkSessionId,
             backendSessionId,
@@ -1548,7 +1553,10 @@ export class StrategyService {
     );
 
     if (config.supervisorId) {
-      const supervisorSlug = await this.resolveAgentSlug(config.supervisorId);
+      const supervisorSlug = await resolveAgentSlug(
+        this.dataComposer.getClient(),
+        config.supervisorId
+      );
       if (supervisorSlug) {
         await this.notifyDispatcher(
           group,
@@ -1595,24 +1603,6 @@ export class StrategyService {
   }
 
   /**
-   * Resolve an identity UUID to an agent_id slug for notification routing.
-   * notifyDispatcher/handleSendToInbox accept slugs, but we store identity UUIDs.
-   */
-  private async resolveAgentSlug(sbId: string): Promise<string | null> {
-    try {
-      const { data } = await this.dataComposer
-        .getClient()
-        .from('agent_identities')
-        .select('agent_id')
-        .eq('id', sbId)
-        .single();
-      return data ? (data as { agent_id: string }).agent_id : null;
-    } catch {
-      return null;
-    }
-  }
-
-  /**
    * Log a strategy event to the activity stream.
    * Links to the task group via task_group_id for dashboard correlation.
    */
@@ -1624,9 +1614,10 @@ export class StrategyService {
   ): Promise<void> {
     try {
       const reqCtx = getRequestContext();
+      const agentSlug = (await this.resolveOwnerSlug(group)) || 'system';
       await this.dataComposer.repositories.activityStream.logActivity({
         userId: group.user_id,
-        agentId: group.owner_agent_id || 'system',
+        agentId: agentSlug,
         type: 'state_change',
         subtype,
         content,
@@ -1636,6 +1627,7 @@ export class StrategyService {
           groupId: group.id,
           groupTitle: group.title,
           strategy: group.strategy,
+          sbId: group.sb_id || undefined,
           ...payload,
         } as unknown as import('../data/repositories/activity-stream.repository').Json,
         status: 'completed',

@@ -1284,11 +1284,6 @@ export const updateTaskGroupSchema = z.object({
   outputTarget: taskGroupOutputTargetEnum.nullable().optional(),
   outputStatus: taskGroupOutputStatusEnum.nullable().optional(),
   threadKey: z.string().nullable().optional(),
-  ownerAgentId: z
-    .string()
-    .nullable()
-    .optional()
-    .describe('Agent slug owning this group (e.g. "wren"). Pass null to clear.'),
   sbId: z
     .string()
     .uuid()
@@ -1382,7 +1377,6 @@ export async function handleUpdateTaskGroup(
       output_target: args.outputTarget,
       output_status: args.outputStatus,
       thread_key: args.threadKey,
-      owner_agent_id: args.ownerAgentId,
       sb_id: nextSbId,
       autonomous: args.autonomous,
       max_sessions: args.maxSessions,
@@ -1400,7 +1394,6 @@ export async function handleUpdateTaskGroup(
         metadata: updated.metadata,
         projectId: updated.project_id,
         sbId: updated.sb_id,
-        ownerAgentId: updated.owner_agent_id,
         autonomous: updated.autonomous,
         maxSessions: updated.max_sessions,
         sessionsUsed: updated.sessions_used,
@@ -1433,11 +1426,6 @@ export const listTaskGroupsSchema = z.object({
     ),
   projectId: z.string().uuid().optional().describe('Filter by project'),
   sbId: z.string().uuid().optional().describe('Filter by agent identity UUID'),
-  ownerAgentId: z
-    .string()
-    .max(64)
-    .optional()
-    .describe('Filter by owner agent ID (e.g. "wren", "lumen")'),
   autonomousOnly: z.boolean().optional().default(false).describe('Only autonomous groups'),
   includeTaskCounts: z
     .boolean()
@@ -1464,7 +1452,6 @@ export async function handleListTaskGroups(
       status: statuses,
       projectId: args.projectId,
       sbId: args.sbId,
-      ownerAgentId: args.ownerAgentId,
       autonomousOnly: args.autonomousOnly,
       limit: args.limit,
     });
@@ -1514,7 +1501,6 @@ export async function handleListTaskGroups(
         sbId: g.sb_id,
         agentId: g.sb_id ? identityMap.get(g.sb_id)?.agentId || null : null,
         agentName: g.sb_id ? identityMap.get(g.sb_id)?.name || null : null,
-        ownerAgentId: g.owner_agent_id,
         autonomous: g.autonomous,
         maxSessions: g.max_sessions,
         sessionsUsed: g.sessions_used,

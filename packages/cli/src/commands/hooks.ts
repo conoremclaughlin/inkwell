@@ -1865,7 +1865,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     hookBackendOverride: options?.backend || process.env.INK_HOOK_BACKEND || null,
   });
 
-  let { studioId, studioName, role } = getIdentitySessionContext(cwd);
+  let { studioId, sbId, studioName, role } = getIdentitySessionContext(cwd);
   const studioLine = studioName ? `Studio: ${studioName}` : '';
 
   let identityBlock = '';
@@ -1974,7 +1974,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
       callPcpTool('list_task_groups', {
         email: config?.email,
         statuses: ['active', 'paused'],
-        ownerAgentId: agentId,
+        ...(sbId ? { sbId } : {}),
         includeTaskCounts: true,
       }),
       callPcpTool('list_tasks', {

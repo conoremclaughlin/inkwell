@@ -47,7 +47,6 @@ export interface TaskGroup {
   iterations_since_approval: number;
   strategy_started_at: string | null;
   strategy_paused_at: string | null;
-  owner_agent_id: string | null;
   group_number: number;
   slug: string | null;
   outcome: string | null;
@@ -105,7 +104,6 @@ export interface CreateTaskGroupInput {
   strategy_config?: StrategyConfig;
   verification_mode?: VerificationMode;
   plan_uri?: string;
-  owner_agent_id?: string;
 }
 
 export interface UpdateTaskGroupInput {
@@ -134,7 +132,6 @@ export interface UpdateTaskGroupInput {
   iterations_since_approval?: number;
   strategy_started_at?: string | null;
   strategy_paused_at?: string | null;
-  owner_agent_id?: string | null;
   outcome?: string | null;
   conclusion?: string | null;
 }
@@ -145,7 +142,6 @@ export interface ListTaskGroupsOptions {
   sbId?: string;
   autonomousOnly?: boolean;
   strategy?: StrategyPreset;
-  ownerAgentId?: string;
   limit?: number;
 }
 
@@ -177,7 +173,6 @@ export class TaskGroupsRepository {
         strategy_config: input.strategy_config ?? {},
         verification_mode: input.verification_mode ?? 'self',
         plan_uri: input.plan_uri ?? null,
-        owner_agent_id: input.owner_agent_id ?? null,
       } as never)
       .select()
       .single();
@@ -234,10 +229,6 @@ export class TaskGroupsRepository {
       query = query.eq('strategy', options.strategy);
     }
 
-    if (options?.ownerAgentId) {
-      query = query.eq('owner_agent_id', options.ownerAgentId);
-    }
-
     if (options?.limit) {
       query = query.limit(options.limit);
     }
@@ -282,7 +273,6 @@ export class TaskGroupsRepository {
       updates.strategy_started_at = input.strategy_started_at;
     if (input.strategy_paused_at !== undefined)
       updates.strategy_paused_at = input.strategy_paused_at;
-    if (input.owner_agent_id !== undefined) updates.owner_agent_id = input.owner_agent_id;
     if (input.outcome !== undefined) updates.outcome = input.outcome;
     if (input.conclusion !== undefined) updates.conclusion = input.conclusion;
 
@@ -318,7 +308,7 @@ export class TaskGroupsRepository {
   /**
    * Find active strategies for an agent — used by heartbeat recovery
    */
-  async findActiveStrategies(userId: string, ownerAgentId?: string): Promise<TaskGroup[]> {
+  async findActiveStrategies(userId: string, sbId?: string): Promise<TaskGroup[]> {
     let query = this.client
       .from('task_groups' as never)
       .select('*')
@@ -326,8 +316,8 @@ export class TaskGroupsRepository {
       .eq('status', 'active')
       .not('strategy', 'is', null);
 
-    if (ownerAgentId) {
-      query = query.eq('owner_agent_id', ownerAgentId);
+    if (sbId) {
+      query = query.eq('sb_id', sbId);
     }
 
     const { data, error } = await query;

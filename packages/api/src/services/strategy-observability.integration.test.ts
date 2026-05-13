@@ -40,6 +40,8 @@ const configPath = resolve(process.env.HOME || '', '.ink/config.json');
 const inkConfig = existsSync(configPath) ? JSON.parse(readFileSync(configPath, 'utf-8')) : {};
 const TEST_USER_ID: string | undefined = inkConfig.userId;
 
+let TEST_SB_ID: string | undefined;
+
 const canRun = !!SUPABASE_URL && !!SUPABASE_KEY && !!TEST_USER_ID;
 
 // Mock inbox handlers — we don't want real triggers during tests
@@ -95,6 +97,14 @@ describe.skipIf(!canRun)('Watchdog wakeup/skip observability (integration)', () 
       },
     };
 
+    const { data: identity } = await client
+      .from('agent_identities')
+      .select('id')
+      .eq('user_id', TEST_USER_ID!)
+      .limit(1)
+      .single();
+    TEST_SB_ID = identity?.id;
+
     // Create test group + task
     const group = await dc.repositories.taskGroups.create({
       user_id: TEST_USER_ID,
@@ -139,7 +149,7 @@ describe.skipIf(!canRun)('Watchdog wakeup/skip observability (integration)', () 
       groupId,
       userId: TEST_USER_ID!,
       strategy: 'persistence',
-      ownerAgentId: 'integration-test',
+      sbId: TEST_SB_ID!,
     });
 
     // Trigger watchdog — should log watchdog_wakeup then attempt trigger
@@ -241,6 +251,16 @@ describe.skipIf(!canRun)('Approval gate pauseReason metadata (integration)', () 
       },
     };
 
+    if (!TEST_SB_ID) {
+      const { data: identity } = await client
+        .from('agent_identities')
+        .select('id')
+        .eq('user_id', TEST_USER_ID!)
+        .limit(1)
+        .single();
+      TEST_SB_ID = identity?.id;
+    }
+
     // Create group with approval gate at 1 task
     const group = await dc.repositories.taskGroups.create({
       user_id: TEST_USER_ID,
@@ -293,7 +313,7 @@ describe.skipIf(!canRun)('Approval gate pauseReason metadata (integration)', () 
       groupId,
       userId: TEST_USER_ID!,
       strategy: 'persistence',
-      ownerAgentId: 'integration-test',
+      sbId: TEST_SB_ID!,
       config: { maxIterationsWithoutApproval: 1 },
     });
 
@@ -403,6 +423,16 @@ describe.skipIf(!canRun)('strategy_trigger activity events (integration)', () =>
       },
     };
 
+    if (!TEST_SB_ID) {
+      const { data: identity } = await client
+        .from('agent_identities')
+        .select('id')
+        .eq('user_id', TEST_USER_ID!)
+        .limit(1)
+        .single();
+      TEST_SB_ID = identity?.id;
+    }
+
     const group = await dc.repositories.taskGroups.create({
       user_id: TEST_USER_ID,
       title: `__observability_trigger_test_${Date.now()}`,
@@ -445,7 +475,7 @@ describe.skipIf(!canRun)('strategy_trigger activity events (integration)', () =>
       groupId,
       userId: TEST_USER_ID!,
       strategy: 'persistence',
-      ownerAgentId: 'integration-test',
+      sbId: TEST_SB_ID!,
     });
 
     // Wait briefly for fire-and-forget logs
@@ -458,7 +488,7 @@ describe.skipIf(!canRun)('strategy_trigger activity events (integration)', () =>
     expect(triggerEvents[0].payload).toMatchObject({
       groupId,
       reason: 'strategy_kickoff',
-      ownerAgentId: 'integration-test',
+      sbId: TEST_SB_ID!,
     });
     expect(triggerEvents[0].payload).toHaveProperty('taskId');
     expect(triggerEvents[0].payload).toHaveProperty('taskTitle');
@@ -481,7 +511,7 @@ describe.skipIf(!canRun)('strategy_trigger activity events (integration)', () =>
     expect(watchdogTriggers[0].payload).toMatchObject({
       groupId,
       reason: 'watchdog',
-      ownerAgentId: 'integration-test',
+      sbId: TEST_SB_ID!,
     });
   });
 

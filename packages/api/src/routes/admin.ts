@@ -884,7 +884,7 @@ async function resolveWorkspaceIdentityScope(
       id: string;
       agent_id: string;
       name: string;
-      role: string | null;
+      role: string;
     } => Boolean(row.id) && Boolean(row.agent_id) && Boolean(row.name)
   );
 
@@ -6357,28 +6357,6 @@ router.get('/task-groups', async (req: Request, res: Response) => {
       }
     }
 
-    // Resolve strategy owner display names (owner_agent_id may differ from creator)
-    const ownerAgentIds = [
-      ...new Set(groups.map((g) => g.owner_agent_id).filter(Boolean)),
-    ] as string[];
-    let ownerNameMap: Record<string, string> = {};
-
-    if (ownerAgentIds.length > 0) {
-      const { data: ownerData } = await supabase
-        .from('agent_identities')
-        .select('agent_id, name')
-        .eq('user_id', authReq.pcpUserId)
-        .in('agent_id', ownerAgentIds);
-
-      if (ownerData) {
-        for (const row of ownerData) {
-          if (row.agent_id && row.name) {
-            ownerNameMap[row.agent_id] = row.name;
-          }
-        }
-      }
-    }
-
     res.json({
       groups: groups.map((g) => ({
         id: g.id,
@@ -6403,8 +6381,6 @@ router.get('/task-groups', async (req: Request, res: Response) => {
         agentName: (g.agent_identities as { agent_id: string; name: string } | null)?.name ?? null,
         taskCount: taskCountMap[g.id] || 0,
         strategy: g.strategy ?? null,
-        ownerAgentId: g.owner_agent_id ?? null,
-        ownerAgentName: (g.owner_agent_id && ownerNameMap[g.owner_agent_id]) || null,
         currentTaskIndex: g.current_task_index ?? 0,
         strategyStartedAt: g.strategy_started_at ?? null,
         strategyPausedAt: g.strategy_paused_at ?? null,
@@ -6467,21 +6443,6 @@ router.get('/task-groups/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    // Resolve owner agent name if owner_agent_id is set
-    let ownerAgentName: string | null = null;
-    if (group.owner_agent_id) {
-      const { data: ownerData } = await supabase
-        .from('agent_identities')
-        .select('name')
-        .eq('user_id', userId)
-        .eq('agent_id', group.owner_agent_id)
-        .single();
-
-      if (ownerData?.name) {
-        ownerAgentName = ownerData.name;
-      }
-    }
-
     const tasks = tasksData || [];
 
     res.json({
@@ -6509,8 +6470,6 @@ router.get('/task-groups/:id', async (req: Request, res: Response) => {
           (group.agent_identities as { agent_id: string; name: string } | null)?.name ?? null,
         taskCount: tasks.length,
         strategy: group.strategy ?? null,
-        ownerAgentId: group.owner_agent_id ?? null,
-        ownerAgentName,
         currentTaskIndex: group.current_task_index ?? 0,
         strategyStartedAt: group.strategy_started_at ?? null,
         strategyPausedAt: group.strategy_paused_at ?? null,
