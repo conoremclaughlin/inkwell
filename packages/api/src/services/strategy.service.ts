@@ -201,6 +201,27 @@ export class StrategyService {
       );
     }
 
+    // Validate mutual exclusivity before any side effects
+    const inputConfig = input.config || (group.strategy_config as StrategyConfig);
+    if (inputConfig?.studioSlug && inputConfig?.ephemeralStudio) {
+      throw new Error('studioSlug and ephemeralStudio are mutually exclusive');
+    }
+
+    // Persistent studio: create BEFORE activating the strategy so (a) failure
+    // doesn't leave an active group in a broken state, and (b) the group update
+    // below returns metadata that includes the new studioId for sandbox routing.
+    if (inputConfig?.studioSlug) {
+      const metadata = (group.metadata || {}) as Record<string, unknown>;
+      if (!metadata.studioId) {
+        const created = await this.createPersistentStudio(group, inputConfig.studioSlug);
+        if (!created) {
+          throw new Error(
+            `Failed to create persistent studio "${inputConfig.studioSlug}" — check repoRoot in group metadata`
+          );
+        }
+      }
+    }
+
     // Update the group with strategy config
     const updated = await this.dataComposer.repositories.taskGroups.update(input.groupId, {
       strategy: input.strategy,
@@ -236,26 +257,12 @@ export class StrategyService {
     // Create a watchdog reminder so the heartbeat checks progress periodically
     await this.createWatchdogReminder(updated, input.userId);
 
-    // Persistent studio: create a durable worktree + studio for the strategy.
-    // Runs before sandbox setup so the studio is available for sandbox routing.
-    const config = updated.strategy_config as StrategyConfig;
-    if (config.studioSlug) {
-      const metadata = (updated.metadata || {}) as Record<string, unknown>;
-      if (!metadata.studioId) {
-        const created = await this.createPersistentStudio(updated, config.studioSlug);
-        if (!created) {
-          throw new Error(
-            `Failed to create persistent studio "${config.studioSlug}" — check repoRoot in group metadata`
-          );
-        }
-      }
-    }
-
     // Spin up sandbox BEFORE triggering the agent — if sandboxPolicy is
     // 'required' (default), a failed sandbox aborts the strategy instead
     // of silently degrading to host execution.
     // Note: maybeSpinUpSandbox may create an ephemeral studio and update
     // group metadata in the DB, so we re-read the group afterward.
+    const config = updated.strategy_config as StrategyConfig;
     const sandboxResult = await this.maybeSpinUpSandbox(updated);
     const sandboxPolicy = config.sandboxPolicy || 'required';
 

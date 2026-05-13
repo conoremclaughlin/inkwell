@@ -2518,42 +2518,8 @@ describe('StrategyService', () => {
         status: 'active',
         metadata: {},
       });
-      const task = createMockTask();
 
       dc.repositories.taskGroups.findById.mockResolvedValue(group);
-      dc.repositories.taskGroups.update.mockResolvedValue({
-        ...group,
-        strategy: 'persistence',
-        status: 'active',
-        strategy_config: { studioSlug: 'auth-refactor' },
-        metadata: {},
-      });
-
-      dc.getClient.mockReturnValue({
-        from: vi.fn().mockReturnValue({
-          select: vi.fn().mockReturnValue({
-            eq: vi.fn().mockReturnValue({
-              eq: vi.fn().mockReturnValue({
-                in: vi.fn().mockReturnValue({
-                  limit: vi.fn().mockReturnValue({
-                    single: vi.fn().mockResolvedValue({ data: task, error: null }),
-                  }),
-                }),
-                order: vi.fn().mockReturnValue({
-                  order: vi.fn().mockReturnValue({
-                    limit: vi.fn().mockResolvedValue({ data: [task], error: null }),
-                  }),
-                }),
-                single: vi.fn().mockResolvedValue({ data: task, error: null }),
-              }),
-            }),
-          }),
-          insert: vi.fn().mockResolvedValue({ data: null, error: null }),
-          update: vi.fn().mockReturnValue({
-            contains: vi.fn().mockResolvedValue({ data: null, error: null }),
-          }),
-        }),
-      });
 
       const service = new StrategyService(dc as any);
       await expect(
@@ -2565,6 +2531,32 @@ describe('StrategyService', () => {
           config: { studioSlug: 'auth-refactor' },
         })
       ).rejects.toThrow('Failed to create persistent studio');
+
+      // Group should NOT have been activated — failure happens before update
+      expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
+    });
+
+    it('rejects when both studioSlug and ephemeralStudio are set', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: { repoRoot: '/repo' },
+      });
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+
+      const service = new StrategyService(dc as any);
+      await expect(
+        service.startStrategy({
+          groupId: 'group-1',
+          userId: 'user-123',
+          strategy: 'persistence',
+          ownerAgentId: 'wren',
+          config: { studioSlug: 'auth-refactor', ephemeralStudio: true },
+        })
+      ).rejects.toThrow('mutually exclusive');
+
+      expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
     });
 
     it('skips creation when studioId already exists in metadata', async () => {
