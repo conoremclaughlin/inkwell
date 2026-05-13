@@ -1,7 +1,7 @@
 import { coerce } from 'semver';
 import type { Writable } from 'stream';
-import { env } from '../utils/env.js';
-import { gte } from '../utils/semver.js';
+import { env } from './compat/env.js';
+import { gte } from './compat/semver.js';
 import { getClearTerminalSequence } from './clearTerminal.js';
 import type { Diff } from './frame.js';
 import { cursorMove, cursorTo, eraseLines } from './termio/csi.js';

@@ -33,6 +33,7 @@
     "ink": "npm:@jrichman/ink@6.4.11",
     "ora": "^8.0.1",
     "react": "^19.2.4",
+    "semver": "^7.7.4",
     "yaml": "^2.8.2"
   },
   "devDependencies": {

@@ -1,5 +1,5 @@
 import { type AnsiCode, ansiCodesToString, diffAnsiCodes } from '@alcalzone/ansi-tokenize';
-import { logForDebugging } from '../utils/debug.js';
+import { logForDebugging } from './compat/debug.js';
 import type { Diff, FlickerReason, Frame } from './frame.js';
 import type { Point } from './layout/geometry.js';
 import {
