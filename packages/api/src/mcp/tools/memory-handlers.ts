@@ -498,9 +498,9 @@ export const listSessionsSchema = userIdentifierBaseSchema.extend({
   limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
 });
 
-// ==============================================// SESSION PHASE SCHEMA
+// ==============================================// SESSION STATE SCHEMA
 // ==============================================
-export const updateSessionPhaseSchema = userIdentifierBaseSchema.extend({
+export const updateSessionStateSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
     .uuid()
@@ -1461,8 +1461,8 @@ function toJsonObject(value: Record<string, unknown>): Json {
   return value as Json;
 }
 
-export async function handleUpdateSessionPhase(args: unknown, dataComposer: DataComposer) {
-  const params = updateSessionPhaseSchema.parse(args);
+export async function handleUpdateSessionState(args: unknown, dataComposer: DataComposer) {
+  const params = updateSessionStateSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
   const studioScope = resolveStudioScope(rawStudioId);

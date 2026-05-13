@@ -307,7 +307,7 @@ Implementations MUST ensure at most one active session exists per `(userId, agen
 
 When `start_session` is called with a `threadKey` that has no active match, implementations MUST create a new session (not silently route to a default session). This ensures threadKey isolation: work on `pr:42` never accidentally lands in a session tracking `pr:41`.
 
-**Phase Updates (`update_session_phase`)**
+**Phase Updates (`update_session_state`)**
 
 Phases describe the agent's current work state. Core phases:
 

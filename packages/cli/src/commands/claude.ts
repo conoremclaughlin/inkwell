@@ -2420,7 +2420,7 @@ async function persistBackendSessionLink(options: {
         conflictingAgentId?: string;
       };
       sessionTrace?: { changedFields?: string[] };
-    }>('update_session_phase', {
+    }>('update_session_state', {
       email: options.email,
       agentId: options.agentId,
       sessionId: options.pcpSessionId,
@@ -3371,7 +3371,7 @@ async function ensurePcpSessionContext(
 
   if (email) {
     try {
-      await callPcpTool('update_session_phase', {
+      await callPcpTool('update_session_state', {
         email,
         agentId,
         sessionId: chosen.id,

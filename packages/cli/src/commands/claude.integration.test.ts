@@ -191,7 +191,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CLAUDE_SESSION_ID || '
       expect(persistedBackendSessionId).toBe('claude-session-int-1');
 
       const phaseUpdatesWithBackendId = pcpToolCalls
-        .filter((call) => call.name === 'update_session_phase')
+        .filter((call) => call.name === 'update_session_state')
         .some((call) => call.args.backendSessionId === 'claude-session-int-1');
       expect(phaseUpdatesWithBackendId).toBe(true);
     } finally {
@@ -367,7 +367,7 @@ console.log('fake-claude-run-complete');
       expect(persistedBackendSessionId).toBe(delayedSessionId);
 
       const phaseUpdatesWithBackendId = pcpToolCalls
-        .filter((call) => call.name === 'update_session_phase')
+        .filter((call) => call.name === 'update_session_state')
         .some((call) => call.args.backendSessionId === delayedSessionId);
       expect(phaseUpdatesWithBackendId).toBe(true);
     } finally {
@@ -526,7 +526,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_CODEX_SESSION_ID || 'c
       expect(persistedBackendSessionId).toBe('codex-session-int-1');
 
       const phaseUpdatesWithBackendId = pcpToolCalls
-        .filter((call) => call.name === 'update_session_phase')
+        .filter((call) => call.name === 'update_session_state')
         .some((call) => call.args.backendSessionId === 'codex-session-int-1');
       expect(phaseUpdatesWithBackendId).toBe(true);
     } finally {
@@ -677,7 +677,7 @@ console.log(JSON.stringify({ session_id: process.env.FAKE_GEMINI_SESSION_ID || '
       expect(persistedBackendSessionId).toBe('gemini-session-int-1');
 
       const phaseUpdatesWithBackendId = pcpToolCalls
-        .filter((call) => call.name === 'update_session_phase')
+        .filter((call) => call.name === 'update_session_state')
         .some((call) => call.args.backendSessionId === 'gemini-session-int-1');
       expect(phaseUpdatesWithBackendId).toBe(true);
     } finally {
