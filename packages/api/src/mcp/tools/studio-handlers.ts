@@ -14,6 +14,7 @@ import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
 import { ensureStudioSettings } from '../../services/studio-settings';
+import { resolveMainStudio } from '../../services/sessions/session-service';
 
 // ============== Helpers ==============
 
@@ -605,6 +606,52 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
   });
 }
 
+const registerStudioSchema = userIdentifierBaseSchema.extend({
+  agentId: z.string().describe('Agent ID to own the studio'),
+  repoRoot: z.string().describe('Absolute path to the repository root'),
+});
+
+export async function handleRegisterStudio(args: unknown, dataComposer: DataComposer) {
+  const parsed = registerStudioSchema.parse(args);
+  const { user } = await resolveUserOrThrow(parsed, dataComposer);
+
+  // Check if studio already exists before auto-create
+  const existingId = await resolveMainStudio(
+    dataComposer.getClient(),
+    user.id,
+    parsed.repoRoot,
+    parsed.agentId
+  );
+
+  const studioId =
+    existingId ??
+    (await resolveMainStudio(dataComposer.getClient(), user.id, parsed.repoRoot, parsed.agentId, {
+      autoCreate: true,
+    }));
+
+  if (!studioId) {
+    return errorResponse('Failed to register studio — could not create or find studio row');
+  }
+
+  const studio = await dataComposer.repositories.studios.findById(studioId);
+  if (!studio) {
+    return errorResponse('Studio was created but could not be retrieved');
+  }
+
+  return successResponse({
+    studio: {
+      id: studio.id,
+      slug: studio.slug,
+      repoRoot: studio.repoRoot,
+      worktreePath: studio.worktreePath,
+      branch: studio.branch,
+      agentId: studio.agentId,
+      status: studio.status,
+    },
+    created: !existingId,
+  });
+}
+
 // ============== Tool Registration ==============
 
 export const studioToolDefinitions = [
@@ -648,5 +695,12 @@ export const studioToolDefinitions = [
       'Adopt an existing studio by linking a new session to it and setting it to active. Useful when resuming work in a previously created worktree.',
     schema: adoptStudioSchema,
     handler: handleAdoptStudio,
+  },
+  {
+    name: 'register_studio',
+    description:
+      'Register an existing repository as a studio. Creates a studio row for the root repo if one does not exist, or returns the existing one. Use this to make repos visible in the dashboard without starting a session.',
+    schema: registerStudioSchema,
+    handler: handleRegisterStudio,
   },
 ];
