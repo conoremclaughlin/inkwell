@@ -815,6 +815,10 @@ export class MemoryRepository {
       return null;
     }
 
+    if (!config.chunkedRecallEnabled) {
+      return this.tryLegacySemanticRecallCandidates(userId, options, limit, offset, queryEmbedding);
+    }
+
     const matchCount = Math.max(
       limit,
       (offset + limit) * Math.max(1, config.matchCountMultiplier || 1)
@@ -864,7 +868,9 @@ export class MemoryRepository {
 
       const matchedChunkType =
         row.matched_chunk_type &&
-        ['summary', 'fact', 'topic', 'entity', 'content'].includes(row.matched_chunk_type)
+        ['summary', 'fact', 'topic', 'entity', 'current_state', 'content'].includes(
+          row.matched_chunk_type
+        )
           ? (row.matched_chunk_type as MemoryChunkType)
           : inferChunkTypeFromMetadata(row.matched_chunk_index, memory.metadata);
       const semanticScore = Math.max(0, Math.min(1, row.similarity ?? 0));

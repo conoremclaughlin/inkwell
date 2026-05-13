@@ -262,6 +262,12 @@ To explicitly disable embeddings and keep text-only recall:
 echo 'MEMORY_EMBEDDINGS_ENABLED=false' >> .env.local
 ```
 
+Chunked multi-vector recall is experimental and disabled by default. To test it explicitly:
+
+```bash
+echo 'MEMORY_CHUNKED_RECALL_ENABLED=true' >> .env.local
+```
+
 ### Identity Resolution
 
 The agent ID is resolved in order:

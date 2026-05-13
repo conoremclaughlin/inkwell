@@ -45,7 +45,9 @@ export const VETTED_EMBEDDING_MODELS: VettedEmbeddingModel[] = [
     model: 'text-embedding-3-small',
     recommendedFor: 'Reliable API default',
     dimensions: [1536, 1024, 512, 256],
-    notes: 'Strong cost/performance API model for production defaults.',
+    maxInputChars: 24000,
+    notes:
+      'Strong cost/performance API model for production defaults. Char limit is a conservative proxy for the 8192-token embedding input limit.',
     default: true,
   },
   {
@@ -53,7 +55,9 @@ export const VETTED_EMBEDDING_MODELS: VettedEmbeddingModel[] = [
     model: 'text-embedding-3-large',
     recommendedFor: 'Highest API retrieval quality',
     dimensions: [3072, 2048, 1024, 512, 256],
-    notes: 'Highest quality API option with larger vectors/cost.',
+    maxInputChars: 24000,
+    notes:
+      'Highest quality API option with larger vectors/cost. Char limit is a conservative proxy for the 8192-token embedding input limit.',
   },
 ];
 

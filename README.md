@@ -181,6 +181,12 @@ MEMORY_EMBEDDINGS_ENABLED=false
 
 in `.env.local`.
 
+Chunked multi-vector memory recall is experimental and off by default. To test it explicitly, set:
+
+```bash
+MEMORY_CHUNKED_RECALL_ENABLED=true
+```
+
 ### Alternative: Use Inkwell from another platform
 
 If you're using [OpenClaw](https://github.com/openclaw) or another MCP-compatible client, you can connect directly to the Inkwell server without the `ink` CLI:

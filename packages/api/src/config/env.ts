@@ -177,6 +177,10 @@ const envSchema = z.object({
   MEMORY_EMBEDDING_DIMENSIONS: optionalNumber,
   MEMORY_EMBEDDING_QUERY_THRESHOLD: optionalNumber,
   MEMORY_EMBEDDING_MATCH_COUNT_MULTIPLIER: optionalNumber,
+  MEMORY_CHUNKED_RECALL_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
   MEMORY_LLM_EXTRACTION_ENABLED: z
     .enum(['true', 'false'])
     .default('false')
