@@ -1,4 +1,4 @@
-import { mkdtemp } from 'fs/promises';
+import { mkdtemp, rm } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { randomUUID } from 'crypto';
@@ -40,4 +40,8 @@ export function contentTypeForFormat(format: string): string {
 export async function createTempAudioPath(extension: string): Promise<string> {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'pcp-tts-'));
   return path.join(dir, `${randomUUID()}.${extension}`);
+}
+
+export async function removeTempAudioDir(filePath: string): Promise<void> {
+  await rm(path.dirname(filePath), { recursive: true, force: true }).catch(() => {});
 }

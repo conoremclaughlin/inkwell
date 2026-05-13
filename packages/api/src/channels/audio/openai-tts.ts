@@ -1,6 +1,11 @@
-import { writeFile, rm } from 'fs/promises';
+import { writeFile } from 'fs/promises';
 import { truncate } from '../provider-utils';
-import { createTempAudioPath, extensionForFormat, contentTypeForFormat } from './audio-utils';
+import {
+  createTempAudioPath,
+  removeTempAudioDir,
+  extensionForFormat,
+  contentTypeForFormat,
+} from './audio-utils';
 import type {
   TextToSpeechProvider,
   TextToSpeechProviderConfig,
@@ -75,7 +80,7 @@ export class OpenAITextToSpeechProvider implements TextToSpeechProvider {
         contentType: contentTypeForFormat(this.format),
         filename: `reply.${extension}`,
         cleanup: async () => {
-          await rm(filePath, { force: true }).catch(() => {});
+          await removeTempAudioDir(filePath);
         },
       };
     } finally {

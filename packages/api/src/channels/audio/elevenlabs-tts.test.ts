@@ -1,4 +1,5 @@
-import { rm, readFile } from 'fs/promises';
+import { readFile, stat } from 'fs/promises';
+import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ElevenLabsTextToSpeechProvider } from './elevenlabs-tts';
 
@@ -87,6 +88,29 @@ describe('ElevenLabsTextToSpeechProvider', () => {
     const provider = new ElevenLabsTextToSpeechProvider({ apiKey: 'test-key' });
     const result = await provider.synthesize({ text: 'hello' });
     expect(result).toBeUndefined();
+  });
+
+  it('cleanup removes the parent temp directory', async () => {
+    const raw = new Uint8Array([0x61, 0x62, 0x63]);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        arrayBuffer: async () => raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength),
+      }))
+    );
+
+    const provider = new ElevenLabsTextToSpeechProvider({ apiKey: 'test-key' });
+    const result = await provider.synthesize({ text: 'hello' });
+    expect(result).toBeDefined();
+
+    const parentDir = path.dirname(result!.filePath);
+    const before = await stat(parentDir);
+    expect(before.isDirectory()).toBe(true);
+
+    await result!.cleanup();
+
+    await expect(stat(parentDir)).rejects.toThrow();
   });
 
   it('returns undefined on empty response body', async () => {

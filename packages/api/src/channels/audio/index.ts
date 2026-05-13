@@ -16,4 +16,9 @@ export { CliTextToSpeechProvider } from './cli-tts';
 export { OpenAITranscriptionProvider } from './openai-stt';
 export { CliTranscriptionProvider } from './cli-stt';
 
-export { extensionForFormat, contentTypeForFormat, createTempAudioPath } from './audio-utils';
+export {
+  extensionForFormat,
+  contentTypeForFormat,
+  createTempAudioPath,
+  removeTempAudioDir,
+} from './audio-utils';

@@ -1,7 +1,12 @@
-import { rm, stat } from 'fs/promises';
+import { stat } from 'fs/promises';
 import { logger } from '../../utils/logger';
 import { runShellCommand, shellEscape } from '../provider-utils';
-import { createTempAudioPath, extensionForFormat, contentTypeForFormat } from './audio-utils';
+import {
+  createTempAudioPath,
+  removeTempAudioDir,
+  extensionForFormat,
+  contentTypeForFormat,
+} from './audio-utils';
 import type { TextToSpeechProvider, TextToSpeechInput, SynthesizedAudio } from './tts-provider';
 
 export class CliTextToSpeechProvider implements TextToSpeechProvider {
@@ -26,7 +31,7 @@ export class CliTextToSpeechProvider implements TextToSpeechProvider {
 
     const result = await runShellCommand(command, this.timeoutMs);
     if (result.timedOut || result.code !== 0) {
-      await rm(filePath, { force: true }).catch(() => {});
+      await removeTempAudioDir(filePath);
       logger.warn('TTS CLI provider failed', {
         code: result.code,
         timedOut: result.timedOut,
@@ -38,11 +43,11 @@ export class CliTextToSpeechProvider implements TextToSpeechProvider {
     try {
       const details = await stat(filePath);
       if (details.size <= 0) {
-        await rm(filePath, { force: true }).catch(() => {});
+        await removeTempAudioDir(filePath);
         return undefined;
       }
     } catch {
-      await rm(filePath, { force: true }).catch(() => {});
+      await removeTempAudioDir(filePath);
       return undefined;
     }
 
@@ -51,7 +56,7 @@ export class CliTextToSpeechProvider implements TextToSpeechProvider {
       contentType: contentTypeForFormat(this.format),
       filename: `reply.${extension}`,
       cleanup: async () => {
-        await rm(filePath, { force: true }).catch(() => {});
+        await removeTempAudioDir(filePath);
       },
     };
   }

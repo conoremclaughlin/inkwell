@@ -1,6 +1,6 @@
-import { writeFile, rm } from 'fs/promises';
+import { writeFile } from 'fs/promises';
 import { truncate } from '../provider-utils';
-import { createTempAudioPath } from './audio-utils';
+import { createTempAudioPath, removeTempAudioDir } from './audio-utils';
 import type {
   TextToSpeechProvider,
   TextToSpeechProviderConfig,
@@ -88,7 +88,7 @@ export class ElevenLabsTextToSpeechProvider implements TextToSpeechProvider {
         contentType: outputFormatToContentType(this.format),
         filename: `reply.${extension}`,
         cleanup: async () => {
-          await rm(filePath, { force: true }).catch(() => {});
+          await removeTempAudioDir(filePath);
         },
       };
     } finally {
