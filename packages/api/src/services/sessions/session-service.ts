@@ -1452,6 +1452,22 @@ This session will continue with a fresh context after compaction. Your identity,
       },
     });
 
+    // Clear stale channel_routes so heartbeat reminders don't route to this ended session
+    if (this.supabase) {
+      await this.supabase
+        .from('channel_routes')
+        .update({ active_session_id: null })
+        .eq('active_session_id', sessionId)
+        .then(({ error }) => {
+          if (error) {
+            logger.warn('Failed to clear channel_routes.active_session_id', {
+              sessionId,
+              error: error.message,
+            });
+          }
+        });
+    }
+
     logger.info('Session ended', { sessionId, summary });
   }
 

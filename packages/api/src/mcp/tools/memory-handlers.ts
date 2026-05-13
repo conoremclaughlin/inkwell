@@ -1196,13 +1196,28 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
     };
   }
 
-  // Clear cli_attached flag so triggers don't get stuck in the pending queue
-  // after the CLI detaches. endSession already sets ended_at which prevents
-  // matching, but this is belt-and-suspenders for edge cases.
   if (session) {
+    // Clear cli_attached flag so triggers don't get stuck in the pending queue
+    // after the CLI detaches.
     await dataComposer.repositories.memory
       .updateSession(session.id, { cliAttached: false })
       .catch(() => {});
+
+    // Clear stale channel_routes pointing to this session so heartbeat
+    // reminders don't try to route to a dead session and spawn duplicates.
+    await dataComposer
+      .getClient()
+      .from('channel_routes')
+      .update({ active_session_id: null })
+      .eq('active_session_id', session.id)
+      .then(({ error }) => {
+        if (error) {
+          logger.warn('Failed to clear channel_routes.active_session_id', {
+            sessionId: session.id,
+            error: error.message,
+          });
+        }
+      });
   }
 
   logger.info(`Session ended`, { sessionId: session.id, hasSummary: !!params.summary });
