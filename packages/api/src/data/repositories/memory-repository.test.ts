@@ -1205,6 +1205,7 @@ describe('MemoryRepository', () => {
           dimensions: 1024,
           queryThreshold: 0.2,
           matchCountMultiplier: 5,
+          chunkedRecallEnabled: false,
           ollamaBaseUrl: 'http://localhost:11434',
           openaiBaseUrl: 'https://api.openai.com',
           hasOpenAIKey: false,
@@ -1230,25 +1231,24 @@ describe('MemoryRepository', () => {
         expect.arrayContaining([
           expect.objectContaining({
             memory_id: 'mem-hm-5',
-            chunk_type: 'summary',
+            chunk_type: 'content',
             chunk_index: 0,
-            chunk_text: 'Chunked summary',
           }),
         ]),
         expect.objectContaining({ onConflict: 'memory_id,chunk_index' })
       );
-      expect(chunkRows.some((row) => row.chunk_type === 'content')).toBe(true);
-      expect(chunkRows.some((row) => row.chunk_type === 'topic')).toBe(true);
+      expect(chunkRows.every((row) => row.chunk_type === 'content')).toBe(true);
       expect(mockSupabase._queryBuilder.update).toHaveBeenCalledWith(
         expect.objectContaining({
-          embedding_chunks_version: 2,
+          embedding_chunks_version: 3,
           embedding_chunk_count: chunkRows.length,
           metadata: expect.objectContaining({
             embedding_chunks: expect.objectContaining({
               chunkCount: chunkRows.length,
-              version: 2,
+              version: 3,
               viewCounts: expect.objectContaining({
-                summary: 1,
+                content: chunkRows.length,
+                summary: 0,
               }),
             }),
             embedding: expect.objectContaining({
@@ -1508,6 +1508,65 @@ describe('MemoryRepository', () => {
   });
 
   describe('semantic recall integration', () => {
+    it('uses legacy memory embeddings when chunked recall is disabled', async () => {
+      const rpc = vi.fn().mockResolvedValue({
+        data: [
+          {
+            id: 'mem-sem-legacy-default',
+            user_id: 'user-456',
+            content: 'Legacy semantic memory',
+            summary: 'Legacy semantic memory',
+            topic_key: 'project:pcp/memory',
+            source: 'observation',
+            salience: 'high',
+            topics: ['project:pcp/memory'],
+            agent_id: 'lumen',
+            embedding: '[0.1,0.2,0.3]',
+            metadata: {},
+            version: 1,
+            created_at: '2026-03-16T00:00:00Z',
+            expires_at: null,
+            sb_id: null,
+            similarity: 0.88,
+          },
+        ],
+        error: null,
+      });
+      (mockSupabase as any).rpc = rpc;
+      (repo as any).embeddingRouter = {
+        embedQuery: vi.fn().mockResolvedValue({
+          vector: [0.1, 0.2, 0.3],
+          provider: 'openai',
+          model: 'text-embedding-3-small',
+          dimensions: 1024,
+        }),
+        getRuntimeConfig: vi.fn().mockReturnValue({
+          enabled: true,
+          provider: 'openai',
+          model: 'text-embedding-3-small',
+          dimensions: 1024,
+          queryThreshold: 0.2,
+          matchCountMultiplier: 5,
+          chunkedRecallEnabled: false,
+          ollamaBaseUrl: 'http://localhost:11434',
+          openaiBaseUrl: 'https://api.openai.com',
+          hasOpenAIKey: true,
+        }),
+      };
+
+      const results = await repo.recall('user-456', 'semantic query', { recallMode: 'semantic' });
+
+      expect(rpc).toHaveBeenCalledTimes(1);
+      expect(rpc).toHaveBeenCalledWith(
+        'match_memories',
+        expect.objectContaining({
+          query_embedding: '[0.1,0.2,0.3]',
+        })
+      );
+      expect(results).toHaveLength(1);
+      expect(results[0].id).toBe('mem-sem-legacy-default');
+    });
+
     it('serializes query embeddings for chunk matcher RPC', async () => {
       const rpc = vi.fn().mockResolvedValue({
         data: [
@@ -1561,6 +1620,7 @@ describe('MemoryRepository', () => {
           dimensions: 1024,
           queryThreshold: 0.2,
           matchCountMultiplier: 5,
+          chunkedRecallEnabled: true,
           ollamaBaseUrl: 'http://localhost:11434',
           openaiBaseUrl: 'https://api.openai.com',
           hasOpenAIKey: true,
@@ -1625,6 +1685,7 @@ describe('MemoryRepository', () => {
           dimensions: 1024,
           queryThreshold: 0.2,
           matchCountMultiplier: 5,
+          chunkedRecallEnabled: true,
           ollamaBaseUrl: 'http://localhost:11434',
           openaiBaseUrl: 'https://api.openai.com',
           hasOpenAIKey: true,
@@ -1751,6 +1812,7 @@ describe('MemoryRepository', () => {
           dimensions: 1024,
           queryThreshold: 0.2,
           matchCountMultiplier: 5,
+          chunkedRecallEnabled: true,
           ollamaBaseUrl: 'http://localhost:11434',
           openaiBaseUrl: 'https://api.openai.com',
           hasOpenAIKey: true,

@@ -9,6 +9,7 @@ const baseConfig: EmbeddingRuntimeConfig = {
   dimensions: 1024,
   queryThreshold: 0.2,
   matchCountMultiplier: 5,
+  chunkedRecallEnabled: false,
   ollamaBaseUrl: 'http://localhost:11434',
   openaiBaseUrl: 'https://api.openai.com',
   hasOpenAIKey: true,

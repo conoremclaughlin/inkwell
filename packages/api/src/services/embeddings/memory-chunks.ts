@@ -14,14 +14,18 @@ import { type VettedEmbeddingModel } from './vetted-models';
 export { MEMORY_EMBEDDING_CHUNKS_VERSION };
 const DEFAULT_MAX_CHARS = 1000;
 const DEFAULT_OVERLAP_CHARS = 150;
-const MAX_FACT_CHUNKS = 3;
-const MAX_ENTITY_CHUNKS = 2;
-const MIN_FACT_SENTENCE_CHARS = 48;
-const MAX_FACT_SENTENCE_CHARS = 280;
 
 export type MemoryChunkType = 'summary' | 'fact' | 'topic' | 'entity' | 'current_state' | 'content';
 export type MemoryExtractionChunkMode = 'heuristic' | 'llm' | 'merged';
 const CHUNK_TYPE_ORDER: MemoryChunkType[] = [
+  'content',
+  'summary',
+  'fact',
+  'topic',
+  'entity',
+  'current_state',
+];
+const LEGACY_CHUNK_TYPE_ORDER: MemoryChunkType[] = [
   'summary',
   'fact',
   'topic',
@@ -150,103 +154,6 @@ function sanitizeChunkText(text: string): string {
   return replaceUnpairedSurrogates(text);
 }
 
-function splitIntoSentences(text: string): string[] {
-  const normalized = text
-    .replace(/\r/g, '\n')
-    .split(/\n+/)
-    .flatMap((line) => line.split(/(?<=[.!?])\s+/))
-    .map(normalizeWhitespace)
-    .filter(Boolean);
-
-  return normalized;
-}
-
-function sentenceScore(sentence: string): number {
-  const lowered = sentence.toLowerCase();
-  const cueWords = [
-    ' must ',
-    ' should ',
-    ' decided ',
-    ' because ',
-    ' prefer ',
-    ' important ',
-    ' override',
-    ' replace',
-    ' policy',
-    ' convention',
-    ' requires ',
-    ' means ',
-  ];
-
-  let score = 0;
-  if (/\d/.test(sentence)) score += 0.3;
-  if (cueWords.some((cue) => lowered.includes(cue.trim()) || lowered.includes(cue))) score += 0.4;
-  if (/[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+/.test(sentence) || /\b[A-Z]{2,}\b/.test(sentence)) {
-    score += 0.2;
-  }
-
-  const tokens = lowered.split(/[^a-z0-9]+/).filter((token) => token.length > 2);
-  const uniqueTokens = new Set(tokens);
-  if (tokens.length > 0) score += Math.min(0.3, uniqueTokens.size / Math.max(tokens.length, 1) / 2);
-
-  return score;
-}
-
-function buildFactChunks(text: string): MemoryEmbeddingChunk[] {
-  const sentences = splitIntoSentences(text)
-    .filter(
-      (sentence) =>
-        sentence.length >= MIN_FACT_SENTENCE_CHARS && sentence.length <= MAX_FACT_SENTENCE_CHARS
-    )
-    .map((sentence) => ({ sentence, score: sentenceScore(sentence) }))
-    .filter((entry) => entry.score > 0.2)
-    .sort((a, b) => b.score - a.score || b.sentence.length - a.sentence.length);
-
-  const seen = new Set<string>();
-  const chunks: MemoryEmbeddingChunk[] = [];
-
-  for (const entry of sentences) {
-    const normalized = entry.sentence.toLowerCase();
-    if (seen.has(normalized)) continue;
-    seen.add(normalized);
-    chunks.push({
-      chunkIndex: chunks.length,
-      chunkType: 'fact',
-      text: entry.sentence,
-      startOffset: 0,
-      endOffset: entry.sentence.length,
-    });
-    if (chunks.length >= MAX_FACT_CHUNKS) break;
-  }
-
-  return chunks;
-}
-
-function buildTopicChunks(params: {
-  topicKey?: string | null;
-  topics?: string[] | null;
-  source?: string | null;
-  salience?: string | null;
-}): MemoryEmbeddingChunk[] {
-  const lines: string[] = [];
-  if (params.topicKey?.trim()) lines.push(`topic key: ${params.topicKey.trim()}`);
-  const normalizedTopics = (params.topics || []).map((topic) => topic.trim()).filter(Boolean);
-  if (normalizedTopics.length > 0) lines.push(`topics: ${normalizedTopics.join(', ')}`);
-  if (params.source?.trim()) lines.push(`source: ${params.source.trim()}`);
-  if (params.salience?.trim()) lines.push(`salience: ${params.salience.trim()}`);
-  const text = lines.join('\n').trim();
-  if (!text) return [];
-  return [
-    {
-      chunkIndex: 0,
-      chunkType: 'topic',
-      text,
-      startOffset: 0,
-      endOffset: text.length,
-    },
-  ];
-}
-
 function buildChunksFromTexts(chunkType: MemoryChunkType, texts: string[]): MemoryEmbeddingChunk[] {
   return texts
     .map((text) => sanitizeChunkText(normalizeWhitespace(text)))
@@ -258,67 +165,6 @@ function buildChunksFromTexts(chunkType: MemoryChunkType, texts: string[]): Memo
       startOffset: 0,
       endOffset: text.length,
     }));
-}
-
-function extractEntityPhrases(text: string): string[] {
-  const matches = [
-    ...text.matchAll(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\b/g),
-    ...text.matchAll(/\b[A-Z]{2,}(?:\s+[A-Z]{2,})*\b/g),
-  ].map((match) => normalizeWhitespace(match[0] || ''));
-
-  const unique = new Set<string>();
-  for (const phrase of matches) {
-    if (phrase.length < 3) continue;
-    unique.add(phrase);
-    if (unique.size >= 8) break;
-  }
-
-  return Array.from(unique);
-}
-
-function buildEntityChunks(params: {
-  summary?: string | null;
-  content: string;
-  topicKey?: string | null;
-  topics?: string[] | null;
-}): MemoryEmbeddingChunk[] {
-  const phrases = new Set<string>();
-
-  for (const topic of params.topics || []) {
-    const normalized = topic
-      .split(':')
-      .map((part) => part.trim())
-      .filter(Boolean)
-      .join(' ');
-    if (normalized) phrases.add(normalized);
-  }
-
-  if (params.topicKey?.trim()) {
-    const normalized = params.topicKey
-      .split(':')
-      .map((part) => part.trim())
-      .filter(Boolean)
-      .join(' ');
-    if (normalized) phrases.add(normalized);
-  }
-
-  for (const phrase of extractEntityPhrases(`${params.summary || ''}\n${params.content}`)) {
-    phrases.add(phrase);
-    if (phrases.size >= 10) break;
-  }
-
-  const entries = Array.from(phrases)
-    .map(normalizeWhitespace)
-    .filter(Boolean)
-    .slice(0, MAX_ENTITY_CHUNKS);
-
-  return entries.map((entry, index) => ({
-    chunkIndex: index,
-    chunkType: 'entity',
-    text: `entity focus: ${entry}`,
-    startOffset: 0,
-    endOffset: entry.length,
-  }));
 }
 
 function reindexChunks(chunks: MemoryEmbeddingChunk[], startIndex: number): MemoryEmbeddingChunk[] {
@@ -363,8 +209,14 @@ export function inferChunkTypeFromMetadata(
 
   if (!viewCounts) return null;
 
+  const version = typeof embeddingChunks.version === 'number' ? embeddingChunks.version : null;
+  const chunkTypeOrder =
+    version !== null && version >= MEMORY_EMBEDDING_CHUNKS_VERSION
+      ? CHUNK_TYPE_ORDER
+      : LEGACY_CHUNK_TYPE_ORDER;
+
   let offset = 0;
-  for (const chunkType of CHUNK_TYPE_ORDER) {
+  for (const chunkType of chunkTypeOrder) {
     const rawCount = viewCounts[chunkType];
     const count = typeof rawCount === 'number' ? rawCount : 0;
     if (chunkIndex < offset + count) return chunkType;
@@ -385,43 +237,35 @@ export function buildMemoryEmbeddingChunks(params: {
   llmExtractions?: MemoryExtractions | Record<string, unknown> | null;
   extractionMode?: MemoryExtractionChunkMode;
 }): MemoryEmbeddingChunk[] {
-  const { summary, content, topicKey, topics, source, salience, model = null } = params;
+  const { content, model = null } = params;
   const maxChars = pickMaxChunkChars(model);
   const chunks: MemoryEmbeddingChunk[] = [];
   const llmExtractions = normalizeMemoryExtractions(params.llmExtractions);
   const extractionMode = params.extractionMode || 'heuristic';
-  const includeHeuristic = extractionMode === 'heuristic' || extractionMode === 'merged';
   const includeLlm = extractionMode === 'llm' || extractionMode === 'merged';
+
+  // The raw episodic memory is the authoritative representation. For normal-size memories this
+  // produces exactly one embedding; content is split only when it exceeds the vetted model limit.
+  chunks.push(
+    ...reindexChunks(buildContentChunks(content, maxChars, DEFAULT_OVERLAP_CHARS), chunks.length)
+  );
 
   const extractedSummaryTexts = llmExtractions?.summary
     ? buildSummaryEmbeddingTexts(llmExtractions.summary)
     : [];
-  const normalizedSummary = summary?.trim();
-  const summaryTexts = [
-    ...(includeLlm ? extractedSummaryTexts : []),
-    ...(includeHeuristic && normalizedSummary ? [normalizedSummary] : []),
-  ];
+  const summaryTexts = includeLlm ? extractedSummaryTexts : [];
   chunks.push(...reindexChunks(buildChunksFromTexts('summary', summaryTexts), chunks.length));
 
   const durableFactTexts = llmExtractions?.durable_fact
     ? buildDurableFactEmbeddingTexts(llmExtractions.durable_fact)
     : [];
-  const factChunks = [
-    ...(includeLlm ? buildChunksFromTexts('fact', durableFactTexts) : []),
-    ...(includeHeuristic ? buildFactChunks(`${normalizedSummary || ''}\n${content}`) : []),
-  ];
+  const factChunks = includeLlm ? buildChunksFromTexts('fact', durableFactTexts) : [];
   chunks.push(...reindexChunks(factChunks, chunks.length));
-  chunks.push(
-    ...reindexChunks(buildTopicChunks({ topicKey, topics, source, salience }), chunks.length)
-  );
 
   const entityTexts = llmExtractions?.entity
     ? buildEntityEmbeddingTexts(llmExtractions.entity)
     : [];
-  const entityChunks = [
-    ...(includeLlm ? buildChunksFromTexts('entity', entityTexts) : []),
-    ...(includeHeuristic ? buildEntityChunks({ summary, content, topicKey, topics }) : []),
-  ];
+  const entityChunks = includeLlm ? buildChunksFromTexts('entity', entityTexts) : [];
   chunks.push(...reindexChunks(entityChunks, chunks.length));
 
   const currentStateTexts = llmExtractions?.current_state
@@ -432,9 +276,6 @@ export function buildMemoryEmbeddingChunks(params: {
       ...reindexChunks(buildChunksFromTexts('current_state', currentStateTexts), chunks.length)
     );
   }
-  chunks.push(
-    ...reindexChunks(buildContentChunks(content, maxChars, DEFAULT_OVERLAP_CHARS), chunks.length)
-  );
 
   return chunks;
 }
