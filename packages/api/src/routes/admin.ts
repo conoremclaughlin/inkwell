@@ -884,7 +884,7 @@ async function resolveWorkspaceIdentityScope(
       id: string;
       agent_id: string;
       name: string;
-      role: string | null;
+      role: string;
     } => Boolean(row.id) && Boolean(row.agent_id) && Boolean(row.name)
   );
 
