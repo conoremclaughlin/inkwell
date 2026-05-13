@@ -1,8 +1,3 @@
-/**
- * Geometry primitives — Point, Size, Rectangle, Edges.
- * Copied from Claude Code fork's rendering engine.
- */
-
 export type Point = {
   x: number;
   y: number;
@@ -15,6 +10,7 @@ export type Size = {
 
 export type Rectangle = Point & Size;
 
+/** Edge insets (padding, margin, border) */
 export type Edges = {
   top: number;
   right: number;
@@ -22,6 +18,7 @@ export type Edges = {
   left: number;
 };
 
+/** Create uniform edges */
 export function edges(all: number): Edges;
 export function edges(vertical: number, horizontal: number): Edges;
 export function edges(top: number, right: number, bottom: number, left: number): Edges;
@@ -35,6 +32,7 @@ export function edges(a: number, b?: number, c?: number, d?: number): Edges {
   return { top: a, right: b, bottom: c, left: d! };
 }
 
+/** Add two edge values */
 export function addEdges(a: Edges, b: Edges): Edges {
   return {
     top: a.top + b.top,
@@ -44,8 +42,10 @@ export function addEdges(a: Edges, b: Edges): Edges {
   };
 }
 
+/** Zero edges constant */
 export const ZERO_EDGES: Edges = { top: 0, right: 0, bottom: 0, left: 0 };
 
+/** Convert partial edges to full edges with defaults */
 export function resolveEdges(partial?: Partial<Edges>): Edges {
   return {
     top: partial?.top ?? 0,
