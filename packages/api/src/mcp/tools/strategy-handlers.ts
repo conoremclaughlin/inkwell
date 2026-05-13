@@ -118,6 +118,13 @@ export const startStrategySchema = z.object({
     .describe(
       'Auto-create an ephemeral git worktree + studio for sandbox work. Requires sandbox: true and repoRoot in group metadata.'
     ),
+  studioSlug: z
+    .string()
+    .regex(/^[a-z0-9][a-z0-9-]*[a-z0-9]$/)
+    .optional()
+    .describe(
+      'Create a persistent git worktree + studio for this strategy. The slug becomes the studio name and branch suffix. Requires repoRoot in group metadata. Mutually exclusive with ephemeralStudio.'
+    ),
   requireFinalApproval: z
     .boolean()
     .optional()
@@ -179,6 +186,7 @@ export async function handleStartStrategy(
         sandboxPolicy: args.sandboxPolicy,
         sandboxBackendAuth: args.sandboxBackendAuth,
         ephemeralStudio: args.ephemeralStudio,
+        studioSlug: args.studioSlug,
         requireFinalApproval: args.requireFinalApproval,
         approvalCriteria: args.approvalCriteria,
       },
