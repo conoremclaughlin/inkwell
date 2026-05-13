@@ -93,6 +93,10 @@ const getStudioSchema = userIdentifierBaseSchema.extend({
   studioId: z.string().uuid().optional().describe('Studio UUID'),
   branch: z.string().optional().describe('Branch name to look up'),
   path: z.string().optional().describe('Worktree path to look up'),
+  agentId: z
+    .string()
+    .optional()
+    .describe('Agent ID to disambiguate when multiple agents share the same branch or path'),
 });
 
 const updateStudioSchema = userIdentifierBaseSchema.extend({
@@ -342,18 +346,19 @@ export async function handleListStudios(args: unknown, dataComposer: DataCompose
 
 export async function handleGetStudio(args: unknown, dataComposer: DataComposer) {
   const parsed = getStudioSchema.parse(args);
-  await resolveUserOrThrow(parsed, dataComposer);
+  const { user } = await resolveUserOrThrow(parsed, dataComposer);
 
   const studiosRepo = dataComposer.repositories.studios;
+  const scope = { userId: user.id, agentId: parsed.agentId };
   let studio = null;
 
   // Try identifiers in order: studioId, branch, path
   if (parsed.studioId) {
     studio = await studiosRepo.findById(parsed.studioId);
   } else if (parsed.branch) {
-    studio = await studiosRepo.findByBranch(parsed.branch);
+    studio = await studiosRepo.findByBranch(parsed.branch, scope);
   } else if (parsed.path) {
-    studio = await studiosRepo.findByPath(parsed.path);
+    studio = await studiosRepo.findByPath(parsed.path, scope);
   } else {
     return errorResponse('Must provide at least one of: studioId, branch, or path');
   }
@@ -536,19 +541,20 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
 
 export async function handleAdoptStudio(args: unknown, dataComposer: DataComposer) {
   const parsed = adoptStudioSchema.parse(args);
-  await resolveUserOrThrow(parsed, dataComposer);
+  const { user } = await resolveUserOrThrow(parsed, dataComposer);
 
   const { agentId, sessionId, routePatterns } = parsed;
   const studiosRepo = dataComposer.repositories.studios;
+  const scope = { userId: user.id, agentId };
 
   // Find studio by ID, branch, or path
   let studio = null;
   if (parsed.studioId) {
     studio = await studiosRepo.findById(parsed.studioId);
   } else if (parsed.branch) {
-    studio = await studiosRepo.findByBranch(parsed.branch);
+    studio = await studiosRepo.findByBranch(parsed.branch, scope);
   } else if (parsed.worktreePath) {
-    studio = await studiosRepo.findByPath(parsed.worktreePath);
+    studio = await studiosRepo.findByPath(parsed.worktreePath, scope);
   } else {
     return errorResponse('Must provide at least one of: studioId, branch, or worktreePath');
   }

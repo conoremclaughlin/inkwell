@@ -1838,6 +1838,12 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
             .string()
             .optional()
             .describe('Model identifier (e.g., "opus-4-6", "sonnet", "o3")'),
+          repoRoot: z
+            .string()
+            .optional()
+            .describe(
+              'Absolute path to the repository root. When studioId is "main" and no studio row exists, a studio is auto-created at this path.'
+            ),
           metadata: z.record(z.unknown()).optional().describe('Session metadata'),
           forceNew: z
             .boolean()

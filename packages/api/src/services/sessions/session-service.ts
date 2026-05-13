@@ -10,6 +10,7 @@
 
 import { randomUUID } from 'crypto';
 import { access } from 'fs/promises';
+import path from 'path';
 import { SupabaseClient } from '@supabase/supabase-js';
 import jwt from 'jsonwebtoken';
 import type { Database } from '../../data/supabase/types.js';
@@ -1624,29 +1625,76 @@ This session will continue with a fresh context after compaction. Your identity,
  * target project. When no repoRoot is provided, falls back to process.cwd()
  * (the server's working directory).
  *
- * Returns undefined when no matching studio exists — callers should use
- * defaultWorkingDirectory as the spawn path (the root repo itself).
+ * When `autoCreate` is true and both `agentId` and `repoRoot` are provided,
+ * auto-creates a studio row so every root-repo session gets a real
+ * studio_id instead of NULL.  Falls back to undefined when the caller
+ * didn't supply enough info to safely auto-create.
  */
 export async function resolveMainStudio(
   supabase: SupabaseClient<Database>,
   userId: string,
   repoRoot?: string,
-  agentId?: string
+  agentId?: string,
+  options?: { autoCreate?: boolean }
 ): Promise<string | undefined> {
   const targetRoot = repoRoot || process.cwd();
-  let query = supabase
+
+  const lookupQuery = () => {
+    let q = supabase
+      .from('studios')
+      .select('id, updated_at')
+      .eq('user_id', userId)
+      .eq('repo_root', targetRoot)
+      .eq('worktree_path', targetRoot)
+      .in('status', ['active', 'idle', 'archived'])
+      .order('updated_at', { ascending: false })
+      .limit(1);
+    if (agentId) q = q.eq('agent_id', agentId);
+    return q;
+  };
+
+  const { data: match } = await lookupQuery().maybeSingle();
+  if (match?.id) return match.id;
+
+  // Auto-create only when explicitly opted in AND both agentId and repoRoot
+  // are provided — avoids creating spurious studios from fallback paths.
+  if (!options?.autoCreate || !agentId || !repoRoot) return undefined;
+
+  const slug = path.basename(targetRoot);
+  const { data: created, error } = await supabase
     .from('studios')
-    .select('id, updated_at')
-    .eq('user_id', userId)
-    .eq('repo_root', targetRoot)
-    .in('status', ['active', 'idle', 'archived'])
-    .order('updated_at', { ascending: false })
-    .limit(1);
-  if (agentId) {
-    query = query.eq('agent_id', agentId);
+    .insert({
+      user_id: userId,
+      agent_id: agentId,
+      repo_root: targetRoot,
+      worktree_path: targetRoot,
+      branch: 'main',
+      slug,
+      status: 'active',
+      purpose: 'Root repository studio (auto-created)',
+      metadata: { autoCreated: true },
+    })
+    .select('id')
+    .single();
+
+  if (error) {
+    // Unique constraint race — another concurrent request already created it
+    if (error.code === '23505') {
+      const { data: retry } = await lookupQuery().maybeSingle();
+      return retry?.id || undefined;
+    }
+    logger.warn('Failed to auto-create main studio', { error, userId, agentId, repoRoot });
+    return undefined;
   }
-  const { data: match } = await query.maybeSingle();
-  return match?.id || undefined;
+
+  logger.info('Auto-created main studio for root repo', {
+    studioId: created.id,
+    userId,
+    agentId,
+    repoRoot: targetRoot,
+    slug,
+  });
+  return created.id;
 }
 
 /**

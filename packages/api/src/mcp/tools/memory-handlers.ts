@@ -21,6 +21,7 @@ import {
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import type { MemorySource, Salience, Session } from '../../data/models/memory';
 import { getCloudSkillsService } from '../../skills/cloud-service';
+import { resolveMainStudio } from '../../services/sessions/session-service';
 
 // Helper to safely read a file, returning null if it doesn't exist
 async function safeReadFile(filePath: string): Promise<string | null> {
@@ -440,6 +441,12 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
       'Contact ID for per-sender session isolation. When set, the session is scoped to this contact.'
     ),
   metadata: z.record(z.unknown()).optional().describe('Additional session metadata'),
+  repoRoot: z
+    .string()
+    .optional()
+    .describe(
+      'Absolute path to the repository root. When studioId is "main" and no studio row exists, a studio is auto-created at this path.'
+    ),
   forceNew: z
     .boolean()
     .optional()
@@ -997,8 +1004,18 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
   const params = startSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
-  const studioScope = resolveStudioScope(rawStudioId);
+  let studioScope = resolveStudioScope(rawStudioId);
   const agentId = getEffectiveAgentId(params.agentId);
+
+  // When studioScope is null ("main" sentinel) and repoRoot is provided,
+  // resolve to a real studio UUID — auto-creating the studio if needed.
+  if (studioScope === null && params.repoRoot && agentId) {
+    const client = dataComposer.getClient();
+    const mainStudioId = await resolveMainStudio(client, user.id, params.repoRoot, agentId, {
+      autoCreate: true,
+    });
+    if (mainStudioId) studioScope = mainStudioId;
+  }
 
   // Session matching priority:
   // 1. threadKey match — find active session with same agent+threadKey

@@ -149,28 +149,36 @@ export class StudiosRepository {
     return data ? this.mapRow(data as Record<string, unknown>) : null;
   }
 
-  async findByBranch(branch: string): Promise<Studio | null> {
-    const { data, error } = await this.client
-      .from('studios')
-      .select('*')
-      .eq('branch', branch)
-      .single();
+  async findByBranch(
+    branch: string,
+    scope?: { userId?: string; agentId?: string }
+  ): Promise<Studio | null> {
+    let q = this.client.from('studios').select('*').eq('branch', branch);
+    if (scope?.userId) q = q.eq('user_id', scope.userId);
+    if (scope?.agentId) q = q.eq('agent_id', scope.agentId);
+    q = q.order('updated_at', { ascending: false }).limit(1);
 
-    if (error && error.code !== 'PGRST116') {
+    const { data, error } = await q.maybeSingle();
+
+    if (error) {
       throw new Error(`Failed to find studio by branch: ${error.message}`);
     }
 
     return data ? this.mapRow(data as Record<string, unknown>) : null;
   }
 
-  async findByPath(worktreePath: string): Promise<Studio | null> {
-    const { data, error } = await this.client
-      .from('studios')
-      .select('*')
-      .eq('worktree_path', worktreePath)
-      .single();
+  async findByPath(
+    worktreePath: string,
+    scope?: { userId?: string; agentId?: string }
+  ): Promise<Studio | null> {
+    let q = this.client.from('studios').select('*').eq('worktree_path', worktreePath);
+    if (scope?.userId) q = q.eq('user_id', scope.userId);
+    if (scope?.agentId) q = q.eq('agent_id', scope.agentId);
+    q = q.order('updated_at', { ascending: false }).limit(1);
 
-    if (error && error.code !== 'PGRST116') {
+    const { data, error } = await q.maybeSingle();
+
+    if (error) {
       throw new Error(`Failed to find studio by path: ${error.message}`);
     }
 
