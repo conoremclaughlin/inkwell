@@ -213,7 +213,11 @@ export class StrategyService {
     if (inputConfig?.studioSlug) {
       const metadata = (group.metadata || {}) as Record<string, unknown>;
       if (!metadata.studioId) {
-        const created = await this.createPersistentStudio(group, inputConfig.studioSlug);
+        const created = await this.createPersistentStudio(
+          group,
+          inputConfig.studioSlug,
+          input.ownerAgentId
+        );
         if (!created) {
           throw new Error(
             `Failed to create persistent studio "${inputConfig.studioSlug}" — check repoRoot in group metadata`
@@ -1183,7 +1187,8 @@ export class StrategyService {
    */
   private async createPersistentStudio(
     group: TaskGroup,
-    slug: string
+    slug: string,
+    ownerAgentId: string
   ): Promise<{ studioId: string; worktreePath: string; branch: string } | null> {
     const metadata = (group.metadata || {}) as Record<string, unknown>;
     const repoRoot = typeof metadata.repoRoot === 'string' ? metadata.repoRoot : undefined;
@@ -1194,7 +1199,7 @@ export class StrategyService {
       return null;
     }
 
-    const agentId = group.owner_agent_id || 'agent';
+    const agentId = ownerAgentId;
     const branch = `${agentId}/${slug}`;
 
     let mainRoot = repoRoot;

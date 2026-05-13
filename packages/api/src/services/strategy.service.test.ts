@@ -2622,6 +2622,71 @@ describe('StrategyService', () => {
       expect(dc.repositories.studios.create).not.toHaveBeenCalled();
     });
 
+    it('uses input.ownerAgentId for branch/studio even when group.owner_agent_id is null', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        owner_agent_id: null,
+        metadata: { repoRoot: '/repo' },
+      });
+      const task = createMockTask();
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockImplementation(async (_id: string, data: any) => ({
+        ...group,
+        strategy: 'persistence',
+        status: 'active',
+        strategy_config: { studioSlug: 'auth-refactor' },
+        metadata: { ...group.metadata, ...data.metadata },
+        ...data,
+      }));
+
+      const mockTasks = {
+        findById: vi.fn(),
+        startTask: vi.fn().mockResolvedValue({}),
+      };
+      dc.repositories.tasks = mockTasks as any;
+
+      dc.getClient.mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          select: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                in: vi.fn().mockReturnValue({
+                  limit: vi.fn().mockReturnValue({
+                    single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                  }),
+                }),
+                order: vi.fn().mockReturnValue({
+                  order: vi.fn().mockReturnValue({
+                    limit: vi.fn().mockResolvedValue({ data: [task], error: null }),
+                  }),
+                }),
+                single: vi.fn().mockResolvedValue({ data: task, error: null }),
+              }),
+            }),
+          }),
+          insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+          update: vi.fn().mockReturnValue({
+            contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+          }),
+        }),
+      });
+
+      const service = new StrategyService(dc as any);
+      await service.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        ownerAgentId: 'wren',
+        config: { studioSlug: 'auth-refactor' },
+      });
+
+      const createCall = dc.repositories.studios.create.mock.calls[0][0];
+      expect(createCall.agentId).toBe('wren');
+      expect(createCall.branch).toBe('wren/auth-refactor');
+    });
+
     it('does not tear down persistent studio on strategy completion', async () => {
       const group = createMockGroup({
         metadata: {
