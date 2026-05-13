@@ -344,6 +344,13 @@ function drawAgent(
   ctx.font = `${Math.max(8, 10 * z)}px ${skin.fonts.mono}`;
   ctx.textAlign = 'center';
   ctx.fillText(phaseText, pos.x, barY + barHeight + 6 * z);
+
+  // Active thread key (what artifact they're working on)
+  if (agent.activeThreadKey) {
+    ctx.fillStyle = skin.colors.accent;
+    ctx.font = `${Math.max(7, 9 * z)}px ${skin.fonts.mono}`;
+    ctx.fillText(agent.activeThreadKey, pos.x, barY + barHeight + 18 * z);
+  }
 }
 
 export function SpatialMap() {

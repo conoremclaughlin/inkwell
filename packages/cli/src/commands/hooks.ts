@@ -2059,6 +2059,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
         workingDir: cwd,
       };
       if (backendSessionId) updateArgs.backendSessionId = backendSessionId;
+      if (pcpThreadKey) updateArgs.activeThreadKey = pcpThreadKey;
       await callPcpTool('update_session_state', updateArgs);
     } catch {
       // Non-fatal; startup should continue even if linkage fails.
@@ -2429,7 +2430,8 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
         '(started/stopped a server, opened a PR, kicked off a build, changed ports, etc.), ' +
         'update your session context via `update_session_state(context: "...")` so it survives ' +
         "compaction. Context is your scratch board for transient active state — what's running, " +
-        "what's pending, what port you're on.\n" +
+        "what's pending, what port you're on. If you're working on a specific artifact " +
+        '(PR, spec, thread), set `activeThreadKey` too (e.g., "pr:350", "spec:auth-refactor").\n' +
         '</ink-reminder>\n'
     );
     writeRuntimeFile(cwd, 'last-context-reminder', new Date().toISOString());
