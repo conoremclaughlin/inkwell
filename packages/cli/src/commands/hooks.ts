@@ -2048,6 +2048,24 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   pcpThreadKey = reconciled.threadKey || pcpThreadKey;
   const backendSessionId = reconciled.backendSessionId;
 
+  // Hydrate threadKey from the server when we have a pre-created session
+  // (e.g., INK_SESSION_ID from trigger) but no local threadKey yet.
+  if (pcpSessionId && !pcpThreadKey) {
+    try {
+      const sessionResult = await callPcpTool('get_session', {
+        email: config?.email,
+        sessionId: pcpSessionId,
+      });
+      const session = sessionResult?.session as Record<string, unknown> | undefined;
+      if (session) {
+        if (typeof session.activeThreadKey === 'string') pcpThreadKey = session.activeThreadKey;
+        else if (typeof session.threadKey === 'string') pcpThreadKey = session.threadKey;
+      }
+    } catch {
+      // Non-fatal
+    }
+  }
+
   // Set lifecycle to idle on startup (ready for user input).
   if (pcpSessionId) {
     try {
