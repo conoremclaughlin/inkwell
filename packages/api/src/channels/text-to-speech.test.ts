@@ -31,8 +31,40 @@ describe('TextToSpeechService', () => {
     expect(result).toBeUndefined();
   });
 
+  it('builds elevenlabs provider from config', () => {
+    const service = new TextToSpeechService({
+      enabled: true,
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-4o-mini-tts',
+      voice: 'alloy',
+      format: 'opus',
+      timeoutMs: 5000,
+      maxChars: 1000,
+      providers: ['elevenlabs', 'openai'],
+      elevenlabsApiKey: 'el-test-key',
+    });
+
+    expect(service.isEnabled()).toBe(true);
+  });
+
+  it('skips elevenlabs when no API key and falls through', async () => {
+    const service = new TextToSpeechService({
+      enabled: true,
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-4o-mini-tts',
+      voice: 'alloy',
+      format: 'opus',
+      timeoutMs: 5000,
+      maxChars: 1000,
+      providers: ['elevenlabs'],
+    });
+
+    const result = await service.synthesize({ text: 'hello' });
+    expect(result).toBeUndefined();
+  });
+
   it('returns synthesized audio from provider chain', async () => {
-    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'pcp-tts-test-'));
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'ink-tts-test-'));
     const filePath = path.join(tmpDir, 'reply.ogg');
     await writeFile(filePath, Buffer.from('audio-bytes'));
 
