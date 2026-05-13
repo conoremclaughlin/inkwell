@@ -42,6 +42,16 @@ export async function createTempAudioPath(extension: string): Promise<string> {
   return path.join(dir, `${randomUUID()}.${extension}`);
 }
 
+const TMP_PREFIX = 'pcp-tts-';
+
 export async function removeTempAudioDir(filePath: string): Promise<void> {
-  await rm(path.dirname(filePath), { recursive: true, force: true }).catch(() => {});
+  const dir = path.dirname(filePath);
+  const tmpRoot = os.tmpdir();
+  if (
+    path.isAbsolute(dir) &&
+    path.dirname(dir) === tmpRoot &&
+    path.basename(dir).startsWith(TMP_PREFIX)
+  ) {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
 }
