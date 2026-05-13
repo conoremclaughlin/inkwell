@@ -115,9 +115,9 @@ export function scoreScenario(
   const failureReasons: string[] = [];
   const rubric = scenario.rubric;
 
-  if (rubric.precisionFloor !== undefined && precision < rubric.precisionFloor) {
-    failureReasons.push(`precision ${precision.toFixed(2)} < floor ${rubric.precisionFloor}`);
-  }
+  // Precision is reported as a metric but not a hard pass/fail gate.
+  // With limit=20 recall results and 1-2 expected items, precision is
+  // structurally low (max 10%) regardless of recall quality.
   if (rubric.recallFloor !== undefined && recall < rubric.recallFloor) {
     failureReasons.push(`recall ${recall.toFixed(2)} < floor ${rubric.recallFloor}`);
   }

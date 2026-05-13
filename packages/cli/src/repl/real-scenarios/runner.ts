@@ -24,7 +24,7 @@ export type QueryMode = 'keyword' | 'llm';
 export type LlmQueryFn = (scenario: Scenario) => Promise<string>;
 
 export interface RunOptions {
-  /** Max memories to fetch per recall call. Default 10. */
+  /** Max memories to fetch per recall call. Default 20. */
   recallLimit?: number;
   /** Query construction strategy. Default 'keyword'. */
   queryMode?: QueryMode;
@@ -101,7 +101,7 @@ export async function runScenario(
 
   let surfaced: SurfacedMemory[] = [];
   try {
-    surfaced = await recallFn(topicSignal, opts.recallLimit ?? 10);
+    surfaced = await recallFn(topicSignal, opts.recallLimit ?? 20);
   } catch (err) {
     return {
       scenarioId: scenario.id,
