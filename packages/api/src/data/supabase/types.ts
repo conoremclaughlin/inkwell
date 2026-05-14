@@ -4005,7 +4005,10 @@ export type Database = {
         | 'agent_complete'
         | 'state_change'
         | 'thinking'
-        | 'error';
+        | 'error'
+        | 'inkmail_dispatch'
+        | 'inkmail_deliver'
+        | 'inkmail_fail';
       trust_level: 'owner' | 'admin' | 'member';
     };
     CompositeTypes: {
@@ -4674,6 +4677,9 @@ export const Constants = {
         'state_change',
         'thinking',
         'error',
+        'inkmail_dispatch',
+        'inkmail_deliver',
+        'inkmail_fail',
       ],
       trust_level: ['owner', 'admin', 'member'],
     },

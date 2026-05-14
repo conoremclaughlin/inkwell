@@ -55,6 +55,7 @@ import {
   type SessionPollRow,
   type SessionAttachedRow,
 } from './services/sessions/trigger-delivery';
+import type { ActivityType } from './data/repositories/activity-stream.repository';
 
 // Server configuration
 interface ServerConfig {
@@ -637,6 +638,47 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
   // 7. Register default trigger handler for stateless, database-driven agent routing
   // This handles triggers for ANY agent by looking up config from the database
   const agentGateway = getAgentGateway();
+
+  async function logInkmail(
+    type: ActivityType & `inkmail_${string}`,
+    payload: AgentTriggerPayload,
+    userId: string,
+    extra?: { sessionId?: string; error?: string; deliveryMethod?: string }
+  ): Promise<void> {
+    try {
+      await dataComposer!.repositories.activityStream.logActivity({
+        userId,
+        agentId: payload.toAgentId,
+        type,
+        subtype: payload.triggerType,
+        content: payload.summary || `Inkmail from ${payload.fromAgentId}`,
+        sessionId: extra?.sessionId,
+        correlationId: payload.threadMessageId || payload.inboxMessageId,
+        payload: {
+          fromAgentId: payload.fromAgentId,
+          toAgentId: payload.toAgentId,
+          threadKey: payload.threadKey || null,
+          messageId: payload.threadMessageId || payload.inboxMessageId || null,
+          priority: payload.priority || 'normal',
+          studioId: payload.studioId || null,
+          ...(extra?.deliveryMethod ? { deliveryMethod: extra.deliveryMethod } : {}),
+          ...(extra?.error ? { error: extra.error } : {}),
+        },
+        status:
+          type === 'inkmail_dispatch'
+            ? 'pending'
+            : type === 'inkmail_deliver'
+              ? 'completed'
+              : 'failed',
+      });
+    } catch (err) {
+      logger.warn('[Inkmail] Failed to log activity', {
+        type,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   agentGateway.setDefaultHandler(async (payload: AgentTriggerPayload) => {
     const targetAgentId = payload.toAgentId;
 
@@ -778,6 +820,8 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         'Cannot process trigger without userId (no inbox message and no auth context)'
       );
     }
+
+    await logInkmail('inkmail_dispatch', payload, userId);
 
     // 2. Resolve and verify target identity for this user
     // Prefer recipient_sb_id from inbox; fallback to user+agent_id with disambiguation.
@@ -1008,6 +1052,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             threadKey: payload.threadKey,
           }
         );
+        await logInkmail('inkmail_deliver', payload, userId, {
+          sessionId: routedSession.id,
+          deliveryMethod: `cli_${delivery.source}`,
+        });
         return;
       }
     } catch (err) {
@@ -1038,6 +1086,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       );
     }
 
+    await logInkmail('inkmail_deliver', payload, userId, { deliveryMethod: 'spawn' });
     logger.info(`[Trigger] Successfully processed trigger for ${targetAgentId}`);
   });
   logger.info('Default agent trigger handler registered (stateless, database-driven)');
@@ -1129,6 +1178,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           .eq('id', payload.threadId)
           .single();
         recipientUserId = thread?.user_id;
+      }
+
+      if (recipientUserId) {
+        await logInkmail('inkmail_fail', payload, recipientUserId, {
+          error: errorText.slice(0, 2000),
+        });
       }
 
       if (!recipientUserId) {
