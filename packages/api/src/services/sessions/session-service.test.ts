@@ -39,6 +39,17 @@ vi.mock('./claude-runner.js', async (importOriginal) => {
   };
 });
 
+// Mock fs/promises for readImageAttachments tests
+vi.mock('fs/promises', async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...actual,
+    stat: vi.fn().mockResolvedValue({ size: 1024 }),
+    readFile: vi.fn().mockResolvedValue(Buffer.from('fake-image-data')),
+    access: vi.fn().mockResolvedValue(undefined),
+  };
+});
+
 describe('SessionService', () => {
   let sessionService: SessionService;
 
@@ -47,6 +58,7 @@ describe('SessionService', () => {
   let mockContextBuilder: IContextBuilder;
   let mockClaudeRunner: IClaudeRunner;
   let mockCodexRunner: IClaudeRunner;
+  let mockInkRunner: IClaudeRunner;
   let mockActivityStream: IActivityStream;
 
   const createMockSession = (overrides: Partial<Session> = {}): Session => ({
@@ -159,6 +171,10 @@ describe('SessionService', () => {
         .mockResolvedValue(createMockClaudeResult({ backendSessionId: 'codex-session-1' })),
     };
 
+    mockInkRunner = {
+      run: vi.fn().mockResolvedValue(createMockClaudeResult({ backendSessionId: 'ink-session-1' })),
+    };
+
     mockActivityStream = {
       logMessage: vi.fn().mockResolvedValue({ id: 'msg-123' }),
       logActivity: vi.fn().mockResolvedValue({ id: 'activity-123' }),
@@ -175,7 +191,10 @@ describe('SessionService', () => {
         mcpConfigPath: '/test/.mcp.json',
         compactionThreshold: 150000,
       },
-      mockCodexRunner
+      mockCodexRunner,
+      undefined,
+      undefined,
+      mockInkRunner
     );
   });
 
@@ -1687,6 +1706,145 @@ describe('SessionService', () => {
 
       // Default session was ended, so a new session should be created
       expect(mockRepository.create).toHaveBeenCalled();
+    });
+  });
+
+  describe('Multimodal Image Handling', () => {
+    it('passes imageContents to ink runner when image media is present', async () => {
+      const session = createMockSession({ lifecycle: 'idle', backend: 'ink' });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      const request = createMockRequest({
+        metadata: {
+          media: [{ type: 'image', path: '/tmp/photo1.jpg', contentType: 'image/jpeg' }],
+        },
+      });
+
+      await sessionService.handleMessage(request);
+
+      expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+      const runOptions = vi.mocked(mockInkRunner.run).mock.calls[0][1];
+      expect(runOptions.imageContents).toBeDefined();
+      expect(runOptions.imageContents).toHaveLength(1);
+      expect(runOptions.imageContents![0]).toEqual({
+        type: 'image',
+        source: 'base64',
+        mediaType: 'image/jpeg',
+        data: Buffer.from('fake-image-data').toString('base64'),
+      });
+    });
+
+    it('passes multiple images from a gallery', async () => {
+      const session = createMockSession({ lifecycle: 'idle', backend: 'ink' });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      const request = createMockRequest({
+        metadata: {
+          media: [
+            { type: 'image', path: '/tmp/photo1.jpg', contentType: 'image/jpeg' },
+            { type: 'image', path: '/tmp/photo2.png', contentType: 'image/png' },
+            { type: 'image', path: '/tmp/photo3.webp', contentType: 'image/webp' },
+          ],
+        },
+      });
+
+      await sessionService.handleMessage(request);
+
+      const runOptions = vi.mocked(mockInkRunner.run).mock.calls[0][1];
+      expect(runOptions.imageContents).toHaveLength(3);
+      expect(runOptions.imageContents![0].mediaType).toBe('image/jpeg');
+      expect(runOptions.imageContents![1].mediaType).toBe('image/png');
+      expect(runOptions.imageContents![2].mediaType).toBe('image/webp');
+    });
+
+    it('skips image reading for CLI backends', async () => {
+      const session = createMockSession({ lifecycle: 'idle', backend: 'claude-code' });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      const request = createMockRequest({
+        metadata: {
+          media: [{ type: 'image', path: '/tmp/photo1.jpg', contentType: 'image/jpeg' }],
+        },
+      });
+
+      await sessionService.handleMessage(request);
+
+      const runOptions = vi.mocked(mockClaudeRunner.run).mock.calls[0][1];
+      expect(runOptions.imageContents).toBeUndefined();
+    });
+
+    it('skips non-image media attachments', async () => {
+      const session = createMockSession({ lifecycle: 'idle', backend: 'ink' });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      const request = createMockRequest({
+        metadata: {
+          media: [
+            { type: 'document', path: '/tmp/file.pdf', contentType: 'application/pdf' },
+            { type: 'audio', path: '/tmp/voice.ogg', contentType: 'audio/ogg' },
+          ],
+        },
+      });
+
+      await sessionService.handleMessage(request);
+
+      const runOptions = vi.mocked(mockInkRunner.run).mock.calls[0][1];
+      expect(runOptions.imageContents).toBeUndefined();
+    });
+
+    it('skips unsupported image types', async () => {
+      const { stat } = await import('fs/promises');
+      vi.mocked(stat).mockResolvedValue({ size: 1024 } as any);
+
+      const session = createMockSession({ lifecycle: 'idle', backend: 'ink' });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      const request = createMockRequest({
+        metadata: {
+          media: [{ type: 'image', path: '/tmp/photo.bmp', contentType: 'image/bmp' }],
+        },
+      });
+
+      await sessionService.handleMessage(request);
+
+      const runOptions = vi.mocked(mockInkRunner.run).mock.calls[0][1];
+      expect(runOptions.imageContents).toBeUndefined();
+    });
+
+    it('respects MAX_IMAGES limit of 10', async () => {
+      const session = createMockSession({ lifecycle: 'idle', backend: 'ink' });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      const media = Array.from({ length: 15 }, (_, i) => ({
+        type: 'image' as const,
+        path: `/tmp/photo${i}.jpg`,
+        contentType: 'image/jpeg',
+      }));
+
+      const request = createMockRequest({ metadata: { media } });
+      await sessionService.handleMessage(request);
+
+      const runOptions = vi.mocked(mockInkRunner.run).mock.calls[0][1];
+      expect(runOptions.imageContents).toHaveLength(10);
+    });
+
+    it('skips images that exceed MAX_IMAGE_BYTES', async () => {
+      const { stat } = await import('fs/promises');
+      vi.mocked(stat).mockResolvedValue({ size: 25 * 1024 * 1024 } as any);
+
+      const session = createMockSession({ lifecycle: 'idle', backend: 'ink' });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      const request = createMockRequest({
+        metadata: {
+          media: [{ type: 'image', path: '/tmp/huge.jpg', contentType: 'image/jpeg' }],
+        },
+      });
+
+      await sessionService.handleMessage(request);
+
+      const runOptions = vi.mocked(mockInkRunner.run).mock.calls[0][1];
+      expect(runOptions.imageContents).toBeUndefined();
     });
   });
 });

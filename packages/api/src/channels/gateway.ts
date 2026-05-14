@@ -59,6 +59,14 @@ export interface ChannelGatewayConfig {
   dataComposer?: DataComposer;
 }
 
+export interface GatewayMediaAttachment {
+  type: 'image' | 'video' | 'audio' | 'document';
+  path?: string;
+  url?: string;
+  contentType?: string;
+  filename?: string;
+}
+
 export type IncomingMessageHandler = (
   channel: GatewayChannel,
   conversationId: string,
@@ -67,7 +75,7 @@ export type IncomingMessageHandler = (
   metadata?: {
     userId?: string;
     replyToMessageId?: string;
-    media?: Array<{ type: 'image' | 'video' | 'audio' | 'document'; path?: string; url?: string }>;
+    media?: GatewayMediaAttachment[];
     chatType?: 'direct' | 'group' | 'channel';
     mentions?: { users: string[]; botMentioned: boolean };
     platformAccountId?: string;
@@ -86,7 +94,7 @@ const DEFAULT_BUFFER_DELAY_MS = 2000; // Wait 2 seconds for additional messages
 interface BufferedMessage {
   content: string;
   timestamp: Date;
-  media?: Array<{ type: 'image' | 'video' | 'audio' | 'document'; path?: string; url?: string }>;
+  media?: GatewayMediaAttachment[];
 }
 
 interface MessageBuffer {
@@ -390,11 +398,7 @@ export class ChannelGateway extends EventEmitter {
     metadata?: {
       userId?: string;
       replyToMessageId?: string;
-      media?: Array<{
-        type: 'image' | 'video' | 'audio' | 'document';
-        path?: string;
-        url?: string;
-      }>;
+      media?: GatewayMediaAttachment[];
       chatType?: 'direct' | 'group' | 'channel';
       mentions?: { users: string[]; botMentioned: boolean };
       platformAccountId?: string;
@@ -546,11 +550,7 @@ export class ChannelGateway extends EventEmitter {
     metadata?: {
       userId?: string;
       replyToMessageId?: string;
-      media?: Array<{
-        type: 'image' | 'video' | 'audio' | 'document';
-        path?: string;
-        url?: string;
-      }>;
+      media?: GatewayMediaAttachment[];
       chatType?: 'direct' | 'group' | 'channel';
       mentions?: { users: string[]; botMentioned: boolean };
       platformAccountId?: string;

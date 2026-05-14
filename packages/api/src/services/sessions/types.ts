@@ -23,8 +23,10 @@ export type ChatType = 'direct' | 'group' | 'supergroup' | 'channel';
 
 export interface MediaAttachment {
   type: 'image' | 'video' | 'audio' | 'document' | 'voice';
+  path?: string;
   url?: string;
   data?: Buffer;
+  contentType?: string;
   mimeType?: string;
   filename?: string;
 }
@@ -102,6 +104,17 @@ export interface Session {
   // Flexible metadata
   metadata: Record<string, unknown>;
 }
+
+// ─── Multimodal Content Types ───
+
+export interface ImageContent {
+  type: 'image';
+  source: 'base64';
+  mediaType: string;
+  data: string;
+}
+
+export type ContentBlock = { type: 'text'; text: string } | ImageContent;
 
 // ─── Request/Response Types ───
 
@@ -477,6 +490,7 @@ export interface IRunner {
       backendSessionId?: string;
       injectedContext?: InjectedContext;
       config: ClaudeRunnerConfig;
+      imageContents?: ImageContent[];
     }
   ): Promise<RunnerResult>;
 }
