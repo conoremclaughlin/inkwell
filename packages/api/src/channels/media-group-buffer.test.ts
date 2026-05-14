@@ -331,6 +331,27 @@ describe('MediaGroupBuffer', () => {
   // Metadata preservation
   // --------------------------------------------------------------------------
 
+  it('preserves contentType through combined media', async () => {
+    const msg1 = makeMessage({
+      messageId: 'msg-1',
+      media: [{ type: 'image', path: '/tmp/photo1.jpg', contentType: 'image/jpeg' }],
+    });
+    const msg2 = makeMessage({
+      messageId: 'msg-2',
+      media: [{ type: 'image', path: '/tmp/photo2.png', contentType: 'image/png' }],
+    });
+
+    buffer.add('group-1', msg1);
+    buffer.add('group-1', msg2);
+
+    await vi.advanceTimersByTimeAsync(500);
+
+    const combined = flushCallback.mock.calls[0][0] as InboundMessage;
+    expect(combined.media).toHaveLength(2);
+    expect(combined.media![0].contentType).toBe('image/jpeg');
+    expect(combined.media![1].contentType).toBe('image/png');
+  });
+
   it('preserves sender, conversationId, platform, and chatType from first message', async () => {
     const msg1 = makeMessage({
       sender: { id: '100', username: 'alice', name: 'Alice' },
