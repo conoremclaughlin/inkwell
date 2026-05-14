@@ -119,6 +119,15 @@ Inkwell uses Supabase (PostgreSQL) as its database. There are **two access paths
 
 5. **Never expose the service role key to the client.** It lives in `.env.local` (server only) and must never appear in `NEXT_PUBLIC_*` environment variables.
 
+### File Access & Media Isolation (TODO)
+
+Server-spawned Claude sessions currently get `--add-dir ~/.ink/files` for media access (Telegram downloads, Gmail attachments, etc.). This is a shared directory — **all SBs can read all SBs' files**. Future work should consider:
+
+- **Per-agent file namespacing**: `~/.ink/files/<agentId>/telegram/` instead of `~/.ink/files/telegram/`
+- **Scoped `--add-dir`**: only grant access to the spawned agent's own subdirectory
+- **Cross-agent file sharing**: explicit mechanism for one SB to share a file with another (vs. implicit shared access)
+- **File lifecycle**: cleanup policy for downloaded media (currently accumulates indefinitely)
+
 ## Timezone Handling (IMPORTANT)
 
 **Always convert UTC timestamps to the user's local timezone when displaying.**
