@@ -58,6 +58,7 @@ describe('SessionService', () => {
   let mockContextBuilder: IContextBuilder;
   let mockClaudeRunner: IClaudeRunner;
   let mockCodexRunner: IClaudeRunner;
+  let mockInkRunner: IClaudeRunner;
   let mockActivityStream: IActivityStream;
 
   const createMockSession = (overrides: Partial<Session> = {}): Session => ({
@@ -170,6 +171,10 @@ describe('SessionService', () => {
         .mockResolvedValue(createMockClaudeResult({ backendSessionId: 'codex-session-1' })),
     };
 
+    mockInkRunner = {
+      run: vi.fn().mockResolvedValue(createMockClaudeResult({ backendSessionId: 'ink-session-1' })),
+    };
+
     mockActivityStream = {
       logMessage: vi.fn().mockResolvedValue({ id: 'msg-123' }),
       logActivity: vi.fn().mockResolvedValue({ id: 'activity-123' }),
@@ -186,7 +191,10 @@ describe('SessionService', () => {
         mcpConfigPath: '/test/.mcp.json',
         compactionThreshold: 150000,
       },
-      mockCodexRunner
+      mockCodexRunner,
+      undefined,
+      undefined,
+      mockInkRunner
     );
   });
 
@@ -1702,8 +1710,8 @@ describe('SessionService', () => {
   });
 
   describe('Multimodal Image Handling', () => {
-    it('passes imageContents to runner when image media is present', async () => {
-      const session = createMockSession({ lifecycle: 'idle' });
+    it('passes imageContents to ink runner when image media is present', async () => {
+      const session = createMockSession({ lifecycle: 'idle', backend: 'ink' });
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
 
       const request = createMockRequest({
@@ -1714,8 +1722,8 @@ describe('SessionService', () => {
 
       await sessionService.handleMessage(request);
 
-      expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
-      const runOptions = vi.mocked(mockClaudeRunner.run).mock.calls[0][1];
+      expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+      const runOptions = vi.mocked(mockInkRunner.run).mock.calls[0][1];
       expect(runOptions.imageContents).toBeDefined();
       expect(runOptions.imageContents).toHaveLength(1);
       expect(runOptions.imageContents![0]).toEqual({
@@ -1727,7 +1735,7 @@ describe('SessionService', () => {
     });
 
     it('passes multiple images from a gallery', async () => {
-      const session = createMockSession({ lifecycle: 'idle' });
+      const session = createMockSession({ lifecycle: 'idle', backend: 'ink' });
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
 
       const request = createMockRequest({
@@ -1742,15 +1750,31 @@ describe('SessionService', () => {
 
       await sessionService.handleMessage(request);
 
-      const runOptions = vi.mocked(mockClaudeRunner.run).mock.calls[0][1];
+      const runOptions = vi.mocked(mockInkRunner.run).mock.calls[0][1];
       expect(runOptions.imageContents).toHaveLength(3);
       expect(runOptions.imageContents![0].mediaType).toBe('image/jpeg');
       expect(runOptions.imageContents![1].mediaType).toBe('image/png');
       expect(runOptions.imageContents![2].mediaType).toBe('image/webp');
     });
 
+    it('skips image reading for CLI backends', async () => {
+      const session = createMockSession({ lifecycle: 'idle', backend: 'claude-code' });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      const request = createMockRequest({
+        metadata: {
+          media: [{ type: 'image', path: '/tmp/photo1.jpg', contentType: 'image/jpeg' }],
+        },
+      });
+
+      await sessionService.handleMessage(request);
+
+      const runOptions = vi.mocked(mockClaudeRunner.run).mock.calls[0][1];
+      expect(runOptions.imageContents).toBeUndefined();
+    });
+
     it('skips non-image media attachments', async () => {
-      const session = createMockSession({ lifecycle: 'idle' });
+      const session = createMockSession({ lifecycle: 'idle', backend: 'ink' });
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
 
       const request = createMockRequest({
@@ -1764,7 +1788,7 @@ describe('SessionService', () => {
 
       await sessionService.handleMessage(request);
 
-      const runOptions = vi.mocked(mockClaudeRunner.run).mock.calls[0][1];
+      const runOptions = vi.mocked(mockInkRunner.run).mock.calls[0][1];
       expect(runOptions.imageContents).toBeUndefined();
     });
 
@@ -1772,7 +1796,7 @@ describe('SessionService', () => {
       const { stat } = await import('fs/promises');
       vi.mocked(stat).mockResolvedValue({ size: 1024 } as any);
 
-      const session = createMockSession({ lifecycle: 'idle' });
+      const session = createMockSession({ lifecycle: 'idle', backend: 'ink' });
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
 
       const request = createMockRequest({
@@ -1783,12 +1807,12 @@ describe('SessionService', () => {
 
       await sessionService.handleMessage(request);
 
-      const runOptions = vi.mocked(mockClaudeRunner.run).mock.calls[0][1];
+      const runOptions = vi.mocked(mockInkRunner.run).mock.calls[0][1];
       expect(runOptions.imageContents).toBeUndefined();
     });
 
     it('respects MAX_IMAGES limit of 10', async () => {
-      const session = createMockSession({ lifecycle: 'idle' });
+      const session = createMockSession({ lifecycle: 'idle', backend: 'ink' });
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
 
       const media = Array.from({ length: 15 }, (_, i) => ({
@@ -1800,7 +1824,7 @@ describe('SessionService', () => {
       const request = createMockRequest({ metadata: { media } });
       await sessionService.handleMessage(request);
 
-      const runOptions = vi.mocked(mockClaudeRunner.run).mock.calls[0][1];
+      const runOptions = vi.mocked(mockInkRunner.run).mock.calls[0][1];
       expect(runOptions.imageContents).toHaveLength(10);
     });
 
@@ -1808,7 +1832,7 @@ describe('SessionService', () => {
       const { stat } = await import('fs/promises');
       vi.mocked(stat).mockResolvedValue({ size: 25 * 1024 * 1024 } as any);
 
-      const session = createMockSession({ lifecycle: 'idle' });
+      const session = createMockSession({ lifecycle: 'idle', backend: 'ink' });
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
 
       const request = createMockRequest({
@@ -1819,7 +1843,7 @@ describe('SessionService', () => {
 
       await sessionService.handleMessage(request);
 
-      const runOptions = vi.mocked(mockClaudeRunner.run).mock.calls[0][1];
+      const runOptions = vi.mocked(mockInkRunner.run).mock.calls[0][1];
       expect(runOptions.imageContents).toBeUndefined();
     });
   });

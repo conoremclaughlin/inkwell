@@ -540,8 +540,9 @@ export class SessionService implements ISessionService {
     // Mark session as running before backend turn
     await this.repository.update(session.id, { lifecycle: 'running' });
 
-    // Read image attachments for multimodal-capable backends
-    const imageContents = await this.readImageAttachments(request.metadata?.media);
+    // Read image attachments only for vision-capable backends (ink runner calls Anthropic API directly)
+    const imageContents =
+      resolvedBackend === 'ink' ? await this.readImageAttachments(request.metadata?.media) : [];
 
     let result;
     let turnDurationMs: number;
