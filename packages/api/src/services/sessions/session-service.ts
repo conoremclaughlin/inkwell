@@ -9,7 +9,7 @@
  */
 
 import { randomUUID } from 'crypto';
-import { access } from 'fs/promises';
+import { access, readFile, stat } from 'fs/promises';
 import path from 'path';
 import { SupabaseClient } from '@supabase/supabase-js';
 import jwt from 'jsonwebtoken';
@@ -27,6 +27,7 @@ import type {
   ISessionRepository,
   IContextBuilder,
   ToolCall,
+  ImageContent,
 } from './types.js';
 import type { Json } from '../../data/supabase/types.js';
 import { SessionRepository } from './session-repository.js';
@@ -539,6 +540,9 @@ export class SessionService implements ISessionService {
     // Mark session as running before backend turn
     await this.repository.update(session.id, { lifecycle: 'running' });
 
+    // Read image attachments for multimodal-capable backends
+    const imageContents = await this.readImageAttachments(request.metadata?.media);
+
     let result;
     let turnDurationMs: number;
     const turnStartMs = Date.now();
@@ -547,6 +551,7 @@ export class SessionService implements ISessionService {
         backendSessionId: session.backendSessionId || undefined,
         injectedContext: session.backendSessionId ? undefined : injectedContext,
         config: runnerConfig,
+        imageContents: imageContents.length > 0 ? imageContents : undefined,
       });
       turnDurationMs = Date.now() - turnStartMs;
     } catch (runnerError) {
@@ -1550,6 +1555,47 @@ This session will continue with a fresh context after compaction. Your identity,
    * External channel messages are wrapped in <untrusted-data> tags following
    * Supabase's proven pattern for prompt injection protection.
    */
+  private async readImageAttachments(
+    media?: import('./types.js').MediaAttachment[]
+  ): Promise<ImageContent[]> {
+    if (!media || media.length === 0) return [];
+
+    const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+    const MAX_IMAGES = 10;
+    const SUPPORTED_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+    const images: ImageContent[] = [];
+
+    for (const attachment of media) {
+      if (images.length >= MAX_IMAGES) break;
+      if (attachment.type !== 'image') continue;
+      if (!attachment.path) continue;
+
+      const mimeType = attachment.contentType || attachment.mimeType || 'image/jpeg';
+      if (!SUPPORTED_TYPES.has(mimeType)) continue;
+
+      try {
+        const info = await stat(attachment.path);
+        if (info.size <= 0 || info.size > MAX_IMAGE_BYTES) continue;
+
+        const bytes = await readFile(attachment.path);
+        images.push({
+          type: 'image',
+          source: 'base64',
+          mediaType: mimeType,
+          data: bytes.toString('base64'),
+        });
+      } catch (error) {
+        logger.warn('Failed to read image attachment for multimodal', {
+          filePath: attachment.path,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    return images;
+  }
+
   private formatMessage(request: SessionRequest, timezone?: string): string {
     const { sender, content, channel, conversationId, metadata } = request;
     const isExternalChannel =

@@ -808,7 +808,7 @@ export class TelegramListener extends EventEmitter {
       const largestPhoto = msg.photo[msg.photo.length - 1];
       const localPath = await this.downloadFile(largestPhoto.file_id);
       if (localPath) {
-        mediaAttachments.push({ type: 'image', path: localPath });
+        mediaAttachments.push({ type: 'image', path: localPath, contentType: 'image/jpeg' });
         logger.info('Photo attachment downloaded', {
           fileId: largestPhoto.file_id,
           localPath,

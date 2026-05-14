@@ -16,6 +16,7 @@ import type {
   ChannelType,
   IRunner,
   ToolCall,
+  ImageContent,
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
 import { buildIdentityPrompt } from './claude-runner.js';
@@ -55,6 +56,7 @@ export class InkRunner implements IRunner {
       backendSessionId?: string;
       injectedContext?: InjectedContext;
       config: ClaudeRunnerConfig;
+      imageContents?: ImageContent[];
     }
   ): Promise<RunnerResult> {
     const { injectedContext, config } = options;
@@ -84,8 +86,11 @@ export class InkRunner implements IRunner {
       executorMap.set(tool.schema.name, tool.execute);
     }
 
+    // Build first user message — multimodal when images present
+    const userContent = this.buildUserContent(fullMessage, options.imageContents);
+
     // Run the agentic loop
-    const messages: Anthropic.MessageParam[] = [{ role: 'user', content: fullMessage }];
+    const messages: Anthropic.MessageParam[] = [{ role: 'user', content: userContent }];
     const responses: ChannelResponse[] = [];
     const toolCalls: ToolCall[] = [];
     let totalInputTokens = 0;
@@ -200,6 +205,27 @@ export class InkRunner implements IRunner {
       finalTextResponse: finalTextResponse || undefined,
       toolCalls,
     };
+  }
+
+  private buildUserContent(
+    text: string,
+    imageContents?: ImageContent[]
+  ): string | Anthropic.ContentBlockParam[] {
+    if (!imageContents || imageContents.length === 0) return text;
+
+    const blocks: Anthropic.ContentBlockParam[] = [];
+    for (const img of imageContents) {
+      blocks.push({
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: img.mediaType as Anthropic.Base64ImageSource['media_type'],
+          data: img.data,
+        },
+      });
+    }
+    blocks.push({ type: 'text', text });
+    return blocks;
   }
 
   private ensureClient(): void {
