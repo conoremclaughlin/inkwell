@@ -23,7 +23,10 @@ export type ActivityType =
   | 'agent_complete'
   | 'state_change'
   | 'thinking'
-  | 'error';
+  | 'error'
+  | 'inkmail_dispatch'
+  | 'inkmail_deliver'
+  | 'inkmail_fail';
 
 export type ActivityStatus = 'pending' | 'running' | 'completed' | 'failed';
 
