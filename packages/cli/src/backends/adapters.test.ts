@@ -21,7 +21,7 @@ describe('buildIdentityPrompt conditional bootstrap', () => {
     // Should NOT unconditionally instruct bootstrap
     expect(prompt).not.toContain('Skip directly to loading user config');
     // Should NOT have the actual startup context section
-    expect(prompt).not.toContain('## Bootstrapped Startup Context (PCP)');
+    expect(prompt).not.toContain('## Bootstrapped Startup Context (Inkwell)');
   });
 
   it('skips manual bootstrap when startup context is provided', () => {
@@ -30,7 +30,7 @@ describe('buildIdentityPrompt conditional bootstrap', () => {
     expect(prompt).toContain('You are lumen');
     expect(prompt).toContain('Bootstrap has already been completed');
     expect(prompt).toContain('Do NOT call bootstrap again');
-    expect(prompt).toContain('## Bootstrapped Startup Context (PCP)');
+    expect(prompt).toContain('## Bootstrapped Startup Context (Inkwell)');
     expect(prompt).toContain('### Identity');
     expect(prompt).toContain('I am Lumen.');
     expect(prompt).not.toContain('check whether your constitution docs are already present');
@@ -141,7 +141,7 @@ describe('backend adapters session resume wiring', () => {
       expect(modelInstructionsArg).toBeDefined();
       const promptPath = modelInstructionsArg!.slice('model_instructions_file='.length);
       const promptBody = readFileSync(promptPath, 'utf-8');
-      expect(promptBody).toContain('## Bootstrapped Startup Context (PCP)');
+      expect(promptBody).toContain('## Bootstrapped Startup Context (Inkwell)');
       expect(promptBody).toContain('### STARTUP TEST');
       expect(promptBody).toContain('Injected from bootstrap.');
     } finally {
