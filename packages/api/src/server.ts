@@ -1381,9 +1381,8 @@ async function shutdown(): Promise<void> {
   forceKillTimer.unref(); // Don't let the timer itself keep the process alive
 
   try {
-    // Stop heartbeat cron job
+    // Stop heartbeat cron job (logs internally)
     stopHeartbeatService();
-    logger.info('Heartbeat service stopped');
 
     // Remove agent gateway listeners to release event loop references
     getAgentGateway().removeAllListeners();
