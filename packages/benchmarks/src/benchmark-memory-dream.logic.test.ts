@@ -121,6 +121,64 @@ describe('benchmark-memory-dream logic', () => {
     expect(hasOptionalAnswer(rendered, '38')).toBe(true);
   });
 
+  it('promotes exact detail views into evidence-linked local dream facts', () => {
+    const state = createInitialDreamState('case-smoker', 'online');
+    const [session] = buildOrderedDreamSessions(
+      {
+        id: 'case-smoker',
+        query: 'How many days ago did I buy a smoker?',
+        answer: '38',
+        answerSessionIds: ['s1'],
+        sessions: [
+          {
+            sessionId: 's1',
+            content: 'session s1\nuser: I bought the smoker 38 days ago.',
+            hasAnswer: true,
+            isAnswerSession: true,
+            turnCount: 1,
+          },
+        ],
+      },
+      [
+        {
+          id: 'mem-s1',
+          content: 'session s1\nuser: I bought the smoker 38 days ago.',
+          summary: null,
+          created_at: '2026-01-01T00:00:00Z',
+          metadata: {
+            llm_extractions: {
+              exact_details: {
+                exactDetails: [
+                  {
+                    kind: 'quantity',
+                    subject: 'smoker purchase',
+                    predicate: 'happened',
+                    value: '38',
+                    unit: 'days ago',
+                    status: 'active',
+                    evidence: 'I bought the smoker 38 days ago.',
+                  },
+                ],
+              },
+            },
+          },
+        },
+      ]
+    ).sessions;
+
+    const updated = applyLocalDreamUpdate(state, session);
+
+    expect(updated.durableFacts).toHaveLength(1);
+    expect(updated.durableFacts[0]).toMatchObject({
+      category: 'exact_quantity',
+      subject: 'smoker purchase',
+      object: '38 days ago',
+      evidenceMemoryIds: ['mem-s1'],
+      evidenceSessionIds: ['s1'],
+    });
+    expect(renderDreamStateForAnswerCheck(updated)).toContain('38 days ago');
+  });
+
   it('keeps richer entity descriptions when later mentions are terse', () => {
     const state = createInitialDreamState('case-entity', 'online');
     const [detailed, terse] = buildOrderedDreamSessions(

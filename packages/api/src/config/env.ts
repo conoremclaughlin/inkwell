@@ -204,6 +204,10 @@ const envSchema = z.object({
     .enum(['true', 'false'])
     .default('false')
     .transform((v) => v === 'true'),
+  MEMORY_LLM_EXACT_DETAILS_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
   OLLAMA_BASE_URL: optionalUrl,
   OPENAI_API_KEY: optionalString,
   OPENAI_BASE_URL: optionalUrl,

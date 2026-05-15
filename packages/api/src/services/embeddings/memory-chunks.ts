@@ -4,6 +4,7 @@ import {
   buildCurrentStateEmbeddingTexts,
   buildDurableFactEmbeddingTexts,
   buildEntityEmbeddingTexts,
+  buildExactDetailsEmbeddingTexts,
   buildSummaryEmbeddingTexts,
   normalizeMemoryExtractions,
   type MemoryExtractions,
@@ -15,12 +16,20 @@ export { MEMORY_EMBEDDING_CHUNKS_VERSION };
 const DEFAULT_MAX_CHARS = 1000;
 const DEFAULT_OVERLAP_CHARS = 150;
 
-export type MemoryChunkType = 'summary' | 'fact' | 'topic' | 'entity' | 'current_state' | 'content';
+export type MemoryChunkType =
+  | 'summary'
+  | 'fact'
+  | 'exact_detail'
+  | 'topic'
+  | 'entity'
+  | 'current_state'
+  | 'content';
 export type MemoryExtractionChunkMode = 'heuristic' | 'llm' | 'merged';
 const CHUNK_TYPE_ORDER: MemoryChunkType[] = [
   'content',
   'summary',
   'fact',
+  'exact_detail',
   'topic',
   'entity',
   'current_state',
@@ -28,6 +37,7 @@ const CHUNK_TYPE_ORDER: MemoryChunkType[] = [
 const LEGACY_CHUNK_TYPE_ORDER: MemoryChunkType[] = [
   'summary',
   'fact',
+  'exact_detail',
   'topic',
   'entity',
   'current_state',
@@ -49,6 +59,7 @@ export interface EmbeddedMemoryChunk extends MemoryEmbeddingChunk {
 export interface MemoryChunkViewCounts {
   summary: number;
   fact: number;
+  exact_detail: number;
   topic: number;
   entity: number;
   current_state: number;
@@ -59,6 +70,7 @@ function emptyViewCounts(): MemoryChunkViewCounts {
   return {
     summary: 0,
     fact: 0,
+    exact_detail: 0,
     topic: 0,
     entity: 0,
     current_state: 0,
@@ -207,7 +219,7 @@ export function inferChunkTypeFromMetadata(
       ? (embeddingChunks.viewCounts as Record<string, unknown>)
       : null;
 
-  if (!viewCounts) return null;
+  if (!embeddingChunks || !viewCounts) return null;
 
   const version = typeof embeddingChunks.version === 'number' ? embeddingChunks.version : null;
   const chunkTypeOrder =
@@ -261,6 +273,15 @@ export function buildMemoryEmbeddingChunks(params: {
     : [];
   const factChunks = includeLlm ? buildChunksFromTexts('fact', durableFactTexts) : [];
   chunks.push(...reindexChunks(factChunks, chunks.length));
+
+  const exactDetailTexts = llmExtractions?.exact_details
+    ? buildExactDetailsEmbeddingTexts(llmExtractions.exact_details)
+    : [];
+  if (includeLlm) {
+    chunks.push(
+      ...reindexChunks(buildChunksFromTexts('exact_detail', exactDetailTexts), chunks.length)
+    );
+  }
 
   const entityTexts = llmExtractions?.entity
     ? buildEntityEmbeddingTexts(llmExtractions.entity)

@@ -94,6 +94,7 @@ const EMBEDDING_PERSIST_RETRY_ATTEMPTS = 3;
 const DERIVED_CHUNK_TYPES: MemoryChunkType[] = [
   'summary',
   'fact',
+  'exact_detail',
   'topic',
   'entity',
   'current_state',
@@ -109,6 +110,8 @@ function computeChunkTypeBoost(chunkType?: MemoryChunkType | null): number {
   switch (chunkType) {
     case 'fact':
       return 0.08;
+    case 'exact_detail':
+      return 0.09;
     case 'topic':
       return 0.05;
     case 'entity':
@@ -868,7 +871,7 @@ export class MemoryRepository {
 
       const matchedChunkType =
         row.matched_chunk_type &&
-        ['summary', 'fact', 'topic', 'entity', 'current_state', 'content'].includes(
+        ['summary', 'fact', 'exact_detail', 'topic', 'entity', 'current_state', 'content'].includes(
           row.matched_chunk_type
         )
           ? (row.matched_chunk_type as MemoryChunkType)

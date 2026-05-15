@@ -9,6 +9,7 @@ import {
   buildCurrentStateEmbeddingTexts,
   buildDurableFactEmbeddingTexts,
   buildEntityEmbeddingTexts,
+  buildExactDetailsEmbeddingTexts,
   buildSummaryEmbeddingTexts,
   MemoryLlmExtractor,
   normalizeMemoryExtractions,
@@ -67,6 +68,9 @@ function buildExtractionEmbeddingTexts(
     current_state: llmExtractions.current_state
       ? buildCurrentStateEmbeddingTexts(llmExtractions.current_state)
       : [],
+    exact_details: llmExtractions.exact_details
+      ? buildExactDetailsEmbeddingTexts(llmExtractions.exact_details)
+      : [],
   };
 }
 
@@ -113,6 +117,9 @@ function mergeMemoryExtractions(
     current_state: replaceKinds.has('current_state')
       ? next.current_state
       : (next.current_state ?? existing?.current_state),
+    exact_details: replaceKinds.has('exact_details')
+      ? next.exact_details
+      : (next.exact_details ?? existing?.exact_details),
     version: next.version,
     provider: next.provider,
     model: next.model,
@@ -552,12 +559,13 @@ async function processMemoryBatch(params: {
 }
 
 function getEnabledKinds(options: { batchAllKinds?: boolean } = {}): ExtractionKind[] {
-  if (options.batchAllKinds) return ['entity', 'durable_fact', 'summary'];
+  if (options.batchAllKinds) return ['entity', 'durable_fact', 'summary', 'exact_details'];
   const enabledKinds: ExtractionKind[] = [];
   if (env.MEMORY_LLM_ENTITY_ENABLED) enabledKinds.push('entity');
   if (env.MEMORY_LLM_DURABLE_FACT_ENABLED) enabledKinds.push('durable_fact');
   if (env.MEMORY_LLM_SUMMARY_ENABLED) enabledKinds.push('summary');
   if (env.MEMORY_LLM_CURRENT_STATE_ENABLED) enabledKinds.push('current_state');
+  if (env.MEMORY_LLM_EXACT_DETAILS_ENABLED) enabledKinds.push('exact_details');
   return enabledKinds;
 }
 
@@ -601,6 +609,9 @@ function assignExtractionPayload(
       break;
     case 'current_state':
       payload.current_state = result as MemoryExtractions['current_state'];
+      break;
+    case 'exact_details':
+      payload.exact_details = result as MemoryExtractions['exact_details'];
       break;
   }
 }
@@ -690,7 +701,7 @@ class RunnerBackedMemoryExtractor {
     const normalized = normalizeMemoryExtractions(payload);
     return normalized &&
       Object.keys(normalized).some((key) =>
-        ['entity', 'durable_fact', 'summary', 'current_state'].includes(key)
+        ['entity', 'durable_fact', 'summary', 'current_state', 'exact_details'].includes(key)
       )
       ? normalized
       : null;
@@ -903,7 +914,7 @@ class RunnerBackedMemoryExtractor {
           invalid ||
           !normalized ||
           !Object.keys(normalized).some((key) =>
-            ['entity', 'durable_fact', 'summary', 'current_state'].includes(key)
+            ['entity', 'durable_fact', 'summary', 'current_state', 'exact_details'].includes(key)
           )
         ) {
           invalidMemoryIds.add(resultItem.memoryId);

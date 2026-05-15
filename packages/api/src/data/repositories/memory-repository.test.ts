@@ -6,6 +6,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { MemoryRepository, computeKnowledgeMemoryScore } from './memory-repository';
 import { createMockSupabaseClient, type MockSupabaseClient } from '../../test/mocks/supabase.mock';
 import type { SupabaseClient } from '@supabase/supabase-js';
+import { MEMORY_EMBEDDING_CHUNKS_VERSION } from '../../services/embeddings/memory-chunks';
 
 describe('MemoryRepository', () => {
   let mockSupabase: MockSupabaseClient;
@@ -1240,12 +1241,12 @@ describe('MemoryRepository', () => {
       expect(chunkRows.every((row) => row.chunk_type === 'content')).toBe(true);
       expect(mockSupabase._queryBuilder.update).toHaveBeenCalledWith(
         expect.objectContaining({
-          embedding_chunks_version: 3,
+          embedding_chunks_version: MEMORY_EMBEDDING_CHUNKS_VERSION,
           embedding_chunk_count: chunkRows.length,
           metadata: expect.objectContaining({
             embedding_chunks: expect.objectContaining({
               chunkCount: chunkRows.length,
-              version: 3,
+              version: MEMORY_EMBEDDING_CHUNKS_VERSION,
               viewCounts: expect.objectContaining({
                 content: chunkRows.length,
                 summary: 0,
@@ -1829,7 +1830,7 @@ describe('MemoryRepository', () => {
         1,
         'match_memory_embedding_chunks',
         expect.objectContaining({
-          p_chunk_types: ['summary', 'fact', 'topic', 'entity', 'current_state'],
+          p_chunk_types: ['summary', 'fact', 'exact_detail', 'topic', 'entity', 'current_state'],
         })
       );
       expect(rpc).toHaveBeenNthCalledWith(
