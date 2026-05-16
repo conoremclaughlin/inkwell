@@ -367,6 +367,18 @@ export function registerAllTools(
   // Calls exceeding SLOW_TOOL_THRESHOLD_MS are logged at warn level.
   // ---------------------------------------------------------------------------
   const SLOW_TOOL_THRESHOLD_MS = 500;
+  const TRANSIENT_PG_PATTERNS = [
+    'current transaction is aborted',
+    'connection terminated unexpectedly',
+    'server closed the connection unexpectedly',
+    'could not obtain connection',
+    'remaining connection slots are reserved',
+  ];
+  function isTransientPgError(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    return TRANSIENT_PG_PATTERNS.some((p) => msg.includes(p));
+  }
+
   const originalRegisterTool = server.registerTool.bind(server);
   (server as any).registerTool = (name: string, ...rest: any[]) => {
     const handler = rest[rest.length - 1];
@@ -383,6 +395,22 @@ export function registerAllTools(
           }
           return result;
         } catch (error) {
+          if (isTransientPgError(error)) {
+            logger.warn(`[retry] ${name}: transient PG error, retrying once`, {
+              error: error instanceof Error ? error.message : String(error),
+            });
+            await new Promise((r) => setTimeout(r, 150));
+            try {
+              const result = await handler(...handlerArgs);
+              const durationMs = Math.round(performance.now() - start);
+              logger.info(`[retry] ${name}: retry succeeded (${durationMs}ms)`);
+              return result;
+            } catch (retryError) {
+              const durationMs = Math.round(performance.now() - start);
+              logger.warn(`[timing] ${name}: ${durationMs}ms (RETRY FAILED)`);
+              throw retryError;
+            }
+          }
           const durationMs = Math.round(performance.now() - start);
           logger.warn(`[timing] ${name}: ${durationMs}ms (ERROR)`);
           throw error;

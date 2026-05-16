@@ -56,6 +56,13 @@ let heartbeatCallback: (() => Promise<void>) | null = null;
  * Initialize the heartbeat service
  */
 export function initHeartbeatService(config: HeartbeatConfig = {}): void {
+  // Guard: stop any existing cron before creating a new one (prevents leaked tasks on hot reload)
+  if (cronTask) {
+    cronTask.stop();
+    cronTask = null;
+    logger.warn('Stopped existing heartbeat cron before re-initializing');
+  }
+
   const {
     interval = '*/5 * * * *', // Every 5 minutes
     enableLocalCron = process.env.NODE_ENV !== 'production',

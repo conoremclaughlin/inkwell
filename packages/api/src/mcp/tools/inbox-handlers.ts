@@ -1084,92 +1084,103 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         .limit(20);
 
       if (threads?.length) {
-        threadsWithUnread = await Promise.all(
-          threads.map(
-            async (t: {
-              id: string;
-              thread_key: string;
-              title: string | null;
-              created_by_agent_id: string;
-              updated_at: string;
-            }) => {
-              // Get participants (include joined_at for unread baseline)
-              const { data: parts } = await threadTable(supabase, 'inbox_thread_participants')
-                .select('agent_id, joined_at')
-                .eq('thread_id', t.id);
-              const participants = (parts || []).map((p: { agent_id: string }) => p.agent_id);
+        const tIds = threads.map((t: { id: string }) => t.id);
 
-              // Get last read timestamp (only meaningful with agentId)
-              let lastReadAt: string | null = null;
-              let joinedAt: string | null = null;
-              if (agentId) {
-                const { data: readStatus } = await threadTable(supabase, 'inbox_thread_read_status')
-                  .select('last_read_at')
-                  .eq('thread_id', t.id)
-                  .eq('agent_id', agentId)
-                  .maybeSingle();
-                lastReadAt = readStatus?.last_read_at || null;
+        // Batch 1: all participants for all threads (was N queries)
+        const { data: allParts } = await threadTable(supabase, 'inbox_thread_participants')
+          .select('thread_id, agent_id, joined_at')
+          .in('thread_id', tIds);
+        const partsByThread = new Map<string, Array<{ agent_id: string; joined_at?: string }>>();
+        for (const p of allParts || []) {
+          const arr = partsByThread.get(p.thread_id) || [];
+          arr.push(p);
+          partsByThread.set(p.thread_id, arr);
+        }
 
-                // If no read status exists, use the participant's joined_at as
-                // baseline so messages from before they joined don't count as
-                // unread. Without this, a participant who has never read a thread
-                // sees the entire history as "unread" on every poll — causing
-                // replay floods on session restart.
-                const callerPart = (parts || []).find(
-                  (p: { agent_id: string }) => p.agent_id === agentId
-                ) as { joined_at?: string } | undefined;
-                joinedAt = callerPart?.joined_at || null;
-              }
+        // Batch 2: all read statuses for all threads (was N queries)
+        const readStatusByThread = new Map<string, string | null>();
+        if (agentId) {
+          const { data: allReadStatuses } = await threadTable(supabase, 'inbox_thread_read_status')
+            .select('thread_id, last_read_at')
+            .in('thread_id', tIds)
+            .eq('agent_id', agentId);
+          for (const rs of allReadStatuses || []) {
+            readStatusByThread.set(rs.thread_id, rs.last_read_at);
+          }
+        }
 
-              // Count unread messages. Baseline priority:
-              //   1. last_read_at (explicit read pointer)
-              //   2. joined_at (participant join time — no replay of pre-join history)
-              //   3. no filter (shouldn't happen — agent is always a participant)
-              const unreadBaseline = lastReadAt || joinedAt;
-              let countQuery = threadTable(supabase, 'inbox_thread_messages')
-                .select('*', { count: 'exact', head: true })
-                .eq('thread_id', t.id);
+        // Batch 3: recent messages for all threads — used for both unread counts
+        // and preview messages (was 2N queries). Fetch enough to cover previews +
+        // reasonable unread counts. Threads with >50 unread will show a lower-bound.
+        const MSG_BATCH_LIMIT = Math.max(tIds.length * 20, 200);
+        const { data: allMsgs } = await threadTable(supabase, 'inbox_thread_messages')
+          .select('thread_id, sender_agent_id, content, message_type, created_at, metadata')
+          .in('thread_id', tIds)
+          .order('created_at', { ascending: false })
+          .limit(MSG_BATCH_LIMIT);
 
-              if (unreadBaseline) {
-                countQuery = countQuery.gt('created_at', unreadBaseline);
-              }
+        const msgsByThread = new Map<
+          string,
+          Array<{
+            thread_id: string;
+            sender_agent_id: string;
+            content: string;
+            message_type: string;
+            created_at: string;
+            metadata: unknown;
+          }>
+        >();
+        for (const m of allMsgs || []) {
+          const arr = msgsByThread.get(m.thread_id) || [];
+          arr.push(m);
+          msgsByThread.set(m.thread_id, arr);
+        }
 
-              const { count } = await countQuery;
+        // Assemble thread summaries from batched data (pure JS, zero queries)
+        threadsWithUnread = threads.map(
+          (t: {
+            id: string;
+            thread_key: string;
+            title: string | null;
+            created_by_agent_id: string;
+            updated_at: string;
+          }) => {
+            const parts = partsByThread.get(t.id) || [];
+            const participants = parts.map((p) => p.agent_id);
 
-              // Get preview messages (last 3 non-system messages)
-              const { data: previewRows } = await threadTable(supabase, 'inbox_thread_messages')
-                .select('sender_agent_id, content, message_type, created_at')
-                .eq('thread_id', t.id)
-                .neq('message_type', 'system')
-                .order('created_at', { ascending: false })
-                .limit(3);
-
-              const previewMessages = (previewRows || [])
-                .reverse()
-                .map(
-                  (m: {
-                    sender_agent_id: string;
-                    content: string;
-                    message_type: string;
-                    created_at: string;
-                  }) => ({
-                    senderAgentId: m.sender_agent_id,
-                    content: m.content,
-                    messageType: m.message_type,
-                    createdAt: m.created_at,
-                  })
-                );
-
-              return {
-                threadKey: t.thread_key,
-                title: t.title,
-                participants,
-                unreadCount: count || 0,
-                lastMessageAt: t.updated_at,
-                previewMessages,
-              };
+            let lastReadAt: string | null = readStatusByThread.get(t.id) || null;
+            let joinedAt: string | null = null;
+            if (agentId) {
+              const callerPart = parts.find((p) => p.agent_id === agentId);
+              joinedAt = callerPart?.joined_at || null;
             }
-          )
+
+            const unreadBaseline = lastReadAt || joinedAt;
+            const threadMsgs = msgsByThread.get(t.id) || [];
+            const unreadCount = unreadBaseline
+              ? threadMsgs.filter((m) => m.created_at > unreadBaseline).length
+              : threadMsgs.length;
+
+            const previewMessages = threadMsgs
+              .filter((m) => m.message_type !== 'system')
+              .slice(0, 3)
+              .reverse()
+              .map((m) => ({
+                senderAgentId: m.sender_agent_id,
+                content: m.content,
+                messageType: m.message_type,
+                createdAt: m.created_at,
+              }));
+
+            return {
+              threadKey: t.thread_key,
+              title: t.title,
+              participants,
+              unreadCount,
+              lastMessageAt: t.updated_at,
+              previewMessages,
+            };
+          }
         );
 
         // Only include threads that actually have unread messages
@@ -1177,44 +1188,33 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
 
         // Channel poll studio filtering (defense-in-depth): when channelPoll=true
         // and no session_id filter was applied, fall back to message-metadata-based
-        // studio ownership check. When session filtering is active (callerSessionId
-        // is set), skip this — session_id on participants is the primary routing.
+        // studio ownership check. Uses the already-batched messages (no extra queries).
         if (channelPoll && agentId && !callerSessionId) {
           const reqCtx = getRequestContext();
           const sessCtx = getSessionContext();
           const callerStudioId = reqCtx?.studioId || sessCtx?.studioId || null;
 
           if (callerStudioId) {
-            const filteredThreads: typeof threadsWithUnread = [];
+            // Build a threadKey→threadId map for lookup
+            const keyToId = new Map<string, string>(
+              threads.map((t: { id: string; thread_key: string }) => [t.thread_key, t.id])
+            );
 
-            for (const thread of threadsWithUnread) {
-              // Fetch our agent's messages on this thread to check studio ownership
-              const threadRow = threads?.find(
-                (t: { thread_key: string }) => t.thread_key === thread.threadKey
-              );
-              if (!threadRow) {
-                filteredThreads.push(thread); // safety fallback — include if we can't check
-                continue;
-              }
-
-              const { data: ourMessages } = await threadTable(supabase, 'inbox_thread_messages')
-                .select('metadata')
-                .eq('thread_id', (threadRow as { id: string }).id)
-                .eq('sender_agent_id', agentId)
-                .order('created_at', { ascending: false })
-                .limit(5);
-
-              if (isThreadOwnedByStudio(ourMessages || [], callerStudioId)) {
-                filteredThreads.push(thread);
-              } else {
+            threadsWithUnread = threadsWithUnread.filter((thread) => {
+              const tid = keyToId.get(thread.threadKey);
+              if (!tid) return true; // safety fallback
+              const ourMsgs = (msgsByThread.get(tid) || [])
+                .filter((m) => m.sender_agent_id === agentId)
+                .slice(0, 5);
+              const owned = isThreadOwnedByStudio(ourMsgs, callerStudioId);
+              if (!owned) {
                 logger.debug('[ChannelPoll] Filtered thread (owned by different studio)', {
                   threadKey: thread.threadKey,
                   callerStudioId,
                 });
               }
-            }
-
-            threadsWithUnread = filteredThreads;
+              return owned;
+            });
           }
         }
 
