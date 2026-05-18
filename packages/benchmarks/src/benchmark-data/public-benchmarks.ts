@@ -39,7 +39,8 @@ export const PUBLIC_BENCHMARKS: PublicBenchmarkDescriptor[] = [
   {
     family: 'convomem',
     displayName: 'ConvoMem',
-    primaryQuestion: 'How well does the system perform on large-scale conversational memory retrieval?',
+    primaryQuestion:
+      'How well does the system perform on large-scale conversational memory retrieval?',
     whyItMatters:
       'Useful for measuring scale and broader conversational coverage once LongMemEval and LoCoMo are stable.',
     recommendedMetrics: ['recall@k', 'category breakdown', 'latency'],

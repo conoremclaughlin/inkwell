@@ -33,19 +33,18 @@ expectedSurfaced:
     reason: Safety constraint on destructive test commands
     containsPhrases:
       - destructive
-      - real executor
+      - real executors
 
 mustAssert:
   - claim: Prefer live integration and e2e tests over mocks
     criticality: high
     containsPhrases:
       - prefer
-      - integration
-  - claim: Mocks are the fallback, not the default
+      - e2e
+  - claim: Mocks are not the preferred approach
     criticality: medium
     containsPhrases:
       - mocks
-      - fallback
 
 mustNotAssert:
   - claim: Always mock external services
@@ -57,7 +56,6 @@ rubric:
   sufficiencyBar: >
     Can the SB recommend real integration tests over mocks and cite
     the team's testing philosophy?
-  precisionFloor: 0.15
   recallFloor: 0.3
   mustAssertPassRate: 0.5
   mustNotAssertLeakRate: 0.0

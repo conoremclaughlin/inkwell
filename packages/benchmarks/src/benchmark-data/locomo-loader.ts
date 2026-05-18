@@ -60,9 +60,7 @@ function formatSession(session: SessionRecord, evidenceIds: Set<string>): string
 
   if (lines.length === 0) return null;
 
-  const header = session.dateTime
-    ? `${session.key} @ ${session.dateTime}`
-    : `${session.key}`;
+  const header = session.dateTime ? `${session.key} @ ${session.dateTime}` : `${session.key}`;
 
   return `${header}\n${lines.join('\n')}`;
 }

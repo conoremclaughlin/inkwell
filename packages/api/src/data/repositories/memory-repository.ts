@@ -37,6 +37,7 @@ import type {
   SessionLogCreateInput,
   SessionLogRow,
   Salience,
+  RecallIntent,
 } from '../models/memory';
 
 type RecallMode = NonNullable<MemorySearchOptions['recallMode']>;
@@ -601,7 +602,8 @@ export class MemoryRepository {
             applyChunkTypeBoosts,
             applyMultiViewBoost,
             applyChronologyBoost,
-          }
+          },
+          this.computeIntentMultiplier(candidate.memory, options.recallIntent)
         ),
       };
     });
@@ -624,7 +626,8 @@ export class MemoryRepository {
       applyChunkTypeBoosts?: boolean;
       applyMultiViewBoost?: boolean;
       applyChronologyBoost?: boolean;
-    } = {}
+    } = {},
+    intentMultiplier: number = 1
   ): number {
     const s = semanticScore ?? 0;
     const t = textScore ?? 0;
@@ -635,11 +638,29 @@ export class MemoryRepository {
     const chunkTypeBoost =
       options.applyChunkTypeBoosts === false ? 0 : computeChunkTypeBoost(matchedChunkType);
     const chronologyScore = options.applyChronologyBoost === false ? 0 : chronologyBoost;
-    // Blend with heavier semantic weighting, but allow lexical key matches to lift ranking.
     return Math.max(
       0,
-      Math.min(1, s * 0.7 + t * 0.3 + chunkTypeBoost + multiViewBoost + chronologyScore)
+      Math.min(
+        1,
+        (s * 0.7 + t * 0.3 + chunkTypeBoost + multiViewBoost + chronologyScore) * intentMultiplier
+      )
     );
+  }
+
+  private computeIntentMultiplier(memory: Memory, intent?: RecallIntent): number {
+    if (!intent) return 1;
+    if (intent === 'activity') return 1;
+
+    const content = memory.content.toLowerCase();
+    const isSessionPhase =
+      memory.source === 'session' ||
+      content.startsWith('[complete]') ||
+      content.startsWith('[waiting:') ||
+      content.startsWith('[blocked:') ||
+      content.startsWith('completed:') ||
+      /^completed\b/.test(content);
+
+    return isSessionPhase ? 0.4 : 1;
   }
 
   private buildChronologyWindow(memories: Memory[]): { min: Date; max: Date } | null {

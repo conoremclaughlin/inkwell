@@ -1636,6 +1636,12 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .describe(
             'Recall strategy: text (keyword only), semantic (embeddings only), hybrid (blend both), auto (semantic then fallback). Default: hybrid.'
           ),
+        recallIntent: z
+          .enum(['knowledge', 'activity'])
+          .optional()
+          .describe(
+            'Query intent for scoring adjustment. "knowledge" de-ranks session-phase noise. "activity" preserves session entries. Omit for default.'
+          ),
         source: z.string().optional().describe('Filter by source'),
         salience: z
           .enum(['low', 'medium', 'high', 'critical'])

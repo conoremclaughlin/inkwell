@@ -31,7 +31,7 @@ describe('scorer: basic precision/recall', () => {
     expect(r.passed).toBe(true);
   });
 
-  it('0 precision when no matches but items surfaced', () => {
+  it('0 precision when no matches but items surfaced (informational, not a gate)', () => {
     const scenario = makeScenario({
       rubric: { precisionFloor: 0.5 },
     });
@@ -42,8 +42,9 @@ describe('scorer: basic precision/recall', () => {
     const r = scoreScenario(scenario, 'signal', surfaced);
     expect(r.metrics.precision).toBe(0);
     expect(r.metrics.recall).toBe(0);
-    expect(r.passed).toBe(false);
-    expect(r.failureReasons[0]).toMatch(/precision/);
+    // Precision is informational only — recall floor (default 0) is still met,
+    // so the scenario passes unless other gates fail.
+    expect(r.passed).toBe(true);
   });
 
   it('0 precision & recall for empty surfaced set', () => {

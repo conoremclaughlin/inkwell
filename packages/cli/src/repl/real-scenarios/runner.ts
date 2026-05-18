@@ -15,9 +15,21 @@ import type { Scenario, ScenarioResult } from './types.js';
 
 export type RecallFn = (query: string, limit: number) => Promise<SurfacedMemory[]>;
 
+export type QueryMode = 'keyword' | 'llm';
+
+/**
+ * Builds a recall query from scenario context using an LLM.
+ * Caller provides this to avoid coupling the runner to a specific LLM SDK.
+ */
+export type LlmQueryFn = (scenario: Scenario) => Promise<string>;
+
 export interface RunOptions {
-  /** Max memories to fetch per recall call. Default 10. */
+  /** Max memories to fetch per recall call. Default 20. */
   recallLimit?: number;
+  /** Query construction strategy. Default 'keyword'. */
+  queryMode?: QueryMode;
+  /** Required when queryMode is 'llm'. */
+  llmQueryFn?: LlmQueryFn;
 }
 
 /**
@@ -32,6 +44,15 @@ function buildSignalInput(scenario: Scenario): { userInput: string; assistantRes
     userInput,
     assistantResponse: scenario.impliedQuestion,
   };
+}
+
+async function buildQuery(scenario: Scenario, opts: RunOptions): Promise<string> {
+  if (opts.queryMode === 'llm') {
+    if (!opts.llmQueryFn) throw new Error('queryMode "llm" requires llmQueryFn');
+    return opts.llmQueryFn(scenario);
+  }
+  const { userInput, assistantResponse } = buildSignalInput(scenario);
+  return extractTopicSignal(userInput, assistantResponse);
 }
 
 export async function runScenario(
@@ -60,12 +81,27 @@ export async function runScenario(
     };
   }
 
-  const { userInput, assistantResponse } = buildSignalInput(scenario);
-  const topicSignal = extractTopicSignal(userInput, assistantResponse);
+  let topicSignal: string;
+  try {
+    topicSignal = await buildQuery(scenario, opts);
+  } catch (err) {
+    return {
+      scenarioId: scenario.id,
+      shape: scenario.shape,
+      topicSignal: '',
+      surfacedCount: 0,
+      surfaced: [],
+      metrics: { precision: 0, recall: 0 },
+      passed: false,
+      failureReasons: [
+        `query construction error: ${err instanceof Error ? err.message : String(err)}`,
+      ],
+    };
+  }
 
   let surfaced: SurfacedMemory[] = [];
   try {
-    surfaced = await recallFn(topicSignal, opts.recallLimit ?? 10);
+    surfaced = await recallFn(topicSignal, opts.recallLimit ?? 20);
   } catch (err) {
     return {
       scenarioId: scenario.id,

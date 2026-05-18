@@ -64,6 +64,8 @@ export interface MemoryCreateInput {
   contactId?: string; // Per-sender memory scoping
 }
 
+export type RecallIntent = 'knowledge' | 'activity';
+
 export type MemorySearchChunkType =
   | 'summary'
   | 'fact'
@@ -76,6 +78,7 @@ export type MemorySemanticQueryStrategy = 'single' | 'parallel-content-entity';
 
 export interface MemorySearchOptions {
   recallMode?: 'auto' | 'text' | 'semantic' | 'hybrid';
+  recallIntent?: RecallIntent;
   source?: MemorySource;
   salience?: Salience;
   topics?: string[];

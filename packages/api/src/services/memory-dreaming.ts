@@ -103,8 +103,7 @@ export function computeChronologyAwareBoost(params: {
     [params.memory.summary || '', params.memory.topicKey || '', params.memory.content].join('\n')
   );
   const spanMs = Math.max(1, params.maxCreatedAt.getTime() - params.minCreatedAt.getTime());
-  const recencyRatio =
-    (params.memory.createdAt.getTime() - params.minCreatedAt.getTime()) / spanMs;
+  const recencyRatio = (params.memory.createdAt.getTime() - params.minCreatedAt.getTime()) / spanMs;
 
   let boost = recencyRatio * 0.08;
   if (FORWARD_LOOKING_MEMORY_CUES.some((cue) => combined.includes(cue))) boost += 0.05;
@@ -113,7 +112,9 @@ export function computeChronologyAwareBoost(params: {
   return Math.max(-0.05, Math.min(0.15, boost));
 }
 
-export function extractDreamDurableFacts(memory: Pick<Memory, 'content' | 'summary'>): DreamFactCandidate[] {
+export function extractDreamDurableFacts(
+  memory: Pick<Memory, 'content' | 'summary'>
+): DreamFactCandidate[] {
   const source = [memory.summary || '', memory.content]
     .join('\n')
     .replace(/\r/g, '\n')
@@ -172,7 +173,10 @@ export function findDreamSupersessionCandidates(
 ): DreamSupersessionCandidate[] {
   const candidates: DreamSupersessionCandidate[] = [];
 
-  const byTopic = new Map<string, Array<Pick<Memory, 'id' | 'content' | 'summary' | 'createdAt'>>>();
+  const byTopic = new Map<
+    string,
+    Array<Pick<Memory, 'id' | 'content' | 'summary' | 'createdAt'>>
+  >();
   for (const memory of memories) {
     if (!memory.topicKey) continue;
     const bucket = byTopic.get(memory.topicKey) || [];
@@ -187,11 +191,12 @@ export function findDreamSupersessionCandidates(
       const newer = ordered[i];
       const combined = normalize(`${newer.summary || ''} ${newer.content}`);
 
-      const reason = combined.includes('override') || combined.includes('supersede')
-        ? 'override-cue'
-        : combined.includes('replace') || combined.includes('instead of')
-          ? 'replacement-cue'
-          : null;
+      const reason =
+        combined.includes('override') || combined.includes('supersede')
+          ? 'override-cue'
+          : combined.includes('replace') || combined.includes('instead of')
+            ? 'replacement-cue'
+            : null;
       if (!reason) continue;
 
       const tokenSimilarity = jaccard(

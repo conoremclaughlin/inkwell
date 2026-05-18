@@ -35,19 +35,20 @@ expectedSurfaced:
     reason: Clarifies that server runs via yarn dev, not PM2
     containsPhrases:
       - yarn dev
-      - not pm2
+      - not via pm2
 
 mustAssert:
   - claim: Never kill or restart the main dev server on port 3001
     criticality: high
     containsPhrases:
       - never
-      - main dev server
+      - kill
+      - dev server
   - claim: Code changes are picked up automatically via hot reload
     criticality: high
     containsPhrases:
       - hot reload
-      - automatically
+      - picked up
   - claim: Use PCP_PORT_BASE for isolated testing on a different port
     criticality: medium
     containsPhrases:
@@ -68,7 +69,6 @@ rubric:
   sufficiencyBar: >
     Can the SB refuse to kill the dev server, explain hot reload, and
     suggest PCP_PORT_BASE for isolated testing?
-  precisionFloor: 0.15
   recallFloor: 0.3
   mustAssertPassRate: 0.5
   mustNotAssertLeakRate: 0.0

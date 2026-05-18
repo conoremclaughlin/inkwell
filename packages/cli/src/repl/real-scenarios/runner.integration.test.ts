@@ -4,10 +4,13 @@
  * Runs the bundled fixtures against the running PCP server's `recall` tool
  * and asserts that the curated memory set supports each scenario's rubric.
  *
- * This is the actual signal: does passive recall surface the memories we
- * expect when the SB is working on a real task?
+ * Two query modes:
+ * - keyword: extractTopicSignal bag-of-words (current passive recall)
+ * - llm: LLM-constructed natural language query (experiment)
  *
- * Run with: INK_SERVER_URL=http://localhost:3001 npx vitest run src/repl/real-scenarios/runner.integration.test.ts
+ * Run with:
+ *   INK_SERVER_URL=http://localhost:3001 npx vitest run src/repl/real-scenarios/runner.integration.test.ts
+ *   ANTHROPIC_API_KEY=... INK_SERVER_URL=http://localhost:3001 npx vitest run src/repl/real-scenarios/runner.integration.test.ts
  */
 
 import { describe, expect, it } from 'vitest';
@@ -16,9 +19,12 @@ import { readFileSync } from 'fs';
 import { runScenario, type RecallFn } from './runner.js';
 import { loadScenariosFromDir, defaultFixturesDir } from './loader.js';
 import { writeMarkdownReport } from './report.js';
+import { createLlmQueryFn } from './llm-query.js';
 import type { SurfacedMemory } from './scorer.js';
+import type { ScenarioResult } from './types.js';
 
 const PCP_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
+const LLM_ENABLED = process.env.INK_LIVE_RUN_LLM === 'true';
 
 let serverAvailable = false;
 try {
@@ -40,7 +46,11 @@ interface RecallResponse {
   memories: RecallMemory[];
 }
 
-async function pcpRecall(query: string, limit: number): Promise<SurfacedMemory[]> {
+async function pcpRecall(
+  query: string,
+  limit: number,
+  extraArgs: Record<string, unknown> = {}
+): Promise<SurfacedMemory[]> {
   const authPath = `${process.env.HOME}/.ink/auth.json`;
   const auth = JSON.parse(readFileSync(authPath, 'utf-8'));
   const accessToken = auth.accessToken || auth.access_token;
@@ -65,6 +75,7 @@ async function pcpRecall(query: string, limit: number): Promise<SurfacedMemory[]
           includeShared: true,
           limit,
           recallMode: 'hybrid',
+          ...extraArgs,
         },
       },
     }),
@@ -84,10 +95,88 @@ async function pcpRecall(query: string, limit: number): Promise<SurfacedMemory[]
 }
 
 const recall: RecallFn = (query, limit) => pcpRecall(query, limit);
+const recallWithIntent: (intent: string) => RecallFn = (intent) => (query, limit) =>
+  pcpRecall(query, limit, { recallIntent: intent });
+
+function printComparisonTable(
+  keywordResults: ScenarioResult[],
+  llmResults: ScenarioResult[]
+): void {
+  console.log('\n## Query Mode Comparison: keyword vs LLM\n');
+  console.log('| Scenario | KW Prec | KW Rec | KW Pass | LLM Prec | LLM Rec | LLM Pass | Winner |');
+  console.log('|---|---|---|---|---|---|---|---|');
+
+  let kwWins = 0;
+  let llmWins = 0;
+  let ties = 0;
+
+  for (let i = 0; i < keywordResults.length; i++) {
+    const kw = keywordResults[i];
+    const llm = llmResults[i];
+
+    const kwF1 =
+      kw.metrics.precision + kw.metrics.recall > 0
+        ? (2 * kw.metrics.precision * kw.metrics.recall) /
+          (kw.metrics.precision + kw.metrics.recall)
+        : 0;
+    const llmF1 =
+      llm.metrics.precision + llm.metrics.recall > 0
+        ? (2 * llm.metrics.precision * llm.metrics.recall) /
+          (llm.metrics.precision + llm.metrics.recall)
+        : 0;
+
+    let winner: string;
+    if (llmF1 > kwF1 + 0.01) {
+      winner = 'LLM';
+      llmWins++;
+    } else if (kwF1 > llmF1 + 0.01) {
+      winner = 'KW';
+      kwWins++;
+    } else {
+      winner = 'TIE';
+      ties++;
+    }
+
+    console.log(
+      `| ${kw.scenarioId} | ${pct(kw.metrics.precision)} | ${pct(kw.metrics.recall)} | ${kw.passed ? 'Y' : 'N'} | ${pct(llm.metrics.precision)} | ${pct(llm.metrics.recall)} | ${llm.passed ? 'Y' : 'N'} | ${winner} |`
+    );
+  }
+
+  const avgKwP = avg(keywordResults.map((r) => r.metrics.precision));
+  const avgKwR = avg(keywordResults.map((r) => r.metrics.recall));
+  const avgLlmP = avg(llmResults.map((r) => r.metrics.precision));
+  const avgLlmR = avg(llmResults.map((r) => r.metrics.recall));
+  const kwPassRate = keywordResults.filter((r) => r.passed).length;
+  const llmPassRate = llmResults.filter((r) => r.passed).length;
+
+  console.log(`\n**Aggregates:**`);
+  console.log(
+    `- Keyword: precision=${pct(avgKwP)}, recall=${pct(avgKwR)}, passed=${kwPassRate}/${keywordResults.length}`
+  );
+  console.log(
+    `- LLM:     precision=${pct(avgLlmP)}, recall=${pct(avgLlmR)}, passed=${llmPassRate}/${llmResults.length}`
+  );
+  console.log(`- Wins: KW=${kwWins}, LLM=${llmWins}, TIE=${ties}`);
+
+  console.log('\n### Query Comparison\n');
+  for (let i = 0; i < keywordResults.length; i++) {
+    console.log(`**${keywordResults[i].scenarioId}**`);
+    console.log(`  KW:  "${keywordResults[i].topicSignal}"`);
+    console.log(`  LLM: "${llmResults[i].topicSignal}"`);
+  }
+}
+
+function pct(n: number): string {
+  return `${Math.round(n * 100)}%`;
+}
+
+function avg(nums: number[]): number {
+  return nums.length === 0 ? 0 : nums.reduce((a, b) => a + b, 0) / nums.length;
+}
 
 describe('real-scenarios: live PCP', () => {
   it.skipIf(!serverAvailable)(
-    'runs all bundled fixtures and reports results',
+    'keyword mode — runs all bundled fixtures and reports results',
     { timeout: 60_000 },
     async () => {
       const scenarios = loadScenariosFromDir(defaultFixturesDir());
@@ -99,17 +188,11 @@ describe('real-scenarios: live PCP', () => {
         results.push(result);
       }
 
-      const report = writeMarkdownReport(results, { title: 'Real-Scenario Eval (live PCP)' });
+      const report = writeMarkdownReport(results, {
+        title: 'Real-Scenario Eval — keyword mode (live PCP)',
+      });
       console.log('\n' + report + '\n');
 
-      // This is a REPORTING test, not a rubric gate. The point is to measure
-      // how well recall works against curated scenarios and print the numbers.
-      // Rubric misses usually mean memories haven't been seeded yet (e.g. no
-      // memory exists yet for "NEVER squash merge") — that's a finding, not a
-      // test failure. The harness just needs to run end-to-end.
-      //
-      // The only hard assertion: every supported scenario should get SOMETHING
-      // back. Zero memories means the integration layer is broken.
       const supported = results.filter(
         (r) => !r.failureReasons.some((f) => /not yet implemented/.test(f))
       );
@@ -121,6 +204,138 @@ describe('real-scenarios: live PCP', () => {
       const passed = supported.filter((r) => r.passed).length;
       const passRate = supported.length === 0 ? 0 : passed / supported.length;
       console.log(`Pass rate: ${passed}/${supported.length} (${(passRate * 100).toFixed(0)}%)`);
+    }
+  );
+
+  it.skipIf(!serverAvailable || !LLM_ENABLED)(
+    'keyword vs LLM comparison benchmark',
+    { timeout: 600_000 },
+    async () => {
+      const scenarios = loadScenariosFromDir(defaultFixturesDir());
+      const supported = scenarios.filter(
+        (s) =>
+          !['topic-shift', 're-entry', 'concurrent-threads', 'post-compaction-continuity'].includes(
+            s.shape
+          )
+      );
+      expect(supported.length).toBeGreaterThan(0);
+
+      const llmQueryFn = createLlmQueryFn();
+
+      const keywordResults: ScenarioResult[] = [];
+      const llmResults: ScenarioResult[] = [];
+
+      for (const scenario of supported) {
+        const kwResult = await runScenario(scenario, recall, { queryMode: 'keyword' });
+        keywordResults.push(kwResult);
+
+        const llmResult = await runScenario(scenario, recall, {
+          queryMode: 'llm',
+          llmQueryFn,
+        });
+        llmResults.push(llmResult);
+      }
+
+      printComparisonTable(keywordResults, llmResults);
+
+      // At least some scenarios should surface memories in each mode.
+      // Individual scenarios can occasionally get zero results due to
+      // transient recall timing, so we check the aggregate.
+      const kwWithResults = keywordResults.filter((r) => r.surfacedCount > 0).length;
+      const llmWithResults = llmResults.filter((r) => r.surfacedCount > 0).length;
+      expect(kwWithResults, 'keyword mode surfaced zero across all scenarios').toBeGreaterThan(0);
+      expect(llmWithResults, 'llm mode surfaced zero across all scenarios').toBeGreaterThan(0);
+    }
+  );
+
+  it.skipIf(!serverAvailable)(
+    'recallIntent comparison: default vs knowledge',
+    { timeout: 120_000 },
+    async () => {
+      const scenarios = loadScenariosFromDir(defaultFixturesDir());
+      const supported = scenarios.filter(
+        (s) =>
+          !['topic-shift', 're-entry', 'concurrent-threads', 'post-compaction-continuity'].includes(
+            s.shape
+          )
+      );
+      expect(supported.length).toBeGreaterThan(0);
+
+      const defaultResults: ScenarioResult[] = [];
+      const knowledgeResults: ScenarioResult[] = [];
+
+      for (const scenario of supported) {
+        const defaultResult = await runScenario(scenario, recall);
+        defaultResults.push(defaultResult);
+
+        const knowledgeResult = await runScenario(scenario, recallWithIntent('knowledge'));
+        knowledgeResults.push(knowledgeResult);
+      }
+
+      console.log('\n## recallIntent Comparison: default vs knowledge\n');
+      console.log(
+        '| Scenario | Def Prec | Def Rec | Def Pass | Know Prec | Know Rec | Know Pass | Winner |'
+      );
+      console.log('|---|---|---|---|---|---|---|---|');
+
+      let defWins = 0;
+      let knowWins = 0;
+      let ties = 0;
+
+      for (let i = 0; i < defaultResults.length; i++) {
+        const def = defaultResults[i];
+        const know = knowledgeResults[i];
+
+        const defF1 =
+          def.metrics.precision + def.metrics.recall > 0
+            ? (2 * def.metrics.precision * def.metrics.recall) /
+              (def.metrics.precision + def.metrics.recall)
+            : 0;
+        const knowF1 =
+          know.metrics.precision + know.metrics.recall > 0
+            ? (2 * know.metrics.precision * know.metrics.recall) /
+              (know.metrics.precision + know.metrics.recall)
+            : 0;
+
+        let winner: string;
+        if (knowF1 > defF1 + 0.01) {
+          winner = 'KNOW';
+          knowWins++;
+        } else if (defF1 > knowF1 + 0.01) {
+          winner = 'DEF';
+          defWins++;
+        } else {
+          winner = 'TIE';
+          ties++;
+        }
+
+        console.log(
+          `| ${def.scenarioId} | ${pct(def.metrics.precision)} | ${pct(def.metrics.recall)} | ${def.passed ? 'Y' : 'N'} | ${pct(know.metrics.precision)} | ${pct(know.metrics.recall)} | ${know.passed ? 'Y' : 'N'} | ${winner} |`
+        );
+      }
+
+      const avgDefP = avg(defaultResults.map((r) => r.metrics.precision));
+      const avgDefR = avg(defaultResults.map((r) => r.metrics.recall));
+      const avgKnowP = avg(knowledgeResults.map((r) => r.metrics.precision));
+      const avgKnowR = avg(knowledgeResults.map((r) => r.metrics.recall));
+      const defPassRate = defaultResults.filter((r) => r.passed).length;
+      const knowPassRate = knowledgeResults.filter((r) => r.passed).length;
+
+      console.log(`\n**Aggregates:**`);
+      console.log(
+        `- Default:   precision=${pct(avgDefP)}, recall=${pct(avgDefR)}, passed=${defPassRate}/${defaultResults.length}`
+      );
+      console.log(
+        `- Knowledge: precision=${pct(avgKnowP)}, recall=${pct(avgKnowR)}, passed=${knowPassRate}/${knowledgeResults.length}`
+      );
+      console.log(`- Wins: DEF=${defWins}, KNOW=${knowWins}, TIE=${ties}`);
+
+      for (const r of defaultResults) {
+        expect(r.surfacedCount, `default: ${r.scenarioId} surfaced zero`).toBeGreaterThan(0);
+      }
+      for (const r of knowledgeResults) {
+        expect(r.surfacedCount, `knowledge: ${r.scenarioId} surfaced zero`).toBeGreaterThan(0);
+      }
     }
   );
 });
