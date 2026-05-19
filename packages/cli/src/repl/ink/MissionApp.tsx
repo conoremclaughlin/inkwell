@@ -186,31 +186,14 @@ export const MissionApp = React.forwardRef<MissionAppHandle, MissionAppProps>(fu
     },
   }));
 
-  // Terminal dimensions + remount key for <Static> resize re-render
+  // Terminal dimensions — Ink re-renders on resize automatically, no manual listener needed.
   const { stdout } = useStdout();
-  const [cols, setCols] = useState(stdout?.columns || 80);
-  const [remountKey, setRemountKey] = useState(0);
-  useEffect(() => {
-    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-    const onResize = () => {
-      setCols(stdout?.columns || 80);
-      if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => {
-        setRemountKey((k) => k + 1);
-      }, 150);
-    };
-    stdout?.on('resize', onResize);
-    return () => {
-      stdout?.off('resize', onResize);
-      if (debounceTimer) clearTimeout(debounceTimer);
-    };
-  }, [stdout]);
+  const cols = stdout?.columns || 80;
 
   // Ctrl+O to toggle detail expansion (re-renders all feed events)
   useInput((_input, key) => {
     if (key.ctrl && _input === 'o') {
       setDetailExpanded((prev) => !prev);
-      setRemountKey((k) => k + 1);
     }
   });
 
@@ -250,9 +233,8 @@ export const MissionApp = React.forwardRef<MissionAppHandle, MissionAppProps>(fu
 
   return (
     <Box flexDirection="column">
-      {/* Events — written once to terminal scrollback via <Static>.
-          key={remountKey} forces full re-render on terminal resize. */}
-      <Static key={remountKey} items={events}>
+      {/* Events — written once to terminal scrollback via <Static>. */}
+      <Static items={events}>
         {(event) => (
           <FeedEventLine
             key={event.id}
