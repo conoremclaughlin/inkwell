@@ -2595,7 +2595,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
 
     if (force && fresh.length === 0) {
-      printLine(chalk.dim('No new inbox messages.'));
+      if (inkRepl) {
+        inkRepl.setCommandOutput(['No new inbox messages.']);
+      } else {
+        printLine(chalk.dim('No new inbox messages.'));
+      }
     }
     if (autoRuns > 0) {
       printLine(
@@ -2683,7 +2687,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
 
     if (force && activities.length === 0) {
-      printLine(chalk.dim('No new activity events.'));
+      if (inkRepl) {
+        inkRepl.setCommandOutput(['No new activity events.']);
+      } else {
+        printLine(chalk.dim('No new activity events.'));
+      }
     }
     emitStatusLaneIfChanged();
     return activities.length;
