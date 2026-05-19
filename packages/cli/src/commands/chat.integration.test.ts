@@ -34,6 +34,10 @@ vi.mock('../lib/pcp-client.js', () => ({
 
 vi.mock('../repl/backend-runner.js', () => ({
   runBackendTurn: (request: Record<string, unknown>) => testState.runBackendImpl(request),
+  startBackendTurn: (request: Record<string, unknown>) => ({
+    result: testState.runBackendImpl(request),
+    abort: () => {},
+  }),
 }));
 
 vi.mock('../repl/skills.js', () => ({
@@ -1000,8 +1004,8 @@ describe('runChat integration', () => {
     });
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
-    expect(logText).toContain('- allowed-skill [test]');
-    expect(logText).toContain('1 skills hidden by read-path allowlist policy');
+    expect(logText).toContain('allowed-skill [test]');
+    expect(logText).toContain('1 hidden by read-path allowlist');
     expect(logText).toContain('Skill path blocked by read allowlist policy: /blocked/skills/b');
   });
 
@@ -1020,7 +1024,7 @@ describe('runChat integration', () => {
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('Skill trust mode set to trusted-only');
-    expect(logText).toContain('1 skills hidden by trust policy mode');
+    expect(logText).toContain('1 hidden by trust policy');
     expect(logText).toContain(
       'Skill blocked by trust policy (local); set /skill-trust all to allow.'
     );

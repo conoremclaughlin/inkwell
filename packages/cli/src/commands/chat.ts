@@ -1162,13 +1162,13 @@ function buildContextStatusSummary(params: {
   )}%) ${queue} backend:${params.backend}`;
 }
 
-function printUsage(
+function formatUsageLines(
   ledger: ContextLedger,
   maxContextTokens: number,
   previousTotal?: number,
   lastBackendUsage?: BackendTokenUsage,
   backendTokenWindow?: number
-): number {
+): { lines: string[]; total: number } {
   const entries = ledger.listEntries();
   const total = ledger.totalTokens();
   const pct = maxContextTokens > 0 ? Math.min((total / maxContextTokens) * 100, 999) : 0;
@@ -1189,14 +1189,6 @@ function printUsage(
   }
 
   const bar = buildTokenMeter(displayPct);
-  const color =
-    pct >= 95
-      ? chalk.red
-      : pct >= 80
-        ? chalk.yellow
-        : pct >= 60
-          ? chalk.hex('#f59e0b')
-          : chalk.green;
   const windowLabel =
     backendTokenWindow && backendTokenWindow !== maxContextTokens
       ? `  backend-window:${backendTokenWindow.toLocaleString()}`
@@ -1204,17 +1196,31 @@ function printUsage(
   const header = `Context: ~${total.toLocaleString()} / ${maxContextTokens.toLocaleString()} tok (${pct.toFixed(
     1
   )}%)${deltaLabel}${windowLabel}`;
-  console.log(color(header));
-  console.log(
-    color(`[${bar}]`) +
-      chalk.dim(
-        `  entries:${entries.length}  user:${user.toLocaleString()}  assistant:${assistant.toLocaleString()}  inbox:${inbox.toLocaleString()}  system:${system.toLocaleString()}`
-      )
-  );
+  const lines = [
+    header,
+    `[${bar}]  entries:${entries.length}  user:${user.toLocaleString()}  assistant:${assistant.toLocaleString()}  inbox:${inbox.toLocaleString()}  system:${system.toLocaleString()}`,
+  ];
   if (lastBackendUsage) {
-    console.log(chalk.dim(`Last backend usage: ${formatBackendTokenUsage(lastBackendUsage)}`));
+    lines.push(`Last backend usage: ${formatBackendTokenUsage(lastBackendUsage)}`);
   }
+  return { lines, total };
+}
 
+function printUsage(
+  ledger: ContextLedger,
+  maxContextTokens: number,
+  previousTotal?: number,
+  lastBackendUsage?: BackendTokenUsage,
+  backendTokenWindow?: number
+): number {
+  const { lines, total } = formatUsageLines(
+    ledger,
+    maxContextTokens,
+    previousTotal,
+    lastBackendUsage,
+    backendTokenWindow
+  );
+  for (const line of lines) console.log(line);
   return total;
 }
 
@@ -1296,18 +1302,17 @@ function chip(label: string, value: string, color: (text: string) => string): st
   return `${chalk.dim(`${label}:`)} ${color(value)}`;
 }
 
-function printSessionsSnapshot(sessions: SessionSummary[], options?: { timezone?: string }): void {
+function formatSessionsLines(
+  sessions: SessionSummary[],
+  options?: { timezone?: string }
+): string[] {
   if (sessions.length === 0) {
-    console.log(chalk.dim('No active sessions found.'));
-    return;
+    return ['No active sessions found.'];
   }
-
-  console.log(chalk.bold('\nActive sessions'));
-  console.log(
-    chalk.dim(
-      'id       agent   status/phase            studio            thread        started   backend            history    last-msg'
-    )
-  );
+  const lines = [
+    'Active sessions',
+    'id       agent   status/phase            studio            thread        started   backend            history    last-msg',
+  ];
   for (const session of sessions) {
     const transcriptMeta = getSessionTranscriptMetadata(session.id);
     const id = session.id.slice(0, 7).padEnd(7);
@@ -1322,86 +1327,82 @@ function printSessionsSnapshot(sessions: SessionSummary[], options?: { timezone?
       transcriptMeta?.lastMessageAt,
       options?.timezone
     ).padEnd(8, ' ');
-    console.log(
-      chalk.dim(
-        `${id}  ${agent}  ${status}  ${studio}  ${thread}  ${started.padEnd(7)}  ${backend}  ${history}  ${lastMessage}`
-      )
+    lines.push(
+      `${id}  ${agent}  ${status}  ${studio}  ${thread}  ${started.padEnd(7)}  ${backend}  ${history}  ${lastMessage}`
     );
   }
+  return lines;
+}
+
+function printSessionsSnapshot(sessions: SessionSummary[], options?: { timezone?: string }): void {
+  const lines = formatSessionsLines(sessions, options);
+  for (const line of lines) console.log(chalk.dim(line));
   console.log('');
 }
 
-function printToolPolicySnapshot(
+function formatToolPolicyLines(
   toolPolicy: ToolPolicyState,
   sessionId: string | undefined,
   activeSkills: SkillInstruction[]
-): void {
+): string[] {
   const gate = toolPolicy.getBackendToolGate();
-  console.log(chalk.bold('\nTool policy'));
-  console.log(chalk.dim(`Path: ${toolPolicy.getPolicyPath()}`));
-  console.log(chalk.dim(`Effective mode: ${toolPolicy.getMode()}`));
-  console.log(chalk.dim(`Mutation scope: ${toolPolicy.getMutationScopeLabel()}`));
-  console.log(chalk.dim(`Active scopes: ${toolPolicy.listActiveScopeLabels().join(' -> ')}`));
-  console.log(chalk.dim(`Skill trust mode: ${toolPolicy.getSkillTrustMode()}`));
-  console.log(chalk.dim(`Session visibility: ${toolPolicy.getSessionVisibility()}`));
+  const lines: string[] = [
+    'Tool policy',
+    `Path: ${toolPolicy.getPolicyPath()}`,
+    `Effective mode: ${toolPolicy.getMode()}`,
+    `Mutation scope: ${toolPolicy.getMutationScopeLabel()}`,
+    `Active scopes: ${toolPolicy.listActiveScopeLabels().join(' -> ')}`,
+    `Skill trust mode: ${toolPolicy.getSkillTrustMode()}`,
+    `Session visibility: ${toolPolicy.getSessionVisibility()}`,
+  ];
   if (gate.mode === 'backend') {
-    console.log(
-      chalk.dim(
-        `Backend passthrough allowlist (${gate.allowedTools.length}): ${
-          gate.allowedTools.length > 0
-            ? gate.allowedTools.join(', ')
-            : '(empty; backend tools disabled)'
-        }`
-      )
+    lines.push(
+      `Backend passthrough allowlist (${gate.allowedTools.length}): ${
+        gate.allowedTools.length > 0
+          ? gate.allowedTools.join(', ')
+          : '(empty; backend tools disabled)'
+      }`
     );
     if (gate.unresolvedPatterns.length > 0) {
-      console.log(
-        chalk.yellow(
-          `Backend wildcard patterns require local/prompt execution: ${gate.unresolvedPatterns.join(', ')}`
-        )
+      lines.push(
+        `Backend wildcard patterns require local/prompt: ${gate.unresolvedPatterns.join(', ')}`
       );
     }
   }
   if (gate.mode === 'off') {
-    console.log(chalk.dim('Backend passthrough mode is off (no backend tool calls permitted).'));
+    lines.push('Backend passthrough mode is off (no backend tool calls permitted).');
   }
   if (gate.mode === 'privileged') {
-    console.log(
-      chalk.dim('Backend passthrough mode is privileged (backend tool allowlist not clamped).')
-    );
+    lines.push('Backend passthrough mode is privileged (allowlist not clamped).');
   }
 
   const grants = toolPolicy.listGrants();
   if (grants.length > 0) {
-    console.log(
-      chalk.dim(`Grants: ${grants.map((entry) => `${entry.tool}(${entry.uses})`).join(', ')}`)
-    );
+    lines.push(`Grants: ${grants.map((entry) => `${entry.tool}(${entry.uses})`).join(', ')}`);
   }
   const allow = toolPolicy.listAllowTools();
-  if (allow.length > 0) console.log(chalk.dim(`Allow: ${allow.join(', ')}`));
+  if (allow.length > 0) lines.push(`Allow: ${allow.join(', ')}`);
   const deny = toolPolicy.listDenyTools();
-  if (deny.length > 0) console.log(chalk.dim(`Deny: ${deny.join(', ')}`));
+  if (deny.length > 0) lines.push(`Deny: ${deny.join(', ')}`);
   const prompt = toolPolicy.listPromptTools();
-  if (prompt.length > 0) console.log(chalk.dim(`Prompt: ${prompt.join(', ')}`));
+  if (prompt.length > 0) lines.push(`Prompt: ${prompt.join(', ')}`);
 
   const readAllow = toolPolicy.listReadPathAllow();
   const writeAllow = toolPolicy.listWritePathAllow();
-  if (readAllow.length > 0) console.log(chalk.dim(`Read path allow: ${readAllow.join(', ')}`));
-  if (writeAllow.length > 0) console.log(chalk.dim(`Write path allow: ${writeAllow.join(', ')}`));
+  if (readAllow.length > 0) lines.push(`Read path allow: ${readAllow.join(', ')}`);
+  if (writeAllow.length > 0) lines.push(`Write path allow: ${writeAllow.join(', ')}`);
 
   const skills = toolPolicy.listAllowedSkills();
-  if (skills.length > 0) console.log(chalk.dim(`Allowed skills: ${skills.join(', ')}`));
+  if (skills.length > 0) lines.push(`Allowed skills: ${skills.join(', ')}`);
   const sessionGrants = toolPolicy.listSessionGrants(sessionId);
   if (sessionGrants.length > 0) {
-    console.log(
-      chalk.dim(
-        `Session grants: ${sessionGrants.map((entry) => `${entry.tool}(${entry.uses})`).join(', ')}`
-      )
+    lines.push(
+      `Session grants: ${sessionGrants.map((entry) => `${entry.tool}(${entry.uses})`).join(', ')}`
     );
   }
   const scoped = toolPolicy.listActiveScopeSnapshots();
   if (scoped.length > 0) {
-    console.log(chalk.dim('Scope pipeline:'));
+    lines.push('Scope pipeline:');
     for (const scope of scoped) {
       const fragments: string[] = [];
       if (scope.mode) fragments.push(`mode=${scope.mode}`);
@@ -1419,14 +1420,22 @@ function printToolPolicySnapshot(
           `grants=${scope.grants.map((entry) => `${entry.tool}(${entry.uses})`).join('|')}`
         );
       }
-      console.log(
-        chalk.dim(`  - ${scope.label}${fragments.length > 0 ? ` :: ${fragments.join('  ')}` : ''}`)
-      );
+      lines.push(`  ${scope.label}${fragments.length > 0 ? ` :: ${fragments.join('  ')}` : ''}`);
     }
   }
   if (activeSkills.length > 0) {
-    console.log(chalk.dim(`Active skills: ${activeSkills.map((skill) => skill.name).join(', ')}`));
+    lines.push(`Active skills: ${activeSkills.map((skill) => skill.name).join(', ')}`);
   }
+  return lines;
+}
+
+function printToolPolicySnapshot(
+  toolPolicy: ToolPolicyState,
+  sessionId: string | undefined,
+  activeSkills: SkillInstruction[]
+): void {
+  const lines = formatToolPolicyLines(toolPolicy, sessionId, activeSkills);
+  for (const line of lines) console.log(chalk.dim(line));
   console.log('');
 }
 
@@ -3175,9 +3184,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
         )
       );
       const stopContinuation = inkRepl
-        ? (() => {
-            return () => {};
-          })()
+        ? ((repl) => {
+            repl.setWaiting(true, runtime.backend);
+            return () => repl.setWaiting(false);
+          })(inkRepl)
         : startWaitingIndicator(runtime.backend, {
             statusLane,
             logger: printLine,
@@ -3195,10 +3205,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       });
       currentTurnAbort = contTurn.abort;
       inkRepl?.setAbortHandler(abortCurrentTurn);
+      process.on('SIGINT', onSigintDuringTurn);
 
       runResult = await contTurn.result.finally(() => {
         currentTurnAbort = null;
         inkRepl?.setAbortHandler(null);
+        process.off('SIGINT', onSigintDuringTurn);
         stopContinuation();
       });
 
@@ -3717,7 +3729,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               (a, b) => safeDateMs(a.createdAt) - safeDateMs(b.createdAt)
             );
             if (allInbox.length === 0) {
-              inkRepl.printSystem('No unread inbox messages.');
+              showInPanel(['No unread inbox messages.']);
             } else {
               for (const msg of allInbox) {
                 const from = msg.from || 'unknown';
@@ -3870,7 +3882,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
         case 'ui': {
           if (inkRepl) {
-            printLine('UI mode: ink (React). Switch to scroll with --ui scroll on start.');
+            showInPanel(['UI mode: ink (React). Switch to scroll with --ui scroll on start.']);
             break;
           }
           const mode = (slash.args[0] || '').toLowerCase();
@@ -3898,7 +3910,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             showInPanel(['Session watch disabled.']);
           } else {
             const snapshot = await refreshSessionsSnapshot(true);
-            printSessionsSnapshot(snapshot, { timezone: runtime.userTimezone });
+            showInPanel(formatSessionsLines(snapshot, { timezone: runtime.userTimezone }));
           }
           break;
         }
@@ -4141,7 +4153,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           break;
         }
         case 'policy': {
-          printToolPolicySnapshot(toolPolicy, runtime.sessionId, runtime.activeSkills);
+          showInPanel(formatToolPolicyLines(toolPolicy, runtime.sessionId, runtime.activeSkills));
           break;
         }
         case 'mcp': {
@@ -4273,6 +4285,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
             capLines.push(`Blocked by trust mode: ${filtered.blockedByTrust.length}`);
           }
 
+          capLines.push(
+            '',
+            ...formatToolPolicyLines(toolPolicy, runtime.sessionId, runtime.activeSkills)
+          );
           showInPanel(capLines);
           break;
         }
@@ -4757,18 +4773,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
           );
           break;
         }
-        case 'usage':
+        case 'usage': {
           if (pendingTurns > 0) {
             await turnQueue;
           }
-          lastUsageTotal = printUsage(
+          const usage = formatUsageLines(
             ledger,
             runtime.maxContextTokens,
             lastUsageTotal,
             lastBackendUsage,
             runtime.backendTokenWindow
           );
+          lastUsageTotal = usage.total;
+          showInPanel(usage.lines);
           break;
+        }
         default:
           showInPanel([`Unknown command: /${slash.name}`]);
       }
