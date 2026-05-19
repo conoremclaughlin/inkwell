@@ -1,0 +1,42 @@
+diff --git a/build/ink.js b/build/ink.js
+--- a/build/ink.js
++++ b/build/ink.js
+@@ -1,5 +1,6 @@
+ import process from 'node:process';
+ import React from 'react';
++import stringWidth from 'string-width';
+ import { throttle } from 'es-toolkit/compat';
+ import ansiEscapes from 'ansi-escapes';
+ import isInCi from 'is-in-ci';
+@@ -261,11 +262,17 @@
+     }
+     resized = () => {
+         const currentWidth = getWindowSize(this.options.stdout).columns;
+-        if (currentWidth < this.lastTerminalWidth) {
+-            // We clear the screen when decreasing terminal width to prevent duplicate overlapping re-renders.
+-            this.log.clear();
++        if (currentWidth < this.lastTerminalWidth && this.lastOutputToRender) {
++            let termRows = 0;
++            for (const line of this.lastOutputToRender.split('\n')) {
++                const w = stringWidth(line);
++                termRows += w === 0 ? 1 : Math.ceil(w / currentWidth);
++            }
++            this.options.stdout.write(ansiEscapes.eraseLines(termRows));
++            this.log.reset();
+             this.lastOutput = '';
+             this.lastOutputToRender = '';
++            this.lastOutputHeight = 0;
+         }
+         this.calculateLayout();
+         this.onRender();
+diff --git a/build/output.js b/build/output.js
+--- a/build/output.js
++++ b/build/output.js
+@@ -169,6 +169,7 @@
+                         currentLine[offsetX - 1] = spaceCell;
+                     }
+                     for (const character of characters) {
++                        if (offsetX >= this.width) break;
+                         currentLine[offsetX] = character;
+                         // Determine printed width using string-width to align with measurement
+                         const characterWidth = Math.max(1, this.caches.getStringWidth(character.value));

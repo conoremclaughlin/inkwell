@@ -1907,7 +1907,7 @@ __metadata:
     "@types/react": "npm:^19.2.14"
     chalk: "npm:^5.3.0"
     commander: "npm:^12.1.0"
-    ink: "npm:^7.0.3"
+    ink: "patch:ink@npm%3A7.0.3#~/.yarn/patches/ink-npm-7.0.3-483407853e.patch"
     ora: "npm:^8.0.1"
     react: "npm:^19.2.4"
     semver: "npm:^7.7.4"
@@ -9367,7 +9367,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"ink@npm:^7.0.3":
+"ink@npm:7.0.3":
   version: 7.0.3
   resolution: "ink@npm:7.0.3"
   dependencies:
@@ -9406,6 +9406,48 @@ __metadata:
     react-devtools-core:
       optional: true
   checksum: 10/a92ab845eca896690074831a73b41c95143e4f365cf1b1c0ce0d3aebcbf78c63402795aed73237dbc6757e0d5a67761f6de991bda5dd0e58bb9a0ba03f9f0446
+  languageName: node
+  linkType: hard
+
+"ink@patch:ink@npm%3A7.0.3#~/.yarn/patches/ink-npm-7.0.3-483407853e.patch":
+  version: 7.0.3
+  resolution: "ink@patch:ink@npm%3A7.0.3#~/.yarn/patches/ink-npm-7.0.3-483407853e.patch::version=7.0.3&hash=4d44e2"
+  dependencies:
+    "@alcalzone/ansi-tokenize": "npm:^0.3.0"
+    ansi-escapes: "npm:^7.3.0"
+    ansi-styles: "npm:^6.2.3"
+    auto-bind: "npm:^5.0.1"
+    chalk: "npm:^5.6.2"
+    cli-boxes: "npm:^4.0.1"
+    cli-cursor: "npm:^4.0.0"
+    cli-truncate: "npm:^6.0.0"
+    code-excerpt: "npm:^4.0.0"
+    es-toolkit: "npm:^1.45.1"
+    indent-string: "npm:^5.0.0"
+    is-in-ci: "npm:^2.0.0"
+    patch-console: "npm:^2.0.0"
+    react-reconciler: "npm:^0.33.0"
+    scheduler: "npm:^0.27.0"
+    signal-exit: "npm:^3.0.7"
+    slice-ansi: "npm:^9.0.0"
+    stack-utils: "npm:^2.0.6"
+    string-width: "npm:^8.2.0"
+    terminal-size: "npm:^4.0.1"
+    type-fest: "npm:^5.5.0"
+    widest-line: "npm:^6.0.0"
+    wrap-ansi: "npm:^10.0.0"
+    ws: "npm:^8.20.0"
+    yoga-layout: "npm:~3.2.1"
+  peerDependencies:
+    "@types/react": ">=19.2.0"
+    react: ">=19.2.0"
+    react-devtools-core: ">=6.1.2"
+  peerDependenciesMeta:
+    "@types/react":
+      optional: true
+    react-devtools-core:
+      optional: true
+  checksum: 10/13cfeb5becdedec0cb22c78645aeb9a7d4fa84aef2cca56db83f1270bf183522d4daf0ea027560f05d39bc72b903063a0d17d0c04735969013aa2a85cf7f34d6
   languageName: node
   linkType: hard
 
