@@ -1,9 +1,6 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
-import { Box, Static, Text, useApp, useStdout } from 'ink';
-import { StatusBar } from './StatusBar.js';
-import { InfoBar } from './InfoBar.js';
-import { PromptInput } from './PromptInput.js';
-import { Separator } from './Separator.js';
+import { Box, Static, Text, useApp } from 'ink';
+import { Dock } from './Dock.js';
 import { MessageLine, type MessageLineProps } from './MessageLine.js';
 import { formatNow } from '../tui-components.js';
 
@@ -47,6 +44,7 @@ export interface ChatAppHandle {
   setStatusSummary: (summary: string) => void;
   setWaiting: (waiting: boolean, backend?: string) => void;
   setInfoItems: (items: string[]) => void;
+  setAbortHandler: (handler: (() => void) | null) => void;
 }
 
 /**
@@ -68,7 +66,8 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
   const [ctrlCCount, setCtrlCCount] = useState(0);
   const [ctrlCTimer, setCtrlCTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
 
-  const { stdout } = useStdout();
+  // Abort handler — set by orchestrator when a backend turn is running
+  const abortHandlerRef = useRef<(() => void) | null>(null);
 
   // Waiting indicator state — verb rotates every 3s
   const [waitingVerb, setWaitingVerb] = useState('');
@@ -102,6 +101,9 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
     setInfoItems: (items: string[]) => {
       setInfoItems(items);
     },
+    setAbortHandler: (handler: (() => void) | null) => {
+      abortHandlerRef.current = handler;
+    },
   }));
 
   const handleSubmit = useCallback(
@@ -110,6 +112,13 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
     },
     [onUserInput]
   );
+
+  const handleAbort = useCallback(() => {
+    if (abortHandlerRef.current) {
+      abortHandlerRef.current();
+      abortHandlerRef.current = null;
+    }
+  }, []);
 
   // Handle Ctrl+C for double-tap exit
   useEffect(() => {
@@ -149,20 +158,23 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
         )}
       </Static>
 
-      {/* Dynamic tail: waiting indicator + dock */}
-      {waiting && (
-        <Box paddingX={1}>
-          <Text color="cyan">{SPINNER_CHAR + ' '}</Text>
-          <Text dimColor>{waitingVerb}...</Text>
-        </Box>
-      )}
-
-      <Separator />
-      <StatusBar summary={statusSummary} time={now} />
-      <Separator />
-      <PromptInput label={promptLabel} onSubmit={handleSubmit} isActive={!waiting} />
-      <Separator />
-      <InfoBar items={infoItems} />
+      <Dock
+        statusSummary={statusSummary}
+        time={now}
+        infoItems={infoItems}
+        promptLabel={promptLabel}
+        onSubmit={handleSubmit}
+        isPromptActive={!waiting}
+        onAbort={handleAbort}
+        waitingElement={
+          waiting ? (
+            <Box paddingX={1}>
+              <Text color="cyan">{SPINNER_CHAR + ' '}</Text>
+              <Text dimColor>{waitingVerb}...</Text>
+            </Box>
+          ) : undefined
+        }
+      />
     </Box>
   );
 });

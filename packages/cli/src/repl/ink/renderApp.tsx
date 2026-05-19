@@ -54,6 +54,8 @@ export interface InkRepl {
   setWaiting: (waiting: boolean, backend?: string) => void;
   /** Update the info bar items. */
   setInfoItems: (items: string[]) => void;
+  /** Register an abort handler for the current backend turn. */
+  setAbortHandler: (handler: (() => void) | null) => void;
   /** Signal exit from the orchestrator side (makes waitForInput reject). */
   requestExit: () => void;
   /** Unmount the Ink app and restore terminal. */
@@ -170,6 +172,10 @@ export function renderInkChat(options: {
 
     setInfoItems: (items) => {
       getHandle().setInfoItems(items);
+    },
+
+    setAbortHandler: (handler) => {
+      getHandle().setAbortHandler(handler);
     },
 
     requestExit: () => {

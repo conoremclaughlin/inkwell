@@ -26,7 +26,7 @@ import {
   runBackendInteractiveLogin,
   type BackendAuthBackend,
 } from '../lib/backend-auth.js';
-import { runBackendTurn } from '../repl/backend-runner.js';
+import { startBackendTurn, runBackendTurn } from '../repl/backend-runner.js';
 import { ContextLedger, estimateTokens } from '../repl/context-ledger.js';
 import { parseSlashCommand } from '../repl/slash.js';
 import { ToolMode, ToolPolicyScopeKind, ToolPolicyState } from '../repl/tool-policy.js';
@@ -1997,7 +1997,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
   } catch {
     /* not a git repo */
   }
-  const initialInfoItems = ['/help', 'ctrl+c ×2 quit', shortCwd, gitBranch].filter(Boolean);
+  const initialInfoItems = ['/help', 'esc cancel', 'ctrl+c ×2 quit', shortCwd, gitBranch].filter(
+    Boolean
+  );
   statusLane.setInfoItems(initialInfoItems);
 
   // Ink renderer — created lazily after the banner section has printed
@@ -2818,6 +2820,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
         });
     let turnDurationSeconds = 0;
     let turnCtrlCAt = 0;
+    let currentTurnAbort: (() => void) | null = null;
+
+    const abortCurrentTurn = () => {
+      if (currentTurnAbort) {
+        currentTurnAbort();
+        currentTurnAbort = null;
+        inkRepl?.setAbortHandler(null);
+      }
+    };
+
     const onSigintDuringTurn = () => {
       const now = Date.now();
       if (turnCtrlCAt > 0 && now - turnCtrlCAt <= CTRL_C_EXIT_WINDOW_MS) {
@@ -2830,18 +2842,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
         return;
       }
       turnCtrlCAt = now;
+      abortCurrentTurn();
       if (inkRepl) {
-        inkRepl.printSystem(
-          'Backend turn in progress. Press Ctrl+C again to exit after this turn.'
-        );
+        inkRepl.printSystem('Cancelling turn...');
       } else {
-        statusLane.renderHint(
-          'Backend turn in progress. Press Ctrl+C again to exit after this turn.'
-        );
+        statusLane.renderHint('Cancelling turn...');
       }
     };
+
     process.on('SIGINT', onSigintDuringTurn);
-    let runResult = await runBackendTurn({
+    const turn = startBackendTurn({
       backend: runtime.backend,
       agentId,
       model: runtime.model,
@@ -2849,7 +2859,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
       verbose: runtime.verbose,
       passthroughArgs,
       timeoutMs: runtime.backendTurnTimeoutMs,
-    }).finally(() => {
+    });
+    currentTurnAbort = turn.abort;
+    inkRepl?.setAbortHandler(abortCurrentTurn);
+
+    let runResult = await turn.result.finally(() => {
+      currentTurnAbort = null;
+      inkRepl?.setAbortHandler(null);
       process.off('SIGINT', onSigintDuringTurn);
       turnDurationSeconds = Math.max(0, Math.round((Date.now() - turnStartedAt) / 1000));
       stopWaiting();
@@ -3168,7 +3184,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             renderAbovePrompt: true,
           });
 
-      runResult = await runBackendTurn({
+      const contTurn = startBackendTurn({
         backend: runtime.backend,
         agentId,
         model: runtime.model,
@@ -3176,7 +3192,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
         verbose: runtime.verbose,
         passthroughArgs,
         timeoutMs: runtime.backendTurnTimeoutMs,
-      }).finally(() => {
+      });
+      currentTurnAbort = contTurn.abort;
+      inkRepl?.setAbortHandler(abortCurrentTurn);
+
+      runResult = await contTurn.result.finally(() => {
+        currentTurnAbort = null;
+        inkRepl?.setAbortHandler(null);
         stopContinuation();
       });
 
