@@ -3733,22 +3733,20 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }
           break;
         case 'refresh': {
-          console.log(chalk.dim('Refreshing identity context from Inkwell...'));
+          showInPanel(['Refreshing identity context from Inkwell...']);
           const refreshResult = (await pcp
             .callTool('bootstrap', { agentId })
             .catch((error) => ({ error: String(error) }))) as Record<string, unknown>;
           if (refreshResult.error) {
-            console.log(chalk.yellow(`Refresh failed: ${String(refreshResult.error)}`));
+            showInPanel([`Refresh failed: ${String(refreshResult.error)}`]);
           } else {
             const ctx = formatBootstrapContext(refreshResult, agentId);
             if (ctx) {
               runtime.bootstrapContext = ctx;
               const ctxTokens = estimateTokens(ctx);
-              console.log(
-                chalk.green(`Identity context refreshed: ~${ctxTokens.toLocaleString()} tokens`)
-              );
+              showInPanel([`Identity context refreshed: ~${ctxTokens.toLocaleString()} tokens`]);
             } else {
-              console.log(chalk.yellow('Bootstrap returned no identity context.'));
+              showInPanel(['Bootstrap returned no identity context.']);
             }
           }
           break;
@@ -3757,10 +3755,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const mode = slash.args[0];
           if (mode === 'off') {
             runtime.eventPolling = false;
-            console.log(chalk.yellow('Activity polling disabled.'));
+            showInPanel(['Activity polling disabled.']);
           } else if (mode === 'on') {
             runtime.eventPolling = true;
-            console.log(chalk.green('Activity polling enabled.'));
+            showInPanel(['Activity polling enabled.']);
           } else {
             await pollActivity(true);
           }
@@ -3774,95 +3772,81 @@ export async function runChat(options: ChatOptions): Promise<void> {
             const sessionStudio = attachedSessionSummary
               ? sessionStudioLabel(attachedSessionSummary, 'full')
               : sessionStudioLabel({ studioId: runtime.studioId }, 'full');
-            console.log(
-              chalk.dim(
-                `session=${runtime.sessionId || 'none'} backend=${runtime.backend} model=${
-                  runtime.model || '(default)'
-                } routing=${runtime.toolRouting} thread=${runtime.threadKey || '(none)'} studio=${sessionStudio} events=${
-                  runtime.eventPolling ? 'on' : 'off'
-                } autorun=${
-                  runtime.autoRunInbox ? 'on' : 'off'
-                } ui=${runtime.uiMode} budget=${formatTokenCount(
-                  runtime.maxContextTokens
-                )} window=${formatTokenCount(
-                  runtime.backendTokenWindow
-                )} budgetMode=${contextBudgetAuto ? 'auto' : 'manual'} tools=${toolPolicy.getMode()} scope=${toolPolicy.getMutationScopeLabel()} visibility=${toolPolicy.getSessionVisibility()} history=${sessionHistoryLabel(
-                  transcriptMeta
-                )}`
-              )
-            );
+            showInPanel([
+              `session=${runtime.sessionId || 'none'}`,
+              `backend=${runtime.backend} model=${runtime.model || '(default)'}`,
+              `routing=${runtime.toolRouting} thread=${runtime.threadKey || '(none)'}`,
+              `studio=${sessionStudio}`,
+              `events=${runtime.eventPolling ? 'on' : 'off'} autorun=${runtime.autoRunInbox ? 'on' : 'off'}`,
+              `ui=${runtime.uiMode} budget=${formatTokenCount(runtime.maxContextTokens)} window=${formatTokenCount(runtime.backendTokenWindow)}`,
+              `budgetMode=${contextBudgetAuto ? 'auto' : 'manual'} tools=${toolPolicy.getMode()}`,
+              `scope=${toolPolicy.getMutationScopeLabel()} visibility=${toolPolicy.getSessionVisibility()}`,
+              `history=${sessionHistoryLabel(transcriptMeta)}`,
+            ]);
           }
           break;
         case 'autorun':
         case 'auto-run': {
           const mode = (slash.args[0] || '').toLowerCase();
           if (!mode) {
-            console.log(chalk.dim(`Inbox auto-run is ${runtime.autoRunInbox ? 'on' : 'off'}.`));
+            showInPanel([`Inbox auto-run is ${runtime.autoRunInbox ? 'on' : 'off'}.`]);
             break;
           }
           if (!['on', 'off'].includes(mode)) {
-            console.log(chalk.yellow('Usage: /autorun [on|off]'));
+            showInPanel(['Usage: /autorun [on|off]']);
             break;
           }
           runtime.autoRunInbox = mode === 'on';
-          console.log(
-            chalk.green(`Inbox auto-run ${runtime.autoRunInbox ? 'enabled' : 'disabled'}.`)
-          );
+          showInPanel([`Inbox auto-run ${runtime.autoRunInbox ? 'enabled' : 'disabled'}.`]);
           break;
         }
         case 'away': {
           const mode = (slash.args[0] || '').toLowerCase();
           if (!mode) {
-            console.log(chalk.dim(`Away mode is ${runtime.awayMode ? 'on' : 'off'}.`));
+            const awayLines = [`Away mode is ${runtime.awayMode ? 'on' : 'off'}.`];
             if (approvalManager.size > 0) {
-              console.log(chalk.dim(`  ${approvalManager.size} pending approval request(s)`));
+              awayLines.push(`  ${approvalManager.size} pending approval request(s)`);
             }
+            showInPanel(awayLines);
             break;
           }
           if (!['on', 'off'].includes(mode)) {
-            console.log(chalk.yellow('Usage: /away [on|off]'));
+            showInPanel(['Usage: /away [on|off]']);
             break;
           }
           runtime.awayMode = mode === 'on';
           if (runtime.awayMode) {
-            console.log(
-              chalk.green(
-                'Away mode enabled — tool approvals will be sent to your inbox for remote approval.'
-              )
-            );
+            showInPanel(['Away mode enabled — approvals sent to inbox for remote approval.']);
           } else {
-            console.log(chalk.green('Away mode disabled — tool approvals will prompt locally.'));
+            const awayOffLines = ['Away mode disabled — tool approvals will prompt locally.'];
             if (approvalManager.size > 0) {
               approvalManager.cancelAll();
-              console.log(chalk.dim('Cancelled pending remote approval requests.'));
+              awayOffLines.push('Cancelled pending remote approval requests.');
             }
+            showInPanel(awayOffLines);
           }
           break;
         }
         case 'tool-routing': {
           const mode = (slash.args[0] || '').toLowerCase();
           if (!mode) {
-            console.log(chalk.dim(`Tool routing is ${runtime.toolRouting}.`));
+            showInPanel([`Tool routing is ${runtime.toolRouting}.`]);
             break;
           }
           if (!['backend', 'local'].includes(mode)) {
-            console.log(chalk.yellow('Usage: /tool-routing [backend|local]'));
+            showInPanel(['Usage: /tool-routing [backend|local]']);
             break;
           }
           runtime.toolRouting = mode as 'backend' | 'local';
           saveRuntimePreferences(process.cwd(), { toolRouting: runtime.toolRouting });
-          console.log(chalk.green(`Tool routing set to ${runtime.toolRouting}. (auto-saved)`));
+          const routingLines = [`Tool routing set to ${runtime.toolRouting}. (auto-saved)`];
           if (runtime.toolRouting === 'local') {
-            console.log(
-              chalk.dim(
-                'Local routing active: backend-native tools disabled; use ink-tool blocks for local execution.'
-              )
-            );
+            routingLines.push('Local routing: backend tools disabled; use ink-tool blocks.');
           }
+          showInPanel(routingLines);
           break;
         }
         case 'save-config': {
-          // Most preferences auto-persist on change, but /save-config captures the full snapshot
           const prefs: RuntimePreferences = {
             toolRouting: runtime.toolRouting,
             strictTools: runtime.strictTools,
@@ -3870,14 +3854,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
           };
           const saved = saveRuntimePreferences(process.cwd(), prefs);
           if (saved) {
-            console.log(chalk.green('All runtime preferences saved to .ink/identity.json:'));
-            console.log(chalk.dim(`  toolRouting: ${prefs.toolRouting}`));
-            console.log(chalk.dim(`  strictTools: ${prefs.strictTools}`));
+            const configLines = [
+              'Runtime preferences saved to .ink/identity.json:',
+              `  toolRouting: ${prefs.toolRouting}`,
+              `  strictTools: ${prefs.strictTools}`,
+            ];
             if (prefs.approvalMode) {
-              console.log(chalk.dim(`  approvalMode: ${prefs.approvalMode}`));
+              configLines.push(`  approvalMode: ${prefs.approvalMode}`);
             }
+            showInPanel(configLines);
           } else {
-            console.log(chalk.yellow('Failed to save runtime preferences.'));
+            showInPanel(['Failed to save runtime preferences.']);
           }
           break;
         }
@@ -3905,10 +3892,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const mode = slash.args[0];
           if (mode === 'watch') {
             runtime.showSessionsWatch = true;
-            console.log(chalk.green('Session watch enabled.'));
+            showInPanel(['Session watch enabled.']);
           } else if (mode === 'off') {
             runtime.showSessionsWatch = false;
-            console.log(chalk.green('Session watch disabled.'));
+            showInPanel(['Session watch disabled.']);
           } else {
             const snapshot = await refreshSessionsSnapshot(true);
             printSessionsSnapshot(snapshot, { timezone: runtime.userTimezone });
@@ -3918,7 +3905,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         case 'backend': {
           const next = slash.args[0];
           if (!next || !['claude', 'codex', 'gemini'].includes(next)) {
-            console.log(chalk.yellow('Usage: /backend <claude|codex|gemini>'));
+            showInPanel(['Usage: /backend <claude|codex|gemini>']);
             break;
           }
           runtime.backend = next;
@@ -3926,14 +3913,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
           if (contextBudgetAuto) {
             runtime.maxContextTokens = runtime.backendTokenWindow;
           }
-          console.log(chalk.green(`Switched backend to ${next}`));
+          const backendLines = [`Switched backend to ${next}`];
           if (contextBudgetAuto) {
-            console.log(
-              chalk.dim(
-                `Context budget auto-updated to backend window (${formatTokenCount(runtime.maxContextTokens)} tok).`
-              )
+            backendLines.push(
+              `Context budget auto-updated (${formatTokenCount(runtime.maxContextTokens)} tok).`
             );
           }
+          showInPanel(backendLines);
           break;
         }
         case 'model': {
@@ -3943,98 +3929,92 @@ export async function runChat(options: ChatOptions): Promise<void> {
           if (contextBudgetAuto) {
             runtime.maxContextTokens = runtime.backendTokenWindow;
           }
-          console.log(chalk.green(`Model override: ${runtime.model || '(backend default)'}`));
-          console.log(
-            chalk.dim(
-              `Backend window: ${formatTokenCount(runtime.backendTokenWindow)} tok (policy default).`
-            )
-          );
+          showInPanel([
+            `Model override: ${runtime.model || '(backend default)'}`,
+            `Backend window: ${formatTokenCount(runtime.backendTokenWindow)} tok`,
+          ]);
           break;
         }
         case 'tools': {
           const next = slash.args[0];
           if (!next) {
             const grants = toolPolicy.listGrants();
-            console.log(chalk.dim(`Tool mode: ${toolPolicy.getMode()}`));
-            console.log(chalk.dim(`Mutation scope: ${toolPolicy.getMutationScopeLabel()}`));
-            console.log(chalk.dim(`Session visibility: ${toolPolicy.getSessionVisibility()}`));
+            const toolsLines = [
+              `Tool mode: ${toolPolicy.getMode()}`,
+              `Mutation scope: ${toolPolicy.getMutationScopeLabel()}`,
+              `Session visibility: ${toolPolicy.getSessionVisibility()}`,
+            ];
             if (grants.length > 0) {
-              console.log(
-                chalk.dim(`Grants: ${grants.map((g) => `${g.tool}(${g.uses})`).join(', ')}`)
-              );
+              toolsLines.push(`Grants: ${grants.map((g) => `${g.tool}(${g.uses})`).join(', ')}`);
             }
             const sessionGrants = toolPolicy.listSessionGrants(runtime.sessionId);
             if (sessionGrants.length > 0) {
-              console.log(
-                chalk.dim(
-                  `Session grants: ${sessionGrants.map((g) => `${g.tool}(${g.uses})`).join(', ')}`
-                )
+              toolsLines.push(
+                `Session grants: ${sessionGrants.map((g) => `${g.tool}(${g.uses})`).join(', ')}`
               );
             }
+            showInPanel(toolsLines);
             break;
           }
           if (next !== 'backend' && next !== 'off' && next !== 'privileged') {
-            console.log(chalk.yellow('Usage: /tools <backend|off|privileged>'));
+            showInPanel(['Usage: /tools <backend|off|privileged>']);
             break;
           }
           toolPolicy.setMode(next);
           runtime.toolMode = toolPolicy.getMode();
-          console.log(
-            chalk.green(`Tool mode set in ${toolPolicy.getMutationScopeLabel()} to ${next}.`)
-          );
+          const toolsModeLines = [
+            `Tool mode set in ${toolPolicy.getMutationScopeLabel()} to ${next}.`,
+          ];
           if (runtime.toolMode !== next) {
-            console.log(
-              chalk.yellow(`Effective mode remains ${runtime.toolMode} due stricter active scope.`)
+            toolsModeLines.push(
+              `Effective mode remains ${runtime.toolMode} due stricter active scope.`
             );
           }
+          showInPanel(toolsModeLines);
           break;
         }
         case 'grant': {
           const tool = slash.args[0];
           if (!tool) {
-            console.log(chalk.yellow('Usage: /grant <tool> [uses]'));
+            showInPanel(['Usage: /grant <tool> [uses]']);
             break;
           }
           const uses = Number.parseInt(slash.args[1] || '1', 10);
           toolPolicy.grantTool(tool, Number.isNaN(uses) ? 1 : uses);
-          console.log(chalk.green(`Granted ${tool} for ${Number.isNaN(uses) ? 1 : uses} use(s).`));
+          showInPanel([`Granted ${tool} for ${Number.isNaN(uses) ? 1 : uses} use(s).`]);
           break;
         }
         case 'allow': {
           const tool = slash.args[0];
           if (!tool) {
-            console.log(chalk.yellow('Usage: /allow <tool>'));
+            showInPanel(['Usage: /allow <tool>']);
             break;
           }
           toolPolicy.allowTool(tool);
-          console.log(chalk.green(`Persistently allowed ${tool}`));
+          showInPanel([`Persistently allowed ${tool}`]);
           break;
         }
         case 'grant-session': {
           const tool = slash.args[0];
           if (!tool) {
-            console.log(chalk.yellow('Usage: /grant-session <tool>'));
+            showInPanel(['Usage: /grant-session <tool>']);
             break;
           }
           if (!runtime.sessionId) {
-            console.log(chalk.yellow('No Inkwell session id available.'));
+            showInPanel(['No Inkwell session id available.']);
             break;
           }
           toolPolicy.grantToolForSession(runtime.sessionId, tool);
-          console.log(chalk.green(`Granted ${tool} for this Inkwell session.`));
+          showInPanel([`Granted ${tool} for this Inkwell session.`]);
           break;
         }
         case 'grant-remote': {
-          // /grant-remote <agent> <toolSpec> [scope]
-          // Send a permission grant to another SB via inbox
           const targetAgent = slash.args[0];
           const toolSpec = slash.args[1];
           if (!targetAgent || !toolSpec) {
-            console.log(
-              chalk.yellow(
-                'Usage: /grant-remote <agent> <toolSpec> [once|session|always|deny|revoke]'
-              )
-            );
+            showInPanel([
+              'Usage: /grant-remote <agent> <toolSpec> [once|session|always|deny|revoke]',
+            ]);
             break;
           }
           const scopeArg = (slash.args[2] || 'session').toLowerCase();
@@ -4047,9 +4027,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           };
           const action = actionMap[scopeArg];
           if (!action) {
-            console.log(
-              chalk.yellow(`Unknown scope: ${scopeArg}. Use: once, session, always, deny, revoke`)
-            );
+            showInPanel([`Unknown scope: ${scopeArg}. Use: once, session, always, deny, revoke`]);
             break;
           }
           const grantResult = await pcp
@@ -4066,58 +4044,56 @@ export async function runChat(options: ChatOptions): Promise<void> {
               }),
             })
             .catch((err: unknown) => {
-              console.log(
-                chalk.red(
-                  `Failed to send grant: ${err instanceof Error ? err.message : String(err)}`
-                )
-              );
+              showInPanel([
+                `Failed to send grant: ${err instanceof Error ? err.message : String(err)}`,
+              ]);
               return null;
             });
           if (grantResult) {
-            console.log(chalk.green(`Sent ${action} for ${toolSpec} to ${targetAgent}.`));
+            showInPanel([`Sent ${action} for ${toolSpec} to ${targetAgent}.`]);
           }
           break;
         }
         case 'deny': {
           const tool = slash.args[0];
           if (!tool) {
-            console.log(chalk.yellow('Usage: /deny <tool>'));
+            showInPanel(['Usage: /deny <tool>']);
             break;
           }
           toolPolicy.denyTool(tool);
-          console.log(chalk.green(`Persistently denied ${tool}`));
+          showInPanel([`Persistently denied ${tool}`]);
           break;
         }
         case 'prompt': {
           const tool = slash.args[0];
           if (!tool) {
-            console.log(chalk.yellow('Usage: /prompt <tool>'));
+            showInPanel(['Usage: /prompt <tool>']);
             break;
           }
           toolPolicy.addPromptTool(tool);
-          console.log(chalk.green(`Tool ${tool} now requires per-call approval`));
+          showInPanel([`Tool ${tool} now requires per-call approval`]);
           break;
         }
         case 'policy-scope': {
           const scopeRaw = (slash.args[0] || '').trim().toLowerCase();
           if (!scopeRaw) {
-            console.log(chalk.dim(`Mutation scope: ${toolPolicy.getMutationScopeLabel()}`));
-            console.log(
-              chalk.dim(`Active scopes: ${toolPolicy.listActiveScopeLabels().join(' -> ')}`)
-            );
+            showInPanel([
+              `Mutation scope: ${toolPolicy.getMutationScopeLabel()}`,
+              `Active scopes: ${toolPolicy.listActiveScopeLabels().join(' -> ')}`,
+            ]);
             break;
           }
           if (!['global', 'workspace', 'agent', 'studio'].includes(scopeRaw)) {
-            console.log(chalk.yellow('Usage: /policy-scope [global|workspace|agent|studio] [id]'));
+            showInPanel(['Usage: /policy-scope [global|workspace|agent|studio] [id]']);
             break;
           }
           const id = slash.args.slice(1).join(' ').trim() || undefined;
           const result = toolPolicy.setMutationScope(scopeRaw as ToolPolicyScopeKind, id);
           if (!result.success) {
-            console.log(chalk.yellow(result.message));
+            showInPanel([result.message]);
           } else {
             runtime.toolMode = toolPolicy.getMode();
-            console.log(chalk.green(result.message));
+            showInPanel([result.message]);
           }
           break;
         }
@@ -4131,37 +4107,36 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 } as const)
               : undefined;
           if (scopeRaw && !explicitScope) {
-            console.log(chalk.yellow('Usage: /policy-reset [global|workspace|agent|studio] [id]'));
+            showInPanel(['Usage: /policy-reset [global|workspace|agent|studio] [id]']);
             break;
           }
           const result = toolPolicy.clearScopeRules(explicitScope);
           if (!result.success) {
-            console.log(chalk.yellow(result.message));
+            showInPanel([result.message]);
             break;
           }
           runtime.toolMode = toolPolicy.getMode();
-          console.log(chalk.green(result.message));
+          showInPanel([result.message]);
           break;
         }
         case 'profile': {
           const profileArg = (slash.args[0] || '').trim().toLowerCase();
           if (!profileArg) {
-            console.log(chalk.bold('Tool Profiles'));
-            console.log(formatProfileList());
-            console.log(chalk.dim('\nUsage: /profile <minimal|safe|collaborative|full>'));
+            showInPanel([
+              'Tool Profiles',
+              formatProfileList(),
+              'Usage: /profile <minimal|safe|collaborative|full>',
+            ]);
             break;
           }
           if (!isValidProfileId(profileArg)) {
-            console.log(chalk.yellow(`Unknown profile: ${profileArg}`));
-            console.log(formatProfileList());
+            showInPanel([`Unknown profile: ${profileArg}`, formatProfileList()]);
             break;
           }
           const profileResult = applyProfile(toolPolicy, profileArg);
+          showInPanel([profileResult.message]);
           if (profileResult.success) {
             runtime.toolMode = toolPolicy.getMode();
-            console.log(chalk.green(profileResult.message));
-          } else {
-            console.log(chalk.yellow(profileResult.message));
           }
           break;
         }
@@ -4188,7 +4163,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           if (sub === 'call') {
             const tool = slash.args[1];
             if (!tool) {
-              console.log(chalk.yellow('Usage: /mcp call <tool> [jsonArgs]'));
+              showInPanel(['Usage: /mcp call <tool> [jsonArgs]']);
               break;
             }
             let pcpArgs: Record<string, unknown> = {};
@@ -4197,11 +4172,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
               try {
                 pcpArgs = JSON.parse(rawArgs) as Record<string, unknown>;
               } catch {
-                console.log(
-                  chalk.yellow(
-                    'Invalid JSON args. Example: /mcp call get_inbox {"agentId":"lumen"}'
-                  )
-                );
+                showInPanel([
+                  'Invalid JSON args. Example: /mcp call get_inbox {"agentId":"lumen"}',
+                ]);
                 break;
               }
             }
@@ -4221,7 +4194,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 ),
             });
             if (!approved) {
-              console.log(chalk.yellow(`Skipped ${tool}`));
+              showInPanel([`Skipped ${tool}`]);
               break;
             }
             const result = await pcp
@@ -4235,10 +4208,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
               args: pcpArgs,
               result,
             });
-            console.log(rendered);
+            showInPanel(rendered.split('\n'));
             break;
           }
-          console.log(chalk.yellow('Usage: /mcp [servers|list|call <tool> [jsonArgs]]'));
+          showInPanel(['Usage: /mcp [servers|list|call <tool> [jsonArgs]]']);
           break;
         }
         case 'mcp-servers': {
@@ -4306,7 +4279,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         case 'pcp': {
           const tool = slash.args[0];
           if (!tool) {
-            console.log(chalk.yellow('Usage: /ink <tool> [jsonArgs]'));
+            showInPanel(['Usage: /ink <tool> [jsonArgs]']);
             break;
           }
           let pcpArgs: Record<string, unknown> = {};
@@ -4315,9 +4288,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             try {
               pcpArgs = JSON.parse(rawArgs) as Record<string, unknown>;
             } catch {
-              console.log(
-                chalk.yellow('Invalid JSON args. Example: /pcp get_inbox {"agentId":"lumen"}')
-              );
+              showInPanel(['Invalid JSON args. Example: /pcp get_inbox {"agentId":"lumen"}']);
               break;
             }
           }
@@ -4337,7 +4308,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               ),
           });
           if (!approved) {
-            console.log(chalk.yellow(`Skipped ${tool}`));
+            showInPanel([`Skipped ${tool}`]);
             break;
           }
           const result = await pcp
@@ -4351,127 +4322,118 @@ export async function runChat(options: ChatOptions): Promise<void> {
             args: pcpArgs,
             result,
           });
-          console.log(rendered);
+          showInPanel(rendered.split('\n'));
           break;
         }
         case 'skills': {
           const skills = discoverSkills(process.cwd());
           if (skills.length === 0) {
-            console.log(chalk.dim('No local skills discovered.'));
+            showInPanel(['No local skills discovered.']);
             break;
           }
           const filtered = filterSkillsByPolicy(skills, toolPolicy);
           const visible = filtered.visible;
-          const blockedByPolicy = filtered.blockedBySkill.length;
-          const blockedByPath = filtered.blockedByPath.length;
-          const blockedByTrust = filtered.blockedByTrust.length;
-          console.log(chalk.bold(`Discovered skills (${skills.length})`));
+          const skillLines = [`Discovered skills (${skills.length})`];
           for (const skill of visible.slice(0, 80)) {
             const active = runtime.activeSkills.some((entry) => entry.path === skill.path)
               ? ' *active*'
               : '';
-            const trust =
-              skill.trustLevel === 'trusted' ? chalk.green(skill.trustLevel) : skill.trustLevel;
+            const trust = skill.trustLevel;
             const provenance = skill.provenance?.registry
               ? ` registry:${skill.provenance.registry}`
               : '';
-            console.log(
-              chalk.dim(`- ${skill.name} [${skill.source}] trust=${trust}${provenance}${active}`)
+            skillLines.push(
+              `  ${skill.name} [${skill.source}] trust=${trust}${provenance}${active}`
             );
           }
           if (visible.length > 80) {
-            console.log(chalk.dim(`... and ${visible.length - 80} more visible skills`));
+            skillLines.push(`  ... and ${visible.length - 80} more`);
           }
-          if (blockedByPolicy > 0) {
-            console.log(chalk.yellow(`${blockedByPolicy} skills hidden by skill allowlist policy`));
+          if (filtered.blockedBySkill.length > 0) {
+            skillLines.push(`${filtered.blockedBySkill.length} hidden by skill allowlist`);
           }
-          if (blockedByPath > 0) {
-            console.log(
-              chalk.yellow(`${blockedByPath} skills hidden by read-path allowlist policy`)
-            );
+          if (filtered.blockedByPath.length > 0) {
+            skillLines.push(`${filtered.blockedByPath.length} hidden by read-path allowlist`);
           }
-          if (blockedByTrust > 0) {
-            console.log(chalk.yellow(`${blockedByTrust} skills hidden by trust policy mode`));
+          if (filtered.blockedByTrust.length > 0) {
+            skillLines.push(`${filtered.blockedByTrust.length} hidden by trust policy`);
           }
+          showInPanel(skillLines);
           break;
         }
         case 'skill-trust': {
           const mode = (slash.args[0] || '').trim();
           if (!mode || !['all', 'trusted-only'].includes(mode)) {
-            console.log(chalk.yellow('Usage: /skill-trust <all|trusted-only>'));
+            showInPanel(['Usage: /skill-trust <all|trusted-only>']);
             break;
           }
           toolPolicy.setSkillTrustMode(mode as 'all' | 'trusted-only');
-          console.log(chalk.green(`Skill trust mode set to ${mode}`));
+          showInPanel([`Skill trust mode set to ${mode}`]);
           break;
         }
         case 'session-visibility': {
           const value = (slash.args[0] || '').trim().toLowerCase();
           if (!value) {
-            console.log(chalk.dim(`Session visibility is ${toolPolicy.getSessionVisibility()}.`));
+            showInPanel([`Session visibility is ${toolPolicy.getSessionVisibility()}.`]);
             break;
           }
           if (!['self', 'thread', 'studio', 'workspace', 'agent', 'all'].includes(value)) {
-            console.log(
-              chalk.yellow('Usage: /session-visibility <self|thread|studio|workspace|agent|all>')
-            );
+            showInPanel(['Usage: /session-visibility <self|thread|studio|workspace|agent|all>']);
             break;
           }
           toolPolicy.setSessionVisibility(
             value as 'self' | 'thread' | 'studio' | 'workspace' | 'agent' | 'all'
           );
-          console.log(
-            chalk.green(
-              `Session visibility set in ${toolPolicy.getMutationScopeLabel()} to ${value}.`
-            )
-          );
+          showInPanel([
+            `Session visibility set in ${toolPolicy.getMutationScopeLabel()} to ${value}.`,
+          ]);
           break;
         }
         case 'skill-allow': {
           const skill = slash.args.join(' ').trim();
           if (!skill) {
-            console.log(chalk.yellow('Usage: /skill-allow <name>'));
+            showInPanel(['Usage: /skill-allow <name>']);
             break;
           }
           toolPolicy.allowSkill(skill);
-          console.log(chalk.green(`Allowed skill: ${skill}`));
+          showInPanel([`Allowed skill: ${skill}`]);
           break;
         }
         case 'path-allow-read': {
           const pattern = slash.args.join(' ').trim();
           if (!pattern) {
-            console.log(chalk.yellow('Usage: /path-allow-read <glob>'));
+            showInPanel(['Usage: /path-allow-read <glob>']);
             break;
           }
           toolPolicy.addReadPathAllow(pattern);
-          console.log(chalk.green(`Allowed read path: ${pattern}`));
+          showInPanel([`Allowed read path: ${pattern}`]);
           break;
         }
         case 'path-allow-write': {
           const pattern = slash.args.join(' ').trim();
           if (!pattern) {
-            console.log(chalk.yellow('Usage: /path-allow-write <glob>'));
+            showInPanel(['Usage: /path-allow-write <glob>']);
             break;
           }
           toolPolicy.addWritePathAllow(pattern);
-          console.log(chalk.green(`Allowed write path: ${pattern}`));
+          showInPanel([`Allowed write path: ${pattern}`]);
           break;
         }
         case 'skill-use': {
           const name = slash.args.join(' ').trim();
           if (!name) {
-            console.log(chalk.yellow('Usage: /skill-use <name>'));
+            showInPanel(['Usage: /skill-use <name>']);
             break;
           }
           const skills = discoverSkills(process.cwd()).filter((skill) => skill.name === name);
           if (skills.length === 0) {
-            console.log(chalk.yellow(`Skill not found: ${name}`));
+            showInPanel([`Skill not found: ${name}`]);
             break;
           }
           const [skill] = skills;
           const activation = canActivateSkill(skill, toolPolicy);
           if (!activation.allowed) {
-            console.log(chalk.yellow(activation.reason || 'Skill blocked by policy'));
+            showInPanel([activation.reason || 'Skill blocked by policy']);
             break;
           }
           const loaded = loadSkillInstruction(skill);
@@ -4479,23 +4441,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
             ...runtime.activeSkills.filter((entry) => entry.path !== loaded.path),
             loaded,
           ];
-          console.log(chalk.green(`Activated skill ${loaded.name}`));
+          showInPanel([`Activated skill ${loaded.name}`]);
           break;
         }
         case 'skill-clear': {
           const name = slash.args.join(' ').trim();
           if (!name) {
             runtime.activeSkills = [];
-            console.log(chalk.green('Cleared all active skills.'));
+            showInPanel(['Cleared all active skills.']);
             break;
           }
           const before = runtime.activeSkills.length;
           runtime.activeSkills = runtime.activeSkills.filter((skill) => skill.name !== name);
           const removed = before - runtime.activeSkills.length;
           if (removed === 0) {
-            console.log(chalk.yellow(`No active skill matched: ${name}`));
+            showInPanel([`No active skill matched: ${name}`]);
           } else {
-            console.log(chalk.green(`Cleared ${removed} active skill(s) for ${name}`));
+            showInPanel([`Cleared ${removed} active skill(s) for ${name}`]);
           }
           break;
         }
@@ -4505,20 +4467,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const ttlMinutes = Number.parseInt(slash.args[2] || '15', 10);
           const secret = getDelegationSecret();
           if (!secret) {
-            console.log(
-              chalk.yellow('Delegation secret missing. Set INK_DELEGATION_SECRET (or JWT_SECRET).')
-            );
+            showInPanel(['Delegation secret missing. Set INK_DELEGATION_SECRET (or JWT_SECRET).']);
             break;
           }
           if (!toAgent || !scopeSpec) {
-            console.log(
-              chalk.yellow('Usage: /delegate-create <to-agent> <scope1,scope2> [ttl-minutes]')
-            );
+            showInPanel(['Usage: /delegate-create <to-agent> <scope1,scope2> [ttl-minutes]']);
             break;
           }
           const scopes = parseToolScopes(scopeSpec);
           if (scopes.length === 0) {
-            console.log(chalk.yellow('Provide at least one scope.'));
+            showInPanel(['Provide at least one scope.']);
             break;
           }
           const token = mintDelegationToken(
@@ -4543,42 +4501,41 @@ export async function runChat(options: ChatOptions): Promise<void> {
             payload,
             token,
           });
-          console.log(chalk.green(summary));
-          console.log(chalk.dim(token));
+          showInPanel([summary, token]);
           break;
         }
         case 'delegate-show': {
           if (!lastDelegation) {
-            console.log(chalk.dim('No delegation token minted in this chat session yet.'));
+            showInPanel(['No delegation token minted in this chat session yet.']);
             break;
           }
-          console.log(JSON.stringify(lastDelegation.payload, null, 2));
-          console.log(chalk.dim(lastDelegation.token));
+          showInPanel([
+            ...JSON.stringify(lastDelegation.payload, null, 2).split('\n'),
+            lastDelegation.token,
+          ]);
           break;
         }
         case 'delegate-verify': {
           const target = (slash.args[0] || 'last').trim();
           const token = target === 'last' ? lastDelegation?.token : target;
           if (!token) {
-            console.log(
-              chalk.yellow('No token available. Use /delegate-create first or pass a token.')
-            );
+            showInPanel(['No token available. Use /delegate-create first or pass a token.']);
             break;
           }
           const secret = getDelegationSecret();
           if (!secret) {
-            console.log(
-              chalk.yellow('Delegation secret missing. Set INK_DELEGATION_SECRET (or JWT_SECRET).')
-            );
+            showInPanel(['Delegation secret missing. Set INK_DELEGATION_SECRET (or JWT_SECRET).']);
             break;
           }
           const verified = verifyDelegationToken(token, secret);
           if (!verified.valid || !verified.payload) {
-            console.log(chalk.red(`Invalid delegation token: ${verified.error}`));
+            showInPanel([`Invalid delegation token: ${verified.error}`]);
             break;
           }
-          console.log(chalk.green('Delegation token valid.'));
-          console.log(JSON.stringify(verified.payload, null, 2));
+          showInPanel([
+            'Delegation token valid.',
+            ...JSON.stringify(verified.payload, null, 2).split('\n'),
+          ]);
           break;
         }
         case 'delegate-send': {
@@ -4586,22 +4543,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const scopeSpec = (slash.args[1] || '').trim();
           const message = slash.args.slice(2).join(' ').trim();
           if (!toAgent || !scopeSpec || !message) {
-            console.log(
-              chalk.yellow('Usage: /delegate-send <to-agent> <scope1,scope2> <message...>')
-            );
+            showInPanel(['Usage: /delegate-send <to-agent> <scope1,scope2> <message...>']);
             break;
           }
           const secret = getDelegationSecret();
           if (!secret) {
-            console.log(
-              chalk.yellow('Delegation secret missing. Set INK_DELEGATION_SECRET (or JWT_SECRET).')
-            );
+            showInPanel(['Delegation secret missing. Set INK_DELEGATION_SECRET (or JWT_SECRET).']);
             break;
           }
 
           const scopes = parseToolScopes(scopeSpec);
           if (scopes.length === 0) {
-            console.log(chalk.yellow('Provide at least one scope.'));
+            showInPanel(['Provide at least one scope.']);
             break;
           }
 
@@ -4636,7 +4589,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               ),
           });
           if (!approved) {
-            console.log(chalk.yellow('Skipped delegated send_to_inbox (policy blocked).'));
+            showInPanel(['Skipped delegated send_to_inbox (policy blocked).']);
             break;
           }
 
@@ -4672,38 +4625,38 @@ export async function runChat(options: ChatOptions): Promise<void> {
             message,
             result,
           });
-          console.log(chalk.green(`Delegated message sent to ${toAgent}.`));
-          console.log(JSON.stringify(result, null, 2));
+          showInPanel([
+            `Delegated message sent to ${toAgent}.`,
+            ...JSON.stringify(result, null, 2).split('\n'),
+          ]);
           break;
         }
         case 'thread': {
           const next = slash.args[0];
           if (next) {
             runtime.threadKey = next;
-            console.log(chalk.green(`Thread key set to ${next}`));
+            showInPanel([`Thread key set to ${next}`]);
           } else {
-            console.log(chalk.dim(`Thread key: ${runtime.threadKey || '(none)'}`));
+            showInPanel([`Thread key: ${runtime.threadKey || '(none)'}`]);
           }
           break;
         }
         case 'bookmark': {
           const bookmark = ledger.createBookmark(slash.args.join(' '));
-          console.log(chalk.green(`Created bookmark ${bookmark.id} (${bookmark.label})`));
+          showInPanel([`Created bookmark ${bookmark.id} (${bookmark.label})`]);
           break;
         }
         case 'bookmarks': {
           const bookmarks = ledger.listBookmarks();
           if (bookmarks.length === 0) {
-            console.log(chalk.dim('No bookmarks yet.'));
+            showInPanel(['No bookmarks yet.']);
             break;
           }
-          for (const bookmark of bookmarks) {
-            console.log(
-              chalk.dim(
-                `${bookmark.id}  ${bookmark.label}  entry#${bookmark.entryId}  ~${bookmark.approxTokensAtCreation} tok`
-              )
-            );
-          }
+          showInPanel(
+            bookmarks.map(
+              (b) => `${b.id}  ${b.label}  entry#${b.entryId}  ~${b.approxTokensAtCreation} tok`
+            )
+          );
           break;
         }
         case 'eject': {
@@ -4711,7 +4664,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const ref = slash.args.find((arg) => arg !== '--force' && arg !== 'force') || 'last';
           const preview = ledger.previewEjectToBookmark(ref);
           if (!preview) {
-            console.log(chalk.yellow(`Bookmark not found: ${ref}`));
+            showInPanel([`Bookmark not found: ${ref}`]);
             break;
           }
           const removedCount = preview.removedEntries.length;
@@ -4724,20 +4677,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 .map(
                   (entry) => `- ${entry.role}: ${entry.content.slice(0, 80).replace(/\\s+/g, ' ')}`
                 );
-              console.log(
-                chalk.yellow(
-                  `About to eject ${removedCount} entries (~${preview.removedTokens} tok) up to ${preview.bookmark.id}.`
-                )
-              );
-              if (previewLines.length) {
-                console.log(chalk.dim('Recent entries in eject range:'));
-                for (const line of previewLines) console.log(chalk.dim(line));
-              }
+              showInPanel([
+                `About to eject ${removedCount} entries (~${preview.removedTokens} tok) up to ${preview.bookmark.id}.`,
+                ...(previewLines.length ? ['Recent entries in eject range:', ...previewLines] : []),
+              ]);
               const confirm = (
                 await rl!.question(chalk.yellow('Proceed with ejection? [y/N]: '))
               ).trim();
               if (!['y', 'yes'].includes(confirm.toLowerCase())) {
-                console.log(chalk.dim('Ejection cancelled.'));
+                showInPanel(['Ejection cancelled.']);
                 break;
               }
             }
@@ -4745,15 +4693,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
           const result = ledger.ejectToBookmark(ref);
           if (!result) {
-            console.log(chalk.yellow(`Bookmark not found: ${ref}`));
+            showInPanel([`Bookmark not found: ${ref}`]);
             break;
           }
 
-          console.log(
-            chalk.green(
-              `Ejected ${removedCount} entries (~${result.removedTokens} tok) up to ${result.bookmark.id}`
-            )
-          );
+          showInPanel([
+            `Ejected ${removedCount} entries (~${result.removedTokens} tok) up to ${result.bookmark.id}`,
+          ]);
 
           const summary = result.removedEntries
             .slice(-6)
@@ -4788,25 +4734,27 @@ export async function runChat(options: ChatOptions): Promise<void> {
             targetPct < 10 ||
             targetPct > 95
           ) {
-            console.log(chalk.yellow('Usage: /trim [targetPercent 10-95]'));
+            showInPanel(['Usage: /trim [targetPercent 10-95]']);
             break;
           }
           const trimResult = await trimContextToPercent(targetPct, 'manual');
           if (trimResult.removed === 0) {
-            console.log(chalk.dim('No trim needed; context already within target budget.'));
+            showInPanel(['No trim needed; context already within target budget.']);
           }
           break;
         }
         case 'context': {
           const entries = ledger.listEntries().slice(-12);
           if (entries.length === 0) {
-            console.log(chalk.dim('Context is empty.'));
+            showInPanel(['Context is empty.']);
             break;
           }
-          for (const entry of entries) {
-            const prefix = `${entry.role}${entry.source ? `/${entry.source}` : ''}`;
-            console.log(chalk.dim(`${prefix}: ${entry.content.slice(0, 180)}`));
-          }
+          showInPanel(
+            entries.map((entry) => {
+              const prefix = `${entry.role}${entry.source ? `/${entry.source}` : ''}`;
+              return `${prefix}: ${entry.content.slice(0, 180)}`;
+            })
+          );
           break;
         }
         case 'usage':
@@ -4822,7 +4770,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           );
           break;
         default:
-          console.log(chalk.yellow(`Unknown command: /${slash.name}`));
+          showInPanel([`Unknown command: /${slash.name}`]);
       }
       continue;
     }
