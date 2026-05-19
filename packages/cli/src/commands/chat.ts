@@ -3656,63 +3656,50 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     const slash = parseSlashCommand(raw);
     if (slash) {
+      const showInPanel = (lines: string[]) => {
+        if (inkRepl) {
+          inkRepl.setCommandOutput(lines);
+        } else {
+          console.log(lines.join('\n'));
+        }
+      };
+
       switch (slash.name) {
         case 'help': {
-          console.log(
-            [
-              '',
-              '/help                      Show this help',
-              '/quit | /exit              End chat',
-              '/refresh                   Re-bootstrap identity context from Inkwell',
-              '/inbox                     Poll inbox now',
-              '/inbox full                Show all unread messages expanded',
-              '/events [now|on|off]       Poll/toggle merged activity stream',
-              '/session                   Show active session info',
-              '/autorun [on|off]          Toggle inbox auto-run execution',
-              '/away [on|off]             Toggle remote approval mode (approvals via inbox)',
-              '/tool-routing [backend|local]  Toggle backend tools vs local ink-tool routing',
-              '/save-config                  Save current runtime preferences to .ink/identity.json',
-              '/ui [scroll|live]          Set status rendering mode',
-              '/backend <name>            Switch backend (claude|codex|gemini)',
-              '/model <id>                Set/clear model override',
-              '/tools <backend|off|privileged>  Toggle backend-native tools/policy',
-              '/grant <tool> [uses]       Grant blocked Inkwell tool for limited uses',
-              '/grant-session <tool>      Allow a tool for this Inkwell session only',
-              '/allow <tool>               Persistently allow Inkwell tool',
-              '/deny <tool>                Persistently deny Inkwell tool',
-              '/prompt <tool>              Require per-call approval for Inkwell tool',
-              '/policy-scope [global|workspace|agent|studio] [id]  Set rule mutation scope',
-              '/policy                     Show tool policy + storage path',
-              '/mcp [servers|call ...]     List MCP servers or call Inkwell tool via /mcp call',
-              '/mcp-servers                List configured MCP servers from .mcp.json',
-              '/capabilities               Snapshot: MCP servers + skills + policy + grants',
-              '/ink <tool> [jsonArgs]     Call an Inkwell tool directly',
-              '/thread [key]              Show/set active thread key',
-              '/sessions [watch|off]      Show active sessions (or stream each turn)',
-              '/skills                    List discovered local skills',
-              '/skill-trust <all|trusted-only>  Set skill trust policy mode',
-              '/session-visibility <self|thread|studio|workspace|agent|all>  Set session visibility policy',
-              '/skill-allow <pattern>      Persistently allow skill(s) via pattern',
-              '/path-allow-read <glob>      Persistently allow local reads for matching paths',
-              '/path-allow-write <glob>     Persistently allow local writes for matching paths',
-              '/profile [name]             Apply security profile (minimal/safe/collaborative/full)',
-              '/policy-reset [global|workspace|agent|studio] [id]  Reset policy scope to defaults',
-              '/delegate-create <to> <scopes> [ttlMin]  Mint delegation token',
-              '/delegate-show               Show last minted delegation token payload',
-              '/delegate-verify <token|last> Verify delegation token with local secret',
-              '/delegate-send <to> <scopes> <message>  Send inbox message with delegation token',
-              '/skill-use <name>           Activate a discovered skill for prompts',
-              '/skill-clear [name]         Clear active skills (or one skill)',
-              '/bookmark [label]          Set context bookmark',
-              '/bookmarks                 List bookmarks',
-              '/eject <bookmark|last>     Eject context up to bookmark',
-              '/eject <bookmark|last> --force  Eject without confirmation',
-              '/trim [targetPct]          Trim oldest context entries (default 70)',
-              '/context                   Show recent context entries',
-              '/usage                     Show context token estimate',
-              '',
-            ].join('\n')
-          );
+          showInPanel([
+            '/help                      Show this help',
+            '/quit | /exit              End chat',
+            '/refresh                   Re-bootstrap identity context',
+            '/inbox [full]              Poll inbox now',
+            '/events [now|on|off]       Poll/toggle activity stream',
+            '/session                   Show active session info',
+            '/autorun [on|off]          Toggle inbox auto-run',
+            '/away [on|off]             Toggle remote approval mode',
+            '/tool-routing [backend|local]  Switch tool routing',
+            '/save-config               Save runtime preferences',
+            '/ui [scroll|live]          Set rendering mode',
+            '/backend <name>            Switch backend',
+            '/model <id>                Set/clear model override',
+            '/tools <backend|off>       Toggle backend tools',
+            '/grant <tool> [uses]       Grant tool for limited uses',
+            '/allow <tool>              Persistently allow tool',
+            '/deny <tool>               Persistently deny tool',
+            '/policy                    Show tool policy',
+            '/mcp [servers|call ...]    MCP servers / call tool',
+            '/mcp-servers               List .mcp.json servers',
+            '/capabilities              Full capability snapshot',
+            '/ink <tool> [jsonArgs]     Call Inkwell tool directly',
+            '/thread [key]              Show/set thread key',
+            '/sessions [watch|off]      Show active sessions',
+            '/skills                    List discovered skills',
+            '/profile [name]            Apply security profile',
+            '/bookmark [label]          Set context bookmark',
+            '/bookmarks                 List bookmarks',
+            '/eject <bookmark|last>     Eject context',
+            '/trim [targetPct]          Trim oldest context',
+            '/context                   Show recent entries',
+            '/usage                     Token estimate',
+          ]);
           break;
         }
         case 'quit':
@@ -4187,17 +4174,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
           if (sub === 'servers' || sub === 'list') {
             const servers = listConfiguredMcpServers(process.cwd());
             if (servers.length === 0) {
-              console.log(chalk.dim('No MCP servers configured in .mcp.json'));
+              showInPanel(['No MCP servers configured in .mcp.json']);
               break;
             }
-            console.log(chalk.bold(`MCP servers (${servers.length})`));
+            const lines = [`MCP servers (${servers.length})`];
             for (const server of servers) {
               const endpoint = server.url || server.command || '(unknown)';
-              console.log(
-                chalk.dim(`- ${server.name} [${server.transport || 'unknown'}] ${endpoint}`)
-              );
+              lines.push(`  ${server.name} [${server.transport || 'unknown'}] ${endpoint}`);
             }
-            console.log('');
+            showInPanel(lines);
             break;
           }
           if (sub === 'call') {
@@ -4259,17 +4244,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
         case 'mcp-servers': {
           const servers = listConfiguredMcpServers(process.cwd());
           if (servers.length === 0) {
-            console.log(chalk.dim('No MCP servers configured in .mcp.json'));
+            showInPanel(['No MCP servers configured in .mcp.json']);
             break;
           }
-          console.log(chalk.bold(`MCP servers (${servers.length})`));
+          const serverLines = [`MCP servers (${servers.length})`];
           for (const server of servers) {
             const endpoint = server.url || server.command || '(unknown)';
-            console.log(
-              chalk.dim(`- ${server.name} [${server.transport || 'unknown'}] ${endpoint}`)
-            );
+            serverLines.push(`  ${server.name} [${server.transport || 'unknown'}] ${endpoint}`);
           }
-          console.log('');
+          showInPanel(serverLines);
           break;
         }
         case 'capabilities': {
@@ -4277,56 +4260,47 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const skills = discoverSkills(process.cwd());
           const filtered = filterSkillsByPolicy(skills, toolPolicy);
 
-          console.log(chalk.bold('\nCapabilities snapshot'));
-          console.log(
-            chalk.dim(
-              `Backend=${runtime.backend}${runtime.model ? `(${runtime.model})` : ''} thread=${
-                runtime.threadKey || '(none)'
-              } session=${runtime.sessionId || '(none)'}`
-            )
-          );
+          const capLines: string[] = [
+            `Capabilities snapshot`,
+            `Backend=${runtime.backend}${runtime.model ? `(${runtime.model})` : ''} thread=${runtime.threadKey || '(none)'} session=${runtime.sessionId || '(none)'}`,
+            '',
+          ];
 
           if (servers.length === 0) {
-            console.log(chalk.dim('MCP servers: none configured in .mcp.json'));
+            capLines.push('MCP servers: none configured');
           } else {
-            console.log(chalk.bold(`MCP servers (${servers.length})`));
+            capLines.push(`MCP servers (${servers.length})`);
             for (const server of servers) {
               const endpoint = server.url || server.command || '(unknown)';
-              console.log(
-                chalk.dim(`- ${server.name} [${server.transport || 'unknown'}] ${endpoint}`)
-              );
+              capLines.push(`  ${server.name} [${server.transport || 'unknown'}] ${endpoint}`);
             }
           }
 
-          console.log(chalk.bold(`Skills (${skills.length} discovered)`));
+          capLines.push('', `Skills (${skills.length} discovered)`);
           if (filtered.visible.length === 0) {
-            console.log(chalk.dim('- none visible under current policy'));
+            capLines.push('  none visible under current policy');
           } else {
             for (const skill of filtered.visible.slice(0, 20)) {
               const active = runtime.activeSkills.some((entry) => entry.path === skill.path)
                 ? ' *active*'
                 : '';
-              console.log(
-                chalk.dim(`- ${skill.name} [${skill.source}] trust=${skill.trustLevel}${active}`)
-              );
+              capLines.push(`  ${skill.name} [${skill.source}] trust=${skill.trustLevel}${active}`);
             }
             if (filtered.visible.length > 20) {
-              console.log(chalk.dim(`... and ${filtered.visible.length - 20} more visible skills`));
+              capLines.push(`  ... and ${filtered.visible.length - 20} more`);
             }
           }
           if (filtered.blockedBySkill.length > 0) {
-            console.log(
-              chalk.yellow(`Blocked by skill allowlist: ${filtered.blockedBySkill.length}`)
-            );
+            capLines.push(`Blocked by skill allowlist: ${filtered.blockedBySkill.length}`);
           }
           if (filtered.blockedByPath.length > 0) {
-            console.log(chalk.yellow(`Blocked by path policy: ${filtered.blockedByPath.length}`));
+            capLines.push(`Blocked by path policy: ${filtered.blockedByPath.length}`);
           }
           if (filtered.blockedByTrust.length > 0) {
-            console.log(chalk.yellow(`Blocked by trust mode: ${filtered.blockedByTrust.length}`));
+            capLines.push(`Blocked by trust mode: ${filtered.blockedByTrust.length}`);
           }
 
-          printToolPolicySnapshot(toolPolicy, runtime.sessionId, runtime.activeSkills);
+          showInPanel(capLines);
           break;
         }
         case 'pcp': {

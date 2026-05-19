@@ -56,6 +56,8 @@ export interface InkRepl {
   setInfoItems: (items: string[]) => void;
   /** Register an abort handler for the current backend turn. */
   setAbortHandler: (handler: (() => void) | null) => void;
+  /** Show command output in the dock panel (below prompt, above info bar). */
+  setCommandOutput: (lines: string[] | null) => void;
   /** Signal exit from the orchestrator side (makes waitForInput reject). */
   requestExit: () => void;
   /** Unmount the Ink app and restore terminal. */
@@ -176,6 +178,10 @@ export function renderInkChat(options: {
 
     setAbortHandler: (handler) => {
       getHandle().setAbortHandler(handler);
+    },
+
+    setCommandOutput: (lines) => {
+      getHandle().setCommandOutput(lines);
     },
 
     requestExit: () => {

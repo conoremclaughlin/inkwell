@@ -45,6 +45,7 @@ export interface ChatAppHandle {
   setWaiting: (waiting: boolean, backend?: string) => void;
   setInfoItems: (items: string[]) => void;
   setAbortHandler: (handler: (() => void) | null) => void;
+  setCommandOutput: (lines: string[] | null) => void;
 }
 
 /**
@@ -65,6 +66,8 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
   const [infoItems, setInfoItems] = useState(initialInfoItems);
   const [ctrlCCount, setCtrlCCount] = useState(0);
   const [ctrlCTimer, setCtrlCTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
+
+  const [commandOutput, setCommandOutput] = useState<string[] | null>(null);
 
   // Abort handler — set by orchestrator when a backend turn is running
   const abortHandlerRef = useRef<(() => void) | null>(null);
@@ -103,6 +106,9 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
     },
     setAbortHandler: (handler: (() => void) | null) => {
       abortHandlerRef.current = handler;
+    },
+    setCommandOutput: (lines: string[] | null) => {
+      setCommandOutput(lines);
     },
   }));
 
@@ -166,6 +172,8 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
         onSubmit={handleSubmit}
         isPromptActive={!waiting}
         onAbort={handleAbort}
+        commandOutput={commandOutput}
+        onCommandOutputClear={() => setCommandOutput(null)}
         waitingElement={
           waiting ? (
             <Box paddingX={1}>

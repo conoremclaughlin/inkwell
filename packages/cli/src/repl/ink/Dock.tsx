@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Box, useStdout } from 'ink';
+import { Box, Text, useStdout } from 'ink';
 import { StatusBar } from './StatusBar.js';
 import { InfoBar } from './InfoBar.js';
 import { PromptInput } from './PromptInput.js';
@@ -14,6 +14,8 @@ interface DockProps {
   onSubmit: (value: string) => void;
   isPromptActive: boolean;
   onAbort?: () => void;
+  commandOutput?: string[] | null;
+  onCommandOutputClear?: () => void;
   waitingElement?: React.ReactNode;
 }
 
@@ -34,6 +36,8 @@ export function Dock({
   onSubmit,
   isPromptActive,
   onAbort,
+  commandOutput,
+  onCommandOutputClear,
   waitingElement,
 }: DockProps): React.ReactElement {
   const { stdout } = useStdout();
@@ -48,11 +52,19 @@ export function Dock({
     };
   }, [stdout]);
 
-  const handleInputChange = useCallback((value: string) => {
-    setInputValue(value);
-  }, []);
+  const handleInputChange = useCallback(
+    (value: string) => {
+      setInputValue(value);
+      if (commandOutput && value.length > 0) {
+        onCommandOutputClear?.();
+      }
+    },
+    [commandOutput, onCommandOutputClear]
+  );
 
-  const showAutocomplete = inputValue.startsWith('/');
+  const showAutocomplete = inputValue.startsWith('/') && !commandOutput;
+  const showCommandOutput =
+    commandOutput && commandOutput.length > 0 && !inputValue.startsWith('/');
 
   return (
     <Box flexDirection="column">
@@ -68,6 +80,15 @@ export function Dock({
         onInputChange={handleInputChange}
       />
       {showAutocomplete && <SlashAutocomplete input={inputValue} />}
+      {showCommandOutput && (
+        <Box flexDirection="column" paddingX={1}>
+          {commandOutput.map((line, i) => (
+            <Text key={i} dimColor>
+              {line}
+            </Text>
+          ))}
+        </Box>
+      )}
       <Separator />
       <InfoBar items={infoItems} />
     </Box>
