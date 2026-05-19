@@ -1,10 +1,14 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { Box, Text, useInput } from 'ink';
 
 interface PromptInputProps {
   label: string;
   onSubmit: (value: string) => void;
   isActive?: boolean;
+  /** Called when Escape is pressed while waiting (not active). */
+  onAbort?: () => void;
+  /** Called on every keystroke with the current input value. */
+  onInputChange?: (value: string) => void;
   /** Scroll callback for page up/down from within the prompt. */
   onScroll?: (direction: 'up' | 'down') => void;
 }
@@ -37,21 +41,24 @@ export function PromptInput({
   label,
   onSubmit,
   isActive = true,
+  onAbort,
+  onInputChange,
   onScroll,
 }: PromptInputProps): React.ReactElement {
   const [value, setValue] = useState('');
   const [cursor, setCursor] = useState(0);
 
+  useEffect(() => {
+    onInputChange?.(value);
+  }, [value, onInputChange]);
+
   useInput((input, key) => {
-    // Allow typing while waiting — only block submission
     if (key.return) {
-      if (!isActive) return; // Can't submit while agent is responding
       const submitted = value.trim();
+      if (!submitted) return;
       setValue('');
       setCursor(0);
-      if (submitted) {
-        onSubmit(submitted);
-      }
+      onSubmit(submitted);
       return;
     }
 
@@ -108,15 +115,22 @@ export function PromptInput({
       return;
     }
 
-    // Option+Left: move to previous word boundary
-    if (key.leftArrow && key.meta) {
+    // Option+Left / Meta+b: move to previous word boundary
+    if ((key.leftArrow && key.meta) || (key.meta && input === 'b')) {
       setCursor((prev) => prevWordBoundary(value, prev));
       return;
     }
 
-    // Option+Right: move to next word boundary
-    if (key.rightArrow && key.meta) {
+    // Option+Right / Meta+f: move to next word boundary
+    if ((key.rightArrow && key.meta) || (key.meta && input === 'f')) {
       setCursor((prev) => nextWordBoundary(value, prev));
+      return;
+    }
+
+    // Meta+d: delete word forward
+    if (key.meta && input === 'd') {
+      const boundary = nextWordBoundary(value, cursor);
+      setValue((prev) => prev.slice(0, cursor) + prev.slice(boundary));
       return;
     }
 
@@ -141,8 +155,37 @@ export function PromptInput({
       return;
     }
 
+    // macOS Option+key without "Option as Meta" produces Unicode chars
+    if (input === '∫') {
+      // Option+b → word left
+      setCursor((prev) => prevWordBoundary(value, prev));
+      return;
+    }
+    if (input === 'ƒ') {
+      // Option+f → word right
+      setCursor((prev) => nextWordBoundary(value, prev));
+      return;
+    }
+    if (input === '∂') {
+      // Option+d → delete word forward
+      const boundary = nextWordBoundary(value, cursor);
+      setValue((prev) => prev.slice(0, cursor) + prev.slice(boundary));
+      return;
+    }
+
+    // Escape: abort current turn if waiting, clear input if typing
+    if (key.escape) {
+      if (!isActive && onAbort) {
+        onAbort();
+      } else if (value.length > 0) {
+        setValue('');
+        setCursor(0);
+      }
+      return;
+    }
+
     // Ignore other control sequences
-    if (key.ctrl || key.escape) return;
+    if (key.ctrl) return;
     if (key.upArrow || key.downArrow) return;
     if (key.tab) return;
 

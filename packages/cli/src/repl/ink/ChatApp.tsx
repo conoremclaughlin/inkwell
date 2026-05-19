@@ -1,9 +1,6 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
-import { Box, Static, Text, useApp, useStdout } from 'ink';
-import { StatusBar } from './StatusBar.js';
-import { InfoBar } from './InfoBar.js';
-import { PromptInput } from './PromptInput.js';
-import { Separator } from './Separator.js';
+import { Box, Static, Text, useApp } from 'ink';
+import { Dock } from './Dock.js';
 import { MessageLine, type MessageLineProps } from './MessageLine.js';
 import { formatNow } from '../tui-components.js';
 
@@ -47,6 +44,8 @@ export interface ChatAppHandle {
   setStatusSummary: (summary: string) => void;
   setWaiting: (waiting: boolean, backend?: string) => void;
   setInfoItems: (items: string[]) => void;
+  setAbortHandler: (handler: (() => void) | null) => void;
+  setCommandOutput: (lines: string[] | null) => void;
 }
 
 /**
@@ -54,8 +53,6 @@ export interface ChatAppHandle {
  *
  * Uses <Static> for completed messages (written once to terminal scrollback).
  * Only the dock (status | prompt | info) is dynamic (~6 lines).
- * On terminal resize, the Static remount key increments to force a full
- * re-render of all static content at the new width.
  */
 export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function ChatApp(
   { agentId, timezone, infoItems: initialInfoItems, fullscreen = false, onUserInput, onExit },
@@ -70,25 +67,10 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
   const [ctrlCCount, setCtrlCCount] = useState(0);
   const [ctrlCTimer, setCtrlCTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
 
-  // Remount key — incremented on resize to force <Static> to re-render all items
-  const [remountKey, setRemountKey] = useState(0);
+  const [commandOutput, setCommandOutput] = useState<string[] | null>(null);
 
-  // Terminal resize tracking
-  const { stdout } = useStdout();
-  useEffect(() => {
-    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-    const onResize = () => {
-      if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => {
-        setRemountKey((k) => k + 1);
-      }, 150);
-    };
-    stdout?.on('resize', onResize);
-    return () => {
-      stdout?.off('resize', onResize);
-      if (debounceTimer) clearTimeout(debounceTimer);
-    };
-  }, [stdout]);
+  // Abort handler — set by orchestrator when a backend turn is running
+  const abortHandlerRef = useRef<(() => void) | null>(null);
 
   // Waiting indicator state — verb rotates every 3s
   const [waitingVerb, setWaitingVerb] = useState('');
@@ -122,6 +104,12 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
     setInfoItems: (items: string[]) => {
       setInfoItems(items);
     },
+    setAbortHandler: (handler: (() => void) | null) => {
+      abortHandlerRef.current = handler;
+    },
+    setCommandOutput: (lines: string[] | null) => {
+      setCommandOutput(lines);
+    },
   }));
 
   const handleSubmit = useCallback(
@@ -130,6 +118,13 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
     },
     [onUserInput]
   );
+
+  const handleAbort = useCallback(() => {
+    if (abortHandlerRef.current) {
+      abortHandlerRef.current();
+      abortHandlerRef.current = null;
+    }
+  }, []);
 
   // Handle Ctrl+C for double-tap exit
   useEffect(() => {
@@ -155,9 +150,7 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
 
   return (
     <Box flexDirection="column">
-      {/* Messages — written once to terminal scrollback via <Static>.
-          key={remountKey} forces full re-render on terminal resize. */}
-      <Static key={remountKey} items={messages}>
+      <Static items={messages}>
         {(msg) => (
           <MessageLine
             key={msg.id}
@@ -171,20 +164,25 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
         )}
       </Static>
 
-      {/* Dynamic tail: waiting indicator + dock */}
-      {waiting && (
-        <Box paddingX={1}>
-          <Text color="cyan">{SPINNER_CHAR + ' '}</Text>
-          <Text dimColor>{waitingVerb}...</Text>
-        </Box>
-      )}
-
-      <Separator />
-      <StatusBar summary={statusSummary} time={now} />
-      <Separator />
-      <PromptInput label={promptLabel} onSubmit={handleSubmit} isActive={!waiting} />
-      <Separator />
-      <InfoBar items={infoItems} />
+      <Dock
+        statusSummary={statusSummary}
+        time={now}
+        infoItems={infoItems}
+        promptLabel={promptLabel}
+        onSubmit={handleSubmit}
+        isPromptActive={!waiting}
+        onAbort={handleAbort}
+        commandOutput={commandOutput}
+        onCommandOutputClear={() => setCommandOutput(null)}
+        waitingElement={
+          waiting ? (
+            <Box paddingX={1}>
+              <Text color="cyan">{SPINNER_CHAR + ' '}</Text>
+              <Text dimColor>{waitingVerb}...</Text>
+            </Box>
+          ) : undefined
+        }
+      />
     </Box>
   );
 });

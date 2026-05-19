@@ -45,7 +45,7 @@ export function renderInkMission(options: { timezone?: string; fullscreen?: bool
       fullscreen={fullscreen}
       onExit={onExit}
     />,
-    { alternateBuffer: fullscreen, incrementalRendering: true }
+    { alternateScreen: fullscreen, incrementalRendering: true }
   );
 
   return {

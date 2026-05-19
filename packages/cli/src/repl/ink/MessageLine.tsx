@@ -12,13 +12,22 @@ export interface MessageLineProps {
   trailingMeta?: string;
 }
 
-const ROLE_COLORS: Record<MessageRole, string> = {
-  user: 'green',
-  assistant: 'white',
+const LABEL_COLORS: Record<MessageRole, string> = {
+  user: 'greenBright',
+  assistant: 'blueBright',
   inbox: 'cyan',
   activity: 'magenta',
   system: 'gray',
-  grant: 'greenBright',
+  grant: 'green',
+};
+
+const CONTENT_COLORS: Record<MessageRole, string | undefined> = {
+  user: undefined,
+  assistant: undefined,
+  inbox: undefined,
+  activity: undefined,
+  system: 'gray',
+  grant: 'green',
 };
 
 /**
@@ -46,15 +55,15 @@ export const MessageLine = React.memo(function MessageLine({
   trailingMeta,
 }: MessageLineProps): React.ReactElement {
   const displayLabel = label || role;
-  const color = ROLE_COLORS[role] || 'gray';
+  const labelColor = LABEL_COLORS[role] || 'gray';
+  const contentColor = CONTENT_COLORS[role];
   const meta = [time, trailingMeta].filter(Boolean).join('  ·  ');
   const displayContent = collapseImagePaths(content);
 
   return (
     <Box flexDirection="column" paddingLeft={1} marginTop={1}>
-      {/* Header: label + metadata on one line */}
       <Box>
-        <Text bold color={color}>
+        <Text bold color={labelColor}>
           {displayLabel}
         </Text>
         {meta ? (
@@ -64,9 +73,8 @@ export const MessageLine = React.memo(function MessageLine({
           </>
         ) : null}
       </Box>
-      {/* Content: small indent from label, wraps naturally */}
       <Box paddingLeft={2}>
-        <Text color={color} wrap="wrap">
+        <Text color={contentColor} wrap="wrap">
           {displayContent}
         </Text>
       </Box>

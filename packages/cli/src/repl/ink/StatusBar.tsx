@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 import { Box, Text, useStdout } from 'ink';
 
 interface StatusBarProps {
@@ -9,15 +9,7 @@ interface StatusBarProps {
 /** Top bar: context budget + queue status on left, clock on right. */
 export function StatusBar({ summary, time }: StatusBarProps): React.ReactElement {
   const { stdout } = useStdout();
-  const [cols, setCols] = useState(stdout?.columns || 80);
-
-  useEffect(() => {
-    const onResize = () => setCols(stdout?.columns || 80);
-    stdout?.on('resize', onResize);
-    return () => {
-      stdout?.off('resize', onResize);
-    };
-  }, [stdout]);
+  const cols = stdout?.columns || 80;
 
   // Guarantee single visual line: pad = 2 (paddingX), gap = 2 (min space between)
   const maxSummary = cols - 2 - time.length - 2;

@@ -22,10 +22,13 @@ export interface BackendRunResult {
   usage?: BackendTokenUsage;
 }
 
-export async function runBackendTurn(request: BackendRunRequest): Promise<BackendRunResult> {
+export interface BackendTurnHandle {
+  result: Promise<BackendRunResult>;
+  abort: () => void;
+}
+
+export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle {
   const adapter = getBackend(request.backend);
-  // Codex requires `exec` for one-shot/non-interactive turns.
-  // Plain `codex <prompt>` enters interactive mode and can fail in non-TTY flows.
   const promptParts = request.backend === 'codex' ? ['exec', request.prompt] : [request.prompt];
   const prepared = adapter.prepare({
     agentId: request.agentId,
@@ -37,7 +40,7 @@ export async function runBackendTurn(request: BackendRunRequest): Promise<Backen
 
   const command = `${prepared.binary} ${prepared.args.join(' ')}`;
 
-  const { result } = spawnBackend({
+  const { child, result } = spawnBackend({
     binary: prepared.binary,
     args: prepared.args,
     env: prepared.env,
@@ -46,16 +49,32 @@ export async function runBackendTurn(request: BackendRunRequest): Promise<Backen
     onStderr: request.verbose ? (chunk) => process.stderr.write(chunk) : undefined,
   });
 
-  const spawnResult = await result;
-  prepared.cleanup();
-
   return {
-    success: spawnResult.exitCode === 0,
-    stdout: spawnResult.stdout,
-    stderr: spawnResult.stderr,
-    exitCode: spawnResult.exitCode,
-    durationMs: spawnResult.durationMs,
-    command,
-    usage: extractBackendTokenUsage(request.backend, spawnResult.stdout, spawnResult.stderr),
+    result: result.then((spawnResult) => {
+      prepared.cleanup();
+      return {
+        success: spawnResult.exitCode === 0,
+        stdout: spawnResult.stdout,
+        stderr: spawnResult.stderr,
+        exitCode: spawnResult.exitCode,
+        durationMs: spawnResult.durationMs,
+        command,
+        usage: extractBackendTokenUsage(request.backend, spawnResult.stdout, spawnResult.stderr),
+      };
+    }),
+    abort: () => {
+      try {
+        child.kill('SIGTERM');
+      } catch {}
+      setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {}
+      }, 3000);
+    },
   };
+}
+
+export async function runBackendTurn(request: BackendRunRequest): Promise<BackendRunResult> {
+  return startBackendTurn(request).result;
 }
