@@ -13,6 +13,9 @@ interface DockProps {
   promptLabel: string;
   onSubmit: (value: string) => void;
   isPromptActive: boolean;
+  /** When false, PromptInput's useInput unsubscribes from stdin entirely
+   *  (e.g. when ContextViewer is active and needs exclusive key handling). */
+  useInputActive?: boolean;
   onAbort?: () => void;
   commandOutput?: string[] | null;
   onCommandOutputClear?: () => void;
@@ -39,6 +42,7 @@ export function Dock({
   promptLabel,
   onSubmit,
   isPromptActive,
+  useInputActive = true,
   onAbort,
   commandOutput,
   onCommandOutputClear,
@@ -84,6 +88,7 @@ export function Dock({
         label={promptLabel}
         onSubmit={onSubmit}
         isActive={isPromptActive}
+        useInputActive={useInputActive}
         onAbort={onAbort}
         onEscape={onCommandOutputClear}
         onCtrlC={onCtrlC}

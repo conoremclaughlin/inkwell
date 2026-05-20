@@ -213,58 +213,64 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
 
   return (
     <Box flexDirection="column">
-      {showingContext && (
+      {/* Context viewer — always mounted, toggled via display.
+          Keeps useInput lifecycle stable across open/close cycles. */}
+      <Box display={showingContext ? 'flex' : 'none'} flexDirection="column">
         <ContextViewer
-          lines={contextViewLines}
+          lines={contextViewLines ?? []}
           isActive={showingContext}
           onDismiss={() => setContextViewLines(null)}
         />
-      )}
-      {!showingContext && (
-        <>
-          {dynamicMessages ? (
-            <Box flexDirection="column">{messageElements}</Box>
-          ) : (
-            <Static items={messages}>
-              {(msg) => (
-                <MessageLine
-                  key={msg.id}
-                  id={msg.id}
-                  role={msg.role}
-                  content={msg.content}
-                  label={msg.label}
-                  time={msg.time}
-                  trailingMeta={msg.trailingMeta}
-                />
-              )}
-            </Static>
-          )}
+      </Box>
 
-          <Dock
-            statusSummary={statusSummary}
-            time={now}
-            infoItems={infoItems}
-            promptLabel={promptLabel}
-            onSubmit={handleSubmit}
-            isPromptActive={!waiting}
-            onAbort={handleAbort}
-            commandOutput={commandOutput}
-            onCommandOutputClear={() => setCommandOutput(null)}
-            inputHistory={inputHistory}
-            ctrlCHint={ctrlCHint}
-            onCtrlC={handleCtrlC}
-            onExpandMemories={handleExpandMemories}
-            waitingElement={
-              waiting ? (
-                <Box paddingX={1}>
-                  <Text color="cyan">{SPINNER_CHAR + ' '}</Text>
-                  <Text dimColor>{waitingVerb}...</Text>
-                </Box>
-              ) : undefined
-            }
-          />
-        </>
-      )}
+      {/* Chat messages — Static writes to scrollback regardless of display */}
+      {!showingContext &&
+        (dynamicMessages ? (
+          <Box flexDirection="column">{messageElements}</Box>
+        ) : (
+          <Static items={messages}>
+            {(msg) => (
+              <MessageLine
+                key={msg.id}
+                id={msg.id}
+                role={msg.role}
+                content={msg.content}
+                label={msg.label}
+                time={msg.time}
+                trailingMeta={msg.trailingMeta}
+              />
+            )}
+          </Static>
+        ))}
+
+      {/* Dock — always mounted, hidden when context viewer is active.
+          useInputActive=false yields stdin to ContextViewer's useInput. */}
+      <Box display={showingContext ? 'none' : 'flex'} flexDirection="column">
+        <Dock
+          statusSummary={statusSummary}
+          time={now}
+          infoItems={infoItems}
+          promptLabel={promptLabel}
+          onSubmit={handleSubmit}
+          isPromptActive={!waiting}
+          useInputActive={!showingContext}
+          onAbort={handleAbort}
+          commandOutput={commandOutput}
+          onCommandOutputClear={() => setCommandOutput(null)}
+          inputHistory={inputHistory}
+          ctrlCHint={ctrlCHint}
+          onCtrlC={handleCtrlC}
+          onExpandMemories={handleExpandMemories}
+          waitingElement={
+            waiting ? (
+              <Box paddingX={1}>
+                <Text color="cyan">{SPINNER_CHAR + ' '}</Text>
+                <Text dimColor>{waitingVerb}...</Text>
+              </Box>
+            ) : undefined
+          }
+        />
+      </Box>
     </Box>
   );
 });
