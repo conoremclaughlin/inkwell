@@ -71,6 +71,7 @@ import {
   startWaitingIndicator,
 } from '../repl/tui-components.js';
 import { renderInkChat, InkExitSignal, type InkRepl } from '../repl/ink/index.js';
+import { formatContextLines, type ContextSections } from '../repl/ink/context-viewer.js';
 import {
   classifyError,
   decodeDelegationToken,
@@ -106,6 +107,7 @@ type ChatOptions = {
   sbDebug?: boolean;
   verbose?: boolean;
   fullscreen?: boolean;
+  dynamic?: boolean;
   approvalMode?: string;
 };
 
@@ -572,6 +574,7 @@ function hydrateLedgerFromTranscript(
   tailPreview: HistoryHydrationResult['tailPreview'];
   seenInboxIds: string[];
   seenActivityIds: string[];
+  recoveredMemoryIds: string[];
 } {
   const events = readTranscriptEvents(transcriptPath);
   let loaded = 0;
@@ -579,6 +582,7 @@ function hydrateLedgerFromTranscript(
   const preview: HistoryHydrationResult['tailPreview'] = [];
   const seenInboxIds = new Set<string>();
   const seenActivityIds = new Set<string>();
+  const recoveredMemoryIds: string[] = [];
 
   const pushPreview = (role: 'user' | 'assistant' | 'inbox', content: string, ts?: string) => {
     preview.push({ role, content: compactForHistoryPreview(role, content), ts });
@@ -614,6 +618,15 @@ function hydrateLedgerFromTranscript(
       }
       continue;
     }
+    if (type === 'hook_injection' && typeof event.content === 'string') {
+      const source = typeof event.source === 'string' ? event.source : 'hook-history';
+      ledger.addEntry('system', event.content, source);
+      loaded += 1;
+      if (typeof event.memoryId === 'string') {
+        recoveredMemoryIds.push(event.memoryId);
+      }
+      continue;
+    }
     if (type === 'activity' && typeof event.content === 'string') {
       const actor = typeof event.agentId === 'string' ? event.agentId : 'system';
       const activityType = typeof event.activityType === 'string' ? event.activityType : 'activity';
@@ -635,6 +648,7 @@ function hydrateLedgerFromTranscript(
     tailPreview: preview,
     seenInboxIds: Array.from(seenInboxIds),
     seenActivityIds: Array.from(seenActivityIds),
+    recoveredMemoryIds,
   };
 }
 
@@ -2265,6 +2279,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     for (const activityId of hydrated.seenActivityIds) {
       seenActivityIds.add(activityId);
     }
+    if (hydrated.recoveredMemoryIds.length > 0) {
+      passiveRecallHandle.seedBootstrapIds(hydrated.recoveredMemoryIds);
+    }
   } else if (attachedToExistingSession && runtime.sessionId) {
     const sessionContextResult = (await pcp
       .callTool('get_session_context', { sessionId: runtime.sessionId, limit: 120 })
@@ -2758,6 +2775,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
         turnIndex: hookTurnCount + 1,
       },
     });
+
+    // Persist hook-injected entries to transcript so they survive reattach
+    if (promptHookResult.injectedEntries.length > 0) {
+      for (const entry of promptHookResult.injectedEntries) {
+        appendTranscript(runtime.transcriptPath, {
+          type: 'hook_injection',
+          role: entry.role,
+          content: entry.content,
+          source: entry.source,
+          memoryId: entry.memoryId,
+        });
+      }
+    }
 
     // Print notifications from prompt_build hooks
     if (promptHookResult.injected > 0) {
@@ -3296,6 +3326,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
         },
       })
       .then((hookResult) => {
+        // Persist hook-injected entries to transcript so they survive reattach
+        if (hookResult.injectedEntries.length > 0) {
+          for (const entry of hookResult.injectedEntries) {
+            appendTranscript(runtime.transcriptPath, {
+              type: 'hook_injection',
+              role: entry.role,
+              content: entry.content,
+              source: entry.source,
+              memoryId: entry.memoryId,
+            });
+          }
+        }
+
         // Notify the user about passive recall injections
         if (hookResult.injected > 0) {
           const recallEntries = ledger
@@ -3538,6 +3581,30 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let exitAfterTurnNoticeShown = false;
   let activePromptLabel = `${agentId}> `;
 
+  // Helper: build context view lines from current state
+  const buildContextViewLines = (): string[] => {
+    const recallStats = passiveRecallHandle.getStats();
+    const allEntries = ledger.listEntries();
+    const recallEntries = allEntries.filter((e) => e.source === 'passive-recall');
+    return formatContextLines({
+      bootstrapSummary: runtime.bootstrapContext || undefined,
+      passiveRecallEntries: recallEntries.map((e) => ({
+        content: e.content,
+        source: e.source,
+      })),
+      passiveRecallStats: {
+        totalInjected: recallStats.totalInjected,
+        uniqueMemories: recallStats.uniqueMemories,
+        currentTurn: recallStats.currentTurn,
+      },
+      ledgerStats: {
+        totalEntries: allEntries.length,
+        tokenEstimate: ledger.totalTokens(),
+        bootstrapTokens: runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0,
+      },
+    });
+  };
+
   if (useInk) {
     // ── Ink path ──
     inkRepl = renderInkChat({
@@ -3545,6 +3612,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       timezone: runtime.userTimezone,
       infoItems: initialInfoItems,
       fullscreen: !!options.fullscreen,
+      dynamicMessages: !!options.dynamic,
     });
     // Initial status update — ChatApp starts with 'waiting for input'
     // so push the real context budget summary immediately
@@ -3558,6 +3626,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     });
     inkRepl.setStatus(initialSummary);
     lastStatusSummary = initialSummary;
+
+    // Register Ctrl+O handler — opens context viewer via React state
+    inkRepl.handle.setCtrlOHandler(() => {
+      inkRepl!.showContextView(buildContextViewLines());
+    });
 
     // Push prior messages into Ink scrollback so user sees conversation history
     if (historyHydration && historyHydration.tailPreview.length > 0) {
@@ -4815,17 +4888,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
           break;
         }
         case 'context': {
-          const entries = ledger.listEntries().slice(-12);
-          if (entries.length === 0) {
-            showInPanel(['Context is empty.']);
-            break;
+          if (inkRepl) {
+            inkRepl.showContextView(buildContextViewLines());
+          } else {
+            const entries = ledger.listEntries().slice(-12);
+            if (entries.length === 0) {
+              showInPanel(['Context is empty.']);
+              break;
+            }
+            showInPanel(
+              entries.map((entry) => {
+                const prefix = `${entry.role}${entry.source ? `/${entry.source}` : ''}`;
+                return `${prefix}: ${entry.content.slice(0, 180)}`;
+              })
+            );
           }
-          showInPanel(
-            entries.map((entry) => {
-              const prefix = `${entry.role}${entry.source ? `/${entry.source}` : ''}`;
-              return `${prefix}: ${entry.content.slice(0, 180)}`;
-            })
-          );
           break;
         }
         case 'usage': {
@@ -4947,6 +5024,7 @@ export function registerChatCommand(program: Command): void {
       )
       .option('-v, --verbose', 'Verbose backend passthrough output')
       .option('--fullscreen', 'Fullscreen alternate buffer mode (app-controlled scrolling)')
+      .option('--dynamic', 'Render messages dynamically (re-renderable, no terminal scrollback)')
       .action((options: ChatOptions) => runChat(options));
 
   register('chat', 'Start first-class Ink REPL (experimental)');

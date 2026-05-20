@@ -137,18 +137,20 @@ export class SbHookRegistry {
     ctx: Omit<HookContext, 'event'>
   ): Promise<{
     injected: number;
+    injectedEntries: InjectedLedgerEntry[];
     evicted: number;
     blocked: boolean;
     blockReason?: string;
   }> {
     const eventHooks = this.hooks.filter((h) => h.event === event);
     if (eventHooks.length === 0) {
-      return { injected: 0, evicted: 0, blocked: false };
+      return { injected: 0, injectedEntries: [], evicted: 0, blocked: false };
     }
 
     const fullCtx: HookContext = { event, ...ctx };
     let totalInjected = 0;
     let totalEvicted = 0;
+    const allInjected: InjectedLedgerEntry[] = [];
 
     for (const hook of eventHooks) {
       try {
@@ -165,6 +167,7 @@ export class SbHookRegistry {
         if (result.inject && result.inject.length > 0) {
           for (const entry of result.inject) {
             ctx.ledger.addEntry(entry.role, entry.content, entry.source);
+            allInjected.push(entry);
             totalInjected++;
           }
         }
@@ -179,6 +182,7 @@ export class SbHookRegistry {
         if (result.block && BLOCKING_EVENTS.has(event)) {
           return {
             injected: totalInjected,
+            injectedEntries: allInjected,
             evicted: totalEvicted,
             blocked: true,
             blockReason: result.blockReason || `Blocked by hook: ${hook.name}`,
@@ -191,6 +195,11 @@ export class SbHookRegistry {
       }
     }
 
-    return { injected: totalInjected, evicted: totalEvicted, blocked: false };
+    return {
+      injected: totalInjected,
+      injectedEntries: allInjected,
+      evicted: totalEvicted,
+      blocked: false,
+    };
   }
 }

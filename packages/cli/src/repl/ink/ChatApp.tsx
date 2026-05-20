@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { Box, Static, Text, useApp } from 'ink';
+import { ContextViewer } from './context-viewer.js';
 import { Dock } from './Dock.js';
 import { MessageLine, type MessageLineProps } from './MessageLine.js';
 import { formatNow } from '../tui-components.js';
@@ -30,6 +31,8 @@ export interface ChatAppProps {
   timezone?: string;
   infoItems: string[];
   fullscreen?: boolean;
+  /** Render all messages dynamically (re-renderable) instead of write-once Static. */
+  dynamicMessages?: boolean;
   /** Called when the user submits a message from the prompt. */
   onUserInput: (raw: string) => void;
   /** Called when the user requests exit (double Ctrl+C). */
@@ -47,6 +50,10 @@ export interface ChatAppHandle {
   setAbortHandler: (handler: (() => void) | null) => void;
   setCommandOutput: (lines: string[] | null) => void;
   setSurfacedMemories: (lines: string[]) => void;
+  /** Open the context viewer with the given lines. */
+  showContextView: (lines: string[]) => void;
+  /** Register callback for Ctrl+O (orchestrator builds context, calls showContextView). */
+  setCtrlOHandler: (handler: (() => void) | null) => void;
 }
 
 /**
@@ -56,7 +63,15 @@ export interface ChatAppHandle {
  * Only the dock (status | prompt | info) is dynamic (~6 lines).
  */
 export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function ChatApp(
-  { agentId, timezone, infoItems: initialInfoItems, fullscreen = false, onUserInput, onExit },
+  {
+    agentId,
+    timezone,
+    infoItems: initialInfoItems,
+    fullscreen = false,
+    dynamicMessages = false,
+    onUserInput,
+    onExit,
+  },
   ref
 ) {
   const { exit } = useApp();
@@ -74,6 +89,9 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
 
   // Abort handler — set by orchestrator when a backend turn is running
   const abortHandlerRef = useRef<(() => void) | null>(null);
+
+  // Context viewer state
+  const [contextViewLines, setContextViewLines] = useState<string[] | null>(null);
 
   // Waiting indicator state — verb rotates every 3s
   const [waitingVerb, setWaitingVerb] = useState('');
@@ -116,6 +134,12 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
     setSurfacedMemories: (lines: string[]) => {
       setLastSurfacedMemories(lines);
     },
+    showContextView: (lines: string[]) => {
+      setContextViewLines(lines);
+    },
+    setCtrlOHandler: (handler: (() => void) | null) => {
+      ctrlOHandlerRef.current = handler;
+    },
   }));
 
   const handleSubmit = useCallback(
@@ -136,11 +160,14 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
     }
   }, []);
 
+  // Ctrl+O callback — set by orchestrator to build context and call showContextView
+  const ctrlOHandlerRef = useRef<(() => void) | null>(null);
+
   const handleExpandMemories = useCallback(() => {
-    if (lastSurfacedMemories.length > 0) {
-      setCommandOutput(commandOutput ? null : lastSurfacedMemories);
+    if (ctrlOHandlerRef.current) {
+      ctrlOHandlerRef.current();
     }
-  }, [lastSurfacedMemories, commandOutput]);
+  }, []);
 
   const [ctrlCHint, setCtrlCHint] = useState(false);
 
@@ -170,45 +197,74 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
   const now = formatNow(timezone);
   const promptLabel = '> ';
 
+  const showingContext = contextViewLines !== null;
+
+  const messageElements = messages.map((msg) => (
+    <MessageLine
+      key={msg.id}
+      id={msg.id}
+      role={msg.role}
+      content={msg.content}
+      label={msg.label}
+      time={msg.time}
+      trailingMeta={msg.trailingMeta}
+    />
+  ));
+
   return (
     <Box flexDirection="column">
-      <Static items={messages}>
-        {(msg) => (
-          <MessageLine
-            key={msg.id}
-            id={msg.id}
-            role={msg.role}
-            content={msg.content}
-            label={msg.label}
-            time={msg.time}
-            trailingMeta={msg.trailingMeta}
-          />
-        )}
-      </Static>
+      {showingContext && (
+        <ContextViewer
+          lines={contextViewLines}
+          isActive={showingContext}
+          onDismiss={() => setContextViewLines(null)}
+        />
+      )}
+      {!showingContext && (
+        <>
+          {dynamicMessages ? (
+            <Box flexDirection="column">{messageElements}</Box>
+          ) : (
+            <Static items={messages}>
+              {(msg) => (
+                <MessageLine
+                  key={msg.id}
+                  id={msg.id}
+                  role={msg.role}
+                  content={msg.content}
+                  label={msg.label}
+                  time={msg.time}
+                  trailingMeta={msg.trailingMeta}
+                />
+              )}
+            </Static>
+          )}
 
-      <Dock
-        statusSummary={statusSummary}
-        time={now}
-        infoItems={infoItems}
-        promptLabel={promptLabel}
-        onSubmit={handleSubmit}
-        isPromptActive={!waiting}
-        onAbort={handleAbort}
-        commandOutput={commandOutput}
-        onCommandOutputClear={() => setCommandOutput(null)}
-        inputHistory={inputHistory}
-        ctrlCHint={ctrlCHint}
-        onCtrlC={handleCtrlC}
-        onExpandMemories={handleExpandMemories}
-        waitingElement={
-          waiting ? (
-            <Box paddingX={1}>
-              <Text color="cyan">{SPINNER_CHAR + ' '}</Text>
-              <Text dimColor>{waitingVerb}...</Text>
-            </Box>
-          ) : undefined
-        }
-      />
+          <Dock
+            statusSummary={statusSummary}
+            time={now}
+            infoItems={infoItems}
+            promptLabel={promptLabel}
+            onSubmit={handleSubmit}
+            isPromptActive={!waiting}
+            onAbort={handleAbort}
+            commandOutput={commandOutput}
+            onCommandOutputClear={() => setCommandOutput(null)}
+            inputHistory={inputHistory}
+            ctrlCHint={ctrlCHint}
+            onCtrlC={handleCtrlC}
+            onExpandMemories={handleExpandMemories}
+            waitingElement={
+              waiting ? (
+                <Box paddingX={1}>
+                  <Text color="cyan">{SPINNER_CHAR + ' '}</Text>
+                  <Text dimColor>{waitingVerb}...</Text>
+                </Box>
+              ) : undefined
+            }
+          />
+        </>
+      )}
     </Box>
   );
 });

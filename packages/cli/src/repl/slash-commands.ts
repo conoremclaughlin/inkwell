@@ -49,7 +49,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'bookmarks', description: 'List bookmarks' },
   { name: 'eject', description: 'Eject context to bookmark' },
   { name: 'trim', description: 'Trim oldest context entries' },
-  { name: 'context', description: 'Show recent context entries' },
+  { name: 'context', description: 'Open context inspector (bootstrap, memories, ledger)' },
   { name: 'usage', description: 'Show context token estimate' },
 ];
 

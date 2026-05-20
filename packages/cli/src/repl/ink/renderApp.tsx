@@ -60,6 +60,8 @@ export interface InkRepl {
   setCommandOutput: (lines: string[] | null) => void;
   /** Store surfaced memory details for Ctrl+O expansion. */
   setSurfacedMemories: (lines: string[]) => void;
+  /** Open the context viewer with formatted lines. */
+  showContextView: (lines: string[]) => void;
   /** Signal exit from the orchestrator side (makes waitForInput reject). */
   requestExit: () => void;
   /** Unmount the Ink app and restore terminal. */
@@ -85,6 +87,7 @@ export function renderInkChat(options: {
   timezone?: string;
   infoItems: string[];
   fullscreen?: boolean;
+  dynamicMessages?: boolean;
 }): InkRepl {
   const handleRef =
     React.createRef<ChatAppHandle>() as React.MutableRefObject<ChatAppHandle | null>;
@@ -123,6 +126,7 @@ export function renderInkChat(options: {
       timezone={options.timezone}
       infoItems={options.infoItems}
       fullscreen={fullscreen}
+      dynamicMessages={!!options.dynamicMessages}
       onUserInput={onUserInput}
       onExit={onExit}
     />,
@@ -188,6 +192,10 @@ export function renderInkChat(options: {
 
     setSurfacedMemories: (lines) => {
       getHandle().setSurfacedMemories(lines);
+    },
+
+    showContextView: (lines) => {
+      getHandle().showContextView(lines);
     },
 
     requestExit: () => {
