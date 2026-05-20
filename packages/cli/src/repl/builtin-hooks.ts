@@ -118,7 +118,7 @@ export function registerPassiveRecallHook(
   registry: SbHookRegistry,
   callRecall: (query: string, limit: number) => Promise<RecallMemory[]>,
   config?: Partial<PassiveRecallConfig>
-): { getStats: () => PassiveRecallStats } {
+): { getStats: () => PassiveRecallStats; seedBootstrapIds: (ids: string[]) => void } {
   const cfg = { ...DEFAULT_PASSIVE_RECALL_CONFIG, ...config };
   const injectedMemoryIds = new Set<string>();
   const evictedMemoryIds = new Map<string, number>(); // memoryId → turn evicted
@@ -247,6 +247,9 @@ export function registerPassiveRecallHook(
       turnsSinceLastInjection,
       currentTurn: turnCounter,
     }),
+    seedBootstrapIds: (ids: string[]) => {
+      for (const id of ids) injectedMemoryIds.add(id);
+    },
   };
 }
 
@@ -307,7 +310,9 @@ export function registerBuiltinHooks(
     passiveRecallConfig?: Partial<PassiveRecallConfig>;
     budgetThresholds?: number[];
   }
-): { passiveRecall: { getStats: () => PassiveRecallStats } } {
+): {
+  passiveRecall: { getStats: () => PassiveRecallStats; seedBootstrapIds: (ids: string[]) => void };
+} {
   const passiveRecall = registerPassiveRecallHook(
     registry,
     options.callRecall,

@@ -207,6 +207,7 @@ export function buildKnowledgeSummary(memories: import('../../data/models/memory
     topicSummary?: string;
   }>;
   memoriesIncluded: number;
+  memoryIds: string[];
 } {
   const budget = getMemoryBudget();
 
@@ -257,6 +258,7 @@ export function buildKnowledgeSummary(memories: import('../../data/models/memory
   let charsUsed = 0;
   let memoriesIncluded = 0;
   const includedTopics = new Set<string>();
+  const includedMemoryIds: string[] = [];
   const overflowTopics: typeof sortedGroups = [];
 
   for (const group of sortedGroups) {
@@ -276,6 +278,7 @@ export function buildKnowledgeSummary(memories: import('../../data/models/memory
       charsUsed += groupText.length;
       memoriesIncluded += group.memories.length;
       includedTopics.add(group.topicKey);
+      for (const mem of group.memories) includedMemoryIds.push(mem.id);
     } else if (charsUsed + header.length + 50 <= budget) {
       // Try to fit at least the header + first memory
       const firstMem = group.memories[0];
@@ -291,6 +294,7 @@ export function buildKnowledgeSummary(memories: import('../../data/models/memory
         charsUsed += totalPartial.length;
         memoriesIncluded += 1;
         includedTopics.add(group.topicKey);
+        includedMemoryIds.push(firstMem.id);
       } else {
         overflowTopics.push(group);
       }
@@ -307,7 +311,12 @@ export function buildKnowledgeSummary(memories: import('../../data/models/memory
     topicSummary: g.topicSummary,
   }));
 
-  return { knowledgeSummary: summary.trim(), topicIndex, memoriesIncluded };
+  return {
+    knowledgeSummary: summary.trim(),
+    topicIndex,
+    memoriesIncluded,
+    memoryIds: includedMemoryIds,
+  };
 }
 
 function truncateContent(content: string, maxLen: number): string {
@@ -2439,6 +2448,10 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 
             // Topic index: all topics with counts + recency (navigate with recall(topics: [...]))
             topicIndex: topicIndex.length > 0 ? topicIndex : null,
+
+            // Memory IDs included in knowledgeSummary — used by passive recall to avoid
+            // re-injecting memories that are already in context from bootstrap
+            memoryIds: knowledgeSummaryResult?.memoryIds || [],
 
             // Database identity (structural fields only — heartbeat/soul already in identityFiles)
             dbIdentity: dbIdentity

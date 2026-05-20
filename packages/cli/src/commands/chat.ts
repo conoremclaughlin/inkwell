@@ -2098,6 +2098,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       );
     }
 
+    // Seed passive recall dedup with memory IDs already in bootstrap context
+    const bootstrapMemoryIds = bootstrapResult.memoryIds as string[] | undefined;
+    if (bootstrapMemoryIds && bootstrapMemoryIds.length > 0) {
+      passiveRecallHandle.seedBootstrapIds(bootstrapMemoryIds);
+    }
+
     ledger.addEntry(
       'system',
       `Bootstrapped as ${agentId}${timezone ? ` (${String(timezone)})` : ''}${
@@ -3768,6 +3774,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
               showInPanel([`Identity context refreshed: ~${ctxTokens.toLocaleString()} tokens`]);
             } else {
               showInPanel(['Bootstrap returned no identity context.']);
+            }
+            const refreshMemoryIds = refreshResult.memoryIds as string[] | undefined;
+            if (refreshMemoryIds && refreshMemoryIds.length > 0) {
+              passiveRecallHandle.seedBootstrapIds(refreshMemoryIds);
             }
           }
           break;
