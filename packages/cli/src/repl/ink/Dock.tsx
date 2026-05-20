@@ -19,6 +19,7 @@ interface DockProps {
   waitingElement?: React.ReactNode;
   inputHistory?: string[];
   ctrlCHint?: boolean;
+  onCtrlC?: () => void;
 }
 
 /**
@@ -43,6 +44,7 @@ export function Dock({
   waitingElement,
   inputHistory,
   ctrlCHint,
+  onCtrlC,
 }: DockProps): React.ReactElement {
   const { stdout } = useStdout();
   const [, setResizeCounter] = useState(0);
@@ -82,6 +84,7 @@ export function Dock({
         isActive={isPromptActive}
         onAbort={onAbort}
         onEscape={onCommandOutputClear}
+        onCtrlC={onCtrlC}
         onInputChange={handleInputChange}
         history={inputHistory}
       />

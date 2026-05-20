@@ -133,28 +133,28 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
 
   const [ctrlCHint, setCtrlCHint] = useState(false);
 
-  // Handle Ctrl+C for double-tap exit
+  const handleCtrlC = useCallback(() => {
+    if (ctrlCCount >= 1) {
+      if (ctrlCTimer) clearTimeout(ctrlCTimer);
+      onExit();
+      exit();
+      return;
+    }
+    setCtrlCCount(1);
+    setCtrlCHint(true);
+    const timer = setTimeout(() => {
+      setCtrlCCount(0);
+      setCtrlCHint(false);
+    }, 1500);
+    setCtrlCTimer(timer);
+  }, [ctrlCCount, ctrlCTimer, onExit, exit]);
+
+  // Clean up timer on unmount
   useEffect(() => {
-    const handler = () => {
-      if (ctrlCCount >= 1) {
-        onExit();
-        exit();
-        return;
-      }
-      setCtrlCCount(1);
-      setCtrlCHint(true);
-      const timer = setTimeout(() => {
-        setCtrlCCount(0);
-        setCtrlCHint(false);
-      }, 1500);
-      setCtrlCTimer(timer);
-    };
-    process.on('SIGINT', handler);
     return () => {
-      process.off('SIGINT', handler);
       if (ctrlCTimer) clearTimeout(ctrlCTimer);
     };
-  }, [ctrlCCount, ctrlCTimer, onExit, exit]);
+  }, [ctrlCTimer]);
 
   const now = formatNow(timezone);
   const promptLabel = '> ';
@@ -187,6 +187,7 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
         onCommandOutputClear={() => setCommandOutput(null)}
         inputHistory={inputHistory}
         ctrlCHint={ctrlCHint}
+        onCtrlC={handleCtrlC}
         waitingElement={
           waiting ? (
             <Box paddingX={1}>

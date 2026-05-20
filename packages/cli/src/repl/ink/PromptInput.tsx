@@ -9,6 +9,8 @@ interface PromptInputProps {
   onAbort?: () => void;
   /** Called when Escape is pressed with empty input (e.g. dismiss dock panel). */
   onEscape?: () => void;
+  /** Called when Ctrl+C is pressed. */
+  onCtrlC?: () => void;
   /** Called on every keystroke with the current input value. */
   onInputChange?: (value: string) => void;
   /** Scroll callback for page up/down from within the prompt. */
@@ -47,6 +49,7 @@ export function PromptInput({
   isActive = true,
   onAbort,
   onEscape,
+  onCtrlC,
   onInputChange,
   onScroll,
   history = [],
@@ -89,8 +92,10 @@ export function PromptInput({
       return;
     }
 
-    // Ctrl+C is handled by Ink at the app level
-    if (key.ctrl && input === 'c') return;
+    if (key.ctrl && input === 'c') {
+      onCtrlC?.();
+      return;
+    }
 
     // Ctrl+U: clear line
     if (key.ctrl && input === 'u') {
