@@ -3344,13 +3344,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
     }
 
+    const isAbortedTurn =
+      !runResult.success && runResult.exitCode !== undefined && runResult.exitCode >= 128;
+
     if (inkRepl) {
-      const usageMeta = runResult.usage ? formatBackendTokenUsage(runResult.usage) : undefined;
-      const trailingParts = [`${turnDurationSeconds}s`, usageMeta].filter(Boolean).join('  ·  ');
-      inkRepl.addMessage('assistant', assistantDisplayText, {
-        label: agentId,
-        trailingMeta: trailingParts,
-      });
+      if (!isAbortedTurn) {
+        const usageMeta = runResult.usage ? formatBackendTokenUsage(runResult.usage) : undefined;
+        const trailingParts = [`${turnDurationSeconds}s`, usageMeta].filter(Boolean).join('  ·  ');
+        inkRepl.addMessage('assistant', assistantDisplayText, {
+          label: agentId,
+          trailingMeta: trailingParts,
+        });
+      }
     } else {
       printLine('');
       printLine(
