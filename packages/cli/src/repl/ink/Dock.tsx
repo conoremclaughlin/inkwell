@@ -17,6 +17,8 @@ interface DockProps {
   commandOutput?: string[] | null;
   onCommandOutputClear?: () => void;
   waitingElement?: React.ReactNode;
+  inputHistory?: string[];
+  ctrlCHint?: boolean;
 }
 
 /**
@@ -39,6 +41,8 @@ export function Dock({
   commandOutput,
   onCommandOutputClear,
   waitingElement,
+  inputHistory,
+  ctrlCHint,
 }: DockProps): React.ReactElement {
   const { stdout } = useStdout();
   const [, setResizeCounter] = useState(0);
@@ -77,7 +81,9 @@ export function Dock({
         onSubmit={onSubmit}
         isActive={isPromptActive}
         onAbort={onAbort}
+        onEscape={onCommandOutputClear}
         onInputChange={handleInputChange}
+        history={inputHistory}
       />
       {showAutocomplete && <SlashAutocomplete input={inputValue} />}
       {showCommandOutput && (
@@ -90,7 +96,15 @@ export function Dock({
         </Box>
       )}
       <Separator />
-      <InfoBar items={infoItems} />
+      {ctrlCHint ? (
+        <Box paddingX={1}>
+          <Text dimColor>Press </Text>
+          <Text color="yellow">ctrl+c</Text>
+          <Text dimColor> again to quit</Text>
+        </Box>
+      ) : (
+        <InfoBar items={infoItems} />
+      )}
     </Box>
   );
 }
