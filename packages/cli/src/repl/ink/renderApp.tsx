@@ -58,6 +58,8 @@ export interface InkRepl {
   setAbortHandler: (handler: (() => void) | null) => void;
   /** Show command output in the dock panel (below prompt, above info bar). */
   setCommandOutput: (lines: string[] | null) => void;
+  /** Store surfaced memory details for Ctrl+O expansion. */
+  setSurfacedMemories: (lines: string[]) => void;
   /** Signal exit from the orchestrator side (makes waitForInput reject). */
   requestExit: () => void;
   /** Unmount the Ink app and restore terminal. */
@@ -182,6 +184,10 @@ export function renderInkChat(options: {
 
     setCommandOutput: (lines) => {
       getHandle().setCommandOutput(lines);
+    },
+
+    setSurfacedMemories: (lines) => {
+      getHandle().setSurfacedMemories(lines);
     },
 
     requestExit: () => {

@@ -46,6 +46,7 @@ export interface ChatAppHandle {
   setInfoItems: (items: string[]) => void;
   setAbortHandler: (handler: (() => void) | null) => void;
   setCommandOutput: (lines: string[] | null) => void;
+  setSurfacedMemories: (lines: string[]) => void;
 }
 
 /**
@@ -69,6 +70,7 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
 
   const [commandOutput, setCommandOutput] = useState<string[] | null>(null);
   const [inputHistory, setInputHistory] = useState<string[]>([]);
+  const [lastSurfacedMemories, setLastSurfacedMemories] = useState<string[]>([]);
 
   // Abort handler — set by orchestrator when a backend turn is running
   const abortHandlerRef = useRef<(() => void) | null>(null);
@@ -111,6 +113,9 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
     setCommandOutput: (lines: string[] | null) => {
       setCommandOutput(lines);
     },
+    setSurfacedMemories: (lines: string[]) => {
+      setLastSurfacedMemories(lines);
+    },
   }));
 
   const handleSubmit = useCallback(
@@ -130,6 +135,12 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
       abortHandlerRef.current = null;
     }
   }, []);
+
+  const handleExpandMemories = useCallback(() => {
+    if (lastSurfacedMemories.length > 0) {
+      setCommandOutput(commandOutput ? null : lastSurfacedMemories);
+    }
+  }, [lastSurfacedMemories, commandOutput]);
 
   const [ctrlCHint, setCtrlCHint] = useState(false);
 
@@ -188,6 +199,7 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
         inputHistory={inputHistory}
         ctrlCHint={ctrlCHint}
         onCtrlC={handleCtrlC}
+        onExpandMemories={handleExpandMemories}
         waitingElement={
           waiting ? (
             <Box paddingX={1}>

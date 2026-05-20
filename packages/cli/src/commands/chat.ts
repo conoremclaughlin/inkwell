@@ -2771,13 +2771,29 @@ export async function runChat(options: ChatOptions): Promise<void> {
         .filter((e) => e.source === 'budget-monitor')
         .slice(-promptHookResult.injected);
 
-      for (const entry of recallEntries) {
-        const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
-        printLine(
-          chalk.dim(
-            `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`
-          )
-        );
+      if (recallEntries.length > 0) {
+        const totalTok = recallEntries.reduce((sum, e) => sum + e.approxTokens, 0);
+        if (inkRepl) {
+          const details = recallEntries.map((entry) => {
+            const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+            return `  💡 ${preview}${entry.content.length > 120 ? '...' : ''} (${entry.approxTokens} tok)`;
+          });
+          inkRepl.setSurfacedMemories(details);
+          printLine(
+            chalk.dim(
+              `  💡 ${recallEntries.length} ${recallEntries.length === 1 ? 'memory' : 'memories'} surfaced (${totalTok} tok) — ctrl+o to expand`
+            )
+          );
+        } else {
+          for (const entry of recallEntries) {
+            const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+            printLine(
+              chalk.dim(
+                `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`
+              )
+            );
+          }
+        }
       }
 
       if (budgetEntries.length > 0) {
@@ -3287,14 +3303,29 @@ export async function runChat(options: ChatOptions): Promise<void> {
             .filter((e) => e.source === 'passive-recall')
             .slice(-hookResult.injected);
 
-          for (const entry of recallEntries) {
-            const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
-            const tokens = entry.approxTokens;
-            printLine(
-              chalk.dim(
-                `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${tokens} tok)`
-              )
-            );
+          if (recallEntries.length > 0) {
+            const totalTok = recallEntries.reduce((sum, e) => sum + e.approxTokens, 0);
+            if (inkRepl) {
+              const details = recallEntries.map((entry) => {
+                const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+                return `  💡 ${preview}${entry.content.length > 120 ? '...' : ''} (${entry.approxTokens} tok)`;
+              });
+              inkRepl.setSurfacedMemories(details);
+              printLine(
+                chalk.dim(
+                  `  💡 ${recallEntries.length} ${recallEntries.length === 1 ? 'memory' : 'memories'} surfaced (${totalTok} tok) — ctrl+o to expand`
+                )
+              );
+            } else {
+              for (const entry of recallEntries) {
+                const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+                printLine(
+                  chalk.dim(
+                    `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`
+                  )
+                );
+              }
+            }
           }
         }
         if (hookResult.evicted > 0) {

@@ -20,6 +20,7 @@ interface DockProps {
   inputHistory?: string[];
   ctrlCHint?: boolean;
   onCtrlC?: () => void;
+  onExpandMemories?: () => void;
 }
 
 /**
@@ -45,6 +46,7 @@ export function Dock({
   inputHistory,
   ctrlCHint,
   onCtrlC,
+  onExpandMemories,
 }: DockProps): React.ReactElement {
   const { stdout } = useStdout();
   const [, setResizeCounter] = useState(0);
@@ -85,6 +87,7 @@ export function Dock({
         onAbort={onAbort}
         onEscape={onCommandOutputClear}
         onCtrlC={onCtrlC}
+        onExpandMemories={onExpandMemories}
         onInputChange={handleInputChange}
         history={inputHistory}
       />

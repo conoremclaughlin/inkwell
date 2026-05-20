@@ -11,6 +11,8 @@ interface PromptInputProps {
   onEscape?: () => void;
   /** Called when Ctrl+C is pressed. */
   onCtrlC?: () => void;
+  /** Called when Ctrl+O is pressed (expand collapsed memories). */
+  onExpandMemories?: () => void;
   /** Called on every keystroke with the current input value. */
   onInputChange?: (value: string) => void;
   /** Scroll callback for page up/down from within the prompt. */
@@ -50,6 +52,7 @@ export function PromptInput({
   onAbort,
   onEscape,
   onCtrlC,
+  onExpandMemories,
   onInputChange,
   onScroll,
   history = [],
@@ -94,6 +97,12 @@ export function PromptInput({
 
     if (key.ctrl && input === 'c') {
       onCtrlC?.();
+      return;
+    }
+
+    // Ctrl+O: expand collapsed memories in dock panel
+    if (key.ctrl && input === 'o') {
+      onExpandMemories?.();
       return;
     }
 
