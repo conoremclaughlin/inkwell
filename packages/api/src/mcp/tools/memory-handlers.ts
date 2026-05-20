@@ -2329,8 +2329,12 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     }
   }
 
+  const usedCache = !!cachedSummary;
   const knowledgeSummary = cachedSummary || knowledgeSummaryResult?.knowledgeSummary || '';
   const topicIndex = knowledgeSummaryResult?.topicIndex || [];
+  // Only return memoryIds when using the freshly computed summary — cached summaries
+  // may have been built from a different memory set (different thread/focus/limit).
+  const knowledgeMemoryIds = usedCache ? [] : knowledgeSummaryResult?.memoryIds || [];
 
   logger.info(`Bootstrap loaded for user ${user.id}`, {
     agentId: agentId || 'none',
@@ -2339,7 +2343,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     memoryCount: knowledgeMemories.length,
     knowledgeSummaryChars: knowledgeSummary.length,
     topicCount: topicIndex.length,
-    usedCache: !!cachedSummary,
+    usedCache,
     memorySelectionContext: {
       threadKey: inferredThreadKey || null,
       hasFocusText: !!focusText,
@@ -2450,8 +2454,9 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
             topicIndex: topicIndex.length > 0 ? topicIndex : null,
 
             // Memory IDs included in knowledgeSummary — used by passive recall to avoid
-            // re-injecting memories that are already in context from bootstrap
-            memoryIds: knowledgeSummaryResult?.memoryIds || [],
+            // re-injecting memories already in context. Empty when summary served from
+            // cache (cache may have been built from a different memory set).
+            memoryIds: knowledgeMemoryIds,
 
             // Database identity (structural fields only — heartbeat/soul already in identityFiles)
             dbIdentity: dbIdentity
