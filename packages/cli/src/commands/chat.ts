@@ -2006,9 +2006,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   } catch {
     /* not a git repo */
   }
-  const initialInfoItems = ['/help', 'esc cancel', 'ctrl+c ×2 quit', shortCwd, gitBranch].filter(
-    Boolean
-  );
+  const initialInfoItems = [shortCwd, gitBranch].filter(Boolean);
   statusLane.setInfoItems(initialInfoItems);
 
   // Ink renderer — created lazily after the banner section has printed
@@ -2098,6 +2096,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
           `Identity context loaded: ~${ctxTokens.toLocaleString()} tokens injected into prompt`
         )
       );
+    }
+
+    // Seed passive recall dedup with memory IDs already in bootstrap context
+    const bootstrapMemoryIds = bootstrapResult.memoryIds as string[] | undefined;
+    if (bootstrapMemoryIds && bootstrapMemoryIds.length > 0) {
+      passiveRecallHandle.seedBootstrapIds(bootstrapMemoryIds);
     }
 
     ledger.addEntry(
@@ -3300,9 +3304,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       .catch(() => undefined); // never block the REPL
 
     if (!runResult.success) {
-      printLine(chalk.red(`\n[${runtime.backend}] exit=${runResult.exitCode}`));
-      if (runResult.stderr) {
-        printLine(chalk.dim(runResult.stderr));
+      const isSignalExit = runResult.exitCode !== undefined && runResult.exitCode >= 128;
+      if (!isSignalExit) {
+        printLine(chalk.red(`\n[${runtime.backend}] exit=${runResult.exitCode}`));
+        if (runResult.stderr) {
+          printLine(chalk.dim(runResult.stderr));
+        }
       }
     }
 
@@ -3767,6 +3774,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
               showInPanel([`Identity context refreshed: ~${ctxTokens.toLocaleString()} tokens`]);
             } else {
               showInPanel(['Bootstrap returned no identity context.']);
+            }
+            const refreshMemoryIds = refreshResult.memoryIds as string[] | undefined;
+            if (refreshMemoryIds && refreshMemoryIds.length > 0) {
+              passiveRecallHandle.seedBootstrapIds(refreshMemoryIds);
             }
           }
           break;

@@ -68,6 +68,7 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
   const [ctrlCTimer, setCtrlCTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
 
   const [commandOutput, setCommandOutput] = useState<string[] | null>(null);
+  const [inputHistory, setInputHistory] = useState<string[]>([]);
 
   // Abort handler — set by orchestrator when a backend turn is running
   const abortHandlerRef = useRef<(() => void) | null>(null);
@@ -114,6 +115,10 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
 
   const handleSubmit = useCallback(
     (value: string) => {
+      setInputHistory((prev) => {
+        if (prev[prev.length - 1] === value) return prev;
+        return [...prev, value];
+      });
       onUserInput(value);
     },
     [onUserInput]
@@ -126,6 +131,8 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
     }
   }, []);
 
+  const [ctrlCHint, setCtrlCHint] = useState(false);
+
   // Handle Ctrl+C for double-tap exit
   useEffect(() => {
     const handler = () => {
@@ -135,7 +142,11 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
         return;
       }
       setCtrlCCount(1);
-      const timer = setTimeout(() => setCtrlCCount(0), 1500);
+      setCtrlCHint(true);
+      const timer = setTimeout(() => {
+        setCtrlCCount(0);
+        setCtrlCHint(false);
+      }, 1500);
       setCtrlCTimer(timer);
     };
     process.on('SIGINT', handler);
@@ -174,6 +185,8 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
         onAbort={handleAbort}
         commandOutput={commandOutput}
         onCommandOutputClear={() => setCommandOutput(null)}
+        inputHistory={inputHistory}
+        ctrlCHint={ctrlCHint}
         waitingElement={
           waiting ? (
             <Box paddingX={1}>

@@ -7,10 +7,14 @@ interface PromptInputProps {
   isActive?: boolean;
   /** Called when Escape is pressed while waiting (not active). */
   onAbort?: () => void;
+  /** Called when Escape is pressed with empty input (e.g. dismiss dock panel). */
+  onEscape?: () => void;
   /** Called on every keystroke with the current input value. */
   onInputChange?: (value: string) => void;
   /** Scroll callback for page up/down from within the prompt. */
   onScroll?: (direction: 'up' | 'down') => void;
+  /** Input history for up/down arrow recall. */
+  history?: string[];
 }
 
 /** Find the position of the previous word boundary (start of current/previous word). */
@@ -42,11 +46,15 @@ export function PromptInput({
   onSubmit,
   isActive = true,
   onAbort,
+  onEscape,
   onInputChange,
   onScroll,
+  history = [],
 }: PromptInputProps): React.ReactElement {
   const [value, setValue] = useState('');
   const [cursor, setCursor] = useState(0);
+  const [historyIndex, setHistoryIndex] = useState(-1);
+  const [savedInput, setSavedInput] = useState('');
 
   useEffect(() => {
     onInputChange?.(value);
@@ -58,6 +66,8 @@ export function PromptInput({
       if (!submitted) return;
       setValue('');
       setCursor(0);
+      setHistoryIndex(-1);
+      setSavedInput('');
       onSubmit(submitted);
       return;
     }
@@ -173,20 +183,57 @@ export function PromptInput({
       return;
     }
 
-    // Escape: abort current turn if waiting, clear input if typing
+    // Escape: abort current turn if waiting, clear input if typing, dismiss panel if empty
     if (key.escape) {
       if (!isActive && onAbort) {
         onAbort();
       } else if (value.length > 0) {
         setValue('');
         setCursor(0);
+        setHistoryIndex(-1);
+        setSavedInput('');
+      } else {
+        onEscape?.();
+      }
+      return;
+    }
+
+    // Up arrow: navigate input history (most recent first)
+    if (key.upArrow) {
+      if (history.length === 0) return;
+      if (historyIndex === -1) {
+        setSavedInput(value);
+        const newIndex = history.length - 1;
+        setHistoryIndex(newIndex);
+        setValue(history[newIndex]!);
+        setCursor(history[newIndex]!.length);
+      } else if (historyIndex > 0) {
+        const newIndex = historyIndex - 1;
+        setHistoryIndex(newIndex);
+        setValue(history[newIndex]!);
+        setCursor(history[newIndex]!.length);
+      }
+      return;
+    }
+
+    // Down arrow: navigate forward in history, restore saved input at end
+    if (key.downArrow) {
+      if (historyIndex === -1) return;
+      if (historyIndex < history.length - 1) {
+        const newIndex = historyIndex + 1;
+        setHistoryIndex(newIndex);
+        setValue(history[newIndex]!);
+        setCursor(history[newIndex]!.length);
+      } else {
+        setHistoryIndex(-1);
+        setValue(savedInput);
+        setCursor(savedInput.length);
       }
       return;
     }
 
     // Ignore other control sequences
     if (key.ctrl) return;
-    if (key.upArrow || key.downArrow) return;
     if (key.tab) return;
 
     // Regular character input
