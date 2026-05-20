@@ -226,17 +226,14 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
 
   return (
     <Box flexDirection="column">
-      {/* Context viewer — always mounted, toggled via display.
-          Keeps useInput lifecycle stable across open/close cycles. */}
-      <Box display={showingContext ? 'flex' : 'none'} flexDirection="column">
-        <ContextViewer
-          lines={contextViewLines ?? []}
-          isActive={showingContext}
-          onDismiss={handleContextDismiss}
-        />
-      </Box>
+      {/* Context viewer — conditionally rendered so each open gets fresh
+          scroll state. The useInput lifecycle issue only affects the Dock
+          (PromptInput), not the ContextViewer, so mount/unmount is safe. */}
+      {showingContext && (
+        <ContextViewer lines={contextViewLines!} isActive onDismiss={handleContextDismiss} />
+      )}
 
-      {/* Chat messages — Static writes to scrollback regardless of display */}
+      {/* Chat messages — Static writes to scrollback */}
       {dockVisible &&
         (dynamicMessages ? (
           <Box flexDirection="column">{messageElements}</Box>

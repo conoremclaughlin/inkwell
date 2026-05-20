@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback } from 'react';
 import { Box, Text, useInput, useStdout } from 'ink';
 
 export interface ContextSections {
@@ -75,11 +75,6 @@ export function ContextViewer({
   const viewportHeight = Math.max(5, (stdout?.rows || 24) - 4);
   const [scrollOffset, setScrollOffset] = useState(0);
   const maxScroll = Math.max(0, lines.length - viewportHeight);
-
-  // Reset scroll when lines change (new content or viewer reopened)
-  useEffect(() => {
-    setScrollOffset(0);
-  }, [lines]);
 
   const scrollUp = useCallback(
     (amount = 1) => setScrollOffset((prev) => Math.max(0, prev - amount)),
