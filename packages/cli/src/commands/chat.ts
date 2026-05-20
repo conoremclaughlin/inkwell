@@ -2694,6 +2694,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       if (inkRepl) {
         inkRepl.addMessage('activity', `${actor} ${type}${preview ? ` — ${preview}` : ''}`, {
           label: '⚡',
+          time: formatHumanTime(activity.createdAt, runtime.userTimezone),
         });
       } else {
         printLine('');
