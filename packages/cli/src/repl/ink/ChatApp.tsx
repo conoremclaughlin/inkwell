@@ -92,6 +92,9 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
 
   // Context viewer state
   const [contextViewLines, setContextViewLines] = useState<string[] | null>(null);
+  // Brief intermediate state: both views hidden so Ink renders a zero-height
+  // frame, erasing the tall context viewer before showing the shorter dock.
+  const [dismissingContext, setDismissingContext] = useState(false);
 
   // Waiting indicator state — verb rotates every 3s
   const [waitingVerb, setWaitingVerb] = useState('');
@@ -198,6 +201,16 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
   const promptLabel = '> ';
 
   const showingContext = contextViewLines !== null;
+  const dockVisible = !showingContext && !dismissingContext;
+
+  const handleContextDismiss = useCallback(() => {
+    // Two-phase dismiss: hide both views for one frame so Ink renders a
+    // zero-height dynamic area (erasing the tall context viewer), then
+    // show the dock fresh on the next tick.
+    setDismissingContext(true);
+    setContextViewLines(null);
+    setTimeout(() => setDismissingContext(false), 0);
+  }, []);
 
   const messageElements = messages.map((msg) => (
     <MessageLine
@@ -219,12 +232,12 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
         <ContextViewer
           lines={contextViewLines ?? []}
           isActive={showingContext}
-          onDismiss={() => setContextViewLines(null)}
+          onDismiss={handleContextDismiss}
         />
       </Box>
 
       {/* Chat messages — Static writes to scrollback regardless of display */}
-      {!showingContext &&
+      {dockVisible &&
         (dynamicMessages ? (
           <Box flexDirection="column">{messageElements}</Box>
         ) : (
@@ -245,7 +258,7 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
 
       {/* Dock — always mounted, hidden when context viewer is active.
           useInputActive=false yields stdin to ContextViewer's useInput. */}
-      <Box display={showingContext ? 'none' : 'flex'} flexDirection="column">
+      <Box display={dockVisible ? 'flex' : 'none'} flexDirection="column">
         <Dock
           statusSummary={statusSummary}
           time={now}
@@ -253,7 +266,7 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
           promptLabel={promptLabel}
           onSubmit={handleSubmit}
           isPromptActive={!waiting}
-          useInputActive={!showingContext}
+          useInputActive={dockVisible}
           onAbort={handleAbort}
           commandOutput={commandOutput}
           onCommandOutputClear={() => setCommandOutput(null)}
