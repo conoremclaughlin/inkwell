@@ -147,7 +147,8 @@ export async function isParticipant(
  * 1. triggerAgents [...] → wake exactly these (filter to participants)
  * 2. triggerAll: true → wake all participants except sender
  * 3. Actionable messages (task_request, session_resume) → trigger all recipients
- * 4. Default: 1:1 → other participant; group non-creator → creator; group creator → all others
+ * 4. Default: 1:1 → other participant; group with explicit recipients → those recipients;
+ *    group non-creator → creator; group creator → all others
  *
  * Cross-studio self-messaging: when selfStudioTarget is true, the sender is NOT
  * excluded from trigger lists. This allows an agent to message themselves in a
@@ -210,12 +211,19 @@ export function resolveTriggeredAgents(opts: {
     return targets.filter((a) => participants.includes(a));
   }
 
-  // Group thread: non-creator reply → trigger creator only
+  // Group thread: use explicit recipients if provided, otherwise apply defaults.
+  // This handles the common case where a reply targets a specific participant
+  // (e.g., recipientAgentId: "myra" in a 4-person thread → only trigger myra).
+  const explicitTargets = opts.recipients?.filter(excludeSelf);
+  if (explicitTargets && explicitTargets.length > 0) {
+    return explicitTargets.filter((a) => participants.includes(a));
+  }
+
+  // No explicit recipients — fall back to role-based defaults:
+  // Non-creator → trigger creator only; Creator → trigger all others
   if (senderAgentId !== creatorAgentId) {
     return [creatorAgentId];
   }
-
-  // Group thread: creator reply → trigger all other participants
   return otherParticipants;
 }
 

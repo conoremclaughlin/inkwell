@@ -59,6 +59,36 @@ describe('resolveTriggeredAgents', () => {
       });
       expect(result).toEqual(['lumen', 'aster', 'myra']);
     });
+
+    it('should trigger only explicit recipient when creator targets one person', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants,
+        creatorAgentId: 'wren',
+        recipients: ['myra'],
+      });
+      expect(result).toEqual(['myra']);
+    });
+
+    it('should trigger only explicit recipient when non-creator targets one person', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'lumen',
+        participants,
+        creatorAgentId: 'wren',
+        recipients: ['myra'],
+      });
+      expect(result).toEqual(['myra']);
+    });
+
+    it('should filter explicit recipients to actual participants', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants,
+        creatorAgentId: 'wren',
+        recipients: ['myra', 'benson'],
+      });
+      expect(result).toEqual(['myra']);
+    });
   });
 
   describe('actionable message types in group threads', () => {
