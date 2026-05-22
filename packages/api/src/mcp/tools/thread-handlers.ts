@@ -211,12 +211,11 @@ export function resolveTriggeredAgents(opts: {
     return targets.filter((a) => participants.includes(a));
   }
 
-  // Group thread: use explicit recipients if provided, otherwise apply defaults.
-  // This handles the common case where a reply targets a specific participant
-  // (e.g., recipientAgentId: "myra" in a 4-person thread → only trigger myra).
-  const explicitTargets = opts.recipients?.filter(excludeSelf);
-  if (explicitTargets && explicitTargets.length > 0) {
-    return explicitTargets.filter((a) => participants.includes(a));
+  // Group thread: when explicit recipients are provided, use them — even if the
+  // filtered result is empty (e.g., self-target without selfStudioTarget). This
+  // respects the caller's intent rather than falling through to role-based defaults.
+  if (opts.recipients && opts.recipients.length > 0) {
+    return opts.recipients.filter((a) => excludeSelf(a) && participants.includes(a));
   }
 
   // No explicit recipients — fall back to role-based defaults:
