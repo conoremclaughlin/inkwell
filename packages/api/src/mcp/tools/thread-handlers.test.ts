@@ -41,23 +41,23 @@ describe('resolveTriggeredAgents', () => {
       expect(result).toEqual(['wren']);
     });
 
-    it('should trigger no one when creator replies with a plain message', () => {
+    it('should trigger all others when creator replies with a plain message', () => {
       const result = resolveTriggeredAgents({
         senderAgentId: 'wren',
         participants,
         creatorAgentId: 'wren',
         messageType: 'message',
       });
-      expect(result).toEqual([]);
+      expect(result).toEqual(['lumen', 'aster', 'myra']);
     });
 
-    it('should trigger no one when creator replies with no messageType (default)', () => {
+    it('should trigger all others when creator replies with no messageType (default)', () => {
       const result = resolveTriggeredAgents({
         senderAgentId: 'wren',
         participants,
         creatorAgentId: 'wren',
       });
-      expect(result).toEqual([]);
+      expect(result).toEqual(['lumen', 'aster', 'myra']);
     });
   });
 
