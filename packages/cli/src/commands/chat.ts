@@ -2326,7 +2326,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // ── Banner (prints before Ink mounts, goes to terminal scrollback) ──
   {
     const INKWELL_QUOTES = [
-      { text: 'The palest ink is better than the best memory.', attr: 'Chinese proverb' },
       { text: 'A word after a word after a word is power.', attr: 'Margaret Atwood' },
       { text: 'We write to taste life twice.', attr: 'Anaïs Nin' },
       { text: "I write entirely to find out what I'm thinking.", attr: 'Joan Didion' },
@@ -2339,7 +2338,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
         text: 'Either write something worth reading or do something worth writing.',
         attr: 'Benjamin Franklin',
       },
-      { text: 'The pen is the tongue of the mind.', attr: 'Miguel de Cervantes' },
     ];
 
     const bannerWidth = Math.min(process.stdout.columns || 80, 60);
@@ -2518,10 +2516,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     console.log('');
     console.log(bottomGlow);
 
-    // ── Quote ──
+    // ── Quote (inline attribution) ──
     const quote = INKWELL_QUOTES[Math.floor(Math.random() * INKWELL_QUOTES.length)]!;
-    const maxQW = bannerWidth - 8;
-    const qWords = quote.text.split(' ');
+    const fullQuote = `”${quote.text}” — ${quote.attr}`;
+    const maxQW = bannerWidth - 4;
+    const qWords = fullQuote.split(' ');
     const qLines: string[] = [];
     let qCur = '';
     for (const w of qWords) {
@@ -2534,19 +2533,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
     }
     if (qCur) qLines.push(qCur);
-    qLines[0] = `“${qLines[0]!}`;
-    qLines[qLines.length - 1] += `”`;
 
-    const attrText = `— ${quote.attr}`;
-    const blockW = Math.max(...qLines.map((l) => l.length), attrText.length);
-    const blockPad = Math.max(0, Math.floor((bannerWidth - blockW) / 2));
-
+    const qPad = ' '.repeat(
+      Math.max(0, Math.floor((bannerWidth - Math.max(...qLines.map((l) => l.length))) / 2))
+    );
     for (const line of qLines) {
-      console.log(' '.repeat(blockPad) + chalk.dim(line));
+      console.log(qPad + chalk.dim(line));
     }
-    console.log(' '.repeat(blockPad + Math.max(0, blockW - attrText.length)) + chalk.dim(attrText));
     console.log('');
-    console.log(chalk.dim('  ' + '─'.repeat(Math.max(0, bannerWidth - 4))));
   }
   const studioSlug =
     attachedSessionSummary?.studioName ||
