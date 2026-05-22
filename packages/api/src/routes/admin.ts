@@ -5502,6 +5502,45 @@ router.get('/sessions/:id/conversation', async (req: Request, res: Response) => 
       }
     }
 
+    // For ink backend: query activity_stream for conversation messages
+    if (backend === 'ink') {
+      const { data: activities, error: actError } = await supabase
+        .from('activity_stream')
+        .select('id, type, direction, content, agent_id, platform, created_at, payload')
+        .eq('user_id', authReq.pcpUserId)
+        .eq('session_id', sessionId)
+        .in('type', [
+          'message_in',
+          'message_out',
+          'message',
+          'agent_spawn',
+          'agent_complete',
+          'error',
+        ])
+        .order('created_at', { ascending: true })
+        .limit(500);
+
+      if (!actError && activities && activities.length > 0) {
+        const events = activities.map((a) => ({
+          type: a.type,
+          direction: a.direction,
+          content: a.content,
+          agentId: a.agent_id,
+          platform: a.platform,
+          timestamp: a.created_at,
+          payload: a.payload,
+        }));
+        res.json({
+          session: sessionInfo,
+          source: 'cloud',
+          backend,
+          transcript: { events },
+          totalEvents: events.length,
+        });
+        return;
+      }
+    }
+
     res.json({
       session: sessionInfo,
       source: 'none',

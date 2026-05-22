@@ -27,7 +27,7 @@ interface ConversationResponse {
     updatedAt: string;
     endedAt: string | null;
   };
-  source: 'synced' | 'local' | 'none';
+  source: 'synced' | 'local' | 'cloud' | 'none';
   backend: string;
   transcript: TranscriptPayload | null;
   totalEvents: number;

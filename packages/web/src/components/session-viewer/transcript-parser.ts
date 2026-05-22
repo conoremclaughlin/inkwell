@@ -329,8 +329,67 @@ function extractContentBlocks(event: Record<string, unknown>): ContentBlock[] {
   return blocks;
 }
 
+export function parseInkTranscript(events: unknown[]): ConversationTurn[] {
+  const turns: ConversationTurn[] = [];
+
+  for (const raw of events) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const event = raw as Record<string, unknown>;
+
+    const type = String(event.type ?? '');
+    const direction = String(event.direction ?? '');
+    const content = typeof event.content === 'string' ? event.content : '';
+    const timestamp = String(event.timestamp ?? event.created_at ?? '');
+    const id = String(event.id ?? `ink-${turns.length}`);
+
+    if ((type === 'message_in' || type === 'message') && direction === 'in') {
+      if (content.trim()) {
+        turns.push({
+          id,
+          role: 'user',
+          timestamp,
+          blocks: [{ kind: 'text', text: content }],
+        });
+      }
+      continue;
+    }
+
+    if ((type === 'message_out' || type === 'message') && direction === 'out') {
+      if (content.trim()) {
+        turns.push({
+          id,
+          role: 'assistant',
+          timestamp,
+          blocks: [{ kind: 'text', text: content }],
+        });
+      }
+      continue;
+    }
+
+    if (type === 'agent_spawn' || type === 'agent_complete' || type === 'error') {
+      const label =
+        type === 'agent_spawn'
+          ? 'session started'
+          : type === 'agent_complete'
+            ? 'session completed'
+            : 'error';
+      const detail = content.trim() ? `${label}: ${content.slice(0, 300)}` : label;
+      turns.push({
+        id,
+        role: 'system',
+        timestamp,
+        blocks: [{ kind: 'system', text: detail, subtype: type }],
+      });
+      continue;
+    }
+  }
+
+  return turns;
+}
+
 export function parseTranscript(backend: string, events: unknown[]): ConversationTurn[] {
   const b = backend.toLowerCase();
+  if (b === 'ink') return parseInkTranscript(events);
   if (b.includes('gemini')) return parseGeminiTranscript(events);
   if (b.includes('codex')) return parseCodexTranscript(events);
   return parseClaudeTranscript(events);
