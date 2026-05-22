@@ -178,7 +178,7 @@ Structure your output as:
 - **PR description**: Include diagrams directly in the PR body (GitHub renders Mermaid natively)
 - **PR comment**: Post as a review comment for complex PRs that need visual explanation
 - **Inbox update**: Include in `send_to_inbox` messages when reporting on autonomous work
-- **Artifact**: Store as `create_artifact(type: "doc")` for reference
+- **Artifact**: Store as `create_artifact(uri: "ink://docs/<slug>", title: "...", content: "...")` for reference
 
 ## Diagram Style Guidelines
 
