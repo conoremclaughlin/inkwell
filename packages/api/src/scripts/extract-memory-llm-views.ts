@@ -559,7 +559,8 @@ async function processMemoryBatch(params: {
 }
 
 function getEnabledKinds(options: { batchAllKinds?: boolean } = {}): ExtractionKind[] {
-  if (options.batchAllKinds) return ['entity', 'durable_fact', 'summary', 'exact_details'];
+  if (options.batchAllKinds)
+    return ['entity', 'durable_fact', 'summary', 'current_state', 'exact_details'];
   const enabledKinds: ExtractionKind[] = [];
   if (env.MEMORY_LLM_ENTITY_ENABLED) enabledKinds.push('entity');
   if (env.MEMORY_LLM_DURABLE_FACT_ENABLED) enabledKinds.push('durable_fact');

@@ -67,7 +67,7 @@ export interface MemoryCreateInput {
 export type MemorySearchChunkType =
   | 'summary'
   | 'fact'
-  | 'exact_detail'
+  | 'exact_details'
   | 'topic'
   | 'entity'
   | 'current_state'

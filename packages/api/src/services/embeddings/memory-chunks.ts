@@ -19,7 +19,7 @@ const DEFAULT_OVERLAP_CHARS = 150;
 export type MemoryChunkType =
   | 'summary'
   | 'fact'
-  | 'exact_detail'
+  | 'exact_details'
   | 'topic'
   | 'entity'
   | 'current_state'
@@ -29,7 +29,7 @@ const CHUNK_TYPE_ORDER: MemoryChunkType[] = [
   'content',
   'summary',
   'fact',
-  'exact_detail',
+  'exact_details',
   'topic',
   'entity',
   'current_state',
@@ -37,7 +37,7 @@ const CHUNK_TYPE_ORDER: MemoryChunkType[] = [
 const LEGACY_CHUNK_TYPE_ORDER: MemoryChunkType[] = [
   'summary',
   'fact',
-  'exact_detail',
+  'exact_details',
   'topic',
   'entity',
   'current_state',
@@ -59,7 +59,7 @@ export interface EmbeddedMemoryChunk extends MemoryEmbeddingChunk {
 export interface MemoryChunkViewCounts {
   summary: number;
   fact: number;
-  exact_detail: number;
+  exact_details: number;
   topic: number;
   entity: number;
   current_state: number;
@@ -70,7 +70,7 @@ function emptyViewCounts(): MemoryChunkViewCounts {
   return {
     summary: 0,
     fact: 0,
-    exact_detail: 0,
+    exact_details: 0,
     topic: 0,
     entity: 0,
     current_state: 0,
@@ -279,7 +279,7 @@ export function buildMemoryEmbeddingChunks(params: {
     : [];
   if (includeLlm) {
     chunks.push(
-      ...reindexChunks(buildChunksFromTexts('exact_detail', exactDetailTexts), chunks.length)
+      ...reindexChunks(buildChunksFromTexts('exact_details', exactDetailTexts), chunks.length)
     );
   }
 

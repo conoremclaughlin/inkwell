@@ -1830,7 +1830,7 @@ describe('MemoryRepository', () => {
         1,
         'match_memory_embedding_chunks',
         expect.objectContaining({
-          p_chunk_types: ['summary', 'fact', 'exact_detail', 'topic', 'entity', 'current_state'],
+          p_chunk_types: ['summary', 'fact', 'exact_details', 'topic', 'entity', 'current_state'],
         })
       );
       expect(rpc).toHaveBeenNthCalledWith(

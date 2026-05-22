@@ -128,7 +128,7 @@ function buildVariantSemanticOptions(
       };
     case 'content-plus-exact':
       return {
-        semanticChunkTypes: ['content', 'exact_detail'],
+        semanticChunkTypes: ['content', 'exact_details'],
         applyChunkTypeBoosts: false,
       };
     case 'content-plus-summary':
@@ -152,7 +152,7 @@ function buildVariantSemanticOptions(
           'content',
           'summary',
           'fact',
-          'exact_detail',
+          'exact_details',
           'topic',
           'entity',
           'current_state',
@@ -166,7 +166,7 @@ function buildVariantSemanticOptions(
       };
     case 'exact-only':
       return {
-        semanticChunkTypes: ['exact_detail'],
+        semanticChunkTypes: ['exact_details'],
         applyChunkTypeBoosts: false,
       };
     case 'summary-only':
@@ -181,12 +181,12 @@ function buildVariantSemanticOptions(
       };
     case 'derived-only':
       return {
-        semanticChunkTypes: ['summary', 'fact', 'exact_detail', 'topic', 'entity'],
+        semanticChunkTypes: ['summary', 'fact', 'exact_details', 'topic', 'entity'],
         applyChunkTypeBoosts: false,
       };
     case 'multiview-no-boost':
       return {
-        semanticChunkTypes: ['summary', 'fact', 'exact_detail', 'topic', 'entity', 'content'],
+        semanticChunkTypes: ['summary', 'fact', 'exact_details', 'topic', 'entity', 'content'],
         applyChunkTypeBoosts: false,
       };
     case 'multiview-no-chrono':

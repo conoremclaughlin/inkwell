@@ -56,7 +56,7 @@ describe('benchmark-memory-recall variants', () => {
       })
     ).toMatchObject({
       recallMode: 'semantic',
-      semanticChunkTypes: ['summary', 'fact', 'exact_detail', 'topic', 'entity'],
+      semanticChunkTypes: ['summary', 'fact', 'exact_details', 'topic', 'entity'],
       applyChunkTypeBoosts: false,
     });
   });
@@ -173,7 +173,7 @@ describe('benchmark-memory-recall variants', () => {
       })
     ).toMatchObject({
       recallMode: 'semantic',
-      semanticChunkTypes: ['exact_detail'],
+      semanticChunkTypes: ['exact_details'],
       applyChunkTypeBoosts: false,
     });
 
@@ -187,7 +187,7 @@ describe('benchmark-memory-recall variants', () => {
       })
     ).toMatchObject({
       recallMode: 'semantic',
-      semanticChunkTypes: ['content', 'exact_detail'],
+      semanticChunkTypes: ['content', 'exact_details'],
       applyChunkTypeBoosts: false,
     });
   });
@@ -207,7 +207,7 @@ describe('benchmark-memory-recall variants', () => {
         'content',
         'summary',
         'fact',
-        'exact_detail',
+        'exact_details',
         'topic',
         'entity',
         'current_state',

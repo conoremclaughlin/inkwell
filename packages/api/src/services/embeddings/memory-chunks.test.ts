@@ -29,7 +29,7 @@ describe('memory chunk multi-view helpers', () => {
     expect(viewCounts.topic).toBe(0);
     expect(viewCounts.entity).toBe(0);
     expect(viewCounts.current_state).toBe(0);
-    expect(viewCounts.exact_detail).toBe(0);
+    expect(viewCounts.exact_details).toBe(0);
     expect(viewCounts.content).toBe(1);
 
     const metadata = {
@@ -135,7 +135,7 @@ describe('memory chunk multi-view helpers', () => {
       'action relevance'
     );
     expect(chunks.find((chunk) => chunk.chunkType === 'fact')?.text).toContain('durable fact:');
-    expect(chunks.find((chunk) => chunk.chunkType === 'exact_detail')?.text).toContain(
+    expect(chunks.find((chunk) => chunk.chunkType === 'exact_details')?.text).toContain(
       'exact detail: state'
     );
     expect(chunks.find((chunk) => chunk.chunkType === 'entity')?.text).toContain('entity: Wren');
@@ -146,7 +146,7 @@ describe('memory chunk multi-view helpers', () => {
     const viewCounts = countChunkViews(chunks);
     expect(viewCounts.summary).toBe(1);
     expect(viewCounts.fact).toBe(1);
-    expect(viewCounts.exact_detail).toBe(1);
+    expect(viewCounts.exact_details).toBe(1);
     expect(viewCounts.entity).toBe(1);
     expect(viewCounts.current_state).toBe(1);
     expect(viewCounts.content).toBe(1);
