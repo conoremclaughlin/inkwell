@@ -2479,15 +2479,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
       console.log(line);
     }
 
-    // Horizon glow — full width, warm center fading to edges
-    let horizonLine = '';
-    for (let i = 0; i < termW; i++) {
-      const t = Math.abs(i / Math.max(termW - 1, 1) - 0.5) * 2;
-      const c = _lerpHex('#ffeebb', '#e8b4b8', t);
-      horizonLine += chalk.hex(c).bgHex(c)('▀');
-    }
-    console.log(horizonLine);
-
     // Block-letter INKWELL with dawn gradient
     const blockFont: Record<string, string[]> = {
       I: ['█████', '  █  ', '  █  ', '  █  ', '█████'],
