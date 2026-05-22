@@ -3936,7 +3936,7 @@ When threadKey is provided, messages are stored in thread tables (inbox_thread_m
 
 For existing threads, reply semantics are applied automatically:
 - Closed threads are rejected
-- Smart trigger defaults: 1:1 thread → trigger other participant; group thread (non-creator) → trigger creator; group thread (creator) → trigger no one
+- Smart trigger defaults: 1:1 thread → trigger other participant; group thread (non-creator) → trigger creator; group thread (creator) → all others
 - Override with triggerAll (everyone) or triggerAgents (specific agents)
 
 For new threads (first message), all recipients are triggered.
