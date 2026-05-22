@@ -298,11 +298,17 @@ function SessionCard({ session }: { session: Session }) {
           <div className="rounded-md bg-gray-50 p-3 text-xs space-y-3">
             <div>
               <Link
-                href={`/sessions/${session.id}`}
+                href={`/sessions/viewer?id=${session.id}`}
                 className="inline-flex items-center gap-1.5 rounded border border-gray-300 bg-white px-2 py-1 text-xs font-medium text-gray-700 hover:bg-gray-100"
               >
                 <MessageSquare className="h-3.5 w-3.5" />
-                View full log
+                View conversation
+              </Link>
+              <Link
+                href={`/sessions/${session.id}`}
+                className="inline-flex items-center gap-1.5 rounded border border-gray-300 bg-white px-2 py-1 text-xs font-medium text-gray-500 hover:bg-gray-100"
+              >
+                View raw log
               </Link>
             </div>
             {/* Session IDs */}
