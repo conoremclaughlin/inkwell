@@ -2346,9 +2346,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const centerText = (s: string) =>
       ' '.repeat(Math.max(0, Math.floor((bannerWidth - s.length) / 2))) + s;
 
-    // ── Dawn Skyline ASCII art ──
-    const artWidth = Math.min(bannerWidth, 56);
-    const artPad = ' '.repeat(Math.max(0, Math.floor((bannerWidth - artWidth) / 2)));
+    // ── Dawn Skyline ASCII art (full terminal width, centered buildings) ──
+    const termW = process.stdout.columns || 80;
+    const cityW = 56;
+    const cityOffset = Math.max(0, Math.floor((termW - cityW) / 2));
 
     const _lerp = (a: number, b: number, t: number) => Math.round(a + (b - a) * t);
     const _lerpHex = (h1: string, h2: string, t: number) => {
@@ -2377,28 +2378,27 @@ export async function runChat(options: ChatOptions): Promise<void> {
       return _lerpHex(skyStops[idx]!, skyStops[idx2]!, frac);
     };
 
-    // Seeded PRNG for deterministic art per session
     let _seed = Date.now() & 0xffff;
     const _rand = () => {
       _seed = (_seed * 16807 + 0) % 2147483647;
       return (_seed & 0xffff) / 0x10000;
     };
 
-    // Sky rows
+    // Sky rows — full terminal width
     for (let r = 0; r < 4; r++) {
       const rc = _skyAt(r / 8);
       const rc2 = _skyAt((r + 1) / 8);
       let row = '';
-      for (let i = 0; i < artWidth; i++) {
-        const c = _lerpHex(rc, rc2, (i / (artWidth - 1)) * 0.15);
+      for (let i = 0; i < termW; i++) {
+        const c = _lerpHex(rc, rc2, (i / Math.max(termW - 1, 1)) * 0.15);
         if (r < 2 && _rand() < 0.03) row += chalk.hex('#ffffff')('·');
         else if (r < 1 && _rand() < 0.02) row += chalk.hex('#ccccff')('✦');
         else row += chalk.hex(c).bgHex(c)('▄');
       }
-      console.log(artPad + row);
+      console.log(row);
     }
 
-    // Buildings — chaotic variety with four styles
+    // Buildings — chaotic variety, centered in full-width gradient
     type BldgStyle = 'tower' | 'thin' | 'wide' | 'squat';
     interface Bldg {
       s: number;
@@ -2432,28 +2432,36 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     for (let row = 0; row < bldgMaxH; row++) {
       let line = '';
-      for (let x = 0; x < artWidth; x++) {
+      for (let x = 0; x < termW; x++) {
+        const cx = x - cityOffset;
         let drawn = false;
-        for (const b of bldgs) {
-          if (x >= b.s && x < b.s + b.w && row >= bldgMaxH - b.h) {
-            const lx = x - b.s;
-            const ly = row - (bldgMaxH - b.h);
-            let isWin = false;
-            if (b.st === 'tower')
-              isWin =
-                lx > 0 && lx < b.w - 1 && ly > 0 && ly % 2 === 1 && lx % 2 === 1 && _rand() < 0.55;
-            else if (b.st === 'thin')
-              isWin = lx === Math.floor(b.w / 2) && ly > 0 && ly % 2 === 0 && _rand() < 0.7;
-            else if (b.st === 'wide')
-              isWin = lx > 0 && lx < b.w - 1 && ly > 0 && (ly === 2 || ly === 4) && _rand() < 0.5;
-            else isWin = lx > 0 && lx < b.w - 1 && ly > 0 && _rand() < 0.25;
-            if (isWin) {
-              line += chalk.hex(winPalette[Math.floor(_rand() * winPalette.length)]!)('▪');
-            } else {
-              line += chalk.hex(bldgColor).bgHex(bldgColor)('█');
+        if (cx >= 0 && cx < cityW) {
+          for (const b of bldgs) {
+            if (cx >= b.s && cx < b.s + b.w && row >= bldgMaxH - b.h) {
+              const lx = cx - b.s;
+              const ly = row - (bldgMaxH - b.h);
+              let isWin = false;
+              if (b.st === 'tower')
+                isWin =
+                  lx > 0 &&
+                  lx < b.w - 1 &&
+                  ly > 0 &&
+                  ly % 2 === 1 &&
+                  lx % 2 === 1 &&
+                  _rand() < 0.55;
+              else if (b.st === 'thin')
+                isWin = lx === Math.floor(b.w / 2) && ly > 0 && ly % 2 === 0 && _rand() < 0.7;
+              else if (b.st === 'wide')
+                isWin = lx > 0 && lx < b.w - 1 && ly > 0 && (ly === 2 || ly === 4) && _rand() < 0.5;
+              else isWin = lx > 0 && lx < b.w - 1 && ly > 0 && _rand() < 0.25;
+              if (isWin) {
+                line += chalk.hex(winPalette[Math.floor(_rand() * winPalette.length)]!)('▪');
+              } else {
+                line += chalk.hex(bldgColor).bgHex(bldgColor)('█');
+              }
+              drawn = true;
+              break;
             }
-            drawn = true;
-            break;
           }
         }
         if (!drawn) {
@@ -2461,21 +2469,51 @@ export async function runChat(options: ChatOptions): Promise<void> {
           line += chalk.hex(bgC).bgHex(bgC)('▄');
         }
       }
-      console.log(artPad + line);
+      console.log(line);
     }
 
-    // Horizon glow
+    // Horizon glow — full width, warm center fading to edges
     let horizonLine = '';
-    for (let i = 0; i < artWidth; i++) {
-      const t = Math.abs(i / (artWidth - 1) - 0.5) * 2;
+    for (let i = 0; i < termW; i++) {
+      const t = Math.abs(i / Math.max(termW - 1, 1) - 0.5) * 2;
       const c = _lerpHex('#ffeebb', '#e8b4b8', t);
       horizonLine += chalk.hex(c).bgHex(c)('▀');
     }
-    console.log(artPad + horizonLine);
+    console.log(horizonLine);
 
+    // Title — gradient text matching dawn palette
+    const titleText = 'i n k w e l l';
+    const titleStops = [
+      '#c490d1',
+      '#e8b4b8',
+      '#f5d0a9',
+      '#ffeebb',
+      '#f5d0a9',
+      '#e8b4b8',
+      '#c490d1',
+    ];
+    let titleStr = '';
+    for (let i = 0; i < titleText.length; i++) {
+      const t = titleText.length > 1 ? i / (titleText.length - 1) : 0;
+      const si = Math.floor(t * (titleStops.length - 1));
+      const si2 = Math.min(si + 1, titleStops.length - 1);
+      const sf = t * (titleStops.length - 1) - si;
+      const c = _lerpHex(titleStops[si]!, titleStops[si2]!, sf);
+      titleStr += chalk.bold.hex(c)(titleText[i]);
+    }
+    const titlePad = ' '.repeat(Math.max(0, Math.floor((bannerWidth - titleText.length) / 2)));
     console.log('');
-    console.log(centerText(chalk.bold.white('i n k w e l l')));
+    console.log(titlePad + titleStr);
+
+    // Bottom gradient accent — thin warm line mirroring the horizon
+    let bottomGlow = '';
+    for (let i = 0; i < termW; i++) {
+      const t = Math.abs(i / Math.max(termW - 1, 1) - 0.5) * 2;
+      const c = _lerpHex('#f5d0a9', '#c490d1', t);
+      bottomGlow += chalk.hex(c)('─');
+    }
     console.log('');
+    console.log(bottomGlow);
 
     // ── Quote ──
     const quote = INKWELL_QUOTES[Math.floor(Math.random() * INKWELL_QUOTES.length)]!;
