@@ -2346,6 +2346,138 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const centerText = (s: string) =>
       ' '.repeat(Math.max(0, Math.floor((bannerWidth - s.length) / 2))) + s;
 
+    // ── Dawn Skyline ASCII art ──
+    const artWidth = Math.min(bannerWidth, 56);
+    const artPad = ' '.repeat(Math.max(0, Math.floor((bannerWidth - artWidth) / 2)));
+
+    const _lerp = (a: number, b: number, t: number) => Math.round(a + (b - a) * t);
+    const _lerpHex = (h1: string, h2: string, t: number) => {
+      const p = (s: string, o: number) => parseInt(s.slice(o, o + 2), 16);
+      const r = _lerp(p(h1, 1), p(h2, 1), t);
+      const g = _lerp(p(h1, 3), p(h2, 3), t);
+      const b = _lerp(p(h1, 5), p(h2, 5), t);
+      return '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('');
+    };
+
+    const skyStops = [
+      '#0a0a1a',
+      '#1a1040',
+      '#2d1b69',
+      '#5c3d8f',
+      '#8b5fbf',
+      '#c490d1',
+      '#e8b4b8',
+      '#f5d0a9',
+      '#ffeebb',
+    ];
+    const _skyAt = (t: number) => {
+      const idx = Math.floor(t * (skyStops.length - 1));
+      const idx2 = Math.min(idx + 1, skyStops.length - 1);
+      const frac = t * (skyStops.length - 1) - idx;
+      return _lerpHex(skyStops[idx]!, skyStops[idx2]!, frac);
+    };
+
+    // Seeded PRNG for deterministic art per session
+    let _seed = Date.now() & 0xffff;
+    const _rand = () => {
+      _seed = (_seed * 16807 + 0) % 2147483647;
+      return (_seed & 0xffff) / 0x10000;
+    };
+
+    // Sky rows
+    for (let r = 0; r < 4; r++) {
+      const rc = _skyAt(r / 8);
+      const rc2 = _skyAt((r + 1) / 8);
+      let row = '';
+      for (let i = 0; i < artWidth; i++) {
+        const c = _lerpHex(rc, rc2, (i / (artWidth - 1)) * 0.15);
+        if (r < 2 && _rand() < 0.03) row += chalk.hex('#ffffff')('·');
+        else if (r < 1 && _rand() < 0.02) row += chalk.hex('#ccccff')('✦');
+        else row += chalk.hex(c).bgHex(c)('▄');
+      }
+      console.log(artPad + row);
+    }
+
+    // Buildings — chaotic variety with four styles
+    type BldgStyle = 'tower' | 'thin' | 'wide' | 'squat';
+    interface Bldg {
+      s: number;
+      w: number;
+      h: number;
+      st: BldgStyle;
+    }
+    const bldgs: Bldg[] = [
+      { s: 0, w: 4, h: 5, st: 'squat' },
+      { s: 3, w: 2, h: 3, st: 'thin' },
+      { s: 4, w: 7, h: 8, st: 'tower' },
+      { s: 10, w: 3, h: 4, st: 'squat' },
+      { s: 12, w: 2, h: 6, st: 'thin' },
+      { s: 13, w: 5, h: 5, st: 'wide' },
+      { s: 17, w: 3, h: 3, st: 'squat' },
+      { s: 19, w: 8, h: 10, st: 'tower' },
+      { s: 26, w: 2, h: 4, st: 'thin' },
+      { s: 27, w: 5, h: 6, st: 'wide' },
+      { s: 31, w: 3, h: 3, st: 'squat' },
+      { s: 33, w: 6, h: 7, st: 'tower' },
+      { s: 38, w: 2, h: 5, st: 'thin' },
+      { s: 39, w: 4, h: 4, st: 'squat' },
+      { s: 42, w: 3, h: 8, st: 'thin' },
+      { s: 44, w: 5, h: 6, st: 'wide' },
+      { s: 48, w: 2, h: 3, st: 'thin' },
+      { s: 49, w: 7, h: 9, st: 'tower' },
+    ];
+    const bldgMaxH = 10;
+    const bldgColor = '#12122a';
+    const winPalette = ['#ffdd44', '#ff9944', '#ffcc33', '#44aaff', '#ffffff', '#88ddff'];
+
+    for (let row = 0; row < bldgMaxH; row++) {
+      let line = '';
+      for (let x = 0; x < artWidth; x++) {
+        let drawn = false;
+        for (const b of bldgs) {
+          if (x >= b.s && x < b.s + b.w && row >= bldgMaxH - b.h) {
+            const lx = x - b.s;
+            const ly = row - (bldgMaxH - b.h);
+            let isWin = false;
+            if (b.st === 'tower')
+              isWin =
+                lx > 0 && lx < b.w - 1 && ly > 0 && ly % 2 === 1 && lx % 2 === 1 && _rand() < 0.55;
+            else if (b.st === 'thin')
+              isWin = lx === Math.floor(b.w / 2) && ly > 0 && ly % 2 === 0 && _rand() < 0.7;
+            else if (b.st === 'wide')
+              isWin = lx > 0 && lx < b.w - 1 && ly > 0 && (ly === 2 || ly === 4) && _rand() < 0.5;
+            else isWin = lx > 0 && lx < b.w - 1 && ly > 0 && _rand() < 0.25;
+            if (isWin) {
+              line += chalk.hex(winPalette[Math.floor(_rand() * winPalette.length)]!)('▪');
+            } else {
+              line += chalk.hex(bldgColor).bgHex(bldgColor)('█');
+            }
+            drawn = true;
+            break;
+          }
+        }
+        if (!drawn) {
+          const bgC = _skyAt(0.6 + (row / bldgMaxH) * 0.4);
+          line += chalk.hex(bgC).bgHex(bgC)('▄');
+        }
+      }
+      console.log(artPad + line);
+    }
+
+    // Horizon glow
+    let horizonLine = '';
+    for (let i = 0; i < artWidth; i++) {
+      const t = Math.abs(i / (artWidth - 1) - 0.5) * 2;
+      const c = _lerpHex('#ffeebb', '#e8b4b8', t);
+      horizonLine += chalk.hex(c).bgHex(c)('▀');
+    }
+    console.log(artPad + horizonLine);
+
+    console.log('');
+    console.log(centerText(chalk.bold.white('i n k w e l l')));
+    console.log('');
+
+    // ── Quote ──
     const quote = INKWELL_QUOTES[Math.floor(Math.random() * INKWELL_QUOTES.length)]!;
     const maxQW = bannerWidth - 8;
     const qWords = quote.text.split(' ');
@@ -2368,11 +2500,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const blockW = Math.max(...qLines.map((l) => l.length), attrText.length);
     const blockPad = Math.max(0, Math.floor((bannerWidth - blockW) / 2));
 
-    console.log('');
-    console.log(centerText(chalk.white('✦')));
-    console.log('');
-    console.log(centerText(chalk.bold.white('i n k w e l l')));
-    console.log('');
     for (const line of qLines) {
       console.log(' '.repeat(blockPad) + chalk.dim(line));
     }
