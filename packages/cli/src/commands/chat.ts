@@ -2346,10 +2346,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const centerText = (s: string) =>
       ' '.repeat(Math.max(0, Math.floor((bannerWidth - s.length) / 2))) + s;
 
-    // ── Dawn Skyline ASCII art (full terminal width, centered buildings) ──
+    // ── Dawn Skyline ASCII art (full width, tiling buildings) ──
     const termW = process.stdout.columns || 80;
     const cityW = 56;
-    const cityOffset = Math.max(0, Math.floor((termW - cityW) / 2));
 
     const _lerp = (a: number, b: number, t: number) => Math.round(a + (b - a) * t);
     const _lerpHex = (h1: string, h2: string, t: number) => {
@@ -2377,6 +2376,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const frac = t * (skyStops.length - 1) - idx;
       return _lerpHex(skyStops[idx]!, skyStops[idx2]!, frac);
     };
+    const titleStops = [
+      '#c490d1',
+      '#e8b4b8',
+      '#f5d0a9',
+      '#ffeebb',
+      '#f5d0a9',
+      '#e8b4b8',
+      '#c490d1',
+    ];
+    const _titleAt = (t: number) => {
+      const idx = Math.floor(t * (titleStops.length - 1));
+      const idx2 = Math.min(idx + 1, titleStops.length - 1);
+      const frac = t * (titleStops.length - 1) - idx;
+      return _lerpHex(titleStops[idx]!, titleStops[idx2]!, frac);
+    };
 
     let _seed = Date.now() & 0xffff;
     const _rand = () => {
@@ -2398,7 +2412,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       console.log(row);
     }
 
-    // Buildings — chaotic variety, centered in full-width gradient
+    // Buildings — tiling across full terminal width
     type BldgStyle = 'tower' | 'thin' | 'wide' | 'squat';
     interface Bldg {
       s: number;
@@ -2433,35 +2447,28 @@ export async function runChat(options: ChatOptions): Promise<void> {
     for (let row = 0; row < bldgMaxH; row++) {
       let line = '';
       for (let x = 0; x < termW; x++) {
-        const cx = x - cityOffset;
+        const cx = ((x % cityW) + cityW) % cityW;
         let drawn = false;
-        if (cx >= 0 && cx < cityW) {
-          for (const b of bldgs) {
-            if (cx >= b.s && cx < b.s + b.w && row >= bldgMaxH - b.h) {
-              const lx = cx - b.s;
-              const ly = row - (bldgMaxH - b.h);
-              let isWin = false;
-              if (b.st === 'tower')
-                isWin =
-                  lx > 0 &&
-                  lx < b.w - 1 &&
-                  ly > 0 &&
-                  ly % 2 === 1 &&
-                  lx % 2 === 1 &&
-                  _rand() < 0.55;
-              else if (b.st === 'thin')
-                isWin = lx === Math.floor(b.w / 2) && ly > 0 && ly % 2 === 0 && _rand() < 0.7;
-              else if (b.st === 'wide')
-                isWin = lx > 0 && lx < b.w - 1 && ly > 0 && (ly === 2 || ly === 4) && _rand() < 0.5;
-              else isWin = lx > 0 && lx < b.w - 1 && ly > 0 && _rand() < 0.25;
-              if (isWin) {
-                line += chalk.hex(winPalette[Math.floor(_rand() * winPalette.length)]!)('▪');
-              } else {
-                line += chalk.hex(bldgColor).bgHex(bldgColor)('█');
-              }
-              drawn = true;
-              break;
+        for (const b of bldgs) {
+          if (cx >= b.s && cx < b.s + b.w && row >= bldgMaxH - b.h) {
+            const lx = cx - b.s;
+            const ly = row - (bldgMaxH - b.h);
+            let isWin = false;
+            if (b.st === 'tower')
+              isWin =
+                lx > 0 && lx < b.w - 1 && ly > 0 && ly % 2 === 1 && lx % 2 === 1 && _rand() < 0.55;
+            else if (b.st === 'thin')
+              isWin = lx === Math.floor(b.w / 2) && ly > 0 && ly % 2 === 0 && _rand() < 0.7;
+            else if (b.st === 'wide')
+              isWin = lx > 0 && lx < b.w - 1 && ly > 0 && (ly === 2 || ly === 4) && _rand() < 0.5;
+            else isWin = lx > 0 && lx < b.w - 1 && ly > 0 && _rand() < 0.25;
+            if (isWin) {
+              line += chalk.hex(winPalette[Math.floor(_rand() * winPalette.length)]!)('▪');
+            } else {
+              line += chalk.hex(bldgColor).bgHex(bldgColor)('█');
             }
+            drawn = true;
+            break;
           }
         }
         if (!drawn) {
@@ -2481,29 +2488,34 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
     console.log(horizonLine);
 
-    // Title — gradient text matching dawn palette
-    const titleText = 'i n k w e l l';
-    const titleStops = [
-      '#c490d1',
-      '#e8b4b8',
-      '#f5d0a9',
-      '#ffeebb',
-      '#f5d0a9',
-      '#e8b4b8',
-      '#c490d1',
-    ];
-    let titleStr = '';
-    for (let i = 0; i < titleText.length; i++) {
-      const t = titleText.length > 1 ? i / (titleText.length - 1) : 0;
-      const si = Math.floor(t * (titleStops.length - 1));
-      const si2 = Math.min(si + 1, titleStops.length - 1);
-      const sf = t * (titleStops.length - 1) - si;
-      const c = _lerpHex(titleStops[si]!, titleStops[si2]!, sf);
-      titleStr += chalk.bold.hex(c)(titleText[i]);
-    }
-    const titlePad = ' '.repeat(Math.max(0, Math.floor((bannerWidth - titleText.length) / 2)));
+    // Block-letter INKWELL with dawn gradient
+    const blockFont: Record<string, string[]> = {
+      I: ['█████', '  █  ', '  █  ', '  █  ', '█████'],
+      N: ['█   █', '██  █', '█ █ █', '█  ██', '█   █'],
+      K: ['█  █', '█ █ ', '██  ', '█ █ ', '█  █'],
+      W: ['█     █', '█  █  █', '█ █ █ █', '██   ██', '█     █'],
+      E: ['█████', '█    ', '████ ', '█    ', '█████'],
+      L: ['█   ', '█   ', '█   ', '█   ', '████'],
+    };
+    const blockWord = 'INKWELL';
+    const blockSpacing = 2;
+    const blockRows = [0, 1, 2, 3, 4].map((r) =>
+      [...blockWord].map((ch) => blockFont[ch]![r]).join(' '.repeat(blockSpacing))
+    );
+    const blockTotalW = blockRows[0]!.length;
+    const blockPadN = Math.max(0, Math.floor((termW - blockTotalW) / 2));
+
     console.log('');
-    console.log(titlePad + titleStr);
+    for (const bRow of blockRows) {
+      let line = ' '.repeat(blockPadN);
+      for (let i = 0; i < bRow.length; i++) {
+        const ch = bRow[i];
+        const t = bRow.length > 1 ? i / (bRow.length - 1) : 0;
+        const c = _titleAt(t);
+        line += ch === '█' ? chalk.hex(c)('█') : ' ';
+      }
+      console.log(line);
+    }
 
     // Bottom gradient accent — thin warm line mirroring the horizon
     let bottomGlow = '';
