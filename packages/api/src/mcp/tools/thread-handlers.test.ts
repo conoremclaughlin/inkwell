@@ -59,6 +59,67 @@ describe('resolveTriggeredAgents', () => {
       });
       expect(result).toEqual(['lumen', 'aster', 'myra']);
     });
+
+    it('should trigger only explicit recipient when creator targets one person', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants,
+        creatorAgentId: 'wren',
+        recipients: ['myra'],
+      });
+      expect(result).toEqual(['myra']);
+    });
+
+    it('should trigger only explicit recipient when non-creator targets one person', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'lumen',
+        participants,
+        creatorAgentId: 'wren',
+        recipients: ['myra'],
+      });
+      expect(result).toEqual(['myra']);
+    });
+
+    it('should trigger no one when creator explicitly targets self (same studio)', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants,
+        creatorAgentId: 'wren',
+        recipients: ['wren'],
+      });
+      expect(result).toEqual([]);
+    });
+
+    it('should trigger no one when non-creator explicitly targets self (same studio)', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'lumen',
+        participants,
+        creatorAgentId: 'wren',
+        recipients: ['lumen'],
+      });
+      expect(result).toEqual([]);
+    });
+
+    it('should trigger self when explicitly targeting self with selfStudioTarget', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants,
+        creatorAgentId: 'wren',
+        recipients: ['wren'],
+        selfStudioTarget: true,
+      });
+      expect(result).toEqual(['wren']);
+    });
+
+    it('should filter explicit recipients to actual participants', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants,
+        creatorAgentId: 'wren',
+        recipients: ['myra', 'benson'],
+      });
+      expect(result).toEqual(['myra']);
+    });
   });
 
   describe('actionable message types in group threads', () => {
