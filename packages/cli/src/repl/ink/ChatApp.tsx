@@ -57,7 +57,7 @@ export interface ChatAppHandle {
 }
 
 /**
- * Root Ink component for the SB Chat REPL.
+ * Root Ink component for the Inkwell Chat REPL.
  *
  * Uses <Static> for completed messages (written once to terminal scrollback).
  * Only the dock (status | prompt | info) is dynamic (~6 lines).
