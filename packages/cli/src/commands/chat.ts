@@ -607,6 +607,7 @@ function hydrateLedgerFromTranscript(
       continue;
     }
     if (type === 'assistant' && typeof event.content === 'string') {
+      if (event.content === '(no output)') continue;
       const source = typeof event.backend === 'string' ? event.backend : 'backend-history';
       ledger.addEntry('assistant', event.content, source);
       loaded += 1;
