@@ -3,6 +3,7 @@ import type { Database } from '../data/supabase/types';
 import {
   buildDurableFactEmbeddingTexts,
   buildEntityEmbeddingTexts,
+  buildExactDetailsEmbeddingTexts,
   buildSummaryEmbeddingTexts,
   normalizeMemoryExtractions,
   type MemoryExtractions,
@@ -61,6 +62,7 @@ interface CaseCoverage {
   entityHasAnswer: boolean;
   durableFactHasAnswer: boolean;
   summaryHasAnswer: boolean;
+  exactDetailsHasAnswer: boolean;
   derivedHasAnswer: boolean;
   maxDerivedAnswerTokenCoverage: number;
   sourceSnippet: string;
@@ -79,21 +81,26 @@ interface AuditSummary {
     entity: number;
     durableFact: number;
     summary: number;
+    exactDetails: number;
     rawEntity: number;
     rawDurableFact: number;
     rawSummary: number;
+    rawExactDetails: number;
   };
   extractionCounts: {
     entityItems: number;
     durableFactItems: number;
     summaryKeyPoints: number;
+    exactDetailItems: number;
     emptyEntityMemories: number;
     emptyDurableFactMemories: number;
+    emptyExactDetailsMemories: number;
   };
   rawOverflowCounts: {
     entity: number;
     durableFact: number;
     summaryKeyPoints: number;
+    exactDetails: number;
   };
   labelLeakCounts: {
     benchmarkTerms: number;
@@ -115,6 +122,7 @@ interface AuditSummary {
     entityHasAnswer: number;
     durableFactHasAnswer: number;
     summaryHasAnswer: number;
+    exactDetailsHasAnswer: number;
     derivedHasAnswer: number;
     derivedMissWhenTargetContentHasAnswer: number;
     derivedMissWhenTargetExtractionInputHasAnswer: number;
@@ -231,7 +239,7 @@ function snippetAroundAnswer(text: string, answer: string | number, maxChars = 7
 
 function extractionText(
   extraction: MemoryExtractions | null,
-  kind?: 'entity' | 'durable' | 'summary'
+  kind?: 'entity' | 'durable' | 'summary' | 'exact'
 ) {
   if (!extraction) return '';
   const parts: string[] = [];
@@ -244,10 +252,16 @@ function extractionText(
   if ((!kind || kind === 'summary') && extraction.summary) {
     parts.push(buildSummaryEmbeddingTexts(extraction.summary).join('\n'));
   }
+  if ((!kind || kind === 'exact') && extraction.exact_details) {
+    parts.push(buildExactDetailsEmbeddingTexts(extraction.exact_details).join('\n'));
+  }
   return parts.join('\n');
 }
 
-function rawArrayLength(raw: unknown, key: 'entities' | 'durableFacts' | 'keyPoints'): number {
+function rawArrayLength(
+  raw: unknown,
+  key: 'entities' | 'durableFacts' | 'keyPoints' | 'exactDetails'
+): number {
   const value = asRecord(raw)[key];
   return Array.isArray(value) ? value.length : 0;
 }
@@ -340,7 +354,10 @@ function auditCaseCoverage(params: {
     const summaryText = targetMemories
       .map((item) => extractionText(item.extraction, 'summary'))
       .join('\n');
-    const derivedText = [entityText, durableText, summaryText].join('\n');
+    const exactDetailsText = targetMemories
+      .map((item) => extractionText(item.extraction, 'exact'))
+      .join('\n');
+    const derivedText = [entityText, durableText, summaryText, exactDetailsText].join('\n');
 
     cases.push({
       caseId,
@@ -354,6 +371,7 @@ function auditCaseCoverage(params: {
       entityHasAnswer: hasAnswer(entityText, benchmarkCase.answer),
       durableFactHasAnswer: hasAnswer(durableText, benchmarkCase.answer),
       summaryHasAnswer: hasAnswer(summaryText, benchmarkCase.answer),
+      exactDetailsHasAnswer: hasAnswer(exactDetailsText, benchmarkCase.answer),
       derivedHasAnswer: hasAnswer(derivedText, benchmarkCase.answer),
       maxDerivedAnswerTokenCoverage: answerTokenCoverage(derivedText, benchmarkCase.answer),
       sourceSnippet: snippetAroundAnswer(targetContent, benchmarkCase.answer),
@@ -379,18 +397,22 @@ function summarizeAudits(params: {
     entity: 0,
     durableFact: 0,
     summary: 0,
+    exactDetails: 0,
     rawEntity: 0,
     rawDurableFact: 0,
     rawSummary: 0,
+    rawExactDetails: 0,
   };
   const extractionCounts = {
     entityItems: 0,
     durableFactItems: 0,
     summaryKeyPoints: 0,
+    exactDetailItems: 0,
     emptyEntityMemories: 0,
     emptyDurableFactMemories: 0,
+    emptyExactDetailsMemories: 0,
   };
-  const rawOverflowCounts = { entity: 0, durableFact: 0, summaryKeyPoints: 0 };
+  const rawOverflowCounts = { entity: 0, durableFact: 0, summaryKeyPoints: 0, exactDetails: 0 };
   const labelLeakCounts = { benchmarkTerms: 0, targetDistractorTerms: 0 };
   const contentLimit = {
     maxInputChars: env.MEMORY_LLM_MAX_INPUT_CHARS,
@@ -413,14 +435,17 @@ function summarizeAudits(params: {
       missingExtractionCount += 1;
       continue;
     }
-    const hasAllKinds = Boolean(extraction.entity && extraction.durable_fact && extraction.summary);
+    const hasAllKinds = Boolean(
+      extraction.entity && extraction.durable_fact && extraction.summary && extraction.exact_details
+    );
     increment(extractionVersionCounts, String(extraction.version));
     increment(extractionProviderCounts, extraction.provider);
     if (
       hasAllKinds &&
       extraction.raw?.entity &&
       extraction.raw?.durable_fact &&
-      extraction.raw?.summary
+      extraction.raw?.summary &&
+      extraction.raw?.exact_details
     ) {
       completeExtractionCount += 1;
     }
@@ -445,6 +470,13 @@ function summarizeAudits(params: {
     if (extraction.summary) {
       normalizedPresence.summary += 1;
       extractionCounts.summaryKeyPoints += extraction.summary.keyPoints.length;
+    }
+    if (extraction.exact_details) {
+      normalizedPresence.exactDetails += 1;
+      extractionCounts.exactDetailItems += extraction.exact_details.exactDetails.length;
+      if (extraction.exact_details.exactDetails.length === 0) {
+        extractionCounts.emptyExactDetailsMemories += 1;
+      }
     }
 
     if (extraction.raw?.entity) {
@@ -472,6 +504,15 @@ function summarizeAudits(params: {
         (extraction.summary?.keyPoints.length || 0)
       ) {
         rawOverflowCounts.summaryKeyPoints += 1;
+      }
+    }
+    if (extraction.raw?.exact_details) {
+      normalizedPresence.rawExactDetails += 1;
+      if (
+        rawArrayLength(extraction.raw.exact_details, 'exactDetails') >
+        (extraction.exact_details?.exactDetails.length || 0)
+      ) {
+        rawOverflowCounts.exactDetails += 1;
       }
     }
 
@@ -513,6 +554,8 @@ function summarizeAudits(params: {
       entityHasAnswer: params.caseCoverage.filter((item) => item.entityHasAnswer).length,
       durableFactHasAnswer: params.caseCoverage.filter((item) => item.durableFactHasAnswer).length,
       summaryHasAnswer: params.caseCoverage.filter((item) => item.summaryHasAnswer).length,
+      exactDetailsHasAnswer: params.caseCoverage.filter((item) => item.exactDetailsHasAnswer)
+        .length,
       derivedHasAnswer: params.caseCoverage.filter((item) => item.derivedHasAnswer).length,
       derivedMissWhenTargetContentHasAnswer: params.caseCoverage.filter(
         (item) => item.targetContentHasAnswer && !item.derivedHasAnswer
@@ -557,7 +600,7 @@ function buildMarkdownReport(params: {
     `- Label leakage: benchmark terms in ${params.summary.labelLeakCounts.benchmarkTerms}, target/distractor terms in ${params.summary.labelLeakCounts.targetDistractorTerms}`
   );
   lines.push(
-    `- Raw overflow preserved: entity=${params.summary.rawOverflowCounts.entity}, durable_fact=${params.summary.rawOverflowCounts.durableFact}, summary_key_points=${params.summary.rawOverflowCounts.summaryKeyPoints}`
+    `- Raw overflow preserved: entity=${params.summary.rawOverflowCounts.entity}, durable_fact=${params.summary.rawOverflowCounts.durableFact}, summary_key_points=${params.summary.rawOverflowCounts.summaryKeyPoints}, exact_details=${params.summary.rawOverflowCounts.exactDetails}`
   );
   lines.push(
     `- Extraction versions: ${Object.entries(params.summary.extractionVersionCounts)
@@ -588,6 +631,9 @@ function buildMarkdownReport(params: {
     `- Summary view contains answer: ${params.summary.answerCoverage.summaryHasAnswer}/${params.summary.answerCoverage.cases} (${pct(params.summary.answerCoverage.summaryHasAnswer, params.summary.answerCoverage.cases)})`
   );
   lines.push(
+    `- Exact-details view contains answer: ${params.summary.answerCoverage.exactDetailsHasAnswer}/${params.summary.answerCoverage.cases} (${pct(params.summary.answerCoverage.exactDetailsHasAnswer, params.summary.answerCoverage.cases)})`
+  );
+  lines.push(
     `- Any derived view contains answer: ${params.summary.answerCoverage.derivedHasAnswer}/${params.summary.answerCoverage.cases} (${pct(params.summary.answerCoverage.derivedHasAnswer, params.summary.answerCoverage.cases)})`
   );
   lines.push(
@@ -604,6 +650,14 @@ function buildMarkdownReport(params: {
   )) {
     lines.push(`- ${type}: ${count}`);
   }
+  lines.push('');
+  lines.push('## Exact details');
+  lines.push('');
+  lines.push(`- Normalized rows: ${params.summary.normalizedPresence.exactDetails}`);
+  lines.push(`- Items: ${params.summary.extractionCounts.exactDetailItems}`);
+  lines.push(
+    `- Empty exact-detail memories: ${params.summary.extractionCounts.emptyExactDetailsMemories}`
+  );
   lines.push('');
   lines.push('## Durable fact categories');
   lines.push('');
@@ -636,7 +690,7 @@ function buildMarkdownReport(params: {
     lines.push(`- Extraction-visible input has answer: ${item.targetExtractionInputHasAnswer}`);
     lines.push(`- Target over input cap: ${item.targetOverInputLimit}`);
     lines.push(
-      `- Entity/fact/summary hit: ${item.entityHasAnswer}/${item.durableFactHasAnswer}/${item.summaryHasAnswer}`
+      `- Entity/fact/summary/exact hit: ${item.entityHasAnswer}/${item.durableFactHasAnswer}/${item.summaryHasAnswer}/${item.exactDetailsHasAnswer}`
     );
     lines.push(`- Derived answer token coverage: ${item.maxDerivedAnswerTokenCoverage.toFixed(2)}`);
     lines.push(`- Source: ${item.sourceSnippet}`);
@@ -653,7 +707,7 @@ function buildMarkdownReport(params: {
     lines.push(`- Extraction-visible input has answer: ${item.targetExtractionInputHasAnswer}`);
     lines.push(`- Target over input cap: ${item.targetOverInputLimit}`);
     lines.push(
-      `- Entity/fact/summary hit: ${item.entityHasAnswer}/${item.durableFactHasAnswer}/${item.summaryHasAnswer}`
+      `- Entity/fact/summary/exact hit: ${item.entityHasAnswer}/${item.durableFactHasAnswer}/${item.summaryHasAnswer}/${item.exactDetailsHasAnswer}`
     );
     lines.push(`- Source: ${item.sourceSnippet}`);
     lines.push(`- Derived: ${item.derivedSnippet}`);

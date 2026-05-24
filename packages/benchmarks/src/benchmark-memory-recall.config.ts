@@ -43,6 +43,7 @@ export function buildRepresentationKey(env: NodeJS.ProcessEnv = process.env): st
     env.MEMORY_LLM_DURABLE_FACT_ENABLED || 'false',
     env.MEMORY_LLM_SUMMARY_ENABLED || 'false',
     env.MEMORY_LLM_CURRENT_STATE_ENABLED || 'false',
+    env.MEMORY_LLM_EXACT_DETAILS_ENABLED || 'false',
   ];
   return slugify(parts.join('-'));
 }

@@ -29,6 +29,7 @@ describe('benchmark-memory-recall config helpers', () => {
       MEMORY_LLM_DURABLE_FACT_ENABLED: 'false',
       MEMORY_LLM_SUMMARY_ENABLED: 'true',
       MEMORY_LLM_CURRENT_STATE_ENABLED: 'false',
+      MEMORY_LLM_EXACT_DETAILS_ENABLED: 'true',
     } as NodeJS.ProcessEnv);
 
     expect(key).toContain('chunks-v');
