@@ -1,6 +1,7 @@
 import React from 'react';
 import { render } from 'ink';
 import { ChatApp, type ChatAppHandle, type ChatMessage } from './ChatApp.js';
+import { SessionPicker, type SessionPickerEntry } from './SessionPicker.js';
 import type { MessageRole } from './MessageLine.js';
 import { formatNow } from '../tui-components.js';
 
@@ -213,6 +214,25 @@ export function renderInkChat(options: {
 
   return repl;
 }
+
+/**
+ * Show a session picker UI and return the user's selection.
+ * Returns the selected entry, or null for "new session".
+ */
+export function renderSessionPicker(
+  entries: SessionPickerEntry[]
+): Promise<SessionPickerEntry | null> {
+  return new Promise((resolve) => {
+    const onSelect = (entry: SessionPickerEntry | null) => {
+      unmount();
+      resolve(entry);
+    };
+
+    const { unmount } = render(<SessionPicker entries={entries} onSelect={onSelect} />);
+  });
+}
+
+export type { SessionPickerEntry };
 
 /**
  * Sentinel error thrown when the user requests exit (double Ctrl+C or /quit).

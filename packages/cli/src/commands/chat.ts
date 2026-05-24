@@ -70,7 +70,13 @@ import {
   separator,
   startWaitingIndicator,
 } from '../repl/tui-components.js';
-import { renderInkChat, InkExitSignal, type InkRepl } from '../repl/ink/index.js';
+import {
+  renderInkChat,
+  renderSessionPicker,
+  InkExitSignal,
+  type InkRepl,
+  type SessionPickerEntry,
+} from '../repl/ink/index.js';
 import { formatContextLines, type ContextSections } from '../repl/ink/context-viewer.js';
 import {
   classifyError,
@@ -2201,26 +2207,75 @@ export async function runChat(options: ChatOptions): Promise<void> {
       toolPolicy,
       'attach'
     );
-    const selected = pickLatestSession(sessions, undefined, { studioId: runtime.studioId });
-    if (selected) {
-      attachedSessionSummary = selected;
-      runtime.sessionId = selected.id;
-      if (selected.studioId) {
-        runtime.studioId = selected.studioId;
+
+    const isInteractiveInk = useInk && !options.message && !options.nonInteractive;
+
+    if (isInteractiveInk && sessions.length > 0) {
+      // Show interactive session picker
+      const pickerEntries: SessionPickerEntry[] = sessions
+        .sort((a, b) => {
+          const aStudioMatch = runtime.studioId && a.studioId === runtime.studioId ? 1 : 0;
+          const bStudioMatch = runtime.studioId && b.studioId === runtime.studioId ? 1 : 0;
+          if (aStudioMatch !== bStudioMatch) return bStudioMatch - aStudioMatch;
+          const ams = a.startedAt ? Date.parse(a.startedAt) : 0;
+          const bms = b.startedAt ? Date.parse(b.startedAt) : 0;
+          return bms - ams;
+        })
+        .map((session) => {
+          const transcriptMeta = getSessionTranscriptMetadata(session.id);
+          return {
+            id: session.id,
+            label: session.id.slice(0, 8),
+            phase: session.currentPhase || session.status,
+            threadKey: session.threadKey,
+            studioName: sessionStudioLabel(session),
+            backend: sessionBackendLabel(session),
+            historyLabel: sessionHistoryLabel(transcriptMeta),
+            preview: sessionLatestMessagePreview(session, transcriptMeta) || undefined,
+          };
+        });
+
+      const picked = await renderSessionPicker(pickerEntries);
+      if (picked) {
+        const selected = sessions.find((s) => s.id === picked.id);
+        if (selected) {
+          attachedSessionSummary = selected;
+          runtime.sessionId = selected.id;
+          if (selected.studioId) {
+            runtime.studioId = selected.studioId;
+          }
+          if (!runtime.threadKey && selected.threadKey) {
+            runtime.threadKey = selected.threadKey;
+          }
+          toolPolicy.setContext({ agentId, studioId: runtime.studioId });
+          const currentScope = toolPolicy.getMutationScope();
+          if (currentScope.scope !== 'global') {
+            toolPolicy.setMutationScope(currentScope.scope);
+          }
+          runtime.toolMode = toolPolicy.getMode();
+        }
       }
-      if (!runtime.threadKey && selected.threadKey) {
-        runtime.threadKey = selected.threadKey;
+      // picked === null means "New session" — fall through to create one
+    } else {
+      // Non-interactive or no sessions — auto-attach to latest (existing behavior)
+      const selected = pickLatestSession(sessions, undefined, { studioId: runtime.studioId });
+      if (selected) {
+        attachedSessionSummary = selected;
+        runtime.sessionId = selected.id;
+        if (selected.studioId) {
+          runtime.studioId = selected.studioId;
+        }
+        if (!runtime.threadKey && selected.threadKey) {
+          runtime.threadKey = selected.threadKey;
+        }
+        autoAttachedLatest = true;
+        toolPolicy.setContext({ agentId, studioId: runtime.studioId });
+        const currentScope = toolPolicy.getMutationScope();
+        if (currentScope.scope !== 'global') {
+          toolPolicy.setMutationScope(currentScope.scope);
+        }
+        runtime.toolMode = toolPolicy.getMode();
       }
-      autoAttachedLatest = true;
-      toolPolicy.setContext({
-        agentId,
-        studioId: runtime.studioId,
-      });
-      const currentScope = toolPolicy.getMutationScope();
-      if (currentScope.scope !== 'global') {
-        toolPolicy.setMutationScope(currentScope.scope);
-      }
-      runtime.toolMode = toolPolicy.getMode();
     }
   }
 
