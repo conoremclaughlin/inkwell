@@ -2518,7 +2518,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     // ── Quote (inline attribution) ──
     const quote = INKWELL_QUOTES[Math.floor(Math.random() * INKWELL_QUOTES.length)]!;
-    const fullQuote = `”${quote.text}” — ${quote.attr}`;
+    const fullQuote = `”${quote.text}” ${quote.attr}`;
     const maxQW = bannerWidth - 4;
     const qWords = fullQuote.split(' ');
     const qLines: string[] = [];
