@@ -23,7 +23,7 @@ export function SessionPicker({ entries, onSelect }: SessionPickerProps): React.
   const totalItems = entries.length + 1;
   const [selected, setSelected] = useState(0);
 
-  useInput((_input, key) => {
+  useInput((input, key) => {
     if (key.upArrow) {
       setSelected((prev) => (prev > 0 ? prev - 1 : totalItems - 1));
     } else if (key.downArrow) {
@@ -34,6 +34,8 @@ export function SessionPicker({ entries, onSelect }: SessionPickerProps): React.
       } else {
         onSelect(entries[selected - 1]!);
       }
+    } else if (key.escape || (input === 'q' && !key.shift)) {
+      onSelect(null); // cancel → fall through to new session
     }
   });
 
@@ -41,7 +43,7 @@ export function SessionPicker({ entries, onSelect }: SessionPickerProps): React.
     <Box flexDirection="column" paddingX={1}>
       <Box marginBottom={1}>
         <Text bold>Select session</Text>
-        <Text dimColor> — ↑↓ navigate, Enter select</Text>
+        <Text dimColor> — ↑↓ navigate, Enter select, Esc new session</Text>
       </Box>
 
       {/* New session option */}

@@ -257,7 +257,7 @@ describe('runChat integration', () => {
     expect(backendRequest.prompt).toContain('old assistant reply');
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
-    expect(logText).toContain('History: 2 prior message(s) loaded');
+    expect(logText).toContain('history: 2 prior message(s) loaded');
   });
 
   it('hydrates ledger context from PCP session context when no local transcript exists', async () => {
@@ -299,7 +299,7 @@ describe('runChat integration', () => {
     });
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
-    expect(logText).toContain('History: 2 prior message(s) loaded');
+    expect(logText).toContain('history: 2 prior message(s) loaded');
   });
 
   it('supports interactive attach picker from active sessions', async () => {
@@ -353,7 +353,7 @@ describe('runChat integration', () => {
 
     const sessionStatusLine = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(sessionStatusLine).toContain('sess-b222');
-    expect(sessionStatusLine).toContain('Thread: spec:cli-session-hooks');
+    expect(sessionStatusLine).toContain('thread spec:cli-session-hooks');
   });
 
   it('renders latest transcript message previews in attach picker', async () => {
@@ -475,7 +475,7 @@ describe('runChat integration', () => {
     const sessionStatusLine = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(sessionStatusLine).not.toContain('Select session to attach');
     expect(sessionStatusLine).toContain('sess-new');
-    expect(sessionStatusLine).toContain('Thread: pr:2');
+    expect(sessionStatusLine).toContain('thread pr:2');
   });
 
   it('falls back gracefully when attach-latest cannot list sessions', async () => {
@@ -552,9 +552,9 @@ describe('runChat integration', () => {
 
     expect(testState.pcpCalls.some((call) => call.tool === 'start_session')).toBe(false);
     const sessionStatusLine = stripAnsi(logSpy.mock.calls.flat().join('\n'));
-    expect(sessionStatusLine).toContain('Auto-attached to latest session');
+    expect(sessionStatusLine).toContain('auto-attached to latest session');
     expect(sessionStatusLine).toContain('sess-latest');
-    expect(sessionStatusLine).toContain('Thread: pr:10');
+    expect(sessionStatusLine).toContain('thread pr:10');
   });
 
   it('filters cross-agent sessions during auto-attach by default visibility policy', async () => {
@@ -681,11 +681,11 @@ describe('runChat integration', () => {
       expect(logText, `visibility=${row.visibility}`).toContain(row.expectedSession);
       if (row.expectsAutoAttach) {
         expect(logText, `visibility=${row.visibility}`).toContain(
-          'Auto-attached to latest session'
+          'auto-attached to latest session'
         );
       } else {
         expect(logText, `visibility=${row.visibility}`).not.toContain(
-          'Auto-attached to latest session'
+          'auto-attached to latest session'
         );
       }
     }

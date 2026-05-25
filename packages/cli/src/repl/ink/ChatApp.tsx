@@ -175,6 +175,12 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
   const [ctrlCHint, setCtrlCHint] = useState(false);
 
   const handleCtrlC = useCallback(() => {
+    // When a backend turn is active, first Ctrl+C aborts the turn
+    if (waiting && abortHandlerRef.current) {
+      abortHandlerRef.current();
+      abortHandlerRef.current = null;
+      return;
+    }
     if (ctrlCCount >= 1) {
       if (ctrlCTimer) clearTimeout(ctrlCTimer);
       onExit();
@@ -188,7 +194,7 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
       setCtrlCHint(false);
     }, 1500);
     setCtrlCTimer(timer);
-  }, [ctrlCCount, ctrlCTimer, onExit, exit]);
+  }, [waiting, ctrlCCount, ctrlCTimer, onExit, exit]);
 
   // Clean up timer on unmount
   useEffect(() => {
