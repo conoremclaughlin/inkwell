@@ -169,6 +169,7 @@ interface SessionSummary {
   threadKey?: string;
   startedAt?: string;
   backend?: string;
+  provider?: string;
   model?: string;
   backendSessionId?: string;
   claudeSessionId?: string;
@@ -958,6 +959,7 @@ function extractSessionSummaries(
             : typeof row.backend_name === 'string'
               ? row.backend_name
               : undefined,
+        provider: typeof row.provider === 'string' ? row.provider : undefined,
         model:
           typeof row.model === 'string'
             ? row.model
@@ -1181,7 +1183,7 @@ function buildContextStatusSummary(params: {
       : `${total.toLocaleString()}`;
   return `${breakdown} / ${params.maxContextTokens.toLocaleString()} (${pct.toFixed(
     1
-  )}%) ${queue} backend:${params.backend}`;
+  )}%) ${queue} provider:${params.backend}`;
 }
 
 function formatUsageLines(
@@ -2200,7 +2202,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     !runtime.threadKey
   ) {
     const sessionsResult = (await pcp
-      .callTool('list_sessions', { agentId, status: 'active', limit: 30 })
+      .callTool('list_sessions', { agentId, status: 'active', backend: 'ink', limit: 30 })
       .catch(() => null)) as Record<string, unknown> | null;
     const sessions = filterSessionsByPolicy(
       extractSessionSummaries(sessionsResult),
@@ -2283,7 +2285,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   const attachedToExistingSession = Boolean(runtime.sessionId);
   if (!runtime.sessionId) {
-    const startArgs: Record<string, unknown> = { agentId };
+    const startArgs: Record<string, unknown> = {
+      agentId,
+      backend: 'ink',
+      metadata: { provider: runtime.backend },
+    };
     if (runtime.threadKey) startArgs.threadKey = runtime.threadKey;
     if (identity?.studioId) {
       startArgs.studioId = identity.studioId;
@@ -2604,11 +2610,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
     (identity?.studioId ? formatStudioForDisplay(identity.studioId, 'short') : undefined);
   const bannerParts = [
     chip('inkling', agentId, chalk.cyan),
-    chip(
-      'backend',
-      `${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}`,
-      chalk.yellow
-    ),
+    chip('backend', 'ink', chalk.yellow),
+    chip('provider', runtime.backend, chalk.yellow),
     studioSlug ? chip('studio', studioSlug, chalk.cyan) : null,
     chip('window', `${formatTokenCount(runtime.backendTokenWindow)} tok`, chalk.green),
     chip('time', formatNow(runtime.userTimezone), chalk.magenta),

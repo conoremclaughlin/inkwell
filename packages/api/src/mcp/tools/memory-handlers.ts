@@ -511,6 +511,7 @@ export const listSessionsSchema = userIdentifierBaseSchema.extend({
         message: 'Must be a UUID or "main"',
       }
     ),
+  backend: z.string().optional().describe('Filter by backend runtime (e.g., "ink", "claude-code")'),
   limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
 });
 
@@ -1363,6 +1364,7 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
     agentId: params.agentId,
     studioId,
     filterNullStudio,
+    backend: params.backend,
     limit: params.limit,
   });
 
@@ -1402,6 +1404,7 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
               currentPhase: s.currentPhase || null,
               status: s.status || null,
               backend: s.backend || null,
+              provider: (s.metadata?.provider as string) || null,
               model: s.model || null,
               backendSessionId: s.backendSessionId || null,
               /** @deprecated Use backendSessionId */
