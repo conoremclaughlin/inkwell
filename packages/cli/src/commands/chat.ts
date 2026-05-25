@@ -2940,9 +2940,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
         activitySince = activity.createdAt;
       }
 
-      const type = activity.subtype
+      const rawType = activity.subtype
         ? `${activity.type}:${activity.subtype}`
         : activity.type || 'activity';
+      const ACTIVITY_LABELS: Record<string, string> = {
+        message_in: 'received',
+        message_out: 'sent',
+        agent_spawn: 'spawned',
+        agent_complete: 'completed',
+        state_change: 'state change',
+        tool_call: 'tool call',
+        tool_result: 'tool result',
+        inkmail_dispatch: 'mail sent',
+        inkmail_deliver: 'mail delivered',
+        inkmail_fail: 'mail failed',
+      };
+      const type = ACTIVITY_LABELS[rawType] || rawType;
       const actor = activity.agentId || 'system';
       const preview = (activity.content || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
       const rendered = `⚡ ${actor} ${type}${preview ? ` — ${preview}` : ''}`;
