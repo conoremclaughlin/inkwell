@@ -606,8 +606,9 @@ function hydrateLedgerFromTranscript(
       pushPreview('user', event.content, typeof event.ts === 'string' ? event.ts : undefined);
       continue;
     }
-    if (type === 'assistant' && typeof event.content === 'string') {
-      if (event.content === '(no output)') continue;
+    if (type === 'assistant') {
+      if (event.cancelled === true || event.content === '(no output)') continue;
+      if (typeof event.content !== 'string') continue;
       const source = typeof event.backend === 'string' ? event.backend : 'backend-history';
       ledger.addEntry('assistant', event.content, source);
       loaded += 1;
@@ -3542,8 +3543,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       if (!runResult.success) break;
     }
 
-    const assistantDisplayText =
-      runtime.toolRouting === 'local'
+    const isAbortedTurn =
+      !runResult.success && runResult.exitCode !== undefined && runResult.exitCode >= 128;
+
+    const assistantDisplayText = isAbortedTurn
+      ? ''
+      : runtime.toolRouting === 'local'
         ? (() => {
             const stripped = stripLocalToolBlocks(responseText);
             if (stripped) return stripped;
@@ -3553,20 +3558,35 @@ export async function runChat(options: ChatOptions): Promise<void> {
           })()
         : responseText;
 
-    ledger.addEntry('assistant', assistantDisplayText, runtime.backend);
-    appendTranscript(runtime.transcriptPath, {
-      type: 'assistant',
-      backend: runtime.backend,
-      model: runtime.model || null,
-      success: runResult.success,
-      exitCode: runResult.exitCode,
-      durationMs: runResult.durationMs,
-      stderr: runResult.stderr || null,
-      content: assistantDisplayText,
-      rawContent: responseText,
-      approxTokens: estimateTokens(assistantDisplayText),
-      usage: runResult.usage || null,
-    });
+    if (isAbortedTurn) {
+      appendTranscript(runtime.transcriptPath, {
+        type: 'assistant',
+        backend: runtime.backend,
+        model: runtime.model || null,
+        success: false,
+        exitCode: runResult.exitCode,
+        durationMs: runResult.durationMs,
+        stderr: runResult.stderr || null,
+        content: null,
+        cancelled: true,
+        usage: runResult.usage || null,
+      });
+    } else {
+      ledger.addEntry('assistant', assistantDisplayText, runtime.backend);
+      appendTranscript(runtime.transcriptPath, {
+        type: 'assistant',
+        backend: runtime.backend,
+        model: runtime.model || null,
+        success: runResult.success,
+        exitCode: runResult.exitCode,
+        durationMs: runResult.durationMs,
+        stderr: runResult.stderr || null,
+        content: assistantDisplayText,
+        rawContent: responseText,
+        approxTokens: estimateTokens(assistantDisplayText),
+        usage: runResult.usage || null,
+      });
+    }
     lastBackendUsage = runResult.usage;
 
     // ── Fire turn_end hooks (passive recall, etc.) ──
@@ -3644,18 +3664,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       })
       .catch(() => undefined); // never block the REPL
 
-    if (!runResult.success) {
-      const isSignalExit = runResult.exitCode !== undefined && runResult.exitCode >= 128;
-      if (!isSignalExit) {
-        printLine(chalk.red(`\n[${runtime.backend}] exit=${runResult.exitCode}`));
-        if (runResult.stderr) {
-          printLine(chalk.dim(runResult.stderr));
-        }
+    if (!runResult.success && !isAbortedTurn) {
+      printLine(chalk.red(`\n[${runtime.backend}] exit=${runResult.exitCode}`));
+      if (runResult.stderr) {
+        printLine(chalk.dim(runResult.stderr));
       }
     }
-
-    const isAbortedTurn =
-      !runResult.success && runResult.exitCode !== undefined && runResult.exitCode >= 128;
 
     if (inkRepl) {
       if (!isAbortedTurn) {
@@ -3666,7 +3680,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           trailingMeta: trailingParts,
         });
       }
-    } else {
+    } else if (!isAbortedTurn) {
       printLine('');
       printLine(
         renderMessageLine('assistant', assistantDisplayText, {
