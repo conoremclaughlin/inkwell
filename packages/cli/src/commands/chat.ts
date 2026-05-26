@@ -2240,6 +2240,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
         });
 
       const picked = await renderSessionPicker(pickerEntries);
+      if (picked === undefined) {
+        // Cancel — exit without creating a session
+        return;
+      }
       if (picked) {
         const selected = sessions.find((s) => s.id === picked.id);
         if (selected) {

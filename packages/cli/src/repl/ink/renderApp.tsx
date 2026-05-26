@@ -221,14 +221,20 @@ export function renderInkChat(options: {
  */
 export function renderSessionPicker(
   entries: SessionPickerEntry[]
-): Promise<SessionPickerEntry | null> {
+): Promise<SessionPickerEntry | null | undefined> {
   return new Promise((resolve) => {
     const onSelect = (entry: SessionPickerEntry | null) => {
       unmount();
       resolve(entry);
     };
+    const onCancel = () => {
+      unmount();
+      resolve(undefined);
+    };
 
-    const { unmount } = render(<SessionPicker entries={entries} onSelect={onSelect} />);
+    const { unmount } = render(
+      <SessionPicker entries={entries} onSelect={onSelect} onCancel={onCancel} />
+    );
   });
 }
 

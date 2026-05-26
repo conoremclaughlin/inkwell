@@ -16,9 +16,14 @@ export interface SessionPickerEntry {
 interface SessionPickerProps {
   entries: SessionPickerEntry[];
   onSelect: (entry: SessionPickerEntry | null) => void;
+  onCancel: () => void;
 }
 
-export function SessionPicker({ entries, onSelect }: SessionPickerProps): React.ReactElement {
+export function SessionPicker({
+  entries,
+  onSelect,
+  onCancel,
+}: SessionPickerProps): React.ReactElement {
   // Index 0 = "New session", 1..N = existing sessions
   const totalItems = entries.length + 1;
   const [selected, setSelected] = useState(0);
@@ -35,7 +40,7 @@ export function SessionPicker({ entries, onSelect }: SessionPickerProps): React.
         onSelect(entries[selected - 1]!);
       }
     } else if (key.escape || (input === 'q' && !key.shift) || (key.ctrl && input === 'c')) {
-      onSelect(null); // cancel → fall through to new session
+      onCancel();
     }
   });
 
@@ -43,7 +48,7 @@ export function SessionPicker({ entries, onSelect }: SessionPickerProps): React.
     <Box flexDirection="column" paddingX={1}>
       <Box marginBottom={1}>
         <Text bold>Select session</Text>
-        <Text dimColor> — ↑↓ navigate, Enter select, Esc new session</Text>
+        <Text dimColor> — ↑↓ navigate, Enter select, Esc cancel</Text>
       </Box>
 
       {/* New session option */}
