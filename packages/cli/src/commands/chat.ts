@@ -2214,7 +2214,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     const isInteractiveInk = useInk && !options.message && !options.nonInteractive;
 
-    if (isInteractiveInk && sessions.length > 0) {
+    if (isInteractiveInk) {
       // Show interactive session picker
       const pickerEntries: SessionPickerEntry[] = sessions
         .sort((a, b) => {
