@@ -143,7 +143,7 @@ describe('SbHookRegistry: fire', () => {
   it('returns zero counts when no hooks match', async () => {
     const registry = new SbHookRegistry();
     const result = await registry.fire('turn_end', makeCtx());
-    expect(result).toEqual({ injected: 0, evicted: 0, blocked: false });
+    expect(result).toEqual({ injected: 0, evicted: 0, blocked: false, injectedEntries: [] });
   });
 
   it('records fire log entries', async () => {
@@ -399,7 +399,7 @@ describe('SbHookRegistry: error handling', () => {
     });
 
     const result = await registry.fire('turn_end', makeCtx());
-    expect(result).toEqual({ injected: 0, evicted: 0, blocked: false });
+    expect(result).toEqual({ injected: 0, evicted: 0, blocked: false, injectedEntries: [] });
   });
 });
 

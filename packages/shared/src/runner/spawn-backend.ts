@@ -236,7 +236,11 @@ export function spawnBackend(options: SpawnBackendOptions): {
       finalize(1);
     });
 
-    child.on('close', (code) => finalize(code ?? 1));
+    child.on('close', (code, signal) => {
+      if (code !== null) return finalize(code);
+      const SIG_CODES: Record<string, number> = { SIGTERM: 15, SIGKILL: 9, SIGINT: 2 };
+      finalize(signal ? 128 + (SIG_CODES[signal] ?? 15) : 1);
+    });
   });
 
   return { child, result };

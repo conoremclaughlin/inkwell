@@ -34,7 +34,7 @@ export function SessionPicker({ entries, onSelect }: SessionPickerProps): React.
       } else {
         onSelect(entries[selected - 1]!);
       }
-    } else if (key.escape || (input === 'q' && !key.shift)) {
+    } else if (key.escape || (input === 'q' && !key.shift) || (key.ctrl && input === 'c')) {
       onSelect(null); // cancel → fall through to new session
     }
   });
