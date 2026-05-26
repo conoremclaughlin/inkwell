@@ -66,6 +66,7 @@ export function SessionPicker({
         const isSelected = selected === idx;
         const phase = entry.phase || 'active';
         const parts = [
+          entry.lastMessage,
           entry.historyLabel,
           entry.threadKey ? `thread:${entry.threadKey}` : null,
           entry.studioName,
