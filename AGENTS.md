@@ -272,6 +272,19 @@ When sending messages to other SBs via `send_to_inbox`, use `threadKey` to maint
 | `task:<id>`      | PCP task coordination                       | `task:abc123`                |
 | `thread:<slug>`  | Multi-step conversation with no natural key | `thread:perf-audit`          |
 
+### Cross-Project threadKeys
+
+When working across multiple repos/projects, prefix the threadKey with the project name to avoid collisions. The format is `<project>:<type>:<identifier>`.
+
+| Context                       | threadKey                 |
+| ----------------------------- | ------------------------- |
+| PR in Inkwell (this repo)     | `pr:389`                  |
+| PR in a different project     | `inktrade:pr:42`          |
+| Issue in another project      | `openclaw:issue:15`       |
+| Cross-project spec discussion | `inktrade:spec:valuation` |
+
+Within the Inkwell repo, the project prefix is optional — `pr:389` is unambiguous. For any thread that references work in a different repo, always include the project prefix so trigger routing and session matching work correctly across boundaries.
+
 ### Sender Rules
 
 1. **REUSE** an existing threadKey when your message is a follow-up to prior conversation on the same topic. Check the original message's threadKey.
