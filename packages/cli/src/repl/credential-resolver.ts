@@ -1,13 +1,17 @@
 /**
  * Credential Resolver
  *
- * Resolves environment variable references in tool call parameters before
- * they reach MCP servers. This keeps credentials out of LLM context windows,
- * conversation transcripts, and compaction summaries.
+ * Resolves credential references in tool call parameters before they reach
+ * MCP servers. This keeps credentials out of LLM context windows, conversation
+ * transcripts, and compaction summaries.
  *
  * The LLM generates `$GFIBER_PASSWORD` — this module resolves it to the
  * actual value at the tool execution layer. The transcript only ever records
  * the reference, not the secret.
+ *
+ * Resolution cascade:
+ * 1. Keychain cache (loaded at session start via `loadKeychainCredentials()`)
+ * 2. process.env (fallback)
  *
  * Resolution rules:
  * - Only string values are scanned (numbers, booleans, objects pass through)
@@ -17,6 +21,11 @@
  * - Unresolvable references (env var not set) are left as-is
  * - Nested objects/arrays are walked recursively
  */
+
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+
+const execFileAsync = promisify(execFile);
 
 export interface CredentialResolution {
   /** Env var name that was resolved */
@@ -88,4 +97,63 @@ export function resolveCredentialRefs(
 
   const resolvedArgs = resolveObject(args, '');
   return { args: resolvedArgs, resolutions };
+}
+
+// ─── Keychain Integration ──────────────────────────────────────
+
+const SERVICE_PREFIX = 'ink:';
+let keychainCache: Record<string, string> | null = null;
+
+/**
+ * Load all ink-namespaced credentials from macOS Keychain into an
+ * in-memory cache. Call once at session start — the cache is used by
+ * `buildResolverEnv()` to merge Keychain values with process.env.
+ *
+ * On non-macOS or if the Keychain is inaccessible, silently returns
+ * an empty map (credentials fall back to process.env only).
+ */
+export async function loadKeychainCredentials(): Promise<Record<string, string>> {
+  const cache: Record<string, string> = {};
+  if (process.platform !== 'darwin') {
+    keychainCache = cache;
+    return cache;
+  }
+
+  try {
+    const { stdout } = await execFileAsync('security', ['dump-keychain']);
+    const entries = stdout.split(/^keychain:/gm);
+
+    for (const entry of entries) {
+      if (!entry.includes('class: "genp"')) continue;
+      const svcMatch = entry.match(/"svce"<blob>="([^"]+)"/);
+      if (!svcMatch || !svcMatch[1].startsWith(SERVICE_PREFIX)) continue;
+      const name = svcMatch[1].slice(SERVICE_PREFIX.length);
+
+      try {
+        const { stdout: pw } = await execFileAsync('security', [
+          'find-generic-password',
+          '-s',
+          svcMatch[1],
+          '-w',
+        ]);
+        cache[name] = pw.trimEnd();
+      } catch {
+        // Individual credential retrieval failed — skip it
+      }
+    }
+  } catch {
+    // Keychain inaccessible — proceed with empty cache
+  }
+
+  keychainCache = cache;
+  return cache;
+}
+
+/**
+ * Build the merged env map for credential resolution.
+ * Keychain values take precedence over process.env.
+ */
+export function buildResolverEnv(): Record<string, string | undefined> {
+  if (!keychainCache) return process.env;
+  return { ...process.env, ...keychainCache };
 }

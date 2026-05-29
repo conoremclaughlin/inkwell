@@ -35,7 +35,11 @@ import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../
 import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
 import { ensurePcpToolAllowed } from '../repl/tool-gate.js';
 import { executeToolCalls, type ToolCallResult } from '../repl/tool-call-executor.js';
-import { resolveCredentialRefs } from '../repl/credential-resolver.js';
+import {
+  resolveCredentialRefs,
+  loadKeychainCredentials,
+  buildResolverEnv,
+} from '../repl/credential-resolver.js';
 import {
   isClientLocalTool,
   handleClientLocalTool,
@@ -2145,6 +2149,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
       );
     }
 
+    // Pre-load Keychain credentials for the credential resolver.
+    // Runs once at session start; the cache persists for the session lifetime.
+    const keychainCreds = await loadKeychainCredentials();
+    if (Object.keys(keychainCreds).length > 0) {
+      console.log(chalk.dim(`Keychain: ${Object.keys(keychainCreds).length} credential(s) loaded`));
+    }
+
     // Seed passive recall dedup with memory IDs already in bootstrap context
     const bootstrapMemoryIds = bootstrapResult.memoryIds as string[] | undefined;
     if (bootstrapMemoryIds && bootstrapMemoryIds.length > 0) {
@@ -3353,7 +3364,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // Resolve credential references ($VAR / ${VAR}) in tool args.
           // The LLM emits references; actual values are injected here at the
           // execution layer so credentials never enter transcripts or context.
-          const { args: resolvedArgs, resolutions } = resolveCredentialRefs(args);
+          const { args: resolvedArgs, resolutions } = resolveCredentialRefs(
+            args,
+            buildResolverEnv()
+          );
           if (resolutions.length > 0 && runtime.verbose) {
             const refs = resolutions.map((r) => `${r.name} at ${r.path}`).join(', ');
             printLine(
