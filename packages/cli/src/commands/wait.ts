@@ -284,9 +284,13 @@ interface StrategyStatus {
   };
 }
 
-function validateStrategyResult(result: StrategyStatus, context: string): void {
+function validateStrategyResult(result: Record<string, unknown>, context: string): void {
   if (result.success === false) {
-    throw new Error(result.error || `${context}: server returned failure`);
+    throw new Error((result.error as string) || `${context}: server returned failure`);
+  }
+  // callTool returns { text: "MCP error ..." } for non-JSON MCP errors (e.g., schema validation)
+  if (typeof result.text === 'string' && !result.status && !result.progress) {
+    throw new Error(result.text as string);
   }
 }
 
@@ -307,11 +311,12 @@ async function watchStrategy(
   let lastStatus: string | undefined;
 
   try {
-    const initial = (await pcp.callTool('get_strategy_status', {
+    const initialRaw = await pcp.callTool('get_strategy_status', {
       groupId,
       email: config.email,
-    })) as StrategyStatus;
-    validateStrategyResult(initial, 'Initial fetch');
+    });
+    validateStrategyResult(initialRaw, 'Initial fetch');
+    const initial = initialRaw as unknown as StrategyStatus;
     lastCompleted = initial.progress?.completed ?? 0;
     lastTaskId = initial.currentTask?.id;
     lastStatus = initial.status;
@@ -348,11 +353,12 @@ async function watchStrategy(
     await new Promise((resolve) => setTimeout(resolve, sleepMs));
 
     try {
-      const status = (await pcp.callTool('get_strategy_status', {
+      const statusRaw = await pcp.callTool('get_strategy_status', {
         groupId,
         email: config.email,
-      })) as StrategyStatus;
-      validateStrategyResult(status, 'Poll');
+      });
+      validateStrategyResult(statusRaw, 'Poll');
+      const status = statusRaw as unknown as StrategyStatus;
 
       consecutiveErrors = 0;
 
