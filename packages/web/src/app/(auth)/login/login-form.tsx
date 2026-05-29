@@ -9,7 +9,7 @@ import { SocialButtons } from '@/components/auth/social-buttons';
 import { AuthDivider } from '@/components/auth/auth-divider';
 import { signInWithPassword, signInWithOtp } from '@/lib/auth/actions';
 import { getErrorMessage } from '@/lib/auth-utils';
-import { Loader2, Zap } from 'lucide-react';
+import { Eye, EyeOff, Loader2, Zap } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 type AuthMode = 'magic-link' | 'password';
@@ -22,6 +22,7 @@ export default function LoginForm() {
   const [authMode, setAuthMode] = useState<AuthMode>('password');
   const [isLoading, setIsLoading] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [showPassword, setShowPassword] = useState(false);
   const [mcpRedirecting, setMcpRedirecting] = useState(false);
 
   const mcpPendingId = searchParams.get('pending_id');
@@ -174,16 +175,26 @@ export default function LoginForm() {
                 Use magic link instead
               </button>
             </div>
-            <Input
-              id="password"
-              type="password"
-              placeholder="Enter your password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required
-              autoComplete="current-password"
-              className="h-12 rounded-xl px-4 text-base"
-            />
+            <div className="relative">
+              <Input
+                id="password"
+                type={showPassword ? 'text' : 'password'}
+                placeholder="Enter your password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                required
+                autoComplete="current-password"
+                className="h-12 rounded-xl px-4 pr-11 text-base"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword(!showPassword)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 transition-colors"
+                tabIndex={-1}
+              >
+                {showPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
+              </button>
+            </div>
           </div>
         )}
 
