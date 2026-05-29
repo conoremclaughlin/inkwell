@@ -1,6 +1,7 @@
 import React from 'react';
 import { render } from 'ink';
 import { ChatApp, type ChatAppHandle, type ChatMessage } from './ChatApp.js';
+import { SessionPicker, type SessionPickerEntry } from './SessionPicker.js';
 import type { MessageRole } from './MessageLine.js';
 import { formatNow } from '../tui-components.js';
 
@@ -58,6 +59,10 @@ export interface InkRepl {
   setAbortHandler: (handler: (() => void) | null) => void;
   /** Show command output in the dock panel (below prompt, above info bar). */
   setCommandOutput: (lines: string[] | null) => void;
+  /** Store surfaced memory details for Ctrl+O expansion. */
+  setSurfacedMemories: (lines: string[]) => void;
+  /** Open the context viewer with formatted lines. */
+  showContextView: (lines: string[]) => void;
   /** Signal exit from the orchestrator side (makes waitForInput reject). */
   requestExit: () => void;
   /** Unmount the Ink app and restore terminal. */
@@ -83,6 +88,7 @@ export function renderInkChat(options: {
   timezone?: string;
   infoItems: string[];
   fullscreen?: boolean;
+  dynamicMessages?: boolean;
 }): InkRepl {
   const handleRef =
     React.createRef<ChatAppHandle>() as React.MutableRefObject<ChatAppHandle | null>;
@@ -121,10 +127,11 @@ export function renderInkChat(options: {
       timezone={options.timezone}
       infoItems={options.infoItems}
       fullscreen={fullscreen}
+      dynamicMessages={!!options.dynamicMessages}
       onUserInput={onUserInput}
       onExit={onExit}
     />,
-    { alternateScreen: fullscreen, incrementalRendering: true }
+    { alternateScreen: fullscreen, incrementalRendering: true, exitOnCtrlC: false }
   );
 
   // Get the handle (available synchronously after render)
@@ -184,6 +191,14 @@ export function renderInkChat(options: {
       getHandle().setCommandOutput(lines);
     },
 
+    setSurfacedMemories: (lines) => {
+      getHandle().setSurfacedMemories(lines);
+    },
+
+    showContextView: (lines) => {
+      getHandle().showContextView(lines);
+    },
+
     requestExit: () => {
       onExit();
     },
@@ -199,6 +214,31 @@ export function renderInkChat(options: {
 
   return repl;
 }
+
+/**
+ * Show a session picker UI and return the user's selection.
+ * Returns the selected entry, or null for "new session".
+ */
+export function renderSessionPicker(
+  entries: SessionPickerEntry[]
+): Promise<SessionPickerEntry | null | undefined> {
+  return new Promise((resolve) => {
+    const onSelect = (entry: SessionPickerEntry | null) => {
+      unmount();
+      resolve(entry);
+    };
+    const onCancel = () => {
+      unmount();
+      resolve(undefined);
+    };
+
+    const { unmount } = render(
+      <SessionPicker entries={entries} onSelect={onSelect} onCancel={onCancel} />
+    );
+  });
+}
+
+export type { SessionPickerEntry };
 
 /**
  * Sentinel error thrown when the user requests exit (double Ctrl+C or /quit).

@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { Box, Static, Text, useApp } from 'ink';
+import { ContextViewer } from './context-viewer.js';
 import { Dock } from './Dock.js';
 import { MessageLine, type MessageLineProps } from './MessageLine.js';
 import { formatNow } from '../tui-components.js';
@@ -30,6 +31,8 @@ export interface ChatAppProps {
   timezone?: string;
   infoItems: string[];
   fullscreen?: boolean;
+  /** Render all messages dynamically (re-renderable) instead of write-once Static. */
+  dynamicMessages?: boolean;
   /** Called when the user submits a message from the prompt. */
   onUserInput: (raw: string) => void;
   /** Called when the user requests exit (double Ctrl+C). */
@@ -46,16 +49,29 @@ export interface ChatAppHandle {
   setInfoItems: (items: string[]) => void;
   setAbortHandler: (handler: (() => void) | null) => void;
   setCommandOutput: (lines: string[] | null) => void;
+  setSurfacedMemories: (lines: string[]) => void;
+  /** Open the context viewer with the given lines. */
+  showContextView: (lines: string[]) => void;
+  /** Register callback for Ctrl+O (orchestrator builds context, calls showContextView). */
+  setCtrlOHandler: (handler: (() => void) | null) => void;
 }
 
 /**
- * Root Ink component for the SB Chat REPL.
+ * Root Ink component for the Inkwell Chat REPL.
  *
  * Uses <Static> for completed messages (written once to terminal scrollback).
  * Only the dock (status | prompt | info) is dynamic (~6 lines).
  */
 export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function ChatApp(
-  { agentId, timezone, infoItems: initialInfoItems, fullscreen = false, onUserInput, onExit },
+  {
+    agentId,
+    timezone,
+    infoItems: initialInfoItems,
+    fullscreen = false,
+    dynamicMessages = false,
+    onUserInput,
+    onExit,
+  },
   ref
 ) {
   const { exit } = useApp();
@@ -69,9 +85,16 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
 
   const [commandOutput, setCommandOutput] = useState<string[] | null>(null);
   const [inputHistory, setInputHistory] = useState<string[]>([]);
+  const [lastSurfacedMemories, setLastSurfacedMemories] = useState<string[]>([]);
 
   // Abort handler — set by orchestrator when a backend turn is running
   const abortHandlerRef = useRef<(() => void) | null>(null);
+
+  // Context viewer state
+  const [contextViewLines, setContextViewLines] = useState<string[] | null>(null);
+  // Brief intermediate state: both views hidden so Ink renders a zero-height
+  // frame, erasing the tall context viewer before showing the shorter dock.
+  const [dismissingContext, setDismissingContext] = useState(false);
 
   // Waiting indicator state — verb rotates every 3s
   const [waitingVerb, setWaitingVerb] = useState('');
@@ -111,6 +134,15 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
     setCommandOutput: (lines: string[] | null) => {
       setCommandOutput(lines);
     },
+    setSurfacedMemories: (lines: string[]) => {
+      setLastSurfacedMemories(lines);
+    },
+    showContextView: (lines: string[]) => {
+      setContextViewLines(lines);
+    },
+    setCtrlOHandler: (handler: (() => void) | null) => {
+      ctrlOHandlerRef.current = handler;
+    },
   }));
 
   const handleSubmit = useCallback(
@@ -131,71 +163,130 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
     }
   }, []);
 
+  // Ctrl+O callback — set by orchestrator to build context and call showContextView
+  const ctrlOHandlerRef = useRef<(() => void) | null>(null);
+
+  const handleExpandMemories = useCallback(() => {
+    if (ctrlOHandlerRef.current) {
+      ctrlOHandlerRef.current();
+    }
+  }, []);
+
   const [ctrlCHint, setCtrlCHint] = useState(false);
 
-  // Handle Ctrl+C for double-tap exit
+  const handleCtrlC = useCallback(() => {
+    // When a backend turn is active, first Ctrl+C aborts the turn
+    if (waiting && abortHandlerRef.current) {
+      abortHandlerRef.current();
+      abortHandlerRef.current = null;
+      return;
+    }
+    if (ctrlCCount >= 1) {
+      if (ctrlCTimer) clearTimeout(ctrlCTimer);
+      onExit();
+      exit();
+      return;
+    }
+    setCtrlCCount(1);
+    setCtrlCHint(true);
+    const timer = setTimeout(() => {
+      setCtrlCCount(0);
+      setCtrlCHint(false);
+    }, 1500);
+    setCtrlCTimer(timer);
+  }, [waiting, ctrlCCount, ctrlCTimer, onExit, exit]);
+
+  // Clean up timer on unmount
   useEffect(() => {
-    const handler = () => {
-      if (ctrlCCount >= 1) {
-        onExit();
-        exit();
-        return;
-      }
-      setCtrlCCount(1);
-      setCtrlCHint(true);
-      const timer = setTimeout(() => {
-        setCtrlCCount(0);
-        setCtrlCHint(false);
-      }, 1500);
-      setCtrlCTimer(timer);
-    };
-    process.on('SIGINT', handler);
     return () => {
-      process.off('SIGINT', handler);
       if (ctrlCTimer) clearTimeout(ctrlCTimer);
     };
-  }, [ctrlCCount, ctrlCTimer, onExit, exit]);
+  }, [ctrlCTimer]);
 
   const now = formatNow(timezone);
   const promptLabel = '> ';
 
+  const showingContext = contextViewLines !== null;
+  const dockVisible = !showingContext && !dismissingContext;
+
+  const handleContextDismiss = useCallback(() => {
+    // Two-phase dismiss: hide both views for one frame so Ink renders a
+    // zero-height dynamic area (erasing the tall context viewer), then
+    // show the dock fresh on the next tick.
+    setDismissingContext(true);
+    setContextViewLines(null);
+    setTimeout(() => setDismissingContext(false), 0);
+  }, []);
+
+  const messageElements = messages.map((msg) => (
+    <MessageLine
+      key={msg.id}
+      id={msg.id}
+      role={msg.role}
+      content={msg.content}
+      label={msg.label}
+      time={msg.time}
+      trailingMeta={msg.trailingMeta}
+    />
+  ));
+
   return (
     <Box flexDirection="column">
-      <Static items={messages}>
-        {(msg) => (
-          <MessageLine
-            key={msg.id}
-            id={msg.id}
-            role={msg.role}
-            content={msg.content}
-            label={msg.label}
-            time={msg.time}
-            trailingMeta={msg.trailingMeta}
-          />
-        )}
-      </Static>
+      {/* Context viewer — conditionally rendered so each open gets fresh
+          scroll state. The useInput lifecycle issue only affects the Dock
+          (PromptInput), not the ContextViewer, so mount/unmount is safe. */}
+      {showingContext && (
+        <ContextViewer lines={contextViewLines!} isActive onDismiss={handleContextDismiss} />
+      )}
 
-      <Dock
-        statusSummary={statusSummary}
-        time={now}
-        infoItems={infoItems}
-        promptLabel={promptLabel}
-        onSubmit={handleSubmit}
-        isPromptActive={!waiting}
-        onAbort={handleAbort}
-        commandOutput={commandOutput}
-        onCommandOutputClear={() => setCommandOutput(null)}
-        inputHistory={inputHistory}
-        ctrlCHint={ctrlCHint}
-        waitingElement={
-          waiting ? (
-            <Box paddingX={1}>
-              <Text color="cyan">{SPINNER_CHAR + ' '}</Text>
-              <Text dimColor>{waitingVerb}...</Text>
-            </Box>
-          ) : undefined
-        }
-      />
+      {/* Chat messages — Static writes to scrollback */}
+      {dockVisible &&
+        (dynamicMessages ? (
+          <Box flexDirection="column">{messageElements}</Box>
+        ) : (
+          <Static items={messages}>
+            {(msg) => (
+              <MessageLine
+                key={msg.id}
+                id={msg.id}
+                role={msg.role}
+                content={msg.content}
+                label={msg.label}
+                time={msg.time}
+                trailingMeta={msg.trailingMeta}
+              />
+            )}
+          </Static>
+        ))}
+
+      {/* Dock — always mounted, hidden when context viewer is active.
+          useInputActive=false yields stdin to ContextViewer's useInput. */}
+      <Box display={dockVisible ? 'flex' : 'none'} flexDirection="column">
+        <Dock
+          statusSummary={statusSummary}
+          time={now}
+          infoItems={infoItems}
+          promptLabel={promptLabel}
+          onSubmit={handleSubmit}
+          isPromptActive={!waiting}
+          useInputActive={dockVisible}
+          onAbort={handleAbort}
+          commandOutput={commandOutput}
+          onCommandOutputClear={() => setCommandOutput(null)}
+          inputHistory={inputHistory}
+          ctrlCHint={ctrlCHint}
+          onCtrlC={handleCtrlC}
+          onExpandMemories={handleExpandMemories}
+          waitingElement={
+            waiting ? (
+              <Box paddingX={1}>
+                <Text color="cyan">{SPINNER_CHAR + ' '}</Text>
+                <Text dimColor>{waitingVerb}...</Text>
+              </Box>
+            ) : undefined
+          }
+        />
+      </Box>
     </Box>
   );
 });

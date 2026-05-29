@@ -13,12 +13,17 @@ interface DockProps {
   promptLabel: string;
   onSubmit: (value: string) => void;
   isPromptActive: boolean;
+  /** When false, PromptInput's useInput unsubscribes from stdin entirely
+   *  (e.g. when ContextViewer is active and needs exclusive key handling). */
+  useInputActive?: boolean;
   onAbort?: () => void;
   commandOutput?: string[] | null;
   onCommandOutputClear?: () => void;
   waitingElement?: React.ReactNode;
   inputHistory?: string[];
   ctrlCHint?: boolean;
+  onCtrlC?: () => void;
+  onExpandMemories?: () => void;
 }
 
 /**
@@ -37,12 +42,15 @@ export function Dock({
   promptLabel,
   onSubmit,
   isPromptActive,
+  useInputActive = true,
   onAbort,
   commandOutput,
   onCommandOutputClear,
   waitingElement,
   inputHistory,
   ctrlCHint,
+  onCtrlC,
+  onExpandMemories,
 }: DockProps): React.ReactElement {
   const { stdout } = useStdout();
   const [, setResizeCounter] = useState(0);
@@ -80,8 +88,11 @@ export function Dock({
         label={promptLabel}
         onSubmit={onSubmit}
         isActive={isPromptActive}
+        useInputActive={useInputActive}
         onAbort={onAbort}
         onEscape={onCommandOutputClear}
+        onCtrlC={onCtrlC}
+        onExpandMemories={onExpandMemories}
         onInputChange={handleInputChange}
         history={inputHistory}
       />

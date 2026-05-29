@@ -70,7 +70,14 @@ import {
   separator,
   startWaitingIndicator,
 } from '../repl/tui-components.js';
-import { renderInkChat, InkExitSignal, type InkRepl } from '../repl/ink/index.js';
+import {
+  renderInkChat,
+  renderSessionPicker,
+  InkExitSignal,
+  type InkRepl,
+  type SessionPickerEntry,
+} from '../repl/ink/index.js';
+import { formatContextLines, type ContextSections } from '../repl/ink/context-viewer.js';
 import {
   classifyError,
   decodeDelegationToken,
@@ -106,6 +113,7 @@ type ChatOptions = {
   sbDebug?: boolean;
   verbose?: boolean;
   fullscreen?: boolean;
+  dynamic?: boolean;
   approvalMode?: string;
 };
 
@@ -161,6 +169,7 @@ interface SessionSummary {
   threadKey?: string;
   startedAt?: string;
   backend?: string;
+  provider?: string;
   model?: string;
   backendSessionId?: string;
   claudeSessionId?: string;
@@ -572,6 +581,7 @@ function hydrateLedgerFromTranscript(
   tailPreview: HistoryHydrationResult['tailPreview'];
   seenInboxIds: string[];
   seenActivityIds: string[];
+  recoveredMemoryIds: string[];
 } {
   const events = readTranscriptEvents(transcriptPath);
   let loaded = 0;
@@ -579,6 +589,7 @@ function hydrateLedgerFromTranscript(
   const preview: HistoryHydrationResult['tailPreview'] = [];
   const seenInboxIds = new Set<string>();
   const seenActivityIds = new Set<string>();
+  const recoveredMemoryIds: string[] = [];
 
   const pushPreview = (role: 'user' | 'assistant' | 'inbox', content: string, ts?: string) => {
     preview.push({ role, content: compactForHistoryPreview(role, content), ts });
@@ -596,7 +607,9 @@ function hydrateLedgerFromTranscript(
       pushPreview('user', event.content, typeof event.ts === 'string' ? event.ts : undefined);
       continue;
     }
-    if (type === 'assistant' && typeof event.content === 'string') {
+    if (type === 'assistant') {
+      if (event.cancelled === true || event.content === '(no output)') continue;
+      if (typeof event.content !== 'string') continue;
       const source = typeof event.backend === 'string' ? event.backend : 'backend-history';
       ledger.addEntry('assistant', event.content, source);
       loaded += 1;
@@ -611,6 +624,15 @@ function hydrateLedgerFromTranscript(
       pushPreview('inbox', event.rendered, typeof event.ts === 'string' ? event.ts : undefined);
       if (typeof event.messageId === 'string') {
         seenInboxIds.add(event.messageId);
+      }
+      continue;
+    }
+    if (type === 'hook_injection' && typeof event.content === 'string') {
+      const source = typeof event.source === 'string' ? event.source : 'hook-history';
+      ledger.addEntry('system', event.content, source);
+      loaded += 1;
+      if (typeof event.memoryId === 'string') {
+        recoveredMemoryIds.push(event.memoryId);
       }
       continue;
     }
@@ -635,6 +657,7 @@ function hydrateLedgerFromTranscript(
     tailPreview: preview,
     seenInboxIds: Array.from(seenInboxIds),
     seenActivityIds: Array.from(seenActivityIds),
+    recoveredMemoryIds,
   };
 }
 
@@ -936,6 +959,7 @@ function extractSessionSummaries(
             : typeof row.backend_name === 'string'
               ? row.backend_name
               : undefined,
+        provider: typeof row.provider === 'string' ? row.provider : undefined,
         model:
           typeof row.model === 'string'
             ? row.model
@@ -1159,7 +1183,7 @@ function buildContextStatusSummary(params: {
       : `${total.toLocaleString()}`;
   return `${breakdown} / ${params.maxContextTokens.toLocaleString()} (${pct.toFixed(
     1
-  )}%) ${queue} backend:${params.backend}`;
+  )}%) ${queue} provider:${params.backend}`;
 }
 
 function formatUsageLines(
@@ -2178,7 +2202,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     !runtime.threadKey
   ) {
     const sessionsResult = (await pcp
-      .callTool('list_sessions', { agentId, status: 'active', limit: 30 })
+      .callTool('list_sessions', { agentId, status: 'active', backend: 'ink', limit: 30 })
       .catch(() => null)) as Record<string, unknown> | null;
     const sessions = filterSessionsByPolicy(
       extractSessionSummaries(sessionsResult),
@@ -2187,32 +2211,89 @@ export async function runChat(options: ChatOptions): Promise<void> {
       toolPolicy,
       'attach'
     );
-    const selected = pickLatestSession(sessions, undefined, { studioId: runtime.studioId });
-    if (selected) {
-      attachedSessionSummary = selected;
-      runtime.sessionId = selected.id;
-      if (selected.studioId) {
-        runtime.studioId = selected.studioId;
+
+    const isInteractiveInk = useInk && !options.message && !options.nonInteractive;
+
+    if (isInteractiveInk && sessions.length > 0) {
+      // Show interactive session picker
+      const pickerEntries: SessionPickerEntry[] = sessions
+        .sort((a, b) => {
+          const aStudioMatch = runtime.studioId && a.studioId === runtime.studioId ? 1 : 0;
+          const bStudioMatch = runtime.studioId && b.studioId === runtime.studioId ? 1 : 0;
+          if (aStudioMatch !== bStudioMatch) return bStudioMatch - aStudioMatch;
+          const ams = a.startedAt ? Date.parse(a.startedAt) : 0;
+          const bms = b.startedAt ? Date.parse(b.startedAt) : 0;
+          return bms - ams;
+        })
+        .map((session) => {
+          const transcriptMeta = getSessionTranscriptMetadata(session.id);
+          return {
+            id: session.id,
+            label: session.id.slice(0, 8),
+            phase: session.currentPhase || session.status,
+            threadKey: session.threadKey,
+            studioName: sessionStudioLabel(session),
+            backend: sessionBackendLabel(session),
+            historyLabel: sessionHistoryLabel(transcriptMeta),
+            preview: sessionLatestMessagePreview(session, transcriptMeta) || undefined,
+          };
+        });
+
+      const picked = await renderSessionPicker(pickerEntries);
+      if (picked === undefined) {
+        // Cancel — exit without creating a session
+        return;
       }
-      if (!runtime.threadKey && selected.threadKey) {
-        runtime.threadKey = selected.threadKey;
+      if (picked) {
+        const selected = sessions.find((s) => s.id === picked.id);
+        if (selected) {
+          attachedSessionSummary = selected;
+          runtime.sessionId = selected.id;
+          if (selected.studioId) {
+            runtime.studioId = selected.studioId;
+          }
+          if (!runtime.threadKey && selected.threadKey) {
+            runtime.threadKey = selected.threadKey;
+          }
+          toolPolicy.setContext({ agentId, studioId: runtime.studioId });
+          const currentScope = toolPolicy.getMutationScope();
+          if (currentScope.scope !== 'global') {
+            toolPolicy.setMutationScope(currentScope.scope);
+          }
+          runtime.toolMode = toolPolicy.getMode();
+        }
       }
-      autoAttachedLatest = true;
-      toolPolicy.setContext({
-        agentId,
-        studioId: runtime.studioId,
-      });
-      const currentScope = toolPolicy.getMutationScope();
-      if (currentScope.scope !== 'global') {
-        toolPolicy.setMutationScope(currentScope.scope);
+      // picked === null means "New session" — fall through to create one
+    } else {
+      // Non-interactive or no sessions — auto-attach to latest (existing behavior)
+      const selected = pickLatestSession(sessions, undefined, { studioId: runtime.studioId });
+      if (selected) {
+        attachedSessionSummary = selected;
+        runtime.sessionId = selected.id;
+        if (selected.studioId) {
+          runtime.studioId = selected.studioId;
+        }
+        if (!runtime.threadKey && selected.threadKey) {
+          runtime.threadKey = selected.threadKey;
+        }
+        autoAttachedLatest = true;
+        toolPolicy.setContext({ agentId, studioId: runtime.studioId });
+        const currentScope = toolPolicy.getMutationScope();
+        if (currentScope.scope !== 'global') {
+          toolPolicy.setMutationScope(currentScope.scope);
+        }
+        runtime.toolMode = toolPolicy.getMode();
       }
-      runtime.toolMode = toolPolicy.getMode();
     }
   }
 
   const attachedToExistingSession = Boolean(runtime.sessionId);
   if (!runtime.sessionId) {
-    const startArgs: Record<string, unknown> = { agentId };
+    const startArgs: Record<string, unknown> = {
+      agentId,
+      backend: 'ink',
+      metadata: { provider: runtime.backend },
+    };
     if (runtime.threadKey) startArgs.threadKey = runtime.threadKey;
     if (identity?.studioId) {
       startArgs.studioId = identity.studioId;
@@ -2265,6 +2346,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     for (const activityId of hydrated.seenActivityIds) {
       seenActivityIds.add(activityId);
     }
+    if (hydrated.recoveredMemoryIds.length > 0) {
+      passiveRecallHandle.seedBootstrapIds(hydrated.recoveredMemoryIds);
+    }
   } else if (attachedToExistingSession && runtime.sessionId) {
     const sessionContextResult = (await pcp
       .callTool('get_session_context', { sessionId: runtime.sessionId, limit: 120 })
@@ -2308,41 +2392,248 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   // ── Banner (prints before Ink mounts, goes to terminal scrollback) ──
   {
+    const INKWELL_QUOTES = [
+      { text: 'A word after a word after a word is power.', attr: 'Margaret Atwood' },
+      { text: 'We write to taste life twice.', attr: 'Anaïs Nin' },
+      { text: "I write entirely to find out what I'm thinking.", attr: 'Joan Didion' },
+      { text: 'Memory is the diary we all carry about with us.', attr: 'Oscar Wilde' },
+      {
+        text: 'Fill your paper with the breathings of your heart.',
+        attr: 'William Wordsworth',
+      },
+      {
+        text: 'Either write something worth reading or do something worth writing.',
+        attr: 'Benjamin Franklin',
+      },
+    ];
+
     const bannerWidth = Math.min(process.stdout.columns || 80, 60);
-    const bar = '━'.repeat(Math.max(0, bannerWidth - 2));
-    console.log(chalk.magentaBright(`\n✦${bar}✦`));
-    console.log(chalk.bold.white('  SB Chat'));
-    console.log(chalk.magentaBright(`✦${bar}✦`));
+    const centerText = (s: string) =>
+      ' '.repeat(Math.max(0, Math.floor((bannerWidth - s.length) / 2))) + s;
+
+    // ── Dawn Skyline ASCII art (full width, tiling buildings) ──
+    const termW = process.stdout.columns || 80;
+    const cityW = 56;
+
+    const _lerp = (a: number, b: number, t: number) => Math.round(a + (b - a) * t);
+    const _lerpHex = (h1: string, h2: string, t: number) => {
+      const p = (s: string, o: number) => parseInt(s.slice(o, o + 2), 16);
+      const r = _lerp(p(h1, 1), p(h2, 1), t);
+      const g = _lerp(p(h1, 3), p(h2, 3), t);
+      const b = _lerp(p(h1, 5), p(h2, 5), t);
+      return '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('');
+    };
+
+    const skyStops = [
+      '#0a0a1a',
+      '#1a1040',
+      '#2d1b69',
+      '#5c3d8f',
+      '#8b5fbf',
+      '#c490d1',
+      '#e8b4b8',
+      '#f5d0a9',
+      '#ffeebb',
+    ];
+    const _skyAt = (t: number) => {
+      const idx = Math.floor(t * (skyStops.length - 1));
+      const idx2 = Math.min(idx + 1, skyStops.length - 1);
+      const frac = t * (skyStops.length - 1) - idx;
+      return _lerpHex(skyStops[idx]!, skyStops[idx2]!, frac);
+    };
+    const titleStops = [
+      '#c490d1',
+      '#e8b4b8',
+      '#f5d0a9',
+      '#ffeebb',
+      '#f5d0a9',
+      '#e8b4b8',
+      '#c490d1',
+    ];
+    const _titleAt = (t: number) => {
+      const idx = Math.floor(t * (titleStops.length - 1));
+      const idx2 = Math.min(idx + 1, titleStops.length - 1);
+      const frac = t * (titleStops.length - 1) - idx;
+      return _lerpHex(titleStops[idx]!, titleStops[idx2]!, frac);
+    };
+
+    let _seed = Date.now() & 0xffff;
+    const _rand = () => {
+      _seed = (_seed * 16807 + 0) % 2147483647;
+      return (_seed & 0xffff) / 0x10000;
+    };
+
+    // Sky rows — full terminal width
+    for (let r = 0; r < 4; r++) {
+      const rc = _skyAt(r / 8);
+      const rc2 = _skyAt((r + 1) / 8);
+      let row = '';
+      for (let i = 0; i < termW; i++) {
+        const c = _lerpHex(rc, rc2, (i / Math.max(termW - 1, 1)) * 0.15);
+        if (r < 2 && _rand() < 0.03) row += chalk.hex('#ffffff')('·');
+        else if (r < 1 && _rand() < 0.02) row += chalk.hex('#ccccff')('✦');
+        else row += chalk.hex(c).bgHex(c)('▄');
+      }
+      console.log(row);
+    }
+
+    // Buildings — tiling across full terminal width
+    type BldgStyle = 'tower' | 'thin' | 'wide' | 'squat';
+    interface Bldg {
+      s: number;
+      w: number;
+      h: number;
+      st: BldgStyle;
+    }
+    const bldgs: Bldg[] = [
+      { s: 0, w: 4, h: 5, st: 'squat' },
+      { s: 3, w: 2, h: 3, st: 'thin' },
+      { s: 4, w: 7, h: 8, st: 'tower' },
+      { s: 10, w: 3, h: 4, st: 'squat' },
+      { s: 12, w: 2, h: 6, st: 'thin' },
+      { s: 13, w: 5, h: 5, st: 'wide' },
+      { s: 17, w: 3, h: 3, st: 'squat' },
+      { s: 19, w: 8, h: 10, st: 'tower' },
+      { s: 26, w: 2, h: 4, st: 'thin' },
+      { s: 27, w: 5, h: 6, st: 'wide' },
+      { s: 31, w: 3, h: 3, st: 'squat' },
+      { s: 33, w: 6, h: 7, st: 'tower' },
+      { s: 38, w: 2, h: 5, st: 'thin' },
+      { s: 39, w: 4, h: 4, st: 'squat' },
+      { s: 42, w: 3, h: 8, st: 'thin' },
+      { s: 44, w: 5, h: 6, st: 'wide' },
+      { s: 48, w: 2, h: 3, st: 'thin' },
+      { s: 49, w: 7, h: 9, st: 'tower' },
+    ];
+    const bldgMaxH = 10;
+    const bldgColor = '#12122a';
+    const winPalette = ['#ffdd44', '#ff9944', '#ffcc33', '#44aaff', '#ffffff', '#88ddff'];
+
+    for (let row = 0; row < bldgMaxH; row++) {
+      let line = '';
+      for (let x = 0; x < termW; x++) {
+        const cx = ((x % cityW) + cityW) % cityW;
+        let drawn = false;
+        for (const b of bldgs) {
+          if (cx >= b.s && cx < b.s + b.w && row >= bldgMaxH - b.h) {
+            const lx = cx - b.s;
+            const ly = row - (bldgMaxH - b.h);
+            let isWin = false;
+            if (b.st === 'tower')
+              isWin =
+                lx > 0 && lx < b.w - 1 && ly > 0 && ly % 2 === 1 && lx % 2 === 1 && _rand() < 0.55;
+            else if (b.st === 'thin')
+              isWin = lx === Math.floor(b.w / 2) && ly > 0 && ly % 2 === 0 && _rand() < 0.7;
+            else if (b.st === 'wide')
+              isWin = lx > 0 && lx < b.w - 1 && ly > 0 && (ly === 2 || ly === 4) && _rand() < 0.5;
+            else isWin = lx > 0 && lx < b.w - 1 && ly > 0 && _rand() < 0.25;
+            if (isWin) {
+              line += chalk.hex(winPalette[Math.floor(_rand() * winPalette.length)]!)('▪');
+            } else {
+              line += chalk.hex(bldgColor).bgHex(bldgColor)('█');
+            }
+            drawn = true;
+            break;
+          }
+        }
+        if (!drawn) {
+          const bgC = _skyAt(0.6 + (row / bldgMaxH) * 0.4);
+          line += chalk.hex(bgC).bgHex(bgC)('▄');
+        }
+      }
+      console.log(line);
+    }
+
+    // Block-letter INKWELL with dawn gradient
+    const blockFont: Record<string, string[]> = {
+      I: ['█████', '  █  ', '  █  ', '  █  ', '█████'],
+      N: ['█   █', '██  █', '█ █ █', '█  ██', '█   █'],
+      K: ['█  █', '█ █ ', '██  ', '█ █ ', '█  █'],
+      W: ['█     █', '█  █  █', '█ █ █ █', '██   ██', '█     █'],
+      E: ['█████', '█    ', '████ ', '█    ', '█████'],
+      L: ['█   ', '█   ', '█   ', '█   ', '████'],
+    };
+    const blockWord = 'INKWELL';
+    const blockSpacing = 2;
+    const blockRows = [0, 1, 2, 3, 4].map((r) =>
+      [...blockWord].map((ch) => blockFont[ch]![r]).join(' '.repeat(blockSpacing))
+    );
+    const blockTotalW = blockRows[0]!.length;
+    const blockPadN = Math.max(0, Math.floor((termW - blockTotalW) / 2));
+
+    console.log('');
+    for (const bRow of blockRows) {
+      let line = ' '.repeat(blockPadN);
+      for (let i = 0; i < bRow.length; i++) {
+        const ch = bRow[i];
+        const t = bRow.length > 1 ? i / (bRow.length - 1) : 0;
+        const c = _titleAt(t);
+        line += ch === '█' ? chalk.hex(c)('█') : ' ';
+      }
+      console.log(line);
+    }
+
+    // Bottom gradient accent — thin warm line mirroring the horizon
+    let bottomGlow = '';
+    for (let i = 0; i < termW; i++) {
+      const t = Math.abs(i / Math.max(termW - 1, 1) - 0.5) * 2;
+      const c = _lerpHex('#f5d0a9', '#c490d1', t);
+      bottomGlow += chalk.hex(c)('─');
+    }
+    console.log('');
+    console.log(bottomGlow);
+
+    // ── Quote (inline attribution) ──
+    const quote = INKWELL_QUOTES[Math.floor(Math.random() * INKWELL_QUOTES.length)]!;
+    const fullQuote = `”${quote.text}” ${quote.attr}`;
+    const maxQW = Math.min(termW - 4, 80);
+    const qWords = fullQuote.split(' ');
+    const qLines: string[] = [];
+    let qCur = '';
+    for (const w of qWords) {
+      const test = qCur ? `${qCur} ${w}` : w;
+      if (test.length > maxQW && qCur) {
+        qLines.push(qCur);
+        qCur = w;
+      } else {
+        qCur = test;
+      }
+    }
+    if (qCur) qLines.push(qCur);
+
+    const qPad = ' '.repeat(
+      Math.max(0, Math.floor((bannerWidth - Math.max(...qLines.map((l) => l.length))) / 2))
+    );
+    for (const line of qLines) {
+      console.log(qPad + chalk.dim(line));
+    }
+    console.log('');
   }
-  // Use studio slug/name where available, fall back to short ID
   const studioSlug =
     attachedSessionSummary?.studioName ||
     (identity?.studioId ? formatStudioForDisplay(identity.studioId, 'short') : undefined);
   const bannerParts = [
-    chip('agent', agentId, chalk.cyan),
-    chip(
-      'backend',
-      `${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}`,
-      chalk.yellow
-    ),
+    chip('inkling', agentId, chalk.cyan),
+    chip('backend', 'ink', chalk.yellow),
+    chip('provider', runtime.backend, chalk.yellow),
     studioSlug ? chip('studio', studioSlug, chalk.cyan) : null,
     chip('window', `${formatTokenCount(runtime.backendTokenWindow)} tok`, chalk.green),
     chip('time', formatNow(runtime.userTimezone), chalk.magenta),
   ].filter(Boolean);
-  console.log(bannerParts.join(chalk.dim('  •  ')));
-  if (runtime.sessionId) console.log(chalk.dim(`Session: ${runtime.sessionId}`));
-  if (runtime.threadKey) console.log(chalk.dim(`Thread: ${runtime.threadKey}`));
+  console.log('  ' + bannerParts.join(chalk.dim('  ·  ')));
+  if (runtime.sessionId) console.log(chalk.dim(`  session ${runtime.sessionId}`));
+  if (runtime.threadKey) console.log(chalk.dim(`  thread ${runtime.threadKey}`));
   if (attachedToExistingSession) {
     console.log(
       chalk.dim(
-        autoAttachedLatest ? 'Auto-attached to latest session' : 'Attached to existing session'
+        autoAttachedLatest ? '  auto-attached to latest session' : '  attached to existing session'
       )
     );
   }
   if (historyHydration && historyHydration.messageCount > 0) {
-    console.log(chalk.dim(`History: ${historyHydration.messageCount} prior message(s) loaded`));
+    console.log(chalk.dim(`  history: ${historyHydration.messageCount} prior message(s) loaded`));
   }
-  console.log(chalk.dim('Type /help for commands.\n'));
+  console.log(chalk.dim('  /help for commands\n'));
 
   const refreshSessionsSnapshot = async (force = false): Promise<SessionSummary[]> => {
     const stale = Date.now() - sessionsCacheAt > 15_000;
@@ -2656,9 +2947,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
         activitySince = activity.createdAt;
       }
 
-      const type = activity.subtype
+      const rawType = activity.subtype
         ? `${activity.type}:${activity.subtype}`
         : activity.type || 'activity';
+      const ACTIVITY_LABELS: Record<string, string> = {
+        message_in: 'received',
+        message_out: 'sent',
+        agent_spawn: 'spawned',
+        agent_complete: 'completed',
+        state_change: 'state change',
+        tool_call: 'tool call',
+        tool_result: 'tool result',
+        inkmail_dispatch: 'mail sent',
+        inkmail_deliver: 'mail delivered',
+        inkmail_fail: 'mail failed',
+      };
+      const type = ACTIVITY_LABELS[rawType] || rawType;
       const actor = activity.agentId || 'system';
       const preview = (activity.content || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
       const rendered = `⚡ ${actor} ${type}${preview ? ` — ${preview}` : ''}`;
@@ -2677,6 +2981,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       if (inkRepl) {
         inkRepl.addMessage('activity', `${actor} ${type}${preview ? ` — ${preview}` : ''}`, {
           label: '⚡',
+          time: formatHumanTime(activity.createdAt, runtime.userTimezone),
         });
       } else {
         printLine('');
@@ -2759,6 +3064,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
       },
     });
 
+    // Persist hook-injected entries to transcript so they survive reattach
+    if (promptHookResult.injectedEntries.length > 0) {
+      for (const entry of promptHookResult.injectedEntries) {
+        appendTranscript(runtime.transcriptPath, {
+          type: 'hook_injection',
+          role: entry.role,
+          content: entry.content,
+          source: entry.source,
+          memoryId: entry.memoryId,
+        });
+      }
+    }
+
     // Print notifications from prompt_build hooks
     if (promptHookResult.injected > 0) {
       // Check if any were passive recall vs budget warnings
@@ -2771,13 +3089,29 @@ export async function runChat(options: ChatOptions): Promise<void> {
         .filter((e) => e.source === 'budget-monitor')
         .slice(-promptHookResult.injected);
 
-      for (const entry of recallEntries) {
-        const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
-        printLine(
-          chalk.dim(
-            `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`
-          )
-        );
+      if (recallEntries.length > 0) {
+        const totalTok = recallEntries.reduce((sum, e) => sum + e.approxTokens, 0);
+        if (inkRepl) {
+          const details = recallEntries.map((entry) => {
+            const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+            return `  💡 ${preview}${entry.content.length > 120 ? '...' : ''} (${entry.approxTokens} tok)`;
+          });
+          inkRepl.setSurfacedMemories(details);
+          printLine(
+            chalk.dim(
+              `  💡 ${recallEntries.length} ${recallEntries.length === 1 ? 'memory' : 'memories'} surfaced (${totalTok} tok) — ctrl+o to expand`
+            )
+          );
+        } else {
+          for (const entry of recallEntries) {
+            const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+            printLine(
+              chalk.dim(
+                `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`
+              )
+            );
+          }
+        }
       }
 
       if (budgetEntries.length > 0) {
@@ -3229,8 +3563,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       if (!runResult.success) break;
     }
 
-    const assistantDisplayText =
-      runtime.toolRouting === 'local'
+    const isAbortedTurn =
+      !runResult.success && runResult.exitCode !== undefined && runResult.exitCode >= 128;
+
+    const assistantDisplayText = isAbortedTurn
+      ? ''
+      : runtime.toolRouting === 'local'
         ? (() => {
             const stripped = stripLocalToolBlocks(responseText);
             if (stripped) return stripped;
@@ -3240,20 +3578,35 @@ export async function runChat(options: ChatOptions): Promise<void> {
           })()
         : responseText;
 
-    ledger.addEntry('assistant', assistantDisplayText, runtime.backend);
-    appendTranscript(runtime.transcriptPath, {
-      type: 'assistant',
-      backend: runtime.backend,
-      model: runtime.model || null,
-      success: runResult.success,
-      exitCode: runResult.exitCode,
-      durationMs: runResult.durationMs,
-      stderr: runResult.stderr || null,
-      content: assistantDisplayText,
-      rawContent: responseText,
-      approxTokens: estimateTokens(assistantDisplayText),
-      usage: runResult.usage || null,
-    });
+    if (isAbortedTurn) {
+      appendTranscript(runtime.transcriptPath, {
+        type: 'assistant',
+        backend: runtime.backend,
+        model: runtime.model || null,
+        success: false,
+        exitCode: runResult.exitCode,
+        durationMs: runResult.durationMs,
+        stderr: runResult.stderr || null,
+        content: null,
+        cancelled: true,
+        usage: runResult.usage || null,
+      });
+    } else {
+      ledger.addEntry('assistant', assistantDisplayText, runtime.backend);
+      appendTranscript(runtime.transcriptPath, {
+        type: 'assistant',
+        backend: runtime.backend,
+        model: runtime.model || null,
+        success: runResult.success,
+        exitCode: runResult.exitCode,
+        durationMs: runResult.durationMs,
+        stderr: runResult.stderr || null,
+        content: assistantDisplayText,
+        rawContent: responseText,
+        approxTokens: estimateTokens(assistantDisplayText),
+        usage: runResult.usage || null,
+      });
+    }
     lastBackendUsage = runResult.usage;
 
     // ── Fire turn_end hooks (passive recall, etc.) ──
@@ -3280,6 +3633,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
         },
       })
       .then((hookResult) => {
+        // Persist hook-injected entries to transcript so they survive reattach
+        if (hookResult.injectedEntries.length > 0) {
+          for (const entry of hookResult.injectedEntries) {
+            appendTranscript(runtime.transcriptPath, {
+              type: 'hook_injection',
+              role: entry.role,
+              content: entry.content,
+              source: entry.source,
+              memoryId: entry.memoryId,
+            });
+          }
+        }
+
         // Notify the user about passive recall injections
         if (hookResult.injected > 0) {
           const recallEntries = ledger
@@ -3287,14 +3653,29 @@ export async function runChat(options: ChatOptions): Promise<void> {
             .filter((e) => e.source === 'passive-recall')
             .slice(-hookResult.injected);
 
-          for (const entry of recallEntries) {
-            const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
-            const tokens = entry.approxTokens;
-            printLine(
-              chalk.dim(
-                `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${tokens} tok)`
-              )
-            );
+          if (recallEntries.length > 0) {
+            const totalTok = recallEntries.reduce((sum, e) => sum + e.approxTokens, 0);
+            if (inkRepl) {
+              const details = recallEntries.map((entry) => {
+                const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+                return `  💡 ${preview}${entry.content.length > 120 ? '...' : ''} (${entry.approxTokens} tok)`;
+              });
+              inkRepl.setSurfacedMemories(details);
+              printLine(
+                chalk.dim(
+                  `  💡 ${recallEntries.length} ${recallEntries.length === 1 ? 'memory' : 'memories'} surfaced (${totalTok} tok) — ctrl+o to expand`
+                )
+              );
+            } else {
+              for (const entry of recallEntries) {
+                const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+                printLine(
+                  chalk.dim(
+                    `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`
+                  )
+                );
+              }
+            }
           }
         }
         if (hookResult.evicted > 0) {
@@ -3303,24 +3684,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
       })
       .catch(() => undefined); // never block the REPL
 
-    if (!runResult.success) {
-      const isSignalExit = runResult.exitCode !== undefined && runResult.exitCode >= 128;
-      if (!isSignalExit) {
-        printLine(chalk.red(`\n[${runtime.backend}] exit=${runResult.exitCode}`));
-        if (runResult.stderr) {
-          printLine(chalk.dim(runResult.stderr));
-        }
+    if (!runResult.success && !isAbortedTurn) {
+      printLine(chalk.red(`\n[${runtime.backend}] exit=${runResult.exitCode}`));
+      if (runResult.stderr) {
+        printLine(chalk.dim(runResult.stderr));
       }
     }
 
     if (inkRepl) {
-      const usageMeta = runResult.usage ? formatBackendTokenUsage(runResult.usage) : undefined;
-      const trailingParts = [`${turnDurationSeconds}s`, usageMeta].filter(Boolean).join('  ·  ');
-      inkRepl.addMessage('assistant', assistantDisplayText, {
-        label: agentId,
-        trailingMeta: trailingParts,
-      });
-    } else {
+      if (!isAbortedTurn) {
+        const usageMeta = runResult.usage ? formatBackendTokenUsage(runResult.usage) : undefined;
+        const trailingParts = [`${turnDurationSeconds}s`, usageMeta].filter(Boolean).join('  ·  ');
+        inkRepl.addMessage('assistant', assistantDisplayText, {
+          label: agentId,
+          trailingMeta: trailingParts,
+        });
+      }
+    } else if (!isAbortedTurn) {
       printLine('');
       printLine(
         renderMessageLine('assistant', assistantDisplayText, {
@@ -3502,6 +3882,30 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let exitAfterTurnNoticeShown = false;
   let activePromptLabel = `${agentId}> `;
 
+  // Helper: build context view lines from current state
+  const buildContextViewLines = (): string[] => {
+    const recallStats = passiveRecallHandle.getStats();
+    const allEntries = ledger.listEntries();
+    const recallEntries = allEntries.filter((e) => e.source === 'passive-recall');
+    return formatContextLines({
+      bootstrapSummary: runtime.bootstrapContext || undefined,
+      passiveRecallEntries: recallEntries.map((e) => ({
+        content: e.content,
+        source: e.source,
+      })),
+      passiveRecallStats: {
+        totalInjected: recallStats.totalInjected,
+        uniqueMemories: recallStats.uniqueMemories,
+        currentTurn: recallStats.currentTurn,
+      },
+      ledgerStats: {
+        totalEntries: allEntries.length,
+        tokenEstimate: ledger.totalTokens(),
+        bootstrapTokens: runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0,
+      },
+    });
+  };
+
   if (useInk) {
     // ── Ink path ──
     inkRepl = renderInkChat({
@@ -3509,6 +3913,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       timezone: runtime.userTimezone,
       infoItems: initialInfoItems,
       fullscreen: !!options.fullscreen,
+      dynamicMessages: !!options.dynamic,
     });
     // Initial status update — ChatApp starts with 'waiting for input'
     // so push the real context budget summary immediately
@@ -3522,6 +3927,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     });
     inkRepl.setStatus(initialSummary);
     lastStatusSummary = initialSummary;
+
+    // Register Ctrl+O handler — opens context viewer via React state
+    inkRepl.handle.setCtrlOHandler(() => {
+      inkRepl!.showContextView(buildContextViewLines());
+    });
 
     // Push prior messages into Ink scrollback so user sees conversation history
     if (historyHydration && historyHydration.tailPreview.length > 0) {
@@ -4779,17 +5189,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
           break;
         }
         case 'context': {
-          const entries = ledger.listEntries().slice(-12);
-          if (entries.length === 0) {
-            showInPanel(['Context is empty.']);
-            break;
+          if (inkRepl) {
+            inkRepl.showContextView(buildContextViewLines());
+          } else {
+            const entries = ledger.listEntries().slice(-12);
+            if (entries.length === 0) {
+              showInPanel(['Context is empty.']);
+              break;
+            }
+            showInPanel(
+              entries.map((entry) => {
+                const prefix = `${entry.role}${entry.source ? `/${entry.source}` : ''}`;
+                return `${prefix}: ${entry.content.slice(0, 180)}`;
+              })
+            );
           }
-          showInPanel(
-            entries.map((entry) => {
-              const prefix = `${entry.role}${entry.source ? `/${entry.source}` : ''}`;
-              return `${prefix}: ${entry.content.slice(0, 180)}`;
-            })
-          );
           break;
         }
         case 'usage': {
@@ -4911,6 +5325,7 @@ export function registerChatCommand(program: Command): void {
       )
       .option('-v, --verbose', 'Verbose backend passthrough output')
       .option('--fullscreen', 'Fullscreen alternate buffer mode (app-controlled scrolling)')
+      .option('--dynamic', 'Render messages dynamically (re-renderable, no terminal scrollback)')
       .action((options: ChatOptions) => runChat(options));
 
   register('chat', 'Start first-class Ink REPL (experimental)');

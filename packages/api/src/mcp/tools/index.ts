@@ -2004,7 +2004,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'list_sessions',
     {
-      description: `List past sessions, optionally filtered by agent.
+      description: `List past sessions, optionally filtered by agent and/or backend.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
@@ -2014,6 +2014,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .string()
           .optional()
           .describe('Filter by studio (UUID or "main" for the main studio)'),
+        backend: z
+          .string()
+          .optional()
+          .describe('Filter by backend runtime (e.g., "ink", "claude-code")'),
         limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
       },
     },
