@@ -7,6 +7,7 @@
  * Usage:
  *   ink wait                              # Wait for any new message
  *   ink wait --thread pr:231              # Wait for activity on a specific thread
+ *   ink wait --group <uuid>               # Watch autonomous strategy progress
  *   ink wait --timeout 300 --interval 15  # Custom timing
  */
 
@@ -15,6 +16,7 @@ import { PcpClient } from '../lib/pcp-client.js';
 
 interface WaitOptions {
   thread?: string;
+  group?: string;
   timeout?: string;
   interval?: string;
   agent?: string;
@@ -30,6 +32,7 @@ export function registerWaitCommand(program: Command): void {
     .command('wait')
     .description('Wait for new inbox or thread messages, then exit with the content')
     .option('-t, --thread <threadKey>', 'Watch a specific thread for new messages')
+    .option('-g, --group <groupId>', 'Watch an autonomous strategy/task group for progress')
     .option('--timeout <seconds>', 'Max wait time in seconds (default: 300)', '300')
     .option('--interval <seconds>', 'Poll interval in seconds (default: 15)', '15')
     .option('-a, --agent <agentId>', 'Agent ID (default: from env)')
@@ -39,6 +42,7 @@ export function registerWaitCommand(program: Command): void {
       const intervalSec = Math.max(5, parseInt(options.interval || '15', 10));
       const agentId = options.agent || resolveAgentId();
       const threadKey = options.thread;
+      const groupId = options.group;
 
       const pcp = new PcpClient();
       const config = pcp.getConfig();
@@ -46,6 +50,12 @@ export function registerWaitCommand(program: Command): void {
       if (!config.email) {
         console.error('[ink wait] PCP not configured. Run: ink init');
         process.exit(2);
+      }
+
+      // ── Strategy/task group watch mode ──
+      if (groupId) {
+        await watchStrategy(pcp, groupId, timeoutSec, intervalSec);
+        return;
       }
 
       const deadline = Date.now() + timeoutSec * 1000;
@@ -243,4 +253,176 @@ export function registerWaitCommand(program: Command): void {
       console.error(`[ink wait] Timed out after ${timeoutSec}s with no new messages.`);
       process.exit(1);
     });
+}
+
+interface StrategyStatus {
+  title?: string;
+  strategy?: string;
+  status?: string;
+  progress?: {
+    total?: number;
+    completed?: number;
+    pending?: number;
+    inProgress?: number;
+    blocked?: number;
+    completionRate?: number;
+  };
+  currentTask?: {
+    id?: string;
+    title?: string;
+    status?: string;
+    taskOrder?: number;
+  };
+  summary?: string;
+  config?: {
+    supervisorId?: string;
+    approvalNotify?: string;
+    studioSlug?: string;
+    [key: string]: unknown;
+  };
+}
+
+async function watchStrategy(
+  pcp: PcpClient,
+  groupId: string,
+  timeoutSec: number,
+  intervalSec: number
+): Promise<void> {
+  const deadline = Date.now() + timeoutSec * 1000;
+  let consecutiveErrors = 0;
+  const maxBackoffSec = Math.max(intervalSec, 120);
+
+  // Fetch initial state
+  let lastCompleted = 0;
+  let lastTaskId: string | undefined;
+  let lastStatus: string | undefined;
+
+  try {
+    const initial = (await pcp.callTool('get_strategy_status', {
+      groupId,
+    })) as StrategyStatus;
+    lastCompleted = initial.progress?.completed ?? 0;
+    lastTaskId = initial.currentTask?.id;
+    lastStatus = initial.status;
+
+    const total = initial.progress?.total ?? 0;
+    console.log(`[ink wait] Watching strategy: ${initial.title || groupId}`);
+    console.log(
+      `[ink wait] Strategy: ${initial.strategy || 'unknown'} | Status: ${initial.status || 'unknown'} | Progress: ${lastCompleted}/${total}`
+    );
+    if (initial.currentTask) {
+      console.log(
+        `[ink wait] Current task: "${initial.currentTask.title}" (${initial.currentTask.status})`
+      );
+    }
+    if (initial.config?.approvalNotify) {
+      console.log(`[ink wait] Architect reviewer: ${initial.config.approvalNotify}`);
+    }
+    if (initial.config?.studioSlug) {
+      console.log(`[ink wait] Studio: ${initial.config.studioSlug}`);
+    }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    console.error(`[ink wait] Failed to fetch initial strategy status: ${msg}`);
+    process.exit(2);
+  }
+
+  while (Date.now() < deadline) {
+    const sleepMs =
+      consecutiveErrors === 0
+        ? intervalSec * 1000
+        : Math.min(maxBackoffSec * 1000, intervalSec * 1000 * 2 ** Math.min(consecutiveErrors, 6)) *
+          (0.5 + Math.random() * 0.5);
+
+    await new Promise((resolve) => setTimeout(resolve, sleepMs));
+
+    try {
+      const status = (await pcp.callTool('get_strategy_status', {
+        groupId,
+      })) as StrategyStatus;
+
+      consecutiveErrors = 0;
+
+      const completed = status.progress?.completed ?? 0;
+      const total = status.progress?.total ?? 0;
+      const blocked = status.progress?.blocked ?? 0;
+      const currentTaskId = status.currentTask?.id;
+      const strategyStatus = status.status;
+
+      // Strategy completed or cancelled — exit with summary
+      if (strategyStatus === 'completed' || strategyStatus === 'cancelled') {
+        console.log(`\n[ink wait] Strategy ${strategyStatus}: ${completed}/${total} tasks done`);
+        if (status.summary) {
+          console.log(`[ink wait] ${status.summary}`);
+        }
+        process.exit(strategyStatus === 'completed' ? 0 : 1);
+      }
+
+      // Strategy paused (e.g., awaiting approval)
+      if (strategyStatus === 'paused' && lastStatus !== 'paused') {
+        console.log(
+          `\n[ink wait] Strategy paused — may be awaiting approval (${completed}/${total} done)`
+        );
+        if (status.currentTask) {
+          console.log(
+            `[ink wait] Last task: "${status.currentTask.title}" (${status.currentTask.status})`
+          );
+        }
+        lastStatus = strategyStatus;
+        continue;
+      }
+
+      // Task advanced — a task was completed since last check
+      if (completed > lastCompleted) {
+        const delta = completed - lastCompleted;
+        console.log(
+          `\n[ink wait] ${delta} task(s) completed! Progress: ${completed}/${total} (${Math.round((completed / total) * 100)}%)`
+        );
+        if (status.currentTask) {
+          console.log(
+            `[ink wait] Now working on: "${status.currentTask.title}" (${status.currentTask.status})`
+          );
+        }
+        lastCompleted = completed;
+        lastTaskId = currentTaskId;
+        lastStatus = strategyStatus;
+        continue;
+      }
+
+      // Current task changed (e.g., moved from pending to in_progress)
+      if (currentTaskId && currentTaskId !== lastTaskId) {
+        console.log(
+          `[ink wait] Task changed: "${status.currentTask?.title}" (${status.currentTask?.status})`
+        );
+        lastTaskId = currentTaskId;
+        lastStatus = strategyStatus;
+        continue;
+      }
+
+      // Blocked tasks appeared
+      if (blocked > 0) {
+        console.log(`[ink wait] ${blocked} task(s) blocked — ${completed}/${total} done`);
+        lastStatus = strategyStatus;
+        continue;
+      }
+
+      // No change
+      const taskLabel = status.currentTask ? `working on: "${status.currentTask.title}"` : 'idle';
+      console.log(`[ink wait] ${completed}/${total} done — ${taskLabel}`);
+      lastStatus = strategyStatus;
+    } catch (error) {
+      consecutiveErrors += 1;
+      const msg = error instanceof Error ? error.message : String(error);
+      const nextBackoffSec = Math.min(
+        maxBackoffSec,
+        intervalSec * 2 ** Math.min(consecutiveErrors, 6)
+      );
+      console.log(
+        `[ink wait] Poll error #${consecutiveErrors} (next retry in ~${nextBackoffSec}s): ${msg.slice(0, 100)}`
+      );
+    }
+  }
+
+  console.error(`[ink wait] Timed out after ${timeoutSec}s. Strategy still running.`);
+  process.exit(1);
 }
