@@ -1,6 +1,7 @@
 'use client';
 
-import { useMemo, useRef, useEffect } from 'react';
+import { useMemo, useRef, useEffect, useCallback } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { useApiQuery, useApiPost, useQueryClient } from '@/lib/api';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -174,12 +175,27 @@ export function ConversationViewer({ sessionId }: { sessionId: string }) {
   }, [turns]);
 
   const isLive = session?.lifecycle === 'running';
+  const prevTurnCount = useRef(0);
+
+  const virtualizer = useVirtualizer({
+    count: turns.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => 80,
+    overscan: 10,
+  });
+
+  const scrollToBottom = useCallback(() => {
+    if (turns.length > 0) {
+      virtualizer.scrollToIndex(turns.length - 1, { align: 'end' });
+    }
+  }, [virtualizer, turns.length]);
 
   useEffect(() => {
-    if (scrollRef.current && turns.length > 0) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    if (turns.length > 0 && turns.length !== prevTurnCount.current) {
+      prevTurnCount.current = turns.length;
+      requestAnimationFrame(scrollToBottom);
     }
-  }, [turns.length]);
+  }, [turns.length, scrollToBottom]);
 
   if (!conversationData && !logsData && !conversationError) {
     return (
@@ -239,7 +255,9 @@ export function ConversationViewer({ sessionId }: { sessionId: string }) {
                     ? 'Activity'
                     : 'No transcript'}
             </Badge>
-            <span className="text-xs text-gray-400">{totalEvents} events</span>
+            <span className="text-xs text-gray-400">
+              {turns.length} turns · {totalEvents} events
+            </span>
             {source !== 'synced' && (
               <Button
                 size="sm"
@@ -265,8 +283,8 @@ export function ConversationViewer({ sessionId }: { sessionId: string }) {
         )}
       </div>
 
-      {/* Conversation body */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4 space-y-3 bg-gray-50/50">
+      {/* Conversation body — virtualized */}
+      <div ref={scrollRef} className="flex-1 overflow-y-auto bg-gray-50/50">
         {turns.length === 0 && source === 'none' ? (
           <div className="flex flex-col items-center justify-center h-full text-gray-400 gap-3">
             <p className="text-sm">No transcript available for this session.</p>
@@ -284,14 +302,38 @@ export function ConversationViewer({ sessionId }: { sessionId: string }) {
             <p className="text-sm">Transcript is empty.</p>
           </div>
         ) : (
-          turns.map((turn) => (
-            <MessageBubble
-              key={turn.id}
-              turn={turn}
-              agentName={turn.role === 'assistant' ? agentName : undefined}
-              toolResults={toolResults}
-            />
-          ))
+          <div
+            style={{ height: virtualizer.getTotalSize(), position: 'relative' }}
+            className="px-4"
+          >
+            {virtualizer.getVirtualItems().map((virtualRow) => {
+              const turn = turns[virtualRow.index];
+              return (
+                <div
+                  key={turn.id}
+                  data-index={virtualRow.index}
+                  ref={virtualizer.measureElement}
+                  style={{
+                    position: 'absolute',
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    transform: `translateY(${virtualRow.start}px)`,
+                    paddingLeft: '1rem',
+                    paddingRight: '1rem',
+                    paddingTop: virtualRow.index === 0 ? '1rem' : '0.375rem',
+                    paddingBottom: virtualRow.index === turns.length - 1 ? '1rem' : '0.375rem',
+                  }}
+                >
+                  <MessageBubble
+                    turn={turn}
+                    agentName={turn.role === 'assistant' ? agentName : undefined}
+                    toolResults={toolResults}
+                  />
+                </div>
+              );
+            })}
+          </div>
         )}
       </div>
     </div>
