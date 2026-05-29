@@ -284,7 +284,7 @@ interface StrategyStatus {
   };
 }
 
-function validateStrategyResult(result: Record<string, unknown>, context: string): void {
+export function validateStrategyResult(result: Record<string, unknown>, context: string): void {
   if (result.success === false) {
     throw new Error((result.error as string) || `${context}: server returned failure`);
   }
