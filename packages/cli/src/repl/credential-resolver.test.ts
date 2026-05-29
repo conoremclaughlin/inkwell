@@ -21,24 +21,30 @@ describe('resolveCredentialRefs', () => {
     expect(resolutions[1]).toEqual({ name: 'TEST_PASS', path: 'password' });
   });
 
-  it('resolves ${VAR} braced references', () => {
-    const { args } = resolveCredentialRefs(
+  it('resolves bare ${VAR} braced references', () => {
+    const { args } = resolveCredentialRefs({ host: '${TEST_HOST}' }, testEnv);
+    expect(args.host).toBe('example.com');
+  });
+
+  it('does NOT resolve embedded references in longer strings', () => {
+    const { args, resolutions } = resolveCredentialRefs(
       { url: 'https://${TEST_HOST}:${TEST_PORT}/api' },
       testEnv
     );
-    expect(args.url).toBe('https://example.com:8080/api');
+    expect(args.url).toBe('https://${TEST_HOST}:${TEST_PORT}/api');
+    expect(resolutions).toHaveLength(0);
   });
 
-  it('interpolates references embedded in strings', () => {
+  it('does NOT interpolate references embedded in text', () => {
     const { args, resolutions } = resolveCredentialRefs(
       { greeting: 'Hello $TEST_USER, welcome!' },
       testEnv
     );
-    expect(args.greeting).toBe('Hello alice, welcome!');
-    expect(resolutions).toHaveLength(1);
+    expect(args.greeting).toBe('Hello $TEST_USER, welcome!');
+    expect(resolutions).toHaveLength(0);
   });
 
-  it('leaves unresolvable references as-is', () => {
+  it('leaves unresolvable bare references as-is', () => {
     const { args, resolutions } = resolveCredentialRefs({ value: '$NONEXISTENT_VAR' }, testEnv);
     expect(args.value).toBe('$NONEXISTENT_VAR');
     expect(resolutions).toHaveLength(0);
@@ -84,18 +90,13 @@ describe('resolveCredentialRefs', () => {
     expect(resolutions).toEqual([{ name: 'TEST_HOST', path: 'hosts[0]' }]);
   });
 
-  it('resolves multiple references in a single string', () => {
+  it('does NOT resolve multi-reference strings (not bare)', () => {
     const { args, resolutions } = resolveCredentialRefs(
       { dsn: '$TEST_USER:$TEST_PASS@$TEST_HOST' },
       testEnv
     );
-    expect(args.dsn).toBe('alice:s3cret@example.com');
-    expect(resolutions).toHaveLength(3);
-  });
-
-  it('handles mixed resolved and unresolved in one string', () => {
-    const { args } = resolveCredentialRefs({ partial: '$TEST_USER@$UNKNOWN_DOMAIN' }, testEnv);
-    expect(args.partial).toBe('alice@$UNKNOWN_DOMAIN');
+    expect(args.dsn).toBe('$TEST_USER:$TEST_PASS@$TEST_HOST');
+    expect(resolutions).toHaveLength(0);
   });
 
   it('returns empty resolutions for args with no references', () => {
@@ -131,6 +132,20 @@ describe('resolveCredentialRefs', () => {
     } finally {
       delete process.env.INK_TEST_LIVE_CRED;
     }
+  });
+
+  it('does NOT resolve known credential names embedded in text fields', () => {
+    const keychainOnly: Record<string, string> = { GFIBER_PASSWORD: 'super-secret' };
+    const { args, resolutions } = resolveCredentialRefs(
+      {
+        content: 'Please use $GFIBER_PASSWORD literally',
+        password: '$GFIBER_PASSWORD',
+      },
+      keychainOnly
+    );
+    expect(args.content).toBe('Please use $GFIBER_PASSWORD literally');
+    expect(args.password).toBe('super-secret');
+    expect(resolutions).toEqual([{ name: 'GFIBER_PASSWORD', path: 'password' }]);
   });
 
   it('does NOT resolve $VAR references absent from the provided env', () => {

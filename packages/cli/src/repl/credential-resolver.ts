@@ -12,15 +12,19 @@
  * Resolution scope:
  * ONLY resolves references that match known Keychain credential names
  * (loaded at session start via `loadKeychainCredentials()`). Arbitrary
- * process.env vars like $HOME or $PATH are never resolved. This prevents
- * accidental secret injection in text fields like send_to_inbox.content
- * where "$API_TOKEN" should stay literal.
+ * process.env vars like $HOME or $PATH are never resolved.
+ *
+ * Safety invariant:
+ * Only BARE references are resolved — the entire string value must be
+ * exactly `$VAR` or `${VAR}` with no surrounding text. This prevents
+ * credential leakage into text fields: `send_to_inbox({ content:
+ * "use $GFIBER_PASSWORD" })` stays literal, while `{ password:
+ * "$GFIBER_PASSWORD" }` resolves correctly.
  *
  * Resolution rules:
  * - Only string values are scanned (numbers, booleans, objects pass through)
- * - Pattern: `$VAR_NAME` or `${VAR_NAME}` anywhere in a string value
- * - A string that IS a bare reference (`$FOO`) resolves to just the value
- * - A string with embedded references (`user: $FOO`) does interpolation
+ * - Pattern: entire value must be `$VAR_NAME` or `${VAR_NAME}` (bare ref)
+ * - Embedded references (`user: $FOO`) are NOT resolved
  * - Unresolvable references are left as-is
  * - Nested objects/arrays are walked recursively
  */
@@ -44,14 +48,14 @@ export interface ResolveResult {
   resolutions: CredentialResolution[];
 }
 
-const REF_PATTERN = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g;
+const BARE_REF_PATTERN = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$|^\$([A-Za-z_][A-Za-z0-9_]*)$/;
 
 /**
  * Resolve credential references in tool call arguments.
  *
- * Walks all string values in `args`, replacing `$VAR` / `${VAR}` patterns
- * with their `process.env` values. Returns the resolved args and an audit
- * trail of which references were resolved (without the actual values).
+ * Only resolves bare references where the entire string value is a single
+ * `$VAR` or `${VAR}`. Embedded references in longer strings are left as-is
+ * to prevent credential leakage into text fields.
  */
 export function resolveCredentialRefs(
   args: Record<string, unknown>,
@@ -73,17 +77,14 @@ export function resolveCredentialRefs(
   }
 
   function resolveString(value: string, path: string): string {
-    return value.replace(
-      REF_PATTERN,
-      (match, braced: string | undefined, bare: string | undefined) => {
-        const varName = braced || bare;
-        if (!varName) return match;
-        const envValue = env[varName];
-        if (envValue === undefined) return match;
-        resolutions.push({ name: varName, path });
-        return envValue;
-      }
-    );
+    const m = value.trim().match(BARE_REF_PATTERN);
+    if (!m) return value;
+    const varName = m[1] || m[2];
+    if (!varName) return value;
+    const resolved = env[varName];
+    if (resolved === undefined) return value;
+    resolutions.push({ name: varName, path });
+    return resolved;
   }
 
   function resolveObject(
