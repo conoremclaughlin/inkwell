@@ -36,6 +36,11 @@ import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-ap
 import { ensurePcpToolAllowed } from '../repl/tool-gate.js';
 import { executeToolCalls, type ToolCallResult } from '../repl/tool-call-executor.js';
 import {
+  resolveCredentialRefs,
+  loadKeychainCredentials,
+  buildResolverEnv,
+} from '../repl/credential-resolver.js';
+import {
   isClientLocalTool,
   handleClientLocalTool,
   getLastSignal,
@@ -1273,6 +1278,28 @@ function formatTimestampForSessionList(value?: string, timezone?: string): strin
   }
 }
 
+function formatRelativeTime(ms: number, timezone?: string): string {
+  const now = Date.now();
+  const diffMs = now - ms;
+  if (diffMs < 0) return 'just now';
+  const mins = Math.floor(diffMs / 60_000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  try {
+    return new Date(ms).toLocaleDateString([], {
+      month: 'short',
+      day: 'numeric',
+      timeZone: timezone,
+    });
+  } catch {
+    return new Date(ms).toLocaleDateString([], { month: 'short', day: 'numeric' });
+  }
+}
+
 function safeDateMs(value?: string): number {
   if (!value) return 0;
   const ms = Date.parse(value);
@@ -2122,6 +2149,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
       );
     }
 
+    // Pre-load Keychain credentials for the credential resolver.
+    // Runs once at session start; the cache persists for the session lifetime.
+    const keychainCreds = await loadKeychainCredentials();
+    if (Object.keys(keychainCreds).length > 0) {
+      console.log(chalk.dim(`Keychain: ${Object.keys(keychainCreds).length} credential(s) loaded`));
+    }
+
     // Seed passive recall dedup with memory IDs already in bootstrap context
     const bootstrapMemoryIds = bootstrapResult.memoryIds as string[] | undefined;
     if (bootstrapMemoryIds && bootstrapMemoryIds.length > 0) {
@@ -2214,30 +2248,40 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     const isInteractiveInk = useInk && !options.message && !options.nonInteractive;
 
-    if (isInteractiveInk && sessions.length > 0) {
+    if (isInteractiveInk) {
       // Show interactive session picker
-      const pickerEntries: SessionPickerEntry[] = sessions
-        .sort((a, b) => {
-          const aStudioMatch = runtime.studioId && a.studioId === runtime.studioId ? 1 : 0;
-          const bStudioMatch = runtime.studioId && b.studioId === runtime.studioId ? 1 : 0;
-          if (aStudioMatch !== bStudioMatch) return bStudioMatch - aStudioMatch;
-          const ams = a.startedAt ? Date.parse(a.startedAt) : 0;
-          const bms = b.startedAt ? Date.parse(b.startedAt) : 0;
-          return bms - ams;
+      const sessionsWithMeta = sessions.map((session) => {
+        const transcriptMeta = getSessionTranscriptMetadata(session.id);
+        const lastActivityMs = transcriptMeta?.lastMessageAt
+          ? Date.parse(transcriptMeta.lastMessageAt)
+          : session.startedAt
+            ? Date.parse(session.startedAt)
+            : 0;
+        return { session, transcriptMeta, lastActivityMs };
+      });
+
+      sessionsWithMeta.sort((a, b) => {
+        const aStudioMatch = runtime.studioId && a.session.studioId === runtime.studioId ? 1 : 0;
+        const bStudioMatch = runtime.studioId && b.session.studioId === runtime.studioId ? 1 : 0;
+        if (aStudioMatch !== bStudioMatch) return bStudioMatch - aStudioMatch;
+        return b.lastActivityMs - a.lastActivityMs;
+      });
+
+      const pickerEntries: SessionPickerEntry[] = sessionsWithMeta.map(
+        ({ session, transcriptMeta, lastActivityMs }) => ({
+          id: session.id,
+          label: session.id.slice(0, 8),
+          phase: session.currentPhase || session.status,
+          threadKey: session.threadKey,
+          studioName: sessionStudioLabel(session),
+          backend: sessionBackendLabel(session),
+          historyLabel: sessionHistoryLabel(transcriptMeta),
+          lastMessage: lastActivityMs
+            ? formatRelativeTime(lastActivityMs, runtime.userTimezone)
+            : undefined,
+          preview: sessionLatestMessagePreview(session, transcriptMeta) || undefined,
         })
-        .map((session) => {
-          const transcriptMeta = getSessionTranscriptMetadata(session.id);
-          return {
-            id: session.id,
-            label: session.id.slice(0, 8),
-            phase: session.currentPhase || session.status,
-            threadKey: session.threadKey,
-            studioName: sessionStudioLabel(session),
-            backend: sessionBackendLabel(session),
-            historyLabel: sessionHistoryLabel(transcriptMeta),
-            preview: sessionLatestMessagePreview(session, transcriptMeta) || undefined,
-          };
-        });
+      );
 
       const picked = await renderSessionPicker(pickerEntries);
       if (picked === undefined) {
@@ -3317,10 +3361,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
             const result = handleClientLocalTool(tool, args, ledger);
             if (result) return Promise.resolve(result);
           }
+          // Resolve credential references ($VAR / ${VAR}) in tool args.
+          // The LLM emits references; actual values are injected here at the
+          // execution layer so credentials never enter transcripts or context.
+          const { args: resolvedArgs, resolutions } = resolveCredentialRefs(
+            args,
+            buildResolverEnv()
+          );
+          if (resolutions.length > 0 && runtime.verbose) {
+            const refs = resolutions.map((r) => `${r.name} at ${r.path}`).join(', ');
+            printLine(
+              chalk.dim(`credential-resolver: resolved ${resolutions.length} ref(s): ${refs}`)
+            );
+          }
           // Strip MCP namespace prefix — the SB may emit mcp__inkwell__tool_name
           // but PcpClient expects bare tool names (get_inbox, recall, etc.)
           const bareTool = tool.replace(/^mcp__inkwell__/, '');
-          return pcp.callTool(bareTool, args);
+          return pcp.callTool(bareTool, resolvedArgs);
         },
         sessionId: runtime.sessionId,
         promptForApproval: async (tool, reason) => {

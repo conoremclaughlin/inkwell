@@ -22,6 +22,7 @@ import {
   MessageSquare,
   ListTodo,
   Swords,
+  KeyRound,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useRouter } from 'next/navigation';
@@ -75,6 +76,7 @@ const mainNav: NavGroup[] = [
       { name: 'Connections', href: '/connected-accounts', icon: Link2 },
       { name: 'Routing', href: '/routing', icon: Route },
       { name: 'Sessions', href: '/sessions', icon: Activity },
+      { name: 'Secrets', href: '/secrets', icon: KeyRound },
     ],
   },
 ];

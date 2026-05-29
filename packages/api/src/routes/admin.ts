@@ -7075,4 +7075,59 @@ router.get('/approval-requests/:requestId/status', async (req: Request, res: Res
 // platform identity — no HTTP endpoint means no client-asserted trust boundary.
 // See ink://specs/2fa-permission-grants for the security invariant.
 
+// ─── Secrets (Keychain) ────────────────────────────────────────
+
+import { listCredentials, saveCredential, deleteCredential } from '../services/keychain.js';
+
+router.get('/secrets', async (_req: Request, res: Response) => {
+  try {
+    const credentials = await listCredentials();
+    res.json({ secrets: credentials });
+  } catch (error) {
+    logger.error('Failed to list secrets:', error);
+    res.status(500).json(errorJson('Failed to list secrets', error));
+  }
+});
+
+router.post('/secrets', async (req: Request, res: Response) => {
+  const { name, value, label } = req.body as {
+    name?: string;
+    value?: string;
+    label?: string;
+  };
+  if (!name || !value) {
+    res.status(400).json({ error: 'name and value are required' });
+    return;
+  }
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+    res.status(400).json({
+      error:
+        'name must match env-var format: start with a letter or underscore, then letters, numbers, underscores (e.g., GFIBER_PASSWORD)',
+    });
+    return;
+  }
+  try {
+    await saveCredential(name, value, label);
+    res.json({ success: true, name });
+  } catch (error) {
+    logger.error('Failed to save secret:', error);
+    res.status(500).json(errorJson('Failed to save secret', error));
+  }
+});
+
+router.delete('/secrets/:name', async (req: Request, res: Response) => {
+  const { name } = req.params;
+  try {
+    const deleted = await deleteCredential(name);
+    if (!deleted) {
+      res.status(404).json({ error: 'Secret not found' });
+      return;
+    }
+    res.json({ success: true, name });
+  } catch (error) {
+    logger.error('Failed to delete secret:', error);
+    res.status(500).json(errorJson('Failed to delete secret', error));
+  }
+});
+
 export default router;
