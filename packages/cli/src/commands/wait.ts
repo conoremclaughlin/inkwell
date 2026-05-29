@@ -256,6 +256,8 @@ export function registerWaitCommand(program: Command): void {
 }
 
 interface StrategyStatus {
+  success?: boolean;
+  error?: string;
   title?: string;
   strategy?: string;
   status?: string;
@@ -282,6 +284,12 @@ interface StrategyStatus {
   };
 }
 
+function validateStrategyResult(result: StrategyStatus, context: string): void {
+  if (result.success === false) {
+    throw new Error(result.error || `${context}: server returned failure`);
+  }
+}
+
 async function watchStrategy(
   pcp: PcpClient,
   groupId: string,
@@ -291,6 +299,7 @@ async function watchStrategy(
   const deadline = Date.now() + timeoutSec * 1000;
   let consecutiveErrors = 0;
   const maxBackoffSec = Math.max(intervalSec, 120);
+  const config = pcp.getConfig();
 
   // Fetch initial state
   let lastCompleted = 0;
@@ -300,7 +309,9 @@ async function watchStrategy(
   try {
     const initial = (await pcp.callTool('get_strategy_status', {
       groupId,
+      email: config.email,
     })) as StrategyStatus;
+    validateStrategyResult(initial, 'Initial fetch');
     lastCompleted = initial.progress?.completed ?? 0;
     lastTaskId = initial.currentTask?.id;
     lastStatus = initial.status;
@@ -339,7 +350,9 @@ async function watchStrategy(
     try {
       const status = (await pcp.callTool('get_strategy_status', {
         groupId,
+        email: config.email,
       })) as StrategyStatus;
+      validateStrategyResult(status, 'Poll');
 
       consecutiveErrors = 0;
 
