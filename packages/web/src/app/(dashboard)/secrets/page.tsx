@@ -74,19 +74,19 @@ export default function SecretsPage() {
   const handleCreate = (e: React.FormEvent) => {
     e.preventDefault();
     setFormError('');
-    if (!name.trim() || !value.trim()) {
+    if (!name.trim() || !value) {
       setFormError('Name and value are required');
       return;
     }
-    if (!/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(name)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
       setFormError(
-        'Name must start with a letter and contain only letters, numbers, hyphens, underscores'
+        'Name must match env-var format: letters, numbers, underscores (e.g., GFIBER_PASSWORD)'
       );
       return;
     }
     createMutation.mutate({
       name: name.trim(),
-      value: value.trim(),
+      value,
       label: label.trim() || undefined,
     });
   };

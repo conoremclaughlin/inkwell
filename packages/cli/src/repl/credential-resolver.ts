@@ -9,16 +9,19 @@
  * actual value at the tool execution layer. The transcript only ever records
  * the reference, not the secret.
  *
- * Resolution cascade:
- * 1. Keychain cache (loaded at session start via `loadKeychainCredentials()`)
- * 2. process.env (fallback)
+ * Resolution scope:
+ * ONLY resolves references that match known Keychain credential names
+ * (loaded at session start via `loadKeychainCredentials()`). Arbitrary
+ * process.env vars like $HOME or $PATH are never resolved. This prevents
+ * accidental secret injection in text fields like send_to_inbox.content
+ * where "$API_TOKEN" should stay literal.
  *
  * Resolution rules:
  * - Only string values are scanned (numbers, booleans, objects pass through)
  * - Pattern: `$VAR_NAME` or `${VAR_NAME}` anywhere in a string value
  * - A string that IS a bare reference (`$FOO`) resolves to just the value
  * - A string with embedded references (`user: $FOO`) does interpolation
- * - Unresolvable references (env var not set) are left as-is
+ * - Unresolvable references are left as-is
  * - Nested objects/arrays are walked recursively
  */
 
@@ -150,10 +153,11 @@ export async function loadKeychainCredentials(): Promise<Record<string, string>>
 }
 
 /**
- * Build the merged env map for credential resolution.
- * Keychain values take precedence over process.env.
+ * Return the Keychain-only credential map for resolution.
+ * Only explicitly stored secrets are resolvable — process.env is NOT
+ * included, preventing accidental injection of $HOME, $PATH, etc.
+ * into text fields.
  */
-export function buildResolverEnv(): Record<string, string | undefined> {
-  if (!keychainCache) return process.env;
-  return { ...process.env, ...keychainCache };
+export function buildResolverEnv(): Record<string, string> {
+  return keychainCache ?? {};
 }

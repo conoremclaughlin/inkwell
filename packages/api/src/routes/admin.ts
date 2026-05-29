@@ -7099,13 +7099,11 @@ router.post('/secrets', async (req: Request, res: Response) => {
     res.status(400).json({ error: 'name and value are required' });
     return;
   }
-  if (!/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(name)) {
-    res
-      .status(400)
-      .json({
-        error:
-          'name must start with a letter and contain only letters, numbers, hyphens, underscores',
-      });
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+    res.status(400).json({
+      error:
+        'name must match env-var format: start with a letter or underscore, then letters, numbers, underscores (e.g., GFIBER_PASSWORD)',
+    });
     return;
   }
   try {

@@ -132,4 +132,18 @@ describe('resolveCredentialRefs', () => {
       delete process.env.INK_TEST_LIVE_CRED;
     }
   });
+
+  it('does NOT resolve $VAR references absent from the provided env', () => {
+    const keychainOnly: Record<string, string> = { GFIBER_PASSWORD: 'secret123' };
+    const { args, resolutions } = resolveCredentialRefs(
+      {
+        content: 'Please use $API_TOKEN in your config and set $HOME correctly',
+        password: '$GFIBER_PASSWORD',
+      },
+      keychainOnly
+    );
+    expect(args.content).toBe('Please use $API_TOKEN in your config and set $HOME correctly');
+    expect(args.password).toBe('secret123');
+    expect(resolutions).toEqual([{ name: 'GFIBER_PASSWORD', path: 'password' }]);
+  });
 });
