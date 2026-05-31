@@ -9,7 +9,7 @@
  */
 
 import { randomUUID } from 'crypto';
-import { access } from 'fs/promises';
+import { access, readFile, stat } from 'fs/promises';
 import path from 'path';
 import { SupabaseClient } from '@supabase/supabase-js';
 import jwt from 'jsonwebtoken';
@@ -27,6 +27,7 @@ import type {
   ISessionRepository,
   IContextBuilder,
   ToolCall,
+  ImageContent,
 } from './types.js';
 import type { Json } from '../../data/supabase/types.js';
 import { SessionRepository } from './session-repository.js';
@@ -34,6 +35,7 @@ import { ContextBuilder } from './context-builder.js';
 import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 import { CodexRunner } from './codex-runner.js';
 import { GeminiRunner } from './gemini-runner.js';
+import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import { resolveIdentityId } from '../../auth/resolve-identity.js';
 import { classifyError } from '@inklabs/shared';
@@ -136,6 +138,7 @@ export class SessionService implements ISessionService {
   private claudeRunner: IRunner;
   private codexRunner: IRunner;
   private geminiRunner: IRunner;
+  private inkRunner: IRunner;
   private activityStream: IActivityStream;
   private config: SessionServiceConfig;
   private supabase: SupabaseClient<Database> | null;
@@ -168,13 +171,15 @@ export class SessionService implements ISessionService {
     config: Partial<SessionServiceConfig> = {},
     codexRunner?: IRunner,
     supabase?: SupabaseClient<Database>,
-    geminiRunner?: IRunner
+    geminiRunner?: IRunner,
+    inkRunner?: IRunner
   ) {
     this.repository = repository;
     this.contextBuilder = contextBuilder;
     this.claudeRunner = claudeRunner;
     this.codexRunner = codexRunner || claudeRunner;
     this.geminiRunner = geminiRunner || claudeRunner;
+    this.inkRunner = inkRunner || new InkRunner();
     this.activityStream = activityStream;
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.supabase = supabase || null;
@@ -482,12 +487,24 @@ export class SessionService implements ISessionService {
     };
 
     // 5. Run with selected backend
+    // Ink runner executes tools in-process against the host filesystem —
+    // it cannot route to a Docker container. Reject the combination so a
+    // sandboxed strategy doesn't silently bypass containment.
+    if (resolvedBackend === 'ink' && runnerConfig.container) {
+      throw new Error(
+        'ink backend cannot run inside a sandbox container. ' +
+          'Use a CLI backend (claude-code, codex-cli, gemini) for sandboxed strategies.'
+      );
+    }
+
     const runner =
       resolvedBackend === 'codex-cli'
         ? this.codexRunner
         : resolvedBackend === 'gemini'
           ? this.geminiRunner
-          : this.claudeRunner;
+          : resolvedBackend === 'ink'
+            ? this.inkRunner
+            : this.claudeRunner;
 
     // 5a. Log backend spawn to activity stream (fire-and-forget)
     const triggerSource = metadata?.triggerType as string | undefined;
@@ -523,6 +540,10 @@ export class SessionService implements ISessionService {
     // Mark session as running before backend turn
     await this.repository.update(session.id, { lifecycle: 'running' });
 
+    // Read image attachments only for vision-capable backends (ink runner calls Anthropic API directly)
+    const imageContents =
+      resolvedBackend === 'ink' ? await this.readImageAttachments(request.metadata?.media) : [];
+
     let result;
     let turnDurationMs: number;
     const turnStartMs = Date.now();
@@ -531,6 +552,7 @@ export class SessionService implements ISessionService {
         backendSessionId: session.backendSessionId || undefined,
         injectedContext: session.backendSessionId ? undefined : injectedContext,
         config: runnerConfig,
+        imageContents: imageContents.length > 0 ? imageContents : undefined,
       });
       turnDurationMs = Date.now() - turnStartMs;
     } catch (runnerError) {
@@ -1312,7 +1334,9 @@ This session will continue with a fresh context after compaction. Your identity,
           ? this.codexRunner
           : runtimeBackend === 'gemini'
             ? this.geminiRunner
-            : this.claudeRunner;
+            : runtimeBackend === 'ink'
+              ? this.inkRunner
+              : this.claudeRunner;
 
       // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session
       const result = await runner.run(compactionPrompt, {
@@ -1525,6 +1549,52 @@ This session will continue with a fresh context after compaction. Your identity,
         platformChatId: request.conversationId,
       });
     }
+  }
+
+  /**
+   * Format an incoming message with sender context.
+   * External channel messages are wrapped in <untrusted-data> tags following
+   * Supabase's proven pattern for prompt injection protection.
+   */
+  private async readImageAttachments(
+    media?: import('./types.js').MediaAttachment[]
+  ): Promise<ImageContent[]> {
+    if (!media || media.length === 0) return [];
+
+    const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+    const MAX_IMAGES = 10;
+    const SUPPORTED_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+    const images: ImageContent[] = [];
+
+    for (const attachment of media) {
+      if (images.length >= MAX_IMAGES) break;
+      if (attachment.type !== 'image') continue;
+      if (!attachment.path) continue;
+
+      const mimeType = attachment.contentType || attachment.mimeType || 'image/jpeg';
+      if (!SUPPORTED_TYPES.has(mimeType)) continue;
+
+      try {
+        const info = await stat(attachment.path);
+        if (info.size <= 0 || info.size > MAX_IMAGE_BYTES) continue;
+
+        const bytes = await readFile(attachment.path);
+        images.push({
+          type: 'image',
+          source: 'base64',
+          mediaType: mimeType,
+          data: bytes.toString('base64'),
+        });
+      } catch (error) {
+        logger.warn('Failed to read image attachment for multimodal', {
+          filePath: attachment.path,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    return images;
   }
 
   private formatMessage(request: SessionRequest, timezone?: string): string {
@@ -1743,6 +1813,7 @@ export function createSessionService(
     config,
     new CodexRunner(),
     supabase,
-    new GeminiRunner()
+    new GeminiRunner(),
+    new InkRunner()
   );
 }
