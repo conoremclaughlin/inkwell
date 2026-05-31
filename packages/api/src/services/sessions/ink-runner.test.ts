@@ -1,95 +1,141 @@
 import { describe, it, expect, vi } from 'vitest';
 import { InkRunner } from './ink-runner';
-import type { InkToolDefinition } from '../../agent/tools/pi-coding-tools';
-import type { ImageContent } from './types';
 
 vi.mock('../../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
 describe('InkRunner', () => {
-  describe('buildUserContent', () => {
-    it('returns plain string when no images', () => {
-      const runner = new InkRunner({ apiKey: 'test-key' });
-      const result = (runner as any).buildUserContent('Hello world');
-      expect(result).toBe('Hello world');
-    });
-
-    it('returns plain string when images is empty array', () => {
-      const runner = new InkRunner({ apiKey: 'test-key' });
-      const result = (runner as any).buildUserContent('Hello world', []);
-      expect(result).toBe('Hello world');
-    });
-
-    it('returns multimodal content blocks when images are present', () => {
-      const runner = new InkRunner({ apiKey: 'test-key' });
-      const images: ImageContent[] = [
-        { type: 'image', source: 'base64', mediaType: 'image/jpeg', data: 'abc123' },
-      ];
-      const result = (runner as any).buildUserContent('Describe this', images);
-
-      expect(Array.isArray(result)).toBe(true);
-      expect(result).toHaveLength(2);
-      expect(result[0]).toEqual({
-        type: 'image',
-        source: { type: 'base64', media_type: 'image/jpeg', data: 'abc123' },
+  describe('buildArgs', () => {
+    it('builds base args for a new session', () => {
+      const runner = new InkRunner();
+      const args = (runner as any).buildArgs('session-123', false, {
+        workingDirectory: '/tmp',
+        agentId: 'myra',
       });
-      expect(result[1]).toEqual({ type: 'text', text: 'Describe this' });
+
+      expect(args).toContain('chat');
+      expect(args).toContain('--non-interactive');
+      expect(args).toContain('--agent');
+      expect(args).toContain('myra');
+      expect(args).toContain('--max-turns');
+      expect(args).not.toContain('--session-id');
     });
 
-    it('handles multiple images in a gallery', () => {
-      const runner = new InkRunner({ apiKey: 'test-key' });
-      const images: ImageContent[] = [
-        { type: 'image', source: 'base64', mediaType: 'image/jpeg', data: 'img1' },
-        { type: 'image', source: 'base64', mediaType: 'image/png', data: 'img2' },
-        { type: 'image', source: 'base64', mediaType: 'image/webp', data: 'img3' },
-      ];
-      const result = (runner as any).buildUserContent('Gallery caption', images);
+    it('adds --session-id for resumed sessions', () => {
+      const runner = new InkRunner();
+      const args = (runner as any).buildArgs('session-456', true, {
+        workingDirectory: '/tmp',
+        agentId: 'myra',
+      });
 
-      expect(result).toHaveLength(4);
-      expect(result[0].type).toBe('image');
-      expect(result[1].type).toBe('image');
-      expect(result[2].type).toBe('image');
-      expect(result[3]).toEqual({ type: 'text', text: 'Gallery caption' });
+      expect(args).toContain('--session-id');
+      expect(args).toContain('session-456');
+    });
+
+    it('includes --model when specified', () => {
+      const runner = new InkRunner();
+      const args = (runner as any).buildArgs('session-789', false, {
+        workingDirectory: '/tmp',
+        agentId: 'wren',
+        model: 'claude-sonnet-4-20250514',
+      });
+
+      expect(args).toContain('--model');
+      expect(args).toContain('claude-sonnet-4-20250514');
+    });
+
+    it('omits --agent when agentId is not provided', () => {
+      const runner = new InkRunner();
+      const args = (runner as any).buildArgs('session-000', false, {
+        workingDirectory: '/tmp',
+      });
+
+      expect(args).not.toContain('--agent');
     });
   });
 
-  describe('agentId propagation', () => {
-    it('creates guarded bash tools when agentId is provided', async () => {
-      const runner = new InkRunner({ apiKey: 'test-key' });
+  describe('parseOutput', () => {
+    it('captures plain text as finalTextResponse', () => {
+      const runner = new InkRunner();
+      const result = (runner as any).parseOutput(
+        'Hello! I checked and the appointment is still the same.\n',
+        ''
+      );
 
-      // Access private getTools to verify agentId propagation
-      const tools: InkToolDefinition[] = await (runner as any).getTools('/tmp', 'wren');
-      const bash = tools.find((t) => t.schema.name === 'bash')!;
-
-      // If agentId propagated, the guard blocks dangerous commands
-      const result = await bash.execute({ command: ':(){ :|:& };:' });
-      expect(result).toContain('fork bomb');
+      expect(result.finalTextResponse).toBe(
+        'Hello! I checked and the appointment is still the same.'
+      );
+      expect(result.responses).toHaveLength(0);
+      expect(result.toolCalls).toHaveLength(0);
     });
 
-    it('creates unguarded bash tools when agentId is absent', async () => {
-      const runner = new InkRunner({ apiKey: 'test-key' });
+    it('parses send_response JSON lines into responses', () => {
+      const runner = new InkRunner();
+      const stdout = [
+        JSON.stringify({
+          type: 'send_response',
+          channel: 'telegram',
+          conversationId: '123',
+          content: 'Done!',
+        }),
+        'Some trailing text',
+      ].join('\n');
 
-      const tools: InkToolDefinition[] = await (runner as any).getTools('/tmp');
-      const bash = tools.find((t) => t.schema.name === 'bash')!;
+      const result = (runner as any).parseOutput(stdout, '');
 
-      // Without agentId, guard is bypassed — command would execute
-      // (we test with a safe command to avoid actual execution of dangerous ones)
-      const result = await bash.execute({ command: 'echo hello' });
-      expect(result).toContain('hello');
+      expect(result.responses).toHaveLength(1);
+      expect(result.responses[0]).toEqual({
+        channel: 'telegram',
+        conversationId: '123',
+        content: 'Done!',
+        format: undefined,
+      });
+      expect(result.finalTextResponse).toBe('Some trailing text');
     });
 
-    it('caches tools by cwd+agentId combination', async () => {
-      const runner = new InkRunner({ apiKey: 'test-key' });
+    it('parses tool_call JSON lines', () => {
+      const runner = new InkRunner();
+      const stdout = JSON.stringify({
+        type: 'tool_call',
+        toolName: 'browser_navigate',
+        toolUseId: 'tc-1',
+        input: { url: 'https://example.com' },
+      });
 
-      const tools1 = await (runner as any).getTools('/tmp', 'wren');
-      const tools2 = await (runner as any).getTools('/tmp', 'wren');
-      const tools3 = await (runner as any).getTools('/tmp', 'lumen');
+      const result = (runner as any).parseOutput(stdout, '');
 
-      // Same cwd+agentId returns cached instance
-      expect(tools1).toBe(tools2);
-      // Different agentId returns different instance
-      expect(tools1).not.toBe(tools3);
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls[0].toolName).toBe('browser_navigate');
+      expect(result.toolCalls[0].input).toEqual({ url: 'https://example.com' });
+    });
+
+    it('handles empty output', () => {
+      const runner = new InkRunner();
+      const result = (runner as any).parseOutput('', '');
+
+      expect(result.finalTextResponse).toBeUndefined();
+      expect(result.responses).toHaveLength(0);
+      expect(result.toolCalls).toHaveLength(0);
+    });
+
+    it('handles mixed JSON and plain text', () => {
+      const runner = new InkRunner();
+      const stdout = [
+        'Starting task...',
+        JSON.stringify({
+          type: 'tool_call',
+          toolName: 'bash',
+          id: 'tc-2',
+          input: { command: 'ls' },
+        }),
+        'All done.',
+      ].join('\n');
+
+      const result = (runner as any).parseOutput(stdout, '');
+
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.finalTextResponse).toBe('Starting task...\nAll done.');
     });
   });
 });
