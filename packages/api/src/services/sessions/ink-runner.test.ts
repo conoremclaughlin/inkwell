@@ -7,9 +7,9 @@ vi.mock('../../utils/logger', () => ({
 
 describe('InkRunner', () => {
   describe('buildArgs', () => {
-    it('builds base args for a new session', () => {
+    it('always includes --session-id with the PCP session ID', () => {
       const runner = new InkRunner();
-      const args = (runner as any).buildArgs('session-123', false, {
+      const args = (runner as any).buildArgs('session-123', {
         workingDirectory: '/tmp',
         agentId: 'myra',
       });
@@ -19,23 +19,13 @@ describe('InkRunner', () => {
       expect(args).toContain('--agent');
       expect(args).toContain('myra');
       expect(args).toContain('--max-turns');
-      expect(args).not.toContain('--session-id');
-    });
-
-    it('adds --session-id for resumed sessions', () => {
-      const runner = new InkRunner();
-      const args = (runner as any).buildArgs('session-456', true, {
-        workingDirectory: '/tmp',
-        agentId: 'myra',
-      });
-
       expect(args).toContain('--session-id');
-      expect(args).toContain('session-456');
+      expect(args).toContain('session-123');
     });
 
     it('includes --model when specified', () => {
       const runner = new InkRunner();
-      const args = (runner as any).buildArgs('session-789', false, {
+      const args = (runner as any).buildArgs('session-789', {
         workingDirectory: '/tmp',
         agentId: 'wren',
         model: 'claude-sonnet-4-20250514',
@@ -47,25 +37,25 @@ describe('InkRunner', () => {
 
     it('omits --agent when agentId is not provided', () => {
       const runner = new InkRunner();
-      const args = (runner as any).buildArgs('session-000', false, {
+      const args = (runner as any).buildArgs('session-000', {
         workingDirectory: '/tmp',
       });
 
       expect(args).not.toContain('--agent');
+      expect(args).toContain('--session-id');
+      expect(args).toContain('session-000');
     });
   });
 
   describe('parseOutput', () => {
-    it('captures plain text as finalTextResponse', () => {
+    it('does not treat plain text stdout as finalTextResponse', () => {
       const runner = new InkRunner();
       const result = (runner as any).parseOutput(
         'Hello! I checked and the appointment is still the same.\n',
         ''
       );
 
-      expect(result.finalTextResponse).toBe(
-        'Hello! I checked and the appointment is still the same.'
-      );
+      expect(result.finalTextResponse).toBeUndefined();
       expect(result.responses).toHaveLength(0);
       expect(result.toolCalls).toHaveLength(0);
     });
@@ -79,7 +69,7 @@ describe('InkRunner', () => {
           conversationId: '123',
           content: 'Done!',
         }),
-        'Some trailing text',
+        'Some trailing CLI noise',
       ].join('\n');
 
       const result = (runner as any).parseOutput(stdout, '');
@@ -91,7 +81,7 @@ describe('InkRunner', () => {
         content: 'Done!',
         format: undefined,
       });
-      expect(result.finalTextResponse).toBe('Some trailing text');
+      expect(result.finalTextResponse).toBeUndefined();
     });
 
     it('parses tool_call JSON lines', () => {
@@ -119,7 +109,7 @@ describe('InkRunner', () => {
       expect(result.toolCalls).toHaveLength(0);
     });
 
-    it('handles mixed JSON and plain text', () => {
+    it('ignores non-JSON text lines (CLI noise)', () => {
       const runner = new InkRunner();
       const stdout = [
         'Starting task...',
@@ -135,7 +125,7 @@ describe('InkRunner', () => {
       const result = (runner as any).parseOutput(stdout, '');
 
       expect(result.toolCalls).toHaveLength(1);
-      expect(result.finalTextResponse).toBe('Starting task...\nAll done.');
+      expect(result.finalTextResponse).toBeUndefined();
     });
   });
 });

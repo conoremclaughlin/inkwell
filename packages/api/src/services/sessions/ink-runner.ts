@@ -39,7 +39,7 @@ export class InkRunner implements IRunner {
     const { backendSessionId, injectedContext, config } = options;
 
     const isResume = !!backendSessionId;
-    let sessionId = backendSessionId || randomUUID();
+    const sessionId = config.pcpSessionId || backendSessionId || randomUUID();
 
     let fullMessage = message;
     if (injectedContext && !isResume) {
@@ -47,10 +47,11 @@ export class InkRunner implements IRunner {
       fullMessage = `${contextBlock}\n\n---\n\n${message}`;
     }
 
-    let args = this.buildArgs(sessionId, isResume, config);
+    const args = this.buildArgs(sessionId, config);
 
     logger.info('Spawning ink chat (non-interactive)', {
       sessionId,
+      pcpSessionId: config.pcpSessionId,
       isResume,
       workingDirectory: config.workingDirectory,
       messageLength: fullMessage.length,
@@ -63,15 +64,14 @@ export class InkRunner implements IRunner {
         logger.warn('Resume failed - session not found locally. Starting fresh session.', {
           oldSessionId: sessionId,
         });
-        sessionId = randomUUID();
-        args = this.buildArgs(sessionId, false, config);
 
         if (injectedContext) {
           const contextBlock = formatInjectedContext(injectedContext);
           fullMessage = `${contextBlock}\n\n---\n\n${message}`;
         }
 
-        const retryResult = await this.spawnProcess(args, fullMessage, config);
+        const freshArgs = this.buildArgs(sessionId, config);
+        const retryResult = await this.spawnProcess(freshArgs, fullMessage, config);
         return {
           success: true,
           backendSessionId: sessionId,
@@ -104,22 +104,19 @@ export class InkRunner implements IRunner {
     }
   }
 
-  private buildArgs(sessionId: string, isResume: boolean, config: ClaudeRunnerConfig): string[] {
+  private buildArgs(sessionId: string, config: ClaudeRunnerConfig): string[] {
     const args: string[] = ['chat', '--non-interactive'];
 
     if (config.agentId) {
       args.push('--agent', config.agentId);
     }
 
-    if (isResume) {
-      args.push('--session-id', sessionId);
-    }
+    args.push('--session-id', sessionId);
 
     if (config.model) {
       args.push('--model', config.model);
     }
 
-    // Max turns: let the ink runtime handle multi-turn tool loops
     args.push('--max-turns', '25');
 
     return args;
@@ -248,12 +245,11 @@ export class InkRunner implements IRunner {
   } {
     const responses: ChannelResponse[] = [];
     const toolCalls: ToolCall[] = [];
-    let finalTextResponse = '';
 
-    // ink chat --non-interactive outputs the assistant's response to stdout.
-    // Parse any structured JSON lines if present, otherwise treat as plain text.
+    // ink chat routes responses via MCP send_response — stdout may contain
+    // CLI chrome, status lines, or other noise that must NOT be treated as
+    // routeable content. Only parse structured JSON lines.
     const lines = stdout.split('\n');
-    const textLines: string[] = [];
 
     for (const line of lines) {
       if (!line.trim()) continue;
@@ -273,21 +269,15 @@ export class InkRunner implements IRunner {
             toolName: parsed.toolName || parsed.name || '',
             input: parsed.input || {},
           });
-        } else if (parsed.type === 'usage') {
-          // Will be handled if present
-        } else {
-          textLines.push(line);
         }
       } catch {
-        textLines.push(line);
+        // Non-JSON line — CLI noise, ignore
       }
     }
 
-    finalTextResponse = textLines.join('\n').trim();
-
     return {
       responses,
-      finalTextResponse: finalTextResponse || undefined,
+      finalTextResponse: undefined,
       toolCalls,
     };
   }
