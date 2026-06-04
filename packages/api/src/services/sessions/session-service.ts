@@ -540,9 +540,14 @@ export class SessionService implements ISessionService {
     // Mark session as running before backend turn
     await this.repository.update(session.id, { lifecycle: 'running' });
 
-    // Read image attachments only for vision-capable backends (ink runner calls Anthropic API directly)
+    // Read image attachments for backends that accept them via the runner interface.
+    // Currently only ClaudeRunner supports inline base64 images via --image flags.
+    // InkRunner spawns ink chat which manages its own backend — images are not
+    // passed through the runner interface for ink.
     const imageContents =
-      resolvedBackend === 'ink' ? await this.readImageAttachments(request.metadata?.media) : [];
+      resolvedBackend === 'claude-code'
+        ? await this.readImageAttachments(request.metadata?.media)
+        : [];
 
     let result;
     let turnDurationMs: number;

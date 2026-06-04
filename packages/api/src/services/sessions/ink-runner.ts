@@ -245,10 +245,14 @@ export class InkRunner implements IRunner {
   } {
     const responses: ChannelResponse[] = [];
     const toolCalls: ToolCall[] = [];
+    let finalTextResponse: string | undefined;
 
     // ink chat routes responses via MCP send_response — stdout may contain
     // CLI chrome, status lines, or other noise that must NOT be treated as
-    // routeable content. Only parse structured JSON lines.
+    // routeable content. Only parse structured JSON lines:
+    //   - type: "send_response" → explicit channel routing
+    //   - type: "tool_call"     → tool invocation tracking
+    //   - type: "result"        → assistant's final text (emitted by --non-interactive)
     const lines = stdout.split('\n');
 
     for (const line of lines) {
@@ -269,6 +273,8 @@ export class InkRunner implements IRunner {
             toolName: parsed.toolName || parsed.name || '',
             input: parsed.input || {},
           });
+        } else if (parsed.type === 'result' && parsed.text) {
+          finalTextResponse = parsed.text;
         }
       } catch {
         // Non-JSON line — CLI noise, ignore
@@ -277,7 +283,7 @@ export class InkRunner implements IRunner {
 
     return {
       responses,
-      finalTextResponse: undefined,
+      finalTextResponse,
       toolCalls,
     };
   }

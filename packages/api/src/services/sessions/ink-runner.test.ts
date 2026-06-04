@@ -127,5 +127,45 @@ describe('InkRunner', () => {
       expect(result.toolCalls).toHaveLength(1);
       expect(result.finalTextResponse).toBeUndefined();
     });
+
+    it('extracts finalTextResponse from type=result JSON line', () => {
+      const runner = new InkRunner();
+      const stdout = [
+        JSON.stringify({
+          type: 'result',
+          text: 'Your appointment is confirmed for Thursday at 2pm.',
+          sessionId: 'sess-123',
+        }),
+        '\x1b[2m\nSession completed.\x1b[22m',
+        '\x1b[36m  Resume with: ink chat --attach-latest myra\n\x1b[39m',
+      ].join('\n');
+
+      const result = (runner as any).parseOutput(stdout, '');
+
+      expect(result.finalTextResponse).toBe('Your appointment is confirmed for Thursday at 2pm.');
+      expect(result.responses).toHaveLength(0);
+    });
+
+    it('prefers send_response over result for channel routing', () => {
+      const runner = new InkRunner();
+      const stdout = [
+        JSON.stringify({
+          type: 'send_response',
+          channel: 'telegram',
+          conversationId: '456',
+          content: 'Routed via MCP',
+        }),
+        JSON.stringify({
+          type: 'result',
+          text: 'Fallback text from ledger',
+        }),
+      ].join('\n');
+
+      const result = (runner as any).parseOutput(stdout, '');
+
+      expect(result.responses).toHaveLength(1);
+      expect(result.responses[0].content).toBe('Routed via MCP');
+      expect(result.finalTextResponse).toBe('Fallback text from ledger');
+    });
   });
 });

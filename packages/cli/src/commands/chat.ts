@@ -3918,6 +3918,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
       signal: finalSignal || undefined,
     });
 
+    // Emit structured result for machine consumers (InkRunner, etc.).
+    // Must come before human-readable status lines so parsers can
+    // distinguish the assistant's response from CLI chrome.
+    const lastAssistant = ledger
+      .listEntries()
+      .filter((e) => e.role === 'assistant')
+      .pop();
+    if (lastAssistant) {
+      console.log(
+        JSON.stringify({
+          type: 'result',
+          text: lastAssistant.content,
+          sessionId: runtime.sessionId || null,
+        })
+      );
+    }
+
     if (finalSignal?.status === 'blocked') {
       console.log(chalk.yellow(`\nSession blocked: ${finalSignal.reason || 'needs input'}`));
     } else if (finalSignal?.status === 'completed') {
