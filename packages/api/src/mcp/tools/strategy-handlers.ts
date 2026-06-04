@@ -193,6 +193,7 @@ export async function handleStartStrategy(
         studioSlug: args.studioSlug,
         requireFinalApproval: args.requireFinalApproval,
         approvalCriteria: args.approvalCriteria,
+        userNotify: args.userNotify,
       },
     });
 
