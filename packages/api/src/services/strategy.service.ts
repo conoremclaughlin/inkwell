@@ -416,6 +416,7 @@ export class StrategyService {
             ? `\n\nAcceptance criteria:\n${criteria.map((c) => `• ${c}`).join('\n')}`
             : '';
 
+        await this.cancelWatchdogReminder(groupId);
         await this.dataComposer.repositories.taskGroups.update(groupId, {
           strategy_paused_at: new Date().toISOString(),
           status: 'paused',
@@ -451,6 +452,15 @@ export class StrategyService {
           }
         }
 
+        if (config.userNotify) {
+          await this.notifyDispatcher(
+            group,
+            config.userNotify,
+            `All tasks complete on "${group.title}" (${completed}/${tasks.length}). Awaiting final review.`,
+            userId
+          );
+        }
+
         await this.logStrategyEvent(
           group,
           'final_review_requested',
@@ -461,6 +471,7 @@ export class StrategyService {
             approvalCriteria: criteria,
             notified,
             routedTo: config.approvalNotify || config.checkInNotify || null,
+            userNotified: config.userNotify || null,
           }
         );
 
@@ -492,6 +503,7 @@ export class StrategyService {
 
       // Pause for approval — set pauseReason so resumeStrategy can distinguish
       // approval-gate pauses from manual pauses (Lumen review, PR #338)
+      await this.cancelWatchdogReminder(groupId);
       await this.dataComposer.repositories.taskGroups.update(groupId, {
         strategy_paused_at: new Date().toISOString(),
         status: 'paused',
@@ -1585,6 +1597,9 @@ export class StrategyService {
     const intervalMinutes = config.watchdogIntervalMinutes || 10;
 
     try {
+      // Cancel any existing watchdog before creating a new one to prevent duplicates
+      await this.cancelWatchdogReminder(group.id);
+
       const nextRunAt = new Date();
       nextRunAt.setMinutes(nextRunAt.getMinutes() + intervalMinutes);
 
@@ -1703,6 +1718,15 @@ export class StrategyService {
           userId
         );
       }
+    }
+
+    if (config.userNotify) {
+      await this.notifyDispatcher(
+        group,
+        config.userNotify,
+        `Strategy complete: "${group.title}" — ${stats.completed}/${stats.total} tasks finished.${stats.hasIncomplete ? ` (${stats.pending} pending, ${stats.blocked} blocked)` : ''}`,
+        userId
+      );
     }
   }
 

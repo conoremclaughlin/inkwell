@@ -78,6 +78,10 @@ export const startStrategySchema = z.object({
     .describe('Post progress check-in every N tasks'),
   checkInNotify: z.string().optional().describe('Agent ID to notify on check-ins (e.g., "myra")'),
   approvalNotify: z.string().optional().describe('Agent ID to notify when approval is needed'),
+  userNotify: z
+    .string()
+    .optional()
+    .describe('Agent to relay user-facing completion alerts (e.g., "myra" for Telegram)'),
   maxIterationsWithoutApproval: z
     .number()
     .int()
@@ -401,6 +405,10 @@ export const updateStrategySchema = z.object({
     .max(1440)
     .optional()
     .describe('How often (minutes) the watchdog checks for stuck strategies'),
+  userNotify: z
+    .string()
+    .optional()
+    .describe('Agent to relay user-facing completion alerts (e.g., "myra" for Telegram)'),
 });
 
 export async function handleUpdateStrategy(
@@ -454,6 +462,7 @@ export async function handleUpdateStrategy(
     if (args.watchdogIntervalMinutes !== undefined)
       configUpdates.watchdogIntervalMinutes = args.watchdogIntervalMinutes;
     if (args.supervisorId !== undefined) configUpdates.supervisorId = args.supervisorId;
+    if (args.userNotify !== undefined) configUpdates.userNotify = args.userNotify;
 
     if (Object.keys(configUpdates).length === 0 && args.verificationMode === undefined) {
       return mcpResponse(

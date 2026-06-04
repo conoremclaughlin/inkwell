@@ -1555,12 +1555,13 @@ describe('StrategyService', () => {
       // Watchdog chains, then getTaskByOrder (not found), getGroupTasks, cleanup
       let idx = 0;
       const chains = [
+        noopChain, // cancelWatchdog (called before create to prevent duplicates)
         noopChain, // watchdog: sessions
         noopChain, // watchdog: insert (sb_id resolved directly, no identity lookup)
         taskNotFoundChain, // getTaskByOrder: exact match (fails)
         taskNotFoundChain, // getTaskByOrder: fallback (empty)
         groupTasksChain, // getGroupTasks for finalization
-        noopChain, // cancelWatchdog
+        noopChain, // cancelWatchdog (cleanup in finalizeStrategy)
       ];
       mockClient.from.mockImplementation(() => chains[idx++] || noopChain);
 
