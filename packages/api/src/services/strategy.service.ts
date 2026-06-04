@@ -1508,7 +1508,8 @@ export class StrategyService {
   async triggerWatchdog(groupId: string): Promise<boolean> {
     const group = await this.dataComposer.repositories.taskGroups.findById(groupId);
     if (!group) {
-      logger.warn(`Strategy watchdog: group ${groupId} not found, skipping`);
+      logger.warn(`Strategy watchdog: group ${groupId} not found, cancelling orphaned watchdog`);
+      await this.cancelWatchdogReminder(groupId);
       return false;
     }
 
@@ -1523,12 +1524,13 @@ export class StrategyService {
 
     if (group.status !== 'active' || !group.strategy) {
       logger.info(
-        `Strategy watchdog: group ${groupId} is ${group.status} (strategy=${group.strategy ?? 'null'}), skipping`
+        `Strategy watchdog: group ${groupId} is ${group.status} (strategy=${group.strategy ?? 'null'}), cancelling stale watchdog`
       );
+      await this.cancelWatchdogReminder(groupId);
       await this.logStrategyEvent(
         group,
         'watchdog_skip',
-        `Watchdog skipped: group is ${group.status}`,
+        `Watchdog skipped and self-cancelled: group is ${group.status}`,
         { reason: 'inactive_group' }
       );
       return false;
@@ -1543,12 +1545,13 @@ export class StrategyService {
     }
     if (!currentTask) {
       logger.info(
-        `Strategy watchdog: group ${groupId} has no in_progress or pending task, skipping`
+        `Strategy watchdog: group ${groupId} has no in_progress or pending task, cancelling stale watchdog`
       );
+      await this.cancelWatchdogReminder(groupId);
       await this.logStrategyEvent(
         group,
         'watchdog_skip',
-        `Watchdog skipped: no pending/in-progress task`,
+        `Watchdog skipped and self-cancelled: no pending/in-progress task`,
         {
           reason: 'no_current_task',
           currentTaskIndex: group.current_task_index,
@@ -1573,6 +1576,7 @@ export class StrategyService {
           `Watchdog aborted: sandbox required but spin-up failed — ${sandboxResult.error}`,
           { error: sandboxResult.error, policy: 'required', trigger: 'watchdog' }
         );
+        await this.cancelWatchdogReminder(groupId);
         await this.dataComposer.repositories.taskGroups.update(groupId, {
           status: 'paused',
           strategy_paused_at: new Date().toISOString(),
