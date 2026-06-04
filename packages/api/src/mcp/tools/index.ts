@@ -1366,7 +1366,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Modify strategy configuration on a running or paused strategy without tearing it down. Avoids cancel + start which loses session continuity.
 
-Mutable: checkInInterval, verificationGates, maxIterationsWithoutApproval, verificationMode, supervisorId, watchdogIntervalMinutes, contextSummaryInterval, approvalNotify, checkInNotify.
+Mutable: checkInInterval, verificationGates, maxIterationsWithoutApproval, verificationMode, supervisorId, watchdogIntervalMinutes, contextSummaryInterval, approvalNotify, checkInNotify, userNotify.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: updateStrategySchema.shape,

@@ -416,6 +416,7 @@ export class StrategyService {
             ? `\n\nAcceptance criteria:\n${criteria.map((c) => `• ${c}`).join('\n')}`
             : '';
 
+        await this.cancelWatchdogReminder(groupId);
         await this.dataComposer.repositories.taskGroups.update(groupId, {
           strategy_paused_at: new Date().toISOString(),
           status: 'paused',
@@ -451,6 +452,15 @@ export class StrategyService {
           }
         }
 
+        if (config.userNotify) {
+          await this.notifyDispatcher(
+            group,
+            config.userNotify,
+            `All tasks complete on "${group.title}" (${completed}/${tasks.length}). Awaiting final review.`,
+            userId
+          );
+        }
+
         await this.logStrategyEvent(
           group,
           'final_review_requested',
@@ -461,6 +471,7 @@ export class StrategyService {
             approvalCriteria: criteria,
             notified,
             routedTo: config.approvalNotify || config.checkInNotify || null,
+            userNotified: config.userNotify || null,
           }
         );
 
@@ -492,6 +503,7 @@ export class StrategyService {
 
       // Pause for approval — set pauseReason so resumeStrategy can distinguish
       // approval-gate pauses from manual pauses (Lumen review, PR #338)
+      await this.cancelWatchdogReminder(groupId);
       await this.dataComposer.repositories.taskGroups.update(groupId, {
         strategy_paused_at: new Date().toISOString(),
         status: 'paused',
@@ -1496,7 +1508,8 @@ export class StrategyService {
   async triggerWatchdog(groupId: string): Promise<boolean> {
     const group = await this.dataComposer.repositories.taskGroups.findById(groupId);
     if (!group) {
-      logger.warn(`Strategy watchdog: group ${groupId} not found, skipping`);
+      logger.warn(`Strategy watchdog: group ${groupId} not found, cancelling orphaned watchdog`);
+      await this.cancelWatchdogReminder(groupId);
       return false;
     }
 
@@ -1511,12 +1524,13 @@ export class StrategyService {
 
     if (group.status !== 'active' || !group.strategy) {
       logger.info(
-        `Strategy watchdog: group ${groupId} is ${group.status} (strategy=${group.strategy ?? 'null'}), skipping`
+        `Strategy watchdog: group ${groupId} is ${group.status} (strategy=${group.strategy ?? 'null'}), cancelling stale watchdog`
       );
+      await this.cancelWatchdogReminder(groupId);
       await this.logStrategyEvent(
         group,
         'watchdog_skip',
-        `Watchdog skipped: group is ${group.status}`,
+        `Watchdog skipped and self-cancelled: group is ${group.status}`,
         { reason: 'inactive_group' }
       );
       return false;
@@ -1531,12 +1545,13 @@ export class StrategyService {
     }
     if (!currentTask) {
       logger.info(
-        `Strategy watchdog: group ${groupId} has no in_progress or pending task, skipping`
+        `Strategy watchdog: group ${groupId} has no in_progress or pending task, cancelling stale watchdog`
       );
+      await this.cancelWatchdogReminder(groupId);
       await this.logStrategyEvent(
         group,
         'watchdog_skip',
-        `Watchdog skipped: no pending/in-progress task`,
+        `Watchdog skipped and self-cancelled: no pending/in-progress task`,
         {
           reason: 'no_current_task',
           currentTaskIndex: group.current_task_index,
@@ -1561,6 +1576,7 @@ export class StrategyService {
           `Watchdog aborted: sandbox required but spin-up failed — ${sandboxResult.error}`,
           { error: sandboxResult.error, policy: 'required', trigger: 'watchdog' }
         );
+        await this.cancelWatchdogReminder(groupId);
         await this.dataComposer.repositories.taskGroups.update(groupId, {
           status: 'paused',
           strategy_paused_at: new Date().toISOString(),
@@ -1585,6 +1601,9 @@ export class StrategyService {
     const intervalMinutes = config.watchdogIntervalMinutes || 10;
 
     try {
+      // Cancel any existing watchdog before creating a new one to prevent duplicates
+      await this.cancelWatchdogReminder(group.id);
+
       const nextRunAt = new Date();
       nextRunAt.setMinutes(nextRunAt.getMinutes() + intervalMinutes);
 
@@ -1703,6 +1722,15 @@ export class StrategyService {
           userId
         );
       }
+    }
+
+    if (config.userNotify) {
+      await this.notifyDispatcher(
+        group,
+        config.userNotify,
+        `Strategy complete: "${group.title}" — ${stats.completed}/${stats.total} tasks finished.${stats.hasIncomplete ? ` (${stats.pending} pending, ${stats.blocked} blocked)` : ''}`,
+        userId
+      );
     }
   }
 

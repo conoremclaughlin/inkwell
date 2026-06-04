@@ -153,6 +153,7 @@ describe('handleStartStrategy', () => {
         checkInNotify: 'myra',
         supervisorId: 'supervisor-uuid',
         verificationGates: ['tests', 'build'],
+        userNotify: 'myra',
       },
       dc
     );
@@ -164,6 +165,7 @@ describe('handleStartStrategy', () => {
           checkInNotify: 'myra',
           supervisorId: 'supervisor-uuid',
           verificationGates: ['tests', 'build'],
+          userNotify: 'myra',
         }),
       })
     );

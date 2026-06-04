@@ -1555,12 +1555,13 @@ describe('StrategyService', () => {
       // Watchdog chains, then getTaskByOrder (not found), getGroupTasks, cleanup
       let idx = 0;
       const chains = [
+        noopChain, // cancelWatchdog (called before create to prevent duplicates)
         noopChain, // watchdog: sessions
         noopChain, // watchdog: insert (sb_id resolved directly, no identity lookup)
         taskNotFoundChain, // getTaskByOrder: exact match (fails)
         taskNotFoundChain, // getTaskByOrder: fallback (empty)
         groupTasksChain, // getGroupTasks for finalization
-        noopChain, // cancelWatchdog
+        noopChain, // cancelWatchdog (cleanup in finalizeStrategy)
       ];
       mockClient.from.mockImplementation(() => chains[idx++] || noopChain);
 
@@ -1856,27 +1857,34 @@ describe('StrategyService', () => {
       expect((payload.metadata as Record<string, unknown>).reason).toBe('watchdog');
     });
 
-    it('triggerWatchdog returns false when group is not active', async () => {
+    it('triggerWatchdog returns false and cancels watchdog when group is not active', async () => {
       const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
 
       const group = createMockGroup({ strategy: 'persistence', status: 'paused' });
       dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      setupChains(dc, [chainNoop()]); // cancelWatchdogReminder
 
       const fired = await service.triggerWatchdog('group-1');
 
       expect(fired).toBe(false);
       expect(sendMock).not.toHaveBeenCalled();
+      // Verify the watchdog cancelled itself
+      const client = dc.getClient();
+      expect(client.from).toHaveBeenCalledWith('scheduled_reminders');
     });
 
-    it('triggerWatchdog returns false when group is not found', async () => {
+    it('triggerWatchdog returns false and cancels watchdog when group is not found', async () => {
       const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
 
       dc.repositories.taskGroups.findById.mockResolvedValue(null);
+      setupChains(dc, [chainNoop()]); // cancelWatchdogReminder
 
       const fired = await service.triggerWatchdog('group-missing');
 
       expect(fired).toBe(false);
       expect(sendMock).not.toHaveBeenCalled();
+      const client = dc.getClient();
+      expect(client.from).toHaveBeenCalledWith('scheduled_reminders');
     });
 
     it('triggerWatchdog falls back to current_task_index when no in-progress task', async () => {

@@ -60,6 +60,8 @@ export interface StrategyConfig {
   checkInInterval?: number;
   checkInNotify?: string;
   approvalNotify?: string;
+  /** Agent to notify for user-facing completion alerts (e.g., "myra" for Telegram relay) */
+  userNotify?: string;
   maxIterationsWithoutApproval?: number;
   contextSummaryInterval?: number;
   verificationGates?: string[];
