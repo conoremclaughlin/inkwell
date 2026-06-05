@@ -286,6 +286,12 @@ export class SessionService implements ISessionService {
 
       try {
         const result = await this.processMessage(request, session);
+        // If the initial lock-holder failed with a non-retryable error,
+        // flush queued messages before processQueueOrReleaseLock runs —
+        // every queued message would fail the same way.
+        if (!result.success && result.error) {
+          this.flushQueueOnNonRetryableError(lockKey, result.error);
+        }
         return result;
       } finally {
         // 6. Process queued messages or release lock
@@ -352,30 +358,16 @@ export class SessionService implements ISessionService {
 
         const result = await this.processMessage(pending.request, session);
         pending.resolve(result);
+        // Flush on non-retryable success:false results (e.g. InkRunner session limit)
+        if (!result.success && result.error) {
+          this.flushQueueOnNonRetryableError(lockKey, result.error);
+        }
       } catch (error) {
         pending.reject(error instanceof Error ? error : new Error(String(error)));
-
-        // On non-retryable errors (quota, auth), flush the remaining queue —
-        // every pending message will fail the same way.
-        const errorText = error instanceof Error ? error.message : String(error);
-        const errorClass = classifyError({ errorText });
-        if (!errorClass.retryable && errorClass.category !== 'unknown') {
-          const remaining = this.pendingQueues.get(lockKey);
-          if (remaining && remaining.length > 0) {
-            logger.warn('Flushing message queue after non-retryable error', {
-              lockKey,
-              errorCategory: errorClass.category,
-              flushedCount: remaining.length,
-            });
-            const flushError = new Error(
-              `Queue flushed: ${errorClass.category} — ${errorClass.summary}`
-            );
-            for (const queued of remaining) {
-              queued.reject(flushError);
-            }
-            this.pendingQueues.delete(lockKey);
-          }
-        }
+        this.flushQueueOnNonRetryableError(
+          lockKey,
+          error instanceof Error ? error.message : String(error)
+        );
       } finally {
         // Continue processing queue (if not flushed above)
         await this.processQueueOrReleaseLock(lockKey);
@@ -385,6 +377,31 @@ export class SessionService implements ISessionService {
       this.processingLocks.delete(lockKey);
       this.pendingQueues.delete(lockKey);
       logger.debug('Released processing lock', { lockKey });
+    }
+  }
+
+  /**
+   * Flush remaining queued messages when the error is non-retryable (quota, auth, config).
+   * Every pending message would fail the same way — flushing prevents budget burn.
+   */
+  private flushQueueOnNonRetryableError(lockKey: string, errorText: string): void {
+    const errorClass = classifyError({ errorText });
+    if (!errorClass.retryable && errorClass.category !== 'unknown') {
+      const remaining = this.pendingQueues.get(lockKey);
+      if (remaining && remaining.length > 0) {
+        logger.warn('Flushing message queue after non-retryable error', {
+          lockKey,
+          errorCategory: errorClass.category,
+          flushedCount: remaining.length,
+        });
+        const flushError = new Error(
+          `Queue flushed: ${errorClass.category} — ${errorClass.summary}`
+        );
+        for (const queued of remaining) {
+          queued.reject(flushError);
+        }
+        this.pendingQueues.delete(lockKey);
+      }
     }
   }
 

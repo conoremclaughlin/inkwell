@@ -1799,6 +1799,91 @@ describe('SessionService', () => {
       expect(mockClaudeRunner.run).toHaveBeenCalledTimes(3);
     });
 
+    it('should flush queue when queued message returns success:false with quota error (no throw)', async () => {
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      let callIndex = 0;
+      vi.mocked(mockClaudeRunner.run).mockImplementation(async () => {
+        callIndex++;
+        if (callIndex === 1) {
+          await new Promise((r) => setTimeout(r, 50));
+          return createMockClaudeResult();
+        }
+        // InkRunner returns success:false instead of throwing
+        return createMockClaudeResult({
+          success: false,
+          error: "You've hit your session limit · resets 7:10pm (America/Los_Angeles)",
+        });
+      });
+
+      const p1 = sessionService.handleMessage(createMockRequest({ content: 'Message 1' }));
+      const p2 = sessionService.handleMessage(createMockRequest({ content: 'Message 2' }));
+      const p3 = sessionService.handleMessage(createMockRequest({ content: 'Message 3' }));
+
+      const results = await Promise.allSettled([p1, p2, p3]);
+
+      // Message 1: succeeded
+      expect(results[0].status).toBe('fulfilled');
+      expect((results[0] as PromiseFulfilledResult<unknown>).value).toMatchObject({
+        success: true,
+      });
+
+      // Message 2: resolved with success:false (not rejected — runner didn't throw)
+      expect(results[1].status).toBe('fulfilled');
+      expect((results[1] as PromiseFulfilledResult<unknown>).value).toMatchObject({
+        success: false,
+      });
+
+      // Message 3: rejected with flush error (queue flushed after message 2's failure)
+      expect(results[2].status).toBe('rejected');
+      expect((results[2] as PromiseRejectedResult).reason.message).toContain('Queue flushed');
+      expect((results[2] as PromiseRejectedResult).reason.message).toContain('quota');
+
+      // Runner called twice — message 3 was flushed, not processed
+      expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
+    });
+
+    it('should flush queue when initial lock-holder returns success:false with quota error', async () => {
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      let callIndex = 0;
+      vi.mocked(mockClaudeRunner.run).mockImplementation(async () => {
+        callIndex++;
+        if (callIndex === 1) {
+          // Initial lock-holder: delay to let messages 2+3 queue, then fail
+          await new Promise((r) => setTimeout(r, 50));
+          return createMockClaudeResult({
+            success: false,
+            error: "You've hit your session limit · resets 7:10pm (America/Los_Angeles)",
+          });
+        }
+        return createMockClaudeResult();
+      });
+
+      const p1 = sessionService.handleMessage(createMockRequest({ content: 'Message 1' }));
+      const p2 = sessionService.handleMessage(createMockRequest({ content: 'Message 2' }));
+      const p3 = sessionService.handleMessage(createMockRequest({ content: 'Message 3' }));
+
+      const results = await Promise.allSettled([p1, p2, p3]);
+
+      // Message 1: resolved with success:false (initial lock-holder)
+      expect(results[0].status).toBe('fulfilled');
+      expect((results[0] as PromiseFulfilledResult<unknown>).value).toMatchObject({
+        success: false,
+      });
+
+      // Messages 2+3: rejected with flush error (queue flushed after message 1's failure)
+      expect(results[1].status).toBe('rejected');
+      expect((results[1] as PromiseRejectedResult).reason.message).toContain('Queue flushed');
+      expect(results[2].status).toBe('rejected');
+      expect((results[2] as PromiseRejectedResult).reason.message).toContain('Queue flushed');
+
+      // Runner called only once — messages 2+3 were flushed before processing
+      expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
+    });
+
     it('should NOT flush queue on unknown errors', async () => {
       const session = createMockSession();
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
