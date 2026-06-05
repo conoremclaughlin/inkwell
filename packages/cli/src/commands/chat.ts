@@ -3967,13 +3967,20 @@ export async function runChat(options: ChatOptions): Promise<void> {
       console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${agentId}\n`));
     }
 
-    // Clean up handles that would keep the process alive (approval channel
-    // stdin listeners, pending approval timers, etc.). Without this, the
-    // non-interactive path skips the REPL cleanup at the end of runChat()
-    // and Node hangs indefinitely on open handles.
+    // Clean up handles that would keep the process alive. Without this,
+    // the non-interactive path skips the REPL cleanup at the end of
+    // runChat() and Node hangs on open handles — blocking InkRunner's
+    // heartbeat delivery callback indefinitely.
+    readyForAutoRun = false;
     approvalManager.cancelAll();
     runtime.approvalChannel?.dispose();
-    process.exit(process.exitCode ?? 0);
+    if (pendingTurns > 0) {
+      await turnQueue;
+    }
+    // Unref stdio so lingering streams (e.g. piped stdin from InkRunner)
+    // don't prevent the event loop from draining.
+    process.stdin.unref();
+    return;
   }
 
   // ── Mount the REPL input layer (Ink or legacy readline) ──
