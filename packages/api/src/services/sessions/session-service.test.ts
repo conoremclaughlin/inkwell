@@ -1709,6 +1709,124 @@ describe('SessionService', () => {
     });
   });
 
+  // ═══════════════════════════════════════════════════════════════
+  // Queue flush on non-retryable errors — regression test for PR #397
+  //
+  // When a queued message fails with a non-retryable error (quota,
+  // auth, config), every remaining queued message would fail the
+  // same way. Instead of burning budget processing each one, the
+  // queue is flushed immediately. This prevents the 67-message
+  // pileup that burned Myra's budget overnight.
+  // ═══════════════════════════════════════════════════════════════
+  describe('Queue flush on non-retryable errors', () => {
+    it('should flush remaining queue when a queued message hits a quota error', async () => {
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      let callIndex = 0;
+      vi.mocked(mockClaudeRunner.run).mockImplementation(async () => {
+        callIndex++;
+        if (callIndex === 1) {
+          // First call: use setTimeout to create a macrotask delay. This ensures
+          // messages 2 and 3 complete getOrCreateSession and queue up before
+          // message 1's runner.run resolves.
+          await new Promise((r) => setTimeout(r, 50));
+          return createMockClaudeResult();
+        }
+        // Second call: throw quota error (session limit)
+        throw new Error("You've hit your session limit · resets 7:10pm (America/Los_Angeles)");
+      });
+
+      // Send 3 messages synchronously. Message 1 acquires the lock; 2 and 3
+      // will queue during message 1's 50ms delay.
+      const p1 = sessionService.handleMessage(createMockRequest({ content: 'Message 1' }));
+      const p2 = sessionService.handleMessage(createMockRequest({ content: 'Message 2' }));
+      const p3 = sessionService.handleMessage(createMockRequest({ content: 'Message 3' }));
+
+      const results = await Promise.allSettled([p1, p2, p3]);
+
+      // Message 1: processed successfully
+      expect(results[0].status).toBe('fulfilled');
+      expect((results[0] as PromiseFulfilledResult<unknown>).value).toMatchObject({
+        success: true,
+      });
+
+      // Message 2: rejected with quota error (runner threw)
+      expect(results[1].status).toBe('rejected');
+      expect((results[1] as PromiseRejectedResult).reason.message).toContain('session limit');
+
+      // Message 3: rejected with flush error (never processed — queue flushed)
+      expect(results[2].status).toBe('rejected');
+      expect((results[2] as PromiseRejectedResult).reason.message).toContain('Queue flushed');
+      expect((results[2] as PromiseRejectedResult).reason.message).toContain('quota');
+
+      // Runner should only have been called twice (message 1 + message 2),
+      // NOT three times — message 3 was flushed without processing
+      expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
+    });
+
+    it('should NOT flush queue on retryable errors (capacity)', async () => {
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      let callIndex = 0;
+      vi.mocked(mockClaudeRunner.run).mockImplementation(async () => {
+        callIndex++;
+        if (callIndex === 1) {
+          await new Promise((r) => setTimeout(r, 50));
+          return createMockClaudeResult();
+        }
+        // Capacity errors are retryable — should NOT flush queue
+        throw new Error('We are currently experiencing high demand. Please try again later.');
+      });
+
+      const p1 = sessionService.handleMessage(createMockRequest({ content: 'Message 1' }));
+      const p2 = sessionService.handleMessage(createMockRequest({ content: 'Message 2' }));
+      const p3 = sessionService.handleMessage(createMockRequest({ content: 'Message 3' }));
+
+      const results = await Promise.allSettled([p1, p2, p3]);
+
+      // Message 1: succeeded
+      expect(results[0].status).toBe('fulfilled');
+
+      // Messages 2 and 3: both rejected with capacity error (NOT flushed —
+      // each was attempted individually because capacity errors are retryable)
+      expect(results[1].status).toBe('rejected');
+      expect(results[2].status).toBe('rejected');
+      expect((results[2] as PromiseRejectedResult).reason.message).toContain('high demand');
+
+      // All 3 calls to runner should have been attempted
+      expect(mockClaudeRunner.run).toHaveBeenCalledTimes(3);
+    });
+
+    it('should NOT flush queue on unknown errors', async () => {
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      let callIndex = 0;
+      vi.mocked(mockClaudeRunner.run).mockImplementation(async () => {
+        callIndex++;
+        if (callIndex === 1) {
+          await new Promise((r) => setTimeout(r, 50));
+          return createMockClaudeResult();
+        }
+        throw new Error('Something unexpected happened');
+      });
+
+      const p1 = sessionService.handleMessage(createMockRequest({ content: 'Message 1' }));
+      const p2 = sessionService.handleMessage(createMockRequest({ content: 'Message 2' }));
+      const p3 = sessionService.handleMessage(createMockRequest({ content: 'Message 3' }));
+
+      const results = await Promise.allSettled([p1, p2, p3]);
+
+      // Unknown errors are NOT flushed — each message is processed individually
+      expect(mockClaudeRunner.run).toHaveBeenCalledTimes(3);
+      expect(results[0].status).toBe('fulfilled');
+      expect(results[1].status).toBe('rejected');
+      expect(results[2].status).toBe('rejected');
+    });
+  });
+
   describe('Multimodal Image Handling', () => {
     it('passes imageContents to ink runner when image media is present', async () => {
       const session = createMockSession({ lifecycle: 'idle', backend: 'ink' });
