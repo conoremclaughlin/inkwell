@@ -604,6 +604,18 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     try {
       const result = await sessionService!.handleMessage(request);
 
+      logger.info('[Heartbeat] Delivery result', {
+        reminderId: reminder.id,
+        agentId: reminderAgentId,
+        success: result.success,
+        responseCount: result.responses?.length || 0,
+        ...(result.error ? { error: result.error } : {}),
+        ...(result.finalTextResponse
+          ? { responsePreview: result.finalTextResponse.slice(0, 200) }
+          : {}),
+        ...(result.usage ? { tokens: result.usage } : {}),
+      });
+
       // Route any responses
       if (result.responses && result.responses.length > 0) {
         await routeResponses(result.responses);

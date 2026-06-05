@@ -3072,7 +3072,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       appendTranscript(runtime.transcriptPath, { type: 'auto_turn', content: raw });
     }
 
-    if (runtime.sessionId) {
+    if (runtime.sessionId && !options.nonInteractive) {
       await pcp
         .callTool('update_session_state', {
           agentId,
@@ -3940,16 +3940,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
       .listEntries()
       .filter((e) => e.role === 'assistant')
       .pop();
-    if (lastAssistant) {
-      console.log(
-        JSON.stringify({
-          type: 'result',
-          text: lastAssistant.content,
-          sessionId: runtime.sessionId || null,
-          ...(isBackendFailure ? { backendFailure: true } : {}),
-        })
-      );
-    }
+    console.log(
+      JSON.stringify({
+        type: 'result',
+        text: lastAssistant?.content || null,
+        sessionId: runtime.sessionId || null,
+        phase,
+        signal: finalSignal?.status || null,
+        reason: finalSignal?.reason || (isBackendFailure ? 'backend_failure' : null),
+        ...(isBackendFailure ? { backendFailure: true } : {}),
+      })
+    );
 
     if (isBackendFailure) {
       console.log(chalk.red(`\nSession aborted: backend returned consecutive failures.`));
