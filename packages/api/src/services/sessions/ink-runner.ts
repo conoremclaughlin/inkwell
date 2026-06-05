@@ -171,6 +171,8 @@ export class InkRunner implements IRunner {
       ...sessionEnv,
       PATH: spawnPath,
       AGENT_ID: config.agentId || '',
+      // Production mode disables React Reconciler profiling (perf_hooks measure accumulation)
+      NODE_ENV: 'production',
     } as Record<string, string>;
 
     // Strip CLAUDECODE to prevent nested-session detection

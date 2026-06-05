@@ -3293,12 +3293,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // Log backend CLI turn completion to activity stream
     if (runtime.sessionId) {
       const turnStatus = runResult.success ? 'completed' : 'failed';
-      const turnContent = runResult.success
-        ? `Backend turn completed (${runtime.backend}, ${turnDurationSeconds}s)`
-        : `Backend turn failed (${runtime.backend}, exit ${runResult.exitCode})`;
       const cliErrorClassification = !runResult.success
         ? classifyError({
-            errorText: runResult.stderr,
+            errorText: runResult.stderr || runResult.stdout,
             backend: runtime.backend,
             exitCode: runResult.exitCode,
           })
@@ -3309,7 +3306,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           agentId,
           type: runResult.success ? 'agent_complete' : 'error',
           subtype: `backend_cli:${runtime.backend}`,
-          content: turnContent,
+          content: runResult.success
+            ? `Backend turn completed (${runtime.backend}, ${turnDurationSeconds}s)`
+            : `Backend turn failed (${runtime.backend}, ${cliErrorClassification?.category || 'exit ' + runResult.exitCode}): ${cliErrorClassification?.summary || runResult.stderr.slice(0, 200) || 'unknown error'}`,
           sessionId: runtime.sessionId,
           status: turnStatus,
           payload: {

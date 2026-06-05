@@ -1,5 +1,20 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { getHeartbeatProcessingConfig } from './heartbeat-flags';
+
+vi.mock('fs', async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...actual,
+    statSync: vi.fn((path: string) => {
+      if (path.endsWith('worktree-repo/.git')) {
+        return { isFile: () => true };
+      }
+      // Default: .git is a directory (root repo)
+      return { isFile: () => false };
+    }),
+    readFileSync: vi.fn(() => 'gitdir: /some/repo/.git/worktrees/worktree-repo'),
+  };
+});
 
 describe('getHeartbeatProcessingConfig', () => {
   it('defaults to enabled when heartbeat flags are unset', () => {

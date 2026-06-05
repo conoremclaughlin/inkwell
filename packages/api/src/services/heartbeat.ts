@@ -48,6 +48,7 @@ interface HeartbeatConfig {
 // Singleton state
 let cronTask: ReturnType<typeof cron.schedule> | null = null;
 let supabase: SupabaseClient<Database> | null = null;
+let heartbeatRunning = false;
 
 // Store the onHeartbeat callback
 let heartbeatCallback: (() => Promise<void>) | null = null;
@@ -78,12 +79,19 @@ export function initHeartbeatService(config: HeartbeatConfig = {}): void {
     logger.info('Starting local heartbeat cron scheduler', { interval });
 
     cronTask = cron.schedule(interval, async () => {
+      if (heartbeatRunning) {
+        logger.debug('Heartbeat tick skipped — previous tick still running');
+        return;
+      }
+      heartbeatRunning = true;
       try {
         if (heartbeatCallback) {
           await heartbeatCallback();
         }
       } catch (error) {
         logger.error('Heartbeat cron error:', error);
+      } finally {
+        heartbeatRunning = false;
       }
     });
 
@@ -166,6 +174,12 @@ export async function processHeartbeat(
         continue;
       }
 
+      // Advance next_run_at BEFORE delivery (at-most-once). This prevents the
+      // same reminder from being picked up by the next tick if delivery takes
+      // longer than the heartbeat interval. Missing one beat is far better than
+      // queuing 67 duplicate deliveries.
+      await updateReminderAfterDelivery(reminder);
+
       // Deliver via caller-provided callback
       let delivered = false;
       if (deliver) {
@@ -177,7 +191,6 @@ export async function processHeartbeat(
       if (delivered) {
         stats.delivered++;
         await recordDeliveryAttempt(reminder.id, 'delivered');
-        await updateReminderAfterDelivery(reminder);
       } else {
         stats.failed++;
         await recordDeliveryAttempt(reminder.id, 'failed', 'Delivery callback returned false');

@@ -633,7 +633,7 @@ export class SessionService implements ISessionService {
         subtype: `backend_cli:${resolvedBackend}`,
         content: result.success
           ? `Backend turn completed (${resolvedBackend}, ${Math.round(turnDurationMs / 1000)}s)`
-          : `Backend turn failed (${resolvedBackend}): ${result.error?.slice(0, 500) || 'unknown error'}`,
+          : `Backend turn failed (${resolvedBackend}, ${errorClassification?.category || 'unknown'}): ${errorClassification?.summary || result.error?.slice(0, 500) || 'unknown error'}`,
         sessionId: session.id,
         taskGroupId,
         payload: {
