@@ -3284,6 +3284,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       debugFile ? { force: true, file: debugFile } : undefined
     );
 
+    if (runResult.success) {
+      consecutiveBackendFailures = 0;
+    } else {
+      consecutiveBackendFailures += 1;
+    }
+
     // Log backend CLI turn completion to activity stream
     if (runtime.sessionId) {
       const turnStatus = runResult.success ? 'completed' : 'failed';
@@ -3777,6 +3783,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   let turnQueue: Promise<void> = Promise.resolve();
   let pendingTurns = 0;
+  let consecutiveBackendFailures = 0;
   let lastStatusSummary = '';
   const emitStatusLaneIfChanged = (force = false) => {
     const summary = buildContextStatusSummary({
@@ -3864,11 +3871,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
     clearLastSignal();
     await enqueueTurn(message);
 
-    // Check for signal after turn 1
+    // Check for signal or failure after turn 1
     let exitReason: string | undefined;
     const signal1 = getLastSignal();
     if (signal1?.status === 'completed' || signal1?.status === 'blocked') {
       exitReason = `${signal1.status}${signal1.reason ? `: ${signal1.reason}` : ''}`;
+    }
+    if (!exitReason && consecutiveBackendFailures > 0) {
+      exitReason = 'backend_failure';
     }
 
     // Turns 2..N: continuation prompts — the SB signals when it's done
@@ -3884,18 +3894,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
           exitReason = `${signal.status}${signal.reason ? `: ${signal.reason}` : ''}`;
           break;
         }
-        // No signal or 'continuing' → keep going
+        if (consecutiveBackendFailures >= 2) {
+          exitReason = 'backend_failure';
+          break;
+        }
       }
     }
 
     if (pollTimer) clearInterval(pollTimer);
     const summary = summarizeForSessionEnd(ledger);
 
+    const isBackendFailure = exitReason === 'backend_failure';
+
     // Map the signal to a session phase. Don't end the session — leave it
     // resumable so the user or another SB can attach and follow up.
     const finalSignal = getLastSignal();
-    const phase =
-      finalSignal?.status === 'blocked'
+    const phase = isBackendFailure
+      ? 'blocked:backend-error'
+      : finalSignal?.status === 'blocked'
         ? 'blocked:needs-input'
         : finalSignal?.status === 'completed'
           ? 'idle:completed'
@@ -3931,11 +3947,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
           type: 'result',
           text: lastAssistant.content,
           sessionId: runtime.sessionId || null,
+          ...(isBackendFailure ? { backendFailure: true } : {}),
         })
       );
     }
 
-    if (finalSignal?.status === 'blocked') {
+    if (isBackendFailure) {
+      console.log(chalk.red(`\nSession aborted: backend returned consecutive failures.`));
+      console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${agentId}\n`));
+      process.exitCode = 1;
+      return;
+    } else if (finalSignal?.status === 'blocked') {
       console.log(chalk.yellow(`\nSession blocked: ${finalSignal.reason || 'needs input'}`));
     } else if (finalSignal?.status === 'completed') {
       console.log(chalk.green(`\nSession completed.`));

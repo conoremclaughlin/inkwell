@@ -14,7 +14,7 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "dev": "tsx watch --exclude 'dist,node_modules,.next,.pcp' --watch-path=../shared/dist src/index.ts",
+    "dev": "NODE_OPTIONS='--trace-warnings' tsx watch --exclude 'dist,node_modules,.next,.pcp' --watch-path=../shared/dist src/index.ts",
     "dev:mcp": "tsx watch --exclude 'dist,node_modules,.next,.pcp' --watch-path=../shared/dist src/index.ts",
     "build": "tsc; cp -r src/skills/builtin dist/skills/builtin",
     "start": "node dist/index.js",

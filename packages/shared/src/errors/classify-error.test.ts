@@ -74,6 +74,16 @@ describe('classifyError', () => {
     expect(r.category).toBe('quota');
   });
 
+  it('Claude Code session limit → quota', () => {
+    const r = classifyError({
+      errorText: "You've hit your session limit · resets 7:10pm (America/Los_Angeles)",
+      backend: 'claude',
+      exitCode: 1,
+    });
+    expect(r.category).toBe('quota');
+    expect(r.retryable).toBe(false);
+  });
+
   // ── timeout ───────────────────────────────────────────────────
   it('"timed out" → timeout', () => {
     const r = classifyError({ errorText: 'Process timed out after 300s idle' });

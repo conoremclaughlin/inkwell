@@ -51,6 +51,7 @@ const RULES: Array<{
     retryable: false,
     test: ({ errorText }) =>
       /usage limit/i.test(errorText) ||
+      /session limit/i.test(errorText) ||
       /\bquota\b/i.test(errorText) ||
       /TerminalQuotaError/i.test(errorText) ||
       /rate_limit_error/i.test(errorText) ||

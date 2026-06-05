@@ -354,8 +354,30 @@ export class SessionService implements ISessionService {
         pending.resolve(result);
       } catch (error) {
         pending.reject(error instanceof Error ? error : new Error(String(error)));
+
+        // On non-retryable errors (quota, auth), flush the remaining queue —
+        // every pending message will fail the same way.
+        const errorText = error instanceof Error ? error.message : String(error);
+        const errorClass = classifyError({ errorText });
+        if (!errorClass.retryable && errorClass.category !== 'unknown') {
+          const remaining = this.pendingQueues.get(lockKey);
+          if (remaining && remaining.length > 0) {
+            logger.warn('Flushing message queue after non-retryable error', {
+              lockKey,
+              errorCategory: errorClass.category,
+              flushedCount: remaining.length,
+            });
+            const flushError = new Error(
+              `Queue flushed: ${errorClass.category} — ${errorClass.summary}`
+            );
+            for (const queued of remaining) {
+              queued.reject(flushError);
+            }
+            this.pendingQueues.delete(lockKey);
+          }
+        }
       } finally {
-        // Continue processing queue
+        // Continue processing queue (if not flushed above)
         await this.processQueueOrReleaseLock(lockKey);
       }
     } else {
