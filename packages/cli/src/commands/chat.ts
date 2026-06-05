@@ -3955,7 +3955,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
       console.log(chalk.red(`\nSession aborted: backend returned consecutive failures.`));
       console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${agentId}\n`));
       process.exitCode = 1;
-      return;
     } else if (finalSignal?.status === 'blocked') {
       console.log(chalk.yellow(`\nSession blocked: ${finalSignal.reason || 'needs input'}`));
     } else if (finalSignal?.status === 'completed') {
@@ -3963,8 +3962,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
     } else {
       console.log(chalk.dim(`\nSession paused (${maxTurns} turn(s) completed).`));
     }
-    console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${agentId}\n`));
-    return;
+    if (!isBackendFailure) {
+      console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${agentId}\n`));
+    }
+
+    // Clean up handles that would keep the process alive (approval channel
+    // stdin listeners, pending approval timers, etc.). Without this, the
+    // non-interactive path skips the REPL cleanup at the end of runChat()
+    // and Node hangs indefinitely on open handles.
+    approvalManager.cancelAll();
+    runtime.approvalChannel?.dispose();
+    process.exit(process.exitCode ?? 0);
   }
 
   // ── Mount the REPL input layer (Ink or legacy readline) ──
