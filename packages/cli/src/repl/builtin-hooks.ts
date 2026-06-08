@@ -159,6 +159,11 @@ export function registerPassiveRecallHook(
       return;
     }
 
+    // Reset cooldown after every recall attempt, not just successful injection.
+    // Without this, once all memories are injected the cooldown stays expired
+    // and every subsequent turn fires a wasteful recall call.
+    turnsSinceLastInjection = 0;
+
     if (memories.length === 0) return;
 
     // Filter: dedup + re-injection cooldown
@@ -175,7 +180,6 @@ export function registerPassiveRecallHook(
     if (novel.length === 0) return;
 
     const toInject = novel.slice(0, cfg.maxInjectPerTurn);
-    turnsSinceLastInjection = 0;
     totalInjected += toInject.length;
 
     return {

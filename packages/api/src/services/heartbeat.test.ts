@@ -106,6 +106,7 @@ vi.mock('@supabase/supabase-js', () => ({
 }));
 
 // ─── Import module under test AFTER mocks ───
+import * as cron from 'node-cron';
 import {
   initHeartbeatService,
   stopHeartbeatService,
@@ -488,6 +489,156 @@ describe('Heartbeat Service', () => {
           agentId: 'wren',
         })
       ).resolves.toBeUndefined();
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Concurrency guard — regression test for PR #397
+  //
+  // node-cron fires ticks regardless of whether the previous callback
+  // is still running. Without the heartbeatRunning guard, concurrent
+  // ticks find the same reminder due (next_run_at not yet advanced)
+  // and queue 67+ duplicate deliveries. This test verifies the guard.
+  // ═══════════════════════════════════════════════════════════════
+  describe('Cron concurrency guard (heartbeatRunning flag)', () => {
+    it('should skip a cron tick when the previous tick is still running', async () => {
+      let resolveFirstTick: () => void;
+      const firstTickBlocking = new Promise<void>((resolve) => {
+        resolveFirstTick = resolve;
+      });
+
+      const tickLog: string[] = [];
+      const onHeartbeat = vi.fn().mockImplementation(async () => {
+        tickLog.push('tick-start');
+        await firstTickBlocking;
+        tickLog.push('tick-end');
+      });
+
+      initHeartbeatService({ enableLocalCron: true, onHeartbeat });
+
+      // Capture the callback registered with cron.schedule
+      const cronCallback = vi.mocked(cron.schedule).mock.calls[0][1] as () => Promise<void>;
+
+      // Fire tick 1 — starts and blocks
+      const tick1 = cronCallback();
+
+      // Fire tick 2 while tick 1 is still running — should be skipped
+      const tick2 = cronCallback();
+
+      // Unblock tick 1
+      resolveFirstTick!();
+      await tick1;
+      await tick2;
+
+      // Only one actual tick should have run
+      expect(tickLog).toEqual(['tick-start', 'tick-end']);
+      expect(onHeartbeat).toHaveBeenCalledTimes(1);
+    });
+
+    it('should allow a new tick after the previous one completes', async () => {
+      const tickLog: string[] = [];
+      const onHeartbeat = vi.fn().mockImplementation(async () => {
+        tickLog.push(`tick-${tickLog.length + 1}`);
+      });
+
+      initHeartbeatService({ enableLocalCron: true, onHeartbeat });
+
+      const cronCallback = vi.mocked(cron.schedule).mock.calls[0][1] as () => Promise<void>;
+
+      // Fire tick 1 — completes
+      await cronCallback();
+      // Fire tick 2 — should run since tick 1 is done
+      await cronCallback();
+
+      expect(tickLog).toEqual(['tick-1', 'tick-2']);
+      expect(onHeartbeat).toHaveBeenCalledTimes(2);
+    });
+
+    it('should reset the running flag even when onHeartbeat throws', async () => {
+      const onHeartbeat = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('DB down'))
+        .mockResolvedValueOnce(undefined);
+
+      initHeartbeatService({ enableLocalCron: true, onHeartbeat });
+
+      const cronCallback = vi.mocked(cron.schedule).mock.calls[0][1] as () => Promise<void>;
+
+      // Tick 1: fails — should still reset heartbeatRunning
+      await cronCallback();
+      // Tick 2: should run (not permanently blocked by failed tick 1)
+      await cronCallback();
+
+      expect(onHeartbeat).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // At-most-once delivery — regression test for PR #397
+  //
+  // If next_run_at is advanced only AFTER delivery, a slow delivery
+  // (20+ min) lets the next cron tick find the same reminder due
+  // and queue a duplicate. By advancing BEFORE deliver(), the
+  // reminder becomes invisible to concurrent ticks immediately.
+  // ═══════════════════════════════════════════════════════════════
+  describe('At-most-once delivery (advance next_run_at before deliver)', () => {
+    it('should update next_run_at BEFORE calling deliver callback', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      const reminder = makeDueReminder({ cron_expression: '0 * * * *' });
+      setQueryResult('scheduled_reminders', [reminder]); // select due reminders
+      setQueryResult('scheduled_reminders', null); // update (advance next_run_at)
+      setQueryResult('users', { timezone: null }); // getUserTimezone
+
+      let updateCalledBeforeDeliver = false;
+
+      const mockDeliver = vi.fn().mockImplementation(async () => {
+        const builder = tableBuilders.get('scheduled_reminders')!;
+        const updateCalls = (builder.update as ReturnType<typeof vi.fn>).mock.calls;
+        updateCalledBeforeDeliver = updateCalls.length > 0;
+        return true;
+      });
+
+      await processHeartbeat(mockDeliver);
+
+      expect(mockDeliver).toHaveBeenCalledTimes(1);
+      expect(updateCalledBeforeDeliver).toBe(true);
+    });
+
+    it('should still advance next_run_at even when deliver fails', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      const reminder = makeDueReminder({ cron_expression: '0 * * * *' });
+      setQueryResult('scheduled_reminders', [reminder]);
+      setQueryResult('scheduled_reminders', null); // update
+      setQueryResult('users', { timezone: null });
+
+      const mockDeliver = vi.fn().mockResolvedValue(false);
+      await processHeartbeat(mockDeliver);
+
+      const builder = tableBuilders.get('scheduled_reminders')!;
+      const updateCalls = (builder.update as ReturnType<typeof vi.fn>).mock.calls;
+      expect(updateCalls.length).toBeGreaterThan(0);
+
+      const updateArgs = updateCalls[0][0] as Record<string, unknown>;
+      expect(updateArgs.next_run_at).toBeDefined();
+      expect(updateArgs.run_count).toBe(1);
+    });
+
+    it('should still advance next_run_at even when deliver throws', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      const reminder = makeDueReminder({ cron_expression: '0 * * * *' });
+      setQueryResult('scheduled_reminders', [reminder]);
+      setQueryResult('scheduled_reminders', null); // update
+      setQueryResult('users', { timezone: null });
+
+      const mockDeliver = vi.fn().mockRejectedValue(new Error('Session host down'));
+      await processHeartbeat(mockDeliver);
+
+      const builder = tableBuilders.get('scheduled_reminders')!;
+      const updateCalls = (builder.update as ReturnType<typeof vi.fn>).mock.calls;
+      expect(updateCalls.length).toBeGreaterThan(0);
     });
   });
 });

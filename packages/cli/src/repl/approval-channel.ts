@@ -105,7 +105,10 @@ export class JsonlApprovalChannel implements ApprovalChannel {
 
   constructor(
     private output: { write: (data: string) => boolean | void },
-    private input?: { on: (event: string, cb: (data: Buffer | string) => void) => void }
+    private input?: {
+      on: (event: string, cb: (data: Buffer | string) => void) => void;
+      off?: (event: string, cb: (data: Buffer | string) => void) => void;
+    }
   ) {
     if (input) {
       this.onDataHandler = (chunk: Buffer | string) => {
@@ -179,6 +182,9 @@ export class JsonlApprovalChannel implements ApprovalChannel {
   }
 
   dispose(): void {
+    if (this.input?.off && this.onDataHandler) {
+      this.input.off('data', this.onDataHandler);
+    }
     for (const [id, entry] of this.pending) {
       clearTimeout(entry.timer);
       entry.resolve({ type: 'approval_response', id, decision: 'cancel', by: 'disposed' });

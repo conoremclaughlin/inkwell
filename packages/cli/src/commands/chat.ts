@@ -3072,7 +3072,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       appendTranscript(runtime.transcriptPath, { type: 'auto_turn', content: raw });
     }
 
-    if (runtime.sessionId) {
+    if (runtime.sessionId && !options.nonInteractive) {
       await pcp
         .callTool('update_session_state', {
           agentId,
@@ -3284,15 +3284,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
       debugFile ? { force: true, file: debugFile } : undefined
     );
 
+    if (runResult.success) {
+      consecutiveBackendFailures = 0;
+    } else {
+      consecutiveBackendFailures += 1;
+    }
+
     // Log backend CLI turn completion to activity stream
     if (runtime.sessionId) {
       const turnStatus = runResult.success ? 'completed' : 'failed';
-      const turnContent = runResult.success
-        ? `Backend turn completed (${runtime.backend}, ${turnDurationSeconds}s)`
-        : `Backend turn failed (${runtime.backend}, exit ${runResult.exitCode})`;
       const cliErrorClassification = !runResult.success
         ? classifyError({
-            errorText: runResult.stderr,
+            errorText: runResult.stderr || runResult.stdout,
             backend: runtime.backend,
             exitCode: runResult.exitCode,
           })
@@ -3303,7 +3306,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           agentId,
           type: runResult.success ? 'agent_complete' : 'error',
           subtype: `backend_cli:${runtime.backend}`,
-          content: turnContent,
+          content: runResult.success
+            ? `Backend turn completed (${runtime.backend}, ${turnDurationSeconds}s)`
+            : `Backend turn failed (${runtime.backend}, ${cliErrorClassification?.category || 'exit ' + runResult.exitCode}): ${cliErrorClassification?.summary || runResult.stderr.slice(0, 200) || 'unknown error'}`,
           sessionId: runtime.sessionId,
           status: turnStatus,
           payload: {
@@ -3777,6 +3782,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   let turnQueue: Promise<void> = Promise.resolve();
   let pendingTurns = 0;
+  let consecutiveBackendFailures = 0;
   let lastStatusSummary = '';
   const emitStatusLaneIfChanged = (force = false) => {
     const summary = buildContextStatusSummary({
@@ -3864,11 +3870,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
     clearLastSignal();
     await enqueueTurn(message);
 
-    // Check for signal after turn 1
+    // Check for signal or failure after turn 1
     let exitReason: string | undefined;
     const signal1 = getLastSignal();
     if (signal1?.status === 'completed' || signal1?.status === 'blocked') {
       exitReason = `${signal1.status}${signal1.reason ? `: ${signal1.reason}` : ''}`;
+    }
+    if (!exitReason && consecutiveBackendFailures > 0) {
+      exitReason = 'backend_failure';
     }
 
     // Turns 2..N: continuation prompts — the SB signals when it's done
@@ -3884,18 +3893,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
           exitReason = `${signal.status}${signal.reason ? `: ${signal.reason}` : ''}`;
           break;
         }
-        // No signal or 'continuing' → keep going
+        if (consecutiveBackendFailures >= 2) {
+          exitReason = 'backend_failure';
+          break;
+        }
       }
     }
 
     if (pollTimer) clearInterval(pollTimer);
     const summary = summarizeForSessionEnd(ledger);
 
+    const isBackendFailure = exitReason === 'backend_failure';
+
     // Map the signal to a session phase. Don't end the session — leave it
     // resumable so the user or another SB can attach and follow up.
     const finalSignal = getLastSignal();
-    const phase =
-      finalSignal?.status === 'blocked'
+    const phase = isBackendFailure
+      ? 'blocked:backend-error'
+      : finalSignal?.status === 'blocked'
         ? 'blocked:needs-input'
         : finalSignal?.status === 'completed'
           ? 'idle:completed'
@@ -3925,24 +3940,46 @@ export async function runChat(options: ChatOptions): Promise<void> {
       .listEntries()
       .filter((e) => e.role === 'assistant')
       .pop();
-    if (lastAssistant) {
-      console.log(
-        JSON.stringify({
-          type: 'result',
-          text: lastAssistant.content,
-          sessionId: runtime.sessionId || null,
-        })
-      );
-    }
+    console.log(
+      JSON.stringify({
+        type: 'result',
+        text: lastAssistant?.content || null,
+        sessionId: runtime.sessionId || null,
+        phase,
+        signal: finalSignal?.status || null,
+        reason: finalSignal?.reason || (isBackendFailure ? 'backend_failure' : null),
+        ...(isBackendFailure ? { backendFailure: true } : {}),
+      })
+    );
 
-    if (finalSignal?.status === 'blocked') {
+    if (isBackendFailure) {
+      console.log(chalk.red(`\nSession aborted: backend returned consecutive failures.`));
+      console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${agentId}\n`));
+      process.exitCode = 1;
+    } else if (finalSignal?.status === 'blocked') {
       console.log(chalk.yellow(`\nSession blocked: ${finalSignal.reason || 'needs input'}`));
     } else if (finalSignal?.status === 'completed') {
       console.log(chalk.green(`\nSession completed.`));
     } else {
       console.log(chalk.dim(`\nSession paused (${maxTurns} turn(s) completed).`));
     }
-    console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${agentId}\n`));
+    if (!isBackendFailure) {
+      console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${agentId}\n`));
+    }
+
+    // Clean up handles that would keep the process alive. Without this,
+    // the non-interactive path skips the REPL cleanup at the end of
+    // runChat() and Node hangs on open handles — blocking InkRunner's
+    // heartbeat delivery callback indefinitely.
+    readyForAutoRun = false;
+    approvalManager.cancelAll();
+    runtime.approvalChannel?.dispose();
+    if (pendingTurns > 0) {
+      await turnQueue;
+    }
+    // Unref stdio so lingering streams (e.g. piped stdin from InkRunner)
+    // don't prevent the event loop from draining.
+    process.stdin.unref();
     return;
   }
 

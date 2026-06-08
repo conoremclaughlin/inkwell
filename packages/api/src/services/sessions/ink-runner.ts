@@ -171,6 +171,8 @@ export class InkRunner implements IRunner {
       ...sessionEnv,
       PATH: spawnPath,
       AGENT_ID: config.agentId || '',
+      // Production mode disables React Reconciler profiling (perf_hooks measure accumulation)
+      NODE_ENV: 'production',
     } as Record<string, string>;
 
     // Strip CLAUDECODE to prevent nested-session detection
@@ -246,6 +248,9 @@ export class InkRunner implements IRunner {
     const responses: ChannelResponse[] = [];
     const toolCalls: ToolCall[] = [];
     let finalTextResponse: string | undefined;
+    let exitPhase: string | undefined;
+    let exitSignal: string | undefined;
+    let exitReason: string | undefined;
 
     // ink chat routes responses via MCP send_response — stdout may contain
     // CLI chrome, status lines, or other noise that must NOT be treated as
@@ -273,12 +278,26 @@ export class InkRunner implements IRunner {
             toolName: parsed.toolName || parsed.name || '',
             input: parsed.input || {},
           });
-        } else if (parsed.type === 'result' && parsed.text) {
-          finalTextResponse = parsed.text;
+        } else if (parsed.type === 'result') {
+          if (parsed.text) finalTextResponse = parsed.text;
+          if (parsed.phase) exitPhase = parsed.phase;
+          if (parsed.signal) exitSignal = parsed.signal;
+          if (parsed.reason) exitReason = parsed.reason;
         }
       } catch {
         // Non-JSON line — CLI noise, ignore
       }
+    }
+
+    if (exitPhase || exitSignal) {
+      logger.info('ink chat non-interactive exit', {
+        exitPhase,
+        exitSignal,
+        exitReason,
+        hasResponse: !!finalTextResponse,
+        responseCount: responses.length,
+        toolCallCount: toolCalls.length,
+      });
     }
 
     return {
