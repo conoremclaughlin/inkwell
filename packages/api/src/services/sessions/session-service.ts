@@ -389,11 +389,30 @@ export class SessionService implements ISessionService {
     if (!errorClass.retryable && errorClass.category !== 'unknown') {
       const remaining = this.pendingQueues.get(lockKey);
       if (remaining && remaining.length > 0) {
+        const flushedCount = remaining.length;
         logger.warn('Flushing message queue after non-retryable error', {
           lockKey,
           errorCategory: errorClass.category,
-          flushedCount: remaining.length,
+          flushedCount,
         });
+
+        const firstQueued = remaining[0];
+        this.activityStream
+          .logActivity({
+            userId: firstQueued.request.userId,
+            agentId: firstQueued.request.agentId,
+            type: 'error',
+            subtype: 'queue_flush',
+            content: `Flushed ${flushedCount} queued message${flushedCount === 1 ? '' : 's'}: ${errorClass.category} — ${errorClass.summary}`,
+            payload: {
+              errorCategory: errorClass.category,
+              errorSummary: errorClass.summary,
+              flushedCount,
+              lockKey,
+            } as unknown as Json,
+          })
+          .catch(() => {});
+
         const flushError = new Error(
           `Queue flushed: ${errorClass.category} — ${errorClass.summary}`
         );
