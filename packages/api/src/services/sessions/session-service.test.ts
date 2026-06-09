@@ -530,6 +530,30 @@ describe('SessionService', () => {
       );
     });
 
+    it('should use ink runner with claude model when backend=ink and provider=claude-code', async () => {
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+      vi.mocked(mockContextBuilder.getAgentBackend).mockResolvedValue({
+        backend: 'ink',
+        provider: 'claude-code',
+      });
+      vi.mocked(mockContextBuilder.buildContext).mockResolvedValue({
+        ...createMockInjectedContext(),
+        agent: { ...createMockInjectedContext().agent, backend: 'ink', provider: 'claude-code' },
+      });
+      const inkSession = createMockSession({ id: 'ink-session', backend: 'ink' });
+      vi.mocked(mockRepository.create).mockResolvedValue(inkSession);
+
+      const request = createMockRequest();
+      await sessionService.handleMessage(request);
+
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ backend: 'ink' })
+      );
+      expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+      expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+      expect(mockCodexRunner.run).not.toHaveBeenCalled();
+    });
+
     it('should increment messageCount after each processed message', async () => {
       const session = createMockSession({ messageCount: 5 });
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
