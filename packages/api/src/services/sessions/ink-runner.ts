@@ -25,7 +25,7 @@ import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 import { injectSessionHeaders, buildSessionEnv, writeRuntimeSessionHint } from '@inklabs/shared';
 
-const PROCESS_TIMEOUT_MS = parseInt(process.env.INK_PROCESS_TIMEOUT_MS || '', 10) || 30 * 60 * 1000;
+const PROCESS_TIMEOUT_MS = parseInt(process.env.INK_PROCESS_TIMEOUT_MS || '', 10) || 15 * 60 * 1000;
 
 export class InkRunner implements IRunner {
   async run(
@@ -117,7 +117,13 @@ export class InkRunner implements IRunner {
       args.push('--model', config.model);
     }
 
-    args.push('--max-turns', '25');
+    args.push('--max-turns', '5');
+
+    // Auto-approve tools for non-interactive spawns. Without this, the CLI
+    // defaults to auto-deny, which causes a slow deny→retry loop that easily
+    // exceeds the process timeout. Uses --approval-mode (runtime-only) rather
+    // than --profile full (which persists policy mutations to disk).
+    args.push('--approval-mode', 'auto-approve');
 
     return args;
   }

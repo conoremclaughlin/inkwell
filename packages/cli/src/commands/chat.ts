@@ -3860,6 +3860,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
   }
 
   if (options.nonInteractive || options.message) {
+    // Suppress MaxListenersExceeded for non-interactive spawns. Various
+    // libraries (Commander, Ink renderer, MCP clients) each add SIGINT
+    // handlers during init, easily exceeding the default limit of 10.
+    // These are benign — the handlers are paired with cleanup.
+    process.setMaxListeners(25);
+
     const message = options.message?.trim();
     if (!message) {
       throw new Error('--non-interactive requires --message "<text>"');
