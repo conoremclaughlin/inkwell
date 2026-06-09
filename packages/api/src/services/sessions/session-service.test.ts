@@ -158,7 +158,7 @@ describe('SessionService', () => {
         temporal: createMockInjectedContext().temporal,
         agent: createMockInjectedContext().agent,
       }),
-      getAgentBackend: vi.fn().mockResolvedValue('claude'),
+      getAgentBackend: vi.fn().mockResolvedValue({ backend: 'claude', provider: null }),
     };
 
     mockClaudeRunner = {
@@ -492,7 +492,10 @@ describe('SessionService', () => {
 
     it('should resolve codex backend from agent identity when creating a new session', async () => {
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
-      vi.mocked(mockContextBuilder.getAgentBackend).mockResolvedValue('codex');
+      vi.mocked(mockContextBuilder.getAgentBackend).mockResolvedValue({
+        backend: 'codex',
+        provider: null,
+      });
       vi.mocked(mockRepository.create).mockResolvedValue(createMockSession({ id: 'new-session' }));
 
       const request = createMockRequest();
@@ -525,6 +528,30 @@ describe('SessionService', () => {
         'codex-session',
         expect.objectContaining({ backend: 'codex-cli' })
       );
+    });
+
+    it('should use ink runner with claude model when backend=ink and provider=claude-code', async () => {
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+      vi.mocked(mockContextBuilder.getAgentBackend).mockResolvedValue({
+        backend: 'ink',
+        provider: 'claude-code',
+      });
+      vi.mocked(mockContextBuilder.buildContext).mockResolvedValue({
+        ...createMockInjectedContext(),
+        agent: { ...createMockInjectedContext().agent, backend: 'ink', provider: 'claude-code' },
+      });
+      const inkSession = createMockSession({ id: 'ink-session', backend: 'ink' });
+      vi.mocked(mockRepository.create).mockResolvedValue(inkSession);
+
+      const request = createMockRequest();
+      await sessionService.handleMessage(request);
+
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ backend: 'ink' })
+      );
+      expect(mockInkRunner.run).toHaveBeenCalledTimes(1);
+      expect(mockClaudeRunner.run).not.toHaveBeenCalled();
+      expect(mockCodexRunner.run).not.toHaveBeenCalled();
     });
 
     it('should increment messageCount after each processed message', async () => {

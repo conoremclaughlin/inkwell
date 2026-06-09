@@ -457,10 +457,16 @@ export class SessionService implements ISessionService {
       session.backend,
       injectedContext.agent.backend
     );
+    // For ink, model selection is based on the provider (the LLM underneath),
+    // not the backend itself. For direct backends, backend === provider.
+    const modelKey =
+      resolvedBackend === 'ink'
+        ? this.normalizeBackend(injectedContext.agent.provider)
+        : resolvedBackend;
     const runtimeModel =
-      resolvedBackend === 'codex-cli'
+      modelKey === 'codex-cli'
         ? this.config.defaultCodexModel
-        : resolvedBackend === 'gemini'
+        : modelKey === 'gemini'
           ? this.config.defaultGeminiModel
           : this.config.defaultModel;
 
@@ -828,7 +834,7 @@ export class SessionService implements ISessionService {
   ): Promise<Session> {
     const type = options?.type || 'primary';
 
-    const backend = await this.resolveAgentBackend(userId, agentId);
+    const { backend } = await this.resolveAgentBackend(userId, agentId);
     const resolvedStudioId = await this.resolveStudioId(userId, agentId, {
       threadKey: options?.threadKey,
       explicitStudioId: options?.studioId,
@@ -1370,10 +1376,12 @@ This session will continue with a fresh context after compaction. Your identity,
       );
 
       const runtimeBackend = this.resolveRuntimeBackend(session.backend, context.agent.backend);
+      const compactionModelKey =
+        runtimeBackend === 'ink' ? this.normalizeBackend(context.agent.provider) : runtimeBackend;
       const runtimeModel =
-        runtimeBackend === 'codex-cli'
+        compactionModelKey === 'codex-cli'
           ? this.config.defaultCodexModel
-          : runtimeBackend === 'gemini'
+          : compactionModelKey === 'gemini'
             ? this.config.defaultGeminiModel
             : this.config.defaultModel;
 
@@ -1481,17 +1489,23 @@ This session will continue with a fresh context after compaction. Your identity,
   private async resolveAgentBackend(
     userId: string,
     agentId: string
-  ): Promise<'claude-code' | 'codex-cli' | 'gemini' | 'ink'> {
+  ): Promise<{
+    backend: 'claude-code' | 'codex-cli' | 'gemini' | 'ink';
+    provider: 'claude-code' | 'codex-cli' | 'gemini' | 'ink' | null;
+  }> {
     try {
-      const identityBackend = await this.contextBuilder.getAgentBackend(userId, agentId);
-      return this.normalizeBackend(identityBackend);
+      const { backend, provider } = await this.contextBuilder.getAgentBackend(userId, agentId);
+      return {
+        backend: this.normalizeBackend(backend),
+        provider: provider ? this.normalizeBackend(provider) : null,
+      };
     } catch (error) {
       logger.warn('Failed to resolve agent backend, falling back to claude-code', {
         userId,
         agentId,
         error: error instanceof Error ? error.message : String(error),
       });
-      return 'claude-code';
+      return { backend: 'claude-code', provider: null };
     }
   }
 

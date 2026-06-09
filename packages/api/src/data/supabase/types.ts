@@ -179,6 +179,7 @@ export type Database = {
           metadata: Json | null;
           name: string;
           permissions: Json;
+          provider: string | null;
           relationships: Json | null;
           role: string;
           sandbox_bypass: boolean;
@@ -203,6 +204,7 @@ export type Database = {
           metadata?: Json | null;
           name: string;
           permissions?: Json;
+          provider?: string | null;
           relationships?: Json | null;
           role: string;
           sandbox_bypass?: boolean;
@@ -227,6 +229,7 @@ export type Database = {
           metadata?: Json | null;
           name?: string;
           permissions?: Json;
+          provider?: string | null;
           relationships?: Json | null;
           role?: string;
           sandbox_bypass?: boolean;
