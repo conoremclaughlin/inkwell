@@ -119,10 +119,11 @@ export class InkRunner implements IRunner {
 
     args.push('--max-turns', '5');
 
-    // Full profile = auto-approve all tools. Without this, non-interactive
-    // mode defaults to auto-deny, which causes a slow deny→retry loop that
-    // easily exceeds the process timeout.
-    args.push('--profile', 'full');
+    // Auto-approve tools for non-interactive spawns. Without this, the CLI
+    // defaults to auto-deny, which causes a slow deny→retry loop that easily
+    // exceeds the process timeout. Uses --approval-mode (runtime-only) rather
+    // than --profile full (which persists policy mutations to disk).
+    args.push('--approval-mode', 'auto-approve');
 
     return args;
   }
