@@ -158,7 +158,7 @@ describe('SessionService', () => {
         temporal: createMockInjectedContext().temporal,
         agent: createMockInjectedContext().agent,
       }),
-      getAgentBackend: vi.fn().mockResolvedValue('claude'),
+      getAgentBackend: vi.fn().mockResolvedValue({ backend: 'claude', provider: null }),
     };
 
     mockClaudeRunner = {
@@ -492,7 +492,10 @@ describe('SessionService', () => {
 
     it('should resolve codex backend from agent identity when creating a new session', async () => {
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
-      vi.mocked(mockContextBuilder.getAgentBackend).mockResolvedValue('codex');
+      vi.mocked(mockContextBuilder.getAgentBackend).mockResolvedValue({
+        backend: 'codex',
+        provider: null,
+      });
       vi.mocked(mockRepository.create).mockResolvedValue(createMockSession({ id: 'new-session' }));
 
       const request = createMockRequest();

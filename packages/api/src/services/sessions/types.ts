@@ -220,6 +220,7 @@ export interface AgentIdentity {
   role: string;
   description?: string;
   backend?: string;
+  provider?: string;
   values: string[];
   capabilities: string[];
   soul?: string;
@@ -424,7 +425,10 @@ export interface IContextBuilder {
    * Resolve the preferred runtime backend for an agent identity.
    * Returns raw backend string from DB (e.g. "claude", "codex", "gemini").
    */
-  getAgentBackend(userId: string, agentId: string): Promise<string | null>;
+  getAgentBackend(
+    userId: string,
+    agentId: string
+  ): Promise<{ backend: string | null; provider: string | null }>;
 }
 
 // ─── Runner Interface ───
