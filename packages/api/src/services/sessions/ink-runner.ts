@@ -117,13 +117,19 @@ export class InkRunner implements IRunner {
       args.push('--model', config.model);
     }
 
-    args.push('--max-turns', '5');
+    // Turn backstop only — the real limit is the CLI's token budget
+    // (200K default), which auto-compacts the transcript when approached.
+    args.push('--max-turns', '15');
 
     // Auto-approve tools for non-interactive spawns. Without this, the CLI
     // defaults to auto-deny, which causes a slow deny→retry loop that easily
     // exceeds the process timeout. Uses --approval-mode (runtime-only) rather
     // than --profile full (which persists policy mutations to disk).
     args.push('--approval-mode', 'auto-approve');
+
+    // Label the delivered message with its originating channel so the
+    // transcript renders it as a system message (not "you").
+    args.push('--message-label', config.channel || 'server');
 
     return args;
   }
@@ -257,6 +263,7 @@ export class InkRunner implements IRunner {
     let exitPhase: string | undefined;
     let exitSignal: string | undefined;
     let exitReason: string | undefined;
+    let usage: { contextTokens: number; inputTokens: number; outputTokens: number } | undefined;
 
     // ink chat routes responses via MCP send_response — stdout may contain
     // CLI chrome, status lines, or other noise that must NOT be treated as
@@ -289,6 +296,16 @@ export class InkRunner implements IRunner {
           if (parsed.phase) exitPhase = parsed.phase;
           if (parsed.signal) exitSignal = parsed.signal;
           if (parsed.reason) exitReason = parsed.reason;
+          // Usage from the ink CLI's budget view (transcript + identity).
+          // Without this, sessions report contextTokens=0 and token-based
+          // lifecycle decisions never fire for the ink backend.
+          if (parsed.usage && typeof parsed.usage === 'object') {
+            usage = {
+              contextTokens: Number(parsed.usage.contextTokens) || 0,
+              inputTokens: Number(parsed.usage.inputTokens) || 0,
+              outputTokens: Number(parsed.usage.outputTokens) || 0,
+            };
+          }
         }
       } catch {
         // Non-JSON line — CLI noise, ignore
@@ -303,11 +320,13 @@ export class InkRunner implements IRunner {
         hasResponse: !!finalTextResponse,
         responseCount: responses.length,
         toolCallCount: toolCalls.length,
+        contextTokens: usage?.contextTokens,
       });
     }
 
     return {
       responses,
+      usage,
       finalTextResponse,
       toolCalls,
     };
