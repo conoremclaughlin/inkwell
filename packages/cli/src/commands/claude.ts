@@ -3555,8 +3555,10 @@ export async function runClaude(
     }
   };
 
+  // Adapters that pass the prompt via stdin (Claude — avoids argv E2BIG on
+  // large prompts) need a piped stdin we write to; otherwise inherit the TTY.
   const child = spawn(prepared.binary, prepared.args, {
-    stdio: ['inherit', 'pipe', 'pipe'],
+    stdio: [prepared.stdinData !== undefined ? 'pipe' : 'inherit', 'pipe', 'pipe'],
     env: {
       ...process.env,
       ...authEnv,
@@ -3568,6 +3570,12 @@ export async function runClaude(
       ...(runtimeLinkId ? { INK_RUNTIME_LINK_ID: runtimeLinkId } : {}),
     },
   });
+
+  if (prepared.stdinData !== undefined && child.stdin) {
+    child.stdin.on('error', () => {});
+    child.stdin.write(prepared.stdinData);
+    child.stdin.end();
+  }
 
   child.stdout?.on('data', (chunk) => {
     process.stdout.write(chunk);
