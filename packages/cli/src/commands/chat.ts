@@ -110,6 +110,7 @@ type ChatOptions = {
   tools?: string;
   profile?: string;
   message?: string;
+  messageLabel?: string;
   nonInteractive?: boolean;
   maxTurns?: string;
   backendTimeoutSeconds?: string;
@@ -402,10 +403,23 @@ const AUTO_TRIM_KEEP_RECENT_ENTRIES = 6;
 const DEFAULT_TRIM_TARGET_PCT = 70;
 const CTRL_C_EXIT_WINDOW_MS = 3000;
 const DEFAULT_BACKEND_TOKEN_WINDOW = 1_000_000;
+// Our working context budget — deliberately smaller than the backend's raw
+// window. When the transcript approaches this, we compact (summarize the
+// oldest entries into a new start state) rather than letting it grow until
+// turns degrade or argv/window limits bite. Override with --max-context-tokens.
+const DEFAULT_MAX_CONTEXT_TOKENS = 200_000;
+// Compact when transcript+identity utilization crosses this fraction of budget
+const AUTO_COMPACT_THRESHOLD_PCT = 0.8;
+// Entries kept verbatim after the compaction summary (the working tail)
+const AUTO_COMPACT_KEEP_RECENT_ENTRIES = 12;
 const HISTORY_PREVIEW_MAX = 200;
 function resolveBackendTokenWindow(_backend: string, _model?: string): number {
   // Current policy: claude/codex/gemini all default to 1M effective context window.
   return DEFAULT_BACKEND_TOKEN_WINDOW;
+}
+
+function defaultContextBudget(backendTokenWindow: number): number {
+  return Math.min(backendTokenWindow, DEFAULT_MAX_CONTEXT_TOKENS);
 }
 
 function formatTokenCount(value: number): string {
@@ -595,6 +609,9 @@ function hydrateLedgerFromTranscript(
   const seenInboxIds = new Set<string>();
   const seenActivityIds = new Set<string>();
   const recoveredMemoryIds: string[] = [];
+  // Entries added by THIS hydration pass — a compaction event collapses them
+  // (and only them; entries that pre-date hydration are left alone).
+  const hydratedEntryIds: number[] = [];
 
   const pushPreview = (role: 'user' | 'assistant' | 'inbox', content: string, ts?: string) => {
     preview.push({ role, content: compactForHistoryPreview(role, content), ts });
@@ -605,8 +622,20 @@ function hydrateLedgerFromTranscript(
 
   for (const event of events) {
     const type = typeof event.type === 'string' ? event.type : '';
+    if (type === 'compaction' && typeof event.summary === 'string') {
+      // Compaction marks a new start state: everything replayed before this
+      // point is superseded by the summary. Evict it and seed the summary.
+      ledger.evictEntries(hydratedEntryIds);
+      hydratedEntryIds.length = 0;
+      const summaryEntry = ledger.addEntry('system', event.summary, 'compaction-history');
+      hydratedEntryIds.push(summaryEntry.id);
+      loaded = 1;
+      messageCount = 0;
+      continue;
+    }
     if (type === 'user' && typeof event.content === 'string') {
-      ledger.addEntry('user', event.content, 'repl-history');
+      const entry = ledger.addEntry('user', event.content, 'repl-history');
+      hydratedEntryIds.push(entry.id);
       loaded += 1;
       messageCount += 1;
       pushPreview('user', event.content, typeof event.ts === 'string' ? event.ts : undefined);
@@ -616,14 +645,16 @@ function hydrateLedgerFromTranscript(
       if (event.cancelled === true || event.content === '(no output)') continue;
       if (typeof event.content !== 'string') continue;
       const source = typeof event.backend === 'string' ? event.backend : 'backend-history';
-      ledger.addEntry('assistant', event.content, source);
+      const entry = ledger.addEntry('assistant', event.content, source);
+      hydratedEntryIds.push(entry.id);
       loaded += 1;
       messageCount += 1;
       pushPreview('assistant', event.content, typeof event.ts === 'string' ? event.ts : undefined);
       continue;
     }
     if (type === 'inbox' && typeof event.rendered === 'string') {
-      ledger.addEntry('inbox', compactForLedger(event.rendered), 'inkmail-history');
+      const entry = ledger.addEntry('inbox', compactForLedger(event.rendered), 'inkmail-history');
+      hydratedEntryIds.push(entry.id);
       loaded += 1;
       messageCount += 1;
       pushPreview('inbox', event.rendered, typeof event.ts === 'string' ? event.ts : undefined);
@@ -632,9 +663,19 @@ function hydrateLedgerFromTranscript(
       }
       continue;
     }
+    if (type === 'system_turn' && typeof event.content === 'string') {
+      // Synthetic turn input (heartbeat trigger, continuation prompt, etc.)
+      const label = typeof event.label === 'string' ? event.label : 'system';
+      const entry = ledger.addEntry('system', event.content, label);
+      hydratedEntryIds.push(entry.id);
+      loaded += 1;
+      messageCount += 1;
+      continue;
+    }
     if (type === 'hook_injection' && typeof event.content === 'string') {
       const source = typeof event.source === 'string' ? event.source : 'hook-history';
-      ledger.addEntry('system', event.content, source);
+      const entry = ledger.addEntry('system', event.content, source);
+      hydratedEntryIds.push(entry.id);
       loaded += 1;
       if (typeof event.memoryId === 'string') {
         recoveredMemoryIds.push(event.memoryId);
@@ -644,11 +685,12 @@ function hydrateLedgerFromTranscript(
     if (type === 'activity' && typeof event.content === 'string') {
       const actor = typeof event.agentId === 'string' ? event.agentId : 'system';
       const activityType = typeof event.activityType === 'string' ? event.activityType : 'activity';
-      ledger.addEntry(
+      const entry = ledger.addEntry(
         'system',
         compactForLedger(`⚡ ${actor} ${activityType} — ${event.content}`, 320),
         'pcp-activity-history'
       );
+      hydratedEntryIds.push(entry.id);
       loaded += 1;
       if (typeof event.activityId === 'string') {
         seenActivityIds.add(event.activityId);
@@ -1883,7 +1925,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const initialBackend = options.backend || 'claude';
   const initialBackendTokenWindow = resolveBackendTokenWindow(initialBackend, options.model);
   const configuredMaxContextTokens = Number.parseInt(
-    options.maxContextTokens || String(initialBackendTokenWindow),
+    options.maxContextTokens || String(defaultContextBudget(initialBackendTokenWindow)),
     10
   );
   const parsedBackendTimeoutSeconds =
@@ -1918,7 +1960,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     backendTokenWindow: initialBackendTokenWindow,
     sessionId: options.sessionId?.trim() || undefined,
     maxContextTokens: Number.isNaN(configuredMaxContextTokens)
-      ? initialBackendTokenWindow
+      ? defaultContextBudget(initialBackendTokenWindow)
       : configuredMaxContextTokens,
     pollSeconds: Number.parseInt(options.pollSeconds || '20', 10),
     showSessionsWatch: false,
@@ -2723,6 +2765,93 @@ export async function runChat(options: ChatOptions): Promise<void> {
     return { removed: trim.removedEntries.length, removedTokens: trim.removedTokens };
   };
 
+  // ── Token-budget auto-compaction ──
+  // When the transcript approaches the context budget, summarize the oldest
+  // entries into a dense brief via the backend and replace them with it. The
+  // `compaction` transcript event is the pointer to the new start state —
+  // hydration collapses everything before it on reattach. If summarization
+  // fails, fall back to a hard trim so the turn can still proceed.
+  let compactionInFlight = false;
+
+  const buildCompactionPrompt = (chunk: string): string =>
+    [
+      'You are compacting a conversation transcript into a dense continuation brief.',
+      'Summarize the conversation below, preserving: decisions and their rationale,',
+      'completed and in-progress work, key facts and constraints, open questions,',
+      'commitments made, and any identifiers (PR numbers, session IDs, file paths, URLs).',
+      'Write compact bullet points. Output ONLY the summary — no preamble.',
+      '',
+      '<conversation>',
+      chunk,
+      '</conversation>',
+    ].join('\n');
+
+  const maybeCompactContext = async (reason: string): Promise<void> => {
+    if (compactionInFlight) return;
+    const bootstrapReserve = runtime.bootstrapContext
+      ? estimateTokens(runtime.bootstrapContext)
+      : 0;
+    const effectiveBudget = Math.max(1, runtime.maxContextTokens - bootstrapReserve);
+    const threshold = Math.floor(effectiveBudget * AUTO_COMPACT_THRESHOLD_PCT);
+    if (ledger.totalTokens() <= threshold) return;
+
+    const entries = ledger.listEntries();
+    const cutoff = Math.max(0, entries.length - AUTO_COMPACT_KEEP_RECENT_ENTRIES);
+    if (cutoff === 0) return; // only the protected tail remains — nothing to compact
+
+    compactionInFlight = true;
+    try {
+      const oldest = entries.slice(0, cutoff);
+      const chunk = oldest
+        .map((e) => `${e.role.toUpperCase()}${e.source ? ` [${e.source}]` : ''}: ${e.content}`)
+        .join('\n\n');
+      const before = ledger.totalTokens();
+      printLine(
+        chalk.yellow(
+          `  ⛁ Context at ${formatTokenCount(before)} tok (> ${formatTokenCount(threshold)} threshold) — compacting (${reason})`
+        )
+      );
+
+      try {
+        const turn = await runBackendTurn({
+          backend: runtime.backend,
+          agentId,
+          model: runtime.model,
+          prompt: buildCompactionPrompt(chunk),
+          // Summarizing a large chunk takes longer than a normal turn
+          timeoutMs: Math.max(runtime.backendTurnTimeoutMs ?? 0, 5 * 60 * 1000),
+        });
+        const summaryText = turn.success ? turn.stdout.trim() : '';
+        if (!summaryText) {
+          throw new Error(turn.stderr.trim().slice(0, 200) || `exit code ${turn.exitCode}`);
+        }
+
+        const summary = `[Conversation summary — compacted ${oldest.length} earlier entries]\n${summaryText}`;
+        const result = ledger.compactToSummary(summary, AUTO_COMPACT_KEEP_RECENT_ENTRIES);
+        appendTranscript(runtime.transcriptPath, {
+          type: 'compaction',
+          reason,
+          summary,
+          removedCount: result.removedEntries.length,
+          removedTokens: result.removedTokens,
+          summaryTokens: result.summaryTokens,
+          totalAfter: result.totalAfter,
+        });
+        printLine(
+          chalk.green(
+            `  ⛁ Compacted ${result.removedEntries.length} entries: ${formatTokenCount(before)} → ${formatTokenCount(result.totalAfter)} tok`
+          )
+        );
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        printLine(chalk.yellow(`  ⛁ Compaction summarization failed (${msg}) — hard-trimming`));
+        await trimContextToPercent(DEFAULT_TRIM_TARGET_PCT, `${reason} (compaction fallback)`);
+      }
+    } finally {
+      compactionInFlight = false;
+    }
+  };
+
   const pollInbox = async (force = false): Promise<number> => {
     const inboxResult = (await pcp
       .callTool('get_inbox', { agentId, status: 'unread', limit: 10 })
@@ -3050,7 +3179,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     return activities.length;
   };
 
-  const runUserTurn = async (raw: string, source: 'user' | 'inbox-auto' = 'user') => {
+  const runUserTurn = async (
+    raw: string,
+    source: 'user' | 'inbox-auto' | 'system' = 'user',
+    displayLabel?: string
+  ) => {
     if (!raw.trim()) return;
     if (source === 'user') {
       // Echo the user's message
@@ -3067,6 +3200,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
       ledger.addEntry('user', raw, 'repl');
       appendTranscript(runtime.transcriptPath, { type: 'user', content: raw });
+    } else if (source === 'system') {
+      // Synthetic turn input: heartbeat triggers, server-delivered messages,
+      // continuation prompts. Rendered as system (not "you") so transcripts
+      // distinguish harness prompts from the human's words.
+      const label = displayLabel || 'system';
+      if (inkRepl) {
+        inkRepl.addMessage('system', raw, { label });
+      } else {
+        printLine(
+          renderMessageLine('system', raw, {
+            label,
+            timezone: runtime.userTimezone,
+          })
+        );
+        printLine('');
+      }
+      ledger.addEntry('system', raw, label);
+      appendTranscript(runtime.transcriptPath, { type: 'system_turn', content: raw, label });
     } else {
       ledger.addEntry('system', compactForLedger(`[auto-run inbox] ${raw}`, 500), 'auto-run');
       appendTranscript(runtime.transcriptPath, { type: 'auto_turn', content: raw });
@@ -3082,6 +3233,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
         })
         .catch(() => undefined);
     }
+
+    // ── Token-budget enforcement: compact before building the prompt ──
+    // If the transcript has grown past the compaction threshold, summarize
+    // the oldest entries into a new start state before this turn spends them.
+    await maybeCompactContext('pre-turn budget check');
 
     // ── Fire prompt_build hooks (budget monitor, etc.) ──
     // Budget utilization must account for bootstrap tokens — the ledger only
@@ -3806,7 +3962,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
       statusLane.markPromptRefreshed();
     }
   };
-  const enqueueTurn = (raw: string, source: 'user' | 'inbox-auto' = 'user'): Promise<void> => {
+  const enqueueTurn = (
+    raw: string,
+    source: 'user' | 'inbox-auto' | 'system' = 'user',
+    displayLabel?: string
+  ): Promise<void> => {
     pendingTurns += 1;
     emitStatusLaneIfChanged();
     const run = async () => {
@@ -3816,7 +3976,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         statusLane.setTurnActive(true);
       }
       try {
-        await runUserTurn(raw, source);
+        await runUserTurn(raw, source, displayLabel);
       } catch (error) {
         printLine(chalk.red(`Turn failed: ${String(error)}`));
       } finally {
@@ -3872,9 +4032,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
     const maxTurns = parseInt(options.maxTurns || '1', 10);
 
-    // Turn 1: user-provided message
+    // Turn 1: the delivered message. When --message-label is set (server
+    // spawns pass the originating channel, e.g. "heartbeat"), render as a
+    // system message — it's harness-delivered, not typed by the human.
+    const messageLabel = options.messageLabel?.trim();
     clearLastSignal();
-    await enqueueTurn(message);
+    await enqueueTurn(message, messageLabel ? 'system' : 'user', messageLabel);
 
     // Check for signal or failure after turn 1
     let exitReason: string | undefined;
@@ -3891,7 +4054,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       for (let turn = 2; turn <= maxTurns; turn++) {
         clearLastSignal();
         await enqueueTurn(
-          'Continue working. Use signal_status to indicate when you are completed, blocked, or continuing.'
+          'Continue working. Use signal_status to indicate when you are completed, blocked, or continuing.',
+          'system',
+          'continuation'
         );
 
         const signal = getLastSignal();
@@ -3946,6 +4111,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
       .listEntries()
       .filter((e) => e.role === 'assistant')
       .pop();
+    // Context utilization from our budget's view: transcript + identity.
+    // The server (InkRunner) persists this so session-level token tracking
+    // works for the ink backend — without it, sessions report 0 context
+    // tokens and grow unbounded.
+    const reportedContextTokens =
+      ledger.totalTokens() +
+      (runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0);
     console.log(
       JSON.stringify({
         type: 'result',
@@ -3954,6 +4126,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
         phase,
         signal: finalSignal?.status || null,
         reason: finalSignal?.reason || (isBackendFailure ? 'backend_failure' : null),
+        usage: {
+          contextTokens: reportedContextTokens,
+          inputTokens: lastBackendUsage?.inputTokens || 0,
+          outputTokens: lastBackendUsage?.outputTokens || 0,
+        },
         ...(isBackendFailure ? { backendFailure: true } : {}),
       })
     );
@@ -3984,8 +4161,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
       await turnQueue;
     }
     // Unref stdio so lingering streams (e.g. piped stdin from InkRunner)
-    // don't prevent the event loop from draining.
-    process.stdin.unref();
+    // don't prevent the event loop from draining. Guarded: some stdin
+    // stream types (already-closed pipes) don't implement unref.
+    if (typeof process.stdin.unref === 'function') {
+      process.stdin.unref();
+    }
     return;
   }
 
@@ -4469,7 +4649,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           runtime.backend = next;
           runtime.backendTokenWindow = resolveBackendTokenWindow(runtime.backend, runtime.model);
           if (contextBudgetAuto) {
-            runtime.maxContextTokens = runtime.backendTokenWindow;
+            runtime.maxContextTokens = defaultContextBudget(runtime.backendTokenWindow);
           }
           const backendLines = [`Switched backend to ${next}`];
           if (contextBudgetAuto) {
@@ -4485,7 +4665,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           runtime.model = next || undefined;
           runtime.backendTokenWindow = resolveBackendTokenWindow(runtime.backend, runtime.model);
           if (contextBudgetAuto) {
-            runtime.maxContextTokens = runtime.backendTokenWindow;
+            runtime.maxContextTokens = defaultContextBudget(runtime.backendTokenWindow);
           }
           showInPanel([
             `Model override: ${runtime.model || '(backend default)'}`,
@@ -5420,6 +5600,10 @@ export function registerChatCommand(program: Command): void {
       .option('--profile <name>', 'Apply security profile: minimal|safe|collaborative|full')
       .option('--auto-run', 'Automatically execute backend turns for new inbox task messages')
       .option('--message <text>', 'Single-turn message for non-interactive mode')
+      .option(
+        '--message-label <label>',
+        'Render the --message as a system message with this label (e.g., heartbeat, telegram). Used by server spawns.'
+      )
       .option('--non-interactive', 'Run one turn and exit (requires --message)')
       .option('--max-turns <n>', 'Run up to N conversational turns then exit (requires --message)')
       .option(

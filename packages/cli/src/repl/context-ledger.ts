@@ -36,6 +36,13 @@ export interface LedgerEvictResult {
   totalAfter: number;
 }
 
+export interface LedgerCompactResult {
+  removedEntries: LedgerEntry[];
+  removedTokens: number;
+  summaryTokens: number;
+  totalAfter: number;
+}
+
 export interface PromptBuildOptions {
   maxTokens?: number;
   includeSources?: boolean;
@@ -185,6 +192,47 @@ export class ContextLedger {
 
     runningTotal = this.totalTokens();
     return { removedEntries, removedTokens, totalAfter: runningTotal };
+  }
+
+  /**
+   * Replace the oldest entries with a single summary entry, keeping the most
+   * recent `keepRecentEntries` verbatim. This is the in-memory half of
+   * transcript compaction: the summary becomes the new start state and the
+   * recent tail preserves working context.
+   */
+  public compactToSummary(
+    summary: string,
+    keepRecentEntries: number,
+    source = 'compaction'
+  ): LedgerCompactResult {
+    const keep = Math.max(0, Math.floor(keepRecentEntries));
+    const cutoff = Math.max(0, this.entries.length - keep);
+    const removedEntries = this.entries.slice(0, cutoff);
+    const removedTokens = removedEntries.reduce((sum, entry) => sum + entry.approxTokens, 0);
+    const kept = this.entries.slice(cutoff);
+
+    const summaryEntry: LedgerEntry = {
+      id: this.entrySeq++,
+      role: 'system',
+      content: summary,
+      source,
+      createdAt: new Date().toISOString(),
+      approxTokens: estimateTokens(summary),
+    };
+
+    this.entries = [summaryEntry, ...kept];
+    // Bookmarks inside the compacted region are gone; survivors shift to
+    // account for removed entries plus the prepended summary.
+    this.bookmarks = this.bookmarks
+      .filter((bookmark) => bookmark.entryIndex >= cutoff)
+      .map((bookmark) => ({ ...bookmark, entryIndex: bookmark.entryIndex - cutoff + 1 }));
+
+    return {
+      removedEntries,
+      removedTokens,
+      summaryTokens: summaryEntry.approxTokens,
+      totalAfter: this.totalTokens(),
+    };
   }
 
   /**
