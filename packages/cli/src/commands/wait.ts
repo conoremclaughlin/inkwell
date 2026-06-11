@@ -75,6 +75,11 @@ export function registerWaitCommand(program: Command): void {
       if (threadKey) {
         try {
           // Fetch recent messages to find the latest message ID as anchor.
+          // fullHistory is load-bearing: without it (and without a cursor)
+          // the server falls back to the last-read pointer, and push-channel
+          // delivery marks threads read — so the watcher would baseline on
+          // 0 messages and then race the push pipeline on every poll (the
+          // pr:404/pr:408 watchers timed out through live replies this way).
           // Known limitation: threads with >200 messages will anchor on #200,
           // not the true latest. Needs server-side "latest message" support
           // or descending order in get_thread_messages to fix properly.
@@ -83,6 +88,7 @@ export function registerWaitCommand(program: Command): void {
             agentId,
             threadKey,
             markRead: false,
+            fullHistory: true,
             limit: 200,
           })) as Record<string, unknown>;
           const messages = (threadResult.messages as Array<Record<string, unknown>>) || [];
@@ -166,12 +172,17 @@ export function registerWaitCommand(program: Command): void {
           }
 
           if (threadKey) {
-            // Watch specific thread — use afterMessageId to only get NEW messages
+            // Watch specific thread — use afterMessageId to only get NEW
+            // messages. fullHistory keeps anchor-less polls (thread empty at
+            // baseline) immune to the read-state fallback: a reply that the
+            // push channel already delivered-and-marked-read must still
+            // trigger the watcher.
             const pollArgs: Record<string, unknown> = {
               email: config.email,
               agentId,
               threadKey,
               markRead: false,
+              fullHistory: true,
               limit: 10,
             };
             if (baselineLastMessageId) {
