@@ -16,6 +16,14 @@ export interface ContextSections {
   };
   /** Tool calls executed this session (most recent last) */
   toolCalls?: Array<{ tool: string; status: string; at: string }>;
+  /** Entries evicted from the context window — out of the prompt, not erased */
+  evicted?: Array<{
+    role: string;
+    source?: string;
+    preview: string;
+    actor?: string;
+    reason?: string;
+  }>;
 }
 
 export function formatContextLines(sections: ContextSections): string[] {
@@ -45,6 +53,20 @@ export function formatContextLines(sections: ContextSections): string[] {
     for (const call of recent) {
       const time = call.at ? new Date(call.at).toLocaleTimeString() : '';
       lines.push(`• ${call.tool} (${call.status})${time ? ` · ${time}` : ''}`);
+    }
+    lines.push('');
+  }
+
+  if (sections.evicted && sections.evicted.length > 0) {
+    lines.push('── Evicted from Context ──');
+    lines.push('(out of the prompt window — still in the transcript)');
+    lines.push('');
+    const recentEvicted = sections.evicted.slice(-25).reverse();
+    for (const entry of recentEvicted) {
+      const attribution = [entry.actor, entry.reason].filter(Boolean).join(' · ');
+      lines.push(
+        `✕ [${entry.role}${entry.source ? `/${entry.source}` : ''}] ${entry.preview}${attribution ? ` (${attribution})` : ''}`
+      );
     }
     lines.push('');
   }

@@ -10,7 +10,7 @@
  * but the CLI intercepts and handles them locally.
  */
 
-import type { ContextLedger, LedgerEvictResult } from './context-ledger.js';
+import { entryRefHash, type ContextLedger, type LedgerEvictResult } from './context-ledger.js';
 import type { PcpToolCallResult } from '../lib/pcp-client.js';
 
 // ─── Session Status Signal ──────────────────────────────────────
@@ -171,6 +171,16 @@ function handleEvictContext(
             source: e.source,
             tokens: e.approxTokens,
             preview: e.content.slice(0, 80),
+          })),
+          // Persistent eviction refs — the runtime writes these to a
+          // context_evict transcript event so the eviction survives reattach
+          evictRefs: result.removedEntries.map((e) => ({
+            ...(e.eid !== undefined ? { eid: e.eid } : {}),
+            hash: entryRefHash(e.role, e.content),
+            role: e.role,
+            source: e.source,
+            preview: e.content.slice(0, 80),
+            tokens: e.approxTokens,
           })),
         }),
       },
