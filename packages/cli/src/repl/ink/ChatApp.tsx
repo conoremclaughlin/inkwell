@@ -50,10 +50,12 @@ export interface ChatAppHandle {
   setAbortHandler: (handler: (() => void) | null) => void;
   setCommandOutput: (lines: string[] | null) => void;
   setSurfacedMemories: (lines: string[]) => void;
-  /** Open the context viewer with the given lines. */
-  showContextView: (lines: string[]) => void;
+  /** Open the context viewer with the given lines (optionally at a section). */
+  showContextView: (lines: string[], opts?: { initialSection?: string }) => void;
   /** Register callback for Ctrl+O (orchestrator builds context, calls showContextView). */
   setCtrlOHandler: (handler: (() => void) | null) => void;
+  /** Register callback for Ctrl+T (orchestrator opens the viewer at Tool Calls). */
+  setCtrlTHandler: (handler: (() => void) | null) => void;
 }
 
 /**
@@ -92,6 +94,8 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
 
   // Context viewer state
   const [contextViewLines, setContextViewLines] = useState<string[] | null>(null);
+  // Section the viewer opens at ('t' for tools, undefined for top)
+  const [contextViewSection, setContextViewSection] = useState<string | undefined>(undefined);
   // Brief intermediate state: both views hidden so Ink renders a zero-height
   // frame, erasing the tall context viewer before showing the shorter dock.
   const [dismissingContext, setDismissingContext] = useState(false);
@@ -137,11 +141,15 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
     setSurfacedMemories: (lines: string[]) => {
       setLastSurfacedMemories(lines);
     },
-    showContextView: (lines: string[]) => {
+    showContextView: (lines: string[], opts?: { initialSection?: string }) => {
+      setContextViewSection(opts?.initialSection);
       setContextViewLines(lines);
     },
     setCtrlOHandler: (handler: (() => void) | null) => {
       ctrlOHandlerRef.current = handler;
+    },
+    setCtrlTHandler: (handler: (() => void) | null) => {
+      ctrlTHandlerRef.current = handler;
     },
   }));
 
@@ -165,10 +173,18 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
 
   // Ctrl+O callback — set by orchestrator to build context and call showContextView
   const ctrlOHandlerRef = useRef<(() => void) | null>(null);
+  // Ctrl+T callback — same, but opens the viewer at the Tool Calls section
+  const ctrlTHandlerRef = useRef<(() => void) | null>(null);
 
   const handleExpandMemories = useCallback(() => {
     if (ctrlOHandlerRef.current) {
       ctrlOHandlerRef.current();
+    }
+  }, []);
+
+  const handleShowToolCalls = useCallback(() => {
+    if (ctrlTHandlerRef.current) {
+      ctrlTHandlerRef.current();
     }
   }, []);
 
@@ -236,7 +252,13 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
           scroll state. The useInput lifecycle issue only affects the Dock
           (PromptInput), not the ContextViewer, so mount/unmount is safe. */}
       {showingContext && (
-        <ContextViewer lines={contextViewLines!} isActive onDismiss={handleContextDismiss} />
+        <ContextViewer
+          key={contextViewSection || 'top'}
+          lines={contextViewLines!}
+          isActive
+          onDismiss={handleContextDismiss}
+          initialSection={contextViewSection}
+        />
       )}
 
       {/* Chat messages — Static writes to scrollback */}
@@ -277,6 +299,7 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
           ctrlCHint={ctrlCHint}
           onCtrlC={handleCtrlC}
           onExpandMemories={handleExpandMemories}
+          onShowToolCalls={handleShowToolCalls}
           waitingElement={
             waiting ? (
               <Box paddingX={1}>

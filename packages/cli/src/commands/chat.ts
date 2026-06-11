@@ -654,6 +654,8 @@ export function hydrateLedgerFromTranscript(
   compactionCollapsed: boolean;
   /** Entries excluded by context_evict events — for evicted-content display */
   evictedEntries: EvictedEntryRecord[];
+  /** Tool calls replayed from the transcript (for the context inspector) */
+  toolCalls: Array<{ tool: string; status: string; at: string; args?: string }>;
   /** Highest event id seen — seeds the append counter so new eids continue */
   maxEid: number;
 } {
@@ -667,6 +669,7 @@ export function hydrateLedgerFromTranscript(
   const seenActivityIds = new Set<string>();
   const recoveredMemoryIds: string[] = [];
   const evictedEntries: EvictedEntryRecord[] = [];
+  const toolCalls: Array<{ tool: string; status: string; at: string; args?: string }> = [];
   // Entries added by THIS hydration pass — a compaction event collapses them
   // (and only them; entries that pre-date hydration are left alone).
   const hydratedEntryIds: number[] = [];
@@ -902,11 +905,12 @@ export function hydrateLedgerFromTranscript(
       // Tool calls are part of the story — when the assistant says "I sent
       // him a heads-up via Telegram", the send_response call is the receipt.
       // Replay them as dim event lines (display only — tool RESULTS are not
-      // reconstructed into the ledger here).
+      // reconstructed into the ledger here). The inline row is a one-line
+      // teaser; fuller args land in the context inspector's Tool Calls
+      // section (Ctrl+T) via the toolCalls collected here.
       const status = typeof event.status === 'string' ? event.status : 'executed';
-      const argsPreview = event.args
-        ? JSON.stringify(event.args).replace(/\s+/g, ' ').slice(0, 100)
-        : '';
+      const argsJson = event.args ? JSON.stringify(event.args).replace(/\s+/g, ' ') : '';
+      const argsPreview = argsJson.length > 100 ? `${argsJson.slice(0, 100)}…` : argsJson;
       pushPreview(
         'event',
         `🛠 ${event.tool} (${status})${argsPreview ? ` — ${argsPreview}` : ''}`,
@@ -914,6 +918,19 @@ export function hydrateLedgerFromTranscript(
         undefined,
         eid
       );
+      toolCalls.push({
+        tool: event.tool,
+        status,
+        at: typeof event.ts === 'string' ? event.ts : '',
+        args: argsJson
+          ? argsJson.length > 400
+            ? `${argsJson.slice(0, 400)}…`
+            : argsJson
+          : undefined,
+      });
+      if (toolCalls.length > 100) {
+        toolCalls.splice(0, toolCalls.length - 100);
+      }
       continue;
     }
     if (type === 'activity' && typeof event.content === 'string') {
@@ -942,6 +959,7 @@ export function hydrateLedgerFromTranscript(
     recoveredMemoryIds,
     compactionCollapsed,
     evictedEntries,
+    toolCalls,
     maxEid,
   };
 }
@@ -2416,7 +2434,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let hookTurnCount = 0;
 
   // Session-level tool call log — surfaced in the Ctrl+O context inspector
-  const recentToolCalls: Array<{ tool: string; status: string; at: string }> = [];
+  const recentToolCalls: Array<{ tool: string; status: string; at: string; args?: string }> = [];
 
   // Entries evicted from the window (hydration replay + live evictions) —
   // out of context but never out of sight; surfaced in the inspector
@@ -2720,6 +2738,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // Continue the event-id sequence from where the file left off
     seedTranscriptEidCounter(existingTranscript, hydrated.maxEid);
     sessionEvictedEntries.push(...hydrated.evictedEntries);
+    // Replayed tool calls populate the inspector's Tool Calls section so
+    // Ctrl+T shows the receipts behind prior turns, not just this session's
+    recentToolCalls.push(...hydrated.toolCalls);
     historyHydration = {
       loaded: hydrated.loaded,
       messageCount: hydrated.messageCount,
@@ -3926,7 +3947,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
     let toolLoopIteration = 0;
     let responseText = '';
     let localToolCalls: ReturnType<typeof extractLocalToolCalls> = [];
-    let allToolResults: Array<{ tool: string; result: unknown; status: string }> = [];
+    let allToolResults: Array<{ tool: string; result: unknown; status: string; args?: unknown }> =
+      [];
 
     // eslint-disable-next-line no-constant-condition
     while (true) {
@@ -4144,6 +4166,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               tool: result.tool,
               result: result.result,
               status: result.status,
+              args: result.args,
             });
           } else if (result.status === 'error') {
             const msg = `Local tool error (${result.tool}): ${result.error}`;
@@ -4163,7 +4186,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
       allToolResults.push(...iterationResults);
       for (const r of iterationResults) {
-        recentToolCalls.push({ tool: r.tool, status: r.status, at: new Date().toISOString() });
+        const liveArgsJson = r.args ? JSON.stringify(r.args).replace(/\s+/g, ' ') : '';
+        recentToolCalls.push({
+          tool: r.tool,
+          status: r.status,
+          at: new Date().toISOString(),
+          args: liveArgsJson
+            ? liveArgsJson.length > 400
+              ? `${liveArgsJson.slice(0, 400)}…`
+              : liveArgsJson
+            : undefined,
+        });
       }
       if (recentToolCalls.length > 100) {
         recentToolCalls.splice(0, recentToolCalls.length - 100);
@@ -4696,6 +4729,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     inkRepl.handle.setCtrlOHandler(() => {
       inkRepl!.showContextView(buildContextViewLines());
     });
+    // Ctrl+T — same viewer, opened at the Tool Calls section (expands the
+    // one-line 🛠 rows in the replay to full args)
+    inkRepl.handle.setCtrlTHandler(() => {
+      inkRepl!.showContextView(buildContextViewLines(), { initialSection: 't' });
+    });
 
     // Push prior messages into Ink scrollback so user sees conversation history
     if (historyHydration && historyHydration.tailPreview.length > 0) {
@@ -4915,6 +4953,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
             '/evicted                   Show evicted-from-context entries',
             '/context                   Show recent entries',
             '/usage                     Token estimate',
+            'Ctrl+O                     Context inspector (e/t/m/b: jump sections)',
+            'Ctrl+T                     Context inspector at Tool Calls',
           ]);
           break;
         }

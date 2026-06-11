@@ -17,6 +17,7 @@ interface PromptInputProps {
   onCtrlC?: () => void;
   /** Called when Ctrl+O is pressed (expand collapsed memories). */
   onExpandMemories?: () => void;
+  onShowToolCalls?: () => void;
   /** Called on every keystroke with the current input value. */
   onInputChange?: (value: string) => void;
   /** Scroll callback for page up/down from within the prompt. */
@@ -58,6 +59,7 @@ export function PromptInput({
   onEscape,
   onCtrlC,
   onExpandMemories,
+  onShowToolCalls,
   onInputChange,
   onScroll,
   history = [],
@@ -106,9 +108,16 @@ export function PromptInput({
         return;
       }
 
-      // Ctrl+O: expand collapsed memories in dock panel
+      // Ctrl+O: open the context inspector
       if (key.ctrl && input === 'o') {
         onExpandMemories?.();
+        return;
+      }
+
+      // Ctrl+T: open the context inspector at the Tool Calls section.
+      // (Ctrl+M is unavailable — it emits the same byte as Enter.)
+      if (key.ctrl && input === 't') {
+        onShowToolCalls?.();
         return;
       }
 

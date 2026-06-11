@@ -71,11 +71,15 @@ export const MessageLine = React.memo(function MessageLine({
 
   // Events are compact progress/status lines (tool runs, signals, dividers):
   // a single dim line at the content column — no label row, no spacing.
+  // trimStart normalizes call sites that embed their own leading spaces so
+  // every event row aligns flush with message content (column 3), and
+  // truncate-end keeps them to ONE line with a terminal-width ellipsis —
+  // full details live in the context inspector (Ctrl+O / Ctrl+T).
   if (role === 'event') {
     return (
       <Box paddingLeft={3}>
-        <Text dimColor wrap="wrap">
-          {displayContent}
+        <Text dimColor wrap="truncate-end">
+          {displayContent.trimStart()}
           {meta ? `  ·  ${meta}` : ''}
         </Text>
       </Box>
