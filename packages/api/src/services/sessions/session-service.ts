@@ -605,14 +605,15 @@ export class SessionService implements ISessionService {
     // Mark session as running before backend turn
     await this.repository.update(session.id, { lifecycle: 'running' });
 
-    // Read image attachments for backends that accept them via the runner interface.
-    // Currently only ClaudeRunner supports inline base64 images via --image flags.
-    // InkRunner spawns ink chat which manages its own backend — images are not
-    // passed through the runner interface for ink.
-    const imageContents =
-      resolvedBackend === 'claude-code'
-        ? await this.readImageAttachments(request.metadata?.media)
-        : [];
+    // Media flows to backends as file paths, not inline base64. Channel
+    // listeners download attachments to ~/.ink/files/<channel>/; the
+    // formatted message lists the full paths, and each runner forwards
+    // them natively (ClaudeRunner already grants --add-dir ~/.ink/files;
+    // InkRunner passes --attach-file so ink chat exposes them to its
+    // provider backend). The base64 imageContents branch
+    // (readImageAttachmentsAsBase64) is reserved for future API-direct
+    // providers / a persistent media store and is not invoked here.
+    const mediaAttachments = (request.metadata?.media ?? []).filter((m) => !!m.path);
 
     let result;
     let turnDurationMs: number;
@@ -622,7 +623,7 @@ export class SessionService implements ISessionService {
         backendSessionId: session.backendSessionId || undefined,
         injectedContext: session.backendSessionId ? undefined : injectedContext,
         config: runnerConfig,
-        imageContents: imageContents.length > 0 ? imageContents : undefined,
+        mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
       });
       turnDurationMs = Date.now() - turnStartMs;
     } catch (runnerError) {
@@ -1637,47 +1638,6 @@ This session will continue with a fresh context after compaction. Your identity,
    * External channel messages are wrapped in <untrusted-data> tags following
    * Supabase's proven pattern for prompt injection protection.
    */
-  private async readImageAttachments(
-    media?: import('./types.js').MediaAttachment[]
-  ): Promise<ImageContent[]> {
-    if (!media || media.length === 0) return [];
-
-    const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
-    const MAX_IMAGES = 10;
-    const SUPPORTED_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
-
-    const images: ImageContent[] = [];
-
-    for (const attachment of media) {
-      if (images.length >= MAX_IMAGES) break;
-      if (attachment.type !== 'image') continue;
-      if (!attachment.path) continue;
-
-      const mimeType = attachment.contentType || attachment.mimeType || 'image/jpeg';
-      if (!SUPPORTED_TYPES.has(mimeType)) continue;
-
-      try {
-        const info = await stat(attachment.path);
-        if (info.size <= 0 || info.size > MAX_IMAGE_BYTES) continue;
-
-        const bytes = await readFile(attachment.path);
-        images.push({
-          type: 'image',
-          source: 'base64',
-          mediaType: mimeType,
-          data: bytes.toString('base64'),
-        });
-      } catch (error) {
-        logger.warn('Failed to read image attachment for multimodal', {
-          filePath: attachment.path,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
-
-    return images;
-  }
-
   private formatMessage(request: SessionRequest, timezone?: string): string {
     const { sender, content, channel, conversationId, metadata } = request;
     const isExternalChannel =
@@ -1719,10 +1679,21 @@ This session will continue with a fresh context after compaction. Your identity,
       lines.push(`Conversation ID: ${conversationId}`);
     }
 
-    // Add media info if present
+    // Add media info if present — full local paths so the session can read
+    // the files directly (ClaudeRunner grants --add-dir ~/.ink/files; ink
+    // sessions receive the same paths via --attach-file).
     if (metadata?.media && metadata.media.length > 0) {
-      const mediaTypes = metadata.media.map((m) => m.type).join(', ');
-      lines.push(`Attachments: ${mediaTypes}`);
+      lines.push('Attachments:');
+      for (const m of metadata.media) {
+        const mime = m.contentType || m.mimeType;
+        const name = m.filename ? ` ${m.filename}` : '';
+        if (m.path) {
+          lines.push(`- ${m.type}: ${m.path}${mime ? ` (${mime})` : ''}${name}`);
+        } else {
+          lines.push(`- ${m.type}${mime ? ` (${mime})` : ''}${name}`);
+        }
+      }
+      lines.push('View attached files with your file-reading tool using the paths above.');
     }
 
     lines.push('');
@@ -1876,6 +1847,58 @@ export async function resolveStudioHint(
   if (agentId) query = query.eq('agent_id', agentId);
   const { data: namedStudio } = await query.maybeSingle();
   return namedStudio?.id || undefined;
+}
+
+/**
+ * FUTURE PATH — inline base64 media for API-direct providers.
+ *
+ * Reads image attachments into base64 ImageContent blocks. Not invoked in
+ * the live message flow: CLI-spawned backends (claude-code, ink) receive
+ * media as file paths and read the files natively, which avoids buffering
+ * up to 10×20MB into server memory per message. Kept (with tests) for the
+ * planned API-provider runner and a persistent media store with ready
+ * access — those consume IRunner's imageContents option, which this
+ * function produces.
+ */
+export async function readImageAttachmentsAsBase64(
+  media?: import('./types.js').MediaAttachment[]
+): Promise<ImageContent[]> {
+  if (!media || media.length === 0) return [];
+
+  const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+  const MAX_IMAGES = 10;
+  const SUPPORTED_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+  const images: ImageContent[] = [];
+
+  for (const attachment of media) {
+    if (images.length >= MAX_IMAGES) break;
+    if (attachment.type !== 'image') continue;
+    if (!attachment.path) continue;
+
+    const mimeType = attachment.contentType || attachment.mimeType || 'image/jpeg';
+    if (!SUPPORTED_TYPES.has(mimeType)) continue;
+
+    try {
+      const info = await stat(attachment.path);
+      if (info.size <= 0 || info.size > MAX_IMAGE_BYTES) continue;
+
+      const bytes = await readFile(attachment.path);
+      images.push({
+        type: 'image',
+        source: 'base64',
+        mediaType: mimeType,
+        data: bytes.toString('base64'),
+      });
+    } catch (error) {
+      logger.warn('Failed to read image attachment for multimodal', {
+        filePath: attachment.path,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  return images;
 }
 
 /**

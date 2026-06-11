@@ -496,7 +496,23 @@ export interface IRunner {
       backendSessionId?: string;
       injectedContext?: InjectedContext;
       config: ClaudeRunnerConfig;
+      /**
+       * FUTURE: inline base64 media for API-direct providers and a
+       * persistent media store with ready access. No concrete CLI runner
+       * consumes this today — CLI-spawned backends receive media as file
+       * paths (mediaAttachments) and read the files natively. Kept on the
+       * interface so an API-provider runner can adopt it without a
+       * boundary change.
+       */
       imageContents?: ImageContent[];
+      /**
+       * Media attachments as local file paths (downloaded by channel
+       * listeners to ~/.ink/files/<channel>/). The live path for media:
+       * runners forward paths to their backend (ClaudeRunner via
+       * --add-dir + paths in the message; InkRunner via --attach-file)
+       * and the backend reads the files natively.
+       */
+      mediaAttachments?: MediaAttachment[];
     }
   ): Promise<RunnerResult>;
 }

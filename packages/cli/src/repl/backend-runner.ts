@@ -10,6 +10,12 @@ export interface BackendRunRequest {
   verbose?: boolean;
   passthroughArgs?: string[];
   timeoutMs?: number;
+  /**
+   * Directories containing turn attachments (--attach-file). Adapters
+   * grant the backend read access to these (claude: --add-dir) so it can
+   * view attached files natively.
+   */
+  attachmentDirs?: string[];
 }
 
 export interface BackendRunResult {
@@ -36,6 +42,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     prompt: request.prompt,
     promptParts,
     passthroughArgs: request.passthroughArgs || [],
+    attachmentDirs: request.attachmentDirs,
   });
 
   const command = `${prepared.binary} ${prepared.args.join(' ')}`;

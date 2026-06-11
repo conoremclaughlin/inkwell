@@ -76,6 +76,14 @@ export class ClaudeAdapter implements BackendAdapter {
       args.push('--dangerously-skip-permissions');
     }
 
+    // Attachment directories: grant read access so files attached to the
+    // turn (--attach-file paths referenced in the prompt) are readable
+    // without permission prompts. Claude Code's Read renders images
+    // natively, so this is the full multimodal path for CLI spawns.
+    for (const dir of config.attachmentDirs ?? []) {
+      args.push('--add-dir', dir);
+    }
+
     // PCP channel plugin: enable real-time inbox push notifications.
     // The channel plugin is a stdio MCP server that bridges PCP's HTTP
     // inbox to Claude Code's channel notification system.

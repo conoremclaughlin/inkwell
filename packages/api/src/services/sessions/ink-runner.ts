@@ -19,6 +19,7 @@ import type {
   ChannelResponse,
   IRunner,
   ToolCall,
+  MediaAttachment,
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
@@ -26,6 +27,8 @@ import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 import { injectSessionHeaders, buildSessionEnv, writeRuntimeSessionHint } from '@inklabs/shared';
 
 const PROCESS_TIMEOUT_MS = parseInt(process.env.INK_PROCESS_TIMEOUT_MS || '', 10) || 15 * 60 * 1000;
+/** Max --attach-file args forwarded per spawn (matches the channel-side media cap) */
+const MAX_ATTACHMENT_ARGS = 10;
 
 export class InkRunner implements IRunner {
   async run(
@@ -34,9 +37,10 @@ export class InkRunner implements IRunner {
       backendSessionId?: string;
       injectedContext?: InjectedContext;
       config: ClaudeRunnerConfig;
+      mediaAttachments?: MediaAttachment[];
     }
   ): Promise<RunnerResult> {
-    const { backendSessionId, injectedContext, config } = options;
+    const { backendSessionId, injectedContext, config, mediaAttachments } = options;
 
     const isResume = !!backendSessionId;
     const sessionId = config.pcpSessionId || backendSessionId || randomUUID();
@@ -47,7 +51,7 @@ export class InkRunner implements IRunner {
       fullMessage = `${contextBlock}\n\n---\n\n${message}`;
     }
 
-    const args = this.buildArgs(sessionId, config);
+    const args = this.buildArgs(sessionId, config, mediaAttachments);
 
     logger.info('Spawning ink chat (non-interactive)', {
       sessionId,
@@ -70,7 +74,7 @@ export class InkRunner implements IRunner {
           fullMessage = `${contextBlock}\n\n---\n\n${message}`;
         }
 
-        const freshArgs = this.buildArgs(sessionId, config);
+        const freshArgs = this.buildArgs(sessionId, config, mediaAttachments);
         const retryResult = await this.spawnProcess(freshArgs, fullMessage, config);
         return {
           success: true,
@@ -104,7 +108,11 @@ export class InkRunner implements IRunner {
     }
   }
 
-  private buildArgs(sessionId: string, config: ClaudeRunnerConfig): string[] {
+  private buildArgs(
+    sessionId: string,
+    config: ClaudeRunnerConfig,
+    mediaAttachments?: MediaAttachment[]
+  ): string[] {
     const args: string[] = ['chat', '--non-interactive'];
 
     if (config.agentId) {
@@ -130,6 +138,18 @@ export class InkRunner implements IRunner {
     // Label the delivered message with its originating channel so the
     // transcript renders it as a system message (not "you").
     args.push('--message-label', config.channel || 'server');
+
+    // Forward media attachments as file paths. ink chat appends an
+    // attachment block to the turn and grants its provider backend
+    // directory access (e.g., --add-dir for claude) so the files can be
+    // read natively. Cap defensively — argv space is finite.
+    if (mediaAttachments && mediaAttachments.length > 0) {
+      for (const attachment of mediaAttachments.slice(0, MAX_ATTACHMENT_ARGS)) {
+        if (attachment.path) {
+          args.push('--attach-file', attachment.path);
+        }
+      }
+    }
 
     return args;
   }

@@ -199,6 +199,40 @@ describe('runChat integration', () => {
     expect(testState.pcpCalls.some((call) => call.tool === 'update_session_state')).toBe(true);
   });
 
+  it('forwards --attach-file into the turn prompt, transcript, and backend attachment dirs', async () => {
+    const mediaDir = join(testCwd, 'files', 'telegram');
+    mkdirSync(mediaDir, { recursive: true });
+    const imagePath = join(mediaDir, 'photo.jpg');
+    writeFileSync(imagePath, Buffer.alloc(1024, 7));
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      nonInteractive: true,
+      message: 'what is in this photo?',
+      attachFile: [imagePath],
+      pollSeconds: '999',
+    });
+
+    expect(testState.runBackendImpl).toHaveBeenCalledTimes(1);
+    const backendRequest = testState.runBackendImpl.mock.calls[0][0] as {
+      prompt: string;
+      attachmentDirs?: string[];
+    };
+    // Attachment block rides the turn message into the backend prompt
+    expect(backendRequest.prompt).toContain('[Attached files]');
+    expect(backendRequest.prompt).toContain(`- ${imagePath} (image/jpeg, 1KB)`);
+    // Backend gets read access to the attachment's directory
+    expect(backendRequest.attachmentDirs).toEqual([mediaDir]);
+
+    // The block persists in the transcript (and therefore hydration)
+    const replDir = join(testCwd, '.ink', 'runtime', 'repl');
+    const transcriptFiles = readdirSync(replDir).filter((entry) => entry.endsWith('.jsonl'));
+    expect(transcriptFiles.length).toBeGreaterThan(0);
+    const transcript = readFileSync(join(replDir, transcriptFiles[0]!), 'utf-8');
+    expect(transcript).toContain('[Attached files]');
+  });
+
   it('attaches to provided session id and does not end attached session', async () => {
     testState.inputs = ['/quit'];
     await runChat({
