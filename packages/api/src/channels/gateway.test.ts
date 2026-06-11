@@ -500,23 +500,21 @@ describe('isAgentMentioned', () => {
 
   it('returns true when mentioned username matches a known agent name', () => {
     gateway.setKnownAgentNames(['wren', 'myra', 'benson']);
-    expect(
-      isAgentMentioned(gateway, 'hello', { users: ['@wren'], botMentioned: false })
-    ).toBe(true);
+    expect(isAgentMentioned(gateway, 'hello', { users: ['@wren'], botMentioned: false })).toBe(
+      true
+    );
   });
 
   it('matches mentioned usernames case-insensitively', () => {
     gateway.setKnownAgentNames(['wren']);
-    expect(
-      isAgentMentioned(gateway, 'hello', { users: ['WREN'], botMentioned: false })
-    ).toBe(true);
+    expect(isAgentMentioned(gateway, 'hello', { users: ['WREN'], botMentioned: false })).toBe(true);
   });
 
   it('strips @ prefix from mentioned usernames', () => {
     gateway.setKnownAgentNames(['myra']);
-    expect(
-      isAgentMentioned(gateway, 'hello', { users: ['@myra'], botMentioned: false })
-    ).toBe(true);
+    expect(isAgentMentioned(gateway, 'hello', { users: ['@myra'], botMentioned: false })).toBe(
+      true
+    );
   });
 
   it('returns true when agent name appears in message text', () => {
@@ -544,9 +542,9 @@ describe('isAgentMentioned', () => {
 
   it('returns false when mentioned username does not match any agent', () => {
     gateway.setKnownAgentNames(['wren', 'myra']);
-    expect(
-      isAgentMentioned(gateway, 'hello', { users: ['someuser'], botMentioned: false })
-    ).toBe(false);
+    expect(isAgentMentioned(gateway, 'hello', { users: ['someuser'], botMentioned: false })).toBe(
+      false
+    );
   });
 
   it('handles multiple mentioned usernames', () => {
@@ -562,16 +560,16 @@ describe('isAgentMentioned', () => {
   it('safely handles agent names with regex metacharacters', () => {
     gateway.setKnownAgentNames(['agent+1', 'bot.v2']);
     // Should not throw, and should match literally
-    expect(
-      isAgentMentioned(gateway, 'hey agent+1!', { users: [], botMentioned: false })
-    ).toBe(true);
+    expect(isAgentMentioned(gateway, 'hey agent+1!', { users: [], botMentioned: false })).toBe(
+      true
+    );
     expect(
       isAgentMentioned(gateway, 'ask bot.v2 about it', { users: [], botMentioned: false })
     ).toBe(true);
     // "+" unescaped would match "agent1" — escaped should NOT
-    expect(
-      isAgentMentioned(gateway, 'hey agent1 help', { users: [], botMentioned: false })
-    ).toBe(false);
+    expect(isAgentMentioned(gateway, 'hey agent1 help', { users: [], botMentioned: false })).toBe(
+      false
+    );
   });
 });
 
@@ -869,5 +867,126 @@ describe('Activity Stream Integration', () => {
         })
       );
     });
+  });
+});
+
+describe('Telegram album batching', () => {
+  let gateway: ChannelGateway;
+  let sendMediaGroup: Mock;
+  let sendPhoto: Mock;
+  let sendVideo: Mock;
+  let sendDocument: Mock;
+
+  const img = (n: number) => ({
+    type: 'image' as const,
+    path: `/tmp/photo${n}.jpg`,
+    contentType: 'image/jpeg',
+  });
+
+  const sendMedia = (media: unknown[]) =>
+    (gateway as any).sendMediaAttachments('telegram', 'chat-album', media) as Promise<{
+      sent: number;
+      failed: number;
+      errors: string[];
+    }>;
+
+  beforeEach(() => {
+    gateway = new ChannelGateway({ enableTelegram: false, enableWhatsApp: false });
+    sendMediaGroup = vi.fn().mockResolvedValue(undefined);
+    sendPhoto = vi.fn().mockResolvedValue(undefined);
+    sendVideo = vi.fn().mockResolvedValue(undefined);
+    sendDocument = vi.fn().mockResolvedValue(undefined);
+    (gateway as any).telegramListener = { sendMediaGroup, sendPhoto, sendVideo, sendDocument };
+  });
+
+  it('groups multiple images into one sendMediaGroup album', async () => {
+    const result = await sendMedia([img(1), img(2), img(3)]);
+
+    expect(sendMediaGroup).toHaveBeenCalledTimes(1);
+    const [conversationId, items] = sendMediaGroup.mock.calls[0];
+    expect(conversationId).toBe('chat-album');
+    expect(items).toHaveLength(3);
+    expect(items.map((i: { filePath: string }) => i.filePath)).toEqual([
+      '/tmp/photo1.jpg',
+      '/tmp/photo2.jpg',
+      '/tmp/photo3.jpg',
+    ]);
+    expect(sendPhoto).not.toHaveBeenCalled();
+    expect(result.sent).toBe(3);
+    expect(result.failed).toBe(0);
+  });
+
+  it('sends a single image directly without an album', async () => {
+    const result = await sendMedia([img(1)]);
+
+    expect(sendMediaGroup).not.toHaveBeenCalled();
+    expect(sendPhoto).toHaveBeenCalledTimes(1);
+    expect(result.sent).toBe(1);
+  });
+
+  it('splits 12 images into albums of 10 and 2', async () => {
+    const result = await sendMedia(Array.from({ length: 12 }, (_, i) => img(i)));
+
+    expect(sendMediaGroup).toHaveBeenCalledTimes(2);
+    expect(sendMediaGroup.mock.calls[0][1]).toHaveLength(10);
+    expect(sendMediaGroup.mock.calls[1][1]).toHaveLength(2);
+    expect(sendPhoto).not.toHaveBeenCalled();
+    expect(result.sent).toBe(12);
+  });
+
+  it('sends a trailing remainder of one image singly (11 images)', async () => {
+    const result = await sendMedia(Array.from({ length: 11 }, (_, i) => img(i)));
+
+    expect(sendMediaGroup).toHaveBeenCalledTimes(1);
+    expect(sendMediaGroup.mock.calls[0][1]).toHaveLength(10);
+    expect(sendPhoto).toHaveBeenCalledTimes(1);
+    expect(result.sent).toBe(11);
+  });
+
+  it('mixes videos into albums alongside images', async () => {
+    const result = await sendMedia([
+      img(1),
+      { type: 'video', path: '/tmp/clip.mp4', contentType: 'video/mp4' },
+    ]);
+
+    expect(sendMediaGroup).toHaveBeenCalledTimes(1);
+    const items = sendMediaGroup.mock.calls[0][1];
+    expect(items.map((i: { type: string }) => i.type)).toEqual(['image', 'video']);
+    expect(sendVideo).not.toHaveBeenCalled();
+    expect(result.sent).toBe(2);
+  });
+
+  it('keeps non-groupable media on the per-item path', async () => {
+    const result = await sendMedia([
+      img(1),
+      img(2),
+      { type: 'document', path: '/tmp/report.pdf', contentType: 'application/pdf' },
+    ]);
+
+    expect(sendMediaGroup).toHaveBeenCalledTimes(1);
+    expect(sendMediaGroup.mock.calls[0][1]).toHaveLength(2);
+    expect(sendDocument).toHaveBeenCalledTimes(1);
+    expect(result.sent).toBe(3);
+  });
+
+  it('counts the whole batch as failed when the album send fails', async () => {
+    sendMediaGroup.mockRejectedValueOnce(new Error('flood control'));
+
+    const result = await sendMedia([img(1), img(2)]);
+
+    expect(result.sent).toBe(0);
+    expect(result.failed).toBe(2);
+    expect(result.errors.some((e) => e.includes('flood control'))).toBe(true);
+    // Album failure must not cascade into single sends
+    expect(sendPhoto).not.toHaveBeenCalled();
+  });
+
+  it('skips attachments missing both path and url without sinking the album', async () => {
+    const result = await sendMedia([img(1), img(2), { type: 'image' }]);
+
+    expect(sendMediaGroup).toHaveBeenCalledTimes(1);
+    expect(sendMediaGroup.mock.calls[0][1]).toHaveLength(2);
+    expect(result.sent).toBe(2);
+    expect(result.failed).toBe(1);
   });
 });
