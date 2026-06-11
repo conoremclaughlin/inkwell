@@ -1112,6 +1112,7 @@ export class ChannelGateway extends EventEmitter {
     const fs = await import('fs/promises');
     const pathMod = await import('path');
     const os = await import('os');
+    const { randomUUID } = await import('crypto');
 
     const response = await fetch(url);
     if (!response.ok) {
@@ -1119,10 +1120,15 @@ export class ChannelGateway extends EventEmitter {
     }
 
     const buffer = Buffer.from(await response.arrayBuffer());
-    const tmpDir = pathMod.join(os.tmpdir(), 'pcp-media');
+    // Each download gets its own unique subdirectory while the basename
+    // keeps the display filename. Naming the file directly from
+    // attachment.filename collided when two attachments shared a name
+    // (e.g. an album of two photo.jpg items) — the later download
+    // overwrote the earlier and the album uploaded duplicate bytes.
+    const tmpDir = pathMod.join(os.tmpdir(), 'pcp-media', randomUUID());
     await fs.mkdir(tmpDir, { recursive: true });
 
-    const safeName = (filename || `media_${Date.now()}`).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const safeName = (filename || 'media').replace(/[^a-zA-Z0-9._-]/g, '_') || 'media';
     const tmpPath = pathMod.join(tmpDir, safeName);
     await fs.writeFile(tmpPath, buffer);
 
@@ -1131,6 +1137,7 @@ export class ChannelGateway extends EventEmitter {
       cleanup: async () => {
         try {
           await fs.unlink(tmpPath);
+          await fs.rmdir(tmpDir);
         } catch {
           // Best-effort cleanup
         }

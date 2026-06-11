@@ -989,4 +989,47 @@ describe('Telegram album batching', () => {
     expect(result.sent).toBe(2);
     expect(result.failed).toBe(1);
   });
+
+  it('downloads URL album items with the same filename to distinct temp paths', async () => {
+    // Two album items sharing a display filename must not overwrite each
+    // other's temp download — that uploaded duplicate bytes for one of them.
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const body = String(url).includes('first') ? 'AAAA' : 'BBBB';
+      return {
+        ok: true,
+        arrayBuffer: async () => new TextEncoder().encode(body).buffer,
+      } as unknown as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    // Read temp file contents inside the send, before batch cleanup runs
+    const { readFileSync } = await import('fs');
+    const capturedPaths: string[] = [];
+    const capturedContents: string[] = [];
+    sendMediaGroup.mockImplementation(async (_conv: string, items: Array<{ filePath: string }>) => {
+      for (const item of items) {
+        capturedPaths.push(item.filePath);
+        capturedContents.push(readFileSync(item.filePath, 'utf-8'));
+      }
+    });
+
+    try {
+      const result = await sendMedia([
+        { type: 'image', url: 'https://example.com/first/photo.jpg', filename: 'photo.jpg' },
+        { type: 'image', url: 'https://example.com/second/photo.jpg', filename: 'photo.jpg' },
+      ]);
+
+      expect(sendMediaGroup).toHaveBeenCalledTimes(1);
+      expect(capturedPaths).toHaveLength(2);
+      // Distinct temp paths, distinct bytes — the colliding implementation
+      // produced ['BBBB', 'BBBB'] here
+      expect(capturedPaths[0]).not.toBe(capturedPaths[1]);
+      expect(capturedContents).toEqual(['AAAA', 'BBBB']);
+      // Display filename preserved as the basename of both
+      expect(capturedPaths.every((p) => p.endsWith('photo.jpg'))).toBe(true);
+      expect(result.sent).toBe(2);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });
