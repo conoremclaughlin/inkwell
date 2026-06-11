@@ -49,6 +49,8 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'bookmarks', description: 'List bookmarks' },
   { name: 'eject', description: 'Eject context to bookmark' },
   { name: 'trim', description: 'Trim oldest context entries' },
+  { name: 'evict', description: 'Evict context entries (ids, source:, role:)' },
+  { name: 'evicted', description: 'Show evicted-from-context entries' },
   { name: 'context', description: 'Open context inspector (bootstrap, memories, ledger)' },
   { name: 'usage', description: 'Show context token estimate' },
 ];
