@@ -39,6 +39,11 @@ import {
   selectEvictionEntries,
   formatEvictCandidate,
 } from '../repl/evict-selection.js';
+import {
+  resolveAttachments,
+  buildAttachmentBlock,
+  collectAttachmentDirs,
+} from '../repl/attachments.js';
 import { ToolMode, ToolPolicyScopeKind, ToolPolicyState } from '../repl/tool-policy.js';
 import { formatBackendTokenUsage, type BackendTokenUsage } from '../repl/token-usage.js';
 import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../repl/skills.js';
@@ -122,6 +127,7 @@ type ChatOptions = {
   profile?: string;
   message?: string;
   messageLabel?: string;
+  attachFile?: string[];
   nonInteractive?: boolean;
   maxTurns?: string;
   backendTimeoutSeconds?: string;
@@ -3536,12 +3542,41 @@ export async function runChat(options: ChatOptions): Promise<void> {
     return activities.length;
   };
 
+  // ── Turn attachments (--attach-file) ──
+  // Resolved once at startup; the block attaches to the FIRST turn (the
+  // message the attachments belong to) and the directories stay granted
+  // to the backend for the whole session so later turns can re-read the
+  // files. Server spawns (InkRunner) pass --attach-file per media item.
+  let pendingAttachmentBlock = '';
+  let sessionAttachmentDirs: string[] = [];
+  if (options.attachFile && options.attachFile.length > 0) {
+    const resolvedAttachments = await resolveAttachments(options.attachFile);
+    pendingAttachmentBlock = buildAttachmentBlock(resolvedAttachments);
+    sessionAttachmentDirs = collectAttachmentDirs(resolvedAttachments);
+    const missingAttachments = resolvedAttachments.filter((a) => a.missing);
+    if (missingAttachments.length > 0) {
+      console.log(
+        chalk.yellow(
+          `  ⚠ ${missingAttachments.length} attached file(s) not readable: ${missingAttachments
+            .map((m) => m.path)
+            .join(', ')}`
+        )
+      );
+    }
+  }
+
   const runUserTurn = async (
     raw: string,
     source: 'user' | 'inbox-auto' | 'system' = 'user',
     displayLabel?: string
   ) => {
     if (!raw.trim()) return;
+    // Attach pending files to this turn — append the block so the backend
+    // sees the paths inline with the message that delivered them.
+    if (pendingAttachmentBlock) {
+      raw = `${raw}\n\n${pendingAttachmentBlock}`;
+      pendingAttachmentBlock = '';
+    }
     if (source === 'user') {
       // Echo the user's message
       if (inkRepl) {
@@ -3771,6 +3806,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       verbose: runtime.verbose,
       passthroughArgs,
       timeoutMs: runtime.backendTurnTimeoutMs,
+      attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
     });
     currentTurnAbort = turn.abort;
     inkRepl?.setAbortHandler(abortCurrentTurn);
@@ -4150,6 +4186,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         verbose: runtime.verbose,
         passthroughArgs,
         timeoutMs: runtime.backendTurnTimeoutMs,
+        attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
       });
       currentTurnAbort = contTurn.abort;
       inkRepl?.setAbortHandler(abortCurrentTurn);
@@ -6076,6 +6113,12 @@ export function registerChatCommand(program: Command): void {
       .option('--profile <name>', 'Apply security profile: minimal|safe|collaborative|full')
       .option('--auto-run', 'Automatically execute backend turns for new inbox task messages')
       .option('--message <text>', 'Single-turn message for non-interactive mode')
+      .option(
+        '--attach-file <path>',
+        'Attach a local file to the first turn (repeatable). The path is shared with the backend for native viewing.',
+        (value: string, previous: string[]) => [...previous, value],
+        [] as string[]
+      )
       .option(
         '--message-label <label>',
         'Render the --message as a system message with this label (e.g., heartbeat, telegram). Used by server spawns.'

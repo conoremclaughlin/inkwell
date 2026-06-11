@@ -17,6 +17,14 @@ export interface BackendConfig {
   backendSessionSeedId?: string;
   studioId?: string;
   dangerous?: boolean;
+  /**
+   * Directories containing turn attachments. Adapters that support it
+   * grant the backend read access (claude: --add-dir per directory) so
+   * attached files referenced in the prompt are readable without
+   * permission prompts. Adapters without an equivalent flag may ignore
+   * this — the attachment paths still appear in the prompt text.
+   */
+  attachmentDirs?: string[];
 }
 
 export interface PreparedBackend {

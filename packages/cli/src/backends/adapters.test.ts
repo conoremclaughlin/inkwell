@@ -233,6 +233,49 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
+  // ── Attachment directory grants ──
+  // Files attached to a turn (--attach-file) live outside the cwd
+  // (~/.ink/files/<channel>/). The claude adapter must grant read access
+  // via --add-dir or the backend's Read silently fails on the paths the
+  // prompt references.
+
+  it('claude adapter grants --add-dir for each attachment directory', () => {
+    const adapter = new ClaudeAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'wren',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+      attachmentDirs: ['/home/u/.ink/files/telegram', '/tmp/uploads'],
+    });
+
+    try {
+      const grantedDirs = prepared.args
+        .map((arg, i) => (arg === '--add-dir' ? prepared.args[i + 1] : null))
+        .filter(Boolean);
+      expect(grantedDirs).toContain('/home/u/.ink/files/telegram');
+      expect(grantedDirs).toContain('/tmp/uploads');
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('claude adapter adds no --add-dir without attachment directories', () => {
+    const adapter = new ClaudeAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'wren',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+    });
+
+    try {
+      expect(prepared.args).not.toContain('--add-dir');
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
   // ── INK_SESSION_ID env propagation ──
   // These tests verify the most fragile link in the session identity chain:
   // the CLI backends must inject INK_SESSION_ID into the spawned process's

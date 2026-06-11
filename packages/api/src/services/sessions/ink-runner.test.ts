@@ -45,6 +45,53 @@ describe('InkRunner', () => {
       expect(args).toContain('--session-id');
       expect(args).toContain('session-000');
     });
+
+    it('forwards media attachments as --attach-file args', () => {
+      const runner = new InkRunner();
+      const args = (runner as any).buildArgs(
+        'session-media',
+        { workingDirectory: '/tmp', agentId: 'myra' },
+        [
+          { type: 'image', path: '/home/u/.ink/files/telegram/photo.jpg' },
+          { type: 'document', path: '/home/u/.ink/files/telegram/report.pdf' },
+          { type: 'image', url: 'https://example.com/no-local-path.jpg' },
+        ]
+      );
+
+      const attachPaths = args
+        .map((arg: string, i: number) => (arg === '--attach-file' ? args[i + 1] : null))
+        .filter(Boolean);
+      expect(attachPaths).toEqual([
+        '/home/u/.ink/files/telegram/photo.jpg',
+        '/home/u/.ink/files/telegram/report.pdf',
+      ]);
+    });
+
+    it('caps --attach-file forwarding at 10 attachments', () => {
+      const runner = new InkRunner();
+      const media = Array.from({ length: 15 }, (_, i) => ({
+        type: 'image',
+        path: `/tmp/photo${i}.jpg`,
+      }));
+      const args = (runner as any).buildArgs(
+        'session-cap',
+        { workingDirectory: '/tmp', agentId: 'myra' },
+        media
+      );
+
+      const attachCount = args.filter((arg: string) => arg === '--attach-file').length;
+      expect(attachCount).toBe(10);
+    });
+
+    it('adds no --attach-file without attachments', () => {
+      const runner = new InkRunner();
+      const args = (runner as any).buildArgs('session-nomedia', {
+        workingDirectory: '/tmp',
+        agentId: 'myra',
+      });
+
+      expect(args).not.toContain('--attach-file');
+    });
   });
 
   describe('parseOutput', () => {
