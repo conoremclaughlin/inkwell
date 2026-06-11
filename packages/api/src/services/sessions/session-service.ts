@@ -1640,8 +1640,15 @@ This session will continue with a fresh context after compaction. Your identity,
    */
   private formatMessage(request: SessionRequest, timezone?: string): string {
     const { sender, content, channel, conversationId, metadata } = request;
+    // Channels carrying user-controlled content get <untrusted-data>
+    // wrapping. Keep in sync with the external-channel list in
+    // handleMessage's response routing — slack was missing here while the
+    // slack listener was live, leaving its inbound bodies unwrapped.
     const isExternalChannel =
-      channel === 'telegram' || channel === 'whatsapp' || channel === 'discord';
+      channel === 'telegram' ||
+      channel === 'whatsapp' ||
+      channel === 'discord' ||
+      channel === 'slack';
 
     const lines: string[] = [];
 
