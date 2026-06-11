@@ -70,6 +70,7 @@ import {
   isOlderThan5Days,
   LiveStatusLane,
   renderCollapsedInbox,
+  renderContextCutoff,
   renderMessageLine,
   renderTimedBlock,
   separator,
@@ -389,6 +390,8 @@ interface HistoryHydrationResult {
   tailPreview: Array<{ role: 'user' | 'assistant' | 'inbox'; content: string; ts?: string }>;
   seenInboxIds?: string[];
   seenActivityIds?: string[];
+  /** True when hydration collapsed history at a compaction event */
+  compactionCollapsed?: boolean;
 }
 
 interface SessionContextMessage {
@@ -602,10 +605,12 @@ export function hydrateLedgerFromTranscript(
   seenInboxIds: string[];
   seenActivityIds: string[];
   recoveredMemoryIds: string[];
+  compactionCollapsed: boolean;
 } {
   const events = readTranscriptEvents(transcriptPath);
   let loaded = 0;
   let messageCount = 0;
+  let compactionCollapsed = false;
   const preview: HistoryHydrationResult['tailPreview'] = [];
   const seenInboxIds = new Set<string>();
   const seenActivityIds = new Set<string>();
@@ -635,6 +640,7 @@ export function hydrateLedgerFromTranscript(
       hydratedEntryIds.push(summaryEntry.id);
       loaded = 1;
       messageCount = 0;
+      compactionCollapsed = true;
       const keptEntries = Array.isArray(event.keptEntries) ? event.keptEntries : [];
       for (const kept of keptEntries) {
         if (!kept || typeof kept !== 'object') continue;
@@ -737,6 +743,7 @@ export function hydrateLedgerFromTranscript(
     seenInboxIds: Array.from(seenInboxIds),
     seenActivityIds: Array.from(seenActivityIds),
     recoveredMemoryIds,
+    compactionCollapsed,
   };
 }
 
@@ -2150,9 +2157,26 @@ export async function runChat(options: ChatOptions): Promise<void> {
     restorePromptAfterWrite?.();
   };
 
+  // Compact progress/status lines (tool runs, signals, dividers, surfaced
+  // memories): rendered as dim unlabeled events in Ink mode rather than
+  // "system"-labeled message blocks. Legacy mode prints them as-is.
+  const printEvent = (line: string) => {
+    if (inkRepl) {
+      if (line.trim()) {
+        inkRepl.printEvent(line);
+      }
+      return;
+    }
+    statusLane.printLine(line);
+    restorePromptAfterWrite?.();
+  };
+
   const ledger = new ContextLedger();
   const hookRegistry = new SbHookRegistry();
   let hookTurnCount = 0;
+
+  // Session-level tool call log — surfaced in the Ctrl+O context inspector
+  const recentToolCalls: Array<{ tool: string; status: string; at: string }> = [];
 
   // Register built-in hooks (passive recall + budget monitor).
   // callRecall wraps pcp.callTool('recall', ...) into the shape hooks expect.
@@ -2457,6 +2481,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       tailPreview: hydrated.tailPreview,
       seenInboxIds: hydrated.seenInboxIds,
       seenActivityIds: hydrated.seenActivityIds,
+      compactionCollapsed: hydrated.compactionCollapsed,
     };
     for (const inboxId of hydrated.seenInboxIds) {
       seenInboxIds.add(inboxId);
@@ -2749,6 +2774,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
     );
   }
   if (historyHydration && historyHydration.messageCount > 0) {
+    if (historyHydration.compactionCollapsed) {
+      // Earlier history was compacted — mark where the loaded window begins
+      console.log(
+        renderContextCutoff(
+          `earlier history compacted · ${formatTokenCount(ledger.totalTokens())} tok loaded`
+        )
+      );
+    }
     console.log(chalk.dim(`  history: ${historyHydration.messageCount} prior message(s) loaded`));
   }
   console.log(chalk.dim('  /help for commands\n'));
@@ -2838,7 +2871,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         .map((e) => `${e.role.toUpperCase()}${e.source ? ` [${e.source}]` : ''}: ${e.content}`)
         .join('\n\n');
       const before = ledger.totalTokens();
-      printLine(
+      printEvent(
         chalk.yellow(
           `  ⛁ Context at ${formatTokenCount(before)} tok (> ${formatTokenCount(threshold)} threshold) — compacting (${reason})`
         )
@@ -2879,14 +2912,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
           summaryTokens: result.summaryTokens,
           totalAfter: result.totalAfter,
         });
-        printLine(
-          chalk.green(
-            `  ⛁ Compacted ${result.removedEntries.length} entries: ${formatTokenCount(before)} → ${formatTokenCount(result.totalAfter)} tok`
+        // Cutoff divider: everything above this line in the scrollback is
+        // now out of the context window (replaced by the summary).
+        printEvent(
+          renderContextCutoff(
+            `compacted ${result.removedEntries.length} entries · ${formatTokenCount(before)} → ${formatTokenCount(result.totalAfter)} tok`
           )
         );
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
-        printLine(chalk.yellow(`  ⛁ Compaction summarization failed (${msg}) — hard-trimming`));
+        printEvent(chalk.yellow(`  ⛁ Compaction summarization failed (${msg}) — hard-trimming`));
         await trimContextToPercent(DEFAULT_TRIM_TARGET_PCT, `${reason} (compaction fallback)`);
       }
     } finally {
@@ -3193,7 +3228,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
         createdAt: activity.createdAt || null,
         content: activity.content || null,
       });
-      if (inkRepl) {
+      // This agent's own bookkeeping (session state updates, tool call
+      // echoes) is progress, not conversation — render as a dim event line
+      // instead of a full activity block.
+      const isOwnBookkeeping =
+        activity.agentId === agentId &&
+        (rawType.startsWith('state_change') ||
+          rawType.startsWith('tool_call') ||
+          rawType.startsWith('tool_result'));
+      if (isOwnBookkeeping) {
+        printEvent(
+          chalk.dim(
+            `  ⚡ ${type}${preview ? ` — ${preview}` : ''} · ${formatHumanTime(activity.createdAt, runtime.userTimezone)}`
+          )
+        );
+      } else if (inkRepl) {
         inkRepl.addMessage('activity', `${actor} ${type}${preview ? ` — ${preview}` : ''}`, {
           label: '⚡',
           time: formatHumanTime(activity.createdAt, runtime.userTimezone),
@@ -3339,7 +3388,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             return `  💡 ${preview}${entry.content.length > 120 ? '...' : ''} (${entry.approxTokens} tok)`;
           });
           inkRepl.setSurfacedMemories(details);
-          printLine(
+          printEvent(
             chalk.dim(
               `  💡 ${recallEntries.length} ${recallEntries.length === 1 ? 'memory' : 'memories'} surfaced (${totalTok} tok) — ctrl+o to expand`
             )
@@ -3347,7 +3396,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         } else {
           for (const entry of recallEntries) {
             const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
-            printLine(
+            printEvent(
               chalk.dim(
                 `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`
               )
@@ -3358,7 +3407,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
       if (budgetEntries.length > 0) {
         const util = Math.round((ledger.totalTokens() / effectiveBudget) * 100);
-        printLine(
+        printEvent(
           chalk.yellow(
             `  ⚠ Context at ${util}% — ${ledger.totalTokens().toLocaleString()} / ${effectiveBudget.toLocaleString()} tok (bootstrap: ${bootstrapReserve.toLocaleString()} reserved)`
           )
@@ -3705,7 +3754,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
                       : signal.status === 'blocked'
                         ? '🚫'
                         : '➡️';
-                  printLine(
+                  printEvent(
                     chalk.dim(
                       `  ${icon} signal: ${signal.status}${signal.reason ? ` — ${signal.reason}` : ''}`
                     )
@@ -3754,6 +3803,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       });
 
       allToolResults.push(...iterationResults);
+      for (const r of iterationResults) {
+        recentToolCalls.push({ tool: r.tool, status: r.status, at: new Date().toISOString() });
+      }
+      if (recentToolCalls.length > 100) {
+        recentToolCalls.splice(0, recentToolCalls.length - 100);
+      }
       toolLoopIteration++;
 
       // Check if we should continue the loop
@@ -3783,10 +3838,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
         `[Tool results from previous turn]\n${toolResultsSummary}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`
       );
 
-      // Show continuation indicator
-      printLine(
+      // Show continuation indicator naming the tools that just ran — this is
+      // the SB working, not a system message
+      const ranTools = Array.from(new Set(iterationResults.map((r) => r.tool))).join(', ');
+      printEvent(
         chalk.dim(
-          `  ↳ continuing with tool results (${toolLoopIteration}/${MAX_TOOL_LOOP_ITERATIONS})…`
+          `  ⋯ ran ${ranTools} — continuing (${toolLoopIteration}/${MAX_TOOL_LOOP_ITERATIONS})…`
         )
       );
       const stopContinuation = inkRepl
@@ -4242,6 +4299,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         tokenEstimate: ledger.totalTokens(),
         bootstrapTokens: runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0,
       },
+      toolCalls: recentToolCalls,
     });
   };
 

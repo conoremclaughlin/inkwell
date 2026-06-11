@@ -49,6 +49,11 @@ export interface InkRepl {
   ) => void;
   /** Print a system/info line (replaces printLine for non-message output). */
   printSystem: (content: string) => void;
+  /**
+   * Print a compact progress/status event line (tool runs, signals,
+   * dividers). Renders as a single dim line without a label row.
+   */
+  printEvent: (content: string) => void;
   /** Update the status bar summary. */
   setStatus: (summary: string) => void;
   /** Show/hide the waiting indicator. */
@@ -168,6 +173,14 @@ export function renderInkChat(options: {
         role: 'system',
         content,
         time: formatNow(options.timezone),
+      });
+    },
+
+    printEvent: (content) => {
+      getHandle().addMessage({
+        id: nextMessageId(),
+        role: 'event',
+        content,
       });
     },
 
