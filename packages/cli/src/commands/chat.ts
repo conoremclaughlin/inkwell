@@ -27,7 +27,7 @@ import {
   type BackendAuthBackend,
 } from '../lib/backend-auth.js';
 import { startBackendTurn, runBackendTurn } from '../repl/backend-runner.js';
-import { ContextLedger, estimateTokens } from '../repl/context-ledger.js';
+import { ContextLedger, estimateTokens, type LedgerRole } from '../repl/context-ledger.js';
 import { parseSlashCommand } from '../repl/slash.js';
 import { ToolMode, ToolPolicyScopeKind, ToolPolicyState } from '../repl/tool-policy.js';
 import { formatBackendTokenUsage, type BackendTokenUsage } from '../repl/token-usage.js';
@@ -591,7 +591,8 @@ function getSessionTranscriptMetadata(sessionId: string): SessionTranscriptMetad
   };
 }
 
-function hydrateLedgerFromTranscript(
+// Exported for tests — verifies compaction events rehydrate summary + kept tail
+export function hydrateLedgerFromTranscript(
   ledger: ContextLedger,
   transcriptPath: string
 ): {
@@ -624,13 +625,44 @@ function hydrateLedgerFromTranscript(
     const type = typeof event.type === 'string' ? event.type : '';
     if (type === 'compaction' && typeof event.summary === 'string') {
       // Compaction marks a new start state: everything replayed before this
-      // point is superseded by the summary. Evict it and seed the summary.
+      // point is superseded by the event's summary + kept tail. The tail's
+      // original events precede this marker in the file, so they were just
+      // evicted — re-seed them from the event to match the live session's
+      // post-compaction ledger exactly.
       ledger.evictEntries(hydratedEntryIds);
       hydratedEntryIds.length = 0;
       const summaryEntry = ledger.addEntry('system', event.summary, 'compaction-history');
       hydratedEntryIds.push(summaryEntry.id);
       loaded = 1;
       messageCount = 0;
+      const keptEntries = Array.isArray(event.keptEntries) ? event.keptEntries : [];
+      for (const kept of keptEntries) {
+        if (!kept || typeof kept !== 'object') continue;
+        const keptRecord = kept as Record<string, unknown>;
+        if (typeof keptRecord.content !== 'string') continue;
+        const role: LedgerRole =
+          keptRecord.role === 'user' ||
+          keptRecord.role === 'assistant' ||
+          keptRecord.role === 'inbox' ||
+          keptRecord.role === 'system'
+            ? keptRecord.role
+            : 'system';
+        const entry = ledger.addEntry(
+          role,
+          keptRecord.content,
+          typeof keptRecord.source === 'string' ? keptRecord.source : 'compaction-tail'
+        );
+        hydratedEntryIds.push(entry.id);
+        loaded += 1;
+        if (role === 'user' || role === 'assistant' || role === 'inbox') {
+          messageCount += 1;
+          pushPreview(
+            role,
+            keptRecord.content,
+            typeof event.ts === 'string' ? event.ts : undefined
+          );
+        }
+      }
       continue;
     }
     if (type === 'user' && typeof event.content === 'string') {
@@ -2828,10 +2860,20 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
         const summary = `[Conversation summary — compacted ${oldest.length} earlier entries]\n${summaryText}`;
         const result = ledger.compactToSummary(summary, AUTO_COMPACT_KEEP_RECENT_ENTRIES);
+        // The compaction event is the COMPLETE new start state: summary plus
+        // the verbatim recent tail. The tail's original events precede this
+        // marker in the file, so hydration must get the tail from here —
+        // otherwise reattach would keep only the summary and lose the
+        // protected recent entries the live session still has.
+        const keptEntries = ledger
+          .listEntries()
+          .slice(1) // entry 0 is the summary itself
+          .map((e) => ({ role: e.role, content: e.content, source: e.source }));
         appendTranscript(runtime.transcriptPath, {
           type: 'compaction',
           reason,
           summary,
+          keptEntries,
           removedCount: result.removedEntries.length,
           removedTokens: result.removedTokens,
           summaryTokens: result.summaryTokens,
