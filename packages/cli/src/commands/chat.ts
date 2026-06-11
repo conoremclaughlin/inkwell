@@ -640,6 +640,10 @@ export function hydrateLedgerFromTranscript(
       hydratedEntryIds.push(summaryEntry.id);
       loaded = 1;
       messageCount = 0;
+      // Reset the visible replay too — pre-compaction turns are out of
+      // context and must not appear below the cutoff divider. The kept
+      // tail is re-added below from the event's keptEntries.
+      preview.length = 0;
       compactionCollapsed = true;
       const keptEntries = Array.isArray(event.keptEntries) ? event.keptEntries : [];
       for (const kept of keptEntries) {

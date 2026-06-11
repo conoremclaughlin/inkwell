@@ -133,6 +133,42 @@ describe('hydrateLedgerFromTranscript — compaction events', () => {
     expect(contents).toEqual(['bootstrap identity block', 'the summary']);
   });
 
+  it('resets tailPreview at the compaction marker (regression: stale pre-compaction preview)', () => {
+    // Pre-compaction turns must NOT appear in the visible replay below the
+    // cutoff divider, and kept tail entries must not duplicate.
+    writeTranscript([
+      { type: 'user', content: 'ancient question' },
+      { type: 'assistant', content: 'ancient answer', backend: 'claude' },
+      { type: 'user', content: 'kept question' },
+      { type: 'assistant', content: 'kept answer', backend: 'claude' },
+      {
+        type: 'compaction',
+        summary: 'the summary',
+        keptEntries: [
+          { role: 'user', content: 'kept question', source: 'repl-history' },
+          { role: 'assistant', content: 'kept answer', source: 'claude' },
+        ],
+      },
+      { type: 'user', content: 'post-marker question' },
+      { type: 'assistant', content: 'post-marker answer', backend: 'claude' },
+    ]);
+
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+
+    const previewContents = result.tailPreview.map((p) => p.content);
+    // Exactly: kept tail + post-marker — no pre-compaction turns, no duplicates
+    expect(previewContents).toEqual([
+      'kept question',
+      'kept answer',
+      'post-marker question',
+      'post-marker answer',
+    ]);
+    expect(previewContents).not.toContain('ancient question');
+    expect(previewContents).not.toContain('ancient answer');
+    expect(previewContents.filter((c) => c === 'kept question')).toHaveLength(1);
+  });
+
   it('skips malformed keptEntries without crashing', () => {
     writeTranscript([
       {
