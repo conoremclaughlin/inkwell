@@ -58,7 +58,9 @@ export function renderMessageLine(
     trailingMeta?: string;
   } = {}
 ): string {
-  const clock = options.ts ? formatClock(options.ts, options.timezone) : formatNow(options.timezone);
+  const clock = options.ts
+    ? formatClock(options.ts, options.timezone)
+    : formatNow(options.timezone);
   const meta = options.trailingMeta ? `  ·  ${options.trailingMeta}` : '';
   const timeStr = chalk.dim(`${clock}${meta}`);
 
@@ -105,6 +107,18 @@ export function renderCollapsedInbox(count: number): string {
   return chalk.dim(`${'┄'.repeat(side)}${label}${'┄'.repeat(side)}`);
 }
 
+/**
+ * Context-window cutoff divider. Marks the boundary in the scrollback where
+ * the loaded context begins: everything above it has been compacted or
+ * trimmed out of the prompt window; everything below is what the SB sees.
+ */
+export function renderContextCutoff(detail: string): string {
+  const label = ` ⌃ out of context · ${detail} · in context ⌄ `;
+  const w = process.stdout.columns || 80;
+  const side = Math.max(2, Math.floor((w - label.length) / 2));
+  return chalk.dim(`${'─'.repeat(side)}${label}${'─'.repeat(side)}`);
+}
+
 /** Check if a timestamp is older than 5 days. */
 export function isOlderThan5Days(createdAt?: string): boolean {
   if (!createdAt) return false;
@@ -142,7 +156,11 @@ export function formatHumanTime(value?: string, timezone?: string): string {
 
   try {
     if (sameDay) {
-      return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', timeZone: timezone });
+      return date.toLocaleTimeString([], {
+        hour: 'numeric',
+        minute: '2-digit',
+        timeZone: timezone,
+      });
     }
     // Older — show short date + time
     return date.toLocaleDateString([], {
@@ -345,19 +363,11 @@ export class LiveStatusLane {
       chalk.dim(` ${this.statusLine}`),
       chalk.dim(formatNow(this.timezone))
     );
-    const info = this.infoItems.length > 0
-      ? ` ${infoBar(this.infoItems)}`
-      : chalk.dim(` ${this.hintLine}`);
+    const info =
+      this.infoItems.length > 0 ? ` ${infoBar(this.infoItems)}` : chalk.dim(` ${this.hintLine}`);
     // Prompt MUST be the last line so readline places the cursor there.
     // Layout: sep | status | sep | info | sep | prompt
-    return [
-      sep,
-      statusWithTime,
-      sep,
-      info,
-      sep,
-      ` ${promptLabel}`,
-    ].join('\n');
+    return [sep, statusWithTime, sep, info, sep, ` ${promptLabel}`].join('\n');
   }
 }
 

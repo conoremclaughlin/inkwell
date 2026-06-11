@@ -1,7 +1,14 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 
-export type MessageRole = 'user' | 'assistant' | 'inbox' | 'activity' | 'system' | 'grant';
+export type MessageRole =
+  | 'user'
+  | 'assistant'
+  | 'inbox'
+  | 'activity'
+  | 'system'
+  | 'grant'
+  | 'event';
 
 export interface MessageLineProps {
   id: string;
@@ -19,6 +26,7 @@ const LABEL_COLORS: Record<MessageRole, string> = {
   activity: 'magenta',
   system: 'gray',
   grant: 'green',
+  event: 'gray',
 };
 
 const CONTENT_COLORS: Record<MessageRole, string | undefined> = {
@@ -28,6 +36,7 @@ const CONTENT_COLORS: Record<MessageRole, string | undefined> = {
   activity: undefined,
   system: 'gray',
   grant: 'green',
+  event: 'gray',
 };
 
 /**
@@ -60,9 +69,23 @@ export const MessageLine = React.memo(function MessageLine({
   const meta = [time, trailingMeta].filter(Boolean).join('  ·  ');
   const displayContent = collapseImagePaths(content);
 
+  // Events are compact progress/status lines (tool runs, signals, dividers):
+  // a single dim line at the content column — no label row, no spacing.
+  if (role === 'event') {
+    return (
+      <Box paddingLeft={3}>
+        <Text dimColor wrap="wrap">
+          {displayContent}
+          {meta ? `  ·  ${meta}` : ''}
+        </Text>
+      </Box>
+    );
+  }
+
   return (
     <Box flexDirection="column" paddingLeft={1} marginTop={1}>
-      <Box>
+      {/* Label is padded to sit flush with the content text below it */}
+      <Box paddingLeft={2}>
         <Text bold color={labelColor}>
           {displayLabel}
         </Text>

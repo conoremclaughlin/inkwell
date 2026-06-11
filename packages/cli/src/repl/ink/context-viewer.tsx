@@ -14,6 +14,8 @@ export interface ContextSections {
     tokenEstimate: number;
     bootstrapTokens: number;
   };
+  /** Tool calls executed this session (most recent last) */
+  toolCalls?: Array<{ tool: string; status: string; at: string }>;
 }
 
 export function formatContextLines(sections: ContextSections): string[] {
@@ -34,6 +36,18 @@ export function formatContextLines(sections: ContextSections): string[] {
   lines.push(`Unique memories: ${sections.passiveRecallStats.uniqueMemories}`);
   lines.push(`Current turn: ${sections.passiveRecallStats.currentTurn}`);
   lines.push('');
+
+  if (sections.toolCalls && sections.toolCalls.length > 0) {
+    lines.push('── Recent Tool Calls ──');
+    lines.push('');
+    // Most recent first, capped for readability
+    const recent = sections.toolCalls.slice(-25).reverse();
+    for (const call of recent) {
+      const time = call.at ? new Date(call.at).toLocaleTimeString() : '';
+      lines.push(`• ${call.tool} (${call.status})${time ? ` · ${time}` : ''}`);
+    }
+    lines.push('');
+  }
 
   if (sections.passiveRecallEntries.length > 0) {
     lines.push('── Memories in Context ──');
