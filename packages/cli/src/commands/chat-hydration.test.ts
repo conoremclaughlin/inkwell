@@ -349,6 +349,27 @@ describe('hydrateLedgerFromTranscript — context_evict events', () => {
     expect(ledger.listEntries().map((e) => e.content)).toContain('bootstrap identity block');
   });
 
+  it('keeps the surviving duplicate preview row on eid-specific eviction (regression)', () => {
+    // Lumen's repro: two identical-content entries; evicting ONE by eid must
+    // leave the other's preview row intact (content-key fallback must not
+    // collateral-evict survivors).
+    writeTranscript([
+      { eid: 1, type: 'user', content: 'duplicate' },
+      { eid: 2, type: 'user', content: 'duplicate' },
+      { eid: 3, type: 'context_evict', actor: 'sb', refs: [{ eid: 1 }] },
+    ]);
+
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+
+    expect(ledger.listEntries()).toHaveLength(1);
+    expect(ledger.listEntries()[0].eid).toBe(2);
+    expect(result.messageCount).toBe(1);
+    expect(result.tailPreview).toHaveLength(1);
+    expect(result.tailPreview[0].eid).toBe(2);
+    expect(result.tailPreview[0].content).toBe('duplicate');
+  });
+
   it('reports maxEid so the append counter continues the sequence', () => {
     writeTranscript([
       { eid: 7, type: 'user', content: 'a' },

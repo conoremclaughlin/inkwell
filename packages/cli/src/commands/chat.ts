@@ -686,21 +686,25 @@ export function hydrateLedgerFromTranscript(
       for (let i = hydratedEntryIds.length - 1; i >= 0; i--) {
         if (removedLedgerIds.has(hydratedEntryIds[i])) hydratedEntryIds.splice(i, 1);
       }
-      // Drop evicted entries from the visible replay and adjust counts
+      // Drop evicted entries from the visible replay and adjust counts.
+      // Eid-preferred matching: rows with eids are filtered ONLY by eid —
+      // content-key matching is reserved for eid-less (legacy) removals.
+      // Otherwise evicting one of two identical-content entries by eid
+      // would also drop the survivor's preview row.
       const removedEids = new Set(
         evictResult.removedEntries.map((e) => e.eid).filter((v): v is number => v !== undefined)
       );
-      const removedKeys = new Set(
-        evictResult.removedEntries.map(
-          (e) => `${e.role} ${compactForHistoryPreview(e.role, e.content)}`
-        )
+      const removedKeysWithoutEid = new Set(
+        evictResult.removedEntries
+          .filter((e) => e.eid === undefined)
+          .map((e) => `${e.role} ${compactForHistoryPreview(e.role, e.content)}`)
       );
       for (let i = preview.length - 1; i >= 0; i--) {
         const p = preview[i];
-        if (
-          (p.eid !== undefined && removedEids.has(p.eid)) ||
-          removedKeys.has(`${p.role} ${p.content}`)
-        ) {
+        const matchesByEid = p.eid !== undefined && removedEids.has(p.eid);
+        const matchesByKey =
+          p.eid === undefined && removedKeysWithoutEid.has(`${p.role} ${p.content}`);
+        if (matchesByEid || matchesByKey) {
           preview.splice(i, 1);
         }
       }
