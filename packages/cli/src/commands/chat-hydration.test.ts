@@ -169,6 +169,55 @@ describe('hydrateLedgerFromTranscript — compaction events', () => {
     expect(previewContents.filter((c) => c === 'kept question')).toHaveLength(1);
   });
 
+  it('includes labeled system turns in tailPreview, excluding continuation noise', () => {
+    // Heartbeat triggers / channel-delivered messages must stay visible in
+    // the replay (regression: moving them from type:user to type:system_turn
+    // dropped them from the preview — answers appeared without questions).
+    writeTranscript([
+      { type: 'system_turn', content: '[HEARTBEAT TRIGGER] check email', label: 'heartbeat' },
+      { type: 'assistant', content: 'heartbeat cycle complete', backend: 'claude' },
+      {
+        type: 'system_turn',
+        content: 'Continue working. Use signal_status…',
+        label: 'continuation',
+      },
+      { type: 'assistant', content: 'still done', backend: 'claude' },
+    ]);
+
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+
+    const previews = result.tailPreview.map((p) => ({ role: p.role, label: p.label }));
+    expect(result.tailPreview[0].content).toContain('[HEARTBEAT TRIGGER]');
+    expect(previews[0]).toEqual({ role: 'system', label: 'heartbeat' });
+    // Continuation prompts excluded from replay; both assistant replies kept
+    expect(result.tailPreview.filter((p) => p.label === 'continuation')).toHaveLength(0);
+    expect(result.tailPreview.filter((p) => p.role === 'assistant')).toHaveLength(2);
+  });
+
+  it('keeps labeled system turns visible through compaction keptEntries', () => {
+    writeTranscript([
+      { type: 'user', content: 'old' },
+      {
+        type: 'compaction',
+        summary: 'the summary',
+        keptEntries: [
+          { role: 'system', content: '[HEARTBEAT TRIGGER] hourly check', source: 'heartbeat' },
+          { role: 'assistant', content: 'cycle complete', source: 'claude' },
+          { role: 'system', content: 'internal echo', source: 'pcp-activity' },
+        ],
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+
+    const labels = result.tailPreview.map((p) => p.label || p.role);
+    expect(labels).toContain('heartbeat');
+    expect(labels).not.toContain('pcp-activity'); // internal sources stay out of replay
+    expect(result.tailPreview.map((p) => p.content)).not.toContain('old');
+  });
+
   it('skips malformed keptEntries without crashing', () => {
     writeTranscript([
       {

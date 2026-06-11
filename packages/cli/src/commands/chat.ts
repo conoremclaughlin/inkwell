@@ -387,7 +387,13 @@ interface HistoryHydrationResult {
   messageCount: number;
   source: 'repl-transcript' | 'pcp-session-context' | 'none';
   transcriptPath?: string;
-  tailPreview: Array<{ role: 'user' | 'assistant' | 'inbox'; content: string; ts?: string }>;
+  tailPreview: Array<{
+    role: 'user' | 'assistant' | 'inbox' | 'system';
+    content: string;
+    ts?: string;
+    /** Display label for system entries (e.g., "heartbeat", "continuation") */
+    label?: string;
+  }>;
   seenInboxIds?: string[];
   seenActivityIds?: string[];
   /** True when hydration collapsed history at a compaction event */
@@ -619,8 +625,13 @@ export function hydrateLedgerFromTranscript(
   // (and only them; entries that pre-date hydration are left alone).
   const hydratedEntryIds: number[] = [];
 
-  const pushPreview = (role: 'user' | 'assistant' | 'inbox', content: string, ts?: string) => {
-    preview.push({ role, content: compactForHistoryPreview(role, content), ts });
+  const pushPreview = (
+    role: 'user' | 'assistant' | 'inbox' | 'system',
+    content: string,
+    ts?: string,
+    label?: string
+  ) => {
+    preview.push({ role, content: compactForHistoryPreview(role, content), ts, label });
     if (preview.length > HISTORY_PREVIEW_MAX) {
       preview.shift();
     }
@@ -657,11 +668,9 @@ export function hydrateLedgerFromTranscript(
           keptRecord.role === 'system'
             ? keptRecord.role
             : 'system';
-        const entry = ledger.addEntry(
-          role,
-          keptRecord.content,
-          typeof keptRecord.source === 'string' ? keptRecord.source : 'compaction-tail'
-        );
+        const source =
+          typeof keptRecord.source === 'string' ? keptRecord.source : 'compaction-tail';
+        const entry = ledger.addEntry(role, keptRecord.content, source);
         hydratedEntryIds.push(entry.id);
         loaded += 1;
         if (role === 'user' || role === 'assistant' || role === 'inbox') {
@@ -670,6 +679,15 @@ export function hydrateLedgerFromTranscript(
             role,
             keptRecord.content,
             typeof event.ts === 'string' ? event.ts : undefined
+          );
+        } else if (role === 'system' && !INTERNAL_SYSTEM_SOURCES.has(source)) {
+          // Kept system turns with a meaningful channel label (heartbeat,
+          // telegram, …) stay visible in the replay
+          pushPreview(
+            'system',
+            keptRecord.content,
+            typeof event.ts === 'string' ? event.ts : undefined,
+            source
           );
         }
       }
@@ -712,6 +730,16 @@ export function hydrateLedgerFromTranscript(
       hydratedEntryIds.push(entry.id);
       loaded += 1;
       messageCount += 1;
+      // Continuation prompts are repetitive noise — keep delivered messages
+      // (heartbeat triggers, channel messages) visible in the replay.
+      if (label !== 'continuation') {
+        pushPreview(
+          'system',
+          event.content,
+          typeof event.ts === 'string' ? event.ts : undefined,
+          label
+        );
+      }
       continue;
     }
     if (type === 'hook_injection' && typeof event.content === 'string') {
@@ -835,7 +863,25 @@ function compactForLedger(content: string, maxChars = LEDGER_COMPACT_CHARS): str
   return `${normalized.slice(0, Math.max(1, maxChars - 1))}…`;
 }
 
-function compactForHistoryPreview(role: 'user' | 'assistant' | 'inbox', content: string): string {
+// System-entry sources that are runtime bookkeeping, not conversation —
+// excluded from the visible history replay (they stay in the ledger).
+const INTERNAL_SYSTEM_SOURCES = new Set([
+  'continuation',
+  'compaction-tail',
+  'compaction-history',
+  'pcp-activity',
+  'pcp-activity-history',
+  'passive-recall',
+  'budget-monitor',
+  'auto-run',
+  'hook-history',
+  'bootstrap',
+]);
+
+function compactForHistoryPreview(
+  role: 'user' | 'assistant' | 'inbox' | 'system',
+  content: string
+): string {
   if (role === 'inbox') {
     return compactForLedger(content.replace(/\s+/g, ' ').trim(), 180);
   }
@@ -4342,9 +4388,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
             ? ('user' as const)
             : entry.role === 'assistant'
               ? ('assistant' as const)
-              : ('inbox' as const);
+              : entry.role === 'system'
+                ? ('system' as const)
+                : ('inbox' as const);
         const label =
-          entry.role === 'user' ? 'you' : entry.role === 'assistant' ? agentId : '📬 inbox';
+          entry.role === 'user'
+            ? 'you'
+            : entry.role === 'assistant'
+              ? agentId
+              : entry.role === 'system'
+                ? entry.label || 'system'
+                : '📬 inbox';
         inkRepl.addMessage(role, entry.content, {
           label,
           time: formatHumanTime(entry.ts, runtime.userTimezone),
