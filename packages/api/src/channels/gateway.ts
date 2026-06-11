@@ -1112,6 +1112,7 @@ export class ChannelGateway extends EventEmitter {
     const fs = await import('fs/promises');
     const pathMod = await import('path');
     const os = await import('os');
+    const { randomUUID } = await import('crypto');
 
     const response = await fetch(url);
     if (!response.ok) {
@@ -1119,10 +1120,15 @@ export class ChannelGateway extends EventEmitter {
     }
 
     const buffer = Buffer.from(await response.arrayBuffer());
-    const tmpDir = pathMod.join(os.tmpdir(), 'pcp-media');
+    // Each download gets its own unique subdirectory while the basename
+    // keeps the display filename. Naming the file directly from
+    // attachment.filename collided when two attachments shared a name
+    // (e.g. an album of two photo.jpg items) — the later download
+    // overwrote the earlier and the album uploaded duplicate bytes.
+    const tmpDir = pathMod.join(os.tmpdir(), 'pcp-media', randomUUID());
     await fs.mkdir(tmpDir, { recursive: true });
 
-    const safeName = (filename || `media_${Date.now()}`).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const safeName = (filename || 'media').replace(/[^a-zA-Z0-9._-]/g, '_') || 'media';
     const tmpPath = pathMod.join(tmpDir, safeName);
     await fs.writeFile(tmpPath, buffer);
 
@@ -1131,6 +1137,7 @@ export class ChannelGateway extends EventEmitter {
       cleanup: async () => {
         try {
           await fs.unlink(tmpPath);
+          await fs.rmdir(tmpDir);
         } catch {
           // Best-effort cleanup
         }
@@ -1157,7 +1164,97 @@ export class ChannelGateway extends EventEmitter {
     let failed = 0;
     const errors: string[] = [];
 
-    for (const attachment of media) {
+    // Telegram albums: 2+ photos/videos batch into sendMediaGroup (10 per
+    // album) so they arrive as one grouped message instead of a stream of
+    // singles. Other media types fall through to the per-item loop below.
+    let queue = media;
+    if (channel === 'telegram' && this.telegramListener) {
+      const groupable = media.filter((m) => m.type === 'image' || m.type === 'video');
+      if (groupable.length >= 2) {
+        queue = media.filter((m) => m.type !== 'image' && m.type !== 'video');
+        const TELEGRAM_ALBUM_MAX = 10;
+        for (let i = 0; i < groupable.length; i += TELEGRAM_ALBUM_MAX) {
+          const batch = groupable.slice(i, i + TELEGRAM_ALBUM_MAX);
+          const resolved: Array<{
+            filePath: string;
+            type: 'image' | 'video';
+            caption?: string;
+            contentType?: string;
+            filename?: string;
+          }> = [];
+          const cleanups: Array<() => Promise<void>> = [];
+
+          for (const attachment of batch) {
+            let filePath = attachment.path;
+            if (!filePath && attachment.url) {
+              try {
+                const temp = await this.downloadToTempFile(attachment.url, attachment.filename);
+                filePath = temp.path;
+                cleanups.push(temp.cleanup);
+              } catch (error) {
+                const msg = `Failed to download media URL: ${attachment.url}`;
+                logger.error(msg, error);
+                errors.push(msg);
+                failed++;
+                continue;
+              }
+            }
+            if (!filePath) {
+              const msg = `Media attachment missing both path and url (type: ${attachment.type})`;
+              logger.warn(msg, { channel, attachment });
+              errors.push(msg);
+              failed++;
+              continue;
+            }
+            resolved.push({
+              filePath,
+              type: attachment.type === 'video' ? 'video' : 'image',
+              caption: attachment.caption,
+              contentType: attachment.contentType,
+              filename: attachment.filename,
+            });
+          }
+
+          try {
+            if (resolved.length >= 2) {
+              await this.telegramListener.sendMediaGroup(conversationId, resolved, {
+                replyToMessageId: options?.replyToMessageId,
+              });
+              sent += resolved.length;
+            } else if (resolved.length === 1) {
+              // Album collapsed to one item (trailing remainder or download
+              // failures) — sendMediaGroup needs 2+, send it singly.
+              const single = resolved[0];
+              const singleOpts = {
+                caption: single.caption,
+                filename: single.filename,
+                contentType: single.contentType,
+                replyToMessageId: options?.replyToMessageId,
+              };
+              if (single.type === 'video') {
+                await this.telegramListener.sendVideo(conversationId, single.filePath, singleOpts);
+              } else {
+                await this.telegramListener.sendPhoto(conversationId, single.filePath, singleOpts);
+              }
+              sent += 1;
+            }
+          } catch (error) {
+            const msg = `Failed to send telegram album (${resolved.length} items): ${
+              error instanceof Error ? error.message : String(error)
+            }`;
+            logger.error(msg);
+            errors.push(msg);
+            failed += resolved.length;
+          } finally {
+            for (const cleanup of cleanups) {
+              await cleanup().catch(() => undefined);
+            }
+          }
+        }
+      }
+    }
+
+    for (const attachment of queue) {
       let filePath = attachment.path;
       let tempCleanup: (() => Promise<void>) | null = null;
 

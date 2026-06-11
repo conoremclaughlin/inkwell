@@ -389,6 +389,8 @@ interface LocalToolCall {
 
 interface SessionTranscriptMetadata {
   transcriptPath: string;
+  /** Transcript file size in bytes — quick toxic-session indicator */
+  transcriptBytes: number;
   messageCount: number;
   userCount: number;
   assistantCount: number;
@@ -618,8 +620,15 @@ function getSessionTranscriptMetadata(sessionId: string): SessionTranscriptMetad
   }
 
   const messageCount = userCount + assistantCount + inboxCount;
+  let transcriptBytes = 0;
+  try {
+    transcriptBytes = statSync(path).size;
+  } catch {
+    // File raced away between read and stat — size stays 0
+  }
   return {
     transcriptPath: path,
+    transcriptBytes,
     messageCount,
     userCount,
     assistantCount,
@@ -1613,9 +1622,19 @@ function sessionBackendLabel(session: SessionSummary): string {
   return '-';
 }
 
+/** Human file size for transcript footprints: 412KB, 1.2MB, 24MB. Exported for tests. */
+export function formatTranscriptSize(bytes: number): string {
+  if (bytes <= 0) return '';
+  const mb = bytes / (1024 * 1024);
+  if (mb < 1) return `${Math.max(1, Math.round(bytes / 1024))}KB`;
+  if (mb < 10) return `${mb.toFixed(1)}MB`;
+  return `${Math.round(mb)}MB`;
+}
+
 function sessionHistoryLabel(meta: SessionTranscriptMetadata | null): string {
   if (!meta) return 'remote';
-  return `${meta.messageCount} msgs`;
+  const size = formatTranscriptSize(meta.transcriptBytes);
+  return size ? `${meta.messageCount} msgs · ${size}` : `${meta.messageCount} msgs`;
 }
 
 function sessionLatestMessagePreview(
@@ -1645,7 +1664,7 @@ function formatSessionsLines(
   }
   const lines = [
     'Active sessions',
-    'id       agent   status/phase            studio            thread        started   backend            history    last-msg',
+    'id       agent   status/phase            studio            thread        started   backend            history             last-msg',
   ];
   for (const session of sessions) {
     const transcriptMeta = getSessionTranscriptMetadata(session.id);
@@ -1656,7 +1675,7 @@ function formatSessionsLines(
     const thread = (session.threadKey || '-').slice(0, 12).padEnd(12);
     const started = formatStartedAt(session.startedAt);
     const backend = sessionBackendLabel(session).slice(0, 18).padEnd(18);
-    const history = sessionHistoryLabel(transcriptMeta).slice(0, 9).padEnd(9);
+    const history = sessionHistoryLabel(transcriptMeta).slice(0, 18).padEnd(18);
     const lastMessage = formatTimestampForSessionList(
       transcriptMeta?.lastMessageAt,
       options?.timezone

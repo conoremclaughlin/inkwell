@@ -1209,6 +1209,72 @@ export class TelegramListener extends EventEmitter {
   }
 
   /**
+   * Send 2-10 photos/videos as a single album (sendMediaGroup).
+   * Telegram renders these as one grouped message — files are attached
+   * via multipart and referenced with attach://<name> in the media JSON.
+   * Captions are per-item; a caption on the first item displays under
+   * the album.
+   */
+  async sendMediaGroup(
+    conversationId: string,
+    items: Array<{
+      filePath: string;
+      type: 'image' | 'video';
+      caption?: string;
+      contentType?: string;
+      filename?: string;
+    }>,
+    options?: { replyToMessageId?: string }
+  ): Promise<void> {
+    if (items.length < 2 || items.length > 10) {
+      throw new Error(`sendMediaGroup requires 2-10 items, got ${items.length}`);
+    }
+
+    const chatId = conversationId.startsWith('telegram:')
+      ? conversationId.replace('telegram:', '')
+      : conversationId;
+
+    const fs = await import('fs/promises');
+    const pathMod = await import('path');
+
+    const form = new FormData();
+    form.append('chat_id', chatId);
+    if (options?.replyToMessageId) {
+      form.append('reply_to_message_id', String(parseInt(options.replyToMessageId, 10)));
+    }
+
+    const mediaSpec: Array<Record<string, string>> = [];
+    let totalBytes = 0;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const bytes = await fs.readFile(item.filePath);
+      totalBytes += bytes.byteLength;
+      const attachName = `media${i}`;
+      const filename = item.filename || pathMod.basename(item.filePath) || attachName;
+      const contentType = item.contentType || (item.type === 'video' ? 'video/mp4' : 'image/jpeg');
+      form.append(attachName, new Blob([new Uint8Array(bytes)], { type: contentType }), filename);
+      mediaSpec.push({
+        type: item.type === 'video' ? 'video' : 'photo',
+        media: `attach://${attachName}`,
+        ...(item.caption ? { caption: item.caption } : {}),
+      });
+    }
+    form.append('media', JSON.stringify(mediaSpec));
+
+    const url = `${TELEGRAM_API}/bot${this.token}/sendMediaGroup`;
+    const response = await fetch(url, { method: 'POST', body: form });
+
+    const data = (await response.json()) as TelegramApiResponse<unknown>;
+    if (!data.ok) {
+      throw new Error(`Telegram API error: ${data.description}`);
+    }
+    logger.info(`Sent media group to Telegram chat ${chatId}`, {
+      items: items.length,
+      totalBytes,
+    });
+  }
+
+  /**
    * Send a document (file) to a Telegram chat
    */
   async sendDocument(

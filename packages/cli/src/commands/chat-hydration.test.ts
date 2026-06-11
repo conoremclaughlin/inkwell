@@ -3,7 +3,18 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ContextLedger, entryRefHash } from '../repl/context-ledger.js';
-import { hydrateLedgerFromTranscript } from './chat.js';
+import { hydrateLedgerFromTranscript, formatTranscriptSize } from './chat.js';
+
+describe('formatTranscriptSize', () => {
+  it('formats KB below 1MB, one decimal below 10MB, whole MB above', () => {
+    expect(formatTranscriptSize(0)).toBe('');
+    expect(formatTranscriptSize(512)).toBe('1KB');
+    expect(formatTranscriptSize(420 * 1024)).toBe('420KB');
+    expect(formatTranscriptSize(1.2 * 1024 * 1024)).toBe('1.2MB');
+    expect(formatTranscriptSize(9.44 * 1024 * 1024)).toBe('9.4MB');
+    expect(formatTranscriptSize(24.6 * 1024 * 1024)).toBe('25MB');
+  });
+});
 
 describe('hydrateLedgerFromTranscript — compaction events', () => {
   let dir: string;
