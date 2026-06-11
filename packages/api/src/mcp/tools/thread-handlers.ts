@@ -42,6 +42,13 @@ const getThreadMessagesSchema = userIdentifierBaseSchema.extend({
   afterMessageId: z.string().uuid().optional().describe('Cursor: get messages after this ID'),
   includeSystemEvents: z.boolean().optional().default(true),
   markRead: z.boolean().optional().default(true),
+  fullHistory: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      'Return the full timeline regardless of read state. Without this (and without an explicit cursor), results fall back to messages newer than the last-read pointer — which hides already-delivered messages from watchers/pollers that manage their own cursor (e.g., ink wait).'
+    ),
 });
 
 const addThreadParticipantSchema = userIdentifierBaseSchema.extend({
@@ -327,9 +334,12 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
     if (cursor) {
       query = query.gt('created_at', cursor.created_at);
     }
-  } else if (!beforeMessageId) {
+  } else if (!beforeMessageId && !parsed.fullHistory) {
     // No explicit cursor — fall back to stored read state so a client whose
     // in-memory cursor was reset doesn't replay the full thread history.
+    // Skipped when fullHistory is set: watchers (ink wait) need the true
+    // timeline to anchor on, or push-delivery read-marking races them into
+    // seeing an eternally-empty thread.
     // Baseline priority:
     //   1. last_read_at (explicit read pointer from prior reads)
     //   2. joined_at (participant join time — no replay of pre-join history)
@@ -793,7 +803,7 @@ export const threadToolDefinitions = [
   {
     name: 'get_thread_messages',
     description:
-      'Get the full message timeline of a thread. Requires participant membership. Automatically marks the thread as read for the requesting agent.',
+      'Get the message timeline of a thread. Requires participant membership. By default returns messages newer than your last-read pointer and advances it (markRead); pass fullHistory: true for the complete timeline regardless of read state, or an explicit before/afterMessageId cursor.',
     schema: getThreadMessagesSchema,
     handler: handleGetThreadMessages,
   },

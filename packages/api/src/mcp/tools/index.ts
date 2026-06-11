@@ -4137,7 +4137,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'get_thread_messages',
     {
-      description: `Get the full message timeline of a thread. Requires participant membership. Automatically marks the thread as read for the requesting agent.
+      // Description derived from the canonical definition so the MCP catalog
+      // can't drift from the handler's documented behavior again
+      description: `${threadToolDefinitions[0].description}
 
 Use to read conversation history in a group thread before replying.
 
