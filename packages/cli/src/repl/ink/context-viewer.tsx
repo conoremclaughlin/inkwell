@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useMemo } from 'react';
 import { Box, Text, useInput, useStdout } from 'ink';
 
 export interface ContextSections {
@@ -96,6 +96,26 @@ export function formatContextLines(sections: ContextSections): string[] {
   return lines;
 }
 
+/**
+ * Single-key section jumps for the viewer. Maps a key to the line index of
+ * its section header, when the section is present in the rendered lines.
+ */
+export const SECTION_JUMP_KEYS: ReadonlyArray<{ key: string; header: string; label: string }> = [
+  { key: 'e', header: '── Evicted from Context ──', label: 'evicted' },
+  { key: 't', header: '── Recent Tool Calls ──', label: 'tools' },
+  { key: 'm', header: '── Memories in Context ──', label: 'memories' },
+  { key: 'b', header: '── Bootstrap Context ──', label: 'bootstrap' },
+];
+
+export function computeSectionJumps(lines: string[]): Map<string, number> {
+  const jumps = new Map<string, number>();
+  for (const { key, header } of SECTION_JUMP_KEYS) {
+    const index = lines.indexOf(header);
+    if (index >= 0) jumps.set(key, index);
+  }
+  return jumps;
+}
+
 interface ContextViewerProps {
   lines: string[];
   isActive: boolean;
@@ -111,6 +131,7 @@ export function ContextViewer({
   const viewportHeight = Math.max(5, (stdout?.rows || 24) - 4);
   const [scrollOffset, setScrollOffset] = useState(0);
   const maxScroll = Math.max(0, lines.length - viewportHeight);
+  const sectionJumps = useMemo(() => computeSectionJumps(lines), [lines]);
 
   const scrollUp = useCallback(
     (amount = 1) => setScrollOffset((prev) => Math.max(0, prev - amount)),
@@ -161,6 +182,14 @@ export function ContextViewer({
         scrollDown(Math.floor(viewportHeight / 2));
         return;
       }
+      // Section jumps (e: evicted, t: tools, m: memories, b: bootstrap)
+      if (!key.ctrl && !key.meta) {
+        const target = sectionJumps.get(input.toLowerCase());
+        if (target !== undefined) {
+          setScrollOffset(Math.min(maxScroll, target));
+          return;
+        }
+      }
     },
     { isActive }
   );
@@ -197,7 +226,14 @@ export function ContextViewer({
         })}
       </Box>
       <Box paddingX={1} justifyContent="space-between">
-        <Text dimColor>q/esc: close · ↑↓/j/k: scroll · ctrl+u/d: page</Text>
+        <Text dimColor>
+          q/esc: close · ↑↓/j/k: scroll · ctrl+u/d: page
+          {sectionJumps.size > 0
+            ? ` · ${SECTION_JUMP_KEYS.filter((s) => sectionJumps.has(s.key))
+                .map((s) => `${s.key}: ${s.label}`)
+                .join(' · ')}`
+            : ''}
+        </Text>
         <Text dimColor>
           {position} {scrollPct}%
         </Text>

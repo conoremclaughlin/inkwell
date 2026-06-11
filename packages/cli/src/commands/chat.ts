@@ -34,6 +34,11 @@ import {
   type LedgerRole,
 } from '../repl/context-ledger.js';
 import { parseSlashCommand } from '../repl/slash.js';
+import {
+  parseEvictSelection,
+  selectEvictionEntries,
+  formatEvictCandidate,
+} from '../repl/evict-selection.js';
 import { ToolMode, ToolPolicyScopeKind, ToolPolicyState } from '../repl/tool-policy.js';
 import { formatBackendTokenUsage, type BackendTokenUsage } from '../repl/token-usage.js';
 import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../repl/skills.js';
@@ -3001,6 +3006,50 @@ export async function runChat(options: ChatOptions): Promise<void> {
     return sessionsCache;
   };
 
+  // ── Persistent eviction (single writer) ──
+  // Every eviction — SB tool, user /evict, system trim — flows through here
+  // so the transcript event shape and the live evicted-display list can't
+  // drift between actors. The context_evict event is what makes the
+  // eviction survive reattach; sessionEvictedEntries is what Ctrl+O and
+  // /evicted show right now.
+  const recordEviction = (
+    actor: 'sb' | 'user' | 'system',
+    reason: string,
+    removedTokens: number,
+    refs: Array<{
+      eid?: number;
+      hash: string;
+      role: LedgerRole;
+      source?: string;
+      preview: string;
+    }>
+  ): void => {
+    if (refs.length === 0) return;
+    appendTranscript(runtime.transcriptPath, {
+      type: 'context_evict',
+      actor,
+      reason,
+      removedTokens,
+      refs: refs.map((ref) => ({
+        ...(typeof ref.eid === 'number' ? { eid: ref.eid } : {}),
+        hash: ref.hash,
+      })),
+    });
+    for (const ref of refs) {
+      sessionEvictedEntries.push({
+        role: ref.role,
+        content: ref.preview,
+        source: ref.source,
+        eid: ref.eid,
+        actor,
+        reason,
+      });
+    }
+    if (sessionEvictedEntries.length > EVICTED_DISPLAY_MAX) {
+      sessionEvictedEntries.splice(0, sessionEvictedEntries.length - EVICTED_DISPLAY_MAX);
+    }
+  };
+
   const trimContextToPercent = async (
     targetPercent: number,
     reason: string
@@ -3026,16 +3075,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
     });
     // Persist the trim as an eviction so it survives reattach (context_trim
     // alone is informational — hydration doesn't replay it)
-    appendTranscript(runtime.transcriptPath, {
-      type: 'context_evict',
-      actor: 'system',
-      reason: `trim: ${reason}`,
-      removedTokens: trim.removedTokens,
-      refs: trim.removedEntries.map((e) => ({
+    recordEviction(
+      'system',
+      `trim: ${reason}`,
+      trim.removedTokens,
+      trim.removedEntries.map((e) => ({
         ...(e.eid !== undefined ? { eid: e.eid } : {}),
         hash: entryRefHash(e.role, e.content),
-      })),
-    });
+        role: e.role,
+        source: e.source,
+        preview: e.content.slice(0, 100),
+      }))
+    );
 
     return { removed: trim.removedEntries.length, removedTokens: trim.removedTokens };
   };
@@ -3940,31 +3991,20 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 // hydration replays the raw events and evicted entries resurrect
                 if (parsed.success && Array.isArray(parsed.evictRefs) && parsed.evicted > 0) {
                   const refs = parsed.evictRefs as Array<Record<string, unknown>>;
-                  appendTranscript(runtime.transcriptPath, {
-                    type: 'context_evict',
-                    actor: 'sb',
-                    reason: compactForLedger(JSON.stringify(result.args ?? {}), 200),
-                    removedTokens: parsed.tokensFreed,
-                    refs: refs.map((ref) => ({
-                      ...(typeof ref.eid === 'number' ? { eid: ref.eid } : {}),
-                      hash: ref.hash,
-                    })),
-                  });
-                  for (const ref of refs) {
-                    sessionEvictedEntries.push({
-                      role: (ref.role as LedgerRole) || 'system',
-                      content: typeof ref.preview === 'string' ? ref.preview : '',
-                      source: typeof ref.source === 'string' ? ref.source : undefined,
-                      eid: typeof ref.eid === 'number' ? ref.eid : undefined,
-                      actor: 'sb',
-                    });
-                  }
-                  if (sessionEvictedEntries.length > EVICTED_DISPLAY_MAX) {
-                    sessionEvictedEntries.splice(
-                      0,
-                      sessionEvictedEntries.length - EVICTED_DISPLAY_MAX
-                    );
-                  }
+                  recordEviction(
+                    'sb',
+                    compactForLedger(JSON.stringify(result.args ?? {}), 200),
+                    typeof parsed.tokensFreed === 'number' ? parsed.tokensFreed : 0,
+                    refs
+                      .filter((ref) => typeof ref.hash === 'string')
+                      .map((ref) => ({
+                        ...(typeof ref.eid === 'number' ? { eid: ref.eid } : {}),
+                        hash: ref.hash as string,
+                        role: (ref.role as LedgerRole) || 'system',
+                        source: typeof ref.source === 'string' ? ref.source : undefined,
+                        preview: typeof ref.preview === 'string' ? ref.preview : '',
+                      }))
+                  );
                 }
               }
             } else if (result.tool === 'list_context') {
@@ -4740,7 +4780,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           '',
           chalk.bold('Quick commands'),
           chalk.dim(
-            '/help  /mcp  /capabilities  /skills  /profile  /policy  /away  /tool-routing  /save-config  /ui  /trim  /quit'
+            '/help  /mcp  /capabilities  /skills  /profile  /policy  /away  /tool-routing  /save-config  /ui  /trim  /evict  /quit'
           ),
           '',
         ].join('\n')
@@ -4791,6 +4831,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
             '/bookmarks                 List bookmarks',
             '/eject <bookmark|last>     Eject context',
             '/trim [targetPct]          Trim oldest context',
+            '/evict [sel] [--dry-run]   Evict entries (ids, source:<x>, role:<x>)',
+            '/evicted                   Show evicted-from-context entries',
             '/context                   Show recent entries',
             '/usage                     Token estimate',
           ]);
@@ -5843,6 +5885,80 @@ export async function runChat(options: ChatOptions): Promise<void> {
           if (trimResult.removed === 0) {
             showInPanel(['No trim needed; context already within target budget.']);
           }
+          break;
+        }
+        case 'evict': {
+          const selection = parseEvictSelection(slash.args);
+          if (selection.error) {
+            showInPanel([
+              selection.error,
+              'Usage: /evict [ids | source:<name> | role:<role>] [--dry-run]',
+            ]);
+            break;
+          }
+          if (selection.list) {
+            // No selector — show the pick list, never mutate
+            const entries = ledger.listEntries();
+            if (entries.length === 0) {
+              showInPanel(['Context is empty — nothing to evict.']);
+              break;
+            }
+            showInPanel([
+              `Evictable entries (${entries.length}, ~${ledger.totalTokens().toLocaleString()} tok):`,
+              ...entries.map((e) => formatEvictCandidate(e)),
+              '',
+              'Evict with: /evict <ids> | /evict source:<name> | /evict role:<role> [--dry-run]',
+            ]);
+            break;
+          }
+          const matched = selectEvictionEntries(ledger.listEntries(), selection);
+          if (matched.length === 0) {
+            showInPanel(['No context entries match that selection.']);
+            break;
+          }
+          const matchedTokens = matched.reduce((sum, e) => sum + e.approxTokens, 0);
+          if (selection.dryRun) {
+            showInPanel([
+              `Would evict ${matched.length} entries (~${matchedTokens.toLocaleString()} tok):`,
+              ...matched.map((e) => formatEvictCandidate(e)),
+              '',
+              'Re-run without --dry-run to evict.',
+            ]);
+            break;
+          }
+          const evictResult = ledger.evictEntries(matched.map((e) => e.id));
+          recordEviction(
+            'user',
+            `/evict ${slash.args.filter((a) => !a.startsWith('--')).join(' ')}`,
+            evictResult.removedTokens,
+            evictResult.removedEntries.map((e) => ({
+              ...(e.eid !== undefined ? { eid: e.eid } : {}),
+              hash: entryRefHash(e.role, e.content),
+              role: e.role,
+              source: e.source,
+              preview: e.content.slice(0, 100),
+            }))
+          );
+          printEvent(
+            chalk.dim(
+              `  🗑 evicted ${evictResult.removedEntries.length} entries (~${evictResult.removedTokens.toLocaleString()} tok freed, ~${evictResult.totalAfter.toLocaleString()} tok remaining) — /evicted to review`
+            )
+          );
+          break;
+        }
+        case 'evicted': {
+          if (sessionEvictedEntries.length === 0) {
+            showInPanel(['Nothing evicted from context this session.']);
+            break;
+          }
+          const lines = [
+            `${sessionEvictedEntries.length} entries evicted — out of the prompt window, still in the transcript:`,
+            ...sessionEvictedEntries.map((e) => {
+              const attribution = [e.actor, e.reason].filter(Boolean).join(' · ');
+              return `✕ [${e.role}${e.source ? `/${e.source}` : ''}] ${e.content.slice(0, 100)}${attribution ? ` (${attribution})` : ''}`;
+            }),
+          ];
+          showInPanel(lines);
           break;
         }
         case 'context': {
