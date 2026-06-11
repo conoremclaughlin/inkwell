@@ -534,6 +534,7 @@ export class SessionService implements ISessionService {
       ...(pcpAccessToken ? { pcpAccessToken } : {}),
       pcpSessionId: session.id,
       agentId,
+      channel: request.channel,
       ...(session.studioId ? { studioId: session.studioId } : {}),
       ...(sandboxBypass ? { sandboxBypass: true } : {}),
       ...(permissionOverlay ? { permissionOverlay } : {}),
@@ -749,7 +750,10 @@ export class SessionService implements ISessionService {
 
       // 6. Check if compaction is needed — only for claude-code backend where
       // PCP controls the context window (via sb chat). Native CLI backends
-      // (codex-cli, gemini) manage their own context lifecycle.
+      // (codex-cli, gemini) manage their own context lifecycle. The ink
+      // backend self-compacts inside ink chat (token-budget auto-compaction);
+      // its usage is persisted above for visibility but the server must NOT
+      // also trigger compaction — one compaction owner per backend.
       if (
         resolvedBackend === 'claude-code' &&
         result.usage.contextTokens >= this.config.compactionThreshold

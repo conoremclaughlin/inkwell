@@ -44,6 +44,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     binary: prepared.binary,
     args: prepared.args,
     env: prepared.env,
+    stdinData: prepared.stdinData,
     timeoutMs: request.timeoutMs || 20 * 60 * 1000,
     onStdout: request.verbose ? (chunk) => process.stdout.write(chunk) : undefined,
     onStderr: request.verbose ? (chunk) => process.stderr.write(chunk) : undefined,

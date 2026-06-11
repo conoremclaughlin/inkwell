@@ -444,6 +444,8 @@ export interface ClaudeRunnerConfig {
   pcpSessionId?: string;
   /** Agent ID for this run — written to runtime hint files */
   agentId?: string;
+  /** Originating channel (heartbeat, telegram, agent, …) — used by runners that label delivered messages */
+  channel?: string;
   /** Studio/worktree scope — written to runtime hint so findRuntimeSessionByLinkId matches */
   studioId?: string;
   /** When true, bypass sandbox restrictions (e.g., Codex --dangerously-bypass-approvals-and-sandbox). Opt-in per studio. */

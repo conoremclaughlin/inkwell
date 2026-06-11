@@ -24,6 +24,13 @@ export interface PreparedBackend {
   args: string[];
   env: Record<string, string>;
   cleanup: () => void;
+  /**
+   * Prompt data to pass via stdin instead of argv. Large transcripts exceed
+   * the OS argv limit (~256KB on macOS → spawn E2BIG), so adapters that
+   * support reading the prompt from stdin should set this and omit the
+   * prompt from args.
+   */
+  stdinData?: string;
 }
 
 export interface BackendAdapter {

@@ -37,11 +37,12 @@ export class ClaudeAdapter implements BackendAdapter {
 
     const args: string[] = [];
 
-    // Prompt mode vs interactive
+    // Prompt mode vs interactive. The prompt is passed via stdin (not argv):
+    // transcripts can exceed the OS argv limit (~256KB on macOS), which
+    // makes spawn fail with E2BIG. `claude -p` reads the prompt from piped
+    // stdin when no positional prompt is given.
     if (config.prompt) {
       args.push('-p');
-      // Claude expects print prompt immediately after -p/--print.
-      args.push(config.prompt);
     }
 
     // Model (only if explicitly specified)
@@ -106,6 +107,7 @@ export class ClaudeAdapter implements BackendAdapter {
         ...(config.studioId ? { INK_STUDIO_ID: config.studioId } : {}),
       },
       cleanup: mcpCleanup,
+      ...(config.prompt ? { stdinData: config.prompt } : {}),
     };
   }
 }
