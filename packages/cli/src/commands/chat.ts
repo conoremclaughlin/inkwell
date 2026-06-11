@@ -27,7 +27,12 @@ import {
   type BackendAuthBackend,
 } from '../lib/backend-auth.js';
 import { startBackendTurn, runBackendTurn } from '../repl/backend-runner.js';
-import { ContextLedger, estimateTokens, type LedgerRole } from '../repl/context-ledger.js';
+import {
+  ContextLedger,
+  entryRefHash,
+  estimateTokens,
+  type LedgerRole,
+} from '../repl/context-ledger.js';
 import { parseSlashCommand } from '../repl/slash.js';
 import { ToolMode, ToolPolicyScopeKind, ToolPolicyState } from '../repl/tool-policy.js';
 import { formatBackendTokenUsage, type BackendTokenUsage } from '../repl/token-usage.js';
@@ -393,12 +398,26 @@ interface HistoryHydrationResult {
     ts?: string;
     /** Display label for system entries (e.g., "heartbeat", "continuation") */
     label?: string;
+    /** Transcript event id (for eviction filtering of the replay) */
+    eid?: number;
   }>;
   seenInboxIds?: string[];
   seenActivityIds?: string[];
   /** True when hydration collapsed history at a compaction event */
   compactionCollapsed?: boolean;
 }
+
+/** An entry excluded from the window by a context_evict event — kept for display */
+interface EvictedEntryRecord {
+  role: LedgerRole;
+  content: string;
+  source?: string;
+  eid?: number;
+  actor?: string;
+  reason?: string;
+}
+
+const EVICTED_DISPLAY_MAX = 100;
 
 interface SessionContextMessage {
   role: 'user' | 'assistant' | 'inbox' | 'system';
@@ -612,15 +631,21 @@ export function hydrateLedgerFromTranscript(
   seenActivityIds: string[];
   recoveredMemoryIds: string[];
   compactionCollapsed: boolean;
+  /** Entries excluded by context_evict events — for evicted-content display */
+  evictedEntries: EvictedEntryRecord[];
+  /** Highest event id seen — seeds the append counter so new eids continue */
+  maxEid: number;
 } {
   const events = readTranscriptEvents(transcriptPath);
   let loaded = 0;
   let messageCount = 0;
   let compactionCollapsed = false;
+  let maxEid = 0;
   const preview: HistoryHydrationResult['tailPreview'] = [];
   const seenInboxIds = new Set<string>();
   const seenActivityIds = new Set<string>();
   const recoveredMemoryIds: string[] = [];
+  const evictedEntries: EvictedEntryRecord[] = [];
   // Entries added by THIS hydration pass — a compaction event collapses them
   // (and only them; entries that pre-date hydration are left alone).
   const hydratedEntryIds: number[] = [];
@@ -629,9 +654,10 @@ export function hydrateLedgerFromTranscript(
     role: 'user' | 'assistant' | 'inbox' | 'system',
     content: string,
     ts?: string,
-    label?: string
+    label?: string,
+    eid?: number
   ) => {
-    preview.push({ role, content: compactForHistoryPreview(role, content), ts, label });
+    preview.push({ role, content: compactForHistoryPreview(role, content), ts, label, eid });
     if (preview.length > HISTORY_PREVIEW_MAX) {
       preview.shift();
     }
@@ -639,6 +665,77 @@ export function hydrateLedgerFromTranscript(
 
   for (const event of events) {
     const type = typeof event.type === 'string' ? event.type : '';
+    const eid = typeof event.eid === 'number' ? event.eid : undefined;
+    if (eid !== undefined && eid > maxEid) maxEid = eid;
+    if (type === 'context_evict' && Array.isArray(event.refs)) {
+      // Apply the eviction exactly as it happened live: remove matching
+      // entries that exist at this point in the replay. Entries appended
+      // AFTER this event (even with identical content) are unaffected —
+      // in-stream ordering gives exclusion the right semantics for free.
+      const refs = (event.refs as Array<Record<string, unknown>>)
+        .filter((r) => r && typeof r === 'object')
+        .map((r) => ({
+          eid: typeof r.eid === 'number' ? r.eid : undefined,
+          hash: typeof r.hash === 'string' ? r.hash : undefined,
+        }));
+      const hydratedSet = new Set(hydratedEntryIds);
+      const matchIds = ledger.findEntriesByRefs(refs).filter((id) => hydratedSet.has(id));
+      if (matchIds.length === 0) continue;
+      const evictResult = ledger.evictEntries(matchIds);
+      const removedLedgerIds = new Set(evictResult.removedEntries.map((e) => e.id));
+      for (let i = hydratedEntryIds.length - 1; i >= 0; i--) {
+        if (removedLedgerIds.has(hydratedEntryIds[i])) hydratedEntryIds.splice(i, 1);
+      }
+      // Drop evicted entries from the visible replay and adjust counts.
+      // Eid-preferred matching: rows with eids are filtered ONLY by eid —
+      // content-key matching is reserved for eid-less (legacy) removals.
+      // Otherwise evicting one of two identical-content entries by eid
+      // would also drop the survivor's preview row.
+      const removedEids = new Set(
+        evictResult.removedEntries.map((e) => e.eid).filter((v): v is number => v !== undefined)
+      );
+      const removedKeysWithoutEid = new Set(
+        evictResult.removedEntries
+          .filter((e) => e.eid === undefined)
+          .map((e) => `${e.role} ${compactForHistoryPreview(e.role, e.content)}`)
+      );
+      for (let i = preview.length - 1; i >= 0; i--) {
+        const p = preview[i];
+        const matchesByEid = p.eid !== undefined && removedEids.has(p.eid);
+        const matchesByKey =
+          p.eid === undefined && removedKeysWithoutEid.has(`${p.role} ${p.content}`);
+        if (matchesByEid || matchesByKey) {
+          preview.splice(i, 1);
+        }
+      }
+      let removedMessages = 0;
+      for (const removed of evictResult.removedEntries) {
+        if (
+          removed.role === 'user' ||
+          removed.role === 'assistant' ||
+          removed.role === 'inbox' ||
+          (removed.role === 'system' &&
+            (removed.source === 'continuation' ||
+              !INTERNAL_SYSTEM_SOURCES.has(removed.source || '')))
+        ) {
+          removedMessages += 1;
+        }
+        evictedEntries.push({
+          role: removed.role,
+          content: removed.content,
+          source: removed.source,
+          eid: removed.eid,
+          actor: typeof event.actor === 'string' ? event.actor : undefined,
+          reason: typeof event.reason === 'string' ? event.reason : undefined,
+        });
+      }
+      if (evictedEntries.length > EVICTED_DISPLAY_MAX) {
+        evictedEntries.splice(0, evictedEntries.length - EVICTED_DISPLAY_MAX);
+      }
+      messageCount = Math.max(0, messageCount - removedMessages);
+      loaded = Math.max(0, loaded - evictResult.removedEntries.length);
+      continue;
+    }
     if (type === 'compaction' && typeof event.summary === 'string') {
       // Compaction marks a new start state: everything replayed before this
       // point is superseded by the event's summary + kept tail. The tail's
@@ -670,7 +767,8 @@ export function hydrateLedgerFromTranscript(
             : 'system';
         const source =
           typeof keptRecord.source === 'string' ? keptRecord.source : 'compaction-tail';
-        const entry = ledger.addEntry(role, keptRecord.content, source);
+        const keptEid = typeof keptRecord.eid === 'number' ? keptRecord.eid : undefined;
+        const entry = ledger.addEntry(role, keptRecord.content, source, keptEid);
         hydratedEntryIds.push(entry.id);
         loaded += 1;
         if (role === 'user' || role === 'assistant' || role === 'inbox') {
@@ -678,7 +776,9 @@ export function hydrateLedgerFromTranscript(
           pushPreview(
             role,
             keptRecord.content,
-            typeof event.ts === 'string' ? event.ts : undefined
+            typeof event.ts === 'string' ? event.ts : undefined,
+            undefined,
+            keptEid
           );
         } else if (role === 'system' && !INTERNAL_SYSTEM_SOURCES.has(source)) {
           // Kept system turns with a meaningful channel label (heartbeat,
@@ -687,37 +787,61 @@ export function hydrateLedgerFromTranscript(
             'system',
             keptRecord.content,
             typeof event.ts === 'string' ? event.ts : undefined,
-            source
+            source,
+            keptEid
           );
         }
       }
       continue;
     }
     if (type === 'user' && typeof event.content === 'string') {
-      const entry = ledger.addEntry('user', event.content, 'repl-history');
+      const entry = ledger.addEntry('user', event.content, 'repl-history', eid);
       hydratedEntryIds.push(entry.id);
       loaded += 1;
       messageCount += 1;
-      pushPreview('user', event.content, typeof event.ts === 'string' ? event.ts : undefined);
+      pushPreview(
+        'user',
+        event.content,
+        typeof event.ts === 'string' ? event.ts : undefined,
+        undefined,
+        eid
+      );
       continue;
     }
     if (type === 'assistant') {
       if (event.cancelled === true || event.content === '(no output)') continue;
       if (typeof event.content !== 'string') continue;
       const source = typeof event.backend === 'string' ? event.backend : 'backend-history';
-      const entry = ledger.addEntry('assistant', event.content, source);
+      const entry = ledger.addEntry('assistant', event.content, source, eid);
       hydratedEntryIds.push(entry.id);
       loaded += 1;
       messageCount += 1;
-      pushPreview('assistant', event.content, typeof event.ts === 'string' ? event.ts : undefined);
+      pushPreview(
+        'assistant',
+        event.content,
+        typeof event.ts === 'string' ? event.ts : undefined,
+        undefined,
+        eid
+      );
       continue;
     }
     if (type === 'inbox' && typeof event.rendered === 'string') {
-      const entry = ledger.addEntry('inbox', compactForLedger(event.rendered), 'inkmail-history');
+      const entry = ledger.addEntry(
+        'inbox',
+        compactForLedger(event.rendered),
+        'inkmail-history',
+        eid
+      );
       hydratedEntryIds.push(entry.id);
       loaded += 1;
       messageCount += 1;
-      pushPreview('inbox', event.rendered, typeof event.ts === 'string' ? event.ts : undefined);
+      pushPreview(
+        'inbox',
+        event.rendered,
+        typeof event.ts === 'string' ? event.ts : undefined,
+        undefined,
+        eid
+      );
       if (typeof event.messageId === 'string') {
         seenInboxIds.add(event.messageId);
       }
@@ -726,7 +850,7 @@ export function hydrateLedgerFromTranscript(
     if (type === 'system_turn' && typeof event.content === 'string') {
       // Synthetic turn input (heartbeat trigger, continuation prompt, etc.)
       const label = typeof event.label === 'string' ? event.label : 'system';
-      const entry = ledger.addEntry('system', event.content, label);
+      const entry = ledger.addEntry('system', event.content, label, eid);
       hydratedEntryIds.push(entry.id);
       loaded += 1;
       messageCount += 1;
@@ -737,14 +861,15 @@ export function hydrateLedgerFromTranscript(
           'system',
           event.content,
           typeof event.ts === 'string' ? event.ts : undefined,
-          label
+          label,
+          eid
         );
       }
       continue;
     }
     if (type === 'hook_injection' && typeof event.content === 'string') {
       const source = typeof event.source === 'string' ? event.source : 'hook-history';
-      const entry = ledger.addEntry('system', event.content, source);
+      const entry = ledger.addEntry('system', event.content, source, eid);
       hydratedEntryIds.push(entry.id);
       loaded += 1;
       if (typeof event.memoryId === 'string') {
@@ -758,7 +883,8 @@ export function hydrateLedgerFromTranscript(
       const entry = ledger.addEntry(
         'system',
         compactForLedger(`⚡ ${actor} ${activityType} — ${event.content}`, 320),
-        'pcp-activity-history'
+        'pcp-activity-history',
+        eid
       );
       hydratedEntryIds.push(entry.id);
       loaded += 1;
@@ -776,6 +902,8 @@ export function hydrateLedgerFromTranscript(
     seenActivityIds: Array.from(seenActivityIds),
     recoveredMemoryIds,
     compactionCollapsed,
+    evictedEntries,
+    maxEid,
   };
 }
 
@@ -853,8 +981,21 @@ async function tailTranscript(target: string): Promise<void> {
   });
 }
 
-function appendTranscript(path: string, event: Record<string, unknown>): void {
-  appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n');
+// Per-transcript monotonic event id counters. Every appended event gets an
+// `eid` so persistent operations (context_evict) can reference events
+// precisely across reattach. Seeded from the file's max eid on hydration.
+const transcriptEidCounters = new Map<string, number>();
+
+export function seedTranscriptEidCounter(path: string, maxSeen: number): void {
+  const current = transcriptEidCounters.get(path) ?? 0;
+  if (maxSeen > current) transcriptEidCounters.set(path, maxSeen);
+}
+
+function appendTranscript(path: string, event: Record<string, unknown>): number {
+  const eid = (transcriptEidCounters.get(path) ?? 0) + 1;
+  transcriptEidCounters.set(path, eid);
+  appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), eid, ...event }) + '\n');
+  return eid;
 }
 
 function compactForLedger(content: string, maxChars = LEDGER_COMPACT_CHARS): string {
@@ -2228,6 +2369,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // Session-level tool call log — surfaced in the Ctrl+O context inspector
   const recentToolCalls: Array<{ tool: string; status: string; at: string }> = [];
 
+  // Entries evicted from the window (hydration replay + live evictions) —
+  // out of context but never out of sight; surfaced in the inspector
+  const sessionEvictedEntries: EvictedEntryRecord[] = [];
+
   // Register built-in hooks (passive recall + budget monitor).
   // callRecall wraps pcp.callTool('recall', ...) into the shape hooks expect.
   const { passiveRecall: passiveRecallHandle } = registerBuiltinHooks(hookRegistry, {
@@ -2523,6 +2668,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let historyHydration: HistoryHydrationResult | null = null;
   if (attachedToExistingSession && existingTranscript) {
     const hydrated = hydrateLedgerFromTranscript(ledger, existingTranscript);
+    // Continue the event-id sequence from where the file left off
+    seedTranscriptEidCounter(existingTranscript, hydrated.maxEid);
+    sessionEvictedEntries.push(...hydrated.evictedEntries);
     historyHydration = {
       loaded: hydrated.loaded,
       messageCount: hydrated.messageCount,
@@ -2876,6 +3024,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
       removedTokens: trim.removedTokens,
       totalAfter: trim.totalAfter,
     });
+    // Persist the trim as an eviction so it survives reattach (context_trim
+    // alone is informational — hydration doesn't replay it)
+    appendTranscript(runtime.transcriptPath, {
+      type: 'context_evict',
+      actor: 'system',
+      reason: `trim: ${reason}`,
+      removedTokens: trim.removedTokens,
+      refs: trim.removedEntries.map((e) => ({
+        ...(e.eid !== undefined ? { eid: e.eid } : {}),
+        hash: entryRefHash(e.role, e.content),
+      })),
+    });
 
     return { removed: trim.removedEntries.length, removedTokens: trim.removedTokens };
   };
@@ -2951,7 +3111,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
         const keptEntries = ledger
           .listEntries()
           .slice(1) // entry 0 is the summary itself
-          .map((e) => ({ role: e.role, content: e.content, source: e.source }));
+          .map((e) => ({
+            role: e.role,
+            content: e.content,
+            source: e.source,
+            ...(e.eid !== undefined ? { eid: e.eid } : {}),
+          }));
         appendTranscript(runtime.transcriptPath, {
           type: 'compaction',
           reason,
@@ -3766,11 +3931,41 @@ export async function runChat(options: ChatOptions): Promise<void> {
               const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
               if (content) {
                 const parsed = JSON.parse(content);
-                printLine(
+                printEvent(
                   chalk.dim(
                     `  🗑 evicted ${parsed.evicted} entries (${parsed.tokensFreed} tok freed, ${parsed.totalAfter} tok remaining)`
                   )
                 );
+                // Persist the eviction so it survives reattach — without this,
+                // hydration replays the raw events and evicted entries resurrect
+                if (parsed.success && Array.isArray(parsed.evictRefs) && parsed.evicted > 0) {
+                  const refs = parsed.evictRefs as Array<Record<string, unknown>>;
+                  appendTranscript(runtime.transcriptPath, {
+                    type: 'context_evict',
+                    actor: 'sb',
+                    reason: compactForLedger(JSON.stringify(result.args ?? {}), 200),
+                    removedTokens: parsed.tokensFreed,
+                    refs: refs.map((ref) => ({
+                      ...(typeof ref.eid === 'number' ? { eid: ref.eid } : {}),
+                      hash: ref.hash,
+                    })),
+                  });
+                  for (const ref of refs) {
+                    sessionEvictedEntries.push({
+                      role: (ref.role as LedgerRole) || 'system',
+                      content: typeof ref.preview === 'string' ? ref.preview : '',
+                      source: typeof ref.source === 'string' ? ref.source : undefined,
+                      eid: typeof ref.eid === 'number' ? ref.eid : undefined,
+                      actor: 'sb',
+                    });
+                  }
+                  if (sessionEvictedEntries.length > EVICTED_DISPLAY_MAX) {
+                    sessionEvictedEntries.splice(
+                      0,
+                      sessionEvictedEntries.length - EVICTED_DISPLAY_MAX
+                    );
+                  }
+                }
               }
             } else if (result.tool === 'list_context') {
               const r = result.result as Record<string, unknown> | undefined;
@@ -4350,6 +4545,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
         bootstrapTokens: runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0,
       },
       toolCalls: recentToolCalls,
+      evicted: sessionEvictedEntries.map((e) => ({
+        role: e.role,
+        source: e.source,
+        preview: e.content.slice(0, 100),
+        actor: e.actor,
+        reason: e.reason,
+      })),
     });
   };
 

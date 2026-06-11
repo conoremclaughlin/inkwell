@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { ContextLedger } from '../repl/context-ledger.js';
+import { ContextLedger, entryRefHash } from '../repl/context-ledger.js';
 import { hydrateLedgerFromTranscript } from './chat.js';
 
 describe('hydrateLedgerFromTranscript — compaction events', () => {
@@ -242,5 +242,142 @@ describe('hydrateLedgerFromTranscript — compaction events', () => {
     expect(entries[1].content).toBe('falls back to system role');
     expect(entries[2].role).toBe('user');
     expect(entries[2].content).toBe('valid entry');
+  });
+});
+
+describe('hydrateLedgerFromTranscript — context_evict events', () => {
+  let dir: string;
+  let transcriptPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-evict-test-'));
+    transcriptPath = join(dir, 'session-test.jsonl');
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const writeTranscript = (events: Array<Record<string, unknown>>) => {
+    writeFileSync(transcriptPath, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  };
+
+  it('evicted entries stay gone on reattach (eid refs)', () => {
+    writeTranscript([
+      { eid: 1, type: 'user', content: 'keep me' },
+      { eid: 2, type: 'assistant', content: 'stale heartbeat result', backend: 'claude' },
+      { eid: 3, type: 'assistant', content: 'keep me too', backend: 'claude' },
+      { eid: 4, type: 'context_evict', actor: 'sb', reason: 'stale', refs: [{ eid: 2 }] },
+    ]);
+
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+
+    const contents = ledger.listEntries().map((e) => e.content);
+    expect(contents).toEqual(['keep me', 'keep me too']);
+    expect(result.tailPreview.map((p) => p.content)).not.toContain('stale heartbeat result');
+    expect(result.messageCount).toBe(2);
+    expect(result.evictedEntries).toHaveLength(1);
+    expect(result.evictedEntries[0].content).toBe('stale heartbeat result');
+    expect(result.evictedEntries[0].actor).toBe('sb');
+    expect(result.maxEid).toBe(4);
+  });
+
+  it('evicts by content hash when events lack eids (legacy transcripts)', () => {
+    const hash = entryRefHash('user', 'old noise');
+    writeTranscript([
+      { type: 'user', content: 'old noise' },
+      { type: 'user', content: 'signal' },
+      { type: 'context_evict', actor: 'sb', refs: [{ hash }] },
+    ]);
+
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+
+    expect(ledger.listEntries().map((e) => e.content)).toEqual(['signal']);
+  });
+
+  it('does not retro-evict identical content appended AFTER the evict event', () => {
+    const hash = entryRefHash('user', 'repeated message');
+    writeTranscript([
+      { type: 'user', content: 'repeated message' },
+      { type: 'context_evict', actor: 'sb', refs: [{ hash }] },
+      { type: 'user', content: 'repeated message' }, // written after — must survive
+    ]);
+
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+
+    expect(ledger.listEntries().map((e) => e.content)).toEqual(['repeated message']);
+    expect(result.messageCount).toBe(1);
+  });
+
+  it('evicts kept-tail entries re-seeded by a compaction event', () => {
+    writeTranscript([
+      { eid: 1, type: 'user', content: 'old' },
+      {
+        eid: 2,
+        type: 'compaction',
+        summary: 'the summary',
+        keptEntries: [
+          { role: 'user', content: 'kept but stale', source: 'repl-history', eid: 1 },
+          { role: 'assistant', content: 'kept and useful', source: 'claude' },
+        ],
+      },
+      { eid: 3, type: 'context_evict', actor: 'sb', refs: [{ eid: 1 }] },
+    ]);
+
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+
+    const contents = ledger.listEntries().map((e) => e.content);
+    expect(contents).toEqual(['the summary', 'kept and useful']);
+  });
+
+  it('never evicts entries that predate hydration (bootstrap safety)', () => {
+    const hash = entryRefHash('system', 'bootstrap identity block');
+    writeTranscript([
+      { type: 'user', content: 'hello' },
+      { type: 'context_evict', actor: 'sb', refs: [{ hash }] },
+    ]);
+
+    const ledger = new ContextLedger();
+    ledger.addEntry('system', 'bootstrap identity block', 'bootstrap');
+
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+
+    expect(ledger.listEntries().map((e) => e.content)).toContain('bootstrap identity block');
+  });
+
+  it('keeps the surviving duplicate preview row on eid-specific eviction (regression)', () => {
+    // Lumen's repro: two identical-content entries; evicting ONE by eid must
+    // leave the other's preview row intact (content-key fallback must not
+    // collateral-evict survivors).
+    writeTranscript([
+      { eid: 1, type: 'user', content: 'duplicate' },
+      { eid: 2, type: 'user', content: 'duplicate' },
+      { eid: 3, type: 'context_evict', actor: 'sb', refs: [{ eid: 1 }] },
+    ]);
+
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+
+    expect(ledger.listEntries()).toHaveLength(1);
+    expect(ledger.listEntries()[0].eid).toBe(2);
+    expect(result.messageCount).toBe(1);
+    expect(result.tailPreview).toHaveLength(1);
+    expect(result.tailPreview[0].eid).toBe(2);
+    expect(result.tailPreview[0].content).toBe('duplicate');
+  });
+
+  it('reports maxEid so the append counter continues the sequence', () => {
+    writeTranscript([
+      { eid: 7, type: 'user', content: 'a' },
+      { eid: 12, type: 'assistant', content: 'b', backend: 'claude' },
+    ]);
+
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+    expect(result.maxEid).toBe(12);
   });
 });
