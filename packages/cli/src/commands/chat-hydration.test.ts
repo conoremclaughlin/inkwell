@@ -64,6 +64,11 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
     // ...but is not counted as a message and not added to the ledger
     expect(result.messageCount).toBe(2);
     expect(ledger.listEntries().some((e) => e.content.includes('send_response'))).toBe(false);
+
+    // ...and is collected for the context inspector's Tool Calls section
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0].tool).toBe('send_response');
+    expect(result.toolCalls[0].args).toContain('726555973');
   });
 
   it('caps long tool args in the replay preview', () => {
@@ -83,6 +88,11 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
     const row = result.tailPreview.find((p) => p.role === 'event');
     expect(row).toBeDefined();
     expect(row!.content.length).toBeLessThan(150);
+    // Truncation is explicit, not a mid-word clip
+    expect(row!.content.endsWith('…')).toBe(true);
+    // The inspector record keeps a longer (but still capped) version
+    expect(result.toolCalls[0].args!.length).toBeLessThanOrEqual(401);
+    expect(result.toolCalls[0].args!.endsWith('…')).toBe(true);
   });
 });
 

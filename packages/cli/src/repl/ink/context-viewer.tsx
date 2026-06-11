@@ -14,8 +14,8 @@ export interface ContextSections {
     tokenEstimate: number;
     bootstrapTokens: number;
   };
-  /** Tool calls executed this session (most recent last) */
-  toolCalls?: Array<{ tool: string; status: string; at: string }>;
+  /** Tool calls executed this session or replayed from the transcript (most recent last) */
+  toolCalls?: Array<{ tool: string; status: string; at: string; args?: string }>;
   /** Entries evicted from the context window — out of the prompt, not erased */
   evicted?: Array<{
     role: string;
@@ -53,6 +53,9 @@ export function formatContextLines(sections: ContextSections): string[] {
     for (const call of recent) {
       const time = call.at ? new Date(call.at).toLocaleTimeString() : '';
       lines.push(`• ${call.tool} (${call.status})${time ? ` · ${time}` : ''}`);
+      if (call.args) {
+        lines.push(`    ${call.args}`);
+      }
     }
     lines.push('');
   }
@@ -120,18 +123,24 @@ interface ContextViewerProps {
   lines: string[];
   isActive: boolean;
   onDismiss: () => void;
+  /** Open scrolled to a section (a SECTION_JUMP_KEYS key, e.g. 't' for tools) */
+  initialSection?: string;
 }
 
 export function ContextViewer({
   lines,
   isActive,
   onDismiss,
+  initialSection,
 }: ContextViewerProps): React.ReactElement {
   const { stdout } = useStdout();
   const viewportHeight = Math.max(5, (stdout?.rows || 24) - 4);
-  const [scrollOffset, setScrollOffset] = useState(0);
-  const maxScroll = Math.max(0, lines.length - viewportHeight);
   const sectionJumps = useMemo(() => computeSectionJumps(lines), [lines]);
+  const maxScroll = Math.max(0, lines.length - viewportHeight);
+  const [scrollOffset, setScrollOffset] = useState(() => {
+    const target = initialSection ? sectionJumps.get(initialSection) : undefined;
+    return target !== undefined ? Math.min(maxScroll, target) : 0;
+  });
 
   const scrollUp = useCallback(
     (amount = 1) => setScrollOffset((prev) => Math.max(0, prev - amount)),
@@ -180,6 +189,15 @@ export function ContextViewer({
       }
       if (key.ctrl && input === 'd') {
         scrollDown(Math.floor(viewportHeight / 2));
+        return;
+      }
+      // Ctrl+T re-jumps to Tool Calls — the viewer owns stdin while open,
+      // so the prompt's Ctrl+T binding can't fire; mirror it here.
+      if (key.ctrl && input === 't') {
+        const target = sectionJumps.get('t');
+        if (target !== undefined) {
+          setScrollOffset(Math.min(maxScroll, target));
+        }
         return;
       }
       // Section jumps (e: evicted, t: tools, m: memories, b: bootstrap)

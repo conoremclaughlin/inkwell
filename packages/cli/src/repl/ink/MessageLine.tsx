@@ -40,6 +40,20 @@ const CONTENT_COLORS: Record<MessageRole, string | undefined> = {
 };
 
 /**
+ * Strip leading indentation from event content, including spaces that hide
+ * BEHIND leading ANSI color sequences — live call sites wrap their strings
+ * in chalk (e.g. chalk.dim('  🗑 …')), so the first bytes are SGR escapes
+ * and a plain trimStart() never reaches the embedded spaces. The event
+ * role's paddingLeft owns the column; content must not add to it.
+ */
+// eslint-disable-next-line no-control-regex
+const LEADING_INDENT_RE = /^((?:\u001b\[[0-9;]*m)*)[ \t]+/;
+
+export function normalizeEventContent(content: string): string {
+  return content.replace(LEADING_INDENT_RE, '$1');
+}
+
+/**
  * Collapse image file paths to numbered [Image #N] tokens.
  * Matches absolute paths and file:// URIs ending in common image extensions.
  * Path segments use non-greedy matching and stop at whitespace boundaries.
@@ -71,11 +85,15 @@ export const MessageLine = React.memo(function MessageLine({
 
   // Events are compact progress/status lines (tool runs, signals, dividers):
   // a single dim line at the content column — no label row, no spacing.
+  // normalizeEventContent strips call-site indentation (even behind chalk's
+  // leading ANSI escapes) so every event row aligns flush with message
+  // content (column 3), and truncate-end keeps them to ONE line with a
+  // terminal-width ellipsis — full details live in the inspector (Ctrl+T).
   if (role === 'event') {
     return (
       <Box paddingLeft={3}>
-        <Text dimColor wrap="wrap">
-          {displayContent}
+        <Text dimColor wrap="truncate-end">
+          {normalizeEventContent(displayContent)}
           {meta ? `  ·  ${meta}` : ''}
         </Text>
       </Box>

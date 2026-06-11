@@ -34,6 +34,25 @@ describe('computeSectionJumps', () => {
     expect(jumps.has('b')).toBe(false); // no bootstrap summary
   });
 
+  it('tool calls section renders args beneath each call', () => {
+    const lines = formatContextLines({
+      ...baseSections,
+      toolCalls: [
+        {
+          tool: 'send_response',
+          status: 'executed',
+          at: new Date().toISOString(),
+          args: '{"channel":"telegram","content":"heads-up!"}',
+        },
+        { tool: 'get_inbox', status: 'approved', at: new Date().toISOString() },
+      ],
+    });
+    const joined = lines.join('\n');
+    expect(joined).toContain('• send_response (executed)');
+    expect(joined).toContain('    {"channel":"telegram","content":"heads-up!"}');
+    expect(joined).toContain('• get_inbox (approved)');
+  });
+
   it('evicted section shows attribution and out-of-window note', () => {
     const lines = formatContextLines({
       ...baseSections,

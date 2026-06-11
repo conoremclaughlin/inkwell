@@ -66,8 +66,8 @@ export interface InkRepl {
   setCommandOutput: (lines: string[] | null) => void;
   /** Store surfaced memory details for Ctrl+O expansion. */
   setSurfacedMemories: (lines: string[]) => void;
-  /** Open the context viewer with formatted lines. */
-  showContextView: (lines: string[]) => void;
+  /** Open the context viewer with formatted lines (optionally at a section). */
+  showContextView: (lines: string[], opts?: { initialSection?: string }) => void;
   /** Signal exit from the orchestrator side (makes waitForInput reject). */
   requestExit: () => void;
   /** Unmount the Ink app and restore terminal. */
@@ -208,8 +208,8 @@ export function renderInkChat(options: {
       getHandle().setSurfacedMemories(lines);
     },
 
-    showContextView: (lines) => {
-      getHandle().showContextView(lines);
+    showContextView: (lines, opts) => {
+      getHandle().showContextView(lines, opts);
     },
 
     requestExit: () => {
