@@ -44,6 +44,7 @@ import {
   buildAttachmentBlock,
   collectAttachmentDirs,
 } from '../repl/attachments.js';
+import { classifyActivity } from '../repl/activity-render.js';
 import { ToolMode, ToolPolicyScopeKind, ToolPolicyState } from '../repl/tool-policy.js';
 import { formatBackendTokenUsage, type BackendTokenUsage } from '../repl/token-usage.js';
 import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../repl/skills.js';
@@ -206,6 +207,8 @@ interface ActivitySummary {
   agentId?: string;
   sessionId?: string;
   createdAt?: string;
+  /** Originating platform for message activities (telegram, discord, …) */
+  platform?: string;
 }
 
 function isBackendAuthBackend(value: string): value is BackendAuthBackend {
@@ -1354,6 +1357,7 @@ function extractActivitySummaries(
             : typeof row.created_at === 'string'
               ? row.created_at
               : undefined,
+        platform: typeof row.platform === 'string' ? row.platform : undefined,
       };
     })
     .filter((activity): activity is ActivitySummary => Boolean(activity));
@@ -3559,24 +3563,36 @@ export async function runChat(options: ChatOptions): Promise<void> {
         createdAt: activity.createdAt || null,
         content: activity.content || null,
       });
-      // This agent's own bookkeeping (session state updates, tool call
-      // echoes) is progress, not conversation — render as a dim event line
-      // instead of a full activity block.
-      const isOwnBookkeeping =
-        activity.agentId === agentId &&
-        (rawType.startsWith('state_change') ||
-          rawType.startsWith('tool_call') ||
-          rawType.startsWith('tool_result'));
-      if (isOwnBookkeeping) {
-        printEvent(
-          chalk.dim(
-            `  ⚡ ${type}${preview ? ` — ${preview}` : ''} · ${formatHumanTime(activity.createdAt, runtime.userTimezone)}`
-          )
-        );
+      // Tiered rendering: platform messages are real conversation and get
+      // proper message blocks; the agent's own mechanics (tools, state,
+      // backend turn lifecycle) are dim event lines; everything else stays
+      // a ⚡ activity block.
+      const plan = classifyActivity(activity, agentId);
+      const activityTime = formatHumanTime(activity.createdAt, runtime.userTimezone);
+      if (plan.mode === 'message-in' || plan.mode === 'message-out') {
+        // Full content, not the 200-char preview — these ARE the conversation
+        const messageContent = (activity.content || '').trim() || '(empty message)';
+        if (inkRepl) {
+          inkRepl.addMessage(plan.role!, messageContent, {
+            label: plan.label,
+            time: activityTime,
+          });
+        } else {
+          printLine('');
+          printLine(
+            renderMessageLine(plan.role!, messageContent, {
+              label: plan.label,
+              timezone: runtime.userTimezone,
+              ts: activity.createdAt,
+            })
+          );
+        }
+      } else if (plan.mode === 'bookkeeping') {
+        printEvent(chalk.dim(`  ⚡ ${type}${preview ? ` — ${preview}` : ''} · ${activityTime}`));
       } else if (inkRepl) {
         inkRepl.addMessage('activity', `${actor} ${type}${preview ? ` — ${preview}` : ''}`, {
           label: '⚡',
-          time: formatHumanTime(activity.createdAt, runtime.userTimezone),
+          time: activityTime,
         });
       } else {
         printLine('');
