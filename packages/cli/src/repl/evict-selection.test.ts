@@ -69,6 +69,17 @@ describe('parseEvictSelection', () => {
     expect(parseEvictSelection(['-3']).error).toBeTruthy();
   });
 
+  it('rejects malformed numeric tokens that parseInt would truncate', () => {
+    // Each of these parses to 1 under Number.parseInt — accepting them
+    // would silently evict entry #1 instead of erroring
+    expect(parseEvictSelection(['1abc']).error).toMatch(/Unrecognized selector/);
+    expect(parseEvictSelection(['1.5']).error).toMatch(/Unrecognized selector/);
+    expect(parseEvictSelection(['1e3']).error).toMatch(/Unrecognized selector/);
+    expect(parseEvictSelection(['3,abc']).error).toMatch(/Unrecognized selector/);
+    expect(parseEvictSelection(['+3']).error).toMatch(/Unrecognized selector/);
+    expect(parseEvictSelection(['3 ', '0x2']).error).toBeTruthy();
+  });
+
   it('accepts dry-run alongside a filter', () => {
     const sel = parseEvictSelection(['source:heartbeat', '--dry-run']);
     expect(sel.source).toBe('heartbeat');

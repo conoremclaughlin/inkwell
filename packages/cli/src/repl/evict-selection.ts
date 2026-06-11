@@ -62,11 +62,17 @@ export function parseEvictSelection(args: string[]): EvictSelection {
       selection.role = role as LedgerRole;
       continue;
     }
-    // Bare ids, possibly comma-separated: "3,5" or "7"
+    // Bare ids, possibly comma-separated: "3,5" or "7". Each token must be a
+    // full positive integer — parseInt would accept "1abc"/"1.5"/"1e3" as 1
+    // and silently evict the wrong entry.
     const parts = arg.split(',').filter(Boolean);
-    const parsed = parts.map((p) => Number.parseInt(p, 10));
-    if (parts.length === 0 || parsed.some((n) => !Number.isFinite(n) || n <= 0)) {
+    if (parts.length === 0 || parts.some((p) => !/^\d+$/.test(p))) {
       selection.error = `Unrecognized selector: ${arg} (expected entry ids, source:<name>, role:<role>, or --dry-run)`;
+      return selection;
+    }
+    const parsed = parts.map((p) => Number.parseInt(p, 10));
+    if (parsed.some((n) => n <= 0)) {
+      selection.error = `Entry ids must be positive integers: ${arg}`;
       return selection;
     }
     ids.push(...parsed);
