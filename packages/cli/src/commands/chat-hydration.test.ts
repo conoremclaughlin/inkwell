@@ -5,6 +5,87 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ContextLedger, entryRefHash } from '../repl/context-ledger.js';
 import { hydrateLedgerFromTranscript, formatTranscriptSize } from './chat.js';
 
+describe('hydrateLedgerFromTranscript — tool call replay', () => {
+  let dir: string;
+  let transcriptPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-hydration-tools-test-'));
+    transcriptPath = join(dir, 'session-tools.jsonl');
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('replays local_tool_call events as dim event rows (regression: send_response receipts vanished)', () => {
+    writeFileSync(
+      transcriptPath,
+      [
+        {
+          eid: 1,
+          type: 'system_turn',
+          content: '[HEARTBEAT TRIGGER] check email',
+          label: 'heartbeat',
+        },
+        {
+          eid: 2,
+          type: 'local_tool_call',
+          tool: 'send_response',
+          args: { channel: 'telegram', conversationId: '726555973', content: 'heads-up!' },
+          status: 'executed',
+        },
+        {
+          eid: 3,
+          type: 'assistant',
+          content: 'Sent Conor a heads-up via Telegram.',
+          backend: 'claude',
+        },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join('\n') + '\n'
+    );
+
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+
+    // The tool call shows in the replay as an event row...
+    const eventRows = result.tailPreview.filter((p) => p.role === 'event');
+    expect(eventRows).toHaveLength(1);
+    expect(eventRows[0].content).toContain('send_response');
+    expect(eventRows[0].content).toContain('(executed)');
+    expect(eventRows[0].content).toContain('telegram');
+    expect(eventRows[0].eid).toBe(2);
+
+    // ...in order, between the trigger and the assistant's claim
+    const roles = result.tailPreview.map((p) => p.role);
+    expect(roles).toEqual(['system', 'event', 'assistant']);
+
+    // ...but is not counted as a message and not added to the ledger
+    expect(result.messageCount).toBe(2);
+    expect(ledger.listEntries().some((e) => e.content.includes('send_response'))).toBe(false);
+  });
+
+  it('caps long tool args in the replay preview', () => {
+    writeFileSync(
+      transcriptPath,
+      JSON.stringify({
+        eid: 1,
+        type: 'local_tool_call',
+        tool: 'remember',
+        args: { content: 'x'.repeat(500) },
+        status: 'executed',
+      }) + '\n'
+    );
+
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+    const row = result.tailPreview.find((p) => p.role === 'event');
+    expect(row).toBeDefined();
+    expect(row!.content.length).toBeLessThan(150);
+  });
+});
+
 describe('formatTranscriptSize', () => {
   it('formats KB below 1MB, one decimal below 10MB, whole MB above', () => {
     expect(formatTranscriptSize(0)).toBe('');

@@ -406,7 +406,8 @@ interface HistoryHydrationResult {
   source: 'repl-transcript' | 'pcp-session-context' | 'none';
   transcriptPath?: string;
   tailPreview: Array<{
-    role: 'user' | 'assistant' | 'inbox' | 'system';
+    /** 'event' rows are dim progress lines (tool calls) — not messages */
+    role: 'user' | 'assistant' | 'inbox' | 'system' | 'event';
     content: string;
     ts?: string;
     /** Display label for system entries (e.g., "heartbeat", "continuation") */
@@ -671,7 +672,7 @@ export function hydrateLedgerFromTranscript(
   const hydratedEntryIds: number[] = [];
 
   const pushPreview = (
-    role: 'user' | 'assistant' | 'inbox' | 'system',
+    role: 'user' | 'assistant' | 'inbox' | 'system' | 'event',
     content: string,
     ts?: string,
     label?: string,
@@ -897,6 +898,24 @@ export function hydrateLedgerFromTranscript(
       }
       continue;
     }
+    if (type === 'local_tool_call' && typeof event.tool === 'string') {
+      // Tool calls are part of the story — when the assistant says "I sent
+      // him a heads-up via Telegram", the send_response call is the receipt.
+      // Replay them as dim event lines (display only — tool RESULTS are not
+      // reconstructed into the ledger here).
+      const status = typeof event.status === 'string' ? event.status : 'executed';
+      const argsPreview = event.args
+        ? JSON.stringify(event.args).replace(/\s+/g, ' ').slice(0, 100)
+        : '';
+      pushPreview(
+        'event',
+        `🛠 ${event.tool} (${status})${argsPreview ? ` — ${argsPreview}` : ''}`,
+        typeof event.ts === 'string' ? event.ts : undefined,
+        undefined,
+        eid
+      );
+      continue;
+    }
     if (type === 'activity' && typeof event.content === 'string') {
       const actor = typeof event.agentId === 'string' ? event.agentId : 'system';
       const activityType = typeof event.activityType === 'string' ? event.activityType : 'activity';
@@ -1040,7 +1059,7 @@ const INTERNAL_SYSTEM_SOURCES = new Set([
 ]);
 
 function compactForHistoryPreview(
-  role: 'user' | 'assistant' | 'inbox' | 'system',
+  role: 'user' | 'assistant' | 'inbox' | 'system' | 'event',
   content: string
 ): string {
   if (role === 'inbox') {
@@ -4681,6 +4700,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // Push prior messages into Ink scrollback so user sees conversation history
     if (historyHydration && historyHydration.tailPreview.length > 0) {
       for (const entry of historyHydration.tailPreview) {
+        if (entry.role === 'event') {
+          // Tool calls and other progress lines — dim, unlabeled
+          inkRepl.printEvent(`  ${entry.content}`);
+          continue;
+        }
         const role =
           entry.role === 'user'
             ? ('user' as const)
