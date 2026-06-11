@@ -251,9 +251,12 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
       {/* Context viewer — conditionally rendered so each open gets fresh
           scroll state. The useInput lifecycle issue only affects the Dock
           (PromptInput), not the ContextViewer, so mount/unmount is safe. */}
+      {/* Fresh mount per open (conditional render unmounts on dismiss), so
+          initialSection applies via useState initializer. Re-jumps while
+          open are handled INSIDE the viewer (it owns stdin): plain `t` or
+          Ctrl+T — no keyed remount needed. */}
       {showingContext && (
         <ContextViewer
-          key={contextViewSection || 'top'}
           lines={contextViewLines!}
           isActive
           onDismiss={handleContextDismiss}

@@ -191,6 +191,15 @@ export function ContextViewer({
         scrollDown(Math.floor(viewportHeight / 2));
         return;
       }
+      // Ctrl+T re-jumps to Tool Calls — the viewer owns stdin while open,
+      // so the prompt's Ctrl+T binding can't fire; mirror it here.
+      if (key.ctrl && input === 't') {
+        const target = sectionJumps.get('t');
+        if (target !== undefined) {
+          setScrollOffset(Math.min(maxScroll, target));
+        }
+        return;
+      }
       // Section jumps (e: evicted, t: tools, m: memories, b: bootstrap)
       if (!key.ctrl && !key.meta) {
         const target = sectionJumps.get(input.toLowerCase());

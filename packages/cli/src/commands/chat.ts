@@ -4739,8 +4739,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (historyHydration && historyHydration.tailPreview.length > 0) {
       for (const entry of historyHydration.tailPreview) {
         if (entry.role === 'event') {
-          // Tool calls and other progress lines — dim, unlabeled
-          inkRepl.printEvent(`  ${entry.content}`);
+          // Tool calls and other progress lines — dim, unlabeled.
+          // No manual indent: MessageLine's event role owns the column.
+          inkRepl.printEvent(entry.content);
           continue;
         }
         const role =
