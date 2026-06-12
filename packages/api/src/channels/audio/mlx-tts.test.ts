@@ -143,6 +143,59 @@ describe('MlxAudioTextToSpeechProvider', () => {
     expect(await provider.synthesize({ text: '   ' })).toBeUndefined();
   });
 
+  it('falls back to wav when ffmpeg resolves but fails during encode', async () => {
+    // ffmpeg that passes the -version probe but exits nonzero on the
+    // actual encode — the synthesized WAV must survive, not be discarded.
+    const brokenFfmpeg = join(dir, 'broken-ffmpeg');
+    await writeFile(
+      brokenFfmpeg,
+      '#!/bin/sh\nif [ "$1" = "-version" ]; then echo ffmpeg; exit 0; fi\nexit 2\n'
+    );
+    await chmod(brokenFfmpeg, 0o755);
+    const provider = new MlxAudioTextToSpeechProvider({
+      format: 'opus',
+      pythonCandidates: [fakePython],
+      ffmpegBinCandidates: [brokenFfmpeg],
+    });
+    const result = await provider.synthesize({ text: 'encode failure' });
+    expect(result).toBeDefined();
+    expect(result!.contentType).toBe('audio/wav');
+    expect(result!.filename).toBe('reply.wav');
+    const content = await readFile(result!.filePath, 'utf-8');
+    expect(content).toBe('RIFF:encode failure');
+    await result!.cleanup();
+  });
+
+  it('kills a TERM-ignoring child on timeout — nothing outlives synthesize()', async () => {
+    // A "python" that ignores SIGTERM and loops forever: only the SIGKILL
+    // escalation can stop it. synthesize() must not return while it lives.
+    const pidFile = join(dir, 'hang.pid');
+    const hangPython = join(dir, 'hang-python');
+    await writeFile(
+      hangPython,
+      '#!/bin/sh\n' +
+        'if [ "$1" = "-c" ]; then exit 0; fi\n' +
+        `echo $$ > "${pidFile}"\n` +
+        "trap '' TERM\n" +
+        'while true; do sleep 0.2; done\n'
+    );
+    await chmod(hangPython, 0o755);
+
+    const provider = new MlxAudioTextToSpeechProvider({
+      format: 'wav',
+      timeoutMs: 300,
+      killGraceMs: 300,
+      pythonCandidates: [hangPython],
+    });
+    const result = await provider.synthesize({ text: 'hang forever' });
+    expect(result).toBeUndefined();
+
+    const pid = parseInt((await readFile(pidFile, 'utf-8')).trim(), 10);
+    expect(pid).toBeGreaterThan(0);
+    // Signal 0 probes liveness — ESRCH means the process group is gone.
+    expect(() => process.kill(pid, 0)).toThrow();
+  });
+
   it('returns undefined (not a throw) when generation fails', async () => {
     const brokenPython = join(dir, 'broken-python');
     await writeFile(

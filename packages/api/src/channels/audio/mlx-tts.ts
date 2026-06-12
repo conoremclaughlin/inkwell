@@ -58,6 +58,8 @@ export interface MlxTtsProviderConfig {
   format?: string;
   timeoutMs?: number;
   maxChars?: number;
+  /** Grace period between SIGTERM and SIGKILL on timeout (default 5s) */
+  killGraceMs?: number;
   /** Override python candidate list (tests) */
   pythonCandidates?: string[];
   /** Override ffmpeg candidate list (tests) */
@@ -72,6 +74,7 @@ export class MlxAudioTextToSpeechProvider implements TextToSpeechProvider {
   private readonly format: string;
   private readonly timeoutMs: number;
   private readonly maxChars: number;
+  private readonly killGraceMs: number;
   /** Resolved python path, or null when unavailable. Re-checked after TTL. */
   private resolvedPython: string | null | undefined;
   private resolvedAt = 0;
@@ -87,6 +90,7 @@ export class MlxAudioTextToSpeechProvider implements TextToSpeechProvider {
     // First synthesis downloads model weights — keep generous headroom.
     this.timeoutMs = config?.timeoutMs ?? 300_000;
     this.maxChars = config?.maxChars ?? 4_000;
+    this.killGraceMs = config?.killGraceMs ?? 5_000;
     this.pythonCandidates = config?.pythonCandidates;
     this.ffmpegBinCandidates = config?.ffmpegBinCandidates;
   }
@@ -170,20 +174,31 @@ export class MlxAudioTextToSpeechProvider implements TextToSpeechProvider {
       if (!wavPath) throw new Error('mlx-audio produced no wav output');
 
       // Telegram voice bubbles want OGG/Opus — re-encode when possible.
+      // Any encode problem (no ffmpeg, or ffmpeg fails mid-encode) falls
+      // through to returning the WAV we already have — synthesized speech
+      // must never be discarded over a re-encode failure.
       if (this.format === 'opus' || this.format === 'mp3') {
         const ffmpeg = await this.resolveFfmpeg();
         if (ffmpeg) {
-          const encoded = await this.encode(ffmpeg, wavPath, outputDir, this.format);
-          return {
-            filePath: encoded.path,
-            contentType: contentTypeForFormat(this.format),
-            filename: encoded.filename,
-            cleanup,
-          };
+          try {
+            const encoded = await this.encode(ffmpeg, wavPath, outputDir, this.format);
+            return {
+              filePath: encoded.path,
+              contentType: contentTypeForFormat(this.format),
+              filename: encoded.filename,
+              cleanup,
+            };
+          } catch (error) {
+            logger.warn('MLX TTS: ffmpeg encode failed, returning wav instead', {
+              requestedFormat: this.format,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        } else {
+          logger.warn('MLX TTS: ffmpeg unavailable, returning wav instead of requested format', {
+            requestedFormat: this.format,
+          });
         }
-        logger.warn('MLX TTS: ffmpeg unavailable, returning wav instead of requested format', {
-          requestedFormat: this.format,
-        });
       }
 
       return {
@@ -205,22 +220,42 @@ export class MlxAudioTextToSpeechProvider implements TextToSpeechProvider {
 
   private runProcess(bin: string, args: string[], timeoutMs: number): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const child = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+      // detached → own process group, so a timeout kill reaches any
+      // descendants the python process spawned, not just the shell/python
+      // itself.
+      const child = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
       let stderr = '';
+      let timedOut = false;
+      let killTimer: NodeJS.Timeout | undefined;
       child.stderr?.on('data', (chunk: Buffer) => {
         stderr += chunk.toString();
       });
+      const signalGroup = (signal: NodeJS.Signals) => {
+        if (!child.pid) return;
+        try {
+          process.kill(-child.pid, signal); // whole process group
+        } catch {
+          child.kill(signal); // group already gone — best effort
+        }
+      };
       const timeout = setTimeout(() => {
-        child.kill('SIGTERM');
-        reject(new Error(`${bin} timed out after ${timeoutMs}ms`));
+        timedOut = true;
+        signalGroup('SIGTERM');
+        // Escalate: a TERM-ignoring child must not outlive synthesize().
+        killTimer = setTimeout(() => signalGroup('SIGKILL'), this.killGraceMs);
       }, timeoutMs);
+      // Settle ONLY on close — guarantees the process is actually dead
+      // (not merely signalled) by the time the promise resolves/rejects.
       child.on('close', (code) => {
         clearTimeout(timeout);
-        if (code === 0) resolve();
+        if (killTimer) clearTimeout(killTimer);
+        if (timedOut) reject(new Error(`${bin} timed out after ${timeoutMs}ms`));
+        else if (code === 0) resolve();
         else reject(new Error(`${bin} exited ${code}: ${stderr.slice(0, 300)}`));
       });
       child.on('error', (err) => {
         clearTimeout(timeout);
+        if (killTimer) clearTimeout(killTimer);
         reject(err);
       });
     });
