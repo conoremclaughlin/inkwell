@@ -1,12 +1,21 @@
 import { stat } from 'fs/promises';
 import { logger } from '../utils/logger';
 import { normalizeBaseUrl, parseIntEnv, parseProviderList, truncate } from './provider-utils';
-import { OpenAITranscriptionProvider, CliTranscriptionProvider } from './audio';
+import {
+  OpenAITranscriptionProvider,
+  CliTranscriptionProvider,
+  ParakeetTranscriptionProvider,
+} from './audio';
 import type { AudioTranscriptionProvider, AudioTranscriptionInput } from './audio';
 
 export type { AudioTranscriptionInput };
 
-const DEFAULT_PROVIDER_ORDER = ['openai', 'cli'];
+// parakeet sits between openai and cli: it self-disables when the
+// parakeet-mlx binary is absent (lazy per-call availability check), so
+// including it by default costs nothing for users who haven't installed
+// it — and installing it (e.g. via the setup_audio_transcription MCP
+// tool) enables on-device transcription with zero config.
+const DEFAULT_PROVIDER_ORDER = ['openai', 'parakeet', 'cli'];
 
 export interface AudioTranscriptionConfig {
   enabled: boolean;
@@ -72,6 +81,15 @@ export class AudioTranscriptionService {
               baseUrl: this.config.baseUrl,
               model: this.config.model,
               timeoutMs: this.config.timeoutMs,
+            })
+          );
+          break;
+        case 'parakeet':
+          providers.push(
+            new ParakeetTranscriptionProvider({
+              // First transcription downloads model weights (~600MB) —
+              // give it headroom beyond the steady-state timeout
+              timeoutMs: Math.max(this.config.timeoutMs, 180_000),
             })
           );
           break;
