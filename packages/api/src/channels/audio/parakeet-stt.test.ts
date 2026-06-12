@@ -95,4 +95,29 @@ echo "fake transcript of $base" > "$outdir/\${base%.*}.txt"
     const transcript = await provider.transcribe({ filePath: audioPath });
     expect(transcript).toBeUndefined();
   });
+
+  it('transcribeOrThrow propagates process failure (warmup error-surfacing path)', async () => {
+    // A binary that resolves (--help passes) but fails on transcription —
+    // the exact shape of a broken model download. transcribe() swallows
+    // this; transcribeOrThrow must NOT, or install reports false success.
+    const brokenBin = join(dir, 'broken-parakeet-throw');
+    await writeFile(
+      brokenBin,
+      '#!/bin/sh\nif [ "$1" = "--help" ]; then exit 0; fi\necho "download failed" >&2\nexit 3\n'
+    );
+    await chmod(brokenBin, 0o755);
+    const provider = new ParakeetTranscriptionProvider({ binaryCandidates: [brokenBin] });
+    await expect(provider.transcribeOrThrow({ filePath: audioPath })).rejects.toThrow(
+      /exited 3.*download failed/s
+    );
+  });
+
+  it('transcribeOrThrow throws when no binary is available', async () => {
+    const provider = new ParakeetTranscriptionProvider({
+      binaryCandidates: ['/nonexistent/parakeet-mlx'],
+    });
+    await expect(provider.transcribeOrThrow({ filePath: audioPath })).rejects.toThrow(
+      /binary not found/
+    );
+  });
 });

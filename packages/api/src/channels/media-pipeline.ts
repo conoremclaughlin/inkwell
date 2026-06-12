@@ -106,7 +106,9 @@ export class InboundMediaPipeline {
           'Let the user know you received their voice note but could not hear it yet, and offer to set up ' +
           'on-device transcription: call setup_audio_transcription(action: "status") to check this machine, ' +
           'and — only with the user\'s explicit consent — setup_audio_transcription(action: "install") ' +
-          'to install the local Parakeet model (~600MB one-time download, runs fully offline).'
+          'to install the local Parakeet model (~600MB one-time download, runs fully offline). ' +
+          'Once a provider is available, transcribe THIS saved voice note without asking the user to re-send: ' +
+          'setup_audio_transcription(action: "transcribe", filePath: "<attachment path from this message>").'
       );
     }
 

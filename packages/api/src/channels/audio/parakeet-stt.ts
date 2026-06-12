@@ -91,9 +91,33 @@ export class ParakeetTranscriptionProvider implements AudioTranscriptionProvider
     return null;
   }
 
+  /**
+   * Transcribe, returning undefined on any failure. This is the
+   * pipeline-safe path: a broken install must never block a voice note
+   * from reaching the SB (the setup hint takes over instead).
+   */
   async transcribe(input: AudioTranscriptionInput): Promise<string | undefined> {
+    try {
+      return await this.transcribeOrThrow(input);
+    } catch (error) {
+      logger.warn('Parakeet transcription failed', {
+        filePath: input.filePath,
+        model: this.model,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
+    }
+  }
+
+  /**
+   * Like transcribe(), but propagates failures (missing binary, nonzero
+   * exit, timeout, unreadable output). Used by setup_audio_transcription's
+   * install warmup so a failed model download/transcription surfaces as a
+   * real error instead of a false success.
+   */
+  async transcribeOrThrow(input: AudioTranscriptionInput): Promise<string | undefined> {
     const bin = await this.resolveBinary();
-    if (!bin) return undefined;
+    if (!bin) throw new Error('parakeet-mlx binary not found');
 
     const outputDir = await mkdtemp(join(tmpdir(), 'ink-parakeet-'));
     try {
@@ -133,13 +157,6 @@ export class ParakeetTranscriptionProvider implements AudioTranscriptionProvider
       const base = basename(input.filePath).replace(/\.[^.]*$/, '');
       const transcript = await readFile(join(outputDir, `${base}.txt`), 'utf-8');
       return transcript.trim() || undefined;
-    } catch (error) {
-      logger.warn('Parakeet transcription failed', {
-        filePath: input.filePath,
-        model: this.model,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return undefined;
     } finally {
       await rm(outputDir, { recursive: true, force: true }).catch(() => undefined);
     }
