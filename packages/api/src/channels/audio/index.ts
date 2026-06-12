@@ -15,6 +15,11 @@ export { ElevenLabsTextToSpeechProvider } from './elevenlabs-tts';
 export { CliTextToSpeechProvider } from './cli-tts';
 export { OpenAITranscriptionProvider } from './openai-stt';
 export { CliTranscriptionProvider } from './cli-stt';
+export {
+  ParakeetTranscriptionProvider,
+  parakeetBinaryCandidates,
+  DEFAULT_PARAKEET_MODEL,
+} from './parakeet-stt';
 
 export {
   extensionForFormat,

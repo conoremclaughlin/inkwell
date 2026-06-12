@@ -616,7 +616,10 @@ describe('Activity Stream Integration', () => {
   });
 
   describe('Incoming Messages', () => {
-    it('should log incoming message to activity stream when userId is provided', async () => {
+    it('does not log inbound messages itself — SessionService is the canonical logger', async () => {
+      // Regression: the gateway used to log message_in with a hardcoded
+      // agentId of 'myra' AND SessionService logged the same message again,
+      // producing duplicate rows that double-rendered in attached CLI views.
       const handler = vi.fn().mockResolvedValue(undefined);
       gateway.setMessageHandler(handler);
 
@@ -630,38 +633,8 @@ describe('Activity Stream Integration', () => {
         { userId: 'user-uuid-123', chatType: 'direct' }
       );
 
-      expect(mockLogMessage).toHaveBeenCalledTimes(1);
-      expect(mockLogMessage).toHaveBeenCalledWith({
-        userId: 'user-uuid-123',
-        agentId: 'myra',
-        direction: 'in',
-        content: 'Hello from user',
-        platform: 'telegram',
-        platformChatId: 'chat123',
-        isDm: true,
-        payload: {
-          senderName: 'Test User',
-          senderId: 'sender456',
-        },
-      });
-    });
-
-    it('should set isDm to false for group chats', async () => {
-      const handler = vi.fn().mockResolvedValue(undefined);
-      gateway.setMessageHandler(handler);
-
-      const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
-
-      await forwardToHandler('telegram', 'group123', { id: 'sender456' }, 'Hello group', {
-        userId: 'user-uuid-123',
-        chatType: 'group',
-      });
-
-      expect(mockLogMessage).toHaveBeenCalledWith(
-        expect.objectContaining({
-          isDm: false,
-        })
-      );
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(mockLogMessage).not.toHaveBeenCalled();
     });
 
     it('should resolve userId from platform + sender ID when not in metadata (Telegram flow)', async () => {
@@ -685,17 +658,9 @@ describe('Activity Stream Integration', () => {
       // Should have resolved user from platform ID
       expect(mockFindByPlatformId).toHaveBeenCalledWith('telegram', 'telegram-sender-789');
 
-      // Should log to activity stream with resolved userId
-      expect(mockLogMessage).toHaveBeenCalledTimes(1);
-      expect(mockLogMessage).toHaveBeenCalledWith(
-        expect.objectContaining({
-          userId: 'resolved-user-uuid',
-          direction: 'in',
-          content: 'Hello from Telegram',
-          platform: 'telegram',
-          platformChatId: 'chat123',
-        })
-      );
+      // Gateway does not log inbound itself (SessionService does) — the
+      // resolution's job is enriching metadata for the handler below.
+      expect(mockLogMessage).not.toHaveBeenCalled();
 
       // Should pass resolved userId to handler in enriched metadata
       expect(handler).toHaveBeenCalledWith(
@@ -764,8 +729,9 @@ describe('Activity Stream Integration', () => {
 
       await sendTelegramMessage('chat123', 'Reply message');
 
-      // Should have logged outbound message using stored userId
-      expect(mockLogMessage).toHaveBeenCalledTimes(2);
+      // Only the outbound message logs from the gateway (inbound is
+      // SessionService's job now)
+      expect(mockLogMessage).toHaveBeenCalledTimes(1);
       expect(mockLogMessage).toHaveBeenLastCalledWith({
         userId: 'user-uuid-123',
         agentId: 'myra',
@@ -821,7 +787,7 @@ describe('Activity Stream Integration', () => {
       const sendTelegramMessage = (gateway as any).sendTelegramMessage.bind(gateway);
       await sendTelegramMessage('chat123', 'Outgoing reply');
 
-      expect(mockLogMessage).toHaveBeenCalledTimes(2);
+      expect(mockLogMessage).toHaveBeenCalledTimes(1);
       expect(mockLogMessage).toHaveBeenLastCalledWith(
         expect.objectContaining({
           userId: 'resolved-user-uuid',

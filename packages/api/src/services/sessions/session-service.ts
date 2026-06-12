@@ -206,7 +206,9 @@ export class SessionService implements ISessionService {
         content,
         platform: request.channel,
         platformChatId: request.conversationId,
-        isDm: metadata?.chatType === 'direct',
+        // Telegram reports private chats as 'private' (not 'direct') — treat
+        // anything that isn't group-shaped as a DM
+        isDm: !['group', 'supergroup', 'channel'].includes(metadata?.chatType ?? ''),
         payload: JSON.parse(
           JSON.stringify({
             sender: request.sender,

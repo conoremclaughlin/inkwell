@@ -591,27 +591,11 @@ export class ChannelGateway extends EventEmitter {
       this.pendingVoiceReplyConversations.add(this.getBufferKey(channel, conversationId));
     }
 
-    // Log incoming message to activity stream
-    if (this.dataComposer && userId) {
-      try {
-        const isGroupChat = metadata?.chatType === 'group' || metadata?.chatType === 'channel';
-        await this.dataComposer.repositories.activityStream.logMessage({
-          userId,
-          agentId: 'myra',
-          direction: 'in',
-          content,
-          platform: channel,
-          platformChatId: conversationId,
-          isDm: !isGroupChat,
-          payload: {
-            senderName: sender.name,
-            senderId: sender.id,
-          },
-        });
-      } catch (activityError) {
-        logger.warn('Failed to log incoming message to activity stream:', activityError);
-      }
-    }
+    // NOTE: inbound messages are NOT logged to the activity stream here.
+    // SessionService.handleMessage logs them first thing with the RESOLVED
+    // agentId and full payload (media, threadKey, sender) — this site used
+    // to log a second copy with a hardcoded agentId of 'myra', producing
+    // duplicate message_in rows (double-rendered in attached CLI views).
 
     // Pass resolved userId to message handler so SessionService can persist messages
     const enrichedMetadata = userId && !metadata?.userId ? { ...metadata, userId } : metadata;
