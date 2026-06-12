@@ -4,12 +4,18 @@ import {
   OpenAITextToSpeechProvider,
   ElevenLabsTextToSpeechProvider,
   CliTextToSpeechProvider,
+  MlxAudioTextToSpeechProvider,
 } from './audio';
 import type { TextToSpeechProvider, TextToSpeechInput, SynthesizedAudio } from './audio';
 
 export type { TextToSpeechInput, SynthesizedAudio };
 
-const DEFAULT_PROVIDER_ORDER = ['openai', 'cli'];
+// mlx sits between openai and cli: it self-disables when no python has
+// mlx_audio importable (lazy per-call availability check), so including
+// it by default costs nothing for users who haven't installed it — and
+// `pip install mlx-audio` enables on-device synthesis with zero config.
+// Same pattern as the Parakeet STT provider.
+const DEFAULT_PROVIDER_ORDER = ['openai', 'mlx', 'cli'];
 
 function normalizeFormat(value: string | undefined): string {
   const format = value?.trim().toLowerCase();
@@ -103,6 +109,17 @@ export class TextToSpeechService {
               voice: this.config.elevenlabsVoice,
               model: this.config.elevenlabsModel,
               timeoutMs: this.config.timeoutMs,
+            })
+          );
+          break;
+        case 'mlx':
+          providers.push(
+            new MlxAudioTextToSpeechProvider({
+              format: this.config.format,
+              // First synthesis downloads model weights (~700MB) — give
+              // it headroom beyond the steady-state timeout
+              timeoutMs: Math.max(this.config.timeoutMs, 300_000),
+              maxChars: this.config.maxChars,
             })
           );
           break;

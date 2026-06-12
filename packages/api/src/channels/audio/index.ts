@@ -13,6 +13,13 @@ export type {
 export { OpenAITextToSpeechProvider } from './openai-tts';
 export { ElevenLabsTextToSpeechProvider } from './elevenlabs-tts';
 export { CliTextToSpeechProvider } from './cli-tts';
+export {
+  MlxAudioTextToSpeechProvider,
+  mlxPythonCandidates,
+  ffmpegCandidates,
+  DEFAULT_MLX_TTS_MODEL,
+  DEFAULT_MLX_TTS_VOICE,
+} from './mlx-tts';
 export { OpenAITranscriptionProvider } from './openai-stt';
 export { CliTranscriptionProvider } from './cli-stt';
 export {

@@ -31,6 +31,35 @@ describe('TextToSpeechService', () => {
     expect(result).toBeUndefined();
   });
 
+  it('builds the mlx provider with no API key or cliCommand required', () => {
+    // Unlike 'cli' (needs cliCommand to be constructed), 'mlx' is always
+    // constructible — it self-disables at call time when mlx-audio isn't
+    // installed. This is what makes on-device TTS zero-config.
+    const cliOnly = new TextToSpeechService({
+      enabled: true,
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-4o-mini-tts',
+      voice: 'alloy',
+      format: 'opus',
+      timeoutMs: 5000,
+      maxChars: 1000,
+      providers: ['cli'], // no cliCommand → no providers → disabled
+    });
+    expect(cliOnly.isEnabled()).toBe(false);
+
+    const mlxOnly = new TextToSpeechService({
+      enabled: true,
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-4o-mini-tts',
+      voice: 'alloy',
+      format: 'opus',
+      timeoutMs: 5000,
+      maxChars: 1000,
+      providers: ['mlx'],
+    });
+    expect(mlxOnly.isEnabled()).toBe(true);
+  });
+
   it('builds elevenlabs provider from config', () => {
     const service = new TextToSpeechService({
       enabled: true,
