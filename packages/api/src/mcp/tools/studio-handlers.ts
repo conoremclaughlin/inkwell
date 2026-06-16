@@ -206,6 +206,13 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     skipGitOperations = false,
   } = parsed;
 
+  if (defaultProjectId) {
+    const project = await dataComposer.repositories.projects.findById(defaultProjectId);
+    if (!project || project.user_id !== resolved.user.id) {
+      return errorResponse('defaultProjectId not found or does not belong to this user');
+    }
+  }
+
   // Resolve to the main worktree root (handles case where repoRoot is a linked worktree)
   const mainRoot = resolveMainWorktree(repoRoot);
 
@@ -410,7 +417,7 @@ export async function handleGetStudio(args: unknown, dataComposer: DataComposer)
 
 export async function handleUpdateStudio(args: unknown, dataComposer: DataComposer) {
   const parsed = updateStudioSchema.parse(args);
-  await resolveUserOrThrow(parsed, dataComposer);
+  const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const {
     studioId,
@@ -431,6 +438,13 @@ export async function handleUpdateStudio(args: unknown, dataComposer: DataCompos
   const existing = await studiosRepo.findById(studioId);
   if (!existing) {
     return errorResponse(`Studio not found: ${studioId}`);
+  }
+
+  if (typeof defaultProjectId === 'string') {
+    const project = await dataComposer.repositories.projects.findById(defaultProjectId);
+    if (!project || project.user_id !== resolved.user.id) {
+      return errorResponse('defaultProjectId not found or does not belong to this user');
+    }
   }
 
   let updated;
