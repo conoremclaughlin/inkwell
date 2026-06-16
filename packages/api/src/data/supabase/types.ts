@@ -3054,6 +3054,7 @@ export type Database = {
           branch: string;
           cleaned_at: string | null;
           created_at: string | null;
+          default_project_id: string | null;
           id: string;
           metadata: Json | null;
           permissions: Json;
@@ -3078,6 +3079,7 @@ export type Database = {
           branch: string;
           cleaned_at?: string | null;
           created_at?: string | null;
+          default_project_id?: string | null;
           id?: string;
           metadata?: Json | null;
           permissions?: Json;
@@ -3102,6 +3104,7 @@ export type Database = {
           branch?: string;
           cleaned_at?: string | null;
           created_at?: string | null;
+          default_project_id?: string | null;
           id?: string;
           metadata?: Json | null;
           permissions?: Json;
