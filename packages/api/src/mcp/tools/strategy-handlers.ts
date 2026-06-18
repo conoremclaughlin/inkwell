@@ -141,6 +141,13 @@ export const startStrategySchema = z.object({
     .describe(
       'Acceptance criteria the approver should verify (e.g., ["tests pass", "PR reviewed", "visual review via Playwright"])'
     ),
+  executionMode: z
+    .enum(['spawn', 'inline'])
+    .optional()
+    .default('spawn')
+    .describe(
+      "How to execute: 'spawn' (default) force-spawns a new session for the work, 'inline' returns the prompt so the calling agent loops in the current session"
+    ),
 });
 
 export async function handleStartStrategy(
@@ -177,6 +184,7 @@ export async function handleStartStrategy(
       sbId,
       verificationMode: args.verificationMode as VerificationMode,
       planUri: args.planUri,
+      executionMode: args.executionMode as 'spawn' | 'inline',
       config: {
         planUri: args.planUri,
         checkInInterval: args.checkInInterval,

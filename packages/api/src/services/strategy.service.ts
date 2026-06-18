@@ -37,6 +37,8 @@ const execFileAsync = promisify(execFile);
 // Types
 // ============================================================================
 
+export type ExecutionMode = 'spawn' | 'inline';
+
 export interface StartStrategyInput {
   groupId: string;
   userId: string;
@@ -45,6 +47,7 @@ export interface StartStrategyInput {
   config?: StrategyConfig;
   verificationMode?: VerificationMode;
   planUri?: string;
+  executionMode?: ExecutionMode;
 }
 
 export interface StrategyAdvanceResult {
@@ -62,6 +65,8 @@ export interface StrategyAdvanceResult {
   stats?: { total: number; completed: number };
   /** Sandbox container info (when sandbox mode is active) */
   sandbox?: SandboxSpinUpResult;
+  /** How execution was requested: 'spawn' (new session) or 'inline' (current session loops) */
+  executionMode?: ExecutionMode;
 }
 
 export interface StrategyStatus {
@@ -69,6 +74,7 @@ export interface StrategyStatus {
   title: string;
   strategy: StrategyPreset;
   status: string;
+  executionPhase: string;
   sbId: string | null;
   planUri: string | null;
   verificationMode: VerificationMode;
@@ -233,6 +239,8 @@ export class StrategyService {
       }
     }
 
+    const executionMode = input.executionMode || 'spawn';
+
     // Update the group with strategy config
     const updated = await this.dataComposer.repositories.taskGroups.update(input.groupId, {
       strategy: input.strategy,
@@ -246,6 +254,7 @@ export class StrategyService {
       iterations_since_approval: 0,
       strategy_started_at: new Date().toISOString(),
       strategy_paused_at: null,
+      execution_phase: executionMode === 'inline' ? 'worker_active' : 'pending_trigger',
     });
 
     // Get the first task
@@ -282,6 +291,7 @@ export class StrategyService {
       await this.dataComposer.repositories.taskGroups.update(input.groupId, {
         status: 'paused',
         strategy_paused_at: new Date().toISOString(),
+        execution_phase: 'paused',
       });
       await this.logStrategyEvent(
         updated,
@@ -314,24 +324,27 @@ export class StrategyService {
       this.getAssignment(currentGroup)
     );
 
-    // Trigger the owner agent in the assigned studio. The trigger spawns
-    // (or resumes) a session in the target studio so work actually begins.
-    // Pass the sandbox container name so the triggered session routes
-    // CLI execution into the container.
+    // In 'inline' mode the calling agent will loop in the current session —
+    // skip the trigger entirely (no spawn needed).
+    let triggered = false;
     const sandboxContainer = sandboxResult?.success ? sandboxResult.containerName : undefined;
-    const triggered = await this.triggerOwnerAgent(
-      currentGroup,
-      nextTask,
-      'strategy_kickoff',
-      sandboxContainer
-    );
+
+    if (executionMode === 'spawn') {
+      triggered = await this.triggerOwnerAgent(
+        currentGroup,
+        nextTask,
+        'strategy_kickoff',
+        sandboxContainer
+      );
+    }
 
     // Log strategy start
     await this.logStrategyEvent(
       currentGroup,
       'strategy_started',
-      `Strategy "${input.strategy}" started on "${currentGroup.title}"`,
+      `Strategy "${input.strategy}" started on "${currentGroup.title}" (executionMode: ${executionMode})`,
       {
+        executionMode,
         firstTaskId: nextTask.id,
         firstTaskTitle: nextTask.title,
         ownerTriggered: triggered,
@@ -348,6 +361,7 @@ export class StrategyService {
       nextTask,
       prompt,
       notified: triggered,
+      executionMode,
       sandbox: sandboxResult || undefined,
     };
   }
@@ -420,6 +434,7 @@ export class StrategyService {
         await this.dataComposer.repositories.taskGroups.update(groupId, {
           strategy_paused_at: new Date().toISOString(),
           status: 'paused',
+          execution_phase: 'paused',
           context_summary: summary,
           metadata: { ...group.metadata, pauseReason: 'final_review' },
         });
@@ -507,6 +522,7 @@ export class StrategyService {
       await this.dataComposer.repositories.taskGroups.update(groupId, {
         strategy_paused_at: new Date().toISOString(),
         status: 'paused',
+        execution_phase: 'paused',
         context_summary: summary,
         metadata: { ...group.metadata, pauseReason: 'approval_gate' },
       });
@@ -628,6 +644,7 @@ export class StrategyService {
     return this.dataComposer.repositories.taskGroups.update(groupId, {
       status: 'paused',
       strategy_paused_at: new Date().toISOString(),
+      execution_phase: 'paused',
     });
   }
 
@@ -687,6 +704,7 @@ export class StrategyService {
       strategy_paused_at: null,
       iterations_since_approval: 0,
       metadata: cleanedMetadata,
+      execution_phase: 'pending_trigger',
     });
 
     // Re-create watchdog reminder
@@ -727,6 +745,7 @@ export class StrategyService {
           status: 'paused',
           context_summary: summary,
           metadata: { ...cleanedMetadata, pauseReason: 'final_review' },
+          execution_phase: 'paused',
         });
 
         const approvalMessage =
@@ -799,6 +818,7 @@ export class StrategyService {
     return this.dataComposer.repositories.taskGroups.update(groupId, {
       status: 'cancelled',
       strategy_paused_at: null,
+      execution_phase: 'idle',
     });
   }
 
@@ -832,6 +852,8 @@ export class StrategyService {
     ];
     if (group.status === 'paused') {
       summaryParts.push(group.iterations_since_approval > 0 ? 'paused for approval' : 'paused');
+    } else if (group.execution_phase === 'pending_trigger') {
+      summaryParts.push('awaiting session spawn');
     } else if (currentTask) {
       summaryParts.push(`working on: "${currentTask.title}"`);
     }
@@ -841,6 +863,7 @@ export class StrategyService {
       title: group.title,
       strategy: group.strategy as StrategyPreset,
       status: group.status,
+      executionPhase: group.execution_phase,
       sbId: group.sb_id,
       planUri: group.plan_uri,
       verificationMode: group.verification_mode,
@@ -1682,6 +1705,7 @@ export class StrategyService {
   ): Promise<void> {
     await this.dataComposer.repositories.taskGroups.update(group.id, {
       status: 'completed',
+      execution_phase: 'completed',
       context_summary: stats.hasIncomplete
         ? `Strategy complete with issues: ${stats.completed}/${stats.total} done, ${stats.pending} pending, ${stats.blocked} blocked.`
         : `Strategy complete. ${stats.completed}/${stats.total} tasks done.`,

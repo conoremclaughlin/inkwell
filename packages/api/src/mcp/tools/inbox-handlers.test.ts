@@ -386,6 +386,40 @@ describe('handleSendToInbox - threadKey', () => {
     expect(mockGateway.dispatchTrigger).toHaveBeenCalled();
   });
 
+  it('should forward caller metadata into trigger payload (strategy trigger propagation)', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+
+    const mockSb = createMockSupabase();
+    const mockDc = createMockDataComposer(mockSb);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        senderAgentId: 'wren',
+        messageType: 'session_resume',
+        content: 'Strategy kickoff',
+        metadata: {
+          source: 'strategy_service',
+          strategyTrigger: true,
+          groupId: 'group-abc',
+          taskId: 'task-1',
+        },
+      },
+      mockDc as never
+    );
+
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metadata: expect.objectContaining({
+          strategyTrigger: true,
+          groupId: 'group-abc',
+        }),
+      })
+    );
+  });
+
   // ===================================================================
   // 2FA SECURITY — permission_grant from agent senders must be rejected
   // ===================================================================
