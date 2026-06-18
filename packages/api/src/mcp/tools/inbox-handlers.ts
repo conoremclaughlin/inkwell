@@ -547,8 +547,11 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           selfStudioTarget,
         });
       } else {
-        // New thread: trigger all recipients (exclude sender unless cross-studio self-message)
-        agentsToTrigger = allRecipients.filter((a) => selfStudioTarget || a !== senderAgentId);
+        // New thread: trigger all recipients (exclude sender unless cross-studio
+        // self-message or actionable self-target like strategy kickoff)
+        const actionableSelf = new Set(['task_request', 'session_resume']);
+        const allowSelf = selfStudioTarget || (!!messageType && actionableSelf.has(messageType));
+        agentsToTrigger = allRecipients.filter((a) => allowSelf || a !== senderAgentId);
       }
     }
 

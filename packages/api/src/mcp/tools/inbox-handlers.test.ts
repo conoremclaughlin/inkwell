@@ -420,6 +420,36 @@ describe('handleSendToInbox - threadKey', () => {
     );
   });
 
+  it('should dispatch trigger for new self-thread session_resume (strategy first kickoff)', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+    // findThread returns null → new thread path
+    const { findThread } = await import('./thread-handlers.js');
+    vi.mocked(findThread).mockResolvedValue(null);
+
+    const mockSb = createThreadMockSupabase();
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        senderAgentId: 'wren',
+        messageType: 'session_resume',
+        threadKey: 'strategy:new-group-123',
+        content: 'Strategy kickoff — first trigger',
+      },
+      mockDc as never
+    );
+
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toAgentId: 'wren',
+        threadKey: 'strategy:new-group-123',
+      })
+    );
+  });
+
   // ===================================================================
   // 2FA SECURITY — permission_grant from agent senders must be rejected
   // ===================================================================
