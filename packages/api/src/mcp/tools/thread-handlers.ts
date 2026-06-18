@@ -198,9 +198,14 @@ export function resolveTriggeredAgents(opts: {
   // Precedence 3: default rules by thread size
   const otherParticipants = participants.filter((a) => a !== senderAgentId);
 
-  // Self-thread (1 participant): trigger only if cross-studio self-message
+  // Self-thread (1 participant): trigger if cross-studio OR actionable message type.
+  // session_resume / task_request to self are inherently "wake me up" signals
+  // (e.g., strategy triggers) and must not be silently dropped.
   if (otherParticipants.length === 0) {
-    return selfStudioTarget ? [senderAgentId] : [];
+    if (selfStudioTarget) return [senderAgentId];
+    const selfActionable = new Set(['task_request', 'session_resume']);
+    if (messageType && selfActionable.has(messageType)) return [senderAgentId];
+    return [];
   }
 
   // 1:1 thread (2 participants): trigger the other one
