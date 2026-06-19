@@ -29,6 +29,7 @@ export interface Studio {
   workType: string | null;
   slug: string | null;
   roleTemplate: string | null;
+  defaultProjectId: string | null;
   status: StudioStatus;
   metadata: Json;
   createdAt: string;
@@ -49,6 +50,7 @@ export interface CreateStudioInput {
   purpose?: string;
   workType?: WorkType;
   roleTemplate?: string;
+  defaultProjectId?: string | null;
   metadata?: Json;
 }
 
@@ -60,6 +62,7 @@ export interface UpdateStudioInput {
   roleTemplate?: string | null;
   worktreePath?: string;
   slug?: string | null;
+  defaultProjectId?: string | null;
   metadata?: Json;
   archivedAt?: string;
   cleanedAt?: string;
@@ -95,6 +98,7 @@ export class StudiosRepository {
       workType: (row.work_type as string) || null,
       slug: (row.slug as string) || null,
       roleTemplate: (row.role_template as string) || null,
+      defaultProjectId: (row.default_project_id as string) || null,
       status: row.status as StudioStatus,
       metadata: (row.metadata as Json) || {},
       createdAt: row.created_at as string,
@@ -121,6 +125,7 @@ export class StudiosRepository {
       purpose: input.purpose,
       work_type: input.workType,
       role_template: input.roleTemplate,
+      default_project_id: input.defaultProjectId ?? null,
       slug: deriveStudioSlug(input.worktreePath),
       status: 'active',
       metadata: input.metadata || {},
@@ -276,6 +281,8 @@ export class StudiosRepository {
     if (input.roleTemplate !== undefined) updateData.role_template = input.roleTemplate;
     if (input.worktreePath !== undefined) updateData.worktree_path = input.worktreePath;
     if (input.slug !== undefined) updateData.slug = input.slug;
+    if (input.defaultProjectId !== undefined)
+      updateData.default_project_id = input.defaultProjectId;
     if (input.metadata !== undefined) updateData.metadata = input.metadata;
     if (input.archivedAt !== undefined) updateData.archived_at = input.archivedAt;
     if (input.cleanedAt !== undefined) updateData.cleaned_at = input.cleanedAt;

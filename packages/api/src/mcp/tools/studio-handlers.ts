@@ -69,6 +69,11 @@ const createStudioSchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe('Role template name used when creating the studio (e.g., "reviewer", "builder")'),
+  defaultProjectId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('Default project ID for task groups created in this studio'),
   skipGitOperations: z
     .boolean()
     .optional()
@@ -113,6 +118,12 @@ const updateStudioSchema = userIdentifierBaseSchema.extend({
     .boolean()
     .optional()
     .describe('If true, unlink the current session and set status to idle'),
+  defaultProjectId: z
+    .string()
+    .uuid()
+    .nullable()
+    .optional()
+    .describe('Default project ID for task groups created in this studio. Set to null to clear.'),
   routePatterns: z
     .array(z.string().max(200))
     .optional()
@@ -191,6 +202,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     baseBranch = 'main',
     sessionId,
     roleTemplate,
+    defaultProjectId,
     skipGitOperations = false,
   } = parsed;
 
@@ -251,6 +263,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
       purpose,
       workType,
       roleTemplate,
+      defaultProjectId,
     });
   } catch (dbError) {
     // If DB insert fails but git succeeded, attempt cleanup
@@ -293,6 +306,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
       purpose: studio.purpose,
       workType: studio.workType,
       roleTemplate: studio.roleTemplate,
+      defaultProjectId: studio.defaultProjectId,
       status: studio.status,
       sessionId: studio.sessionId,
       createdAt: studio.createdAt,
@@ -339,6 +353,7 @@ export async function handleListStudios(args: unknown, dataComposer: DataCompose
       status: w.status,
       workType: w.workType,
       roleTemplate: w.roleTemplate,
+      defaultProjectId: w.defaultProjectId,
       hasLinkedSession: !!w.sessionId,
       createdAt: w.createdAt,
     })),
@@ -381,6 +396,7 @@ export async function handleGetStudio(args: unknown, dataComposer: DataComposer)
       purpose: studio.purpose,
       workType: studio.workType,
       roleTemplate: studio.roleTemplate,
+      defaultProjectId: studio.defaultProjectId,
       status: studio.status,
       sessionId: studio.sessionId,
       metadata: studio.metadata,
@@ -406,6 +422,7 @@ export async function handleUpdateStudio(args: unknown, dataComposer: DataCompos
     slug,
     sessionId,
     unlinkSession,
+    defaultProjectId,
     routePatterns,
   } = parsed;
   const studiosRepo = dataComposer.repositories.studios;
@@ -439,6 +456,9 @@ export async function handleUpdateStudio(args: unknown, dataComposer: DataCompos
     if (slug !== undefined) {
       updateObj.slug = slug;
     }
+    if (defaultProjectId !== undefined) {
+      updateObj.defaultProjectId = defaultProjectId;
+    }
     if (routePatterns !== undefined) {
       updateObj.routePatterns = routePatterns;
     }
@@ -458,6 +478,7 @@ export async function handleUpdateStudio(args: unknown, dataComposer: DataCompos
       worktreePath: updated.worktreePath,
       purpose: updated.purpose,
       roleTemplate: updated.roleTemplate,
+      defaultProjectId: updated.defaultProjectId,
       status: updated.status,
       sessionId: updated.sessionId,
       updatedAt: updated.updatedAt,
@@ -599,6 +620,7 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
       worktreePath: updated.worktreePath,
       purpose: updated.purpose,
       roleTemplate: updated.roleTemplate,
+      defaultProjectId: updated.defaultProjectId,
       status: updated.status,
       sessionId: updated.sessionId,
       updatedAt: updated.updatedAt,
