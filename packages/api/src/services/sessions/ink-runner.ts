@@ -129,11 +129,11 @@ export class InkRunner implements IRunner {
     // (200K default), which auto-compacts the transcript when approached.
     args.push('--max-turns', '15');
 
-    // Auto-approve tools for non-interactive spawns. Without this, the CLI
-    // defaults to auto-deny, which causes a slow deny→retry loop that easily
-    // exceeds the process timeout. Uses --approval-mode (runtime-only) rather
-    // than --profile full (which persists policy mutations to disk).
-    args.push('--approval-mode', 'auto-approve');
+    // Use the safe profile with away mode for non-interactive spawns.
+    // Safe profile allows read tools freely but requires approval for
+    // write/comms tools. Away mode routes approval prompts to the user's
+    // inbox (2FA) instead of auto-denying.
+    args.push('--profile', 'safe', '--away');
 
     // Label the delivered message with its originating channel so the
     // transcript renders it as a system message (not "you").

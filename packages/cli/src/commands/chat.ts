@@ -140,6 +140,7 @@ type ChatOptions = {
   fullscreen?: boolean;
   dynamic?: boolean;
   approvalMode?: string;
+  away?: boolean;
 };
 
 interface InboxMessage {
@@ -2268,7 +2269,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     showSessionsWatch: false,
     eventPolling: true,
     autoRunInbox: options.autoRun ?? false,
-    awayMode: false,
+    awayMode: options.away ?? false,
     transcriptPath: ensureRuntimeTranscriptPath(),
     activeSkills: [],
     strictTools: options.sbStrictTools ?? persisted?.strictTools ?? false,
@@ -2281,7 +2282,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           : options.nonInteractive || options.message
             ? options.profile === 'full'
               ? 'auto-approve' // --profile full + non-interactive = trust all tools
-              : 'auto-deny'
+              : options.away
+                ? 'interactive' // --away + non-interactive = route approvals to inbox
+                : 'auto-deny'
             : 'interactive',
   };
   // Resolve --sender or --contact-id for per-sender session isolation
@@ -6217,6 +6220,7 @@ export function registerChatCommand(program: Command): void {
       .option('--poll-seconds <n>', 'Inbox polling interval seconds', '20')
       .option('--tools <mode>', 'Tool mode: backend|off|privileged', 'backend')
       .option('--profile <name>', 'Apply security profile: minimal|safe|collaborative|full')
+      .option('--away', 'Start with away mode on (route tool approvals to inbox for 2FA)')
       .option('--auto-run', 'Automatically execute backend turns for new inbox task messages')
       .option('--message <text>', 'Single-turn message for non-interactive mode')
       .option(
