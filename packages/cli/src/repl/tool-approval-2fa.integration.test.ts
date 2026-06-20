@@ -474,12 +474,17 @@ describe('2FA Flow Phase 6: Approval response patterns', () => {
     // write is promptable initially
     expect(policy.canCallPcpTool('write').promptable).toBe(true);
 
-    // Simulate grant-agent: add to agent scope allow list
-    policy.allowTool('write', { scope: 'agent', id: 'myra' });
+    // Simulate grant-agent: persistentGrant removes from promptTools
+    // without adding to allowTools (avoids narrowing filter)
+    policy.persistentGrant('write');
 
-    // Now write should be allowed
+    // Now write should be allowed (no longer in promptTools)
     const afterGrant = policy.canCallPcpTool('write');
     expect(afterGrant.allowed).toBe(true);
+
+    // Other tools should NOT be blocked (no narrowing side effect)
+    const otherTool = policy.canCallPcpTool('get_integration_health');
+    expect(otherTool.allowed).toBe(true);
   });
 
   it('session grants persist only for the session', async () => {

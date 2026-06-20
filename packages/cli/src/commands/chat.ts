@@ -4051,26 +4051,26 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
             if (result.status === 'granted') {
               // Apply persistent grants to the tool policy
-              if (result.action === 'grant-agent' || result.action === 'allow') {
-                const agentId = toolPolicy.getContext()?.agentId;
-                if (agentId) {
-                  toolPolicy.allowTool(tool, { scope: 'agent', id: agentId });
-                  printLine(
-                    chalk.green(`✅ 2FA: ${tool} permanently approved (agent: ${agentId})`)
-                  );
-                } else {
-                  printLine(chalk.green(`✅ 2FA approval granted for ${tool}`));
-                }
-              } else if (result.action === 'grant-studio') {
-                const studioId = toolPolicy.getContext()?.studioId;
-                if (studioId) {
-                  toolPolicy.allowTool(tool, { scope: 'studio', id: studioId });
-                  printLine(
-                    chalk.green(`✅ 2FA: ${tool} permanently approved (studio: ${studioId})`)
-                  );
-                } else {
-                  printLine(chalk.green(`✅ 2FA approval granted for ${tool}`));
-                }
+              if (
+                result.action === 'grant-agent' ||
+                result.action === 'allow' ||
+                result.action === 'grant-studio'
+              ) {
+                // persistentGrant removes the tool from promptTools across all
+                // active scopes. Unlike allowTool, it doesn't add to allowTools
+                // — avoiding the narrowing filter bug where a single-tool
+                // allowlist at a scope blocks every other tool.
+                toolPolicy.persistentGrant(tool);
+                const scope = result.action === 'grant-studio' ? 'studio' : 'agent';
+                const scopeId =
+                  scope === 'studio'
+                    ? toolPolicy.getContext()?.studioId
+                    : toolPolicy.getContext()?.agentId;
+                printLine(
+                  chalk.green(
+                    `✅ 2FA: ${tool} permanently approved (${scope}${scopeId ? `: ${scopeId}` : ''})`
+                  )
+                );
               } else if (result.action === 'grant-session') {
                 if (runtime.sessionId) {
                   toolPolicy.grantToolForSession(runtime.sessionId, tool);

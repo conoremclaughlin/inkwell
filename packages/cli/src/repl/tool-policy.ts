@@ -933,6 +933,25 @@ export class ToolPolicyState {
     return Array.from(values).sort();
   }
 
+  /**
+   * Grant a tool permanently by removing it from promptTools across all active
+   * scopes. Unlike allowTool(), this does NOT add to allowTools — avoiding the
+   * narrowing side effect where a single-tool allowlist at a scope blocks
+   * every other tool.
+   */
+  public persistentGrant(tool: string): void {
+    const expanded = expandToolSpec(tool);
+    if (expanded.length === 0) return;
+
+    for (const { rules } of this.getActiveScopeRules()) {
+      for (const key of expanded) {
+        rules.promptTools.delete(key);
+      }
+    }
+
+    this.saveToDisk();
+  }
+
   public allowTool(tool: string, scope?: ToolPolicyScopeRef): void {
     const rules = this.resolveRulesForMutation(scope);
     const expanded = expandToolSpec(tool);
