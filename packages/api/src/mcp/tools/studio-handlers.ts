@@ -434,9 +434,12 @@ export async function handleUpdateStudio(args: unknown, dataComposer: DataCompos
   } = parsed;
   const studiosRepo = dataComposer.repositories.studios;
 
-  // Verify studio exists
+  // Verify studio exists and belongs to this user
   const existing = await studiosRepo.findById(studioId);
   if (!existing) {
+    return errorResponse(`Studio not found: ${studioId}`);
+  }
+  if (existing.userId !== resolved.user.id) {
     return errorResponse(`Studio not found: ${studioId}`);
   }
 
