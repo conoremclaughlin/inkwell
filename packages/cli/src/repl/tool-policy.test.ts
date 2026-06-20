@@ -11,14 +11,22 @@ describe('ToolPolicyState', () => {
     expect(decision.allowed).toBe(true);
   });
 
-  it('blocks unsafe tools by default', () => {
+  it('blocks tools in deny list', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
+    policy.denyTool('send_to_inbox');
     const decision = policy.canCallPcpTool('send_to_inbox');
     expect(decision.allowed).toBe(false);
   });
 
+  it('allows unlisted tools by default (no narrowing without allowlist)', () => {
+    const policy = new ToolPolicyState('backend', { persist: false });
+    const decision = policy.canCallPcpTool('send_to_inbox');
+    expect(decision.allowed).toBe(true);
+  });
+
   it('consumes scoped grants', () => {
     const policy = new ToolPolicyState('off', { persist: false });
+    policy.addPromptTool('send_to_inbox');
     policy.grantTool('send_to_inbox', 2);
 
     expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
@@ -39,6 +47,7 @@ describe('ToolPolicyState', () => {
 
   it('supports session-scoped grants', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
+    policy.addPromptTool('send_to_inbox');
     policy.grantToolForSession('sess-1', 'send_to_inbox');
     expect(policy.canCallPcpTool('send_to_inbox', 'sess-1').allowed).toBe(true);
     expect(policy.canCallPcpTool('send_to_inbox', 'sess-2').allowed).toBe(false);
@@ -112,8 +121,8 @@ describe('ToolPolicyState', () => {
 
     policy.removeToolRule('send_to_inbox');
     const postRemove = policy.canCallPcpTool('send_to_inbox');
-    expect(postRemove.allowed).toBe(false);
-    expect(postRemove.promptable).toBe(true);
+    // After removing the prompt rule, the tool is allowed by default
+    expect(postRemove.allowed).toBe(true);
   });
 
   it('supports wildcard allow and deny patterns', () => {
@@ -175,7 +184,7 @@ describe('ToolPolicyState', () => {
       JSON.stringify({
         version: 1,
         denyTools: ['send_*'],
-        promptTools: ['trigger_*'],
+        promptTools: ['trigger_*', 'remember'],
         grants: { create_task: -3, remember: 2 },
       }),
       'utf-8'
@@ -187,6 +196,7 @@ describe('ToolPolicyState', () => {
     expect(triggerDecision.allowed).toBe(false);
     expect(triggerDecision.promptable).toBe(true);
     expect(policy.listGrants().find((entry) => entry.tool === 'create_task')?.uses).toBe(0);
+    // remember has 2 grants + prompt rule — grants consumed first, then blocked
     expect(policy.canCallPcpTool('remember').allowed).toBe(true);
     expect(policy.canCallPcpTool('remember').allowed).toBe(true);
     expect(policy.canCallPcpTool('remember').allowed).toBe(false);
@@ -206,6 +216,8 @@ describe('ToolPolicyState', () => {
     expect(policy.canCallPcpTool('send_to_inbox', 'sess-1').allowed).toBe(true);
 
     // Exercise finite decrement branch inside hasSessionGrant.
+    // Add a prompt rule so the tool is blocked after the grant is consumed.
+    policy.addPromptTool('send_to_inbox');
     (
       policy as unknown as {
         sessionGrants: Map<string, Map<string, number>>;
@@ -421,10 +433,7 @@ describe('ToolPolicyState', () => {
       },
     } as const;
 
-    const expectations: Record<
-      SessionVisibility,
-      Record<keyof typeof targets, boolean>
-    > = {
+    const expectations: Record<SessionVisibility, Record<keyof typeof targets, boolean>> = {
       self: {
         self: true,
         sameThread: false,

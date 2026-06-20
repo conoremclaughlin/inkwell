@@ -14,6 +14,8 @@ describe('tool approval', () => {
 
   it('applies one-time approval', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
+    // Add a prompt rule so the tool needs approval
+    policy.addPromptTool('send_to_inbox');
     const result = applyToolApprovalChoice({
       policy,
       tool: 'send_to_inbox',
@@ -65,6 +67,8 @@ describe('tool approval', () => {
 
   it('returns cancelled when user declines approval', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
+    // Add a prompt rule so the tool would be blocked without a grant
+    policy.addPromptTool('send_to_inbox');
     const result = applyToolApprovalChoice({
       policy,
       tool: 'send_to_inbox',
