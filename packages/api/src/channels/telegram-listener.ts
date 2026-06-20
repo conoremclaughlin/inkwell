@@ -13,7 +13,7 @@ import { MediaGroupBuffer } from './media-group-buffer';
 import { logger } from '../utils/logger';
 import { env } from '../config/env';
 import { getAuthorizationService, type AuthorizationService } from '../services/authorization';
-import { checkApprovalResponse } from './approval-interceptor';
+import { checkApprovalResponse, formatApprovalConfirmation } from './approval-interceptor';
 
 const TELEGRAM_API = 'https://api.telegram.org';
 
@@ -472,11 +472,7 @@ export class TelegramListener extends EventEmitter {
         replyToId
       );
       if (result.intercepted) {
-        const emoji = result.action === 'deny' ? '🚫' : '✅';
-        await this.sendMessage(
-          chatId,
-          `${emoji} Permission ${result.action}: request ${result.requestId}`
-        );
+        await this.sendMessage(chatId, formatApprovalConfirmation(result));
         return; // Do NOT forward to agent routing
       }
     }

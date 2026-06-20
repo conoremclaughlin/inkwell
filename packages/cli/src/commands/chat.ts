@@ -67,6 +67,7 @@ import { registerBuiltinHooks } from '../repl/builtin-hooks.js';
 import { applyProfile, formatProfileList, isValidProfileId } from '../repl/tool-profiles.js';
 import { isPiTool, callPiTool } from '../repl/pi-tools.js';
 import { ApprovalRequestManager } from '../repl/approval-request.js';
+import { requestToolApproval } from '../repl/approval-api.js';
 import {
   type ApprovalChannel,
   type ApprovalResponseDecision,
@@ -4031,49 +4032,66 @@ export async function runChat(options: ChatOptions): Promise<void> {
               runtime.approvalChannel
             );
           }
-          // Remote approval: register request, send to inbox, wait for resolution
-          const { request, promise } = approvalManager.register(tool, {}, reason);
-          printLine(
-            chalk.yellow(`⏳ Awaiting remote approval for ${tool} (${request.id.slice(0, 8)}…)`)
-          );
+          // 2FA approval: create request on the PCP server, which sends
+          // notifications to the user's connected platforms (Telegram, etc.).
+          // The server handles all routing — we just poll for the result.
+          printLine(chalk.yellow(`⏳ Requesting 2FA approval for ${tool}…`));
           try {
-            await pcp.callTool('send_to_inbox', {
-              recipientAgentId: agentId,
-              senderAgentId: agentId,
-              content: `🔐 Tool approval needed: **${tool}**\n\nReason: ${reason}\n\nReply with a permission_grant to approve or deny.\nRequest ID: ${request.id}`,
-              messageType: 'notification',
-              metadata: { approvalRequestId: request.id, tool },
-              ...(runtime.threadKey ? { threadKey: runtime.threadKey } : {}),
-              trigger: false,
-            });
-          } catch {
-            printLine(
-              chalk.yellow('Failed to send remote approval request — falling back to local prompt')
-            );
-            approvalManager.expire(request.id);
-            return promptForToolApproval(
-              rl,
-              toolPolicy,
-              runtime.sessionId,
+            const result = await requestToolApproval({
               tool,
               reason,
-              inkRepl,
-              runtime.approvalChannel
-            );
-          }
-          const response = await promise;
-          if (response.decision === 'approved') {
-            printLine(
-              chalk.green(
-                `✅ Remote approval granted for ${tool}${response.resolvedBy ? ` by ${response.resolvedBy}` : ''}`
-              )
-            );
-            return true;
-          } else if (response.decision === 'timeout') {
-            printLine(chalk.yellow(`⏰ Remote approval timed out for ${tool}`));
-            return false;
-          } else {
-            printLine(chalk.yellow(`🚫 Remote approval denied for ${tool}`));
+              sessionId: runtime.sessionId,
+              studioId: runtime.studioId,
+              onCreated: (id) => {
+                printLine(
+                  chalk.yellow(`   Request ${id.slice(0, 8)}… sent to connected platforms`)
+                );
+              },
+            });
+
+            if (result.status === 'granted') {
+              // Apply persistent grants to the tool policy
+              if (result.action === 'grant-agent' || result.action === 'allow') {
+                const agentId = toolPolicy.getContext()?.agentId;
+                if (agentId) {
+                  toolPolicy.allowTool(tool, { scope: 'agent', id: agentId });
+                  printLine(
+                    chalk.green(`✅ 2FA: ${tool} permanently approved (agent: ${agentId})`)
+                  );
+                } else {
+                  printLine(chalk.green(`✅ 2FA approval granted for ${tool}`));
+                }
+              } else if (result.action === 'grant-studio') {
+                const studioId = toolPolicy.getContext()?.studioId;
+                if (studioId) {
+                  toolPolicy.allowTool(tool, { scope: 'studio', id: studioId });
+                  printLine(
+                    chalk.green(`✅ 2FA: ${tool} permanently approved (studio: ${studioId})`)
+                  );
+                } else {
+                  printLine(chalk.green(`✅ 2FA approval granted for ${tool}`));
+                }
+              } else if (result.action === 'grant-session') {
+                if (runtime.sessionId) {
+                  toolPolicy.grantToolForSession(runtime.sessionId, tool);
+                }
+                printLine(chalk.green(`✅ 2FA: ${tool} approved for this session`));
+              } else {
+                printLine(chalk.green(`✅ 2FA approval granted for ${tool}`));
+              }
+              return true;
+            } else if (result.status === 'timeout') {
+              printLine(chalk.yellow(`⏰ 2FA approval timed out for ${tool}`));
+              return false;
+            } else if (result.status === 'error') {
+              printLine(chalk.yellow(`⚠️ 2FA error: ${result.error}`));
+              return false;
+            } else {
+              printLine(chalk.yellow(`🚫 2FA approval denied for ${tool}`));
+              return false;
+            }
+          } catch {
+            printLine(chalk.yellow('Failed to create 2FA approval request — denying tool call'));
             return false;
           }
         },

@@ -596,11 +596,24 @@ export class ToolPolicyState {
     return false;
   }
 
+  private isExplicitlyAllowedAtAnyScope(tool: string): boolean {
+    for (const { rules } of this.getActiveScopeRules()) {
+      if (rules.allowTools.has(tool)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private findAllowFilterBlockingScope(tool: string): string | undefined {
     for (const { ref, rules } of this.getActiveScopeRules()) {
-      const allowPatterns = collectRulePatterns(rules);
-      if (allowPatterns.length === 0) continue;
-      if (!matchesAnyPolicyPattern(tool, allowPatterns)) {
+      // Only explicit allow-list entries create a narrowing filter.
+      // safeTools (DEFAULT_SAFE_PCP_TOOLS) are auto-allowed but must not
+      // block tools that happen to not be in the safe list — e.g., MCP
+      // tools like list_emails, get_integration_health.
+      if (rules.allowTools.size === 0) continue;
+      if (rules.safeTools.has(tool)) continue;
+      if (!matchesAnyPolicyPattern(tool, Array.from(rules.allowTools))) {
         return normalizeScopeLabel(ref);
       }
     }
@@ -1140,6 +1153,12 @@ export class ToolPolicyState {
     }
 
     if (this.matchesAnyPromptTool(key)) {
+      // Explicit allow at any scope overrides prompt requirements at other scopes.
+      // This lets persistent grants (approve agent / approve studio) override
+      // the safe profile's promptTools list.
+      if (this.isExplicitlyAllowedAtAnyScope(key)) {
+        return { allowed: true, reason: 'Tool explicitly allowed by scoped policy.' };
+      }
       return {
         allowed: false,
         reason: 'Tool requires explicit per-call confirmation by policy.',
