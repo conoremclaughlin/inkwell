@@ -179,6 +179,8 @@ export const TOOL_GROUPS: ToolGroupMap = {
     'list_sessions',
     'end_session',
   ],
+  'group:read': ['read', 'grep', 'find', 'ls'],
+  'group:write': ['edit', 'write', 'bash'],
 };
 
 const MODE_RANK: Record<ToolMode, number> = {
