@@ -1195,7 +1195,12 @@ export async function handleCreateTaskGroup(
     if (!effectiveProjectId && reqCtx?.studioId) {
       const studio = await dataComposer.repositories.studios.findById(reqCtx.studioId);
       if (studio?.defaultProjectId) {
-        effectiveProjectId = studio.defaultProjectId;
+        const defaultProject = await dataComposer.repositories.projects.findById(
+          studio.defaultProjectId
+        );
+        if (defaultProject && defaultProject.user_id === resolved.user.id) {
+          effectiveProjectId = studio.defaultProjectId;
+        }
       }
     }
     const sbId = await resolveIdentityIdForAgent(
