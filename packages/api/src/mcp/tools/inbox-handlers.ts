@@ -645,6 +645,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           ...(isAddressedRecipient && !resolvedRecipientStudioId && recipientStudioSlugOrHint
             ? { studioHint: recipientStudioSlugOrHint }
             : {}),
+          ...(Object.keys(rawMeta).length > 0 ? { metadata: rawMeta } : {}),
         };
         const result = gateway.dispatchTrigger(payload);
         if (result.accepted) {
@@ -789,6 +790,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       sessionAlias,
       studioId: recipientStudioId,
       studioHint: recipientStudioSlugOrHint,
+      ...(Object.keys(metadataRecord).length > 0 ? { metadata: metadataRecord } : {}),
     };
 
     logger.info('Inbox message trigger dispatched (async)', {
