@@ -29,7 +29,12 @@ import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js'
  * for GitHub auth which works, but Inkwell headers haven't been verified end-to-end.
  * Live validation needed once Aster's quota resets.
  */
-function buildGeminiSettings(cwd: string): { path: string; cleanup: () => void } | null {
+function buildGeminiSettings(
+  cwd: string,
+  contextToken: string,
+  sessionId?: string,
+  studioId?: string
+): { path: string; cleanup: () => void } | null {
   // Start from .mcp.json to preserve other MCP servers (supabase, github, etc.)
   const mcpJsonPath = join(cwd, '.mcp.json');
   let mcpServers: Record<string, unknown> = {};
@@ -53,9 +58,9 @@ function buildGeminiSettings(cwd: string): { path: string; cleanup: () => void }
     headers: {
       ...existingHeaders,
       Authorization: 'Bearer ${INK_ACCESS_TOKEN}',
-      'x-ink-context': '${INK_CONTEXT}',
-      'x-ink-session-id': '${INK_SESSION_ID}',
-      'x-ink-studio-id': '${INK_STUDIO_ID}',
+      'x-ink-context': contextToken,
+      ...(sessionId ? { 'x-ink-session-id': sessionId } : {}),
+      ...(studioId ? { 'x-ink-studio-id': studioId } : {}),
     },
   };
 
@@ -126,7 +131,12 @@ export class GeminiAdapter implements BackendAdapter {
     // Build temp settings.json with Inkwell auth + session headers.
     // INK_ACCESS_TOKEN is set at the spawn site (after prepare) — the
     // ${INK_ACCESS_TOKEN} syntax in settings.json resolves at Gemini runtime.
-    const settings = buildGeminiSettings(process.cwd());
+    const settings = buildGeminiSettings(
+      process.cwd(),
+      contextToken,
+      config.pcpSessionId,
+      config.studioId
+    );
     const cleanup = () => {
       identityCleanup();
       settings?.cleanup();

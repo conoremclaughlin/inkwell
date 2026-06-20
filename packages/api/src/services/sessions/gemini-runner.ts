@@ -26,7 +26,12 @@ import type {
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
-import { buildSessionEnv, resolveSpawnTarget, CONTAINER_RUNNER_FILES } from '@inklabs/shared';
+import {
+  buildSessionEnv,
+  resolveSpawnTarget,
+  CONTAINER_RUNNER_FILES,
+  encodeContextToken,
+} from '@inklabs/shared';
 
 /** Maximum time (ms) to wait for a Gemini CLI subprocess before killing it.
  *  Override with GEMINI_PROCESS_TIMEOUT_MS env var. */
@@ -91,6 +96,15 @@ export class GeminiRunner implements IRunner {
         }
       }
 
+      // Build consolidated context token
+      const contextToken = encodeContextToken({
+        sessionId: config.pcpSessionId || '',
+        studioId: config.studioId || '',
+        agentId: config.agentId || 'unknown',
+        cliAttached: false,
+        runtime: 'gemini',
+      });
+
       // Ensure PCP server has auth + session headers
       const pcpConfig = (mcpServers.inkwell || {}) as Record<string, unknown>;
       const existingHeaders = (pcpConfig.headers || {}) as Record<string, string>;
@@ -101,9 +115,9 @@ export class GeminiRunner implements IRunner {
         headers: {
           ...existingHeaders,
           Authorization: 'Bearer ${INK_ACCESS_TOKEN}',
-          'x-ink-context': '${INK_CONTEXT}',
-          'x-ink-session-id': '${INK_SESSION_ID}',
-          'x-ink-studio-id': '${INK_STUDIO_ID}',
+          'x-ink-context': contextToken,
+          ...(config.pcpSessionId ? { 'x-ink-session-id': config.pcpSessionId } : {}),
+          ...(config.studioId ? { 'x-ink-studio-id': config.studioId } : {}),
         },
       };
 
