@@ -361,6 +361,7 @@ describe('StrategyService', () => {
       expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith('group-1', {
         status: 'cancelled',
         strategy_paused_at: null,
+        execution_phase: 'idle',
       });
       expect(dc.repositories.activityStream.logActivity).toHaveBeenCalledWith(
         expect.objectContaining({
