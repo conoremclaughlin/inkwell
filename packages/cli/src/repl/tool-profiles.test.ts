@@ -154,6 +154,71 @@ describe('tool-profiles', () => {
       expect(decision.allowed).toBe(false);
       expect(decision.promptable).toBe(false);
     });
+
+    // Pi coding tool groups (group:read / group:write)
+    describe('Pi tool groups', () => {
+      it('minimal profile allows read tools and denies write tools', () => {
+        applyProfile(policy, 'minimal');
+
+        // group:read → allowed
+        expect(policy.canCallPcpTool('read').allowed).toBe(true);
+        expect(policy.canCallPcpTool('grep').allowed).toBe(true);
+        expect(policy.canCallPcpTool('find').allowed).toBe(true);
+        expect(policy.canCallPcpTool('ls').allowed).toBe(true);
+
+        // group:write → denied
+        const bashDecision = policy.canCallPcpTool('bash');
+        expect(bashDecision.allowed).toBe(false);
+        expect(bashDecision.promptable).toBe(false);
+
+        const editDecision = policy.canCallPcpTool('edit');
+        expect(editDecision.allowed).toBe(false);
+        expect(editDecision.promptable).toBe(false);
+
+        const writeDecision = policy.canCallPcpTool('write');
+        expect(writeDecision.allowed).toBe(false);
+        expect(writeDecision.promptable).toBe(false);
+      });
+
+      it('safe profile allows read tools and prompts for write tools', () => {
+        applyProfile(policy, 'safe');
+
+        // group:read → allowed
+        expect(policy.canCallPcpTool('read').allowed).toBe(true);
+        expect(policy.canCallPcpTool('grep').allowed).toBe(true);
+
+        // group:write → promptable (2FA path)
+        const bashDecision = policy.canCallPcpTool('bash');
+        expect(bashDecision.allowed).toBe(false);
+        expect(bashDecision.promptable).toBe(true);
+
+        const editDecision = policy.canCallPcpTool('edit');
+        expect(editDecision.allowed).toBe(false);
+        expect(editDecision.promptable).toBe(true);
+
+        const writeDecision = policy.canCallPcpTool('write');
+        expect(writeDecision.allowed).toBe(false);
+        expect(writeDecision.promptable).toBe(true);
+      });
+
+      it('collaborative profile allows both read and write tools', () => {
+        applyProfile(policy, 'collaborative');
+
+        expect(policy.canCallPcpTool('read').allowed).toBe(true);
+        expect(policy.canCallPcpTool('grep').allowed).toBe(true);
+        expect(policy.canCallPcpTool('bash').allowed).toBe(true);
+        expect(policy.canCallPcpTool('edit').allowed).toBe(true);
+        expect(policy.canCallPcpTool('write').allowed).toBe(true);
+      });
+
+      it('full profile allows everything via privileged mode', () => {
+        applyProfile(policy, 'full');
+
+        expect(policy.canCallPcpTool('read').allowed).toBe(true);
+        expect(policy.canCallPcpTool('bash').allowed).toBe(true);
+        expect(policy.canCallPcpTool('edit').allowed).toBe(true);
+      });
+    });
   });
 
   describe('formatProfileList', () => {

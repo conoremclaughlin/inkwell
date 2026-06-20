@@ -103,12 +103,7 @@ export function applyProfile(
   // Set mode
   policy.setMode(profile.mode, scope);
 
-  // Apply tool specs
-  for (const spec of profile.safeSpecs) {
-    // Safe tools go through allowTool — they're already in DEFAULT_SAFE_PCP_TOOLS
-    // which clearScopeRules re-populates for global scope
-  }
-
+  // Safe tools (group:ink-safe) are auto-populated by clearScopeRules above.
   for (const spec of profile.allowSpecs) {
     policy.allowTool(spec, scope);
   }
