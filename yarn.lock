@@ -1903,6 +1903,8 @@ __metadata:
     "@alcalzone/ansi-tokenize": "npm:^0.3.0"
     "@inklabs/shared": "workspace:*"
     "@inquirer/prompts": "npm:^8.2.0"
+    "@mariozechner/pi-agent-core": "npm:0.71.1"
+    "@mariozechner/pi-coding-agent": "npm:0.71.1"
     "@types/node": "npm:^20.10.0"
     "@types/react": "npm:^19.2.14"
     chalk: "npm:^5.3.0"

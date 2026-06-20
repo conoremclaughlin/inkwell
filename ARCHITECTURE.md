@@ -139,26 +139,41 @@ Wren calls send_to_inbox() + trigger: true
   → Myra processes, responds via ChannelGateway
 ```
 
-### SB CLI → Claude Code
+### SB CLI → Claude Code (direct backend)
 
 ```
 sb "fix the bug" → Identity injection (--append-system-prompt)
   → Spawns claude with Inkwell identity + MCP config
   → Claude Code connects to MCP server at localhost:3001
   → Agent bootstraps, remembers who it is
+  → Full native tools: Read, Edit, Write, Bash, MCP
 ```
+
+### Ink Backend → Local Tool Routing (Myra, Benson)
+
+````
+InkRunner → ink chat --non-interactive --approval-mode auto-approve
+  → ink CLI spawns Claude Code with --allowedTools '' (tools OFF)
+  → LLM generates text with ```ink-tool blocks
+  → ink CLI extracts + executes via PCP server HTTP
+  → Results injected as context → next LLM turn
+  → No filesystem access, Inkwell tools only
+````
 
 ## Multi-Agent Identity
 
-Three agents share the same infrastructure with distinct identities and filtered memories:
+Six agents share the same infrastructure with distinct identities, backends, and filtered memories:
 
-| Agent      | Interface              | Nature                                 |
-| ---------- | ---------------------- | -------------------------------------- |
-| **Wren**   | Claude Code (via `sb`) | Session-based development collaborator |
-| **Myra**   | Telegram / WhatsApp    | Persistent messaging bridge            |
-| **Benson** | Discord / Slack        | Conversational partner                 |
+| Agent      | Interface              | Backend     | Provider    | Nature                                 |
+| ---------- | ---------------------- | ----------- | ----------- | -------------------------------------- |
+| **Wren**   | Claude Code (via `sb`) | claude-code | claude-code | Session-based development collaborator |
+| **Lumen**  | Codex CLI              | codex       | codex       | Development collaborator               |
+| **Aster**  | Gemini CLI             | gemini      | gemini      | Development collaborator               |
+| **Myra**   | Telegram / WhatsApp    | ink         | claude-code | Persistent messaging bridge            |
+| **Benson** | Discord / Slack        | claude      | claude      | Conversational partner                 |
+| **Echo**   | (test only)            | —           | —           | Integration test agent                 |
 
-Identity is resolved from: system prompt override → `$AGENT_ID` env var → `.ink/identity.json` → `~/.ink/config.json`. Each agent has identity files at `~/.ink/individuals/<agentId>/` and memories filtered by agentId.
+Identity is resolved from: system prompt override → `$AGENT_ID` env var → `.ink/identity.json` → `~/.ink/config.json`. Identity documents (SOUL, HEARTBEAT, IDENTITY) live in the database (`agent_identities` table), with `~/.ink/` as a fallback cache. Memories are filtered by agentId (plus shared memories where `agentId` is null).
 
 ## MCP Tools
 
@@ -210,6 +225,104 @@ Identity is resolved from: system prompt override → `$AGENT_ID` env var → `.
 
 For production, use `yarn prod:direct` or Docker Compose (`docker-compose.app.yml`).
 
+## Session Runners and Tool Routing (2026-06-15)
+
+The server supports multiple runtime backends. Each agent's `backend` and `provider` columns in `agent_identities` determine which runner and LLM are used.
+
+### Runner Selection
+
+| Backend value | Runner         | What it spawns        | Tool access                             |
+| ------------- | -------------- | --------------------- | --------------------------------------- |
+| `claude-code` | `ClaudeRunner` | `claude` CLI directly | Native CC tools (Read, Edit, Bash, MCP) |
+| `codex-cli`   | `CodexRunner`  | `codex` CLI directly  | Native Codex tools                      |
+| `gemini`      | `GeminiRunner` | `gemini` CLI directly | Native Gemini tools                     |
+| `ink`         | `InkRunner`    | `ink chat` CLI        | Ink local tool routing (see below)      |
+
+The `provider` column (separate from `backend`) determines which LLM model family is used. For `ink` backend sessions, `provider` selects the underlying CLI (e.g., `provider: 'claude-code'` means `ink chat` spawns Claude Code as its LLM).
+
+### Current Agent Configuration
+
+| Agent  | Backend     | Provider    | sandbox_bypass |
+| ------ | ----------- | ----------- | -------------- |
+| wren   | claude-code | claude-code | false          |
+| myra   | ink         | claude-code | false          |
+| lumen  | codex       | codex       | true           |
+| benson | claude      | claude      | false          |
+| aster  | gemini      | gemini      | false          |
+
+### Ink Backend: Local Tool Routing
+
+When `backend = 'ink'`, the session flows through the ink CLI's local tool routing architecture:
+
+````
+InkRunner spawns: ink chat --non-interactive --approval-mode auto-approve
+  └─ ink CLI sets toolRouting: 'local' (default)
+     └─ Spawns Claude Code with --allowedTools '' (EMPTY — all native tools disabled)
+     └─ LLM generates text with fenced ink-tool blocks:
+        ```ink-tool
+        {"tool":"recall","args":{"query":"..."}}
+        ```
+     └─ ink CLI extracts blocks, executes via PCP server HTTP
+     └─ Results fed back as context for next LLM turn
+     └─ Loop repeats (max 5 iterations) until no tool blocks emitted
+````
+
+**Key implications:**
+
+- Claude Code's native tools (Read, Edit, Write, Bash, Agent, etc.) are **completely disabled** via `--allowedTools ''`
+- The LLM is a pure text generator — no filesystem access, no shell execution
+- Available tools are Inkwell MCP tools only: `recall`, `remember`, `send_response`, `get_inbox`, etc.
+- `.claude/settings.local.json` permissions are **irrelevant** — the empty allowlist overrides everything
+- Tool policy and approval happen at the ink CLI layer, not Claude Code's permission system
+
+### Tool Approval (2FA)
+
+The ink CLI has a multi-tier approval system for local tool calls:
+
+1. **Interactive mode** — TUI prompt (when a human is at the terminal)
+2. **Auto-approve** — `--approval-mode auto-approve` sets `AutoApprovalChannel('once')`, approves all tool calls. Used by InkRunner for non-interactive spawns.
+3. **Remote approval (2FA)** — When the session is in `awayMode`, tool calls that need approval are sent as inbox notifications. The user can approve/deny via Telegram/WhatsApp. Currently only gates Inkwell tools (no filesystem tools exist in the local tool set to gate).
+
+### Model Override
+
+Default model for spawned sessions is controlled by env vars in `.env.local`:
+
+```
+DEFAULT_CLAUDE_MODEL=claude-opus-4-6    # Claude Code / ink+claude sessions
+DEFAULT_CODEX_MODEL=...                  # Codex sessions
+DEFAULT_GEMINI_MODEL=...                 # Gemini sessions
+```
+
+When set, these flow through `SessionServiceConfig` → runner config → `--model` flag on the spawned CLI process. When unset, the CLI uses its own default (which can change without warning — set explicitly for stability).
+
+### Pi Coding Tools (2026-06-16)
+
+The ink CLI integrates [@mariozechner/pi-coding-agent](https://github.com/badlogic/pi-mono)'s coding tools in-process, giving ink-backend agents filesystem access through the same local tool routing layer used for Inkwell tools.
+
+````
+LLM emits: ```ink-tool {"tool":"read","args":{"path":"src/server.ts"}} ```
+  → ink CLI extracts ink-tool block
+  → isPiTool("read") → true
+  → callPiTool("read", args, cwd) → Pi tool executes in-process
+  → Result injected as context → next LLM turn
+````
+
+**Available coding tools** (from Pi, scoped to working directory):
+
+| Tool    | What it does                                             |
+| ------- | -------------------------------------------------------- |
+| `read`  | Read file with offset/limit, line numbers, truncation    |
+| `edit`  | Find-and-replace with conflict detection and diff output |
+| `write` | Create/overwrite file with directory creation            |
+| `bash`  | Execute shell command with timeout and output truncation |
+| `grep`  | Search file contents with regex and context lines        |
+| `find`  | Find files by pattern, gitignore-aware                   |
+| `ls`    | List directory with file sizes and depth control         |
+
+Pi tools are initialized lazily per working directory via `createReadTool(cwd)`, `createEditTool(cwd)`, etc. The tool policy and 2FA approval flow still applies — Pi tools flow through the same `executeToolCalls` pipeline as Inkwell tools.
+
+**Design decision:** Import Pi's tool implementations rather than reimplementing. Pi's tools are battle-tested in OpenClaw production with edge-case handling (encoding detection, binary safety, diff formatting, symlink guards) that would take significant effort to replicate. We only use the tool layer — not Pi's agent loop, session management, or LLM abstraction.
+
 ## Key Design Decisions
 
 1. **Stateless SessionService** — All state in the database. Processing locks prevent races. Enables horizontal scaling.
@@ -218,3 +331,5 @@ For production, use `yarn prod:direct` or Docker Compose (`docker-compose.app.ym
 4. **Channel-agnostic routing** — SessionService doesn't know about Telegram/WhatsApp. ChannelGateway handles routing.
 5. **Heartbeat via SessionService** — Reminders are just messages. Same processing pipeline, same agent capabilities.
 6. **Identity injection** — The `sb` CLI injects identity via system prompt. The agent bootstraps from there.
+7. **Local tool routing as default for ink backend** — (2026-06-15) The ink CLI intercepts tool calls at its own layer rather than delegating to the underlying LLM CLI's native tools. This gives the ink CLI control over approval, policy, credential injection, and tool execution.
+8. **Pi coding tools over reimplementation** — (2026-06-16) Rather than building filesystem tools from scratch, the ink CLI imports Pi's battle-tested tool implementations in-process. Same local tool routing, different executor for coding tools vs Inkwell tools. Leverages others' effort for the subtleties of code editing (diff formatting, truncation, encoding detection).
