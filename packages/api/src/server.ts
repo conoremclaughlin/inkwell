@@ -1051,7 +1051,18 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         attachedRow.cli_attached = false;
       }
 
-      const delivery = shouldSkipSpawn(pollRow, attachedRow);
+      // Strategy triggers (kickoff/watchdog/resume) must always spawn a new
+      // session — they are self-addressed (agent triggers itself) and the
+      // channel plugin's self-message filter silently drops them. Bypassing
+      // shouldSkipSpawn ensures autonomous work actually starts.
+      const isStrategyTrigger =
+        payload.metadata &&
+        typeof payload.metadata.strategyTrigger === 'boolean' &&
+        payload.metadata.strategyTrigger;
+
+      const delivery = isStrategyTrigger
+        ? { skip: false, source: null, sessionId: null }
+        : shouldSkipSpawn(pollRow, attachedRow);
 
       if (delivery.skip) {
         logger.info(
@@ -1070,6 +1081,14 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         });
         return;
       }
+
+      if (isStrategyTrigger) {
+        logger.info('[Trigger] Strategy trigger — bypassing CLI-attached check, forcing spawn', {
+          targetAgentId,
+          reason: payload.metadata?.reason,
+          groupId: payload.metadata?.groupId,
+        });
+      }
     } catch (err) {
       // If session resolution fails, fall through to normal handleMessage
       logger.debug('[Trigger] CLI-attached check failed, falling through to spawn', {
@@ -1082,6 +1101,28 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     if (!result.success) {
       logger.error(`[Trigger] SessionService failed for ${targetAgentId}: ${result.error}`);
       throw new Error(result.error || 'SessionService processing failed');
+    }
+
+    // Stamp execution_phase → worker_active now that a session is actually running
+    const strategyGroupId =
+      payload.metadata && typeof payload.metadata.groupId === 'string'
+        ? payload.metadata.groupId
+        : undefined;
+    if (strategyGroupId && payload.metadata?.strategyTrigger) {
+      try {
+        await dataComposer!
+          .getClient()
+          .from('task_groups')
+          .update({ execution_phase: 'worker_active' } as never)
+          .eq('id', strategyGroupId)
+          .eq('status', 'active');
+        logger.info(`[Trigger] Stamped execution_phase=worker_active on group ${strategyGroupId}`);
+      } catch (phaseErr) {
+        logger.warn('[Trigger] Failed to stamp execution_phase', {
+          groupId: strategyGroupId,
+          error: phaseErr instanceof Error ? phaseErr.message : String(phaseErr),
+        });
+      }
     }
 
     // 5. Route any responses — wrapped in try-catch because the session already

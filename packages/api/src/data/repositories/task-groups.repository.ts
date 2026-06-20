@@ -17,6 +17,7 @@ export type TaskGroupOutputTarget = 'spec' | 'pr' | 'report' | 'proposal';
 export type TaskGroupOutputStatus = 'ready_for_review' | 'needs_more_work' | 'blocked';
 export type StrategyPreset = 'persistence' | 'review' | 'architect' | 'parallel' | 'swarm';
 export type VerificationMode = 'self' | 'peer' | 'architect';
+export type ExecutionPhase = 'idle' | 'pending_trigger' | 'worker_active' | 'paused' | 'completed';
 
 export interface TaskGroup {
   id: string;
@@ -47,6 +48,7 @@ export interface TaskGroup {
   iterations_since_approval: number;
   strategy_started_at: string | null;
   strategy_paused_at: string | null;
+  execution_phase: ExecutionPhase;
   group_number: number;
   slug: string | null;
   outcome: string | null;
@@ -139,6 +141,7 @@ export interface UpdateTaskGroupInput {
   strategy_paused_at?: string | null;
   outcome?: string | null;
   conclusion?: string | null;
+  execution_phase?: ExecutionPhase;
 }
 
 export interface ListTaskGroupsOptions {
@@ -280,6 +283,7 @@ export class TaskGroupsRepository {
       updates.strategy_paused_at = input.strategy_paused_at;
     if (input.outcome !== undefined) updates.outcome = input.outcome;
     if (input.conclusion !== undefined) updates.conclusion = input.conclusion;
+    if (input.execution_phase !== undefined) updates.execution_phase = input.execution_phase;
 
     const { data, error } = await this.client
       .from('task_groups' as never)
