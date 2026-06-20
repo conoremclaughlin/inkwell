@@ -112,6 +112,7 @@ interface PersistedToolPolicyRules {
   allowTools?: string[];
   denyTools?: string[];
   promptTools?: string[];
+  permanentGrants?: string[];
   grants?: Record<string, number>;
   readPathAllow?: string[];
   writePathAllow?: string[];
@@ -140,6 +141,7 @@ interface ToolPolicyRulesState {
   allowTools: Set<string>;
   denyTools: Set<string>;
   promptTools: Set<string>;
+  permanentGrants: Set<string>;
   grants: Map<string, number>;
   readPathAllow: string[];
   writePathAllow: string[];
@@ -227,6 +229,7 @@ function createRules(options?: {
     allowTools: new Set<string>(),
     denyTools: new Set<string>(),
     promptTools: new Set<string>(),
+    permanentGrants: new Set<string>(),
     grants: new Map<string, number>(),
     readPathAllow: [],
     writePathAllow: [],
@@ -298,6 +301,7 @@ function hasAnyRules(rule: ToolPolicyRulesState): boolean {
     rule.allowTools.size ||
     rule.denyTools.size ||
     rule.promptTools.size ||
+    rule.permanentGrants.size ||
     rule.grants.size ||
     rule.readPathAllow.length ||
     rule.writePathAllow.length ||
@@ -445,6 +449,7 @@ export class ToolPolicyState {
     for (const tool of data.allowTools || []) addToolSpec(target.allowTools, tool);
     for (const tool of data.denyTools || []) addToolSpec(target.denyTools, tool);
     for (const tool of data.promptTools || []) addToolSpec(target.promptTools, tool);
+    for (const tool of data.permanentGrants || []) addToolSpec(target.permanentGrants, tool);
 
     target.grants = sanitizeGrants(data.grants);
 
@@ -462,6 +467,7 @@ export class ToolPolicyState {
       allowTools: Array.from(rules.allowTools).sort(),
       denyTools: Array.from(rules.denyTools).sort(),
       promptTools: Array.from(rules.promptTools).sort(),
+      permanentGrants: Array.from(rules.permanentGrants).sort(),
       grants: Object.fromEntries(rules.grants.entries()),
       readPathAllow: [...rules.readPathAllow],
       writePathAllow: [...rules.writePathAllow],
@@ -860,12 +866,14 @@ export class ToolPolicyState {
   public clearScopeRules(scope?: ToolPolicyScopeRef): SetMutationScopeResult {
     const target = this.resolveMutationScope(scope);
     if (target.scope === 'global') {
+      const preserved = this.globalRules.permanentGrants;
       this.globalRules = createRules({
         mode: 'backend',
         skillTrustMode: 'all',
         sessionVisibility: DEFAULT_SESSION_VISIBILITY,
         includeDefaultSafeTools: true,
       });
+      this.globalRules.permanentGrants = preserved;
       this.saveToDisk();
       return {
         success: true,
@@ -879,7 +887,15 @@ export class ToolPolicyState {
     }
 
     const map = this.getScopeMap(target.scope);
-    map.delete(target.id);
+    const existing = map.get(target.id);
+    const preserved = existing?.permanentGrants;
+    if (preserved && preserved.size > 0) {
+      const fresh = createRules();
+      fresh.permanentGrants = preserved;
+      map.set(target.id, fresh);
+    } else {
+      map.delete(target.id);
+    }
     this.saveToDisk();
     return {
       success: true,
@@ -925,6 +941,23 @@ export class ToolPolicyState {
     return Array.from(values);
   }
 
+  public listPermanentGrants(): string[] {
+    return Array.from(this.collectPermanentGrants()).sort();
+  }
+
+  public revokePermanentGrant(tool: string): void {
+    const expanded = expandToolSpec(tool);
+    if (expanded.length === 0) return;
+
+    for (const { rules } of this.getActiveScopeRules()) {
+      for (const key of expanded) {
+        rules.permanentGrants.delete(key);
+      }
+    }
+
+    this.saveToDisk();
+  }
+
   public listAllowedSkills(): string[] {
     const values = new Set<string>();
     for (const { rules } of this.getActiveScopeRules()) {
@@ -946,6 +979,7 @@ export class ToolPolicyState {
     for (const { rules } of this.getActiveScopeRules()) {
       for (const key of expanded) {
         rules.promptTools.delete(key);
+        rules.permanentGrants.add(key);
       }
     }
 
@@ -985,13 +1019,23 @@ export class ToolPolicyState {
     const expanded = expandToolSpec(tool);
     if (expanded.length === 0) return;
 
+    const allGrants = this.collectPermanentGrants();
     for (const key of expanded) {
+      if (allGrants.has(key)) continue;
       rules.promptTools.add(key);
       rules.allowTools.delete(key);
       rules.denyTools.delete(key);
     }
 
     this.saveToDisk();
+  }
+
+  private collectPermanentGrants(): Set<string> {
+    const all = new Set<string>();
+    for (const { rules } of this.getActiveScopeRules()) {
+      for (const tool of rules.permanentGrants) all.add(tool);
+    }
+    return all;
   }
 
   public removeToolRule(tool: string, scope?: ToolPolicyScopeRef): void {
