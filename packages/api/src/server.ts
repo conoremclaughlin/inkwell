@@ -135,6 +135,9 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     mcpConfigPath,
     compactionThreshold: config.compactionThreshold || 150000,
     responseHandler: async (responses) => routeResponses(responses),
+    ...(env.DEFAULT_CLAUDE_MODEL ? { defaultModel: env.DEFAULT_CLAUDE_MODEL } : {}),
+    ...(env.DEFAULT_CODEX_MODEL ? { defaultCodexModel: env.DEFAULT_CODEX_MODEL } : {}),
+    ...(env.DEFAULT_GEMINI_MODEL ? { defaultGeminiModel: env.DEFAULT_GEMINI_MODEL } : {}),
   };
   sessionService = createSessionService(dataComposer.getClient(), sessionServiceConfig);
   logger.info('SessionService ready');
