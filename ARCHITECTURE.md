@@ -275,13 +275,86 @@ InkRunner spawns: ink chat --non-interactive --approval-mode auto-approve
 - `.claude/settings.local.json` permissions are **irrelevant** — the empty allowlist overrides everything
 - Tool policy and approval happen at the ink CLI layer, not Claude Code's permission system
 
+### Tool Policy & Profiles
+
+The ink CLI enforces a tool policy system (`ToolPolicyState`) that controls which tools agents can call. Profiles are predefined policy configurations applied via `--profile <name>`:
+
+| Profile         | Mode       | Behavior                                                                 |
+| --------------- | ---------- | ------------------------------------------------------------------------ |
+| `minimal`       | backend    | Read-only. `group:read` allowed, comms/writes denied. Allowlist narrows. |
+| `safe`          | backend    | All tools allowed except comms and writes, which require 2FA approval.   |
+| `collaborative` | backend    | Everything allowed. No prompts, no restrictions.                         |
+| `full`          | privileged | All tools allowed, policy bypassed entirely.                             |
+
+**Policy decision flow** (`canCallPcpTool`):
+
+1. Deny list → blocked (not promptable)
+2. Privileged mode → allowed
+3. Session grant → allowed
+4. Scoped grant → allowed (one-time use, decrements)
+5. Prompt list → blocked, promptable (2FA path)
+6. Allow-list narrowing → if allowTools is non-empty and tool isn't in it, blocked+promptable
+7. Default → allowed
+
+**Key design property:** `safeTools` (DEFAULT_SAFE_PCP_TOOLS) do NOT create narrowing. Only explicit `allowTools` entries create a whitelist filter. This means profiles like `safe` that have empty `allowSpecs` allow all MCP tools by default — only `promptSpecs` gates specific tools.
+
+**Tool groups** define logical sets expanded at policy application time:
+
+| Group               | Tools                                                  |
+| ------------------- | ------------------------------------------------------ |
+| `group:ink-safe`    | bootstrap, recall, get_inbox, list_sessions, etc.      |
+| `group:ink-comms`   | send_to_inbox, trigger_agent, send_response            |
+| `group:ink-memory`  | remember, recall, forget, update_memory, etc.          |
+| `group:ink-session` | start_session, update_session_state, end_session, etc. |
+| `group:read`        | read, grep, find, ls                                   |
+| `group:write`       | edit, write, bash                                      |
+
+InkRunner spawns with `--profile safe --away`, meaning server-spawned agents can read freely, call MCP tools, but must get human approval for file writes and cross-agent communication.
+
 ### Tool Approval (2FA)
 
-The ink CLI has a multi-tier approval system for local tool calls:
+The ink CLI has a multi-tier approval system for tool calls:
 
-1. **Interactive mode** — TUI prompt (when a human is at the terminal)
-2. **Auto-approve** — `--approval-mode auto-approve` sets `AutoApprovalChannel('once')`, approves all tool calls. Used by InkRunner for non-interactive spawns.
-3. **Remote approval (2FA)** — When the session is in `awayMode`, tool calls that need approval are sent as inbox notifications. The user can approve/deny via Telegram/WhatsApp. Currently only gates Inkwell tools (no filesystem tools exist in the local tool set to gate).
+1. **Interactive mode** — TUI prompt when a human is at the terminal
+2. **JSONL mode** — Structured protocol for programmatic integrations: `approval_request` on stderr, `approval_response` on stdin
+3. **Remote 2FA (away mode)** — Server-routed approval via connected platforms (Telegram, WhatsApp)
+
+#### 2FA Architecture
+
+When `--away` is set, tool calls requiring approval trigger a server-side 2FA flow:
+
+```
+Agent calls tool → canCallPcpTool returns promptable
+  → CLI creates approval_requests DB record via POST /api/admin/approval-requests
+    → Server calls notifyPlatformOfApprovalRequest()
+      → Looks up user's trusted_users (Telegram, WhatsApp)
+      → Sends formatted notification directly via Telegram Bot API
+      → Stores telegramMessageId in request metadata (for reply-to threading)
+  → CLI polls GET /api/admin/approval-requests/:requestId/status (every 3s, 5min timeout)
+  → User replies on Telegram: "approve" / "deny" / "approve session"
+    → approval-interceptor.ts catches reply BEFORE agent routing
+      → Matches against pending approval_requests by user + reply-to thread
+      → Updates DB: status, action, granted_tools, granted_by, resolved_at
+      → Sends ack emoji back to user
+  → CLI poll picks up resolution → tool allowed or denied
+```
+
+**Security properties:**
+
+- `permission_grant` messages can ONLY originate from the system layer (verified platform identity). Agents cannot forge grants — enforced in `inbox-handlers.ts`.
+- No HTTP endpoint for grant resolution — prevents client-side spoofing.
+- Optimistic lock on DB updates — prevents double-approval races.
+- The approval interceptor runs BEFORE agent routing — the user's "approve" reply never reaches the agent.
+- Fails closed: any error during creation or polling results in denial.
+
+**Key files:**
+
+- `packages/cli/src/repl/approval-api.ts` — Shared HTTP client for create + poll
+- `packages/api/src/channels/approval-interceptor.ts` — Platform response interception
+- `supabase/migrations/20260416232802_approval_requests.sql` — DB schema
+- `packages/api/src/routes/admin.ts` — REST endpoints for approval lifecycle
+- `packages/cli/src/commands/hooks.ts` — PreToolUse hook (Claude Code integration)
+- `packages/cli/src/repl/permission-grant.ts` — Grant payload structure and application
 
 ### Model Override
 
