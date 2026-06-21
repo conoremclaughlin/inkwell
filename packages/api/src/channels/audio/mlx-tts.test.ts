@@ -216,4 +216,70 @@ describe('MlxAudioTextToSpeechProvider', () => {
     expect(await provider.resolvePython()).toBe(fakePython);
     expect(await provider.resolvePython()).toBe(fakePython);
   });
+
+  it('uses per-call voice override when provided', async () => {
+    const voiceCapture = join(dir, 'voice-capture');
+    const voicePython = join(dir, 'voice-python');
+    await writeFile(
+      voicePython,
+      '#!/bin/sh\n' +
+        'if [ "$1" = "-c" ]; then exit 0; fi\n' +
+        'outdir=""; prefix=""; voice=""\n' +
+        'prev=""\n' +
+        'for arg in "$@"; do\n' +
+        '  if [ "$prev" = "--output_path" ]; then outdir="$arg"; fi\n' +
+        '  if [ "$prev" = "--file_prefix" ]; then prefix="$arg"; fi\n' +
+        '  if [ "$prev" = "--voice" ]; then voice="$arg"; fi\n' +
+        '  prev="$arg"\n' +
+        'done\n' +
+        `printf "%s" "$voice" > "${voiceCapture}"\n` +
+        'printf "RIFF:audio" > "$outdir/$prefix.wav"\n'
+    );
+    await chmod(voicePython, 0o755);
+
+    const provider = new MlxAudioTextToSpeechProvider({
+      format: 'wav',
+      voice: 'serena',
+      pythonCandidates: [voicePython],
+    });
+
+    const result = await provider.synthesize({ text: 'hello', voice: 'vivian' });
+    expect(result).toBeDefined();
+    const usedVoice = await readFile(voiceCapture, 'utf-8');
+    expect(usedVoice).toBe('vivian');
+    await result!.cleanup();
+  });
+
+  it('falls back to configured voice when no per-call override', async () => {
+    const voiceCapture = join(dir, 'voice-capture-default');
+    const voicePython = join(dir, 'voice-python-default');
+    await writeFile(
+      voicePython,
+      '#!/bin/sh\n' +
+        'if [ "$1" = "-c" ]; then exit 0; fi\n' +
+        'outdir=""; prefix=""; voice=""\n' +
+        'prev=""\n' +
+        'for arg in "$@"; do\n' +
+        '  if [ "$prev" = "--output_path" ]; then outdir="$arg"; fi\n' +
+        '  if [ "$prev" = "--file_prefix" ]; then prefix="$arg"; fi\n' +
+        '  if [ "$prev" = "--voice" ]; then voice="$arg"; fi\n' +
+        '  prev="$arg"\n' +
+        'done\n' +
+        `printf "%s" "$voice" > "${voiceCapture}"\n` +
+        'printf "RIFF:audio" > "$outdir/$prefix.wav"\n'
+    );
+    await chmod(voicePython, 0o755);
+
+    const provider = new MlxAudioTextToSpeechProvider({
+      format: 'wav',
+      voice: 'ryan',
+      pythonCandidates: [voicePython],
+    });
+
+    const result = await provider.synthesize({ text: 'hello' });
+    expect(result).toBeDefined();
+    const usedVoice = await readFile(voiceCapture, 'utf-8');
+    expect(usedVoice).toBe('ryan');
+    await result!.cleanup();
+  });
 });
