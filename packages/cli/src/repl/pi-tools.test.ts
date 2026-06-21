@@ -2,7 +2,13 @@ import { mkdtemp, rm, writeFile, readFile, mkdir } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
-import { isPiTool, getPiToolNames, callPiTool, initPiTools } from './pi-tools.js';
+import {
+  isPiTool,
+  getPiToolNames,
+  callPiTool,
+  initPiTools,
+  PathContainmentError,
+} from './pi-tools.js';
 import { executeToolCalls, type ToolCallExecutorDeps } from './tool-call-executor.js';
 
 // ─── Unit Tests ──────────────────────────────────────────────────────
@@ -93,7 +99,7 @@ describe('pi-tools: live', () => {
       expect(result.text).toContain('Line two');
     });
 
-    it('throws ENOENT for missing file', async () => {
+    it('throws ENOENT for missing file within workspace', async () => {
       await expect(callPiTool('read', { path: 'nonexistent.txt' }, tmpDir)).rejects.toThrow(
         'ENOENT'
       );
@@ -199,6 +205,74 @@ describe('pi-tools: live', () => {
       const content = result.content as Array<{ type: string; text?: string }>;
       expect(content.length).toBeGreaterThan(0);
       expect(content[0].type).toBe('text');
+    });
+  });
+
+  describe('path containment', () => {
+    it('blocks read with ../ traversal', async () => {
+      const outsideFile = path.join(tmpDir, '..', 'outside-read.txt');
+      await writeFile(outsideFile, 'should not be readable');
+      try {
+        await expect(callPiTool('read', { path: '../outside-read.txt' }, tmpDir)).rejects.toThrow(
+          PathContainmentError
+        );
+      } finally {
+        await rm(outsideFile, { force: true });
+      }
+    });
+
+    it('blocks write with ../ traversal', async () => {
+      await expect(
+        callPiTool('write', { path: '../escape.txt', content: 'escaped!' }, tmpDir)
+      ).rejects.toThrow(PathContainmentError);
+    });
+
+    it('blocks edit with ../ traversal', async () => {
+      await expect(callPiTool('edit', { path: '../hello.txt', edits: [] }, tmpDir)).rejects.toThrow(
+        PathContainmentError
+      );
+    });
+
+    it('blocks absolute path outside workspace', async () => {
+      await expect(callPiTool('read', { path: '/etc/passwd' }, tmpDir)).rejects.toThrow(
+        PathContainmentError
+      );
+    });
+
+    it('blocks ls with ../ traversal', async () => {
+      await expect(callPiTool('ls', { path: '..' }, tmpDir)).rejects.toThrow(PathContainmentError);
+    });
+
+    it('blocks grep with ../ traversal', async () => {
+      await expect(callPiTool('grep', { pattern: 'secret', path: '..' }, tmpDir)).rejects.toThrow(
+        PathContainmentError
+      );
+    });
+
+    it('blocks find with ../ traversal', async () => {
+      await expect(callPiTool('find', { pattern: '*', path: '..' }, tmpDir)).rejects.toThrow(
+        PathContainmentError
+      );
+    });
+
+    it('allows paths within workspace', async () => {
+      const result = await callPiTool('read', { path: 'subdir/nested.txt' }, tmpDir);
+      expect(result.success).toBe(true);
+      expect(result.text).toContain('nested content');
+    });
+
+    it('allows . as path', async () => {
+      const result = await callPiTool('ls', { path: '.' }, tmpDir);
+      expect(result.success).toBe(true);
+    });
+
+    it('blocks symlink escaping workspace', async () => {
+      const { symlink } = await import('fs/promises');
+      const linkPath = path.join(tmpDir, 'escape-link');
+      await symlink('/tmp', linkPath);
+      await expect(callPiTool('read', { path: 'escape-link/some-file' }, tmpDir)).rejects.toThrow(
+        PathContainmentError
+      );
     });
   });
 });
@@ -324,11 +398,22 @@ describe('pi-tools: integration with executeToolCalls', () => {
     expect(deps.promptForApproval).toHaveBeenCalledWith('read', 'needs approval');
   });
 
-  it('handles Pi tool execution errors gracefully', async () => {
+  it('handles Pi tool path containment errors gracefully', async () => {
     const deps = makeDeps();
-    // Pi's read tool throws ENOENT for missing files — executeToolCalls catches it
     const results = await executeToolCalls(
       [{ tool: 'read', args: { path: '/absolute/nonexistent/path/that/breaks' }, raw: '' }],
+      deps
+    );
+
+    expect(results).toHaveLength(1);
+    expect(results[0].status).toBe('error');
+    expect(results[0].error).toContain('Path containment violation');
+  });
+
+  it('handles Pi tool ENOENT errors gracefully', async () => {
+    const deps = makeDeps();
+    const results = await executeToolCalls(
+      [{ tool: 'read', args: { path: 'does-not-exist.txt' }, raw: '' }],
       deps
     );
 

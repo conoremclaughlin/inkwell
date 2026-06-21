@@ -6,6 +6,8 @@
  * bash, grep, find, ls) execute in-process against a working directory.
  */
 
+import { resolve, relative, dirname, basename, join } from 'path';
+import { realpathSync, existsSync } from 'fs';
 import type { PcpToolCallResult } from '../lib/pcp-client.js';
 
 // Pi tool types — we use the AgentTool shape from pi-agent-core
@@ -63,6 +65,70 @@ export async function initPiTools(cwd: string): Promise<Map<string, PiAgentTool>
   return cachedTools;
 }
 
+const PATH_TOOLS = new Set(['read', 'edit', 'write', 'ls', 'grep', 'find']);
+
+export class PathContainmentError extends Error {
+  constructor(
+    public readonly tool: string,
+    public readonly requestedPath: string,
+    public readonly resolvedPath: string,
+    public readonly cwd: string
+  ) {
+    super(
+      `Path containment violation: ${tool} attempted to access "${requestedPath}" ` +
+        `(resolved to "${resolvedPath}") which is outside workspace "${cwd}"`
+    );
+    this.name = 'PathContainmentError';
+  }
+}
+
+function resolveDeepestAncestor(targetPath: string): string {
+  const parts: string[] = [];
+  let current = targetPath;
+  while (!existsSync(current) && current !== dirname(current)) {
+    parts.unshift(basename(current));
+    current = dirname(current);
+  }
+  try {
+    const realAncestor = realpathSync(current);
+    return join(realAncestor, ...parts);
+  } catch {
+    return targetPath;
+  }
+}
+
+function assertContainedPath(rawPath: string, cwd: string, tool: string): void {
+  let realCwd: string;
+  try {
+    realCwd = realpathSync(cwd);
+  } catch {
+    realCwd = cwd;
+  }
+
+  const resolved = resolve(realCwd, rawPath);
+
+  let realResolved: string;
+  try {
+    realResolved = realpathSync(resolved);
+  } catch {
+    realResolved = resolveDeepestAncestor(resolved);
+  }
+
+  const rel = relative(realCwd, realResolved);
+  if (rel.startsWith('..') || resolve(realCwd, rel) !== realResolved) {
+    throw new PathContainmentError(tool, rawPath, realResolved, realCwd);
+  }
+}
+
+function validatePathArgs(toolName: string, args: Record<string, unknown>, cwd: string): void {
+  if (!PATH_TOOLS.has(toolName)) return;
+
+  const pathArg = args.path ?? args.file_path ?? args.filePath;
+  if (typeof pathArg === 'string' && pathArg) {
+    assertContainedPath(pathArg, cwd, toolName);
+  }
+}
+
 /**
  * Execute a Pi coding tool and return the result in PcpToolCallResult format.
  * This is the adapter between Pi's tool interface and the ink CLI's tool routing.
@@ -78,6 +144,8 @@ export async function callPiTool(
   if (!tool) {
     throw new Error(`Pi tool "${toolName}" not found. Available: ${[...tools.keys()].join(', ')}`);
   }
+
+  validatePathArgs(toolName, args, cwd);
 
   const callId = `pi-${toolName}-${Date.now()}`;
   const result = await tool.execute(callId, args, signal);

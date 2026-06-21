@@ -543,8 +543,12 @@ describe('backend adapters session resume wiring', () => {
       // PCP server should have auth + context headers
       expect(settings.mcpServers.inkwell).toBeDefined();
       expect(settings.mcpServers.inkwell.headers.Authorization).toBe('Bearer ${INK_ACCESS_TOKEN}');
-      expect(settings.mcpServers.inkwell.headers['x-ink-context']).toBe('${INK_CONTEXT}');
-      expect(settings.mcpServers.inkwell.headers['x-ink-session-id']).toBe('${INK_SESSION_ID}');
+      const contextToken = settings.mcpServers.inkwell.headers['x-ink-context'];
+      const decoded = JSON.parse(Buffer.from(contextToken, 'base64url').toString());
+      expect(decoded.sessionId).toBe('sess-gemini-789');
+      expect(decoded.agentId).toBe('aster');
+      expect(decoded.runtime).toBe('gemini');
+      expect(settings.mcpServers.inkwell.headers['x-ink-session-id']).toBe('sess-gemini-789');
     } finally {
       prepared.cleanup();
     }
