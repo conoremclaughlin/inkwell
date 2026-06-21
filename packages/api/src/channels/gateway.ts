@@ -1377,7 +1377,12 @@ export class ChannelGateway extends EventEmitter {
     if (!this.textToSpeech.isEnabled()) return false;
     if (!this.shouldUseVoiceReply(response)) return false;
 
-    const audio = await this.textToSpeech.synthesize({ text: response.content });
+    const metadata = response.metadata as Record<string, unknown> | undefined;
+    const voiceOverride = typeof metadata?.ttsVoice === 'string' ? metadata.ttsVoice : undefined;
+    const audio = await this.textToSpeech.synthesize({
+      text: response.content,
+      voice: voiceOverride,
+    });
     if (!audio) return false;
 
     try {

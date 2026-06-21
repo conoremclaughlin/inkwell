@@ -58,7 +58,7 @@ export class OpenAITextToSpeechProvider implements TextToSpeechProvider {
         },
         body: JSON.stringify({
           model: this.model,
-          voice: this.voice,
+          voice: input.voice || this.voice,
           input: prompt,
           response_format: this.format,
         }),
