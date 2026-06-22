@@ -105,6 +105,16 @@ export const sendResponseSchema = z.object({
     .optional()
     .describe('Format of the response content'),
   replyToMessageId: z.string().optional().describe('Message ID to reply to (for threading)'),
+  voiceReply: z
+    .boolean()
+    .optional()
+    .describe(
+      'Send as a voice note instead of text (Telegram only). Uses on-device TTS, zero API cost.'
+    ),
+  ttsVoice: z
+    .enum(['serena', 'vivian', 'sohee', 'ono_anna', 'ryan', 'aiden', 'eric'])
+    .optional()
+    .describe('Voice for TTS synthesis. Only used when voiceReply is true. Default: serena.'),
   metadata: z.record(z.unknown()).optional().describe('Additional channel-specific metadata'),
   media: z
     .array(outboundMediaSchema)
@@ -139,14 +149,18 @@ export async function handleSendResponse(
       mediaPaths: args.media?.map((m) => m.path || m.url || 'none'),
     });
 
-    // Build the response object
+    // Merge voice fields into metadata so the gateway's TTS path picks them up
+    const metadata: Record<string, unknown> = { ...args.metadata };
+    if (args.voiceReply) metadata.voiceReply = true;
+    if (args.ttsVoice) metadata.ttsVoice = args.ttsVoice;
+
     const response: AgentResponse = {
       channel: args.channel as ChannelType,
       conversationId: args.conversationId,
       content: args.content,
       format: args.format as ResponseFormat | undefined,
       replyToMessageId: args.replyToMessageId,
-      metadata: args.metadata,
+      metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       media: args.media as OutboundMedia[] | undefined,
     };
 

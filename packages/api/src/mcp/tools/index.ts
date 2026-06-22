@@ -1420,7 +1420,12 @@ Example — send a photo with caption:
 Example — send a document:
   media: [{ type: "document", path: "/path/to/report.pdf", filename: "report.pdf" }]
 
-Supported types: image, video, audio, document. The \`content\` field is sent as a separate text message before the media.`,
+Supported types: image, video, audio, document. The \`content\` field is sent as a separate text message before the media.
+
+## Voice Replies (Telegram)
+
+Set \`voiceReply: true\` to send content as a voice note instead of text. Uses on-device TTS (zero cost).
+Optionally set \`ttsVoice\` to choose a voice. Available voices: serena (default), vivian, sohee, ono_anna, ryan, aiden, eric.`,
       inputSchema: {
         channel: z
           .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'agent'])
@@ -1432,6 +1437,16 @@ Supported types: image, video, audio, document. The \`content\` field is sent as
           .optional()
           .describe('Format of the response content'),
         replyToMessageId: z.string().optional().describe('Message ID to reply to (for threading)'),
+        voiceReply: z
+          .boolean()
+          .optional()
+          .describe(
+            'Send as a voice note instead of text (Telegram only). Uses on-device TTS, zero API cost.'
+          ),
+        ttsVoice: z
+          .enum(['serena', 'vivian', 'sohee', 'ono_anna', 'ryan', 'aiden', 'eric'])
+          .optional()
+          .describe('Voice for TTS synthesis. Only used when voiceReply is true. Default: serena.'),
         media: z
           .array(
             z.object({
