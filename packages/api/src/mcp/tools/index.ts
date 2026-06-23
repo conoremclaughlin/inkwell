@@ -157,6 +157,8 @@ import {
   setupAudioTranscriptionSchema,
 } from './audio-setup-handlers';
 
+import { handleReadPdf, readPdfSchema } from './pdf-handlers';
+
 import {
   handleCreateArtifact,
   handleGetArtifact,
@@ -3636,6 +3638,39 @@ Action "transcribe" (with filePath) transcribes a saved audio file under ~/.ink/
         };
       } catch (error) {
         logger.error('Error in setup_audio_transcription:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'read_pdf',
+    {
+      description: `Extract text from a PDF file saved under ~/.ink/files (e.g., email attachments from download_email_attachment).
+
+Use when you need to read the contents of a PDF — invoices, documents, reports — that was downloaded via email or other channels. Returns the extracted text and page count.
+
+Paths are confined to ~/.ink/files for security. Pass the absolute path returned by download_email_attachment.`,
+      inputSchema: readPdfSchema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        const result = await handleReadPdf(args);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify(result) }],
+        };
+      } catch (error) {
+        logger.error('Error in read_pdf:', error);
         return {
           content: [
             {
