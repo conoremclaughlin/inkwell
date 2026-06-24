@@ -390,7 +390,9 @@ describe('pi-tools: integration with executeToolCalls', () => {
 
     expect(results).toHaveLength(1);
     expect(results[0].status).toBe('approved');
-    expect(deps.promptForApproval).toHaveBeenCalledWith('read', 'needs approval');
+    expect(deps.promptForApproval).toHaveBeenCalledWith('read', 'needs approval', {
+      path: 'target.txt',
+    });
   });
 
   it('handles Pi tool path containment errors gracefully', async () => {
