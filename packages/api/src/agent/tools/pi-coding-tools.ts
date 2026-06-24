@@ -11,6 +11,7 @@ import path from 'path';
 import { existsSync } from 'fs';
 import { readdir, readFile, stat } from 'fs/promises';
 import type Anthropic from '@anthropic-ai/sdk';
+import { PathContainmentError, assertContainedPath } from '@inklabs/shared';
 import { logger } from '../../utils/logger';
 import { guardBashCommand } from './bash-guard';
 
@@ -62,12 +63,6 @@ export interface PiCodingToolsConfig {
 }
 
 const TOOLS_WITH_PATH_PARAM = new Set(['read', 'write', 'edit', 'grep', 'find', 'ls']);
-
-function isPathWithinWorkspace(filePath: string, cwd: string): boolean {
-  const resolved = path.resolve(cwd, filePath);
-  const normalizedCwd = path.resolve(cwd);
-  return resolved.startsWith(normalizedCwd + path.sep) || resolved === normalizedCwd;
-}
 
 interface PiModuleExports {
   createCodingTools: (cwd: string) => PiAgentTool[];
@@ -310,11 +305,18 @@ export async function createInkCodingTools(
       input_schema: piParametersToJsonSchema(tool.parameters) as Anthropic.Tool.InputSchema,
     },
     execute: async (params: Record<string, unknown>, signal?: AbortSignal): Promise<string> => {
-      // Workspace root enforcement for file-based tools
+      // Workspace root enforcement — realpath-based, catches symlink escapes
       if (enforceRoot && TOOLS_WITH_PATH_PARAM.has(tool.name)) {
         const filePath = (params.path as string) || '';
-        if (filePath && !isPathWithinWorkspace(filePath, config.cwd)) {
-          return `Error: Access denied — path "${filePath}" is outside workspace root "${config.cwd}"`;
+        if (filePath) {
+          try {
+            assertContainedPath(filePath, config.cwd, tool.name);
+          } catch (err) {
+            if (err instanceof PathContainmentError) {
+              return `Error: Access denied — path "${filePath}" is outside workspace root "${config.cwd}"`;
+            }
+            throw err;
+          }
         }
       }
 

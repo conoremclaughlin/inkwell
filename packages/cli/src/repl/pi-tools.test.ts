@@ -2,13 +2,8 @@ import { mkdtemp, rm, writeFile, readFile, mkdir } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
-import {
-  isPiTool,
-  getPiToolNames,
-  callPiTool,
-  initPiTools,
-  PathContainmentError,
-} from './pi-tools.js';
+import { isPiTool, getPiToolNames, callPiTool, initPiTools } from './pi-tools.js';
+import { PathContainmentError } from '@inklabs/shared';
 import { executeToolCalls, type ToolCallExecutorDeps } from './tool-call-executor.js';
 
 // ─── Unit Tests ──────────────────────────────────────────────────────

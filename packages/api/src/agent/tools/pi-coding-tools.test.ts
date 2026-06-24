@@ -1,6 +1,7 @@
-import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll, afterEach } from 'vitest';
 import path from 'path';
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from 'fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, symlinkSync, existsSync } from 'fs';
+import { rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { createInkCodingTools, type InkToolDefinition } from './pi-coding-tools';
 import { resetProcessRegistry, getProcessRegistry } from './bash-guard';
@@ -192,6 +193,42 @@ describe('Pi Coding Tools Adapter', () => {
       const readTool = tools.find((t) => t.schema.name === 'read')!;
       const result = await readTool.execute({ path: '../../etc/hostname' });
       expect(result).toContain('Access denied');
+    });
+
+    it('blocks symlink escaping workspace (read)', async () => {
+      const outsideDir = mkdtempSync(path.join(tmpdir(), 'pi-outside-'));
+      writeFileSync(path.join(outsideDir, 'secret.txt'), 'TOP SECRET');
+      const linkPath = path.join(testDir, 'escape-link');
+      symlinkSync(outsideDir, linkPath);
+
+      try {
+        const readTool = tools.find((t) => t.schema.name === 'read')!;
+        const result = await readTool.execute({ path: 'escape-link/secret.txt' });
+        expect(result).toContain('Access denied');
+        expect(result).toContain('outside workspace root');
+      } finally {
+        await rm(linkPath, { force: true });
+        await rm(outsideDir, { recursive: true, force: true });
+      }
+    });
+
+    it('blocks symlink escaping workspace (write)', async () => {
+      const outsideDir = mkdtempSync(path.join(tmpdir(), 'pi-outside-'));
+      const linkPath = path.join(testDir, 'write-escape-link');
+      symlinkSync(outsideDir, linkPath);
+
+      try {
+        const writeTool = tools.find((t) => t.schema.name === 'write')!;
+        const result = await writeTool.execute({
+          path: 'write-escape-link/pwned.txt',
+          content: 'SHOULD NOT BE WRITTEN',
+        });
+        expect(result).toContain('Access denied');
+        expect(existsSync(path.join(outsideDir, 'pwned.txt'))).toBe(false);
+      } finally {
+        await rm(linkPath, { force: true });
+        await rm(outsideDir, { recursive: true, force: true });
+      }
     });
 
     it('can be disabled', async () => {
