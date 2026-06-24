@@ -6915,15 +6915,7 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
     });
     const authReq = req as AdminAuthRequest;
 
-    const {
-      tool,
-      args,
-      reason,
-      studioId,
-      sessionId,
-      timeoutSeconds = 300,
-      requestingAgentId: bodyAgentId,
-    } = req.body;
+    const { tool, args, reason, studioId, sessionId, timeoutSeconds = 300 } = req.body;
 
     if (!tool) {
       res.status(400).json({ error: 'tool is required' });
@@ -6932,7 +6924,8 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
 
     const expiresAt = new Date(Date.now() + timeoutSeconds * 1000).toISOString();
 
-    // Resolve requesting agent: x-ink-context header > request body > 'unknown'
+    // Resolve requesting agent from trusted sources only (not client body).
+    // Priority: x-ink-context header > session record lookup > 'unknown'
     const contextHeader = req.headers['x-ink-context'] as string | undefined;
     let requestingAgentId = 'unknown';
     if (contextHeader) {
@@ -6943,12 +6936,23 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
         // fall through
       }
     }
-    if (requestingAgentId === 'unknown' && bodyAgentId) {
-      requestingAgentId = bodyAgentId;
+    // Fallback: look up agent from the session record (server-side, not client-supplied)
+    if (requestingAgentId === 'unknown' && sessionId) {
+      const UUID_RE_CHECK = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      if (UUID_RE_CHECK.test(sessionId)) {
+        const { data: session } = await supabase
+          .from('sessions')
+          .select('agent_id')
+          .eq('id', sessionId)
+          .single();
+        if (session?.agent_id) {
+          requestingAgentId = session.agent_id;
+        }
+      }
     }
     if (requestingAgentId === 'unknown') {
       logger.warn(
-        'Approval request created with unknown agent — no x-ink-context header or requestingAgentId in body',
+        'Approval request created with unknown agent — no x-ink-context header and session lookup failed',
         {
           tool,
           studioId,

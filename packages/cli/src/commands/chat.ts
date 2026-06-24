@@ -4042,7 +4042,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
               reason,
               sessionId: runtime.sessionId,
               studioId: runtime.studioId,
-              requestingAgentId: agentId,
               onCreated: (id) => {
                 printLine(
                   chalk.yellow(`   Request ${id.slice(0, 8)}… sent to connected platforms`)

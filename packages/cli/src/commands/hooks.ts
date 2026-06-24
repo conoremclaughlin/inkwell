@@ -2224,7 +2224,6 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
         studioId,
         sessionId,
         timeoutSeconds: 300,
-        requestingAgentId: resolveAgentId() || undefined,
       }),
       signal: AbortSignal.timeout(10000),
     });
