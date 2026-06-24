@@ -16,7 +16,9 @@ vi.mock('../utils/logger', () => ({
 }));
 
 vi.mock('../utils/request-context', () => ({
-  getRequestContext: vi.fn().mockReturnValue({ sessionId: 'session-abc' }),
+  getRequestContext: vi
+    .fn()
+    .mockReturnValue({ sessionId: 'session-abc', repoRoot: '/default/repo' }),
 }));
 
 vi.mock('../mcp/tools/inbox-handlers', () => ({
@@ -149,6 +151,9 @@ function createMockDataComposer() {
       },
       activityStream: {
         logActivity: vi.fn().mockResolvedValue({ id: 'activity-1' }),
+      },
+      projects: {
+        findById: vi.fn().mockResolvedValue(null),
       },
       studios: {
         findById: vi.fn().mockResolvedValue(null),
@@ -321,6 +326,269 @@ describe('StrategyService', () => {
       expect(result.action).toBe('next_task');
       expect(result.prompt).toContain('no tasks yet');
       expect(result.prompt).toContain('ink://specs/test');
+    });
+  });
+
+  describe('startStrategy — repoRoot resolution', () => {
+    it('should resolve repoRoot from group metadata (highest priority)', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: { repoRoot: '/from/metadata' },
+      });
+      const task = createMockTask();
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockImplementation((_id, data) =>
+        Promise.resolve({ ...group, ...data })
+      );
+
+      const mockClient = dc.getClient();
+      mockClient.from.mockReturnValue({
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                }),
+              }),
+              order: vi.fn().mockReturnValue({
+                order: vi
+                  .fn()
+                  .mockReturnValue({ limit: vi.fn().mockResolvedValue({ data: [], error: null }) }),
+              }),
+              single: vi.fn().mockResolvedValue({ data: null, error: null }),
+            }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      });
+
+      const result = await service.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        sbId: 'sb-wren-uuid',
+      });
+
+      expect(result.action).toBe('next_task');
+      // Should NOT have persisted metadata since it was already set
+      const updateCalls = dc.repositories.taskGroups.update.mock.calls;
+      const metadataUpdate = updateCalls.find(
+        (c: unknown[]) => (c[1] as Record<string, unknown>).metadata !== undefined
+      );
+      expect(metadataUpdate).toBeUndefined();
+    });
+
+    it('should resolve repoRoot from project when not in group metadata', async () => {
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: {},
+        project_id: 'proj-1',
+      });
+      const task = createMockTask();
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockImplementation((_id, data) =>
+        Promise.resolve({ ...group, ...data })
+      );
+      dc.repositories.projects.findById.mockResolvedValue({
+        id: 'proj-1',
+        name: 'Test Project',
+        repo_root: '/from/project',
+        repository_url: null,
+        user_id: 'user-123',
+        description: null,
+        status: 'active',
+        tech_stack: null,
+        goals: null,
+        metadata: {},
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+      });
+
+      const mockClient = dc.getClient();
+      mockClient.from.mockReturnValue({
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                }),
+              }),
+              order: vi.fn().mockReturnValue({
+                order: vi
+                  .fn()
+                  .mockReturnValue({ limit: vi.fn().mockResolvedValue({ data: [], error: null }) }),
+              }),
+              single: vi.fn().mockResolvedValue({ data: null, error: null }),
+            }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      });
+
+      const result = await service.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        sbId: 'sb-wren-uuid',
+      });
+
+      expect(result.action).toBe('next_task');
+      // Should have persisted the project's repoRoot to group metadata
+      expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+        'group-1',
+        expect.objectContaining({
+          metadata: expect.objectContaining({ repoRoot: '/from/project' }),
+        })
+      );
+    });
+
+    it('should resolve repoRoot from session context as last fallback', async () => {
+      const { getRequestContext } = await import('../utils/request-context');
+      vi.mocked(getRequestContext).mockReturnValueOnce({
+        sessionId: 'session-abc',
+        repoRoot: '/from/session',
+      });
+
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: {},
+        project_id: null,
+      });
+      const task = createMockTask();
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockImplementation((_id, data) =>
+        Promise.resolve({ ...group, ...data })
+      );
+
+      const mockClient = dc.getClient();
+      mockClient.from.mockReturnValue({
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                }),
+              }),
+              order: vi.fn().mockReturnValue({
+                order: vi
+                  .fn()
+                  .mockReturnValue({ limit: vi.fn().mockResolvedValue({ data: [], error: null }) }),
+              }),
+              single: vi.fn().mockResolvedValue({ data: null, error: null }),
+            }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      });
+
+      const result = await service.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        sbId: 'sb-wren-uuid',
+      });
+
+      expect(result.action).toBe('next_task');
+      expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+        'group-1',
+        expect.objectContaining({
+          metadata: expect.objectContaining({ repoRoot: '/from/session' }),
+        })
+      );
+    });
+
+    it('should throw for spawn mode when no repoRoot is resolvable', async () => {
+      const { getRequestContext } = await import('../utils/request-context');
+      vi.mocked(getRequestContext).mockReturnValueOnce({ sessionId: 'session-abc' });
+
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: {},
+        project_id: null,
+      });
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+
+      await expect(
+        service.startStrategy({
+          groupId: 'group-1',
+          userId: 'user-123',
+          strategy: 'persistence',
+          sbId: 'sb-wren-uuid',
+        })
+      ).rejects.toThrow('no repoRoot found');
+    });
+
+    it('should allow inline mode without repoRoot', async () => {
+      const { getRequestContext } = await import('../utils/request-context');
+      vi.mocked(getRequestContext).mockReturnValueOnce({ sessionId: 'session-abc' });
+
+      const group = createMockGroup({
+        strategy: null,
+        status: 'active',
+        metadata: {},
+        project_id: null,
+      });
+      const task = createMockTask();
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockImplementation((_id, data) =>
+        Promise.resolve({ ...group, ...data })
+      );
+
+      const mockClient = dc.getClient();
+      mockClient.from.mockReturnValue({
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              in: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({ data: task, error: null }),
+                }),
+              }),
+              order: vi.fn().mockReturnValue({
+                order: vi
+                  .fn()
+                  .mockReturnValue({ limit: vi.fn().mockResolvedValue({ data: [], error: null }) }),
+              }),
+              single: vi.fn().mockResolvedValue({ data: null, error: null }),
+            }),
+          }),
+        }),
+        insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+        update: vi.fn().mockReturnValue({
+          contains: vi.fn().mockResolvedValue({ data: null, error: null }),
+        }),
+      });
+
+      const result = await service.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        sbId: 'sb-wren-uuid',
+        executionMode: 'inline',
+      });
+
+      expect(result.action).toBe('next_task');
     });
   });
 
@@ -2522,7 +2790,10 @@ describe('StrategyService', () => {
       expect(result.action).toBe('next_task');
     });
 
-    it('throws when studioSlug is set but no repoRoot in metadata', async () => {
+    it('throws when no repoRoot resolvable (metadata, project, or session)', async () => {
+      const { getRequestContext } = await import('../utils/request-context');
+      vi.mocked(getRequestContext).mockReturnValueOnce({ sessionId: 'session-abc' });
+
       const group = createMockGroup({
         strategy: null,
         status: 'active',
@@ -2540,10 +2811,7 @@ describe('StrategyService', () => {
           sbId: 'sb-wren-uuid',
           config: { studioSlug: 'auth-refactor' },
         })
-      ).rejects.toThrow('Failed to create persistent studio');
-
-      // Group should NOT have been activated — failure happens before update
-      expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
+      ).rejects.toThrow('no repoRoot found');
     });
 
     it('rejects when both studioSlug and ephemeralStudio are set', async () => {

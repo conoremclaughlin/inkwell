@@ -2301,6 +2301,7 @@ export type Database = {
           id: string;
           metadata: Json | null;
           name: string;
+          repo_root: string | null;
           repository_url: string | null;
           status: string | null;
           tech_stack: string[] | null;
@@ -2314,6 +2315,7 @@ export type Database = {
           id?: string;
           metadata?: Json | null;
           name: string;
+          repo_root?: string | null;
           repository_url?: string | null;
           status?: string | null;
           tech_stack?: string[] | null;
@@ -2327,6 +2329,7 @@ export type Database = {
           id?: string;
           metadata?: Json | null;
           name?: string;
+          repo_root?: string | null;
           repository_url?: string | null;
           status?: string | null;
           tech_stack?: string[] | null;
