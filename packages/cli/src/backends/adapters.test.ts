@@ -260,7 +260,7 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
-  it('claude adapter adds no --add-dir without attachment directories', () => {
+  it('claude adapter adds no attachment --add-dir without attachment directories', () => {
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
       agentId: 'wren',
@@ -270,7 +270,14 @@ describe('backend adapters session resume wiring', () => {
     });
 
     try {
-      expect(prepared.args).not.toContain('--add-dir');
+      // The only --add-dir should be ~/.ink/files (if it exists on this machine).
+      // No attachment-specific dirs should appear.
+      const addDirPairs = prepared.args
+        .map((arg, i) => (arg === '--add-dir' ? prepared.args[i + 1] : null))
+        .filter(Boolean);
+      for (const dir of addDirPairs) {
+        expect(dir).toMatch(/\.ink\/files$/);
+      }
     } finally {
       prepared.cleanup();
     }

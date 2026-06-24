@@ -7,6 +7,7 @@
 
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { homedir } from 'os';
 import { encodeContextToken } from '@inklabs/shared';
 import { buildIdentityPrompt } from './identity.js';
 import { buildMergedMcpConfig } from '../lib/skill-mcp.js';
@@ -82,6 +83,14 @@ export class ClaudeAdapter implements BackendAdapter {
     // natively, so this is the full multimodal path for CLI spawns.
     for (const dir of config.attachmentDirs ?? []) {
       args.push('--add-dir', dir);
+    }
+
+    // Inkwell media directory: always grant read access so agents can
+    // read downloaded attachments (email, Telegram, etc.) via the native
+    // Read tool. This is Inkwell's own directory, not arbitrary fs access.
+    const inkFilesDir = join(homedir(), '.ink', 'files');
+    if (existsSync(inkFilesDir)) {
+      args.push('--add-dir', inkFilesDir);
     }
 
     // PCP channel plugin: enable real-time inbox push notifications.
