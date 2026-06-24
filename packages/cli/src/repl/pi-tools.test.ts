@@ -441,3 +441,78 @@ describe('pi-tools: integration with executeToolCalls', () => {
     expect((readResults[0].result as Record<string, unknown>).text).toContain('roundtrip data');
   });
 });
+
+// ─── PDF Document Adapter ──────────────────────────────────────────
+
+describe('pi-tools: PDF read adapter', () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(path.join(os.tmpdir(), 'pi-pdf-test-'));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  function makeMinimalPdf(text: string): Buffer {
+    // Minimal valid PDF with one page containing the given text.
+    // This is a bare-minimum PDF 1.4 structure that pdf-parse can extract.
+    const stream = `BT /F1 12 Tf 100 700 Td (${text}) Tj ET`;
+    const streamBytes = Buffer.from(stream);
+    const objects = [
+      '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj',
+      '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj',
+      `3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj`,
+      `4 0 obj\n<< /Length ${streamBytes.length} >>\nstream\n${stream}\nendstream\nendobj`,
+      '5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj',
+    ];
+
+    let body = '';
+    const offsets: number[] = [];
+    const header = '%PDF-1.4\n';
+    let pos = header.length;
+    for (const obj of objects) {
+      offsets.push(pos);
+      body += obj + '\n';
+      pos += Buffer.byteLength(obj + '\n');
+    }
+
+    const xrefStart = pos;
+    let xref = `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+    for (const offset of offsets) {
+      xref += `${String(offset).padStart(10, '0')} 00000 n \n`;
+    }
+    xref += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+
+    return Buffer.from(header + body + xref);
+  }
+
+  it('extracts text from a PDF file via the read adapter', async () => {
+    const pdfPath = path.join(tmpDir, 'test.pdf');
+    await writeFile(pdfPath, makeMinimalPdf('Hello from PDF'));
+
+    const result = await callPiTool('read', { path: 'test.pdf' }, tmpDir);
+    expect(result.success).toBe(true);
+    expect(result.text).toContain('Hello from PDF');
+    expect(result.text).toContain('[PDF:');
+    expect(result.text).toContain('1 page');
+  });
+
+  it('throws for non-existent PDF (falls through to Pi read)', async () => {
+    // Non-existent .pdf: tryReadDocument returns null (existsSync fails),
+    // so it falls through to the Pi read tool which throws ENOENT.
+    await expect(callPiTool('read', { path: 'missing.pdf' }, tmpDir)).rejects.toThrow('ENOENT');
+  });
+
+  it('does not intercept non-PDF files', async () => {
+    const txtPath = path.join(tmpDir, 'notes.txt');
+    await writeFile(txtPath, 'plain text content');
+
+    const result = await callPiTool('read', { path: 'notes.txt' }, tmpDir);
+    expect(result.success).toBe(true);
+    expect(result.text).toContain('plain text content');
+    // Should NOT have the PDF header
+    expect(result.text).not.toContain('[PDF:');
+  });
+});

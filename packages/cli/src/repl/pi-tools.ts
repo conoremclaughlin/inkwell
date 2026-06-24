@@ -8,6 +8,7 @@
 
 import { resolve, relative, dirname, basename, join } from 'path';
 import { realpathSync, existsSync } from 'fs';
+import { readFile } from 'fs/promises';
 import type { PcpToolCallResult } from '../lib/pcp-client.js';
 
 // Pi tool types — we use the AgentTool shape from pi-agent-core
@@ -129,6 +130,52 @@ function validatePathArgs(toolName: string, args: Record<string, unknown>, cwd: 
   }
 }
 
+const DOCUMENT_EXTENSIONS: Record<string, string> = {
+  '.pdf': 'application/pdf',
+};
+
+async function tryReadDocument(filePath: string, cwd: string): Promise<PcpToolCallResult | null> {
+  const ext = filePath.toLowerCase().slice(filePath.lastIndexOf('.'));
+  if (!DOCUMENT_EXTENSIONS[ext]) return null;
+
+  const absolutePath = resolve(cwd, filePath);
+  if (!existsSync(absolutePath)) return null;
+
+  if (ext === '.pdf') {
+    try {
+      const { PDFParse } = await import('pdf-parse');
+      const buffer = await readFile(absolutePath);
+      const parser = new PDFParse(new Uint8Array(buffer));
+      try {
+        const textResult = await parser.getText();
+        const info = await parser.getInfo();
+        const pages = textResult.total;
+        const header = `[PDF: ${basename(filePath)} — ${pages} page${pages !== 1 ? 's' : ''}]`;
+        const text = textResult.text.trim()
+          ? `${header}\n\n${textResult.text}`
+          : `${header}\n\n(No extractable text — this PDF may contain only images or scanned content.)`;
+        return {
+          content: [{ type: 'text', text }],
+          text,
+          success: true,
+          metadata: { pages, info: info.info },
+        };
+      } finally {
+        parser.destroy();
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: 'text', text: `Error reading PDF: ${message}` }],
+        text: `Error reading PDF: ${message}`,
+        success: false,
+      };
+    }
+  }
+
+  return null;
+}
+
 /**
  * Execute a Pi coding tool and return the result in PcpToolCallResult format.
  * This is the adapter between Pi's tool interface and the ink CLI's tool routing.
@@ -146,6 +193,18 @@ export async function callPiTool(
   }
 
   validatePathArgs(toolName, args, cwd);
+
+  // Adapter: handle document types the Pi read tool doesn't support.
+  // Pi's read handles text + images (jpg/png/gif/webp). For PDFs and
+  // other document types, we extract text here before Pi tries to read
+  // them as UTF-8 (which produces garbled output).
+  if (toolName === 'read') {
+    const filePath = (args.path as string) || (args.file_path as string) || '';
+    if (filePath) {
+      const docResult = await tryReadDocument(filePath, cwd);
+      if (docResult) return docResult;
+    }
+  }
 
   const callId = `pi-${toolName}-${Date.now()}`;
   const result = await tool.execute(callId, args, signal);

@@ -1912,6 +1912,7 @@ __metadata:
     commander: "npm:^12.1.0"
     ink: "patch:ink@npm%3A7.0.3#~/.yarn/patches/ink-npm-7.0.3-483407853e.patch"
     ora: "npm:^8.0.1"
+    pdf-parse: "npm:^2.4.5"
     react: "npm:^19.2.4"
     semver: "npm:^7.7.4"
     tsx: "npm:^4.7.0"
