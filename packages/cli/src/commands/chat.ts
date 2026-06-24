@@ -2014,6 +2014,30 @@ function pickLatestSession(
   })[0];
 }
 
+function sanitizeArgsForApproval(tool: string, args: Record<string, unknown>): string {
+  const policyName = tool.replace(/^mcp__inkwell__/, '');
+  switch (policyName) {
+    case 'bash':
+      return typeof args.command === 'string' ? args.command.slice(0, 500) : '';
+    case 'write':
+    case 'edit': {
+      const path = (args.path ?? args.file_path ?? args.filePath) as string | undefined;
+      return path ? path.slice(0, 200) : '';
+    }
+    case 'read':
+    case 'ls':
+    case 'grep':
+    case 'find': {
+      const path = (args.path ?? args.file_path ?? args.filePath ?? args.pattern) as
+        | string
+        | undefined;
+      return path ? path.slice(0, 200) : '';
+    }
+    default:
+      return '';
+  }
+}
+
 async function promptForToolApproval(
   rl: ReturnType<typeof createInterface> | null,
   toolPolicy: ToolPolicyState,
@@ -4020,7 +4044,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           return pcp.callTool(bareTool, resolvedArgs);
         },
         sessionId: runtime.sessionId,
-        promptForApproval: async (tool, reason) => {
+        promptForApproval: async (tool, reason, args) => {
           if (!runtime.awayMode) {
             return promptForToolApproval(
               rl,
@@ -4036,9 +4060,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // notifications to the user's connected platforms (Telegram, etc.).
           // The server handles all routing — we just poll for the result.
           printLine(chalk.yellow(`⏳ Requesting 2FA approval for ${tool}…`));
+          // Sanitize args for the notification — show command/path but redact large content
+          const sanitizedArgs = args ? sanitizeArgsForApproval(tool, args) : undefined;
           try {
             const result = await requestToolApproval({
               tool,
+              args: sanitizedArgs,
               reason,
               sessionId: runtime.sessionId,
               studioId: runtime.studioId,
@@ -4056,16 +4083,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 result.action === 'allow' ||
                 result.action === 'grant-studio'
               ) {
-                // persistentGrant removes the tool from promptTools across all
-                // active scopes. Unlike allowTool, it doesn't add to allowTools
-                // — avoiding the narrowing filter bug where a single-tool
-                // allowlist at a scope blocks every other tool.
-                toolPolicy.persistentGrant(tool);
-                const scope = result.action === 'grant-studio' ? 'studio' : 'agent';
+                // Grant at the specific scope from the approval response.
+                // persistentGrant writes the permanent grant at the target scope
+                // and removes from promptTools at all scopes so the tool stops prompting.
+                const grantScope = result.action === 'grant-studio' ? 'studio' : 'agent';
                 const scopeId =
-                  scope === 'studio'
+                  grantScope === 'studio'
                     ? toolPolicy.getContext()?.studioId
                     : toolPolicy.getContext()?.agentId;
+                toolPolicy.persistentGrant(
+                  tool,
+                  scopeId ? { scope: grantScope, id: scopeId } : undefined
+                );
+                const scope = grantScope;
                 printLine(
                   chalk.green(
                     `✅ 2FA: ${tool} permanently approved (${scope}${scopeId ? `: ${scopeId}` : ''})`

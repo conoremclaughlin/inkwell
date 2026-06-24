@@ -35,7 +35,11 @@ export interface ToolCallExecutorDeps {
   /** Current session ID for session-scoped grants */
   sessionId?: string;
   /** Prompt callback for tools requiring approval — returns true if approved */
-  promptForApproval: (tool: string, reason: string) => Promise<boolean>;
+  promptForApproval: (
+    tool: string,
+    reason: string,
+    args?: Record<string, unknown>
+  ) => Promise<boolean>;
   /** Called after each tool call with the result */
   onResult?: (result: ToolCallResult) => void;
 }
@@ -100,8 +104,8 @@ async function executeOneToolCall(
     };
   }
 
-  // Promptable — pause for approval
-  const approved = await promptForApproval(call.tool, decision.reason);
+  // Promptable — pause for approval (pass args so the notification shows what's being approved)
+  const approved = await promptForApproval(call.tool, decision.reason, call.args);
   if (!approved) {
     return {
       tool: call.tool,

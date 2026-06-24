@@ -74,7 +74,9 @@ describe('executeToolCalls', () => {
     expect(results).toHaveLength(1);
     expect(results[0].status).toBe('approved');
     expect(results[0].result).toEqual({ success: true });
-    expect(deps.promptForApproval).toHaveBeenCalledWith('send_to_inbox', 'Requires approval');
+    expect(deps.promptForApproval).toHaveBeenCalledWith('send_to_inbox', 'Requires approval', {
+      content: 'hi',
+    });
     expect(deps.callTool).toHaveBeenCalledWith('send_to_inbox', { content: 'hi' });
   });
 
@@ -246,7 +248,8 @@ describe('executeToolCalls', () => {
       expect(results[0].status).toBe('approved');
       expect(deps.promptForApproval).toHaveBeenCalledWith(
         'bash',
-        'Tool requires explicit per-call confirmation by policy.'
+        'Tool requires explicit per-call confirmation by policy.',
+        { command: 'echo hello' }
       );
     });
 

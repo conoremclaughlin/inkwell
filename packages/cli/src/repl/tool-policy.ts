@@ -967,19 +967,28 @@ export class ToolPolicyState {
   }
 
   /**
-   * Grant a tool permanently by removing it from promptTools across all active
-   * scopes. Unlike allowTool(), this does NOT add to allowTools — avoiding the
-   * narrowing side effect where a single-tool allowlist at a scope blocks
-   * every other tool.
+   * Grant a tool permanently. When a target scope is provided, adds the
+   * permanent grant ONLY at that scope and removes from promptTools at all
+   * active scopes (so the tool won't prompt anywhere). Without a scope,
+   * grants at the most specific active scope (studio > agent > global).
    */
-  public persistentGrant(tool: string): void {
+  public persistentGrant(tool: string, scope?: ToolPolicyScopeRef): void {
     const expanded = expandToolSpec(tool);
     if (expanded.length === 0) return;
 
+    // Determine where to write the permanent grant
+    const targetRef = scope ?? this.getActiveScopeRefs().at(-1) ?? { scope: 'global' as const };
+    const targetRules = this.getRulesForScope(targetRef, true);
+    if (targetRules) {
+      for (const key of expanded) {
+        targetRules.permanentGrants.add(key);
+      }
+    }
+
+    // Remove from promptTools at ALL active scopes so the tool stops prompting
     for (const { rules } of this.getActiveScopeRules()) {
       for (const key of expanded) {
         rules.promptTools.delete(key);
-        rules.permanentGrants.add(key);
       }
     }
 
