@@ -446,16 +446,17 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // so the channelPoll filter can recognize the target studio as an owner.
     // Resolve recipientStudioSlug/Hint to a studioId if needed.
     let resolvedRecipientStudioId: string | undefined = recipientStudioId || undefined;
-    if (!resolvedRecipientStudioId && recipientStudioSlugOrHint && senderAgentId) {
+    const resolveAgentForStudio = recipientAgentId || senderAgentId;
+    if (!resolvedRecipientStudioId && recipientStudioSlugOrHint && resolveAgentForStudio) {
       try {
-        // Reuse the shared resolution function (worktree path → branch fallback
-        // for 'main', slug match for named hints).
+        // Resolve in the recipient's scope so cross-agent sends (sender=wren,
+        // recipient=myra) find the recipient's studio, not the sender's.
         const reqCtxForHint = getRequestContext();
         resolvedRecipientStudioId = await resolveStudioHint(
           supabase,
           resolved.user.id,
           recipientStudioSlugOrHint,
-          senderAgentId,
+          resolveAgentForStudio,
           reqCtxForHint?.repoRoot
         );
       } catch {

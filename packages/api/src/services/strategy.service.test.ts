@@ -833,6 +833,44 @@ describe('StrategyService', () => {
       );
     });
 
+    it('should route notifyDispatcher to main studio with owner sender, not system', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+
+      const group = createMockGroup({
+        current_task_index: 2,
+        iterations_since_approval: 2,
+        strategy_config: {
+          checkInInterval: 3,
+          checkInNotify: 'myra',
+        } as StrategyConfig,
+      });
+      const nextTask = createMockTask({ id: 'task-4', title: 'Fourth task', task_order: 3 });
+      const groupTasks = [
+        createMockTask({ status: 'completed', task_order: 0 }),
+        createMockTask({ status: 'completed', task_order: 1 }),
+        createMockTask({ status: 'completed', task_order: 2 }),
+        createMockTask({ id: 'task-4', status: 'pending', task_order: 3 }),
+      ];
+
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      dc.repositories.taskGroups.update.mockResolvedValue(group);
+      setupChains(dc, [chainTaskFound(nextTask), chainGroupTasks(groupTasks)]);
+
+      await service.advanceStrategy('group-1', 'task-3', 'user-123');
+
+      // notifyDispatcher sends to a different agent (myra) than the owner (wren).
+      // It should route to the recipient's main studio and use the owner's slug
+      // as sender — never 'system'.
+      expect(sendMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          recipientAgentId: 'myra',
+          senderAgentId: 'wren',
+          recipientStudioSlug: 'main',
+        }),
+        expect.anything()
+      );
+    });
+
     it('should pause for approval when max iterations reached', async () => {
       const group = createMockGroup({
         current_task_index: 4,

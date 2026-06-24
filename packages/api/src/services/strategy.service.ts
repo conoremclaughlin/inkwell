@@ -981,13 +981,14 @@ export class StrategyService {
 
     try {
       const threadKey = group.thread_key || `strategy:${group.id}`;
-      const senderSlug = (await this.resolveOwnerSlug(group)) || 'system';
+      const senderSlug = (await this.resolveOwnerSlug(group)) || group.sb_id || 'strategy';
 
       await handleSendToInbox(
         {
           userId,
           recipientAgentId: notifyAgentId,
           senderAgentId: senderSlug,
+          recipientStudioSlug: 'main',
           content: message,
           messageType: 'notification',
           priority: 'high',
@@ -1804,7 +1805,7 @@ export class StrategyService {
   ): Promise<void> {
     try {
       const reqCtx = getRequestContext();
-      const agentSlug = (await this.resolveOwnerSlug(group)) || 'system';
+      const agentSlug = (await this.resolveOwnerSlug(group)) || group.sb_id || 'strategy';
       await this.dataComposer.repositories.activityStream.logActivity({
         userId: group.user_id,
         agentId: agentSlug,
