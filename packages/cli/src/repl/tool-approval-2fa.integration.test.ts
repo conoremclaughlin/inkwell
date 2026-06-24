@@ -37,10 +37,17 @@ try {
 
 // ─── Helpers ────────────────────────────────────────────────────
 
+const TEST_CONTEXT_TOKEN = Buffer.from(
+  JSON.stringify({ agentId: 'test:2fa-integration', studioId: 'main', cliAttached: false })
+).toString('base64url');
+
 async function getAuthHeaders(): Promise<Record<string, string>> {
   const { getValidAccessToken } = await import('../auth/tokens.js');
   const token = await getValidAccessToken(PCP_URL);
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'x-ink-context': TEST_CONTEXT_TOKEN,
+  };
   if (token) headers.Authorization = `Bearer ${token}`;
   return headers;
 }
