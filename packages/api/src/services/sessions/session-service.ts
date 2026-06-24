@@ -1129,15 +1129,21 @@ export class SessionService implements ISessionService {
 
     // 3) Studio route pattern match — studios declare which threadKey patterns
     //    they handle (e.g., 'pr:*', 'spec:*'). See spec:trigger-studio-routing.
+    //    When repoRoot is provided, scope to studios in the same repo to prevent
+    //    catch-all patterns in project A from capturing triggers for project B.
     if (options.threadKey) {
       // route_patterns is not yet in generated Supabase types — cast result
-      const { data: patternStudios } = (await this.supabase
+      let patternQuery = this.supabase
         .from('studios')
         .select('id, route_patterns')
         .eq('user_id', userId)
         .eq('agent_id', agentId)
         .in('status', ['active', 'idle'])
-        .not('route_patterns', 'eq', '{}')) as {
+        .not('route_patterns', 'eq', '{}');
+      if (options.repoRoot) {
+        patternQuery = patternQuery.eq('repo_root', options.repoRoot);
+      }
+      const { data: patternStudios } = (await patternQuery) as unknown as {
         data: Array<{ id: string; route_patterns: string[] }> | null;
       };
 
@@ -1194,7 +1200,23 @@ export class SessionService implements ISessionService {
       }
     }
 
-    // 4) Agent's own studio (authoritative — from studios table, not session history)
+    // 4) repoRoot-scoped main studio — when the caller specifies a target repo
+    //    (e.g., strategy triggers with cross-project repoRoot), resolve to the
+    //    main studio for that repo before falling through to the generic
+    //    "agent's most recent studio" which may belong to a different project.
+    if (options.repoRoot) {
+      const repoRootStudioId = await this.resolveMainStudioId(userId, options.repoRoot, agentId);
+      if (repoRootStudioId) {
+        logger.debug('[StudioResolve] Resolved studio via repoRoot', {
+          repoRoot: options.repoRoot,
+          agentId,
+          studioId: repoRootStudioId,
+        });
+        return repoRootStudioId;
+      }
+    }
+
+    // 5) Agent's own studio (authoritative — from studios table, not session history)
     const { data: agentStudio } = await this.supabase
       .from('studios')
       .select('id, updated_at')
@@ -1218,7 +1240,7 @@ export class SessionService implements ISessionService {
     // It creates feedback loops: if an agent is misrouted once, all future sessions
     // inherit the bad studio. The studios table is the authoritative source.
 
-    // 5) Shared per-user main studio fallback
+    // 6) Shared per-user main studio fallback (no repoRoot — uses default cwd)
     const mainStudioId = await this.resolveMainStudioId(userId, options.repoRoot, agentId);
     if (mainStudioId) {
       logger.debug('[StudioResolve] Fell back to main studio', {

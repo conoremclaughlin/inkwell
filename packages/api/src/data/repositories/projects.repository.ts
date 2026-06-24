@@ -12,6 +12,7 @@ export interface Project {
   status: ProjectStatus;
   tech_stack: string[] | null;
   repository_url: string | null;
+  repo_root: string | null;
   goals: string[] | null;
   metadata: Record<string, unknown>;
   created_at: string;
@@ -25,6 +26,7 @@ export interface ProjectInsert {
   status?: ProjectStatus;
   tech_stack?: string[];
   repository_url?: string | null;
+  repo_root?: string | null;
   goals?: string[];
   metadata?: Record<string, unknown>;
 }
@@ -35,6 +37,7 @@ export interface ProjectUpdate {
   status?: ProjectStatus;
   tech_stack?: string[];
   repository_url?: string | null;
+  repo_root?: string | null;
   goals?: string[];
   metadata?: Record<string, unknown>;
 }
@@ -132,6 +135,7 @@ export class ProjectsRepository extends BaseRepository {
           status: data.status,
           tech_stack: data.tech_stack,
           repository_url: data.repository_url,
+          repo_root: data.repo_root,
           goals: data.goals,
           metadata: data.metadata,
         });

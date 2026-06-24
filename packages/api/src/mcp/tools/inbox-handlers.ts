@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
-import { resolveIdentityId } from '../../auth/resolve-identity';
+import { resolveIdentityId, resolveAgentSlug } from '../../auth/resolve-identity';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
@@ -269,9 +269,18 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     );
   }
 
-  // Enforce identity on sender (who is performing the action), not recipient (target)
-  const senderAgentId = getEffectiveAgentId(parsed.senderAgentId);
-  const triggerSenderId = senderAgentId || 'system';
+  // Resolve sender identity: pinned/explicit → request context sbId → context agentId → unknown
+  let senderAgentId = getEffectiveAgentId(parsed.senderAgentId);
+  if (!senderAgentId) {
+    const reqCtx = getRequestContext() || getSessionContext();
+    if (reqCtx?.sbId) {
+      senderAgentId =
+        (await resolveAgentSlug(dataComposer.getClient(), reqCtx.sbId)) || reqCtx.agentId;
+    } else if (reqCtx?.agentId) {
+      senderAgentId = reqCtx.agentId;
+    }
+  }
+  const triggerSenderId = senderAgentId || 'unknown';
 
   // SECURITY: permission_grant messages can only originate from the system layer
   // (platform listeners verifying human identity), never from agents.
@@ -331,13 +340,13 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   // and warn the sender. Without session context, reply routing is broken
   // (recipients can't auto-resolve back to the sender's session/studio).
   //
-  // 'system' is exempt: it is the canonical sender for heartbeat/watchdog/
-  // platform-originated sends, which by design run outside a request context
-  // (no x-ink-context token, no session). Suppressing those triggers silently
-  // broke the strategy watchdog — it inserted thread messages but never woke
-  // the owner agent. Since 'system' has no reply session anyway, the routing
-  // concerns that justify the suppression don't apply.
-  const missingSenderSession = !senderSessionId && !!senderAgentId && senderAgentId !== 'system';
+  // 'system' and 'unknown' are exempt: they are canonical senders for
+  // heartbeat/watchdog/platform-originated sends that run outside a request
+  // context (no x-ink-context token, no session). Suppressing those triggers
+  // silently broke the strategy watchdog. Since they have no reply session
+  // anyway, the routing concerns that justify suppression don't apply.
+  const nonAgentSender = triggerSenderId === 'system' || triggerSenderId === 'unknown';
+  const missingSenderSession = !senderSessionId && !!senderAgentId && !nonAgentSender;
 
   // ── Thread-first path: when threadKey is provided, route to thread tables ──
   // Unified handler for both new thread creation and replies to existing threads.
