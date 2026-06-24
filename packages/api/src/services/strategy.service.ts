@@ -277,8 +277,6 @@ export class StrategyService {
       }
     }
 
-    const executionMode = input.executionMode || 'spawn';
-
     // Update the group with strategy config
     const updated = await this.dataComposer.repositories.taskGroups.update(input.groupId, {
       strategy: input.strategy,
