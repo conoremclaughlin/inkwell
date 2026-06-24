@@ -1143,7 +1143,7 @@ export class SessionService implements ISessionService {
       if (options.repoRoot) {
         patternQuery = patternQuery.eq('repo_root', options.repoRoot);
       }
-      const { data: patternStudios } = patternQuery as {
+      const { data: patternStudios } = (await patternQuery) as unknown as {
         data: Array<{ id: string; route_patterns: string[] }> | null;
       };
 
