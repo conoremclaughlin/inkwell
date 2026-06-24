@@ -2058,6 +2058,65 @@ describe('StrategyService', () => {
       expect(payload.recipientStudioSlug).toBe('wren-omega');
     });
 
+    it('startStrategy forwards repoRoot in trigger metadata (project-only, no studio)', async () => {
+      const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
+
+      const group = createMockGroup({
+        strategy: null,
+        sb_id: 'sb-wren-uuid',
+        project_id: 'proj-1',
+        metadata: {},
+      });
+
+      dc.repositories.projects.findById.mockResolvedValue({
+        id: 'proj-1',
+        name: 'InkTrade',
+        repo_root: '/Users/conor/ws/inktrade',
+        repository_url: null,
+        user_id: 'user-123',
+        description: null,
+        status: 'active' as const,
+        tech_stack: null,
+        goals: null,
+        metadata: {},
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+      });
+
+      const groupWithRepo = {
+        ...group,
+        metadata: { repoRoot: '/Users/conor/ws/inktrade' },
+      };
+      const updatedGroup = {
+        ...groupWithRepo,
+        strategy: 'persistence',
+        status: 'active' as const,
+      };
+      // findById called 3 times: initial load, after repoRoot persistence, after sandbox setup
+      dc.repositories.taskGroups.findById
+        .mockResolvedValueOnce(group)
+        .mockResolvedValueOnce(groupWithRepo)
+        .mockResolvedValueOnce(updatedGroup);
+      dc.repositories.taskGroups.update.mockResolvedValue(updatedGroup);
+      const task = createMockTask();
+      setupChains(dc, [chainTaskFound(task)]);
+
+      await service.startStrategy({
+        groupId: 'group-1',
+        userId: 'user-123',
+        strategy: 'persistence',
+        sbId: 'sb-wren-uuid',
+      });
+
+      expect(sendMock).toHaveBeenCalledTimes(1);
+      const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
+      const payload = call[0] as Record<string, unknown>;
+      const meta = payload.metadata as Record<string, unknown>;
+      expect(meta.repoRoot).toBe('/Users/conor/ws/inktrade');
+      expect(payload.recipientStudioId).toBeUndefined();
+      expect(payload.recipientStudioSlug).toBeUndefined();
+    });
+
     it('startStrategy skips trigger when group has no sb_id', async () => {
       const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
 

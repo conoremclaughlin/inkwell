@@ -1088,8 +1088,10 @@ export class StrategyService {
       const metadata = (group.metadata || {}) as Record<string, unknown>;
       const rawStudioId = metadata.studioId;
       const rawStudioSlug = metadata.studioSlug;
+      const rawRepoRoot = metadata.repoRoot;
       const studioId = typeof rawStudioId === 'string' ? rawStudioId : undefined;
       const studioSlug = typeof rawStudioSlug === 'string' ? rawStudioSlug : undefined;
+      const repoRoot = typeof rawRepoRoot === 'string' ? rawRepoRoot : undefined;
       const content = STRATEGY_PROMPTS[group.strategy as StrategyPreset](group, task);
 
       await handleSendToInbox(
@@ -1114,6 +1116,7 @@ export class StrategyService {
             groupId: group.id,
             taskId: task.id,
             strategy: group.strategy,
+            ...(repoRoot ? { repoRoot } : {}),
             ...(sandboxContainerName ? { sandboxContainerName } : {}),
           },
         },
