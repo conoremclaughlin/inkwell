@@ -457,6 +457,40 @@ describe('2FA Flow Phase 5: Confirmation formatting', () => {
     expect(result).toContain('Denied');
     expect(result).toContain('`write`');
   });
+
+  it('includes agent name in confirmation', async () => {
+    const { formatApprovalConfirmation } =
+      await import('../../../api/src/channels/approval-interceptor.js');
+
+    const result = formatApprovalConfirmation({
+      intercepted: true,
+      action: 'grant-agent',
+      requestId: 'abc123',
+      resolvedRequests: [{ id: 'abc123', tool: 'bash', action: 'grant-agent', agentId: 'myra' }],
+    });
+
+    expect(result).toContain('for myra');
+    expect(result).toContain('`bash`');
+    expect(result).toContain('agent scope');
+  });
+
+  it('lists multiple agents in batch confirmation', async () => {
+    const { formatApprovalConfirmation } =
+      await import('../../../api/src/channels/approval-interceptor.js');
+
+    const result = formatApprovalConfirmation({
+      intercepted: true,
+      action: 'grant',
+      requestId: 'abc123',
+      resolvedRequests: [
+        { id: 'abc123', tool: 'write', action: 'grant', agentId: 'myra' },
+        { id: 'def456', tool: 'bash', action: 'grant', agentId: 'lumen' },
+      ],
+    });
+
+    expect(result).toContain('for myra, lumen');
+    expect(result).toContain('2 tools');
+  });
 });
 
 // ─── Phase 6: Approval pattern matching ───────────────────────────

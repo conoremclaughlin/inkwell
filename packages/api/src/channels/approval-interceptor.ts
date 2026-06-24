@@ -56,7 +56,7 @@ export interface ApprovalInterceptResult {
   intercepted: boolean;
   action?: string;
   requestId?: string;
-  resolvedRequests?: Array<{ id: string; tool: string; action: string }>;
+  resolvedRequests?: Array<{ id: string; tool: string; action: string; agentId?: string }>;
 }
 
 // ─── Notification Debounce Buffer ────────────────────────────────
@@ -207,7 +207,8 @@ export async function checkApprovalResponse(
 
   // Resolve all targeted requests
   const status = action === 'deny' ? 'denied' : 'granted';
-  const resolvedRequests: Array<{ id: string; tool: string; action: string }> = [];
+  const resolvedRequests: Array<{ id: string; tool: string; action: string; agentId?: string }> =
+    [];
 
   for (const req of targetRequests) {
     const grantedTools = action !== 'deny' ? [req.tool + (req.args ? `(${req.args})` : '')] : null;
@@ -232,7 +233,12 @@ export async function checkApprovalResponse(
       continue;
     }
 
-    resolvedRequests.push({ id: req.id, tool: req.tool, action });
+    resolvedRequests.push({
+      id: req.id,
+      tool: req.tool,
+      action,
+      agentId: req.requesting_agent_id,
+    });
   }
 
   if (resolvedRequests.length === 0) {
@@ -267,6 +273,7 @@ export function formatApprovalConfirmation(result: ApprovalInterceptResult): str
   const emoji = isDeny ? '\u{1F6AB}' : '\u{2705}';
   const tools = result.resolvedRequests.map((r) => r.tool);
   const uniqueTools = [...new Set(tools)];
+  const agents = [...new Set(result.resolvedRequests.map((r) => r.agentId).filter(Boolean))];
 
   let scopeLabel = '';
   if (result.action === 'grant-session') scopeLabel = ' (session scope)';
@@ -276,12 +283,13 @@ export function formatApprovalConfirmation(result: ApprovalInterceptResult): str
 
   const verb = isDeny ? 'Denied' : 'Granted';
   const toolList = uniqueTools.map((t) => `\`${t}\``).join(', ');
+  const agentLabel = agents.length > 0 ? ` for ${agents.join(', ')}` : '';
 
   if (result.resolvedRequests.length === 1) {
-    return `${emoji} ${verb}: ${toolList}${scopeLabel}`;
+    return `${emoji} ${verb}${agentLabel}: ${toolList}${scopeLabel}`;
   }
 
-  return `${emoji} ${verb} ${result.resolvedRequests.length} tools: ${toolList}${scopeLabel}`;
+  return `${emoji} ${verb} ${result.resolvedRequests.length} tools${agentLabel}: ${toolList}${scopeLabel}`;
 }
 
 // ─── Batch Notification ──────────────────────────────────────────
