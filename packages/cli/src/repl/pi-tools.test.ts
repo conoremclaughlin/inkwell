@@ -512,7 +512,39 @@ describe('pi-tools: PDF read adapter', () => {
     const result = await callPiTool('read', { path: 'notes.txt' }, tmpDir);
     expect(result.success).toBe(true);
     expect(result.text).toContain('plain text content');
-    // Should NOT have the PDF header
     expect(result.text).not.toContain('[PDF:');
+  });
+
+  it('blocks PDF read with ../ traversal (path containment)', async () => {
+    const outsidePdf = path.join(tmpDir, '..', 'escape.pdf');
+    await writeFile(outsidePdf, makeMinimalPdf('escaped content'));
+    try {
+      await expect(callPiTool('read', { path: '../escape.pdf' }, tmpDir)).rejects.toThrow(
+        PathContainmentError
+      );
+    } finally {
+      await rm(outsidePdf, { force: true });
+    }
+  });
+
+  it('blocks PDF read with absolute path outside workspace', async () => {
+    await expect(callPiTool('read', { path: '/tmp/secret.pdf' }, tmpDir)).rejects.toThrow(
+      PathContainmentError
+    );
+  });
+
+  it('blocks PDF read via symlink escaping workspace', async () => {
+    const { symlink } = await import('fs/promises');
+    const outsideDir = await mkdtemp(path.join(os.tmpdir(), 'pi-pdf-outside-'));
+    await writeFile(path.join(outsideDir, 'secret.pdf'), makeMinimalPdf('secret'));
+    const linkPath = path.join(tmpDir, 'linked-dir');
+    await symlink(outsideDir, linkPath);
+    try {
+      await expect(callPiTool('read', { path: 'linked-dir/secret.pdf' }, tmpDir)).rejects.toThrow(
+        PathContainmentError
+      );
+    } finally {
+      await rm(outsideDir, { recursive: true, force: true });
+    }
   });
 });

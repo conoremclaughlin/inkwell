@@ -165,6 +165,19 @@ describe('Pi Coding Tools Adapter', () => {
       expect(result).toContain('Hello, world!');
       expect(result).not.toContain('[PDF:');
     });
+
+    it('blocks PDF read with absolute path outside workspace', async () => {
+      const readTool = tools.find((t) => t.schema.name === 'read')!;
+      const result = await readTool.execute({ path: '/tmp/secret.pdf' });
+      expect(result).toContain('Access denied');
+      expect(result).toContain('outside workspace root');
+    });
+
+    it('blocks PDF read with ../ traversal', async () => {
+      const readTool = tools.find((t) => t.schema.name === 'read')!;
+      const result = await readTool.execute({ path: '../../etc/secret.pdf' });
+      expect(result).toContain('Access denied');
+    });
   });
 
   describe('workspace root enforcement', () => {
