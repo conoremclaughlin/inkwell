@@ -170,8 +170,44 @@ export async function checkApprovalResponse(
       .map((n) => orderedRequests[n - 1]) // 1-indexed
       .filter(Boolean);
   } else if (isAllOrScoped) {
-    // "approve all", "approve session", "approve agent", "approve studio"
-    targetRequests = pendingRequests;
+    // Scoped commands filter by the relevant dimension.
+    // "approve all" truly resolves everything pending.
+    // "approve session/agent/studio" anchors to the replied-to request's scope.
+    const anchorRequest = replyToMessageId
+      ? pendingRequests.find(
+          (r) =>
+            r.metadata &&
+            typeof r.metadata === 'object' &&
+            (('telegramMessageId' in r.metadata &&
+              String(r.metadata.telegramMessageId) === replyToMessageId) ||
+              ('batchMessageId' in r.metadata &&
+                String(r.metadata.batchMessageId) === replyToMessageId))
+        )
+      : undefined;
+
+    if (/^approve\s+all$/i.test(trimmed) || /^deny\s+all$/i.test(trimmed)) {
+      targetRequests = pendingRequests;
+    } else if (match.scope === 'agent') {
+      // "approve agent" / "approve always" — filter to same requesting agent
+      const agentId = anchorRequest?.requesting_agent_id;
+      targetRequests = agentId
+        ? pendingRequests.filter((r) => r.requesting_agent_id === agentId)
+        : pendingRequests.slice(-1); // no anchor → most recent only
+    } else if (match.scope === 'studio') {
+      // "approve studio" — filter to same studio
+      const studioId = anchorRequest?.studio_id;
+      targetRequests = studioId
+        ? pendingRequests.filter((r) => r.studio_id === studioId)
+        : pendingRequests.slice(-1);
+    } else if (action === 'grant-session') {
+      // "approve session" — filter to same session
+      const sessionId = anchorRequest?.session_id;
+      targetRequests = sessionId
+        ? pendingRequests.filter((r) => r.session_id === sessionId)
+        : pendingRequests.slice(-1);
+    } else {
+      targetRequests = pendingRequests;
+    }
   } else if (replyToMessageId) {
     // Reply-to threading: match by metadata.telegramMessageId or batchMessageId
     const replyMatch = pendingRequests.find(
