@@ -8,6 +8,7 @@
  */
 
 import path from 'path';
+import { existsSync } from 'fs';
 import { readdir, readFile, stat } from 'fs/promises';
 import type Anthropic from '@anthropic-ai/sdk';
 import { logger } from '../../utils/logger';
@@ -122,6 +123,41 @@ function formatToolResult(result: unknown): string {
 
   if (typeof result === 'string') return result;
   return JSON.stringify(result);
+}
+
+const DOCUMENT_EXTENSIONS: Record<string, string> = {
+  '.pdf': 'application/pdf',
+};
+
+async function tryReadDocument(filePath: string, cwd: string): Promise<string | null> {
+  const ext = filePath.toLowerCase().slice(filePath.lastIndexOf('.'));
+  if (!DOCUMENT_EXTENSIONS[ext]) return null;
+
+  const absolutePath = path.resolve(cwd, filePath);
+  if (!existsSync(absolutePath)) return null;
+
+  if (ext === '.pdf') {
+    try {
+      const { PDFParse } = await import('pdf-parse');
+      const buffer = await readFile(absolutePath);
+      const parser = new PDFParse(new Uint8Array(buffer));
+      try {
+        const textResult = await parser.getText();
+        const pages = textResult.total;
+        const header = `[PDF: ${path.basename(filePath)} — ${pages} page${pages !== 1 ? 's' : ''}]`;
+        return textResult.text.trim()
+          ? `${header}\n\n${textResult.text}`
+          : `${header}\n\n(No extractable text — this PDF may contain only images or scanned content.)`;
+      } finally {
+        parser.destroy();
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return `Error reading PDF: ${message}`;
+    }
+  }
+
+  return null;
 }
 
 const DEFAULT_BASH_TIMEOUT_SECONDS = 120;
@@ -279,6 +315,15 @@ export async function createInkCodingTools(
         const filePath = (params.path as string) || '';
         if (filePath && !isPathWithinWorkspace(filePath, config.cwd)) {
           return `Error: Access denied — path "${filePath}" is outside workspace root "${config.cwd}"`;
+        }
+      }
+
+      // Document adapter: handle file types Pi read doesn't support
+      if (tool.name === 'read') {
+        const filePath = (params.path as string) || '';
+        if (filePath) {
+          const docResult = await tryReadDocument(filePath, config.cwd);
+          if (docResult) return docResult;
         }
       }
 

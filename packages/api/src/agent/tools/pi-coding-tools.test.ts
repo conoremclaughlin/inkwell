@@ -123,6 +123,50 @@ describe('Pi Coding Tools Adapter', () => {
     });
   });
 
+  describe('PDF read adapter', () => {
+    it('extracts text from a PDF file', async () => {
+      const stream = 'BT /F1 12 Tf 100 700 Td (Hello from PDF) Tj ET';
+      const streamBytes = Buffer.from(stream);
+      const objects = [
+        '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj',
+        '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj',
+        `3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj`,
+        `4 0 obj\n<< /Length ${streamBytes.length} >>\nstream\n${stream}\nendstream\nendobj`,
+        '5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj',
+      ];
+      let body = '';
+      const offsets: number[] = [];
+      const header = '%PDF-1.4\n';
+      let pos = header.length;
+      for (const obj of objects) {
+        offsets.push(pos);
+        body += obj + '\n';
+        pos += Buffer.byteLength(obj + '\n');
+      }
+      const xrefStart = pos;
+      let xref = `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+      for (const offset of offsets) {
+        xref += `${String(offset).padStart(10, '0')} 00000 n \n`;
+      }
+      xref += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+
+      writeFileSync(path.join(testDir, 'test.pdf'), header + body + xref);
+
+      const readTool = tools.find((t) => t.schema.name === 'read')!;
+      const result = await readTool.execute({ path: 'test.pdf' });
+      expect(result).toContain('Hello from PDF');
+      expect(result).toContain('[PDF:');
+      expect(result).toContain('1 page');
+    });
+
+    it('does not intercept non-PDF files', async () => {
+      const readTool = tools.find((t) => t.schema.name === 'read')!;
+      const result = await readTool.execute({ path: 'hello.txt' });
+      expect(result).toContain('Hello, world!');
+      expect(result).not.toContain('[PDF:');
+    });
+  });
+
   describe('workspace root enforcement', () => {
     it('blocks absolute path escape', async () => {
       const readTool = tools.find((t) => t.schema.name === 'read')!;
