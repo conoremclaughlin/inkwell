@@ -311,7 +311,7 @@ describe('handleSendToInbox - threadKey', () => {
     expect(parsed.recipientSessionId).toBe('b85490f5-0836-4bdd-8193-f6cfa2562a41');
   });
 
-  it('should trigger without senderAgentId using system sender', async () => {
+  it('should trigger without senderAgentId using unknown sender', async () => {
     const { getAgentGateway } = await import('../../channels/agent-gateway.js');
     const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
 
@@ -330,7 +330,7 @@ describe('handleSendToInbox - threadKey', () => {
 
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
-        fromAgentId: 'system',
+        fromAgentId: 'unknown',
       })
     );
   });
