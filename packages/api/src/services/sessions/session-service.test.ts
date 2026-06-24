@@ -1637,6 +1637,8 @@ describe('SessionService', () => {
       }
       chain.maybeSingle = vi.fn().mockResolvedValue(terminalResult);
       chain.single = vi.fn().mockResolvedValue(terminalResult);
+      chain.then = (resolve: (v: unknown) => unknown) =>
+        Promise.resolve(terminalResult).then(resolve);
       return chain;
     }
 
@@ -2218,6 +2220,200 @@ describe('SessionService', () => {
       expect(sanitizeHeaderText(undefined)).toBeUndefined();
       expect(sanitizeHeaderText('')).toBeUndefined();
       expect(sanitizeHeaderText('\n\n\t\x00')).toBeUndefined();
+    });
+  });
+
+  describe('repoRoot routing priority', () => {
+    function createChainableMock(terminalResult: unknown) {
+      const chain: Record<string, unknown> = {};
+      const chainMethods = ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit'];
+      for (const m of chainMethods) {
+        chain[m] = vi.fn().mockReturnValue(chain);
+      }
+      chain.maybeSingle = vi.fn().mockResolvedValue(terminalResult);
+      chain.single = vi.fn().mockResolvedValue(terminalResult);
+      chain.then = (resolve: (v: unknown) => unknown) =>
+        Promise.resolve(terminalResult).then(resolve);
+      return chain;
+    }
+
+    it('repoRoot-resolved studio beats agent most-recent-studio fallback', async () => {
+      const correctStudioId = 'repo-root-studio';
+      const wrongStudioId = 'unrelated-project-studio';
+
+      let studiosCallCount = 0;
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          if (table === 'studios') {
+            studiosCallCount++;
+            if (studiosCallCount === 1) {
+              // resolveMainStudio call — return the correct repoRoot studio
+              return createChainableMock({
+                data: { id: correctStudioId, updated_at: '2026-01-01T00:00:00Z' },
+              });
+            }
+            // resolveWorkingDirectory or agent's-own-studio — return the wrong one
+            // (agent's-own-studio should NOT be reached; resolveWorkingDirectory is OK)
+            return createChainableMock({
+              data: {
+                id: wrongStudioId,
+                worktree_path: '/other/project',
+                status: 'active',
+                updated_at: '2026-01-01T00:00:00Z',
+              },
+            });
+          }
+          if (table === 'agent_identities') {
+            return createChainableMock({ data: null });
+          }
+          return createChainableMock({ data: null });
+        }),
+      };
+
+      const serviceWithSupabase = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        mockSupabase as never
+      );
+
+      await serviceWithSupabase.handleMessage(
+        createMockRequest({
+          channel: 'agent',
+          metadata: {
+            repoRoot: '/Users/conor/ws/inktrade',
+            triggerType: 'agent',
+            chatType: 'direct',
+          },
+        })
+      );
+
+      // Session should be created with the repoRoot studio, not the unrelated one
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ studioId: correctStudioId })
+      );
+    });
+
+    it('repoRoot scopes route-pattern matching to the target repo (fall-through)', async () => {
+      const correctStudioId = 'inktrade-main-studio';
+
+      // Mock findByThreadKey so session lookup falls through to studio resolution
+      (mockRepository as Record<string, unknown>).findByThreadKey = vi.fn().mockResolvedValue(null);
+
+      let studiosCallCount = 0;
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          if (table === 'sessions') {
+            return createChainableMock({ data: null });
+          }
+          if (table === 'studios') {
+            studiosCallCount++;
+            if (studiosCallCount === 1) {
+              // Route-pattern query — scoped to repoRoot, no match in target repo
+              // (the catch-all studio is in a different repo so it's filtered out)
+              return createChainableMock({ data: null });
+            }
+            if (studiosCallCount === 2) {
+              // resolveMainStudio — returns the correct studio for the target repo
+              return createChainableMock({
+                data: { id: correctStudioId, updated_at: '2026-01-01T00:00:00Z' },
+              });
+            }
+            return createChainableMock({ data: null });
+          }
+          if (table === 'agent_identities') {
+            return createChainableMock({ data: null });
+          }
+          return createChainableMock({ data: null });
+        }),
+      };
+
+      const serviceWithSupabase = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        mockSupabase as never
+      );
+
+      await serviceWithSupabase.handleMessage(
+        createMockRequest({
+          channel: 'agent',
+          metadata: {
+            threadKey: 'strategy:group-abc',
+            repoRoot: '/Users/conor/ws/inktrade',
+            triggerType: 'agent',
+            chatType: 'direct',
+          },
+        })
+      );
+
+      // Session should be created with the repoRoot studio, not the catch-all
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ studioId: correctStudioId })
+      );
+    });
+
+    it('same-repo route pattern is honored when repoRoot matches', async () => {
+      const patternStudioId = 'inktrade-pr-studio';
+
+      (mockRepository as Record<string, unknown>).findByThreadKey = vi.fn().mockResolvedValue(null);
+
+      let studiosCallCount = 0;
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          if (table === 'sessions') {
+            return createChainableMock({ data: null });
+          }
+          if (table === 'studios') {
+            studiosCallCount++;
+            if (studiosCallCount === 1) {
+              // Route-pattern query — scoped to repoRoot, returns a matching studio
+              return createChainableMock({
+                data: [{ id: patternStudioId, route_patterns: ['pr:*'] }],
+              });
+            }
+            // Should NOT reach resolveMainStudio — pattern match should win
+            return createChainableMock({ data: null });
+          }
+          if (table === 'agent_identities') {
+            return createChainableMock({ data: null });
+          }
+          return createChainableMock({ data: null });
+        }),
+      };
+
+      const serviceWithSupabase = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        mockSupabase as never
+      );
+
+      await serviceWithSupabase.handleMessage(
+        createMockRequest({
+          channel: 'agent',
+          metadata: {
+            threadKey: 'pr:420',
+            repoRoot: '/Users/conor/ws/inktrade',
+            triggerType: 'agent',
+            chatType: 'direct',
+          },
+        })
+      );
+
+      // Session should land in the pattern-matched studio, not fall through
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ studioId: patternStudioId })
+      );
     });
   });
 });

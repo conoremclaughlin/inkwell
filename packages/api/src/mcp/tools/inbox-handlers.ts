@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
-import { resolveIdentityId } from '../../auth/resolve-identity';
+import { resolveIdentityId, resolveAgentSlug } from '../../auth/resolve-identity';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
@@ -269,9 +269,18 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     );
   }
 
-  // Enforce identity on sender (who is performing the action), not recipient (target)
-  const senderAgentId = getEffectiveAgentId(parsed.senderAgentId);
-  const triggerSenderId = senderAgentId || 'system';
+  // Resolve sender identity: pinned/explicit → request context sbId → context agentId → unknown
+  let senderAgentId = getEffectiveAgentId(parsed.senderAgentId);
+  if (!senderAgentId) {
+    const reqCtx = getRequestContext() || getSessionContext();
+    if (reqCtx?.sbId) {
+      senderAgentId =
+        (await resolveAgentSlug(dataComposer.getClient(), reqCtx.sbId)) || reqCtx.agentId;
+    } else if (reqCtx?.agentId) {
+      senderAgentId = reqCtx.agentId;
+    }
+  }
+  const triggerSenderId = senderAgentId || 'unknown';
 
   // SECURITY: permission_grant messages can only originate from the system layer
   // (platform listeners verifying human identity), never from agents.
@@ -331,13 +340,13 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   // and warn the sender. Without session context, reply routing is broken
   // (recipients can't auto-resolve back to the sender's session/studio).
   //
-  // 'system' is exempt: it is the canonical sender for heartbeat/watchdog/
-  // platform-originated sends, which by design run outside a request context
-  // (no x-ink-context token, no session). Suppressing those triggers silently
-  // broke the strategy watchdog — it inserted thread messages but never woke
-  // the owner agent. Since 'system' has no reply session anyway, the routing
-  // concerns that justify the suppression don't apply.
-  const missingSenderSession = !senderSessionId && !!senderAgentId && senderAgentId !== 'system';
+  // 'system' and 'unknown' are exempt: they are canonical senders for
+  // heartbeat/watchdog/platform-originated sends that run outside a request
+  // context (no x-ink-context token, no session). Suppressing those triggers
+  // silently broke the strategy watchdog. Since they have no reply session
+  // anyway, the routing concerns that justify suppression don't apply.
+  const nonAgentSender = triggerSenderId === 'system' || triggerSenderId === 'unknown';
+  const missingSenderSession = !senderSessionId && !!senderAgentId && !nonAgentSender;
 
   // ── Thread-first path: when threadKey is provided, route to thread tables ──
   // Unified handler for both new thread creation and replies to existing threads.
@@ -446,16 +455,17 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // so the channelPoll filter can recognize the target studio as an owner.
     // Resolve recipientStudioSlug/Hint to a studioId if needed.
     let resolvedRecipientStudioId: string | undefined = recipientStudioId || undefined;
-    if (!resolvedRecipientStudioId && recipientStudioSlugOrHint && senderAgentId) {
+    const resolveAgentForStudio = recipientAgentId || senderAgentId;
+    if (!resolvedRecipientStudioId && recipientStudioSlugOrHint && resolveAgentForStudio) {
       try {
-        // Reuse the shared resolution function (worktree path → branch fallback
-        // for 'main', slug match for named hints).
+        // Resolve in the recipient's scope so cross-agent sends (sender=wren,
+        // recipient=myra) find the recipient's studio, not the sender's.
         const reqCtxForHint = getRequestContext();
         resolvedRecipientStudioId = await resolveStudioHint(
           supabase,
           resolved.user.id,
           recipientStudioSlugOrHint,
-          senderAgentId,
+          resolveAgentForStudio,
           reqCtxForHint?.repoRoot
         );
       } catch {
@@ -547,8 +557,11 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           selfStudioTarget,
         });
       } else {
-        // New thread: trigger all recipients (exclude sender unless cross-studio self-message)
-        agentsToTrigger = allRecipients.filter((a) => selfStudioTarget || a !== senderAgentId);
+        // New thread: trigger all recipients (exclude sender unless cross-studio
+        // self-message or actionable self-target like strategy kickoff)
+        const actionableSelf = new Set(['task_request', 'session_resume']);
+        const allowSelf = selfStudioTarget || (!!messageType && actionableSelf.has(messageType));
+        agentsToTrigger = allRecipients.filter((a) => allowSelf || a !== senderAgentId);
       }
     }
 

@@ -170,11 +170,41 @@ describe('resolveTriggeredAgents', () => {
   });
 
   describe('self-thread (1 participant)', () => {
-    it('should trigger no one', () => {
+    it('should trigger no one for plain messages', () => {
       const result = resolveTriggeredAgents({
         senderAgentId: 'wren',
         participants: ['wren'],
         creatorAgentId: 'wren',
+      });
+      expect(result).toEqual([]);
+    });
+
+    it('should trigger self for session_resume (strategy self-trigger)', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants: ['wren'],
+        creatorAgentId: 'wren',
+        messageType: 'session_resume',
+      });
+      expect(result).toEqual(['wren']);
+    });
+
+    it('should trigger self for task_request', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants: ['wren'],
+        creatorAgentId: 'wren',
+        messageType: 'task_request',
+      });
+      expect(result).toEqual(['wren']);
+    });
+
+    it('should not trigger self for notification', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants: ['wren'],
+        creatorAgentId: 'wren',
+        messageType: 'notification',
       });
       expect(result).toEqual([]);
     });

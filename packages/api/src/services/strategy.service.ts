@@ -202,7 +202,7 @@ export class StrategyService {
    * Sets the group to active, records the strategy preset, and returns the first task.
    */
   async startStrategy(input: StartStrategyInput): Promise<StrategyAdvanceResult> {
-    const group = await this.dataComposer.repositories.taskGroups.findById(input.groupId);
+    let group = await this.dataComposer.repositories.taskGroups.findById(input.groupId);
     if (!group) throw new Error('Task group not found');
     if (group.user_id !== input.userId) throw new Error('Task group does not belong to this user');
 
@@ -216,6 +216,44 @@ export class StrategyService {
     const inputConfig = input.config || (group.strategy_config as StrategyConfig);
     if (inputConfig?.studioSlug && inputConfig?.ephemeralStudio) {
       throw new Error('studioSlug and ephemeralStudio are mutually exclusive');
+    }
+
+    // ── Resolve repoRoot ──
+    // Required for spawn mode so the spawner knows where to start the session.
+    // Resolution chain: group metadata → project repo_root → caller's session context.
+    const groupMeta = (group.metadata || {}) as Record<string, unknown>;
+    let resolvedRepoRoot = typeof groupMeta.repoRoot === 'string' ? groupMeta.repoRoot : undefined;
+
+    if (!resolvedRepoRoot && group.project_id) {
+      const project = await this.dataComposer.repositories.projects.findById(group.project_id);
+      if (project?.repo_root) {
+        resolvedRepoRoot = project.repo_root;
+      }
+    }
+
+    if (!resolvedRepoRoot) {
+      const reqCtx = getRequestContext();
+      if (reqCtx?.repoRoot) {
+        resolvedRepoRoot = reqCtx.repoRoot;
+      }
+    }
+
+    const executionMode = input.executionMode || 'spawn';
+    if (!resolvedRepoRoot && executionMode === 'spawn') {
+      throw new Error(
+        'Cannot start strategy in spawn mode: no repoRoot found. ' +
+          'Set repo_root on the project, repoRoot in group metadata, or call from a session with a known repo context.'
+      );
+    }
+
+    // Persist resolved repoRoot to group metadata so downstream studio creation
+    // and trigger routing have it available without re-resolving.
+    if (resolvedRepoRoot && groupMeta.repoRoot !== resolvedRepoRoot) {
+      await this.dataComposer.repositories.taskGroups.update(input.groupId, {
+        metadata: { ...groupMeta, repoRoot: resolvedRepoRoot },
+      });
+      // Refresh local reference so studio creation sees the updated metadata
+      group = (await this.dataComposer.repositories.taskGroups.findById(input.groupId)) || group;
     }
 
     // Persistent studio: create BEFORE activating the strategy so (a) failure
@@ -981,13 +1019,14 @@ export class StrategyService {
 
     try {
       const threadKey = group.thread_key || `strategy:${group.id}`;
-      const senderSlug = (await this.resolveOwnerSlug(group)) || 'system';
+      const senderSlug = (await this.resolveOwnerSlug(group)) || group.sb_id || 'strategy';
 
       await handleSendToInbox(
         {
           userId,
           recipientAgentId: notifyAgentId,
           senderAgentId: senderSlug,
+          recipientStudioSlug: 'main',
           content: message,
           messageType: 'notification',
           priority: 'high',
@@ -1052,8 +1091,10 @@ export class StrategyService {
       const metadata = (group.metadata || {}) as Record<string, unknown>;
       const rawStudioId = metadata.studioId;
       const rawStudioSlug = metadata.studioSlug;
+      const rawRepoRoot = metadata.repoRoot;
       const studioId = typeof rawStudioId === 'string' ? rawStudioId : undefined;
       const studioSlug = typeof rawStudioSlug === 'string' ? rawStudioSlug : undefined;
+      const repoRoot = typeof rawRepoRoot === 'string' ? rawRepoRoot : undefined;
       const content = STRATEGY_PROMPTS[group.strategy as StrategyPreset](group, task);
 
       await handleSendToInbox(
@@ -1078,6 +1119,7 @@ export class StrategyService {
             groupId: group.id,
             taskId: task.id,
             strategy: group.strategy,
+            ...(repoRoot ? { repoRoot } : {}),
             ...(sandboxContainerName ? { sandboxContainerName } : {}),
           },
         },
@@ -1804,7 +1846,7 @@ export class StrategyService {
   ): Promise<void> {
     try {
       const reqCtx = getRequestContext();
-      const agentSlug = (await this.resolveOwnerSlug(group)) || 'system';
+      const agentSlug = (await this.resolveOwnerSlug(group)) || group.sb_id || 'strategy';
       await this.dataComposer.repositories.activityStream.logActivity({
         userId: group.user_id,
         agentId: agentSlug,

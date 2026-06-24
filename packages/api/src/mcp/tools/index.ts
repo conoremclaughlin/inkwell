@@ -659,6 +659,12 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         status: z.enum(['active', 'paused', 'completed', 'archived']).optional(),
         techStack: z.array(z.string()).optional().describe('Technologies used'),
         repositoryUrl: z.string().url().optional().describe('Repository URL'),
+        repoRoot: z
+          .string()
+          .optional()
+          .describe(
+            'Local filesystem path to the repo root (e.g., /Users/.../my-project). Used by strategy spawner to know where to start autonomous sessions.'
+          ),
         goals: z.array(z.string()).optional().describe('Project goals'),
       },
     },

@@ -396,6 +396,24 @@ export class CodexRunner implements IRunner {
             parsedEventTypes.every((type) => type === 'thread.started' || type === 'turn.started');
 
           const diagnostics: string[] = [];
+
+          // Lead with actionable error content — truncateSummary() grabs the first line,
+          // so the notification shows the actual error, not just exit metadata.
+          if (stderrTrimmed) {
+            diagnostics.push(stderrTrimmed);
+          } else if (parsedErrorMessages.length > 0) {
+            diagnostics.push(parsedErrorMessages.join('\n'));
+          } else if (nonJsonText) {
+            diagnostics.push(nonJsonText);
+          } else if (startupOnlyEvents) {
+            diagnostics.push(
+              'Codex emitted startup events only (thread.started/turn.started) then exited before completion.'
+            );
+          } else {
+            diagnostics.push('No stderr and no non-JSON stdout captured.');
+          }
+
+          // Exit metadata — still valuable, just not the lead
           diagnostics.push(
             `exitCode=${code ?? 'null'} signal=${signal ?? 'none'} stdoutBytes=${stdoutBytes} stderrBytes=${stderrBytes}`
           );
@@ -405,19 +423,9 @@ export class CodexRunner implements IRunner {
               `parsedEvents=${parsedEventCount} types=${uniqueTypes.join(',') || '(none)'}`
             );
           }
-          if (parsedErrorMessages.length > 0) {
+          // Include parsed error messages as supplementary context when stderr was the lead
+          if (stderrTrimmed && parsedErrorMessages.length > 0) {
             diagnostics.push(`parsedErrorMessages:\n${parsedErrorMessages.join('\n')}`);
-          }
-          if (stderrTrimmed) {
-            diagnostics.push(`stderr:\n${stderrTrimmed}`);
-          } else if (nonJsonText) {
-            diagnostics.push(`stdout(non-json):\n${nonJsonText}`);
-          } else if (startupOnlyEvents) {
-            diagnostics.push(
-              'Codex emitted startup events only (thread.started/turn.started) then exited before completion.'
-            );
-          } else {
-            diagnostics.push('No stderr and no non-JSON stdout captured.');
           }
 
           const diagnostic = diagnostics.join('\n\n').slice(0, DIAGNOSTIC_MAX_CHARS);
