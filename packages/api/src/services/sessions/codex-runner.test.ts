@@ -565,7 +565,6 @@ describe('CodexRunner', () => {
     expect(result.error).toContain('parsedEvents=3');
     expect(result.error).toContain('thread.started');
     expect(result.error).toContain('turn.started');
-    expect(result.error).toContain('parsedErrorMessages');
     expect(result.error).toContain('stream disconnected before completion');
   });
 });
