@@ -2220,4 +2220,77 @@ describe('SessionService', () => {
       expect(sanitizeHeaderText('\n\n\t\x00')).toBeUndefined();
     });
   });
+
+  describe('repoRoot routing priority', () => {
+    function createChainableMock(terminalResult: unknown) {
+      const chain: Record<string, unknown> = {};
+      const chainMethods = ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit'];
+      for (const m of chainMethods) {
+        chain[m] = vi.fn().mockReturnValue(chain);
+      }
+      chain.maybeSingle = vi.fn().mockResolvedValue(terminalResult);
+      chain.single = vi.fn().mockResolvedValue(terminalResult);
+      return chain;
+    }
+
+    it('repoRoot-resolved studio beats agent most-recent-studio fallback', async () => {
+      const correctStudioId = 'repo-root-studio';
+      const wrongStudioId = 'unrelated-project-studio';
+
+      let studiosCallCount = 0;
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          if (table === 'studios') {
+            studiosCallCount++;
+            if (studiosCallCount === 1) {
+              // resolveMainStudio call — return the correct repoRoot studio
+              return createChainableMock({
+                data: { id: correctStudioId, updated_at: '2026-01-01T00:00:00Z' },
+              });
+            }
+            // resolveWorkingDirectory or agent's-own-studio — return the wrong one
+            // (agent's-own-studio should NOT be reached; resolveWorkingDirectory is OK)
+            return createChainableMock({
+              data: {
+                id: wrongStudioId,
+                worktree_path: '/other/project',
+                status: 'active',
+                updated_at: '2026-01-01T00:00:00Z',
+              },
+            });
+          }
+          if (table === 'agent_identities') {
+            return createChainableMock({ data: null });
+          }
+          return createChainableMock({ data: null });
+        }),
+      };
+
+      const serviceWithSupabase = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        mockSupabase as never
+      );
+
+      await serviceWithSupabase.handleMessage(
+        createMockRequest({
+          channel: 'agent',
+          metadata: {
+            repoRoot: '/Users/conor/ws/inktrade',
+            triggerType: 'agent',
+            chatType: 'direct',
+          },
+        })
+      );
+
+      // Session should be created with the repoRoot studio, not the unrelated one
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ studioId: correctStudioId })
+      );
+    });
+  });
 });
