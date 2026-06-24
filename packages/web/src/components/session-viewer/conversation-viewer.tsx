@@ -174,6 +174,34 @@ export function ConversationViewer({ sessionId }: { sessionId: string }) {
     return map;
   }, [turns]);
 
+  const TIME_GAP_MS = 5 * 60 * 1000;
+  const isVisibleTurn = useCallback((t: (typeof turns)[number]): boolean => {
+    if (t.role === 'system') return t.blocks.length > 0 && t.blocks[0].kind === 'system';
+    if (t.blocks.every((b) => b.kind === 'tool-result')) return false;
+    return true;
+  }, []);
+  const shouldShowHeader = useCallback(
+    (index: number): boolean => {
+      const curr = turns[index];
+      if (!curr) return true;
+      let prev: (typeof turns)[number] | undefined;
+      for (let i = index - 1; i >= 0; i--) {
+        if (isVisibleTurn(turns[i])) {
+          prev = turns[i];
+          break;
+        }
+      }
+      if (!prev) return true;
+      if (prev.role !== curr.role) return true;
+      if (prev.timestamp && curr.timestamp) {
+        const gap = new Date(curr.timestamp).getTime() - new Date(prev.timestamp).getTime();
+        if (gap > TIME_GAP_MS) return true;
+      }
+      return false;
+    },
+    [turns, isVisibleTurn]
+  );
+
   const isLive = session?.lifecycle === 'running';
   const prevTurnCount = useRef(0);
 
@@ -308,6 +336,7 @@ export function ConversationViewer({ sessionId }: { sessionId: string }) {
           >
             {virtualizer.getVirtualItems().map((virtualRow) => {
               const turn = turns[virtualRow.index];
+              const hasHeader = shouldShowHeader(virtualRow.index);
               return (
                 <div
                   key={turn.id}
@@ -321,14 +350,16 @@ export function ConversationViewer({ sessionId }: { sessionId: string }) {
                     transform: `translateY(${virtualRow.start}px)`,
                     paddingLeft: '1rem',
                     paddingRight: '1rem',
-                    paddingTop: virtualRow.index === 0 ? '1rem' : '0.375rem',
-                    paddingBottom: virtualRow.index === turns.length - 1 ? '1rem' : '0.375rem',
+                    paddingTop:
+                      virtualRow.index === 0 ? '1rem' : hasHeader ? '0.75rem' : '0.125rem',
+                    paddingBottom: virtualRow.index === turns.length - 1 ? '1rem' : '0.125rem',
                   }}
                 >
                   <MessageBubble
                     turn={turn}
                     agentName={turn.role === 'assistant' ? agentName : undefined}
                     toolResults={toolResults}
+                    showHeader={hasHeader}
                   />
                 </div>
               );

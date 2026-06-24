@@ -62,10 +62,12 @@ export function MessageBubble({
   turn,
   agentName,
   toolResults,
+  showHeader = true,
 }: {
   turn: ConversationTurn;
   agentName?: string;
   toolResults: Map<string, ToolResultBlock>;
+  showHeader?: boolean;
 }) {
   if (turn.role === 'system') {
     const block = turn.blocks[0];
@@ -83,15 +85,15 @@ export function MessageBubble({
   return (
     <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} group`}>
       <div className={`max-w-[85%] ${isUser ? 'items-end' : 'items-start'} flex flex-col`}>
-        {/* Header */}
-        <div className={`flex items-center gap-2 mb-0.5 ${isUser ? 'flex-row-reverse' : ''}`}>
-          {!isUser && agentName && (
-            <span className="text-xs font-semibold text-gray-700">{agentName}</span>
-          )}
-          <span className="text-[10px] text-gray-400 opacity-0 group-hover:opacity-100 transition-opacity">
-            {formatTime(turn.timestamp)}
-          </span>
-        </div>
+        {/* Header — only on first message in a group or after a time gap */}
+        {showHeader && (
+          <div className={`flex items-center gap-2 mb-0.5 ${isUser ? 'flex-row-reverse' : ''}`}>
+            {!isUser && agentName && (
+              <span className="text-xs font-semibold text-gray-700">{agentName}</span>
+            )}
+            <span className="text-[10px] text-gray-400">{formatTime(turn.timestamp)}</span>
+          </div>
+        )}
 
         {/* Content blocks */}
         <div className={`space-y-1 ${isUser ? 'text-right' : ''}`}>
