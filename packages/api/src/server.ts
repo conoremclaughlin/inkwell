@@ -993,6 +993,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         studioId: payload.studioId,
         studioHint: payload.studioHint,
         recipientSessionId: payload.recipientSessionId,
+        repoRoot:
+          payload.metadata?.repoRoot && typeof payload.metadata.repoRoot === 'string'
+            ? payload.metadata.repoRoot
+            : undefined,
       });
 
       // Stamp the resolved session on the recipient's thread participant record
