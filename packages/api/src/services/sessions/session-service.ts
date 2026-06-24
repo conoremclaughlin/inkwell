@@ -1129,15 +1129,21 @@ export class SessionService implements ISessionService {
 
     // 3) Studio route pattern match — studios declare which threadKey patterns
     //    they handle (e.g., 'pr:*', 'spec:*'). See spec:trigger-studio-routing.
+    //    When repoRoot is provided, scope to studios in the same repo to prevent
+    //    catch-all patterns in project A from capturing triggers for project B.
     if (options.threadKey) {
       // route_patterns is not yet in generated Supabase types — cast result
-      const { data: patternStudios } = (await this.supabase
+      let patternQuery = this.supabase
         .from('studios')
         .select('id, route_patterns')
         .eq('user_id', userId)
         .eq('agent_id', agentId)
         .in('status', ['active', 'idle'])
-        .not('route_patterns', 'eq', '{}')) as {
+        .not('route_patterns', 'eq', '{}');
+      if (options.repoRoot) {
+        patternQuery = patternQuery.eq('repo_root', options.repoRoot);
+      }
+      const { data: patternStudios } = patternQuery as {
         data: Array<{ id: string; route_patterns: string[] }> | null;
       };
 

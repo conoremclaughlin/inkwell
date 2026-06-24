@@ -2292,5 +2292,67 @@ describe('SessionService', () => {
         expect.objectContaining({ studioId: correctStudioId })
       );
     });
+
+    it('repoRoot scopes route-pattern matching to the target repo', async () => {
+      const correctStudioId = 'inktrade-main-studio';
+
+      // Mock findByThreadKey so session lookup falls through to studio resolution
+      (mockRepository as Record<string, unknown>).findByThreadKey = vi.fn().mockResolvedValue(null);
+
+      let studiosCallCount = 0;
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          if (table === 'sessions') {
+            return createChainableMock({ data: null });
+          }
+          if (table === 'studios') {
+            studiosCallCount++;
+            if (studiosCallCount === 1) {
+              // Route-pattern query — scoped to repoRoot, no match in target repo
+              // (the catch-all studio is in a different repo so it's filtered out)
+              return createChainableMock({ data: null });
+            }
+            if (studiosCallCount === 2) {
+              // resolveMainStudio — returns the correct studio for the target repo
+              return createChainableMock({
+                data: { id: correctStudioId, updated_at: '2026-01-01T00:00:00Z' },
+              });
+            }
+            return createChainableMock({ data: null });
+          }
+          if (table === 'agent_identities') {
+            return createChainableMock({ data: null });
+          }
+          return createChainableMock({ data: null });
+        }),
+      };
+
+      const serviceWithSupabase = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        mockSupabase as never
+      );
+
+      await serviceWithSupabase.handleMessage(
+        createMockRequest({
+          channel: 'agent',
+          metadata: {
+            threadKey: 'strategy:group-abc',
+            repoRoot: '/Users/conor/ws/inktrade',
+            triggerType: 'agent',
+            chatType: 'direct',
+          },
+        })
+      );
+
+      // Session should be created with the repoRoot studio, not the catch-all
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ studioId: correctStudioId })
+      );
+    });
   });
 });
