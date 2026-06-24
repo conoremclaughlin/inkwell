@@ -51,6 +51,7 @@ export async function requestToolApproval(options: {
   reason: string;
   sessionId?: string;
   studioId?: string;
+  requestingAgentId?: string;
   timeoutSeconds?: number;
   onCreated?: (requestId: string) => void;
   onPoll?: (elapsed: number) => void;
@@ -77,6 +78,7 @@ export async function requestToolApproval(options: {
         reason: options.reason,
         sessionId: options.sessionId,
         studioId: options.studioId,
+        requestingAgentId: options.requestingAgentId,
         timeoutSeconds,
       }),
       signal: AbortSignal.timeout(10000),

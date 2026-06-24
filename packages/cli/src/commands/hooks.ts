@@ -2220,10 +2220,11 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
       body: JSON.stringify({
         tool: toolName,
         args: toolInput,
-        reason: `Tool requires 2FA approval`,
+        reason: 'Tool requires explicit per-call confirmation by policy.',
         studioId,
         sessionId,
         timeoutSeconds: 300,
+        requestingAgentId: resolveAgentId() || undefined,
       }),
       signal: AbortSignal.timeout(10000),
     });

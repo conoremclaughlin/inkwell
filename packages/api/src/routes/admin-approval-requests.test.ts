@@ -365,6 +365,45 @@ describe('POST /approval-requests', () => {
     );
   });
 
+  it('falls back to requestingAgentId from body when no x-ink-context', async () => {
+    installInsertMock({
+      data: { id: 'req-body-agent', status: 'pending', expires_at: futureIso() },
+      error: null,
+    });
+
+    const handler = findRouteHandler('post', '/approval-requests');
+    const req = createAuthenticatedReq({
+      body: { tool: 'Bash', args: 'ls', requestingAgentId: 'lumen' },
+    });
+    const res = createMockRes();
+    await handler!(req as Request, res as unknown as Response);
+
+    expect(res._status).toBe(201);
+    const insertFn = mockSupabaseFrom.mock.results[0].value.insert as ReturnType<typeof vi.fn>;
+    expect(insertFn).toHaveBeenCalledWith(
+      expect.objectContaining({ requesting_agent_id: 'lumen' })
+    );
+  });
+
+  it('prefers x-ink-context over body requestingAgentId', async () => {
+    installInsertMock({
+      data: { id: 'req-prefer-ctx', status: 'pending', expires_at: futureIso() },
+      error: null,
+    });
+
+    const contextToken = Buffer.from(JSON.stringify({ agentId: 'wren' })).toString('base64url');
+    const handler = findRouteHandler('post', '/approval-requests');
+    const req = createAuthenticatedReq({
+      body: { tool: 'Bash', args: 'ls', requestingAgentId: 'lumen' },
+      headers: { authorization: 'Bearer t', 'x-ink-context': contextToken },
+    });
+    const res = createMockRes();
+    await handler!(req as Request, res as unknown as Response);
+
+    const insertFn = mockSupabaseFrom.mock.results[0].value.insert as ReturnType<typeof vi.fn>;
+    expect(insertFn).toHaveBeenCalledWith(expect.objectContaining({ requesting_agent_id: 'wren' }));
+  });
+
   it('triggers platform notification after successful insert (non-blocking)', async () => {
     installInsertMock({
       data: { id: 'req-notify', status: 'pending', expires_at: futureIso() },

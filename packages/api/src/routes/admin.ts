@@ -6915,7 +6915,15 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
     });
     const authReq = req as AdminAuthRequest;
 
-    const { tool, args, reason, studioId, sessionId, timeoutSeconds = 300 } = req.body;
+    const {
+      tool,
+      args,
+      reason,
+      studioId,
+      sessionId,
+      timeoutSeconds = 300,
+      requestingAgentId: bodyAgentId,
+    } = req.body;
 
     if (!tool) {
       res.status(400).json({ error: 'tool is required' });
@@ -6924,7 +6932,7 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
 
     const expiresAt = new Date(Date.now() + timeoutSeconds * 1000).toISOString();
 
-    // Resolve requesting agent from session context header
+    // Resolve requesting agent: x-ink-context header > request body > 'unknown'
     const contextHeader = req.headers['x-ink-context'] as string | undefined;
     let requestingAgentId = 'unknown';
     if (contextHeader) {
@@ -6934,6 +6942,18 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
       } catch {
         // fall through
       }
+    }
+    if (requestingAgentId === 'unknown' && bodyAgentId) {
+      requestingAgentId = bodyAgentId;
+    }
+    if (requestingAgentId === 'unknown') {
+      logger.warn(
+        'Approval request created with unknown agent — no x-ink-context header or requestingAgentId in body',
+        {
+          tool,
+          studioId,
+        }
+      );
     }
 
     // studio_id is a UUID column. The CLI sends the literal string "main"
