@@ -168,25 +168,13 @@ interface InsertResult {
   error: unknown;
 }
 
-function installInsertMock(result: InsertResult, sessionAgent?: string) {
+function installInsertMock(result: InsertResult) {
   const insertChain = {
     select: vi.fn().mockReturnValue({
       single: vi.fn().mockResolvedValue(result),
     }),
   };
   mockSupabaseFrom.mockImplementation((table: string) => {
-    if (table === 'sessions') {
-      return {
-        select: vi.fn().mockReturnValue({
-          eq: vi.fn().mockReturnValue({
-            single: vi.fn().mockResolvedValue({
-              data: sessionAgent ? { agent_id: sessionAgent } : null,
-              error: null,
-            }),
-          }),
-        }),
-      };
-    }
     if (table === 'approval_requests') {
       return {
         insert: vi.fn().mockReturnValue(insertChain),
@@ -301,12 +289,8 @@ describe('POST /approval-requests', () => {
       status: 'pending',
     });
 
-    // Inspect the insert payload — find the approval_requests call (may not be index 0
-    // since session lookup may precede it)
-    const arIdx = mockSupabaseFrom.mock.calls.findIndex(
-      (c: unknown[]) => c[0] === 'approval_requests'
-    );
-    const insertFn = mockSupabaseFrom.mock.results[arIdx].value.insert as ReturnType<typeof vi.fn>;
+    // Inspect the insert payload
+    const insertFn = mockSupabaseFrom.mock.results[0].value.insert as ReturnType<typeof vi.fn>;
     expect(insertFn).toHaveBeenCalledWith(
       expect.objectContaining({
         user_id: USER_ID,
@@ -316,7 +300,7 @@ describe('POST /approval-requests', () => {
         studio_id: STUDIO_UUID,
         session_id: SESSION_UUID,
         timeout_seconds: 300,
-        requesting_agent_id: 'unknown', // no x-ink-context header — session lookup returns null
+        requesting_agent_id: 'unknown', // no x-ink-context header in this test
       })
     );
     expect(insertChain.select).toHaveBeenCalled();
@@ -379,35 +363,6 @@ describe('POST /approval-requests', () => {
     expect(insertFn).toHaveBeenCalledWith(
       expect.objectContaining({ requesting_agent_id: 'unknown' })
     );
-  });
-
-  it('falls back to session lookup when no x-ink-context', async () => {
-    installInsertMock(
-      {
-        data: { id: 'req-session-agent', status: 'pending', expires_at: futureIso() },
-        error: null,
-      },
-      'myra'
-    );
-
-    const handler = findRouteHandler('post', '/approval-requests');
-    const req = createAuthenticatedReq({
-      body: {
-        tool: 'bash',
-        args: 'echo hello',
-        sessionId: '11111111-2222-3333-4444-555555555555',
-      },
-    });
-    const res = createMockRes();
-    await handler!(req as Request, res as unknown as Response);
-
-    expect(res._status).toBe(201);
-    // Find the approval_requests insert call (sessions call comes first)
-    const arMock = mockSupabaseFrom.mock.results.find(
-      (_r: unknown, i: number) => mockSupabaseFrom.mock.calls[i][0] === 'approval_requests'
-    );
-    const insertFn = arMock.value.insert as ReturnType<typeof vi.fn>;
-    expect(insertFn).toHaveBeenCalledWith(expect.objectContaining({ requesting_agent_id: 'myra' }));
   });
 
   it('triggers platform notification after successful insert (non-blocking)', async () => {

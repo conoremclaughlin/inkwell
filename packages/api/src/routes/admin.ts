@@ -6924,8 +6924,8 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
 
     const expiresAt = new Date(Date.now() + timeoutSeconds * 1000).toISOString();
 
-    // Resolve requesting agent from trusted sources only (not client body).
-    // Priority: x-ink-context header > session record lookup > 'unknown'
+    // Resolve requesting agent from x-ink-context header (set by CLI hooks).
+    // This is the sole trusted identity channel — agents cannot set it themselves.
     const contextHeader = req.headers['x-ink-context'] as string | undefined;
     let requestingAgentId = 'unknown';
     if (contextHeader) {
@@ -6936,28 +6936,12 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
         // fall through
       }
     }
-    // Fallback: look up agent from the session record (server-side, not client-supplied)
-    if (requestingAgentId === 'unknown' && sessionId) {
-      const UUID_RE_CHECK = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-      if (UUID_RE_CHECK.test(sessionId)) {
-        const { data: session } = await supabase
-          .from('sessions')
-          .select('agent_id')
-          .eq('id', sessionId)
-          .single();
-        if (session?.agent_id) {
-          requestingAgentId = session.agent_id;
-        }
-      }
-    }
     if (requestingAgentId === 'unknown') {
-      logger.warn(
-        'Approval request created with unknown agent — no x-ink-context header and session lookup failed',
-        {
-          tool,
-          studioId,
-        }
-      );
+      logger.warn('Approval request with unknown agent — missing x-ink-context header', {
+        tool,
+        studioId,
+        sessionId,
+      });
     }
 
     // studio_id is a UUID column. The CLI sends the literal string "main"

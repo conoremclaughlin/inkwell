@@ -12,6 +12,7 @@
  */
 
 import { getValidAccessToken } from '../auth/tokens.js';
+import { resolveAgentId, readIdentityJson } from '../backends/identity.js';
 
 const DEFAULT_TIMEOUT_SECONDS = 300;
 const POLL_INTERVAL_MS = 3000;
@@ -22,7 +23,20 @@ function getServerUrl(): string {
 
 function getContextHeaders(): Record<string, string> {
   const headers: Record<string, string> = {};
-  const contextToken = process.env.INK_CONTEXT?.trim();
+  let contextToken = process.env.INK_CONTEXT?.trim();
+  if (!contextToken) {
+    const agentId = resolveAgentId();
+    if (agentId) {
+      const identity = readIdentityJson(process.cwd());
+      contextToken = Buffer.from(
+        JSON.stringify({
+          agentId,
+          studioId: identity?.studioId || 'main',
+          cliAttached: true,
+        })
+      ).toString('base64url');
+    }
+  }
   if (contextToken) headers['x-ink-context'] = contextToken;
   return headers;
 }
