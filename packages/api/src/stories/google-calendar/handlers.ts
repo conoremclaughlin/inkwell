@@ -120,8 +120,20 @@ export const listCalendarsSchema = userIdentifierBaseSchema.extend({});
 export const listCalendarEventsSchema = userIdentifierBaseSchema.extend({
   startDate: z
     .string()
-    .describe('Start of date range (ISO 8601 format, e.g., 2026-01-30T00:00:00Z)'),
-  endDate: z.string().describe('End of date range (ISO 8601 format, e.g., 2026-02-06T00:00:00Z)'),
+    .describe(
+      'Start of date range. Full ISO 8601 (e.g., 2026-01-30T00:00:00Z) or bare date (e.g., 2026-01-30) — bare dates are resolved to midnight in the specified timezone.'
+    ),
+  endDate: z
+    .string()
+    .describe(
+      'End of date range. Full ISO 8601 or bare date — bare dates are resolved to midnight in the specified timezone.'
+    ),
+  timezone: z
+    .string()
+    .optional()
+    .describe(
+      'IANA timezone for bare-date resolution (e.g., "America/Los_Angeles", "Europe/London"). Falls back to the user profile timezone. Required when passing bare dates to get correct day boundaries.'
+    ),
   calendarId: z.string().optional().describe('Calendar ID to query (default: "primary")'),
   maxResults: z
     .number()
@@ -286,6 +298,9 @@ export async function handleListCalendarEvents(
 
   const calendarService = getGoogleCalendarService();
 
+  // Resolve timezone for bare-date normalization: explicit param > user profile > UTC
+  const timezone = params.timezone || user.timezone || 'UTC';
+
   try {
     const events = await calendarService.listEvents(user.id, {
       startDate: params.startDate,
@@ -293,6 +308,7 @@ export async function handleListCalendarEvents(
       calendarId: params.calendarId,
       maxResults: params.maxResults,
       query: params.query,
+      timezone,
     });
 
     logger.info('Listed calendar events', {
