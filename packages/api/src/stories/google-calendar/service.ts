@@ -83,10 +83,14 @@ export class GoogleCalendarService {
       maxResults,
     });
 
+    // Google Calendar API requires RFC 3339 timestamps for timeMin/timeMax.
+    // Agents often pass bare dates ("2026-06-25") — normalize to midnight UTC.
+    const normalizeDate = (d: string) => (/^\d{4}-\d{2}-\d{2}$/.test(d) ? `${d}T00:00:00Z` : d);
+
     const response = await calendar.events.list({
       calendarId,
-      timeMin: startDate,
-      timeMax: endDate,
+      timeMin: normalizeDate(startDate),
+      timeMax: normalizeDate(endDate),
       maxResults,
       q: query,
       singleEvents,
