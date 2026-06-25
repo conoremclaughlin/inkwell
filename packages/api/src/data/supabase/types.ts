@@ -186,6 +186,7 @@ export type Database = {
           session_scope: string | null;
           soul: string | null;
           studio_hint: string | null;
+          tts_config: Json | null;
           updated_at: string | null;
           user_id: string;
           values: Json | null;
@@ -211,6 +212,7 @@ export type Database = {
           session_scope?: string | null;
           soul?: string | null;
           studio_hint?: string | null;
+          tts_config?: Json | null;
           updated_at?: string | null;
           user_id: string;
           values?: Json | null;
@@ -236,6 +238,7 @@ export type Database = {
           session_scope?: string | null;
           soul?: string | null;
           studio_hint?: string | null;
+          tts_config?: Json | null;
           updated_at?: string | null;
           user_id?: string;
           values?: Json | null;
