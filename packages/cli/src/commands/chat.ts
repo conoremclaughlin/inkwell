@@ -3943,7 +3943,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       consecutiveBackendFailures += 1;
     }
 
-    // Log backend CLI turn completion to activity stream
+    // Log backend CLI turn completion to activity stream.
+    // Use 'ink' as the runner label (not the LLM backend like 'claude')
+    // so the mission feed shows the correct execution layer.
     if (runtime.sessionId) {
       const turnStatus = runResult.success ? 'completed' : 'failed';
       const cliErrorClassification = !runResult.success
@@ -3954,18 +3956,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
           })
         : null;
 
+      const runnerLabel = 'ink';
       pcp
         .callTool('log_activity', {
           agentId,
           type: runResult.success ? 'agent_complete' : 'error',
-          subtype: `backend_cli:${runtime.backend}`,
+          subtype: `backend_cli:${runnerLabel}`,
           content: runResult.success
-            ? `Backend turn completed (${runtime.backend}, ${turnDurationSeconds}s)`
-            : `Backend turn failed (${runtime.backend}, ${cliErrorClassification?.category || 'exit ' + runResult.exitCode}): ${cliErrorClassification?.summary || runResult.stderr.slice(0, 200) || 'unknown error'}`,
+            ? `Backend turn completed (${runnerLabel}, ${turnDurationSeconds}s)`
+            : `Backend turn failed (${runnerLabel}, ${cliErrorClassification?.category || 'exit ' + runResult.exitCode}): ${cliErrorClassification?.summary || runResult.stderr.slice(0, 200) || 'unknown error'}`,
           sessionId: runtime.sessionId,
           status: turnStatus,
           payload: {
-            backend: runtime.backend,
+            backend: runnerLabel,
             exitCode: runResult.exitCode,
             durationMs: turnDurationSeconds * 1000,
             studioId: runtime.studioId,

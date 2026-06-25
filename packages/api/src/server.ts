@@ -543,13 +543,22 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
             deliveryTarget: reminder.delivery_target,
           });
         }
-        if (route.activeSessionId) {
+        if (route.activeSessionId && route.agentId === reminderAgentId) {
           routeActiveSessionId = route.activeSessionId;
           logger.info(`[Heartbeat] Using active_session_id from channel_route`, {
             activeSessionId: routeActiveSessionId,
             deliveryChannel: reminder.delivery_channel,
             reminderId: reminder.id,
           });
+        } else if (route.activeSessionId && route.agentId !== reminderAgentId) {
+          logger.debug(
+            `[Heartbeat] Ignoring active_session_id — route agent ${route.agentId} ≠ reminder agent ${reminderAgentId}`,
+            {
+              routeAgentId: route.agentId,
+              reminderAgentId,
+              activeSessionId: route.activeSessionId,
+            }
+          );
         }
       }
     }
