@@ -54,7 +54,7 @@ export function ToolCallCard({ call, result }: { call: ToolCallBlock; result?: T
   const summary = formatInput(call.input);
 
   return (
-    <div className="my-1.5 rounded-lg border border-gray-200 bg-gray-50/80 overflow-hidden">
+    <div className="rounded-lg border border-gray-200 bg-gray-50/80 overflow-hidden">
       <button
         onClick={() => setExpanded(!expanded)}
         className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-gray-100/80 transition-colors"
