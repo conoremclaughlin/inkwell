@@ -220,7 +220,7 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
   }, [ctrlCTimer]);
 
   const now = formatNow(timezone);
-  const promptLabel = '> ';
+  const promptLabel = '❯ ';
 
   const showingContext = contextViewLines !== null;
   const dockVisible = !showingContext && !dismissingContext;
