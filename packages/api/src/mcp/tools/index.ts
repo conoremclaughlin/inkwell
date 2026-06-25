@@ -4444,6 +4444,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 
 Returns events with start/end times, summary, location, attendees, and status.
 
+Dates can be full ISO 8601 (e.g., "2026-01-30T00:00:00-08:00") or bare YYYY-MM-DD (e.g., "2026-01-30"). Bare dates are resolved to midnight in the specified timezone — always pass timezone when using bare dates to get correct day boundaries.
+
 User must have connected their Google account with Calendar permissions.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,

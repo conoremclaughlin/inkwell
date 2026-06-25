@@ -83,6 +83,39 @@ export const BLOCKED_OPERATIONS: Set<CalendarOperation> = new Set([
 ]);
 
 /**
+ * Extract a human-readable error from Google Calendar API responses.
+ * Google's GaxiosError includes structured error data with field-level detail.
+ */
+function extractCalendarError(error: unknown): { message: string; detail: string | null } {
+  const message = error instanceof Error ? error.message : 'Unknown error';
+
+  // GaxiosError from googleapis includes response.data.error
+  const resp = (
+    error as {
+      response?: {
+        data?: {
+          error?: {
+            message?: string;
+            errors?: Array<{ domain?: string; reason?: string; message?: string }>;
+          };
+        };
+      };
+    }
+  )?.response;
+  const apiError = resp?.data?.error;
+
+  if (apiError) {
+    const fieldErrors = apiError.errors?.map((e) => e.message || e.reason).filter(Boolean);
+    const detail = fieldErrors?.length
+      ? `${apiError.message || message}: ${fieldErrors.join('; ')}`
+      : apiError.message || null;
+    return { message, detail };
+  }
+
+  return { message, detail: null };
+}
+
+/**
  * Check if a calendar operation is allowed.
  *
  * @param operation The operation to check
@@ -261,8 +294,8 @@ export async function handleListCalendars(
       ],
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    logger.error('Failed to list calendars', { userId: user.id, error: message });
+    const { message, detail } = extractCalendarError(error);
+    logger.error('Failed to list calendars', { userId: user.id, error: message, detail });
 
     return {
       content: [
@@ -271,7 +304,7 @@ export async function handleListCalendars(
           text: JSON.stringify(
             {
               success: false,
-              error: message,
+              error: detail || message,
               hint: message.includes('No active google account')
                 ? 'User needs to connect their Google account in the web dashboard'
                 : undefined,
@@ -343,10 +376,11 @@ export async function handleListCalendarEvents(
       ],
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
+    const { message, detail } = extractCalendarError(error);
     logger.error('Failed to list calendar events', {
       userId: user.id,
       error: message,
+      detail,
     });
 
     return {
@@ -356,7 +390,7 @@ export async function handleListCalendarEvents(
           text: JSON.stringify(
             {
               success: false,
-              error: message,
+              error: detail || message,
               hint: message.includes('No active google account')
                 ? 'User needs to connect their Google account in the web dashboard'
                 : message.includes('calendar.readonly')
@@ -413,11 +447,12 @@ export async function handleGetCalendarEvent(
       ],
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
+    const { message, detail } = extractCalendarError(error);
     logger.error('Failed to get calendar event', {
       userId: user.id,
       eventId: params.eventId,
       error: message,
+      detail,
     });
 
     return {
@@ -427,7 +462,7 @@ export async function handleGetCalendarEvent(
           text: JSON.stringify(
             {
               success: false,
-              error: message,
+              error: detail || message,
             },
             null,
             2
@@ -521,12 +556,13 @@ export async function handleRespondToCalendarEvent(
       ],
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
+    const { message, detail } = extractCalendarError(error);
     logger.error('Failed to respond to calendar event', {
       userId: user.id,
       eventId: params.eventId,
       responseStatus: params.responseStatus,
       error: message,
+      detail,
     });
 
     return {
@@ -536,7 +572,7 @@ export async function handleRespondToCalendarEvent(
           text: JSON.stringify(
             {
               success: false,
-              error: message,
+              error: detail || message,
               hint: message.includes('not listed as an attendee')
                 ? 'You can only respond to events where you are an invited attendee'
                 : message.includes('No active google account')
@@ -695,12 +731,13 @@ export async function handleUpdateCalendarEvent(
       ],
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
+    const { message, detail } = extractCalendarError(error);
     logger.error('Failed to update calendar event', {
       userId: user.id,
       eventId: params.eventId,
       attemptedFields: Object.keys(fields),
       error: message,
+      detail,
     });
 
     return {
@@ -710,7 +747,7 @@ export async function handleUpdateCalendarEvent(
           text: JSON.stringify(
             {
               success: false,
-              error: message,
+              error: detail || message,
               hint: message.includes('No active google account')
                 ? 'User needs to connect their Google account in the web dashboard'
                 : message.includes('calendar.events')
@@ -812,11 +849,12 @@ export async function handleCreateCalendarEvent(
       ],
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
+    const { message, detail } = extractCalendarError(error);
     logger.error('Failed to create calendar event', {
       userId: user.id,
       summary: params.summary,
       error: message,
+      detail,
     });
 
     return {
@@ -826,7 +864,7 @@ export async function handleCreateCalendarEvent(
           text: JSON.stringify(
             {
               success: false,
-              error: message,
+              error: detail || message,
               hint: message.includes('No active google account')
                 ? 'User needs to connect their Google account in the web dashboard'
                 : message.includes('calendar.events')
