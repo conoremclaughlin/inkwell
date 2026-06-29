@@ -139,6 +139,12 @@ export class ChannelGateway extends EventEmitter {
   private pendingVoiceReplyConversations: Set<string> = new Set();
   private conversationUserMap = new Map<string, string>(); // channel:conversationId -> userId
 
+  // Channel reconnect state
+  private channelRetryTimers = new Map<GatewayChannel, NodeJS.Timeout>();
+  private channelRetryAttempts = new Map<GatewayChannel, number>();
+  private static readonly RETRY_BASE_MS = 30_000; // 30s initial
+  private static readonly RETRY_CAP_MS = 5 * 60_000; // 5min max
+
   constructor(config: ChannelGatewayConfig = {}) {
     super();
     this.config = {
@@ -279,6 +285,13 @@ export class ChannelGateway extends EventEmitter {
 
     this.pendingVoiceReplyConversations.clear();
     this.conversationUserMap.clear();
+
+    // Cancel pending reconnect timers
+    for (const [channel, timer] of this.channelRetryTimers) {
+      clearTimeout(timer);
+      this.channelRetryTimers.delete(channel);
+    }
+    this.channelRetryAttempts.clear();
 
     // Clear all message buffers (flush them first)
     for (const [key, buffer] of this.messageBuffers) {
@@ -1406,6 +1419,78 @@ export class ChannelGateway extends EventEmitter {
   }
 
   /**
+   * Schedule a background retry for a channel that failed to start.
+   * Uses exponential backoff: 30s, 60s, 120s, ... capped at 5min.
+   */
+  private scheduleChannelRetry(channel: GatewayChannel, startFn: () => Promise<void>): void {
+    const existing = this.channelRetryTimers.get(channel);
+    if (existing) clearTimeout(existing);
+
+    const attempt = (this.channelRetryAttempts.get(channel) ?? 0) + 1;
+    this.channelRetryAttempts.set(channel, attempt);
+
+    const delay = Math.min(
+      ChannelGateway.RETRY_BASE_MS * Math.pow(2, attempt - 1),
+      ChannelGateway.RETRY_CAP_MS
+    );
+
+    logger.info(
+      `[Gateway] Scheduling ${channel} reconnect in ${Math.round(delay / 1000)}s (attempt ${attempt})`
+    );
+
+    const timer = setTimeout(async () => {
+      this.channelRetryTimers.delete(channel);
+      try {
+        await startFn.call(this);
+        this.channelRetryAttempts.delete(channel);
+        logger.info(`[Gateway] ${channel} reconnected on attempt ${attempt}`);
+      } catch {
+        // startFn already logs the error and sets listener to null;
+        // the catch in startFn calls scheduleChannelRetry again
+      }
+    }, delay);
+
+    this.channelRetryTimers.set(channel, timer);
+  }
+
+  /**
+   * Manually trigger a reconnect for a channel that failed startup.
+   * Respects a minimum 60s cooldown between manual reconnect attempts.
+   */
+  async reconnectChannel(channel: GatewayChannel): Promise<{ success: boolean; message: string }> {
+    const startFns: Record<GatewayChannel, (() => Promise<void>) | undefined> = {
+      telegram: this.startTelegram,
+      whatsapp: this.startWhatsApp,
+      discord: this.startDiscord,
+      slack: this.startSlack,
+    };
+
+    const startFn = startFns[channel];
+    if (!startFn) {
+      return { success: false, message: `Unknown channel: ${channel}` };
+    }
+
+    const existing = this.channelRetryTimers.get(channel);
+    if (existing) {
+      clearTimeout(existing);
+      this.channelRetryTimers.delete(channel);
+    }
+
+    this.channelRetryAttempts.set(channel, 0);
+
+    try {
+      await startFn.call(this);
+      this.channelRetryAttempts.delete(channel);
+      return { success: true, message: `${channel} reconnected` };
+    } catch (err) {
+      return {
+        success: false,
+        message: `${channel} reconnect failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  /**
    * Start Telegram listener
    */
   private async startTelegram(): Promise<void> {
@@ -1464,8 +1549,16 @@ export class ChannelGateway extends EventEmitter {
       this.emit('telegram:error', error);
     });
 
-    await this.telegramListener.start();
-    logger.info('Telegram listener started');
+    try {
+      await this.telegramListener.start();
+      logger.info('Telegram listener started');
+    } catch (err) {
+      logger.error('Telegram listener failed to start — server will continue without it', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.telegramListener = null;
+      this.scheduleChannelRetry('telegram', this.startTelegram);
+    }
   }
 
   /**
@@ -1532,8 +1625,16 @@ export class ChannelGateway extends EventEmitter {
       this.emit('whatsapp:error', error);
     });
 
-    await this.whatsappListener.start();
-    logger.info('WhatsApp listener started');
+    try {
+      await this.whatsappListener.start();
+      logger.info('WhatsApp listener started');
+    } catch (err) {
+      logger.error('WhatsApp listener failed to start — server will continue without it', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.whatsappListener = null;
+      this.scheduleChannelRetry('whatsapp', this.startWhatsApp);
+    }
   }
 
   /**
@@ -1591,8 +1692,16 @@ export class ChannelGateway extends EventEmitter {
       this.emit('discord:error', error);
     });
 
-    await this.discordListener.start();
-    logger.info('Discord listener started');
+    try {
+      await this.discordListener.start();
+      logger.info('Discord listener started');
+    } catch (err) {
+      logger.error('Discord listener failed to start — server will continue without it', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.discordListener = null;
+      this.scheduleChannelRetry('discord', this.startDiscord);
+    }
   }
 
   /**
@@ -1653,8 +1762,16 @@ export class ChannelGateway extends EventEmitter {
       this.emit('slack:error', error);
     });
 
-    await this.slackListener.start();
-    logger.info('Slack listener started');
+    try {
+      await this.slackListener.start();
+      logger.info('Slack listener started');
+    } catch (err) {
+      logger.error('Slack listener failed to start — server will continue without it', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.slackListener = null;
+      this.scheduleChannelRetry('slack', this.startSlack);
+    }
   }
 
   /**
