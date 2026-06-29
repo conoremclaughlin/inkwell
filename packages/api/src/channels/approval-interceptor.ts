@@ -188,23 +188,36 @@ export async function checkApprovalResponse(
     if (/^approve\s+all$/i.test(trimmed) || /^deny\s+all$/i.test(trimmed)) {
       targetRequests = pendingRequests;
     } else if (match.scope === 'agent') {
-      // "approve agent" / "approve always" — filter to same requesting agent
-      const agentId = anchorRequest?.requesting_agent_id;
-      targetRequests = agentId
-        ? pendingRequests.filter((r) => r.requesting_agent_id === agentId)
-        : pendingRequests.slice(-1); // no anchor → most recent only
+      // "approve agent" / "approve always" — filter to same requesting agent.
+      // Requires reply-to anchor so the scope is unambiguous.
+      if (!anchorRequest) {
+        // No reply-to: fall back to most recent only (single-request approval)
+        targetRequests = pendingRequests.slice(-1);
+      } else {
+        targetRequests = pendingRequests.filter(
+          (r) => r.requesting_agent_id === anchorRequest.requesting_agent_id
+        );
+      }
     } else if (match.scope === 'studio') {
-      // "approve studio" — filter to same studio
-      const studioId = anchorRequest?.studio_id;
-      targetRequests = studioId
-        ? pendingRequests.filter((r) => r.studio_id === studioId)
-        : pendingRequests.slice(-1);
+      // "approve studio" — filter to same studio.
+      // Requires reply-to anchor so the scope is unambiguous.
+      if (!anchorRequest) {
+        targetRequests = pendingRequests.slice(-1);
+      } else {
+        targetRequests = anchorRequest.studio_id
+          ? pendingRequests.filter((r) => r.studio_id === anchorRequest.studio_id)
+          : [anchorRequest];
+      }
     } else if (action === 'grant-session') {
-      // "approve session" — filter to same session
-      const sessionId = anchorRequest?.session_id;
-      targetRequests = sessionId
-        ? pendingRequests.filter((r) => r.session_id === sessionId)
-        : pendingRequests.slice(-1);
+      // "approve session" — filter to same session.
+      // Requires reply-to anchor so the scope is unambiguous.
+      if (!anchorRequest) {
+        targetRequests = pendingRequests.slice(-1);
+      } else {
+        targetRequests = anchorRequest.session_id
+          ? pendingRequests.filter((r) => r.session_id === anchorRequest.session_id)
+          : [anchorRequest];
+      }
     } else {
       targetRequests = pendingRequests;
     }

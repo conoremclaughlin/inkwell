@@ -2045,15 +2045,18 @@ async function promptForToolApproval(
   tool: string,
   reason: string,
   inkRepl?: InkRepl | null,
-  approvalChannel?: ApprovalChannel
+  approvalChannel?: ApprovalChannel,
+  args?: Record<string, unknown>
 ): Promise<boolean> {
   let choice: import('../repl/tool-approval.js').ToolApprovalChoice;
+
+  const argsDisplay = args ? sanitizeArgsForApproval(tool, args) : '';
 
   if (approvalChannel) {
     // JSONL or auto channel — structured approval protocol
     const response = await approvalChannel.requestApproval({
       tool,
-      args: {},
+      args: args ?? {},
       reason,
       sessionId,
     });
@@ -2061,20 +2064,15 @@ async function promptForToolApproval(
     choice = response.decision as import('../repl/tool-approval.js').ToolApprovalChoice;
   } else if (inkRepl) {
     // Render a visually distinct permission prompt in Ink
-    inkRepl.addMessage(
-      'system',
-      [
-        `🔐 ${tool}`,
-        reason,
-        '',
-        '[y] once · [s] session · [a] always · [d] deny · [n] cancel',
-      ].join('\n'),
-      { label: '🔐 permission' }
-    );
+    const lines = [`🔐 ${tool}`];
+    if (argsDisplay) lines.push(argsDisplay);
+    lines.push(reason, '', '[y] once · [s] session · [a] always · [d] deny · [n] cancel');
+    inkRepl.addMessage('system', lines.join('\n'), { label: '🔐 permission' });
     const answer = (await inkRepl.waitForInput()).trim();
     choice = parseToolApprovalInput(answer);
   } else if (rl) {
-    console.log(chalk.yellow(`🔐 ${tool} — ${reason}`));
+    const detail = argsDisplay ? ` (${argsDisplay})` : '';
+    console.log(chalk.yellow(`🔐 ${tool}${detail} — ${reason}`));
     const answer = (
       await rl.question(
         chalk.yellow(`Allow? [y] once, [s] session, [a] always, [d] deny, [n] cancel: `)
@@ -4056,7 +4054,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
               tool,
               reason,
               inkRepl,
-              runtime.approvalChannel
+              runtime.approvalChannel,
+              args
             );
           }
           // 2FA approval: create request on the PCP server, which sends
@@ -4094,16 +4093,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
                   grantScope === 'studio'
                     ? toolPolicy.getContext()?.studioId
                     : toolPolicy.getContext()?.agentId;
-                toolPolicy.persistentGrant(
-                  tool,
-                  scopeId ? { scope: grantScope, id: scopeId } : undefined
-                );
-                const scope = grantScope;
-                printLine(
-                  chalk.green(
-                    `✅ 2FA: ${tool} permanently approved (${scope}${scopeId ? `: ${scopeId}` : ''})`
-                  )
-                );
+                if (scopeId) {
+                  toolPolicy.persistentGrant(tool, { scope: grantScope, id: scopeId });
+                  printLine(
+                    chalk.green(`✅ 2FA: ${tool} permanently approved (${grantScope}: ${scopeId})`)
+                  );
+                } else {
+                  // Can't resolve scope — fall back to session grant instead of leaking to global
+                  if (runtime.sessionId) {
+                    toolPolicy.grantToolForSession(runtime.sessionId, tool);
+                  }
+                  printLine(
+                    chalk.yellow(
+                      `⚠️ 2FA: ${tool} approved for session only (could not resolve ${grantScope} scope)`
+                    )
+                  );
+                }
               } else if (result.action === 'grant-session') {
                 if (runtime.sessionId) {
                   toolPolicy.grantToolForSession(runtime.sessionId, tool);
