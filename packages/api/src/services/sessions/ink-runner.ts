@@ -205,6 +205,10 @@ export class InkRunner implements IRunner {
       AGENT_ID: config.agentId || '',
       // Production mode disables React Reconciler profiling (perf_hooks measure accumulation)
       NODE_ENV: 'production',
+      // Server-minted access token so the ink CLI's PcpClient can call /mcp
+      // (bootstrap, tools) without depending on the human's ~/.ink/auth.json.
+      // getValidAccessToken() checks INK_ACCESS_TOKEN before any file source.
+      ...(config.pcpAccessToken ? { INK_ACCESS_TOKEN: config.pcpAccessToken } : {}),
     } as Record<string, string>;
 
     // Strip CLAUDECODE to prevent nested-session detection
