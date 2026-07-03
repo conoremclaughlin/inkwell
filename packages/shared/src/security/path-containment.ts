@@ -10,6 +10,7 @@
 
 import { resolve, relative, dirname, basename, join } from 'path';
 import { realpathSync, existsSync } from 'fs';
+import { realpath, access } from 'fs/promises';
 
 export class PathContainmentError extends Error {
   constructor(
@@ -104,5 +105,97 @@ export function validatePathArgs(
   const pathArg = args.path ?? args.file_path ?? args.filePath;
   if (typeof pathArg === 'string' && pathArg) {
     assertContainedPath(pathArg, cwd, toolName);
+  }
+}
+
+/* ---------- Async variants (server-side — never block the event loop) ---------- */
+
+/**
+ * Async version of resolveDeepestAncestor.
+ * Walks up to the deepest existing ancestor using non-blocking fs calls,
+ * resolves its real path, then reattaches the remaining segments.
+ */
+async function resolveDeepestAncestorAsync(targetPath: string): Promise<string> {
+  const parts: string[] = [];
+  let current = targetPath;
+
+  // Walk up until we find an ancestor that exists
+  while (current !== dirname(current)) {
+    try {
+      await access(current);
+      break; // current exists
+    } catch {
+      parts.unshift(basename(current));
+      current = dirname(current);
+    }
+  }
+
+  try {
+    const realAncestor = await realpath(current);
+    return join(realAncestor, ...parts);
+  } catch {
+    return targetPath;
+  }
+}
+
+/**
+ * Async version of assertContainedPath.
+ * Same containment logic but uses non-blocking fs calls.
+ * Throws PathContainmentError if the path escapes the workspace root.
+ */
+export async function assertContainedPathAsync(
+  rawPath: string,
+  cwd: string,
+  tool: string
+): Promise<void> {
+  let realCwd: string;
+  try {
+    realCwd = await realpath(cwd);
+  } catch {
+    realCwd = cwd;
+  }
+
+  const resolved = resolve(realCwd, rawPath);
+
+  let realResolved: string;
+  try {
+    realResolved = await realpath(resolved);
+  } catch {
+    realResolved = await resolveDeepestAncestorAsync(resolved);
+  }
+
+  const rel = relative(realCwd, realResolved);
+  if (rel.startsWith('..') || resolve(realCwd, rel) !== realResolved) {
+    throw new PathContainmentError(tool, rawPath, realResolved, realCwd);
+  }
+}
+
+/**
+ * Async version of isPathWithinWorkspace.
+ * Returns false if the path escapes the workspace.
+ */
+export async function isPathWithinWorkspaceAsync(filePath: string, cwd: string): Promise<boolean> {
+  try {
+    await assertContainedPathAsync(filePath, cwd, 'check');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Async version of validatePathArgs.
+ * Validates all path-bearing arguments for a tool call without blocking.
+ */
+export async function validatePathArgsAsync(
+  toolName: string,
+  args: Record<string, unknown>,
+  cwd: string
+): Promise<void> {
+  if (!PATH_TOOLS.has(toolName)) return;
+
+  const pathArg = args.path ?? args.file_path ?? args.filePath;
+  if (typeof pathArg === 'string' && pathArg) {
+    await assertContainedPathAsync(pathArg, cwd, toolName);
   }
 }

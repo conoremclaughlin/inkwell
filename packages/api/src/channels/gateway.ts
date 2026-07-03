@@ -230,28 +230,44 @@ export class ChannelGateway extends EventEmitter {
 
     // Start Telegram listener
     if (this.config.enableTelegram) {
-      await this.startTelegram();
+      try {
+        await this.startTelegram();
+      } catch {
+        this.scheduleChannelRetry('telegram', this.startTelegram);
+      }
     } else {
       logger.info('Telegram listener disabled');
     }
 
     // Start WhatsApp listener
     if (this.config.enableWhatsApp) {
-      await this.startWhatsApp();
+      try {
+        await this.startWhatsApp();
+      } catch {
+        this.scheduleChannelRetry('whatsapp', this.startWhatsApp);
+      }
     } else {
       logger.info('WhatsApp listener disabled (set ENABLE_WHATSAPP=true to enable)');
     }
 
     // Start Discord listener
     if (this.config.enableDiscord) {
-      await this.startDiscord();
+      try {
+        await this.startDiscord();
+      } catch {
+        this.scheduleChannelRetry('discord', this.startDiscord);
+      }
     } else {
       logger.info('Discord listener disabled (set ENABLE_DISCORD=true to enable)');
     }
 
     // Start Slack listener
     if (this.config.enableSlack) {
-      await this.startSlack();
+      try {
+        await this.startSlack();
+      } catch {
+        this.scheduleChannelRetry('slack', this.startSlack);
+      }
     } else {
       logger.info('Slack listener disabled (set ENABLE_SLACK=true to enable)');
     }
@@ -1445,8 +1461,9 @@ export class ChannelGateway extends EventEmitter {
         this.channelRetryAttempts.delete(channel);
         logger.info(`[Gateway] ${channel} reconnected on attempt ${attempt}`);
       } catch {
-        // startFn already logs the error and sets listener to null;
-        // the catch in startFn calls scheduleChannelRetry again
+        // startFn logs the error and sets listener to null.
+        // Schedule the next retry attempt.
+        this.scheduleChannelRetry(channel, startFn);
       }
     }, delay);
 
@@ -1557,7 +1574,7 @@ export class ChannelGateway extends EventEmitter {
         error: err instanceof Error ? err.message : String(err),
       });
       this.telegramListener = null;
-      this.scheduleChannelRetry('telegram', this.startTelegram);
+      throw err;
     }
   }
 
@@ -1633,7 +1650,7 @@ export class ChannelGateway extends EventEmitter {
         error: err instanceof Error ? err.message : String(err),
       });
       this.whatsappListener = null;
-      this.scheduleChannelRetry('whatsapp', this.startWhatsApp);
+      throw err;
     }
   }
 
@@ -1700,7 +1717,7 @@ export class ChannelGateway extends EventEmitter {
         error: err instanceof Error ? err.message : String(err),
       });
       this.discordListener = null;
-      this.scheduleChannelRetry('discord', this.startDiscord);
+      throw err;
     }
   }
 
@@ -1770,7 +1787,7 @@ export class ChannelGateway extends EventEmitter {
         error: err instanceof Error ? err.message : String(err),
       });
       this.slackListener = null;
-      this.scheduleChannelRetry('slack', this.startSlack);
+      throw err;
     }
   }
 

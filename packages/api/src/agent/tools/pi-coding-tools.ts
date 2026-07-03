@@ -11,7 +11,7 @@ import path from 'path';
 import { existsSync } from 'fs';
 import { readdir, readFile, stat } from 'fs/promises';
 import type Anthropic from '@anthropic-ai/sdk';
-import { PathContainmentError, assertContainedPath } from '@inklabs/shared';
+import { PathContainmentError, assertContainedPathAsync } from '@inklabs/shared';
 import { logger } from '../../utils/logger';
 import { guardBashCommand } from './bash-guard';
 
@@ -310,7 +310,7 @@ export async function createInkCodingTools(
         const filePath = (params.path as string) || '';
         if (filePath) {
           try {
-            assertContainedPath(filePath, config.cwd, tool.name);
+            await assertContainedPathAsync(filePath, config.cwd, tool.name);
           } catch (err) {
             if (err instanceof PathContainmentError) {
               return `Error: Access denied — path "${filePath}" is outside workspace root "${config.cwd}"`;

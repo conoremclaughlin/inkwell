@@ -967,9 +967,8 @@ export class ToolPolicyState {
   }
 
   /**
-   * Grant a tool permanently. When a target scope is provided, adds the
-   * permanent grant ONLY at that scope and removes from promptTools at all
-   * active scopes (so the tool won't prompt anywhere). Without a scope,
+   * Grant a tool permanently. Adds the permanent grant at the target scope
+   * and removes from promptTools only at that scope. Without a scope,
    * grants at the most specific active scope (studio > agent > global).
    */
   public persistentGrant(tool: string, scope?: ToolPolicyScopeRef): void {
@@ -985,10 +984,13 @@ export class ToolPolicyState {
       }
     }
 
-    // Remove from promptTools at ALL active scopes so the tool stops prompting
-    for (const { rules } of this.getActiveScopeRules()) {
+    // Remove from promptTools ONLY at the target scope where the grant lives.
+    // Other scopes keep their promptTools entries so agents not covered by
+    // this grant still get prompted. The permanent grant overrides the prompt
+    // check for sessions where the target scope is active.
+    if (targetRules) {
       for (const key of expanded) {
-        rules.promptTools.delete(key);
+        targetRules.promptTools.delete(key);
       }
     }
 

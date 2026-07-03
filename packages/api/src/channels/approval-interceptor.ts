@@ -233,15 +233,9 @@ export async function checkApprovalResponse(
             String(r.metadata.batchMessageId) === replyToMessageId))
     );
     if (replyMatch) {
-      // If replying to a batch message, resolve all requests in that batch
-      const batchRequests = pendingRequests.filter(
-        (r) =>
-          r.metadata &&
-          typeof r.metadata === 'object' &&
-          'batchMessageId' in r.metadata &&
-          String(r.metadata.batchMessageId) === replyToMessageId
-      );
-      targetRequests = batchRequests.length > 1 ? batchRequests : [replyMatch];
+      // Bare approve/yes on a batch resolves only the single matched request.
+      // Use "approve all" or numbered "approve 1,3" for batch-wide resolution.
+      targetRequests = [replyMatch];
     } else {
       targetRequests = [pendingRequests[pendingRequests.length - 1]];
     }
