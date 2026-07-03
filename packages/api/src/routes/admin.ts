@@ -47,6 +47,8 @@ import {
   exchangeRefreshToken,
 } from '../auth/pcp-tokens';
 import type { Database } from '../data/supabase/types';
+import { activityBus } from '../services/events/activity-bus';
+import type { Activity } from '../data/repositories/activity-stream.repository';
 
 // WhatsApp listener reference (set via setWhatsAppListener)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1853,6 +1855,94 @@ router.get('/whatsapp/qr', (req: Request, res: Response) => {
     whatsAppListener.off('connected', connectedHandler);
     whatsAppListener.off('disconnected', disconnectedHandler);
     whatsAppListener.off('loggedOut', disconnectedHandler);
+  });
+});
+
+/**
+ * GET /api/admin/events
+ * Generic SSE stream of activity_stream events for the authenticated user.
+ * Filters: ?sessionId= &taskGroupId= &agentId= — optional, ANDed together.
+ * Backfill: ?since=<ISO timestamp> replays persisted rows before going live.
+ * Reconnect: Last-Event-ID header (or ?since) — clients pass the last seen
+ * activity id/timestamp to resume without gaps.
+ *
+ * Live delivery comes from the in-process activityBus (the API server is
+ * the sole writer of activity_stream). See ink://specs/live-session-experience WS1.
+ */
+router.get('/events', async (req: Request, res: Response) => {
+  const authReq = req as AdminAuthRequest;
+  const sessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId : undefined;
+  const taskGroupId = typeof req.query.taskGroupId === 'string' ? req.query.taskGroupId : undefined;
+  const agentId = typeof req.query.agentId === 'string' ? req.query.agentId : undefined;
+  const sinceRaw = typeof req.query.since === 'string' ? req.query.since : undefined;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+
+  const writeEvent = (activity: Activity): void => {
+    res.write(`id: ${activity.id}\n`);
+    res.write(`event: activity\n`);
+    res.write(`data: ${JSON.stringify(activity)}\n\n`);
+  };
+
+  // Backfill persisted rows since the cursor, oldest-first, before going live.
+  // Subscribe BEFORE the backfill query so rows logged during the query window
+  // aren't dropped; dedupe by id across the seam.
+  const seenIds = new Set<string>();
+  const buffered: Activity[] = [];
+  let backfilling = true;
+
+  const unsubscribe = activityBus.subscribe(
+    { userId: authReq.pcpUserId, sessionId, taskGroupId, agentId },
+    (activity) => {
+      if (backfilling) {
+        buffered.push(activity);
+        return;
+      }
+      if (seenIds.has(activity.id)) return;
+      writeEvent(activity);
+    }
+  );
+
+  try {
+    const since = sinceRaw ? new Date(sinceRaw) : undefined;
+    if (since && !Number.isNaN(since.getTime())) {
+      const activityRepo = (await getDataComposer()).repositories.activityStream;
+      const backfill = await activityRepo.getActivity(authReq.pcpUserId, {
+        sessionId,
+        taskGroupId,
+        agentId,
+        since,
+        limit: 500,
+      });
+      for (const activity of backfill.reverse()) {
+        seenIds.add(activity.id);
+        writeEvent(activity);
+      }
+    }
+  } catch (error) {
+    logger.error('Failed to backfill events stream:', error);
+    res.write(`event: stream_error\ndata: ${JSON.stringify({ message: 'backfill failed' })}\n\n`);
+  }
+
+  backfilling = false;
+  for (const activity of buffered) {
+    if (!seenIds.has(activity.id)) writeEvent(activity);
+  }
+  buffered.length = 0;
+  res.write(`event: ready\ndata: {}\n\n`);
+
+  // Comment heartbeat holds proxies (Next rewrites) open through idle periods.
+  const heartbeat = setInterval(() => {
+    res.write(`: heartbeat\n\n`);
+  }, 25_000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    unsubscribe();
   });
 });
 

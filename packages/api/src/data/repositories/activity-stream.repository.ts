@@ -164,7 +164,17 @@ export class ActivityStreamRepository {
       throw new Error(`Failed to log activity: ${error.message}`);
     }
 
-    return this.rowToActivity(data);
+    const activity = this.rowToActivity(data);
+
+    // Publish to the in-process bus for SSE subscribers. Lazy import breaks
+    // the repositories → services → repositories require cycle.
+    import('../../services/events/activity-bus.js')
+      .then(({ activityBus }) => activityBus.publish(activity))
+      .catch(() => {
+        // Bus delivery is best-effort; the row is already persisted.
+      });
+
+    return activity;
   }
 
   /**
