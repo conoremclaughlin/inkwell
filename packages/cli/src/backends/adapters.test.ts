@@ -260,7 +260,7 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
-  it('claude adapter adds no --add-dir without attachment directories', () => {
+  it('claude adapter adds no attachment --add-dir without attachment directories', () => {
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
       agentId: 'wren',
@@ -270,7 +270,14 @@ describe('backend adapters session resume wiring', () => {
     });
 
     try {
-      expect(prepared.args).not.toContain('--add-dir');
+      // The only --add-dir should be ~/.ink/files (if it exists on this machine).
+      // No attachment-specific dirs should appear.
+      const addDirPairs = prepared.args
+        .map((arg, i) => (arg === '--add-dir' ? prepared.args[i + 1] : null))
+        .filter(Boolean);
+      for (const dir of addDirPairs) {
+        expect(dir).toMatch(/\.ink\/files$/);
+      }
     } finally {
       prepared.cleanup();
     }
@@ -543,8 +550,12 @@ describe('backend adapters session resume wiring', () => {
       // PCP server should have auth + context headers
       expect(settings.mcpServers.inkwell).toBeDefined();
       expect(settings.mcpServers.inkwell.headers.Authorization).toBe('Bearer ${INK_ACCESS_TOKEN}');
-      expect(settings.mcpServers.inkwell.headers['x-ink-context']).toBe('${INK_CONTEXT}');
-      expect(settings.mcpServers.inkwell.headers['x-ink-session-id']).toBe('${INK_SESSION_ID}');
+      const contextToken = settings.mcpServers.inkwell.headers['x-ink-context'];
+      const decoded = JSON.parse(Buffer.from(contextToken, 'base64url').toString());
+      expect(decoded.sessionId).toBe('sess-gemini-789');
+      expect(decoded.agentId).toBe('aster');
+      expect(decoded.runtime).toBe('gemini');
+      expect(settings.mcpServers.inkwell.headers['x-ink-session-id']).toBe('sess-gemini-789');
     } finally {
       prepared.cleanup();
     }

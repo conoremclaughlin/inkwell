@@ -6924,7 +6924,8 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
 
     const expiresAt = new Date(Date.now() + timeoutSeconds * 1000).toISOString();
 
-    // Resolve requesting agent from session context header
+    // Resolve requesting agent from x-ink-context header (set by CLI hooks).
+    // This is the sole trusted identity channel — agents cannot set it themselves.
     const contextHeader = req.headers['x-ink-context'] as string | undefined;
     let requestingAgentId = 'unknown';
     if (contextHeader) {
@@ -6934,6 +6935,13 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
       } catch {
         // fall through
       }
+    }
+    if (requestingAgentId === 'unknown') {
+      logger.warn('Approval request with unknown agent — missing x-ink-context header', {
+        tool,
+        studioId,
+        sessionId,
+      });
     }
 
     // studio_id is a UUID column. The CLI sends the literal string "main"

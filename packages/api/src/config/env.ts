@@ -211,6 +211,11 @@ const envSchema = z.object({
   OLLAMA_BASE_URL: optionalUrl,
   OPENAI_API_KEY: optionalString,
   OPENAI_BASE_URL: optionalUrl,
+
+  // Default model overrides for spawned SB sessions (e.g. "claude-opus-4-6")
+  DEFAULT_CLAUDE_MODEL: optionalString,
+  DEFAULT_CODEX_MODEL: optionalString,
+  DEFAULT_GEMINI_MODEL: optionalString,
 });
 
 // Parse and validate environment variables

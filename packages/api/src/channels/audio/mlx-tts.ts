@@ -29,7 +29,7 @@ import type { TextToSpeechProvider, TextToSpeechInput, SynthesizedAudio } from '
 const execFileAsync = promisify(execFile);
 
 export const DEFAULT_MLX_TTS_MODEL = 'mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit';
-export const DEFAULT_MLX_TTS_VOICE = 'serena';
+export const DEFAULT_MLX_TTS_VOICE = 'vivian';
 
 /** Python interpreters checked for an importable mlx_audio, in order. */
 export function mlxPythonCandidates(): string[] {
@@ -142,12 +142,19 @@ export class MlxAudioTextToSpeechProvider implements TextToSpeechProvider {
     const python = await this.resolvePython();
     if (!python) return undefined;
 
+    const voice = input.voice || this.voice;
     const outputDir = await mkdtemp(join(tmpdir(), 'ink-mlx-tts-'));
     const cleanup = async () => {
       await rm(outputDir, { recursive: true, force: true }).catch(() => undefined);
     };
 
     try {
+      logger.info('MLX TTS synthesizing', {
+        model: this.model,
+        voice,
+        inputChars: text.length,
+        python,
+      });
       await this.runProcess(
         python,
         [
@@ -158,7 +165,7 @@ export class MlxAudioTextToSpeechProvider implements TextToSpeechProvider {
           '--text',
           text,
           '--voice',
-          this.voice,
+          voice,
           '--output_path',
           outputDir,
           '--file_prefix',

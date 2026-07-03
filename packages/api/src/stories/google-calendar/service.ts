@@ -18,6 +18,36 @@ import type {
   CreateEventOptions,
 } from './types';
 
+/**
+ * Convert a bare YYYY-MM-DD date to an RFC 3339 timestamp at midnight in the
+ * given IANA timezone. Already-qualified timestamps pass through unchanged.
+ */
+function bareDateToRfc3339(date: string, timezone: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return date;
+
+  // Intl.DateTimeFormat resolves the UTC offset for a given date + timezone.
+  // We construct midnight local, then compute the UTC equivalent.
+  const midnight = new Date(`${date}T00:00:00`);
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+    timeZoneName: 'longOffset',
+  });
+  const parts = formatter.formatToParts(midnight);
+  const offsetPart = parts.find((p) => p.type === 'timeZoneName');
+  // offsetPart.value is like "GMT-07:00" or "GMT+01:00" or "GMT"
+  const offsetStr = offsetPart?.value?.replace('GMT', '') || '+00:00';
+  const offset = offsetStr === '' ? '+00:00' : offsetStr;
+
+  return `${date}T00:00:00${offset}`;
+}
+
 export class GoogleCalendarService {
   private oauthService = getOAuthService();
 
@@ -73,6 +103,7 @@ export class GoogleCalendarService {
       query,
       singleEvents = true,
       orderBy = 'startTime',
+      timezone = 'UTC',
     } = options;
 
     logger.info('Fetching calendar events', {
@@ -80,13 +111,14 @@ export class GoogleCalendarService {
       calendarId,
       startDate,
       endDate,
+      timezone,
       maxResults,
     });
 
     const response = await calendar.events.list({
       calendarId,
-      timeMin: startDate,
-      timeMax: endDate,
+      timeMin: bareDateToRfc3339(startDate, timezone),
+      timeMax: bareDateToRfc3339(endDate, timezone),
       maxResults,
       q: query,
       singleEvents,

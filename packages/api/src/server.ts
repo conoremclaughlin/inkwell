@@ -135,6 +135,9 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     mcpConfigPath,
     compactionThreshold: config.compactionThreshold || 150000,
     responseHandler: async (responses) => routeResponses(responses),
+    ...(env.DEFAULT_CLAUDE_MODEL ? { defaultModel: env.DEFAULT_CLAUDE_MODEL } : {}),
+    ...(env.DEFAULT_CODEX_MODEL ? { defaultCodexModel: env.DEFAULT_CODEX_MODEL } : {}),
+    ...(env.DEFAULT_GEMINI_MODEL ? { defaultGeminiModel: env.DEFAULT_GEMINI_MODEL } : {}),
   };
   sessionService = createSessionService(dataComposer.getClient(), sessionServiceConfig);
   logger.info('SessionService ready');
@@ -540,13 +543,22 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
             deliveryTarget: reminder.delivery_target,
           });
         }
-        if (route.activeSessionId) {
+        if (route.activeSessionId && route.agentId === reminderAgentId) {
           routeActiveSessionId = route.activeSessionId;
           logger.info(`[Heartbeat] Using active_session_id from channel_route`, {
             activeSessionId: routeActiveSessionId,
             deliveryChannel: reminder.delivery_channel,
             reminderId: reminder.id,
           });
+        } else if (route.activeSessionId && route.agentId !== reminderAgentId) {
+          logger.debug(
+            `[Heartbeat] Ignoring active_session_id — route agent ${route.agentId} ≠ reminder agent ${reminderAgentId}`,
+            {
+              routeAgentId: route.agentId,
+              reminderAgentId,
+              activeSessionId: route.activeSessionId,
+            }
+          );
         }
       }
     }

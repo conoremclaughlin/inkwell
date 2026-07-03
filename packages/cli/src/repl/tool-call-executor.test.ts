@@ -74,7 +74,9 @@ describe('executeToolCalls', () => {
     expect(results).toHaveLength(1);
     expect(results[0].status).toBe('approved');
     expect(results[0].result).toEqual({ success: true });
-    expect(deps.promptForApproval).toHaveBeenCalledWith('send_to_inbox', 'Requires approval');
+    expect(deps.promptForApproval).toHaveBeenCalledWith('send_to_inbox', 'Requires approval', {
+      content: 'hi',
+    });
     expect(deps.callTool).toHaveBeenCalledWith('send_to_inbox', { content: 'hi' });
   });
 
@@ -200,5 +202,105 @@ describe('executeToolCalls', () => {
     const results = await executeToolCalls([], deps);
     expect(results).toEqual([]);
     expect(deps.callTool).not.toHaveBeenCalled();
+  });
+
+  describe('Pi coding tools through policy', () => {
+    it('allows read tools when policy allows them', async () => {
+      const canCallPcpTool = vi.fn().mockImplementation((tool: string) => {
+        if (['read', 'grep', 'find', 'ls'].includes(tool)) {
+          return { allowed: true, reason: 'Allowed by group:read' };
+        }
+        return { allowed: false, promptable: false, reason: 'Blocked' };
+      });
+
+      const deps = makeDeps({
+        policy: { canCallPcpTool } as unknown as ToolCallExecutorDeps['policy'],
+      });
+
+      const results = await executeToolCalls(
+        [makeCall('read', { file_path: '/tmp/test.ts' })],
+        deps
+      );
+
+      expect(results).toHaveLength(1);
+      expect(results[0].status).toBe('executed');
+      expect(canCallPcpTool).toHaveBeenCalledWith('read', 'session-1');
+    });
+
+    it('prompts for write tools under safe profile', async () => {
+      const canCallPcpTool = vi
+        .fn()
+        .mockReturnValueOnce({
+          allowed: false,
+          promptable: true,
+          reason: 'Tool requires explicit per-call confirmation by policy.',
+        })
+        .mockReturnValueOnce({ allowed: true, reason: 'Grant applied' });
+
+      const deps = makeDeps({
+        policy: { canCallPcpTool } as unknown as ToolCallExecutorDeps['policy'],
+        promptForApproval: vi.fn().mockResolvedValue(true),
+      });
+
+      const results = await executeToolCalls([makeCall('bash', { command: 'echo hello' })], deps);
+
+      expect(results).toHaveLength(1);
+      expect(results[0].status).toBe('approved');
+      expect(deps.promptForApproval).toHaveBeenCalledWith(
+        'bash',
+        'Tool requires explicit per-call confirmation by policy.',
+        { command: 'echo hello' }
+      );
+    });
+
+    it('blocks write tools under minimal profile (not promptable)', async () => {
+      const deps = makeDeps({
+        policy: {
+          canCallPcpTool: vi.fn().mockReturnValue({
+            allowed: false,
+            promptable: false,
+            reason: 'Tool is explicitly denied by policy.',
+          }),
+        } as unknown as ToolCallExecutorDeps['policy'],
+      });
+
+      const results = await executeToolCalls(
+        [makeCall('edit', { file_path: '/tmp/f.ts', old_string: 'a', new_string: 'b' })],
+        deps
+      );
+
+      expect(results).toHaveLength(1);
+      expect(results[0].status).toBe('blocked');
+      expect(deps.callTool).not.toHaveBeenCalled();
+      expect(deps.promptForApproval).not.toHaveBeenCalled();
+    });
+
+    it('mixed read + write calls with safe profile', async () => {
+      let callCount = 0;
+      const canCallPcpTool = vi.fn().mockImplementation((tool: string) => {
+        callCount++;
+        if (tool === 'read') return { allowed: true, reason: 'group:read' };
+        if (tool === 'bash') {
+          if (callCount <= 2) return { allowed: false, promptable: true, reason: 'group:write' };
+          return { allowed: true, reason: 'Grant applied' };
+        }
+        return { allowed: true, reason: '' };
+      });
+
+      const deps = makeDeps({
+        policy: { canCallPcpTool } as unknown as ToolCallExecutorDeps['policy'],
+        promptForApproval: vi.fn().mockResolvedValue(true),
+      });
+
+      const results = await executeToolCalls(
+        [makeCall('read', { file_path: '/tmp/test.ts' }), makeCall('bash', { command: 'echo hi' })],
+        deps
+      );
+
+      expect(results).toHaveLength(2);
+      expect(results[0].status).toBe('executed');
+      expect(results[1].status).toBe('approved');
+      expect(deps.promptForApproval).toHaveBeenCalledTimes(1);
+    });
   });
 });

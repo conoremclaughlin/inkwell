@@ -92,6 +92,20 @@ describe('InkRunner', () => {
 
       expect(args).not.toContain('--attach-file');
     });
+
+    it('uses --profile safe --away instead of --approval-mode auto-approve', () => {
+      const runner = new InkRunner();
+      const args = (runner as any).buildArgs('session-policy', {
+        workingDirectory: '/tmp',
+        agentId: 'myra',
+      });
+
+      expect(args).toContain('--profile');
+      expect(args).toContain('safe');
+      expect(args).toContain('--away');
+      expect(args).not.toContain('--approval-mode');
+      expect(args).not.toContain('auto-approve');
+    });
   });
 
   describe('parseOutput', () => {

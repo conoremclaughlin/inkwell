@@ -305,7 +305,7 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
           onShowToolCalls={handleShowToolCalls}
           waitingElement={
             waiting ? (
-              <Box paddingX={1}>
+              <Box paddingLeft={3} marginTop={1} marginBottom={1}>
                 <Text color="cyan">{SPINNER_CHAR + ' '}</Text>
                 <Text dimColor>{waitingVerb}...</Text>
               </Box>

@@ -64,12 +64,27 @@ export class PcpClient {
       return result;
     }
 
+    // callToolJsonRpc returns null in two cases: no access token, or the
+    // server doesn't serve /mcp. Surface the auth case directly — falling
+    // through to the legacy endpoint just produces a misleading 404.
+    this.reloadConfig();
+    const hasToken = Boolean(await this.ensureAccessToken());
+    if (!hasToken) {
+      throw new Error(
+        `Not authenticated with PCP server at ${this.baseUrl} (no ~/.ink/auth.json token).\n` +
+          `Run: INK_SERVER_URL=${this.baseUrl} ink auth login`
+      );
+    }
+
     // Fallback for local/dev flows.
     try {
       return await this.callToolLegacy(tool, args);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (message.includes('Cannot POST /api/mcp/call') || message.includes('legacy tool call failed (404)')) {
+      if (
+        message.includes('Cannot POST /api/mcp/call') ||
+        message.includes('legacy tool call failed (404)')
+      ) {
         throw new Error(
           `PCP server at ${this.baseUrl} does not expose legacy /api/mcp/call.\n` +
             `Run 'ink auth login' and ensure INK_SERVER_URL points to the same server.\n` +
@@ -129,9 +144,10 @@ export class PcpClient {
     return refreshed?.accessToken || this.config.accessToken || null;
   }
 
-  private async refreshAccessToken(): Promise<
-    { accessToken: string; tokenExpiresAt: string } | null
-  > {
+  private async refreshAccessToken(): Promise<{
+    accessToken: string;
+    tokenExpiresAt: string;
+  } | null> {
     if (!this.config.refreshToken) return null;
 
     const clientId = this.getClientId();

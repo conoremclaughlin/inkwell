@@ -2205,8 +2205,19 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (token) headers.Authorization = `Bearer ${token}`;
 
-  // Forward context header so server knows the agent/studio
-  const contextToken = process.env.INK_CONTEXT?.trim();
+  // Forward context header so server knows the agent/studio.
+  // If INK_CONTEXT isn't set (interactive session, not spawned by runner),
+  // synthesize a minimal token from available identity info.
+  let contextToken = process.env.INK_CONTEXT?.trim();
+  if (!contextToken) {
+    const agentId = resolveAgentId();
+    if (agentId) {
+      const { studioId: ctxStudioId } = getIdentitySessionContext(cwd);
+      contextToken = Buffer.from(
+        JSON.stringify({ agentId, studioId: ctxStudioId || 'main', cliAttached: true })
+      ).toString('base64url');
+    }
+  }
   if (contextToken) headers['x-ink-context'] = contextToken;
 
   const sessionId = process.env.INK_SESSION_ID?.trim() || undefined;
@@ -2220,7 +2231,7 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
       body: JSON.stringify({
         tool: toolName,
         args: toolInput,
-        reason: `Tool requires 2FA approval`,
+        reason: 'Tool requires explicit per-call confirmation by policy.',
         studioId,
         sessionId,
         timeoutSeconds: 300,

@@ -52,13 +52,14 @@ export interface CalendarInfo {
 }
 
 export interface ListEventsOptions {
-  startDate: string; // ISO 8601
-  endDate: string; // ISO 8601
+  startDate: string; // ISO 8601 or bare YYYY-MM-DD
+  endDate: string; // ISO 8601 or bare YYYY-MM-DD
   calendarId?: string; // Defaults to 'primary'
   maxResults?: number; // Defaults to 10
   query?: string; // Free text search
   singleEvents?: boolean; // Expand recurring events
   orderBy?: 'startTime' | 'updated';
+  timezone?: string; // IANA timezone for bare-date resolution
 }
 
 export interface GetEventOptions {

@@ -139,6 +139,12 @@ export class ChannelGateway extends EventEmitter {
   private pendingVoiceReplyConversations: Set<string> = new Set();
   private conversationUserMap = new Map<string, string>(); // channel:conversationId -> userId
 
+  // Channel reconnect state
+  private channelRetryTimers = new Map<GatewayChannel, NodeJS.Timeout>();
+  private channelRetryAttempts = new Map<GatewayChannel, number>();
+  private static readonly RETRY_BASE_MS = 30_000; // 30s initial
+  private static readonly RETRY_CAP_MS = 5 * 60_000; // 5min max
+
   constructor(config: ChannelGatewayConfig = {}) {
     super();
     this.config = {
@@ -224,28 +230,44 @@ export class ChannelGateway extends EventEmitter {
 
     // Start Telegram listener
     if (this.config.enableTelegram) {
-      await this.startTelegram();
+      try {
+        await this.startTelegram();
+      } catch {
+        this.scheduleChannelRetry('telegram', this.startTelegram);
+      }
     } else {
       logger.info('Telegram listener disabled');
     }
 
     // Start WhatsApp listener
     if (this.config.enableWhatsApp) {
-      await this.startWhatsApp();
+      try {
+        await this.startWhatsApp();
+      } catch {
+        this.scheduleChannelRetry('whatsapp', this.startWhatsApp);
+      }
     } else {
       logger.info('WhatsApp listener disabled (set ENABLE_WHATSAPP=true to enable)');
     }
 
     // Start Discord listener
     if (this.config.enableDiscord) {
-      await this.startDiscord();
+      try {
+        await this.startDiscord();
+      } catch {
+        this.scheduleChannelRetry('discord', this.startDiscord);
+      }
     } else {
       logger.info('Discord listener disabled (set ENABLE_DISCORD=true to enable)');
     }
 
     // Start Slack listener
     if (this.config.enableSlack) {
-      await this.startSlack();
+      try {
+        await this.startSlack();
+      } catch {
+        this.scheduleChannelRetry('slack', this.startSlack);
+      }
     } else {
       logger.info('Slack listener disabled (set ENABLE_SLACK=true to enable)');
     }
@@ -279,6 +301,13 @@ export class ChannelGateway extends EventEmitter {
 
     this.pendingVoiceReplyConversations.clear();
     this.conversationUserMap.clear();
+
+    // Cancel pending reconnect timers
+    for (const [channel, timer] of this.channelRetryTimers) {
+      clearTimeout(timer);
+      this.channelRetryTimers.delete(channel);
+    }
+    this.channelRetryAttempts.clear();
 
     // Clear all message buffers (flush them first)
     for (const [key, buffer] of this.messageBuffers) {
@@ -1377,7 +1406,12 @@ export class ChannelGateway extends EventEmitter {
     if (!this.textToSpeech.isEnabled()) return false;
     if (!this.shouldUseVoiceReply(response)) return false;
 
-    const audio = await this.textToSpeech.synthesize({ text: response.content });
+    const metadata = response.metadata as Record<string, unknown> | undefined;
+    const voiceOverride = typeof metadata?.ttsVoice === 'string' ? metadata.ttsVoice : undefined;
+    const audio = await this.textToSpeech.synthesize({
+      text: response.content,
+      voice: voiceOverride,
+    });
     if (!audio) return false;
 
     try {
@@ -1397,6 +1431,79 @@ export class ChannelGateway extends EventEmitter {
       await audio.cleanup().catch((cleanupError) => {
         logger.debug('Failed to clean up synthesized audio file', cleanupError);
       });
+    }
+  }
+
+  /**
+   * Schedule a background retry for a channel that failed to start.
+   * Uses exponential backoff: 30s, 60s, 120s, ... capped at 5min.
+   */
+  private scheduleChannelRetry(channel: GatewayChannel, startFn: () => Promise<void>): void {
+    const existing = this.channelRetryTimers.get(channel);
+    if (existing) clearTimeout(existing);
+
+    const attempt = (this.channelRetryAttempts.get(channel) ?? 0) + 1;
+    this.channelRetryAttempts.set(channel, attempt);
+
+    const delay = Math.min(
+      ChannelGateway.RETRY_BASE_MS * Math.pow(2, attempt - 1),
+      ChannelGateway.RETRY_CAP_MS
+    );
+
+    logger.info(
+      `[Gateway] Scheduling ${channel} reconnect in ${Math.round(delay / 1000)}s (attempt ${attempt})`
+    );
+
+    const timer = setTimeout(async () => {
+      this.channelRetryTimers.delete(channel);
+      try {
+        await startFn.call(this);
+        this.channelRetryAttempts.delete(channel);
+        logger.info(`[Gateway] ${channel} reconnected on attempt ${attempt}`);
+      } catch {
+        // startFn logs the error and sets listener to null.
+        // Schedule the next retry attempt.
+        this.scheduleChannelRetry(channel, startFn);
+      }
+    }, delay);
+
+    this.channelRetryTimers.set(channel, timer);
+  }
+
+  /**
+   * Manually trigger a reconnect for a channel that failed startup.
+   * Respects a minimum 60s cooldown between manual reconnect attempts.
+   */
+  async reconnectChannel(channel: GatewayChannel): Promise<{ success: boolean; message: string }> {
+    const startFns: Record<GatewayChannel, (() => Promise<void>) | undefined> = {
+      telegram: this.startTelegram,
+      whatsapp: this.startWhatsApp,
+      discord: this.startDiscord,
+      slack: this.startSlack,
+    };
+
+    const startFn = startFns[channel];
+    if (!startFn) {
+      return { success: false, message: `Unknown channel: ${channel}` };
+    }
+
+    const existing = this.channelRetryTimers.get(channel);
+    if (existing) {
+      clearTimeout(existing);
+      this.channelRetryTimers.delete(channel);
+    }
+
+    this.channelRetryAttempts.set(channel, 0);
+
+    try {
+      await startFn.call(this);
+      this.channelRetryAttempts.delete(channel);
+      return { success: true, message: `${channel} reconnected` };
+    } catch (err) {
+      return {
+        success: false,
+        message: `${channel} reconnect failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
     }
   }
 
@@ -1459,8 +1566,16 @@ export class ChannelGateway extends EventEmitter {
       this.emit('telegram:error', error);
     });
 
-    await this.telegramListener.start();
-    logger.info('Telegram listener started');
+    try {
+      await this.telegramListener.start();
+      logger.info('Telegram listener started');
+    } catch (err) {
+      logger.error('Telegram listener failed to start — server will continue without it', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.telegramListener = null;
+      throw err;
+    }
   }
 
   /**
@@ -1527,8 +1642,16 @@ export class ChannelGateway extends EventEmitter {
       this.emit('whatsapp:error', error);
     });
 
-    await this.whatsappListener.start();
-    logger.info('WhatsApp listener started');
+    try {
+      await this.whatsappListener.start();
+      logger.info('WhatsApp listener started');
+    } catch (err) {
+      logger.error('WhatsApp listener failed to start — server will continue without it', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.whatsappListener = null;
+      throw err;
+    }
   }
 
   /**
@@ -1586,8 +1709,16 @@ export class ChannelGateway extends EventEmitter {
       this.emit('discord:error', error);
     });
 
-    await this.discordListener.start();
-    logger.info('Discord listener started');
+    try {
+      await this.discordListener.start();
+      logger.info('Discord listener started');
+    } catch (err) {
+      logger.error('Discord listener failed to start — server will continue without it', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.discordListener = null;
+      throw err;
+    }
   }
 
   /**
@@ -1648,8 +1779,16 @@ export class ChannelGateway extends EventEmitter {
       this.emit('slack:error', error);
     });
 
-    await this.slackListener.start();
-    logger.info('Slack listener started');
+    try {
+      await this.slackListener.start();
+      logger.info('Slack listener started');
+    } catch (err) {
+      logger.error('Slack listener failed to start — server will continue without it', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.slackListener = null;
+      throw err;
+    }
   }
 
   /**

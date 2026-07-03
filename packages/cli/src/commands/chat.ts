@@ -65,7 +65,9 @@ import {
 import { SbHookRegistry } from '../repl/hook-registry.js';
 import { registerBuiltinHooks } from '../repl/builtin-hooks.js';
 import { applyProfile, formatProfileList, isValidProfileId } from '../repl/tool-profiles.js';
+import { isPiTool, callPiTool } from '../repl/pi-tools.js';
 import { ApprovalRequestManager } from '../repl/approval-request.js';
+import { requestToolApproval } from '../repl/approval-api.js';
 import {
   type ApprovalChannel,
   type ApprovalResponseDecision,
@@ -139,6 +141,7 @@ type ChatOptions = {
   fullscreen?: boolean;
   dynamic?: boolean;
   approvalMode?: string;
+  away?: boolean;
 };
 
 interface InboxMessage {
@@ -2011,6 +2014,30 @@ function pickLatestSession(
   })[0];
 }
 
+function sanitizeArgsForApproval(tool: string, args: Record<string, unknown>): string {
+  const policyName = tool.replace(/^mcp__inkwell__/, '');
+  switch (policyName) {
+    case 'bash':
+      return typeof args.command === 'string' ? args.command.slice(0, 500) : '';
+    case 'write':
+    case 'edit': {
+      const path = (args.path ?? args.file_path ?? args.filePath) as string | undefined;
+      return path ? path.slice(0, 200) : '';
+    }
+    case 'read':
+    case 'ls':
+    case 'grep':
+    case 'find': {
+      const path = (args.path ?? args.file_path ?? args.filePath ?? args.pattern) as
+        | string
+        | undefined;
+      return path ? path.slice(0, 200) : '';
+    }
+    default:
+      return '';
+  }
+}
+
 async function promptForToolApproval(
   rl: ReturnType<typeof createInterface> | null,
   toolPolicy: ToolPolicyState,
@@ -2018,15 +2045,18 @@ async function promptForToolApproval(
   tool: string,
   reason: string,
   inkRepl?: InkRepl | null,
-  approvalChannel?: ApprovalChannel
+  approvalChannel?: ApprovalChannel,
+  args?: Record<string, unknown>
 ): Promise<boolean> {
   let choice: import('../repl/tool-approval.js').ToolApprovalChoice;
+
+  const argsDisplay = args ? sanitizeArgsForApproval(tool, args) : '';
 
   if (approvalChannel) {
     // JSONL or auto channel — structured approval protocol
     const response = await approvalChannel.requestApproval({
       tool,
-      args: {},
+      args: args ?? {},
       reason,
       sessionId,
     });
@@ -2034,20 +2064,15 @@ async function promptForToolApproval(
     choice = response.decision as import('../repl/tool-approval.js').ToolApprovalChoice;
   } else if (inkRepl) {
     // Render a visually distinct permission prompt in Ink
-    inkRepl.addMessage(
-      'system',
-      [
-        `🔐 ${tool}`,
-        reason,
-        '',
-        '[y] once · [s] session · [a] always · [d] deny · [n] cancel',
-      ].join('\n'),
-      { label: '🔐 permission' }
-    );
+    const lines = [`🔐 ${tool}`];
+    if (argsDisplay) lines.push(argsDisplay);
+    lines.push(reason, '', '[y] once · [s] session · [a] always · [d] deny · [n] cancel');
+    inkRepl.addMessage('system', lines.join('\n'), { label: '🔐 permission' });
     const answer = (await inkRepl.waitForInput()).trim();
     choice = parseToolApprovalInput(answer);
   } else if (rl) {
-    console.log(chalk.yellow(`🔐 ${tool} — ${reason}`));
+    const detail = argsDisplay ? ` (${argsDisplay})` : '';
+    console.log(chalk.yellow(`🔐 ${tool}${detail} — ${reason}`));
     const answer = (
       await rl.question(
         chalk.yellow(`Allow? [y] once, [s] session, [a] always, [d] deny, [n] cancel: `)
@@ -2160,7 +2185,7 @@ function buildPromptEnvelope(
 
   const toolInstruction =
     runtime.toolRouting === 'local'
-      ? 'IMPORTANT: To call Inkwell tools (get_inbox, recall, remember, list_tasks, send_response, etc.), you MUST emit fenced code blocks in this exact format:\n\n```ink-tool\n{"tool":"tool_name","args":{}}\n```\n\nDo NOT use ToolSearch, mcp__inkwell__*, or native MCP tool calling for Inkwell tools — those will not work in this runtime. Only the fenced block format above will execute Inkwell tools. You can emit multiple ink-tool blocks in one response.\n\nClient-local tools (also via ink-tool blocks, no server round-trip):\n- list_context: Introspect your context window — see all entries with IDs, token counts, sources, and previews.\n- evict_context: Remove specific entries from your context to reclaim tokens. Args: entryIds (number[]), source (string), or role (string).\n- signal_status: Signal your session status. Args: status ("completed" | "blocked" | "continuing"), reason (string, optional). Use this at the end of your work to tell the runtime whether you are done, blocked on something, or need another turn.'
+      ? 'IMPORTANT: To call tools, you MUST emit fenced code blocks in this exact format:\n\n```ink-tool\n{"tool":"tool_name","args":{}}\n```\n\nDo NOT use ToolSearch, mcp__inkwell__*, or native MCP tool calling — those will not work in this runtime. Only the fenced block format above will execute tools. You can emit multiple ink-tool blocks in one response.\n\nInkwell tools (server round-trip): get_inbox, recall, remember, list_tasks, send_response, save_link, create_task, update_session_state, bootstrap, etc.\n\nCoding tools (in-process, scoped to working directory):\n- read: Read a file. Args: path (string), offset (number, optional), limit (number, optional).\n- edit: Edit a file by find-and-replace. Args: path (string), edits (array of {oldText, newText}).\n- write: Create or overwrite a file. Args: path (string), content (string).\n- bash: Execute a shell command. Args: command (string), timeout (number, optional).\n- grep: Search file contents. Args: pattern (string), path (string, optional), include (string, optional).\n- find: Find files by name/pattern. Args: pattern (string), path (string, optional).\n- ls: List directory contents. Args: path (string, optional).\n\nClient-local tools (no server round-trip):\n- list_context: Introspect your context window — see all entries with IDs, token counts, sources, and previews.\n- evict_context: Remove specific entries from your context to reclaim tokens. Args: entryIds (number[]), source (string), or role (string).\n- signal_status: Signal your session status. Args: status ("completed" | "blocked" | "continuing"), reason (string, optional). Use this at the end of your work to tell the runtime whether you are done, blocked on something, or need another turn.'
       : runtime.toolMode === 'off'
         ? 'Do not call backend-native tools. Provide reasoning and instructions only.'
         : runtime.toolMode === 'privileged'
@@ -2267,7 +2292,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     showSessionsWatch: false,
     eventPolling: true,
     autoRunInbox: options.autoRun ?? false,
-    awayMode: false,
+    awayMode: options.away ?? false,
     transcriptPath: ensureRuntimeTranscriptPath(),
     activeSkills: [],
     strictTools: options.sbStrictTools ?? persisted?.strictTools ?? false,
@@ -2280,7 +2305,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           : options.nonInteractive || options.message
             ? options.profile === 'full'
               ? 'auto-approve' // --profile full + non-interactive = trust all tools
-              : 'auto-deny'
+              : options.away
+                ? 'interactive' // --away + non-interactive = route approvals to inbox
+                : 'auto-deny'
             : 'interactive',
   };
   // Resolve --sender or --contact-id for per-sender session isolation
@@ -3914,7 +3941,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       consecutiveBackendFailures += 1;
     }
 
-    // Log backend CLI turn completion to activity stream
+    // Log backend CLI turn completion to activity stream.
+    // Use 'ink' as the runner label (not the LLM backend like 'claude')
+    // so the mission feed shows the correct execution layer.
     if (runtime.sessionId) {
       const turnStatus = runResult.success ? 'completed' : 'failed';
       const cliErrorClassification = !runResult.success
@@ -3925,18 +3954,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
           })
         : null;
 
+      const runnerLabel = 'ink';
       pcp
         .callTool('log_activity', {
           agentId,
           type: runResult.success ? 'agent_complete' : 'error',
-          subtype: `backend_cli:${runtime.backend}`,
+          subtype: `backend_cli:${runnerLabel}`,
           content: runResult.success
-            ? `Backend turn completed (${runtime.backend}, ${turnDurationSeconds}s)`
-            : `Backend turn failed (${runtime.backend}, ${cliErrorClassification?.category || 'exit ' + runResult.exitCode}): ${cliErrorClassification?.summary || runResult.stderr.slice(0, 200) || 'unknown error'}`,
+            ? `Backend turn completed (${runnerLabel}, ${turnDurationSeconds}s)`
+            : `Backend turn failed (${runnerLabel}, ${cliErrorClassification?.category || 'exit ' + runResult.exitCode}): ${cliErrorClassification?.summary || runResult.stderr.slice(0, 200) || 'unknown error'}`,
           sessionId: runtime.sessionId,
           status: turnStatus,
           payload: {
-            backend: runtime.backend,
+            backend: runnerLabel,
             exitCode: runResult.exitCode,
             durationMs: turnDurationSeconds * 1000,
             studioId: runtime.studioId,
@@ -3991,6 +4021,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
             const result = handleClientLocalTool(tool, args, ledger);
             if (result) return Promise.resolve(result);
           }
+          // Pi coding tools (read, edit, write, bash, grep, find, ls) execute
+          // in-process via @mariozechner/pi-coding-agent, scoped to cwd
+          if (isPiTool(tool)) {
+            return callPiTool(tool, args, process.cwd());
+          }
           // Resolve credential references ($VAR / ${VAR}) in tool args.
           // The LLM emits references; actual values are injected here at the
           // execution layer so credentials never enter transcripts or context.
@@ -4010,7 +4045,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           return pcp.callTool(bareTool, resolvedArgs);
         },
         sessionId: runtime.sessionId,
-        promptForApproval: async (tool, reason) => {
+        promptForApproval: async (tool, reason, args) => {
           if (!runtime.awayMode) {
             return promptForToolApproval(
               rl,
@@ -4019,52 +4054,82 @@ export async function runChat(options: ChatOptions): Promise<void> {
               tool,
               reason,
               inkRepl,
-              runtime.approvalChannel
+              runtime.approvalChannel,
+              args
             );
           }
-          // Remote approval: register request, send to inbox, wait for resolution
-          const { request, promise } = approvalManager.register(tool, {}, reason);
-          printLine(
-            chalk.yellow(`⏳ Awaiting remote approval for ${tool} (${request.id.slice(0, 8)}…)`)
-          );
+          // 2FA approval: create request on the PCP server, which sends
+          // notifications to the user's connected platforms (Telegram, etc.).
+          // The server handles all routing — we just poll for the result.
+          printLine(chalk.yellow(`⏳ Requesting 2FA approval for ${tool}…`));
+          // Sanitize args for the notification — show command/path but redact large content
+          const sanitizedArgs = args ? sanitizeArgsForApproval(tool, args) : undefined;
           try {
-            await pcp.callTool('send_to_inbox', {
-              recipientAgentId: agentId,
-              senderAgentId: agentId,
-              content: `🔐 Tool approval needed: **${tool}**\n\nReason: ${reason}\n\nReply with a permission_grant to approve or deny.\nRequest ID: ${request.id}`,
-              messageType: 'notification',
-              metadata: { approvalRequestId: request.id, tool },
-              ...(runtime.threadKey ? { threadKey: runtime.threadKey } : {}),
-              trigger: false,
-            });
-          } catch {
-            printLine(
-              chalk.yellow('Failed to send remote approval request — falling back to local prompt')
-            );
-            approvalManager.expire(request.id);
-            return promptForToolApproval(
-              rl,
-              toolPolicy,
-              runtime.sessionId,
+            const result = await requestToolApproval({
               tool,
+              args: sanitizedArgs,
               reason,
-              inkRepl,
-              runtime.approvalChannel
-            );
-          }
-          const response = await promise;
-          if (response.decision === 'approved') {
-            printLine(
-              chalk.green(
-                `✅ Remote approval granted for ${tool}${response.resolvedBy ? ` by ${response.resolvedBy}` : ''}`
-              )
-            );
-            return true;
-          } else if (response.decision === 'timeout') {
-            printLine(chalk.yellow(`⏰ Remote approval timed out for ${tool}`));
-            return false;
-          } else {
-            printLine(chalk.yellow(`🚫 Remote approval denied for ${tool}`));
+              sessionId: runtime.sessionId,
+              studioId: runtime.studioId,
+              onCreated: (id) => {
+                printLine(
+                  chalk.yellow(`   Request ${id.slice(0, 8)}… sent to connected platforms`)
+                );
+              },
+            });
+
+            if (result.status === 'granted') {
+              // Apply persistent grants to the tool policy
+              if (
+                result.action === 'grant-agent' ||
+                result.action === 'allow' ||
+                result.action === 'grant-studio'
+              ) {
+                // Grant at the specific scope from the approval response.
+                // persistentGrant writes the permanent grant at the target scope
+                // and removes from promptTools at all scopes so the tool stops prompting.
+                const grantScope = result.action === 'grant-studio' ? 'studio' : 'agent';
+                const scopeId =
+                  grantScope === 'studio'
+                    ? toolPolicy.getContext()?.studioId
+                    : toolPolicy.getContext()?.agentId;
+                if (scopeId) {
+                  toolPolicy.persistentGrant(tool, { scope: grantScope, id: scopeId });
+                  printLine(
+                    chalk.green(`✅ 2FA: ${tool} permanently approved (${grantScope}: ${scopeId})`)
+                  );
+                } else {
+                  // Can't resolve scope — fall back to session grant instead of leaking to global
+                  if (runtime.sessionId) {
+                    toolPolicy.grantToolForSession(runtime.sessionId, tool);
+                  }
+                  printLine(
+                    chalk.yellow(
+                      `⚠️ 2FA: ${tool} approved for session only (could not resolve ${grantScope} scope)`
+                    )
+                  );
+                }
+              } else if (result.action === 'grant-session') {
+                if (runtime.sessionId) {
+                  toolPolicy.grantToolForSession(runtime.sessionId, tool);
+                }
+                printLine(chalk.green(`✅ 2FA: ${tool} approved for this session`));
+              } else {
+                printLine(chalk.green(`✅ 2FA approval granted for ${tool}`));
+              }
+              return true;
+            } else if (result.status === 'timeout') {
+              printLine(chalk.yellow(`⏰ 2FA approval timed out for ${tool}`));
+              return false;
+            } else if (result.status === 'error') {
+              printLine(chalk.yellow(`⚠️ 2FA error: ${result.error}`));
+              return false;
+            } else {
+              printLine(chalk.yellow(`🚫 2FA approval denied for ${tool}`));
+              return false;
+            }
+          } catch {
+            printLine(chalk.yellow('Failed to create 2FA approval request — denying tool call'));
             return false;
           }
         },
@@ -6211,6 +6276,7 @@ export function registerChatCommand(program: Command): void {
       .option('--poll-seconds <n>', 'Inbox polling interval seconds', '20')
       .option('--tools <mode>', 'Tool mode: backend|off|privileged', 'backend')
       .option('--profile <name>', 'Apply security profile: minimal|safe|collaborative|full')
+      .option('--away', 'Start with away mode on (route tool approvals to inbox for 2FA)')
       .option('--auto-run', 'Automatically execute backend turns for new inbox task messages')
       .option('--message <text>', 'Single-turn message for non-interactive mode')
       .option(

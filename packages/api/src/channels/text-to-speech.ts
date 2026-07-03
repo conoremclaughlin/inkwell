@@ -150,7 +150,15 @@ export class TextToSpeechService {
     for (const provider of this.providers) {
       try {
         const result = await provider.synthesize(input);
-        if (result) return result;
+        if (result) {
+          logger.info('TTS synthesis succeeded', {
+            provider: provider.name,
+            inputChars: input.text.length,
+            outputFile: result.filename,
+            contentType: result.contentType,
+          });
+          return result;
+        }
       } catch (error) {
         logger.warn('TTS provider failed', {
           provider: provider.name,
@@ -159,6 +167,10 @@ export class TextToSpeechService {
       }
     }
 
+    logger.warn('TTS synthesis: all providers exhausted', {
+      providersAttempted: this.providers.map((p) => p.name),
+      inputChars: input.text.length,
+    });
     return undefined;
   }
 }

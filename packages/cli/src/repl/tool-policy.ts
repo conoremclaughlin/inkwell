@@ -112,6 +112,7 @@ interface PersistedToolPolicyRules {
   allowTools?: string[];
   denyTools?: string[];
   promptTools?: string[];
+  permanentGrants?: string[];
   grants?: Record<string, number>;
   readPathAllow?: string[];
   writePathAllow?: string[];
@@ -140,6 +141,7 @@ interface ToolPolicyRulesState {
   allowTools: Set<string>;
   denyTools: Set<string>;
   promptTools: Set<string>;
+  permanentGrants: Set<string>;
   grants: Map<string, number>;
   readPathAllow: string[];
   writePathAllow: string[];
@@ -179,6 +181,8 @@ export const TOOL_GROUPS: ToolGroupMap = {
     'list_sessions',
     'end_session',
   ],
+  'group:read': ['read', 'grep', 'find', 'ls'],
+  'group:write': ['edit', 'write', 'bash'],
 };
 
 const MODE_RANK: Record<ToolMode, number> = {
@@ -225,6 +229,7 @@ function createRules(options?: {
     allowTools: new Set<string>(),
     denyTools: new Set<string>(),
     promptTools: new Set<string>(),
+    permanentGrants: new Set<string>(),
     grants: new Map<string, number>(),
     readPathAllow: [],
     writePathAllow: [],
@@ -296,6 +301,7 @@ function hasAnyRules(rule: ToolPolicyRulesState): boolean {
     rule.allowTools.size ||
     rule.denyTools.size ||
     rule.promptTools.size ||
+    rule.permanentGrants.size ||
     rule.grants.size ||
     rule.readPathAllow.length ||
     rule.writePathAllow.length ||
@@ -443,6 +449,7 @@ export class ToolPolicyState {
     for (const tool of data.allowTools || []) addToolSpec(target.allowTools, tool);
     for (const tool of data.denyTools || []) addToolSpec(target.denyTools, tool);
     for (const tool of data.promptTools || []) addToolSpec(target.promptTools, tool);
+    for (const tool of data.permanentGrants || []) addToolSpec(target.permanentGrants, tool);
 
     target.grants = sanitizeGrants(data.grants);
 
@@ -460,6 +467,7 @@ export class ToolPolicyState {
       allowTools: Array.from(rules.allowTools).sort(),
       denyTools: Array.from(rules.denyTools).sort(),
       promptTools: Array.from(rules.promptTools).sort(),
+      permanentGrants: Array.from(rules.permanentGrants).sort(),
       grants: Object.fromEntries(rules.grants.entries()),
       readPathAllow: [...rules.readPathAllow],
       writePathAllow: [...rules.writePathAllow],
@@ -594,11 +602,24 @@ export class ToolPolicyState {
     return false;
   }
 
+  private isExplicitlyAllowedAtAnyScope(tool: string): boolean {
+    for (const { rules } of this.getActiveScopeRules()) {
+      if (rules.allowTools.has(tool) || rules.permanentGrants.has(tool)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private findAllowFilterBlockingScope(tool: string): string | undefined {
     for (const { ref, rules } of this.getActiveScopeRules()) {
-      const allowPatterns = collectRulePatterns(rules);
-      if (allowPatterns.length === 0) continue;
-      if (!matchesAnyPolicyPattern(tool, allowPatterns)) {
+      // Only explicit allow-list entries create a narrowing filter.
+      // safeTools (DEFAULT_SAFE_PCP_TOOLS) are auto-allowed but must not
+      // block tools that happen to not be in the safe list — e.g., MCP
+      // tools like list_emails, get_integration_health.
+      if (rules.allowTools.size === 0) continue;
+      if (rules.safeTools.has(tool)) continue;
+      if (!matchesAnyPolicyPattern(tool, Array.from(rules.allowTools))) {
         return normalizeScopeLabel(ref);
       }
     }
@@ -845,12 +866,14 @@ export class ToolPolicyState {
   public clearScopeRules(scope?: ToolPolicyScopeRef): SetMutationScopeResult {
     const target = this.resolveMutationScope(scope);
     if (target.scope === 'global') {
+      const preserved = this.globalRules.permanentGrants;
       this.globalRules = createRules({
         mode: 'backend',
         skillTrustMode: 'all',
         sessionVisibility: DEFAULT_SESSION_VISIBILITY,
         includeDefaultSafeTools: true,
       });
+      this.globalRules.permanentGrants = preserved;
       this.saveToDisk();
       return {
         success: true,
@@ -864,7 +887,15 @@ export class ToolPolicyState {
     }
 
     const map = this.getScopeMap(target.scope);
-    map.delete(target.id);
+    const existing = map.get(target.id);
+    const preserved = existing?.permanentGrants;
+    if (preserved && preserved.size > 0) {
+      const fresh = createRules();
+      fresh.permanentGrants = preserved;
+      map.set(target.id, fresh);
+    } else {
+      map.delete(target.id);
+    }
     this.saveToDisk();
     return {
       success: true,
@@ -910,12 +941,60 @@ export class ToolPolicyState {
     return Array.from(values);
   }
 
+  public listPermanentGrants(): string[] {
+    return Array.from(this.collectPermanentGrants()).sort();
+  }
+
+  public revokePermanentGrant(tool: string): void {
+    const expanded = expandToolSpec(tool);
+    if (expanded.length === 0) return;
+
+    for (const { rules } of this.getActiveScopeRules()) {
+      for (const key of expanded) {
+        rules.permanentGrants.delete(key);
+      }
+    }
+
+    this.saveToDisk();
+  }
+
   public listAllowedSkills(): string[] {
     const values = new Set<string>();
     for (const { rules } of this.getActiveScopeRules()) {
       for (const value of rules.allowedSkills) values.add(value);
     }
     return Array.from(values).sort();
+  }
+
+  /**
+   * Grant a tool permanently. Adds the permanent grant at the target scope
+   * and removes from promptTools only at that scope. Without a scope,
+   * grants at the most specific active scope (studio > agent > global).
+   */
+  public persistentGrant(tool: string, scope?: ToolPolicyScopeRef): void {
+    const expanded = expandToolSpec(tool);
+    if (expanded.length === 0) return;
+
+    // Determine where to write the permanent grant
+    const targetRef = scope ?? this.getActiveScopeRefs().at(-1) ?? { scope: 'global' as const };
+    const targetRules = this.getRulesForScope(targetRef, true);
+    if (targetRules) {
+      for (const key of expanded) {
+        targetRules.permanentGrants.add(key);
+      }
+    }
+
+    // Remove from promptTools ONLY at the target scope where the grant lives.
+    // Other scopes keep their promptTools entries so agents not covered by
+    // this grant still get prompted. The permanent grant overrides the prompt
+    // check for sessions where the target scope is active.
+    if (targetRules) {
+      for (const key of expanded) {
+        targetRules.promptTools.delete(key);
+      }
+    }
+
+    this.saveToDisk();
   }
 
   public allowTool(tool: string, scope?: ToolPolicyScopeRef): void {
@@ -951,13 +1030,23 @@ export class ToolPolicyState {
     const expanded = expandToolSpec(tool);
     if (expanded.length === 0) return;
 
+    const allGrants = this.collectPermanentGrants();
     for (const key of expanded) {
+      if (allGrants.has(key)) continue;
       rules.promptTools.add(key);
       rules.allowTools.delete(key);
       rules.denyTools.delete(key);
     }
 
     this.saveToDisk();
+  }
+
+  private collectPermanentGrants(): Set<string> {
+    const all = new Set<string>();
+    for (const { rules } of this.getActiveScopeRules()) {
+      for (const tool of rules.permanentGrants) all.add(tool);
+    }
+    return all;
   }
 
   public removeToolRule(tool: string, scope?: ToolPolicyScopeRef): void {
@@ -1138,6 +1227,12 @@ export class ToolPolicyState {
     }
 
     if (this.matchesAnyPromptTool(key)) {
+      // Explicit allow at any scope overrides prompt requirements at other scopes.
+      // This lets persistent grants (approve agent / approve studio) override
+      // the safe profile's promptTools list.
+      if (this.isExplicitlyAllowedAtAnyScope(key)) {
+        return { allowed: true, reason: 'Tool explicitly allowed by scoped policy.' };
+      }
       return {
         allowed: false,
         reason: 'Tool requires explicit per-call confirmation by policy.',

@@ -1,5 +1,6 @@
 export interface TextToSpeechInput {
   text: string;
+  voice?: string;
 }
 
 export interface SynthesizedAudio {

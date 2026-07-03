@@ -1426,7 +1426,12 @@ Example — send a photo with caption:
 Example — send a document:
   media: [{ type: "document", path: "/path/to/report.pdf", filename: "report.pdf" }]
 
-Supported types: image, video, audio, document. The \`content\` field is sent as a separate text message before the media.`,
+Supported types: image, video, audio, document. The \`content\` field is sent as a separate text message before the media.
+
+## Voice Replies (Telegram)
+
+Set \`voiceReply: true\` to send content as a voice note instead of text. Uses on-device TTS (zero cost).
+Optionally set \`ttsVoice\` to choose a voice. Available voices: serena (default), vivian, sohee, ono_anna, ryan, aiden, eric.`,
       inputSchema: {
         channel: z
           .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'agent'])
@@ -1438,6 +1443,16 @@ Supported types: image, video, audio, document. The \`content\` field is sent as
           .optional()
           .describe('Format of the response content'),
         replyToMessageId: z.string().optional().describe('Message ID to reply to (for threading)'),
+        voiceReply: z
+          .boolean()
+          .optional()
+          .describe(
+            'Send as a voice note instead of text (Telegram only). Uses on-device TTS, zero API cost.'
+          ),
+        ttsVoice: z
+          .enum(['serena', 'vivian', 'sohee', 'ono_anna', 'ryan', 'aiden', 'eric'])
+          .optional()
+          .describe('Voice for TTS synthesis. Only used when voiceReply is true. Default: serena.'),
         media: z
           .array(
             z.object({
@@ -4428,6 +4443,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `List events from a Google calendar within a date range.
 
 Returns events with start/end times, summary, location, attendees, and status.
+
+Dates can be full ISO 8601 (e.g., "2026-01-30T00:00:00-08:00") or bare YYYY-MM-DD (e.g., "2026-01-30"). Bare dates are resolved to midnight in the specified timezone — always pass timezone when using bare dates to get correct day boundaries.
 
 User must have connected their Google account with Calendar permissions.
 
