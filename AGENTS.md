@@ -272,18 +272,23 @@ When sending messages to other SBs via `send_to_inbox`, use `threadKey` to maint
 | `task:<id>`      | PCP task coordination                       | `task:abc123`                |
 | `thread:<slug>`  | Multi-step conversation with no natural key | `thread:perf-audit`          |
 
-### Cross-Project threadKeys
+### Cross-Project threadKeys (MANDATORY outside Inkwell)
 
 When working across multiple repos/projects, prefix the threadKey with the project name to avoid collisions. The format is `<project>:<type>:<identifier>`.
 
-| Context                       | threadKey                 |
-| ----------------------------- | ------------------------- |
-| PR in Inkwell (this repo)     | `pr:389`                  |
-| PR in a different project     | `inktrade:pr:42`          |
-| Issue in another project      | `openclaw:issue:15`       |
-| Cross-project spec discussion | `inktrade:spec:valuation` |
+| Context                       | threadKey                       |
+| ----------------------------- | ------------------------------- |
+| PR in Inkwell (this repo)     | `pr:389`                        |
+| PR in a different project     | `inktrade:pr:42`                |
+| Issue in another project      | `openclaw:issue:15`             |
+| Cross-project spec discussion | `inktrade:spec:valuation`       |
+| Branch in another project     | `inktrade:branch:supabase-auth` |
 
-Within the Inkwell repo, the project prefix is optional — `pr:389` is unambiguous. For any thread that references work in a different repo, always include the project prefix so trigger routing and session matching work correctly across boundaries.
+Within the Inkwell repo, the project prefix is optional — `pr:389` is unambiguous. For any thread that references work in a **different repo, the project prefix is REQUIRED** — `pr:12` in two repos is a routing collision, and studio route patterns (`inktrade:pr:*`) can only target project-scoped keys.
+
+The project goes in the **prefix slot, never the identifier**: `inktrade:pr:42`, not `pr:inktrade-42` or `pr:inktrade-supabase-auth`. Baking the project into the identifier defeats pattern matching and prefix-based routing.
+
+Each repo's AGENTS.md should carry this threadKey section so agents working there natively derive project-prefixed keys.
 
 ### Sender Rules
 
@@ -292,6 +297,7 @@ Within the Inkwell repo, the project prefix is optional — `pr:389` is unambigu
 3. **DERIVE** the key from the most specific reference. If a PR review involves spec changes, use `pr:<number>` (the actionable unit), not `spec:<slug>`.
 4. **Keep identifiers stable** — use PR numbers, not PR titles. Use spec URI slugs, not descriptions.
 5. If no natural key exists for a multi-step conversation, use `thread:<short-slug>` with a descriptive slug.
+6. **Prefix with the project** for any thread about work outside this repo: `<project>:<type>:<identifier>` (see Cross-Project threadKeys above).
 
 ### Recipient Rules
 
