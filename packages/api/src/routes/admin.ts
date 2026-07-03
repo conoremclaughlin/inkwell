@@ -1874,7 +1874,14 @@ router.get('/events', async (req: Request, res: Response) => {
   const sessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId : undefined;
   const taskGroupId = typeof req.query.taskGroupId === 'string' ? req.query.taskGroupId : undefined;
   const agentId = typeof req.query.agentId === 'string' ? req.query.agentId : undefined;
-  const sinceRaw = typeof req.query.since === 'string' ? req.query.since : undefined;
+  // Cursor priority: explicit ?since= > Last-Event-ID reconnect header
+  // (format "<ISO>|<id>", set by writeEvent below).
+  const lastEventId = req.headers['last-event-id'];
+  const reconnectSince =
+    typeof lastEventId === 'string' && lastEventId.includes('|')
+      ? lastEventId.split('|')[0]
+      : undefined;
+  const sinceRaw = typeof req.query.since === 'string' ? req.query.since : reconnectSince;
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -1882,8 +1889,14 @@ router.get('/events', async (req: Request, res: Response) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders?.();
 
+  // SSE id = "<createdAt ISO>|<activity id>" so the browser's automatic
+  // Last-Event-ID reconnect header doubles as a since-cursor (parsed below).
   const writeEvent = (activity: Activity): void => {
-    res.write(`id: ${activity.id}\n`);
+    const ts =
+      activity.createdAt instanceof Date
+        ? activity.createdAt.toISOString()
+        : String(activity.createdAt);
+    res.write(`id: ${ts}|${activity.id}\n`);
     res.write(`event: activity\n`);
     res.write(`data: ${JSON.stringify(activity)}\n\n`);
   };
@@ -1908,7 +1921,9 @@ router.get('/events', async (req: Request, res: Response) => {
   );
 
   try {
-    const since = sinceRaw ? new Date(sinceRaw) : undefined;
+    // Unencoded "+" in ISO offsets ("+00:00") arrives as a space after URL
+    // decoding — restore it so new Date() parses the timestamp.
+    const since = sinceRaw ? new Date(sinceRaw.replace(' ', '+')) : undefined;
     if (since && !Number.isNaN(since.getTime())) {
       const activityRepo = (await getDataComposer()).repositories.activityStream;
       const backfill = await activityRepo.getActivity(authReq.pcpUserId, {

@@ -15,6 +15,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { useApiPost, useApiQuery, useQueryClient } from '@/lib/api';
+import { useEventStream, type StreamActivity } from '@/lib/api/use-event-stream';
 import clsx from 'clsx';
 
 interface SessionLogsResponse {
@@ -195,10 +196,29 @@ function formatEntryContent(
   return { display: summary, rawJson, kind: 'json' };
 }
 
+type SessionLogEntry = SessionLogsResponse['logs'][number];
+
+function activityToLogEntry(activity: StreamActivity): SessionLogEntry {
+  const role =
+    activity.type === 'message_in' ? 'in' : activity.type === 'message_out' ? 'out' : 'system';
+  return {
+    id: activity.id,
+    source: 'activity_stream',
+    type: activity.subtype ? `${activity.type}:${activity.subtype}` : activity.type,
+    role,
+    content: activity.content,
+    timestamp: activity.createdAt,
+    metadata: activity.payload,
+  };
+}
+
 export default function SessionLogsPage() {
   const params = useParams();
   const sessionId = params.sessionId as string;
   const [offset, setOffset] = useState(0);
+  // Stable stream cursor — captured once so the SSE connection doesn't
+  // resubscribe on every poll. Overlap with polled pages dedupes by id.
+  const [streamSince] = useState(() => new Date().toISOString());
   const [rawModal, setRawModal] = useState<{
     id: string;
     type: string;
@@ -212,10 +232,17 @@ export default function SessionLogsPage() {
     [sessionId, limit, offset]
   );
 
+  // Live stream (first page only). Polling stays as fallback — relaxed to
+  // 60s while the stream is healthy, 15s otherwise.
+  const { events: streamedEvents, status: streamStatus } = useEventStream(
+    { sessionId, since: streamSince },
+    { enabled: offset === 0 }
+  );
+
   const { data, isLoading, error } = useApiQuery<SessionLogsResponse>(
     ['session-logs', sessionId, offset],
     queryPath,
-    { refetchInterval: 15000 }
+    { refetchInterval: streamStatus === 'live' ? 60000 : 15000 }
   );
 
   const syncTranscript = useApiPost<
@@ -230,7 +257,17 @@ export default function SessionLogsPage() {
     },
   });
 
-  const logs = data?.logs || [];
+  const logs = useMemo(() => {
+    const polled = data?.logs || [];
+    if (offset !== 0 || streamedEvents.length === 0) return polled;
+    const polledIds = new Set(polled.map((entry) => entry.id));
+    // Streamed events arrive oldest-first; the timeline renders newest-first.
+    const streamed = streamedEvents
+      .filter((activity) => !polledIds.has(activity.id))
+      .map(activityToLogEntry)
+      .reverse();
+    return [...streamed, ...polled];
+  }, [data?.logs, streamedEvents, offset]);
   const pagination = data?.pagination;
   const session = data?.session;
   const statusBadge = session ? sessionStatusBadge(session.status, session.currentPhase) : null;
@@ -276,7 +313,20 @@ export default function SessionLogsPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Timeline</CardTitle>
+          <CardTitle className="flex items-center gap-2">
+            Timeline
+            {offset === 0 && streamStatus === 'live' ? (
+              <span className="flex items-center gap-1.5 text-xs font-medium text-emerald-600">
+                <span className="relative flex h-2 w-2">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                  <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+                </span>
+                Live
+              </span>
+            ) : offset === 0 && streamStatus === 'connecting' ? (
+              <span className="text-xs font-medium text-gray-400">Connecting…</span>
+            ) : null}
+          </CardTitle>
           <CardDescription>
             Latest activity, session logs, synced transcript archive, and local fallback when
             available.
