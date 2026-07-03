@@ -604,7 +604,7 @@ export class ToolPolicyState {
 
   private isExplicitlyAllowedAtAnyScope(tool: string): boolean {
     for (const { rules } of this.getActiveScopeRules()) {
-      if (rules.allowTools.has(tool)) {
+      if (rules.allowTools.has(tool) || rules.permanentGrants.has(tool)) {
         return true;
       }
     }

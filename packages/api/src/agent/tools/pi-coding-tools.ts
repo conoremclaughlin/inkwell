@@ -8,8 +8,7 @@
  */
 
 import path from 'path';
-import { existsSync } from 'fs';
-import { readdir, readFile, stat } from 'fs/promises';
+import { readdir, readFile, stat, access } from 'fs/promises';
 import type Anthropic from '@anthropic-ai/sdk';
 import { PathContainmentError, assertContainedPathAsync } from '@inklabs/shared';
 import { logger } from '../../utils/logger';
@@ -129,7 +128,11 @@ async function tryReadDocument(filePath: string, cwd: string): Promise<string | 
   if (!DOCUMENT_EXTENSIONS[ext]) return null;
 
   const absolutePath = path.resolve(cwd, filePath);
-  if (!existsSync(absolutePath)) return null;
+  try {
+    await access(absolutePath);
+  } catch {
+    return null;
+  }
 
   if (ext === '.pdf') {
     try {
