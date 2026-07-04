@@ -29,6 +29,8 @@ import {
   Hash,
   Timer,
   MessageSquare,
+  MessageCircle,
+  Send,
   FileCheck,
 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
@@ -87,6 +89,7 @@ interface ActivityEvent {
   content: string;
   agentId: string;
   sessionId: string | null;
+  platform: string | null;
   payload: Record<string, unknown>;
   createdAt: string;
 }
@@ -330,6 +333,129 @@ function computeElapsed(startedAt: string | null): string | null {
   return `${mins}m`;
 }
 
+// ─── Message / Check-in Entries ───
+
+const PLATFORM_LABELS: Record<string, string> = {
+  telegram: 'via Telegram',
+  whatsapp: 'via WhatsApp',
+  discord: 'via Discord',
+  slack: 'via Slack',
+  web: 'via web chat',
+  http: 'via web chat',
+  api: 'via API',
+  terminal: 'via terminal',
+  heartbeat: 'via heartbeat',
+};
+
+function snippet(text: string, max = 140): string {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  return clean.length > max ? `${clean.slice(0, max).trimEnd()}…` : clean;
+}
+
+interface MessageSender {
+  id?: string;
+  name?: string;
+  username?: string;
+}
+
+/** "Conor · via Telegram" for humans, "inkmail from lumen" for agent triggers */
+function checkInSenderLabel(event: ActivityEvent): string {
+  const sender = (event.payload?.sender ?? {}) as MessageSender;
+  const name = sender.name || sender.username || sender.id || 'Unknown';
+  if (event.platform === 'agent') return `inkmail from ${name}`;
+  const platform = event.platform
+    ? (PLATFORM_LABELS[event.platform] ?? `via ${event.platform}`)
+    : '';
+  return platform ? `${name} · ${platform}` : name;
+}
+
+function SessionLink({ sessionId }: { sessionId: string | null }) {
+  if (!sessionId) return null;
+  return (
+    <Link
+      href={`/sessions/${sessionId}`}
+      className="text-[10px] text-blue-500 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300 flex items-center gap-0.5 transition-colors"
+    >
+      <ExternalLink className="h-2.5 w-2.5" />
+      session
+    </Link>
+  );
+}
+
+/** Human (or inkmail-trigger) check-in — accent card so touchpoints stand out */
+function CheckInEntry({ event }: { event: ActivityEvent }) {
+  return (
+    <div className="flex-1 min-w-0 -mt-0.5">
+      <div className="rounded-lg border border-sky-200 dark:border-sky-900 border-l-2 border-l-sky-400 dark:border-l-sky-600 bg-sky-50/60 dark:bg-sky-950/30 px-3 py-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-xs font-semibold text-sky-700 dark:text-sky-300">Check-in</span>
+          <span className="text-[11px] text-gray-500 dark:text-gray-400">
+            {checkInSenderLabel(event)}
+          </span>
+          <SessionLink sessionId={event.sessionId} />
+        </div>
+        {event.content && (
+          <p className="text-[11px] text-gray-600 dark:text-gray-300 mt-1 line-clamp-3">
+            &ldquo;{snippet(event.content)}&rdquo;
+          </p>
+        )}
+      </div>
+      <span className="text-[10px] text-gray-400 dark:text-gray-500">
+        {formatTime(event.createdAt)}
+      </span>
+    </div>
+  );
+}
+
+/** Cross-agent inkmail (dispatch/deliver) — from → to with thread key badge */
+function AgentMessageEntry({ event }: { event: ActivityEvent }) {
+  const from = typeof event.payload?.fromAgentId === 'string' ? event.payload.fromAgentId : null;
+  const to = typeof event.payload?.toAgentId === 'string' ? event.payload.toAgentId : null;
+  const threadKey = typeof event.payload?.threadKey === 'string' ? event.payload.threadKey : null;
+  const delivered = event.type === 'inkmail_deliver';
+
+  return (
+    <div className="flex-1 min-w-0 -mt-0.5">
+      <div className="rounded-lg border border-violet-200 dark:border-violet-900 border-l-2 border-l-violet-400 dark:border-l-violet-600 bg-violet-50/50 dark:bg-violet-950/30 px-3 py-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-xs font-semibold text-violet-700 dark:text-violet-300">
+            Agent message
+          </span>
+          {from && to && (
+            <span className="text-[11px] text-gray-500 dark:text-gray-400">
+              {from} → {to}
+            </span>
+          )}
+          <span
+            className={clsx(
+              'text-[10px] font-medium px-1.5 py-0.5 rounded-full',
+              delivered
+                ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-300'
+                : 'bg-violet-100 text-violet-700 dark:bg-violet-900/50 dark:text-violet-300'
+            )}
+          >
+            {delivered ? 'delivered' : 'sent'}
+          </span>
+          {threadKey && (
+            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400">
+              {threadKey}
+            </span>
+          )}
+          <SessionLink sessionId={event.sessionId} />
+        </div>
+        {event.content && (
+          <p className="text-[11px] text-gray-600 dark:text-gray-300 mt-1 line-clamp-3">
+            {snippet(event.content)}
+          </p>
+        )}
+      </div>
+      <span className="text-[10px] text-gray-400 dark:text-gray-500">
+        {formatTime(event.createdAt)}
+      </span>
+    </div>
+  );
+}
+
 // ─── Task Progress Column ───
 
 function TaskProgressList({ tasks, currentIndex }: { tasks: Task[]; currentIndex: number }) {
@@ -455,6 +581,7 @@ function streamActivityToEvent(activity: StreamActivity): ActivityEvent {
     content: activity.content,
     agentId: activity.agentId,
     sessionId: activity.sessionId,
+    platform: activity.platform,
     payload: activity.payload,
     createdAt: activity.createdAt,
   };
@@ -532,9 +659,16 @@ function LiveTimeline({ groupId, isActive }: { groupId: string; isActive: boolea
             <div className="absolute left-[9px] top-1 bottom-1 w-px bg-border" />
 
             {dayEvents.map((event, i) => {
+              const isCheckIn = event.type === 'message_in';
+              const isInkmail =
+                event.type === 'inkmail_dispatch' || event.type === 'inkmail_deliver';
               const meta = SUBTYPE_META[event.subtype ?? ''];
-              const Icon = meta?.icon ?? Activity;
-              const color = meta?.color ?? 'text-muted-foreground/70';
+              const Icon = isCheckIn ? MessageCircle : isInkmail ? Send : (meta?.icon ?? Activity);
+              const color = isCheckIn
+                ? 'text-sky-500 dark:text-sky-400'
+                : isInkmail
+                  ? 'text-violet-500 dark:text-violet-400'
+                  : (meta?.color ?? 'text-muted-foreground/70');
               const label = meta?.label ?? event.subtype ?? event.type;
               const isLatest =
                 i === dayEvents.length - 1 && dateLabel === [...dateGroups.keys()].at(-1);
@@ -561,36 +695,42 @@ function LiveTimeline({ groupId, isActive }: { groupId: string; isActive: boolea
                   </div>
 
                   {/* Content */}
-                  <div className="flex-1 min-w-0 -mt-0.5">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="text-xs font-medium text-foreground/90">{label}</span>
-                      {agentBadge && (
-                        <span
-                          className={clsx(
-                            'text-[10px] font-medium px-1.5 py-0.5 rounded-full',
-                            agentBadge
-                          )}
-                        >
-                          {event.agentId}
-                        </span>
-                      )}
-                      {event.sessionId && (
-                        <Link
-                          href={`/sessions/${event.sessionId}`}
-                          className="text-[10px] text-blue-500 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300 flex items-center gap-0.5 transition-colors opacity-0 group-hover:opacity-100"
-                        >
-                          <ExternalLink className="h-2.5 w-2.5" />
-                          session
-                        </Link>
-                      )}
+                  {isCheckIn ? (
+                    <CheckInEntry event={event} />
+                  ) : isInkmail ? (
+                    <AgentMessageEntry event={event} />
+                  ) : (
+                    <div className="flex-1 min-w-0 -mt-0.5">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-xs font-medium text-foreground/90">{label}</span>
+                        {agentBadge && (
+                          <span
+                            className={clsx(
+                              'text-[10px] font-medium px-1.5 py-0.5 rounded-full',
+                              agentBadge
+                            )}
+                          >
+                            {event.agentId}
+                          </span>
+                        )}
+                        {event.sessionId && (
+                          <Link
+                            href={`/sessions/${event.sessionId}`}
+                            className="text-[10px] text-blue-500 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300 flex items-center gap-0.5 transition-colors opacity-0 group-hover:opacity-100"
+                          >
+                            <ExternalLink className="h-2.5 w-2.5" />
+                            session
+                          </Link>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-muted-foreground mt-0.5 line-clamp-3">
+                        {event.content}
+                      </p>
+                      <span className="text-[10px] text-muted-foreground/70">
+                        {formatTime(event.createdAt)}
+                      </span>
                     </div>
-                    <p className="text-[11px] text-muted-foreground mt-0.5 line-clamp-3">
-                      {event.content}
-                    </p>
-                    <span className="text-[10px] text-muted-foreground/70">
-                      {formatTime(event.createdAt)}
-                    </span>
-                  </div>
+                  )}
                 </div>
               );
             })}

@@ -6733,7 +6733,7 @@ router.get('/task-groups/:id/activity', async (req: Request, res: Response) => {
 
     const { data: events, error: eventsError } = await supabase
       .from('activity_stream')
-      .select('id, type, subtype, content, payload, agent_id, session_id, created_at')
+      .select('id, type, subtype, content, payload, agent_id, session_id, platform, created_at')
       .eq('task_group_id' as never, id)
       .order('created_at', { ascending: true })
       .limit(limit);
@@ -6751,6 +6751,7 @@ router.get('/task-groups/:id/activity', async (req: Request, res: Response) => {
         content: e.content,
         agentId: e.agent_id,
         sessionId: e.session_id,
+        platform: e.platform,
         payload: e.payload,
         createdAt: e.created_at,
       })),

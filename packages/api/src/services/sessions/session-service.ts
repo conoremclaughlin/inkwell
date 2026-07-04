@@ -39,6 +39,7 @@ import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import { resolveIdentityId } from '../../auth/resolve-identity.js';
 import { classifyError } from '@inklabs/shared';
+import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
 import { logger } from '../../utils/logger.js';
 
@@ -82,6 +83,7 @@ export interface IActivityStream {
     platformChatId?: string;
     isDm?: boolean;
     payload?: Json;
+    taskGroupId?: string;
   }): Promise<{ id: string }>;
 
   logActivity(params: {
@@ -96,6 +98,12 @@ export interface IActivityStream {
     platformChatId?: string;
     taskGroupId?: string;
   }): Promise<{ id: string }>;
+
+  /**
+   * Optional: backfill task-group/session linkage on an already-logged
+   * activity (incoming messages are logged before session routing resolves).
+   */
+  tagActivityTaskGroup?(activityId: string, taskGroupId: string, sessionId?: string): Promise<void>;
 }
 
 /**
@@ -196,10 +204,17 @@ export class SessionService implements ISessionService {
       contentLength: content.length,
     });
 
+    // Mission (task group) linkage for the check-in entry. Only explicit
+    // metadata tags at insert time (free — no lookup). Resolver-based tagging
+    // is deferred to a detached backfill after routing so timeline bookkeeping
+    // never delays message handling.
+    const messageTaskGroupId: string | undefined = metadata?.taskGroupId;
+
     // Persist incoming message to activity stream immediately
     // This ensures messages are logged even if processing fails
+    let loggedMessageId: string | undefined;
     try {
-      await this.activityStream.logMessage({
+      const logged = await this.activityStream.logMessage({
         userId,
         agentId,
         direction: 'in',
@@ -219,7 +234,9 @@ export class SessionService implements ISessionService {
             studioHint: metadata?.studioHint,
           })
         ),
+        taskGroupId: messageTaskGroupId,
       });
+      loggedMessageId = logged.id;
     } catch (logError) {
       // Don't fail the request if activity logging fails
       logger.warn('Failed to log incoming message to activity stream', {
@@ -243,6 +260,24 @@ export class SessionService implements ISessionService {
         contactId: metadata?.contactId,
         repoRoot: metadata?.repoRoot,
       });
+
+      // Backfill mission linkage now that routing resolved: a check-in that
+      // landed in a session bound to a mission thread (e.g. a Telegram reply
+      // routed into a strategy session) belongs on that mission's timeline.
+      // Also stamps session_id so the timeline can link to the session turn
+      // the check-in triggered. Genuinely fire-and-forget — the resolve →
+      // tag ordering lives inside the detached chain and nothing here is
+      // awaited, so message processing continues immediately.
+      if (loggedMessageId && this.activityStream.tagActivityTaskGroup) {
+        this.backfillMessageTaskGroup({
+          activityId: loggedMessageId,
+          userId,
+          sessionId: session.id,
+          knownTaskGroupId: messageTaskGroupId,
+          metadataThreadKey: metadata?.threadKey,
+          sessionThreadKey: session.threadKey,
+        });
+      }
 
       // 2. Log session routing for external + heartbeat channels
       // so we can verify messages and heartbeats land in the same session.
@@ -325,6 +360,49 @@ export class SessionService implements ISessionService {
    * If there are pending messages, process the next one (lock remains held).
    * If queue is empty, release the lock.
    */
+  /**
+   * Detached (fire-and-forget) mission backfill for a logged check-in.
+   *
+   * Resolves the task group from explicit metadata, the request threadKey, or
+   * the routed session's threadKey — in that order — then tags the activity
+   * row with task_group_id + session_id. Best-effort timeline bookkeeping:
+   * callers must NOT await this; failures are logged at debug and never throw.
+   */
+  private backfillMessageTaskGroup(params: {
+    activityId: string;
+    userId: string;
+    sessionId: string;
+    knownTaskGroupId?: string;
+    metadataThreadKey?: string;
+    sessionThreadKey?: string;
+  }): void {
+    const { activityId, userId, sessionId, knownTaskGroupId, metadataThreadKey, sessionThreadKey } =
+      params;
+    const tagActivityTaskGroup = this.activityStream.tagActivityTaskGroup?.bind(
+      this.activityStream
+    );
+    if (!tagActivityTaskGroup) return;
+    const supabase = this.supabase;
+
+    void (async () => {
+      let groupId: string | null = knownTaskGroupId ?? null;
+      if (!groupId && supabase && metadataThreadKey) {
+        groupId = await resolveTaskGroupForThreadKey(supabase, userId, metadataThreadKey);
+      }
+      if (!groupId && supabase && sessionThreadKey && sessionThreadKey !== metadataThreadKey) {
+        groupId = await resolveTaskGroupForThreadKey(supabase, userId, sessionThreadKey);
+      }
+      if (groupId) {
+        await tagActivityTaskGroup(activityId, groupId, sessionId);
+      }
+    })().catch((tagError) => {
+      logger.debug('Failed to backfill task group on check-in activity', {
+        activityId,
+        error: tagError instanceof Error ? tagError.message : String(tagError),
+      });
+    });
+  }
+
   private async processQueueOrReleaseLock(lockKey: string): Promise<void> {
     const queue = this.pendingQueues.get(lockKey);
 
