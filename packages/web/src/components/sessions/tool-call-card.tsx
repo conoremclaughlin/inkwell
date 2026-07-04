@@ -107,10 +107,13 @@ export function ToolCallCard({
   const isResult = entry.type.startsWith('tool_result');
 
   return (
-    <div className="rounded-md border border-gray-200 bg-white p-3">
-      <div className="mb-2 flex items-center justify-between gap-3 text-xs text-gray-500">
+    <div className="rounded-md border border-border bg-card p-3">
+      <div className="mb-2 flex items-center justify-between gap-3 text-xs text-muted-foreground">
         <div className="flex items-center gap-2">
-          <Badge variant="outline" className="border-violet-300 text-violet-700">
+          <Badge
+            variant="outline"
+            className="border-violet-300 text-violet-700 dark:border-violet-800 dark:text-violet-400"
+          >
             {isResult ? 'tool result' : 'tool call'}
           </Badge>
           <Badge variant="outline">{entry.source}</Badge>
@@ -120,18 +123,18 @@ export function ToolCallCard({
 
       <button
         type="button"
-        className="flex w-full items-center gap-2 text-left text-sm text-gray-800"
+        className="flex w-full items-center gap-2 text-left text-sm text-foreground/90"
         onClick={() => setExpanded((prev) => !prev)}
         aria-expanded={expanded}
       >
         {expanded ? (
-          <ChevronDown className="h-4 w-4 shrink-0 text-gray-400" />
+          <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground/70" />
         ) : (
-          <ChevronRight className="h-4 w-4 shrink-0 text-gray-400" />
+          <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/70" />
         )}
-        <Wrench className="h-4 w-4 shrink-0 text-violet-500" />
-        <span className="shrink-0 font-mono text-xs font-semibold text-gray-900">{toolName}</span>
-        <span className="min-w-0 flex-1 truncate font-mono text-xs text-gray-500">
+        <Wrench className="h-4 w-4 shrink-0 text-violet-500 dark:text-violet-400" />
+        <span className="shrink-0 font-mono text-xs font-semibold text-foreground">{toolName}</span>
+        <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">
           {argsPreview}
         </span>
         {status ? (
@@ -140,23 +143,25 @@ export function ToolCallCard({
             className={clsx(
               'shrink-0 text-[10px]',
               status === 'failed'
-                ? 'border-red-300 text-red-700'
+                ? 'border-red-300 text-red-700 dark:border-red-800 dark:text-red-400'
                 : status === 'completed'
-                  ? 'border-emerald-300 text-emerald-700'
-                  : 'border-gray-300 text-gray-600'
+                  ? 'border-emerald-300 text-emerald-700 dark:border-emerald-800 dark:text-emerald-400'
+                  : 'border-border text-muted-foreground'
             )}
           >
             {status}
           </Badge>
         ) : null}
         {durationMs != null ? (
-          <span className="shrink-0 text-xs text-gray-400">{formatDuration(durationMs)}</span>
+          <span className="shrink-0 text-xs text-muted-foreground/70">
+            {formatDuration(durationMs)}
+          </span>
         ) : null}
       </button>
 
       {expanded ? (
         <div className="mt-2 space-y-2">
-          <div className="overflow-auto rounded-md border border-gray-200 bg-gray-950 p-3">
+          <div className="overflow-auto rounded-md border border-border bg-gray-950 p-3">
             <pre className="whitespace-pre-wrap break-words font-mono text-xs text-gray-100">
               {expandedDetail(entry)}
             </pre>

@@ -55,10 +55,13 @@ export function ForkCard({
   const isRecent = Date.now() - new Date(entry.timestamp).getTime() < RECENT_FORK_WINDOW_MS;
 
   return (
-    <div className="rounded-md border border-indigo-200 bg-indigo-50/50 p-3">
-      <div className="mb-2 flex items-center justify-between gap-3 text-xs text-gray-500">
+    <div className="rounded-md border border-indigo-200 bg-indigo-50/50 dark:border-indigo-800 dark:bg-indigo-900/20 p-3">
+      <div className="mb-2 flex items-center justify-between gap-3 text-xs text-muted-foreground">
         <div className="flex items-center gap-2">
-          <Badge variant="outline" className="border-indigo-300 text-indigo-700">
+          <Badge
+            variant="outline"
+            className="border-indigo-300 text-indigo-700 dark:border-indigo-800 dark:text-indigo-400"
+          >
             fork
           </Badge>
           <Badge variant="outline">{entry.source}</Badge>
@@ -66,17 +69,17 @@ export function ForkCard({
         </div>
         <span className="shrink-0">{formatDate(entry.timestamp)}</span>
       </div>
-      <div className="flex items-center gap-2 text-sm text-gray-800">
+      <div className="flex items-center gap-2 text-sm text-foreground/90">
         <span className="relative flex h-4 w-4 shrink-0 items-center justify-center">
           {isRecent ? (
             <span className="absolute inline-flex h-3 w-3 animate-ping rounded-full bg-indigo-400 opacity-60" />
           ) : null}
-          <GitBranch className="relative h-4 w-4 text-indigo-600" />
+          <GitBranch className="relative h-4 w-4 text-indigo-600 dark:text-indigo-400" />
         </span>
         <span className="min-w-0 flex-1 truncate">{label}</span>
         <Link
           href={`/sessions/${childSessionId}`}
-          className="shrink-0 text-xs font-medium text-indigo-700 underline-offset-2 hover:underline"
+          className="shrink-0 text-xs font-medium text-indigo-700 dark:text-indigo-400 underline-offset-2 hover:underline"
         >
           View child session →
         </Link>
