@@ -359,6 +359,131 @@ describe('admin endpoint handlers (no-500 regression)', () => {
   });
 
   // =========================================================================
+  // GET /automations — loaded by automations page
+  // =========================================================================
+
+  describe('GET /automations', () => {
+    it('should return 200 with empty automations list', async () => {
+      const handler = findRouteHandler('get', '/automations');
+      expect(handler).not.toBeNull();
+
+      const req = createAuthenticatedReq();
+      const res = createMockRes();
+      await handler!(req, res);
+
+      expect(res._status).toBe(200);
+      expect((res._json as any).automations).toEqual([]);
+    });
+
+    it('workspace-scopes BOTH reminders and strategy task_groups queries', async () => {
+      // Regression: strategies come from task_groups, which is a per-user
+      // table — without the identity inner-join filter, same-user strategies
+      // from OTHER workspaces would leak into this workspace's view.
+      const remindersChain = createQueryChain([]);
+      const groupsChain = createQueryChain([]);
+      mockSupabaseFrom.mockImplementation((table: string) => {
+        if (table === 'scheduled_reminders') return remindersChain;
+        if (table === 'task_groups') return groupsChain;
+        return createQueryChain([]);
+      });
+
+      const handler = findRouteHandler('get', '/automations');
+      const req = createAuthenticatedReq();
+      const res = createMockRes();
+      await handler!(req, res);
+
+      expect(res._status).toBe(200);
+
+      // Reminders: inner-joined on identity, filtered to active workspace
+      expect(remindersChain.select).toHaveBeenCalledWith(
+        expect.stringContaining('agent_identities!inner')
+      );
+      expect(remindersChain.eq).toHaveBeenCalledWith(
+        'agent_identities.workspace_id',
+        TEST_WORKSPACE_ID
+      );
+
+      // Strategy task_groups: same inner-join + workspace filter as reminders
+      expect(groupsChain.select).toHaveBeenCalledWith(
+        expect.stringContaining('agent_identities!inner')
+      );
+      expect(groupsChain.eq).toHaveBeenCalledWith(
+        'agent_identities.workspace_id',
+        TEST_WORKSPACE_ID
+      );
+      expect(groupsChain.eq).toHaveBeenCalledWith('user_id', TEST_USER_ID);
+    });
+
+    it('excludes other-workspace strategies once the workspace filter is applied', async () => {
+      // Simulate PostgREST semantics for the inner-join workspace filter:
+      // only rows whose joined identity matches the requested workspace
+      // survive. The chain applies the filter the handler passes, so if the
+      // handler ever drops the workspace filter, the foreign row leaks and
+      // this test fails.
+      const allGroups = [
+        {
+          id: 'group-mine',
+          title: 'My workspace strategy',
+          status: 'active',
+          strategy: 'sequential',
+          strategy_config: {},
+          strategy_started_at: '2026-07-01T00:00:00Z',
+          strategy_paused_at: null,
+          updated_at: '2026-07-03T00:00:00Z',
+          agent_identities: { agent_id: 'wren', name: 'Wren', workspace_id: TEST_WORKSPACE_ID },
+        },
+        {
+          id: 'group-foreign',
+          title: 'Other workspace strategy',
+          status: 'active',
+          strategy: 'sequential',
+          strategy_config: {},
+          strategy_started_at: '2026-07-01T00:00:00Z',
+          strategy_paused_at: null,
+          updated_at: '2026-07-03T00:00:00Z',
+          agent_identities: {
+            agent_id: 'wren',
+            name: 'Wren',
+            workspace_id: 'workspace-other-999',
+          },
+        },
+      ];
+
+      const groupsChain = createQueryChain([]);
+      let groupWorkspaceFilter: string | null = null;
+      groupsChain.eq = vi.fn((column: string, value: string) => {
+        if (column === 'agent_identities.workspace_id') groupWorkspaceFilter = value;
+        return groupsChain;
+      });
+      groupsChain.then = (resolve: (val: unknown) => unknown) =>
+        resolve({
+          data: allGroups.filter(
+            (g) =>
+              groupWorkspaceFilter === null ||
+              g.agent_identities.workspace_id === groupWorkspaceFilter
+          ),
+          error: null,
+        });
+
+      mockSupabaseFrom.mockImplementation((table: string) => {
+        if (table === 'task_groups') return groupsChain;
+        return createQueryChain([]);
+      });
+
+      const handler = findRouteHandler('get', '/automations');
+      const req = createAuthenticatedReq();
+      const res = createMockRes();
+      await handler!(req, res);
+
+      expect(res._status).toBe(200);
+      const automations = (res._json as any).automations;
+      expect(automations).toHaveLength(1);
+      expect(automations[0].id).toBe('group-mine');
+      expect(automations.map((a: any) => a.id)).not.toContain('group-foreign');
+    });
+  });
+
+  // =========================================================================
   // GET /trusted-users — loaded by trusted users page
   // =========================================================================
 

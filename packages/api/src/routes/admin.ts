@@ -2973,12 +2973,16 @@ router.get('/automations', async (req: Request, res: Response) => {
         .eq('agent_identities.workspace_id', authReq.pcpWorkspaceId)
         .order('next_run_at', { ascending: true })
         .limit(200),
+      // Workspace-scoped via the owning identity, same as the reminders
+      // query above — without the inner-join filter, same-user strategies
+      // from other workspaces would leak into this workspace's view.
       supabase
         .from('task_groups')
         .select(
-          'id, title, status, strategy, strategy_config, strategy_started_at, strategy_paused_at, updated_at, agent_identities(agent_id, name)'
+          'id, title, status, strategy, strategy_config, strategy_started_at, strategy_paused_at, updated_at, agent_identities!inner(agent_id, name, workspace_id)'
         )
         .eq('user_id', authReq.pcpUserId)
+        .eq('agent_identities.workspace_id', authReq.pcpWorkspaceId)
         .eq('status', 'active')
         .not('strategy', 'is', null)
         .order('updated_at', { ascending: false })
