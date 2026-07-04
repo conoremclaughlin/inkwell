@@ -32,25 +32,41 @@ function readStoredTheme(): Theme {
   return 'system';
 }
 
+/**
+ * Read the theme the inline <head> script (app/layout.tsx) already applied.
+ *
+ * INVARIANT: the inline script owns first paint — it sets the `dark` class
+ * on <html> before hydration from the same storage key + media query this
+ * provider uses. The provider must initialize its state FROM that DOM state
+ * and must not touch the class unless the resolved theme actually differs.
+ * Initializing to a hardcoded default and "correcting" in a mount effect
+ * would briefly strip `.dark` and re-add it, flashing light for
+ * persisted/system dark users.
+ */
+function getInitialResolvedTheme(): 'light' | 'dark' {
+  if (typeof document === 'undefined') return 'light';
+  return document.documentElement.classList.contains('dark') ? 'dark' : 'light';
+}
+
+/** Sync the `dark` class, mutating the DOM only when it disagrees. */
 function applyThemeClass(resolved: 'light' | 'dark') {
   const classList = document.documentElement.classList;
-  if (resolved === 'dark') {
+  const isDark = classList.contains('dark');
+  if (resolved === 'dark' && !isDark) {
     classList.add('dark');
-  } else {
+  } else if (resolved === 'light' && isDark) {
     classList.remove('dark');
   }
 }
 
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  const [theme, setThemeState] = useState<Theme>('system');
-  const [resolvedTheme, setResolvedTheme] = useState<'light' | 'dark'>('light');
-
-  // Sync initial state from localStorage / media query after mount.
-  useEffect(() => {
-    const stored = readStoredTheme();
-    setThemeState(stored);
-    setResolvedTheme(stored === 'system' ? getSystemTheme() : stored);
-  }, []);
+  // Lazy initializers run during the first client render, so by mount the
+  // provider already agrees with what the inline script painted — no
+  // corrective effect pass, no flash. (On the server they fall back to
+  // defaults, which is fine: the provider renders no theme-dependent markup,
+  // so there is no hydration mismatch.)
+  const [theme, setThemeState] = useState<Theme>(readStoredTheme);
+  const [resolvedTheme, setResolvedTheme] = useState<'light' | 'dark'>(getInitialResolvedTheme);
 
   // Follow OS preference changes while in 'system' mode.
   useEffect(() => {
@@ -65,7 +81,10 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     return () => mediaQuery.removeEventListener('change', handleChange);
   }, [theme]);
 
-  // Keep the DOM class in sync with the resolved theme.
+  // Keep the DOM class in sync with the resolved theme. On mount this is a
+  // no-op (state was initialized from the DOM and applyThemeClass only
+  // mutates on disagreement); it only takes effect after an explicit
+  // setTheme or a system-preference change.
   useEffect(() => {
     applyThemeClass(resolvedTheme);
   }, [resolvedTheme]);
