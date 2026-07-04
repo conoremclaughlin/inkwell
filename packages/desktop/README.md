@@ -27,7 +27,7 @@ Both fields are optional — defaults are `localhost:3000`. If you run the dashb
 
 ## Prerequisites
 
-- **Rust toolchain** (rustc/cargo ≥ 1.77.2): `brew install rust` or [rustup](https://rustup.rs)
+- **Rust toolchain** (rustc/cargo ≥ 1.87, matching `rust-version` in `src-tauri/Cargo.toml`): `brew install rust` or [rustup](https://rustup.rs)
 - **Xcode Command Line Tools** (macOS): `xcode-select --install`
 - Node + Yarn (already required by the monorepo) — `@tauri-apps/cli` is a devDependency here.
 

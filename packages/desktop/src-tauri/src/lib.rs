@@ -182,14 +182,25 @@ pub fn run() {
             // The window starts on the bundled waiting page (ui/index.html) so
             // the user never sees a blank white window. The initialization
             // script tells that page which server URL we're waiting for.
+            //
+            // Initialization scripts run on EVERY top-level navigation, so the
+            // injection is guarded to the bundled asset origin (tauri: on
+            // macOS/Linux, tauri.localhost on Windows) — it must not leak into
+            // the dashboard or any external page.
+            let inject_server_url = format!(
+                "(function () {{\
+                   var loc = window.location;\
+                   if (loc.protocol === 'tauri:' || loc.hostname === 'tauri.localhost') {{\
+                     window.__INK_SERVER_URL__ = {};\
+                   }}\
+                 }})();",
+                serde_json::to_string(&server_url)?
+            );
             WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::App("index.html".into()))
                 .title("Inkwell")
                 .inner_size(1280.0, 850.0)
                 .min_inner_size(720.0, 480.0)
-                .initialization_script(&format!(
-                    "window.__INK_SERVER_URL__ = {};",
-                    serde_json::to_string(&server_url)?
-                ))
+                .initialization_script(&inject_server_url)
                 .build()?;
 
             build_tray(app.handle(), target.clone())?;
