@@ -122,6 +122,11 @@ type SessionPreviewItem = {
 
 type SessionLogItem = SessionPreviewItem & {
   metadata?: Record<string, unknown>;
+  /** activity_stream lineage — lets the timeline nest child entries (fork tree) */
+  parentId?: string | null;
+  childSessionId?: string | null;
+  status?: string | null;
+  durationMs?: number | null;
 };
 
 type WorkspaceIdentityScope = {
@@ -288,6 +293,10 @@ function toActivityLogItem(row: {
   content: string;
   created_at: string;
   payload: unknown;
+  parent_id?: string | null;
+  child_session_id?: string | null;
+  status?: string | null;
+  duration_ms?: number | null;
 }): SessionLogItem {
   const fallbackContent = row.content || '';
   const payloadContent = pickContentFromUnknown(row.payload);
@@ -296,7 +305,9 @@ function toActivityLogItem(row: {
   return {
     id: `activity:${row.id}`,
     source: 'activity_stream',
-    type: row.subtype || row.type,
+    // "<type>:<subtype>" matches the SSE-streamed entry format so the
+    // timeline can detect tool_call/tool_result/agent_spawn kinds uniformly.
+    type: row.subtype ? `${row.type}:${row.subtype}` : row.type,
     role: roleFromActivityType(row.type),
     content: truncateText(combined),
     timestamp: row.created_at,
@@ -304,6 +315,10 @@ function toActivityLogItem(row: {
       row.payload && typeof row.payload === 'object'
         ? (row.payload as Record<string, unknown>)
         : undefined,
+    parentId: row.parent_id ?? null,
+    childSessionId: row.child_session_id ?? null,
+    status: row.status ?? null,
+    durationMs: row.duration_ms ?? null,
   };
 }
 
@@ -820,7 +835,9 @@ async function fetchCloudSessionLogs(
   const [{ data: activityRows }, { data: sessionLogRows }] = await Promise.all([
     supabase
       .from('activity_stream')
-      .select('id, type, subtype, content, created_at, payload')
+      .select(
+        'id, type, subtype, content, created_at, payload, parent_id, child_session_id, status, duration_ms'
+      )
       .eq('user_id', userId)
       .eq('session_id', sessionId)
       .order('created_at', { ascending: false })
