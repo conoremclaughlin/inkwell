@@ -1662,28 +1662,33 @@ describe('SessionService', () => {
         })
       );
 
-      expect(mockActivityStream.tagActivityTaskGroup).toHaveBeenCalledWith(
-        'msg-123',
-        'group-xyz',
-        'session-123'
-      );
+      // Backfill is detached (fire-and-forget) — wait for the chain to settle
+      await vi.waitFor(() => {
+        expect(mockActivityStream.tagActivityTaskGroup).toHaveBeenCalledWith(
+          'msg-123',
+          'group-xyz',
+          'session-123'
+        );
+      });
     });
 
-    it('resolves the mission from the routed session threadKey when metadata has none', async () => {
-      const groupId = '11111111-2222-3333-4444-555555555555';
-      const session = createMockSession({ threadKey: 'pr:239' });
-      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+    const groupId = '11111111-2222-3333-4444-555555555555';
 
-      // Supabase mock: any chained method returns the builder; awaited list
-      // queries against task_groups return exactly one group, everything else
-      // resolves empty. Proxy-based so incidental routing helpers
-      // (resolveStudioId, resolveDefaultSessionId, ...) don't blow up on
-      // methods we didn't anticipate.
+    /**
+     * Supabase mock: any chained method returns the builder; awaited list
+     * queries against task_groups return exactly one group (optionally held
+     * behind a gate promise to simulate a slow resolver), everything else
+     * resolves empty. Proxy-based so incidental routing helpers
+     * (resolveStudioId, resolveDefaultSessionId, ...) don't blow up on
+     * methods we didn't anticipate.
+     */
+    const makeSupabaseMock = (options: { taskGroupsGate?: Promise<void> } = {}) => {
       const makeBuilder = (table: string) => {
-        const listResult =
-          table === 'task_groups'
-            ? { data: [{ id: groupId }], error: null }
-            : { data: [], error: null };
+        const isTaskGroups = table === 'task_groups';
+        const listResult = isTaskGroups
+          ? { data: [{ id: groupId }], error: null }
+          : { data: [], error: null };
+        const gate = isTaskGroups ? options.taskGroupsGate : undefined;
         const proxy: Record<string, unknown> = new Proxy(
           {},
           {
@@ -1696,10 +1701,8 @@ describe('SessionService', () => {
                   Promise.resolve({ data: null, error: { code: 'PGRST116', message: 'none' } });
               }
               if (prop === 'then') {
-                return (resolve: (v: unknown) => void) => {
-                  resolve(listResult);
-                  return Promise.resolve(listResult);
-                };
+                return (resolve: (v: unknown) => void) =>
+                  (gate ?? Promise.resolve()).then(() => resolve(listResult));
               }
               return () => proxy;
             },
@@ -1707,9 +1710,11 @@ describe('SessionService', () => {
         );
         return proxy;
       };
-      const mockSupabase = { from: vi.fn((table: string) => makeBuilder(table)) };
+      return { from: vi.fn((table: string) => makeBuilder(table)) };
+    };
 
-      const serviceWithSupabase = new SessionService(
+    const makeServiceWithSupabase = (mockSupabase: { from: unknown }) =>
+      new SessionService(
         mockRepository,
         mockContextBuilder,
         mockClaudeRunner,
@@ -1719,6 +1724,12 @@ describe('SessionService', () => {
         mockSupabase as never
       );
 
+    it('resolves the mission from the routed session threadKey when metadata has none', async () => {
+      const session = createMockSession({ threadKey: 'pr:239' });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      const serviceWithSupabase = makeServiceWithSupabase(makeSupabaseMock());
+
       // Telegram check-in — no threadKey/taskGroupId in metadata
       await serviceWithSupabase.handleMessage(createMockRequest());
 
@@ -1726,12 +1737,44 @@ describe('SessionService', () => {
       expect(mockActivityStream.logMessage).toHaveBeenCalledWith(
         expect.objectContaining({ taskGroupId: undefined })
       );
-      // Backfill resolves via the session's threadKey
-      expect(mockActivityStream.tagActivityTaskGroup).toHaveBeenCalledWith(
-        'msg-123',
-        groupId,
-        'session-123'
+      // Backfill is detached — resolves via the session's threadKey
+      await vi.waitFor(() => {
+        expect(mockActivityStream.tagActivityTaskGroup).toHaveBeenCalledWith(
+          'msg-123',
+          groupId,
+          'session-123'
+        );
+      });
+    });
+
+    it('does not block message processing on the backfill resolver', async () => {
+      const session = createMockSession({ threadKey: 'pr:239' });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      // Hold the resolver's task_groups query behind a gate we control
+      let openGate: () => void = () => {};
+      const gate = new Promise<void>((resolve) => {
+        openGate = resolve;
+      });
+      const serviceWithSupabase = makeServiceWithSupabase(
+        makeSupabaseMock({ taskGroupsGate: gate })
       );
+
+      const result = await serviceWithSupabase.handleMessage(createMockRequest());
+
+      // handleMessage completed while the resolver query is still pending
+      expect(result.success).toBe(true);
+      expect(mockActivityStream.tagActivityTaskGroup).not.toHaveBeenCalled();
+
+      // Release the gate — the detached chain finishes the tagging afterwards
+      openGate();
+      await vi.waitFor(() => {
+        expect(mockActivityStream.tagActivityTaskGroup).toHaveBeenCalledWith(
+          'msg-123',
+          groupId,
+          'session-123'
+        );
+      });
     });
 
     it('leaves the check-in untagged when no mission linkage exists', async () => {
@@ -1743,6 +1786,8 @@ describe('SessionService', () => {
       expect(mockActivityStream.logMessage).toHaveBeenCalledWith(
         expect.objectContaining({ taskGroupId: undefined })
       );
+      // Flush the detached backfill chain before asserting it stayed silent
+      await new Promise((resolve) => setTimeout(resolve, 0));
       expect(mockActivityStream.tagActivityTaskGroup).not.toHaveBeenCalled();
     });
   });

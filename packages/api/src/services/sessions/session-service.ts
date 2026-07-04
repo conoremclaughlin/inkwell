@@ -204,15 +204,11 @@ export class SessionService implements ISessionService {
       contentLength: content.length,
     });
 
-    // Resolve mission (task group) linkage for the check-in entry so it shows
-    // on the mission timeline. Conservative: only explicit metadata or a
-    // verified threadKey match tags the message — null beats wrong.
-    let messageTaskGroupId: string | undefined = metadata?.taskGroupId;
-    if (!messageTaskGroupId && metadata?.threadKey && this.supabase) {
-      messageTaskGroupId =
-        (await resolveTaskGroupForThreadKey(this.supabase, userId, metadata.threadKey)) ??
-        undefined;
-    }
+    // Mission (task group) linkage for the check-in entry. Only explicit
+    // metadata tags at insert time (free — no lookup). Resolver-based tagging
+    // is deferred to a detached backfill after routing so timeline bookkeeping
+    // never delays message handling.
+    const messageTaskGroupId: string | undefined = metadata?.taskGroupId;
 
     // Persist incoming message to activity stream immediately
     // This ensures messages are logged even if processing fails
@@ -269,28 +265,18 @@ export class SessionService implements ISessionService {
       // landed in a session bound to a mission thread (e.g. a Telegram reply
       // routed into a strategy session) belongs on that mission's timeline.
       // Also stamps session_id so the timeline can link to the session turn
-      // the check-in triggered.
+      // the check-in triggered. Genuinely fire-and-forget — the resolve →
+      // tag ordering lives inside the detached chain and nothing here is
+      // awaited, so message processing continues immediately.
       if (loggedMessageId && this.activityStream.tagActivityTaskGroup) {
-        let resolvedGroupId: string | null = messageTaskGroupId ?? null;
-        if (!resolvedGroupId && session.threadKey && this.supabase) {
-          resolvedGroupId = await resolveTaskGroupForThreadKey(
-            this.supabase,
-            userId,
-            session.threadKey
-          );
-        }
-        if (resolvedGroupId) {
-          // Best-effort — never block or fail message processing on this.
-          this.activityStream
-            .tagActivityTaskGroup(loggedMessageId, resolvedGroupId, session.id)
-            .catch((tagError) => {
-              logger.warn('Failed to backfill task group on check-in activity', {
-                activityId: loggedMessageId,
-                taskGroupId: resolvedGroupId,
-                error: tagError instanceof Error ? tagError.message : String(tagError),
-              });
-            });
-        }
+        this.backfillMessageTaskGroup({
+          activityId: loggedMessageId,
+          userId,
+          sessionId: session.id,
+          knownTaskGroupId: messageTaskGroupId,
+          metadataThreadKey: metadata?.threadKey,
+          sessionThreadKey: session.threadKey,
+        });
       }
 
       // 2. Log session routing for external + heartbeat channels
@@ -374,6 +360,49 @@ export class SessionService implements ISessionService {
    * If there are pending messages, process the next one (lock remains held).
    * If queue is empty, release the lock.
    */
+  /**
+   * Detached (fire-and-forget) mission backfill for a logged check-in.
+   *
+   * Resolves the task group from explicit metadata, the request threadKey, or
+   * the routed session's threadKey — in that order — then tags the activity
+   * row with task_group_id + session_id. Best-effort timeline bookkeeping:
+   * callers must NOT await this; failures are logged at debug and never throw.
+   */
+  private backfillMessageTaskGroup(params: {
+    activityId: string;
+    userId: string;
+    sessionId: string;
+    knownTaskGroupId?: string;
+    metadataThreadKey?: string;
+    sessionThreadKey?: string;
+  }): void {
+    const { activityId, userId, sessionId, knownTaskGroupId, metadataThreadKey, sessionThreadKey } =
+      params;
+    const tagActivityTaskGroup = this.activityStream.tagActivityTaskGroup?.bind(
+      this.activityStream
+    );
+    if (!tagActivityTaskGroup) return;
+    const supabase = this.supabase;
+
+    void (async () => {
+      let groupId: string | null = knownTaskGroupId ?? null;
+      if (!groupId && supabase && metadataThreadKey) {
+        groupId = await resolveTaskGroupForThreadKey(supabase, userId, metadataThreadKey);
+      }
+      if (!groupId && supabase && sessionThreadKey && sessionThreadKey !== metadataThreadKey) {
+        groupId = await resolveTaskGroupForThreadKey(supabase, userId, sessionThreadKey);
+      }
+      if (groupId) {
+        await tagActivityTaskGroup(activityId, groupId, sessionId);
+      }
+    })().catch((tagError) => {
+      logger.debug('Failed to backfill task group on check-in activity', {
+        activityId,
+        error: tagError instanceof Error ? tagError.message : String(tagError),
+      });
+    });
+  }
+
   private async processQueueOrReleaseLock(lockKey: string): Promise<void> {
     const queue = this.pendingQueues.get(lockKey);
 
