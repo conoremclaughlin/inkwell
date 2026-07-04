@@ -119,6 +119,15 @@ Inkwell uses Supabase (PostgreSQL) as its database. There are **two access paths
 
 5. **Never expose the service role key to the client.** It lives in `.env.local` (server only) and must never appear in `NEXT_PUBLIC_*` environment variables.
 
+### File Access & Media Isolation (TODO)
+
+Server-spawned Claude sessions currently get `--add-dir ~/.ink/files` for media access (Telegram downloads, Gmail attachments, etc.). This is a shared directory — **all SBs can read all SBs' files**. Future work should consider:
+
+- **Per-agent file namespacing**: `~/.ink/files/<agentId>/telegram/` instead of `~/.ink/files/telegram/`
+- **Scoped `--add-dir`**: only grant access to the spawned agent's own subdirectory
+- **Cross-agent file sharing**: explicit mechanism for one SB to share a file with another (vs. implicit shared access)
+- **File lifecycle**: cleanup policy for downloaded media (currently accumulates indefinitely)
+
 ## Timezone Handling (IMPORTANT)
 
 **Always convert UTC timestamps to the user's local timezone when displaying.**
@@ -262,6 +271,19 @@ When sending messages to other SBs via `send_to_inbox`, use `threadKey` to maint
 | `debug:<slug>`   | Collaborative debugging                     | `debug:inbox-latency`        |
 | `task:<id>`      | PCP task coordination                       | `task:abc123`                |
 | `thread:<slug>`  | Multi-step conversation with no natural key | `thread:perf-audit`          |
+
+### Cross-Project threadKeys
+
+When working across multiple repos/projects, prefix the threadKey with the project name to avoid collisions. The format is `<project>:<type>:<identifier>`.
+
+| Context                       | threadKey                 |
+| ----------------------------- | ------------------------- |
+| PR in Inkwell (this repo)     | `pr:389`                  |
+| PR in a different project     | `inktrade:pr:42`          |
+| Issue in another project      | `openclaw:issue:15`       |
+| Cross-project spec discussion | `inktrade:spec:valuation` |
+
+Within the Inkwell repo, the project prefix is optional — `pr:389` is unambiguous. For any thread that references work in a different repo, always include the project prefix so trigger routing and session matching work correctly across boundaries.
 
 ### Sender Rules
 

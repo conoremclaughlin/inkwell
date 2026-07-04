@@ -26,15 +26,36 @@ import {
   runBackendInteractiveLogin,
   type BackendAuthBackend,
 } from '../lib/backend-auth.js';
-import { runBackendTurn } from '../repl/backend-runner.js';
-import { ContextLedger, estimateTokens } from '../repl/context-ledger.js';
+import { startBackendTurn, runBackendTurn } from '../repl/backend-runner.js';
+import {
+  ContextLedger,
+  entryRefHash,
+  estimateTokens,
+  type LedgerRole,
+} from '../repl/context-ledger.js';
 import { parseSlashCommand } from '../repl/slash.js';
+import {
+  parseEvictSelection,
+  selectEvictionEntries,
+  formatEvictCandidate,
+} from '../repl/evict-selection.js';
+import {
+  resolveAttachments,
+  buildAttachmentBlock,
+  collectAttachmentDirs,
+} from '../repl/attachments.js';
+import { classifyActivity } from '../repl/activity-render.js';
 import { ToolMode, ToolPolicyScopeKind, ToolPolicyState } from '../repl/tool-policy.js';
 import { formatBackendTokenUsage, type BackendTokenUsage } from '../repl/token-usage.js';
 import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../repl/skills.js';
 import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
 import { ensurePcpToolAllowed } from '../repl/tool-gate.js';
 import { executeToolCalls, type ToolCallResult } from '../repl/tool-call-executor.js';
+import {
+  resolveCredentialRefs,
+  loadKeychainCredentials,
+  buildResolverEnv,
+} from '../repl/credential-resolver.js';
 import {
   isClientLocalTool,
   handleClientLocalTool,
@@ -44,7 +65,9 @@ import {
 import { SbHookRegistry } from '../repl/hook-registry.js';
 import { registerBuiltinHooks } from '../repl/builtin-hooks.js';
 import { applyProfile, formatProfileList, isValidProfileId } from '../repl/tool-profiles.js';
+import { isPiTool, callPiTool } from '../repl/pi-tools.js';
 import { ApprovalRequestManager } from '../repl/approval-request.js';
+import { requestToolApproval } from '../repl/approval-api.js';
 import {
   type ApprovalChannel,
   type ApprovalResponseDecision,
@@ -65,12 +88,20 @@ import {
   isOlderThan5Days,
   LiveStatusLane,
   renderCollapsedInbox,
+  renderContextCutoff,
   renderMessageLine,
   renderTimedBlock,
   separator,
   startWaitingIndicator,
 } from '../repl/tui-components.js';
-import { renderInkChat, InkExitSignal, type InkRepl } from '../repl/ink/index.js';
+import {
+  renderInkChat,
+  renderSessionPicker,
+  InkExitSignal,
+  type InkRepl,
+  type SessionPickerEntry,
+} from '../repl/ink/index.js';
+import { formatContextLines, type ContextSections } from '../repl/ink/context-viewer.js';
 import {
   classifyError,
   decodeDelegationToken,
@@ -98,6 +129,8 @@ type ChatOptions = {
   tools?: string;
   profile?: string;
   message?: string;
+  messageLabel?: string;
+  attachFile?: string[];
   nonInteractive?: boolean;
   maxTurns?: string;
   backendTimeoutSeconds?: string;
@@ -106,7 +139,9 @@ type ChatOptions = {
   sbDebug?: boolean;
   verbose?: boolean;
   fullscreen?: boolean;
+  dynamic?: boolean;
   approvalMode?: string;
+  away?: boolean;
 };
 
 interface InboxMessage {
@@ -161,6 +196,7 @@ interface SessionSummary {
   threadKey?: string;
   startedAt?: string;
   backend?: string;
+  provider?: string;
   model?: string;
   backendSessionId?: string;
   claudeSessionId?: string;
@@ -174,6 +210,8 @@ interface ActivitySummary {
   agentId?: string;
   sessionId?: string;
   createdAt?: string;
+  /** Originating platform for message activities (telegram, discord, …) */
+  platform?: string;
 }
 
 function isBackendAuthBackend(value: string): value is BackendAuthBackend {
@@ -357,6 +395,8 @@ interface LocalToolCall {
 
 interface SessionTranscriptMetadata {
   transcriptPath: string;
+  /** Transcript file size in bytes — quick toxic-session indicator */
+  transcriptBytes: number;
   messageCount: number;
   userCount: number;
   assistantCount: number;
@@ -371,10 +411,33 @@ interface HistoryHydrationResult {
   messageCount: number;
   source: 'repl-transcript' | 'pcp-session-context' | 'none';
   transcriptPath?: string;
-  tailPreview: Array<{ role: 'user' | 'assistant' | 'inbox'; content: string; ts?: string }>;
+  tailPreview: Array<{
+    /** 'event' rows are dim progress lines (tool calls) — not messages */
+    role: 'user' | 'assistant' | 'inbox' | 'system' | 'event';
+    content: string;
+    ts?: string;
+    /** Display label for system entries (e.g., "heartbeat", "continuation") */
+    label?: string;
+    /** Transcript event id (for eviction filtering of the replay) */
+    eid?: number;
+  }>;
   seenInboxIds?: string[];
   seenActivityIds?: string[];
+  /** True when hydration collapsed history at a compaction event */
+  compactionCollapsed?: boolean;
 }
+
+/** An entry excluded from the window by a context_evict event — kept for display */
+interface EvictedEntryRecord {
+  role: LedgerRole;
+  content: string;
+  source?: string;
+  eid?: number;
+  actor?: string;
+  reason?: string;
+}
+
+const EVICTED_DISPLAY_MAX = 100;
 
 interface SessionContextMessage {
   role: 'user' | 'assistant' | 'inbox' | 'system';
@@ -388,10 +451,23 @@ const AUTO_TRIM_KEEP_RECENT_ENTRIES = 6;
 const DEFAULT_TRIM_TARGET_PCT = 70;
 const CTRL_C_EXIT_WINDOW_MS = 3000;
 const DEFAULT_BACKEND_TOKEN_WINDOW = 1_000_000;
+// Our working context budget — deliberately smaller than the backend's raw
+// window. When the transcript approaches this, we compact (summarize the
+// oldest entries into a new start state) rather than letting it grow until
+// turns degrade or argv/window limits bite. Override with --max-context-tokens.
+const DEFAULT_MAX_CONTEXT_TOKENS = 200_000;
+// Compact when transcript+identity utilization crosses this fraction of budget
+const AUTO_COMPACT_THRESHOLD_PCT = 0.8;
+// Entries kept verbatim after the compaction summary (the working tail)
+const AUTO_COMPACT_KEEP_RECENT_ENTRIES = 12;
 const HISTORY_PREVIEW_MAX = 200;
 function resolveBackendTokenWindow(_backend: string, _model?: string): number {
   // Current policy: claude/codex/gemini all default to 1M effective context window.
   return DEFAULT_BACKEND_TOKEN_WINDOW;
+}
+
+function defaultContextBudget(backendTokenWindow: number): number {
+  return Math.min(backendTokenWindow, DEFAULT_MAX_CONTEXT_TOKENS);
 }
 
 function formatTokenCount(value: number): string {
@@ -551,8 +627,15 @@ function getSessionTranscriptMetadata(sessionId: string): SessionTranscriptMetad
   }
 
   const messageCount = userCount + assistantCount + inboxCount;
+  let transcriptBytes = 0;
+  try {
+    transcriptBytes = statSync(path).size;
+  } catch {
+    // File raced away between read and stat — size stays 0
+  }
   return {
     transcriptPath: path,
+    transcriptBytes,
     messageCount,
     userCount,
     assistantCount,
@@ -563,7 +646,8 @@ function getSessionTranscriptMetadata(sessionId: string): SessionTranscriptMetad
   };
 }
 
-function hydrateLedgerFromTranscript(
+// Exported for tests — verifies compaction events rehydrate summary + kept tail
+export function hydrateLedgerFromTranscript(
   ledger: ContextLedger,
   transcriptPath: string
 ): {
@@ -572,16 +656,38 @@ function hydrateLedgerFromTranscript(
   tailPreview: HistoryHydrationResult['tailPreview'];
   seenInboxIds: string[];
   seenActivityIds: string[];
+  recoveredMemoryIds: string[];
+  compactionCollapsed: boolean;
+  /** Entries excluded by context_evict events — for evicted-content display */
+  evictedEntries: EvictedEntryRecord[];
+  /** Tool calls replayed from the transcript (for the context inspector) */
+  toolCalls: Array<{ tool: string; status: string; at: string; args?: string }>;
+  /** Highest event id seen — seeds the append counter so new eids continue */
+  maxEid: number;
 } {
   const events = readTranscriptEvents(transcriptPath);
   let loaded = 0;
   let messageCount = 0;
+  let compactionCollapsed = false;
+  let maxEid = 0;
   const preview: HistoryHydrationResult['tailPreview'] = [];
   const seenInboxIds = new Set<string>();
   const seenActivityIds = new Set<string>();
+  const recoveredMemoryIds: string[] = [];
+  const evictedEntries: EvictedEntryRecord[] = [];
+  const toolCalls: Array<{ tool: string; status: string; at: string; args?: string }> = [];
+  // Entries added by THIS hydration pass — a compaction event collapses them
+  // (and only them; entries that pre-date hydration are left alone).
+  const hydratedEntryIds: number[] = [];
 
-  const pushPreview = (role: 'user' | 'assistant' | 'inbox', content: string, ts?: string) => {
-    preview.push({ role, content: compactForHistoryPreview(role, content), ts });
+  const pushPreview = (
+    role: 'user' | 'assistant' | 'inbox' | 'system' | 'event',
+    content: string,
+    ts?: string,
+    label?: string,
+    eid?: number
+  ) => {
+    preview.push({ role, content: compactForHistoryPreview(role, content), ts, label, eid });
     if (preview.length > HISTORY_PREVIEW_MAX) {
       preview.shift();
     }
@@ -589,39 +695,260 @@ function hydrateLedgerFromTranscript(
 
   for (const event of events) {
     const type = typeof event.type === 'string' ? event.type : '';
-    if (type === 'user' && typeof event.content === 'string') {
-      ledger.addEntry('user', event.content, 'repl-history');
-      loaded += 1;
-      messageCount += 1;
-      pushPreview('user', event.content, typeof event.ts === 'string' ? event.ts : undefined);
+    const eid = typeof event.eid === 'number' ? event.eid : undefined;
+    if (eid !== undefined && eid > maxEid) maxEid = eid;
+    if (type === 'context_evict' && Array.isArray(event.refs)) {
+      // Apply the eviction exactly as it happened live: remove matching
+      // entries that exist at this point in the replay. Entries appended
+      // AFTER this event (even with identical content) are unaffected —
+      // in-stream ordering gives exclusion the right semantics for free.
+      const refs = (event.refs as Array<Record<string, unknown>>)
+        .filter((r) => r && typeof r === 'object')
+        .map((r) => ({
+          eid: typeof r.eid === 'number' ? r.eid : undefined,
+          hash: typeof r.hash === 'string' ? r.hash : undefined,
+        }));
+      const hydratedSet = new Set(hydratedEntryIds);
+      const matchIds = ledger.findEntriesByRefs(refs).filter((id) => hydratedSet.has(id));
+      if (matchIds.length === 0) continue;
+      const evictResult = ledger.evictEntries(matchIds);
+      const removedLedgerIds = new Set(evictResult.removedEntries.map((e) => e.id));
+      for (let i = hydratedEntryIds.length - 1; i >= 0; i--) {
+        if (removedLedgerIds.has(hydratedEntryIds[i])) hydratedEntryIds.splice(i, 1);
+      }
+      // Drop evicted entries from the visible replay and adjust counts.
+      // Eid-preferred matching: rows with eids are filtered ONLY by eid —
+      // content-key matching is reserved for eid-less (legacy) removals.
+      // Otherwise evicting one of two identical-content entries by eid
+      // would also drop the survivor's preview row.
+      const removedEids = new Set(
+        evictResult.removedEntries.map((e) => e.eid).filter((v): v is number => v !== undefined)
+      );
+      const removedKeysWithoutEid = new Set(
+        evictResult.removedEntries
+          .filter((e) => e.eid === undefined)
+          .map((e) => `${e.role} ${compactForHistoryPreview(e.role, e.content)}`)
+      );
+      for (let i = preview.length - 1; i >= 0; i--) {
+        const p = preview[i];
+        const matchesByEid = p.eid !== undefined && removedEids.has(p.eid);
+        const matchesByKey =
+          p.eid === undefined && removedKeysWithoutEid.has(`${p.role} ${p.content}`);
+        if (matchesByEid || matchesByKey) {
+          preview.splice(i, 1);
+        }
+      }
+      let removedMessages = 0;
+      for (const removed of evictResult.removedEntries) {
+        if (
+          removed.role === 'user' ||
+          removed.role === 'assistant' ||
+          removed.role === 'inbox' ||
+          (removed.role === 'system' &&
+            (removed.source === 'continuation' ||
+              !INTERNAL_SYSTEM_SOURCES.has(removed.source || '')))
+        ) {
+          removedMessages += 1;
+        }
+        evictedEntries.push({
+          role: removed.role,
+          content: removed.content,
+          source: removed.source,
+          eid: removed.eid,
+          actor: typeof event.actor === 'string' ? event.actor : undefined,
+          reason: typeof event.reason === 'string' ? event.reason : undefined,
+        });
+      }
+      if (evictedEntries.length > EVICTED_DISPLAY_MAX) {
+        evictedEntries.splice(0, evictedEntries.length - EVICTED_DISPLAY_MAX);
+      }
+      messageCount = Math.max(0, messageCount - removedMessages);
+      loaded = Math.max(0, loaded - evictResult.removedEntries.length);
       continue;
     }
-    if (type === 'assistant' && typeof event.content === 'string') {
-      const source = typeof event.backend === 'string' ? event.backend : 'backend-history';
-      ledger.addEntry('assistant', event.content, source);
+    if (type === 'compaction' && typeof event.summary === 'string') {
+      // Compaction marks a new start state: everything replayed before this
+      // point is superseded by the event's summary + kept tail. The tail's
+      // original events precede this marker in the file, so they were just
+      // evicted — re-seed them from the event to match the live session's
+      // post-compaction ledger exactly.
+      ledger.evictEntries(hydratedEntryIds);
+      hydratedEntryIds.length = 0;
+      const summaryEntry = ledger.addEntry('system', event.summary, 'compaction-history');
+      hydratedEntryIds.push(summaryEntry.id);
+      loaded = 1;
+      messageCount = 0;
+      // Reset the visible replay too — pre-compaction turns are out of
+      // context and must not appear below the cutoff divider. The kept
+      // tail is re-added below from the event's keptEntries.
+      preview.length = 0;
+      compactionCollapsed = true;
+      const keptEntries = Array.isArray(event.keptEntries) ? event.keptEntries : [];
+      for (const kept of keptEntries) {
+        if (!kept || typeof kept !== 'object') continue;
+        const keptRecord = kept as Record<string, unknown>;
+        if (typeof keptRecord.content !== 'string') continue;
+        const role: LedgerRole =
+          keptRecord.role === 'user' ||
+          keptRecord.role === 'assistant' ||
+          keptRecord.role === 'inbox' ||
+          keptRecord.role === 'system'
+            ? keptRecord.role
+            : 'system';
+        const source =
+          typeof keptRecord.source === 'string' ? keptRecord.source : 'compaction-tail';
+        const keptEid = typeof keptRecord.eid === 'number' ? keptRecord.eid : undefined;
+        const entry = ledger.addEntry(role, keptRecord.content, source, keptEid);
+        hydratedEntryIds.push(entry.id);
+        loaded += 1;
+        if (role === 'user' || role === 'assistant' || role === 'inbox') {
+          messageCount += 1;
+          pushPreview(
+            role,
+            keptRecord.content,
+            typeof event.ts === 'string' ? event.ts : undefined,
+            undefined,
+            keptEid
+          );
+        } else if (role === 'system' && !INTERNAL_SYSTEM_SOURCES.has(source)) {
+          // Kept system turns with a meaningful channel label (heartbeat,
+          // telegram, …) stay visible in the replay
+          pushPreview(
+            'system',
+            keptRecord.content,
+            typeof event.ts === 'string' ? event.ts : undefined,
+            source,
+            keptEid
+          );
+        }
+      }
+      continue;
+    }
+    if (type === 'user' && typeof event.content === 'string') {
+      const entry = ledger.addEntry('user', event.content, 'repl-history', eid);
+      hydratedEntryIds.push(entry.id);
       loaded += 1;
       messageCount += 1;
-      pushPreview('assistant', event.content, typeof event.ts === 'string' ? event.ts : undefined);
+      pushPreview(
+        'user',
+        event.content,
+        typeof event.ts === 'string' ? event.ts : undefined,
+        undefined,
+        eid
+      );
+      continue;
+    }
+    if (type === 'assistant') {
+      if (event.cancelled === true || event.content === '(no output)') continue;
+      if (typeof event.content !== 'string') continue;
+      const source = typeof event.backend === 'string' ? event.backend : 'backend-history';
+      const entry = ledger.addEntry('assistant', event.content, source, eid);
+      hydratedEntryIds.push(entry.id);
+      loaded += 1;
+      messageCount += 1;
+      pushPreview(
+        'assistant',
+        event.content,
+        typeof event.ts === 'string' ? event.ts : undefined,
+        undefined,
+        eid
+      );
       continue;
     }
     if (type === 'inbox' && typeof event.rendered === 'string') {
-      ledger.addEntry('inbox', compactForLedger(event.rendered), 'inkmail-history');
+      const entry = ledger.addEntry(
+        'inbox',
+        compactForLedger(event.rendered),
+        'inkmail-history',
+        eid
+      );
+      hydratedEntryIds.push(entry.id);
       loaded += 1;
       messageCount += 1;
-      pushPreview('inbox', event.rendered, typeof event.ts === 'string' ? event.ts : undefined);
+      pushPreview(
+        'inbox',
+        event.rendered,
+        typeof event.ts === 'string' ? event.ts : undefined,
+        undefined,
+        eid
+      );
       if (typeof event.messageId === 'string') {
         seenInboxIds.add(event.messageId);
+      }
+      continue;
+    }
+    if (type === 'system_turn' && typeof event.content === 'string') {
+      // Synthetic turn input (heartbeat trigger, continuation prompt, etc.)
+      const label = typeof event.label === 'string' ? event.label : 'system';
+      const entry = ledger.addEntry('system', event.content, label, eid);
+      hydratedEntryIds.push(entry.id);
+      loaded += 1;
+      messageCount += 1;
+      // Continuation prompts are repetitive noise — keep delivered messages
+      // (heartbeat triggers, channel messages) visible in the replay.
+      if (label !== 'continuation') {
+        pushPreview(
+          'system',
+          event.content,
+          typeof event.ts === 'string' ? event.ts : undefined,
+          label,
+          eid
+        );
+      }
+      continue;
+    }
+    if (type === 'hook_injection' && typeof event.content === 'string') {
+      const source = typeof event.source === 'string' ? event.source : 'hook-history';
+      const entry = ledger.addEntry('system', event.content, source, eid);
+      hydratedEntryIds.push(entry.id);
+      loaded += 1;
+      if (typeof event.memoryId === 'string') {
+        recoveredMemoryIds.push(event.memoryId);
+      }
+      continue;
+    }
+    if (type === 'local_tool_call' && typeof event.tool === 'string') {
+      // Tool calls are part of the story — when the assistant says "I sent
+      // him a heads-up via Telegram", the send_response call is the receipt.
+      // Replay them as dim event lines (display only — tool RESULTS are not
+      // reconstructed into the ledger here). The inline row is a one-line
+      // teaser; fuller args land in the context inspector's Tool Calls
+      // section (Ctrl+T) via the toolCalls collected here.
+      const status = typeof event.status === 'string' ? event.status : 'executed';
+      const argsJson = event.args ? JSON.stringify(event.args).replace(/\s+/g, ' ') : '';
+      const argsPreview = argsJson.length > 100 ? `${argsJson.slice(0, 100)}…` : argsJson;
+      pushPreview(
+        'event',
+        `🛠 ${event.tool} (${status})${argsPreview ? ` — ${argsPreview}` : ''}`,
+        typeof event.ts === 'string' ? event.ts : undefined,
+        undefined,
+        eid
+      );
+      toolCalls.push({
+        tool: event.tool,
+        status,
+        at: typeof event.ts === 'string' ? event.ts : '',
+        args: argsJson
+          ? argsJson.length > 400
+            ? `${argsJson.slice(0, 400)}…`
+            : argsJson
+          : undefined,
+      });
+      if (toolCalls.length > 100) {
+        toolCalls.splice(0, toolCalls.length - 100);
       }
       continue;
     }
     if (type === 'activity' && typeof event.content === 'string') {
       const actor = typeof event.agentId === 'string' ? event.agentId : 'system';
       const activityType = typeof event.activityType === 'string' ? event.activityType : 'activity';
-      ledger.addEntry(
+      const entry = ledger.addEntry(
         'system',
         compactForLedger(`⚡ ${actor} ${activityType} — ${event.content}`, 320),
-        'pcp-activity-history'
+        'pcp-activity-history',
+        eid
       );
+      hydratedEntryIds.push(entry.id);
       loaded += 1;
       if (typeof event.activityId === 'string') {
         seenActivityIds.add(event.activityId);
@@ -635,6 +962,11 @@ function hydrateLedgerFromTranscript(
     tailPreview: preview,
     seenInboxIds: Array.from(seenInboxIds),
     seenActivityIds: Array.from(seenActivityIds),
+    recoveredMemoryIds,
+    compactionCollapsed,
+    evictedEntries,
+    toolCalls,
+    maxEid,
   };
 }
 
@@ -712,8 +1044,21 @@ async function tailTranscript(target: string): Promise<void> {
   });
 }
 
-function appendTranscript(path: string, event: Record<string, unknown>): void {
-  appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n');
+// Per-transcript monotonic event id counters. Every appended event gets an
+// `eid` so persistent operations (context_evict) can reference events
+// precisely across reattach. Seeded from the file's max eid on hydration.
+const transcriptEidCounters = new Map<string, number>();
+
+export function seedTranscriptEidCounter(path: string, maxSeen: number): void {
+  const current = transcriptEidCounters.get(path) ?? 0;
+  if (maxSeen > current) transcriptEidCounters.set(path, maxSeen);
+}
+
+function appendTranscript(path: string, event: Record<string, unknown>): number {
+  const eid = (transcriptEidCounters.get(path) ?? 0) + 1;
+  transcriptEidCounters.set(path, eid);
+  appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), eid, ...event }) + '\n');
+  return eid;
 }
 
 function compactForLedger(content: string, maxChars = LEDGER_COMPACT_CHARS): string {
@@ -722,7 +1067,25 @@ function compactForLedger(content: string, maxChars = LEDGER_COMPACT_CHARS): str
   return `${normalized.slice(0, Math.max(1, maxChars - 1))}…`;
 }
 
-function compactForHistoryPreview(role: 'user' | 'assistant' | 'inbox', content: string): string {
+// System-entry sources that are runtime bookkeeping, not conversation —
+// excluded from the visible history replay (they stay in the ledger).
+const INTERNAL_SYSTEM_SOURCES = new Set([
+  'continuation',
+  'compaction-tail',
+  'compaction-history',
+  'pcp-activity',
+  'pcp-activity-history',
+  'passive-recall',
+  'budget-monitor',
+  'auto-run',
+  'hook-history',
+  'bootstrap',
+]);
+
+function compactForHistoryPreview(
+  role: 'user' | 'assistant' | 'inbox' | 'system' | 'event',
+  content: string
+): string {
   if (role === 'inbox') {
     return compactForLedger(content.replace(/\s+/g, ' ').trim(), 180);
   }
@@ -936,6 +1299,7 @@ function extractSessionSummaries(
             : typeof row.backend_name === 'string'
               ? row.backend_name
               : undefined,
+        provider: typeof row.provider === 'string' ? row.provider : undefined,
         model:
           typeof row.model === 'string'
             ? row.model
@@ -996,6 +1360,7 @@ function extractActivitySummaries(
             : typeof row.created_at === 'string'
               ? row.created_at
               : undefined,
+        platform: typeof row.platform === 'string' ? row.platform : undefined,
       };
     })
     .filter((activity): activity is ActivitySummary => Boolean(activity));
@@ -1159,16 +1524,16 @@ function buildContextStatusSummary(params: {
       : `${total.toLocaleString()}`;
   return `${breakdown} / ${params.maxContextTokens.toLocaleString()} (${pct.toFixed(
     1
-  )}%) ${queue} backend:${params.backend}`;
+  )}%) ${queue} provider:${params.backend}`;
 }
 
-function printUsage(
+function formatUsageLines(
   ledger: ContextLedger,
   maxContextTokens: number,
   previousTotal?: number,
   lastBackendUsage?: BackendTokenUsage,
   backendTokenWindow?: number
-): number {
+): { lines: string[]; total: number } {
   const entries = ledger.listEntries();
   const total = ledger.totalTokens();
   const pct = maxContextTokens > 0 ? Math.min((total / maxContextTokens) * 100, 999) : 0;
@@ -1189,14 +1554,6 @@ function printUsage(
   }
 
   const bar = buildTokenMeter(displayPct);
-  const color =
-    pct >= 95
-      ? chalk.red
-      : pct >= 80
-        ? chalk.yellow
-        : pct >= 60
-          ? chalk.hex('#f59e0b')
-          : chalk.green;
   const windowLabel =
     backendTokenWindow && backendTokenWindow !== maxContextTokens
       ? `  backend-window:${backendTokenWindow.toLocaleString()}`
@@ -1204,17 +1561,31 @@ function printUsage(
   const header = `Context: ~${total.toLocaleString()} / ${maxContextTokens.toLocaleString()} tok (${pct.toFixed(
     1
   )}%)${deltaLabel}${windowLabel}`;
-  console.log(color(header));
-  console.log(
-    color(`[${bar}]`) +
-      chalk.dim(
-        `  entries:${entries.length}  user:${user.toLocaleString()}  assistant:${assistant.toLocaleString()}  inbox:${inbox.toLocaleString()}  system:${system.toLocaleString()}`
-      )
-  );
+  const lines = [
+    header,
+    `[${bar}]  entries:${entries.length}  user:${user.toLocaleString()}  assistant:${assistant.toLocaleString()}  inbox:${inbox.toLocaleString()}  system:${system.toLocaleString()}`,
+  ];
   if (lastBackendUsage) {
-    console.log(chalk.dim(`Last backend usage: ${formatBackendTokenUsage(lastBackendUsage)}`));
+    lines.push(`Last backend usage: ${formatBackendTokenUsage(lastBackendUsage)}`);
   }
+  return { lines, total };
+}
 
+function printUsage(
+  ledger: ContextLedger,
+  maxContextTokens: number,
+  previousTotal?: number,
+  lastBackendUsage?: BackendTokenUsage,
+  backendTokenWindow?: number
+): number {
+  const { lines, total } = formatUsageLines(
+    ledger,
+    maxContextTokens,
+    previousTotal,
+    lastBackendUsage,
+    backendTokenWindow
+  );
+  for (const line of lines) console.log(line);
   return total;
 }
 
@@ -1240,6 +1611,28 @@ function formatTimestampForSessionList(value?: string, timezone?: string): strin
       hour: 'numeric',
       minute: '2-digit',
     });
+  }
+}
+
+function formatRelativeTime(ms: number, timezone?: string): string {
+  const now = Date.now();
+  const diffMs = now - ms;
+  if (diffMs < 0) return 'just now';
+  const mins = Math.floor(diffMs / 60_000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  try {
+    return new Date(ms).toLocaleDateString([], {
+      month: 'short',
+      day: 'numeric',
+      timeZone: timezone,
+    });
+  } catch {
+    return new Date(ms).toLocaleDateString([], { month: 'short', day: 'numeric' });
   }
 }
 
@@ -1273,9 +1666,19 @@ function sessionBackendLabel(session: SessionSummary): string {
   return '-';
 }
 
+/** Human file size for transcript footprints: 412KB, 1.2MB, 24MB. Exported for tests. */
+export function formatTranscriptSize(bytes: number): string {
+  if (bytes <= 0) return '';
+  const mb = bytes / (1024 * 1024);
+  if (mb < 1) return `${Math.max(1, Math.round(bytes / 1024))}KB`;
+  if (mb < 10) return `${mb.toFixed(1)}MB`;
+  return `${Math.round(mb)}MB`;
+}
+
 function sessionHistoryLabel(meta: SessionTranscriptMetadata | null): string {
   if (!meta) return 'remote';
-  return `${meta.messageCount} msgs`;
+  const size = formatTranscriptSize(meta.transcriptBytes);
+  return size ? `${meta.messageCount} msgs · ${size}` : `${meta.messageCount} msgs`;
 }
 
 function sessionLatestMessagePreview(
@@ -1296,18 +1699,17 @@ function chip(label: string, value: string, color: (text: string) => string): st
   return `${chalk.dim(`${label}:`)} ${color(value)}`;
 }
 
-function printSessionsSnapshot(sessions: SessionSummary[], options?: { timezone?: string }): void {
+function formatSessionsLines(
+  sessions: SessionSummary[],
+  options?: { timezone?: string }
+): string[] {
   if (sessions.length === 0) {
-    console.log(chalk.dim('No active sessions found.'));
-    return;
+    return ['No active sessions found.'];
   }
-
-  console.log(chalk.bold('\nActive sessions'));
-  console.log(
-    chalk.dim(
-      'id       agent   status/phase            studio            thread        started   backend            history    last-msg'
-    )
-  );
+  const lines = [
+    'Active sessions',
+    'id       agent   status/phase            studio            thread        started   backend            history             last-msg',
+  ];
   for (const session of sessions) {
     const transcriptMeta = getSessionTranscriptMetadata(session.id);
     const id = session.id.slice(0, 7).padEnd(7);
@@ -1317,91 +1719,87 @@ function printSessionsSnapshot(sessions: SessionSummary[], options?: { timezone?
     const thread = (session.threadKey || '-').slice(0, 12).padEnd(12);
     const started = formatStartedAt(session.startedAt);
     const backend = sessionBackendLabel(session).slice(0, 18).padEnd(18);
-    const history = sessionHistoryLabel(transcriptMeta).slice(0, 9).padEnd(9);
+    const history = sessionHistoryLabel(transcriptMeta).slice(0, 18).padEnd(18);
     const lastMessage = formatTimestampForSessionList(
       transcriptMeta?.lastMessageAt,
       options?.timezone
     ).padEnd(8, ' ');
-    console.log(
-      chalk.dim(
-        `${id}  ${agent}  ${status}  ${studio}  ${thread}  ${started.padEnd(7)}  ${backend}  ${history}  ${lastMessage}`
-      )
+    lines.push(
+      `${id}  ${agent}  ${status}  ${studio}  ${thread}  ${started.padEnd(7)}  ${backend}  ${history}  ${lastMessage}`
     );
   }
+  return lines;
+}
+
+function printSessionsSnapshot(sessions: SessionSummary[], options?: { timezone?: string }): void {
+  const lines = formatSessionsLines(sessions, options);
+  for (const line of lines) console.log(chalk.dim(line));
   console.log('');
 }
 
-function printToolPolicySnapshot(
+function formatToolPolicyLines(
   toolPolicy: ToolPolicyState,
   sessionId: string | undefined,
   activeSkills: SkillInstruction[]
-): void {
+): string[] {
   const gate = toolPolicy.getBackendToolGate();
-  console.log(chalk.bold('\nTool policy'));
-  console.log(chalk.dim(`Path: ${toolPolicy.getPolicyPath()}`));
-  console.log(chalk.dim(`Effective mode: ${toolPolicy.getMode()}`));
-  console.log(chalk.dim(`Mutation scope: ${toolPolicy.getMutationScopeLabel()}`));
-  console.log(chalk.dim(`Active scopes: ${toolPolicy.listActiveScopeLabels().join(' -> ')}`));
-  console.log(chalk.dim(`Skill trust mode: ${toolPolicy.getSkillTrustMode()}`));
-  console.log(chalk.dim(`Session visibility: ${toolPolicy.getSessionVisibility()}`));
+  const lines: string[] = [
+    'Tool policy',
+    `Path: ${toolPolicy.getPolicyPath()}`,
+    `Effective mode: ${toolPolicy.getMode()}`,
+    `Mutation scope: ${toolPolicy.getMutationScopeLabel()}`,
+    `Active scopes: ${toolPolicy.listActiveScopeLabels().join(' -> ')}`,
+    `Skill trust mode: ${toolPolicy.getSkillTrustMode()}`,
+    `Session visibility: ${toolPolicy.getSessionVisibility()}`,
+  ];
   if (gate.mode === 'backend') {
-    console.log(
-      chalk.dim(
-        `Backend passthrough allowlist (${gate.allowedTools.length}): ${
-          gate.allowedTools.length > 0
-            ? gate.allowedTools.join(', ')
-            : '(empty; backend tools disabled)'
-        }`
-      )
+    lines.push(
+      `Backend passthrough allowlist (${gate.allowedTools.length}): ${
+        gate.allowedTools.length > 0
+          ? gate.allowedTools.join(', ')
+          : '(empty; backend tools disabled)'
+      }`
     );
     if (gate.unresolvedPatterns.length > 0) {
-      console.log(
-        chalk.yellow(
-          `Backend wildcard patterns require local/prompt execution: ${gate.unresolvedPatterns.join(', ')}`
-        )
+      lines.push(
+        `Backend wildcard patterns require local/prompt: ${gate.unresolvedPatterns.join(', ')}`
       );
     }
   }
   if (gate.mode === 'off') {
-    console.log(chalk.dim('Backend passthrough mode is off (no backend tool calls permitted).'));
+    lines.push('Backend passthrough mode is off (no backend tool calls permitted).');
   }
   if (gate.mode === 'privileged') {
-    console.log(
-      chalk.dim('Backend passthrough mode is privileged (backend tool allowlist not clamped).')
-    );
+    lines.push('Backend passthrough mode is privileged (allowlist not clamped).');
   }
 
   const grants = toolPolicy.listGrants();
   if (grants.length > 0) {
-    console.log(
-      chalk.dim(`Grants: ${grants.map((entry) => `${entry.tool}(${entry.uses})`).join(', ')}`)
-    );
+    lines.push(`Grants: ${grants.map((entry) => `${entry.tool}(${entry.uses})`).join(', ')}`);
   }
   const allow = toolPolicy.listAllowTools();
-  if (allow.length > 0) console.log(chalk.dim(`Allow: ${allow.join(', ')}`));
+  if (allow.length > 0) lines.push(`Allow: ${allow.join(', ')}`);
   const deny = toolPolicy.listDenyTools();
-  if (deny.length > 0) console.log(chalk.dim(`Deny: ${deny.join(', ')}`));
+  if (deny.length > 0) lines.push(`Deny: ${deny.join(', ')}`);
   const prompt = toolPolicy.listPromptTools();
-  if (prompt.length > 0) console.log(chalk.dim(`Prompt: ${prompt.join(', ')}`));
+  if (prompt.length > 0) lines.push(`Prompt: ${prompt.join(', ')}`);
 
   const readAllow = toolPolicy.listReadPathAllow();
   const writeAllow = toolPolicy.listWritePathAllow();
-  if (readAllow.length > 0) console.log(chalk.dim(`Read path allow: ${readAllow.join(', ')}`));
-  if (writeAllow.length > 0) console.log(chalk.dim(`Write path allow: ${writeAllow.join(', ')}`));
+  if (readAllow.length > 0) lines.push(`Read path allow: ${readAllow.join(', ')}`);
+  if (writeAllow.length > 0) lines.push(`Write path allow: ${writeAllow.join(', ')}`);
 
   const skills = toolPolicy.listAllowedSkills();
-  if (skills.length > 0) console.log(chalk.dim(`Allowed skills: ${skills.join(', ')}`));
+  if (skills.length > 0) lines.push(`Allowed skills: ${skills.join(', ')}`);
   const sessionGrants = toolPolicy.listSessionGrants(sessionId);
   if (sessionGrants.length > 0) {
-    console.log(
-      chalk.dim(
-        `Session grants: ${sessionGrants.map((entry) => `${entry.tool}(${entry.uses})`).join(', ')}`
-      )
+    lines.push(
+      `Session grants: ${sessionGrants.map((entry) => `${entry.tool}(${entry.uses})`).join(', ')}`
     );
   }
   const scoped = toolPolicy.listActiveScopeSnapshots();
   if (scoped.length > 0) {
-    console.log(chalk.dim('Scope pipeline:'));
+    lines.push('Scope pipeline:');
     for (const scope of scoped) {
       const fragments: string[] = [];
       if (scope.mode) fragments.push(`mode=${scope.mode}`);
@@ -1419,14 +1817,22 @@ function printToolPolicySnapshot(
           `grants=${scope.grants.map((entry) => `${entry.tool}(${entry.uses})`).join('|')}`
         );
       }
-      console.log(
-        chalk.dim(`  - ${scope.label}${fragments.length > 0 ? ` :: ${fragments.join('  ')}` : ''}`)
-      );
+      lines.push(`  ${scope.label}${fragments.length > 0 ? ` :: ${fragments.join('  ')}` : ''}`);
     }
   }
   if (activeSkills.length > 0) {
-    console.log(chalk.dim(`Active skills: ${activeSkills.map((skill) => skill.name).join(', ')}`));
+    lines.push(`Active skills: ${activeSkills.map((skill) => skill.name).join(', ')}`);
   }
+  return lines;
+}
+
+function printToolPolicySnapshot(
+  toolPolicy: ToolPolicyState,
+  sessionId: string | undefined,
+  activeSkills: SkillInstruction[]
+): void {
+  const lines = formatToolPolicyLines(toolPolicy, sessionId, activeSkills);
+  for (const line of lines) console.log(chalk.dim(line));
   console.log('');
 }
 
@@ -1608,6 +2014,30 @@ function pickLatestSession(
   })[0];
 }
 
+function sanitizeArgsForApproval(tool: string, args: Record<string, unknown>): string {
+  const policyName = tool.replace(/^mcp__inkwell__/, '');
+  switch (policyName) {
+    case 'bash':
+      return typeof args.command === 'string' ? args.command.slice(0, 500) : '';
+    case 'write':
+    case 'edit': {
+      const path = (args.path ?? args.file_path ?? args.filePath) as string | undefined;
+      return path ? path.slice(0, 200) : '';
+    }
+    case 'read':
+    case 'ls':
+    case 'grep':
+    case 'find': {
+      const path = (args.path ?? args.file_path ?? args.filePath ?? args.pattern) as
+        | string
+        | undefined;
+      return path ? path.slice(0, 200) : '';
+    }
+    default:
+      return '';
+  }
+}
+
 async function promptForToolApproval(
   rl: ReturnType<typeof createInterface> | null,
   toolPolicy: ToolPolicyState,
@@ -1615,15 +2045,18 @@ async function promptForToolApproval(
   tool: string,
   reason: string,
   inkRepl?: InkRepl | null,
-  approvalChannel?: ApprovalChannel
+  approvalChannel?: ApprovalChannel,
+  args?: Record<string, unknown>
 ): Promise<boolean> {
   let choice: import('../repl/tool-approval.js').ToolApprovalChoice;
+
+  const argsDisplay = args ? sanitizeArgsForApproval(tool, args) : '';
 
   if (approvalChannel) {
     // JSONL or auto channel — structured approval protocol
     const response = await approvalChannel.requestApproval({
       tool,
-      args: {},
+      args: args ?? {},
       reason,
       sessionId,
     });
@@ -1631,20 +2064,15 @@ async function promptForToolApproval(
     choice = response.decision as import('../repl/tool-approval.js').ToolApprovalChoice;
   } else if (inkRepl) {
     // Render a visually distinct permission prompt in Ink
-    inkRepl.addMessage(
-      'system',
-      [
-        `🔐 ${tool}`,
-        reason,
-        '',
-        '[y] once · [s] session · [a] always · [d] deny · [n] cancel',
-      ].join('\n'),
-      { label: '🔐 permission' }
-    );
+    const lines = [`🔐 ${tool}`];
+    if (argsDisplay) lines.push(argsDisplay);
+    lines.push(reason, '', '[y] once · [s] session · [a] always · [d] deny · [n] cancel');
+    inkRepl.addMessage('system', lines.join('\n'), { label: '🔐 permission' });
     const answer = (await inkRepl.waitForInput()).trim();
     choice = parseToolApprovalInput(answer);
   } else if (rl) {
-    console.log(chalk.yellow(`🔐 ${tool} — ${reason}`));
+    const detail = argsDisplay ? ` (${argsDisplay})` : '';
+    console.log(chalk.yellow(`🔐 ${tool}${detail} — ${reason}`));
     const answer = (
       await rl.question(
         chalk.yellow(`Allow? [y] once, [s] session, [a] always, [d] deny, [n] cancel: `)
@@ -1757,7 +2185,7 @@ function buildPromptEnvelope(
 
   const toolInstruction =
     runtime.toolRouting === 'local'
-      ? 'IMPORTANT: To call Inkwell tools (get_inbox, recall, remember, list_tasks, send_response, etc.), you MUST emit fenced code blocks in this exact format:\n\n```ink-tool\n{"tool":"tool_name","args":{}}\n```\n\nDo NOT use ToolSearch, mcp__inkwell__*, or native MCP tool calling for Inkwell tools — those will not work in this runtime. Only the fenced block format above will execute Inkwell tools. You can emit multiple ink-tool blocks in one response.\n\nClient-local tools (also via ink-tool blocks, no server round-trip):\n- list_context: Introspect your context window — see all entries with IDs, token counts, sources, and previews.\n- evict_context: Remove specific entries from your context to reclaim tokens. Args: entryIds (number[]), source (string), or role (string).\n- signal_status: Signal your session status. Args: status ("completed" | "blocked" | "continuing"), reason (string, optional). Use this at the end of your work to tell the runtime whether you are done, blocked on something, or need another turn.'
+      ? 'IMPORTANT: To call tools, you MUST emit fenced code blocks in this exact format:\n\n```ink-tool\n{"tool":"tool_name","args":{}}\n```\n\nDo NOT use ToolSearch, mcp__inkwell__*, or native MCP tool calling — those will not work in this runtime. Only the fenced block format above will execute tools. You can emit multiple ink-tool blocks in one response.\n\nInkwell tools (server round-trip): get_inbox, recall, remember, list_tasks, send_response, save_link, create_task, update_session_state, bootstrap, etc.\n\nCoding tools (in-process, scoped to working directory):\n- read: Read a file. Args: path (string), offset (number, optional), limit (number, optional).\n- edit: Edit a file by find-and-replace. Args: path (string), edits (array of {oldText, newText}).\n- write: Create or overwrite a file. Args: path (string), content (string).\n- bash: Execute a shell command. Args: command (string), timeout (number, optional).\n- grep: Search file contents. Args: pattern (string), path (string, optional), include (string, optional).\n- find: Find files by name/pattern. Args: pattern (string), path (string, optional).\n- ls: List directory contents. Args: path (string, optional).\n\nClient-local tools (no server round-trip):\n- list_context: Introspect your context window — see all entries with IDs, token counts, sources, and previews.\n- evict_context: Remove specific entries from your context to reclaim tokens. Args: entryIds (number[]), source (string), or role (string).\n- signal_status: Signal your session status. Args: status ("completed" | "blocked" | "continuing"), reason (string, optional). Use this at the end of your work to tell the runtime whether you are done, blocked on something, or need another turn.'
       : runtime.toolMode === 'off'
         ? 'Do not call backend-native tools. Provide reasoning and instructions only.'
         : runtime.toolMode === 'privileged'
@@ -1823,7 +2251,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const initialBackend = options.backend || 'claude';
   const initialBackendTokenWindow = resolveBackendTokenWindow(initialBackend, options.model);
   const configuredMaxContextTokens = Number.parseInt(
-    options.maxContextTokens || String(initialBackendTokenWindow),
+    options.maxContextTokens || String(defaultContextBudget(initialBackendTokenWindow)),
     10
   );
   const parsedBackendTimeoutSeconds =
@@ -1858,13 +2286,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
     backendTokenWindow: initialBackendTokenWindow,
     sessionId: options.sessionId?.trim() || undefined,
     maxContextTokens: Number.isNaN(configuredMaxContextTokens)
-      ? initialBackendTokenWindow
+      ? defaultContextBudget(initialBackendTokenWindow)
       : configuredMaxContextTokens,
     pollSeconds: Number.parseInt(options.pollSeconds || '20', 10),
     showSessionsWatch: false,
     eventPolling: true,
     autoRunInbox: options.autoRun ?? false,
-    awayMode: false,
+    awayMode: options.away ?? false,
     transcriptPath: ensureRuntimeTranscriptPath(),
     activeSkills: [],
     strictTools: options.sbStrictTools ?? persisted?.strictTools ?? false,
@@ -1877,7 +2305,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           : options.nonInteractive || options.message
             ? options.profile === 'full'
               ? 'auto-approve' // --profile full + non-interactive = trust all tools
-              : 'auto-deny'
+              : options.away
+                ? 'interactive' // --away + non-interactive = route approvals to inbox
+                : 'auto-deny'
             : 'interactive',
   };
   // Resolve --sender or --contact-id for per-sender session isolation
@@ -1997,7 +2427,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   } catch {
     /* not a git repo */
   }
-  const initialInfoItems = ['/help', 'ctrl+c ×2 quit', shortCwd, gitBranch].filter(Boolean);
+  const initialInfoItems = [shortCwd, gitBranch].filter(Boolean);
   statusLane.setInfoItems(initialInfoItems);
 
   // Ink renderer — created lazily after the banner section has printed
@@ -2016,9 +2446,30 @@ export async function runChat(options: ChatOptions): Promise<void> {
     restorePromptAfterWrite?.();
   };
 
+  // Compact progress/status lines (tool runs, signals, dividers, surfaced
+  // memories): rendered as dim unlabeled events in Ink mode rather than
+  // "system"-labeled message blocks. Legacy mode prints them as-is.
+  const printEvent = (line: string) => {
+    if (inkRepl) {
+      if (line.trim()) {
+        inkRepl.printEvent(line);
+      }
+      return;
+    }
+    statusLane.printLine(line);
+    restorePromptAfterWrite?.();
+  };
+
   const ledger = new ContextLedger();
   const hookRegistry = new SbHookRegistry();
   let hookTurnCount = 0;
+
+  // Session-level tool call log — surfaced in the Ctrl+O context inspector
+  const recentToolCalls: Array<{ tool: string; status: string; at: string; args?: string }> = [];
+
+  // Entries evicted from the window (hydration replay + live evictions) —
+  // out of context but never out of sight; surfaced in the inspector
+  const sessionEvictedEntries: EvictedEntryRecord[] = [];
 
   // Register built-in hooks (passive recall + budget monitor).
   // callRecall wraps pcp.callTool('recall', ...) into the shape hooks expect.
@@ -2087,6 +2538,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
           `Identity context loaded: ~${ctxTokens.toLocaleString()} tokens injected into prompt`
         )
       );
+    }
+
+    // Pre-load Keychain credentials for the credential resolver.
+    // Runs once at session start; the cache persists for the session lifetime.
+    const keychainCreds = await loadKeychainCredentials();
+    if (Object.keys(keychainCreds).length > 0) {
+      console.log(chalk.dim(`Keychain: ${Object.keys(keychainCreds).length} credential(s) loaded`));
+    }
+
+    // Seed passive recall dedup with memory IDs already in bootstrap context
+    const bootstrapMemoryIds = bootstrapResult.memoryIds as string[] | undefined;
+    if (bootstrapMemoryIds && bootstrapMemoryIds.length > 0) {
+      passiveRecallHandle.seedBootstrapIds(bootstrapMemoryIds);
     }
 
     ledger.addEntry(
@@ -2163,7 +2627,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     !runtime.threadKey
   ) {
     const sessionsResult = (await pcp
-      .callTool('list_sessions', { agentId, status: 'active', limit: 30 })
+      .callTool('list_sessions', { agentId, status: 'active', backend: 'ink', limit: 30 })
       .catch(() => null)) as Record<string, unknown> | null;
     const sessions = filterSessionsByPolicy(
       extractSessionSummaries(sessionsResult),
@@ -2172,32 +2636,99 @@ export async function runChat(options: ChatOptions): Promise<void> {
       toolPolicy,
       'attach'
     );
-    const selected = pickLatestSession(sessions, undefined, { studioId: runtime.studioId });
-    if (selected) {
-      attachedSessionSummary = selected;
-      runtime.sessionId = selected.id;
-      if (selected.studioId) {
-        runtime.studioId = selected.studioId;
-      }
-      if (!runtime.threadKey && selected.threadKey) {
-        runtime.threadKey = selected.threadKey;
-      }
-      autoAttachedLatest = true;
-      toolPolicy.setContext({
-        agentId,
-        studioId: runtime.studioId,
+
+    const isInteractiveInk = useInk && !options.message && !options.nonInteractive;
+
+    if (isInteractiveInk) {
+      // Show interactive session picker
+      const sessionsWithMeta = sessions.map((session) => {
+        const transcriptMeta = getSessionTranscriptMetadata(session.id);
+        const lastActivityMs = transcriptMeta?.lastMessageAt
+          ? Date.parse(transcriptMeta.lastMessageAt)
+          : session.startedAt
+            ? Date.parse(session.startedAt)
+            : 0;
+        return { session, transcriptMeta, lastActivityMs };
       });
-      const currentScope = toolPolicy.getMutationScope();
-      if (currentScope.scope !== 'global') {
-        toolPolicy.setMutationScope(currentScope.scope);
+
+      sessionsWithMeta.sort((a, b) => {
+        const aStudioMatch = runtime.studioId && a.session.studioId === runtime.studioId ? 1 : 0;
+        const bStudioMatch = runtime.studioId && b.session.studioId === runtime.studioId ? 1 : 0;
+        if (aStudioMatch !== bStudioMatch) return bStudioMatch - aStudioMatch;
+        return b.lastActivityMs - a.lastActivityMs;
+      });
+
+      const pickerEntries: SessionPickerEntry[] = sessionsWithMeta.map(
+        ({ session, transcriptMeta, lastActivityMs }) => ({
+          id: session.id,
+          label: session.id.slice(0, 8),
+          phase: session.currentPhase || session.status,
+          threadKey: session.threadKey,
+          studioName: sessionStudioLabel(session),
+          backend: sessionBackendLabel(session),
+          historyLabel: sessionHistoryLabel(transcriptMeta),
+          lastMessage: lastActivityMs
+            ? formatRelativeTime(lastActivityMs, runtime.userTimezone)
+            : undefined,
+          preview: sessionLatestMessagePreview(session, transcriptMeta) || undefined,
+        })
+      );
+
+      const picked = await renderSessionPicker(pickerEntries);
+      if (picked === undefined) {
+        // Cancel — exit without creating a session
+        return;
       }
-      runtime.toolMode = toolPolicy.getMode();
+      if (picked) {
+        const selected = sessions.find((s) => s.id === picked.id);
+        if (selected) {
+          attachedSessionSummary = selected;
+          runtime.sessionId = selected.id;
+          if (selected.studioId) {
+            runtime.studioId = selected.studioId;
+          }
+          if (!runtime.threadKey && selected.threadKey) {
+            runtime.threadKey = selected.threadKey;
+          }
+          toolPolicy.setContext({ agentId, studioId: runtime.studioId });
+          const currentScope = toolPolicy.getMutationScope();
+          if (currentScope.scope !== 'global') {
+            toolPolicy.setMutationScope(currentScope.scope);
+          }
+          runtime.toolMode = toolPolicy.getMode();
+        }
+      }
+      // picked === null means "New session" — fall through to create one
+    } else {
+      // Non-interactive or no sessions — auto-attach to latest (existing behavior)
+      const selected = pickLatestSession(sessions, undefined, { studioId: runtime.studioId });
+      if (selected) {
+        attachedSessionSummary = selected;
+        runtime.sessionId = selected.id;
+        if (selected.studioId) {
+          runtime.studioId = selected.studioId;
+        }
+        if (!runtime.threadKey && selected.threadKey) {
+          runtime.threadKey = selected.threadKey;
+        }
+        autoAttachedLatest = true;
+        toolPolicy.setContext({ agentId, studioId: runtime.studioId });
+        const currentScope = toolPolicy.getMutationScope();
+        if (currentScope.scope !== 'global') {
+          toolPolicy.setMutationScope(currentScope.scope);
+        }
+        runtime.toolMode = toolPolicy.getMode();
+      }
     }
   }
 
   const attachedToExistingSession = Boolean(runtime.sessionId);
   if (!runtime.sessionId) {
-    const startArgs: Record<string, unknown> = { agentId };
+    const startArgs: Record<string, unknown> = {
+      agentId,
+      backend: 'ink',
+      metadata: { provider: runtime.backend },
+    };
     if (runtime.threadKey) startArgs.threadKey = runtime.threadKey;
     if (identity?.studioId) {
       startArgs.studioId = identity.studioId;
@@ -2235,6 +2766,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let historyHydration: HistoryHydrationResult | null = null;
   if (attachedToExistingSession && existingTranscript) {
     const hydrated = hydrateLedgerFromTranscript(ledger, existingTranscript);
+    // Continue the event-id sequence from where the file left off
+    seedTranscriptEidCounter(existingTranscript, hydrated.maxEid);
+    sessionEvictedEntries.push(...hydrated.evictedEntries);
+    // Replayed tool calls populate the inspector's Tool Calls section so
+    // Ctrl+T shows the receipts behind prior turns, not just this session's
+    recentToolCalls.push(...hydrated.toolCalls);
     historyHydration = {
       loaded: hydrated.loaded,
       messageCount: hydrated.messageCount,
@@ -2243,12 +2780,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
       tailPreview: hydrated.tailPreview,
       seenInboxIds: hydrated.seenInboxIds,
       seenActivityIds: hydrated.seenActivityIds,
+      compactionCollapsed: hydrated.compactionCollapsed,
     };
     for (const inboxId of hydrated.seenInboxIds) {
       seenInboxIds.add(inboxId);
     }
     for (const activityId of hydrated.seenActivityIds) {
       seenActivityIds.add(activityId);
+    }
+    if (hydrated.recoveredMemoryIds.length > 0) {
+      passiveRecallHandle.seedBootstrapIds(hydrated.recoveredMemoryIds);
     }
   } else if (attachedToExistingSession && runtime.sessionId) {
     const sessionContextResult = (await pcp
@@ -2293,41 +2834,256 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   // ── Banner (prints before Ink mounts, goes to terminal scrollback) ──
   {
+    const INKWELL_QUOTES = [
+      { text: 'A word after a word after a word is power.', attr: 'Margaret Atwood' },
+      { text: 'We write to taste life twice.', attr: 'Anaïs Nin' },
+      { text: "I write entirely to find out what I'm thinking.", attr: 'Joan Didion' },
+      { text: 'Memory is the diary we all carry about with us.', attr: 'Oscar Wilde' },
+      {
+        text: 'Fill your paper with the breathings of your heart.',
+        attr: 'William Wordsworth',
+      },
+      {
+        text: 'Either write something worth reading or do something worth writing.',
+        attr: 'Benjamin Franklin',
+      },
+    ];
+
     const bannerWidth = Math.min(process.stdout.columns || 80, 60);
-    const bar = '━'.repeat(Math.max(0, bannerWidth - 2));
-    console.log(chalk.magentaBright(`\n✦${bar}✦`));
-    console.log(chalk.bold.white('  SB Chat'));
-    console.log(chalk.magentaBright(`✦${bar}✦`));
+    const centerText = (s: string) =>
+      ' '.repeat(Math.max(0, Math.floor((bannerWidth - s.length) / 2))) + s;
+
+    // ── Dawn Skyline ASCII art (full width, tiling buildings) ──
+    const termW = process.stdout.columns || 80;
+    const cityW = 56;
+
+    const _lerp = (a: number, b: number, t: number) => Math.round(a + (b - a) * t);
+    const _lerpHex = (h1: string, h2: string, t: number) => {
+      const p = (s: string, o: number) => parseInt(s.slice(o, o + 2), 16);
+      const r = _lerp(p(h1, 1), p(h2, 1), t);
+      const g = _lerp(p(h1, 3), p(h2, 3), t);
+      const b = _lerp(p(h1, 5), p(h2, 5), t);
+      return '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('');
+    };
+
+    const skyStops = [
+      '#0a0a1a',
+      '#1a1040',
+      '#2d1b69',
+      '#5c3d8f',
+      '#8b5fbf',
+      '#c490d1',
+      '#e8b4b8',
+      '#f5d0a9',
+      '#ffeebb',
+    ];
+    const _skyAt = (t: number) => {
+      const idx = Math.floor(t * (skyStops.length - 1));
+      const idx2 = Math.min(idx + 1, skyStops.length - 1);
+      const frac = t * (skyStops.length - 1) - idx;
+      return _lerpHex(skyStops[idx]!, skyStops[idx2]!, frac);
+    };
+    const titleStops = [
+      '#c490d1',
+      '#e8b4b8',
+      '#f5d0a9',
+      '#ffeebb',
+      '#f5d0a9',
+      '#e8b4b8',
+      '#c490d1',
+    ];
+    const _titleAt = (t: number) => {
+      const idx = Math.floor(t * (titleStops.length - 1));
+      const idx2 = Math.min(idx + 1, titleStops.length - 1);
+      const frac = t * (titleStops.length - 1) - idx;
+      return _lerpHex(titleStops[idx]!, titleStops[idx2]!, frac);
+    };
+
+    let _seed = Date.now() & 0xffff;
+    const _rand = () => {
+      _seed = (_seed * 16807 + 0) % 2147483647;
+      return (_seed & 0xffff) / 0x10000;
+    };
+
+    // Sky rows — full terminal width
+    for (let r = 0; r < 4; r++) {
+      const rc = _skyAt(r / 8);
+      const rc2 = _skyAt((r + 1) / 8);
+      let row = '';
+      for (let i = 0; i < termW; i++) {
+        const c = _lerpHex(rc, rc2, (i / Math.max(termW - 1, 1)) * 0.15);
+        if (r < 2 && _rand() < 0.03) row += chalk.hex('#ffffff')('·');
+        else if (r < 1 && _rand() < 0.02) row += chalk.hex('#ccccff')('✦');
+        else row += chalk.hex(c).bgHex(c)('▄');
+      }
+      console.log(row);
+    }
+
+    // Buildings — tiling across full terminal width
+    type BldgStyle = 'tower' | 'thin' | 'wide' | 'squat';
+    interface Bldg {
+      s: number;
+      w: number;
+      h: number;
+      st: BldgStyle;
+    }
+    const bldgs: Bldg[] = [
+      { s: 0, w: 4, h: 5, st: 'squat' },
+      { s: 3, w: 2, h: 3, st: 'thin' },
+      { s: 4, w: 7, h: 8, st: 'tower' },
+      { s: 10, w: 3, h: 4, st: 'squat' },
+      { s: 12, w: 2, h: 6, st: 'thin' },
+      { s: 13, w: 5, h: 5, st: 'wide' },
+      { s: 17, w: 3, h: 3, st: 'squat' },
+      { s: 19, w: 8, h: 10, st: 'tower' },
+      { s: 26, w: 2, h: 4, st: 'thin' },
+      { s: 27, w: 5, h: 6, st: 'wide' },
+      { s: 31, w: 3, h: 3, st: 'squat' },
+      { s: 33, w: 6, h: 7, st: 'tower' },
+      { s: 38, w: 2, h: 5, st: 'thin' },
+      { s: 39, w: 4, h: 4, st: 'squat' },
+      { s: 42, w: 3, h: 8, st: 'thin' },
+      { s: 44, w: 5, h: 6, st: 'wide' },
+      { s: 48, w: 2, h: 3, st: 'thin' },
+      { s: 49, w: 7, h: 9, st: 'tower' },
+    ];
+    const bldgMaxH = 10;
+    const bldgColor = '#12122a';
+    const winPalette = ['#ffdd44', '#ff9944', '#ffcc33', '#44aaff', '#ffffff', '#88ddff'];
+
+    for (let row = 0; row < bldgMaxH; row++) {
+      let line = '';
+      for (let x = 0; x < termW; x++) {
+        const cx = ((x % cityW) + cityW) % cityW;
+        let drawn = false;
+        for (const b of bldgs) {
+          if (cx >= b.s && cx < b.s + b.w && row >= bldgMaxH - b.h) {
+            const lx = cx - b.s;
+            const ly = row - (bldgMaxH - b.h);
+            let isWin = false;
+            if (b.st === 'tower')
+              isWin =
+                lx > 0 && lx < b.w - 1 && ly > 0 && ly % 2 === 1 && lx % 2 === 1 && _rand() < 0.55;
+            else if (b.st === 'thin')
+              isWin = lx === Math.floor(b.w / 2) && ly > 0 && ly % 2 === 0 && _rand() < 0.7;
+            else if (b.st === 'wide')
+              isWin = lx > 0 && lx < b.w - 1 && ly > 0 && (ly === 2 || ly === 4) && _rand() < 0.5;
+            else isWin = lx > 0 && lx < b.w - 1 && ly > 0 && _rand() < 0.25;
+            if (isWin) {
+              line += chalk.hex(winPalette[Math.floor(_rand() * winPalette.length)]!)('▪');
+            } else {
+              line += chalk.hex(bldgColor).bgHex(bldgColor)('█');
+            }
+            drawn = true;
+            break;
+          }
+        }
+        if (!drawn) {
+          const bgC = _skyAt(0.6 + (row / bldgMaxH) * 0.4);
+          line += chalk.hex(bgC).bgHex(bgC)('▄');
+        }
+      }
+      console.log(line);
+    }
+
+    // Block-letter INKWELL with dawn gradient
+    const blockFont: Record<string, string[]> = {
+      I: ['█████', '  █  ', '  █  ', '  █  ', '█████'],
+      N: ['█   █', '██  █', '█ █ █', '█  ██', '█   █'],
+      K: ['█  █', '█ █ ', '██  ', '█ █ ', '█  █'],
+      W: ['█     █', '█  █  █', '█ █ █ █', '██   ██', '█     █'],
+      E: ['█████', '█    ', '████ ', '█    ', '█████'],
+      L: ['█   ', '█   ', '█   ', '█   ', '████'],
+    };
+    const blockWord = 'INKWELL';
+    const blockSpacing = 2;
+    const blockRows = [0, 1, 2, 3, 4].map((r) =>
+      [...blockWord].map((ch) => blockFont[ch]![r]).join(' '.repeat(blockSpacing))
+    );
+    const blockTotalW = blockRows[0]!.length;
+    const blockPadN = Math.max(0, Math.floor((termW - blockTotalW) / 2));
+
+    console.log('');
+    for (const bRow of blockRows) {
+      let line = ' '.repeat(blockPadN);
+      for (let i = 0; i < bRow.length; i++) {
+        const ch = bRow[i];
+        const t = bRow.length > 1 ? i / (bRow.length - 1) : 0;
+        const c = _titleAt(t);
+        line += ch === '█' ? chalk.hex(c)('█') : ' ';
+      }
+      console.log(line);
+    }
+
+    // Bottom gradient accent — thin warm line mirroring the horizon
+    let bottomGlow = '';
+    for (let i = 0; i < termW; i++) {
+      const t = Math.abs(i / Math.max(termW - 1, 1) - 0.5) * 2;
+      const c = _lerpHex('#f5d0a9', '#c490d1', t);
+      bottomGlow += chalk.hex(c)('─');
+    }
+    console.log('');
+    console.log(bottomGlow);
+
+    // ── Quote (inline attribution) ──
+    const quote = INKWELL_QUOTES[Math.floor(Math.random() * INKWELL_QUOTES.length)]!;
+    const fullQuote = `”${quote.text}” ${quote.attr}`;
+    const maxQW = Math.min(termW - 4, 80);
+    const qWords = fullQuote.split(' ');
+    const qLines: string[] = [];
+    let qCur = '';
+    for (const w of qWords) {
+      const test = qCur ? `${qCur} ${w}` : w;
+      if (test.length > maxQW && qCur) {
+        qLines.push(qCur);
+        qCur = w;
+      } else {
+        qCur = test;
+      }
+    }
+    if (qCur) qLines.push(qCur);
+
+    const qPad = ' '.repeat(
+      Math.max(0, Math.floor((bannerWidth - Math.max(...qLines.map((l) => l.length))) / 2))
+    );
+    for (const line of qLines) {
+      console.log(qPad + chalk.dim(line));
+    }
+    console.log('');
   }
-  // Use studio slug/name where available, fall back to short ID
   const studioSlug =
     attachedSessionSummary?.studioName ||
     (identity?.studioId ? formatStudioForDisplay(identity.studioId, 'short') : undefined);
   const bannerParts = [
-    chip('agent', agentId, chalk.cyan),
-    chip(
-      'backend',
-      `${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}`,
-      chalk.yellow
-    ),
+    chip('inkling', agentId, chalk.cyan),
+    chip('backend', 'ink', chalk.yellow),
+    chip('provider', runtime.backend, chalk.yellow),
     studioSlug ? chip('studio', studioSlug, chalk.cyan) : null,
     chip('window', `${formatTokenCount(runtime.backendTokenWindow)} tok`, chalk.green),
     chip('time', formatNow(runtime.userTimezone), chalk.magenta),
   ].filter(Boolean);
-  console.log(bannerParts.join(chalk.dim('  •  ')));
-  if (runtime.sessionId) console.log(chalk.dim(`Session: ${runtime.sessionId}`));
-  if (runtime.threadKey) console.log(chalk.dim(`Thread: ${runtime.threadKey}`));
+  console.log('  ' + bannerParts.join(chalk.dim('  ·  ')));
+  if (runtime.sessionId) console.log(chalk.dim(`  session ${runtime.sessionId}`));
+  if (runtime.threadKey) console.log(chalk.dim(`  thread ${runtime.threadKey}`));
   if (attachedToExistingSession) {
     console.log(
       chalk.dim(
-        autoAttachedLatest ? 'Auto-attached to latest session' : 'Attached to existing session'
+        autoAttachedLatest ? '  auto-attached to latest session' : '  attached to existing session'
       )
     );
   }
   if (historyHydration && historyHydration.messageCount > 0) {
-    console.log(chalk.dim(`History: ${historyHydration.messageCount} prior message(s) loaded`));
+    if (historyHydration.compactionCollapsed) {
+      // Earlier history was compacted — mark where the loaded window begins
+      console.log(
+        renderContextCutoff(
+          `earlier history compacted · ${formatTokenCount(ledger.totalTokens())} tok loaded`
+        )
+      );
+    }
+    console.log(chalk.dim(`  history: ${historyHydration.messageCount} prior message(s) loaded`));
   }
-  console.log(chalk.dim('Type /help for commands.\n'));
+  console.log(chalk.dim('  /help for commands\n'));
 
   const refreshSessionsSnapshot = async (force = false): Promise<SessionSummary[]> => {
     const stale = Date.now() - sessionsCacheAt > 15_000;
@@ -2344,6 +3100,50 @@ export async function runChat(options: ChatOptions): Promise<void> {
     );
     sessionsCacheAt = Date.now();
     return sessionsCache;
+  };
+
+  // ── Persistent eviction (single writer) ──
+  // Every eviction — SB tool, user /evict, system trim — flows through here
+  // so the transcript event shape and the live evicted-display list can't
+  // drift between actors. The context_evict event is what makes the
+  // eviction survive reattach; sessionEvictedEntries is what Ctrl+O and
+  // /evicted show right now.
+  const recordEviction = (
+    actor: 'sb' | 'user' | 'system',
+    reason: string,
+    removedTokens: number,
+    refs: Array<{
+      eid?: number;
+      hash: string;
+      role: LedgerRole;
+      source?: string;
+      preview: string;
+    }>
+  ): void => {
+    if (refs.length === 0) return;
+    appendTranscript(runtime.transcriptPath, {
+      type: 'context_evict',
+      actor,
+      reason,
+      removedTokens,
+      refs: refs.map((ref) => ({
+        ...(typeof ref.eid === 'number' ? { eid: ref.eid } : {}),
+        hash: ref.hash,
+      })),
+    });
+    for (const ref of refs) {
+      sessionEvictedEntries.push({
+        role: ref.role,
+        content: ref.preview,
+        source: ref.source,
+        eid: ref.eid,
+        actor,
+        reason,
+      });
+    }
+    if (sessionEvictedEntries.length > EVICTED_DISPLAY_MAX) {
+      sessionEvictedEntries.splice(0, sessionEvictedEntries.length - EVICTED_DISPLAY_MAX);
+    }
   };
 
   const trimContextToPercent = async (
@@ -2369,8 +3169,126 @@ export async function runChat(options: ChatOptions): Promise<void> {
       removedTokens: trim.removedTokens,
       totalAfter: trim.totalAfter,
     });
+    // Persist the trim as an eviction so it survives reattach (context_trim
+    // alone is informational — hydration doesn't replay it)
+    recordEviction(
+      'system',
+      `trim: ${reason}`,
+      trim.removedTokens,
+      trim.removedEntries.map((e) => ({
+        ...(e.eid !== undefined ? { eid: e.eid } : {}),
+        hash: entryRefHash(e.role, e.content),
+        role: e.role,
+        source: e.source,
+        preview: e.content.slice(0, 100),
+      }))
+    );
 
     return { removed: trim.removedEntries.length, removedTokens: trim.removedTokens };
+  };
+
+  // ── Token-budget auto-compaction ──
+  // When the transcript approaches the context budget, summarize the oldest
+  // entries into a dense brief via the backend and replace them with it. The
+  // `compaction` transcript event is the pointer to the new start state —
+  // hydration collapses everything before it on reattach. If summarization
+  // fails, fall back to a hard trim so the turn can still proceed.
+  let compactionInFlight = false;
+
+  const buildCompactionPrompt = (chunk: string): string =>
+    [
+      'You are compacting a conversation transcript into a dense continuation brief.',
+      'Summarize the conversation below, preserving: decisions and their rationale,',
+      'completed and in-progress work, key facts and constraints, open questions,',
+      'commitments made, and any identifiers (PR numbers, session IDs, file paths, URLs).',
+      'Write compact bullet points. Output ONLY the summary — no preamble.',
+      '',
+      '<conversation>',
+      chunk,
+      '</conversation>',
+    ].join('\n');
+
+  const maybeCompactContext = async (reason: string): Promise<void> => {
+    if (compactionInFlight) return;
+    const bootstrapReserve = runtime.bootstrapContext
+      ? estimateTokens(runtime.bootstrapContext)
+      : 0;
+    const effectiveBudget = Math.max(1, runtime.maxContextTokens - bootstrapReserve);
+    const threshold = Math.floor(effectiveBudget * AUTO_COMPACT_THRESHOLD_PCT);
+    if (ledger.totalTokens() <= threshold) return;
+
+    const entries = ledger.listEntries();
+    const cutoff = Math.max(0, entries.length - AUTO_COMPACT_KEEP_RECENT_ENTRIES);
+    if (cutoff === 0) return; // only the protected tail remains — nothing to compact
+
+    compactionInFlight = true;
+    try {
+      const oldest = entries.slice(0, cutoff);
+      const chunk = oldest
+        .map((e) => `${e.role.toUpperCase()}${e.source ? ` [${e.source}]` : ''}: ${e.content}`)
+        .join('\n\n');
+      const before = ledger.totalTokens();
+      printEvent(
+        chalk.yellow(
+          `  ⛁ Context at ${formatTokenCount(before)} tok (> ${formatTokenCount(threshold)} threshold) — compacting (${reason})`
+        )
+      );
+
+      try {
+        const turn = await runBackendTurn({
+          backend: runtime.backend,
+          agentId,
+          model: runtime.model,
+          prompt: buildCompactionPrompt(chunk),
+          // Summarizing a large chunk takes longer than a normal turn
+          timeoutMs: Math.max(runtime.backendTurnTimeoutMs ?? 0, 5 * 60 * 1000),
+        });
+        const summaryText = turn.success ? turn.stdout.trim() : '';
+        if (!summaryText) {
+          throw new Error(turn.stderr.trim().slice(0, 200) || `exit code ${turn.exitCode}`);
+        }
+
+        const summary = `[Conversation summary — compacted ${oldest.length} earlier entries]\n${summaryText}`;
+        const result = ledger.compactToSummary(summary, AUTO_COMPACT_KEEP_RECENT_ENTRIES);
+        // The compaction event is the COMPLETE new start state: summary plus
+        // the verbatim recent tail. The tail's original events precede this
+        // marker in the file, so hydration must get the tail from here —
+        // otherwise reattach would keep only the summary and lose the
+        // protected recent entries the live session still has.
+        const keptEntries = ledger
+          .listEntries()
+          .slice(1) // entry 0 is the summary itself
+          .map((e) => ({
+            role: e.role,
+            content: e.content,
+            source: e.source,
+            ...(e.eid !== undefined ? { eid: e.eid } : {}),
+          }));
+        appendTranscript(runtime.transcriptPath, {
+          type: 'compaction',
+          reason,
+          summary,
+          keptEntries,
+          removedCount: result.removedEntries.length,
+          removedTokens: result.removedTokens,
+          summaryTokens: result.summaryTokens,
+          totalAfter: result.totalAfter,
+        });
+        // Cutoff divider: everything above this line in the scrollback is
+        // now out of the context window (replaced by the summary).
+        printEvent(
+          renderContextCutoff(
+            `compacted ${result.removedEntries.length} entries · ${formatTokenCount(before)} → ${formatTokenCount(result.totalAfter)} tok`
+          )
+        );
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        printEvent(chalk.yellow(`  ⛁ Compaction summarization failed (${msg}) — hard-trimming`));
+        await trimContextToPercent(DEFAULT_TRIM_TARGET_PCT, `${reason} (compaction fallback)`);
+      }
+    } finally {
+      compactionInFlight = false;
+    }
   };
 
   const pollInbox = async (force = false): Promise<number> => {
@@ -2584,7 +3502,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
 
     if (force && fresh.length === 0) {
-      printLine(chalk.dim('No new inbox messages.'));
+      if (inkRepl) {
+        inkRepl.setCommandOutput(['No new inbox messages.']);
+      } else {
+        printLine(chalk.dim('No new inbox messages.'));
+      }
     }
     if (autoRuns > 0) {
       printLine(
@@ -2637,9 +3559,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
         activitySince = activity.createdAt;
       }
 
-      const type = activity.subtype
+      const rawType = activity.subtype
         ? `${activity.type}:${activity.subtype}`
         : activity.type || 'activity';
+      const ACTIVITY_LABELS: Record<string, string> = {
+        message_in: 'received',
+        message_out: 'sent',
+        agent_spawn: 'spawned',
+        agent_complete: 'completed',
+        state_change: 'state change',
+        tool_call: 'tool call',
+        tool_result: 'tool result',
+        inkmail_dispatch: 'mail sent',
+        inkmail_deliver: 'mail delivered',
+        inkmail_fail: 'mail failed',
+      };
+      const type = ACTIVITY_LABELS[rawType] || rawType;
       const actor = activity.agentId || 'system';
       const preview = (activity.content || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
       const rendered = `⚡ ${actor} ${type}${preview ? ` — ${preview}` : ''}`;
@@ -2655,9 +3590,36 @@ export async function runChat(options: ChatOptions): Promise<void> {
         createdAt: activity.createdAt || null,
         content: activity.content || null,
       });
-      if (inkRepl) {
+      // Tiered rendering: platform messages are real conversation and get
+      // proper message blocks; the agent's own mechanics (tools, state,
+      // backend turn lifecycle) are dim event lines; everything else stays
+      // a ⚡ activity block.
+      const plan = classifyActivity(activity, agentId);
+      const activityTime = formatHumanTime(activity.createdAt, runtime.userTimezone);
+      if (plan.mode === 'message-in' || plan.mode === 'message-out') {
+        // Full content, not the 200-char preview — these ARE the conversation
+        const messageContent = (activity.content || '').trim() || '(empty message)';
+        if (inkRepl) {
+          inkRepl.addMessage(plan.role!, messageContent, {
+            label: plan.label,
+            time: activityTime,
+          });
+        } else {
+          printLine('');
+          printLine(
+            renderMessageLine(plan.role!, messageContent, {
+              label: plan.label,
+              timezone: runtime.userTimezone,
+              ts: activity.createdAt,
+            })
+          );
+        }
+      } else if (plan.mode === 'bookkeeping') {
+        printEvent(chalk.dim(`  ⚡ ${type}${preview ? ` — ${preview}` : ''} · ${activityTime}`));
+      } else if (inkRepl) {
         inkRepl.addMessage('activity', `${actor} ${type}${preview ? ` — ${preview}` : ''}`, {
           label: '⚡',
+          time: activityTime,
         });
       } else {
         printLine('');
@@ -2672,14 +3634,51 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
 
     if (force && activities.length === 0) {
-      printLine(chalk.dim('No new activity events.'));
+      if (inkRepl) {
+        inkRepl.setCommandOutput(['No new activity events.']);
+      } else {
+        printLine(chalk.dim('No new activity events.'));
+      }
     }
     emitStatusLaneIfChanged();
     return activities.length;
   };
 
-  const runUserTurn = async (raw: string, source: 'user' | 'inbox-auto' = 'user') => {
+  // ── Turn attachments (--attach-file) ──
+  // Resolved once at startup; the block attaches to the FIRST turn (the
+  // message the attachments belong to) and the directories stay granted
+  // to the backend for the whole session so later turns can re-read the
+  // files. Server spawns (InkRunner) pass --attach-file per media item.
+  let pendingAttachmentBlock = '';
+  let sessionAttachmentDirs: string[] = [];
+  if (options.attachFile && options.attachFile.length > 0) {
+    const resolvedAttachments = await resolveAttachments(options.attachFile);
+    pendingAttachmentBlock = buildAttachmentBlock(resolvedAttachments);
+    sessionAttachmentDirs = collectAttachmentDirs(resolvedAttachments);
+    const missingAttachments = resolvedAttachments.filter((a) => a.missing);
+    if (missingAttachments.length > 0) {
+      console.log(
+        chalk.yellow(
+          `  ⚠ ${missingAttachments.length} attached file(s) not readable: ${missingAttachments
+            .map((m) => m.path)
+            .join(', ')}`
+        )
+      );
+    }
+  }
+
+  const runUserTurn = async (
+    raw: string,
+    source: 'user' | 'inbox-auto' | 'system' = 'user',
+    displayLabel?: string
+  ) => {
     if (!raw.trim()) return;
+    // Attach pending files to this turn — append the block so the backend
+    // sees the paths inline with the message that delivered them.
+    if (pendingAttachmentBlock) {
+      raw = `${raw}\n\n${pendingAttachmentBlock}`;
+      pendingAttachmentBlock = '';
+    }
     if (source === 'user') {
       // Echo the user's message
       if (inkRepl) {
@@ -2695,12 +3694,30 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
       ledger.addEntry('user', raw, 'repl');
       appendTranscript(runtime.transcriptPath, { type: 'user', content: raw });
+    } else if (source === 'system') {
+      // Synthetic turn input: heartbeat triggers, server-delivered messages,
+      // continuation prompts. Rendered as system (not "you") so transcripts
+      // distinguish harness prompts from the human's words.
+      const label = displayLabel || 'system';
+      if (inkRepl) {
+        inkRepl.addMessage('system', raw, { label });
+      } else {
+        printLine(
+          renderMessageLine('system', raw, {
+            label,
+            timezone: runtime.userTimezone,
+          })
+        );
+        printLine('');
+      }
+      ledger.addEntry('system', raw, label);
+      appendTranscript(runtime.transcriptPath, { type: 'system_turn', content: raw, label });
     } else {
       ledger.addEntry('system', compactForLedger(`[auto-run inbox] ${raw}`, 500), 'auto-run');
       appendTranscript(runtime.transcriptPath, { type: 'auto_turn', content: raw });
     }
 
-    if (runtime.sessionId) {
+    if (runtime.sessionId && !options.nonInteractive) {
       await pcp
         .callTool('update_session_state', {
           agentId,
@@ -2710,6 +3727,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
         })
         .catch(() => undefined);
     }
+
+    // ── Token-budget enforcement: compact before building the prompt ──
+    // If the transcript has grown past the compaction threshold, summarize
+    // the oldest entries into a new start state before this turn spends them.
+    await maybeCompactContext('pre-turn budget check');
 
     // ── Fire prompt_build hooks (budget monitor, etc.) ──
     // Budget utilization must account for bootstrap tokens — the ledger only
@@ -2736,6 +3758,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
       },
     });
 
+    // Persist hook-injected entries to transcript so they survive reattach
+    if (promptHookResult.injectedEntries.length > 0) {
+      for (const entry of promptHookResult.injectedEntries) {
+        appendTranscript(runtime.transcriptPath, {
+          type: 'hook_injection',
+          role: entry.role,
+          content: entry.content,
+          source: entry.source,
+          memoryId: entry.memoryId,
+        });
+      }
+    }
+
     // Print notifications from prompt_build hooks
     if (promptHookResult.injected > 0) {
       // Check if any were passive recall vs budget warnings
@@ -2748,18 +3783,34 @@ export async function runChat(options: ChatOptions): Promise<void> {
         .filter((e) => e.source === 'budget-monitor')
         .slice(-promptHookResult.injected);
 
-      for (const entry of recallEntries) {
-        const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
-        printLine(
-          chalk.dim(
-            `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`
-          )
-        );
+      if (recallEntries.length > 0) {
+        const totalTok = recallEntries.reduce((sum, e) => sum + e.approxTokens, 0);
+        if (inkRepl) {
+          const details = recallEntries.map((entry) => {
+            const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+            return `  💡 ${preview}${entry.content.length > 120 ? '...' : ''} (${entry.approxTokens} tok)`;
+          });
+          inkRepl.setSurfacedMemories(details);
+          printEvent(
+            chalk.dim(
+              `  💡 ${recallEntries.length} ${recallEntries.length === 1 ? 'memory' : 'memories'} surfaced (${totalTok} tok) — ctrl+o to expand`
+            )
+          );
+        } else {
+          for (const entry of recallEntries) {
+            const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+            printEvent(
+              chalk.dim(
+                `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`
+              )
+            );
+          }
+        }
       }
 
       if (budgetEntries.length > 0) {
         const util = Math.round((ledger.totalTokens() / effectiveBudget) * 100);
-        printLine(
+        printEvent(
           chalk.yellow(
             `  ⚠ Context at ${util}% — ${ledger.totalTokens().toLocaleString()} / ${effectiveBudget.toLocaleString()} tok (bootstrap: ${bootstrapReserve.toLocaleString()} reserved)`
           )
@@ -2818,6 +3869,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
         });
     let turnDurationSeconds = 0;
     let turnCtrlCAt = 0;
+    let currentTurnAbort: (() => void) | null = null;
+
+    const abortCurrentTurn = () => {
+      if (currentTurnAbort) {
+        currentTurnAbort();
+        currentTurnAbort = null;
+        inkRepl?.setAbortHandler(null);
+      }
+    };
+
     const onSigintDuringTurn = () => {
       const now = Date.now();
       if (turnCtrlCAt > 0 && now - turnCtrlCAt <= CTRL_C_EXIT_WINDOW_MS) {
@@ -2830,18 +3891,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
         return;
       }
       turnCtrlCAt = now;
+      abortCurrentTurn();
       if (inkRepl) {
-        inkRepl.printSystem(
-          'Backend turn in progress. Press Ctrl+C again to exit after this turn.'
-        );
+        inkRepl.printSystem('Cancelling turn...');
       } else {
-        statusLane.renderHint(
-          'Backend turn in progress. Press Ctrl+C again to exit after this turn.'
-        );
+        statusLane.renderHint('Cancelling turn...');
       }
     };
+
     process.on('SIGINT', onSigintDuringTurn);
-    let runResult = await runBackendTurn({
+    const turn = startBackendTurn({
       backend: runtime.backend,
       agentId,
       model: runtime.model,
@@ -2849,7 +3908,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
       verbose: runtime.verbose,
       passthroughArgs,
       timeoutMs: runtime.backendTurnTimeoutMs,
-    }).finally(() => {
+      attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+    });
+    currentTurnAbort = turn.abort;
+    inkRepl?.setAbortHandler(abortCurrentTurn);
+
+    let runResult = await turn.result.finally(() => {
+      currentTurnAbort = null;
+      inkRepl?.setAbortHandler(null);
       process.off('SIGINT', onSigintDuringTurn);
       turnDurationSeconds = Math.max(0, Math.round((Date.now() - turnStartedAt) / 1000));
       stopWaiting();
@@ -2869,30 +3935,38 @@ export async function runChat(options: ChatOptions): Promise<void> {
       debugFile ? { force: true, file: debugFile } : undefined
     );
 
-    // Log backend CLI turn completion to activity stream
+    if (runResult.success) {
+      consecutiveBackendFailures = 0;
+    } else {
+      consecutiveBackendFailures += 1;
+    }
+
+    // Log backend CLI turn completion to activity stream.
+    // Use 'ink' as the runner label (not the LLM backend like 'claude')
+    // so the mission feed shows the correct execution layer.
     if (runtime.sessionId) {
       const turnStatus = runResult.success ? 'completed' : 'failed';
-      const turnContent = runResult.success
-        ? `Backend turn completed (${runtime.backend}, ${turnDurationSeconds}s)`
-        : `Backend turn failed (${runtime.backend}, exit ${runResult.exitCode})`;
       const cliErrorClassification = !runResult.success
         ? classifyError({
-            errorText: runResult.stderr,
+            errorText: runResult.stderr || runResult.stdout,
             backend: runtime.backend,
             exitCode: runResult.exitCode,
           })
         : null;
 
+      const runnerLabel = 'ink';
       pcp
         .callTool('log_activity', {
           agentId,
           type: runResult.success ? 'agent_complete' : 'error',
-          subtype: `backend_cli:${runtime.backend}`,
-          content: turnContent,
+          subtype: `backend_cli:${runnerLabel}`,
+          content: runResult.success
+            ? `Backend turn completed (${runnerLabel}, ${turnDurationSeconds}s)`
+            : `Backend turn failed (${runnerLabel}, ${cliErrorClassification?.category || 'exit ' + runResult.exitCode}): ${cliErrorClassification?.summary || runResult.stderr.slice(0, 200) || 'unknown error'}`,
           sessionId: runtime.sessionId,
           status: turnStatus,
           payload: {
-            backend: runtime.backend,
+            backend: runnerLabel,
             exitCode: runResult.exitCode,
             durationMs: turnDurationSeconds * 1000,
             studioId: runtime.studioId,
@@ -2919,7 +3993,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
     let toolLoopIteration = 0;
     let responseText = '';
     let localToolCalls: ReturnType<typeof extractLocalToolCalls> = [];
-    let allToolResults: Array<{ tool: string; result: unknown; status: string }> = [];
+    let allToolResults: Array<{ tool: string; result: unknown; status: string; args?: unknown }> =
+      [];
 
     // eslint-disable-next-line no-constant-condition
     while (true) {
@@ -2946,13 +4021,31 @@ export async function runChat(options: ChatOptions): Promise<void> {
             const result = handleClientLocalTool(tool, args, ledger);
             if (result) return Promise.resolve(result);
           }
+          // Pi coding tools (read, edit, write, bash, grep, find, ls) execute
+          // in-process via @mariozechner/pi-coding-agent, scoped to cwd
+          if (isPiTool(tool)) {
+            return callPiTool(tool, args, process.cwd());
+          }
+          // Resolve credential references ($VAR / ${VAR}) in tool args.
+          // The LLM emits references; actual values are injected here at the
+          // execution layer so credentials never enter transcripts or context.
+          const { args: resolvedArgs, resolutions } = resolveCredentialRefs(
+            args,
+            buildResolverEnv()
+          );
+          if (resolutions.length > 0 && runtime.verbose) {
+            const refs = resolutions.map((r) => `${r.name} at ${r.path}`).join(', ');
+            printLine(
+              chalk.dim(`credential-resolver: resolved ${resolutions.length} ref(s): ${refs}`)
+            );
+          }
           // Strip MCP namespace prefix — the SB may emit mcp__inkwell__tool_name
           // but PcpClient expects bare tool names (get_inbox, recall, etc.)
           const bareTool = tool.replace(/^mcp__inkwell__/, '');
-          return pcp.callTool(bareTool, args);
+          return pcp.callTool(bareTool, resolvedArgs);
         },
         sessionId: runtime.sessionId,
-        promptForApproval: async (tool, reason) => {
+        promptForApproval: async (tool, reason, args) => {
           if (!runtime.awayMode) {
             return promptForToolApproval(
               rl,
@@ -2961,52 +4054,82 @@ export async function runChat(options: ChatOptions): Promise<void> {
               tool,
               reason,
               inkRepl,
-              runtime.approvalChannel
+              runtime.approvalChannel,
+              args
             );
           }
-          // Remote approval: register request, send to inbox, wait for resolution
-          const { request, promise } = approvalManager.register(tool, {}, reason);
-          printLine(
-            chalk.yellow(`⏳ Awaiting remote approval for ${tool} (${request.id.slice(0, 8)}…)`)
-          );
+          // 2FA approval: create request on the PCP server, which sends
+          // notifications to the user's connected platforms (Telegram, etc.).
+          // The server handles all routing — we just poll for the result.
+          printLine(chalk.yellow(`⏳ Requesting 2FA approval for ${tool}…`));
+          // Sanitize args for the notification — show command/path but redact large content
+          const sanitizedArgs = args ? sanitizeArgsForApproval(tool, args) : undefined;
           try {
-            await pcp.callTool('send_to_inbox', {
-              recipientAgentId: agentId,
-              senderAgentId: agentId,
-              content: `🔐 Tool approval needed: **${tool}**\n\nReason: ${reason}\n\nReply with a permission_grant to approve or deny.\nRequest ID: ${request.id}`,
-              messageType: 'notification',
-              metadata: { approvalRequestId: request.id, tool },
-              ...(runtime.threadKey ? { threadKey: runtime.threadKey } : {}),
-              trigger: false,
-            });
-          } catch {
-            printLine(
-              chalk.yellow('Failed to send remote approval request — falling back to local prompt')
-            );
-            approvalManager.expire(request.id);
-            return promptForToolApproval(
-              rl,
-              toolPolicy,
-              runtime.sessionId,
+            const result = await requestToolApproval({
               tool,
+              args: sanitizedArgs,
               reason,
-              inkRepl,
-              runtime.approvalChannel
-            );
-          }
-          const response = await promise;
-          if (response.decision === 'approved') {
-            printLine(
-              chalk.green(
-                `✅ Remote approval granted for ${tool}${response.resolvedBy ? ` by ${response.resolvedBy}` : ''}`
-              )
-            );
-            return true;
-          } else if (response.decision === 'timeout') {
-            printLine(chalk.yellow(`⏰ Remote approval timed out for ${tool}`));
-            return false;
-          } else {
-            printLine(chalk.yellow(`🚫 Remote approval denied for ${tool}`));
+              sessionId: runtime.sessionId,
+              studioId: runtime.studioId,
+              onCreated: (id) => {
+                printLine(
+                  chalk.yellow(`   Request ${id.slice(0, 8)}… sent to connected platforms`)
+                );
+              },
+            });
+
+            if (result.status === 'granted') {
+              // Apply persistent grants to the tool policy
+              if (
+                result.action === 'grant-agent' ||
+                result.action === 'allow' ||
+                result.action === 'grant-studio'
+              ) {
+                // Grant at the specific scope from the approval response.
+                // persistentGrant writes the permanent grant at the target scope
+                // and removes from promptTools at all scopes so the tool stops prompting.
+                const grantScope = result.action === 'grant-studio' ? 'studio' : 'agent';
+                const scopeId =
+                  grantScope === 'studio'
+                    ? toolPolicy.getContext()?.studioId
+                    : toolPolicy.getContext()?.agentId;
+                if (scopeId) {
+                  toolPolicy.persistentGrant(tool, { scope: grantScope, id: scopeId });
+                  printLine(
+                    chalk.green(`✅ 2FA: ${tool} permanently approved (${grantScope}: ${scopeId})`)
+                  );
+                } else {
+                  // Can't resolve scope — fall back to session grant instead of leaking to global
+                  if (runtime.sessionId) {
+                    toolPolicy.grantToolForSession(runtime.sessionId, tool);
+                  }
+                  printLine(
+                    chalk.yellow(
+                      `⚠️ 2FA: ${tool} approved for session only (could not resolve ${grantScope} scope)`
+                    )
+                  );
+                }
+              } else if (result.action === 'grant-session') {
+                if (runtime.sessionId) {
+                  toolPolicy.grantToolForSession(runtime.sessionId, tool);
+                }
+                printLine(chalk.green(`✅ 2FA: ${tool} approved for this session`));
+              } else {
+                printLine(chalk.green(`✅ 2FA approval granted for ${tool}`));
+              }
+              return true;
+            } else if (result.status === 'timeout') {
+              printLine(chalk.yellow(`⏰ 2FA approval timed out for ${tool}`));
+              return false;
+            } else if (result.status === 'error') {
+              printLine(chalk.yellow(`⚠️ 2FA error: ${result.error}`));
+              return false;
+            } else {
+              printLine(chalk.yellow(`🚫 2FA approval denied for ${tool}`));
+              return false;
+            }
+          } catch {
+            printLine(chalk.yellow('Failed to create 2FA approval request — denying tool call'));
             return false;
           }
         },
@@ -3036,11 +4159,30 @@ export async function runChat(options: ChatOptions): Promise<void> {
               const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
               if (content) {
                 const parsed = JSON.parse(content);
-                printLine(
+                printEvent(
                   chalk.dim(
                     `  🗑 evicted ${parsed.evicted} entries (${parsed.tokensFreed} tok freed, ${parsed.totalAfter} tok remaining)`
                   )
                 );
+                // Persist the eviction so it survives reattach — without this,
+                // hydration replays the raw events and evicted entries resurrect
+                if (parsed.success && Array.isArray(parsed.evictRefs) && parsed.evicted > 0) {
+                  const refs = parsed.evictRefs as Array<Record<string, unknown>>;
+                  recordEviction(
+                    'sb',
+                    compactForLedger(JSON.stringify(result.args ?? {}), 200),
+                    typeof parsed.tokensFreed === 'number' ? parsed.tokensFreed : 0,
+                    refs
+                      .filter((ref) => typeof ref.hash === 'string')
+                      .map((ref) => ({
+                        ...(typeof ref.eid === 'number' ? { eid: ref.eid } : {}),
+                        hash: ref.hash as string,
+                        role: (ref.role as LedgerRole) || 'system',
+                        source: typeof ref.source === 'string' ? ref.source : undefined,
+                        preview: typeof ref.preview === 'string' ? ref.preview : '',
+                      }))
+                  );
+                }
               }
             } else if (result.tool === 'list_context') {
               const r = result.result as Record<string, unknown> | undefined;
@@ -3074,7 +4216,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
                       : signal.status === 'blocked'
                         ? '🚫'
                         : '➡️';
-                  printLine(
+                  printEvent(
                     chalk.dim(
                       `  ${icon} signal: ${signal.status}${signal.reason ? ` — ${signal.reason}` : ''}`
                     )
@@ -3105,6 +4247,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               tool: result.tool,
               result: result.result,
               status: result.status,
+              args: result.args,
             });
           } else if (result.status === 'error') {
             const msg = `Local tool error (${result.tool}): ${result.error}`;
@@ -3123,6 +4266,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
       });
 
       allToolResults.push(...iterationResults);
+      for (const r of iterationResults) {
+        const liveArgsJson = r.args ? JSON.stringify(r.args).replace(/\s+/g, ' ') : '';
+        recentToolCalls.push({
+          tool: r.tool,
+          status: r.status,
+          at: new Date().toISOString(),
+          args: liveArgsJson
+            ? liveArgsJson.length > 400
+              ? `${liveArgsJson.slice(0, 400)}…`
+              : liveArgsJson
+            : undefined,
+        });
+      }
+      if (recentToolCalls.length > 100) {
+        recentToolCalls.splice(0, recentToolCalls.length - 100);
+      }
       toolLoopIteration++;
 
       // Check if we should continue the loop
@@ -3152,23 +4311,26 @@ export async function runChat(options: ChatOptions): Promise<void> {
         `[Tool results from previous turn]\n${toolResultsSummary}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`
       );
 
-      // Show continuation indicator
-      printLine(
+      // Show continuation indicator naming the tools that just ran — this is
+      // the SB working, not a system message
+      const ranTools = Array.from(new Set(iterationResults.map((r) => r.tool))).join(', ');
+      printEvent(
         chalk.dim(
-          `  ↳ continuing with tool results (${toolLoopIteration}/${MAX_TOOL_LOOP_ITERATIONS})…`
+          `  ⋯ ran ${ranTools} — continuing (${toolLoopIteration}/${MAX_TOOL_LOOP_ITERATIONS})…`
         )
       );
       const stopContinuation = inkRepl
-        ? (() => {
-            return () => {};
-          })()
+        ? ((repl) => {
+            repl.setWaiting(true, runtime.backend);
+            return () => repl.setWaiting(false);
+          })(inkRepl)
         : startWaitingIndicator(runtime.backend, {
             statusLane,
             logger: printLine,
             renderAbovePrompt: true,
           });
 
-      runResult = await runBackendTurn({
+      const contTurn = startBackendTurn({
         backend: runtime.backend,
         agentId,
         model: runtime.model,
@@ -3176,15 +4338,28 @@ export async function runChat(options: ChatOptions): Promise<void> {
         verbose: runtime.verbose,
         passthroughArgs,
         timeoutMs: runtime.backendTurnTimeoutMs,
-      }).finally(() => {
+        attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+      });
+      currentTurnAbort = contTurn.abort;
+      inkRepl?.setAbortHandler(abortCurrentTurn);
+      process.on('SIGINT', onSigintDuringTurn);
+
+      runResult = await contTurn.result.finally(() => {
+        currentTurnAbort = null;
+        inkRepl?.setAbortHandler(null);
+        process.off('SIGINT', onSigintDuringTurn);
         stopContinuation();
       });
 
       if (!runResult.success) break;
     }
 
-    const assistantDisplayText =
-      runtime.toolRouting === 'local'
+    const isAbortedTurn =
+      !runResult.success && runResult.exitCode !== undefined && runResult.exitCode >= 128;
+
+    const assistantDisplayText = isAbortedTurn
+      ? ''
+      : runtime.toolRouting === 'local'
         ? (() => {
             const stripped = stripLocalToolBlocks(responseText);
             if (stripped) return stripped;
@@ -3194,20 +4369,35 @@ export async function runChat(options: ChatOptions): Promise<void> {
           })()
         : responseText;
 
-    ledger.addEntry('assistant', assistantDisplayText, runtime.backend);
-    appendTranscript(runtime.transcriptPath, {
-      type: 'assistant',
-      backend: runtime.backend,
-      model: runtime.model || null,
-      success: runResult.success,
-      exitCode: runResult.exitCode,
-      durationMs: runResult.durationMs,
-      stderr: runResult.stderr || null,
-      content: assistantDisplayText,
-      rawContent: responseText,
-      approxTokens: estimateTokens(assistantDisplayText),
-      usage: runResult.usage || null,
-    });
+    if (isAbortedTurn) {
+      appendTranscript(runtime.transcriptPath, {
+        type: 'assistant',
+        backend: runtime.backend,
+        model: runtime.model || null,
+        success: false,
+        exitCode: runResult.exitCode,
+        durationMs: runResult.durationMs,
+        stderr: runResult.stderr || null,
+        content: null,
+        cancelled: true,
+        usage: runResult.usage || null,
+      });
+    } else {
+      ledger.addEntry('assistant', assistantDisplayText, runtime.backend);
+      appendTranscript(runtime.transcriptPath, {
+        type: 'assistant',
+        backend: runtime.backend,
+        model: runtime.model || null,
+        success: runResult.success,
+        exitCode: runResult.exitCode,
+        durationMs: runResult.durationMs,
+        stderr: runResult.stderr || null,
+        content: assistantDisplayText,
+        rawContent: responseText,
+        approxTokens: estimateTokens(assistantDisplayText),
+        usage: runResult.usage || null,
+      });
+    }
     lastBackendUsage = runResult.usage;
 
     // ── Fire turn_end hooks (passive recall, etc.) ──
@@ -3234,6 +4424,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
         },
       })
       .then((hookResult) => {
+        // Persist hook-injected entries to transcript so they survive reattach
+        if (hookResult.injectedEntries.length > 0) {
+          for (const entry of hookResult.injectedEntries) {
+            appendTranscript(runtime.transcriptPath, {
+              type: 'hook_injection',
+              role: entry.role,
+              content: entry.content,
+              source: entry.source,
+              memoryId: entry.memoryId,
+            });
+          }
+        }
+
         // Notify the user about passive recall injections
         if (hookResult.injected > 0) {
           const recallEntries = ledger
@@ -3241,14 +4444,29 @@ export async function runChat(options: ChatOptions): Promise<void> {
             .filter((e) => e.source === 'passive-recall')
             .slice(-hookResult.injected);
 
-          for (const entry of recallEntries) {
-            const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
-            const tokens = entry.approxTokens;
-            printLine(
-              chalk.dim(
-                `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${tokens} tok)`
-              )
-            );
+          if (recallEntries.length > 0) {
+            const totalTok = recallEntries.reduce((sum, e) => sum + e.approxTokens, 0);
+            if (inkRepl) {
+              const details = recallEntries.map((entry) => {
+                const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+                return `  💡 ${preview}${entry.content.length > 120 ? '...' : ''} (${entry.approxTokens} tok)`;
+              });
+              inkRepl.setSurfacedMemories(details);
+              printLine(
+                chalk.dim(
+                  `  💡 ${recallEntries.length} ${recallEntries.length === 1 ? 'memory' : 'memories'} surfaced (${totalTok} tok) — ctrl+o to expand`
+                )
+              );
+            } else {
+              for (const entry of recallEntries) {
+                const preview = entry.content.replace(/^\[passive-recall\]\s*/, '').slice(0, 120);
+                printLine(
+                  chalk.dim(
+                    `  💡 memory surfaced: "${preview}${entry.content.length > 120 ? '...' : ''}" (${entry.approxTokens} tok)`
+                  )
+                );
+              }
+            }
           }
         }
         if (hookResult.evicted > 0) {
@@ -3257,7 +4475,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       })
       .catch(() => undefined); // never block the REPL
 
-    if (!runResult.success) {
+    if (!runResult.success && !isAbortedTurn) {
       printLine(chalk.red(`\n[${runtime.backend}] exit=${runResult.exitCode}`));
       if (runResult.stderr) {
         printLine(chalk.dim(runResult.stderr));
@@ -3265,13 +4483,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
 
     if (inkRepl) {
-      const usageMeta = runResult.usage ? formatBackendTokenUsage(runResult.usage) : undefined;
-      const trailingParts = [`${turnDurationSeconds}s`, usageMeta].filter(Boolean).join('  ·  ');
-      inkRepl.addMessage('assistant', assistantDisplayText, {
-        label: agentId,
-        trailingMeta: trailingParts,
-      });
-    } else {
+      if (!isAbortedTurn) {
+        const usageMeta = runResult.usage ? formatBackendTokenUsage(runResult.usage) : undefined;
+        const trailingParts = [`${turnDurationSeconds}s`, usageMeta].filter(Boolean).join('  ·  ');
+        inkRepl.addMessage('assistant', assistantDisplayText, {
+          label: agentId,
+          trailingMeta: trailingParts,
+        });
+      }
+    } else if (!isAbortedTurn) {
       printLine('');
       printLine(
         renderMessageLine('assistant', assistantDisplayText, {
@@ -3291,6 +4511,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   let turnQueue: Promise<void> = Promise.resolve();
   let pendingTurns = 0;
+  let consecutiveBackendFailures = 0;
   let lastStatusSummary = '';
   const emitStatusLaneIfChanged = (force = false) => {
     const summary = buildContextStatusSummary({
@@ -3314,7 +4535,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
       statusLane.markPromptRefreshed();
     }
   };
-  const enqueueTurn = (raw: string, source: 'user' | 'inbox-auto' = 'user'): Promise<void> => {
+  const enqueueTurn = (
+    raw: string,
+    source: 'user' | 'inbox-auto' | 'system' = 'user',
+    displayLabel?: string
+  ): Promise<void> => {
     pendingTurns += 1;
     emitStatusLaneIfChanged();
     const run = async () => {
@@ -3324,7 +4549,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         statusLane.setTurnActive(true);
       }
       try {
-        await runUserTurn(raw, source);
+        await runUserTurn(raw, source, displayLabel);
       } catch (error) {
         printLine(chalk.red(`Turn failed: ${String(error)}`));
       } finally {
@@ -3368,21 +4593,33 @@ export async function runChat(options: ChatOptions): Promise<void> {
   }
 
   if (options.nonInteractive || options.message) {
+    // Suppress MaxListenersExceeded for non-interactive spawns. Various
+    // libraries (Commander, Ink renderer, MCP clients) each add SIGINT
+    // handlers during init, easily exceeding the default limit of 10.
+    // These are benign — the handlers are paired with cleanup.
+    process.setMaxListeners(25);
+
     const message = options.message?.trim();
     if (!message) {
       throw new Error('--non-interactive requires --message "<text>"');
     }
     const maxTurns = parseInt(options.maxTurns || '1', 10);
 
-    // Turn 1: user-provided message
+    // Turn 1: the delivered message. When --message-label is set (server
+    // spawns pass the originating channel, e.g. "heartbeat"), render as a
+    // system message — it's harness-delivered, not typed by the human.
+    const messageLabel = options.messageLabel?.trim();
     clearLastSignal();
-    await enqueueTurn(message);
+    await enqueueTurn(message, messageLabel ? 'system' : 'user', messageLabel);
 
-    // Check for signal after turn 1
+    // Check for signal or failure after turn 1
     let exitReason: string | undefined;
     const signal1 = getLastSignal();
     if (signal1?.status === 'completed' || signal1?.status === 'blocked') {
       exitReason = `${signal1.status}${signal1.reason ? `: ${signal1.reason}` : ''}`;
+    }
+    if (!exitReason && consecutiveBackendFailures > 0) {
+      exitReason = 'backend_failure';
     }
 
     // Turns 2..N: continuation prompts — the SB signals when it's done
@@ -3390,7 +4627,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       for (let turn = 2; turn <= maxTurns; turn++) {
         clearLastSignal();
         await enqueueTurn(
-          'Continue working. Use signal_status to indicate when you are completed, blocked, or continuing.'
+          'Continue working. Use signal_status to indicate when you are completed, blocked, or continuing.',
+          'system',
+          'continuation'
         );
 
         const signal = getLastSignal();
@@ -3398,18 +4637,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
           exitReason = `${signal.status}${signal.reason ? `: ${signal.reason}` : ''}`;
           break;
         }
-        // No signal or 'continuing' → keep going
+        if (consecutiveBackendFailures >= 2) {
+          exitReason = 'backend_failure';
+          break;
+        }
       }
     }
 
     if (pollTimer) clearInterval(pollTimer);
     const summary = summarizeForSessionEnd(ledger);
 
+    const isBackendFailure = exitReason === 'backend_failure';
+
     // Map the signal to a session phase. Don't end the session — leave it
     // resumable so the user or another SB can attach and follow up.
     const finalSignal = getLastSignal();
-    const phase =
-      finalSignal?.status === 'blocked'
+    const phase = isBackendFailure
+      ? 'blocked:backend-error'
+      : finalSignal?.status === 'blocked'
         ? 'blocked:needs-input'
         : finalSignal?.status === 'completed'
           ? 'idle:completed'
@@ -3432,14 +4677,68 @@ export async function runChat(options: ChatOptions): Promise<void> {
       signal: finalSignal || undefined,
     });
 
-    if (finalSignal?.status === 'blocked') {
+    // Emit structured result for machine consumers (InkRunner, etc.).
+    // Must come before human-readable status lines so parsers can
+    // distinguish the assistant's response from CLI chrome.
+    const lastAssistant = ledger
+      .listEntries()
+      .filter((e) => e.role === 'assistant')
+      .pop();
+    // Context utilization from our budget's view: transcript + identity.
+    // The server (InkRunner) persists this so session-level token tracking
+    // works for the ink backend — without it, sessions report 0 context
+    // tokens and grow unbounded.
+    const reportedContextTokens =
+      ledger.totalTokens() +
+      (runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0);
+    console.log(
+      JSON.stringify({
+        type: 'result',
+        text: lastAssistant?.content || null,
+        sessionId: runtime.sessionId || null,
+        phase,
+        signal: finalSignal?.status || null,
+        reason: finalSignal?.reason || (isBackendFailure ? 'backend_failure' : null),
+        usage: {
+          contextTokens: reportedContextTokens,
+          inputTokens: lastBackendUsage?.inputTokens || 0,
+          outputTokens: lastBackendUsage?.outputTokens || 0,
+        },
+        ...(isBackendFailure ? { backendFailure: true } : {}),
+      })
+    );
+
+    if (isBackendFailure) {
+      console.log(chalk.red(`\nSession aborted: backend returned consecutive failures.`));
+      console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${agentId}\n`));
+      process.exitCode = 1;
+    } else if (finalSignal?.status === 'blocked') {
       console.log(chalk.yellow(`\nSession blocked: ${finalSignal.reason || 'needs input'}`));
     } else if (finalSignal?.status === 'completed') {
       console.log(chalk.green(`\nSession completed.`));
     } else {
       console.log(chalk.dim(`\nSession paused (${maxTurns} turn(s) completed).`));
     }
-    console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${agentId}\n`));
+    if (!isBackendFailure) {
+      console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${agentId}\n`));
+    }
+
+    // Clean up handles that would keep the process alive. Without this,
+    // the non-interactive path skips the REPL cleanup at the end of
+    // runChat() and Node hangs on open handles — blocking InkRunner's
+    // heartbeat delivery callback indefinitely.
+    readyForAutoRun = false;
+    approvalManager.cancelAll();
+    runtime.approvalChannel?.dispose();
+    if (pendingTurns > 0) {
+      await turnQueue;
+    }
+    // Unref stdio so lingering streams (e.g. piped stdin from InkRunner)
+    // don't prevent the event loop from draining. Guarded: some stdin
+    // stream types (already-closed pipes) don't implement unref.
+    if (typeof process.stdin.unref === 'function') {
+      process.stdin.unref();
+    }
     return;
   }
 
@@ -3453,6 +4752,38 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let exitAfterTurnNoticeShown = false;
   let activePromptLabel = `${agentId}> `;
 
+  // Helper: build context view lines from current state
+  const buildContextViewLines = (): string[] => {
+    const recallStats = passiveRecallHandle.getStats();
+    const allEntries = ledger.listEntries();
+    const recallEntries = allEntries.filter((e) => e.source === 'passive-recall');
+    return formatContextLines({
+      bootstrapSummary: runtime.bootstrapContext || undefined,
+      passiveRecallEntries: recallEntries.map((e) => ({
+        content: e.content,
+        source: e.source,
+      })),
+      passiveRecallStats: {
+        totalInjected: recallStats.totalInjected,
+        uniqueMemories: recallStats.uniqueMemories,
+        currentTurn: recallStats.currentTurn,
+      },
+      ledgerStats: {
+        totalEntries: allEntries.length,
+        tokenEstimate: ledger.totalTokens(),
+        bootstrapTokens: runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0,
+      },
+      toolCalls: recentToolCalls,
+      evicted: sessionEvictedEntries.map((e) => ({
+        role: e.role,
+        source: e.source,
+        preview: e.content.slice(0, 100),
+        actor: e.actor,
+        reason: e.reason,
+      })),
+    });
+  };
+
   if (useInk) {
     // ── Ink path ──
     inkRepl = renderInkChat({
@@ -3460,6 +4791,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       timezone: runtime.userTimezone,
       infoItems: initialInfoItems,
       fullscreen: !!options.fullscreen,
+      dynamicMessages: !!options.dynamic,
     });
     // Initial status update — ChatApp starts with 'waiting for input'
     // so push the real context budget summary immediately
@@ -3474,17 +4806,41 @@ export async function runChat(options: ChatOptions): Promise<void> {
     inkRepl.setStatus(initialSummary);
     lastStatusSummary = initialSummary;
 
+    // Register Ctrl+O handler — opens context viewer via React state
+    inkRepl.handle.setCtrlOHandler(() => {
+      inkRepl!.showContextView(buildContextViewLines());
+    });
+    // Ctrl+T — same viewer, opened at the Tool Calls section (expands the
+    // one-line 🛠 rows in the replay to full args)
+    inkRepl.handle.setCtrlTHandler(() => {
+      inkRepl!.showContextView(buildContextViewLines(), { initialSection: 't' });
+    });
+
     // Push prior messages into Ink scrollback so user sees conversation history
     if (historyHydration && historyHydration.tailPreview.length > 0) {
       for (const entry of historyHydration.tailPreview) {
+        if (entry.role === 'event') {
+          // Tool calls and other progress lines — dim, unlabeled.
+          // No manual indent: MessageLine's event role owns the column.
+          inkRepl.printEvent(entry.content);
+          continue;
+        }
         const role =
           entry.role === 'user'
             ? ('user' as const)
             : entry.role === 'assistant'
               ? ('assistant' as const)
-              : ('inbox' as const);
+              : entry.role === 'system'
+                ? ('system' as const)
+                : ('inbox' as const);
         const label =
-          entry.role === 'user' ? 'you' : entry.role === 'assistant' ? agentId : '📬 inbox';
+          entry.role === 'user'
+            ? 'you'
+            : entry.role === 'assistant'
+              ? agentId
+              : entry.role === 'system'
+                ? entry.label || 'system'
+                : '📬 inbox';
         inkRepl.addMessage(role, entry.content, {
           label,
           time: formatHumanTime(entry.ts, runtime.userTimezone),
@@ -3624,7 +4980,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           '',
           chalk.bold('Quick commands'),
           chalk.dim(
-            '/help  /mcp  /capabilities  /skills  /profile  /policy  /away  /tool-routing  /save-config  /ui  /trim  /quit'
+            '/help  /mcp  /capabilities  /skills  /profile  /policy  /away  /tool-routing  /save-config  /ui  /trim  /evict  /quit'
           ),
           '',
         ].join('\n')
@@ -3634,63 +4990,54 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     const slash = parseSlashCommand(raw);
     if (slash) {
+      const showInPanel = (lines: string[]) => {
+        if (inkRepl) {
+          inkRepl.setCommandOutput(lines);
+        } else {
+          console.log(lines.join('\n'));
+        }
+      };
+
       switch (slash.name) {
         case 'help': {
-          console.log(
-            [
-              '',
-              '/help                      Show this help',
-              '/quit | /exit              End chat',
-              '/refresh                   Re-bootstrap identity context from Inkwell',
-              '/inbox                     Poll inbox now',
-              '/inbox full                Show all unread messages expanded',
-              '/events [now|on|off]       Poll/toggle merged activity stream',
-              '/session                   Show active session info',
-              '/autorun [on|off]          Toggle inbox auto-run execution',
-              '/away [on|off]             Toggle remote approval mode (approvals via inbox)',
-              '/tool-routing [backend|local]  Toggle backend tools vs local ink-tool routing',
-              '/save-config                  Save current runtime preferences to .ink/identity.json',
-              '/ui [scroll|live]          Set status rendering mode',
-              '/backend <name>            Switch backend (claude|codex|gemini)',
-              '/model <id>                Set/clear model override',
-              '/tools <backend|off|privileged>  Toggle backend-native tools/policy',
-              '/grant <tool> [uses]       Grant blocked Inkwell tool for limited uses',
-              '/grant-session <tool>      Allow a tool for this Inkwell session only',
-              '/allow <tool>               Persistently allow Inkwell tool',
-              '/deny <tool>                Persistently deny Inkwell tool',
-              '/prompt <tool>              Require per-call approval for Inkwell tool',
-              '/policy-scope [global|workspace|agent|studio] [id]  Set rule mutation scope',
-              '/policy                     Show tool policy + storage path',
-              '/mcp [servers|call ...]     List MCP servers or call Inkwell tool via /mcp call',
-              '/mcp-servers                List configured MCP servers from .mcp.json',
-              '/capabilities               Snapshot: MCP servers + skills + policy + grants',
-              '/ink <tool> [jsonArgs]     Call an Inkwell tool directly',
-              '/thread [key]              Show/set active thread key',
-              '/sessions [watch|off]      Show active sessions (or stream each turn)',
-              '/skills                    List discovered local skills',
-              '/skill-trust <all|trusted-only>  Set skill trust policy mode',
-              '/session-visibility <self|thread|studio|workspace|agent|all>  Set session visibility policy',
-              '/skill-allow <pattern>      Persistently allow skill(s) via pattern',
-              '/path-allow-read <glob>      Persistently allow local reads for matching paths',
-              '/path-allow-write <glob>     Persistently allow local writes for matching paths',
-              '/profile [name]             Apply security profile (minimal/safe/collaborative/full)',
-              '/policy-reset [global|workspace|agent|studio] [id]  Reset policy scope to defaults',
-              '/delegate-create <to> <scopes> [ttlMin]  Mint delegation token',
-              '/delegate-show               Show last minted delegation token payload',
-              '/delegate-verify <token|last> Verify delegation token with local secret',
-              '/delegate-send <to> <scopes> <message>  Send inbox message with delegation token',
-              '/skill-use <name>           Activate a discovered skill for prompts',
-              '/skill-clear [name]         Clear active skills (or one skill)',
-              '/bookmark [label]          Set context bookmark',
-              '/bookmarks                 List bookmarks',
-              '/eject <bookmark|last>     Eject context up to bookmark',
-              '/eject <bookmark|last> --force  Eject without confirmation',
-              '/trim [targetPct]          Trim oldest context entries (default 70)',
-              '/context                   Show recent context entries',
-              '/usage                     Show context token estimate',
-              '',
-            ].join('\n')
-          );
+          showInPanel([
+            '/help                      Show this help',
+            '/quit | /exit              End chat',
+            '/refresh                   Re-bootstrap identity context',
+            '/inbox [full]              Poll inbox now',
+            '/events [now|on|off]       Poll/toggle activity stream',
+            '/session                   Show active session info',
+            '/autorun [on|off]          Toggle inbox auto-run',
+            '/away [on|off]             Toggle remote approval mode',
+            '/tool-routing [backend|local]  Switch tool routing',
+            '/save-config               Save runtime preferences',
+            '/ui [scroll|live]          Set rendering mode',
+            '/backend <name>            Switch backend',
+            '/model <id>                Set/clear model override',
+            '/tools <backend|off>       Toggle backend tools',
+            '/grant <tool> [uses]       Grant tool for limited uses',
+            '/allow <tool>              Persistently allow tool',
+            '/deny <tool>               Persistently deny tool',
+            '/policy                    Show tool policy',
+            '/mcp [servers|call ...]    MCP servers / call tool',
+            '/mcp-servers               List .mcp.json servers',
+            '/capabilities              Full capability snapshot',
+            '/ink <tool> [jsonArgs]     Call Inkwell tool directly',
+            '/thread [key]              Show/set thread key',
+            '/sessions [watch|off]      Show active sessions',
+            '/skills                    List discovered skills',
+            '/profile [name]            Apply security profile',
+            '/bookmark [label]          Set context bookmark',
+            '/bookmarks                 List bookmarks',
+            '/eject <bookmark|last>     Eject context',
+            '/trim [targetPct]          Trim oldest context',
+            '/evict [sel] [--dry-run]   Evict entries (ids, source:<x>, role:<x>)',
+            '/evicted                   Show evicted-from-context entries',
+            '/context                   Show recent entries',
+            '/usage                     Token estimate',
+            'Ctrl+O                     Context inspector (e/t/m/b: jump sections)',
+            'Ctrl+T                     Context inspector at Tool Calls',
+          ]);
           break;
         }
         case 'quit':
@@ -3708,7 +5055,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               (a, b) => safeDateMs(a.createdAt) - safeDateMs(b.createdAt)
             );
             if (allInbox.length === 0) {
-              inkRepl.printSystem('No unread inbox messages.');
+              showInPanel(['No unread inbox messages.']);
             } else {
               for (const msg of allInbox) {
                 const from = msg.from || 'unknown';
@@ -3724,22 +5071,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }
           break;
         case 'refresh': {
-          console.log(chalk.dim('Refreshing identity context from Inkwell...'));
+          showInPanel(['Refreshing identity context from Inkwell...']);
           const refreshResult = (await pcp
             .callTool('bootstrap', { agentId })
             .catch((error) => ({ error: String(error) }))) as Record<string, unknown>;
           if (refreshResult.error) {
-            console.log(chalk.yellow(`Refresh failed: ${String(refreshResult.error)}`));
+            showInPanel([`Refresh failed: ${String(refreshResult.error)}`]);
           } else {
             const ctx = formatBootstrapContext(refreshResult, agentId);
             if (ctx) {
               runtime.bootstrapContext = ctx;
               const ctxTokens = estimateTokens(ctx);
-              console.log(
-                chalk.green(`Identity context refreshed: ~${ctxTokens.toLocaleString()} tokens`)
-              );
+              showInPanel([`Identity context refreshed: ~${ctxTokens.toLocaleString()} tokens`]);
             } else {
-              console.log(chalk.yellow('Bootstrap returned no identity context.'));
+              showInPanel(['Bootstrap returned no identity context.']);
+            }
+            const refreshMemoryIds = refreshResult.memoryIds as string[] | undefined;
+            if (refreshMemoryIds && refreshMemoryIds.length > 0) {
+              passiveRecallHandle.seedBootstrapIds(refreshMemoryIds);
             }
           }
           break;
@@ -3748,10 +5097,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const mode = slash.args[0];
           if (mode === 'off') {
             runtime.eventPolling = false;
-            console.log(chalk.yellow('Activity polling disabled.'));
+            showInPanel(['Activity polling disabled.']);
           } else if (mode === 'on') {
             runtime.eventPolling = true;
-            console.log(chalk.green('Activity polling enabled.'));
+            showInPanel(['Activity polling enabled.']);
           } else {
             await pollActivity(true);
           }
@@ -3765,95 +5114,81 @@ export async function runChat(options: ChatOptions): Promise<void> {
             const sessionStudio = attachedSessionSummary
               ? sessionStudioLabel(attachedSessionSummary, 'full')
               : sessionStudioLabel({ studioId: runtime.studioId }, 'full');
-            console.log(
-              chalk.dim(
-                `session=${runtime.sessionId || 'none'} backend=${runtime.backend} model=${
-                  runtime.model || '(default)'
-                } routing=${runtime.toolRouting} thread=${runtime.threadKey || '(none)'} studio=${sessionStudio} events=${
-                  runtime.eventPolling ? 'on' : 'off'
-                } autorun=${
-                  runtime.autoRunInbox ? 'on' : 'off'
-                } ui=${runtime.uiMode} budget=${formatTokenCount(
-                  runtime.maxContextTokens
-                )} window=${formatTokenCount(
-                  runtime.backendTokenWindow
-                )} budgetMode=${contextBudgetAuto ? 'auto' : 'manual'} tools=${toolPolicy.getMode()} scope=${toolPolicy.getMutationScopeLabel()} visibility=${toolPolicy.getSessionVisibility()} history=${sessionHistoryLabel(
-                  transcriptMeta
-                )}`
-              )
-            );
+            showInPanel([
+              `session=${runtime.sessionId || 'none'}`,
+              `backend=${runtime.backend} model=${runtime.model || '(default)'}`,
+              `routing=${runtime.toolRouting} thread=${runtime.threadKey || '(none)'}`,
+              `studio=${sessionStudio}`,
+              `events=${runtime.eventPolling ? 'on' : 'off'} autorun=${runtime.autoRunInbox ? 'on' : 'off'}`,
+              `ui=${runtime.uiMode} budget=${formatTokenCount(runtime.maxContextTokens)} window=${formatTokenCount(runtime.backendTokenWindow)}`,
+              `budgetMode=${contextBudgetAuto ? 'auto' : 'manual'} tools=${toolPolicy.getMode()}`,
+              `scope=${toolPolicy.getMutationScopeLabel()} visibility=${toolPolicy.getSessionVisibility()}`,
+              `history=${sessionHistoryLabel(transcriptMeta)}`,
+            ]);
           }
           break;
         case 'autorun':
         case 'auto-run': {
           const mode = (slash.args[0] || '').toLowerCase();
           if (!mode) {
-            console.log(chalk.dim(`Inbox auto-run is ${runtime.autoRunInbox ? 'on' : 'off'}.`));
+            showInPanel([`Inbox auto-run is ${runtime.autoRunInbox ? 'on' : 'off'}.`]);
             break;
           }
           if (!['on', 'off'].includes(mode)) {
-            console.log(chalk.yellow('Usage: /autorun [on|off]'));
+            showInPanel(['Usage: /autorun [on|off]']);
             break;
           }
           runtime.autoRunInbox = mode === 'on';
-          console.log(
-            chalk.green(`Inbox auto-run ${runtime.autoRunInbox ? 'enabled' : 'disabled'}.`)
-          );
+          showInPanel([`Inbox auto-run ${runtime.autoRunInbox ? 'enabled' : 'disabled'}.`]);
           break;
         }
         case 'away': {
           const mode = (slash.args[0] || '').toLowerCase();
           if (!mode) {
-            console.log(chalk.dim(`Away mode is ${runtime.awayMode ? 'on' : 'off'}.`));
+            const awayLines = [`Away mode is ${runtime.awayMode ? 'on' : 'off'}.`];
             if (approvalManager.size > 0) {
-              console.log(chalk.dim(`  ${approvalManager.size} pending approval request(s)`));
+              awayLines.push(`  ${approvalManager.size} pending approval request(s)`);
             }
+            showInPanel(awayLines);
             break;
           }
           if (!['on', 'off'].includes(mode)) {
-            console.log(chalk.yellow('Usage: /away [on|off]'));
+            showInPanel(['Usage: /away [on|off]']);
             break;
           }
           runtime.awayMode = mode === 'on';
           if (runtime.awayMode) {
-            console.log(
-              chalk.green(
-                'Away mode enabled — tool approvals will be sent to your inbox for remote approval.'
-              )
-            );
+            showInPanel(['Away mode enabled — approvals sent to inbox for remote approval.']);
           } else {
-            console.log(chalk.green('Away mode disabled — tool approvals will prompt locally.'));
+            const awayOffLines = ['Away mode disabled — tool approvals will prompt locally.'];
             if (approvalManager.size > 0) {
               approvalManager.cancelAll();
-              console.log(chalk.dim('Cancelled pending remote approval requests.'));
+              awayOffLines.push('Cancelled pending remote approval requests.');
             }
+            showInPanel(awayOffLines);
           }
           break;
         }
         case 'tool-routing': {
           const mode = (slash.args[0] || '').toLowerCase();
           if (!mode) {
-            console.log(chalk.dim(`Tool routing is ${runtime.toolRouting}.`));
+            showInPanel([`Tool routing is ${runtime.toolRouting}.`]);
             break;
           }
           if (!['backend', 'local'].includes(mode)) {
-            console.log(chalk.yellow('Usage: /tool-routing [backend|local]'));
+            showInPanel(['Usage: /tool-routing [backend|local]']);
             break;
           }
           runtime.toolRouting = mode as 'backend' | 'local';
           saveRuntimePreferences(process.cwd(), { toolRouting: runtime.toolRouting });
-          console.log(chalk.green(`Tool routing set to ${runtime.toolRouting}. (auto-saved)`));
+          const routingLines = [`Tool routing set to ${runtime.toolRouting}. (auto-saved)`];
           if (runtime.toolRouting === 'local') {
-            console.log(
-              chalk.dim(
-                'Local routing active: backend-native tools disabled; use ink-tool blocks for local execution.'
-              )
-            );
+            routingLines.push('Local routing: backend tools disabled; use ink-tool blocks.');
           }
+          showInPanel(routingLines);
           break;
         }
         case 'save-config': {
-          // Most preferences auto-persist on change, but /save-config captures the full snapshot
           const prefs: RuntimePreferences = {
             toolRouting: runtime.toolRouting,
             strictTools: runtime.strictTools,
@@ -3861,20 +5196,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
           };
           const saved = saveRuntimePreferences(process.cwd(), prefs);
           if (saved) {
-            console.log(chalk.green('All runtime preferences saved to .ink/identity.json:'));
-            console.log(chalk.dim(`  toolRouting: ${prefs.toolRouting}`));
-            console.log(chalk.dim(`  strictTools: ${prefs.strictTools}`));
+            const configLines = [
+              'Runtime preferences saved to .ink/identity.json:',
+              `  toolRouting: ${prefs.toolRouting}`,
+              `  strictTools: ${prefs.strictTools}`,
+            ];
             if (prefs.approvalMode) {
-              console.log(chalk.dim(`  approvalMode: ${prefs.approvalMode}`));
+              configLines.push(`  approvalMode: ${prefs.approvalMode}`);
             }
+            showInPanel(configLines);
           } else {
-            console.log(chalk.yellow('Failed to save runtime preferences.'));
+            showInPanel(['Failed to save runtime preferences.']);
           }
           break;
         }
         case 'ui': {
           if (inkRepl) {
-            printLine('UI mode: ink (React). Switch to scroll with --ui scroll on start.');
+            showInPanel(['UI mode: ink (React). Switch to scroll with --ui scroll on start.']);
             break;
           }
           const mode = (slash.args[0] || '').toLowerCase();
@@ -3896,35 +5234,34 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const mode = slash.args[0];
           if (mode === 'watch') {
             runtime.showSessionsWatch = true;
-            console.log(chalk.green('Session watch enabled.'));
+            showInPanel(['Session watch enabled.']);
           } else if (mode === 'off') {
             runtime.showSessionsWatch = false;
-            console.log(chalk.green('Session watch disabled.'));
+            showInPanel(['Session watch disabled.']);
           } else {
             const snapshot = await refreshSessionsSnapshot(true);
-            printSessionsSnapshot(snapshot, { timezone: runtime.userTimezone });
+            showInPanel(formatSessionsLines(snapshot, { timezone: runtime.userTimezone }));
           }
           break;
         }
         case 'backend': {
           const next = slash.args[0];
           if (!next || !['claude', 'codex', 'gemini'].includes(next)) {
-            console.log(chalk.yellow('Usage: /backend <claude|codex|gemini>'));
+            showInPanel(['Usage: /backend <claude|codex|gemini>']);
             break;
           }
           runtime.backend = next;
           runtime.backendTokenWindow = resolveBackendTokenWindow(runtime.backend, runtime.model);
           if (contextBudgetAuto) {
-            runtime.maxContextTokens = runtime.backendTokenWindow;
+            runtime.maxContextTokens = defaultContextBudget(runtime.backendTokenWindow);
           }
-          console.log(chalk.green(`Switched backend to ${next}`));
+          const backendLines = [`Switched backend to ${next}`];
           if (contextBudgetAuto) {
-            console.log(
-              chalk.dim(
-                `Context budget auto-updated to backend window (${formatTokenCount(runtime.maxContextTokens)} tok).`
-              )
+            backendLines.push(
+              `Context budget auto-updated (${formatTokenCount(runtime.maxContextTokens)} tok).`
             );
           }
+          showInPanel(backendLines);
           break;
         }
         case 'model': {
@@ -3932,100 +5269,94 @@ export async function runChat(options: ChatOptions): Promise<void> {
           runtime.model = next || undefined;
           runtime.backendTokenWindow = resolveBackendTokenWindow(runtime.backend, runtime.model);
           if (contextBudgetAuto) {
-            runtime.maxContextTokens = runtime.backendTokenWindow;
+            runtime.maxContextTokens = defaultContextBudget(runtime.backendTokenWindow);
           }
-          console.log(chalk.green(`Model override: ${runtime.model || '(backend default)'}`));
-          console.log(
-            chalk.dim(
-              `Backend window: ${formatTokenCount(runtime.backendTokenWindow)} tok (policy default).`
-            )
-          );
+          showInPanel([
+            `Model override: ${runtime.model || '(backend default)'}`,
+            `Backend window: ${formatTokenCount(runtime.backendTokenWindow)} tok`,
+          ]);
           break;
         }
         case 'tools': {
           const next = slash.args[0];
           if (!next) {
             const grants = toolPolicy.listGrants();
-            console.log(chalk.dim(`Tool mode: ${toolPolicy.getMode()}`));
-            console.log(chalk.dim(`Mutation scope: ${toolPolicy.getMutationScopeLabel()}`));
-            console.log(chalk.dim(`Session visibility: ${toolPolicy.getSessionVisibility()}`));
+            const toolsLines = [
+              `Tool mode: ${toolPolicy.getMode()}`,
+              `Mutation scope: ${toolPolicy.getMutationScopeLabel()}`,
+              `Session visibility: ${toolPolicy.getSessionVisibility()}`,
+            ];
             if (grants.length > 0) {
-              console.log(
-                chalk.dim(`Grants: ${grants.map((g) => `${g.tool}(${g.uses})`).join(', ')}`)
-              );
+              toolsLines.push(`Grants: ${grants.map((g) => `${g.tool}(${g.uses})`).join(', ')}`);
             }
             const sessionGrants = toolPolicy.listSessionGrants(runtime.sessionId);
             if (sessionGrants.length > 0) {
-              console.log(
-                chalk.dim(
-                  `Session grants: ${sessionGrants.map((g) => `${g.tool}(${g.uses})`).join(', ')}`
-                )
+              toolsLines.push(
+                `Session grants: ${sessionGrants.map((g) => `${g.tool}(${g.uses})`).join(', ')}`
               );
             }
+            showInPanel(toolsLines);
             break;
           }
           if (next !== 'backend' && next !== 'off' && next !== 'privileged') {
-            console.log(chalk.yellow('Usage: /tools <backend|off|privileged>'));
+            showInPanel(['Usage: /tools <backend|off|privileged>']);
             break;
           }
           toolPolicy.setMode(next);
           runtime.toolMode = toolPolicy.getMode();
-          console.log(
-            chalk.green(`Tool mode set in ${toolPolicy.getMutationScopeLabel()} to ${next}.`)
-          );
+          const toolsModeLines = [
+            `Tool mode set in ${toolPolicy.getMutationScopeLabel()} to ${next}.`,
+          ];
           if (runtime.toolMode !== next) {
-            console.log(
-              chalk.yellow(`Effective mode remains ${runtime.toolMode} due stricter active scope.`)
+            toolsModeLines.push(
+              `Effective mode remains ${runtime.toolMode} due stricter active scope.`
             );
           }
+          showInPanel(toolsModeLines);
           break;
         }
         case 'grant': {
           const tool = slash.args[0];
           if (!tool) {
-            console.log(chalk.yellow('Usage: /grant <tool> [uses]'));
+            showInPanel(['Usage: /grant <tool> [uses]']);
             break;
           }
           const uses = Number.parseInt(slash.args[1] || '1', 10);
           toolPolicy.grantTool(tool, Number.isNaN(uses) ? 1 : uses);
-          console.log(chalk.green(`Granted ${tool} for ${Number.isNaN(uses) ? 1 : uses} use(s).`));
+          showInPanel([`Granted ${tool} for ${Number.isNaN(uses) ? 1 : uses} use(s).`]);
           break;
         }
         case 'allow': {
           const tool = slash.args[0];
           if (!tool) {
-            console.log(chalk.yellow('Usage: /allow <tool>'));
+            showInPanel(['Usage: /allow <tool>']);
             break;
           }
           toolPolicy.allowTool(tool);
-          console.log(chalk.green(`Persistently allowed ${tool}`));
+          showInPanel([`Persistently allowed ${tool}`]);
           break;
         }
         case 'grant-session': {
           const tool = slash.args[0];
           if (!tool) {
-            console.log(chalk.yellow('Usage: /grant-session <tool>'));
+            showInPanel(['Usage: /grant-session <tool>']);
             break;
           }
           if (!runtime.sessionId) {
-            console.log(chalk.yellow('No Inkwell session id available.'));
+            showInPanel(['No Inkwell session id available.']);
             break;
           }
           toolPolicy.grantToolForSession(runtime.sessionId, tool);
-          console.log(chalk.green(`Granted ${tool} for this Inkwell session.`));
+          showInPanel([`Granted ${tool} for this Inkwell session.`]);
           break;
         }
         case 'grant-remote': {
-          // /grant-remote <agent> <toolSpec> [scope]
-          // Send a permission grant to another SB via inbox
           const targetAgent = slash.args[0];
           const toolSpec = slash.args[1];
           if (!targetAgent || !toolSpec) {
-            console.log(
-              chalk.yellow(
-                'Usage: /grant-remote <agent> <toolSpec> [once|session|always|deny|revoke]'
-              )
-            );
+            showInPanel([
+              'Usage: /grant-remote <agent> <toolSpec> [once|session|always|deny|revoke]',
+            ]);
             break;
           }
           const scopeArg = (slash.args[2] || 'session').toLowerCase();
@@ -4038,9 +5369,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           };
           const action = actionMap[scopeArg];
           if (!action) {
-            console.log(
-              chalk.yellow(`Unknown scope: ${scopeArg}. Use: once, session, always, deny, revoke`)
-            );
+            showInPanel([`Unknown scope: ${scopeArg}. Use: once, session, always, deny, revoke`]);
             break;
           }
           const grantResult = await pcp
@@ -4057,58 +5386,56 @@ export async function runChat(options: ChatOptions): Promise<void> {
               }),
             })
             .catch((err: unknown) => {
-              console.log(
-                chalk.red(
-                  `Failed to send grant: ${err instanceof Error ? err.message : String(err)}`
-                )
-              );
+              showInPanel([
+                `Failed to send grant: ${err instanceof Error ? err.message : String(err)}`,
+              ]);
               return null;
             });
           if (grantResult) {
-            console.log(chalk.green(`Sent ${action} for ${toolSpec} to ${targetAgent}.`));
+            showInPanel([`Sent ${action} for ${toolSpec} to ${targetAgent}.`]);
           }
           break;
         }
         case 'deny': {
           const tool = slash.args[0];
           if (!tool) {
-            console.log(chalk.yellow('Usage: /deny <tool>'));
+            showInPanel(['Usage: /deny <tool>']);
             break;
           }
           toolPolicy.denyTool(tool);
-          console.log(chalk.green(`Persistently denied ${tool}`));
+          showInPanel([`Persistently denied ${tool}`]);
           break;
         }
         case 'prompt': {
           const tool = slash.args[0];
           if (!tool) {
-            console.log(chalk.yellow('Usage: /prompt <tool>'));
+            showInPanel(['Usage: /prompt <tool>']);
             break;
           }
           toolPolicy.addPromptTool(tool);
-          console.log(chalk.green(`Tool ${tool} now requires per-call approval`));
+          showInPanel([`Tool ${tool} now requires per-call approval`]);
           break;
         }
         case 'policy-scope': {
           const scopeRaw = (slash.args[0] || '').trim().toLowerCase();
           if (!scopeRaw) {
-            console.log(chalk.dim(`Mutation scope: ${toolPolicy.getMutationScopeLabel()}`));
-            console.log(
-              chalk.dim(`Active scopes: ${toolPolicy.listActiveScopeLabels().join(' -> ')}`)
-            );
+            showInPanel([
+              `Mutation scope: ${toolPolicy.getMutationScopeLabel()}`,
+              `Active scopes: ${toolPolicy.listActiveScopeLabels().join(' -> ')}`,
+            ]);
             break;
           }
           if (!['global', 'workspace', 'agent', 'studio'].includes(scopeRaw)) {
-            console.log(chalk.yellow('Usage: /policy-scope [global|workspace|agent|studio] [id]'));
+            showInPanel(['Usage: /policy-scope [global|workspace|agent|studio] [id]']);
             break;
           }
           const id = slash.args.slice(1).join(' ').trim() || undefined;
           const result = toolPolicy.setMutationScope(scopeRaw as ToolPolicyScopeKind, id);
           if (!result.success) {
-            console.log(chalk.yellow(result.message));
+            showInPanel([result.message]);
           } else {
             runtime.toolMode = toolPolicy.getMode();
-            console.log(chalk.green(result.message));
+            showInPanel([result.message]);
           }
           break;
         }
@@ -4122,42 +5449,41 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 } as const)
               : undefined;
           if (scopeRaw && !explicitScope) {
-            console.log(chalk.yellow('Usage: /policy-reset [global|workspace|agent|studio] [id]'));
+            showInPanel(['Usage: /policy-reset [global|workspace|agent|studio] [id]']);
             break;
           }
           const result = toolPolicy.clearScopeRules(explicitScope);
           if (!result.success) {
-            console.log(chalk.yellow(result.message));
+            showInPanel([result.message]);
             break;
           }
           runtime.toolMode = toolPolicy.getMode();
-          console.log(chalk.green(result.message));
+          showInPanel([result.message]);
           break;
         }
         case 'profile': {
           const profileArg = (slash.args[0] || '').trim().toLowerCase();
           if (!profileArg) {
-            console.log(chalk.bold('Tool Profiles'));
-            console.log(formatProfileList());
-            console.log(chalk.dim('\nUsage: /profile <minimal|safe|collaborative|full>'));
+            showInPanel([
+              'Tool Profiles',
+              formatProfileList(),
+              'Usage: /profile <minimal|safe|collaborative|full>',
+            ]);
             break;
           }
           if (!isValidProfileId(profileArg)) {
-            console.log(chalk.yellow(`Unknown profile: ${profileArg}`));
-            console.log(formatProfileList());
+            showInPanel([`Unknown profile: ${profileArg}`, formatProfileList()]);
             break;
           }
           const profileResult = applyProfile(toolPolicy, profileArg);
+          showInPanel([profileResult.message]);
           if (profileResult.success) {
             runtime.toolMode = toolPolicy.getMode();
-            console.log(chalk.green(profileResult.message));
-          } else {
-            console.log(chalk.yellow(profileResult.message));
           }
           break;
         }
         case 'policy': {
-          printToolPolicySnapshot(toolPolicy, runtime.sessionId, runtime.activeSkills);
+          showInPanel(formatToolPolicyLines(toolPolicy, runtime.sessionId, runtime.activeSkills));
           break;
         }
         case 'mcp': {
@@ -4165,23 +5491,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
           if (sub === 'servers' || sub === 'list') {
             const servers = listConfiguredMcpServers(process.cwd());
             if (servers.length === 0) {
-              console.log(chalk.dim('No MCP servers configured in .mcp.json'));
+              showInPanel(['No MCP servers configured in .mcp.json']);
               break;
             }
-            console.log(chalk.bold(`MCP servers (${servers.length})`));
+            const lines = [`MCP servers (${servers.length})`];
             for (const server of servers) {
               const endpoint = server.url || server.command || '(unknown)';
-              console.log(
-                chalk.dim(`- ${server.name} [${server.transport || 'unknown'}] ${endpoint}`)
-              );
+              lines.push(`  ${server.name} [${server.transport || 'unknown'}] ${endpoint}`);
             }
-            console.log('');
+            showInPanel(lines);
             break;
           }
           if (sub === 'call') {
             const tool = slash.args[1];
             if (!tool) {
-              console.log(chalk.yellow('Usage: /mcp call <tool> [jsonArgs]'));
+              showInPanel(['Usage: /mcp call <tool> [jsonArgs]']);
               break;
             }
             let pcpArgs: Record<string, unknown> = {};
@@ -4190,11 +5514,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
               try {
                 pcpArgs = JSON.parse(rawArgs) as Record<string, unknown>;
               } catch {
-                console.log(
-                  chalk.yellow(
-                    'Invalid JSON args. Example: /mcp call get_inbox {"agentId":"lumen"}'
-                  )
-                );
+                showInPanel([
+                  'Invalid JSON args. Example: /mcp call get_inbox {"agentId":"lumen"}',
+                ]);
                 break;
               }
             }
@@ -4214,7 +5536,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 ),
             });
             if (!approved) {
-              console.log(chalk.yellow(`Skipped ${tool}`));
+              showInPanel([`Skipped ${tool}`]);
               break;
             }
             const result = await pcp
@@ -4228,26 +5550,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
               args: pcpArgs,
               result,
             });
-            console.log(rendered);
+            showInPanel(rendered.split('\n'));
             break;
           }
-          console.log(chalk.yellow('Usage: /mcp [servers|list|call <tool> [jsonArgs]]'));
+          showInPanel(['Usage: /mcp [servers|list|call <tool> [jsonArgs]]']);
           break;
         }
         case 'mcp-servers': {
           const servers = listConfiguredMcpServers(process.cwd());
           if (servers.length === 0) {
-            console.log(chalk.dim('No MCP servers configured in .mcp.json'));
+            showInPanel(['No MCP servers configured in .mcp.json']);
             break;
           }
-          console.log(chalk.bold(`MCP servers (${servers.length})`));
+          const serverLines = [`MCP servers (${servers.length})`];
           for (const server of servers) {
             const endpoint = server.url || server.command || '(unknown)';
-            console.log(
-              chalk.dim(`- ${server.name} [${server.transport || 'unknown'}] ${endpoint}`)
-            );
+            serverLines.push(`  ${server.name} [${server.transport || 'unknown'}] ${endpoint}`);
           }
-          console.log('');
+          showInPanel(serverLines);
           break;
         }
         case 'capabilities': {
@@ -4255,62 +5575,57 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const skills = discoverSkills(process.cwd());
           const filtered = filterSkillsByPolicy(skills, toolPolicy);
 
-          console.log(chalk.bold('\nCapabilities snapshot'));
-          console.log(
-            chalk.dim(
-              `Backend=${runtime.backend}${runtime.model ? `(${runtime.model})` : ''} thread=${
-                runtime.threadKey || '(none)'
-              } session=${runtime.sessionId || '(none)'}`
-            )
-          );
+          const capLines: string[] = [
+            `Capabilities snapshot`,
+            `Backend=${runtime.backend}${runtime.model ? `(${runtime.model})` : ''} thread=${runtime.threadKey || '(none)'} session=${runtime.sessionId || '(none)'}`,
+            '',
+          ];
 
           if (servers.length === 0) {
-            console.log(chalk.dim('MCP servers: none configured in .mcp.json'));
+            capLines.push('MCP servers: none configured');
           } else {
-            console.log(chalk.bold(`MCP servers (${servers.length})`));
+            capLines.push(`MCP servers (${servers.length})`);
             for (const server of servers) {
               const endpoint = server.url || server.command || '(unknown)';
-              console.log(
-                chalk.dim(`- ${server.name} [${server.transport || 'unknown'}] ${endpoint}`)
-              );
+              capLines.push(`  ${server.name} [${server.transport || 'unknown'}] ${endpoint}`);
             }
           }
 
-          console.log(chalk.bold(`Skills (${skills.length} discovered)`));
+          capLines.push('', `Skills (${skills.length} discovered)`);
           if (filtered.visible.length === 0) {
-            console.log(chalk.dim('- none visible under current policy'));
+            capLines.push('  none visible under current policy');
           } else {
             for (const skill of filtered.visible.slice(0, 20)) {
               const active = runtime.activeSkills.some((entry) => entry.path === skill.path)
                 ? ' *active*'
                 : '';
-              console.log(
-                chalk.dim(`- ${skill.name} [${skill.source}] trust=${skill.trustLevel}${active}`)
-              );
+              capLines.push(`  ${skill.name} [${skill.source}] trust=${skill.trustLevel}${active}`);
             }
             if (filtered.visible.length > 20) {
-              console.log(chalk.dim(`... and ${filtered.visible.length - 20} more visible skills`));
+              capLines.push(`  ... and ${filtered.visible.length - 20} more`);
             }
           }
           if (filtered.blockedBySkill.length > 0) {
-            console.log(
-              chalk.yellow(`Blocked by skill allowlist: ${filtered.blockedBySkill.length}`)
-            );
+            capLines.push(`Blocked by skill allowlist: ${filtered.blockedBySkill.length}`);
           }
           if (filtered.blockedByPath.length > 0) {
-            console.log(chalk.yellow(`Blocked by path policy: ${filtered.blockedByPath.length}`));
+            capLines.push(`Blocked by path policy: ${filtered.blockedByPath.length}`);
           }
           if (filtered.blockedByTrust.length > 0) {
-            console.log(chalk.yellow(`Blocked by trust mode: ${filtered.blockedByTrust.length}`));
+            capLines.push(`Blocked by trust mode: ${filtered.blockedByTrust.length}`);
           }
 
-          printToolPolicySnapshot(toolPolicy, runtime.sessionId, runtime.activeSkills);
+          capLines.push(
+            '',
+            ...formatToolPolicyLines(toolPolicy, runtime.sessionId, runtime.activeSkills)
+          );
+          showInPanel(capLines);
           break;
         }
         case 'pcp': {
           const tool = slash.args[0];
           if (!tool) {
-            console.log(chalk.yellow('Usage: /ink <tool> [jsonArgs]'));
+            showInPanel(['Usage: /ink <tool> [jsonArgs]']);
             break;
           }
           let pcpArgs: Record<string, unknown> = {};
@@ -4319,9 +5634,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             try {
               pcpArgs = JSON.parse(rawArgs) as Record<string, unknown>;
             } catch {
-              console.log(
-                chalk.yellow('Invalid JSON args. Example: /pcp get_inbox {"agentId":"lumen"}')
-              );
+              showInPanel(['Invalid JSON args. Example: /pcp get_inbox {"agentId":"lumen"}']);
               break;
             }
           }
@@ -4341,7 +5654,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               ),
           });
           if (!approved) {
-            console.log(chalk.yellow(`Skipped ${tool}`));
+            showInPanel([`Skipped ${tool}`]);
             break;
           }
           const result = await pcp
@@ -4355,127 +5668,118 @@ export async function runChat(options: ChatOptions): Promise<void> {
             args: pcpArgs,
             result,
           });
-          console.log(rendered);
+          showInPanel(rendered.split('\n'));
           break;
         }
         case 'skills': {
           const skills = discoverSkills(process.cwd());
           if (skills.length === 0) {
-            console.log(chalk.dim('No local skills discovered.'));
+            showInPanel(['No local skills discovered.']);
             break;
           }
           const filtered = filterSkillsByPolicy(skills, toolPolicy);
           const visible = filtered.visible;
-          const blockedByPolicy = filtered.blockedBySkill.length;
-          const blockedByPath = filtered.blockedByPath.length;
-          const blockedByTrust = filtered.blockedByTrust.length;
-          console.log(chalk.bold(`Discovered skills (${skills.length})`));
+          const skillLines = [`Discovered skills (${skills.length})`];
           for (const skill of visible.slice(0, 80)) {
             const active = runtime.activeSkills.some((entry) => entry.path === skill.path)
               ? ' *active*'
               : '';
-            const trust =
-              skill.trustLevel === 'trusted' ? chalk.green(skill.trustLevel) : skill.trustLevel;
+            const trust = skill.trustLevel;
             const provenance = skill.provenance?.registry
               ? ` registry:${skill.provenance.registry}`
               : '';
-            console.log(
-              chalk.dim(`- ${skill.name} [${skill.source}] trust=${trust}${provenance}${active}`)
+            skillLines.push(
+              `  ${skill.name} [${skill.source}] trust=${trust}${provenance}${active}`
             );
           }
           if (visible.length > 80) {
-            console.log(chalk.dim(`... and ${visible.length - 80} more visible skills`));
+            skillLines.push(`  ... and ${visible.length - 80} more`);
           }
-          if (blockedByPolicy > 0) {
-            console.log(chalk.yellow(`${blockedByPolicy} skills hidden by skill allowlist policy`));
+          if (filtered.blockedBySkill.length > 0) {
+            skillLines.push(`${filtered.blockedBySkill.length} hidden by skill allowlist`);
           }
-          if (blockedByPath > 0) {
-            console.log(
-              chalk.yellow(`${blockedByPath} skills hidden by read-path allowlist policy`)
-            );
+          if (filtered.blockedByPath.length > 0) {
+            skillLines.push(`${filtered.blockedByPath.length} hidden by read-path allowlist`);
           }
-          if (blockedByTrust > 0) {
-            console.log(chalk.yellow(`${blockedByTrust} skills hidden by trust policy mode`));
+          if (filtered.blockedByTrust.length > 0) {
+            skillLines.push(`${filtered.blockedByTrust.length} hidden by trust policy`);
           }
+          showInPanel(skillLines);
           break;
         }
         case 'skill-trust': {
           const mode = (slash.args[0] || '').trim();
           if (!mode || !['all', 'trusted-only'].includes(mode)) {
-            console.log(chalk.yellow('Usage: /skill-trust <all|trusted-only>'));
+            showInPanel(['Usage: /skill-trust <all|trusted-only>']);
             break;
           }
           toolPolicy.setSkillTrustMode(mode as 'all' | 'trusted-only');
-          console.log(chalk.green(`Skill trust mode set to ${mode}`));
+          showInPanel([`Skill trust mode set to ${mode}`]);
           break;
         }
         case 'session-visibility': {
           const value = (slash.args[0] || '').trim().toLowerCase();
           if (!value) {
-            console.log(chalk.dim(`Session visibility is ${toolPolicy.getSessionVisibility()}.`));
+            showInPanel([`Session visibility is ${toolPolicy.getSessionVisibility()}.`]);
             break;
           }
           if (!['self', 'thread', 'studio', 'workspace', 'agent', 'all'].includes(value)) {
-            console.log(
-              chalk.yellow('Usage: /session-visibility <self|thread|studio|workspace|agent|all>')
-            );
+            showInPanel(['Usage: /session-visibility <self|thread|studio|workspace|agent|all>']);
             break;
           }
           toolPolicy.setSessionVisibility(
             value as 'self' | 'thread' | 'studio' | 'workspace' | 'agent' | 'all'
           );
-          console.log(
-            chalk.green(
-              `Session visibility set in ${toolPolicy.getMutationScopeLabel()} to ${value}.`
-            )
-          );
+          showInPanel([
+            `Session visibility set in ${toolPolicy.getMutationScopeLabel()} to ${value}.`,
+          ]);
           break;
         }
         case 'skill-allow': {
           const skill = slash.args.join(' ').trim();
           if (!skill) {
-            console.log(chalk.yellow('Usage: /skill-allow <name>'));
+            showInPanel(['Usage: /skill-allow <name>']);
             break;
           }
           toolPolicy.allowSkill(skill);
-          console.log(chalk.green(`Allowed skill: ${skill}`));
+          showInPanel([`Allowed skill: ${skill}`]);
           break;
         }
         case 'path-allow-read': {
           const pattern = slash.args.join(' ').trim();
           if (!pattern) {
-            console.log(chalk.yellow('Usage: /path-allow-read <glob>'));
+            showInPanel(['Usage: /path-allow-read <glob>']);
             break;
           }
           toolPolicy.addReadPathAllow(pattern);
-          console.log(chalk.green(`Allowed read path: ${pattern}`));
+          showInPanel([`Allowed read path: ${pattern}`]);
           break;
         }
         case 'path-allow-write': {
           const pattern = slash.args.join(' ').trim();
           if (!pattern) {
-            console.log(chalk.yellow('Usage: /path-allow-write <glob>'));
+            showInPanel(['Usage: /path-allow-write <glob>']);
             break;
           }
           toolPolicy.addWritePathAllow(pattern);
-          console.log(chalk.green(`Allowed write path: ${pattern}`));
+          showInPanel([`Allowed write path: ${pattern}`]);
           break;
         }
         case 'skill-use': {
           const name = slash.args.join(' ').trim();
           if (!name) {
-            console.log(chalk.yellow('Usage: /skill-use <name>'));
+            showInPanel(['Usage: /skill-use <name>']);
             break;
           }
           const skills = discoverSkills(process.cwd()).filter((skill) => skill.name === name);
           if (skills.length === 0) {
-            console.log(chalk.yellow(`Skill not found: ${name}`));
+            showInPanel([`Skill not found: ${name}`]);
             break;
           }
           const [skill] = skills;
           const activation = canActivateSkill(skill, toolPolicy);
           if (!activation.allowed) {
-            console.log(chalk.yellow(activation.reason || 'Skill blocked by policy'));
+            showInPanel([activation.reason || 'Skill blocked by policy']);
             break;
           }
           const loaded = loadSkillInstruction(skill);
@@ -4483,23 +5787,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
             ...runtime.activeSkills.filter((entry) => entry.path !== loaded.path),
             loaded,
           ];
-          console.log(chalk.green(`Activated skill ${loaded.name}`));
+          showInPanel([`Activated skill ${loaded.name}`]);
           break;
         }
         case 'skill-clear': {
           const name = slash.args.join(' ').trim();
           if (!name) {
             runtime.activeSkills = [];
-            console.log(chalk.green('Cleared all active skills.'));
+            showInPanel(['Cleared all active skills.']);
             break;
           }
           const before = runtime.activeSkills.length;
           runtime.activeSkills = runtime.activeSkills.filter((skill) => skill.name !== name);
           const removed = before - runtime.activeSkills.length;
           if (removed === 0) {
-            console.log(chalk.yellow(`No active skill matched: ${name}`));
+            showInPanel([`No active skill matched: ${name}`]);
           } else {
-            console.log(chalk.green(`Cleared ${removed} active skill(s) for ${name}`));
+            showInPanel([`Cleared ${removed} active skill(s) for ${name}`]);
           }
           break;
         }
@@ -4509,20 +5813,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const ttlMinutes = Number.parseInt(slash.args[2] || '15', 10);
           const secret = getDelegationSecret();
           if (!secret) {
-            console.log(
-              chalk.yellow('Delegation secret missing. Set INK_DELEGATION_SECRET (or JWT_SECRET).')
-            );
+            showInPanel(['Delegation secret missing. Set INK_DELEGATION_SECRET (or JWT_SECRET).']);
             break;
           }
           if (!toAgent || !scopeSpec) {
-            console.log(
-              chalk.yellow('Usage: /delegate-create <to-agent> <scope1,scope2> [ttl-minutes]')
-            );
+            showInPanel(['Usage: /delegate-create <to-agent> <scope1,scope2> [ttl-minutes]']);
             break;
           }
           const scopes = parseToolScopes(scopeSpec);
           if (scopes.length === 0) {
-            console.log(chalk.yellow('Provide at least one scope.'));
+            showInPanel(['Provide at least one scope.']);
             break;
           }
           const token = mintDelegationToken(
@@ -4547,42 +5847,41 @@ export async function runChat(options: ChatOptions): Promise<void> {
             payload,
             token,
           });
-          console.log(chalk.green(summary));
-          console.log(chalk.dim(token));
+          showInPanel([summary, token]);
           break;
         }
         case 'delegate-show': {
           if (!lastDelegation) {
-            console.log(chalk.dim('No delegation token minted in this chat session yet.'));
+            showInPanel(['No delegation token minted in this chat session yet.']);
             break;
           }
-          console.log(JSON.stringify(lastDelegation.payload, null, 2));
-          console.log(chalk.dim(lastDelegation.token));
+          showInPanel([
+            ...JSON.stringify(lastDelegation.payload, null, 2).split('\n'),
+            lastDelegation.token,
+          ]);
           break;
         }
         case 'delegate-verify': {
           const target = (slash.args[0] || 'last').trim();
           const token = target === 'last' ? lastDelegation?.token : target;
           if (!token) {
-            console.log(
-              chalk.yellow('No token available. Use /delegate-create first or pass a token.')
-            );
+            showInPanel(['No token available. Use /delegate-create first or pass a token.']);
             break;
           }
           const secret = getDelegationSecret();
           if (!secret) {
-            console.log(
-              chalk.yellow('Delegation secret missing. Set INK_DELEGATION_SECRET (or JWT_SECRET).')
-            );
+            showInPanel(['Delegation secret missing. Set INK_DELEGATION_SECRET (or JWT_SECRET).']);
             break;
           }
           const verified = verifyDelegationToken(token, secret);
           if (!verified.valid || !verified.payload) {
-            console.log(chalk.red(`Invalid delegation token: ${verified.error}`));
+            showInPanel([`Invalid delegation token: ${verified.error}`]);
             break;
           }
-          console.log(chalk.green('Delegation token valid.'));
-          console.log(JSON.stringify(verified.payload, null, 2));
+          showInPanel([
+            'Delegation token valid.',
+            ...JSON.stringify(verified.payload, null, 2).split('\n'),
+          ]);
           break;
         }
         case 'delegate-send': {
@@ -4590,22 +5889,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const scopeSpec = (slash.args[1] || '').trim();
           const message = slash.args.slice(2).join(' ').trim();
           if (!toAgent || !scopeSpec || !message) {
-            console.log(
-              chalk.yellow('Usage: /delegate-send <to-agent> <scope1,scope2> <message...>')
-            );
+            showInPanel(['Usage: /delegate-send <to-agent> <scope1,scope2> <message...>']);
             break;
           }
           const secret = getDelegationSecret();
           if (!secret) {
-            console.log(
-              chalk.yellow('Delegation secret missing. Set INK_DELEGATION_SECRET (or JWT_SECRET).')
-            );
+            showInPanel(['Delegation secret missing. Set INK_DELEGATION_SECRET (or JWT_SECRET).']);
             break;
           }
 
           const scopes = parseToolScopes(scopeSpec);
           if (scopes.length === 0) {
-            console.log(chalk.yellow('Provide at least one scope.'));
+            showInPanel(['Provide at least one scope.']);
             break;
           }
 
@@ -4640,7 +5935,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               ),
           });
           if (!approved) {
-            console.log(chalk.yellow('Skipped delegated send_to_inbox (policy blocked).'));
+            showInPanel(['Skipped delegated send_to_inbox (policy blocked).']);
             break;
           }
 
@@ -4676,38 +5971,38 @@ export async function runChat(options: ChatOptions): Promise<void> {
             message,
             result,
           });
-          console.log(chalk.green(`Delegated message sent to ${toAgent}.`));
-          console.log(JSON.stringify(result, null, 2));
+          showInPanel([
+            `Delegated message sent to ${toAgent}.`,
+            ...JSON.stringify(result, null, 2).split('\n'),
+          ]);
           break;
         }
         case 'thread': {
           const next = slash.args[0];
           if (next) {
             runtime.threadKey = next;
-            console.log(chalk.green(`Thread key set to ${next}`));
+            showInPanel([`Thread key set to ${next}`]);
           } else {
-            console.log(chalk.dim(`Thread key: ${runtime.threadKey || '(none)'}`));
+            showInPanel([`Thread key: ${runtime.threadKey || '(none)'}`]);
           }
           break;
         }
         case 'bookmark': {
           const bookmark = ledger.createBookmark(slash.args.join(' '));
-          console.log(chalk.green(`Created bookmark ${bookmark.id} (${bookmark.label})`));
+          showInPanel([`Created bookmark ${bookmark.id} (${bookmark.label})`]);
           break;
         }
         case 'bookmarks': {
           const bookmarks = ledger.listBookmarks();
           if (bookmarks.length === 0) {
-            console.log(chalk.dim('No bookmarks yet.'));
+            showInPanel(['No bookmarks yet.']);
             break;
           }
-          for (const bookmark of bookmarks) {
-            console.log(
-              chalk.dim(
-                `${bookmark.id}  ${bookmark.label}  entry#${bookmark.entryId}  ~${bookmark.approxTokensAtCreation} tok`
-              )
-            );
-          }
+          showInPanel(
+            bookmarks.map(
+              (b) => `${b.id}  ${b.label}  entry#${b.entryId}  ~${b.approxTokensAtCreation} tok`
+            )
+          );
           break;
         }
         case 'eject': {
@@ -4715,7 +6010,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const ref = slash.args.find((arg) => arg !== '--force' && arg !== 'force') || 'last';
           const preview = ledger.previewEjectToBookmark(ref);
           if (!preview) {
-            console.log(chalk.yellow(`Bookmark not found: ${ref}`));
+            showInPanel([`Bookmark not found: ${ref}`]);
             break;
           }
           const removedCount = preview.removedEntries.length;
@@ -4728,20 +6023,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 .map(
                   (entry) => `- ${entry.role}: ${entry.content.slice(0, 80).replace(/\\s+/g, ' ')}`
                 );
-              console.log(
-                chalk.yellow(
-                  `About to eject ${removedCount} entries (~${preview.removedTokens} tok) up to ${preview.bookmark.id}.`
-                )
-              );
-              if (previewLines.length) {
-                console.log(chalk.dim('Recent entries in eject range:'));
-                for (const line of previewLines) console.log(chalk.dim(line));
-              }
+              showInPanel([
+                `About to eject ${removedCount} entries (~${preview.removedTokens} tok) up to ${preview.bookmark.id}.`,
+                ...(previewLines.length ? ['Recent entries in eject range:', ...previewLines] : []),
+              ]);
               const confirm = (
                 await rl!.question(chalk.yellow('Proceed with ejection? [y/N]: '))
               ).trim();
               if (!['y', 'yes'].includes(confirm.toLowerCase())) {
-                console.log(chalk.dim('Ejection cancelled.'));
+                showInPanel(['Ejection cancelled.']);
                 break;
               }
             }
@@ -4749,15 +6039,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
           const result = ledger.ejectToBookmark(ref);
           if (!result) {
-            console.log(chalk.yellow(`Bookmark not found: ${ref}`));
+            showInPanel([`Bookmark not found: ${ref}`]);
             break;
           }
 
-          console.log(
-            chalk.green(
-              `Ejected ${removedCount} entries (~${result.removedTokens} tok) up to ${result.bookmark.id}`
-            )
-          );
+          showInPanel([
+            `Ejected ${removedCount} entries (~${result.removedTokens} tok) up to ${result.bookmark.id}`,
+          ]);
 
           const summary = result.removedEntries
             .slice(-6)
@@ -4792,41 +6080,124 @@ export async function runChat(options: ChatOptions): Promise<void> {
             targetPct < 10 ||
             targetPct > 95
           ) {
-            console.log(chalk.yellow('Usage: /trim [targetPercent 10-95]'));
+            showInPanel(['Usage: /trim [targetPercent 10-95]']);
             break;
           }
           const trimResult = await trimContextToPercent(targetPct, 'manual');
           if (trimResult.removed === 0) {
-            console.log(chalk.dim('No trim needed; context already within target budget.'));
+            showInPanel(['No trim needed; context already within target budget.']);
           }
+          break;
+        }
+        case 'evict': {
+          const selection = parseEvictSelection(slash.args);
+          if (selection.error) {
+            showInPanel([
+              selection.error,
+              'Usage: /evict [ids | source:<name> | role:<role>] [--dry-run]',
+            ]);
+            break;
+          }
+          if (selection.list) {
+            // No selector — show the pick list, never mutate
+            const entries = ledger.listEntries();
+            if (entries.length === 0) {
+              showInPanel(['Context is empty — nothing to evict.']);
+              break;
+            }
+            showInPanel([
+              `Evictable entries (${entries.length}, ~${ledger.totalTokens().toLocaleString()} tok):`,
+              ...entries.map((e) => formatEvictCandidate(e)),
+              '',
+              'Evict with: /evict <ids> | /evict source:<name> | /evict role:<role> [--dry-run]',
+            ]);
+            break;
+          }
+          const matched = selectEvictionEntries(ledger.listEntries(), selection);
+          if (matched.length === 0) {
+            showInPanel(['No context entries match that selection.']);
+            break;
+          }
+          const matchedTokens = matched.reduce((sum, e) => sum + e.approxTokens, 0);
+          if (selection.dryRun) {
+            showInPanel([
+              `Would evict ${matched.length} entries (~${matchedTokens.toLocaleString()} tok):`,
+              ...matched.map((e) => formatEvictCandidate(e)),
+              '',
+              'Re-run without --dry-run to evict.',
+            ]);
+            break;
+          }
+          const evictResult = ledger.evictEntries(matched.map((e) => e.id));
+          recordEviction(
+            'user',
+            `/evict ${slash.args.filter((a) => !a.startsWith('--')).join(' ')}`,
+            evictResult.removedTokens,
+            evictResult.removedEntries.map((e) => ({
+              ...(e.eid !== undefined ? { eid: e.eid } : {}),
+              hash: entryRefHash(e.role, e.content),
+              role: e.role,
+              source: e.source,
+              preview: e.content.slice(0, 100),
+            }))
+          );
+          printEvent(
+            chalk.dim(
+              `  🗑 evicted ${evictResult.removedEntries.length} entries (~${evictResult.removedTokens.toLocaleString()} tok freed, ~${evictResult.totalAfter.toLocaleString()} tok remaining) — /evicted to review`
+            )
+          );
+          break;
+        }
+        case 'evicted': {
+          if (sessionEvictedEntries.length === 0) {
+            showInPanel(['Nothing evicted from context this session.']);
+            break;
+          }
+          const lines = [
+            `${sessionEvictedEntries.length} entries evicted — out of the prompt window, still in the transcript:`,
+            ...sessionEvictedEntries.map((e) => {
+              const attribution = [e.actor, e.reason].filter(Boolean).join(' · ');
+              return `✕ [${e.role}${e.source ? `/${e.source}` : ''}] ${e.content.slice(0, 100)}${attribution ? ` (${attribution})` : ''}`;
+            }),
+          ];
+          showInPanel(lines);
           break;
         }
         case 'context': {
-          const entries = ledger.listEntries().slice(-12);
-          if (entries.length === 0) {
-            console.log(chalk.dim('Context is empty.'));
-            break;
-          }
-          for (const entry of entries) {
-            const prefix = `${entry.role}${entry.source ? `/${entry.source}` : ''}`;
-            console.log(chalk.dim(`${prefix}: ${entry.content.slice(0, 180)}`));
+          if (inkRepl) {
+            inkRepl.showContextView(buildContextViewLines());
+          } else {
+            const entries = ledger.listEntries().slice(-12);
+            if (entries.length === 0) {
+              showInPanel(['Context is empty.']);
+              break;
+            }
+            showInPanel(
+              entries.map((entry) => {
+                const prefix = `${entry.role}${entry.source ? `/${entry.source}` : ''}`;
+                return `${prefix}: ${entry.content.slice(0, 180)}`;
+              })
+            );
           }
           break;
         }
-        case 'usage':
+        case 'usage': {
           if (pendingTurns > 0) {
             await turnQueue;
           }
-          lastUsageTotal = printUsage(
+          const usage = formatUsageLines(
             ledger,
             runtime.maxContextTokens,
             lastUsageTotal,
             lastBackendUsage,
             runtime.backendTokenWindow
           );
+          lastUsageTotal = usage.total;
+          showInPanel(usage.lines);
           break;
+        }
         default:
-          console.log(chalk.yellow(`Unknown command: /${slash.name}`));
+          showInPanel([`Unknown command: /${slash.name}`]);
       }
       continue;
     }
@@ -4905,8 +6276,19 @@ export function registerChatCommand(program: Command): void {
       .option('--poll-seconds <n>', 'Inbox polling interval seconds', '20')
       .option('--tools <mode>', 'Tool mode: backend|off|privileged', 'backend')
       .option('--profile <name>', 'Apply security profile: minimal|safe|collaborative|full')
+      .option('--away', 'Start with away mode on (route tool approvals to inbox for 2FA)')
       .option('--auto-run', 'Automatically execute backend turns for new inbox task messages')
       .option('--message <text>', 'Single-turn message for non-interactive mode')
+      .option(
+        '--attach-file <path>',
+        'Attach a local file to the first turn (repeatable). The path is shared with the backend for native viewing.',
+        (value: string, previous: string[]) => [...previous, value],
+        [] as string[]
+      )
+      .option(
+        '--message-label <label>',
+        'Render the --message as a system message with this label (e.g., heartbeat, telegram). Used by server spawns.'
+      )
       .option('--non-interactive', 'Run one turn and exit (requires --message)')
       .option('--max-turns <n>', 'Run up to N conversational turns then exit (requires --message)')
       .option(
@@ -4929,6 +6311,7 @@ export function registerChatCommand(program: Command): void {
       )
       .option('-v, --verbose', 'Verbose backend passthrough output')
       .option('--fullscreen', 'Fullscreen alternate buffer mode (app-controlled scrolling)')
+      .option('--dynamic', 'Render messages dynamically (re-renderable, no terminal scrollback)')
       .action((options: ChatOptions) => runChat(options));
 
   register('chat', 'Start first-class Ink REPL (experimental)');

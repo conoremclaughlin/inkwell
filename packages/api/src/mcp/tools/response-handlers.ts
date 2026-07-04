@@ -79,6 +79,33 @@ function markExplicitResponse(channel: string, conversationId: string): void {
   }
 }
 
+interface TtsConfig {
+  defaultVoice?: string;
+  voices?: Record<string, string>;
+}
+
+async function resolveAgentDefaultVoice(dataComposer: DataComposer): Promise<string | undefined> {
+  try {
+    const reqCtx = getRequestContext();
+    const agentId = reqCtx?.agentId || getPinnedAgentId();
+    if (!agentId) return undefined;
+
+    const { data } = await dataComposer
+      .getClient()
+      .from('agent_identities')
+      .select('tts_config')
+      .eq('agent_id', agentId)
+      .not('tts_config', 'is', null)
+      .limit(1)
+      .single();
+
+    const config = data?.tts_config as TtsConfig | null;
+    return config?.defaultVoice || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // ============================================================================
 // SEND RESPONSE
 // ============================================================================
@@ -105,6 +132,18 @@ export const sendResponseSchema = z.object({
     .optional()
     .describe('Format of the response content'),
   replyToMessageId: z.string().optional().describe('Message ID to reply to (for threading)'),
+  voiceReply: z
+    .boolean()
+    .optional()
+    .describe(
+      'Send as a voice note instead of text (Telegram only). Uses on-device TTS, zero API cost.'
+    ),
+  ttsVoice: z
+    .enum(['serena', 'vivian', 'sohee', 'ono_anna', 'ryan', 'aiden', 'eric', 'dylan'])
+    .optional()
+    .describe(
+      'Override voice for TTS synthesis. Only used when voiceReply is true. Omit to use the agent default from tts_config.'
+    ),
   metadata: z.record(z.unknown()).optional().describe('Additional channel-specific metadata'),
   media: z
     .array(outboundMediaSchema)
@@ -139,14 +178,24 @@ export async function handleSendResponse(
       mediaPaths: args.media?.map((m) => m.path || m.url || 'none'),
     });
 
-    // Build the response object
+    // Merge voice fields into metadata so the gateway's TTS path picks them up
+    const metadata: Record<string, unknown> = { ...args.metadata };
+    if (args.voiceReply) metadata.voiceReply = true;
+    if (args.ttsVoice) {
+      metadata.ttsVoice = args.ttsVoice;
+    } else {
+      // Resolve default voice from agent's tts_config
+      const resolvedVoice = await resolveAgentDefaultVoice(_dataComposer);
+      if (resolvedVoice) metadata.ttsVoice = resolvedVoice;
+    }
+
     const response: AgentResponse = {
       channel: args.channel as ChannelType,
       conversationId: args.conversationId,
       content: args.content,
       format: args.format as ResponseFormat | undefined,
       replyToMessageId: args.replyToMessageId,
-      metadata: args.metadata,
+      metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       media: args.media as OutboundMedia[] | undefined,
     };
 

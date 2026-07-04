@@ -177,6 +177,10 @@ const envSchema = z.object({
   MEMORY_EMBEDDING_DIMENSIONS: optionalNumber,
   MEMORY_EMBEDDING_QUERY_THRESHOLD: optionalNumber,
   MEMORY_EMBEDDING_MATCH_COUNT_MULTIPLIER: optionalNumber,
+  MEMORY_CHUNKED_RECALL_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
   MEMORY_LLM_EXTRACTION_ENABLED: z
     .enum(['true', 'false'])
     .default('false')
@@ -200,9 +204,18 @@ const envSchema = z.object({
     .enum(['true', 'false'])
     .default('false')
     .transform((v) => v === 'true'),
+  MEMORY_LLM_EXACT_DETAILS_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
   OLLAMA_BASE_URL: optionalUrl,
   OPENAI_API_KEY: optionalString,
   OPENAI_BASE_URL: optionalUrl,
+
+  // Default model overrides for spawned SB sessions (e.g. "claude-opus-4-6")
+  DEFAULT_CLAUDE_MODEL: optionalString,
+  DEFAULT_CODEX_MODEL: optionalString,
+  DEFAULT_GEMINI_MODEL: optionalString,
 });
 
 // Parse and validate environment variables

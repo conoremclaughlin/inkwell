@@ -1469,6 +1469,56 @@ export {
 };
 export type { InitResult };
 
+async function registerStudioCommand(options: { agent?: string }): Promise<void> {
+  const gitRoot = findGitRoot();
+  const repoRoot = resolveCanonicalRepoRoot(gitRoot);
+  const agentId = options.agent || resolveAgentId();
+  const email = getCurrentUser();
+
+  if (!agentId) {
+    console.error(chalk.red('No agent ID found. Use --agent <id> or set up .ink/identity.json'));
+    process.exit(1);
+  }
+
+  if (!email) {
+    console.error(chalk.red('No user identity found. Run ink login first.'));
+    process.exit(1);
+  }
+
+  const repoName = basename(repoRoot);
+  console.log(chalk.dim(`Registering ${repoName} for agent ${agentId}...`));
+
+  try {
+    const result = await callPcpTool('register_studio', {
+      email,
+      agentId,
+      repoRoot,
+    });
+
+    if (result.error) {
+      console.error(chalk.red(`Failed: ${(result as Record<string, unknown>).error}`));
+      process.exit(1);
+    }
+
+    const studio = result.studio as Record<string, string>;
+    const wasCreated = result.created as boolean;
+
+    if (wasCreated) {
+      console.log(chalk.green(`✓ Registered studio for ${repoName}`));
+    } else {
+      console.log(chalk.green(`✓ Studio already exists for ${repoName}`));
+    }
+    console.log(chalk.dim(`  id:    ${studio.id}`));
+    console.log(chalk.dim(`  slug:  ${studio.slug}`));
+    console.log(chalk.dim(`  agent: ${studio.agentId}`));
+    console.log(chalk.dim(`  path:  ${studio.worktreePath}`));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(chalk.red(`Failed to register studio: ${message}`));
+    process.exit(1);
+  }
+}
+
 export function registerStudioCommands(program: Command): void {
   const studio = program
     .command('studio')
@@ -1584,6 +1634,12 @@ export function registerStudioCommands(program: Command): void {
     .option('-n, --name <name>', 'Binary name (default: ink-<agent> from .ink/identity.json)')
     .option('--unlink', 'Remove the linked binary instead of creating it')
     .action(cliLinkCommand);
+
+  studio
+    .command('register')
+    .description('Register the current repository as a studio (makes it visible in the dashboard)')
+    .option('-a, --agent <agent>', 'Agent ID to own the studio')
+    .action(registerStudioCommand);
 
   registerStudioSandboxCommands(studio);
 }

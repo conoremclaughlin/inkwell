@@ -42,6 +42,13 @@ const getThreadMessagesSchema = userIdentifierBaseSchema.extend({
   afterMessageId: z.string().uuid().optional().describe('Cursor: get messages after this ID'),
   includeSystemEvents: z.boolean().optional().default(true),
   markRead: z.boolean().optional().default(true),
+  fullHistory: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      'Return the full timeline regardless of read state. Without this (and without an explicit cursor), results fall back to messages newer than the last-read pointer — which hides already-delivered messages from watchers/pollers that manage their own cursor (e.g., ink wait).'
+    ),
 });
 
 const addThreadParticipantSchema = userIdentifierBaseSchema.extend({
@@ -147,7 +154,8 @@ export async function isParticipant(
  * 1. triggerAgents [...] → wake exactly these (filter to participants)
  * 2. triggerAll: true → wake all participants except sender
  * 3. Actionable messages (task_request, session_resume) → trigger all recipients
- * 4. Default: 1:1 → other participant; group non-creator → creator; group creator → no one
+ * 4. Default: 1:1 → other participant; group with explicit recipients → those recipients;
+ *    group non-creator → creator; group creator → all others
  *
  * Cross-studio self-messaging: when selfStudioTarget is true, the sender is NOT
  * excluded from trigger lists. This allows an agent to message themselves in a
@@ -190,9 +198,14 @@ export function resolveTriggeredAgents(opts: {
   // Precedence 3: default rules by thread size
   const otherParticipants = participants.filter((a) => a !== senderAgentId);
 
-  // Self-thread (1 participant): trigger only if cross-studio self-message
+  // Self-thread (1 participant): trigger if cross-studio OR actionable message type.
+  // session_resume / task_request to self are inherently "wake me up" signals
+  // (e.g., strategy triggers) and must not be silently dropped.
   if (otherParticipants.length === 0) {
-    return selfStudioTarget ? [senderAgentId] : [];
+    if (selfStudioTarget) return [senderAgentId];
+    const selfActionable = new Set(['task_request', 'session_resume']);
+    if (messageType && selfActionable.has(messageType)) return [senderAgentId];
+    return [];
   }
 
   // 1:1 thread (2 participants): trigger the other one
@@ -210,13 +223,19 @@ export function resolveTriggeredAgents(opts: {
     return targets.filter((a) => participants.includes(a));
   }
 
-  // Group thread: non-creator reply → trigger creator only
+  // Group thread: when explicit recipients are provided, use them — even if the
+  // filtered result is empty (e.g., self-target without selfStudioTarget). This
+  // respects the caller's intent rather than falling through to role-based defaults.
+  if (opts.recipients && opts.recipients.length > 0) {
+    return opts.recipients.filter((a) => excludeSelf(a) && participants.includes(a));
+  }
+
+  // No explicit recipients — fall back to role-based defaults:
+  // Non-creator → trigger creator only; Creator → trigger all others
   if (senderAgentId !== creatorAgentId) {
     return [creatorAgentId];
   }
-
-  // Group thread: creator reply → trigger no one
-  return [];
+  return otherParticipants;
 }
 
 /**
@@ -320,9 +339,12 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
     if (cursor) {
       query = query.gt('created_at', cursor.created_at);
     }
-  } else if (!beforeMessageId) {
+  } else if (!beforeMessageId && !parsed.fullHistory) {
     // No explicit cursor — fall back to stored read state so a client whose
     // in-memory cursor was reset doesn't replay the full thread history.
+    // Skipped when fullHistory is set: watchers (ink wait) need the true
+    // timeline to anchor on, or push-delivery read-marking races them into
+    // seeing an eternally-empty thread.
     // Baseline priority:
     //   1. last_read_at (explicit read pointer from prior reads)
     //   2. joined_at (participant join time — no replay of pre-join history)
@@ -786,7 +808,7 @@ export const threadToolDefinitions = [
   {
     name: 'get_thread_messages',
     description:
-      'Get the full message timeline of a thread. Requires participant membership. Automatically marks the thread as read for the requesting agent.',
+      'Get the message timeline of a thread. Requires participant membership. By default returns messages newer than your last-read pointer and advances it (markRead); pass fullHistory: true for the complete timeline regardless of read state, or an explicit before/afterMessageId cursor.',
     schema: getThreadMessagesSchema,
     handler: handleGetThreadMessages,
   },

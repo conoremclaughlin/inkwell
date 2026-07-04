@@ -14,6 +14,7 @@ import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
 import { ensureStudioSettings } from '../../services/studio-settings';
+import { resolveMainStudio } from '../../services/sessions/session-service';
 
 // ============== Helpers ==============
 
@@ -68,6 +69,11 @@ const createStudioSchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe('Role template name used when creating the studio (e.g., "reviewer", "builder")'),
+  defaultProjectId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('Default project ID for task groups created in this studio'),
   skipGitOperations: z
     .boolean()
     .optional()
@@ -93,6 +99,10 @@ const getStudioSchema = userIdentifierBaseSchema.extend({
   studioId: z.string().uuid().optional().describe('Studio UUID'),
   branch: z.string().optional().describe('Branch name to look up'),
   path: z.string().optional().describe('Worktree path to look up'),
+  agentId: z
+    .string()
+    .optional()
+    .describe('Agent ID to disambiguate when multiple agents share the same branch or path'),
 });
 
 const updateStudioSchema = userIdentifierBaseSchema.extend({
@@ -108,6 +118,12 @@ const updateStudioSchema = userIdentifierBaseSchema.extend({
     .boolean()
     .optional()
     .describe('If true, unlink the current session and set status to idle'),
+  defaultProjectId: z
+    .string()
+    .uuid()
+    .nullable()
+    .optional()
+    .describe('Default project ID for task groups created in this studio. Set to null to clear.'),
   routePatterns: z
     .array(z.string().max(200))
     .optional()
@@ -186,8 +202,16 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     baseBranch = 'main',
     sessionId,
     roleTemplate,
+    defaultProjectId,
     skipGitOperations = false,
   } = parsed;
+
+  if (defaultProjectId) {
+    const project = await dataComposer.repositories.projects.findById(defaultProjectId);
+    if (!project || project.user_id !== resolved.user.id) {
+      return errorResponse('defaultProjectId not found or does not belong to this user');
+    }
+  }
 
   // Resolve to the main worktree root (handles case where repoRoot is a linked worktree)
   const mainRoot = resolveMainWorktree(repoRoot);
@@ -246,6 +270,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
       purpose,
       workType,
       roleTemplate,
+      defaultProjectId,
     });
   } catch (dbError) {
     // If DB insert fails but git succeeded, attempt cleanup
@@ -288,6 +313,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
       purpose: studio.purpose,
       workType: studio.workType,
       roleTemplate: studio.roleTemplate,
+      defaultProjectId: studio.defaultProjectId,
       status: studio.status,
       sessionId: studio.sessionId,
       createdAt: studio.createdAt,
@@ -334,6 +360,7 @@ export async function handleListStudios(args: unknown, dataComposer: DataCompose
       status: w.status,
       workType: w.workType,
       roleTemplate: w.roleTemplate,
+      defaultProjectId: w.defaultProjectId,
       hasLinkedSession: !!w.sessionId,
       createdAt: w.createdAt,
     })),
@@ -342,18 +369,19 @@ export async function handleListStudios(args: unknown, dataComposer: DataCompose
 
 export async function handleGetStudio(args: unknown, dataComposer: DataComposer) {
   const parsed = getStudioSchema.parse(args);
-  await resolveUserOrThrow(parsed, dataComposer);
+  const { user } = await resolveUserOrThrow(parsed, dataComposer);
 
   const studiosRepo = dataComposer.repositories.studios;
+  const scope = { userId: user.id, agentId: parsed.agentId };
   let studio = null;
 
   // Try identifiers in order: studioId, branch, path
   if (parsed.studioId) {
     studio = await studiosRepo.findById(parsed.studioId);
   } else if (parsed.branch) {
-    studio = await studiosRepo.findByBranch(parsed.branch);
+    studio = await studiosRepo.findByBranch(parsed.branch, scope);
   } else if (parsed.path) {
-    studio = await studiosRepo.findByPath(parsed.path);
+    studio = await studiosRepo.findByPath(parsed.path, scope);
   } else {
     return errorResponse('Must provide at least one of: studioId, branch, or path');
   }
@@ -375,6 +403,7 @@ export async function handleGetStudio(args: unknown, dataComposer: DataComposer)
       purpose: studio.purpose,
       workType: studio.workType,
       roleTemplate: studio.roleTemplate,
+      defaultProjectId: studio.defaultProjectId,
       status: studio.status,
       sessionId: studio.sessionId,
       metadata: studio.metadata,
@@ -388,7 +417,7 @@ export async function handleGetStudio(args: unknown, dataComposer: DataComposer)
 
 export async function handleUpdateStudio(args: unknown, dataComposer: DataComposer) {
   const parsed = updateStudioSchema.parse(args);
-  await resolveUserOrThrow(parsed, dataComposer);
+  const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const {
     studioId,
@@ -400,14 +429,25 @@ export async function handleUpdateStudio(args: unknown, dataComposer: DataCompos
     slug,
     sessionId,
     unlinkSession,
+    defaultProjectId,
     routePatterns,
   } = parsed;
   const studiosRepo = dataComposer.repositories.studios;
 
-  // Verify studio exists
+  // Verify studio exists and belongs to this user
   const existing = await studiosRepo.findById(studioId);
   if (!existing) {
     return errorResponse(`Studio not found: ${studioId}`);
+  }
+  if (existing.userId !== resolved.user.id) {
+    return errorResponse(`Studio not found: ${studioId}`);
+  }
+
+  if (typeof defaultProjectId === 'string') {
+    const project = await dataComposer.repositories.projects.findById(defaultProjectId);
+    if (!project || project.user_id !== resolved.user.id) {
+      return errorResponse('defaultProjectId not found or does not belong to this user');
+    }
   }
 
   let updated;
@@ -433,6 +473,9 @@ export async function handleUpdateStudio(args: unknown, dataComposer: DataCompos
     if (slug !== undefined) {
       updateObj.slug = slug;
     }
+    if (defaultProjectId !== undefined) {
+      updateObj.defaultProjectId = defaultProjectId;
+    }
     if (routePatterns !== undefined) {
       updateObj.routePatterns = routePatterns;
     }
@@ -452,6 +495,7 @@ export async function handleUpdateStudio(args: unknown, dataComposer: DataCompos
       worktreePath: updated.worktreePath,
       purpose: updated.purpose,
       roleTemplate: updated.roleTemplate,
+      defaultProjectId: updated.defaultProjectId,
       status: updated.status,
       sessionId: updated.sessionId,
       updatedAt: updated.updatedAt,
@@ -536,19 +580,20 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
 
 export async function handleAdoptStudio(args: unknown, dataComposer: DataComposer) {
   const parsed = adoptStudioSchema.parse(args);
-  await resolveUserOrThrow(parsed, dataComposer);
+  const { user } = await resolveUserOrThrow(parsed, dataComposer);
 
   const { agentId, sessionId, routePatterns } = parsed;
   const studiosRepo = dataComposer.repositories.studios;
+  const scope = { userId: user.id, agentId };
 
   // Find studio by ID, branch, or path
   let studio = null;
   if (parsed.studioId) {
     studio = await studiosRepo.findById(parsed.studioId);
   } else if (parsed.branch) {
-    studio = await studiosRepo.findByBranch(parsed.branch);
+    studio = await studiosRepo.findByBranch(parsed.branch, scope);
   } else if (parsed.worktreePath) {
-    studio = await studiosRepo.findByPath(parsed.worktreePath);
+    studio = await studiosRepo.findByPath(parsed.worktreePath, scope);
   } else {
     return errorResponse('Must provide at least one of: studioId, branch, or worktreePath');
   }
@@ -592,10 +637,57 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
       worktreePath: updated.worktreePath,
       purpose: updated.purpose,
       roleTemplate: updated.roleTemplate,
+      defaultProjectId: updated.defaultProjectId,
       status: updated.status,
       sessionId: updated.sessionId,
       updatedAt: updated.updatedAt,
     },
+  });
+}
+
+const registerStudioSchema = userIdentifierBaseSchema.extend({
+  agentId: z.string().describe('Agent ID to own the studio'),
+  repoRoot: z.string().describe('Absolute path to the repository root'),
+});
+
+export async function handleRegisterStudio(args: unknown, dataComposer: DataComposer) {
+  const parsed = registerStudioSchema.parse(args);
+  const { user } = await resolveUserOrThrow(parsed, dataComposer);
+
+  // Check if studio already exists before auto-create
+  const existingId = await resolveMainStudio(
+    dataComposer.getClient(),
+    user.id,
+    parsed.repoRoot,
+    parsed.agentId
+  );
+
+  const studioId =
+    existingId ??
+    (await resolveMainStudio(dataComposer.getClient(), user.id, parsed.repoRoot, parsed.agentId, {
+      autoCreate: true,
+    }));
+
+  if (!studioId) {
+    return errorResponse('Failed to register studio — could not create or find studio row');
+  }
+
+  const studio = await dataComposer.repositories.studios.findById(studioId);
+  if (!studio) {
+    return errorResponse('Studio was created but could not be retrieved');
+  }
+
+  return successResponse({
+    studio: {
+      id: studio.id,
+      slug: studio.slug,
+      repoRoot: studio.repoRoot,
+      worktreePath: studio.worktreePath,
+      branch: studio.branch,
+      agentId: studio.agentId,
+      status: studio.status,
+    },
+    created: !existingId,
   });
 }
 
@@ -642,5 +734,12 @@ export const studioToolDefinitions = [
       'Adopt an existing studio by linking a new session to it and setting it to active. Useful when resuming work in a previously created worktree.',
     schema: adoptStudioSchema,
     handler: handleAdoptStudio,
+  },
+  {
+    name: 'register_studio',
+    description:
+      'Register an existing repository as a studio. Creates a studio row for the root repo if one does not exist, or returns the existing one. Use this to make repos visible in the dashboard without starting a session.',
+    schema: registerStudioSchema,
+    handler: handleRegisterStudio,
   },
 ];

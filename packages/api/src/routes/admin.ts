@@ -47,6 +47,13 @@ import {
   exchangeRefreshToken,
 } from '../auth/pcp-tokens';
 import type { Database } from '../data/supabase/types';
+import { activityBus } from '../services/events/activity-bus';
+import type { Activity } from '../data/repositories/activity-stream.repository';
+import {
+  shapeAutomations,
+  type ReminderSourceRow,
+  type StrategyGroupSourceRow,
+} from '../services/automations/automation-shaper';
 
 // WhatsApp listener reference (set via setWhatsAppListener)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -120,6 +127,11 @@ type SessionPreviewItem = {
 
 type SessionLogItem = SessionPreviewItem & {
   metadata?: Record<string, unknown>;
+  /** activity_stream lineage — lets the timeline nest child entries (fork tree) */
+  parentId?: string | null;
+  childSessionId?: string | null;
+  status?: string | null;
+  durationMs?: number | null;
 };
 
 type WorkspaceIdentityScope = {
@@ -286,6 +298,10 @@ function toActivityLogItem(row: {
   content: string;
   created_at: string;
   payload: unknown;
+  parent_id?: string | null;
+  child_session_id?: string | null;
+  status?: string | null;
+  duration_ms?: number | null;
 }): SessionLogItem {
   const fallbackContent = row.content || '';
   const payloadContent = pickContentFromUnknown(row.payload);
@@ -294,7 +310,9 @@ function toActivityLogItem(row: {
   return {
     id: `activity:${row.id}`,
     source: 'activity_stream',
-    type: row.subtype || row.type,
+    // "<type>:<subtype>" matches the SSE-streamed entry format so the
+    // timeline can detect tool_call/tool_result/agent_spawn kinds uniformly.
+    type: row.subtype ? `${row.type}:${row.subtype}` : row.type,
     role: roleFromActivityType(row.type),
     content: truncateText(combined),
     timestamp: row.created_at,
@@ -302,6 +320,10 @@ function toActivityLogItem(row: {
       row.payload && typeof row.payload === 'object'
         ? (row.payload as Record<string, unknown>)
         : undefined,
+    parentId: row.parent_id ?? null,
+    childSessionId: row.child_session_id ?? null,
+    status: row.status ?? null,
+    durationMs: row.duration_ms ?? null,
   };
 }
 
@@ -818,7 +840,9 @@ async function fetchCloudSessionLogs(
   const [{ data: activityRows }, { data: sessionLogRows }] = await Promise.all([
     supabase
       .from('activity_stream')
-      .select('id, type, subtype, content, created_at, payload')
+      .select(
+        'id, type, subtype, content, created_at, payload, parent_id, child_session_id, status, duration_ms'
+      )
       .eq('user_id', userId)
       .eq('session_id', sessionId)
       .order('created_at', { ascending: false })
@@ -1857,6 +1881,117 @@ router.get('/whatsapp/qr', (req: Request, res: Response) => {
 });
 
 /**
+ * GET /api/admin/events
+ * Generic SSE stream of activity_stream events for the authenticated user.
+ * Filters: ?sessionId= &taskGroupId= &agentId= — optional, ANDed together.
+ * Backfill: ?since=<ISO timestamp> replays persisted rows before going live.
+ * Reconnect: Last-Event-ID header (or ?since) — clients pass the last seen
+ * activity id/timestamp to resume without gaps.
+ *
+ * Live delivery comes from the in-process activityBus (the API server is
+ * the sole writer of activity_stream). See ink://specs/live-session-experience WS1.
+ */
+router.get('/events', async (req: Request, res: Response) => {
+  const authReq = req as AdminAuthRequest;
+  const sessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId : undefined;
+  const taskGroupId = typeof req.query.taskGroupId === 'string' ? req.query.taskGroupId : undefined;
+  const agentId = typeof req.query.agentId === 'string' ? req.query.agentId : undefined;
+  // Cursor priority: explicit ?since= > Last-Event-ID reconnect header
+  // (format "<ISO>|<id>", set by writeEvent below).
+  const lastEventId = req.headers['last-event-id'];
+  const reconnectSince =
+    typeof lastEventId === 'string' && lastEventId.includes('|')
+      ? lastEventId.split('|')[0]
+      : undefined;
+  const sinceRaw = typeof req.query.since === 'string' ? req.query.since : reconnectSince;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+
+  // SSE id = "<createdAt ISO>|<activity id>" so the browser's automatic
+  // Last-Event-ID reconnect header doubles as a since-cursor (parsed below).
+  const writeEvent = (activity: Activity): void => {
+    const ts =
+      activity.createdAt instanceof Date
+        ? activity.createdAt.toISOString()
+        : String(activity.createdAt);
+    res.write(`id: ${ts}|${activity.id}\n`);
+    res.write(`event: activity\n`);
+    res.write(`data: ${JSON.stringify(activity)}\n\n`);
+  };
+
+  // Backfill persisted rows since the cursor, oldest-first, before going live.
+  // Subscribe BEFORE the backfill query so rows logged during the query window
+  // aren't dropped; dedupe by id across the seam.
+  const seenIds = new Set<string>();
+  const buffered: Activity[] = [];
+  let backfilling = true;
+  let closed = false;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+
+  const unsubscribe = activityBus.subscribe(
+    { userId: authReq.pcpUserId, sessionId, taskGroupId, agentId },
+    (activity) => {
+      if (closed) return;
+      if (backfilling) {
+        buffered.push(activity);
+        return;
+      }
+      if (seenIds.has(activity.id)) return;
+      writeEvent(activity);
+    }
+  );
+
+  // Register cleanup BEFORE the awaited backfill — a client that disconnects
+  // mid-backfill would otherwise never fire this and leak the subscriber.
+  req.on('close', () => {
+    closed = true;
+    if (heartbeat) clearInterval(heartbeat);
+    unsubscribe();
+  });
+
+  try {
+    // Unencoded "+" in ISO offsets ("+00:00") arrives as a space after URL
+    // decoding — restore it so new Date() parses the timestamp.
+    const since = sinceRaw ? new Date(sinceRaw.replace(' ', '+')) : undefined;
+    if (since && !Number.isNaN(since.getTime())) {
+      const activityRepo = (await getDataComposer()).repositories.activityStream;
+      const backfill = await activityRepo.getActivity(authReq.pcpUserId, {
+        sessionId,
+        taskGroupId,
+        agentId,
+        since,
+        limit: 500,
+      });
+      for (const activity of backfill.reverse()) {
+        seenIds.add(activity.id);
+        writeEvent(activity);
+      }
+    }
+  } catch (error) {
+    logger.error('Failed to backfill events stream:', error);
+    res.write(`event: stream_error\ndata: ${JSON.stringify({ message: 'backfill failed' })}\n\n`);
+  }
+
+  if (closed) return;
+
+  backfilling = false;
+  for (const activity of buffered) {
+    if (!seenIds.has(activity.id)) writeEvent(activity);
+  }
+  buffered.length = 0;
+  res.write(`event: ready\ndata: {}\n\n`);
+
+  // Comment heartbeat holds proxies (Next rewrites) open through idle periods.
+  heartbeat = setInterval(() => {
+    res.write(`: heartbeat\n\n`);
+  }, 25_000);
+});
+
+/**
  * POST /api/admin/whatsapp/logout
  * Logout from WhatsApp
  */
@@ -2812,6 +2947,66 @@ router.get('/reminders', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to list reminders:', error);
     res.status(500).json(errorJson('Failed to list reminders', error));
+  }
+});
+
+/**
+ * GET /api/admin/automations
+ * Read-only unified view of reminders, heartbeats, and strategies.
+ * Presentation-level only — no schema changes. Strategy watchdog reminders
+ * are folded into their strategy item rather than listed separately.
+ */
+router.get('/automations', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    const [remindersResult, strategyGroupsResult] = await Promise.all([
+      supabase
+        .from('scheduled_reminders')
+        .select(
+          'id, title, description, cron_expression, next_run_at, last_run_at, delivery_channel, status, metadata, agent_identities!inner(agent_id, name, workspace_id)'
+        )
+        .eq('user_id', authReq.pcpUserId)
+        .eq('agent_identities.workspace_id', authReq.pcpWorkspaceId)
+        .order('next_run_at', { ascending: true })
+        .limit(200),
+      // Workspace-scoped via the owning identity, same as the reminders
+      // query above — without the inner-join filter, same-user strategies
+      // from other workspaces would leak into this workspace's view.
+      supabase
+        .from('task_groups')
+        .select(
+          'id, title, status, strategy, strategy_config, strategy_started_at, strategy_paused_at, updated_at, agent_identities!inner(agent_id, name, workspace_id)'
+        )
+        .eq('user_id', authReq.pcpUserId)
+        .eq('agent_identities.workspace_id', authReq.pcpWorkspaceId)
+        .eq('status', 'active')
+        .not('strategy', 'is', null)
+        .order('updated_at', { ascending: false })
+        .limit(100),
+    ]);
+
+    if (remindersResult.error) {
+      res.status(500).json(errorJson('Failed to list automations', remindersResult.error));
+      return;
+    }
+    if (strategyGroupsResult.error) {
+      res.status(500).json(errorJson('Failed to list automations', strategyGroupsResult.error));
+      return;
+    }
+
+    const automations = shapeAutomations(
+      (remindersResult.data || []) as unknown as ReminderSourceRow[],
+      (strategyGroupsResult.data || []) as unknown as StrategyGroupSourceRow[]
+    );
+
+    res.json({ automations });
+  } catch (error) {
+    logger.error('Failed to list automations:', error);
+    res.status(500).json(errorJson('Failed to list automations', error));
   }
 });
 
@@ -6699,7 +6894,7 @@ router.get('/task-groups/:id/activity', async (req: Request, res: Response) => {
 
     const { data: events, error: eventsError } = await supabase
       .from('activity_stream')
-      .select('id, type, subtype, content, payload, agent_id, session_id, created_at')
+      .select('id, type, subtype, content, payload, agent_id, session_id, platform, created_at')
       .eq('task_group_id' as never, id)
       .order('created_at', { ascending: true })
       .limit(limit);
@@ -6717,6 +6912,7 @@ router.get('/task-groups/:id/activity', async (req: Request, res: Response) => {
         content: e.content,
         agentId: e.agent_id,
         sessionId: e.session_id,
+        platform: e.platform,
         payload: e.payload,
         createdAt: e.created_at,
       })),
@@ -7085,7 +7281,8 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
 
     const expiresAt = new Date(Date.now() + timeoutSeconds * 1000).toISOString();
 
-    // Resolve requesting agent from session context header
+    // Resolve requesting agent from x-ink-context header (set by CLI hooks).
+    // This is the sole trusted identity channel — agents cannot set it themselves.
     const contextHeader = req.headers['x-ink-context'] as string | undefined;
     let requestingAgentId = 'unknown';
     if (contextHeader) {
@@ -7095,6 +7292,13 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
       } catch {
         // fall through
       }
+    }
+    if (requestingAgentId === 'unknown') {
+      logger.warn('Approval request with unknown agent — missing x-ink-context header', {
+        tool,
+        studioId,
+        sessionId,
+      });
     }
 
     // studio_id is a UUID column. The CLI sends the literal string "main"
@@ -7235,5 +7439,60 @@ router.get('/approval-requests/:requestId/status', async (req: Request, res: Res
 // platform listeners. This ensures grants can only come from verified
 // platform identity — no HTTP endpoint means no client-asserted trust boundary.
 // See ink://specs/2fa-permission-grants for the security invariant.
+
+// ─── Secrets (Keychain) ────────────────────────────────────────
+
+import { listCredentials, saveCredential, deleteCredential } from '../services/keychain.js';
+
+router.get('/secrets', async (_req: Request, res: Response) => {
+  try {
+    const credentials = await listCredentials();
+    res.json({ secrets: credentials });
+  } catch (error) {
+    logger.error('Failed to list secrets:', error);
+    res.status(500).json(errorJson('Failed to list secrets', error));
+  }
+});
+
+router.post('/secrets', async (req: Request, res: Response) => {
+  const { name, value, label } = req.body as {
+    name?: string;
+    value?: string;
+    label?: string;
+  };
+  if (!name || !value) {
+    res.status(400).json({ error: 'name and value are required' });
+    return;
+  }
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+    res.status(400).json({
+      error:
+        'name must match env-var format: start with a letter or underscore, then letters, numbers, underscores (e.g., GFIBER_PASSWORD)',
+    });
+    return;
+  }
+  try {
+    await saveCredential(name, value, label);
+    res.json({ success: true, name });
+  } catch (error) {
+    logger.error('Failed to save secret:', error);
+    res.status(500).json(errorJson('Failed to save secret', error));
+  }
+});
+
+router.delete('/secrets/:name', async (req: Request, res: Response) => {
+  const { name } = req.params;
+  try {
+    const deleted = await deleteCredential(name);
+    if (!deleted) {
+      res.status(404).json({ error: 'Secret not found' });
+      return;
+    }
+    res.json({ success: true, name });
+  } catch (error) {
+    logger.error('Failed to delete secret:', error);
+    res.status(500).json(errorJson('Failed to delete secret', error));
+  }
+});
 
 export default router;

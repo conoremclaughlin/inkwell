@@ -133,37 +133,37 @@ const statusConfig = {
   in_progress: {
     icon: ArrowUpCircle,
     label: 'In Progress',
-    color: 'text-emerald-700',
-    bgColor: 'bg-emerald-50',
-    borderColor: 'border-emerald-200',
-    accentColor: 'text-emerald-600',
+    color: 'text-emerald-700 dark:text-emerald-400',
+    bgColor: 'bg-emerald-50 dark:bg-emerald-900/30',
+    borderColor: 'border-emerald-200 dark:border-emerald-800',
+    accentColor: 'text-emerald-600 dark:text-emerald-400',
     dotColor: 'bg-emerald-500',
   },
   pending: {
     icon: Circle,
     label: 'Pending',
-    color: 'text-blue-700',
-    bgColor: 'bg-blue-50',
-    borderColor: 'border-blue-200',
-    accentColor: 'text-blue-600',
+    color: 'text-blue-700 dark:text-blue-400',
+    bgColor: 'bg-blue-50 dark:bg-blue-900/30',
+    borderColor: 'border-blue-200 dark:border-blue-800',
+    accentColor: 'text-blue-600 dark:text-blue-400',
     dotColor: 'bg-blue-500',
   },
   blocked: {
     icon: AlertCircle,
     label: 'Blocked',
-    color: 'text-red-700',
-    bgColor: 'bg-red-50',
-    borderColor: 'border-red-200',
-    accentColor: 'text-red-600',
+    color: 'text-red-700 dark:text-red-400',
+    bgColor: 'bg-red-50 dark:bg-red-900/30',
+    borderColor: 'border-red-200 dark:border-red-800',
+    accentColor: 'text-red-600 dark:text-red-400',
     dotColor: 'bg-red-500',
   },
   completed: {
     icon: CheckCircle2,
     label: 'Completed',
-    color: 'text-gray-500',
-    bgColor: 'bg-gray-50',
-    borderColor: 'border-gray-200',
-    accentColor: 'text-gray-400',
+    color: 'text-muted-foreground',
+    bgColor: 'bg-muted/50',
+    borderColor: 'border-border',
+    accentColor: 'text-muted-foreground/70',
     dotColor: 'bg-gray-400',
   },
 } as const;
@@ -171,30 +171,30 @@ const statusConfig = {
 const priorityConfig = {
   critical: {
     label: 'Critical',
-    color: 'text-red-700',
-    bgColor: 'bg-red-50',
-    borderColor: 'border-red-200',
+    color: 'text-red-700 dark:text-red-400',
+    bgColor: 'bg-red-50 dark:bg-red-900/30',
+    borderColor: 'border-red-200 dark:border-red-800',
     dotColor: 'bg-red-500',
   },
   high: {
     label: 'High',
-    color: 'text-orange-700',
-    bgColor: 'bg-orange-50',
-    borderColor: 'border-orange-200',
+    color: 'text-orange-700 dark:text-orange-400',
+    bgColor: 'bg-orange-50 dark:bg-orange-900/30',
+    borderColor: 'border-orange-200 dark:border-orange-800',
     dotColor: 'bg-orange-500',
   },
   medium: {
     label: 'Medium',
-    color: 'text-gray-600',
-    bgColor: 'bg-gray-50',
-    borderColor: 'border-gray-200',
+    color: 'text-muted-foreground',
+    bgColor: 'bg-muted/50',
+    borderColor: 'border-border',
     dotColor: 'bg-gray-400',
   },
   low: {
     label: 'Low',
-    color: 'text-slate-500',
-    bgColor: 'bg-slate-50',
-    borderColor: 'border-slate-200',
+    color: 'text-slate-500 dark:text-slate-400',
+    bgColor: 'bg-slate-50 dark:bg-slate-900/30',
+    borderColor: 'border-slate-200 dark:border-slate-800',
     dotColor: 'bg-slate-400',
   },
 } as const;
@@ -262,11 +262,11 @@ function statusSummary(tasks: Task[]): { active: number; completed: number; bloc
 // ─── Comment Thread ───
 
 const AGENT_COLORS: Record<string, string> = {
-  wren: 'bg-sky-100 text-sky-700',
-  lumen: 'bg-amber-100 text-amber-700',
-  myra: 'bg-rose-100 text-rose-700',
-  benson: 'bg-violet-100 text-violet-700',
-  aster: 'bg-emerald-100 text-emerald-700',
+  wren: 'bg-sky-100 text-sky-700 dark:bg-sky-900/30 dark:text-sky-400',
+  lumen: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
+  myra: 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400',
+  benson: 'bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-400',
+  aster: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
 };
 
 function CommentThread({ taskId }: { taskId: string }) {
@@ -295,18 +295,18 @@ function CommentThread({ taskId }: { taskId: string }) {
   const comments = data?.comments ?? [];
 
   return (
-    <div className="mt-3 pt-3 border-t border-gray-100">
+    <div className="mt-3 pt-3 border-t border-border">
       {/* Comment list */}
       {isLoading ? (
-        <div className="text-[11px] text-gray-400 flex items-center gap-1">
+        <div className="text-[11px] text-muted-foreground/70 flex items-center gap-1">
           <Loader2 className="h-3 w-3 animate-spin" /> Loading comments...
         </div>
       ) : comments.length > 0 ? (
         <div className="space-y-2 mb-3">
           {comments.map((c) => {
             const agentColor = c.authorAgentId
-              ? (AGENT_COLORS[c.authorAgentId] ?? 'bg-gray-100 text-gray-600')
-              : 'bg-gray-100 text-gray-600';
+              ? (AGENT_COLORS[c.authorAgentId] ?? 'bg-muted text-muted-foreground')
+              : 'bg-muted text-muted-foreground';
             return (
               <div key={c.id} className="flex gap-2">
                 <div
@@ -319,12 +319,14 @@ function CommentThread({ taskId }: { taskId: string }) {
                 </div>
                 <div className="flex-1 min-w-0">
                   <div className="flex items-baseline gap-2">
-                    <span className="text-xs font-medium text-gray-700">{c.authorName}</span>
-                    <span className="text-[10px] text-gray-400">
+                    <span className="text-xs font-medium text-foreground/90">{c.authorName}</span>
+                    <span className="text-[10px] text-muted-foreground/70">
                       {formatRelativeTime(c.createdAt)}
                     </span>
                   </div>
-                  <p className="text-xs text-gray-600 mt-0.5 whitespace-pre-wrap">{c.content}</p>
+                  <p className="text-xs text-muted-foreground mt-0.5 whitespace-pre-wrap">
+                    {c.content}
+                  </p>
                 </div>
               </div>
             );
@@ -340,7 +342,7 @@ function CommentThread({ taskId }: { taskId: string }) {
           placeholder="Add a comment..."
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          className="flex-1 text-xs rounded-lg border border-gray-200 px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-gray-300 focus:border-gray-300 placeholder:text-gray-400"
+          className="flex-1 text-xs rounded-lg border border-border px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-border focus:border-border placeholder:text-muted-foreground/70"
         />
         <button
           type="submit"
@@ -348,8 +350,8 @@ function CommentThread({ taskId }: { taskId: string }) {
           className={clsx(
             'rounded-lg px-2.5 py-1.5 transition-colors',
             draft.trim()
-              ? 'bg-gray-900 text-white hover:bg-gray-800'
-              : 'bg-gray-100 text-gray-400 cursor-not-allowed'
+              ? 'bg-gray-900 text-white hover:bg-gray-800 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white'
+              : 'bg-muted text-muted-foreground/70 cursor-not-allowed'
           )}
         >
           {addComment.isPending ? (
@@ -366,16 +368,36 @@ function CommentThread({ taskId }: { taskId: string }) {
 // ─── Activity Timeline ───
 
 const SUBTYPE_META: Record<string, { icon: typeof Play; label: string; color: string }> = {
-  strategy_started: { icon: Play, label: 'Strategy started', color: 'text-emerald-600' },
-  strategy_paused: { icon: Pause, label: 'Strategy paused', color: 'text-amber-600' },
-  strategy_resumed: { icon: RotateCcw, label: 'Strategy resumed', color: 'text-blue-600' },
+  strategy_started: {
+    icon: Play,
+    label: 'Strategy started',
+    color: 'text-emerald-600 dark:text-emerald-400',
+  },
+  strategy_paused: {
+    icon: Pause,
+    label: 'Strategy paused',
+    color: 'text-amber-600 dark:text-amber-400',
+  },
+  strategy_resumed: {
+    icon: RotateCcw,
+    label: 'Strategy resumed',
+    color: 'text-blue-600 dark:text-blue-400',
+  },
   strategy_completed: {
     icon: CheckCircle2,
     label: 'Strategy completed',
-    color: 'text-emerald-600',
+    color: 'text-emerald-600 dark:text-emerald-400',
   },
-  task_advanced: { icon: ArrowUpCircle, label: 'Task advanced', color: 'text-indigo-600' },
-  approval_required: { icon: AlertCircle, label: 'Approval required', color: 'text-amber-600' },
+  task_advanced: {
+    icon: ArrowUpCircle,
+    label: 'Task advanced',
+    color: 'text-indigo-600 dark:text-indigo-400',
+  },
+  approval_required: {
+    icon: AlertCircle,
+    label: 'Approval required',
+    color: 'text-amber-600 dark:text-amber-400',
+  },
 };
 
 function ActivityTimeline({ groupId }: { groupId: string }) {
@@ -386,7 +408,7 @@ function ActivityTimeline({ groupId }: { groupId: string }) {
 
   if (isLoading) {
     return (
-      <div className="text-[11px] text-gray-400 flex items-center gap-1 py-3">
+      <div className="text-[11px] text-muted-foreground/70 flex items-center gap-1 py-3">
         <Loader2 className="h-3 w-3 animate-spin" /> Loading timeline...
       </div>
     );
@@ -394,18 +416,20 @@ function ActivityTimeline({ groupId }: { groupId: string }) {
 
   const events = data?.events ?? [];
   if (events.length === 0) {
-    return <div className="text-[11px] text-gray-400 py-3">No activity recorded yet.</div>;
+    return (
+      <div className="text-[11px] text-muted-foreground/70 py-3">No activity recorded yet.</div>
+    );
   }
 
   return (
     <div className="relative pl-4 space-y-0">
       {/* Vertical line */}
-      <div className="absolute left-[7px] top-2 bottom-2 w-px bg-gray-200" />
+      <div className="absolute left-[7px] top-2 bottom-2 w-px bg-border" />
 
       {events.map((event, i) => {
         const meta = SUBTYPE_META[event.subtype ?? ''];
         const Icon = meta?.icon ?? Activity;
-        const color = meta?.color ?? 'text-gray-400';
+        const color = meta?.color ?? 'text-muted-foreground/70';
         const label = meta?.label ?? event.subtype ?? event.type;
         const isLast = i === events.length - 1;
 
@@ -415,19 +439,19 @@ function ActivityTimeline({ groupId }: { groupId: string }) {
             className={clsx('relative flex gap-3 items-start', !isLast && 'pb-3')}
           >
             {/* Dot */}
-            <div className={clsx('relative z-10 rounded-full bg-white p-0.5 -ml-[11px]')}>
+            <div className={clsx('relative z-10 rounded-full bg-card p-0.5 -ml-[11px]')}>
               <Icon className={clsx('h-3.5 w-3.5', color)} />
             </div>
 
             {/* Content */}
             <div className="flex-1 min-w-0 -mt-0.5">
               <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-xs font-medium text-gray-700">{label}</span>
+                <span className="text-xs font-medium text-foreground/90">{label}</span>
                 {event.agentId && (
                   <span
                     className={clsx(
                       'text-[10px] font-medium px-1.5 py-0.5 rounded-full',
-                      AGENT_COLORS[event.agentId] ?? 'bg-gray-100 text-gray-600'
+                      AGENT_COLORS[event.agentId] ?? 'bg-muted text-muted-foreground'
                     )}
                   >
                     {event.agentId}
@@ -436,15 +460,17 @@ function ActivityTimeline({ groupId }: { groupId: string }) {
                 {event.sessionId && (
                   <Link
                     href={`/sessions/${event.sessionId}`}
-                    className="text-[10px] text-blue-500 hover:text-blue-700 flex items-center gap-0.5 transition-colors"
+                    className="text-[10px] text-blue-500 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300 flex items-center gap-0.5 transition-colors"
                   >
                     <ExternalLink className="h-2.5 w-2.5" />
                     session log
                   </Link>
                 )}
               </div>
-              <p className="text-[11px] text-gray-500 mt-0.5 line-clamp-2">{event.content}</p>
-              <span className="text-[10px] text-gray-400">
+              <p className="text-[11px] text-muted-foreground mt-0.5 line-clamp-2">
+                {event.content}
+              </p>
+              <span className="text-[10px] text-muted-foreground/70">
                 {formatRelativeTime(event.createdAt)}
               </span>
             </div>
@@ -507,11 +533,14 @@ function TaskCard({
     <div
       className={clsx(
         'rounded-lg border p-3 transition-all',
-        showComments ? 'shadow-md border-gray-300' : 'hover:shadow-md hover:border-gray-300',
-        task.status === 'in_progress' && 'border-emerald-200 bg-emerald-50/20',
-        task.status === 'pending' && 'border-blue-100 bg-blue-50/10',
-        task.status === 'blocked' && 'border-red-200 bg-red-50/20',
-        task.status === 'completed' && 'border-gray-100 bg-gray-50/30'
+        showComments ? 'shadow-md border-border' : 'hover:shadow-md hover:border-border',
+        task.status === 'in_progress' &&
+          'border-emerald-200 bg-emerald-50/20 dark:border-emerald-800 dark:bg-emerald-900/10',
+        task.status === 'pending' &&
+          'border-blue-100 bg-blue-50/10 dark:border-blue-900 dark:bg-blue-900/10',
+        task.status === 'blocked' &&
+          'border-red-200 bg-red-50/20 dark:border-red-800 dark:bg-red-900/10',
+        task.status === 'completed' && 'border-border bg-muted/30'
       )}
     >
       <div className="flex items-start gap-3">
@@ -520,7 +549,7 @@ function TaskCard({
           onClick={handleToggle}
           className={clsx(
             'mt-0.5 shrink-0 rounded-full p-0.5 transition-colors',
-            task.status === 'blocked' ? 'cursor-default' : 'hover:bg-gray-100 cursor-pointer'
+            task.status === 'blocked' ? 'cursor-default' : 'hover:bg-muted cursor-pointer'
           )}
           title={isDone ? 'Reopen task' : task.status === 'blocked' ? 'Blocked' : 'Mark complete'}
           disabled={task.status === 'blocked'}
@@ -534,7 +563,7 @@ function TaskCard({
             <h4
               className={clsx(
                 'font-medium text-sm',
-                isDone ? 'text-gray-400 line-through' : 'text-gray-900'
+                isDone ? 'text-muted-foreground/70 line-through' : 'text-foreground'
               )}
             >
               {task.title}
@@ -544,17 +573,17 @@ function TaskCard({
 
           {/* Description */}
           {!compact && task.description && (
-            <p className="text-xs text-gray-500 mt-1 line-clamp-2">{task.description}</p>
+            <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{task.description}</p>
           )}
 
           {/* Tags */}
           {task.tags.length > 0 && (
             <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
-              <Tag className="h-3 w-3 text-gray-300" />
+              <Tag className="h-3 w-3 text-muted-foreground/70" />
               {task.tags.map((tag) => (
                 <span
                   key={tag}
-                  className="inline-flex items-center rounded-md bg-gray-100 px-1.5 py-0.5 text-[10px] font-medium text-gray-600"
+                  className="inline-flex items-center rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
                 >
                   {tag}
                 </span>
@@ -563,7 +592,7 @@ function TaskCard({
           )}
 
           {/* Metadata row */}
-          <div className="flex items-center gap-3 mt-1.5 text-[11px] text-gray-400 flex-wrap">
+          <div className="flex items-center gap-3 mt-1.5 text-[11px] text-muted-foreground/70 flex-wrap">
             {task.createdBy && (
               <span className="flex items-center gap-1">
                 <User className="h-3 w-3" />
@@ -581,7 +610,7 @@ function TaskCard({
               {formatRelativeTime(task.createdAt)}
             </span>
             {task.completedAt && (
-              <span className="flex items-center gap-1 text-green-500">
+              <span className="flex items-center gap-1 text-green-500 dark:text-green-400">
                 <CheckCircle2 className="h-3 w-3" />
                 done {formatRelativeTime(task.completedAt)}
               </span>
@@ -591,10 +620,10 @@ function TaskCard({
                 className={clsx(
                   'flex items-center gap-1',
                   isOverdue
-                    ? 'text-red-600 font-medium'
+                    ? 'text-red-600 dark:text-red-400 font-medium'
                     : isDone
-                      ? 'text-gray-400'
-                      : 'text-gray-500'
+                      ? 'text-muted-foreground/70'
+                      : 'text-muted-foreground'
                 )}
               >
                 <Calendar className="h-3 w-3" />
@@ -604,7 +633,7 @@ function TaskCard({
             )}
             <button
               onClick={() => setShowComments(!showComments)}
-              className="flex items-center gap-1 hover:text-gray-600 transition-colors cursor-pointer"
+              className="flex items-center gap-1 hover:text-foreground/90 transition-colors cursor-pointer"
             >
               <MessageCircle className="h-3 w-3" />
               {showComments ? 'hide' : 'comment'}
@@ -613,7 +642,7 @@ function TaskCard({
 
           {/* Blocked reason */}
           {task.status === 'blocked' && task.blockedBy && task.blockedBy.length > 0 && (
-            <div className="mt-1.5 text-[11px] text-red-500 flex items-center gap-1">
+            <div className="mt-1.5 text-[11px] text-red-500 dark:text-red-400 flex items-center gap-1">
               <AlertCircle className="h-3 w-3" />
               Blocked by: {task.blockedBy.join(', ')}
             </div>
@@ -645,20 +674,20 @@ function TaskGroupSection({
   const allDone = summary.active === 0 && summary.blocked === 0 && summary.completed > 0;
 
   return (
-    <div className="rounded-xl border bg-white overflow-hidden">
+    <div className="rounded-xl border bg-card overflow-hidden">
       {/* Group header */}
       <button
         onClick={() => setCollapsed(!collapsed)}
         className={clsx(
           'flex items-center gap-3 w-full px-5 py-3.5 text-left transition-colors',
-          'bg-gradient-to-r from-slate-50 to-white',
-          'hover:from-slate-100/60',
+          'bg-gradient-to-r from-slate-50 to-white dark:from-muted/40 dark:to-card',
+          'hover:from-slate-100/60 dark:hover:from-muted/60',
           'border-b',
-          collapsed ? 'border-transparent' : 'border-gray-100'
+          collapsed ? 'border-transparent' : 'border-border'
         )}
       >
-        <div className="h-8 w-8 rounded-lg bg-indigo-50 flex items-center justify-center shrink-0">
-          <Layers className="h-4 w-4 text-indigo-500" />
+        <div className="h-8 w-8 rounded-lg bg-indigo-50 dark:bg-indigo-900/30 flex items-center justify-center shrink-0">
+          <Layers className="h-4 w-4 text-indigo-500 dark:text-indigo-400" />
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
@@ -667,25 +696,25 @@ function TaskGroupSection({
               onClick={(e) => e.stopPropagation()}
               className={clsx(
                 'font-semibold text-sm hover:underline',
-                allDone ? 'text-gray-400' : 'text-gray-900'
+                allDone ? 'text-muted-foreground/70' : 'text-foreground'
               )}
             >
               {group.title}
             </Link>
             {group.autonomous && (
-              <Badge className="text-[10px] font-medium border bg-violet-50 text-violet-700 border-violet-200 gap-1">
+              <Badge className="text-[10px] font-medium border bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-900/30 dark:text-violet-400 dark:border-violet-800 gap-1">
                 <Zap className="h-2.5 w-2.5" />
                 Autonomous
               </Badge>
             )}
             {group.strategy && (
-              <Badge className="text-[10px] font-medium border bg-indigo-50 text-indigo-700 border-indigo-200 gap-1">
+              <Badge className="text-[10px] font-medium border bg-indigo-50 text-indigo-700 border-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-400 dark:border-indigo-800 gap-1">
                 <GitBranch className="h-2.5 w-2.5" />
                 {group.strategy}
               </Badge>
             )}
           </div>
-          <div className="flex items-center gap-2 mt-0.5 text-[11px] text-gray-400">
+          <div className="flex items-center gap-2 mt-0.5 text-[11px] text-muted-foreground/70">
             {group.agentName && (
               <span className="flex items-center gap-1">
                 <Bot className="h-3 w-3" />
@@ -703,24 +732,24 @@ function TaskGroupSection({
         <div className="flex items-center gap-2 shrink-0">
           {/* Mini status summary */}
           {summary.active > 0 && (
-            <span className="flex items-center gap-1 text-[10px] text-blue-600 font-medium">
+            <span className="flex items-center gap-1 text-[10px] text-blue-600 dark:text-blue-400 font-medium">
               <StatusDot status="pending" /> {summary.active}
             </span>
           )}
           {summary.blocked > 0 && (
-            <span className="flex items-center gap-1 text-[10px] text-red-600 font-medium">
+            <span className="flex items-center gap-1 text-[10px] text-red-600 dark:text-red-400 font-medium">
               <StatusDot status="blocked" /> {summary.blocked}
             </span>
           )}
           {summary.completed > 0 && (
-            <span className="flex items-center gap-1 text-[10px] text-gray-400 font-medium">
+            <span className="flex items-center gap-1 text-[10px] text-muted-foreground/70 font-medium">
               <StatusDot status="completed" /> {summary.completed}
             </span>
           )}
           {collapsed ? (
-            <ChevronRight className="h-4 w-4 text-gray-400 ml-1" />
+            <ChevronRight className="h-4 w-4 text-muted-foreground/70 ml-1" />
           ) : (
-            <ChevronDown className="h-4 w-4 text-gray-400 ml-1" />
+            <ChevronDown className="h-4 w-4 text-muted-foreground/70 ml-1" />
           )}
         </div>
       </button>
@@ -728,7 +757,7 @@ function TaskGroupSection({
       {/* Group description */}
       {!collapsed && group.description && (
         <div className="px-5 pt-3 pb-0">
-          <p className="text-xs text-gray-500">{group.description}</p>
+          <p className="text-xs text-muted-foreground">{group.description}</p>
         </div>
       )}
 
@@ -743,20 +772,20 @@ function TaskGroupSection({
 
       {/* Footer: timeline toggle + mission link */}
       {!collapsed && (
-        <div className="border-t border-gray-100 flex items-center justify-between">
+        <div className="border-t border-border flex items-center justify-between">
           <button
             onClick={(e) => {
               e.stopPropagation();
               setShowTimeline(!showTimeline);
             }}
-            className="flex items-center gap-2 px-5 py-2.5 text-[11px] text-gray-400 hover:text-gray-600 transition-colors text-left"
+            className="flex items-center gap-2 px-5 py-2.5 text-[11px] text-muted-foreground/70 hover:text-foreground/90 transition-colors text-left"
           >
             <Activity className="h-3 w-3" />
             {showTimeline ? 'Hide timeline' : 'Show timeline'}
           </button>
           <Link
             href={`/missions/${group.id}`}
-            className="flex items-center gap-1.5 px-5 py-2.5 text-[11px] text-blue-500 hover:text-blue-700 transition-colors"
+            className="flex items-center gap-1.5 px-5 py-2.5 text-[11px] text-blue-500 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300 transition-colors"
           >
             <ExternalLink className="h-3 w-3" />
             Open mission
@@ -764,7 +793,7 @@ function TaskGroupSection({
         </div>
       )}
       {!collapsed && showTimeline && (
-        <div className="px-5 pb-4 border-t border-gray-50">
+        <div className="px-5 pb-4 border-t border-border/50">
           <ActivityTimeline groupId={group.id} />
         </div>
       )}
@@ -791,15 +820,15 @@ function UngroupedStatusSection({
   if (tasks.length === 0) return null;
 
   return (
-    <div className="rounded-xl border bg-white overflow-hidden">
+    <div className="rounded-xl border bg-card overflow-hidden">
       <button
         onClick={() => setCollapsed(!collapsed)}
         className={clsx(
           'flex items-center gap-3 w-full px-5 py-3.5 text-left transition-colors',
-          'bg-gradient-to-r from-gray-50 to-white',
-          'hover:from-gray-100/60',
+          'bg-gradient-to-r from-gray-50 to-white dark:from-muted/40 dark:to-card',
+          'hover:from-gray-100/60 dark:hover:from-muted/60',
           'border-b',
-          collapsed ? 'border-transparent' : 'border-gray-100'
+          collapsed ? 'border-transparent' : 'border-border'
         )}
       >
         <div
@@ -811,7 +840,7 @@ function UngroupedStatusSection({
           <StatusIcon className={clsx('h-4 w-4', config.accentColor)} />
         </div>
         <div className="flex-1 min-w-0">
-          <span className="font-semibold text-gray-900 text-sm">{config.label}</span>
+          <span className="font-semibold text-foreground text-sm">{config.label}</span>
         </div>
         <div className="flex items-center gap-3 shrink-0">
           <Badge
@@ -825,9 +854,9 @@ function UngroupedStatusSection({
             {tasks.length}
           </Badge>
           {collapsed ? (
-            <ChevronRight className="h-4 w-4 text-gray-400" />
+            <ChevronRight className="h-4 w-4 text-muted-foreground/70" />
           ) : (
-            <ChevronDown className="h-4 w-4 text-gray-400" />
+            <ChevronDown className="h-4 w-4 text-muted-foreground/70" />
           )}
         </div>
       </button>
@@ -955,12 +984,12 @@ export default function TasksPage() {
     <div className="max-w-6xl">
       {/* Header */}
       <div>
-        <h1 className="text-3xl font-bold text-gray-900">Tasks</h1>
-        <p className="mt-1 text-gray-500">Track work across projects and agents.</p>
+        <h1 className="text-3xl font-bold text-foreground">Tasks</h1>
+        <p className="mt-1 text-muted-foreground">Track work across projects and agents.</p>
       </div>
 
       {error && (
-        <div className="mt-4 rounded-lg bg-red-50 border border-red-200 p-4 text-sm text-red-800">
+        <div className="mt-4 rounded-lg bg-red-50 border border-red-200 p-4 text-sm text-red-800 dark:bg-red-900/20 dark:border-red-800 dark:text-red-300">
           {error.message}
         </div>
       )}
@@ -971,30 +1000,35 @@ export default function TasksPage() {
           {
             label: 'Pending',
             value: stats.pending,
-            color: 'text-blue-700',
+            color: 'text-blue-700 dark:text-blue-400',
             dotColor: 'bg-blue-500',
           },
           {
             label: 'In Progress',
             value: stats.inProgress,
-            color: 'text-emerald-700',
+            color: 'text-emerald-700 dark:text-emerald-400',
             dotColor: 'bg-emerald-500',
           },
           {
             label: 'Completed',
             value: stats.completed,
-            color: 'text-gray-500',
+            color: 'text-muted-foreground',
             dotColor: 'bg-gray-400',
           },
-          { label: 'Blocked', value: stats.blocked, color: 'text-red-700', dotColor: 'bg-red-500' },
+          {
+            label: 'Blocked',
+            value: stats.blocked,
+            color: 'text-red-700 dark:text-red-400',
+            dotColor: 'bg-red-500',
+          },
         ].map((stat) => (
           <div
             key={stat.label}
-            className="rounded-lg border bg-white p-3 transition-all hover:shadow-sm"
+            className="rounded-lg border bg-card p-3 transition-all hover:shadow-sm"
           >
             <div className="flex items-center gap-1.5">
               <span className={clsx('inline-block h-2 w-2 rounded-full', stat.dotColor)} />
-              <span className="text-xs text-gray-500">{stat.label}</span>
+              <span className="text-xs text-muted-foreground">{stat.label}</span>
             </div>
             <div className={clsx('text-2xl font-semibold mt-0.5', stat.color)}>{stat.value}</div>
           </div>
@@ -1011,8 +1045,8 @@ export default function TasksPage() {
               className={clsx(
                 'px-3 py-1.5 text-xs font-medium rounded-full transition-colors',
                 statusFilter === btn.key
-                  ? 'bg-gray-900 text-white'
-                  : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                  ? 'bg-gray-900 text-white dark:bg-gray-100 dark:text-gray-900'
+                  : 'bg-muted text-muted-foreground hover:bg-muted/80'
               )}
             >
               {btn.label}
@@ -1020,7 +1054,9 @@ export default function TasksPage() {
                 <span
                   className={clsx(
                     'ml-1.5 tabular-nums',
-                    statusFilter === btn.key ? 'text-gray-300' : 'text-gray-400'
+                    statusFilter === btn.key
+                      ? 'text-gray-300 dark:text-gray-600'
+                      : 'text-muted-foreground/70'
                   )}
                 >
                   {btn.count}
@@ -1035,16 +1071,18 @@ export default function TasksPage() {
       <div className="mt-4 space-y-3">
         {isLoading ? (
           <Card>
-            <CardContent className="py-12 text-center text-gray-500">Loading...</CardContent>
+            <CardContent className="py-12 text-center text-muted-foreground">
+              Loading...
+            </CardContent>
           </Card>
         ) : !hasVisibleTasks ? (
           <Card>
             <CardContent className="py-12 text-center">
-              <ListTodo className="h-10 w-10 mx-auto text-gray-300 mb-3" />
-              <p className="text-gray-500">No tasks yet.</p>
-              <p className="text-sm text-gray-400 mt-1">
-                Use <code className="bg-gray-100 px-1.5 py-0.5 rounded text-xs">create_task</code>{' '}
-                to create one.
+              <ListTodo className="h-10 w-10 mx-auto text-muted-foreground/70 mb-3" />
+              <p className="text-muted-foreground">No tasks yet.</p>
+              <p className="text-sm text-muted-foreground/70 mt-1">
+                Use <code className="bg-muted px-1.5 py-0.5 rounded text-xs">create_task</code> to
+                create one.
               </p>
             </CardContent>
           </Card>
@@ -1069,7 +1107,7 @@ export default function TasksPage() {
             {/* Ungrouped tasks by status */}
             {ungrouped.length > 0 && sortedGroupIds.length > 0 && (
               <div className="pt-2">
-                <h3 className="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2 px-1">
+                <h3 className="text-xs font-medium text-muted-foreground/70 uppercase tracking-wider mb-2 px-1">
                   Ungrouped
                 </h3>
               </div>

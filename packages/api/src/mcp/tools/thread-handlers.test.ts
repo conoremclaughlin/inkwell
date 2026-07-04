@@ -41,23 +41,84 @@ describe('resolveTriggeredAgents', () => {
       expect(result).toEqual(['wren']);
     });
 
-    it('should trigger no one when creator replies with a plain message', () => {
+    it('should trigger all others when creator replies with a plain message', () => {
       const result = resolveTriggeredAgents({
         senderAgentId: 'wren',
         participants,
         creatorAgentId: 'wren',
         messageType: 'message',
       });
-      expect(result).toEqual([]);
+      expect(result).toEqual(['lumen', 'aster', 'myra']);
     });
 
-    it('should trigger no one when creator replies with no messageType (default)', () => {
+    it('should trigger all others when creator replies with no messageType (default)', () => {
       const result = resolveTriggeredAgents({
         senderAgentId: 'wren',
         participants,
         creatorAgentId: 'wren',
       });
+      expect(result).toEqual(['lumen', 'aster', 'myra']);
+    });
+
+    it('should trigger only explicit recipient when creator targets one person', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants,
+        creatorAgentId: 'wren',
+        recipients: ['myra'],
+      });
+      expect(result).toEqual(['myra']);
+    });
+
+    it('should trigger only explicit recipient when non-creator targets one person', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'lumen',
+        participants,
+        creatorAgentId: 'wren',
+        recipients: ['myra'],
+      });
+      expect(result).toEqual(['myra']);
+    });
+
+    it('should trigger no one when creator explicitly targets self (same studio)', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants,
+        creatorAgentId: 'wren',
+        recipients: ['wren'],
+      });
       expect(result).toEqual([]);
+    });
+
+    it('should trigger no one when non-creator explicitly targets self (same studio)', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'lumen',
+        participants,
+        creatorAgentId: 'wren',
+        recipients: ['lumen'],
+      });
+      expect(result).toEqual([]);
+    });
+
+    it('should trigger self when explicitly targeting self with selfStudioTarget', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants,
+        creatorAgentId: 'wren',
+        recipients: ['wren'],
+        selfStudioTarget: true,
+      });
+      expect(result).toEqual(['wren']);
+    });
+
+    it('should filter explicit recipients to actual participants', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants,
+        creatorAgentId: 'wren',
+        recipients: ['myra', 'benson'],
+      });
+      expect(result).toEqual(['myra']);
     });
   });
 
@@ -109,11 +170,41 @@ describe('resolveTriggeredAgents', () => {
   });
 
   describe('self-thread (1 participant)', () => {
-    it('should trigger no one', () => {
+    it('should trigger no one for plain messages', () => {
       const result = resolveTriggeredAgents({
         senderAgentId: 'wren',
         participants: ['wren'],
         creatorAgentId: 'wren',
+      });
+      expect(result).toEqual([]);
+    });
+
+    it('should trigger self for session_resume (strategy self-trigger)', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants: ['wren'],
+        creatorAgentId: 'wren',
+        messageType: 'session_resume',
+      });
+      expect(result).toEqual(['wren']);
+    });
+
+    it('should trigger self for task_request', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants: ['wren'],
+        creatorAgentId: 'wren',
+        messageType: 'task_request',
+      });
+      expect(result).toEqual(['wren']);
+    });
+
+    it('should not trigger self for notification', () => {
+      const result = resolveTriggeredAgents({
+        senderAgentId: 'wren',
+        participants: ['wren'],
+        creatorAgentId: 'wren',
+        messageType: 'notification',
       });
       expect(result).toEqual([]);
     });

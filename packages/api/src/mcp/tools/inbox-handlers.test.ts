@@ -311,7 +311,7 @@ describe('handleSendToInbox - threadKey', () => {
     expect(parsed.recipientSessionId).toBe('b85490f5-0836-4bdd-8193-f6cfa2562a41');
   });
 
-  it('should trigger without senderAgentId using system sender', async () => {
+  it('should trigger without senderAgentId using unknown sender', async () => {
     const { getAgentGateway } = await import('../../channels/agent-gateway.js');
     const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
 
@@ -330,7 +330,7 @@ describe('handleSendToInbox - threadKey', () => {
 
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
-        fromAgentId: 'system',
+        fromAgentId: 'unknown',
       })
     );
   });
@@ -384,6 +384,70 @@ describe('handleSendToInbox - threadKey', () => {
     expect(parsed.success).toBe(true);
     expect(parsed.routingHint).toContain('routing anchor');
     expect(mockGateway.dispatchTrigger).toHaveBeenCalled();
+  });
+
+  it('should forward caller metadata into trigger payload (strategy trigger propagation)', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+
+    const mockSb = createMockSupabase();
+    const mockDc = createMockDataComposer(mockSb);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        senderAgentId: 'wren',
+        messageType: 'session_resume',
+        content: 'Strategy kickoff',
+        metadata: {
+          source: 'strategy_service',
+          strategyTrigger: true,
+          groupId: 'group-abc',
+          taskId: 'task-1',
+        },
+      },
+      mockDc as never
+    );
+
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metadata: expect.objectContaining({
+          strategyTrigger: true,
+          groupId: 'group-abc',
+        }),
+      })
+    );
+  });
+
+  it('should dispatch trigger for new self-thread session_resume (strategy first kickoff)', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+    // findThread returns null → new thread path
+    const { findThread } = await import('./thread-handlers.js');
+    vi.mocked(findThread).mockResolvedValue(null);
+
+    const mockSb = createThreadMockSupabase();
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        senderAgentId: 'wren',
+        messageType: 'session_resume',
+        threadKey: 'strategy:new-group-123',
+        content: 'Strategy kickoff — first trigger',
+      },
+      mockDc as never
+    );
+
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toAgentId: 'wren',
+        threadKey: 'strategy:new-group-123',
+      })
+    );
   });
 
   // ===================================================================

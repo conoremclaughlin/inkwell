@@ -37,6 +37,8 @@ const execFileAsync = promisify(execFile);
 // Types
 // ============================================================================
 
+export type ExecutionMode = 'spawn' | 'inline';
+
 export interface StartStrategyInput {
   groupId: string;
   userId: string;
@@ -45,6 +47,7 @@ export interface StartStrategyInput {
   config?: StrategyConfig;
   verificationMode?: VerificationMode;
   planUri?: string;
+  executionMode?: ExecutionMode;
 }
 
 export interface StrategyAdvanceResult {
@@ -62,6 +65,8 @@ export interface StrategyAdvanceResult {
   stats?: { total: number; completed: number };
   /** Sandbox container info (when sandbox mode is active) */
   sandbox?: SandboxSpinUpResult;
+  /** How execution was requested: 'spawn' (new session) or 'inline' (current session loops) */
+  executionMode?: ExecutionMode;
 }
 
 export interface StrategyStatus {
@@ -69,6 +74,7 @@ export interface StrategyStatus {
   title: string;
   strategy: StrategyPreset;
   status: string;
+  executionPhase: string;
   sbId: string | null;
   planUri: string | null;
   verificationMode: VerificationMode;
@@ -196,7 +202,7 @@ export class StrategyService {
    * Sets the group to active, records the strategy preset, and returns the first task.
    */
   async startStrategy(input: StartStrategyInput): Promise<StrategyAdvanceResult> {
-    const group = await this.dataComposer.repositories.taskGroups.findById(input.groupId);
+    let group = await this.dataComposer.repositories.taskGroups.findById(input.groupId);
     if (!group) throw new Error('Task group not found');
     if (group.user_id !== input.userId) throw new Error('Task group does not belong to this user');
 
@@ -210,6 +216,44 @@ export class StrategyService {
     const inputConfig = input.config || (group.strategy_config as StrategyConfig);
     if (inputConfig?.studioSlug && inputConfig?.ephemeralStudio) {
       throw new Error('studioSlug and ephemeralStudio are mutually exclusive');
+    }
+
+    // ── Resolve repoRoot ──
+    // Required for spawn mode so the spawner knows where to start the session.
+    // Resolution chain: group metadata → project repo_root → caller's session context.
+    const groupMeta = (group.metadata || {}) as Record<string, unknown>;
+    let resolvedRepoRoot = typeof groupMeta.repoRoot === 'string' ? groupMeta.repoRoot : undefined;
+
+    if (!resolvedRepoRoot && group.project_id) {
+      const project = await this.dataComposer.repositories.projects.findById(group.project_id);
+      if (project?.repo_root) {
+        resolvedRepoRoot = project.repo_root;
+      }
+    }
+
+    if (!resolvedRepoRoot) {
+      const reqCtx = getRequestContext();
+      if (reqCtx?.repoRoot) {
+        resolvedRepoRoot = reqCtx.repoRoot;
+      }
+    }
+
+    const executionMode = input.executionMode || 'spawn';
+    if (!resolvedRepoRoot && executionMode === 'spawn') {
+      throw new Error(
+        'Cannot start strategy in spawn mode: no repoRoot found. ' +
+          'Set repo_root on the project, repoRoot in group metadata, or call from a session with a known repo context.'
+      );
+    }
+
+    // Persist resolved repoRoot to group metadata so downstream studio creation
+    // and trigger routing have it available without re-resolving.
+    if (resolvedRepoRoot && groupMeta.repoRoot !== resolvedRepoRoot) {
+      await this.dataComposer.repositories.taskGroups.update(input.groupId, {
+        metadata: { ...groupMeta, repoRoot: resolvedRepoRoot },
+      });
+      // Refresh local reference so studio creation sees the updated metadata
+      group = (await this.dataComposer.repositories.taskGroups.findById(input.groupId)) || group;
     }
 
     // Persistent studio: create BEFORE activating the strategy so (a) failure
@@ -246,6 +290,7 @@ export class StrategyService {
       iterations_since_approval: 0,
       strategy_started_at: new Date().toISOString(),
       strategy_paused_at: null,
+      execution_phase: executionMode === 'inline' ? 'worker_active' : 'pending_trigger',
     });
 
     // Get the first task
@@ -282,6 +327,7 @@ export class StrategyService {
       await this.dataComposer.repositories.taskGroups.update(input.groupId, {
         status: 'paused',
         strategy_paused_at: new Date().toISOString(),
+        execution_phase: 'paused',
       });
       await this.logStrategyEvent(
         updated,
@@ -314,24 +360,27 @@ export class StrategyService {
       this.getAssignment(currentGroup)
     );
 
-    // Trigger the owner agent in the assigned studio. The trigger spawns
-    // (or resumes) a session in the target studio so work actually begins.
-    // Pass the sandbox container name so the triggered session routes
-    // CLI execution into the container.
+    // In 'inline' mode the calling agent will loop in the current session —
+    // skip the trigger entirely (no spawn needed).
+    let triggered = false;
     const sandboxContainer = sandboxResult?.success ? sandboxResult.containerName : undefined;
-    const triggered = await this.triggerOwnerAgent(
-      currentGroup,
-      nextTask,
-      'strategy_kickoff',
-      sandboxContainer
-    );
+
+    if (executionMode === 'spawn') {
+      triggered = await this.triggerOwnerAgent(
+        currentGroup,
+        nextTask,
+        'strategy_kickoff',
+        sandboxContainer
+      );
+    }
 
     // Log strategy start
     await this.logStrategyEvent(
       currentGroup,
       'strategy_started',
-      `Strategy "${input.strategy}" started on "${currentGroup.title}"`,
+      `Strategy "${input.strategy}" started on "${currentGroup.title}" (executionMode: ${executionMode})`,
       {
+        executionMode,
         firstTaskId: nextTask.id,
         firstTaskTitle: nextTask.title,
         ownerTriggered: triggered,
@@ -348,6 +397,7 @@ export class StrategyService {
       nextTask,
       prompt,
       notified: triggered,
+      executionMode,
       sandbox: sandboxResult || undefined,
     };
   }
@@ -416,9 +466,11 @@ export class StrategyService {
             ? `\n\nAcceptance criteria:\n${criteria.map((c) => `• ${c}`).join('\n')}`
             : '';
 
+        await this.cancelWatchdogReminder(groupId);
         await this.dataComposer.repositories.taskGroups.update(groupId, {
           strategy_paused_at: new Date().toISOString(),
           status: 'paused',
+          execution_phase: 'paused',
           context_summary: summary,
           metadata: { ...group.metadata, pauseReason: 'final_review' },
         });
@@ -451,6 +503,15 @@ export class StrategyService {
           }
         }
 
+        if (config.userNotify) {
+          await this.notifyDispatcher(
+            group,
+            config.userNotify,
+            `All tasks complete on "${group.title}" (${completed}/${tasks.length}). Awaiting final review.`,
+            userId
+          );
+        }
+
         await this.logStrategyEvent(
           group,
           'final_review_requested',
@@ -461,6 +522,7 @@ export class StrategyService {
             approvalCriteria: criteria,
             notified,
             routedTo: config.approvalNotify || config.checkInNotify || null,
+            userNotified: config.userNotify || null,
           }
         );
 
@@ -492,9 +554,11 @@ export class StrategyService {
 
       // Pause for approval — set pauseReason so resumeStrategy can distinguish
       // approval-gate pauses from manual pauses (Lumen review, PR #338)
+      await this.cancelWatchdogReminder(groupId);
       await this.dataComposer.repositories.taskGroups.update(groupId, {
         strategy_paused_at: new Date().toISOString(),
         status: 'paused',
+        execution_phase: 'paused',
         context_summary: summary,
         metadata: { ...group.metadata, pauseReason: 'approval_gate' },
       });
@@ -616,6 +680,7 @@ export class StrategyService {
     return this.dataComposer.repositories.taskGroups.update(groupId, {
       status: 'paused',
       strategy_paused_at: new Date().toISOString(),
+      execution_phase: 'paused',
     });
   }
 
@@ -675,6 +740,7 @@ export class StrategyService {
       strategy_paused_at: null,
       iterations_since_approval: 0,
       metadata: cleanedMetadata,
+      execution_phase: 'pending_trigger',
     });
 
     // Re-create watchdog reminder
@@ -715,6 +781,7 @@ export class StrategyService {
           status: 'paused',
           context_summary: summary,
           metadata: { ...cleanedMetadata, pauseReason: 'final_review' },
+          execution_phase: 'paused',
         });
 
         const approvalMessage =
@@ -787,6 +854,7 @@ export class StrategyService {
     return this.dataComposer.repositories.taskGroups.update(groupId, {
       status: 'cancelled',
       strategy_paused_at: null,
+      execution_phase: 'idle',
     });
   }
 
@@ -820,6 +888,8 @@ export class StrategyService {
     ];
     if (group.status === 'paused') {
       summaryParts.push(group.iterations_since_approval > 0 ? 'paused for approval' : 'paused');
+    } else if (group.execution_phase === 'pending_trigger') {
+      summaryParts.push('awaiting session spawn');
     } else if (currentTask) {
       summaryParts.push(`working on: "${currentTask.title}"`);
     }
@@ -829,6 +899,7 @@ export class StrategyService {
       title: group.title,
       strategy: group.strategy as StrategyPreset,
       status: group.status,
+      executionPhase: group.execution_phase,
       sbId: group.sb_id,
       planUri: group.plan_uri,
       verificationMode: group.verification_mode,
@@ -946,13 +1017,14 @@ export class StrategyService {
 
     try {
       const threadKey = group.thread_key || `strategy:${group.id}`;
-      const senderSlug = (await this.resolveOwnerSlug(group)) || 'system';
+      const senderSlug = (await this.resolveOwnerSlug(group)) || group.sb_id || 'strategy';
 
       await handleSendToInbox(
         {
           userId,
           recipientAgentId: notifyAgentId,
           senderAgentId: senderSlug,
+          recipientStudioSlug: 'main',
           content: message,
           messageType: 'notification',
           priority: 'high',
@@ -1017,8 +1089,10 @@ export class StrategyService {
       const metadata = (group.metadata || {}) as Record<string, unknown>;
       const rawStudioId = metadata.studioId;
       const rawStudioSlug = metadata.studioSlug;
+      const rawRepoRoot = metadata.repoRoot;
       const studioId = typeof rawStudioId === 'string' ? rawStudioId : undefined;
       const studioSlug = typeof rawStudioSlug === 'string' ? rawStudioSlug : undefined;
+      const repoRoot = typeof rawRepoRoot === 'string' ? rawRepoRoot : undefined;
       const content = STRATEGY_PROMPTS[group.strategy as StrategyPreset](group, task);
 
       await handleSendToInbox(
@@ -1043,6 +1117,7 @@ export class StrategyService {
             groupId: group.id,
             taskId: task.id,
             strategy: group.strategy,
+            ...(repoRoot ? { repoRoot } : {}),
             ...(sandboxContainerName ? { sandboxContainerName } : {}),
           },
         },
@@ -1496,7 +1571,8 @@ export class StrategyService {
   async triggerWatchdog(groupId: string): Promise<boolean> {
     const group = await this.dataComposer.repositories.taskGroups.findById(groupId);
     if (!group) {
-      logger.warn(`Strategy watchdog: group ${groupId} not found, skipping`);
+      logger.warn(`Strategy watchdog: group ${groupId} not found, cancelling orphaned watchdog`);
+      await this.cancelWatchdogReminder(groupId);
       return false;
     }
 
@@ -1511,12 +1587,13 @@ export class StrategyService {
 
     if (group.status !== 'active' || !group.strategy) {
       logger.info(
-        `Strategy watchdog: group ${groupId} is ${group.status} (strategy=${group.strategy ?? 'null'}), skipping`
+        `Strategy watchdog: group ${groupId} is ${group.status} (strategy=${group.strategy ?? 'null'}), cancelling stale watchdog`
       );
+      await this.cancelWatchdogReminder(groupId);
       await this.logStrategyEvent(
         group,
         'watchdog_skip',
-        `Watchdog skipped: group is ${group.status}`,
+        `Watchdog skipped and self-cancelled: group is ${group.status}`,
         { reason: 'inactive_group' }
       );
       return false;
@@ -1531,12 +1608,13 @@ export class StrategyService {
     }
     if (!currentTask) {
       logger.info(
-        `Strategy watchdog: group ${groupId} has no in_progress or pending task, skipping`
+        `Strategy watchdog: group ${groupId} has no in_progress or pending task, cancelling stale watchdog`
       );
+      await this.cancelWatchdogReminder(groupId);
       await this.logStrategyEvent(
         group,
         'watchdog_skip',
-        `Watchdog skipped: no pending/in-progress task`,
+        `Watchdog skipped and self-cancelled: no pending/in-progress task`,
         {
           reason: 'no_current_task',
           currentTaskIndex: group.current_task_index,
@@ -1561,6 +1639,7 @@ export class StrategyService {
           `Watchdog aborted: sandbox required but spin-up failed — ${sandboxResult.error}`,
           { error: sandboxResult.error, policy: 'required', trigger: 'watchdog' }
         );
+        await this.cancelWatchdogReminder(groupId);
         await this.dataComposer.repositories.taskGroups.update(groupId, {
           status: 'paused',
           strategy_paused_at: new Date().toISOString(),
@@ -1585,6 +1664,9 @@ export class StrategyService {
     const intervalMinutes = config.watchdogIntervalMinutes || 10;
 
     try {
+      // Cancel any existing watchdog before creating a new one to prevent duplicates
+      await this.cancelWatchdogReminder(group.id);
+
       const nextRunAt = new Date();
       nextRunAt.setMinutes(nextRunAt.getMinutes() + intervalMinutes);
 
@@ -1663,6 +1745,7 @@ export class StrategyService {
   ): Promise<void> {
     await this.dataComposer.repositories.taskGroups.update(group.id, {
       status: 'completed',
+      execution_phase: 'completed',
       context_summary: stats.hasIncomplete
         ? `Strategy complete with issues: ${stats.completed}/${stats.total} done, ${stats.pending} pending, ${stats.blocked} blocked.`
         : `Strategy complete. ${stats.completed}/${stats.total} tasks done.`,
@@ -1703,6 +1786,15 @@ export class StrategyService {
           userId
         );
       }
+    }
+
+    if (config.userNotify) {
+      await this.notifyDispatcher(
+        group,
+        config.userNotify,
+        `Strategy complete: "${group.title}" — ${stats.completed}/${stats.total} tasks finished.${stats.hasIncomplete ? ` (${stats.pending} pending, ${stats.blocked} blocked)` : ''}`,
+        userId
+      );
     }
   }
 
@@ -1752,7 +1844,7 @@ export class StrategyService {
   ): Promise<void> {
     try {
       const reqCtx = getRequestContext();
-      const agentSlug = (await this.resolveOwnerSlug(group)) || 'system';
+      const agentSlug = (await this.resolveOwnerSlug(group)) || group.sb_id || 'strategy';
       await this.dataComposer.repositories.activityStream.logActivity({
         userId: group.user_id,
         agentId: agentSlug,

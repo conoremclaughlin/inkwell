@@ -22,6 +22,7 @@ export interface EmbeddingRuntimeConfig {
   dimensions: number;
   queryThreshold: number;
   matchCountMultiplier: number;
+  chunkedRecallEnabled: boolean;
   ollamaBaseUrl: string;
   openaiBaseUrl: string;
   hasOpenAIKey: boolean;
@@ -80,6 +81,7 @@ function buildRuntimeConfig(): EmbeddingRuntimeConfig {
     dimensions,
     queryThreshold: env.MEMORY_EMBEDDING_QUERY_THRESHOLD,
     matchCountMultiplier: env.MEMORY_EMBEDDING_MATCH_COUNT_MULTIPLIER,
+    chunkedRecallEnabled: env.MEMORY_CHUNKED_RECALL_ENABLED,
     ollamaBaseUrl: env.OLLAMA_BASE_URL,
     openaiBaseUrl: env.OPENAI_BASE_URL || DEFAULT_OPENAI_BASE_URL,
     hasOpenAIKey: Boolean(env.OPENAI_API_KEY),

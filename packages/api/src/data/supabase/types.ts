@@ -179,12 +179,14 @@ export type Database = {
           metadata: Json | null;
           name: string;
           permissions: Json;
+          provider: string | null;
           relationships: Json | null;
           role: string;
           sandbox_bypass: boolean;
           session_scope: string | null;
           soul: string | null;
           studio_hint: string | null;
+          tts_config: Json | null;
           updated_at: string | null;
           user_id: string;
           values: Json | null;
@@ -203,12 +205,14 @@ export type Database = {
           metadata?: Json | null;
           name: string;
           permissions?: Json;
+          provider?: string | null;
           relationships?: Json | null;
           role: string;
           sandbox_bypass?: boolean;
           session_scope?: string | null;
           soul?: string | null;
           studio_hint?: string | null;
+          tts_config?: Json | null;
           updated_at?: string | null;
           user_id: string;
           values?: Json | null;
@@ -227,12 +231,14 @@ export type Database = {
           metadata?: Json | null;
           name?: string;
           permissions?: Json;
+          provider?: string | null;
           relationships?: Json | null;
           role?: string;
           sandbox_bypass?: boolean;
           session_scope?: string | null;
           soul?: string | null;
           studio_hint?: string | null;
+          tts_config?: Json | null;
           updated_at?: string | null;
           user_id?: string;
           values?: Json | null;
@@ -2298,6 +2304,7 @@ export type Database = {
           id: string;
           metadata: Json | null;
           name: string;
+          repo_root: string | null;
           repository_url: string | null;
           status: string | null;
           tech_stack: string[] | null;
@@ -2311,6 +2318,7 @@ export type Database = {
           id?: string;
           metadata?: Json | null;
           name: string;
+          repo_root?: string | null;
           repository_url?: string | null;
           status?: string | null;
           tech_stack?: string[] | null;
@@ -2324,6 +2332,7 @@ export type Database = {
           id?: string;
           metadata?: Json | null;
           name?: string;
+          repo_root?: string | null;
           repository_url?: string | null;
           status?: string | null;
           tech_stack?: string[] | null;
@@ -3051,6 +3060,7 @@ export type Database = {
           branch: string;
           cleaned_at: string | null;
           created_at: string | null;
+          default_project_id: string | null;
           id: string;
           metadata: Json | null;
           permissions: Json;
@@ -3075,6 +3085,7 @@ export type Database = {
           branch: string;
           cleaned_at?: string | null;
           created_at?: string | null;
+          default_project_id?: string | null;
           id?: string;
           metadata?: Json | null;
           permissions?: Json;
@@ -3099,6 +3110,7 @@ export type Database = {
           branch?: string;
           cleaned_at?: string | null;
           created_at?: string | null;
+          default_project_id?: string | null;
           id?: string;
           metadata?: Json | null;
           permissions?: Json;
@@ -3282,6 +3294,7 @@ export type Database = {
           created_at: string;
           current_task_index: number;
           description: string | null;
+          execution_phase: string;
           group_number: number | null;
           id: string;
           instructions: string | null;
@@ -3317,6 +3330,7 @@ export type Database = {
           created_at?: string;
           current_task_index?: number;
           description?: string | null;
+          execution_phase?: string;
           group_number?: number | null;
           id?: string;
           instructions?: string | null;
@@ -3352,6 +3366,7 @@ export type Database = {
           created_at?: string;
           current_task_index?: number;
           description?: string | null;
+          execution_phase?: string;
           group_number?: number | null;
           id?: string;
           instructions?: string | null;
@@ -4005,7 +4020,10 @@ export type Database = {
         | 'agent_complete'
         | 'state_change'
         | 'thinking'
-        | 'error';
+        | 'error'
+        | 'inkmail_dispatch'
+        | 'inkmail_deliver'
+        | 'inkmail_fail';
       trust_level: 'owner' | 'admin' | 'member';
     };
     CompositeTypes: {
@@ -4674,6 +4692,9 @@ export const Constants = {
         'state_change',
         'thinking',
         'error',
+        'inkmail_dispatch',
+        'inkmail_deliver',
+        'inkmail_fail',
       ],
       trust_level: ['owner', 'admin', 'member'],
     },

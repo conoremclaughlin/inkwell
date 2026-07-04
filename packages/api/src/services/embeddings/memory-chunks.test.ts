@@ -8,7 +8,7 @@ import {
 import { memoryExtractionsSchema } from '../memory-llm-extraction';
 
 describe('memory chunk multi-view helpers', () => {
-  it('builds summary, fact, topic, entity, and content views when structured data is available', () => {
+  it('builds a single raw content view for short memories by default', () => {
     const chunks = buildMemoryEmbeddingChunks({
       summary: 'Policy B replaces Policy A for wound escalation.',
       content:
@@ -20,16 +20,17 @@ describe('memory chunk multi-view helpers', () => {
       model: { maxInputChars: 1200 } as { maxInputChars: number },
     });
 
-    expect(chunks.some((chunk) => chunk.chunkType === 'summary')).toBe(true);
-    expect(chunks.some((chunk) => chunk.chunkType === 'fact')).toBe(true);
-    expect(chunks.some((chunk) => chunk.chunkType === 'topic')).toBe(true);
-    expect(chunks.some((chunk) => chunk.chunkType === 'entity')).toBe(true);
-    expect(chunks.some((chunk) => chunk.chunkType === 'content')).toBe(true);
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].chunkType).toBe('content');
 
     const viewCounts = countChunkViews(chunks);
-    expect(viewCounts.summary).toBe(1);
+    expect(viewCounts.summary).toBe(0);
+    expect(viewCounts.fact).toBe(0);
+    expect(viewCounts.topic).toBe(0);
+    expect(viewCounts.entity).toBe(0);
     expect(viewCounts.current_state).toBe(0);
-    expect(viewCounts.content).toBeGreaterThan(0);
+    expect(viewCounts.exact_details).toBe(0);
+    expect(viewCounts.content).toBe(1);
 
     const metadata = {
       embedding_chunks: {
@@ -38,10 +39,29 @@ describe('memory chunk multi-view helpers', () => {
       },
     };
 
-    expect(inferChunkTypeFromMetadata(0, metadata)).toBe('summary');
+    expect(inferChunkTypeFromMetadata(0, metadata)).toBe('content');
   });
 
-  it('prefers llm-derived summary, durable fact, entity, and current state chunks when provided', () => {
+  it('infers legacy pre-v3 chunk metadata using the old derived-first order', () => {
+    const metadata = {
+      embedding_chunks: {
+        version: 2,
+        viewCounts: {
+          summary: 1,
+          fact: 1,
+          topic: 1,
+          entity: 0,
+          current_state: 0,
+          content: 1,
+        },
+      },
+    };
+
+    expect(inferChunkTypeFromMetadata(0, metadata)).toBe('summary');
+    expect(inferChunkTypeFromMetadata(3, metadata)).toBe('content');
+  });
+
+  it('prefers llm-derived summary, durable fact, exact detail, entity, and current state chunks when provided', () => {
     const llmExtractions = memoryExtractionsSchema.parse({
       version: 1,
       provider: 'openai',
@@ -61,6 +81,19 @@ describe('memory chunk multi-view helpers', () => {
             object: 'durable_fact index',
             evidence:
               'Current state should stay separate from durable facts because it is volatile.',
+          },
+        ],
+      },
+      exact_details: {
+        exactDetails: [
+          {
+            kind: 'state',
+            subject: 'dev server',
+            predicate: 'restart behavior',
+            value: 'auto-restarts on file change',
+            status: 'active',
+            evidence:
+              'Current state is also important: like the currently running dev server will autorestart.',
           },
         ],
       },
@@ -102,6 +135,9 @@ describe('memory chunk multi-view helpers', () => {
       'action relevance'
     );
     expect(chunks.find((chunk) => chunk.chunkType === 'fact')?.text).toContain('durable fact:');
+    expect(chunks.find((chunk) => chunk.chunkType === 'exact_details')?.text).toContain(
+      'exact detail: state'
+    );
     expect(chunks.find((chunk) => chunk.chunkType === 'entity')?.text).toContain('entity: Wren');
     expect(chunks.find((chunk) => chunk.chunkType === 'current_state')?.text).toContain(
       'current state:'
@@ -110,11 +146,13 @@ describe('memory chunk multi-view helpers', () => {
     const viewCounts = countChunkViews(chunks);
     expect(viewCounts.summary).toBe(1);
     expect(viewCounts.fact).toBe(1);
+    expect(viewCounts.exact_details).toBe(1);
     expect(viewCounts.entity).toBe(1);
     expect(viewCounts.current_state).toBe(1);
+    expect(viewCounts.content).toBe(1);
   });
 
-  it('uses heuristic extraction mode by default even when llm metadata exists', () => {
+  it('does not create heuristic or LLM-derived views by default when LLM mode is not enabled', () => {
     const llmExtractions = memoryExtractionsSchema.parse({
       version: 1,
       provider: 'openai',
@@ -137,7 +175,20 @@ describe('memory chunk multi-view helpers', () => {
     });
 
     expect(chunks.some((chunk) => chunk.chunkType === 'current_state')).toBe(false);
-    expect(chunks.some((chunk) => chunk.chunkType === 'fact')).toBe(true);
+    expect(chunks.some((chunk) => chunk.chunkType === 'fact')).toBe(false);
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].chunkType).toBe('content');
+  });
+
+  it('splits content only when it exceeds the vetted model input limit', () => {
+    const chunks = buildMemoryEmbeddingChunks({
+      content: `${'A'.repeat(1300)}. ${'B'.repeat(1300)}.`,
+      model: { maxInputChars: 1200 } as { maxInputChars: number },
+    });
+
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every((chunk) => chunk.chunkType === 'content')).toBe(true);
+    expect(chunks.every((chunk) => chunk.text.length <= 1100)).toBe(true);
   });
 
   it('sanitizes unpaired unicode surrogates before chunk persistence', () => {

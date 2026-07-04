@@ -127,6 +127,10 @@ export const saveProjectSchema = userIdentifierBaseSchema.extend({
   status: z.enum(['active', 'paused', 'completed', 'archived']).optional(),
   techStack: z.array(z.string()).optional().describe('Technologies used'),
   repositoryUrl: z.string().url().optional().describe('Repository URL'),
+  repoRoot: z
+    .string()
+    .optional()
+    .describe('Local filesystem path to the repo root (e.g., /Users/.../my-project)'),
   goals: z.array(z.string()).optional().describe('Project goals/milestones'),
 });
 
@@ -150,6 +154,7 @@ export async function handleSaveProject(args: unknown, dataComposer: DataCompose
     status: params.status,
     tech_stack: params.techStack,
     repository_url: params.repositoryUrl,
+    repo_root: params.repoRoot,
     goals: params.goals,
   });
 
@@ -259,6 +264,7 @@ export async function handleGetProject(args: unknown, dataComposer: DataComposer
               status: project.status,
               tech_stack: project.tech_stack,
               repository_url: project.repository_url,
+              repo_root: project.repo_root,
               goals: project.goals,
               metadata: project.metadata,
               created_at: project.created_at,

@@ -29,6 +29,7 @@ export interface Studio {
   workType: string | null;
   slug: string | null;
   roleTemplate: string | null;
+  defaultProjectId: string | null;
   status: StudioStatus;
   metadata: Json;
   createdAt: string;
@@ -49,6 +50,7 @@ export interface CreateStudioInput {
   purpose?: string;
   workType?: WorkType;
   roleTemplate?: string;
+  defaultProjectId?: string | null;
   metadata?: Json;
 }
 
@@ -60,6 +62,7 @@ export interface UpdateStudioInput {
   roleTemplate?: string | null;
   worktreePath?: string;
   slug?: string | null;
+  defaultProjectId?: string | null;
   metadata?: Json;
   archivedAt?: string;
   cleanedAt?: string;
@@ -95,6 +98,7 @@ export class StudiosRepository {
       workType: (row.work_type as string) || null,
       slug: (row.slug as string) || null,
       roleTemplate: (row.role_template as string) || null,
+      defaultProjectId: (row.default_project_id as string) || null,
       status: row.status as StudioStatus,
       metadata: (row.metadata as Json) || {},
       createdAt: row.created_at as string,
@@ -121,6 +125,7 @@ export class StudiosRepository {
       purpose: input.purpose,
       work_type: input.workType,
       role_template: input.roleTemplate,
+      default_project_id: input.defaultProjectId ?? null,
       slug: deriveStudioSlug(input.worktreePath),
       status: 'active',
       metadata: input.metadata || {},
@@ -149,28 +154,36 @@ export class StudiosRepository {
     return data ? this.mapRow(data as Record<string, unknown>) : null;
   }
 
-  async findByBranch(branch: string): Promise<Studio | null> {
-    const { data, error } = await this.client
-      .from('studios')
-      .select('*')
-      .eq('branch', branch)
-      .single();
+  async findByBranch(
+    branch: string,
+    scope?: { userId?: string; agentId?: string }
+  ): Promise<Studio | null> {
+    let q = this.client.from('studios').select('*').eq('branch', branch);
+    if (scope?.userId) q = q.eq('user_id', scope.userId);
+    if (scope?.agentId) q = q.eq('agent_id', scope.agentId);
+    q = q.order('updated_at', { ascending: false }).limit(1);
 
-    if (error && error.code !== 'PGRST116') {
+    const { data, error } = await q.maybeSingle();
+
+    if (error) {
       throw new Error(`Failed to find studio by branch: ${error.message}`);
     }
 
     return data ? this.mapRow(data as Record<string, unknown>) : null;
   }
 
-  async findByPath(worktreePath: string): Promise<Studio | null> {
-    const { data, error } = await this.client
-      .from('studios')
-      .select('*')
-      .eq('worktree_path', worktreePath)
-      .single();
+  async findByPath(
+    worktreePath: string,
+    scope?: { userId?: string; agentId?: string }
+  ): Promise<Studio | null> {
+    let q = this.client.from('studios').select('*').eq('worktree_path', worktreePath);
+    if (scope?.userId) q = q.eq('user_id', scope.userId);
+    if (scope?.agentId) q = q.eq('agent_id', scope.agentId);
+    q = q.order('updated_at', { ascending: false }).limit(1);
 
-    if (error && error.code !== 'PGRST116') {
+    const { data, error } = await q.maybeSingle();
+
+    if (error) {
       throw new Error(`Failed to find studio by path: ${error.message}`);
     }
 
@@ -268,6 +281,8 @@ export class StudiosRepository {
     if (input.roleTemplate !== undefined) updateData.role_template = input.roleTemplate;
     if (input.worktreePath !== undefined) updateData.worktree_path = input.worktreePath;
     if (input.slug !== undefined) updateData.slug = input.slug;
+    if (input.defaultProjectId !== undefined)
+      updateData.default_project_id = input.defaultProjectId;
     if (input.metadata !== undefined) updateData.metadata = input.metadata;
     if (input.archivedAt !== undefined) updateData.archived_at = input.archivedAt;
     if (input.cleanedAt !== undefined) updateData.cleaned_at = input.cleanedAt;

@@ -1,269 +1,358 @@
 /**
  * Ink Runner
  *
- * Implements IRunner using the Anthropic API directly with Ink coding tools.
- * Unlike CLI runners (Claude/Codex/Gemini), this calls the API in-process
- * with a proper tool execution loop — tool results are fed back to continue
- * the conversation until the model emits end_turn.
+ * Spawns `ink chat --non-interactive` as a subprocess. The ink runtime
+ * manages the full context window, tools, permissions, credential
+ * resolution, and skills — Claude Code is the LLM execution backend
+ * underneath, just like when a user runs `ink chat` interactively.
+ *
+ * This follows the same subprocess pattern as ClaudeRunner but points
+ * at the `ink` binary instead of `claude`.
  */
 
-import Anthropic from '@anthropic-ai/sdk';
+import { spawn, type ChildProcess } from 'child_process';
+import { randomUUID } from 'crypto';
 import type {
   InjectedContext,
   ClaudeRunnerConfig,
   RunnerResult,
   ChannelResponse,
-  ChannelType,
   IRunner,
   ToolCall,
+  MediaAttachment,
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
-import { buildIdentityPrompt } from './claude-runner.js';
 import { logger } from '../../utils/logger.js';
-import {
-  createInkCodingTools,
-  type InkToolDefinition,
-  type PiCodingToolsConfig,
-} from '../../agent/tools/pi-coding-tools.js';
+import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
+import { injectSessionHeaders, buildSessionEnv, writeRuntimeSessionHint } from '@inklabs/shared';
 
-const MAX_TOOL_ITERATIONS = 50;
-const DEFAULT_MODEL = 'claude-sonnet-4-20250514';
-const DEFAULT_MAX_TOKENS = 16384;
-
-export interface InkRunnerConfig {
-  apiKey?: string;
-  model?: string;
-  maxTokens?: number;
-  /** Pi coding tools config — if omitted, tools are loaded with cwd from runner config */
-  piToolsConfig?: Partial<PiCodingToolsConfig>;
-  /** Additional tools to register alongside Pi coding tools */
-  extraTools?: Anthropic.Tool[];
-}
+const PROCESS_TIMEOUT_MS = parseInt(process.env.INK_PROCESS_TIMEOUT_MS || '', 10) || 15 * 60 * 1000;
+/** Max --attach-file args forwarded per spawn (matches the channel-side media cap) */
+const MAX_ATTACHMENT_ARGS = 10;
 
 export class InkRunner implements IRunner {
-  private client: Anthropic | null = null;
-  private runnerConfig: InkRunnerConfig;
-  private toolsCache = new Map<string, InkToolDefinition[]>();
-
-  constructor(config: InkRunnerConfig = {}) {
-    this.runnerConfig = config;
-  }
-
   async run(
     message: string,
     options: {
       backendSessionId?: string;
       injectedContext?: InjectedContext;
       config: ClaudeRunnerConfig;
+      mediaAttachments?: MediaAttachment[];
     }
   ): Promise<RunnerResult> {
-    const { injectedContext, config } = options;
+    const { backendSessionId, injectedContext, config, mediaAttachments } = options;
 
-    this.ensureClient();
+    const isResume = !!backendSessionId;
+    const sessionId = config.pcpSessionId || backendSessionId || randomUUID();
 
-    // Build system prompt
-    const systemPrompt = this.buildSystemPrompt(config, injectedContext);
-
-    // Build user message with context injection (first turn only)
     let fullMessage = message;
-    if (injectedContext && !options.backendSessionId) {
+    if (injectedContext && !isResume) {
       const contextBlock = formatInjectedContext(injectedContext);
       fullMessage = `${contextBlock}\n\n---\n\n${message}`;
     }
 
-    // Load Pi coding tools scoped to the working directory
-    const tools = await this.getTools(config.workingDirectory, config.agentId);
-    const toolSchemas: Anthropic.Tool[] = tools.map((t) => t.schema);
-    if (this.runnerConfig.extraTools) {
-      toolSchemas.push(...this.runnerConfig.extraTools);
+    const args = this.buildArgs(sessionId, config, mediaAttachments);
+
+    logger.info('Spawning ink chat (non-interactive)', {
+      sessionId,
+      pcpSessionId: config.pcpSessionId,
+      isResume,
+      workingDirectory: config.workingDirectory,
+      messageLength: fullMessage.length,
+    });
+
+    try {
+      const result = await this.spawnProcess(args, fullMessage, config);
+
+      if (result.resumeFailedNoSession && isResume) {
+        logger.warn('Resume failed - session not found locally. Starting fresh session.', {
+          oldSessionId: sessionId,
+        });
+
+        if (injectedContext) {
+          const contextBlock = formatInjectedContext(injectedContext);
+          fullMessage = `${contextBlock}\n\n---\n\n${message}`;
+        }
+
+        const freshArgs = this.buildArgs(sessionId, config, mediaAttachments);
+        const retryResult = await this.spawnProcess(freshArgs, fullMessage, config);
+        return {
+          success: true,
+          backendSessionId: sessionId,
+          responses: retryResult.responses,
+          usage: retryResult.usage,
+          finalTextResponse: retryResult.finalTextResponse,
+          toolCalls: retryResult.toolCalls,
+        };
+      }
+
+      return {
+        success: true,
+        backendSessionId: sessionId,
+        responses: result.responses,
+        usage: result.usage,
+        finalTextResponse: result.finalTextResponse,
+        toolCalls: result.toolCalls,
+      };
+    } catch (error) {
+      logger.error('ink chat process failed', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {
+        success: false,
+        backendSessionId: sessionId,
+        responses: [],
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+
+  private buildArgs(
+    sessionId: string,
+    config: ClaudeRunnerConfig,
+    mediaAttachments?: MediaAttachment[]
+  ): string[] {
+    const args: string[] = ['chat', '--non-interactive'];
+
+    if (config.agentId) {
+      args.push('--agent', config.agentId);
     }
 
-    // Build executor map for fast lookup
-    const executorMap = new Map<string, InkToolDefinition['execute']>();
-    for (const tool of tools) {
-      executorMap.set(tool.schema.name, tool.execute);
+    args.push('--session-id', sessionId);
+
+    if (config.model) {
+      args.push('--model', config.model);
     }
 
-    // Run the agentic loop
-    const messages: Anthropic.MessageParam[] = [{ role: 'user', content: fullMessage }];
-    const responses: ChannelResponse[] = [];
-    const toolCalls: ToolCall[] = [];
-    let totalInputTokens = 0;
-    let totalOutputTokens = 0;
-    let finalTextResponse = '';
-    let backendSessionId = options.backendSessionId || `ink-${Date.now()}`;
+    // Turn backstop only — the real limit is the CLI's token budget
+    // (200K default), which auto-compacts the transcript when approached.
+    args.push('--max-turns', '15');
 
-    for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
-      const response = await this.client!.messages.create({
-        model: this.runnerConfig.model || config.model || DEFAULT_MODEL,
-        max_tokens: this.runnerConfig.maxTokens || DEFAULT_MAX_TOKENS,
-        system: systemPrompt,
-        messages,
-        tools: toolSchemas.length > 0 ? toolSchemas : undefined,
+    // Use the safe profile with away mode for non-interactive spawns.
+    // Safe profile allows read tools freely but requires approval for
+    // write/comms tools. Away mode routes approval prompts to the user's
+    // inbox (2FA) instead of auto-denying.
+    args.push('--profile', 'safe', '--away');
+
+    // Label the delivered message with its originating channel so the
+    // transcript renders it as a system message (not "you").
+    args.push('--message-label', config.channel || 'server');
+
+    // Forward media attachments as file paths. ink chat appends an
+    // attachment block to the turn and grants its provider backend
+    // directory access (e.g., --add-dir for claude) so the files can be
+    // read natively. Cap defensively — argv space is finite.
+    if (mediaAttachments && mediaAttachments.length > 0) {
+      for (const attachment of mediaAttachments.slice(0, MAX_ATTACHMENT_ARGS)) {
+        if (attachment.path) {
+          args.push('--attach-file', attachment.path);
+        }
+      }
+    }
+
+    return args;
+  }
+
+  private async spawnProcess(
+    args: string[],
+    message: string,
+    config: ClaudeRunnerConfig
+  ): Promise<{
+    responses: ChannelResponse[];
+    usage?: { contextTokens: number; inputTokens: number; outputTokens: number };
+    resumeFailedNoSession?: boolean;
+    finalTextResponse?: string;
+    toolCalls: ToolCall[];
+  }> {
+    const inkBin = await resolveBinaryPath('ink');
+
+    if (config.pcpSessionId && config.workingDirectory) {
+      writeRuntimeSessionHint(
+        config.workingDirectory,
+        config.pcpSessionId,
+        config.agentId || 'unknown',
+        'ink',
+        randomUUID(),
+        config.studioId
+      );
+    }
+
+    const mcpInjection =
+      config.mcpConfigPath && config.pcpSessionId
+        ? injectSessionHeaders({
+            mcpConfigPath: config.mcpConfigPath,
+            pcpSessionId: config.pcpSessionId,
+            studioId: config.studioId,
+            accessToken: config.pcpAccessToken,
+          })
+        : null;
+
+    // Pass --message via args (not stdin) so ink chat gets it directly
+    const fullArgs = [...args, '--message', message];
+
+    const spawnPath = buildSpawnPath(inkBin);
+    const sessionEnv = buildSessionEnv({
+      pcpSessionId: config.pcpSessionId,
+      studioId: config.studioId,
+      agentId: config.agentId,
+    });
+
+    const env: Record<string, string> = {
+      ...process.env,
+      ...sessionEnv,
+      PATH: spawnPath,
+      AGENT_ID: config.agentId || '',
+      // Production mode disables React Reconciler profiling (perf_hooks measure accumulation)
+      NODE_ENV: 'production',
+      // Server-minted access token so the ink CLI's PcpClient can call /mcp
+      // (bootstrap, tools) without depending on the human's ~/.ink/auth.json.
+      // getValidAccessToken() checks INK_ACCESS_TOKEN before any file source.
+      ...(config.pcpAccessToken ? { INK_ACCESS_TOKEN: config.pcpAccessToken } : {}),
+    } as Record<string, string>;
+
+    // Strip CLAUDECODE to prevent nested-session detection
+    delete env.CLAUDECODE;
+
+    return new Promise((resolve, reject) => {
+      const child: ChildProcess = spawn(inkBin, fullArgs, {
+        cwd: config.workingDirectory,
+        env,
+        stdio: ['pipe', 'pipe', 'pipe'],
       });
 
-      totalInputTokens += response.usage.input_tokens;
-      totalOutputTokens += response.usage.output_tokens;
+      let stdout = '';
+      let stderr = '';
 
-      // Collect text and tool_use blocks
-      const textParts: string[] = [];
-      const toolUseBlocks: Anthropic.ToolUseBlock[] = [];
+      child.stdout?.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+      child.stderr?.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
 
-      for (const block of response.content) {
-        if (block.type === 'text') {
-          textParts.push(block.text);
-        } else if (block.type === 'tool_use') {
-          toolUseBlocks.push(block);
-        }
-      }
+      const timeout = setTimeout(() => {
+        logger.warn('ink chat process timed out, killing', { timeout: PROCESS_TIMEOUT_MS });
+        child.kill('SIGTERM');
+        setTimeout(() => child.kill('SIGKILL'), 3000);
+      }, PROCESS_TIMEOUT_MS);
 
-      if (textParts.length > 0) {
-        finalTextResponse = textParts.join('');
-      }
+      child.on('close', (code) => {
+        clearTimeout(timeout);
+        mcpInjection?.cleanup();
 
-      // Check for send_response in tool calls
-      for (const toolUse of toolUseBlocks) {
-        const input = toolUse.input as Record<string, unknown>;
-        toolCalls.push({
-          toolUseId: toolUse.id,
-          toolName: toolUse.name,
-          input,
-        });
-
-        if (toolUse.name === 'send_response' || toolUse.name === 'mcp__inkwell__send_response') {
-          const channel = (input.channel as ChannelType) || 'api';
-          const conversationId = input.conversationId as string | undefined;
-          const content = input.content as string | undefined;
-          if (content) {
-            responses.push({
-              channel,
-              conversationId: conversationId || '',
-              content,
-              format: input.format as ChannelResponse['format'],
+        if (code !== 0) {
+          // Check for resume failure
+          if (stderr.includes('session not found') || stderr.includes('No such session')) {
+            resolve({
+              responses: [],
+              resumeFailedNoSession: true,
+              toolCalls: [],
             });
+            return;
           }
-        }
-      }
 
-      // If no tool use, we're done
-      if (toolUseBlocks.length === 0 || response.stop_reason === 'end_turn') {
-        break;
-      }
-
-      // Execute tools and build tool_result messages
-      // Add assistant turn with the full content (text + tool_use)
-      messages.push({ role: 'assistant', content: response.content });
-
-      const toolResults: Anthropic.ToolResultBlockParam[] = [];
-      for (const toolUse of toolUseBlocks) {
-        const executor = executorMap.get(toolUse.name);
-        let resultText: string;
-
-        if (executor) {
-          try {
-            resultText = await executor(toolUse.input as Record<string, unknown>);
-          } catch (err) {
-            const errMsg = err instanceof Error ? err.message : String(err);
-            logger.error(`Ink runner: tool ${toolUse.name} threw`, { error: errMsg });
-            resultText = `Error: ${errMsg}`;
-          }
-        } else {
-          resultText = `Error: Tool "${toolUse.name}" not available in this runtime. Available tools: ${Array.from(executorMap.keys()).join(', ')}`;
-          logger.warn(`Ink runner: unknown tool "${toolUse.name}" requested`);
+          const errorText = stderr.trim() || stdout.trim() || `exit code ${code}`;
+          reject(new Error(`ink chat exited with code ${code}: ${errorText.slice(0, 1000)}`));
+          return;
         }
 
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: toolUse.id,
-          content: resultText,
-        });
+        const result = this.parseOutput(stdout, stderr);
+        resolve(result);
+      });
+
+      child.on('error', (err) => {
+        clearTimeout(timeout);
+        mcpInjection?.cleanup();
+        reject(new Error(`Failed to spawn ink: ${err.message}`));
+      });
+
+      // Close stdin — message is passed via --message arg
+      child.stdin?.end();
+    });
+  }
+
+  private parseOutput(
+    stdout: string,
+    _stderr: string
+  ): {
+    responses: ChannelResponse[];
+    usage?: { contextTokens: number; inputTokens: number; outputTokens: number };
+    finalTextResponse?: string;
+    toolCalls: ToolCall[];
+  } {
+    const responses: ChannelResponse[] = [];
+    const toolCalls: ToolCall[] = [];
+    let finalTextResponse: string | undefined;
+    let exitPhase: string | undefined;
+    let exitSignal: string | undefined;
+    let exitReason: string | undefined;
+    let usage: { contextTokens: number; inputTokens: number; outputTokens: number } | undefined;
+
+    // ink chat routes responses via MCP send_response — stdout may contain
+    // CLI chrome, status lines, or other noise that must NOT be treated as
+    // routeable content. Only parse structured JSON lines:
+    //   - type: "send_response" → explicit channel routing
+    //   - type: "tool_call"     → tool invocation tracking
+    //   - type: "result"        → assistant's final text (emitted by --non-interactive)
+    const lines = stdout.split('\n');
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.type === 'send_response') {
+          responses.push({
+            channel: parsed.channel || 'api',
+            conversationId: parsed.conversationId || '',
+            content: parsed.content || '',
+            format: parsed.format,
+          });
+        } else if (parsed.type === 'tool_call') {
+          toolCalls.push({
+            toolUseId: parsed.toolUseId || parsed.id || '',
+            toolName: parsed.toolName || parsed.name || '',
+            input: parsed.input || {},
+          });
+        } else if (parsed.type === 'result') {
+          if (parsed.text) finalTextResponse = parsed.text;
+          if (parsed.phase) exitPhase = parsed.phase;
+          if (parsed.signal) exitSignal = parsed.signal;
+          if (parsed.reason) exitReason = parsed.reason;
+          // Usage from the ink CLI's budget view (transcript + identity).
+          // Without this, sessions report contextTokens=0 and token-based
+          // lifecycle decisions never fire for the ink backend.
+          if (parsed.usage && typeof parsed.usage === 'object') {
+            usage = {
+              contextTokens: Number(parsed.usage.contextTokens) || 0,
+              inputTokens: Number(parsed.usage.inputTokens) || 0,
+              outputTokens: Number(parsed.usage.outputTokens) || 0,
+            };
+          }
+        }
+      } catch {
+        // Non-JSON line — CLI noise, ignore
       }
+    }
 
-      // Add tool results as user turn
-      messages.push({ role: 'user', content: toolResults });
-
-      logger.debug('Ink runner: tool iteration complete', {
-        iteration,
-        toolsExecuted: toolUseBlocks.map((t) => t.name),
+    if (exitPhase || exitSignal) {
+      logger.info('ink chat non-interactive exit', {
+        exitPhase,
+        exitSignal,
+        exitReason,
+        hasResponse: !!finalTextResponse,
+        responseCount: responses.length,
+        toolCallCount: toolCalls.length,
+        contextTokens: usage?.contextTokens,
       });
     }
 
     return {
-      success: true,
-      backendSessionId,
       responses,
-      usage: {
-        contextTokens: 0,
-        inputTokens: totalInputTokens,
-        outputTokens: totalOutputTokens,
-      },
-      finalTextResponse: finalTextResponse || undefined,
+      usage,
+      finalTextResponse,
       toolCalls,
     };
-  }
-
-  private ensureClient(): void {
-    if (this.client) return;
-    const apiKey = this.runnerConfig.apiKey || process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      throw new Error('ANTHROPIC_API_KEY is required for Ink runner');
-    }
-    this.client = new Anthropic({ apiKey });
-  }
-
-  private async getTools(cwd: string, agentId?: string): Promise<InkToolDefinition[]> {
-    const cacheKey = `${cwd}:${agentId ?? ''}`;
-    if (this.toolsCache.has(cacheKey)) {
-      return this.toolsCache.get(cacheKey)!;
-    }
-
-    const piConfig: PiCodingToolsConfig = {
-      cwd,
-      ...this.runnerConfig.piToolsConfig,
-      ...(agentId && { agentId }),
-    };
-
-    const tools = await createInkCodingTools(piConfig);
-    this.toolsCache.set(cacheKey, tools);
-    return tools;
-  }
-
-  private buildSystemPrompt(config: ClaudeRunnerConfig, context?: InjectedContext): string {
-    const parts: string[] = [];
-
-    // Identity prompt (same as CLI runners)
-    if (config.agentId && context?.agent) {
-      parts.push(
-        buildIdentityPrompt(
-          config.agentId,
-          context.agent.name,
-          context.agent.soul,
-          context.user?.timezone,
-          context.agent.heartbeat,
-          {
-            pcpSessionId: config.pcpSessionId,
-            studioId: config.studioId,
-          }
-        )
-      );
-    }
-
-    // System prompt from config
-    if (config.systemPrompt) {
-      parts.push(config.systemPrompt);
-    }
-    if (config.appendSystemPrompt) {
-      parts.push(config.appendSystemPrompt);
-    }
-
-    // Coding tools context
-    parts.push(`## Coding Tools
-
-You have filesystem access scoped to: ${config.workingDirectory}
-
-Available tools: read, write, edit, bash, grep, find, ls
-All file paths are resolved relative to the working directory. Access outside this directory is blocked.`);
-
-    return parts.join('\n\n');
   }
 }

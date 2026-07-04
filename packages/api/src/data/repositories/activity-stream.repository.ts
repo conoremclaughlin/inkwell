@@ -23,7 +23,10 @@ export type ActivityType =
   | 'agent_complete'
   | 'state_change'
   | 'thinking'
-  | 'error';
+  | 'error'
+  | 'inkmail_dispatch'
+  | 'inkmail_deliver'
+  | 'inkmail_fail';
 
 export type ActivityStatus = 'pending' | 'running' | 'completed' | 'failed';
 
@@ -87,6 +90,8 @@ export interface LogMessageInput {
   platformChatId?: string;
   isDm?: boolean;
   payload?: Json;
+  /** Link to task group so check-ins appear on the mission timeline */
+  taskGroupId?: string;
 }
 
 export interface GetActivityOptions {
@@ -161,7 +166,17 @@ export class ActivityStreamRepository {
       throw new Error(`Failed to log activity: ${error.message}`);
     }
 
-    return this.rowToActivity(data);
+    const activity = this.rowToActivity(data);
+
+    // Publish to the in-process bus for SSE subscribers. Lazy import breaks
+    // the repositories → services → repositories require cycle.
+    import('../../services/events/activity-bus.js')
+      .then(({ activityBus }) => activityBus.publish(activity))
+      .catch(() => {
+        // Bus delivery is best-effort; the row is already persisted.
+      });
+
+    return activity;
   }
 
   /**
@@ -180,7 +195,37 @@ export class ActivityStreamRepository {
       platformChatId: input.platformChatId,
       isDm: input.isDm,
       payload: input.payload || {},
+      taskGroupId: input.taskGroupId,
     });
+  }
+
+  /**
+   * Backfill task-group (and session) linkage on an already-logged activity.
+   *
+   * Incoming messages are logged before session routing resolves, so their
+   * mission linkage is sometimes only known afterwards. Best-effort: logs a
+   * warning on failure instead of throwing.
+   */
+  async tagActivityTaskGroup(
+    activityId: string,
+    taskGroupId: string,
+    sessionId?: string
+  ): Promise<void> {
+    const { error } = await this.supabase
+      .from('activity_stream')
+      .update({
+        task_group_id: taskGroupId,
+        ...(sessionId ? { session_id: sessionId } : {}),
+      } as never)
+      .eq('id', activityId);
+
+    if (error) {
+      logger.warn('Failed to tag activity with task group', {
+        activityId,
+        taskGroupId,
+        error: error.message,
+      });
+    }
   }
 
   /**

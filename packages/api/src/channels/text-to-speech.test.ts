@@ -31,8 +31,159 @@ describe('TextToSpeechService', () => {
     expect(result).toBeUndefined();
   });
 
+  it('builds the mlx provider with no API key or cliCommand required', () => {
+    // Unlike 'cli' (needs cliCommand to be constructed), 'mlx' is always
+    // constructible — it self-disables at call time when mlx-audio isn't
+    // installed. This is what makes on-device TTS zero-config.
+    const cliOnly = new TextToSpeechService({
+      enabled: true,
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-4o-mini-tts',
+      voice: 'alloy',
+      format: 'opus',
+      timeoutMs: 5000,
+      maxChars: 1000,
+      providers: ['cli'], // no cliCommand → no providers → disabled
+    });
+    expect(cliOnly.isEnabled()).toBe(false);
+
+    const mlxOnly = new TextToSpeechService({
+      enabled: true,
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-4o-mini-tts',
+      voice: 'alloy',
+      format: 'opus',
+      timeoutMs: 5000,
+      maxChars: 1000,
+      providers: ['mlx'],
+    });
+    expect(mlxOnly.isEnabled()).toBe(true);
+  });
+
+  it('builds elevenlabs provider from config', () => {
+    const service = new TextToSpeechService({
+      enabled: true,
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-4o-mini-tts',
+      voice: 'alloy',
+      format: 'opus',
+      timeoutMs: 5000,
+      maxChars: 1000,
+      providers: ['elevenlabs', 'openai'],
+      elevenlabsApiKey: 'el-test-key',
+    });
+
+    expect(service.isEnabled()).toBe(true);
+  });
+
+  it('skips elevenlabs when no API key and falls through', async () => {
+    const service = new TextToSpeechService({
+      enabled: true,
+      baseUrl: 'https://api.openai.com/v1',
+      model: 'gpt-4o-mini-tts',
+      voice: 'alloy',
+      format: 'opus',
+      timeoutMs: 5000,
+      maxChars: 1000,
+      providers: ['elevenlabs'],
+    });
+
+    const result = await service.synthesize({ text: 'hello' });
+    expect(result).toBeUndefined();
+  });
+
+  it('passes voice override through to provider', async () => {
+    let receivedInput: { text: string; voice?: string } | undefined;
+    const service = new TextToSpeechService(
+      {
+        enabled: true,
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-4o-mini-tts',
+        voice: 'alloy',
+        format: 'opus',
+        timeoutMs: 5000,
+        maxChars: 1000,
+        providers: ['custom'],
+      },
+      [
+        {
+          name: 'custom',
+          synthesize: async (input) => {
+            receivedInput = input;
+            return undefined;
+          },
+        },
+      ]
+    );
+
+    await service.synthesize({ text: 'hello', voice: 'vivian' });
+    expect(receivedInput).toBeDefined();
+    expect(receivedInput!.voice).toBe('vivian');
+  });
+
+  it('logs provider name on successful synthesis', async () => {
+    const { logger } = await import('../utils/logger');
+    const service = new TextToSpeechService(
+      {
+        enabled: true,
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-4o-mini-tts',
+        voice: 'alloy',
+        format: 'opus',
+        timeoutMs: 5000,
+        maxChars: 1000,
+        providers: ['custom'],
+      },
+      [
+        {
+          name: 'test-provider',
+          synthesize: async () => ({
+            filePath: '/tmp/test.ogg',
+            contentType: 'audio/ogg',
+            filename: 'reply.ogg',
+            cleanup: async () => {},
+          }),
+        },
+      ]
+    );
+
+    await service.synthesize({ text: 'hello' });
+    expect(logger.info).toHaveBeenCalledWith(
+      'TTS synthesis succeeded',
+      expect.objectContaining({ provider: 'test-provider' })
+    );
+  });
+
+  it('logs warning when all providers exhausted', async () => {
+    const { logger } = await import('../utils/logger');
+    const service = new TextToSpeechService(
+      {
+        enabled: true,
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-4o-mini-tts',
+        voice: 'alloy',
+        format: 'opus',
+        timeoutMs: 5000,
+        maxChars: 1000,
+        providers: ['custom'],
+      },
+      [
+        {
+          name: 'failing-provider',
+          synthesize: async () => undefined,
+        },
+      ]
+    );
+
+    await service.synthesize({ text: 'hello' });
+    expect(logger.warn).toHaveBeenCalledWith(
+      'TTS synthesis: all providers exhausted',
+      expect.objectContaining({ providersAttempted: ['failing-provider'] })
+    );
+  });
+
   it('returns synthesized audio from provider chain', async () => {
-    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'pcp-tts-test-'));
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'ink-tts-test-'));
     const filePath = path.join(tmpDir, 'reply.ogg');
     await writeFile(filePath, Buffer.from('audio-bytes'));
 

@@ -500,23 +500,21 @@ describe('isAgentMentioned', () => {
 
   it('returns true when mentioned username matches a known agent name', () => {
     gateway.setKnownAgentNames(['wren', 'myra', 'benson']);
-    expect(
-      isAgentMentioned(gateway, 'hello', { users: ['@wren'], botMentioned: false })
-    ).toBe(true);
+    expect(isAgentMentioned(gateway, 'hello', { users: ['@wren'], botMentioned: false })).toBe(
+      true
+    );
   });
 
   it('matches mentioned usernames case-insensitively', () => {
     gateway.setKnownAgentNames(['wren']);
-    expect(
-      isAgentMentioned(gateway, 'hello', { users: ['WREN'], botMentioned: false })
-    ).toBe(true);
+    expect(isAgentMentioned(gateway, 'hello', { users: ['WREN'], botMentioned: false })).toBe(true);
   });
 
   it('strips @ prefix from mentioned usernames', () => {
     gateway.setKnownAgentNames(['myra']);
-    expect(
-      isAgentMentioned(gateway, 'hello', { users: ['@myra'], botMentioned: false })
-    ).toBe(true);
+    expect(isAgentMentioned(gateway, 'hello', { users: ['@myra'], botMentioned: false })).toBe(
+      true
+    );
   });
 
   it('returns true when agent name appears in message text', () => {
@@ -544,9 +542,9 @@ describe('isAgentMentioned', () => {
 
   it('returns false when mentioned username does not match any agent', () => {
     gateway.setKnownAgentNames(['wren', 'myra']);
-    expect(
-      isAgentMentioned(gateway, 'hello', { users: ['someuser'], botMentioned: false })
-    ).toBe(false);
+    expect(isAgentMentioned(gateway, 'hello', { users: ['someuser'], botMentioned: false })).toBe(
+      false
+    );
   });
 
   it('handles multiple mentioned usernames', () => {
@@ -562,16 +560,16 @@ describe('isAgentMentioned', () => {
   it('safely handles agent names with regex metacharacters', () => {
     gateway.setKnownAgentNames(['agent+1', 'bot.v2']);
     // Should not throw, and should match literally
-    expect(
-      isAgentMentioned(gateway, 'hey agent+1!', { users: [], botMentioned: false })
-    ).toBe(true);
+    expect(isAgentMentioned(gateway, 'hey agent+1!', { users: [], botMentioned: false })).toBe(
+      true
+    );
     expect(
       isAgentMentioned(gateway, 'ask bot.v2 about it', { users: [], botMentioned: false })
     ).toBe(true);
     // "+" unescaped would match "agent1" — escaped should NOT
-    expect(
-      isAgentMentioned(gateway, 'hey agent1 help', { users: [], botMentioned: false })
-    ).toBe(false);
+    expect(isAgentMentioned(gateway, 'hey agent1 help', { users: [], botMentioned: false })).toBe(
+      false
+    );
   });
 });
 
@@ -618,7 +616,10 @@ describe('Activity Stream Integration', () => {
   });
 
   describe('Incoming Messages', () => {
-    it('should log incoming message to activity stream when userId is provided', async () => {
+    it('does not log inbound messages itself — SessionService is the canonical logger', async () => {
+      // Regression: the gateway used to log message_in with a hardcoded
+      // agentId of 'myra' AND SessionService logged the same message again,
+      // producing duplicate rows that double-rendered in attached CLI views.
       const handler = vi.fn().mockResolvedValue(undefined);
       gateway.setMessageHandler(handler);
 
@@ -632,38 +633,8 @@ describe('Activity Stream Integration', () => {
         { userId: 'user-uuid-123', chatType: 'direct' }
       );
 
-      expect(mockLogMessage).toHaveBeenCalledTimes(1);
-      expect(mockLogMessage).toHaveBeenCalledWith({
-        userId: 'user-uuid-123',
-        agentId: 'myra',
-        direction: 'in',
-        content: 'Hello from user',
-        platform: 'telegram',
-        platformChatId: 'chat123',
-        isDm: true,
-        payload: {
-          senderName: 'Test User',
-          senderId: 'sender456',
-        },
-      });
-    });
-
-    it('should set isDm to false for group chats', async () => {
-      const handler = vi.fn().mockResolvedValue(undefined);
-      gateway.setMessageHandler(handler);
-
-      const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
-
-      await forwardToHandler('telegram', 'group123', { id: 'sender456' }, 'Hello group', {
-        userId: 'user-uuid-123',
-        chatType: 'group',
-      });
-
-      expect(mockLogMessage).toHaveBeenCalledWith(
-        expect.objectContaining({
-          isDm: false,
-        })
-      );
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(mockLogMessage).not.toHaveBeenCalled();
     });
 
     it('should resolve userId from platform + sender ID when not in metadata (Telegram flow)', async () => {
@@ -687,17 +658,9 @@ describe('Activity Stream Integration', () => {
       // Should have resolved user from platform ID
       expect(mockFindByPlatformId).toHaveBeenCalledWith('telegram', 'telegram-sender-789');
 
-      // Should log to activity stream with resolved userId
-      expect(mockLogMessage).toHaveBeenCalledTimes(1);
-      expect(mockLogMessage).toHaveBeenCalledWith(
-        expect.objectContaining({
-          userId: 'resolved-user-uuid',
-          direction: 'in',
-          content: 'Hello from Telegram',
-          platform: 'telegram',
-          platformChatId: 'chat123',
-        })
-      );
+      // Gateway does not log inbound itself (SessionService does) — the
+      // resolution's job is enriching metadata for the handler below.
+      expect(mockLogMessage).not.toHaveBeenCalled();
 
       // Should pass resolved userId to handler in enriched metadata
       expect(handler).toHaveBeenCalledWith(
@@ -766,8 +729,9 @@ describe('Activity Stream Integration', () => {
 
       await sendTelegramMessage('chat123', 'Reply message');
 
-      // Should have logged outbound message using stored userId
-      expect(mockLogMessage).toHaveBeenCalledTimes(2);
+      // Only the outbound message logs from the gateway (inbound is
+      // SessionService's job now)
+      expect(mockLogMessage).toHaveBeenCalledTimes(1);
       expect(mockLogMessage).toHaveBeenLastCalledWith({
         userId: 'user-uuid-123',
         agentId: 'myra',
@@ -823,7 +787,7 @@ describe('Activity Stream Integration', () => {
       const sendTelegramMessage = (gateway as any).sendTelegramMessage.bind(gateway);
       await sendTelegramMessage('chat123', 'Outgoing reply');
 
-      expect(mockLogMessage).toHaveBeenCalledTimes(2);
+      expect(mockLogMessage).toHaveBeenCalledTimes(1);
       expect(mockLogMessage).toHaveBeenLastCalledWith(
         expect.objectContaining({
           userId: 'resolved-user-uuid',
@@ -869,5 +833,169 @@ describe('Activity Stream Integration', () => {
         })
       );
     });
+  });
+});
+
+describe('Telegram album batching', () => {
+  let gateway: ChannelGateway;
+  let sendMediaGroup: Mock;
+  let sendPhoto: Mock;
+  let sendVideo: Mock;
+  let sendDocument: Mock;
+
+  const img = (n: number) => ({
+    type: 'image' as const,
+    path: `/tmp/photo${n}.jpg`,
+    contentType: 'image/jpeg',
+  });
+
+  const sendMedia = (media: unknown[]) =>
+    (gateway as any).sendMediaAttachments('telegram', 'chat-album', media) as Promise<{
+      sent: number;
+      failed: number;
+      errors: string[];
+    }>;
+
+  beforeEach(() => {
+    gateway = new ChannelGateway({ enableTelegram: false, enableWhatsApp: false });
+    sendMediaGroup = vi.fn().mockResolvedValue(undefined);
+    sendPhoto = vi.fn().mockResolvedValue(undefined);
+    sendVideo = vi.fn().mockResolvedValue(undefined);
+    sendDocument = vi.fn().mockResolvedValue(undefined);
+    (gateway as any).telegramListener = { sendMediaGroup, sendPhoto, sendVideo, sendDocument };
+  });
+
+  it('groups multiple images into one sendMediaGroup album', async () => {
+    const result = await sendMedia([img(1), img(2), img(3)]);
+
+    expect(sendMediaGroup).toHaveBeenCalledTimes(1);
+    const [conversationId, items] = sendMediaGroup.mock.calls[0];
+    expect(conversationId).toBe('chat-album');
+    expect(items).toHaveLength(3);
+    expect(items.map((i: { filePath: string }) => i.filePath)).toEqual([
+      '/tmp/photo1.jpg',
+      '/tmp/photo2.jpg',
+      '/tmp/photo3.jpg',
+    ]);
+    expect(sendPhoto).not.toHaveBeenCalled();
+    expect(result.sent).toBe(3);
+    expect(result.failed).toBe(0);
+  });
+
+  it('sends a single image directly without an album', async () => {
+    const result = await sendMedia([img(1)]);
+
+    expect(sendMediaGroup).not.toHaveBeenCalled();
+    expect(sendPhoto).toHaveBeenCalledTimes(1);
+    expect(result.sent).toBe(1);
+  });
+
+  it('splits 12 images into albums of 10 and 2', async () => {
+    const result = await sendMedia(Array.from({ length: 12 }, (_, i) => img(i)));
+
+    expect(sendMediaGroup).toHaveBeenCalledTimes(2);
+    expect(sendMediaGroup.mock.calls[0][1]).toHaveLength(10);
+    expect(sendMediaGroup.mock.calls[1][1]).toHaveLength(2);
+    expect(sendPhoto).not.toHaveBeenCalled();
+    expect(result.sent).toBe(12);
+  });
+
+  it('sends a trailing remainder of one image singly (11 images)', async () => {
+    const result = await sendMedia(Array.from({ length: 11 }, (_, i) => img(i)));
+
+    expect(sendMediaGroup).toHaveBeenCalledTimes(1);
+    expect(sendMediaGroup.mock.calls[0][1]).toHaveLength(10);
+    expect(sendPhoto).toHaveBeenCalledTimes(1);
+    expect(result.sent).toBe(11);
+  });
+
+  it('mixes videos into albums alongside images', async () => {
+    const result = await sendMedia([
+      img(1),
+      { type: 'video', path: '/tmp/clip.mp4', contentType: 'video/mp4' },
+    ]);
+
+    expect(sendMediaGroup).toHaveBeenCalledTimes(1);
+    const items = sendMediaGroup.mock.calls[0][1];
+    expect(items.map((i: { type: string }) => i.type)).toEqual(['image', 'video']);
+    expect(sendVideo).not.toHaveBeenCalled();
+    expect(result.sent).toBe(2);
+  });
+
+  it('keeps non-groupable media on the per-item path', async () => {
+    const result = await sendMedia([
+      img(1),
+      img(2),
+      { type: 'document', path: '/tmp/report.pdf', contentType: 'application/pdf' },
+    ]);
+
+    expect(sendMediaGroup).toHaveBeenCalledTimes(1);
+    expect(sendMediaGroup.mock.calls[0][1]).toHaveLength(2);
+    expect(sendDocument).toHaveBeenCalledTimes(1);
+    expect(result.sent).toBe(3);
+  });
+
+  it('counts the whole batch as failed when the album send fails', async () => {
+    sendMediaGroup.mockRejectedValueOnce(new Error('flood control'));
+
+    const result = await sendMedia([img(1), img(2)]);
+
+    expect(result.sent).toBe(0);
+    expect(result.failed).toBe(2);
+    expect(result.errors.some((e) => e.includes('flood control'))).toBe(true);
+    // Album failure must not cascade into single sends
+    expect(sendPhoto).not.toHaveBeenCalled();
+  });
+
+  it('skips attachments missing both path and url without sinking the album', async () => {
+    const result = await sendMedia([img(1), img(2), { type: 'image' }]);
+
+    expect(sendMediaGroup).toHaveBeenCalledTimes(1);
+    expect(sendMediaGroup.mock.calls[0][1]).toHaveLength(2);
+    expect(result.sent).toBe(2);
+    expect(result.failed).toBe(1);
+  });
+
+  it('downloads URL album items with the same filename to distinct temp paths', async () => {
+    // Two album items sharing a display filename must not overwrite each
+    // other's temp download — that uploaded duplicate bytes for one of them.
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const body = String(url).includes('first') ? 'AAAA' : 'BBBB';
+      return {
+        ok: true,
+        arrayBuffer: async () => new TextEncoder().encode(body).buffer,
+      } as unknown as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    // Read temp file contents inside the send, before batch cleanup runs
+    const { readFileSync } = await import('fs');
+    const capturedPaths: string[] = [];
+    const capturedContents: string[] = [];
+    sendMediaGroup.mockImplementation(async (_conv: string, items: Array<{ filePath: string }>) => {
+      for (const item of items) {
+        capturedPaths.push(item.filePath);
+        capturedContents.push(readFileSync(item.filePath, 'utf-8'));
+      }
+    });
+
+    try {
+      const result = await sendMedia([
+        { type: 'image', url: 'https://example.com/first/photo.jpg', filename: 'photo.jpg' },
+        { type: 'image', url: 'https://example.com/second/photo.jpg', filename: 'photo.jpg' },
+      ]);
+
+      expect(sendMediaGroup).toHaveBeenCalledTimes(1);
+      expect(capturedPaths).toHaveLength(2);
+      // Distinct temp paths, distinct bytes — the colliding implementation
+      // produced ['BBBB', 'BBBB'] here
+      expect(capturedPaths[0]).not.toBe(capturedPaths[1]);
+      expect(capturedContents).toEqual(['AAAA', 'BBBB']);
+      // Display filename preserved as the basename of both
+      expect(capturedPaths.every((p) => p.endsWith('photo.jpg'))).toBe(true);
+      expect(result.sent).toBe(2);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

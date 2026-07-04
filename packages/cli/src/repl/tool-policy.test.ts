@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { type SessionVisibility, ToolPolicyState } from './tool-policy.js';
+import { applyProfile } from './tool-profiles.js';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -11,14 +12,22 @@ describe('ToolPolicyState', () => {
     expect(decision.allowed).toBe(true);
   });
 
-  it('blocks unsafe tools by default', () => {
+  it('blocks tools in deny list', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
+    policy.denyTool('send_to_inbox');
     const decision = policy.canCallPcpTool('send_to_inbox');
     expect(decision.allowed).toBe(false);
   });
 
+  it('allows unlisted tools by default (no narrowing without allowlist)', () => {
+    const policy = new ToolPolicyState('backend', { persist: false });
+    const decision = policy.canCallPcpTool('send_to_inbox');
+    expect(decision.allowed).toBe(true);
+  });
+
   it('consumes scoped grants', () => {
     const policy = new ToolPolicyState('off', { persist: false });
+    policy.addPromptTool('send_to_inbox');
     policy.grantTool('send_to_inbox', 2);
 
     expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
@@ -39,6 +48,7 @@ describe('ToolPolicyState', () => {
 
   it('supports session-scoped grants', () => {
     const policy = new ToolPolicyState('backend', { persist: false });
+    policy.addPromptTool('send_to_inbox');
     policy.grantToolForSession('sess-1', 'send_to_inbox');
     expect(policy.canCallPcpTool('send_to_inbox', 'sess-1').allowed).toBe(true);
     expect(policy.canCallPcpTool('send_to_inbox', 'sess-2').allowed).toBe(false);
@@ -112,8 +122,8 @@ describe('ToolPolicyState', () => {
 
     policy.removeToolRule('send_to_inbox');
     const postRemove = policy.canCallPcpTool('send_to_inbox');
-    expect(postRemove.allowed).toBe(false);
-    expect(postRemove.promptable).toBe(true);
+    // After removing the prompt rule, the tool is allowed by default
+    expect(postRemove.allowed).toBe(true);
   });
 
   it('supports wildcard allow and deny patterns', () => {
@@ -175,7 +185,7 @@ describe('ToolPolicyState', () => {
       JSON.stringify({
         version: 1,
         denyTools: ['send_*'],
-        promptTools: ['trigger_*'],
+        promptTools: ['trigger_*', 'remember'],
         grants: { create_task: -3, remember: 2 },
       }),
       'utf-8'
@@ -187,6 +197,7 @@ describe('ToolPolicyState', () => {
     expect(triggerDecision.allowed).toBe(false);
     expect(triggerDecision.promptable).toBe(true);
     expect(policy.listGrants().find((entry) => entry.tool === 'create_task')?.uses).toBe(0);
+    // remember has 2 grants + prompt rule — grants consumed first, then blocked
     expect(policy.canCallPcpTool('remember').allowed).toBe(true);
     expect(policy.canCallPcpTool('remember').allowed).toBe(true);
     expect(policy.canCallPcpTool('remember').allowed).toBe(false);
@@ -206,6 +217,8 @@ describe('ToolPolicyState', () => {
     expect(policy.canCallPcpTool('send_to_inbox', 'sess-1').allowed).toBe(true);
 
     // Exercise finite decrement branch inside hasSessionGrant.
+    // Add a prompt rule so the tool is blocked after the grant is consumed.
+    policy.addPromptTool('send_to_inbox');
     (
       policy as unknown as {
         sessionGrants: Map<string, Map<string, number>>;
@@ -421,10 +434,7 @@ describe('ToolPolicyState', () => {
       },
     } as const;
 
-    const expectations: Record<
-      SessionVisibility,
-      Record<keyof typeof targets, boolean>
-    > = {
+    const expectations: Record<SessionVisibility, Record<keyof typeof targets, boolean>> = {
       self: {
         self: true,
         sameThread: false,
@@ -558,5 +568,164 @@ describe('ToolPolicyState', () => {
         expect(decision.promptable, testCase.name).toBe(testCase.expected.promptable);
       }
     }
+  });
+
+  describe('permanentGrants', () => {
+    it('persistentGrant prevents addPromptTool from re-adding tool', () => {
+      const policy = new ToolPolicyState('backend', { persist: false });
+      policy.addPromptTool('send_response');
+      expect(policy.canCallPcpTool('send_response').allowed).toBe(false);
+
+      policy.persistentGrant('send_response');
+      expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
+
+      policy.addPromptTool('send_response');
+      expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
+      expect(policy.listPermanentGrants()).toContain('send_response');
+    });
+
+    it('permanentGrants survive clearScopeRules for global scope', () => {
+      const policy = new ToolPolicyState('backend', { persist: false });
+      policy.addPromptTool('send_response');
+      policy.persistentGrant('send_response');
+
+      policy.clearScopeRules({ scope: 'global' });
+
+      expect(policy.listPermanentGrants()).toContain('send_response');
+      policy.addPromptTool('send_response');
+      expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
+    });
+
+    it('permanentGrants survive clearScopeRules for scoped scope', () => {
+      const policy = new ToolPolicyState('backend', {
+        persist: false,
+        context: { studioId: 'main' },
+        mutationScope: { scope: 'studio', id: 'main' },
+      });
+      policy.addPromptTool('send_response');
+      policy.persistentGrant('send_response');
+
+      policy.clearScopeRules({ scope: 'studio', id: 'main' });
+
+      expect(policy.listPermanentGrants()).toContain('send_response');
+      policy.addPromptTool('send_response');
+      expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
+    });
+
+    it('simulates full heartbeat cycle: applyProfile does not undo grants', () => {
+      // applyProfile imported at top of file
+      const policy = new ToolPolicyState('backend', {
+        persist: false,
+        context: { studioId: 'main' },
+        mutationScope: { scope: 'studio', id: 'main' },
+      });
+
+      applyProfile(policy, 'safe');
+      expect(policy.canCallPcpTool('send_response').allowed).toBe(false);
+      expect(policy.canCallPcpTool('send_response').promptable).toBe(true);
+
+      policy.persistentGrant('send_response');
+      expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
+
+      applyProfile(policy, 'safe');
+      expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
+      expect(policy.listPromptTools()).not.toContain('send_response');
+    });
+
+    it('permanentGrant on group expands and persists all members', () => {
+      const policy = new ToolPolicyState('backend', { persist: false });
+      policy.addPromptTool('group:ink-comms');
+      policy.persistentGrant('group:ink-comms');
+
+      const grants = policy.listPermanentGrants();
+      expect(grants).toContain('send_to_inbox');
+      expect(grants).toContain('trigger_agent');
+      expect(grants).toContain('send_response');
+
+      policy.addPromptTool('group:ink-comms');
+      expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
+      expect(policy.canCallPcpTool('send_to_inbox').allowed).toBe(true);
+    });
+
+    it('revokePermanentGrant allows re-adding to promptTools', () => {
+      const policy = new ToolPolicyState('backend', { persist: false });
+      policy.addPromptTool('send_response');
+      policy.persistentGrant('send_response');
+      expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
+
+      policy.revokePermanentGrant('send_response');
+      expect(policy.listPermanentGrants()).not.toContain('send_response');
+
+      policy.addPromptTool('send_response');
+      expect(policy.canCallPcpTool('send_response').allowed).toBe(false);
+    });
+
+    it('persistentGrant does not cause narrowing of other tools', () => {
+      const policy = new ToolPolicyState('backend', { persist: false });
+      policy.addPromptTool('send_response');
+      policy.persistentGrant('send_response');
+
+      expect(policy.canCallPcpTool('send_response').allowed).toBe(true);
+      expect(policy.canCallPcpTool('get_integration_health').allowed).toBe(true);
+      expect(policy.canCallPcpTool('remember').allowed).toBe(true);
+    });
+
+    it('permanentGrants persist to disk and load back', () => {
+      const tmpDir = mkdtempSync(join(tmpdir(), 'tp-grants-'));
+      const policyPath = join(tmpDir, 'tool-policy.json');
+
+      try {
+        const policy1 = new ToolPolicyState('backend', {
+          persist: true,
+          policyPath,
+          context: { studioId: 'main' },
+          mutationScope: { scope: 'studio', id: 'main' },
+        });
+        policy1.addPromptTool('send_response');
+        policy1.persistentGrant('send_response');
+
+        const policy2 = new ToolPolicyState('backend', {
+          persist: true,
+          policyPath,
+          context: { studioId: 'main' },
+          mutationScope: { scope: 'studio', id: 'main' },
+        });
+        expect(policy2.listPermanentGrants()).toContain('send_response');
+        expect(policy2.listPromptTools()).not.toContain('send_response');
+      } finally {
+        rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('permanentGrants persist through disk save + clearScopeRules + reload', () => {
+      const tmpDir = mkdtempSync(join(tmpdir(), 'tp-grants-cycle-'));
+      const policyPath = join(tmpDir, 'tool-policy.json');
+
+      try {
+        const policy1 = new ToolPolicyState('backend', {
+          persist: true,
+          policyPath,
+          context: { studioId: 'main' },
+          mutationScope: { scope: 'studio', id: 'main' },
+        });
+        policy1.addPromptTool('group:ink-comms');
+        policy1.persistentGrant('send_response');
+        policy1.clearScopeRules({ scope: 'studio', id: 'main' });
+
+        const policy2 = new ToolPolicyState('backend', {
+          persist: true,
+          policyPath,
+          context: { studioId: 'main' },
+          mutationScope: { scope: 'studio', id: 'main' },
+        });
+        expect(policy2.listPermanentGrants()).toContain('send_response');
+
+        // applyProfile imported at top of file
+        applyProfile(policy2, 'safe');
+        expect(policy2.canCallPcpTool('send_response').allowed).toBe(true);
+      } finally {
+        rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
   });
 });

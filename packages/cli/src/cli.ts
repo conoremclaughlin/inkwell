@@ -35,6 +35,7 @@ import { registerPermissionsCommands } from './commands/permissions.js';
 import { registerSkillsCommands } from './commands/skills.js';
 import { registerMemoryCommands } from './commands/memory.js';
 import { registerWaitCommand } from './commands/wait.js';
+import { registerPolicyCommands } from './commands/policy.js';
 import { runClaude, runClaudeInteractive } from './commands/claude.js';
 import { resolveBackend } from './backends/index.js';
 import { initSbDebug, sbDebugLog } from './lib/sb-debug.js';
@@ -318,6 +319,7 @@ registerPermissionsCommands(program);
 registerSkillsCommands(program);
 registerMemoryCommands(program);
 registerWaitCommand(program);
+registerPolicyCommands(program);
 
 // ============================================================================
 // Subcommand detection

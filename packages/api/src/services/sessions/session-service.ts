@@ -9,7 +9,8 @@
  */
 
 import { randomUUID } from 'crypto';
-import { access } from 'fs/promises';
+import { access, readFile, stat } from 'fs/promises';
+import path from 'path';
 import { SupabaseClient } from '@supabase/supabase-js';
 import jwt from 'jsonwebtoken';
 import type { Database } from '../../data/supabase/types.js';
@@ -26,6 +27,7 @@ import type {
   ISessionRepository,
   IContextBuilder,
   ToolCall,
+  ImageContent,
 } from './types.js';
 import type { Json } from '../../data/supabase/types.js';
 import { SessionRepository } from './session-repository.js';
@@ -37,6 +39,7 @@ import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import { resolveIdentityId } from '../../auth/resolve-identity.js';
 import { classifyError } from '@inklabs/shared';
+import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
 import { logger } from '../../utils/logger.js';
 
@@ -80,6 +83,7 @@ export interface IActivityStream {
     platformChatId?: string;
     isDm?: boolean;
     payload?: Json;
+    taskGroupId?: string;
   }): Promise<{ id: string }>;
 
   logActivity(params: {
@@ -94,6 +98,12 @@ export interface IActivityStream {
     platformChatId?: string;
     taskGroupId?: string;
   }): Promise<{ id: string }>;
+
+  /**
+   * Optional: backfill task-group/session linkage on an already-logged
+   * activity (incoming messages are logged before session routing resolves).
+   */
+  tagActivityTaskGroup?(activityId: string, taskGroupId: string, sessionId?: string): Promise<void>;
 }
 
 /**
@@ -194,17 +204,26 @@ export class SessionService implements ISessionService {
       contentLength: content.length,
     });
 
+    // Mission (task group) linkage for the check-in entry. Only explicit
+    // metadata tags at insert time (free — no lookup). Resolver-based tagging
+    // is deferred to a detached backfill after routing so timeline bookkeeping
+    // never delays message handling.
+    const messageTaskGroupId: string | undefined = metadata?.taskGroupId;
+
     // Persist incoming message to activity stream immediately
     // This ensures messages are logged even if processing fails
+    let loggedMessageId: string | undefined;
     try {
-      await this.activityStream.logMessage({
+      const logged = await this.activityStream.logMessage({
         userId,
         agentId,
         direction: 'in',
         content,
         platform: request.channel,
         platformChatId: request.conversationId,
-        isDm: metadata?.chatType === 'direct',
+        // Telegram reports private chats as 'private' (not 'direct') — treat
+        // anything that isn't group-shaped as a DM
+        isDm: !['group', 'supergroup', 'channel'].includes(metadata?.chatType ?? ''),
         payload: JSON.parse(
           JSON.stringify({
             sender: request.sender,
@@ -215,7 +234,9 @@ export class SessionService implements ISessionService {
             studioHint: metadata?.studioHint,
           })
         ),
+        taskGroupId: messageTaskGroupId,
       });
+      loggedMessageId = logged.id;
     } catch (logError) {
       // Don't fail the request if activity logging fails
       logger.warn('Failed to log incoming message to activity stream', {
@@ -239,6 +260,24 @@ export class SessionService implements ISessionService {
         contactId: metadata?.contactId,
         repoRoot: metadata?.repoRoot,
       });
+
+      // Backfill mission linkage now that routing resolved: a check-in that
+      // landed in a session bound to a mission thread (e.g. a Telegram reply
+      // routed into a strategy session) belongs on that mission's timeline.
+      // Also stamps session_id so the timeline can link to the session turn
+      // the check-in triggered. Genuinely fire-and-forget — the resolve →
+      // tag ordering lives inside the detached chain and nothing here is
+      // awaited, so message processing continues immediately.
+      if (loggedMessageId && this.activityStream.tagActivityTaskGroup) {
+        this.backfillMessageTaskGroup({
+          activityId: loggedMessageId,
+          userId,
+          sessionId: session.id,
+          knownTaskGroupId: messageTaskGroupId,
+          metadataThreadKey: metadata?.threadKey,
+          sessionThreadKey: session.threadKey,
+        });
+      }
 
       // 2. Log session routing for external + heartbeat channels
       // so we can verify messages and heartbeats land in the same session.
@@ -284,6 +323,12 @@ export class SessionService implements ISessionService {
 
       try {
         const result = await this.processMessage(request, session);
+        // If the initial lock-holder failed with a non-retryable error,
+        // flush queued messages before processQueueOrReleaseLock runs —
+        // every queued message would fail the same way.
+        if (!result.success && result.error) {
+          this.flushQueueOnNonRetryableError(lockKey, result.error);
+        }
         return result;
       } finally {
         // 6. Process queued messages or release lock
@@ -315,6 +360,49 @@ export class SessionService implements ISessionService {
    * If there are pending messages, process the next one (lock remains held).
    * If queue is empty, release the lock.
    */
+  /**
+   * Detached (fire-and-forget) mission backfill for a logged check-in.
+   *
+   * Resolves the task group from explicit metadata, the request threadKey, or
+   * the routed session's threadKey — in that order — then tags the activity
+   * row with task_group_id + session_id. Best-effort timeline bookkeeping:
+   * callers must NOT await this; failures are logged at debug and never throw.
+   */
+  private backfillMessageTaskGroup(params: {
+    activityId: string;
+    userId: string;
+    sessionId: string;
+    knownTaskGroupId?: string;
+    metadataThreadKey?: string;
+    sessionThreadKey?: string;
+  }): void {
+    const { activityId, userId, sessionId, knownTaskGroupId, metadataThreadKey, sessionThreadKey } =
+      params;
+    const tagActivityTaskGroup = this.activityStream.tagActivityTaskGroup?.bind(
+      this.activityStream
+    );
+    if (!tagActivityTaskGroup) return;
+    const supabase = this.supabase;
+
+    void (async () => {
+      let groupId: string | null = knownTaskGroupId ?? null;
+      if (!groupId && supabase && metadataThreadKey) {
+        groupId = await resolveTaskGroupForThreadKey(supabase, userId, metadataThreadKey);
+      }
+      if (!groupId && supabase && sessionThreadKey && sessionThreadKey !== metadataThreadKey) {
+        groupId = await resolveTaskGroupForThreadKey(supabase, userId, sessionThreadKey);
+      }
+      if (groupId) {
+        await tagActivityTaskGroup(activityId, groupId, sessionId);
+      }
+    })().catch((tagError) => {
+      logger.debug('Failed to backfill task group on check-in activity', {
+        activityId,
+        error: tagError instanceof Error ? tagError.message : String(tagError),
+      });
+    });
+  }
+
   private async processQueueOrReleaseLock(lockKey: string): Promise<void> {
     const queue = this.pendingQueues.get(lockKey);
 
@@ -350,10 +438,18 @@ export class SessionService implements ISessionService {
 
         const result = await this.processMessage(pending.request, session);
         pending.resolve(result);
+        // Flush on non-retryable success:false results (e.g. InkRunner session limit)
+        if (!result.success && result.error) {
+          this.flushQueueOnNonRetryableError(lockKey, result.error);
+        }
       } catch (error) {
         pending.reject(error instanceof Error ? error : new Error(String(error)));
+        this.flushQueueOnNonRetryableError(
+          lockKey,
+          error instanceof Error ? error.message : String(error)
+        );
       } finally {
-        // Continue processing queue
+        // Continue processing queue (if not flushed above)
         await this.processQueueOrReleaseLock(lockKey);
       }
     } else {
@@ -361,6 +457,50 @@ export class SessionService implements ISessionService {
       this.processingLocks.delete(lockKey);
       this.pendingQueues.delete(lockKey);
       logger.debug('Released processing lock', { lockKey });
+    }
+  }
+
+  /**
+   * Flush remaining queued messages when the error is non-retryable (quota, auth, config).
+   * Every pending message would fail the same way — flushing prevents budget burn.
+   */
+  private flushQueueOnNonRetryableError(lockKey: string, errorText: string): void {
+    const errorClass = classifyError({ errorText });
+    if (!errorClass.retryable && errorClass.category !== 'unknown') {
+      const remaining = this.pendingQueues.get(lockKey);
+      if (remaining && remaining.length > 0) {
+        const flushedCount = remaining.length;
+        logger.warn('Flushing message queue after non-retryable error', {
+          lockKey,
+          errorCategory: errorClass.category,
+          flushedCount,
+        });
+
+        const firstQueued = remaining[0];
+        this.activityStream
+          .logActivity({
+            userId: firstQueued.request.userId,
+            agentId: firstQueued.request.agentId,
+            type: 'error',
+            subtype: 'queue_flush',
+            content: `Flushed ${flushedCount} queued message${flushedCount === 1 ? '' : 's'}: ${errorClass.category} — ${errorClass.summary}`,
+            payload: {
+              errorCategory: errorClass.category,
+              errorSummary: errorClass.summary,
+              flushedCount,
+              lockKey,
+            } as unknown as Json,
+          })
+          .catch(() => {});
+
+        const flushError = new Error(
+          `Queue flushed: ${errorClass.category} — ${errorClass.summary}`
+        );
+        for (const queued of remaining) {
+          queued.reject(flushError);
+        }
+        this.pendingQueues.delete(lockKey);
+      }
     }
   }
 
@@ -397,10 +537,16 @@ export class SessionService implements ISessionService {
       session.backend,
       injectedContext.agent.backend
     );
+    // For ink, model selection is based on the provider (the LLM underneath),
+    // not the backend itself. For direct backends, backend === provider.
+    const modelKey =
+      resolvedBackend === 'ink'
+        ? this.normalizeBackend(injectedContext.agent.provider)
+        : resolvedBackend;
     const runtimeModel =
-      resolvedBackend === 'codex-cli'
+      modelKey === 'codex-cli'
         ? this.config.defaultCodexModel
-        : resolvedBackend === 'gemini'
+        : modelKey === 'gemini'
           ? this.config.defaultGeminiModel
           : this.config.defaultModel;
 
@@ -468,6 +614,7 @@ export class SessionService implements ISessionService {
       ...(pcpAccessToken ? { pcpAccessToken } : {}),
       pcpSessionId: session.id,
       agentId,
+      channel: request.channel,
       ...(session.studioId ? { studioId: session.studioId } : {}),
       ...(sandboxBypass ? { sandboxBypass: true } : {}),
       ...(permissionOverlay ? { permissionOverlay } : {}),
@@ -538,6 +685,16 @@ export class SessionService implements ISessionService {
     // Mark session as running before backend turn
     await this.repository.update(session.id, { lifecycle: 'running' });
 
+    // Media flows to backends as file paths, not inline base64. Channel
+    // listeners download attachments to ~/.ink/files/<channel>/; the
+    // formatted message lists the full paths, and each runner forwards
+    // them natively (ClaudeRunner already grants --add-dir ~/.ink/files;
+    // InkRunner passes --attach-file so ink chat exposes them to its
+    // provider backend). The base64 imageContents branch
+    // (readImageAttachmentsAsBase64) is reserved for future API-direct
+    // providers / a persistent media store and is not invoked here.
+    const mediaAttachments = (request.metadata?.media ?? []).filter((m) => !!m.path);
+
     let result;
     let turnDurationMs: number;
     const turnStartMs = Date.now();
@@ -546,6 +703,7 @@ export class SessionService implements ISessionService {
         backendSessionId: session.backendSessionId || undefined,
         injectedContext: session.backendSessionId ? undefined : injectedContext,
         config: runnerConfig,
+        mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
       });
       turnDurationMs = Date.now() - turnStartMs;
     } catch (runnerError) {
@@ -599,7 +757,7 @@ export class SessionService implements ISessionService {
         subtype: `backend_cli:${resolvedBackend}`,
         content: result.success
           ? `Backend turn completed (${resolvedBackend}, ${Math.round(turnDurationMs / 1000)}s)`
-          : `Backend turn failed (${resolvedBackend}): ${result.error?.slice(0, 500) || 'unknown error'}`,
+          : `Backend turn failed (${resolvedBackend}, ${errorClassification?.category || 'unknown'}): ${errorClassification?.summary || result.error?.slice(0, 500) || 'unknown error'}`,
         sessionId: session.id,
         taskGroupId,
         payload: {
@@ -673,7 +831,10 @@ export class SessionService implements ISessionService {
 
       // 6. Check if compaction is needed — only for claude-code backend where
       // PCP controls the context window (via sb chat). Native CLI backends
-      // (codex-cli, gemini) manage their own context lifecycle.
+      // (codex-cli, gemini) manage their own context lifecycle. The ink
+      // backend self-compacts inside ink chat (token-budget auto-compaction);
+      // its usage is persisted above for visibility but the server must NOT
+      // also trigger compaction — one compaction owner per backend.
       if (
         resolvedBackend === 'claude-code' &&
         result.usage.contextTokens >= this.config.compactionThreshold
@@ -758,7 +919,7 @@ export class SessionService implements ISessionService {
   ): Promise<Session> {
     const type = options?.type || 'primary';
 
-    const backend = await this.resolveAgentBackend(userId, agentId);
+    const { backend } = await this.resolveAgentBackend(userId, agentId);
     const resolvedStudioId = await this.resolveStudioId(userId, agentId, {
       threadKey: options?.threadKey,
       explicitStudioId: options?.studioId,
@@ -1046,15 +1207,21 @@ export class SessionService implements ISessionService {
 
     // 3) Studio route pattern match — studios declare which threadKey patterns
     //    they handle (e.g., 'pr:*', 'spec:*'). See spec:trigger-studio-routing.
+    //    When repoRoot is provided, scope to studios in the same repo to prevent
+    //    catch-all patterns in project A from capturing triggers for project B.
     if (options.threadKey) {
       // route_patterns is not yet in generated Supabase types — cast result
-      const { data: patternStudios } = (await this.supabase
+      let patternQuery = this.supabase
         .from('studios')
         .select('id, route_patterns')
         .eq('user_id', userId)
         .eq('agent_id', agentId)
         .in('status', ['active', 'idle'])
-        .not('route_patterns', 'eq', '{}')) as {
+        .not('route_patterns', 'eq', '{}');
+      if (options.repoRoot) {
+        patternQuery = patternQuery.eq('repo_root', options.repoRoot);
+      }
+      const { data: patternStudios } = (await patternQuery) as unknown as {
         data: Array<{ id: string; route_patterns: string[] }> | null;
       };
 
@@ -1111,7 +1278,23 @@ export class SessionService implements ISessionService {
       }
     }
 
-    // 4) Agent's own studio (authoritative — from studios table, not session history)
+    // 4) repoRoot-scoped main studio — when the caller specifies a target repo
+    //    (e.g., strategy triggers with cross-project repoRoot), resolve to the
+    //    main studio for that repo before falling through to the generic
+    //    "agent's most recent studio" which may belong to a different project.
+    if (options.repoRoot) {
+      const repoRootStudioId = await this.resolveMainStudioId(userId, options.repoRoot, agentId);
+      if (repoRootStudioId) {
+        logger.debug('[StudioResolve] Resolved studio via repoRoot', {
+          repoRoot: options.repoRoot,
+          agentId,
+          studioId: repoRootStudioId,
+        });
+        return repoRootStudioId;
+      }
+    }
+
+    // 5) Agent's own studio (authoritative — from studios table, not session history)
     const { data: agentStudio } = await this.supabase
       .from('studios')
       .select('id, updated_at')
@@ -1135,7 +1318,7 @@ export class SessionService implements ISessionService {
     // It creates feedback loops: if an agent is misrouted once, all future sessions
     // inherit the bad studio. The studios table is the authoritative source.
 
-    // 5) Shared per-user main studio fallback
+    // 6) Shared per-user main studio fallback (no repoRoot — uses default cwd)
     const mainStudioId = await this.resolveMainStudioId(userId, options.repoRoot, agentId);
     if (mainStudioId) {
       logger.debug('[StudioResolve] Fell back to main studio', {
@@ -1300,10 +1483,12 @@ This session will continue with a fresh context after compaction. Your identity,
       );
 
       const runtimeBackend = this.resolveRuntimeBackend(session.backend, context.agent.backend);
+      const compactionModelKey =
+        runtimeBackend === 'ink' ? this.normalizeBackend(context.agent.provider) : runtimeBackend;
       const runtimeModel =
-        runtimeBackend === 'codex-cli'
+        compactionModelKey === 'codex-cli'
           ? this.config.defaultCodexModel
-          : runtimeBackend === 'gemini'
+          : compactionModelKey === 'gemini'
             ? this.config.defaultGeminiModel
             : this.config.defaultModel;
 
@@ -1411,17 +1596,23 @@ This session will continue with a fresh context after compaction. Your identity,
   private async resolveAgentBackend(
     userId: string,
     agentId: string
-  ): Promise<'claude-code' | 'codex-cli' | 'gemini' | 'ink'> {
+  ): Promise<{
+    backend: 'claude-code' | 'codex-cli' | 'gemini' | 'ink';
+    provider: 'claude-code' | 'codex-cli' | 'gemini' | 'ink' | null;
+  }> {
     try {
-      const identityBackend = await this.contextBuilder.getAgentBackend(userId, agentId);
-      return this.normalizeBackend(identityBackend);
+      const { backend, provider } = await this.contextBuilder.getAgentBackend(userId, agentId);
+      return {
+        backend: this.normalizeBackend(backend),
+        provider: provider ? this.normalizeBackend(provider) : null,
+      };
     } catch (error) {
       logger.warn('Failed to resolve agent backend, falling back to claude-code', {
         userId,
         agentId,
         error: error instanceof Error ? error.message : String(error),
       });
-      return 'claude-code';
+      return { backend: 'claude-code', provider: null };
     }
   }
 
@@ -1450,6 +1641,22 @@ This session will continue with a fresh context after compaction. Your identity,
         endSummary: summary,
       },
     });
+
+    // Clear stale channel_routes so heartbeat reminders don't route to this ended session
+    if (this.supabase) {
+      await this.supabase
+        .from('channel_routes')
+        .update({ active_session_id: null })
+        .eq('active_session_id', sessionId)
+        .then(({ error }) => {
+          if (error) {
+            logger.warn('Failed to clear channel_routes.active_session_id', {
+              sessionId,
+              error: error.message,
+            });
+          }
+        });
+    }
 
     logger.info('Session ended', { sessionId, summary });
   }
@@ -1499,8 +1706,10 @@ This session will continue with a fresh context after compaction. Your identity,
     const MAX_INPUT_LENGTH = 10_000;
 
     for (const toolCall of toolCalls) {
-      // Truncate large inputs to avoid bloating the activity stream
-      let inputPayload = toolCall.input;
+      // Redact sensitive keys BEFORE truncation so neither the persisted
+      // input blob nor its preview carries secrets, then truncate large
+      // inputs to avoid bloating the activity stream.
+      let inputPayload = redactSensitiveValues(toolCall.input) as Record<string, unknown>;
       const inputStr = JSON.stringify(inputPayload);
       if (inputStr.length > MAX_INPUT_LENGTH) {
         inputPayload = {
@@ -1510,15 +1719,23 @@ This session will continue with a fresh context after compaction. Your identity,
         };
       }
 
+      const argsSummary = summarizeToolArgs(toolCall.input);
+
       await this.activityStream.logActivity({
         userId,
         agentId,
         type: 'tool_call',
         subtype: toolCall.toolName,
-        content: `${toolCall.toolName}(${Object.keys(toolCall.input).join(', ')})`,
+        content: `${toolCall.toolName}(${argsSummary})`,
         payload: {
           toolUseId: toolCall.toolUseId,
           toolName: toolCall.toolName,
+          tool: toolCall.toolName,
+          argsSummary,
+          // Runners capture tool_use events from a completed turn's output;
+          // per-call failure/duration isn't parsed yet, so status reflects
+          // the turn-level "call was made" fact.
+          status: 'completed',
           input: inputPayload,
         } as unknown as Json,
         sessionId,
@@ -1535,8 +1752,15 @@ This session will continue with a fresh context after compaction. Your identity,
    */
   private formatMessage(request: SessionRequest, timezone?: string): string {
     const { sender, content, channel, conversationId, metadata } = request;
+    // Channels carrying user-controlled content get <untrusted-data>
+    // wrapping. Keep in sync with the external-channel list in
+    // handleMessage's response routing — slack was missing here while the
+    // slack listener was live, leaving its inbound bodies unwrapped.
     const isExternalChannel =
-      channel === 'telegram' || channel === 'whatsapp' || channel === 'discord';
+      channel === 'telegram' ||
+      channel === 'whatsapp' ||
+      channel === 'discord' ||
+      channel === 'slack';
 
     const lines: string[] = [];
 
@@ -1568,16 +1792,39 @@ This session will continue with a fresh context after compaction. Your identity,
     }
 
     // Add sender info header
-    lines.push(`From: ${sender.name}${sender.username ? ` (@${sender.username})` : ''}`);
+    const senderName = sanitizeHeaderText(sender.name) || 'unknown';
+    const senderUsername = sanitizeHeaderText(sender.username);
+    lines.push(`From: ${senderName}${senderUsername ? ` (@${senderUsername})` : ''}`);
     lines.push(`Channel: ${channel}`);
     if (conversationId) {
       lines.push(`Conversation ID: ${conversationId}`);
     }
 
-    // Add media info if present
+    // Add media info if present — full local paths so the session can read
+    // the files directly (ClaudeRunner grants --add-dir ~/.ink/files; ink
+    // sessions receive the same paths via --attach-file).
+    //
+    // SECURITY: this block sits ABOVE the <untrusted-data> wrapper, so any
+    // source-provided display metadata (filenames, content types arrive
+    // from the channel and are user-controlled) must be flattened to a
+    // single bounded line — a filename containing newlines would otherwise
+    // escape its bullet and become trusted prompt text. Paths are
+    // server-generated by the channel listeners but get the same
+    // control-character treatment as belt-and-braces.
     if (metadata?.media && metadata.media.length > 0) {
-      const mediaTypes = metadata.media.map((m) => m.type).join(', ');
-      lines.push(`Attachments: ${mediaTypes}`);
+      lines.push('Attachments:');
+      for (const m of metadata.media) {
+        const mime = sanitizeHeaderText(m.contentType || m.mimeType, 60);
+        const filename = sanitizeHeaderText(m.filename);
+        const name = filename ? ` ${filename}` : '';
+        const path = m.path ? stripControlChars(m.path) : undefined;
+        if (path) {
+          lines.push(`- ${m.type}: ${path}${mime ? ` (${mime})` : ''}${name}`);
+        } else {
+          lines.push(`- ${m.type}${mime ? ` (${mime})` : ''}${name}`);
+        }
+      }
+      lines.push('View attached files with your file-reading tool using the paths above.');
     }
 
     lines.push('');
@@ -1624,29 +1871,76 @@ This session will continue with a fresh context after compaction. Your identity,
  * target project. When no repoRoot is provided, falls back to process.cwd()
  * (the server's working directory).
  *
- * Returns undefined when no matching studio exists — callers should use
- * defaultWorkingDirectory as the spawn path (the root repo itself).
+ * When `autoCreate` is true and both `agentId` and `repoRoot` are provided,
+ * auto-creates a studio row so every root-repo session gets a real
+ * studio_id instead of NULL.  Falls back to undefined when the caller
+ * didn't supply enough info to safely auto-create.
  */
 export async function resolveMainStudio(
   supabase: SupabaseClient<Database>,
   userId: string,
   repoRoot?: string,
-  agentId?: string
+  agentId?: string,
+  options?: { autoCreate?: boolean }
 ): Promise<string | undefined> {
   const targetRoot = repoRoot || process.cwd();
-  let query = supabase
+
+  const lookupQuery = () => {
+    let q = supabase
+      .from('studios')
+      .select('id, updated_at')
+      .eq('user_id', userId)
+      .eq('repo_root', targetRoot)
+      .eq('worktree_path', targetRoot)
+      .in('status', ['active', 'idle', 'archived'])
+      .order('updated_at', { ascending: false })
+      .limit(1);
+    if (agentId) q = q.eq('agent_id', agentId);
+    return q;
+  };
+
+  const { data: match } = await lookupQuery().maybeSingle();
+  if (match?.id) return match.id;
+
+  // Auto-create only when explicitly opted in AND both agentId and repoRoot
+  // are provided — avoids creating spurious studios from fallback paths.
+  if (!options?.autoCreate || !agentId || !repoRoot) return undefined;
+
+  const slug = path.basename(targetRoot);
+  const { data: created, error } = await supabase
     .from('studios')
-    .select('id, updated_at')
-    .eq('user_id', userId)
-    .eq('repo_root', targetRoot)
-    .in('status', ['active', 'idle', 'archived'])
-    .order('updated_at', { ascending: false })
-    .limit(1);
-  if (agentId) {
-    query = query.eq('agent_id', agentId);
+    .insert({
+      user_id: userId,
+      agent_id: agentId,
+      repo_root: targetRoot,
+      worktree_path: targetRoot,
+      branch: 'main',
+      slug,
+      status: 'active',
+      purpose: 'Root repository studio (auto-created)',
+      metadata: { autoCreated: true },
+    })
+    .select('id')
+    .single();
+
+  if (error) {
+    // Unique constraint race — another concurrent request already created it
+    if (error.code === '23505') {
+      const { data: retry } = await lookupQuery().maybeSingle();
+      return retry?.id || undefined;
+    }
+    logger.warn('Failed to auto-create main studio', { error, userId, agentId, repoRoot });
+    return undefined;
   }
-  const { data: match } = await query.maybeSingle();
-  return match?.id || undefined;
+
+  logger.info('Auto-created main studio for root repo', {
+    studioId: created.id,
+    userId,
+    agentId,
+    repoRoot: targetRoot,
+    slug,
+  });
+  return created.id;
 }
 
 /**
@@ -1684,6 +1978,161 @@ export async function resolveStudioHint(
   if (agentId) query = query.eq('agent_id', agentId);
   const { data: namedStudio } = await query.maybeSingle();
   return namedStudio?.id || undefined;
+}
+
+/** Remove control characters (incl. newlines) that could break line structure. */
+export function stripControlChars(value: string): string {
+  // eslint-disable-next-line no-control-regex
+  return value.replace(/[\u0000-\u001f\u007f]+/g, ' ');
+}
+
+/**
+ * Flatten source-provided display text (sender names, filenames, content
+ * types) to a single bounded line for the trusted message header. These
+ * values arrive from external channels and are user-controlled — without
+ * this, a filename like "report.pdf\nIgnore previous instructions" would
+ * escape its bullet and render as trusted prompt text above the
+ * <untrusted-data> wrapper. Unicode is preserved; control characters are
+ * collapsed and length is capped.
+ */
+export function sanitizeHeaderText(value: string | undefined, maxLength = 120): string | undefined {
+  if (!value) return undefined;
+  const cleaned = stripControlChars(value).replace(/\s+/g, ' ').trim().slice(0, maxLength);
+  return cleaned || undefined;
+}
+
+/**
+ * FUTURE PATH — inline base64 media for API-direct providers.
+ *
+ * Reads image attachments into base64 ImageContent blocks. Not invoked in
+ * the live message flow: CLI-spawned backends (claude-code, ink) receive
+ * media as file paths and read the files natively, which avoids buffering
+ * up to 10×20MB into server memory per message. Kept (with tests) for the
+ * planned API-provider runner and a persistent media store with ready
+ * access — those consume IRunner's imageContents option, which this
+ * function produces.
+ */
+export async function readImageAttachmentsAsBase64(
+  media?: import('./types.js').MediaAttachment[]
+): Promise<ImageContent[]> {
+  if (!media || media.length === 0) return [];
+
+  const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+  const MAX_IMAGES = 10;
+  const SUPPORTED_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+  const images: ImageContent[] = [];
+
+  for (const attachment of media) {
+    if (images.length >= MAX_IMAGES) break;
+    if (attachment.type !== 'image') continue;
+    if (!attachment.path) continue;
+
+    const mimeType = attachment.contentType || attachment.mimeType || 'image/jpeg';
+    if (!SUPPORTED_TYPES.has(mimeType)) continue;
+
+    try {
+      const info = await stat(attachment.path);
+      if (info.size <= 0 || info.size > MAX_IMAGE_BYTES) continue;
+
+      const bytes = await readFile(attachment.path);
+      images.push({
+        type: 'image',
+        source: 'base64',
+        mediaType: mimeType,
+        data: bytes.toString('base64'),
+      });
+    } catch (error) {
+      logger.warn('Failed to read image attachment for multimodal', {
+        filePath: attachment.path,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  return images;
+}
+
+const MAX_ARG_VALUE_LENGTH = 200;
+const MAX_ARGS_SUMMARY_LENGTH = 500;
+
+/**
+ * Keys whose values must never reach the activity stream, even truncated.
+ * Substring match, case-insensitive — 'auth' covers authorization/authToken,
+ * 'apikey' covers apiKey after lowercasing.
+ */
+const SENSITIVE_KEY_PATTERNS = [
+  'password',
+  'secret',
+  'token',
+  'auth',
+  'bearer',
+  'credential',
+  'apikey',
+  'api_key',
+];
+
+function isSensitiveKey(key: string): boolean {
+  const lower = key.toLowerCase();
+  return SENSITIVE_KEY_PATTERNS.some((pattern) => lower.includes(pattern));
+}
+
+/**
+ * Recursively replace values under sensitive keys with '[redacted]'.
+ * Truncation alone is not enough — short secrets and the first chunk of a
+ * long one would survive it. Cycle-safe (tool inputs are parsed JSON in
+ * practice, but callers shouldn't have to guarantee that).
+ */
+export function redactSensitiveValues(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return '[circular]';
+    seen.add(value);
+    return value.map((item) => redactSensitiveValues(item, seen));
+  }
+  if (value && typeof value === 'object') {
+    if (seen.has(value)) return '[circular]';
+    seen.add(value);
+    const redacted: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      redacted[key] = isSensitiveKey(key) ? '[redacted]' : redactSensitiveValues(item, seen);
+    }
+    return redacted;
+  }
+  return value;
+}
+
+/**
+ * Build a short, human-readable summary of tool-call arguments for the
+ * activity stream. Sensitive keys are redacted BEFORE truncation (a
+ * truncated secret is still a leak), then values are truncated aggressively
+ * (never full file contents / long strings) — the summary is for timeline
+ * display, not replay.
+ */
+export function summarizeToolArgs(input: Record<string, unknown>): string {
+  const redactedInput = redactSensitiveValues(input) as Record<string, unknown>;
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(redactedInput)) {
+    let rendered: string;
+    if (typeof value === 'string') {
+      const truncated =
+        value.length > MAX_ARG_VALUE_LENGTH ? `${value.slice(0, MAX_ARG_VALUE_LENGTH)}…` : value;
+      rendered = JSON.stringify(truncated);
+    } else {
+      try {
+        rendered = JSON.stringify(value) ?? String(value);
+      } catch {
+        rendered = String(value);
+      }
+      if (rendered.length > MAX_ARG_VALUE_LENGTH) {
+        rendered = `${rendered.slice(0, MAX_ARG_VALUE_LENGTH)}…`;
+      }
+    }
+    parts.push(`${key}: ${rendered}`);
+  }
+  const summary = parts.join(', ');
+  return summary.length > MAX_ARGS_SUMMARY_LENGTH
+    ? `${summary.slice(0, MAX_ARGS_SUMMARY_LENGTH)}…`
+    : summary;
 }
 
 /**

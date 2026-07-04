@@ -1,6 +1,7 @@
-import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll, afterEach } from 'vitest';
 import path from 'path';
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from 'fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, symlinkSync, existsSync } from 'fs';
+import { rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { createInkCodingTools, type InkToolDefinition } from './pi-coding-tools';
 import { resetProcessRegistry, getProcessRegistry } from './bash-guard';
@@ -123,6 +124,63 @@ describe('Pi Coding Tools Adapter', () => {
     });
   });
 
+  describe('PDF read adapter', () => {
+    it('extracts text from a PDF file', async () => {
+      const stream = 'BT /F1 12 Tf 100 700 Td (Hello from PDF) Tj ET';
+      const streamBytes = Buffer.from(stream);
+      const objects = [
+        '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj',
+        '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj',
+        `3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj`,
+        `4 0 obj\n<< /Length ${streamBytes.length} >>\nstream\n${stream}\nendstream\nendobj`,
+        '5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj',
+      ];
+      let body = '';
+      const offsets: number[] = [];
+      const header = '%PDF-1.4\n';
+      let pos = header.length;
+      for (const obj of objects) {
+        offsets.push(pos);
+        body += obj + '\n';
+        pos += Buffer.byteLength(obj + '\n');
+      }
+      const xrefStart = pos;
+      let xref = `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+      for (const offset of offsets) {
+        xref += `${String(offset).padStart(10, '0')} 00000 n \n`;
+      }
+      xref += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+
+      writeFileSync(path.join(testDir, 'test.pdf'), header + body + xref);
+
+      const readTool = tools.find((t) => t.schema.name === 'read')!;
+      const result = await readTool.execute({ path: 'test.pdf' });
+      expect(result).toContain('Hello from PDF');
+      expect(result).toContain('[PDF:');
+      expect(result).toContain('1 page');
+    });
+
+    it('does not intercept non-PDF files', async () => {
+      const readTool = tools.find((t) => t.schema.name === 'read')!;
+      const result = await readTool.execute({ path: 'hello.txt' });
+      expect(result).toContain('Hello, world!');
+      expect(result).not.toContain('[PDF:');
+    });
+
+    it('blocks PDF read with absolute path outside workspace', async () => {
+      const readTool = tools.find((t) => t.schema.name === 'read')!;
+      const result = await readTool.execute({ path: '/tmp/secret.pdf' });
+      expect(result).toContain('Access denied');
+      expect(result).toContain('outside workspace root');
+    });
+
+    it('blocks PDF read with ../ traversal', async () => {
+      const readTool = tools.find((t) => t.schema.name === 'read')!;
+      const result = await readTool.execute({ path: '../../etc/secret.pdf' });
+      expect(result).toContain('Access denied');
+    });
+  });
+
   describe('workspace root enforcement', () => {
     it('blocks absolute path escape', async () => {
       const readTool = tools.find((t) => t.schema.name === 'read')!;
@@ -135,6 +193,42 @@ describe('Pi Coding Tools Adapter', () => {
       const readTool = tools.find((t) => t.schema.name === 'read')!;
       const result = await readTool.execute({ path: '../../etc/hostname' });
       expect(result).toContain('Access denied');
+    });
+
+    it('blocks symlink escaping workspace (read)', async () => {
+      const outsideDir = mkdtempSync(path.join(tmpdir(), 'pi-outside-'));
+      writeFileSync(path.join(outsideDir, 'secret.txt'), 'TOP SECRET');
+      const linkPath = path.join(testDir, 'escape-link');
+      symlinkSync(outsideDir, linkPath);
+
+      try {
+        const readTool = tools.find((t) => t.schema.name === 'read')!;
+        const result = await readTool.execute({ path: 'escape-link/secret.txt' });
+        expect(result).toContain('Access denied');
+        expect(result).toContain('outside workspace root');
+      } finally {
+        await rm(linkPath, { force: true });
+        await rm(outsideDir, { recursive: true, force: true });
+      }
+    });
+
+    it('blocks symlink escaping workspace (write)', async () => {
+      const outsideDir = mkdtempSync(path.join(tmpdir(), 'pi-outside-'));
+      const linkPath = path.join(testDir, 'write-escape-link');
+      symlinkSync(outsideDir, linkPath);
+
+      try {
+        const writeTool = tools.find((t) => t.schema.name === 'write')!;
+        const result = await writeTool.execute({
+          path: 'write-escape-link/pwned.txt',
+          content: 'SHOULD NOT BE WRITTEN',
+        });
+        expect(result).toContain('Access denied');
+        expect(existsSync(path.join(outsideDir, 'pwned.txt'))).toBe(false);
+      } finally {
+        await rm(linkPath, { force: true });
+        await rm(outsideDir, { recursive: true, force: true });
+      }
     });
 
     it('can be disabled', async () => {

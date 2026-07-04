@@ -55,6 +55,8 @@ import {
   type SessionPollRow,
   type SessionAttachedRow,
 } from './services/sessions/trigger-delivery';
+import type { ActivityType } from './data/repositories/activity-stream.repository';
+import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
 
 // Server configuration
 interface ServerConfig {
@@ -134,6 +136,9 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     mcpConfigPath,
     compactionThreshold: config.compactionThreshold || 150000,
     responseHandler: async (responses) => routeResponses(responses),
+    ...(env.DEFAULT_CLAUDE_MODEL ? { defaultModel: env.DEFAULT_CLAUDE_MODEL } : {}),
+    ...(env.DEFAULT_CODEX_MODEL ? { defaultCodexModel: env.DEFAULT_CODEX_MODEL } : {}),
+    ...(env.DEFAULT_GEMINI_MODEL ? { defaultGeminiModel: env.DEFAULT_GEMINI_MODEL } : {}),
   };
   sessionService = createSessionService(dataComposer.getClient(), sessionServiceConfig);
   logger.info('SessionService ready');
@@ -539,13 +544,22 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
             deliveryTarget: reminder.delivery_target,
           });
         }
-        if (route.activeSessionId) {
+        if (route.activeSessionId && route.agentId === reminderAgentId) {
           routeActiveSessionId = route.activeSessionId;
           logger.info(`[Heartbeat] Using active_session_id from channel_route`, {
             activeSessionId: routeActiveSessionId,
             deliveryChannel: reminder.delivery_channel,
             reminderId: reminder.id,
           });
+        } else if (route.activeSessionId && route.agentId !== reminderAgentId) {
+          logger.debug(
+            `[Heartbeat] Ignoring active_session_id — route agent ${route.agentId} ≠ reminder agent ${reminderAgentId}`,
+            {
+              routeAgentId: route.agentId,
+              reminderAgentId,
+              activeSessionId: route.activeSessionId,
+            }
+          );
         }
       }
     }
@@ -603,6 +617,18 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     try {
       const result = await sessionService!.handleMessage(request);
 
+      logger.info('[Heartbeat] Delivery result', {
+        reminderId: reminder.id,
+        agentId: reminderAgentId,
+        success: result.success,
+        responseCount: result.responses?.length || 0,
+        ...(result.error ? { error: result.error } : {}),
+        ...(result.finalTextResponse
+          ? { responsePreview: result.finalTextResponse.slice(0, 200) }
+          : {}),
+        ...(result.usage ? { tokens: result.usage } : {}),
+      });
+
       // Route any responses
       if (result.responses && result.responses.length > 0) {
         await routeResponses(result.responses);
@@ -637,6 +663,65 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
   // 7. Register default trigger handler for stateless, database-driven agent routing
   // This handles triggers for ANY agent by looking up config from the database
   const agentGateway = getAgentGateway();
+
+  async function logInkmail(
+    type: ActivityType & `inkmail_${string}`,
+    payload: AgentTriggerPayload,
+    userId: string,
+    extra?: { sessionId?: string; error?: string; deliveryMethod?: string }
+  ): Promise<void> {
+    try {
+      // Tag inkmail with its mission (task group) so cross-agent messages
+      // appear on the mission timeline. Strategy triggers carry groupId in
+      // metadata; otherwise resolve conservatively from the threadKey
+      // (verified task:/strategy: ids or an exact task_groups.thread_key match).
+      let taskGroupId =
+        payload.metadata && typeof payload.metadata.groupId === 'string' && payload.metadata.groupId
+          ? payload.metadata.groupId
+          : undefined;
+      if (!taskGroupId && payload.threadKey) {
+        taskGroupId =
+          (await resolveTaskGroupForThreadKey(
+            dataComposer!.getClient(),
+            userId,
+            payload.threadKey
+          )) ?? undefined;
+      }
+
+      await dataComposer!.repositories.activityStream.logActivity({
+        userId,
+        agentId: payload.toAgentId,
+        type,
+        subtype: payload.triggerType,
+        content: payload.summary || `Inkmail from ${payload.fromAgentId}`,
+        sessionId: extra?.sessionId,
+        taskGroupId,
+        correlationId: payload.threadMessageId || payload.inboxMessageId,
+        payload: {
+          fromAgentId: payload.fromAgentId,
+          toAgentId: payload.toAgentId,
+          threadKey: payload.threadKey || null,
+          messageId: payload.threadMessageId || payload.inboxMessageId || null,
+          priority: payload.priority || 'normal',
+          studioId: payload.studioId || null,
+          ...(extra?.deliveryMethod ? { deliveryMethod: extra.deliveryMethod } : {}),
+          ...(extra?.error ? { error: extra.error } : {}),
+        },
+        status:
+          type === 'inkmail_dispatch'
+            ? 'pending'
+            : type === 'inkmail_deliver'
+              ? 'completed'
+              : 'failed',
+      });
+    } catch (err) {
+      logger.warn('[Inkmail] Failed to log activity', {
+        type,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   agentGateway.setDefaultHandler(async (payload: AgentTriggerPayload) => {
     const targetAgentId = payload.toAgentId;
 
@@ -779,6 +864,8 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       );
     }
 
+    await logInkmail('inkmail_dispatch', payload, userId);
+
     // 2. Resolve and verify target identity for this user
     // Prefer recipient_sb_id from inbox; fallback to user+agent_id with disambiguation.
     let resolvedIdentityId = recipientSbId;
@@ -905,6 +992,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           payload.metadata && typeof payload.metadata.groupId === 'string'
             ? payload.metadata.groupId
             : undefined,
+        // Forward repoRoot so session service can resolve working directory / main studio
+        ...(payload.metadata?.repoRoot && typeof payload.metadata.repoRoot === 'string'
+          ? { repoRoot: payload.metadata.repoRoot }
+          : {}),
         // Forward sandbox container name so the session service routes CLI execution into it
         ...(payload.metadata?.sandboxContainerName &&
         typeof payload.metadata.sandboxContainerName === 'string'
@@ -933,6 +1024,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         studioId: payload.studioId,
         studioHint: payload.studioHint,
         recipientSessionId: payload.recipientSessionId,
+        repoRoot:
+          payload.metadata?.repoRoot && typeof payload.metadata.repoRoot === 'string'
+            ? payload.metadata.repoRoot
+            : undefined,
       });
 
       // Stamp the resolved session on the recipient's thread participant record
@@ -995,7 +1090,18 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         attachedRow.cli_attached = false;
       }
 
-      const delivery = shouldSkipSpawn(pollRow, attachedRow);
+      // Strategy triggers (kickoff/watchdog/resume) must always spawn a new
+      // session — they are self-addressed (agent triggers itself) and the
+      // channel plugin's self-message filter silently drops them. Bypassing
+      // shouldSkipSpawn ensures autonomous work actually starts.
+      const isStrategyTrigger =
+        payload.metadata &&
+        typeof payload.metadata.strategyTrigger === 'boolean' &&
+        payload.metadata.strategyTrigger;
+
+      const delivery = isStrategyTrigger
+        ? { skip: false, source: null, sessionId: null }
+        : shouldSkipSpawn(pollRow, attachedRow);
 
       if (delivery.skip) {
         logger.info(
@@ -1008,7 +1114,19 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             threadKey: payload.threadKey,
           }
         );
+        await logInkmail('inkmail_deliver', payload, userId, {
+          sessionId: routedSession.id,
+          deliveryMethod: `cli_${delivery.source}`,
+        });
         return;
+      }
+
+      if (isStrategyTrigger) {
+        logger.info('[Trigger] Strategy trigger — bypassing CLI-attached check, forcing spawn', {
+          targetAgentId,
+          reason: payload.metadata?.reason,
+          groupId: payload.metadata?.groupId,
+        });
       }
     } catch (err) {
       // If session resolution fails, fall through to normal handleMessage
@@ -1022,6 +1140,28 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     if (!result.success) {
       logger.error(`[Trigger] SessionService failed for ${targetAgentId}: ${result.error}`);
       throw new Error(result.error || 'SessionService processing failed');
+    }
+
+    // Stamp execution_phase → worker_active now that a session is actually running
+    const strategyGroupId =
+      payload.metadata && typeof payload.metadata.groupId === 'string'
+        ? payload.metadata.groupId
+        : undefined;
+    if (strategyGroupId && payload.metadata?.strategyTrigger) {
+      try {
+        await dataComposer!
+          .getClient()
+          .from('task_groups')
+          .update({ execution_phase: 'worker_active' } as never)
+          .eq('id', strategyGroupId)
+          .eq('status', 'active');
+        logger.info(`[Trigger] Stamped execution_phase=worker_active on group ${strategyGroupId}`);
+      } catch (phaseErr) {
+        logger.warn('[Trigger] Failed to stamp execution_phase', {
+          groupId: strategyGroupId,
+          error: phaseErr instanceof Error ? phaseErr.message : String(phaseErr),
+        });
+      }
     }
 
     // 5. Route any responses — wrapped in try-catch because the session already
@@ -1038,6 +1178,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       );
     }
 
+    await logInkmail('inkmail_deliver', payload, userId, { deliveryMethod: 'spawn' });
     logger.info(`[Trigger] Successfully processed trigger for ${targetAgentId}`);
   });
   logger.info('Default agent trigger handler registered (stateless, database-driven)');
@@ -1129,6 +1270,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           .eq('id', payload.threadId)
           .single();
         recipientUserId = thread?.user_id;
+      }
+
+      if (recipientUserId) {
+        await logInkmail('inkmail_fail', payload, recipientUserId, {
+          error: errorText.slice(0, 2000),
+        });
       }
 
       if (!recipientUserId) {
@@ -1326,9 +1473,8 @@ async function shutdown(): Promise<void> {
   forceKillTimer.unref(); // Don't let the timer itself keep the process alive
 
   try {
-    // Stop heartbeat cron job
+    // Stop heartbeat cron job (logs internally)
     stopHeartbeatService();
-    logger.info('Heartbeat service stopped');
 
     // Remove agent gateway listeners to release event loop references
     getAgentGateway().removeAllListeners();

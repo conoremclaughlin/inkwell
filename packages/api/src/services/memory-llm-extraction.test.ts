@@ -8,12 +8,15 @@ import {
   buildDurableFactExtractionPrompt,
   buildEntityEmbeddingTexts,
   buildEntityExtractionPrompt,
+  buildExactDetailsEmbeddingTexts,
+  buildExactDetailsExtractionPrompt,
   buildSummaryEmbeddingTexts,
   buildSummaryExtractionPrompt,
   coerceExtractionPayload,
   currentStateExtractionSchema,
   durableFactExtractionSchema,
   entityExtractionSchema,
+  exactDetailsExtractionSchema,
   MemoryLlmExtractor,
   memoryExtractionsSchema,
   normalizeMemoryExtractions,
@@ -63,6 +66,14 @@ describe('memory-llm-extraction', () => {
     expect(prompt.kind).toBe('current_state');
     expect(prompt.userPrompt).toContain('present or near-present operational state');
     expect(prompt.userPrompt).toContain('dev server auto-restarts');
+  });
+
+  it('builds an exact-details prompt for atomic source-grounded values', () => {
+    const prompt = buildExactDetailsExtractionPrompt(source);
+    expect(prompt.kind).toBe('exact_details');
+    expect(prompt.userPrompt).toContain('subject / predicate / value');
+    expect(prompt.userPrompt).toContain('counts, dates/times/durations');
+    expect(prompt.schemaDescription).toContain('exactDetails');
   });
 
   it('builds a batch extraction prompt that keeps memories independent', () => {
@@ -146,6 +157,25 @@ describe('memory-llm-extraction', () => {
     expect(buildCurrentStateEmbeddingTexts(parsed)[0]).toContain('volatility: volatile');
   });
 
+  it('formats embedding texts from exact detail extraction', () => {
+    const parsed = exactDetailsExtractionSchema.parse({
+      exactDetails: [
+        {
+          kind: 'quantity',
+          subject: 'smoker purchase',
+          predicate: 'occurred',
+          value: '38',
+          unit: 'days ago',
+          status: 'active',
+          evidence: 'I bought the smoker 38 days ago.',
+        },
+      ],
+    });
+
+    expect(buildExactDetailsEmbeddingTexts(parsed)[0]).toContain('exact detail: quantity');
+    expect(buildExactDetailsEmbeddingTexts(parsed)[0]).toContain('value: 38');
+  });
+
   it('normalizes extraction metadata', () => {
     const normalized = normalizeMemoryExtractions({
       version: 1,
@@ -220,10 +250,23 @@ describe('memory-llm-extraction', () => {
       ],
     });
     const summary = coerceExtractionPayload('summary', rawSummary);
+    const exactDetails = coerceExtractionPayload('exact_details', {
+      details: [
+        {
+          kind: 'count',
+          entity: 'garage',
+          attribute: 'spare screwdriver count',
+          detail: '1',
+          quote: 'There is one spare screwdriver in the garage.',
+        },
+      ],
+    });
 
     expect(entity?.entities[0]?.entityType).toBe('other');
     expect(entity?.entities[0]?.aliases).toHaveLength(6);
     expect(summary?.keyPoints).toHaveLength(6);
+    expect(exactDetails?.exactDetails[0]?.kind).toBe('other');
+    expect(exactDetails?.exactDetails[0]?.value).toBe('1');
     expect(rawSummary.keyPoints).toHaveLength(7);
   });
 

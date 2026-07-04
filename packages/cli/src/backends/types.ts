@@ -17,6 +17,14 @@ export interface BackendConfig {
   backendSessionSeedId?: string;
   studioId?: string;
   dangerous?: boolean;
+  /**
+   * Directories containing turn attachments. Adapters that support it
+   * grant the backend read access (claude: --add-dir per directory) so
+   * attached files referenced in the prompt are readable without
+   * permission prompts. Adapters without an equivalent flag may ignore
+   * this — the attachment paths still appear in the prompt text.
+   */
+  attachmentDirs?: string[];
 }
 
 export interface PreparedBackend {
@@ -24,6 +32,13 @@ export interface PreparedBackend {
   args: string[];
   env: Record<string, string>;
   cleanup: () => void;
+  /**
+   * Prompt data to pass via stdin instead of argv. Large transcripts exceed
+   * the OS argv limit (~256KB on macOS → spawn E2BIG), so adapters that
+   * support reading the prompt from stdin should set this and omit the
+   * prompt from args.
+   */
+  stdinData?: string;
 }
 
 export interface BackendAdapter {

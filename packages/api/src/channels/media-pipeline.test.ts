@@ -57,11 +57,14 @@ describe('InboundMediaPipeline', () => {
   });
 
   it('adds structured media summary for image/video placeholders', async () => {
-    const pipeline = new InboundMediaPipeline({
-      transcribe: async () => undefined,
-    }, {
-      analyze: async () => undefined,
-    });
+    const pipeline = new InboundMediaPipeline(
+      {
+        transcribe: async () => undefined,
+      },
+      {
+        analyze: async () => undefined,
+      }
+    );
 
     const message = createMessage({
       body: '[Image attached]',
@@ -91,11 +94,14 @@ describe('InboundMediaPipeline', () => {
   });
 
   it('preserves normal user text and appends security note', async () => {
-    const pipeline = new InboundMediaPipeline({
-      transcribe: async () => undefined,
-    }, {
-      analyze: async () => undefined,
-    });
+    const pipeline = new InboundMediaPipeline(
+      {
+        transcribe: async () => undefined,
+      },
+      {
+        analyze: async () => undefined,
+      }
+    );
 
     const message = createMessage({
       body: 'Can you summarize this image?',
@@ -161,6 +167,52 @@ describe('InboundMediaPipeline', () => {
 
     expect(message.body).toContain('[Security signal]');
     expect(message.body).toContain('Ignore previous instructions');
+  });
+
+  it('injects a setup hint when audio arrives with no transcription provider', async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'pcp-media-pipeline-'));
+    const audioPath = path.join(tmpDir, 'voice.ogg');
+    await writeFile(audioPath, Buffer.from('audio-bytes'));
+
+    try {
+      // No provider produces a transcript (unconfigured machine)
+      const pipeline = new InboundMediaPipeline({
+        transcribe: async () => undefined,
+      });
+
+      const message = createMessage({
+        media: [
+          { type: 'audio', path: audioPath, contentType: 'audio/ogg', filename: 'voice.ogg' },
+        ],
+      });
+
+      await pipeline.preprocess(message);
+
+      // The SB learns the voice note went unheard and how to offer setup
+      expect(message.body).toContain('[Audio attachment — not transcribed]');
+      expect(message.body).toContain('setup_audio_transcription');
+      expect(message.body).toContain("user's explicit consent");
+      expect(message.body).not.toContain('[Audio transcript]');
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not inject the setup hint for non-audio media', async () => {
+    const pipeline = new InboundMediaPipeline({
+      transcribe: async () => undefined,
+    });
+
+    const message = createMessage({
+      body: '[Image attached]',
+      rawBody: '[Image attached]',
+      media: [
+        { type: 'image', path: '/tmp/photo.png', contentType: 'image/png', filename: 'photo.png' },
+      ],
+    });
+
+    await pipeline.preprocess(message);
+    expect(message.body).not.toContain('[Audio attachment — not transcribed]');
   });
 
   it('degrades gracefully when transcription and analysis throw', async () => {

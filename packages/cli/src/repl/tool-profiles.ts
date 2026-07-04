@@ -26,29 +26,28 @@ export interface ToolProfile {
 export const TOOL_PROFILES: Record<ToolProfileId, ToolProfile> = {
   minimal: {
     label: 'Minimal',
-    description:
-      'Read-only. Only safe tools (bootstrap, recall, list_*, get_*). No writes, no comms.',
+    description: 'Read-only. Safe tools + file reads. No writes, no comms.',
     mode: 'backend',
     safeSpecs: ['group:ink-safe'],
-    allowSpecs: [],
+    allowSpecs: ['group:read'],
     promptSpecs: [],
-    denySpecs: ['group:ink-comms'],
+    denySpecs: ['group:ink-comms', 'group:write'],
   },
   safe: {
     label: 'Safe',
-    description: 'Memory and session tools allowed. Comms require per-call approval.',
+    description: 'All tools allowed except comms and file writes, which require approval.',
     mode: 'backend',
     safeSpecs: ['group:ink-safe'],
-    allowSpecs: ['group:ink-memory', 'group:ink-session'],
-    promptSpecs: ['group:ink-comms'],
+    allowSpecs: [],
+    promptSpecs: ['group:ink-comms', 'group:write'],
     denySpecs: [],
   },
   collaborative: {
     label: 'Collaborative',
-    description: 'Memory, sessions, and comms all allowed. Full collaboration without prompts.',
+    description: 'All tools allowed including file read/write. Full collaboration without prompts.',
     mode: 'backend',
     safeSpecs: ['group:ink-safe'],
-    allowSpecs: ['group:ink-memory', 'group:ink-session', 'group:ink-comms'],
+    allowSpecs: [],
     promptSpecs: [],
     denySpecs: [],
   },
@@ -57,7 +56,7 @@ export const TOOL_PROFILES: Record<ToolProfileId, ToolProfile> = {
     description: 'Privileged mode. All tools allowed, no restrictions.',
     mode: 'privileged',
     safeSpecs: ['group:ink-safe'],
-    allowSpecs: ['group:ink-memory', 'group:ink-session', 'group:ink-comms'],
+    allowSpecs: [],
     promptSpecs: [],
     denySpecs: [],
   },
@@ -91,12 +90,7 @@ export function applyProfile(
   // Set mode
   policy.setMode(profile.mode, scope);
 
-  // Apply tool specs
-  for (const spec of profile.safeSpecs) {
-    // Safe tools go through allowTool — they're already in DEFAULT_SAFE_PCP_TOOLS
-    // which clearScopeRules re-populates for global scope
-  }
-
+  // Safe tools (group:ink-safe) are auto-populated by clearScopeRules above.
   for (const spec of profile.allowSpecs) {
     policy.allowTool(spec, scope);
   }

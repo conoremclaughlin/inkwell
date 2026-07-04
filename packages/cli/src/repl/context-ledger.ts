@@ -1,3 +1,5 @@
+import { createHash } from 'crypto';
+
 export type LedgerRole = 'system' | 'user' | 'assistant' | 'inbox';
 
 export interface LedgerEntry {
@@ -7,6 +9,22 @@ export interface LedgerEntry {
   source?: string;
   createdAt: string;
   approxTokens: number;
+  /**
+   * Transcript event id this entry was hydrated from (file-relative,
+   * stamped by appendTranscript). Undefined for live entries that haven't
+   * been individually tracked — eviction refs fall back to content hash.
+   */
+  eid?: number;
+}
+
+/**
+ * Content-addressed reference for an entry — used by persistent eviction
+ * (context_evict transcript events) to identify entries across reattach.
+ * Stable as long as the role + stored content are reproduced identically
+ * by hydration (they are — ledger transformations are deterministic).
+ */
+export function entryRefHash(role: string, content: string): string {
+  return 'sha1:' + createHash('sha1').update(`${role}|${content}`).digest('hex').slice(0, 16);
 }
 
 export interface LedgerBookmark {
@@ -36,6 +54,13 @@ export interface LedgerEvictResult {
   totalAfter: number;
 }
 
+export interface LedgerCompactResult {
+  removedEntries: LedgerEntry[];
+  removedTokens: number;
+  summaryTokens: number;
+  totalAfter: number;
+}
+
 export interface PromptBuildOptions {
   maxTokens?: number;
   includeSources?: boolean;
@@ -55,7 +80,7 @@ export class ContextLedger {
   private entrySeq = 1;
   private bookmarkSeq = 1;
 
-  public addEntry(role: LedgerRole, content: string, source?: string): LedgerEntry {
+  public addEntry(role: LedgerRole, content: string, source?: string, eid?: number): LedgerEntry {
     const entry: LedgerEntry = {
       id: this.entrySeq++,
       role,
@@ -63,9 +88,31 @@ export class ContextLedger {
       source,
       createdAt: new Date().toISOString(),
       approxTokens: estimateTokens(content),
+      ...(eid !== undefined ? { eid } : {}),
     };
     this.entries.push(entry);
     return entry;
+  }
+
+  /**
+   * Find entry IDs matching persistent eviction refs. Matches by eid when
+   * the ref carries one (precise), otherwise by content hash (legacy /
+   * live entries — identical role+content duplicates match together).
+   */
+  public findEntriesByRefs(refs: Array<{ eid?: number; hash?: string }>): number[] {
+    const eids = new Set(refs.map((r) => r.eid).filter((v): v is number => typeof v === 'number'));
+    const hashes = new Set(
+      refs.filter((r) => r.eid === undefined && typeof r.hash === 'string').map((r) => r.hash)
+    );
+    const ids: number[] = [];
+    for (const entry of this.entries) {
+      if (entry.eid !== undefined && eids.has(entry.eid)) {
+        ids.push(entry.id);
+      } else if (hashes.size > 0 && hashes.has(entryRefHash(entry.role, entry.content))) {
+        ids.push(entry.id);
+      }
+    }
+    return ids;
   }
 
   public listEntries(): LedgerEntry[] {
@@ -185,6 +232,47 @@ export class ContextLedger {
 
     runningTotal = this.totalTokens();
     return { removedEntries, removedTokens, totalAfter: runningTotal };
+  }
+
+  /**
+   * Replace the oldest entries with a single summary entry, keeping the most
+   * recent `keepRecentEntries` verbatim. This is the in-memory half of
+   * transcript compaction: the summary becomes the new start state and the
+   * recent tail preserves working context.
+   */
+  public compactToSummary(
+    summary: string,
+    keepRecentEntries: number,
+    source = 'compaction'
+  ): LedgerCompactResult {
+    const keep = Math.max(0, Math.floor(keepRecentEntries));
+    const cutoff = Math.max(0, this.entries.length - keep);
+    const removedEntries = this.entries.slice(0, cutoff);
+    const removedTokens = removedEntries.reduce((sum, entry) => sum + entry.approxTokens, 0);
+    const kept = this.entries.slice(cutoff);
+
+    const summaryEntry: LedgerEntry = {
+      id: this.entrySeq++,
+      role: 'system',
+      content: summary,
+      source,
+      createdAt: new Date().toISOString(),
+      approxTokens: estimateTokens(summary),
+    };
+
+    this.entries = [summaryEntry, ...kept];
+    // Bookmarks inside the compacted region are gone; survivors shift to
+    // account for removed entries plus the prepended summary.
+    this.bookmarks = this.bookmarks
+      .filter((bookmark) => bookmark.entryIndex >= cutoff)
+      .map((bookmark) => ({ ...bookmark, entryIndex: bookmark.entryIndex - cutoff + 1 }));
+
+    return {
+      removedEntries,
+      removedTokens,
+      summaryTokens: summaryEntry.approxTokens,
+      totalAfter: this.totalTokens(),
+    };
   }
 
   /**

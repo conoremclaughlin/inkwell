@@ -32,6 +32,9 @@ interface MockRequestRow {
   args: string | null;
   expires_at: string;
   metadata: Record<string, unknown> | null;
+  requesting_agent_id: string;
+  studio_id: string | null;
+  session_id: string | null;
 }
 
 interface SupabaseMockState {
@@ -122,6 +125,20 @@ function futureIso(minutes = 5): string {
   return new Date(Date.now() + minutes * 60_000).toISOString();
 }
 
+function mockRow(
+  overrides: Partial<MockRequestRow> & { id: string; tool: string }
+): MockRequestRow {
+  return {
+    args: null,
+    expires_at: futureIso(),
+    metadata: null,
+    requesting_agent_id: 'wren',
+    studio_id: 'studio-1',
+    session_id: 'session-1',
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   currentState = makeState();
   vi.clearAllMocks();
@@ -132,13 +149,7 @@ beforeEach(() => {
 // ============================================================================
 
 describe('checkApprovalResponse: pattern parsing', () => {
-  const pending: MockRequestRow = {
-    id: 'req-1',
-    tool: 'Bash',
-    args: 'docker push registry/app',
-    expires_at: futureIso(),
-    metadata: null,
-  };
+  const pending = mockRow({ id: 'req-1', tool: 'Bash', args: 'docker push registry/app' });
 
   beforeEach(() => {
     currentState = makeState({ pendingSelectResult: { data: [pending], error: null } });
@@ -216,47 +227,41 @@ describe('checkApprovalResponse: request matching', () => {
   });
 
   it('matches by metadata.telegramMessageId when replyToMessageId is provided', async () => {
-    const older: MockRequestRow = {
+    const older = mockRow({
       id: 'req-older',
       tool: 'Bash',
       args: 'rm -rf /',
-      expires_at: futureIso(),
       metadata: { telegramMessageId: 100 },
-    };
-    const newer: MockRequestRow = {
+    });
+    const newer = mockRow({
       id: 'req-newer',
       tool: 'Bash',
       args: 'docker push',
-      expires_at: futureIso(),
       metadata: { telegramMessageId: 200 },
-    };
-    // pendingRequests are returned in descending created_at order (newer first)
+    });
     currentState = makeState({ pendingSelectResult: { data: [newer, older], error: null } });
 
     const result = await checkApprovalResponse(USER_ID, PLATFORM_ID, 'approve', '100');
     expect(result.intercepted).toBe(true);
-    // Should target the older request (the one the reply actually threads to)
     expect(result.requestId).toBe('req-older');
     expect(currentState.updateEqChain.find((c) => c.column === 'id')?.value).toBe('req-older');
   });
 
   it('falls back to most-recent when replyToMessageId does not match any pending metadata', async () => {
-    const first: MockRequestRow = {
+    const first = mockRow({
       id: 'req-first',
       tool: 'Bash',
       args: 'one',
-      expires_at: futureIso(),
       metadata: { telegramMessageId: 111 },
-    };
-    const second: MockRequestRow = {
+    });
+    const second = mockRow({
       id: 'req-second',
       tool: 'Bash',
       args: 'two',
-      expires_at: futureIso(),
       metadata: { telegramMessageId: 222 },
-    };
-    // Most-recent first (matches the order by created_at DESC in prod)
-    currentState = makeState({ pendingSelectResult: { data: [second, first], error: null } });
+    });
+    // Ascending order (oldest first) — matches ORDER BY created_at ASC in the query
+    currentState = makeState({ pendingSelectResult: { data: [first, second], error: null } });
 
     const result = await checkApprovalResponse(USER_ID, PLATFORM_ID, 'approve', '999');
     expect(result.intercepted).toBe(true);
@@ -264,9 +269,10 @@ describe('checkApprovalResponse: request matching', () => {
   });
 
   it('uses most-recent pending when no replyToMessageId is given', async () => {
-    const pending: MockRequestRow[] = [
-      { id: 'newest', tool: 'Bash', args: null, expires_at: futureIso(), metadata: null },
-      { id: 'older', tool: 'Bash', args: null, expires_at: futureIso(), metadata: null },
+    // Ascending order — newest is last in the array
+    const pending = [
+      mockRow({ id: 'older', tool: 'Bash' }),
+      mockRow({ id: 'newest', tool: 'Bash' }),
     ];
     currentState = makeState({ pendingSelectResult: { data: pending, error: null } });
 
@@ -276,17 +282,131 @@ describe('checkApprovalResponse: request matching', () => {
 });
 
 // ============================================================================
+// Scoped resolution — "approve agent/session/studio" must filter by anchor
+// ============================================================================
+
+describe('checkApprovalResponse: scoped resolution', () => {
+  it('"approve agent" with reply-to only resolves requests from the same agent', async () => {
+    const wrenReq = mockRow({
+      id: 'wren-req',
+      tool: 'Bash',
+      requesting_agent_id: 'wren',
+      metadata: { telegramMessageId: 100 },
+    });
+    const lumenReq = mockRow({
+      id: 'lumen-req',
+      tool: 'Write',
+      requesting_agent_id: 'lumen',
+      metadata: { telegramMessageId: 200 },
+    });
+    // Ascending order
+    currentState = makeState({
+      pendingSelectResult: { data: [wrenReq, lumenReq], error: null },
+    });
+
+    // Reply to wren's notification, say "approve agent"
+    const result = await checkApprovalResponse(USER_ID, PLATFORM_ID, 'approve agent', '100');
+    expect(result.intercepted).toBe(true);
+    // Should resolve ONLY wren's request, not lumen's
+    expect(result.resolvedRequests?.length).toBe(1);
+    expect(result.resolvedRequests?.[0].id).toBe('wren-req');
+  });
+
+  it('"approve session" with reply-to only resolves requests from the same session', async () => {
+    const session1Req = mockRow({
+      id: 'sess1-req',
+      tool: 'Bash',
+      session_id: 'session-A',
+      metadata: { telegramMessageId: 100 },
+    });
+    const session2Req = mockRow({
+      id: 'sess2-req',
+      tool: 'Write',
+      session_id: 'session-B',
+      metadata: { telegramMessageId: 200 },
+    });
+    currentState = makeState({
+      pendingSelectResult: { data: [session1Req, session2Req], error: null },
+    });
+
+    const result = await checkApprovalResponse(USER_ID, PLATFORM_ID, 'approve session', '100');
+    expect(result.intercepted).toBe(true);
+    expect(result.resolvedRequests?.length).toBe(1);
+    expect(result.resolvedRequests?.[0].id).toBe('sess1-req');
+  });
+
+  it('"approve studio" with reply-to only resolves requests from the same studio', async () => {
+    const studio1Req = mockRow({
+      id: 'studio1-req',
+      tool: 'Bash',
+      studio_id: 'studio-A',
+      metadata: { telegramMessageId: 100 },
+    });
+    const studio2Req = mockRow({
+      id: 'studio2-req',
+      tool: 'Write',
+      studio_id: 'studio-B',
+      metadata: { telegramMessageId: 200 },
+    });
+    currentState = makeState({
+      pendingSelectResult: { data: [studio1Req, studio2Req], error: null },
+    });
+
+    const result = await checkApprovalResponse(USER_ID, PLATFORM_ID, 'approve studio', '100');
+    expect(result.intercepted).toBe(true);
+    expect(result.resolvedRequests?.length).toBe(1);
+    expect(result.resolvedRequests?.[0].id).toBe('studio1-req');
+  });
+
+  it('"approve all" resolves ALL pending regardless of agent/session/studio', async () => {
+    const wrenReq = mockRow({
+      id: 'wren-req',
+      tool: 'Bash',
+      requesting_agent_id: 'wren',
+    });
+    const lumenReq = mockRow({
+      id: 'lumen-req',
+      tool: 'Write',
+      requesting_agent_id: 'lumen',
+    });
+    currentState = makeState({
+      pendingSelectResult: { data: [wrenReq, lumenReq], error: null },
+    });
+
+    const result = await checkApprovalResponse(USER_ID, PLATFORM_ID, 'approve all');
+    expect(result.intercepted).toBe(true);
+    expect(result.resolvedRequests?.length).toBe(2);
+  });
+
+  it('"approve agent" without reply-to falls back to most recent only', async () => {
+    const wrenReq = mockRow({
+      id: 'wren-req',
+      tool: 'Bash',
+      requesting_agent_id: 'wren',
+    });
+    const lumenReq = mockRow({
+      id: 'lumen-req',
+      tool: 'Write',
+      requesting_agent_id: 'lumen',
+    });
+    currentState = makeState({
+      pendingSelectResult: { data: [wrenReq, lumenReq], error: null },
+    });
+
+    // No reply-to → no anchor → falls back to most recent only
+    const result = await checkApprovalResponse(USER_ID, PLATFORM_ID, 'approve agent');
+    expect(result.intercepted).toBe(true);
+    expect(result.resolvedRequests?.length).toBe(1);
+    expect(result.resolvedRequests?.[0].id).toBe('lumen-req');
+  });
+});
+
+// ============================================================================
 // Resolution — the fields we write on grant/deny, and the optimistic lock
 // ============================================================================
 
 describe('checkApprovalResponse: resolution', () => {
-  const pending: MockRequestRow = {
-    id: 'req-42',
-    tool: 'Bash',
-    args: 'docker push',
-    expires_at: futureIso(),
-    metadata: null,
-  };
+  const pending = mockRow({ id: 'req-42', tool: 'Bash', args: 'docker push' });
 
   beforeEach(() => {
     currentState = makeState({ pendingSelectResult: { data: [pending], error: null } });
@@ -367,17 +487,21 @@ describe('notifyPlatformOfApprovalRequest', () => {
   };
 
   it('returns early and logs warning when user has no connected platforms', async () => {
+    vi.useFakeTimers();
     currentState = makeState({ trustedUsersResult: { data: [] } });
     const fetchSpy = vi.fn();
     vi.stubGlobal('fetch', fetchSpy);
 
     await notifyPlatformOfApprovalRequest(baseRequest);
+    await vi.advanceTimersByTimeAsync(2500);
 
     expect(fetchSpy).not.toHaveBeenCalled();
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
   it('sends Telegram message and stores telegramMessageId in metadata on success', async () => {
+    vi.useFakeTimers();
     currentState = makeState({
       trustedUsersResult: {
         data: [{ platform: 'telegram', platform_user_id: 'chat-999' }],
@@ -390,6 +514,9 @@ describe('notifyPlatformOfApprovalRequest', () => {
     vi.stubGlobal('fetch', fetchSpy);
 
     await notifyPlatformOfApprovalRequest(baseRequest);
+
+    // Advance past the debounce window to flush the notification buffer
+    await vi.advanceTimersByTimeAsync(2500);
 
     expect(fetchSpy).toHaveBeenCalledOnce();
     const [url, options] = fetchSpy.mock.calls[0];
@@ -409,6 +536,7 @@ describe('notifyPlatformOfApprovalRequest', () => {
       chatId: 'chat-999',
     });
 
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 

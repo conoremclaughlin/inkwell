@@ -46,6 +46,7 @@ describe('ensurePcpToolAllowed', () => {
 
   it('returns false when prompt is declined', async () => {
     const policy = new ToolPolicyState('backend', { persist: false });
+    policy.addPromptTool('send_to_inbox');
     const allowed = await ensurePcpToolAllowed({
       policy,
       tool: 'send_to_inbox',

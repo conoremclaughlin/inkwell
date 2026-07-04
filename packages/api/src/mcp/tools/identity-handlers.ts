@@ -66,6 +66,21 @@ export const saveIdentitySchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe('Soul document content - core essence and philosophical grounding'),
+  ttsConfig: z
+    .object({
+      defaultVoice: z
+        .string()
+        .optional()
+        .describe('Default voice name used when no model-specific override matches'),
+      voices: z
+        .record(z.string())
+        .optional()
+        .describe(
+          'Model-specific voice overrides keyed by model ID (e.g., "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit": "vivian")'
+        ),
+    })
+    .optional()
+    .describe('TTS voice configuration for this agent'),
   syncToFile: z
     .boolean()
     .optional()
@@ -208,6 +223,7 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
     metadata,
     heartbeat,
     soul,
+    ttsConfig,
     syncToFile,
     workspaceId,
   } = params;
@@ -241,6 +257,9 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
       : ((existing?.metadata as unknown as Record<string, unknown>) ?? {})) as unknown as Json,
     heartbeat: heartbeat !== undefined ? heartbeat || null : (existing?.heartbeat ?? null),
     soul: soul !== undefined ? soul || null : (existing?.soul ?? null),
+    tts_config: (ttsConfig !== undefined
+      ? ttsConfig
+      : (existing?.tts_config ?? null)) as unknown as Json,
     ...(workspaceId ? { workspace_id: workspaceId } : {}),
   };
 
@@ -419,6 +438,7 @@ export async function handleGetIdentity(args: unknown, dataComposer: DataCompose
               metadata: data.metadata,
               heartbeat: data.heartbeat,
               soul: data.soul,
+              ttsConfig: data.tts_config,
               version: data.version,
               createdAt: data.created_at,
               updatedAt: data.updated_at,

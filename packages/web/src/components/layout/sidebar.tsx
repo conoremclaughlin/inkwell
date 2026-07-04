@@ -22,6 +22,9 @@ import {
   MessageSquare,
   ListTodo,
   Swords,
+  KeyRound,
+  Shield,
+  Workflow,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useRouter } from 'next/navigation';
@@ -39,6 +42,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { ThemeToggle } from '@/components/theme/theme-toggle';
 
 interface NavItem {
   name: string;
@@ -71,10 +75,13 @@ const mainNav: NavGroup[] = [
   {
     label: 'Platform',
     items: [
+      { name: 'Automations', href: '/automations', icon: Workflow },
       { name: 'Reminders', href: '/reminders', icon: Bell },
       { name: 'Connections', href: '/connected-accounts', icon: Link2 },
       { name: 'Routing', href: '/routing', icon: Route },
       { name: 'Sessions', href: '/sessions', icon: Activity },
+      { name: 'Policy', href: '/policy', icon: Shield },
+      { name: 'Secrets', href: '/secrets', icon: KeyRound },
     ],
   },
 ];
@@ -642,6 +649,11 @@ export function Sidebar() {
           ))}
         </div>
       </nav>
+
+      {/* Footer: theme toggle */}
+      <div className="border-t border-white/[0.06] px-3 py-2">
+        <ThemeToggle className="w-full" />
+      </div>
     </div>
   );
 }

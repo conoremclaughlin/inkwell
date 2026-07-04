@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
-import { resolveIdentityId } from '../../auth/resolve-identity';
+import { resolveIdentityId, resolveAgentSlug } from '../../auth/resolve-identity';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
@@ -269,9 +269,18 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     );
   }
 
-  // Enforce identity on sender (who is performing the action), not recipient (target)
-  const senderAgentId = getEffectiveAgentId(parsed.senderAgentId);
-  const triggerSenderId = senderAgentId || 'system';
+  // Resolve sender identity: pinned/explicit → request context sbId → context agentId → unknown
+  let senderAgentId = getEffectiveAgentId(parsed.senderAgentId);
+  if (!senderAgentId) {
+    const reqCtx = getRequestContext() || getSessionContext();
+    if (reqCtx?.sbId) {
+      senderAgentId =
+        (await resolveAgentSlug(dataComposer.getClient(), reqCtx.sbId)) || reqCtx.agentId;
+    } else if (reqCtx?.agentId) {
+      senderAgentId = reqCtx.agentId;
+    }
+  }
+  const triggerSenderId = senderAgentId || 'unknown';
 
   // SECURITY: permission_grant messages can only originate from the system layer
   // (platform listeners verifying human identity), never from agents.
@@ -331,13 +340,13 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   // and warn the sender. Without session context, reply routing is broken
   // (recipients can't auto-resolve back to the sender's session/studio).
   //
-  // 'system' is exempt: it is the canonical sender for heartbeat/watchdog/
-  // platform-originated sends, which by design run outside a request context
-  // (no x-ink-context token, no session). Suppressing those triggers silently
-  // broke the strategy watchdog — it inserted thread messages but never woke
-  // the owner agent. Since 'system' has no reply session anyway, the routing
-  // concerns that justify the suppression don't apply.
-  const missingSenderSession = !senderSessionId && !!senderAgentId && senderAgentId !== 'system';
+  // 'system' and 'unknown' are exempt: they are canonical senders for
+  // heartbeat/watchdog/platform-originated sends that run outside a request
+  // context (no x-ink-context token, no session). Suppressing those triggers
+  // silently broke the strategy watchdog. Since they have no reply session
+  // anyway, the routing concerns that justify suppression don't apply.
+  const nonAgentSender = triggerSenderId === 'system' || triggerSenderId === 'unknown';
+  const missingSenderSession = !senderSessionId && !!senderAgentId && !nonAgentSender;
 
   // ── Thread-first path: when threadKey is provided, route to thread tables ──
   // Unified handler for both new thread creation and replies to existing threads.
@@ -446,16 +455,17 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // so the channelPoll filter can recognize the target studio as an owner.
     // Resolve recipientStudioSlug/Hint to a studioId if needed.
     let resolvedRecipientStudioId: string | undefined = recipientStudioId || undefined;
-    if (!resolvedRecipientStudioId && recipientStudioSlugOrHint && senderAgentId) {
+    const resolveAgentForStudio = recipientAgentId || senderAgentId;
+    if (!resolvedRecipientStudioId && recipientStudioSlugOrHint && resolveAgentForStudio) {
       try {
-        // Reuse the shared resolution function (worktree path → branch fallback
-        // for 'main', slug match for named hints).
+        // Resolve in the recipient's scope so cross-agent sends (sender=wren,
+        // recipient=myra) find the recipient's studio, not the sender's.
         const reqCtxForHint = getRequestContext();
         resolvedRecipientStudioId = await resolveStudioHint(
           supabase,
           resolved.user.id,
           recipientStudioSlugOrHint,
-          senderAgentId,
+          resolveAgentForStudio,
           reqCtxForHint?.repoRoot
         );
       } catch {
@@ -547,8 +557,11 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           selfStudioTarget,
         });
       } else {
-        // New thread: trigger all recipients (exclude sender unless cross-studio self-message)
-        agentsToTrigger = allRecipients.filter((a) => selfStudioTarget || a !== senderAgentId);
+        // New thread: trigger all recipients (exclude sender unless cross-studio
+        // self-message or actionable self-target like strategy kickoff)
+        const actionableSelf = new Set(['task_request', 'session_resume']);
+        const allowSelf = selfStudioTarget || (!!messageType && actionableSelf.has(messageType));
+        agentsToTrigger = allRecipients.filter((a) => allowSelf || a !== senderAgentId);
       }
     }
 
@@ -645,6 +658,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           ...(isAddressedRecipient && !resolvedRecipientStudioId && recipientStudioSlugOrHint
             ? { studioHint: recipientStudioSlugOrHint }
             : {}),
+          ...(Object.keys(rawMeta).length > 0 ? { metadata: rawMeta } : {}),
         };
         const result = gateway.dispatchTrigger(payload);
         if (result.accepted) {
@@ -789,6 +803,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       sessionAlias,
       studioId: recipientStudioId,
       studioHint: recipientStudioSlugOrHint,
+      ...(Object.keys(metadataRecord).length > 0 ? { metadata: metadataRecord } : {}),
     };
 
     logger.info('Inbox message trigger dispatched (async)', {
@@ -1084,92 +1099,103 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         .limit(20);
 
       if (threads?.length) {
-        threadsWithUnread = await Promise.all(
-          threads.map(
-            async (t: {
-              id: string;
-              thread_key: string;
-              title: string | null;
-              created_by_agent_id: string;
-              updated_at: string;
-            }) => {
-              // Get participants (include joined_at for unread baseline)
-              const { data: parts } = await threadTable(supabase, 'inbox_thread_participants')
-                .select('agent_id, joined_at')
-                .eq('thread_id', t.id);
-              const participants = (parts || []).map((p: { agent_id: string }) => p.agent_id);
+        const tIds = threads.map((t: { id: string }) => t.id);
 
-              // Get last read timestamp (only meaningful with agentId)
-              let lastReadAt: string | null = null;
-              let joinedAt: string | null = null;
-              if (agentId) {
-                const { data: readStatus } = await threadTable(supabase, 'inbox_thread_read_status')
-                  .select('last_read_at')
-                  .eq('thread_id', t.id)
-                  .eq('agent_id', agentId)
-                  .maybeSingle();
-                lastReadAt = readStatus?.last_read_at || null;
+        // Batch 1: all participants for all threads (was N queries)
+        const { data: allParts } = await threadTable(supabase, 'inbox_thread_participants')
+          .select('thread_id, agent_id, joined_at')
+          .in('thread_id', tIds);
+        const partsByThread = new Map<string, Array<{ agent_id: string; joined_at?: string }>>();
+        for (const p of allParts || []) {
+          const arr = partsByThread.get(p.thread_id) || [];
+          arr.push(p);
+          partsByThread.set(p.thread_id, arr);
+        }
 
-                // If no read status exists, use the participant's joined_at as
-                // baseline so messages from before they joined don't count as
-                // unread. Without this, a participant who has never read a thread
-                // sees the entire history as "unread" on every poll — causing
-                // replay floods on session restart.
-                const callerPart = (parts || []).find(
-                  (p: { agent_id: string }) => p.agent_id === agentId
-                ) as { joined_at?: string } | undefined;
-                joinedAt = callerPart?.joined_at || null;
-              }
+        // Batch 2: all read statuses for all threads (was N queries)
+        const readStatusByThread = new Map<string, string | null>();
+        if (agentId) {
+          const { data: allReadStatuses } = await threadTable(supabase, 'inbox_thread_read_status')
+            .select('thread_id, last_read_at')
+            .in('thread_id', tIds)
+            .eq('agent_id', agentId);
+          for (const rs of allReadStatuses || []) {
+            readStatusByThread.set(rs.thread_id, rs.last_read_at);
+          }
+        }
 
-              // Count unread messages. Baseline priority:
-              //   1. last_read_at (explicit read pointer)
-              //   2. joined_at (participant join time — no replay of pre-join history)
-              //   3. no filter (shouldn't happen — agent is always a participant)
-              const unreadBaseline = lastReadAt || joinedAt;
-              let countQuery = threadTable(supabase, 'inbox_thread_messages')
-                .select('*', { count: 'exact', head: true })
-                .eq('thread_id', t.id);
+        // Batch 3: recent messages for all threads — used for both unread counts
+        // and preview messages (was 2N queries). Fetch enough to cover previews +
+        // reasonable unread counts. Threads with >50 unread will show a lower-bound.
+        const MSG_BATCH_LIMIT = Math.max(tIds.length * 20, 200);
+        const { data: allMsgs } = await threadTable(supabase, 'inbox_thread_messages')
+          .select('thread_id, sender_agent_id, content, message_type, created_at, metadata')
+          .in('thread_id', tIds)
+          .order('created_at', { ascending: false })
+          .limit(MSG_BATCH_LIMIT);
 
-              if (unreadBaseline) {
-                countQuery = countQuery.gt('created_at', unreadBaseline);
-              }
+        const msgsByThread = new Map<
+          string,
+          Array<{
+            thread_id: string;
+            sender_agent_id: string;
+            content: string;
+            message_type: string;
+            created_at: string;
+            metadata: unknown;
+          }>
+        >();
+        for (const m of allMsgs || []) {
+          const arr = msgsByThread.get(m.thread_id) || [];
+          arr.push(m);
+          msgsByThread.set(m.thread_id, arr);
+        }
 
-              const { count } = await countQuery;
+        // Assemble thread summaries from batched data (pure JS, zero queries)
+        threadsWithUnread = threads.map(
+          (t: {
+            id: string;
+            thread_key: string;
+            title: string | null;
+            created_by_agent_id: string;
+            updated_at: string;
+          }) => {
+            const parts = partsByThread.get(t.id) || [];
+            const participants = parts.map((p) => p.agent_id);
 
-              // Get preview messages (last 3 non-system messages)
-              const { data: previewRows } = await threadTable(supabase, 'inbox_thread_messages')
-                .select('sender_agent_id, content, message_type, created_at')
-                .eq('thread_id', t.id)
-                .neq('message_type', 'system')
-                .order('created_at', { ascending: false })
-                .limit(3);
-
-              const previewMessages = (previewRows || [])
-                .reverse()
-                .map(
-                  (m: {
-                    sender_agent_id: string;
-                    content: string;
-                    message_type: string;
-                    created_at: string;
-                  }) => ({
-                    senderAgentId: m.sender_agent_id,
-                    content: m.content,
-                    messageType: m.message_type,
-                    createdAt: m.created_at,
-                  })
-                );
-
-              return {
-                threadKey: t.thread_key,
-                title: t.title,
-                participants,
-                unreadCount: count || 0,
-                lastMessageAt: t.updated_at,
-                previewMessages,
-              };
+            let lastReadAt: string | null = readStatusByThread.get(t.id) || null;
+            let joinedAt: string | null = null;
+            if (agentId) {
+              const callerPart = parts.find((p) => p.agent_id === agentId);
+              joinedAt = callerPart?.joined_at || null;
             }
-          )
+
+            const unreadBaseline = lastReadAt || joinedAt;
+            const threadMsgs = msgsByThread.get(t.id) || [];
+            const unreadCount = unreadBaseline
+              ? threadMsgs.filter((m) => m.created_at > unreadBaseline).length
+              : threadMsgs.length;
+
+            const previewMessages = threadMsgs
+              .filter((m) => m.message_type !== 'system')
+              .slice(0, 3)
+              .reverse()
+              .map((m) => ({
+                senderAgentId: m.sender_agent_id,
+                content: m.content,
+                messageType: m.message_type,
+                createdAt: m.created_at,
+              }));
+
+            return {
+              threadKey: t.thread_key,
+              title: t.title,
+              participants,
+              unreadCount,
+              lastMessageAt: t.updated_at,
+              previewMessages,
+            };
+          }
         );
 
         // Only include threads that actually have unread messages
@@ -1177,44 +1203,33 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
 
         // Channel poll studio filtering (defense-in-depth): when channelPoll=true
         // and no session_id filter was applied, fall back to message-metadata-based
-        // studio ownership check. When session filtering is active (callerSessionId
-        // is set), skip this — session_id on participants is the primary routing.
+        // studio ownership check. Uses the already-batched messages (no extra queries).
         if (channelPoll && agentId && !callerSessionId) {
           const reqCtx = getRequestContext();
           const sessCtx = getSessionContext();
           const callerStudioId = reqCtx?.studioId || sessCtx?.studioId || null;
 
           if (callerStudioId) {
-            const filteredThreads: typeof threadsWithUnread = [];
+            // Build a threadKey→threadId map for lookup
+            const keyToId = new Map<string, string>(
+              threads.map((t: { id: string; thread_key: string }) => [t.thread_key, t.id])
+            );
 
-            for (const thread of threadsWithUnread) {
-              // Fetch our agent's messages on this thread to check studio ownership
-              const threadRow = threads?.find(
-                (t: { thread_key: string }) => t.thread_key === thread.threadKey
-              );
-              if (!threadRow) {
-                filteredThreads.push(thread); // safety fallback — include if we can't check
-                continue;
-              }
-
-              const { data: ourMessages } = await threadTable(supabase, 'inbox_thread_messages')
-                .select('metadata')
-                .eq('thread_id', (threadRow as { id: string }).id)
-                .eq('sender_agent_id', agentId)
-                .order('created_at', { ascending: false })
-                .limit(5);
-
-              if (isThreadOwnedByStudio(ourMessages || [], callerStudioId)) {
-                filteredThreads.push(thread);
-              } else {
+            threadsWithUnread = threadsWithUnread.filter((thread) => {
+              const tid = keyToId.get(thread.threadKey);
+              if (!tid) return true; // safety fallback
+              const ourMsgs = (msgsByThread.get(tid) || [])
+                .filter((m) => m.sender_agent_id === agentId)
+                .slice(0, 5);
+              const owned = isThreadOwnedByStudio(ourMsgs, callerStudioId);
+              if (!owned) {
                 logger.debug('[ChannelPoll] Filtered thread (owned by different studio)', {
                   threadKey: thread.threadKey,
                   callerStudioId,
                 });
               }
-            }
-
-            threadsWithUnread = filteredThreads;
+              return owned;
+            });
           }
         }
 
@@ -1804,7 +1819,7 @@ export const inboxToolDefinitions = [
   {
     name: 'send_to_inbox',
     description:
-      'Send a message to agent(s) or reply to a thread. Unified tool for all cross-agent messaging.\n\nSingle recipient: send_to_inbox(recipientAgentId: "lumen", content: "...")\nGroup thread: send_to_inbox(recipients: ["lumen", "aster"], threadKey: "pr:165", content: "...")\nReply to thread: send_to_inbox(recipientAgentId: "lumen", threadKey: "pr:165", content: "...")\n\nWhen threadKey is provided, messages go to inbox_thread_messages (thread-first model). Late joiners see full history. Without threadKey, creates a simple agent_inbox row.\n\nFor existing threads, reply semantics are automatic: closed threads are rejected, and smart trigger defaults apply (1:1 → other participant; group non-creator → creator; group creator → no one). Override with triggerAll or triggerAgents.\n\nMessage types:\n- message: General communication\n- task_request: Request another agent to do work\n- session_resume: Request agent to resume a specific session\n- notification: FYI, no response needed\n- permission_grant: Grant or revoke tool permissions\n\nTrigger behavior:\nAll message types trigger recipients by default. Set trigger=false only if the message can wait 5+ hours.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
+      'Send a message to agent(s) or reply to a thread. Unified tool for all cross-agent messaging.\n\nSingle recipient: send_to_inbox(recipientAgentId: "lumen", content: "...")\nGroup thread: send_to_inbox(recipients: ["lumen", "aster"], threadKey: "pr:165", content: "...")\nReply to thread: send_to_inbox(recipientAgentId: "lumen", threadKey: "pr:165", content: "...")\n\nWhen threadKey is provided, messages go to inbox_thread_messages (thread-first model). Late joiners see full history. Without threadKey, creates a simple agent_inbox row.\n\nFor existing threads, reply semantics are automatic: closed threads are rejected, and smart trigger defaults apply (1:1 → other participant; group with explicit recipient → that recipient; group non-creator → creator; group creator → all others). Override with triggerAll or triggerAgents.\n\nMessage types:\n- message: General communication\n- task_request: Request another agent to do work\n- session_resume: Request agent to resume a specific session\n- notification: FYI, no response needed\n- permission_grant: Grant or revoke tool permissions\n\nTrigger behavior:\nAll message types trigger recipients by default. Set trigger=false only if the message can wait 5+ hours.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
     schema: sendToInboxSchema,
     handler: handleSendToInbox,
   },

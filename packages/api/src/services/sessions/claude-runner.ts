@@ -26,6 +26,8 @@ import {
   resolveSpawnTarget,
   CONTAINER_RUNNER_FILES,
 } from '@inklabs/shared';
+import { homedir } from 'os';
+import { join } from 'path';
 import { ensureStudioSettings, applyPermissionOverlay } from '../studio-settings.js';
 
 /** Maximum time (ms) to wait for a Claude Code subprocess before killing it.
@@ -159,6 +161,10 @@ export class ClaudeRunner implements IRunner {
     if (config.appendSystemPrompt) {
       args.push('--append-system-prompt', config.appendSystemPrompt);
     }
+
+    // Allow access to ~/.ink/files (Telegram/Discord/Slack media downloads, Gmail attachments)
+    const inkFilesDir = join(homedir(), '.ink', 'files');
+    args.push('--add-dir', inkFilesDir);
 
     return args;
   }

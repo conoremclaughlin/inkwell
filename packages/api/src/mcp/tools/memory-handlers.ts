@@ -21,6 +21,7 @@ import {
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import type { MemorySource, Salience, Session } from '../../data/models/memory';
 import { getCloudSkillsService } from '../../skills/cloud-service';
+import { resolveMainStudio } from '../../services/sessions/session-service';
 
 // Helper to safely read a file, returning null if it doesn't exist
 async function safeReadFile(filePath: string): Promise<string | null> {
@@ -208,6 +209,7 @@ export function buildKnowledgeSummary(memories: import('../../data/models/memory
     topicSummary?: string;
   }>;
   memoriesIncluded: number;
+  memoryIds: string[];
 } {
   const budget = getMemoryBudget();
 
@@ -258,6 +260,7 @@ export function buildKnowledgeSummary(memories: import('../../data/models/memory
   let charsUsed = 0;
   let memoriesIncluded = 0;
   const includedTopics = new Set<string>();
+  const includedMemoryIds: string[] = [];
   const overflowTopics: typeof sortedGroups = [];
 
   for (const group of sortedGroups) {
@@ -277,6 +280,7 @@ export function buildKnowledgeSummary(memories: import('../../data/models/memory
       charsUsed += groupText.length;
       memoriesIncluded += group.memories.length;
       includedTopics.add(group.topicKey);
+      for (const mem of group.memories) includedMemoryIds.push(mem.id);
     } else if (charsUsed + header.length + 50 <= budget) {
       // Try to fit at least the header + first memory
       const firstMem = group.memories[0];
@@ -292,6 +296,7 @@ export function buildKnowledgeSummary(memories: import('../../data/models/memory
         charsUsed += totalPartial.length;
         memoriesIncluded += 1;
         includedTopics.add(group.topicKey);
+        includedMemoryIds.push(firstMem.id);
       } else {
         overflowTopics.push(group);
       }
@@ -308,7 +313,12 @@ export function buildKnowledgeSummary(memories: import('../../data/models/memory
     topicSummary: g.topicSummary,
   }));
 
-  return { knowledgeSummary: summary.trim(), topicIndex, memoriesIncluded };
+  return {
+    knowledgeSummary: summary.trim(),
+    topicIndex,
+    memoriesIncluded,
+    memoryIds: includedMemoryIds,
+  };
 }
 
 function truncateContent(content: string, maxLen: number): string {
@@ -442,6 +452,12 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
       'Contact ID for per-sender session isolation. When set, the session is scoped to this contact.'
     ),
   metadata: z.record(z.unknown()).optional().describe('Additional session metadata'),
+  repoRoot: z
+    .string()
+    .optional()
+    .describe(
+      'Absolute path to the repository root. When studioId is "main" and no studio row exists, a studio is auto-created at this path.'
+    ),
   forceNew: z
     .boolean()
     .optional()
@@ -497,6 +513,7 @@ export const listSessionsSchema = userIdentifierBaseSchema.extend({
         message: 'Must be a UUID or "main"',
       }
     ),
+  backend: z.string().optional().describe('Filter by backend runtime (e.g., "ink", "claude-code")'),
   limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
 });
 
@@ -999,8 +1016,18 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
   const params = startSessionSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const rawStudioId = resolveStudioId(params);
-  const studioScope = resolveStudioScope(rawStudioId);
+  let studioScope = resolveStudioScope(rawStudioId);
   const agentId = getEffectiveAgentId(params.agentId);
+
+  // When studioScope is null ("main" sentinel) and repoRoot is provided,
+  // resolve to a real studio UUID — auto-creating the studio if needed.
+  if (studioScope === null && params.repoRoot && agentId) {
+    const client = dataComposer.getClient();
+    const mainStudioId = await resolveMainStudio(client, user.id, params.repoRoot, agentId, {
+      autoCreate: true,
+    });
+    if (mainStudioId) studioScope = mainStudioId;
+  }
 
   // Session matching priority:
   // 1. threadKey match — find active session with same agent+threadKey
@@ -1181,13 +1208,28 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
     };
   }
 
-  // Clear cli_attached flag so triggers don't get stuck in the pending queue
-  // after the CLI detaches. endSession already sets ended_at which prevents
-  // matching, but this is belt-and-suspenders for edge cases.
   if (session) {
+    // Clear cli_attached flag so triggers don't get stuck in the pending queue
+    // after the CLI detaches.
     await dataComposer.repositories.memory
       .updateSession(session.id, { cliAttached: false })
       .catch(() => {});
+
+    // Clear stale channel_routes pointing to this session so heartbeat
+    // reminders don't try to route to a dead session and spawn duplicates.
+    await dataComposer
+      .getClient()
+      .from('channel_routes')
+      .update({ active_session_id: null })
+      .eq('active_session_id', session.id)
+      .then(({ error }) => {
+        if (error) {
+          logger.warn('Failed to clear channel_routes.active_session_id', {
+            sessionId: session.id,
+            error: error.message,
+          });
+        }
+      });
   }
 
   logger.info(`Session ended`, { sessionId: session.id, hasSummary: !!params.summary });
@@ -1325,6 +1367,7 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
     agentId: params.agentId,
     studioId,
     filterNullStudio,
+    backend: params.backend,
     limit: params.limit,
   });
 
@@ -1365,6 +1408,7 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
               activeThreadKey: s.activeThreadKey || null,
               status: s.status || null,
               backend: s.backend || null,
+              provider: (s.metadata?.provider as string) || null,
               model: s.model || null,
               backendSessionId: s.backendSessionId || null,
               /** @deprecated Use backendSessionId */
@@ -2292,8 +2336,12 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     }
   }
 
+  const usedCache = !!cachedSummary;
   const knowledgeSummary = cachedSummary || knowledgeSummaryResult?.knowledgeSummary || '';
   const topicIndex = knowledgeSummaryResult?.topicIndex || [];
+  // Only return memoryIds when using the freshly computed summary — cached summaries
+  // may have been built from a different memory set (different thread/focus/limit).
+  const knowledgeMemoryIds = usedCache ? [] : knowledgeSummaryResult?.memoryIds || [];
 
   logger.info(`Bootstrap loaded for user ${user.id}`, {
     agentId: agentId || 'none',
@@ -2302,7 +2350,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
     memoryCount: knowledgeMemories.length,
     knowledgeSummaryChars: knowledgeSummary.length,
     topicCount: topicIndex.length,
-    usedCache: !!cachedSummary,
+    usedCache,
     memorySelectionContext: {
       threadKey: inferredThreadKey || null,
       hasFocusText: !!focusText,
@@ -2411,6 +2459,11 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 
             // Topic index: all topics with counts + recency (navigate with recall(topics: [...]))
             topicIndex: topicIndex.length > 0 ? topicIndex : null,
+
+            // Memory IDs included in knowledgeSummary — used by passive recall to avoid
+            // re-injecting memories already in context. Empty when summary served from
+            // cache (cache may have been built from a different memory set).
+            memoryIds: knowledgeMemoryIds,
 
             // Database identity (structural fields only — heartbeat/soul already in identityFiles)
             dbIdentity: dbIdentity

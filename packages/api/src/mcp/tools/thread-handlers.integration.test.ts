@@ -212,6 +212,47 @@ describe('Thread Handlers Integration — read cursor + monotonic markRead', () 
     expect(second.messages.map((m) => m.id)).toEqual([messageIds[3], messageIds[4]]);
   });
 
+  it('fullHistory bypasses the read-state fallback (ink wait race regression)', async () => {
+    const threadKey = 'thread:test-cursor-fullhistory-' + Date.now();
+    const { threadId, messageIds } = await createThreadWithMessages(threadKey, 'lumen', 'wren', [
+      { sender: 'wren', content: 'review request' },
+      { sender: 'lumen', content: 'review posted' },
+    ]);
+
+    // Simulate push-channel delivery: the trigger pipeline reads the thread
+    // and advances last_read_at past everything
+    await handleGetThreadMessages(
+      { userId, threadKey, agentId: 'wren', limit: 50, markRead: true },
+      dataComposer
+    );
+    const pointerAfterDelivery = await readPointer(threadId, 'wren');
+    expect(pointerAfterDelivery).not.toBeNull();
+
+    // The ink wait failure mode: a cursor-less poll after delivery sees an
+    // empty thread (read-state fallback hides everything already read)...
+    const raced = await parseResult(
+      await handleGetThreadMessages(
+        { userId, threadKey, agentId: 'wren', limit: 50, markRead: false },
+        dataComposer
+      )
+    );
+    expect(raced.messageCount).toBe(0);
+
+    // ...while fullHistory returns the true timeline so a watcher can
+    // anchor and detect the reply regardless of read state
+    const full = await parseResult(
+      await handleGetThreadMessages(
+        { userId, threadKey, agentId: 'wren', limit: 50, markRead: false, fullHistory: true },
+        dataComposer
+      )
+    );
+    expect(full.messages.map((m) => m.content)).toEqual(['review request', 'review posted']);
+    expect(full.messages.map((m) => m.id)).toEqual(messageIds);
+
+    // fullHistory + markRead:false must not move the read pointer
+    expect(await readPointer(threadId, 'wren')).toBe(pointerAfterDelivery);
+  });
+
   it('fallback returns full thread when the caller has no prior read status', async () => {
     const threadKey = 'thread:test-cursor-no-pointer-' + Date.now();
     await createThreadWithMessages(threadKey, 'lumen', 'wren', [

@@ -94,6 +94,7 @@ const EMBEDDING_PERSIST_RETRY_ATTEMPTS = 3;
 const DERIVED_CHUNK_TYPES: MemoryChunkType[] = [
   'summary',
   'fact',
+  'exact_details',
   'topic',
   'entity',
   'current_state',
@@ -109,6 +110,8 @@ function computeChunkTypeBoost(chunkType?: MemoryChunkType | null): number {
   switch (chunkType) {
     case 'fact':
       return 0.08;
+    case 'exact_details':
+      return 0.09;
     case 'topic':
       return 0.05;
     case 'entity':
@@ -815,6 +818,10 @@ export class MemoryRepository {
       return null;
     }
 
+    if (!config.chunkedRecallEnabled) {
+      return this.tryLegacySemanticRecallCandidates(userId, options, limit, offset, queryEmbedding);
+    }
+
     const matchCount = Math.max(
       limit,
       (offset + limit) * Math.max(1, config.matchCountMultiplier || 1)
@@ -864,7 +871,15 @@ export class MemoryRepository {
 
       const matchedChunkType =
         row.matched_chunk_type &&
-        ['summary', 'fact', 'topic', 'entity', 'content'].includes(row.matched_chunk_type)
+        [
+          'summary',
+          'fact',
+          'exact_details',
+          'topic',
+          'entity',
+          'current_state',
+          'content',
+        ].includes(row.matched_chunk_type)
           ? (row.matched_chunk_type as MemoryChunkType)
           : inferChunkTypeFromMetadata(row.matched_chunk_index, memory.metadata);
       const semanticScore = Math.max(0, Math.min(1, row.similarity ?? 0));
@@ -1706,6 +1721,7 @@ export class MemoryRepository {
       agentId?: string;
       studioId?: string;
       filterNullStudio?: boolean;
+      backend?: string;
     } = {}
   ): Promise<Session[]> {
     let query = this.supabase
@@ -1722,6 +1738,10 @@ export class MemoryRepository {
       query = query.is('studio_id', null);
     } else if (options.studioId) {
       query = query.eq('studio_id', options.studioId);
+    }
+
+    if (options.backend) {
+      query = query.eq('backend', options.backend);
     }
 
     const limit = options.limit || 20;

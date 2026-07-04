@@ -34,6 +34,10 @@ vi.mock('../lib/pcp-client.js', () => ({
 
 vi.mock('../repl/backend-runner.js', () => ({
   runBackendTurn: (request: Record<string, unknown>) => testState.runBackendImpl(request),
+  startBackendTurn: (request: Record<string, unknown>) => ({
+    result: testState.runBackendImpl(request),
+    abort: () => {},
+  }),
 }));
 
 vi.mock('../repl/skills.js', () => ({
@@ -195,6 +199,40 @@ describe('runChat integration', () => {
     expect(testState.pcpCalls.some((call) => call.tool === 'update_session_state')).toBe(true);
   });
 
+  it('forwards --attach-file into the turn prompt, transcript, and backend attachment dirs', async () => {
+    const mediaDir = join(testCwd, 'files', 'telegram');
+    mkdirSync(mediaDir, { recursive: true });
+    const imagePath = join(mediaDir, 'photo.jpg');
+    writeFileSync(imagePath, Buffer.alloc(1024, 7));
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      nonInteractive: true,
+      message: 'what is in this photo?',
+      attachFile: [imagePath],
+      pollSeconds: '999',
+    });
+
+    expect(testState.runBackendImpl).toHaveBeenCalledTimes(1);
+    const backendRequest = testState.runBackendImpl.mock.calls[0][0] as {
+      prompt: string;
+      attachmentDirs?: string[];
+    };
+    // Attachment block rides the turn message into the backend prompt
+    expect(backendRequest.prompt).toContain('[Attached files]');
+    expect(backendRequest.prompt).toContain(`- ${imagePath} (image/jpeg, 1KB)`);
+    // Backend gets read access to the attachment's directory
+    expect(backendRequest.attachmentDirs).toEqual([mediaDir]);
+
+    // The block persists in the transcript (and therefore hydration)
+    const replDir = join(testCwd, '.ink', 'runtime', 'repl');
+    const transcriptFiles = readdirSync(replDir).filter((entry) => entry.endsWith('.jsonl'));
+    expect(transcriptFiles.length).toBeGreaterThan(0);
+    const transcript = readFileSync(join(replDir, transcriptFiles[0]!), 'utf-8');
+    expect(transcript).toContain('[Attached files]');
+  });
+
   it('attaches to provided session id and does not end attached session', async () => {
     testState.inputs = ['/quit'];
     await runChat({
@@ -253,7 +291,7 @@ describe('runChat integration', () => {
     expect(backendRequest.prompt).toContain('old assistant reply');
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
-    expect(logText).toContain('History: 2 prior message(s) loaded');
+    expect(logText).toContain('history: 2 prior message(s) loaded');
   });
 
   it('hydrates ledger context from PCP session context when no local transcript exists', async () => {
@@ -295,7 +333,7 @@ describe('runChat integration', () => {
     });
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
-    expect(logText).toContain('History: 2 prior message(s) loaded');
+    expect(logText).toContain('history: 2 prior message(s) loaded');
   });
 
   it('supports interactive attach picker from active sessions', async () => {
@@ -349,7 +387,7 @@ describe('runChat integration', () => {
 
     const sessionStatusLine = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(sessionStatusLine).toContain('sess-b222');
-    expect(sessionStatusLine).toContain('Thread: spec:cli-session-hooks');
+    expect(sessionStatusLine).toContain('thread spec:cli-session-hooks');
   });
 
   it('renders latest transcript message previews in attach picker', async () => {
@@ -471,7 +509,7 @@ describe('runChat integration', () => {
     const sessionStatusLine = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(sessionStatusLine).not.toContain('Select session to attach');
     expect(sessionStatusLine).toContain('sess-new');
-    expect(sessionStatusLine).toContain('Thread: pr:2');
+    expect(sessionStatusLine).toContain('thread pr:2');
   });
 
   it('falls back gracefully when attach-latest cannot list sessions', async () => {
@@ -548,9 +586,9 @@ describe('runChat integration', () => {
 
     expect(testState.pcpCalls.some((call) => call.tool === 'start_session')).toBe(false);
     const sessionStatusLine = stripAnsi(logSpy.mock.calls.flat().join('\n'));
-    expect(sessionStatusLine).toContain('Auto-attached to latest session');
+    expect(sessionStatusLine).toContain('auto-attached to latest session');
     expect(sessionStatusLine).toContain('sess-latest');
-    expect(sessionStatusLine).toContain('Thread: pr:10');
+    expect(sessionStatusLine).toContain('thread pr:10');
   });
 
   it('filters cross-agent sessions during auto-attach by default visibility policy', async () => {
@@ -677,11 +715,11 @@ describe('runChat integration', () => {
       expect(logText, `visibility=${row.visibility}`).toContain(row.expectedSession);
       if (row.expectsAutoAttach) {
         expect(logText, `visibility=${row.visibility}`).toContain(
-          'Auto-attached to latest session'
+          'auto-attached to latest session'
         );
       } else {
         expect(logText, `visibility=${row.visibility}`).not.toContain(
-          'Auto-attached to latest session'
+          'auto-attached to latest session'
         );
       }
     }
@@ -1000,8 +1038,8 @@ describe('runChat integration', () => {
     });
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
-    expect(logText).toContain('- allowed-skill [test]');
-    expect(logText).toContain('1 skills hidden by read-path allowlist policy');
+    expect(logText).toContain('allowed-skill [test]');
+    expect(logText).toContain('1 hidden by read-path allowlist');
     expect(logText).toContain('Skill path blocked by read allowlist policy: /blocked/skills/b');
   });
 
@@ -1020,7 +1058,7 @@ describe('runChat integration', () => {
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('Skill trust mode set to trusted-only');
-    expect(logText).toContain('1 skills hidden by trust policy mode');
+    expect(logText).toContain('1 hidden by trust policy');
     expect(logText).toContain(
       'Skill blocked by trust policy (local); set /skill-trust all to allow.'
     );

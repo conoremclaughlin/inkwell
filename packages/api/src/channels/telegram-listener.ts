@@ -13,7 +13,7 @@ import { MediaGroupBuffer } from './media-group-buffer';
 import { logger } from '../utils/logger';
 import { env } from '../config/env';
 import { getAuthorizationService, type AuthorizationService } from '../services/authorization';
-import { checkApprovalResponse } from './approval-interceptor';
+import { checkApprovalResponse, formatApprovalConfirmation } from './approval-interceptor';
 
 const TELEGRAM_API = 'https://api.telegram.org';
 
@@ -472,11 +472,7 @@ export class TelegramListener extends EventEmitter {
         replyToId
       );
       if (result.intercepted) {
-        const emoji = result.action === 'deny' ? '🚫' : '✅';
-        await this.sendMessage(
-          chatId,
-          `${emoji} Permission ${result.action}: request ${result.requestId}`
-        );
+        await this.sendMessage(chatId, formatApprovalConfirmation(result));
         return; // Do NOT forward to agent routing
       }
     }
@@ -808,7 +804,7 @@ export class TelegramListener extends EventEmitter {
       const largestPhoto = msg.photo[msg.photo.length - 1];
       const localPath = await this.downloadFile(largestPhoto.file_id);
       if (localPath) {
-        mediaAttachments.push({ type: 'image', path: localPath });
+        mediaAttachments.push({ type: 'image', path: localPath, contentType: 'image/jpeg' });
         logger.info('Photo attachment downloaded', {
           fileId: largestPhoto.file_id,
           localPath,
@@ -1206,6 +1202,72 @@ export class TelegramListener extends EventEmitter {
       throw new Error(`Telegram API error: ${data.description}`);
     }
     logger.info(`Sent photo to Telegram chat ${chatId}`, { filename, size: bytes.byteLength });
+  }
+
+  /**
+   * Send 2-10 photos/videos as a single album (sendMediaGroup).
+   * Telegram renders these as one grouped message — files are attached
+   * via multipart and referenced with attach://<name> in the media JSON.
+   * Captions are per-item; a caption on the first item displays under
+   * the album.
+   */
+  async sendMediaGroup(
+    conversationId: string,
+    items: Array<{
+      filePath: string;
+      type: 'image' | 'video';
+      caption?: string;
+      contentType?: string;
+      filename?: string;
+    }>,
+    options?: { replyToMessageId?: string }
+  ): Promise<void> {
+    if (items.length < 2 || items.length > 10) {
+      throw new Error(`sendMediaGroup requires 2-10 items, got ${items.length}`);
+    }
+
+    const chatId = conversationId.startsWith('telegram:')
+      ? conversationId.replace('telegram:', '')
+      : conversationId;
+
+    const fs = await import('fs/promises');
+    const pathMod = await import('path');
+
+    const form = new FormData();
+    form.append('chat_id', chatId);
+    if (options?.replyToMessageId) {
+      form.append('reply_to_message_id', String(parseInt(options.replyToMessageId, 10)));
+    }
+
+    const mediaSpec: Array<Record<string, string>> = [];
+    let totalBytes = 0;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const bytes = await fs.readFile(item.filePath);
+      totalBytes += bytes.byteLength;
+      const attachName = `media${i}`;
+      const filename = item.filename || pathMod.basename(item.filePath) || attachName;
+      const contentType = item.contentType || (item.type === 'video' ? 'video/mp4' : 'image/jpeg');
+      form.append(attachName, new Blob([new Uint8Array(bytes)], { type: contentType }), filename);
+      mediaSpec.push({
+        type: item.type === 'video' ? 'video' : 'photo',
+        media: `attach://${attachName}`,
+        ...(item.caption ? { caption: item.caption } : {}),
+      });
+    }
+    form.append('media', JSON.stringify(mediaSpec));
+
+    const url = `${TELEGRAM_API}/bot${this.token}/sendMediaGroup`;
+    const response = await fetch(url, { method: 'POST', body: form });
+
+    const data = (await response.json()) as TelegramApiResponse<unknown>;
+    if (!data.ok) {
+      throw new Error(`Telegram API error: ${data.description}`);
+    }
+    logger.info(`Sent media group to Telegram chat ${chatId}`, {
+      items: items.length,
+      totalBytes,
+    });
   }
 
   /**

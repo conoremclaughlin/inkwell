@@ -94,8 +94,22 @@ export class InboundMediaPipeline {
     }
 
     const blocks: string[] = [];
+    const hasAudioAttachment = message.media.some((m) => m.type === 'audio' && m.path);
     if (audioTranscript) {
       blocks.push(`[Audio transcript]\n${audioTranscript}`);
+    } else if (hasAudioAttachment) {
+      // No provider produced a transcript — tell the SB so it can offer
+      // setup instead of silently ignoring what the user said.
+      blocks.push(
+        '[Audio attachment — not transcribed]\n' +
+          'No transcription provider is configured or available on this machine. ' +
+          'Let the user know you received their voice note but could not hear it yet, and offer to set up ' +
+          'on-device transcription: call setup_audio_transcription(action: "status") to check this machine, ' +
+          'and — only with the user\'s explicit consent — setup_audio_transcription(action: "install") ' +
+          'to install the local Parakeet model (~600MB one-time download, runs fully offline). ' +
+          'Once a provider is available, transcribe THIS saved voice note without asking the user to re-send: ' +
+          'setup_audio_transcription(action: "transcribe", filePath: "<attachment path from this message>").'
+      );
     }
 
     if (mediaAnalysisBlocks.length > 0) {

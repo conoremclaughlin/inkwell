@@ -15,6 +15,10 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { useApiPost, useApiQuery, useQueryClient } from '@/lib/api';
+import { useEventStream, type StreamActivity } from '@/lib/api/use-event-stream';
+import { ToolCallCard, isToolEntry } from '@/components/sessions/tool-call-card';
+import { ForkCard, forkChildSessionId } from '@/components/sessions/fork-card';
+import { groupTimelineEntries } from '@/lib/sessions/group-timeline-entries';
 import clsx from 'clsx';
 
 interface SessionLogsResponse {
@@ -37,6 +41,10 @@ interface SessionLogsResponse {
     content: string;
     timestamp: string;
     metadata?: Record<string, unknown>;
+    parentId?: string | null;
+    childSessionId?: string | null;
+    status?: string | null;
+    durationMs?: number | null;
   }>;
   pagination: {
     total: number;
@@ -72,18 +80,39 @@ function sessionStatusBadge(
   phase: string | null
 ): { label: string; className: string } {
   const normalizedStatus = String(status || '').toLowerCase();
-  if (isBlocked(phase)) return { label: 'Blocked', className: 'bg-amber-100 text-amber-700' };
+  if (isBlocked(phase))
+    return {
+      label: 'Blocked',
+      className: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
+    };
   if (normalizedStatus === 'paused')
-    return { label: 'Paused', className: 'bg-gray-100 text-gray-600' };
-  if (isGenerating(phase)) return { label: 'Generating', className: 'bg-blue-100 text-blue-700' };
-  if (isRuntimeIdle(phase)) return { label: 'Idle', className: 'bg-green-100 text-green-700' };
+    return { label: 'Paused', className: 'bg-muted text-muted-foreground' };
+  if (isGenerating(phase))
+    return {
+      label: 'Generating',
+      className: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400',
+    };
+  if (isRuntimeIdle(phase))
+    return {
+      label: 'Idle',
+      className: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
+    };
   if (normalizedStatus === 'resumable')
-    return { label: 'Resumable', className: 'bg-violet-100 text-violet-700' };
+    return {
+      label: 'Resumable',
+      className: 'bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-400',
+    };
   if (normalizedStatus === 'idle')
-    return { label: 'Idle', className: 'bg-green-100 text-green-700' };
+    return {
+      label: 'Idle',
+      className: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
+    };
   if (normalizedStatus === 'active' || normalizedStatus === 'running')
-    return { label: 'Running', className: 'bg-green-100 text-green-700' };
-  return { label: status || 'unknown', className: 'bg-gray-100 text-gray-600' };
+    return {
+      label: 'Running',
+      className: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
+    };
+  return { label: status || 'unknown', className: 'bg-muted text-muted-foreground' };
 }
 
 function formatPhaseLabel(phase: string | null): string | null {
@@ -195,10 +224,107 @@ function formatEntryContent(
   return { display: summary, rawJson, kind: 'json' };
 }
 
+type SessionLogEntry = SessionLogsResponse['logs'][number];
+
+function activityToLogEntry(activity: StreamActivity): SessionLogEntry {
+  const role =
+    activity.type === 'message_in' ? 'in' : activity.type === 'message_out' ? 'out' : 'system';
+  return {
+    // Match the id format of polled entries (fetchCloudSessionLogs prefixes
+    // activity_stream rows with "activity:") so merge dedupe works.
+    id: `activity:${activity.id}`,
+    source: 'activity_stream',
+    type: activity.subtype ? `${activity.type}:${activity.subtype}` : activity.type,
+    role,
+    content: activity.content,
+    timestamp: activity.createdAt,
+    metadata: activity.payload,
+    parentId: activity.parentId,
+    childSessionId: activity.childSessionId,
+    status: activity.status,
+    durationMs: activity.durationMs,
+  };
+}
+
+/** Strip the "activity:" prefix so entry ids compare against parentId values. */
+function rawActivityId(id: string): string {
+  return id.startsWith('activity:') ? id.slice('activity:'.length) : id;
+}
+
+function GenericLogCard({
+  entry,
+  backend,
+  onViewRaw,
+}: {
+  entry: SessionLogEntry;
+  backend: string | null | undefined;
+  onViewRaw: (modal: { id: string; type: string; json: string }) => void;
+}) {
+  const formatted = formatEntryContent(entry.content, backend);
+  return (
+    <div className="rounded-md border border-border bg-card p-3">
+      <div className="mb-2 flex items-center justify-between gap-3 text-xs text-muted-foreground">
+        <div className="flex items-center gap-2">
+          <Badge
+            variant="outline"
+            className={clsx(
+              entry.role === 'in' &&
+                'border-slate-300 text-slate-700 dark:border-slate-800 dark:text-slate-400',
+              entry.role === 'out' &&
+                'border-blue-300 text-blue-700 dark:border-blue-800 dark:text-blue-400',
+              entry.role === 'system' &&
+                'border-amber-300 text-amber-700 dark:border-amber-800 dark:text-amber-400'
+            )}
+          >
+            {entry.role}
+          </Badge>
+          <Badge variant="outline">{entry.source}</Badge>
+          <span>{entry.type}</span>
+        </div>
+        <span className="shrink-0">{formatDate(entry.timestamp)}</span>
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-start gap-2 text-sm text-foreground/90">
+          {formatted.kind === 'tool' ? (
+            <Wrench className="mt-0.5 h-4 w-4 shrink-0 text-violet-500 dark:text-violet-400" />
+          ) : formatted.kind === 'json' ? (
+            <Braces className="mt-0.5 h-4 w-4 shrink-0 text-indigo-500 dark:text-indigo-400" />
+          ) : (
+            <TerminalSquare className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground/70" />
+          )}
+          <p className="whitespace-pre-wrap break-words leading-relaxed">{formatted.display}</p>
+        </div>
+        {formatted.rawJson ? (
+          <div className="flex justify-end">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 text-xs"
+              onClick={() =>
+                onViewRaw({
+                  id: entry.id,
+                  type: entry.type,
+                  json: formatted.rawJson || '{}',
+                })
+              }
+            >
+              View raw JSON
+            </Button>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 export default function SessionLogsPage() {
   const params = useParams();
   const sessionId = params.sessionId as string;
   const [offset, setOffset] = useState(0);
+  // Stable stream cursor — captured once so the SSE connection doesn't
+  // resubscribe on every poll. Overlap with polled pages dedupes by id.
+  const [streamSince] = useState(() => new Date().toISOString());
   const [rawModal, setRawModal] = useState<{
     id: string;
     type: string;
@@ -212,10 +338,17 @@ export default function SessionLogsPage() {
     [sessionId, limit, offset]
   );
 
+  // Live stream (first page only). Polling stays as fallback — relaxed to
+  // 60s while the stream is healthy, 15s otherwise.
+  const { events: streamedEvents, status: streamStatus } = useEventStream(
+    { sessionId, since: streamSince },
+    { enabled: offset === 0 }
+  );
+
   const { data, isLoading, error } = useApiQuery<SessionLogsResponse>(
     ['session-logs', sessionId, offset],
     queryPath,
-    { refetchInterval: 15000 }
+    { refetchInterval: streamStatus === 'live' ? 60000 : 15000 }
   );
 
   const syncTranscript = useApiPost<
@@ -230,11 +363,45 @@ export default function SessionLogsPage() {
     },
   });
 
-  const logs = data?.logs || [];
+  const logs = useMemo(() => {
+    const polled = data?.logs || [];
+    if (offset !== 0 || streamedEvents.length === 0) return polled;
+    const polledIds = new Set(polled.map((entry) => entry.id));
+    // Streamed events arrive oldest-first; the timeline renders newest-first.
+    // Map BEFORE filtering so the dedupe compares the same "activity:<id>"
+    // format the polled entries carry.
+    const streamed = streamedEvents
+      .map(activityToLogEntry)
+      .filter((entry) => !polledIds.has(entry.id))
+      .reverse();
+    return [...streamed, ...polled];
+  }, [data?.logs, streamedEvents, offset]);
+
+  // Single-level fork tree: entries whose parentId chain reaches a visible
+  // entry render indented beneath their nearest top-level ancestor (deeper
+  // chains flatten to one level); unmatched parents stay top-level so
+  // nothing is dropped.
+  const { topLevel: topLevelLogs, childrenByAnchor: childrenByParent } = useMemo(
+    () => groupTimelineEntries(logs, rawActivityId),
+    [logs]
+  );
   const pagination = data?.pagination;
   const session = data?.session;
   const statusBadge = session ? sessionStatusBadge(session.status, session.currentPhase) : null;
   const phaseLabel = formatPhaseLabel(session?.currentPhase || null);
+
+  // Tool calls and sub-agent forks get dedicated cards; everything else
+  // falls through to the generic log block.
+  const renderEntry = (item: SessionLogEntry) => {
+    const forkChild = forkChildSessionId(item);
+    if (forkChild) {
+      return <ForkCard entry={item} childSessionId={forkChild} formatDate={formatDate} />;
+    }
+    if (isToolEntry(item)) {
+      return <ToolCallCard entry={item} formatDate={formatDate} onViewRaw={setRawModal} />;
+    }
+    return <GenericLogCard entry={item} backend={session?.backend} onViewRaw={setRawModal} />;
+  };
 
   return (
     <div>
@@ -248,9 +415,9 @@ export default function SessionLogsPage() {
       </div>
 
       <div className="mb-6">
-        <h1 className="text-3xl font-bold text-gray-900">Session Log</h1>
+        <h1 className="text-3xl font-bold text-foreground">Session Log</h1>
         {session && (
-          <div className="mt-2 flex flex-wrap items-center gap-2 text-gray-600">
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-muted-foreground">
             <span className="font-medium">{session.agentId}</span>
             <span>·</span>
             <span>{session.backend || 'unknown backend'}</span>
@@ -272,11 +439,28 @@ export default function SessionLogsPage() {
         )}
       </div>
 
-      {error && <div className="mb-4 rounded-md bg-red-50 p-4 text-red-700">{error.message}</div>}
+      {error && (
+        <div className="mb-4 rounded-md bg-red-50 p-4 text-red-700 dark:bg-red-900/20 dark:text-red-300">
+          {error.message}
+        </div>
+      )}
 
       <Card>
         <CardHeader>
-          <CardTitle>Timeline</CardTitle>
+          <CardTitle className="flex items-center gap-2">
+            Timeline
+            {offset === 0 && streamStatus === 'live' ? (
+              <span className="flex items-center gap-1.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                <span className="relative flex h-2 w-2">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                  <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+                </span>
+                Live
+              </span>
+            ) : offset === 0 && streamStatus === 'connecting' ? (
+              <span className="text-xs font-medium text-muted-foreground/70">Connecting…</span>
+            ) : null}
+          </CardTitle>
           <CardDescription>
             Latest activity, session logs, synced transcript archive, and local fallback when
             available.
@@ -291,14 +475,18 @@ export default function SessionLogsPage() {
               {syncTranscript.isPending ? 'Syncing…' : 'Sync full transcript'}
             </Button>
             {syncTranscript.isSuccess ? (
-              <span className="text-xs text-emerald-700">Synced transcript to cloud archive.</span>
+              <span className="text-xs text-emerald-700 dark:text-emerald-400">
+                Synced transcript to cloud archive.
+              </span>
             ) : null}
             {syncTranscript.error ? (
-              <span className="text-xs text-red-600">{syncTranscript.error.message}</span>
+              <span className="text-xs text-red-600 dark:text-red-400">
+                {syncTranscript.error.message}
+              </span>
             ) : null}
           </div>
           {data && (
-            <div className="flex flex-wrap gap-2 text-xs text-gray-500">
+            <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
               <Badge variant="outline">Cloud: {data.sources.cloud}</Badge>
               <Badge variant="outline">Synced: {data.sources.synced}</Badge>
               <Badge variant="outline">Local: {data.sources.local}</Badge>
@@ -308,70 +496,26 @@ export default function SessionLogsPage() {
         </CardHeader>
         <CardContent>
           {isLoading ? (
-            <p className="text-sm text-gray-500">Loading session log…</p>
+            <p className="text-sm text-muted-foreground">Loading session log…</p>
           ) : logs.length === 0 ? (
-            <p className="text-sm text-gray-500">No log messages found for this session.</p>
+            <p className="text-sm text-muted-foreground">No log messages found for this session.</p>
           ) : (
             <div className="space-y-3">
-              {logs.map((entry) => (
-                <div key={entry.id} className="rounded-md border border-gray-200 bg-white p-3">
-                  <div className="mb-2 flex items-center justify-between gap-3 text-xs text-gray-500">
-                    <div className="flex items-center gap-2">
-                      <Badge
-                        variant="outline"
-                        className={clsx(
-                          entry.role === 'in' && 'border-slate-300 text-slate-700',
-                          entry.role === 'out' && 'border-blue-300 text-blue-700',
-                          entry.role === 'system' && 'border-amber-300 text-amber-700'
-                        )}
-                      >
-                        {entry.role}
-                      </Badge>
-                      <Badge variant="outline">{entry.source}</Badge>
-                      <span>{entry.type}</span>
-                    </div>
-                    <span className="shrink-0">{formatDate(entry.timestamp)}</span>
-                  </div>
-
-                  {(() => {
-                    const formatted = formatEntryContent(entry.content, session?.backend);
-                    return (
-                      <div className="space-y-2">
-                        <div className="flex items-start gap-2 text-sm text-gray-800">
-                          {formatted.kind === 'tool' ? (
-                            <Wrench className="mt-0.5 h-4 w-4 shrink-0 text-violet-500" />
-                          ) : formatted.kind === 'json' ? (
-                            <Braces className="mt-0.5 h-4 w-4 shrink-0 text-indigo-500" />
-                          ) : (
-                            <TerminalSquare className="mt-0.5 h-4 w-4 shrink-0 text-gray-400" />
-                          )}
-                          <p className="whitespace-pre-wrap break-words leading-relaxed">
-                            {formatted.display}
-                          </p>
-                        </div>
-                        {formatted.rawJson ? (
-                          <div className="flex justify-end">
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-7 text-xs"
-                              onClick={() =>
-                                setRawModal({
-                                  id: entry.id,
-                                  type: entry.type,
-                                  json: formatted.rawJson || '{}',
-                                })
-                              }
-                            >
-                              View raw JSON
-                            </Button>
-                          </div>
-                        ) : null}
+              {topLevelLogs.map((entry) => {
+                const children = childrenByParent.get(rawActivityId(entry.id)) || [];
+                return (
+                  <div key={entry.id} className="space-y-2">
+                    {renderEntry(entry)}
+                    {children.length > 0 ? (
+                      <div className="ml-6 space-y-2 border-l-2 border-border pl-3">
+                        {children.map((child) => (
+                          <div key={child.id}>{renderEntry(child)}</div>
+                        ))}
                       </div>
-                    );
-                  })()}
-                </div>
-              ))}
+                    ) : null}
+                  </div>
+                );
+              })}
             </div>
           )}
 
@@ -383,7 +527,7 @@ export default function SessionLogsPage() {
                   {rawModal ? `${rawModal.type} · ${rawModal.id}` : 'Session log payload'}
                 </DialogDescription>
               </DialogHeader>
-              <div className="overflow-auto rounded-md border border-gray-200 bg-gray-950 p-3">
+              <div className="overflow-auto rounded-md border border-border bg-gray-950 p-3">
                 <pre className="whitespace-pre-wrap break-words font-mono text-xs text-gray-100">
                   {rawModal?.json}
                 </pre>
@@ -392,8 +536,8 @@ export default function SessionLogsPage() {
           </Dialog>
 
           {pagination && (
-            <div className="mt-4 flex items-center justify-between border-t border-gray-200 pt-4">
-              <p className="text-xs text-gray-500">
+            <div className="mt-4 flex items-center justify-between border-t border-border pt-4">
+              <p className="text-xs text-muted-foreground">
                 Showing {pagination.offset + 1} -{' '}
                 {Math.min(pagination.offset + pagination.limit, pagination.total)} of{' '}
                 {pagination.total}

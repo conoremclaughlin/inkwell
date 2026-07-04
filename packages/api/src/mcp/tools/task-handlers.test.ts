@@ -91,6 +91,7 @@ function createMockDataComposer() {
 
   const mockProjectsRepo = {
     findById: vi.fn(),
+    findByUserAndName: vi.fn(),
   };
 
   const mockMemoryRepo = {
@@ -99,6 +100,10 @@ function createMockDataComposer() {
 
   const mockActivityStreamRepo = {
     logActivity: vi.fn().mockResolvedValue({ id: 'activity-1' }),
+  };
+
+  const mockStudiosRepo = {
+    findById: vi.fn(),
   };
 
   // Minimal supabase client stub for identity/agent_identities lookups
@@ -137,6 +142,7 @@ function createMockDataComposer() {
       tasks: mockTasksRepo,
       taskGroups: mockTaskGroupsRepo,
       projects: mockProjectsRepo,
+      studios: mockStudiosRepo,
       memory: mockMemoryRepo,
       activityStream: mockActivityStreamRepo,
     },
@@ -1325,6 +1331,166 @@ describe('handleCreateTaskGroup', () => {
     expect(data.error).toBe('User not found');
     expect(dc.repositories.taskGroups.create).not.toHaveBeenCalled();
   });
+
+  it('inherits defaultProjectId from studio when no projectId provided', async () => {
+    const { getRequestContext } = await import('../../utils/request-context');
+    (getRequestContext as any).mockReturnValueOnce({
+      studioId: 'studio-1',
+    });
+
+    dc.repositories.studios.findById.mockResolvedValue({
+      id: 'studio-1',
+      defaultProjectId: 'proj-default',
+    });
+    dc.repositories.projects.findById.mockResolvedValue({
+      id: 'proj-default',
+      user_id: 'user-123',
+      name: 'Inkwell',
+    });
+    dc.repositories.taskGroups.create.mockResolvedValue({
+      id: 'grp-2',
+      user_id: 'user-123',
+      sb_id: null,
+      project_id: 'proj-default',
+      title: 'Inherited project group',
+      status: 'active',
+      priority: 'normal',
+      tags: [],
+      metadata: {},
+      autonomous: false,
+      max_sessions: null,
+      sessions_used: 0,
+      context_summary: null,
+      next_run_after: null,
+      output_target: null,
+      output_status: null,
+      thread_key: null,
+      created_at: '2026-06-16T10:00:00Z',
+      updated_at: '2026-06-16T10:00:00Z',
+    });
+
+    const response = await handleCreateTaskGroup(
+      {
+        userId: 'user-123',
+        title: 'Inherited project group',
+        priority: 'normal',
+        status: 'active',
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(data.success).toBe(true);
+    expect(dc.repositories.taskGroups.create).toHaveBeenCalledWith(
+      expect.objectContaining({ project_id: 'proj-default' })
+    );
+  });
+
+  it('skips studio default project if it belongs to a different user', async () => {
+    const { getRequestContext } = await import('../../utils/request-context');
+    (getRequestContext as any).mockReturnValueOnce({
+      studioId: 'studio-1',
+    });
+
+    dc.repositories.studios.findById.mockResolvedValue({
+      id: 'studio-1',
+      defaultProjectId: 'proj-foreign',
+    });
+    dc.repositories.projects.findById.mockResolvedValue({
+      id: 'proj-foreign',
+      user_id: 'other-user-999',
+      name: 'Foreign Project',
+    });
+    dc.repositories.taskGroups.create.mockResolvedValue({
+      id: 'grp-3',
+      user_id: 'user-123',
+      sb_id: null,
+      project_id: null,
+      title: 'No project',
+      status: 'active',
+      priority: 'normal',
+      tags: [],
+      metadata: {},
+      autonomous: false,
+      max_sessions: null,
+      sessions_used: 0,
+      context_summary: null,
+      next_run_after: null,
+      output_target: null,
+      output_status: null,
+      thread_key: null,
+      created_at: '2026-06-16T10:00:00Z',
+      updated_at: '2026-06-16T10:00:00Z',
+    });
+
+    const response = await handleCreateTaskGroup(
+      {
+        userId: 'user-123',
+        title: 'No project',
+        priority: 'normal',
+        status: 'active',
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(data.success).toBe(true);
+    expect(dc.repositories.taskGroups.create).toHaveBeenCalledWith(
+      expect.objectContaining({ project_id: null })
+    );
+  });
+
+  it('explicit projectId takes precedence over studio default', async () => {
+    const { getRequestContext } = await import('../../utils/request-context');
+    (getRequestContext as any).mockReturnValueOnce({
+      studioId: 'studio-1',
+    });
+
+    dc.repositories.projects.findById.mockResolvedValue({
+      id: '00000000-0000-0000-0000-000000000002',
+      user_id: 'user-123',
+      name: 'Explicit Project',
+    });
+    dc.repositories.taskGroups.create.mockResolvedValue({
+      id: 'grp-4',
+      user_id: 'user-123',
+      sb_id: null,
+      project_id: '00000000-0000-0000-0000-000000000002',
+      title: 'Explicit project group',
+      status: 'active',
+      priority: 'normal',
+      tags: [],
+      metadata: {},
+      autonomous: false,
+      max_sessions: null,
+      sessions_used: 0,
+      context_summary: null,
+      next_run_after: null,
+      output_target: null,
+      output_status: null,
+      thread_key: null,
+      created_at: '2026-06-16T10:00:00Z',
+      updated_at: '2026-06-16T10:00:00Z',
+    });
+
+    const response = await handleCreateTaskGroup(
+      {
+        userId: 'user-123',
+        title: 'Explicit project group',
+        projectId: '00000000-0000-0000-0000-000000000002',
+        priority: 'normal',
+        status: 'active',
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(data.success).toBe(true);
+    expect(dc.repositories.studios.findById).not.toHaveBeenCalled();
+    expect(dc.repositories.taskGroups.create).toHaveBeenCalledWith(
+      expect.objectContaining({ project_id: '00000000-0000-0000-0000-000000000002' })
+    );
+  });
 });
 
 // =====================================================
@@ -2035,6 +2201,55 @@ describe('handleListTaskGroups', () => {
     const data = parseResponse(response);
     expect(response.isError).toBe(true);
     expect(data.error).toBe('User not found');
+    expect(dc.repositories.taskGroups.listByUser).not.toHaveBeenCalled();
+  });
+
+  it('resolves projectName to projectId for filtering', async () => {
+    dc.repositories.projects.findByUserAndName.mockResolvedValue({
+      id: 'proj-by-name',
+      user_id: 'user-123',
+      name: 'Inkwell',
+    });
+    dc.repositories.taskGroups.listByUser.mockResolvedValue([]);
+    dc.repositories.taskGroups.taskCountsByGroup.mockResolvedValue({});
+
+    const response = await handleListTaskGroups(
+      {
+        userId: 'user-123',
+        projectName: 'Inkwell',
+        autonomousOnly: false,
+        includeTaskCounts: true,
+        limit: 200,
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(data.success).toBe(true);
+    expect(dc.repositories.projects.findByUserAndName).toHaveBeenCalledWith('user-123', 'Inkwell');
+    expect(dc.repositories.taskGroups.listByUser).toHaveBeenCalledWith(
+      'user-123',
+      expect.objectContaining({ projectId: 'proj-by-name' })
+    );
+  });
+
+  it('returns error when projectName does not match any project', async () => {
+    dc.repositories.projects.findByUserAndName.mockResolvedValue(null);
+
+    const response = await handleListTaskGroups(
+      {
+        userId: 'user-123',
+        projectName: 'Nonexistent',
+        autonomousOnly: false,
+        includeTaskCounts: true,
+        limit: 200,
+      } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBe(true);
+    expect(data.error).toBe('Project not found: Nonexistent');
     expect(dc.repositories.taskGroups.listByUser).not.toHaveBeenCalled();
   });
 });

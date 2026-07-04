@@ -21,7 +21,7 @@ describe('buildIdentityPrompt conditional bootstrap', () => {
     // Should NOT unconditionally instruct bootstrap
     expect(prompt).not.toContain('Skip directly to loading user config');
     // Should NOT have the actual startup context section
-    expect(prompt).not.toContain('## Bootstrapped Startup Context (PCP)');
+    expect(prompt).not.toContain('## Bootstrapped Startup Context (Inkwell)');
   });
 
   it('skips manual bootstrap when startup context is provided', () => {
@@ -30,7 +30,7 @@ describe('buildIdentityPrompt conditional bootstrap', () => {
     expect(prompt).toContain('You are lumen');
     expect(prompt).toContain('Bootstrap has already been completed');
     expect(prompt).toContain('Do NOT call bootstrap again');
-    expect(prompt).toContain('## Bootstrapped Startup Context (PCP)');
+    expect(prompt).toContain('## Bootstrapped Startup Context (Inkwell)');
     expect(prompt).toContain('### Identity');
     expect(prompt).toContain('I am Lumen.');
     expect(prompt).not.toContain('check whether your constitution docs are already present');
@@ -141,7 +141,7 @@ describe('backend adapters session resume wiring', () => {
       expect(modelInstructionsArg).toBeDefined();
       const promptPath = modelInstructionsArg!.slice('model_instructions_file='.length);
       const promptBody = readFileSync(promptPath, 'utf-8');
-      expect(promptBody).toContain('## Bootstrapped Startup Context (PCP)');
+      expect(promptBody).toContain('## Bootstrapped Startup Context (Inkwell)');
       expect(promptBody).toContain('### STARTUP TEST');
       expect(promptBody).toContain('Injected from bootstrap.');
     } finally {
@@ -230,6 +230,56 @@ describe('backend adapters session resume wiring', () => {
       expect(geminiPrep.args).not.toContain('--yolo');
     } finally {
       geminiPrep.cleanup();
+    }
+  });
+
+  // ── Attachment directory grants ──
+  // Files attached to a turn (--attach-file) live outside the cwd
+  // (~/.ink/files/<channel>/). The claude adapter must grant read access
+  // via --add-dir or the backend's Read silently fails on the paths the
+  // prompt references.
+
+  it('claude adapter grants --add-dir for each attachment directory', () => {
+    const adapter = new ClaudeAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'wren',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+      attachmentDirs: ['/home/u/.ink/files/telegram', '/tmp/uploads'],
+    });
+
+    try {
+      const grantedDirs = prepared.args
+        .map((arg, i) => (arg === '--add-dir' ? prepared.args[i + 1] : null))
+        .filter(Boolean);
+      expect(grantedDirs).toContain('/home/u/.ink/files/telegram');
+      expect(grantedDirs).toContain('/tmp/uploads');
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('claude adapter adds no attachment --add-dir without attachment directories', () => {
+    const adapter = new ClaudeAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'wren',
+      model: undefined,
+      promptParts: [],
+      passthroughArgs: [],
+    });
+
+    try {
+      // The only --add-dir should be ~/.ink/files (if it exists on this machine).
+      // No attachment-specific dirs should appear.
+      const addDirPairs = prepared.args
+        .map((arg, i) => (arg === '--add-dir' ? prepared.args[i + 1] : null))
+        .filter(Boolean);
+      for (const dir of addDirPairs) {
+        expect(dir).toMatch(/\.ink\/files$/);
+      }
+    } finally {
+      prepared.cleanup();
     }
   });
 
@@ -500,8 +550,12 @@ describe('backend adapters session resume wiring', () => {
       // PCP server should have auth + context headers
       expect(settings.mcpServers.inkwell).toBeDefined();
       expect(settings.mcpServers.inkwell.headers.Authorization).toBe('Bearer ${INK_ACCESS_TOKEN}');
-      expect(settings.mcpServers.inkwell.headers['x-ink-context']).toBe('${INK_CONTEXT}');
-      expect(settings.mcpServers.inkwell.headers['x-ink-session-id']).toBe('${INK_SESSION_ID}');
+      const contextToken = settings.mcpServers.inkwell.headers['x-ink-context'];
+      const decoded = JSON.parse(Buffer.from(contextToken, 'base64url').toString());
+      expect(decoded.sessionId).toBe('sess-gemini-789');
+      expect(decoded.agentId).toBe('aster');
+      expect(decoded.runtime).toBe('gemini');
+      expect(settings.mcpServers.inkwell.headers['x-ink-session-id']).toBe('sess-gemini-789');
     } finally {
       prepared.cleanup();
     }

@@ -1177,6 +1177,8 @@ export async function handleCreateTaskGroup(
       return mcpResponse({ success: false, error: 'User not found' }, true);
     }
 
+    let effectiveProjectId = args.projectId ?? null;
+
     if (args.projectId) {
       const project = await dataComposer.repositories.projects.findById(args.projectId);
       if (!project) {
@@ -1189,6 +1191,18 @@ export async function handleCreateTaskGroup(
 
     const agentId = getEffectiveAgentId(args.agentId);
     const reqCtx = getRequestContext();
+
+    if (!effectiveProjectId && reqCtx?.studioId) {
+      const studio = await dataComposer.repositories.studios.findById(reqCtx.studioId);
+      if (studio?.defaultProjectId) {
+        const defaultProject = await dataComposer.repositories.projects.findById(
+          studio.defaultProjectId
+        );
+        if (defaultProject && defaultProject.user_id === resolved.user.id) {
+          effectiveProjectId = studio.defaultProjectId;
+        }
+      }
+    }
     const sbId = await resolveIdentityIdForAgent(
       dataComposer,
       resolved.user.id,
@@ -1199,7 +1213,7 @@ export async function handleCreateTaskGroup(
     const group = await dataComposer.repositories.taskGroups.create({
       user_id: resolved.user.id,
       sb_id: sbId,
-      project_id: args.projectId ?? null,
+      project_id: effectiveProjectId,
       title: args.title,
       description: args.description,
       status: args.status,
@@ -1229,6 +1243,7 @@ export async function handleCreateTaskGroup(
         autonomous: group.autonomous,
         maxSessions: group.max_sessions,
         sessionsUsed: group.sessions_used,
+        executionPhase: group.execution_phase,
         contextSummary: group.context_summary,
         outputTarget: group.output_target,
         outputStatus: group.output_status,
@@ -1397,6 +1412,7 @@ export async function handleUpdateTaskGroup(
         autonomous: updated.autonomous,
         maxSessions: updated.max_sessions,
         sessionsUsed: updated.sessions_used,
+        executionPhase: updated.execution_phase,
         contextSummary: updated.context_summary,
         outputTarget: updated.output_target,
         outputStatus: updated.output_status,
@@ -1424,7 +1440,11 @@ export const listTaskGroupsSchema = z.object({
     .describe(
       'Filter by one or more statuses: active, paused, completed, cancelled. Omit or pass empty array to include all statuses.'
     ),
-  projectId: z.string().uuid().optional().describe('Filter by project'),
+  projectId: z.string().uuid().optional().describe('Filter by project UUID'),
+  projectName: z
+    .string()
+    .optional()
+    .describe('Filter by project name (exact match). Alternative to projectId.'),
   sbId: z.string().uuid().optional().describe('Filter by agent identity UUID'),
   autonomousOnly: z.boolean().optional().default(false).describe('Only autonomous groups'),
   includeTaskCounts: z
@@ -1448,9 +1468,24 @@ export async function handleListTaskGroups(
     // Empty array is treated the same as omitted: include all statuses.
     const statuses = args.statuses && args.statuses.length > 0 ? args.statuses : undefined;
 
+    let projectId = args.projectId;
+    if (!projectId && args.projectName) {
+      const project = await dataComposer.repositories.projects.findByUserAndName(
+        resolved.user.id,
+        args.projectName
+      );
+      if (!project) {
+        return mcpResponse(
+          { success: false, error: `Project not found: ${args.projectName}` },
+          true
+        );
+      }
+      projectId = project.id;
+    }
+
     const groups = await dataComposer.repositories.taskGroups.listByUser(resolved.user.id, {
       status: statuses,
-      projectId: args.projectId,
+      projectId,
       sbId: args.sbId,
       autonomousOnly: args.autonomousOnly,
       limit: args.limit,
@@ -1504,6 +1539,7 @@ export async function handleListTaskGroups(
         autonomous: g.autonomous,
         maxSessions: g.max_sessions,
         sessionsUsed: g.sessions_used,
+        executionPhase: g.execution_phase,
         contextSummary: g.context_summary,
         nextRunAfter: g.next_run_after,
         outputTarget: g.output_target,

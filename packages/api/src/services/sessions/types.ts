@@ -23,8 +23,10 @@ export type ChatType = 'direct' | 'group' | 'supergroup' | 'channel';
 
 export interface MediaAttachment {
   type: 'image' | 'video' | 'audio' | 'document' | 'voice';
+  path?: string;
   url?: string;
   data?: Buffer;
+  contentType?: string;
   mimeType?: string;
   filename?: string;
 }
@@ -102,6 +104,17 @@ export interface Session {
   // Flexible metadata
   metadata: Record<string, unknown>;
 }
+
+// ─── Multimodal Content Types ───
+
+export interface ImageContent {
+  type: 'image';
+  source: 'base64';
+  mediaType: string;
+  data: string;
+}
+
+export type ContentBlock = { type: 'text'; text: string } | ImageContent;
 
 // ─── Request/Response Types ───
 
@@ -207,6 +220,7 @@ export interface AgentIdentity {
   role: string;
   description?: string;
   backend?: string;
+  provider?: string;
   values: string[];
   capabilities: string[];
   soul?: string;
@@ -411,7 +425,10 @@ export interface IContextBuilder {
    * Resolve the preferred runtime backend for an agent identity.
    * Returns raw backend string from DB (e.g. "claude", "codex", "gemini").
    */
-  getAgentBackend(userId: string, agentId: string): Promise<string | null>;
+  getAgentBackend(
+    userId: string,
+    agentId: string
+  ): Promise<{ backend: string | null; provider: string | null }>;
 }
 
 // ─── Runner Interface ───
@@ -427,6 +444,8 @@ export interface ClaudeRunnerConfig {
   pcpSessionId?: string;
   /** Agent ID for this run — written to runtime hint files */
   agentId?: string;
+  /** Originating channel (heartbeat, telegram, agent, …) — used by runners that label delivered messages */
+  channel?: string;
   /** Studio/worktree scope — written to runtime hint so findRuntimeSessionByLinkId matches */
   studioId?: string;
   /** When true, bypass sandbox restrictions (e.g., Codex --dangerously-bypass-approvals-and-sandbox). Opt-in per studio. */
@@ -477,6 +496,23 @@ export interface IRunner {
       backendSessionId?: string;
       injectedContext?: InjectedContext;
       config: ClaudeRunnerConfig;
+      /**
+       * FUTURE: inline base64 media for API-direct providers and a
+       * persistent media store with ready access. No concrete CLI runner
+       * consumes this today — CLI-spawned backends receive media as file
+       * paths (mediaAttachments) and read the files natively. Kept on the
+       * interface so an API-provider runner can adopt it without a
+       * boundary change.
+       */
+      imageContents?: ImageContent[];
+      /**
+       * Media attachments as local file paths (downloaded by channel
+       * listeners to ~/.ink/files/<channel>/). The live path for media:
+       * runners forward paths to their backend (ClaudeRunner via
+       * --add-dir + paths in the message; InkRunner via --attach-file)
+       * and the backend reads the files natively.
+       */
+      mediaAttachments?: MediaAttachment[];
     }
   ): Promise<RunnerResult>;
 }

@@ -40,6 +40,12 @@ export interface SpawnBackendOptions {
   cwd?: string;
   /** Whether to pipe stdin (default: false — stdin is 'ignore') */
   pipeStdin?: boolean;
+  /**
+   * Data to write to the child's stdin (then close it). Implies pipeStdin.
+   * Used to pass large prompts via stdin instead of argv — argv has an OS
+   * limit (~256KB on macOS) and large transcripts trigger spawn E2BIG.
+   */
+  stdinData?: string;
   /** Hard timeout in ms (default: 30 minutes) */
   timeoutMs?: number;
   /** Idle timeout in ms — kill if no output for this long (default: none) */
@@ -153,6 +159,10 @@ export function spawnBackend(options: SpawnBackendOptions): {
   result: Promise<SpawnBackendResult>;
 } {
   const started = Date.now();
+  // stdinData implies pipeStdin (resolveSpawnTarget also checks it for docker -i)
+  if (options.stdinData !== undefined && !options.pipeStdin) {
+    options = { ...options, pipeStdin: true };
+  }
   const target = resolveSpawnTarget(options);
 
   const child = spawn(target.binary, target.args, {
@@ -160,6 +170,14 @@ export function spawnBackend(options: SpawnBackendOptions): {
     cwd: target.cwd,
     env: target.env,
   });
+
+  if (options.stdinData !== undefined && child.stdin) {
+    // EPIPE if the child exits before consuming stdin — swallow, the close
+    // handler reports the real exit
+    child.stdin.on('error', () => {});
+    child.stdin.write(options.stdinData);
+    child.stdin.end();
+  }
 
   let stdout = '';
   let stderr = '';
@@ -236,7 +254,11 @@ export function spawnBackend(options: SpawnBackendOptions): {
       finalize(1);
     });
 
-    child.on('close', (code) => finalize(code ?? 1));
+    child.on('close', (code, signal) => {
+      if (code !== null) return finalize(code);
+      const SIG_CODES: Record<string, number> = { SIGTERM: 15, SIGKILL: 9, SIGINT: 2 };
+      finalize(signal ? 128 + (SIG_CODES[signal] ?? 15) : 1);
+    });
   });
 
   return { child, result };

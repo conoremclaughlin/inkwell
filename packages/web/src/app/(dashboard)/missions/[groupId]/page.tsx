@@ -29,10 +29,13 @@ import {
   Hash,
   Timer,
   MessageSquare,
+  MessageCircle,
+  Send,
   FileCheck,
 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { useApiQuery } from '@/lib/api';
+import { useEventStream, type StreamActivity } from '@/lib/api/use-event-stream';
 import clsx from 'clsx';
 
 // ─── Types ───
@@ -86,6 +89,7 @@ interface ActivityEvent {
   content: string;
   agentId: string;
   sessionId: string | null;
+  platform: string | null;
   payload: Record<string, unknown>;
   createdAt: string;
 }
@@ -122,55 +126,75 @@ interface CommentsResponse {
 // ─── Constants ───
 
 const AGENT_COLORS: Record<string, { bg: string; text: string; dot: string }> = {
-  wren: { bg: 'bg-sky-50', text: 'text-sky-700', dot: 'bg-sky-500' },
-  lumen: { bg: 'bg-amber-50', text: 'text-amber-700', dot: 'bg-amber-500' },
-  myra: { bg: 'bg-rose-50', text: 'text-rose-700', dot: 'bg-rose-500' },
-  benson: { bg: 'bg-violet-50', text: 'text-violet-700', dot: 'bg-violet-500' },
-  aster: { bg: 'bg-emerald-50', text: 'text-emerald-700', dot: 'bg-emerald-500' },
+  wren: {
+    bg: 'bg-sky-50 dark:bg-sky-900/30',
+    text: 'text-sky-700 dark:text-sky-400',
+    dot: 'bg-sky-500',
+  },
+  lumen: {
+    bg: 'bg-amber-50 dark:bg-amber-900/30',
+    text: 'text-amber-700 dark:text-amber-400',
+    dot: 'bg-amber-500',
+  },
+  myra: {
+    bg: 'bg-rose-50 dark:bg-rose-900/30',
+    text: 'text-rose-700 dark:text-rose-400',
+    dot: 'bg-rose-500',
+  },
+  benson: {
+    bg: 'bg-violet-50 dark:bg-violet-900/30',
+    text: 'text-violet-700 dark:text-violet-400',
+    dot: 'bg-violet-500',
+  },
+  aster: {
+    bg: 'bg-emerald-50 dark:bg-emerald-900/30',
+    text: 'text-emerald-700 dark:text-emerald-400',
+    dot: 'bg-emerald-500',
+  },
 };
 
 const AGENT_BADGE_COLORS: Record<string, string> = {
-  wren: 'bg-sky-100 text-sky-700',
-  lumen: 'bg-amber-100 text-amber-700',
-  myra: 'bg-rose-100 text-rose-700',
-  benson: 'bg-violet-100 text-violet-700',
-  aster: 'bg-emerald-100 text-emerald-700',
+  wren: 'bg-sky-100 dark:bg-sky-900/30 text-sky-700 dark:text-sky-400',
+  lumen: 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400',
+  myra: 'bg-rose-100 dark:bg-rose-900/30 text-rose-700 dark:text-rose-400',
+  benson: 'bg-violet-100 dark:bg-violet-900/30 text-violet-700 dark:text-violet-400',
+  aster: 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400',
 };
 
 const STATUS_CONFIG = {
   active: {
     label: 'Active',
-    color: 'text-emerald-700',
-    bg: 'bg-emerald-50',
-    border: 'border-emerald-200',
+    color: 'text-emerald-700 dark:text-emerald-400',
+    bg: 'bg-emerald-50 dark:bg-emerald-900/30',
+    border: 'border-emerald-200 dark:border-emerald-800',
     dot: 'bg-emerald-500',
   },
   paused: {
     label: 'Paused',
-    color: 'text-amber-700',
-    bg: 'bg-amber-50',
-    border: 'border-amber-200',
+    color: 'text-amber-700 dark:text-amber-400',
+    bg: 'bg-amber-50 dark:bg-amber-900/30',
+    border: 'border-amber-200 dark:border-amber-800',
     dot: 'bg-amber-500',
   },
   completed: {
     label: 'Completed',
-    color: 'text-gray-500',
-    bg: 'bg-gray-50',
-    border: 'border-gray-200',
-    dot: 'bg-gray-400',
+    color: 'text-muted-foreground',
+    bg: 'bg-muted/50',
+    border: 'border-border',
+    dot: 'bg-muted-foreground/70',
   },
   draft: {
     label: 'Draft',
-    color: 'text-blue-700',
-    bg: 'bg-blue-50',
-    border: 'border-blue-200',
+    color: 'text-blue-700 dark:text-blue-400',
+    bg: 'bg-blue-50 dark:bg-blue-900/30',
+    border: 'border-blue-200 dark:border-blue-800',
     dot: 'bg-blue-500',
   },
   failed: {
     label: 'Failed',
-    color: 'text-red-700',
-    bg: 'bg-red-50',
-    border: 'border-red-200',
+    color: 'text-red-700 dark:text-red-400',
+    bg: 'bg-red-50 dark:bg-red-900/30',
+    border: 'border-red-200 dark:border-red-800',
     dot: 'bg-red-500',
   },
 } as const;
@@ -183,22 +207,62 @@ const TASK_STATUS_ICON = {
 } as const;
 
 const SUBTYPE_META: Record<string, { icon: typeof Play; label: string; color: string }> = {
-  strategy_started: { icon: Play, label: 'Strategy started', color: 'text-emerald-600' },
-  strategy_paused: { icon: Pause, label: 'Strategy paused', color: 'text-amber-600' },
-  strategy_resumed: { icon: RotateCcw, label: 'Strategy resumed', color: 'text-blue-600' },
+  strategy_started: {
+    icon: Play,
+    label: 'Strategy started',
+    color: 'text-emerald-600 dark:text-emerald-400',
+  },
+  strategy_paused: {
+    icon: Pause,
+    label: 'Strategy paused',
+    color: 'text-amber-600 dark:text-amber-400',
+  },
+  strategy_resumed: {
+    icon: RotateCcw,
+    label: 'Strategy resumed',
+    color: 'text-blue-600 dark:text-blue-400',
+  },
   strategy_completed: {
     icon: CheckCircle2,
     label: 'Strategy completed',
-    color: 'text-emerald-600',
+    color: 'text-emerald-600 dark:text-emerald-400',
   },
-  task_advanced: { icon: ArrowUpCircle, label: 'Task advanced', color: 'text-indigo-600' },
-  approval_required: { icon: AlertCircle, label: 'Approval required', color: 'text-amber-600' },
-  approval_granted: { icon: CheckCircle2, label: 'Approval granted', color: 'text-emerald-600' },
-  runner_spawned: { icon: Zap, label: 'Runner spawned', color: 'text-violet-600' },
-  runner_completed: { icon: CheckCircle2, label: 'Runner completed', color: 'text-gray-500' },
-  runner_crashed: { icon: AlertCircle, label: 'Runner crashed', color: 'text-red-600' },
-  watchdog_wakeup: { icon: Activity, label: 'Watchdog check', color: 'text-gray-400' },
-  strategy_trigger: { icon: Zap, label: 'Strategy triggered', color: 'text-indigo-500' },
+  task_advanced: {
+    icon: ArrowUpCircle,
+    label: 'Task advanced',
+    color: 'text-indigo-600 dark:text-indigo-400',
+  },
+  approval_required: {
+    icon: AlertCircle,
+    label: 'Approval required',
+    color: 'text-amber-600 dark:text-amber-400',
+  },
+  approval_granted: {
+    icon: CheckCircle2,
+    label: 'Approval granted',
+    color: 'text-emerald-600 dark:text-emerald-400',
+  },
+  runner_spawned: {
+    icon: Zap,
+    label: 'Runner spawned',
+    color: 'text-violet-600 dark:text-violet-400',
+  },
+  runner_completed: {
+    icon: CheckCircle2,
+    label: 'Runner completed',
+    color: 'text-muted-foreground',
+  },
+  runner_crashed: {
+    icon: AlertCircle,
+    label: 'Runner crashed',
+    color: 'text-red-600 dark:text-red-400',
+  },
+  watchdog_wakeup: { icon: Activity, label: 'Watchdog check', color: 'text-muted-foreground/70' },
+  strategy_trigger: {
+    icon: Zap,
+    label: 'Strategy triggered',
+    color: 'text-indigo-500 dark:text-indigo-400',
+  },
 };
 
 // ─── Helpers ───
@@ -269,6 +333,129 @@ function computeElapsed(startedAt: string | null): string | null {
   return `${mins}m`;
 }
 
+// ─── Message / Check-in Entries ───
+
+const PLATFORM_LABELS: Record<string, string> = {
+  telegram: 'via Telegram',
+  whatsapp: 'via WhatsApp',
+  discord: 'via Discord',
+  slack: 'via Slack',
+  web: 'via web chat',
+  http: 'via web chat',
+  api: 'via API',
+  terminal: 'via terminal',
+  heartbeat: 'via heartbeat',
+};
+
+function snippet(text: string, max = 140): string {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  return clean.length > max ? `${clean.slice(0, max).trimEnd()}…` : clean;
+}
+
+interface MessageSender {
+  id?: string;
+  name?: string;
+  username?: string;
+}
+
+/** "Conor · via Telegram" for humans, "inkmail from lumen" for agent triggers */
+function checkInSenderLabel(event: ActivityEvent): string {
+  const sender = (event.payload?.sender ?? {}) as MessageSender;
+  const name = sender.name || sender.username || sender.id || 'Unknown';
+  if (event.platform === 'agent') return `inkmail from ${name}`;
+  const platform = event.platform
+    ? (PLATFORM_LABELS[event.platform] ?? `via ${event.platform}`)
+    : '';
+  return platform ? `${name} · ${platform}` : name;
+}
+
+function SessionLink({ sessionId }: { sessionId: string | null }) {
+  if (!sessionId) return null;
+  return (
+    <Link
+      href={`/sessions/${sessionId}`}
+      className="text-[10px] text-blue-500 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300 flex items-center gap-0.5 transition-colors"
+    >
+      <ExternalLink className="h-2.5 w-2.5" />
+      session
+    </Link>
+  );
+}
+
+/** Human (or inkmail-trigger) check-in — accent card so touchpoints stand out */
+function CheckInEntry({ event }: { event: ActivityEvent }) {
+  return (
+    <div className="flex-1 min-w-0 -mt-0.5">
+      <div className="rounded-lg border border-sky-200 dark:border-sky-900 border-l-2 border-l-sky-400 dark:border-l-sky-600 bg-sky-50/60 dark:bg-sky-950/30 px-3 py-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-xs font-semibold text-sky-700 dark:text-sky-300">Check-in</span>
+          <span className="text-[11px] text-gray-500 dark:text-gray-400">
+            {checkInSenderLabel(event)}
+          </span>
+          <SessionLink sessionId={event.sessionId} />
+        </div>
+        {event.content && (
+          <p className="text-[11px] text-gray-600 dark:text-gray-300 mt-1 line-clamp-3">
+            &ldquo;{snippet(event.content)}&rdquo;
+          </p>
+        )}
+      </div>
+      <span className="text-[10px] text-gray-400 dark:text-gray-500">
+        {formatTime(event.createdAt)}
+      </span>
+    </div>
+  );
+}
+
+/** Cross-agent inkmail (dispatch/deliver) — from → to with thread key badge */
+function AgentMessageEntry({ event }: { event: ActivityEvent }) {
+  const from = typeof event.payload?.fromAgentId === 'string' ? event.payload.fromAgentId : null;
+  const to = typeof event.payload?.toAgentId === 'string' ? event.payload.toAgentId : null;
+  const threadKey = typeof event.payload?.threadKey === 'string' ? event.payload.threadKey : null;
+  const delivered = event.type === 'inkmail_deliver';
+
+  return (
+    <div className="flex-1 min-w-0 -mt-0.5">
+      <div className="rounded-lg border border-violet-200 dark:border-violet-900 border-l-2 border-l-violet-400 dark:border-l-violet-600 bg-violet-50/50 dark:bg-violet-950/30 px-3 py-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-xs font-semibold text-violet-700 dark:text-violet-300">
+            Agent message
+          </span>
+          {from && to && (
+            <span className="text-[11px] text-gray-500 dark:text-gray-400">
+              {from} → {to}
+            </span>
+          )}
+          <span
+            className={clsx(
+              'text-[10px] font-medium px-1.5 py-0.5 rounded-full',
+              delivered
+                ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-300'
+                : 'bg-violet-100 text-violet-700 dark:bg-violet-900/50 dark:text-violet-300'
+            )}
+          >
+            {delivered ? 'delivered' : 'sent'}
+          </span>
+          {threadKey && (
+            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400">
+              {threadKey}
+            </span>
+          )}
+          <SessionLink sessionId={event.sessionId} />
+        </div>
+        {event.content && (
+          <p className="text-[11px] text-gray-600 dark:text-gray-300 mt-1 line-clamp-3">
+            {snippet(event.content)}
+          </p>
+        )}
+      </div>
+      <span className="text-[10px] text-gray-400 dark:text-gray-500">
+        {formatTime(event.createdAt)}
+      </span>
+    </div>
+  );
+}
+
 // ─── Task Progress Column ───
 
 function TaskProgressList({ tasks, currentIndex }: { tasks: Task[]; currentIndex: number }) {
@@ -281,14 +468,14 @@ function TaskProgressList({ tasks, currentIndex }: { tasks: Task[]; currentIndex
       {/* Progress bar */}
       <div className="mb-4">
         <div className="flex items-center justify-between mb-1.5">
-          <span className="text-xs font-medium text-gray-600">
+          <span className="text-xs font-medium text-muted-foreground">
             {completed}/{total} tasks complete
           </span>
-          <span className="text-xs text-gray-400">
+          <span className="text-xs text-muted-foreground/70">
             {total > 0 ? Math.round((completed / total) * 100) : 0}%
           </span>
         </div>
-        <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
+        <div className="h-1.5 bg-muted rounded-full overflow-hidden">
           <div
             className="h-full bg-emerald-500 rounded-full transition-all duration-500"
             style={{ width: `${total > 0 ? (completed / total) * 100 : 0}%` }}
@@ -311,18 +498,19 @@ function TaskProgressList({ tasks, currentIndex }: { tasks: Task[]; currentIndex
               key={task.id}
               className={clsx(
                 'flex items-center gap-2.5 px-3 py-2 rounded-lg transition-colors',
-                isCurrent && 'bg-emerald-50 border border-emerald-200',
-                isBlocked && 'bg-red-50/50',
-                !isCurrent && !isBlocked && 'hover:bg-gray-50'
+                isCurrent &&
+                  'bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800',
+                isBlocked && 'bg-red-50/50 dark:bg-red-900/20',
+                !isCurrent && !isBlocked && 'hover:bg-muted/50'
               )}
             >
               <Icon
                 className={clsx(
                   'h-4 w-4 shrink-0',
-                  isDone && 'text-gray-300',
-                  isCurrent && 'text-emerald-600',
-                  isBlocked && 'text-red-500',
-                  !isDone && !isCurrent && !isBlocked && 'text-gray-300'
+                  isDone && 'text-muted-foreground/70',
+                  isCurrent && 'text-emerald-600 dark:text-emerald-400',
+                  isBlocked && 'text-red-500 dark:text-red-400',
+                  !isDone && !isCurrent && !isBlocked && 'text-muted-foreground/70'
                 )}
               />
               <div className="flex-1 min-w-0">
@@ -330,32 +518,34 @@ function TaskProgressList({ tasks, currentIndex }: { tasks: Task[]; currentIndex
                   <span
                     className={clsx(
                       'text-sm',
-                      isDone && 'text-gray-400 line-through',
-                      isCurrent && 'text-gray-900 font-medium',
-                      isBlocked && 'text-red-700',
-                      !isDone && !isCurrent && !isBlocked && 'text-gray-600'
+                      isDone && 'text-muted-foreground/70 line-through',
+                      isCurrent && 'text-foreground font-medium',
+                      isBlocked && 'text-red-700 dark:text-red-400',
+                      !isDone && !isCurrent && !isBlocked && 'text-muted-foreground'
                     )}
                   >
                     {task.title}
                   </span>
                   {isCurrent && (
-                    <span className="flex items-center gap-1 text-[10px] text-emerald-600 font-medium">
+                    <span className="flex items-center gap-1 text-[10px] text-emerald-600 dark:text-emerald-400 font-medium">
                       <Radio className="h-2.5 w-2.5 animate-pulse" />
                       active
                     </span>
                   )}
                 </div>
                 {task.description && isCurrent && (
-                  <p className="text-xs text-gray-500 mt-0.5 line-clamp-2">{task.description}</p>
+                  <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2">
+                    {task.description}
+                  </p>
                 )}
                 {task.outcome && isDone && task.outcome !== 'completed' && (
-                  <p className="text-[11px] text-gray-400 mt-0.5">
+                  <p className="text-[11px] text-muted-foreground/70 mt-0.5">
                     {task.outcome}
                     {task.outcomeReason ? `: ${task.outcomeReason}` : ''}
                   </p>
                 )}
               </div>
-              <span className="text-[10px] text-gray-400 shrink-0 tabular-nums">
+              <span className="text-[10px] text-muted-foreground/70 shrink-0 tabular-nums">
                 {task.taskOrder != null ? `#${task.taskOrder + 1}` : ''}
               </span>
             </div>
@@ -367,7 +557,7 @@ function TaskProgressList({ tasks, currentIndex }: { tasks: Task[]; currentIndex
       {completed > 0 && (
         <button
           onClick={() => setShowCompleted(!showCompleted)}
-          className="mt-2 text-[11px] text-gray-400 hover:text-gray-600 transition-colors flex items-center gap-1"
+          className="mt-2 text-[11px] text-muted-foreground/70 hover:text-foreground/90 transition-colors flex items-center gap-1"
         >
           {showCompleted ? (
             <ChevronDown className="h-3 w-3" />
@@ -383,29 +573,56 @@ function TaskProgressList({ tasks, currentIndex }: { tasks: Task[]; currentIndex
 
 // ─── Live Timeline ───
 
+function streamActivityToEvent(activity: StreamActivity): ActivityEvent {
+  return {
+    id: activity.id,
+    type: activity.type,
+    subtype: activity.subtype,
+    content: activity.content,
+    agentId: activity.agentId,
+    sessionId: activity.sessionId,
+    platform: activity.platform,
+    payload: activity.payload,
+    createdAt: activity.createdAt,
+  };
+}
+
 function LiveTimeline({ groupId, isActive }: { groupId: string; isActive: boolean }) {
+  const [streamSince] = useState(() => new Date().toISOString());
+  const { events: streamedEvents, status: streamStatus } = useEventStream(
+    { taskGroupId: groupId, since: streamSince },
+    { enabled: isActive }
+  );
+
   const { data, isLoading } = useApiQuery<ActivityResponse>(
     ['mission-timeline', groupId],
     `/api/admin/task-groups/${groupId}/activity?limit=200`,
-    { refetchInterval: isActive ? 5000 : false }
+    { refetchInterval: isActive ? (streamStatus === 'live' ? 30000 : 5000) : false }
   );
 
   if (isLoading) {
     return (
-      <div className="flex items-center gap-2 text-sm text-gray-400 py-8 justify-center">
+      <div className="flex items-center gap-2 text-sm text-muted-foreground/70 py-8 justify-center">
         <Loader2 className="h-4 w-4 animate-spin" />
         Loading timeline...
       </div>
     );
   }
 
-  const events = data?.events ?? [];
+  const polled = data?.events ?? [];
+  const polledIds = new Set(polled.map((e) => e.id));
+  // Timeline renders ascending (oldest → newest); streamed events arrive
+  // oldest-first, so append them after the polled page.
+  const events = [
+    ...polled,
+    ...streamedEvents.filter((a) => !polledIds.has(a.id)).map(streamActivityToEvent),
+  ];
   if (events.length === 0) {
     return (
       <div className="text-center py-8">
-        <Activity className="h-8 w-8 mx-auto text-gray-200 mb-2" />
-        <p className="text-sm text-gray-400">No activity recorded yet.</p>
-        <p className="text-xs text-gray-300 mt-1">
+        <Activity className="h-8 w-8 mx-auto text-muted-foreground/40 mb-2" />
+        <p className="text-sm text-muted-foreground/70">No activity recorded yet.</p>
+        <p className="text-xs text-muted-foreground/70 mt-1">
           Events will appear here as the strategy executes.
         </p>
       </div>
@@ -418,12 +635,12 @@ function LiveTimeline({ groupId, isActive }: { groupId: string; isActive: boolea
     <div className="space-y-4">
       {/* Live indicator */}
       {isActive && (
-        <div className="flex items-center gap-2 text-xs text-emerald-600 font-medium">
+        <div className="flex items-center gap-2 text-xs text-emerald-600 dark:text-emerald-400 font-medium">
           <span className="relative flex h-2 w-2">
             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
             <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
           </span>
-          Live — updating every 5s
+          {streamStatus === 'live' ? 'Live — streaming' : 'Live — updating every 5s'}
         </div>
       )}
 
@@ -431,25 +648,32 @@ function LiveTimeline({ groupId, isActive }: { groupId: string; isActive: boolea
         <div key={dateLabel}>
           {/* Date separator */}
           <div className="flex items-center gap-3 mb-3">
-            <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">
+            <span className="text-[10px] font-semibold text-muted-foreground/70 uppercase tracking-wider">
               {dateLabel}
             </span>
-            <div className="flex-1 h-px bg-gray-100" />
+            <div className="flex-1 h-px bg-muted" />
           </div>
 
           {/* Events */}
           <div className="relative pl-5 space-y-0">
-            <div className="absolute left-[9px] top-1 bottom-1 w-px bg-gray-200" />
+            <div className="absolute left-[9px] top-1 bottom-1 w-px bg-border" />
 
             {dayEvents.map((event, i) => {
+              const isCheckIn = event.type === 'message_in';
+              const isInkmail =
+                event.type === 'inkmail_dispatch' || event.type === 'inkmail_deliver';
               const meta = SUBTYPE_META[event.subtype ?? ''];
-              const Icon = meta?.icon ?? Activity;
-              const color = meta?.color ?? 'text-gray-400';
+              const Icon = isCheckIn ? MessageCircle : isInkmail ? Send : (meta?.icon ?? Activity);
+              const color = isCheckIn
+                ? 'text-sky-500 dark:text-sky-400'
+                : isInkmail
+                  ? 'text-violet-500 dark:text-violet-400'
+                  : (meta?.color ?? 'text-muted-foreground/70');
               const label = meta?.label ?? event.subtype ?? event.type;
               const isLatest =
                 i === dayEvents.length - 1 && dateLabel === [...dateGroups.keys()].at(-1);
               const agentBadge = event.agentId
-                ? (AGENT_BADGE_COLORS[event.agentId] ?? 'bg-gray-100 text-gray-600')
+                ? (AGENT_BADGE_COLORS[event.agentId] ?? 'bg-muted text-muted-foreground')
                 : null;
 
               return (
@@ -463,40 +687,50 @@ function LiveTimeline({ groupId, isActive }: { groupId: string; isActive: boolea
                   {/* Icon node */}
                   <div
                     className={clsx(
-                      'relative z-10 rounded-full bg-white p-0.5 -ml-[13px] ring-2 ring-white',
-                      isLatest && isActive && 'ring-emerald-50'
+                      'relative z-10 rounded-full bg-card p-0.5 -ml-[13px] ring-2 ring-card',
+                      isLatest && isActive && 'ring-emerald-50 dark:ring-emerald-900/30'
                     )}
                   >
                     <Icon className={clsx('h-3.5 w-3.5', color)} />
                   </div>
 
                   {/* Content */}
-                  <div className="flex-1 min-w-0 -mt-0.5">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="text-xs font-medium text-gray-700">{label}</span>
-                      {agentBadge && (
-                        <span
-                          className={clsx(
-                            'text-[10px] font-medium px-1.5 py-0.5 rounded-full',
-                            agentBadge
-                          )}
-                        >
-                          {event.agentId}
-                        </span>
-                      )}
-                      {event.sessionId && (
-                        <Link
-                          href={`/sessions/${event.sessionId}`}
-                          className="text-[10px] text-blue-500 hover:text-blue-700 flex items-center gap-0.5 transition-colors opacity-0 group-hover:opacity-100"
-                        >
-                          <ExternalLink className="h-2.5 w-2.5" />
-                          session
-                        </Link>
-                      )}
+                  {isCheckIn ? (
+                    <CheckInEntry event={event} />
+                  ) : isInkmail ? (
+                    <AgentMessageEntry event={event} />
+                  ) : (
+                    <div className="flex-1 min-w-0 -mt-0.5">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-xs font-medium text-foreground/90">{label}</span>
+                        {agentBadge && (
+                          <span
+                            className={clsx(
+                              'text-[10px] font-medium px-1.5 py-0.5 rounded-full',
+                              agentBadge
+                            )}
+                          >
+                            {event.agentId}
+                          </span>
+                        )}
+                        {event.sessionId && (
+                          <Link
+                            href={`/sessions/${event.sessionId}`}
+                            className="text-[10px] text-blue-500 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300 flex items-center gap-0.5 transition-colors opacity-0 group-hover:opacity-100"
+                          >
+                            <ExternalLink className="h-2.5 w-2.5" />
+                            session
+                          </Link>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-muted-foreground mt-0.5 line-clamp-3">
+                        {event.content}
+                      </p>
+                      <span className="text-[10px] text-muted-foreground/70">
+                        {formatTime(event.createdAt)}
+                      </span>
                     </div>
-                    <p className="text-[11px] text-gray-500 mt-0.5 line-clamp-3">{event.content}</p>
-                    <span className="text-[10px] text-gray-400">{formatTime(event.createdAt)}</span>
-                  </div>
+                  )}
                 </div>
               );
             })}
@@ -517,7 +751,7 @@ function CommentsThread({ groupId }: { groupId: string }) {
 
   if (isLoading) {
     return (
-      <div className="flex items-center gap-2 text-sm text-gray-400 py-6 justify-center">
+      <div className="flex items-center gap-2 text-sm text-muted-foreground/70 py-6 justify-center">
         <Loader2 className="h-4 w-4 animate-spin" />
         Loading comments...
       </div>
@@ -528,8 +762,8 @@ function CommentsThread({ groupId }: { groupId: string }) {
   if (comments.length === 0) {
     return (
       <div className="text-center py-6">
-        <MessageSquare className="h-8 w-8 mx-auto text-gray-200 mb-2" />
-        <p className="text-sm text-gray-400">No comments yet.</p>
+        <MessageSquare className="h-8 w-8 mx-auto text-muted-foreground/40 mb-2" />
+        <p className="text-sm text-muted-foreground/70">No comments yet.</p>
       </div>
     );
   }
@@ -545,15 +779,15 @@ function CommentsThread({ groupId }: { groupId: string }) {
           comment.agentId ||
           'Unknown';
         const agentBadge = comment.agentId
-          ? (AGENT_BADGE_COLORS[comment.agentId] ?? 'bg-gray-100 text-gray-600')
+          ? (AGENT_BADGE_COLORS[comment.agentId] ?? 'bg-muted text-muted-foreground')
           : null;
 
         if (isStatusChange) {
           return (
             <div key={comment.id} className="flex items-center gap-2 py-1">
-              <div className="flex-1 h-px bg-gray-100" />
-              <span className="text-[11px] text-gray-400 italic">{comment.content}</span>
-              <div className="flex-1 h-px bg-gray-100" />
+              <div className="flex-1 h-px bg-muted" />
+              <span className="text-[11px] text-muted-foreground/70 italic">{comment.content}</span>
+              <div className="flex-1 h-px bg-muted" />
             </div>
           );
         }
@@ -563,12 +797,16 @@ function CommentsThread({ groupId }: { groupId: string }) {
             key={comment.id}
             className={clsx(
               'rounded-lg border p-4',
-              isConclusion ? 'bg-emerald-50/50 border-emerald-200' : 'bg-white border-gray-200'
+              isConclusion
+                ? 'bg-emerald-50/50 dark:bg-emerald-900/20 border-emerald-200 dark:border-emerald-800'
+                : 'bg-card border-border'
             )}
           >
             <div className="flex items-center justify-between mb-2">
               <div className="flex items-center gap-2">
-                {isConclusion && <FileCheck className="h-3.5 w-3.5 text-emerald-600" />}
+                {isConclusion && (
+                  <FileCheck className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                )}
                 {agentBadge && (
                   <span
                     className={clsx(
@@ -580,25 +818,27 @@ function CommentsThread({ groupId }: { groupId: string }) {
                   </span>
                 )}
                 {!agentBadge && (
-                  <span className="text-xs font-medium text-gray-700">{authorName}</span>
+                  <span className="text-xs font-medium text-foreground/90">{authorName}</span>
                 )}
                 {isConclusion && (
-                  <span className="text-[10px] font-medium text-emerald-600 uppercase tracking-wider">
+                  <span className="text-[10px] font-medium text-emerald-600 dark:text-emerald-400 uppercase tracking-wider">
                     Conclusion
                   </span>
                 )}
                 {comment.createdByIdentity?.backend && (
-                  <span className="text-[10px] text-gray-400">
+                  <span className="text-[10px] text-muted-foreground/70">
                     via {comment.createdByIdentity.backend}
                   </span>
                 )}
               </div>
-              <span className="text-[11px] text-gray-400">{formatDateTime(comment.createdAt)}</span>
+              <span className="text-[11px] text-muted-foreground/70">
+                {formatDateTime(comment.createdAt)}
+              </span>
             </div>
             <p
               className={clsx(
                 'text-sm whitespace-pre-wrap',
-                isConclusion ? 'text-emerald-900' : 'text-gray-700'
+                isConclusion ? 'text-emerald-900 dark:text-emerald-200' : 'text-foreground/90'
               )}
             >
               {comment.content}
@@ -627,12 +867,12 @@ export default function MissionDetailPage() {
       <div className="max-w-6xl">
         <Link
           href="/tasks"
-          className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-700 mb-6 transition-colors"
+          className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground/90 mb-6 transition-colors"
         >
           <ArrowLeft className="h-4 w-4" />
           Back to Tasks
         </Link>
-        <div className="flex items-center gap-3 text-gray-400 py-16 justify-center">
+        <div className="flex items-center gap-3 text-muted-foreground/70 py-16 justify-center">
           <Loader2 className="h-5 w-5 animate-spin" />
           <span className="text-sm">Loading mission...</span>
         </div>
@@ -645,13 +885,15 @@ export default function MissionDetailPage() {
       <div className="max-w-6xl">
         <Link
           href="/tasks"
-          className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-700 mb-6 transition-colors"
+          className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground/90 mb-6 transition-colors"
         >
           <ArrowLeft className="h-4 w-4" />
           Back to Tasks
         </Link>
-        <div className="rounded-lg bg-red-50 border border-red-200 p-6 text-center">
-          <p className="text-sm text-red-800">{error?.message ?? 'Mission not found'}</p>
+        <div className="rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 p-6 text-center">
+          <p className="text-sm text-red-800 dark:text-red-300">
+            {error?.message ?? 'Mission not found'}
+          </p>
         </div>
       </div>
     );
@@ -672,7 +914,7 @@ export default function MissionDetailPage() {
       {/* Navigation */}
       <Link
         href="/tasks"
-        className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-700 mb-6 transition-colors"
+        className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground/90 mb-6 transition-colors"
       >
         <ArrowLeft className="h-4 w-4" />
         Back to Tasks
@@ -681,12 +923,12 @@ export default function MissionDetailPage() {
       {/* Header */}
       <div className="mb-6">
         <div className="flex items-start gap-4">
-          <div className="h-10 w-10 rounded-xl bg-indigo-50 flex items-center justify-center shrink-0">
-            <Layers className="h-5 w-5 text-indigo-500" />
+          <div className="h-10 w-10 rounded-xl bg-indigo-50 dark:bg-indigo-900/30 flex items-center justify-center shrink-0">
+            <Layers className="h-5 w-5 text-indigo-500 dark:text-indigo-400" />
           </div>
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-3 flex-wrap">
-              <h1 className="text-xl font-bold text-gray-900">{group.title}</h1>
+              <h1 className="text-xl font-bold text-foreground">{group.title}</h1>
               <Badge
                 className={clsx(
                   'text-xs font-medium border gap-1',
@@ -699,13 +941,13 @@ export default function MissionDetailPage() {
                 {statusCfg.label}
               </Badge>
               {group.autonomous && (
-                <Badge className="text-xs font-medium border bg-violet-50 text-violet-700 border-violet-200 gap-1">
+                <Badge className="text-xs font-medium border bg-violet-50 dark:bg-violet-900/30 text-violet-700 dark:text-violet-400 border-violet-200 dark:border-violet-800 gap-1">
                   <Zap className="h-3 w-3" />
                   Autonomous
                 </Badge>
               )}
               {group.strategy && (
-                <Badge className="text-xs font-medium border bg-indigo-50 text-indigo-700 border-indigo-200 gap-1">
+                <Badge className="text-xs font-medium border bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-400 border-indigo-200 dark:border-indigo-800 gap-1">
                   <GitBranch className="h-3 w-3" />
                   {group.strategy}
                 </Badge>
@@ -713,20 +955,20 @@ export default function MissionDetailPage() {
             </div>
 
             {group.description && (
-              <p className="text-sm text-gray-500 mt-1.5">{group.description}</p>
+              <p className="text-sm text-muted-foreground mt-1.5">{group.description}</p>
             )}
 
             {/* Meta row */}
             <div className="flex items-center gap-4 mt-2.5 flex-wrap">
               {ownerName && (
-                <span className="flex items-center gap-1.5 text-xs text-gray-500">
+                <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
                   <Bot className="h-3.5 w-3.5" />
                   <span
                     className={clsx(
                       'font-medium px-1.5 py-0.5 rounded-full text-[11px]',
                       agentColors
                         ? `${agentColors.bg} ${agentColors.text}`
-                        : 'bg-gray-100 text-gray-600'
+                        : 'bg-muted text-muted-foreground'
                     )}
                   >
                     {ownerName}
@@ -734,23 +976,23 @@ export default function MissionDetailPage() {
                 </span>
               )}
               {group.projectName && (
-                <span className="flex items-center gap-1.5 text-xs text-gray-500">
+                <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
                   <FolderOpen className="h-3.5 w-3.5" />
                   {group.projectName}
                 </span>
               )}
-              <span className="flex items-center gap-1.5 text-xs text-gray-500">
+              <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
                 <Target className="h-3.5 w-3.5" />
                 {completed}/{tasks.length} tasks
               </span>
               {elapsed && (
-                <span className="flex items-center gap-1.5 text-xs text-gray-500">
+                <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
                   <Timer className="h-3.5 w-3.5" />
                   {elapsed}
                 </span>
               )}
               {group.strategyStartedAt && (
-                <span className="flex items-center gap-1.5 text-xs text-gray-400">
+                <span className="flex items-center gap-1.5 text-xs text-muted-foreground/70">
                   <Clock className="h-3.5 w-3.5" />
                   Started {formatDateTime(group.strategyStartedAt)}
                 </span>
@@ -764,10 +1006,10 @@ export default function MissionDetailPage() {
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
         {/* Left: Task Progress (2 cols) */}
         <div className="lg:col-span-2">
-          <div className="rounded-xl border bg-white p-5 sticky top-8">
+          <div className="rounded-xl border bg-card p-5 sticky top-8">
             <div className="flex items-center gap-2 mb-4">
-              <Hash className="h-4 w-4 text-gray-400" />
-              <h2 className="text-sm font-semibold text-gray-700">Task Progress</h2>
+              <Hash className="h-4 w-4 text-muted-foreground/70" />
+              <h2 className="text-sm font-semibold text-foreground/90">Task Progress</h2>
             </div>
             <TaskProgressList tasks={tasks} currentIndex={group.currentTaskIndex} />
           </div>
@@ -775,14 +1017,14 @@ export default function MissionDetailPage() {
 
         {/* Right: Live Timeline (3 cols) */}
         <div className="lg:col-span-3">
-          <div className="rounded-xl border bg-white p-5">
+          <div className="rounded-xl border bg-card p-5">
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center gap-2">
-                <Activity className="h-4 w-4 text-gray-400" />
-                <h2 className="text-sm font-semibold text-gray-700">Timeline</h2>
+                <Activity className="h-4 w-4 text-muted-foreground/70" />
+                <h2 className="text-sm font-semibold text-foreground/90">Timeline</h2>
               </div>
               {isActive && (
-                <span className="flex items-center gap-1.5 text-[11px] text-emerald-600 font-medium">
+                <span className="flex items-center gap-1.5 text-[11px] text-emerald-600 dark:text-emerald-400 font-medium">
                   <span className="relative flex h-2 w-2">
                     <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
                     <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
@@ -791,7 +1033,7 @@ export default function MissionDetailPage() {
                 </span>
               )}
               {isPaused && (
-                <span className="flex items-center gap-1.5 text-[11px] text-amber-600 font-medium">
+                <span className="flex items-center gap-1.5 text-[11px] text-amber-600 dark:text-amber-400 font-medium">
                   <Pause className="h-3 w-3" />
                   Paused
                 </span>
@@ -804,10 +1046,10 @@ export default function MissionDetailPage() {
 
       {/* Comments Thread */}
       <div className="mt-6">
-        <div className="rounded-xl border bg-white p-5">
+        <div className="rounded-xl border bg-card p-5">
           <div className="flex items-center gap-2 mb-4">
-            <MessageSquare className="h-4 w-4 text-gray-400" />
-            <h2 className="text-sm font-semibold text-gray-700">Comments</h2>
+            <MessageSquare className="h-4 w-4 text-muted-foreground/70" />
+            <h2 className="text-sm font-semibold text-foreground/90">Comments</h2>
           </div>
           <CommentsThread groupId={groupId} />
         </div>

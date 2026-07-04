@@ -7,6 +7,6 @@ export default defineConfig({
     include: ['src/**/*.test.ts'],
     // Live tests spawn real backend CLIs — run them via the root
     // `yarn test:live`, not in the default per-workspace suite.
-    exclude: ['node_modules', 'dist', '**/*.live.test.ts'],
+    exclude: ['node_modules', 'dist', '**/*.integration.test.ts', '**/*.live.test.ts'],
   },
 });

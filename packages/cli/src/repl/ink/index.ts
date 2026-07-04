@@ -13,5 +13,6 @@ export { StatusBar } from './StatusBar.js';
 export { InfoBar } from './InfoBar.js';
 export { PromptInput } from './PromptInput.js';
 export { Separator } from './Separator.js';
-export { renderInkChat, InkExitSignal, type InkRepl } from './renderApp.js';
+export { renderInkChat, renderSessionPicker, InkExitSignal, type InkRepl } from './renderApp.js';
 export { renderInkMission, type InkMission } from './renderMission.js';
+export { type SessionPickerEntry } from './SessionPicker.js';

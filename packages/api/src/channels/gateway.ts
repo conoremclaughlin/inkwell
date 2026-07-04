@@ -59,6 +59,14 @@ export interface ChannelGatewayConfig {
   dataComposer?: DataComposer;
 }
 
+export interface GatewayMediaAttachment {
+  type: 'image' | 'video' | 'audio' | 'document';
+  path?: string;
+  url?: string;
+  contentType?: string;
+  filename?: string;
+}
+
 export type IncomingMessageHandler = (
   channel: GatewayChannel,
   conversationId: string,
@@ -67,7 +75,7 @@ export type IncomingMessageHandler = (
   metadata?: {
     userId?: string;
     replyToMessageId?: string;
-    media?: Array<{ type: 'image' | 'video' | 'audio' | 'document'; path?: string; url?: string }>;
+    media?: GatewayMediaAttachment[];
     chatType?: 'direct' | 'group' | 'channel';
     mentions?: { users: string[]; botMentioned: boolean };
     platformAccountId?: string;
@@ -86,7 +94,7 @@ const DEFAULT_BUFFER_DELAY_MS = 2000; // Wait 2 seconds for additional messages
 interface BufferedMessage {
   content: string;
   timestamp: Date;
-  media?: Array<{ type: 'image' | 'video' | 'audio' | 'document'; path?: string; url?: string }>;
+  media?: GatewayMediaAttachment[];
 }
 
 interface MessageBuffer {
@@ -130,6 +138,12 @@ export class ChannelGateway extends EventEmitter {
   private includeTextAfterVoiceReply = process.env.TELEGRAM_VOICE_INCLUDE_TEXT !== 'false';
   private pendingVoiceReplyConversations: Set<string> = new Set();
   private conversationUserMap = new Map<string, string>(); // channel:conversationId -> userId
+
+  // Channel reconnect state
+  private channelRetryTimers = new Map<GatewayChannel, NodeJS.Timeout>();
+  private channelRetryAttempts = new Map<GatewayChannel, number>();
+  private static readonly RETRY_BASE_MS = 30_000; // 30s initial
+  private static readonly RETRY_CAP_MS = 5 * 60_000; // 5min max
 
   constructor(config: ChannelGatewayConfig = {}) {
     super();
@@ -216,28 +230,44 @@ export class ChannelGateway extends EventEmitter {
 
     // Start Telegram listener
     if (this.config.enableTelegram) {
-      await this.startTelegram();
+      try {
+        await this.startTelegram();
+      } catch {
+        this.scheduleChannelRetry('telegram', this.startTelegram);
+      }
     } else {
       logger.info('Telegram listener disabled');
     }
 
     // Start WhatsApp listener
     if (this.config.enableWhatsApp) {
-      await this.startWhatsApp();
+      try {
+        await this.startWhatsApp();
+      } catch {
+        this.scheduleChannelRetry('whatsapp', this.startWhatsApp);
+      }
     } else {
       logger.info('WhatsApp listener disabled (set ENABLE_WHATSAPP=true to enable)');
     }
 
     // Start Discord listener
     if (this.config.enableDiscord) {
-      await this.startDiscord();
+      try {
+        await this.startDiscord();
+      } catch {
+        this.scheduleChannelRetry('discord', this.startDiscord);
+      }
     } else {
       logger.info('Discord listener disabled (set ENABLE_DISCORD=true to enable)');
     }
 
     // Start Slack listener
     if (this.config.enableSlack) {
-      await this.startSlack();
+      try {
+        await this.startSlack();
+      } catch {
+        this.scheduleChannelRetry('slack', this.startSlack);
+      }
     } else {
       logger.info('Slack listener disabled (set ENABLE_SLACK=true to enable)');
     }
@@ -271,6 +301,13 @@ export class ChannelGateway extends EventEmitter {
 
     this.pendingVoiceReplyConversations.clear();
     this.conversationUserMap.clear();
+
+    // Cancel pending reconnect timers
+    for (const [channel, timer] of this.channelRetryTimers) {
+      clearTimeout(timer);
+      this.channelRetryTimers.delete(channel);
+    }
+    this.channelRetryAttempts.clear();
 
     // Clear all message buffers (flush them first)
     for (const [key, buffer] of this.messageBuffers) {
@@ -390,11 +427,7 @@ export class ChannelGateway extends EventEmitter {
     metadata?: {
       userId?: string;
       replyToMessageId?: string;
-      media?: Array<{
-        type: 'image' | 'video' | 'audio' | 'document';
-        path?: string;
-        url?: string;
-      }>;
+      media?: GatewayMediaAttachment[];
       chatType?: 'direct' | 'group' | 'channel';
       mentions?: { users: string[]; botMentioned: boolean };
       platformAccountId?: string;
@@ -546,11 +579,7 @@ export class ChannelGateway extends EventEmitter {
     metadata?: {
       userId?: string;
       replyToMessageId?: string;
-      media?: Array<{
-        type: 'image' | 'video' | 'audio' | 'document';
-        path?: string;
-        url?: string;
-      }>;
+      media?: GatewayMediaAttachment[];
       chatType?: 'direct' | 'group' | 'channel';
       mentions?: { users: string[]; botMentioned: boolean };
       platformAccountId?: string;
@@ -591,27 +620,11 @@ export class ChannelGateway extends EventEmitter {
       this.pendingVoiceReplyConversations.add(this.getBufferKey(channel, conversationId));
     }
 
-    // Log incoming message to activity stream
-    if (this.dataComposer && userId) {
-      try {
-        const isGroupChat = metadata?.chatType === 'group' || metadata?.chatType === 'channel';
-        await this.dataComposer.repositories.activityStream.logMessage({
-          userId,
-          agentId: 'myra',
-          direction: 'in',
-          content,
-          platform: channel,
-          platformChatId: conversationId,
-          isDm: !isGroupChat,
-          payload: {
-            senderName: sender.name,
-            senderId: sender.id,
-          },
-        });
-      } catch (activityError) {
-        logger.warn('Failed to log incoming message to activity stream:', activityError);
-      }
-    }
+    // NOTE: inbound messages are NOT logged to the activity stream here.
+    // SessionService.handleMessage logs them first thing with the RESOLVED
+    // agentId and full payload (media, threadKey, sender) — this site used
+    // to log a second copy with a hardcoded agentId of 'myra', producing
+    // duplicate message_in rows (double-rendered in attached CLI views).
 
     // Pass resolved userId to message handler so SessionService can persist messages
     const enrichedMetadata = userId && !metadata?.userId ? { ...metadata, userId } : metadata;
@@ -1112,6 +1125,7 @@ export class ChannelGateway extends EventEmitter {
     const fs = await import('fs/promises');
     const pathMod = await import('path');
     const os = await import('os');
+    const { randomUUID } = await import('crypto');
 
     const response = await fetch(url);
     if (!response.ok) {
@@ -1119,10 +1133,15 @@ export class ChannelGateway extends EventEmitter {
     }
 
     const buffer = Buffer.from(await response.arrayBuffer());
-    const tmpDir = pathMod.join(os.tmpdir(), 'pcp-media');
+    // Each download gets its own unique subdirectory while the basename
+    // keeps the display filename. Naming the file directly from
+    // attachment.filename collided when two attachments shared a name
+    // (e.g. an album of two photo.jpg items) — the later download
+    // overwrote the earlier and the album uploaded duplicate bytes.
+    const tmpDir = pathMod.join(os.tmpdir(), 'pcp-media', randomUUID());
     await fs.mkdir(tmpDir, { recursive: true });
 
-    const safeName = (filename || `media_${Date.now()}`).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const safeName = (filename || 'media').replace(/[^a-zA-Z0-9._-]/g, '_') || 'media';
     const tmpPath = pathMod.join(tmpDir, safeName);
     await fs.writeFile(tmpPath, buffer);
 
@@ -1131,6 +1150,7 @@ export class ChannelGateway extends EventEmitter {
       cleanup: async () => {
         try {
           await fs.unlink(tmpPath);
+          await fs.rmdir(tmpDir);
         } catch {
           // Best-effort cleanup
         }
@@ -1157,7 +1177,97 @@ export class ChannelGateway extends EventEmitter {
     let failed = 0;
     const errors: string[] = [];
 
-    for (const attachment of media) {
+    // Telegram albums: 2+ photos/videos batch into sendMediaGroup (10 per
+    // album) so they arrive as one grouped message instead of a stream of
+    // singles. Other media types fall through to the per-item loop below.
+    let queue = media;
+    if (channel === 'telegram' && this.telegramListener) {
+      const groupable = media.filter((m) => m.type === 'image' || m.type === 'video');
+      if (groupable.length >= 2) {
+        queue = media.filter((m) => m.type !== 'image' && m.type !== 'video');
+        const TELEGRAM_ALBUM_MAX = 10;
+        for (let i = 0; i < groupable.length; i += TELEGRAM_ALBUM_MAX) {
+          const batch = groupable.slice(i, i + TELEGRAM_ALBUM_MAX);
+          const resolved: Array<{
+            filePath: string;
+            type: 'image' | 'video';
+            caption?: string;
+            contentType?: string;
+            filename?: string;
+          }> = [];
+          const cleanups: Array<() => Promise<void>> = [];
+
+          for (const attachment of batch) {
+            let filePath = attachment.path;
+            if (!filePath && attachment.url) {
+              try {
+                const temp = await this.downloadToTempFile(attachment.url, attachment.filename);
+                filePath = temp.path;
+                cleanups.push(temp.cleanup);
+              } catch (error) {
+                const msg = `Failed to download media URL: ${attachment.url}`;
+                logger.error(msg, error);
+                errors.push(msg);
+                failed++;
+                continue;
+              }
+            }
+            if (!filePath) {
+              const msg = `Media attachment missing both path and url (type: ${attachment.type})`;
+              logger.warn(msg, { channel, attachment });
+              errors.push(msg);
+              failed++;
+              continue;
+            }
+            resolved.push({
+              filePath,
+              type: attachment.type === 'video' ? 'video' : 'image',
+              caption: attachment.caption,
+              contentType: attachment.contentType,
+              filename: attachment.filename,
+            });
+          }
+
+          try {
+            if (resolved.length >= 2) {
+              await this.telegramListener.sendMediaGroup(conversationId, resolved, {
+                replyToMessageId: options?.replyToMessageId,
+              });
+              sent += resolved.length;
+            } else if (resolved.length === 1) {
+              // Album collapsed to one item (trailing remainder or download
+              // failures) — sendMediaGroup needs 2+, send it singly.
+              const single = resolved[0];
+              const singleOpts = {
+                caption: single.caption,
+                filename: single.filename,
+                contentType: single.contentType,
+                replyToMessageId: options?.replyToMessageId,
+              };
+              if (single.type === 'video') {
+                await this.telegramListener.sendVideo(conversationId, single.filePath, singleOpts);
+              } else {
+                await this.telegramListener.sendPhoto(conversationId, single.filePath, singleOpts);
+              }
+              sent += 1;
+            }
+          } catch (error) {
+            const msg = `Failed to send telegram album (${resolved.length} items): ${
+              error instanceof Error ? error.message : String(error)
+            }`;
+            logger.error(msg);
+            errors.push(msg);
+            failed += resolved.length;
+          } finally {
+            for (const cleanup of cleanups) {
+              await cleanup().catch(() => undefined);
+            }
+          }
+        }
+      }
+    }
+
+    for (const attachment of queue) {
       let filePath = attachment.path;
       let tempCleanup: (() => Promise<void>) | null = null;
 
@@ -1296,7 +1406,12 @@ export class ChannelGateway extends EventEmitter {
     if (!this.textToSpeech.isEnabled()) return false;
     if (!this.shouldUseVoiceReply(response)) return false;
 
-    const audio = await this.textToSpeech.synthesize({ text: response.content });
+    const metadata = response.metadata as Record<string, unknown> | undefined;
+    const voiceOverride = typeof metadata?.ttsVoice === 'string' ? metadata.ttsVoice : undefined;
+    const audio = await this.textToSpeech.synthesize({
+      text: response.content,
+      voice: voiceOverride,
+    });
     if (!audio) return false;
 
     try {
@@ -1316,6 +1431,79 @@ export class ChannelGateway extends EventEmitter {
       await audio.cleanup().catch((cleanupError) => {
         logger.debug('Failed to clean up synthesized audio file', cleanupError);
       });
+    }
+  }
+
+  /**
+   * Schedule a background retry for a channel that failed to start.
+   * Uses exponential backoff: 30s, 60s, 120s, ... capped at 5min.
+   */
+  private scheduleChannelRetry(channel: GatewayChannel, startFn: () => Promise<void>): void {
+    const existing = this.channelRetryTimers.get(channel);
+    if (existing) clearTimeout(existing);
+
+    const attempt = (this.channelRetryAttempts.get(channel) ?? 0) + 1;
+    this.channelRetryAttempts.set(channel, attempt);
+
+    const delay = Math.min(
+      ChannelGateway.RETRY_BASE_MS * Math.pow(2, attempt - 1),
+      ChannelGateway.RETRY_CAP_MS
+    );
+
+    logger.info(
+      `[Gateway] Scheduling ${channel} reconnect in ${Math.round(delay / 1000)}s (attempt ${attempt})`
+    );
+
+    const timer = setTimeout(async () => {
+      this.channelRetryTimers.delete(channel);
+      try {
+        await startFn.call(this);
+        this.channelRetryAttempts.delete(channel);
+        logger.info(`[Gateway] ${channel} reconnected on attempt ${attempt}`);
+      } catch {
+        // startFn logs the error and sets listener to null.
+        // Schedule the next retry attempt.
+        this.scheduleChannelRetry(channel, startFn);
+      }
+    }, delay);
+
+    this.channelRetryTimers.set(channel, timer);
+  }
+
+  /**
+   * Manually trigger a reconnect for a channel that failed startup.
+   * Respects a minimum 60s cooldown between manual reconnect attempts.
+   */
+  async reconnectChannel(channel: GatewayChannel): Promise<{ success: boolean; message: string }> {
+    const startFns: Record<GatewayChannel, (() => Promise<void>) | undefined> = {
+      telegram: this.startTelegram,
+      whatsapp: this.startWhatsApp,
+      discord: this.startDiscord,
+      slack: this.startSlack,
+    };
+
+    const startFn = startFns[channel];
+    if (!startFn) {
+      return { success: false, message: `Unknown channel: ${channel}` };
+    }
+
+    const existing = this.channelRetryTimers.get(channel);
+    if (existing) {
+      clearTimeout(existing);
+      this.channelRetryTimers.delete(channel);
+    }
+
+    this.channelRetryAttempts.set(channel, 0);
+
+    try {
+      await startFn.call(this);
+      this.channelRetryAttempts.delete(channel);
+      return { success: true, message: `${channel} reconnected` };
+    } catch (err) {
+      return {
+        success: false,
+        message: `${channel} reconnect failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
     }
   }
 
@@ -1378,8 +1566,16 @@ export class ChannelGateway extends EventEmitter {
       this.emit('telegram:error', error);
     });
 
-    await this.telegramListener.start();
-    logger.info('Telegram listener started');
+    try {
+      await this.telegramListener.start();
+      logger.info('Telegram listener started');
+    } catch (err) {
+      logger.error('Telegram listener failed to start — server will continue without it', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.telegramListener = null;
+      throw err;
+    }
   }
 
   /**
@@ -1446,8 +1642,16 @@ export class ChannelGateway extends EventEmitter {
       this.emit('whatsapp:error', error);
     });
 
-    await this.whatsappListener.start();
-    logger.info('WhatsApp listener started');
+    try {
+      await this.whatsappListener.start();
+      logger.info('WhatsApp listener started');
+    } catch (err) {
+      logger.error('WhatsApp listener failed to start — server will continue without it', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.whatsappListener = null;
+      throw err;
+    }
   }
 
   /**
@@ -1505,8 +1709,16 @@ export class ChannelGateway extends EventEmitter {
       this.emit('discord:error', error);
     });
 
-    await this.discordListener.start();
-    logger.info('Discord listener started');
+    try {
+      await this.discordListener.start();
+      logger.info('Discord listener started');
+    } catch (err) {
+      logger.error('Discord listener failed to start — server will continue without it', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.discordListener = null;
+      throw err;
+    }
   }
 
   /**
@@ -1567,8 +1779,16 @@ export class ChannelGateway extends EventEmitter {
       this.emit('slack:error', error);
     });
 
-    await this.slackListener.start();
-    logger.info('Slack listener started');
+    try {
+      await this.slackListener.start();
+      logger.info('Slack listener started');
+    } catch (err) {
+      logger.error('Slack listener failed to start — server will continue without it', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.slackListener = null;
+      throw err;
+    }
   }
 
   /**
