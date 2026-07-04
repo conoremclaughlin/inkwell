@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Inkwell</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        display: grid;
+        place-items: center;
+        background: radial-gradient(120% 120% at 50% 0%, #1d2450 0%, #10142e 55%, #0b0e21 100%);
+        color: #e8ebff;
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      main {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 1.1rem;
+        text-align: center;
+        padding: 2rem;
+        max-width: 34rem;
+      }
+      .drop {
+        width: 84px;
+        height: 84px;
+        animation: bob 2.4s ease-in-out infinite;
+        filter: drop-shadow(0 8px 24px rgba(90, 104, 255, 0.35));
+      }
+      @keyframes bob {
+        0%,
+        100% {
+          transform: translateY(0) scale(1);
+          opacity: 0.92;
+        }
+        50% {
+          transform: translateY(-6px) scale(1.03);
+          opacity: 1;
+        }
+      }
+      h1 {
+        font-size: 1.35rem;
+        font-weight: 650;
+        letter-spacing: 0.01em;
+      }
+      p {
+        font-size: 0.92rem;
+        line-height: 1.55;
+        color: #9aa3d4;
+      }
+      .url {
+        font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+        font-size: 0.85rem;
+        color: #c3cbff;
+        background: rgba(122, 134, 255, 0.12);
+        border: 1px solid rgba(122, 134, 255, 0.25);
+        border-radius: 999px;
+        padding: 0.35rem 0.9rem;
+      }
+      .dots::after {
+        content: '';
+        display: inline-block;
+        width: 1.2em;
+        text-align: left;
+        animation: dots 1.6s steps(4, end) infinite;
+      }
+      @keyframes dots {
+        0% {
+          content: '';
+        }
+        25% {
+          content: '.';
+        }
+        50% {
+          content: '..';
+        }
+        75% {
+          content: '...';
+        }
+      }
+      code {
+        font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+        font-size: 0.85em;
+        color: #c3cbff;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <svg class="drop" viewBox="0 0 100 100" aria-hidden="true">
+        <defs>
+          <linearGradient id="ink" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#aab4ff" />
+            <stop offset="100%" stop-color="#5a68ff" />
+          </linearGradient>
+        </defs>
+        <path
+          d="M50 6 C 62 28, 82 44, 82 63 A 32 32 0 1 1 18 63 C 18 44, 38 28, 50 6 Z"
+          fill="url(#ink)"
+        />
+      </svg>
+      <h1>Waiting for the Inkwell server<span class="dots"></span></h1>
+      <p>
+        This app is a shell over your locally running dashboard at
+        <span class="url" id="server-url">http://localhost:3000</span>
+      </p>
+      <p>
+        Start it with <code>yarn dev</code> in the Inkwell repo &mdash; this window will connect
+        automatically as soon as the server is up.
+      </p>
+    </main>
+    <script>
+      // Injected by the Rust shell before page load (see lib.rs). Falls back
+      // to the default so the page still makes sense when opened standalone.
+      const url = window.__INK_SERVER_URL__;
+      if (typeof url === 'string' && url) {
+        document.getElementById('server-url').textContent = url;
+      }
+    </script>
+  </body>
+</html>
