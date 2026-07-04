@@ -264,9 +264,11 @@ export default function SessionLogsPage() {
     if (offset !== 0 || streamedEvents.length === 0) return polled;
     const polledIds = new Set(polled.map((entry) => entry.id));
     // Streamed events arrive oldest-first; the timeline renders newest-first.
+    // Map BEFORE filtering so the dedupe compares the same "activity:<id>"
+    // format the polled entries carry.
     const streamed = streamedEvents
-      .filter((activity) => !polledIds.has(activity.id))
       .map(activityToLogEntry)
+      .filter((entry) => !polledIds.has(entry.id))
       .reverse();
     return [...streamed, ...polled];
   }, [data?.logs, streamedEvents, offset]);
