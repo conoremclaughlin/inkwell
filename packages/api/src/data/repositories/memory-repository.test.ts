@@ -442,6 +442,174 @@ describe('MemoryRepository', () => {
 
       expect(result).toBeNull();
     });
+
+    it('should update content and summary and refresh embeddings', async () => {
+      const refreshSpy = vi
+        .spyOn(repo as any, 'refreshMemoryEmbedding')
+        .mockResolvedValue(undefined);
+
+      const mockUpdatedRow = {
+        id: 'mem-123',
+        user_id: 'user-456',
+        content: 'Corrected content',
+        summary: 'Corrected summary',
+        source: 'observation',
+        salience: 'medium',
+        topics: ['existing'],
+        embedding: null,
+        metadata: {},
+        version: 2,
+        created_at: '2026-01-26T12:00:00Z',
+        expires_at: null,
+      };
+      mockSupabase._setReturnData(mockUpdatedRow);
+
+      const result = await repo.updateMemory('mem-123', 'user-456', {
+        content: 'Corrected content',
+        summary: 'Corrected summary',
+      });
+
+      expect(result?.content).toBe('Corrected content');
+      expect(result?.summary).toBe('Corrected summary');
+      expect(result?.version).toBe(2);
+
+      // Only the provided fields are written — undefined fields stay untouched
+      expect(mockSupabase._queryBuilder.update).toHaveBeenCalledWith({
+        content: 'Corrected content',
+        summary: 'Corrected summary',
+      });
+
+      expect(refreshSpy).toHaveBeenCalledTimes(1);
+      expect(refreshSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'mem-123', content: 'Corrected content' })
+      );
+    });
+
+    it('should not touch content/summary or refresh embeddings on salience-only update', async () => {
+      const refreshSpy = vi
+        .spyOn(repo as any, 'refreshMemoryEmbedding')
+        .mockResolvedValue(undefined);
+
+      const mockUpdatedRow = {
+        id: 'mem-123',
+        user_id: 'user-456',
+        content: 'Original content',
+        summary: 'Original summary',
+        source: 'observation',
+        salience: 'critical',
+        topics: [],
+        embedding: null,
+        metadata: {},
+        version: 2,
+        created_at: '2026-01-26T12:00:00Z',
+        expires_at: null,
+      };
+      mockSupabase._setReturnData(mockUpdatedRow);
+
+      const result = await repo.updateMemory('mem-123', 'user-456', {
+        salience: 'critical',
+      });
+
+      expect(result?.salience).toBe('critical');
+      expect(mockSupabase._queryBuilder.update).toHaveBeenCalledWith({ salience: 'critical' });
+      expect(refreshSpy).not.toHaveBeenCalled();
+    });
+
+    it('should clear summary when an empty string is passed', async () => {
+      vi.spyOn(repo as any, 'refreshMemoryEmbedding').mockResolvedValue(undefined);
+
+      const mockUpdatedRow = {
+        id: 'mem-123',
+        user_id: 'user-456',
+        content: 'Content',
+        summary: null,
+        source: 'observation',
+        salience: 'medium',
+        topics: [],
+        embedding: null,
+        metadata: {},
+        version: 2,
+        created_at: '2026-01-26T12:00:00Z',
+        expires_at: null,
+      };
+      mockSupabase._setReturnData(mockUpdatedRow);
+
+      const result = await repo.updateMemory('mem-123', 'user-456', { summary: '' });
+
+      expect(result?.summary).toBeUndefined();
+      expect(mockSupabase._queryBuilder.update).toHaveBeenCalledWith({ summary: null });
+    });
+
+    it('should clear stale embedding artifacts when re-embedding fails after a content edit', async () => {
+      // Embeddings disabled → tryEmbedMemory returns false → stale vectors must be cleared
+      disableEmbeddings();
+
+      const mockUpdatedRow = {
+        id: 'mem-123',
+        user_id: 'user-456',
+        content: 'Edited content',
+        summary: null,
+        source: 'observation',
+        salience: 'medium',
+        topics: [],
+        embedding: null,
+        metadata: {
+          keep: 'me',
+          embedding: { provider: 'ollama', model: 'mxbai-embed-large', dimensions: 1024 },
+          embedding_chunks: { chunkCount: 2 },
+        },
+        version: 2,
+        created_at: '2026-01-26T12:00:00Z',
+        expires_at: null,
+      };
+      mockSupabase._setReturnData(mockUpdatedRow);
+
+      const result = await repo.updateMemory('mem-123', 'user-456', {
+        content: 'Edited content',
+      });
+
+      // Stale chunk rows deleted
+      expect(mockSupabase.from).toHaveBeenCalledWith('memory_embedding_chunks');
+      expect(mockSupabase._queryBuilder.delete).toHaveBeenCalled();
+
+      // Embedding columns nulled and embedding metadata stripped (other keys kept)
+      expect(mockSupabase._queryBuilder.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          embedding: null,
+          embedding_chunks_version: null,
+          embedding_chunk_count: null,
+          metadata: { keep: 'me' },
+        })
+      );
+
+      expect(result?.metadata).toEqual({ keep: 'me' });
+      expect(result?.embedding).toBeUndefined();
+    });
+
+    it('should skip embedding cleanup when the memory never had embeddings', async () => {
+      disableEmbeddings();
+
+      const mockUpdatedRow = {
+        id: 'mem-123',
+        user_id: 'user-456',
+        content: 'Edited content',
+        summary: null,
+        source: 'observation',
+        salience: 'medium',
+        topics: [],
+        embedding: null,
+        metadata: {},
+        version: 2,
+        created_at: '2026-01-26T12:00:00Z',
+        expires_at: null,
+      };
+      mockSupabase._setReturnData(mockUpdatedRow);
+
+      await repo.updateMemory('mem-123', 'user-456', { content: 'Edited content' });
+
+      expect(mockSupabase.from).not.toHaveBeenCalledWith('memory_embedding_chunks');
+      expect(mockSupabase._queryBuilder.delete).not.toHaveBeenCalled();
+    });
   });
 
   describe('Session Management', () => {

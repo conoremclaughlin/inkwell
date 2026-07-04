@@ -961,8 +961,12 @@ export class MemoryRepository {
     });
   }
 
-  private async tryEmbedMemory(memory: Memory, input: MemoryCreateInput): Promise<void> {
-    if (!this.embeddingRouter.isEnabled()) return;
+  /**
+   * Embed and persist a memory's chunks + primary vector.
+   * Returns true only when both chunk rows and memory embedding metadata were persisted.
+   */
+  private async tryEmbedMemory(memory: Memory, input: MemoryCreateInput): Promise<boolean> {
+    if (!this.embeddingRouter.isEnabled()) return false;
 
     const config = this.embeddingRouter.getRuntimeConfig();
     const vettedModel = getVettedEmbeddingModel(config.provider, config.model);
@@ -981,16 +985,16 @@ export class MemoryRepository {
       llmExtractions,
       extractionMode: env.MEMORY_EXTRACTION_MODE,
     });
-    if (chunks.length === 0) return;
+    if (chunks.length === 0) return false;
 
     const embeddedChunks = [];
     for (const chunk of chunks) {
       const embedding = await this.embeddingRouter.embedDocument(chunk.text);
-      if (!embedding) return;
+      if (!embedding) return false;
       embeddedChunks.push({ chunk, embedding });
     }
 
-    if (embeddedChunks.length === 0) return;
+    if (embeddedChunks.length === 0) return false;
 
     const primaryChunk = embeddedChunks[0];
     const primaryEmbedding = primaryChunk.embedding;
@@ -1046,7 +1050,23 @@ export class MemoryRepository {
         attempts: EMBEDDING_PERSIST_RETRY_ATTEMPTS,
         error: chunkErrorDetails,
       });
-      return;
+      return false;
+    }
+
+    // Re-embeds can produce fewer chunks than a previous version — remove any
+    // leftover higher-index chunk rows so recall never matches stale text.
+    const { error: trimError } = await this.supabase
+      .from('memory_embedding_chunks')
+      .delete()
+      .eq('memory_id', memory.id)
+      .gte('chunk_index', chunkRows.length);
+
+    if (trimError) {
+      logger.warn('Failed to trim stale memory embedding chunks', {
+        ...chunkContext,
+        stage: 'chunk_trim',
+        error: normalizeErrorDetails(trimError),
+      });
     }
 
     const memoryUpdate: Database['public']['Tables']['memories']['Update'] = {
@@ -1113,7 +1133,7 @@ export class MemoryRepository {
         attempts: EMBEDDING_PERSIST_RETRY_ATTEMPTS,
         error: memoryErrorDetails,
       });
-      return;
+      return false;
     }
 
     memory.embedding = primaryEmbedding.vector;
@@ -1132,6 +1152,8 @@ export class MemoryRepository {
         dimensions: primaryEmbedding.dimensions,
       },
     };
+
+    return true;
   }
 
   /**
@@ -1395,14 +1417,30 @@ export class MemoryRepository {
   }
 
   /**
-   * Update memory salience or topics
+   * Update memory content, summary, salience, topics, or metadata.
+   *
+   * Content/summary edits are versioned: the `archive_memory_on_update` DB trigger
+   * snapshots the prior row into `memory_history` and bumps `version`, so the old
+   * version remains visible via getMemoryHistory and restorable via restoreMemory.
+   *
+   * Fields left `undefined` are not touched. Passing an empty-string summary clears it.
+   * Content/summary changes refresh semantic embeddings; if re-embedding fails, stale
+   * embeddings are cleared so recall never matches the old text.
    */
   async updateMemory(
     id: string,
     userId: string,
-    updates: { salience?: Salience; topics?: string[]; metadata?: Record<string, unknown> }
+    updates: {
+      content?: string;
+      summary?: string;
+      salience?: Salience;
+      topics?: string[];
+      metadata?: Record<string, unknown>;
+    }
   ): Promise<Memory | null> {
     const updateData: Record<string, unknown> = {};
+    if (updates.content !== undefined) updateData.content = updates.content;
+    if (updates.summary !== undefined) updateData.summary = updates.summary || null;
     if (updates.salience) updateData.salience = updates.salience;
     if (updates.topics) updateData.topics = updates.topics;
     if (updates.metadata) updateData.metadata = updates.metadata;
@@ -1421,7 +1459,95 @@ export class MemoryRepository {
       throw new Error(`Failed to update memory: ${error.message}`);
     }
 
-    return data ? this.rowToMemory(data) : null;
+    if (!data) return null;
+
+    const memory = this.rowToMemory(data);
+
+    // Embeddings index the memory text — refresh them whenever it changes so
+    // recall matches the edited content instead of the stale version.
+    if (updates.content !== undefined || updates.summary !== undefined) {
+      await this.refreshMemoryEmbedding(memory);
+    }
+
+    return memory;
+  }
+
+  /**
+   * Re-embed a memory after its text changed (content edit or restore).
+   *
+   * Best-effort like the remember() path: if re-embedding cannot complete
+   * (provider disabled/unavailable, persistence failure), stale vectors are
+   * cleared so semantic recall falls back to text search rather than matching
+   * the pre-edit content.
+   */
+  private async refreshMemoryEmbedding(memory: Memory): Promise<void> {
+    const embedded = await this.tryEmbedMemory(memory, {
+      userId: memory.userId,
+      content: memory.content,
+      summary: memory.summary,
+      topicKey: memory.topicKey,
+      topics: memory.topics,
+      source: memory.source,
+      salience: memory.salience,
+    });
+
+    if (!embedded) {
+      await this.clearMemoryEmbedding(memory);
+    }
+  }
+
+  /**
+   * Remove a memory's stale embedding artifacts (vector, chunk rows, embedding
+   * metadata). Called when the memory text changed but re-embedding failed.
+   */
+  private async clearMemoryEmbedding(memory: Memory): Promise<void> {
+    const metadata = memory.metadata || {};
+    const hasEmbeddingArtifacts =
+      memory.embedding !== undefined || 'embedding' in metadata || 'embedding_chunks' in metadata;
+    if (!hasEmbeddingArtifacts) return;
+
+    logger.warn('Clearing stale memory embedding after failed re-embed', {
+      memoryId: memory.id,
+      userId: memory.userId,
+    });
+
+    const { error: chunkError } = await this.supabase
+      .from('memory_embedding_chunks')
+      .delete()
+      .eq('memory_id', memory.id);
+
+    if (chunkError) {
+      logger.error('Failed to delete stale memory embedding chunks', {
+        memoryId: memory.id,
+        error: normalizeErrorDetails(chunkError),
+      });
+    }
+
+    const cleanedMetadata: Record<string, unknown> = { ...metadata };
+    delete cleanedMetadata.embedding;
+    delete cleanedMetadata.embedding_chunks;
+
+    const { error: memoryError } = await this.supabase
+      .from('memories')
+      .update({
+        embedding: null,
+        embedding_chunks_version: null,
+        embedding_chunk_count: null,
+        metadata: cleanedMetadata as Database['public']['Tables']['memories']['Update']['metadata'],
+      })
+      .eq('id', memory.id)
+      .eq('user_id', memory.userId);
+
+    if (memoryError) {
+      logger.error('Failed to clear stale memory embedding', {
+        memoryId: memory.id,
+        error: normalizeErrorDetails(memoryError),
+      });
+      return;
+    }
+
+    memory.embedding = undefined;
+    memory.metadata = cleanedMetadata;
   }
 
   // ==================== SESSIONS ====================
@@ -1979,7 +2105,10 @@ export class MemoryRepository {
         throw new Error(`Failed to restore memory: ${error.message}`);
       }
 
-      return this.rowToMemory(data);
+      const restored = this.rowToMemory(data);
+      // Restore rewrites the memory text — refresh embeddings so recall matches it.
+      await this.refreshMemoryEmbedding(restored);
+      return restored;
     } else {
       // Memory was deleted, recreate it
       const { data, error } = await this.supabase
@@ -2006,7 +2135,10 @@ export class MemoryRepository {
         throw new Error(`Failed to recreate memory: ${error.message}`);
       }
 
-      return this.rowToMemory(data);
+      const recreated = this.rowToMemory(data);
+      // Freshly recreated row has no vector yet — embed it like remember() would.
+      await this.refreshMemoryEmbedding(recreated);
+      return recreated;
     }
   }
 
