@@ -1803,12 +1803,25 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'update_memory',
     {
-      description: `Update a memory's salience, topics, or metadata.
+      description: `Update a memory in place: edit its content/summary, or adjust salience, topics, and metadata.
+
+Content edits are versioned — the previous version is archived to memory history, so get_memory_history shows it and restore_memory can roll back. Embeddings are refreshed automatically so recall matches the new text.
+
+Use content editing to correct or revise a memory while preserving its history trail (especially "current state" memories that evolve). Use forget + remember only when the topic itself is being replaced. Omitted fields are left unchanged.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
         memoryId: z.string().uuid().describe('ID of the memory to update'),
+        content: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('New memory content (prior version is preserved in memory history)'),
+        summary: z
+          .string()
+          .optional()
+          .describe('New one-liner summary. Pass an empty string to clear.'),
         salience: z
           .enum(['low', 'medium', 'high', 'critical'])
           .optional()

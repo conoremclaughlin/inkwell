@@ -76,6 +76,7 @@ function createMockDataComposer() {
     recall: vi.fn(),
     addSessionLog: vi.fn(),
     getSessionLogs: vi.fn(),
+    updateMemory: vi.fn(),
     verifyOwnership: vi.fn().mockResolvedValue(new Set()),
     verifySessionOwnership: vi.fn().mockResolvedValue(true),
   };
@@ -1567,7 +1568,12 @@ describe('handleStartSession - studioId="main" scope resolution', () => {
 // HIERARCHICAL MEMORY TESTS
 // =====================================================
 
-import { rememberSchema, buildKnowledgeSummary } from './memory-handlers';
+import {
+  rememberSchema,
+  buildKnowledgeSummary,
+  updateMemorySchema,
+  handleUpdateMemory,
+} from './memory-handlers';
 import type { Memory } from '../../data/models/memory';
 
 describe('rememberSchema - hierarchical memory fields', () => {
@@ -1633,6 +1639,125 @@ describe('rememberSchema - hierarchical memory fields', () => {
       expect(result.data.topicKey).toBeUndefined();
       expect(result.data.topicSummary).toBeUndefined();
     }
+  });
+});
+
+describe('updateMemorySchema - content editing', () => {
+  it('should accept content and summary fields', () => {
+    const result = updateMemorySchema.safeParse({
+      email: 'test@test.com',
+      memoryId: '123e4567-e89b-12d3-a456-426614174000',
+      content: 'Corrected content',
+      summary: 'Corrected summary',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.content).toBe('Corrected content');
+      expect(result.data.summary).toBe('Corrected summary');
+    }
+  });
+
+  it('should reject empty content', () => {
+    const result = updateMemorySchema.safeParse({
+      email: 'test@test.com',
+      memoryId: '123e4567-e89b-12d3-a456-426614174000',
+      content: '',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('should accept empty summary (clears it)', () => {
+    const result = updateMemorySchema.safeParse({
+      email: 'test@test.com',
+      memoryId: '123e4567-e89b-12d3-a456-426614174000',
+      summary: '',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('should still accept salience/topics-only updates (backward compat)', () => {
+    const result = updateMemorySchema.safeParse({
+      email: 'test@test.com',
+      memoryId: '123e4567-e89b-12d3-a456-426614174000',
+      salience: 'high',
+      topics: ['a', 'b'],
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.content).toBeUndefined();
+      expect(result.data.summary).toBeUndefined();
+    }
+  });
+});
+
+describe('handleUpdateMemory', () => {
+  let mockDataComposer: ReturnType<typeof createMockDataComposer>;
+
+  beforeEach(() => {
+    mockDataComposer = createMockDataComposer();
+    vi.clearAllMocks();
+  });
+
+  const memoryId = '123e4567-e89b-12d3-a456-426614174000';
+
+  it('should pass content and summary through to the repository', async () => {
+    mockDataComposer.repositories.memory.updateMemory.mockResolvedValue({
+      id: memoryId,
+      content: 'New content',
+      summary: 'New summary',
+      salience: 'high',
+      topics: ['a'],
+      version: 3,
+      metadata: {},
+    });
+
+    const result = await handleUpdateMemory(
+      { email: 'test@test.com', memoryId, content: 'New content', summary: 'New summary' },
+      mockDataComposer as never
+    );
+
+    expect(mockDataComposer.repositories.memory.updateMemory).toHaveBeenCalledWith(
+      memoryId,
+      'user-123',
+      expect.objectContaining({
+        content: 'New content',
+        summary: 'New summary',
+        salience: undefined,
+        topics: undefined,
+        metadata: undefined,
+      })
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.memory.content).toBe('New content');
+    expect(parsed.memory.summary).toBe('New summary');
+    expect(parsed.memory.version).toBe(3);
+  });
+
+  it('should reject a call with no update fields without hitting the repository', async () => {
+    const result = await handleUpdateMemory(
+      { email: 'test@test.com', memoryId },
+      mockDataComposer as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain('No updates provided');
+    expect(mockDataComposer.repositories.memory.updateMemory).not.toHaveBeenCalled();
+  });
+
+  it('should return not-found error when memory does not exist', async () => {
+    mockDataComposer.repositories.memory.updateMemory.mockResolvedValue(null);
+
+    const result = await handleUpdateMemory(
+      { email: 'test@test.com', memoryId, content: 'New content' },
+      mockDataComposer as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toBe('Memory not found');
   });
 });
 

@@ -406,6 +406,17 @@ export const forgetSchema = userIdentifierBaseSchema.extend({
 
 export const updateMemorySchema = userIdentifierBaseSchema.extend({
   memoryId: z.string().uuid().describe('ID of the memory to update'),
+  content: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'New memory content. The prior version is archived to memory history (viewable via get_memory_history, reversible via restore_memory) and embeddings are refreshed.'
+    ),
+  summary: z
+    .string()
+    .optional()
+    .describe('New one-liner summary for bootstrap injection. Pass an empty string to clear.'),
   salience: salienceSchema.optional().describe('New salience level'),
   topics: topicsSchema.describe('New topics'),
   metadata: z.record(z.unknown()).optional().describe('Additional metadata to merge'),
@@ -966,7 +977,35 @@ export async function handleUpdateMemory(args: unknown, dataComposer: DataCompos
   const params = updateMemorySchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
+  const hasUpdates =
+    params.content !== undefined ||
+    params.summary !== undefined ||
+    params.salience !== undefined ||
+    params.topics !== undefined ||
+    params.metadata !== undefined;
+
+  if (!hasUpdates) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            {
+              success: false,
+              error:
+                'No updates provided. Pass at least one of: content, summary, salience, topics, metadata.',
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+
   const memory = await dataComposer.repositories.memory.updateMemory(params.memoryId, user.id, {
+    content: params.content,
+    summary: params.summary,
     salience: params.salience as Salience,
     topics: params.topics,
     metadata: params.metadata,
@@ -996,8 +1035,11 @@ export async function handleUpdateMemory(args: unknown, dataComposer: DataCompos
             user: { id: user.id, resolvedBy },
             memory: {
               id: memory.id,
+              content: memory.content,
+              summary: memory.summary,
               salience: memory.salience,
               topics: memory.topics,
+              version: memory.version,
             },
           },
           null,
