@@ -1846,6 +1846,37 @@ function resolveLifecycleBackend(cwd: string, backendOverride?: string): HookCap
   return detectBackend(cwd);
 }
 
+/**
+ * Hydrate threadKey from the server when we have a pre-created session
+ * (e.g., INK_SESSION_ID from a trigger) but no local threadKey yet.
+ *
+ * Triggered sessions skip start_session (the runner pre-creates the session
+ * and passes its id via INK_SESSION_ID), so the thread key never gets
+ * populated locally — without this fetch, activeThreadKey would stay null
+ * for exactly the sessions the thread-key surfacing is meant to cover.
+ */
+export async function hydrateThreadKeyFromServer(
+  pcpSessionId: string | undefined,
+  pcpThreadKey: string | undefined,
+  email?: string
+): Promise<string | undefined> {
+  if (!pcpSessionId || pcpThreadKey) return pcpThreadKey;
+  try {
+    const sessionResult = await callPcpTool('get_session', {
+      email,
+      sessionId: pcpSessionId,
+    });
+    const session = sessionResult?.session as Record<string, unknown> | undefined;
+    if (session) {
+      if (typeof session.activeThreadKey === 'string') return session.activeThreadKey;
+      if (typeof session.threadKey === 'string') return session.threadKey;
+    }
+  } catch {
+    // Non-fatal
+  }
+  return pcpThreadKey;
+}
+
 async function onSessionStartHandler(options?: { backend?: string }): Promise<void> {
   const stdin = await readStdin();
   const cwd = process.cwd();
@@ -2055,23 +2086,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   pcpThreadKey = reconciled.threadKey || pcpThreadKey;
   const backendSessionId = reconciled.backendSessionId;
 
-  // Hydrate threadKey from the server when we have a pre-created session
-  // (e.g., INK_SESSION_ID from trigger) but no local threadKey yet.
-  if (pcpSessionId && !pcpThreadKey) {
-    try {
-      const sessionResult = await callPcpTool('get_session', {
-        email: config?.email,
-        sessionId: pcpSessionId,
-      });
-      const session = sessionResult?.session as Record<string, unknown> | undefined;
-      if (session) {
-        if (typeof session.activeThreadKey === 'string') pcpThreadKey = session.activeThreadKey;
-        else if (typeof session.threadKey === 'string') pcpThreadKey = session.threadKey;
-      }
-    } catch {
-      // Non-fatal
-    }
-  }
+  pcpThreadKey = await hydrateThreadKeyFromServer(pcpSessionId, pcpThreadKey, config?.email);
 
   // Set lifecycle to idle on startup (ready for user input).
   if (pcpSessionId) {
