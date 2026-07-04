@@ -43,18 +43,13 @@ function toolNameFor(entry: ToolTimelineEntry): string {
   return entry.type.startsWith('tool_result') ? 'tool result' : 'tool call';
 }
 
+// SECURITY: only the server-built argsSummary (redacted + truncated) is ever
+// rendered for tool args — never the raw metadata.input object. Full payloads
+// stay behind the explicit "View raw JSON" action.
 function argsPreviewFor(entry: ToolTimelineEntry): string {
   const summary = metaString(entry.metadata, 'argsSummary');
   if (summary) return summary;
-  const input = entry.metadata?.input;
-  if (input !== undefined) {
-    try {
-      return JSON.stringify(input);
-    } catch {
-      return String(input);
-    }
-  }
-  return entry.content;
+  return entry.type.startsWith('tool_result') ? entry.content : '';
 }
 
 function statusFor(entry: ToolTimelineEntry): string | null {
@@ -71,20 +66,12 @@ function expandedDetail(entry: ToolTimelineEntry): string {
   const sections: string[] = [];
   const summary = metaString(entry.metadata, 'argsSummary');
   if (summary) sections.push(`Args: ${summary}`);
-  const input = entry.metadata?.input;
-  if (input !== undefined) {
-    try {
-      sections.push(`Input:\n${JSON.stringify(input, null, 2)}`);
-    } catch {
-      sections.push(`Input:\n${String(input)}`);
-    }
+  // Result text is safe to show for tool_result entries; tool_call content
+  // may embed raw input, so it stays behind the raw-JSON modal.
+  if (entry.type.startsWith('tool_result') && entry.content.trim()) {
+    sections.push(`Result:\n${entry.content}`);
   }
-  if (entry.content && entry.content.trim()) {
-    sections.push(
-      entry.type.startsWith('tool_result') ? `Result:\n${entry.content}` : entry.content
-    );
-  }
-  return sections.join('\n\n') || 'No detail captured.';
+  return sections.join('\n\n') || 'No summary captured — use "View raw JSON" for the full payload.';
 }
 
 export function toolEntryRawJson(entry: ToolTimelineEntry): string {
