@@ -24,6 +24,7 @@ import {
   Swords,
   KeyRound,
   Shield,
+  Workflow,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useRouter } from 'next/navigation';
@@ -74,6 +75,7 @@ const mainNav: NavGroup[] = [
   {
     label: 'Platform',
     items: [
+      { name: 'Automations', href: '/automations', icon: Workflow },
       { name: 'Reminders', href: '/reminders', icon: Bell },
       { name: 'Connections', href: '/connected-accounts', icon: Link2 },
       { name: 'Routing', href: '/routing', icon: Route },
