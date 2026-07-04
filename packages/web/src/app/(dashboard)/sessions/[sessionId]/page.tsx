@@ -15,6 +15,10 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { useApiPost, useApiQuery, useQueryClient } from '@/lib/api';
+import { useEventStream, type StreamActivity } from '@/lib/api/use-event-stream';
+import { ToolCallCard, isToolEntry } from '@/components/sessions/tool-call-card';
+import { ForkCard, forkChildSessionId } from '@/components/sessions/fork-card';
+import { groupTimelineEntries } from '@/lib/sessions/group-timeline-entries';
 import clsx from 'clsx';
 
 interface SessionLogsResponse {
@@ -37,6 +41,10 @@ interface SessionLogsResponse {
     content: string;
     timestamp: string;
     metadata?: Record<string, unknown>;
+    parentId?: string | null;
+    childSessionId?: string | null;
+    status?: string | null;
+    durationMs?: number | null;
   }>;
   pagination: {
     total: number;
@@ -195,10 +203,104 @@ function formatEntryContent(
   return { display: summary, rawJson, kind: 'json' };
 }
 
+type SessionLogEntry = SessionLogsResponse['logs'][number];
+
+function activityToLogEntry(activity: StreamActivity): SessionLogEntry {
+  const role =
+    activity.type === 'message_in' ? 'in' : activity.type === 'message_out' ? 'out' : 'system';
+  return {
+    // Match the id format of polled entries (fetchCloudSessionLogs prefixes
+    // activity_stream rows with "activity:") so merge dedupe works.
+    id: `activity:${activity.id}`,
+    source: 'activity_stream',
+    type: activity.subtype ? `${activity.type}:${activity.subtype}` : activity.type,
+    role,
+    content: activity.content,
+    timestamp: activity.createdAt,
+    metadata: activity.payload,
+    parentId: activity.parentId,
+    childSessionId: activity.childSessionId,
+    status: activity.status,
+    durationMs: activity.durationMs,
+  };
+}
+
+/** Strip the "activity:" prefix so entry ids compare against parentId values. */
+function rawActivityId(id: string): string {
+  return id.startsWith('activity:') ? id.slice('activity:'.length) : id;
+}
+
+function GenericLogCard({
+  entry,
+  backend,
+  onViewRaw,
+}: {
+  entry: SessionLogEntry;
+  backend: string | null | undefined;
+  onViewRaw: (modal: { id: string; type: string; json: string }) => void;
+}) {
+  const formatted = formatEntryContent(entry.content, backend);
+  return (
+    <div className="rounded-md border border-gray-200 bg-white p-3">
+      <div className="mb-2 flex items-center justify-between gap-3 text-xs text-gray-500">
+        <div className="flex items-center gap-2">
+          <Badge
+            variant="outline"
+            className={clsx(
+              entry.role === 'in' && 'border-slate-300 text-slate-700',
+              entry.role === 'out' && 'border-blue-300 text-blue-700',
+              entry.role === 'system' && 'border-amber-300 text-amber-700'
+            )}
+          >
+            {entry.role}
+          </Badge>
+          <Badge variant="outline">{entry.source}</Badge>
+          <span>{entry.type}</span>
+        </div>
+        <span className="shrink-0">{formatDate(entry.timestamp)}</span>
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-start gap-2 text-sm text-gray-800">
+          {formatted.kind === 'tool' ? (
+            <Wrench className="mt-0.5 h-4 w-4 shrink-0 text-violet-500" />
+          ) : formatted.kind === 'json' ? (
+            <Braces className="mt-0.5 h-4 w-4 shrink-0 text-indigo-500" />
+          ) : (
+            <TerminalSquare className="mt-0.5 h-4 w-4 shrink-0 text-gray-400" />
+          )}
+          <p className="whitespace-pre-wrap break-words leading-relaxed">{formatted.display}</p>
+        </div>
+        {formatted.rawJson ? (
+          <div className="flex justify-end">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 text-xs"
+              onClick={() =>
+                onViewRaw({
+                  id: entry.id,
+                  type: entry.type,
+                  json: formatted.rawJson || '{}',
+                })
+              }
+            >
+              View raw JSON
+            </Button>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 export default function SessionLogsPage() {
   const params = useParams();
   const sessionId = params.sessionId as string;
   const [offset, setOffset] = useState(0);
+  // Stable stream cursor — captured once so the SSE connection doesn't
+  // resubscribe on every poll. Overlap with polled pages dedupes by id.
+  const [streamSince] = useState(() => new Date().toISOString());
   const [rawModal, setRawModal] = useState<{
     id: string;
     type: string;
@@ -212,10 +314,17 @@ export default function SessionLogsPage() {
     [sessionId, limit, offset]
   );
 
+  // Live stream (first page only). Polling stays as fallback — relaxed to
+  // 60s while the stream is healthy, 15s otherwise.
+  const { events: streamedEvents, status: streamStatus } = useEventStream(
+    { sessionId, since: streamSince },
+    { enabled: offset === 0 }
+  );
+
   const { data, isLoading, error } = useApiQuery<SessionLogsResponse>(
     ['session-logs', sessionId, offset],
     queryPath,
-    { refetchInterval: 15000 }
+    { refetchInterval: streamStatus === 'live' ? 60000 : 15000 }
   );
 
   const syncTranscript = useApiPost<
@@ -230,11 +339,45 @@ export default function SessionLogsPage() {
     },
   });
 
-  const logs = data?.logs || [];
+  const logs = useMemo(() => {
+    const polled = data?.logs || [];
+    if (offset !== 0 || streamedEvents.length === 0) return polled;
+    const polledIds = new Set(polled.map((entry) => entry.id));
+    // Streamed events arrive oldest-first; the timeline renders newest-first.
+    // Map BEFORE filtering so the dedupe compares the same "activity:<id>"
+    // format the polled entries carry.
+    const streamed = streamedEvents
+      .map(activityToLogEntry)
+      .filter((entry) => !polledIds.has(entry.id))
+      .reverse();
+    return [...streamed, ...polled];
+  }, [data?.logs, streamedEvents, offset]);
+
+  // Single-level fork tree: entries whose parentId chain reaches a visible
+  // entry render indented beneath their nearest top-level ancestor (deeper
+  // chains flatten to one level); unmatched parents stay top-level so
+  // nothing is dropped.
+  const { topLevel: topLevelLogs, childrenByAnchor: childrenByParent } = useMemo(
+    () => groupTimelineEntries(logs, rawActivityId),
+    [logs]
+  );
   const pagination = data?.pagination;
   const session = data?.session;
   const statusBadge = session ? sessionStatusBadge(session.status, session.currentPhase) : null;
   const phaseLabel = formatPhaseLabel(session?.currentPhase || null);
+
+  // Tool calls and sub-agent forks get dedicated cards; everything else
+  // falls through to the generic log block.
+  const renderEntry = (item: SessionLogEntry) => {
+    const forkChild = forkChildSessionId(item);
+    if (forkChild) {
+      return <ForkCard entry={item} childSessionId={forkChild} formatDate={formatDate} />;
+    }
+    if (isToolEntry(item)) {
+      return <ToolCallCard entry={item} formatDate={formatDate} onViewRaw={setRawModal} />;
+    }
+    return <GenericLogCard entry={item} backend={session?.backend} onViewRaw={setRawModal} />;
+  };
 
   return (
     <div>
@@ -276,7 +419,20 @@ export default function SessionLogsPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Timeline</CardTitle>
+          <CardTitle className="flex items-center gap-2">
+            Timeline
+            {offset === 0 && streamStatus === 'live' ? (
+              <span className="flex items-center gap-1.5 text-xs font-medium text-emerald-600">
+                <span className="relative flex h-2 w-2">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                  <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+                </span>
+                Live
+              </span>
+            ) : offset === 0 && streamStatus === 'connecting' ? (
+              <span className="text-xs font-medium text-gray-400">Connecting…</span>
+            ) : null}
+          </CardTitle>
           <CardDescription>
             Latest activity, session logs, synced transcript archive, and local fallback when
             available.
@@ -313,65 +469,21 @@ export default function SessionLogsPage() {
             <p className="text-sm text-gray-500">No log messages found for this session.</p>
           ) : (
             <div className="space-y-3">
-              {logs.map((entry) => (
-                <div key={entry.id} className="rounded-md border border-gray-200 bg-white p-3">
-                  <div className="mb-2 flex items-center justify-between gap-3 text-xs text-gray-500">
-                    <div className="flex items-center gap-2">
-                      <Badge
-                        variant="outline"
-                        className={clsx(
-                          entry.role === 'in' && 'border-slate-300 text-slate-700',
-                          entry.role === 'out' && 'border-blue-300 text-blue-700',
-                          entry.role === 'system' && 'border-amber-300 text-amber-700'
-                        )}
-                      >
-                        {entry.role}
-                      </Badge>
-                      <Badge variant="outline">{entry.source}</Badge>
-                      <span>{entry.type}</span>
-                    </div>
-                    <span className="shrink-0">{formatDate(entry.timestamp)}</span>
-                  </div>
-
-                  {(() => {
-                    const formatted = formatEntryContent(entry.content, session?.backend);
-                    return (
-                      <div className="space-y-2">
-                        <div className="flex items-start gap-2 text-sm text-gray-800">
-                          {formatted.kind === 'tool' ? (
-                            <Wrench className="mt-0.5 h-4 w-4 shrink-0 text-violet-500" />
-                          ) : formatted.kind === 'json' ? (
-                            <Braces className="mt-0.5 h-4 w-4 shrink-0 text-indigo-500" />
-                          ) : (
-                            <TerminalSquare className="mt-0.5 h-4 w-4 shrink-0 text-gray-400" />
-                          )}
-                          <p className="whitespace-pre-wrap break-words leading-relaxed">
-                            {formatted.display}
-                          </p>
-                        </div>
-                        {formatted.rawJson ? (
-                          <div className="flex justify-end">
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-7 text-xs"
-                              onClick={() =>
-                                setRawModal({
-                                  id: entry.id,
-                                  type: entry.type,
-                                  json: formatted.rawJson || '{}',
-                                })
-                              }
-                            >
-                              View raw JSON
-                            </Button>
-                          </div>
-                        ) : null}
+              {topLevelLogs.map((entry) => {
+                const children = childrenByParent.get(rawActivityId(entry.id)) || [];
+                return (
+                  <div key={entry.id} className="space-y-2">
+                    {renderEntry(entry)}
+                    {children.length > 0 ? (
+                      <div className="ml-6 space-y-2 border-l-2 border-gray-200 pl-3">
+                        {children.map((child) => (
+                          <div key={child.id}>{renderEntry(child)}</div>
+                        ))}
                       </div>
-                    );
-                  })()}
-                </div>
-              ))}
+                    ) : null}
+                  </div>
+                );
+              })}
             </div>
           )}
 

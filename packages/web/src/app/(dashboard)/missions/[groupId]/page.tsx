@@ -33,6 +33,7 @@ import {
 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { useApiQuery } from '@/lib/api';
+import { useEventStream, type StreamActivity } from '@/lib/api/use-event-stream';
 import clsx from 'clsx';
 
 // ─── Types ───
@@ -383,11 +384,30 @@ function TaskProgressList({ tasks, currentIndex }: { tasks: Task[]; currentIndex
 
 // ─── Live Timeline ───
 
+function streamActivityToEvent(activity: StreamActivity): ActivityEvent {
+  return {
+    id: activity.id,
+    type: activity.type,
+    subtype: activity.subtype,
+    content: activity.content,
+    agentId: activity.agentId,
+    sessionId: activity.sessionId,
+    payload: activity.payload,
+    createdAt: activity.createdAt,
+  };
+}
+
 function LiveTimeline({ groupId, isActive }: { groupId: string; isActive: boolean }) {
+  const [streamSince] = useState(() => new Date().toISOString());
+  const { events: streamedEvents, status: streamStatus } = useEventStream(
+    { taskGroupId: groupId, since: streamSince },
+    { enabled: isActive }
+  );
+
   const { data, isLoading } = useApiQuery<ActivityResponse>(
     ['mission-timeline', groupId],
     `/api/admin/task-groups/${groupId}/activity?limit=200`,
-    { refetchInterval: isActive ? 5000 : false }
+    { refetchInterval: isActive ? (streamStatus === 'live' ? 30000 : 5000) : false }
   );
 
   if (isLoading) {
@@ -399,7 +419,14 @@ function LiveTimeline({ groupId, isActive }: { groupId: string; isActive: boolea
     );
   }
 
-  const events = data?.events ?? [];
+  const polled = data?.events ?? [];
+  const polledIds = new Set(polled.map((e) => e.id));
+  // Timeline renders ascending (oldest → newest); streamed events arrive
+  // oldest-first, so append them after the polled page.
+  const events = [
+    ...polled,
+    ...streamedEvents.filter((a) => !polledIds.has(a.id)).map(streamActivityToEvent),
+  ];
   if (events.length === 0) {
     return (
       <div className="text-center py-8">
@@ -423,7 +450,7 @@ function LiveTimeline({ groupId, isActive }: { groupId: string; isActive: boolea
             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
             <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
           </span>
-          Live — updating every 5s
+          {streamStatus === 'live' ? 'Live — streaming' : 'Live — updating every 5s'}
         </div>
       )}
 

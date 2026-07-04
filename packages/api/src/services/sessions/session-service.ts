@@ -1628,8 +1628,10 @@ This session will continue with a fresh context after compaction. Your identity,
     const MAX_INPUT_LENGTH = 10_000;
 
     for (const toolCall of toolCalls) {
-      // Truncate large inputs to avoid bloating the activity stream
-      let inputPayload = toolCall.input;
+      // Redact sensitive keys BEFORE truncation so neither the persisted
+      // input blob nor its preview carries secrets, then truncate large
+      // inputs to avoid bloating the activity stream.
+      let inputPayload = redactSensitiveValues(toolCall.input) as Record<string, unknown>;
       const inputStr = JSON.stringify(inputPayload);
       if (inputStr.length > MAX_INPUT_LENGTH) {
         inputPayload = {
@@ -1639,15 +1641,23 @@ This session will continue with a fresh context after compaction. Your identity,
         };
       }
 
+      const argsSummary = summarizeToolArgs(toolCall.input);
+
       await this.activityStream.logActivity({
         userId,
         agentId,
         type: 'tool_call',
         subtype: toolCall.toolName,
-        content: `${toolCall.toolName}(${Object.keys(toolCall.input).join(', ')})`,
+        content: `${toolCall.toolName}(${argsSummary})`,
         payload: {
           toolUseId: toolCall.toolUseId,
           toolName: toolCall.toolName,
+          tool: toolCall.toolName,
+          argsSummary,
+          // Runners capture tool_use events from a completed turn's output;
+          // per-call failure/duration isn't parsed yet, so status reflects
+          // the turn-level "call was made" fact.
+          status: 'completed',
           input: inputPayload,
         } as unknown as Json,
         sessionId,
@@ -1963,6 +1973,88 @@ export async function readImageAttachmentsAsBase64(
   }
 
   return images;
+}
+
+const MAX_ARG_VALUE_LENGTH = 200;
+const MAX_ARGS_SUMMARY_LENGTH = 500;
+
+/**
+ * Keys whose values must never reach the activity stream, even truncated.
+ * Substring match, case-insensitive — 'auth' covers authorization/authToken,
+ * 'apikey' covers apiKey after lowercasing.
+ */
+const SENSITIVE_KEY_PATTERNS = [
+  'password',
+  'secret',
+  'token',
+  'auth',
+  'bearer',
+  'credential',
+  'apikey',
+  'api_key',
+];
+
+function isSensitiveKey(key: string): boolean {
+  const lower = key.toLowerCase();
+  return SENSITIVE_KEY_PATTERNS.some((pattern) => lower.includes(pattern));
+}
+
+/**
+ * Recursively replace values under sensitive keys with '[redacted]'.
+ * Truncation alone is not enough — short secrets and the first chunk of a
+ * long one would survive it. Cycle-safe (tool inputs are parsed JSON in
+ * practice, but callers shouldn't have to guarantee that).
+ */
+export function redactSensitiveValues(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return '[circular]';
+    seen.add(value);
+    return value.map((item) => redactSensitiveValues(item, seen));
+  }
+  if (value && typeof value === 'object') {
+    if (seen.has(value)) return '[circular]';
+    seen.add(value);
+    const redacted: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      redacted[key] = isSensitiveKey(key) ? '[redacted]' : redactSensitiveValues(item, seen);
+    }
+    return redacted;
+  }
+  return value;
+}
+
+/**
+ * Build a short, human-readable summary of tool-call arguments for the
+ * activity stream. Sensitive keys are redacted BEFORE truncation (a
+ * truncated secret is still a leak), then values are truncated aggressively
+ * (never full file contents / long strings) — the summary is for timeline
+ * display, not replay.
+ */
+export function summarizeToolArgs(input: Record<string, unknown>): string {
+  const redactedInput = redactSensitiveValues(input) as Record<string, unknown>;
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(redactedInput)) {
+    let rendered: string;
+    if (typeof value === 'string') {
+      const truncated =
+        value.length > MAX_ARG_VALUE_LENGTH ? `${value.slice(0, MAX_ARG_VALUE_LENGTH)}…` : value;
+      rendered = JSON.stringify(truncated);
+    } else {
+      try {
+        rendered = JSON.stringify(value) ?? String(value);
+      } catch {
+        rendered = String(value);
+      }
+      if (rendered.length > MAX_ARG_VALUE_LENGTH) {
+        rendered = `${rendered.slice(0, MAX_ARG_VALUE_LENGTH)}…`;
+      }
+    }
+    parts.push(`${key}: ${rendered}`);
+  }
+  const summary = parts.join(', ');
+  return summary.length > MAX_ARGS_SUMMARY_LENGTH
+    ? `${summary.slice(0, MAX_ARGS_SUMMARY_LENGTH)}…`
+    : summary;
 }
 
 /**

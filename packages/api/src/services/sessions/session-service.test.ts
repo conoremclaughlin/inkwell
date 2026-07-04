@@ -11,6 +11,8 @@ import {
   readImageAttachmentsAsBase64,
   sanitizeHeaderText,
   stripControlChars,
+  summarizeToolArgs,
+  redactSensitiveValues,
 } from './session-service.js';
 import type {
   Session,
@@ -739,15 +741,24 @@ describe('SessionService', () => {
         expect.objectContaining({
           type: 'tool_call',
           subtype: 'mcp__inkwell__recall',
-          content: 'mcp__inkwell__recall(query)',
+          content: 'mcp__inkwell__recall(query: "emails")',
           sessionId: 'session-123',
+          payload: expect.objectContaining({
+            tool: 'mcp__inkwell__recall',
+            toolName: 'mcp__inkwell__recall',
+            argsSummary: 'query: "emails"',
+            status: 'completed',
+          }),
         })
       );
       expect(mockActivityStream.logActivity).toHaveBeenCalledWith(
         expect.objectContaining({
           type: 'tool_call',
           subtype: 'mcp__inkwell__send_response',
-          content: 'mcp__inkwell__send_response(content)',
+          content: 'mcp__inkwell__send_response(content: "Here are your emails")',
+          payload: expect.objectContaining({
+            argsSummary: 'content: "Here are your emails"',
+          }),
         })
       );
     });
@@ -800,6 +811,60 @@ describe('SessionService', () => {
           }),
         })
       );
+
+      // argsSummary never carries full values — truncated well below the raw size
+      const toolCallLog = vi
+        .mocked(mockActivityStream.logActivity)
+        .mock.calls.map(([params]) => params)
+        .find((params) => params.type === 'tool_call');
+      const payload = toolCallLog?.payload as Record<string, unknown>;
+      expect(typeof payload.argsSummary).toBe('string');
+      expect((payload.argsSummary as string).length).toBeLessThanOrEqual(501);
+    });
+
+    it('redacts sensitive keys from persisted input, argsSummary, and content', async () => {
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      vi.mocked(mockClaudeRunner.run).mockResolvedValue(
+        createMockClaudeResult({
+          toolCalls: [
+            {
+              toolUseId: 'tu-1',
+              toolName: 'mcp__inkwell__send_email',
+              input: {
+                to: 'x@example.com',
+                apiToken: 'sk-super-secret',
+                options: { password: 'hunter2', dryRun: true },
+              },
+            },
+          ],
+        })
+      );
+
+      const request = createMockRequest();
+      await sessionService.handleMessage(request);
+
+      await new Promise((r) => setTimeout(r, 10));
+
+      const toolCallLog = vi
+        .mocked(mockActivityStream.logActivity)
+        .mock.calls.map(([params]) => params)
+        .find((params) => params.type === 'tool_call');
+      expect(toolCallLog).toBeDefined();
+
+      const serialized = JSON.stringify(toolCallLog);
+      expect(serialized).not.toContain('sk-super-secret');
+      expect(serialized).not.toContain('hunter2');
+
+      const payload = toolCallLog?.payload as Record<string, unknown>;
+      expect(payload.input).toEqual({
+        to: 'x@example.com',
+        apiToken: '[redacted]',
+        options: { password: '[redacted]', dryRun: true },
+      });
+      expect(payload.argsSummary).toContain('[redacted]');
+      expect(toolCallLog?.content).toContain('[redacted]');
     });
 
     it('should not block response delivery if tool call logging fails', async () => {
@@ -2415,5 +2480,106 @@ describe('SessionService', () => {
         expect.objectContaining({ studioId: patternStudioId })
       );
     });
+  });
+});
+
+describe('summarizeToolArgs', () => {
+  it('renders key: value pairs with quoted strings', () => {
+    expect(summarizeToolArgs({ query: 'emails', limit: 5 })).toBe('query: "emails", limit: 5');
+  });
+
+  it('truncates long string values to ~200 chars', () => {
+    const summary = summarizeToolArgs({ content: 'a'.repeat(1000) });
+    expect(summary).toContain('…');
+    // key + quotes + ellipsis overhead on top of the 200-char value cap
+    expect(summary.length).toBeLessThan(230);
+    expect(summary).not.toContain('a'.repeat(250));
+  });
+
+  it('truncates long serialized object values', () => {
+    const summary = summarizeToolArgs({ nested: { data: 'b'.repeat(1000) } });
+    expect(summary.startsWith('nested: ')).toBe(true);
+    expect(summary.length).toBeLessThan(230);
+  });
+
+  it('caps the overall summary length', () => {
+    const input: Record<string, unknown> = {};
+    for (let i = 0; i < 20; i++) input[`key${i}`] = 'v'.repeat(150);
+    const summary = summarizeToolArgs(input);
+    expect(summary.length).toBeLessThanOrEqual(501);
+    expect(summary.endsWith('…')).toBe(true);
+  });
+
+  it('handles empty input', () => {
+    expect(summarizeToolArgs({})).toBe('');
+  });
+
+  it('handles unserializable values without throwing', () => {
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const summary = summarizeToolArgs({ circular });
+    expect(summary.startsWith('circular: ')).toBe(true);
+  });
+
+  it('redacts sensitive keys at the top level', () => {
+    const summary = summarizeToolArgs({ apiKey: 'sk-live-12345', query: 'emails' });
+    expect(summary).toBe('apiKey: "[redacted]", query: "emails"');
+    expect(summary).not.toContain('sk-live-12345');
+  });
+
+  it('redacts sensitive keys nested inside object values', () => {
+    const summary = summarizeToolArgs({
+      config: { authToken: 'abc123', name: 'prod' },
+    });
+    expect(summary).toContain('[redacted]');
+    expect(summary).toContain('prod');
+    expect(summary).not.toContain('abc123');
+  });
+
+  it('applies redaction before truncation — no secret prefix survives', () => {
+    const secret = `sk-${'s'.repeat(500)}`;
+    const summary = summarizeToolArgs({ password: secret });
+    expect(summary).toBe('password: "[redacted]"');
+    expect(summary).not.toContain('sk-');
+  });
+});
+
+describe('redactSensitiveValues', () => {
+  it('redacts sensitive keys at the top level', () => {
+    expect(
+      redactSensitiveValues({ password: 'hunter2', Authorization: 'Bearer xyz', query: 'ok' })
+    ).toEqual({ password: '[redacted]', Authorization: '[redacted]', query: 'ok' });
+  });
+
+  it('redacts sensitive keys recursively, including inside arrays', () => {
+    expect(
+      redactSensitiveValues({
+        items: [{ api_key: 'k1', label: 'a' }, { nested: { clientSecret: 'k2' } }],
+      })
+    ).toEqual({
+      items: [{ api_key: '[redacted]', label: 'a' }, { nested: { clientSecret: '[redacted]' } }],
+    });
+  });
+
+  it('leaves non-sensitive keys and primitive values untouched', () => {
+    const input = { query: 'emails', limit: 5, flags: [true, null], note: 'authless' };
+    // 'note' value mentions auth but the KEY is what matters
+    expect(redactSensitiveValues(input)).toEqual(input);
+  });
+
+  it('matches key patterns case-insensitively', () => {
+    expect(redactSensitiveValues({ ApiKey: 'x', REFRESH_TOKEN: 'y', BearerValue: 'z' })).toEqual({
+      ApiKey: '[redacted]',
+      REFRESH_TOKEN: '[redacted]',
+      BearerValue: '[redacted]',
+    });
+  });
+
+  it('is cycle-safe', () => {
+    const circular: Record<string, unknown> = { token: 'leak' };
+    circular.self = circular;
+    const result = redactSensitiveValues(circular) as Record<string, unknown>;
+    expect(result.token).toBe('[redacted]');
+    expect(result.self).toBe('[circular]');
   });
 });
