@@ -1,0 +1,17 @@
+{
+  "name": "@inklabs/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Inkwell desktop app — a thin Tauri shell over the locally running web dashboard",
+  "scripts": {
+    "dev": "tauri dev",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "tauri": "tauri",
+    "icon:generate": "node scripts/generate-icon.mjs && tauri icon assets/icon-source.png --output src-tauri/icons"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}

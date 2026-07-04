@@ -31,6 +31,8 @@
     "ws:list": "yarn ws list",
     "ws:status": "yarn ws status",
     "pr:wait-reply": "node scripts/wait-pr-reply.mjs",
+    "desktop:dev": "yarn workspace @inklabs/desktop tauri:dev",
+    "desktop:build": "yarn workspace @inklabs/desktop tauri:build",
     "build": "yarn install && yarn workspace @inklabs/cli build && yarn workspace @inklabs/cli install:cli",
     "build:all": "yarn workspaces foreach -A -t run build",
     "build:web": "yarn workspace @inklabs/web build",
