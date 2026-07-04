@@ -1,7 +1,7 @@
 //! Inkwell desktop shell.
 //!
 //! A thin native wrapper around the locally running Inkwell web dashboard
-//! (Next.js, default `http://localhost:3000`). The app does NOT bundle the web
+//! (Next.js, default `http://localhost:3002`). The app does NOT bundle the web
 //! app — it points the webview at the local dev/prod server.
 //!
 //! On launch the window shows a bundled "waiting for server" page while a
@@ -20,14 +20,14 @@ use tauri::{AppHandle, Manager, Url, WebviewUrl, WebviewWindowBuilder, WindowEve
 const MAIN_WINDOW: &str = "main";
 const DEFAULT_HOST: &str = "localhost";
 /// Web dashboard default port (`INK_PORT_BASE - 1`, i.e. 3001 - 1).
-const DEFAULT_PORT: u16 = 3000;
+const DEFAULT_PORT: u16 = 3002;
 const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(800);
 
 /// Optional user config at `~/.ink/desktop.json`:
 ///
 /// ```json
-/// { "host": "localhost", "port": 3000 }
+/// { "host": "localhost", "port": 3002 }
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]

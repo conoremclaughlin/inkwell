@@ -4,7 +4,7 @@ Inkwell desktop app — a **thin Tauri v2 native shell** over the locally runnin
 
 ## Architecture
 
-The app does **not** bundle the web app. It opens a native window pointed at the local Next.js server (default `http://localhost:3000`, i.e. `INK_PORT_BASE - 1`; the API stays on 3001). Everything you see is the same dashboard you'd see in a browser — the desktop app just adds native chrome:
+The app does **not** bundle the web app. It opens a native window pointed at the local Next.js server (default `http://localhost:3002`, i.e. `INK_PORT_BASE + 1`; the API stays on 3001). Everything you see is the same dashboard you'd see in a browser — the desktop app just adds native chrome:
 
 - **Window** titled "Inkwell" with the standard macOS menu (Edit/Copy/Paste bindings work in the webview).
 - **Server-not-running fallback**: on launch the window shows a bundled static page (`ui/index.html`) — never a blank white window. A background thread in the Rust shell polls the server's TCP port every 1.5s and navigates the webview to the dashboard the moment it's reachable.
@@ -19,11 +19,11 @@ Optional config file at `~/.ink/desktop.json`:
 ```json
 {
   "host": "localhost",
-  "port": 3000
+  "port": 3002
 }
 ```
 
-Both fields are optional — defaults are `localhost:3000`. If you run the dashboard on a different port base (e.g. `INK_PORT_BASE=4001` → web on 4002), set `"port": 4002`. Invalid JSON falls back to defaults (with a warning on stderr).
+Both fields are optional — defaults are `localhost:3002`. If you run the dashboard on a different port base (e.g. `INK_PORT_BASE=4001` → web on 4002), set `"port": 4002`. Invalid JSON falls back to defaults (with a warning on stderr).
 
 ## Prerequisites
 
