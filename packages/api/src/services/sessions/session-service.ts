@@ -1639,15 +1639,23 @@ This session will continue with a fresh context after compaction. Your identity,
         };
       }
 
+      const argsSummary = summarizeToolArgs(toolCall.input);
+
       await this.activityStream.logActivity({
         userId,
         agentId,
         type: 'tool_call',
         subtype: toolCall.toolName,
-        content: `${toolCall.toolName}(${Object.keys(toolCall.input).join(', ')})`,
+        content: `${toolCall.toolName}(${argsSummary})`,
         payload: {
           toolUseId: toolCall.toolUseId,
           toolName: toolCall.toolName,
+          tool: toolCall.toolName,
+          argsSummary,
+          // Runners capture tool_use events from a completed turn's output;
+          // per-call failure/duration isn't parsed yet, so status reflects
+          // the turn-level "call was made" fact.
+          status: 'completed',
           input: inputPayload,
         } as unknown as Json,
         sessionId,
@@ -1963,6 +1971,40 @@ export async function readImageAttachmentsAsBase64(
   }
 
   return images;
+}
+
+const MAX_ARG_VALUE_LENGTH = 200;
+const MAX_ARGS_SUMMARY_LENGTH = 500;
+
+/**
+ * Build a short, human-readable summary of tool-call arguments for the
+ * activity stream. Values are truncated aggressively (never full file
+ * contents / long strings) — the summary is for timeline display, not replay.
+ */
+export function summarizeToolArgs(input: Record<string, unknown>): string {
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(input)) {
+    let rendered: string;
+    if (typeof value === 'string') {
+      const truncated =
+        value.length > MAX_ARG_VALUE_LENGTH ? `${value.slice(0, MAX_ARG_VALUE_LENGTH)}…` : value;
+      rendered = JSON.stringify(truncated);
+    } else {
+      try {
+        rendered = JSON.stringify(value) ?? String(value);
+      } catch {
+        rendered = String(value);
+      }
+      if (rendered.length > MAX_ARG_VALUE_LENGTH) {
+        rendered = `${rendered.slice(0, MAX_ARG_VALUE_LENGTH)}…`;
+      }
+    }
+    parts.push(`${key}: ${rendered}`);
+  }
+  const summary = parts.join(', ');
+  return summary.length > MAX_ARGS_SUMMARY_LENGTH
+    ? `${summary.slice(0, MAX_ARGS_SUMMARY_LENGTH)}…`
+    : summary;
 }
 
 /**
