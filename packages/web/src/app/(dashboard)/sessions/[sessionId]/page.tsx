@@ -18,6 +18,7 @@ import { useApiPost, useApiQuery, useQueryClient } from '@/lib/api';
 import { useEventStream, type StreamActivity } from '@/lib/api/use-event-stream';
 import { ToolCallCard, isToolEntry } from '@/components/sessions/tool-call-card';
 import { ForkCard, forkChildSessionId } from '@/components/sessions/fork-card';
+import { groupTimelineEntries } from '@/lib/sessions/group-timeline-entries';
 import clsx from 'clsx';
 
 interface SessionLogsResponse {
@@ -352,24 +353,14 @@ export default function SessionLogsPage() {
     return [...streamed, ...polled];
   }, [data?.logs, streamedEvents, offset]);
 
-  // Single-level fork tree: entries whose parentId matches another visible
-  // entry render indented beneath it; everything else stays top-level.
-  const { topLevelLogs, childrenByParent } = useMemo(() => {
-    const visibleIds = new Set(logs.map((entry) => rawActivityId(entry.id)));
-    const childrenByParent = new Map<string, SessionLogEntry[]>();
-    const topLevelLogs: SessionLogEntry[] = [];
-    for (const entry of logs) {
-      const parentId = entry.parentId;
-      if (parentId && visibleIds.has(parentId) && rawActivityId(entry.id) !== parentId) {
-        const siblings = childrenByParent.get(parentId) || [];
-        siblings.push(entry);
-        childrenByParent.set(parentId, siblings);
-      } else {
-        topLevelLogs.push(entry);
-      }
-    }
-    return { topLevelLogs, childrenByParent };
-  }, [logs]);
+  // Single-level fork tree: entries whose parentId chain reaches a visible
+  // entry render indented beneath their nearest top-level ancestor (deeper
+  // chains flatten to one level); unmatched parents stay top-level so
+  // nothing is dropped.
+  const { topLevel: topLevelLogs, childrenByAnchor: childrenByParent } = useMemo(
+    () => groupTimelineEntries(logs, rawActivityId),
+    [logs]
+  );
   const pagination = data?.pagination;
   const session = data?.session;
   const statusBadge = session ? sessionStatusBadge(session.status, session.currentPhase) : null;
